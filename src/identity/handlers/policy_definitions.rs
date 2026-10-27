@@ -53,145 +53,16 @@ pub struct PolicyDefinitionsQuery {
     pub policy_type: Option<String>,
 }
 
-/// Returns `true` when `surface` references `policy_id` in any compiled
-/// policy slot (target, inbound, response, outbound, per-transit-point) —
-/// including per-variant overrides.
+/// Returns `true` when `surface` references `policy_id` in any enforced policy
+/// slot ([`crate::policies::slots::policy_slots`]), including per-variant
+/// overrides, MCP tool policies and gate conditions.
 fn surface_references_policy(
     surface: &crate::config::agent_surface::AgentSurface,
     policy_id: &str,
 ) -> bool {
-    let matches = |id: Option<&str>| id == Some(policy_id);
-
-    // Base surface slots
-    if matches(
-        surface
-            .target
-            .policy
-            .as_ref()
-            .map(|p| {
-                p.policy_definition_id
-                    .as_str()
-            }),
-    ) {
-        return true;
-    }
-    if matches(
-        surface
-            .access_point
-            .inbound_policy
-            .as_ref()
-            .map(|p| {
-                p.policy_definition_id
-                    .as_str()
-            }),
-    ) {
-        return true;
-    }
-    if matches(
-        surface
-            .target
-            .response_policy
-            .as_ref()
-            .map(|p| {
-                p.policy_definition_id
-                    .as_str()
-            }),
-    ) {
-        return true;
-    }
-    if matches(
-        surface
-            .transit
-            .as_ref()
-            .and_then(|t| {
-                t.shared
-                    .opa_policy_definition_id
-                    .as_deref()
-            }),
-    ) {
-        return true;
-    }
-
-    // Per-transit-point policies (request + response)
-    if let Some(ref transit) = surface.transit {
-        for tp in &transit.points {
-            if matches(tp.policy.as_ref().map(|p| {
-                p.policy_definition_id
-                    .as_str()
-            })) {
-                return true;
-            }
-            if matches(
-                tp.response_policy
-                    .as_ref()
-                    .map(|p| {
-                        p.policy_definition_id
-                            .as_str()
-                    }),
-            ) {
-                return true;
-            }
-        }
-    }
-
-    // Variant-level overrides for all slots + transit points
-    surface
-        .variants
-        .iter()
-        .any(|v| {
-            let ov = &v.overrides;
-            matches(
-                ov.target
-                    .as_ref()
-                    .and_then(|t| t.policy.as_ref())
-                    .map(|p| {
-                        p.policy_definition_id
-                            .as_str()
-                    }),
-            ) || matches(
-                ov.access_point
-                    .as_ref()
-                    .and_then(|ap| ap.inbound_policy.as_ref())
-                    .map(|p| {
-                        p.policy_definition_id
-                            .as_str()
-                    }),
-            ) || matches(
-                ov.target
-                    .as_ref()
-                    .and_then(|t| t.response_policy.as_ref())
-                    .map(|p| {
-                        p.policy_definition_id
-                            .as_str()
-                    }),
-            ) || matches(
-                ov.transit
-                    .as_ref()
-                    .and_then(|t| t.shared.as_ref())
-                    .and_then(|s| {
-                        s.opa_policy_definition_id
-                            .as_deref()
-                    }),
-            ) || ov
-                .transit
-                .as_ref()
-                .and_then(|t| t.points.as_ref())
-                .is_some_and(|pts| {
-                    pts.iter().any(|tp| {
-                        matches(tp.policy.as_ref().map(|p| {
-                            p.policy_definition_id
-                                .as_str()
-                        })) || matches(
-                            tp.response_policy
-                                .as_ref()
-                                .map(|p| {
-                                    p.policy_definition_id
-                                        .as_str()
-                                }),
-                        )
-                    })
-                })
-        })
+    crate::policies::slots::policy_slots(surface)
+        .values()
+        .any(|slot| slot.policy_definition_id == policy_id)
 }
 
 fn get_policy_store(state: &IdentityApiState) -> Result<&FileSystemPolicyDefinitionStore, AppError> {
@@ -1414,6 +1285,34 @@ mod tests {
         }))
         .unwrap();
         assert!(surface_references_policy(&s, POL));
+    }
+
+    #[test]
+    fn mcp_tool_policy_and_gate_condition_match() {
+        let tool: AgentSurface = serde_json::from_value(serde_json::json!({
+            "surface_id": "s-1", "name": "test",
+            "access_point": { "listen_address": AP, "route": "/test", "protocol": "mcp" },
+            "target": {
+                "endpoint": "https://upstream",
+                "mcp_tool_policies": [{ "tool_name": "search", "policy_definition_id": POL }],
+            },
+        }))
+        .unwrap();
+        let gate: AgentSurface = serde_json::from_value(serde_json::json!({
+            "surface_id": "s-1", "name": "test",
+            "access_point": { "listen_address": AP, "route": "/test", "protocol": "mcp" },
+            "target": {
+                "endpoint": "https://upstream",
+                "mcp_tool_gating": { "gates": [{
+                    "id": "g-1", "condition_policy_definition_id": POL,
+                    "action": { "effect": "deny", "patterns": ["*"] },
+                }]},
+            },
+        }))
+        .unwrap();
+
+        assert!(surface_references_policy(&tool, POL));
+        assert!(surface_references_policy(&gate, POL));
     }
 
     #[test]

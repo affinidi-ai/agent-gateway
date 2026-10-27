@@ -6,6 +6,7 @@ pub mod mcp_tool_gating;
 pub mod opa;
 pub mod policy_definitions;
 pub mod rate_limiter;
+pub mod slots;
 pub mod surface_manager;
 
 use std::borrow::Cow;

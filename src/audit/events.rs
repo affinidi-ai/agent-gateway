@@ -126,6 +126,8 @@ pub enum PolicySlot {
     /// One transit point's request or response policy.
     TransitPoint,
     McpTool,
+    /// The condition of an MCP tool gate.
+    McpToolGate,
     /// An appliance-wide plane.
     Plane,
 }
