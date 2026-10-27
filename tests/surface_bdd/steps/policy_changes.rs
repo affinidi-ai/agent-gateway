@@ -68,6 +68,11 @@ async fn operator_adds_policy_to_surface(
     assert_eq!(status, Some(200), "adding the audited policy to the surface");
 }
 
+#[given("the operator has created a surface policy definition")]
+async fn operator_has_created_policy(world: &mut SurfaceWorld) {
+    operator_creates_policy(world).await;
+}
+
 #[given(expr = "the operator has added a surface policy definition to surface {string} as its request policy")]
 async fn operator_has_added_policy_to_surface(
     world: &mut SurfaceWorld,
