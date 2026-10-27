@@ -444,6 +444,9 @@ hash its decisions carry: `policy_attached` when it starts applying, `policy_det
 stops (including when a definition replaces it), `policy_updated` with `changed: ["rego"]` and
 `previous_policy_content_hash` when its text changes, and `policy_attachment_changed` when it is
 enabled or disabled. Inline Rego beside a definition reference is not enforced and not recorded.
+An enabled gateway policy with blank inline Rego and no definition denies every request (it
+fails closed), so it is recorded as attached too; a disabled blank one enforces nothing and is
+not, so enabling or disabling it records `policy_attached` or `policy_detached`.
 
 ## Policy decision audit logging
 

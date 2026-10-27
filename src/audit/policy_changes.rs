@@ -128,7 +128,9 @@ pub fn gateway_policy_changes(
 }
 
 /// The hash of a gateway's inline Rego and whether it is enabled, when the
-/// gateway enforces one: it references no definition and its Rego is not blank.
+/// gateway has one: it references no definition, and its Rego is not blank or
+/// the policy is enabled. An enabled blank policy is compiled as it is and
+/// denies every request, as `resolve_and_compile_gateway_set` fails closed.
 fn inline_policy(gateway: Option<&Gateway>) -> Option<(String, bool)> {
     let config = gateway?
         .opa_policy_config
@@ -138,12 +140,12 @@ fn inline_policy(gateway: Option<&Gateway>) -> Option<(String, bool)> {
         .iter()
         .chain(&config.policy_definition_ids)
         .any(|id| !id.is_empty());
-    (!references
-        && !config
-            .policy
-            .trim()
-            .is_empty())
-    .then(|| (content_hash(&PolicyType::Gateway, &config.policy), config.enabled))
+    let blank = config
+        .policy
+        .trim()
+        .is_empty();
+    (!references && (config.enabled || !blank))
+        .then(|| (content_hash(&PolicyType::Gateway, &config.policy), config.enabled))
 }
 
 fn inline_policy_changes(
@@ -837,7 +839,7 @@ mod tests {
 
     #[test]
     fn an_inline_gateway_policy_is_attached_by_its_content_hash() {
-        let changes = gateway_policy_changes(Some(&gateway(true, None, &[])), Some(&inline_gateway(true, "allow")));
+        let changes = gateway_policy_changes(Some(&gateway(false, None, &[])), Some(&inline_gateway(true, "allow")));
 
         assert_eq!(changes.len(), 1);
         let (action, attached) = &changes[0];
@@ -913,6 +915,24 @@ mod tests {
         assert_eq!(summary(changes.clone()), vec![(PolicyChangeAction::PolicyAttachmentChanged, String::new())]);
         assert_eq!(changes[0].1.enabled, Some(false));
         assert_eq!(changes[0].1.previous_enabled, Some(true));
+    }
+
+    #[test]
+    fn a_blank_inline_gateway_policy_is_attached_only_while_enabled() {
+        let enabled = gateway_policy_changes(None, Some(&inline_gateway(true, "  ")));
+        assert_eq!(summary(enabled.clone()), vec![(PolicyChangeAction::PolicyAttached, String::new())]);
+        assert_eq!(
+            enabled[0]
+                .1
+                .policy_content_hash,
+            inline_hash("  ")
+        );
+
+        assert!(gateway_policy_changes(None, Some(&inline_gateway(false, "  "))).is_empty());
+        assert_eq!(
+            summary(gateway_policy_changes(Some(&inline_gateway(true, "")), Some(&inline_gateway(false, "")))),
+            vec![(PolicyChangeAction::PolicyDetached, String::new())]
+        );
     }
 
     #[test]

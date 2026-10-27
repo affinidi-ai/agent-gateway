@@ -515,6 +515,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_enabled_blank_inline_policy_denies_every_request() {
+        let manager = GatewayPolicyManager::new();
+        let gateway = create_test_gateway(
+            "gw-blank",
+            GatewayType::SelfGateway,
+            Some(GatewayOpaPolicyConfig {
+                enabled: true,
+                policy: "  ".to_string(),
+                ..Default::default()
+            }),
+        );
+
+        // Compiling may fail or yield no `allow`; either way the gateway is
+        // enforced and fails closed.
+        let _ = manager
+            .update_gateway_policy(&gateway)
+            .await;
+
+        let decision = manager
+            .evaluate_policy_decision("gw-blank", serde_json::json!({}))
+            .unwrap();
+        assert!(!decision.allow);
+    }
+
+    #[tokio::test]
     async fn test_disabled_policy_allows_by_default() {
         let manager = GatewayPolicyManager::new();
         let gateway = create_test_gateway(
