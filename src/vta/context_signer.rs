@@ -148,7 +148,6 @@ impl ContextSigner for VtaContextSigner {
             "keyId": identity.key_id,
             "header": { "typ": typ, "kid": kid },
             "payload": claims,
-            "algorithm": SIGNING_ALGORITHM,
         });
         let response: SignJwsResult = self
             .client

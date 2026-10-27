@@ -76,7 +76,7 @@ pub fn grant_command_with_provisioning(
 ) -> String {
     format!(
         "vta acl create --did {control_did} --role initiator --contexts {context_id} \
-         --capabilities context-create,key-mint,sign --label agent-gateway"
+         --capabilities context-create,key-mint,sign,sign-jws --label agent-gateway"
     )
 }
 
@@ -393,7 +393,7 @@ mod tests {
             command.contains("--role initiator"),
             "`application` does not derive key-mint, so provisioning would fail: {command}"
         );
-        for capability in ["context-create", "key-mint", "sign"] {
+        for capability in ["context-create", "key-mint", "sign", "sign-jws"] {
             assert!(command.contains(capability), "the provisioning sequence needs `{capability}`: {command}");
         }
         assert!(command.contains("--contexts acme"), "`acl create` spells it --contexts: {command}");

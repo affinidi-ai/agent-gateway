@@ -201,7 +201,6 @@ impl VtaCredentialAuthority {
             "keyId": self.signing_key_id,
             "header": { "typ": typ, "kid": self.signing_key_id },
             "payload": claims,
-            "algorithm": SIGNING_ALGORITHM,
         });
         let response: SignJwsResult = self
             .client
