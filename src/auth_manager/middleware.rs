@@ -189,12 +189,12 @@ fn terms_required_response() -> Response {
 /// Global middleware that requires a valid session for all non-public API routes.
 /// Public paths (auth flows, health, DIDComm, onboarding, etc.) are exempt.
 /// Must be applied via `axum::middleware::from_fn_with_state(AuthGuardState, require_session_auth)`.
-#[allow(clippy::result_large_err)] // FIXME: Response is not an error
+/// A refusal is a response like any other, so it is returned, not raised.
 pub async fn require_session_auth(
     State(state): State<AuthGuardState>,
     request: Request,
     next: Next,
-) -> Result<Response, Response> {
+) -> Response {
     let path = request
         .uri()
         .path()
@@ -204,14 +204,14 @@ pub async fn require_session_auth(
 
     if is_public_path(&path) {
         debug!("require_session_auth: public path {}, skipping auth", path);
-        return Ok(next.run(request).await);
+        return next.run(request).await;
     }
 
     let session_token = match supplied_session_token {
         Some(token) => token,
         None => {
             warn!("require_session_auth: no session_token for protected path {}", path);
-            return Err(StatusCode::UNAUTHORIZED.into_response());
+            return StatusCode::UNAUTHORIZED.into_response();
         }
     };
 
@@ -225,7 +225,7 @@ pub async fn require_session_auth(
             && !user_is_approved(storage, &user_id).await
         {
             warn!("require_session_auth: session valid but user_id={} is not Approved — rejecting {}", user_id, path);
-            return Err(StatusCode::UNAUTHORIZED.into_response());
+            return StatusCode::UNAUTHORIZED.into_response();
         }
 
         // Everything from here runs as the user, with a request id of its
@@ -235,13 +235,16 @@ pub async fn require_session_auth(
         return crate::audit::context::in_management_request(actor.clone(), async move {
             if session.terms_gate == TermsSessionGate::ConsentPending && !CONSENT_PENDING_PATHS.contains(&path.as_str())
             {
-                let status = state
+                let status = match state
                     .terms_manager
                     .status(&user_id, crate::terms::AcceptanceContext::Login)
                     .await
-                    .map_err(IntoResponse::into_response)?;
+                {
+                    Ok(status) => status,
+                    Err(error) => return error.into_response(),
+                };
                 if status.consent_required {
-                    return Err(record_refusal(&request, &actor, terms_required_response()));
+                    return record_refusal(&request, &actor, terms_required_response());
                 }
             }
 
@@ -267,7 +270,7 @@ pub async fn require_session_auth(
                     .headers_mut()
                     .append(SET_COOKIE, value);
             }
-            Ok(response)
+            response
         })
         .await;
     }
@@ -286,7 +289,7 @@ pub async fn require_session_auth(
                 "require_session_auth: access token valid but bound user_id={} is not Approved — rejecting {}",
                 principal.user_id, path
             );
-            return Err(StatusCode::UNAUTHORIZED.into_response());
+            return StatusCode::UNAUTHORIZED.into_response();
         }
 
         let actor = crate::audit::events::Actor::pat(principal.token_id.clone(), principal.user_id.clone());
@@ -298,7 +301,7 @@ pub async fn require_session_auth(
     }
 
     warn!("require_session_auth: invalid/expired session for {}", path);
-    Err(StatusCode::UNAUTHORIZED.into_response())
+    StatusCode::UNAUTHORIZED.into_response()
 }
 
 /// The rest of [`require_session_auth`] for a request authenticated by an
@@ -313,12 +316,15 @@ async fn access_token_request(
     request: Request,
     path: String,
     next: Next,
-) -> Result<Response, Response> {
-    let status = state
+) -> Response {
+    let status = match state
         .terms_manager
         .status(&principal.user_id, crate::terms::AcceptanceContext::Login)
         .await
-        .map_err(IntoResponse::into_response)?;
+    {
+        Ok(status) => status,
+        Err(error) => return error.into_response(),
+    };
     if status.consent_required {
         let response = (
             StatusCode::FORBIDDEN,
@@ -328,7 +334,7 @@ async fn access_token_request(
             })),
         )
             .into_response();
-        return Err(record_refusal(&request, &actor, response));
+        return record_refusal(&request, &actor, response);
     }
 
     let refused = |status: StatusCode| record_refusal(&request, &actor, status.into_response());
@@ -349,7 +355,7 @@ async fn access_token_request(
                     reason = %rejection.message(),
                     "Access-token resource scope rejected request"
                 );
-                return Err(refused(StatusCode::FORBIDDEN));
+                return refused(StatusCode::FORBIDDEN);
             }
         },
         _ => crate::auth_manager::resource_scope::ScopeEvaluation { pattern: None, tenant_id: None },
@@ -377,7 +383,7 @@ async fn access_token_request(
             header = %selector.header_name,
             "PAT tenant selector is broad and no trusted edge is configured — failing closed"
         );
-        return Err(refused(StatusCode::FORBIDDEN));
+        return refused(StatusCode::FORBIDDEN);
     }
 
     if let Some(tenant_id) = scope_evaluation
@@ -385,7 +391,7 @@ async fn access_token_request(
         .as_deref()
         && crate::tenancy::validate_tenant_id(tenant_id).is_err()
     {
-        return Err(refused(StatusCode::FORBIDDEN));
+        return refused(StatusCode::FORBIDDEN);
     }
 
     let tenant_context = scope_evaluation
@@ -412,19 +418,19 @@ async fn access_token_request(
                     &id,
                 ) =>
             {
-                return Err(if is_read {
+                return if is_read {
                     StatusCode::NOT_FOUND.into_response()
                 } else {
                     refused(StatusCode::FORBIDDEN)
-                });
+                };
             }
-            PathScope::Unscoped if !is_read => return Err(refused(StatusCode::FORBIDDEN)),
+            PathScope::Unscoped if !is_read => return refused(StatusCode::FORBIDDEN),
             PathScope::DenyScoped => {
-                return Err(if is_read {
+                return if is_read {
                     StatusCode::NOT_FOUND.into_response()
                 } else {
                     refused(StatusCode::FORBIDDEN)
-                });
+                };
             }
             _ => {}
         }
@@ -459,7 +465,7 @@ async fn access_token_request(
             .extensions_mut()
             .insert(storage);
     }
-    Ok(next.run(request).await)
+    next.run(request).await
 }
 
 /// Records `response` as the refusal of `request` when it refuses a policy
