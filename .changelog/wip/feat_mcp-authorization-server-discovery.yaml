@@ -29,6 +29,14 @@ changes:
         scopes, for the surface and each variant. It keeps token forwarding off and the accepted
         audiences empty while discovery is on, shows the resource each variant advertises, and
         removes a setting the operator switches off.
+    - timestamp: '2026-10-27T19:34:56Z'
+      title: End-to-end MCP discovery demo against Ory Hydra
+      description: >-
+        make mcp-discovery starts Ory Hydra in Docker, a login and consent app, an MCP server and
+        the gateway, then checks discovery, sign-in, the token audience, token stripping and the
+        caller identity in policy with a scripted client and the official MCP client SDK. With
+        ARGS=--keep it stays up for a check with MCP Inspector. The consent app shows how to grant
+        the RFC 8707 resource as the token audience, which Hydra does not do by itself.
   changed: []
   fixed:
     - timestamp: '2026-10-27T10:22:00Z'

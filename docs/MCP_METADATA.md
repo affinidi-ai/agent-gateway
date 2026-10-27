@@ -1433,6 +1433,13 @@ empty, `forward_header` off and the `Authorization` header with the `Bearer`
 scheme. A setting the operator switches off is removed with a merge PATCH
 before the rest of the surface is saved.
 
+`make mcp-discovery` ([`scripts/mcp-discovery/`](../scripts/mcp-discovery/README.md))
+runs the flow end to end against Ory Hydra with a scripted client and the
+official MCP client SDK, and `--keep` leaves it running for MCP Inspector.
+Hydra ignores the RFC 8707 `resource` parameter MCP clients send, so its consent
+app must grant the resource as the access token audience, or every token is
+refused for its audience; the demo's consent app shows how.
+
 The `fabric` CLI sends surface JSON to the gateway as it is, so it sets and
 removes the setting without CLI-specific flags. `--set` sends a JSON Merge
 Patch and `--unset` sends `null`; add `--dry-run` to have the gateway check the
