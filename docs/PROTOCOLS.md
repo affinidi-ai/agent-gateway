@@ -556,6 +556,13 @@ presentation replaces the raw extension there. An identity resolved from an arti
 issuance and the Trust Recorder, but the artifact keeps its raw extension and no credential is
 added to the reply.
 
+The same locations apply over Fabric. The gateway in front of the Managed Agent resolves the
+identity from them and places the presentation on the status message. The calling gateway reads
+the presentation, or a raw identity extension, only from the status message, and never from
+artifacts: the peer gateway never places a presentation in an artifact, so one found there, or a
+raw identity there, did not come from it and is ignored
+([`src/proxy/fabric_identity.rs`](../src/proxy/fabric_identity.rs)).
+
 Neither remaining location proves authorship: A2A artifacts carry no author, and the Gateway does not
 validate responses. A Managed Agent that reflects caller content into its status message or an
 artifact (by echoing it, tracing it, or under prompt injection) can therefore let a caller plant an

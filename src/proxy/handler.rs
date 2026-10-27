@@ -16026,7 +16026,7 @@ async fn inject_backend_agent_vp(
                 inbound_chained_vcs.clone(),
             )
             .await
-            .map(|(body, proof)| (body, Some(proof)))
+            .map(|injected| injected.map_or_else(|| (response_body.clone(), None), |(body, proof)| (body, Some(proof))))
         }
         _ => {
             debug!(channel = channel_name, protocol = ?state.surface.channel_protocol(), "VP injection not supported for this protocol");
@@ -16036,7 +16036,11 @@ async fn inject_backend_agent_vp(
 
     match vp_result {
         Ok((modified_body, vp_jwt)) => {
-            info!(channel = channel_name, did = %did, "Backend agent VP injected into response");
+            if vp_jwt.is_some() {
+                info!(channel = channel_name, did = %did, "Backend agent VP injected into response");
+            } else {
+                debug!(channel = channel_name, did = %did, "No response location carries the agent identity, VP not injected");
+            }
             Ok((modified_body, vp_jwt))
         }
         Err(e) => {
