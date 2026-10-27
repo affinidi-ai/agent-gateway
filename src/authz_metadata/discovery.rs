@@ -914,14 +914,10 @@ mod tests {
     async fn an_unreachable_first_path_issuer_url_ends_discovery_at_once() {
         let server = TestServer::start().await;
         let issuer = path_issuer(&server);
-        server.reply(PATH_RFC8414, Reply::json(&document(&issuer).to_string()).delayed(Duration::from_secs(5)));
+        server.reply(PATH_RFC8414, Reply::cut_short());
         server.reply(PATH_OIDC_INSERTED, Reply::json(&document(&issuer).to_string()));
         server.reply(PATH_OIDC_APPENDED, Reply::json(&document(&issuer).to_string()));
-        let options = DiscoveryOptions {
-            timeout: Duration::from_millis(200),
-            ..DiscoveryOptions::default()
-        };
-        let error = discovered(&issuer, options)
+        let error = discovered(&issuer, DiscoveryOptions::default())
             .await
             .unwrap_err();
         assert_eq!(error.code(), "unreachable");
@@ -934,12 +930,8 @@ mod tests {
         let issuer = path_issuer(&server);
         server.reply(PATH_RFC8414, Reply::status(404));
         server.reply(PATH_OIDC_INSERTED, Reply::status(404));
-        server.reply(PATH_OIDC_APPENDED, Reply::json(&document(&issuer).to_string()).delayed(Duration::from_secs(5)));
-        let options = DiscoveryOptions {
-            timeout: Duration::from_millis(200),
-            ..DiscoveryOptions::default()
-        };
-        let error = discovered(&issuer, options)
+        server.reply(PATH_OIDC_APPENDED, Reply::cut_short());
+        let error = discovered(&issuer, DiscoveryOptions::default())
             .await
             .unwrap_err();
         assert_eq!(error.code(), "unreachable");

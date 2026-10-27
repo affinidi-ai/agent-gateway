@@ -3,9 +3,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::Router;
+use axum::body::Body;
 use axum::extract::State;
 use axum::http::{StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
+use bytes::Bytes;
+use futures::stream;
 use tokio::net::TcpListener;
 
 #[derive(Debug, Clone)]
@@ -14,6 +17,7 @@ pub(super) struct Reply {
     body: String,
     location: Option<String>,
     delay: Duration,
+    cut_short: bool,
 }
 
 impl Reply {
@@ -23,6 +27,14 @@ impl Reply {
             body: body.to_string(),
             location: None,
             delay: Duration::ZERO,
+            cut_short: false,
+        }
+    }
+
+    pub(super) fn cut_short() -> Self {
+        Self {
+            cut_short: true,
+            ..Self::json("")
         }
     }
 
@@ -155,6 +167,12 @@ async fn serve(
         return StatusCode::NOT_FOUND.into_response();
     };
     tokio::time::sleep(reply.delay).await;
+    if reply.cut_short {
+        let chunks: Vec<Result<Bytes, std::io::Error>> =
+            vec![Ok(Bytes::from_static(b"{")), Err(std::io::Error::other("body cut short"))];
+        return (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], Body::from_stream(stream::iter(chunks)))
+            .into_response();
+    }
     let status = StatusCode::from_u16(reply.status).expect("a valid status");
     let mut response = (status, [(header::CONTENT_TYPE, "application/json")], reply.body).into_response();
     if let Some(location) = reply.location {
