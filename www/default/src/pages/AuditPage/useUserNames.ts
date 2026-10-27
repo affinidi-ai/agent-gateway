@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { apiClient } from '../../api';
+import { ApiError, apiClient } from '../../api';
 import type { UserNameResolver } from './eventNarrative';
 
 let cached: Promise<Record<string, string>> | null = null;
@@ -24,7 +24,7 @@ function loadUserNames(): Promise<Record<string, string>> {
       return names;
     })
     .catch(error => {
-      if (error?.response?.status !== 403) cached = null;
+      if (!(error instanceof ApiError && error.status === 403)) cached = null;
       return {};
     });
   return cached;

@@ -7,6 +7,7 @@ import { apiClient } from '../../../api';
 import { clearUserNames } from '../useUserNames';
 
 jest.mock('../../../api', () => ({
+  ApiError: jest.requireActual('../../../api').ApiError,
   apiClient: {
     get: jest.fn(),
     listIssuers: jest.fn(() => Promise.resolve([])),
@@ -438,6 +439,32 @@ describe('AuditPage policy changes', () => {
     await waitFor(() => expect(within(item).getByText('user alice')).toBeInTheDocument());
     expect(mockGet.mock.calls.filter(([url]) => url === '/users')).toHaveLength(1);
   });
+
+  it.each([
+    [403, 1],
+    [500, 2],
+  ])(
+    'after the users list fails with %i, a later visit asks for it %i time(s) in all',
+    async (status, calls) => {
+      const { ApiError } = jest.requireActual('../../../api');
+      mockGet.mockImplementation((url: string) =>
+        url === '/users'
+          ? Promise.reject(new ApiError('failed', status))
+          : Promise.resolve({ data: CHANGE_RESPONSE })
+      );
+
+      const { unmount } = renderPage();
+      const item = await screen.findByTestId('audit-item-0');
+      await waitFor(() => expect(within(item).getByText('user u-1')).toBeInTheDocument());
+      unmount();
+      renderPage();
+      await screen.findByTestId('audit-item-0');
+
+      await waitFor(() =>
+        expect(mockGet.mock.calls.filter(([url]) => url === '/users')).toHaveLength(calls)
+      );
+    }
+  );
 
   it('does not ask for the users list when the page shows no policy change', async () => {
     mockGet.mockImplementation((url: string) =>

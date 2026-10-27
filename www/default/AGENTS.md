@@ -291,7 +291,10 @@ in components.
 - The footnote shows the actor instead of the caller. Records hold ids only; `useUserNames`
   resolves user ids to usernames from `/users` and keeps the id when the list is not readable.
   It is called once, in `AuditPage`, and asks for the list only when the page shows a policy
-  change; the resolver is passed down as the `userName` prop. Don't call it per row.
+  change; the resolver is passed down as the `userName` prop. Don't call it per row. A 403 is
+  remembered for the session; any other failure is retried on the next visit. The status comes
+  from `ApiError` (`api.ts`), which every failed `apiClient` request throws: read
+  `error.status`, not the message text.
 - The evidence pane shows only **Details** for a change (no request journey or signed
   presentation), grouped as Change, Policy, Where and Refusal. The policy links to the Policies
   tab of its type, the target to its surface or gateway page.
