@@ -122,10 +122,18 @@ presentation with `user_hash = SHA256(did)`.
 ### Authorization server metadata module (developer reference)
 
 [`src/authz_metadata/`](../src/authz_metadata/) fetches and validates an authorization
-server's metadata document. It tries the RFC 8414 URL first, then the OpenID Connect
-`/.well-known/openid-configuration` URL, and returns the issuer, the URL the document came
-from, the `token_endpoint` and the `jwks_uri`. The `issuer` in the document must equal the
-requested issuer byte for byte. `token_endpoint` and `jwks_uri` must be absolute `http` or
+server's metadata document and returns the issuer, the URL the document came from, the
+`token_endpoint` and the `jwks_uri`. An issuer is acceptable only when it has no ASCII
+whitespace or control characters anywhere, leading, trailing or inside; the raw string is
+checked before it is parsed, and a failure is `invalid_url` before any DNS lookup or request.
+Let P be the issuer path with its trailing slashes removed. An origin issuer (empty P, with or
+without a trailing slash) has two attempts, in this order: `{origin}/.well-known/oauth-authorization-server`
+(RFC 8414), then `{origin}/.well-known/openid-configuration`. A path issuer has three: the
+RFC 8414 URL with P inserted after the well-known name
+(`{origin}/.well-known/oauth-authorization-server{P}`), the OpenID Connect URL with P inserted
+(`{origin}/.well-known/openid-configuration{P}`), then the OpenID Connect URL with P appended
+(`{origin}{P}/.well-known/openid-configuration`). The first acceptable document wins. The
+`issuer` in the document must equal the requested issuer byte for byte. `token_endpoint` and `jwks_uri` must be absolute `http` or
 `https` URLs of at most 2048 characters, with no whitespace, control characters,
 credentials or fragment, not a cloud-metadata address, and not a weaker scheme than the
 issuer: an `https` issuer with an `http` endpoint is an invalid document under every posture.
@@ -134,9 +142,9 @@ The schemes are compared as parsed, so their case does not matter.
 | Limit | Value |
 | --- | --- |
 | Body size | 64 KiB (`MAX_METADATA_BYTES`), set per call by `DiscoveryOptions::max_bytes` |
-| Timeout | 10 s, set per call by `DiscoveryOptions::timeout`, applied once to resolving the host and again to the HTTP request from connecting to reading the last byte. One fetch can take up to twice the timeout, and `discover` can make two fetches |
+| Timeout | 10 s, set per call by `DiscoveryOptions::timeout`, applied once to resolving the host and again to the HTTP request from connecting to reading the last byte. One fetch can take up to twice the timeout, and `discover` can make three fetches for a path issuer and two for an origin issuer, so up to six or four times the timeout in all |
 | Redirects | Refused |
-| DNS | The egress guard can resolve the host more than once; the connection is pinned to the addresses of the last, vetted resolution. An IPv6 literal host cannot be pinned and fails as `blocked` |
+| DNS | The egress guard can resolve the host more than once; the connection is pinned to the addresses of the last, vetted resolution. An IPv6 literal host cannot be pinned and fails as `blocked`. Pinning does not hold when a proxy is configured: the HTTP client reads `HTTPS_PROXY`, `HTTP_PROXY` and `ALL_PROXY` (also in lower case) and, on macOS and Windows, the system proxy settings. The request then goes to the proxy, which resolves the host again and connects to an address nobody vetted, so address vetting and pinning no longer apply. This is true of the shared pinned egress clients until they call `.no_proxy()` |
 | Status | Only a 2xx response is read |
 
 The caller chooses an `EgressPosture`. `Strict` accepts `https` only: `get_bounded` and
@@ -164,7 +172,7 @@ instead.
 
 | `code()` | Meaning |
 | --- | --- |
-| `invalid_url` | The URL or issuer is not an absolute `http` or `https` URL without credentials (`https` only under `Strict`), or the issuer has a query or fragment |
+| `invalid_url` | The URL or issuer is not an absolute `http` or `https` URL without credentials (`https` only under `Strict`), the issuer has a query or fragment, or the issuer contains whitespace or control characters |
 | `blocked` | The egress posture refused the URL or its resolved address, the host name did not resolve, or the host is an IPv6 literal |
 | `unreachable` | Resolving the host timed out, the connection failed or timed out, or the body could not be read in time |
 | `http_status` | The server answered with a status outside 2xx, including a redirect |
@@ -172,14 +180,15 @@ instead.
 | `invalid_document` | The body is not a JSON object, or a required field is missing or unacceptable, including an endpoint with a weaker scheme than the issuer or, under `Strict`, a non-`https` endpoint |
 | `issuer_mismatch` | The document's `issuer` differs from the requested issuer |
 
-`discover` stops at once on `invalid_url`, `blocked` or `unreachable`. Otherwise, when both
-URLs fail, it returns the more specific failure, from least to most specific: `http_status`,
+`discover` tries the URLs in order and stops at once on `invalid_url`, `blocked` or
+`unreachable`. Otherwise, when every attempt fails, it returns the most specific failure among
+all of them, from least to most specific: `http_status`,
 `too_large`, `invalid_document`, `issuer_mismatch`.
 
 | Function | Use |
 | --- | --- |
-| `discover(issuer, posture, options)` | Fetches and validates, trying both URLs |
-| `metadata_urls(issuer)` | Pure: the two candidate URLs for an issuer |
+| `discover(issuer, posture, options)` | Fetches and validates, trying the URLs in order |
+| `metadata_urls(issuer)` | Pure: the candidate URLs for an issuer, in order: two for an origin issuer, three for a path issuer |
 | `parse_metadata(body, issuer, metadata_url, posture)` | Pure: validates a document already in hand |
 | `get_bounded(url, posture, options)` | The pinned, bounded GET, reusable for a JWKS fetch |
 

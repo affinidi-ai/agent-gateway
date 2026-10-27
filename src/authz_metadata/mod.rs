@@ -83,12 +83,13 @@ impl Default for DiscoveryOptions {
 
 /// Why a discovery or fetch failed, ordered from least to most specific.
 ///
-/// [`discover`] returns the most specific failure of its two attempts.
+/// [`discover`] returns the most specific failure of its attempts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DiscoveryFailure {
     /// The URL is not an absolute http or https URL with a host and without credentials,
     /// its scheme is `http` under [`EgressPosture::Strict`], which accepts `https` only,
-    /// or an issuer has a query or fragment. Code `invalid_url`.
+    /// or an issuer has a query, a fragment, or whitespace or a control character.
+    /// Code `invalid_url`.
     InvalidUrl,
     /// The egress posture forbids the host or an address it resolves to. The egress
     /// guard resolves a host name while vetting it, so a name that does not resolve,

@@ -102,6 +102,12 @@ fn read_deadline_secs(options: DiscoveryOptions) -> u64 {
 /// call can take up to twice the timeout. The body is bounded by `options.max_bytes`
 /// (`too_large`). The request asks for `application/json`.
 ///
+/// The vetting and pinning do not hold when a proxy is configured, through the environment
+/// variables `HTTPS_PROXY`, `HTTP_PROXY` or `ALL_PROXY` (also in lower case) or the system
+/// proxy settings of macOS and Windows: the shared pinned egress clients do not disable
+/// proxies, so the request then goes to the proxy, which resolves the host again and
+/// connects to an address nobody vetted.
+///
 /// Failure codes: `invalid_url`, `blocked`, `unreachable`, `http_status`, `too_large`.
 pub async fn get_bounded(
     url: &str,

@@ -6,17 +6,25 @@ use super::{AuthzServerMetadata, DiscoveryError, DiscoveryFailure, DiscoveryOpti
 use crate::url_validation::{reject_cloud_metadata_url, validate_webhook_url};
 
 const MAX_ENDPOINT_URL_CHARS: usize = 2048;
+const MAX_LOGGED_ISSUER_CHARS: usize = 200;
+const RFC8414_SUFFIX: &str = "/.well-known/oauth-authorization-server";
+const OIDC_SUFFIX: &str = "/.well-known/openid-configuration";
 
-/// The RFC 8414 metadata URL, then the OpenID Connect configuration URL, for `issuer`.
+/// The candidate metadata URLs for `issuer`, in the order [`discover`] tries them.
 ///
-/// RFC 8414 inserts `/.well-known/oauth-authorization-server` between the host and the
-/// issuer path, after removing a terminating `/`; OpenID Connect appends
-/// `/.well-known/openid-configuration` to the issuer path, also without its terminating `/`.
+/// Let the issuer path be its path without terminating `/` characters. For an issuer
+/// without a path (an origin, with or without a trailing `/`) there are two URLs:
+/// `{origin}/.well-known/oauth-authorization-server`, then
+/// `{origin}/.well-known/openid-configuration`. For an issuer with a path there are three:
+/// the RFC 8414 path insertion `{origin}/.well-known/oauth-authorization-server{path}`,
+/// the OpenID Connect path insertion `{origin}/.well-known/openid-configuration{path}`,
+/// then the OpenID Connect path appending `{origin}{path}/.well-known/openid-configuration`.
 ///
 /// Fails with `invalid_url` unless `issuer` is an absolute http or https URL with a
-/// host, no credentials, no query and no fragment. The scheme rule of a posture is
-/// applied when the URLs are fetched. Performs no I/O.
-pub fn metadata_urls(issuer: &str) -> Result<[String; 2], DiscoveryError> {
+/// host, no credentials, no query, no fragment, and no whitespace or control character
+/// anywhere. The scheme rule of a posture is applied when the URLs are fetched.
+/// Performs no I/O.
+pub fn metadata_urls(issuer: &str) -> Result<Vec<String>, DiscoveryError> {
     let url = parse_issuer(issuer, EgressPosture::CloudMetadataOnly)?;
     let origin = url
         .origin()
@@ -24,16 +32,32 @@ pub fn metadata_urls(issuer: &str) -> Result<[String; 2], DiscoveryError> {
     let path = url
         .path()
         .trim_end_matches('/');
-    Ok([
-        format!("{origin}/.well-known/oauth-authorization-server{path}"),
-        format!("{origin}{path}/.well-known/openid-configuration"),
+    if path.is_empty() {
+        return Ok(vec![format!("{origin}{RFC8414_SUFFIX}"), format!("{origin}{OIDC_SUFFIX}")]);
+    }
+    Ok(vec![
+        format!("{origin}{RFC8414_SUFFIX}{path}"),
+        format!("{origin}{OIDC_SUFFIX}{path}"),
+        format!("{origin}{path}{OIDC_SUFFIX}"),
     ])
+}
+
+fn has_whitespace_or_control(value: &str) -> bool {
+    value
+        .chars()
+        .any(|c| c.is_ascii_whitespace() || c.is_control())
 }
 
 fn parse_issuer(
     issuer: &str,
     posture: EgressPosture,
 ) -> Result<Url, DiscoveryError> {
+    if has_whitespace_or_control(issuer) {
+        return Err(DiscoveryError::new(
+            DiscoveryFailure::InvalidUrl,
+            "an issuer has no whitespace or control character",
+        ));
+    }
     let url = parse_fetch_url(issuer, posture)?;
     if url.query().is_some() || url.fragment().is_some() {
         return Err(DiscoveryError::new(DiscoveryFailure::InvalidUrl, "an issuer has no query or fragment"));
@@ -43,21 +67,23 @@ fn parse_issuer(
 
 /// Discover the authorization server metadata of `issuer` under `posture`.
 ///
-/// `issuer` must be an absolute URL with a host and no credentials, query or fragment;
-/// under [`EgressPosture::Strict`] its scheme must be `https`, and under
-/// [`EgressPosture::CloudMetadataOnly`] `http` or `https`. Any other issuer fails with
-/// `invalid_url` before the host is resolved or a request is made.
+/// `issuer` must be an absolute URL with a host and no credentials, query, fragment,
+/// whitespace or control character; under [`EgressPosture::Strict`] its scheme must be
+/// `https`, and under [`EgressPosture::CloudMetadataOnly`] `http` or `https`. Any other
+/// issuer fails with `invalid_url` before the host is resolved or a request is made.
 ///
-/// The RFC 8414 document is fetched first and the OpenID Connect document second, each
-/// with [`get_bounded`]: the host is vetted for `posture` and the connection pinned to
-/// the vetted addresses, redirects are refused, only a 2xx response is accepted, and the
-/// body is capped at `options.max_bytes`, and resolving the host and each request are
-/// each limited to `options.timeout`. Each document is validated with [`parse_metadata`].
-/// With two fetches, discovery can take up to four times `options.timeout` in all.
+/// The URLs of [`metadata_urls`] are fetched in order, each with [`get_bounded`]: the
+/// host is vetted for `posture` and the connection pinned to the vetted addresses,
+/// redirects are refused, only a 2xx response is accepted, the body is capped at
+/// `options.max_bytes`, and resolving the host and each request are each limited to
+/// `options.timeout`. Each document is validated with [`parse_metadata`]. A fetch can
+/// take up to twice `options.timeout`, and discovery makes up to three fetches for an
+/// issuer with a path and two for an origin issuer, so up to six or four times
+/// `options.timeout` in all.
 ///
 /// The first acceptable document wins. An `invalid_url`, `blocked` or `unreachable`
-/// failure ends discovery at once, since the second URL names the same host; otherwise
-/// the more specific failure of the two attempts is returned, from least to most specific:
+/// failure ends discovery at once, since every URL names the same host; otherwise the
+/// most specific failure of all the attempts is returned, from least to most specific:
 /// `http_status`, `too_large`, `invalid_document`, `issuer_mismatch`.
 pub async fn discover(
     issuer: &str,
@@ -94,7 +120,8 @@ pub async fn discover(
 ///
 /// `issuer` must be acceptable to [`discover`] under `posture` (`invalid_url` otherwise).
 /// The body must be a JSON object whose `issuer` member equals `issuer` byte for byte,
-/// trailing slash included (`issuer_mismatch` otherwise). Its `token_endpoint` and
+/// trailing slash included (`issuer_mismatch` otherwise, whose detail shows at most the
+/// first 200 characters of the escaped discovered issuer). Its `token_endpoint` and
 /// `jwks_uri` members must be strings holding absolute http or https URLs of at most
 /// 2048 characters, with a host, without whitespace, control characters, credentials or
 /// a fragment, and not naming a cloud-metadata host. They must not use a weaker scheme
@@ -128,7 +155,7 @@ pub fn parse_metadata(
     if discovered != issuer {
         return Err(DiscoveryError::new(
             DiscoveryFailure::IssuerMismatch,
-            format!("{metadata_url}: issuer {discovered:?} is not {issuer:?}"),
+            format!("{metadata_url}: issuer {} is not {issuer:?}", escaped_for_log(discovered)),
         ));
     }
     let endpoint = |name: &str| -> Result<String, DiscoveryError> {
@@ -154,10 +181,7 @@ fn endpoint_url(
     if value.chars().count() > MAX_ENDPOINT_URL_CHARS {
         return Err("is too long");
     }
-    if value
-        .chars()
-        .any(|c| c.is_ascii_whitespace() || c.is_control())
-    {
+    if has_whitespace_or_control(value) {
         return Err("contains whitespace or a control character");
     }
     let url = parse_fetch_url(value, posture)
@@ -175,6 +199,19 @@ fn endpoint_url(
         return Err("names a host the strict egress posture blocks");
     }
     Ok(value.to_string())
+}
+
+fn escaped_for_log(value: &str) -> String {
+    let escaped = format!("{value:?}");
+    if escaped.chars().count() <= MAX_LOGGED_ISSUER_CHARS {
+        return escaped;
+    }
+    let mut shown: String = escaped
+        .chars()
+        .take(MAX_LOGGED_ISSUER_CHARS)
+        .collect();
+    shown.push('…');
+    shown
 }
 
 #[cfg(test)]
@@ -261,25 +298,100 @@ mod tests {
     }
 
     #[test]
-    fn metadata_urls_follow_rfc_8414_and_openid_connect() {
+    fn an_origin_issuer_has_two_metadata_urls() {
         let origin = [
             "https://as.example.com/.well-known/oauth-authorization-server",
             "https://as.example.com/.well-known/openid-configuration",
         ];
-        assert_eq!(metadata_urls("https://as.example.com").unwrap(), origin);
-        assert_eq!(metadata_urls("https://as.example.com/").unwrap(), origin);
-        let path = [
-            "https://login.example.com/.well-known/oauth-authorization-server/tenant/v2.0",
-            "https://login.example.com/tenant/v2.0/.well-known/openid-configuration",
-        ];
-        assert_eq!(metadata_urls("https://login.example.com/tenant/v2.0").unwrap(), path);
-        assert_eq!(metadata_urls("https://login.example.com/tenant/v2.0/").unwrap(), path);
+        for issuer in ["https://as.example.com", "https://as.example.com/", "https://as.example.com//"] {
+            assert_eq!(metadata_urls(issuer).unwrap(), origin, "{issuer}");
+        }
         assert_eq!(
             metadata_urls("http://127.0.0.1:4444").unwrap(),
             [
                 "http://127.0.0.1:4444/.well-known/oauth-authorization-server",
                 "http://127.0.0.1:4444/.well-known/openid-configuration"
             ]
+        );
+        assert_eq!(
+            metadata_urls("http://127.0.0.1:4444/").unwrap(),
+            [
+                "http://127.0.0.1:4444/.well-known/oauth-authorization-server",
+                "http://127.0.0.1:4444/.well-known/openid-configuration"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_path_issuer_has_the_rfc_8414_then_both_openid_connect_urls() {
+        let one_segment = [
+            "https://as.example.com/.well-known/oauth-authorization-server/realms",
+            "https://as.example.com/.well-known/openid-configuration/realms",
+            "https://as.example.com/realms/.well-known/openid-configuration",
+        ];
+        assert_eq!(metadata_urls("https://as.example.com/realms").unwrap(), one_segment);
+        assert_eq!(metadata_urls("https://as.example.com/realms/").unwrap(), one_segment);
+        let nested = [
+            "https://login.example.com/.well-known/oauth-authorization-server/tenant/v2.0",
+            "https://login.example.com/.well-known/openid-configuration/tenant/v2.0",
+            "https://login.example.com/tenant/v2.0/.well-known/openid-configuration",
+        ];
+        assert_eq!(metadata_urls("https://login.example.com/tenant/v2.0").unwrap(), nested);
+        assert_eq!(metadata_urls("https://login.example.com/tenant/v2.0/").unwrap(), nested);
+        assert_eq!(metadata_urls("https://login.example.com/tenant/v2.0//").unwrap(), nested);
+        assert_eq!(
+            metadata_urls("http://127.0.0.1:4444/realms/agents/").unwrap(),
+            [
+                "http://127.0.0.1:4444/.well-known/oauth-authorization-server/realms/agents",
+                "http://127.0.0.1:4444/.well-known/openid-configuration/realms/agents",
+                "http://127.0.0.1:4444/realms/agents/.well-known/openid-configuration"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_origin_issuer_never_yields_a_duplicate_url() {
+        for issuer in ["https://as.example.com", "https://as.example.com/", "http://127.0.0.1:4444/"] {
+            let mut urls = metadata_urls(issuer).unwrap();
+            urls.sort();
+            urls.dedup();
+            assert_eq!(urls.len(), 2, "{issuer}");
+        }
+    }
+
+    #[test]
+    fn an_issuer_with_whitespace_or_a_control_character_is_an_invalid_url() {
+        for issuer in [
+            "https://as.example.com\n",
+            " https://as.example.com",
+            "https://as.example.com ",
+            "https://as.example.com/te\tnant",
+            "https://as.example.com/te\nnant",
+            "https://as.example.com/\0",
+            "https://as.example.com\r",
+        ] {
+            let error = metadata_urls(issuer).unwrap_err();
+            assert_eq!(error.code(), "invalid_url", "{issuer:?}");
+            let error = parse_for(issuer, "https://as.example.com/token", "https://as.example.com/jwks.json", OPERATOR)
+                .unwrap_err();
+            assert_eq!(error.code(), "invalid_url", "{issuer:?}");
+        }
+        assert_eq!(
+            metadata_urls("https://as.example.com/tenant")
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(
+            parse_for(
+                "https://as.example.com/tenant",
+                "https://as.example.com/token",
+                "https://as.example.com/jwks.json",
+                OPERATOR
+            )
+            .unwrap()
+            .issuer,
+            "https://as.example.com/tenant"
         );
     }
 
@@ -401,6 +513,53 @@ mod tests {
             assert_eq!(error.failure(), DiscoveryFailure::IssuerMismatch, "{requested} vs {advertised}");
             assert_eq!(error.code(), "issuer_mismatch");
         }
+    }
+
+    #[test]
+    fn a_long_mismatching_issuer_is_truncated_in_the_detail() {
+        let advertised = format!("https://other.example.com/{}", "a".repeat(64 * 1024));
+        let error = parse(&document(&advertised), OPERATOR).unwrap_err();
+        assert_eq!(error.code(), "issuer_mismatch");
+        assert_eq!(error.message(), "The discovered issuer does not match the expected issuer");
+        let detail = error.detail();
+        assert!(detail.chars().count() <= 600, "{} characters", detail.chars().count());
+        let first_50: String = advertised
+            .chars()
+            .take(50)
+            .collect();
+        assert!(detail.contains(&first_50), "{detail}");
+        assert!(detail.contains('…'), "{detail}");
+        assert!(detail.ends_with(&format!(" is not {ISSUER:?}")), "{detail}");
+        let shown = format!("{advertised:?}")
+            .chars()
+            .take(200)
+            .collect::<String>();
+        assert_eq!(detail, format!("{METADATA_URL}: issuer {shown}… is not {ISSUER:?}"));
+    }
+
+    #[test]
+    fn a_short_mismatching_issuer_is_shown_in_full_and_escaped() {
+        let advertised = "https://other.example.com/\"x\"\n";
+        let error = parse(&document(advertised), OPERATOR).unwrap_err();
+        assert_eq!(error.code(), "issuer_mismatch");
+        assert_eq!(error.message(), "The discovered issuer does not match the expected issuer");
+        assert_eq!(
+            error.detail(),
+            format!(
+                "{METADATA_URL}: issuer \"https://other.example.com/\\\"x\\\"\\n\" is not \"https://as.example.com\""
+            )
+        );
+        assert!(!error.detail().contains('…'));
+    }
+
+    #[test]
+    fn the_escaped_issuer_is_cut_at_200_characters_not_bytes() {
+        let at_limit = "é".repeat(198);
+        assert_eq!(escaped_for_log(&at_limit), format!("\"{at_limit}\""));
+        let over_limit = "é".repeat(199);
+        let shown = escaped_for_log(&over_limit);
+        assert_eq!(shown, format!("\"{}…", "é".repeat(199)));
+        assert_eq!(shown.chars().count(), 201);
     }
 
     #[test]
@@ -661,22 +820,160 @@ mod tests {
         assert_eq!(server.requests(), [RFC8414, OIDC]);
     }
 
+    const PATH_RFC8414: &str = "/.well-known/oauth-authorization-server/realms/agents";
+    const PATH_OIDC_INSERTED: &str = "/.well-known/openid-configuration/realms/agents";
+    const PATH_OIDC_APPENDED: &str = "/realms/agents/.well-known/openid-configuration";
+
+    fn path_issuer(server: &TestServer) -> String {
+        server.url("/realms/agents/")
+    }
+
     #[tokio::test]
-    async fn a_path_issuer_falls_back_to_openid_connect() {
+    async fn a_path_issuer_is_discovered_from_rfc_8414_path_insertion() {
         let server = TestServer::start().await;
-        let issuer = server.url("/realms/agents/");
-        server.reply("/realms/agents/.well-known/openid-configuration", Reply::json(&document(&issuer).to_string()));
+        let issuer = path_issuer(&server);
+        server.reply(PATH_RFC8414, Reply::json(&document(&issuer).to_string()));
+        server.reply(PATH_OIDC_INSERTED, Reply::json(&document(&issuer).to_string()));
         let metadata = discovered(&issuer, DiscoveryOptions::default())
             .await
             .unwrap();
-        assert_eq!(metadata, expected(&issuer, server.url("/realms/agents/.well-known/openid-configuration")));
-        assert_eq!(
-            server.requests(),
-            [
-                "/.well-known/oauth-authorization-server/realms/agents",
-                "/realms/agents/.well-known/openid-configuration"
-            ]
+        assert_eq!(metadata, expected(&issuer, server.url(PATH_RFC8414)));
+        assert_eq!(server.requests(), [PATH_RFC8414]);
+    }
+
+    #[tokio::test]
+    async fn a_path_issuer_falls_back_to_openid_connect_path_insertion() {
+        let server = TestServer::start().await;
+        let issuer = path_issuer(&server);
+        server.reply(PATH_OIDC_INSERTED, Reply::json(&document(&issuer).to_string()));
+        server.reply(PATH_OIDC_APPENDED, Reply::json(&document(&issuer).to_string()));
+        let metadata = discovered(&issuer, DiscoveryOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(metadata, expected(&issuer, server.url(PATH_OIDC_INSERTED)));
+        assert_eq!(server.requests(), [PATH_RFC8414, PATH_OIDC_INSERTED]);
+    }
+
+    #[tokio::test]
+    async fn a_path_issuer_falls_back_to_openid_connect_path_appending() {
+        let server = TestServer::start().await;
+        let issuer = path_issuer(&server);
+        server.reply(PATH_OIDC_APPENDED, Reply::json(&document(&issuer).to_string()));
+        let metadata = discovered(&issuer, DiscoveryOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(metadata, expected(&issuer, server.url(PATH_OIDC_APPENDED)));
+        assert_eq!(server.requests(), [PATH_RFC8414, PATH_OIDC_INSERTED, PATH_OIDC_APPENDED]);
+    }
+
+    #[tokio::test]
+    async fn a_wrong_issuer_at_rfc_8414_path_insertion_falls_back_to_openid_connect_path_insertion() {
+        let server = TestServer::start().await;
+        let issuer = path_issuer(&server);
+        server.reply(PATH_RFC8414, Reply::json(&document("https://other.example.com/realms/agents/").to_string()));
+        server.reply(PATH_OIDC_INSERTED, Reply::json(&document(&issuer).to_string()));
+        let metadata = discovered(&issuer, DiscoveryOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(metadata, expected(&issuer, server.url(PATH_OIDC_INSERTED)));
+        assert_eq!(server.requests(), [PATH_RFC8414, PATH_OIDC_INSERTED]);
+    }
+
+    #[tokio::test]
+    async fn when_all_three_path_issuer_documents_are_missing_the_status_failure_is_returned() {
+        let server = TestServer::start().await;
+        let error = discovered(&path_issuer(&server), DiscoveryOptions::default())
+            .await
+            .unwrap_err();
+        assert_eq!(error.failure(), DiscoveryFailure::HttpStatus);
+        assert_eq!(server.requests(), [PATH_RFC8414, PATH_OIDC_INSERTED, PATH_OIDC_APPENDED]);
+    }
+
+    #[tokio::test]
+    async fn the_most_specific_failure_of_all_three_path_issuer_attempts_is_returned() {
+        let server = TestServer::start().await;
+        let issuer = path_issuer(&server);
+        server.reply(PATH_RFC8414, Reply::status(404));
+        server.reply(PATH_OIDC_INSERTED, Reply::json(&document("https://other.example.com").to_string()));
+        server.reply(PATH_OIDC_APPENDED, Reply::status(404));
+        let error = discovered(&issuer, DiscoveryOptions::default())
+            .await
+            .unwrap_err();
+        assert_eq!(error.failure(), DiscoveryFailure::IssuerMismatch);
+        assert!(
+            error
+                .detail()
+                .starts_with(&server.url(PATH_OIDC_INSERTED)),
+            "{}",
+            error.detail()
         );
+        assert_eq!(server.requests(), [PATH_RFC8414, PATH_OIDC_INSERTED, PATH_OIDC_APPENDED]);
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_first_path_issuer_url_ends_discovery_at_once() {
+        let server = TestServer::start().await;
+        let issuer = path_issuer(&server);
+        server.reply(PATH_RFC8414, Reply::json(&document(&issuer).to_string()).delayed(Duration::from_secs(5)));
+        server.reply(PATH_OIDC_INSERTED, Reply::json(&document(&issuer).to_string()));
+        server.reply(PATH_OIDC_APPENDED, Reply::json(&document(&issuer).to_string()));
+        let options = DiscoveryOptions {
+            timeout: Duration::from_millis(200),
+            ..DiscoveryOptions::default()
+        };
+        let error = discovered(&issuer, options)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "unreachable");
+        assert_eq!(server.requests(), [PATH_RFC8414]);
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_third_path_issuer_url_is_returned_over_earlier_status_failures() {
+        let server = TestServer::start().await;
+        let issuer = path_issuer(&server);
+        server.reply(PATH_RFC8414, Reply::status(404));
+        server.reply(PATH_OIDC_INSERTED, Reply::status(404));
+        server.reply(PATH_OIDC_APPENDED, Reply::json(&document(&issuer).to_string()).delayed(Duration::from_secs(5)));
+        let options = DiscoveryOptions {
+            timeout: Duration::from_millis(200),
+            ..DiscoveryOptions::default()
+        };
+        let error = discovered(&issuer, options)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "unreachable");
+        assert_eq!(server.requests(), [PATH_RFC8414, PATH_OIDC_INSERTED, PATH_OIDC_APPENDED]);
+    }
+
+    #[tokio::test]
+    async fn an_issuer_with_whitespace_or_a_control_character_is_never_requested() {
+        let server = TestServer::start().await;
+        let base = server.base();
+        server.reply(RFC8414, Reply::json(&document(base).to_string()));
+        server.reply(OIDC, Reply::json(&document(base).to_string()));
+        for issuer in [
+            format!("{base}\n"),
+            format!(" {base}"),
+            format!("{base} "),
+            format!("{base}/te\tnant"),
+            format!("{base}/te\nnant"),
+            format!("{base}/\0"),
+            format!("{base}\r"),
+        ] {
+            for posture in [OPERATOR, STRICT] {
+                let error = discover(&issuer, posture, DiscoveryOptions::default())
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.code(), "invalid_url", "{issuer:?} under {posture:?}");
+            }
+        }
+        assert!(server.requests().is_empty(), "{:?}", server.requests());
+        let metadata = discovered(base, DiscoveryOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(metadata, expected(base, server.url(RFC8414)));
+        assert_eq!(server.requests(), [RFC8414]);
     }
 
     #[tokio::test]
