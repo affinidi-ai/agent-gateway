@@ -2,17 +2,19 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { apiClient } from '../../../../api';
 import { getAuthorities } from '../../../../utils/authoritiesCache';
 import { getIssuers } from '../../../../utils/issuersCache';
-import { findSlotById } from '../edges/archetypes';
 import type { Authority, Issuer, TrustRegistry } from '../../../../types';
 import type { ConfigPanelProps } from '../types';
 import {
   authorityNeedsSelection,
+  isMigratedTrustCheck,
   makeDefaultQuery,
   readQueries,
+  trustCheckLeg,
   type TrustCheckQueryConfig,
   type TrustCheckRecordType,
 } from './definition';
 import TrustCheckQueryForm from './TrustCheckQueryForm';
+import MigratedTrustCheckWarning from './MigratedTrustCheckWarning';
 
 // Mirrors backend `TRUST_CHECK_LIST_MAX` in `src/config/agent_surface.rs`.
 const TRUST_CHECK_LIST_MAX = 10;
@@ -26,11 +28,11 @@ const TrustCheckFullscreenPanel: React.FC<ConfigPanelProps> = ({
   node,
   config,
   updateField,
+  updateFields,
   closeFullscreenEditor,
 }) => {
-  const slotId = node.slotId || '';
-  const resolved = slotId ? findSlotById(slotId) : undefined;
-  const isApMa = resolved?.archetype.id === 'ap-ma' || config._edge === 'ap-ma';
+  const leg = trustCheckLeg(node);
+  const isApMa = leg === 'caller';
   const legLabel = isApMa ? 'caller' : 'target';
 
   const [registries, setRegistries] = useState<TrustRegistry[]>([]);
@@ -157,7 +159,7 @@ const TrustCheckFullscreenPanel: React.FC<ConfigPanelProps> = ({
       authorityNeedsSelection(q.query?.authority_id as string | undefined, isApMa)
     );
     if (hasAuthorityGap) return;
-    updateField('queries', draft);
+    updateFields({ queries: draft, trust_check_migrated: false });
     closeFullscreenEditor?.();
   };
 
@@ -241,14 +243,24 @@ const TrustCheckFullscreenPanel: React.FC<ConfigPanelProps> = ({
           <i className="fas fa-certificate me-2" style={{ color: '#8e44ad' }} />
           Trust Check
         </h4>
-        <div className="text-muted small">
-          Runs on the <strong>{legLabel} leg</strong>. Each query lands on OPA at{' '}
+        <div className="text-muted small" data-testid="trust-check-fullscreen-leg">
+          Runs on the <strong>{legLabel} leg</strong>
+          {leg === 'transit-point' && <> of this Transit Point only</>}. Each query lands on OPA at{' '}
           <code>input.trust_check_results.{legLabel}[]</code> in the order shown below.
         </div>
         <div className="text-muted small mt-1">
           <strong>Only a maximum of {TRUST_CHECK_LIST_MAX} queries allowed per Trust Check.</strong>
         </div>
       </div>
+
+      {leg === 'transit-point' && isMigratedTrustCheck(config) && (
+        <div className="mb-4">
+          <MigratedTrustCheckWarning
+            testid="trust-check-fullscreen-migrated-warning"
+            onKeep={() => updateField('trust_check_migrated', false)}
+          />
+        </div>
+      )}
 
       <div className="card shadow mb-4">
         <div className="card-header py-3 d-flex align-items-center justify-content-between">

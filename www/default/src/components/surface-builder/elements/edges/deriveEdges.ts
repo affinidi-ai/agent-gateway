@@ -10,7 +10,13 @@
 
 import type { CanvasNode } from '../../SurfaceCanvas';
 import type { DerivedEdge, SlotId, SlotDirection } from './types';
-import { isTransitPointType, getArchetype, ANY_EDGE_MW } from './archetypes';
+import {
+  isTransitPointType,
+  getArchetype,
+  ANY_EDGE_MW,
+  TRUST_CHECK_MANAGED_AGENT_SLOT_ID,
+  TRUST_CHECK_TRANSIT_POINT_SLOT_ID,
+} from './archetypes';
 
 /**
  * Resolve the slot id an occupant belongs to within an archetype, by
@@ -250,12 +256,14 @@ export function deriveEdges(nodes: ReadonlyArray<CanvasNode>): DerivedEdge[] {
             pushSlot(edge, 'request:rate-limit', k.id);
           }
         } else if (k.type === 'trust-check' && (k.direction ?? 'request') === 'request') {
-          // Legacy blobs (pre-`ownedBy: 'source'` fix) may have
-          // parented the target-leg trust-check on the TP; keep
-          // hydrating those into the same slot so old surfaces still
-          // snap.
-          if (!k.slotId || k.slotId === 'request:trust-check-target_trust_check_list') {
-            pushSlot(edge, 'request:trust-check-target_trust_check_list', k.id);
+          // A Trust Check parented on the TP is that TP's own target-leg
+          // list. Older canvases tagged it with the Managed Agent slot id.
+          if (
+            !k.slotId ||
+            k.slotId === TRUST_CHECK_TRANSIT_POINT_SLOT_ID ||
+            k.slotId === TRUST_CHECK_MANAGED_AGENT_SLOT_ID
+          ) {
+            pushSlot(edge, TRUST_CHECK_TRANSIT_POINT_SLOT_ID, k.id);
           }
         } else if (k.type === 'workload-binding' && (k.direction ?? 'request') === 'request') {
           // Per-TP workload binding is a per-endpoint request slot
@@ -268,20 +276,6 @@ export function deriveEdges(nodes: ReadonlyArray<CanvasNode>): DerivedEdge[] {
             pushSlot(edge, 'request:workload-binding', k.id);
           }
         }
-      }
-
-      // Target-leg trust-check is `ownedBy: 'source'` and writes to a
-      // target-wide list, so the canonical parent is MA. Bind the
-      // single MA-child node to every ma-tp edge so it renders as a
-      // slot occupant on whichever MA→TP arrow the user snaps it to.
-      const trustCheckTargetNode = (ctx.childrenOf.get(ma.id) ?? []).find(
-        c =>
-          c.type === 'trust-check' &&
-          (c.id === 'trust-check-target' ||
-            c.slotId === 'request:trust-check-target_trust_check_list')
-      );
-      if (trustCheckTargetNode) {
-        pushSlot(edge, 'request:trust-check-target_trust_check_list', trustCheckTargetNode.id);
       }
 
       // Generic request mw chain between MA and TP. Anything that's not
@@ -418,6 +412,14 @@ export function deriveEdges(nodes: ReadonlyArray<CanvasNode>): DerivedEdge[] {
         (c.direction ?? 'response') === 'response' &&
         (!c.slotId || c.slotId === 'response:mcp-tool-gating')
     );
+    // The Managed Agent's own target-leg Trust Check (`ownedBy: 'source'`),
+    // a child of MA on the request direction.
+    const trustCheckManagedAgentNode = (ctx.childrenOf.get(ma.id) ?? []).find(
+      c =>
+        c.type === 'trust-check' &&
+        (c.direction ?? 'request') === 'request' &&
+        (c.id === 'trust-check-target' || c.slotId === TRUST_CHECK_MANAGED_AGENT_SLOT_ID)
+    );
     for (const n of nodes) {
       if (!externalTypes.has(n.type)) continue;
       if (n.parentId !== ma.id) continue;
@@ -431,6 +433,8 @@ export function deriveEdges(nodes: ReadonlyArray<CanvasNode>): DerivedEdge[] {
         pushSlot(edge, 'request:workload-binding', workloadBindingExternalNode.id);
       if (mcpToolGatingExternalNode)
         pushSlot(edge, 'response:mcp-tool-gating', mcpToolGatingExternalNode.id);
+      if (trustCheckManagedAgentNode)
+        pushSlot(edge, TRUST_CHECK_MANAGED_AGENT_SLOT_ID, trustCheckManagedAgentNode.id);
       out.push(edge);
     }
   }

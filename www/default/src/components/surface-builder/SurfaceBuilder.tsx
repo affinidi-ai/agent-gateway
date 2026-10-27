@@ -1,6 +1,7 @@
 import React, { useCallback, useMemo, useRef, useState } from 'react';
 import SurfaceCanvas from './SurfaceCanvas';
 import NodeConfigPanel from './NodeConfigPanel';
+import MigratedTrustChecksSummary from './elements/trust-check/MigratedTrustChecksSummary';
 import MultiSelectionPanel from './MultiSelectionPanel';
 import SurfaceVariantsWidget from './SurfaceVariantsWidget';
 import {
@@ -348,6 +349,9 @@ export function SurfaceBuilder<T extends SurfaceBuilderState>({
             <i className="fas fa-cog" />
           </button>
         </div>
+      </div>
+      <div className="surface-canvas-notices">
+        <MigratedTrustChecksSummary nodes={state.nodes} />
       </div>
       <div onBlur={commit}>
         {multiSelectedIds.length >= 2 ? (

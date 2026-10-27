@@ -330,7 +330,7 @@ pub struct OutboundPipelineContext {
     /// consumes this to synthesize `AGENT_CARD_UNAVAILABLE` results per
     /// configured element instead of executing TRQP probes.
     pub target_agent_card_unavailable: bool,
-    /// Marker: the surface has a non-empty target-leg `trust_check_list`
+    /// Marker: the routed Transit Point's `trust_check_list` is non-empty
     /// (Trust Check active) and the target card's agent identity could not
     /// be established — either the `agent-identity-credential/v1` VP is
     /// absent, or it is present but fails cryptographic verification
@@ -344,8 +344,9 @@ pub struct OutboundPipelineContext {
     pub target_identity_failure: Option<crate::trust_registry_verification::TrustCheckIdentityVerificationFailure>,
     /// Per-leg Trust Check stage results (populated by
     /// `step_trust_check`). Threaded into every outbound OPA evaluation
-    /// via `build_outbound_policy_input`. `None` when the target leg has
-    /// no `trust_check_list` configured for this surface variant.
+    /// via `build_outbound_policy_input`. `None` when the routed Transit
+    /// Point's `trust_check_list` is empty; otherwise the routed Transit
+    /// Point's results under `target`.
     pub trust_check_results: Option<crate::trust_registry_verification::TrustCheckResultsContext>,
     /// Unique request ID for tracing.
     pub request_id: String,
@@ -2446,7 +2447,7 @@ pub(crate) async fn fetch_agent_card(
 
 /// [8] Trust Context Collection — fetches target agent card and queries trust registry.
 ///
-/// Runs whenever the surface's target-leg Trust Check list is non-empty.
+/// Runs whenever the routed Transit Point's Trust Check list is non-empty.
 /// A card-fetch failure is soft; the marker is threaded to
 /// `step_trust_check` which synthesizes `AGENT_CARD_UNAVAILABLE` results
 /// per element so OPA remains authoritative on how to react.
@@ -2458,8 +2459,7 @@ async fn step_collect_trust_context(
     ctx: &mut OutboundPipelineContext,
 ) -> Result<(), OutboundPipelineError> {
     let target_trust_check_present = !ctx
-        .surface
-        .target
+        .virtual_channel
         .trust_check_list
         .is_empty();
 
@@ -2596,9 +2596,8 @@ async fn step_collect_trust_context(
 /// [8b] Trust Check stage (target leg). Runs after legacy trust context
 /// collection and before any OPA evaluation, so all three outbound OPA
 /// scopes (gateway, channel, transit point) see the same
-/// `input.trust_check_results`. No-ops when the surface variant has no
-/// `target.trust_check_list` configured or when the listener manager is
-/// not available. Per-element failures are encoded inside the result
+/// `input.trust_check_results`. Runs the routed Transit Point's list and
+/// no-ops when it is empty or when the listener manager is not available. Per-element failures are encoded inside the result
 /// list (`ok = false`, `error = Some(_)`); the stage never returns Err
 /// — the OPA author decides how to react via `input.trust_check_results`.
 ///
@@ -2634,8 +2633,8 @@ async fn step_collect_trust_context(
 /// [8b] Trust Check stage (target leg). Runs after legacy trust context
 /// collection and before any OPA evaluation, so all three outbound OPA
 /// scopes (gateway, channel, transit point) see the same
-/// `input.trust_check_results`. No-ops when the surface variant has no
-/// `target.trust_check_list` configured. Per-element failures are
+/// `input.trust_check_results`. Runs the routed Transit Point's list and
+/// no-ops when it is empty. Per-element failures are
 /// encoded inside the result list (`ok = false`, `error = Some(_)`);
 /// the stage never returns Err — the OPA author decides how to react
 /// via `input.trust_check_results`.
@@ -2668,7 +2667,7 @@ async fn step_collect_trust_context(
 ///
 /// When the target card **was** fetched but its target agent identity
 /// could not be established (set by [`step_collect_trust_context`] when the
-/// target leg has an active `trust_check_list`), this stage synthesizes a
+/// routed Transit Point has an active `trust_check_list`), this stage synthesizes a
 /// result for **every** configured element using the carried code:
 /// `IDENTITY_VP_VERIFICATION_FAILED` when an `agent-identity-credential/v1`
 /// VP was present but could not be cryptographically verified, or
@@ -2682,19 +2681,25 @@ async fn step_trust_check(
     ctx: &mut OutboundPipelineContext,
 ) -> Result<(), OutboundPipelineError> {
     let target_elements = ctx
-        .surface
-        .target
+        .virtual_channel
         .trust_check_list
         .clone();
     if target_elements.is_empty() {
         return Ok(());
     }
+    let surface_id = ctx.surface.surface_id.clone();
+    let transit_point = ctx
+        .virtual_channel
+        .alias
+        .clone();
+    let origin = crate::observability::trust_check_audit::TrustCheckOrigin {
+        surface_id: &surface_id,
+        transit_point: Some(&transit_point),
+    };
 
     if ctx.target_agent_card_unavailable {
         let synthesized = crate::trust_registry_verification::synthesize_unavailable_target(
-            ctx.surface
-                .surface_id
-                .as_str(),
+            origin,
             &target_elements,
             crate::trust_registry_verification::AGENT_CARD_UNAVAILABLE,
             "target agent card could not be fetched",
@@ -2723,9 +2728,7 @@ async fn step_trust_check(
         .clone()
     {
         let synthesized = crate::trust_registry_verification::synthesize_unavailable_target(
-            ctx.surface
-                .surface_id
-                .as_str(),
+            origin,
             &target_elements,
             failure.code,
             failure.detail,
@@ -2751,9 +2754,7 @@ async fn step_trust_check(
         let wrapped_input = serde_json::json!({ "input": &probe_input });
         let (synthesized_by_index, _runnable) =
             crate::trust_registry_verification::metadata_gate::synthesize_metadata_gate_failures(
-                ctx.surface
-                    .surface_id
-                    .as_str(),
+                origin,
                 crate::trust_registry_verification::TrustCheckLeg::Target,
                 &target_elements,
                 &wrapped_input,
@@ -2778,9 +2779,7 @@ async fn step_trust_check(
 
     let client = crate::trust_registry_verification::TrqpListenerClient::new(manager);
     let target_ctx = crate::trust_registry_verification::run_trust_check_stage(
-        ctx.surface
-            .surface_id
-            .as_str(),
+        origin,
         crate::trust_registry_verification::TrustCheckLeg::Target,
         &target_elements,
         &probe_input,
@@ -10627,7 +10626,15 @@ mod tests {
         (format!("http://{}", addr), TrustCheckTestServer(handle))
     }
 
-    fn attach_target_trust_check_list(
+    fn attach_transit_point_trust_check_list(
+        ctx: &mut OutboundPipelineContext,
+        elements: Vec<crate::trust_registry_verification::TrustCheckElement>,
+    ) {
+        ctx.virtual_channel
+            .trust_check_list = elements;
+    }
+
+    fn attach_surface_target_trust_check_list(
         ctx: &mut OutboundPipelineContext,
         elements: Vec<crate::trust_registry_verification::TrustCheckElement>,
     ) {
@@ -10636,6 +10643,182 @@ mod tests {
             .target
             .trust_check_list = elements;
         ctx.surface = Arc::new(surface);
+    }
+
+    async fn spawn_counting_agent_card_server(
+        card_body: serde_json::Value
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>, TrustCheckTestServer) {
+        use axum::Router;
+        use axum::routing::get;
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = hits.clone();
+        let body_str = card_body.to_string();
+        let app = Router::new().fallback(get(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let body = body_str.clone();
+            async move { ([("Content-Type", "application/json")], body) }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener
+            .local_addr()
+            .expect("addr");
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{}", addr), hits, TrustCheckTestServer(handle))
+    }
+
+    fn result_ids(ctx: &OutboundPipelineContext) -> Vec<String> {
+        ctx.trust_check_results
+            .as_ref()
+            .expect("trust check results populated")
+            .target
+            .iter()
+            .map(|r| r.id.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn outbound_transit_point_without_trust_checks_skips_card_fetch_and_results() {
+        crate::proxy::agent_card_cache::invalidate_all();
+        let (endpoint, hits, _server) = spawn_counting_agent_card_server(json!({"protocolVersion": "1.0"})).await;
+        let state = test_outbound_state();
+        let mut ctx = test_pipeline_context();
+        ctx.virtual_channel.alias = "tp2".to_string();
+        ctx.virtual_channel
+            .target_endpoint = endpoint;
+        attach_surface_target_trust_check_list(&mut ctx, vec![make_test_element("surface-wide")]);
+
+        step_collect_trust_context(&state, &mut ctx)
+            .await
+            .expect("collect ok");
+        step_trust_check(&state, &mut ctx)
+            .await
+            .expect("trust check ok");
+
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0, "no Trust Check agent-card fetch for tp2");
+        assert!(
+            ctx.target_agent_context
+                .is_none()
+        );
+        assert!(!ctx.target_agent_card_unavailable);
+        assert!(
+            ctx.target_identity_failure
+                .is_none()
+        );
+        assert!(
+            ctx.trust_check_results
+                .is_none(),
+            "tp2 has no Trust Checks, so no results"
+        );
+    }
+
+    #[tokio::test]
+    async fn outbound_transit_point_with_trust_checks_fetches_its_card() {
+        crate::proxy::agent_card_cache::invalidate_all();
+        let (endpoint, hits, _server) = spawn_counting_agent_card_server(json!({"protocolVersion": "1.0"})).await;
+        let state = test_outbound_state();
+        let mut ctx = test_pipeline_context();
+        ctx.virtual_channel.alias = "tp1".to_string();
+        ctx.virtual_channel
+            .target_endpoint = endpoint;
+        attach_transit_point_trust_check_list(&mut ctx, vec![make_test_element("tp1-a")]);
+
+        step_collect_trust_context(&state, &mut ctx)
+            .await
+            .expect("collect ok");
+
+        assert!(hits.load(std::sync::atomic::Ordering::SeqCst) >= 1, "tp1's Trust Check fetches its card");
+        assert!(
+            ctx.target_agent_context
+                .is_some()
+        );
+        assert_eq!(
+            ctx.target_identity_failure
+                .as_ref()
+                .map(|f| f.code),
+            Some(crate::trust_registry_verification::TARGET_AGENT_IDENTITY_UNAVAILABLE)
+        );
+    }
+
+    #[tokio::test]
+    async fn outbound_card_unavailable_results_cover_only_the_routed_transit_points_elements() {
+        crate::proxy::agent_card_cache::invalidate_all();
+        let state = test_outbound_state();
+        let mut ctx = test_pipeline_context();
+        ctx.virtual_channel.alias = "tp1".to_string();
+        ctx.virtual_channel
+            .target_endpoint = "http://127.0.0.1:1".to_string();
+        attach_surface_target_trust_check_list(&mut ctx, vec![make_test_element("surface-wide")]);
+        attach_transit_point_trust_check_list(&mut ctx, vec![make_test_element("tp1-a"), make_test_element("tp1-b")]);
+
+        let (_guard, events) = crate::observability::trust_check_audit::test_support::capture_until_dropped();
+        step_collect_trust_context(&state, &mut ctx)
+            .await
+            .expect("collect ok");
+        step_trust_check(&state, &mut ctx)
+            .await
+            .expect("trust check ok");
+
+        assert!(ctx.target_agent_card_unavailable);
+        assert_eq!(result_ids(&ctx), vec!["tp1-a".to_string(), "tp1-b".to_string()]);
+        let results = ctx
+            .trust_check_results
+            .as_ref()
+            .expect("results");
+        assert!(results.caller.is_empty());
+        assert!(
+            results
+                .target
+                .iter()
+                .all(|r| !r.ok
+                    && r.error
+                        .as_ref()
+                        .map(|e| e.code.as_str())
+                        == Some(crate::trust_registry_verification::AGENT_CARD_UNAVAILABLE))
+        );
+
+        use crate::observability::trust_check_audit::test_support::field;
+        let events = events
+            .lock()
+            .expect("events lock")
+            .clone();
+        let audited: Vec<_> = events
+            .iter()
+            .filter(|e| field(e, "element_id").is_some_and(|id| id.starts_with("tp1-") || id == "surface-wide"))
+            .map(|e| (field(e, "element_id").unwrap_or_default(), field(e, "transit_point").unwrap_or_default()))
+            .collect();
+        assert_eq!(audited, vec![("tp1-a", "tp1"), ("tp1-b", "tp1")]);
+    }
+
+    #[tokio::test]
+    async fn outbound_identity_failure_results_cover_only_the_routed_transit_points_elements() {
+        let state = test_outbound_state();
+        let mut ctx = test_pipeline_context();
+        attach_surface_target_trust_check_list(&mut ctx, vec![make_test_element("surface-wide")]);
+        attach_transit_point_trust_check_list(&mut ctx, vec![make_test_element("tp1-a")]);
+        ctx.target_identity_failure = Some(crate::trust_registry_verification::TrustCheckIdentityVerificationFailure {
+            code: crate::trust_registry_verification::IDENTITY_VP_VERIFICATION_FAILED,
+            detail: "target agent identity credential could not be verified",
+        });
+
+        step_trust_check(&state, &mut ctx)
+            .await
+            .expect("trust check ok");
+
+        assert_eq!(result_ids(&ctx), vec!["tp1-a".to_string()]);
+        assert_eq!(
+            ctx.trust_check_results
+                .as_ref()
+                .expect("results")
+                .target[0]
+                .error
+                .as_ref()
+                .map(|e| e.code.as_str()),
+            Some(crate::trust_registry_verification::IDENTITY_VP_VERIFICATION_FAILED)
+        );
     }
 
     fn make_test_element(id: &str) -> crate::trust_registry_verification::TrustCheckElement {
@@ -10713,7 +10896,7 @@ mod tests {
         let mut ctx = test_pipeline_context();
         ctx.virtual_channel
             .target_endpoint = endpoint;
-        attach_target_trust_check_list(&mut ctx, vec![make_test_element("tc-1")]);
+        attach_transit_point_trust_check_list(&mut ctx, vec![make_test_element("tc-1")]);
 
         let result = step_collect_trust_context(&state, &mut ctx).await;
         assert!(result.is_ok(), "widened gate should open without TR-verify: {:?}", result);
@@ -10772,7 +10955,7 @@ mod tests {
         let mut ctx = test_pipeline_context();
         ctx.virtual_channel
             .target_endpoint = endpoint;
-        attach_target_trust_check_list(&mut ctx, vec![make_test_element("tc-1")]);
+        attach_transit_point_trust_check_list(&mut ctx, vec![make_test_element("tc-1")]);
 
         let result = step_collect_trust_context(&state, &mut ctx).await;
         assert!(result.is_ok(), "widened gate should open without TR-verify: {:?}", result);
@@ -10799,7 +10982,7 @@ mod tests {
         crate::proxy::agent_card_cache::invalidate_all();
         let state = test_outbound_state();
         let mut ctx = test_pipeline_context();
-        attach_target_trust_check_list(&mut ctx, vec![make_test_element("tc-1"), make_test_element("tc-2")]);
+        attach_transit_point_trust_check_list(&mut ctx, vec![make_test_element("tc-1"), make_test_element("tc-2")]);
         ctx.target_identity_failure = Some(crate::trust_registry_verification::TrustCheckIdentityVerificationFailure {
             code: crate::trust_registry_verification::TARGET_AGENT_IDENTITY_UNAVAILABLE,
             detail: "target agent card carries no agent-identity-credential",
@@ -10907,7 +11090,7 @@ mod tests {
         let mut ctx = test_pipeline_context();
         ctx.virtual_channel
             .target_endpoint = endpoint;
-        attach_target_trust_check_list(&mut ctx, vec![make_test_element("tc-1")]);
+        attach_transit_point_trust_check_list(&mut ctx, vec![make_test_element("tc-1")]);
 
         step_collect_trust_context(&state, &mut ctx)
             .await
@@ -10993,7 +11176,7 @@ mod tests {
         let mut ctx = test_pipeline_context();
         ctx.virtual_channel
             .target_endpoint = "http://127.0.0.1:1".to_string();
-        attach_target_trust_check_list(&mut ctx, vec![make_test_element("tc-1"), make_test_element("tc-2")]);
+        attach_transit_point_trust_check_list(&mut ctx, vec![make_test_element("tc-1"), make_test_element("tc-2")]);
 
         step_collect_trust_context(&state, &mut ctx)
             .await
@@ -11023,108 +11206,34 @@ mod tests {
 
     #[tokio::test]
     async fn outbound_agent_card_unavailable_synthesized_results_emit_audit_events() {
-        use std::sync::{Arc as StdArc, Mutex};
-        use tracing::field::{Field, Visit};
-        use tracing_subscriber::layer::{Context as LayerContext, Layer};
-        use tracing_subscriber::prelude::*;
+        use crate::observability::trust_check_audit::test_support::{CapturedEvent, capture_until_dropped, field};
 
-        #[derive(Default, Clone)]
-        struct CapturedEvent {
-            level: String,
-            fields: Vec<(String, String)>,
-        }
-        struct FieldVisitor(Vec<(String, String)>);
-        impl Visit for FieldVisitor {
-            fn record_debug(
-                &mut self,
-                f: &Field,
-                v: &dyn std::fmt::Debug,
-            ) {
-                self.0
-                    .push((f.name().to_string(), format!("{:?}", v)));
-            }
-            fn record_str(
-                &mut self,
-                f: &Field,
-                v: &str,
-            ) {
-                self.0
-                    .push((f.name().to_string(), v.to_string()));
-            }
-            fn record_u64(
-                &mut self,
-                f: &Field,
-                v: u64,
-            ) {
-                self.0
-                    .push((f.name().to_string(), v.to_string()));
-            }
-            fn record_bool(
-                &mut self,
-                f: &Field,
-                v: bool,
-            ) {
-                self.0
-                    .push((f.name().to_string(), v.to_string()));
-            }
-        }
-        struct CapturingLayer(StdArc<Mutex<Vec<CapturedEvent>>>);
-        impl<S: tracing::Subscriber> Layer<S> for CapturingLayer {
-            fn on_event(
-                &self,
-                event: &tracing::Event<'_>,
-                _ctx: LayerContext<'_, S>,
-            ) {
-                let mut v = FieldVisitor(Vec::new());
-                event.record(&mut v);
-                self.0
-                    .lock()
-                    .unwrap()
-                    .push(CapturedEvent {
-                        level: event
-                            .metadata()
-                            .level()
-                            .to_string(),
-                        fields: v.0,
-                    });
-            }
-        }
-
-        let events = StdArc::new(Mutex::new(Vec::<CapturedEvent>::new()));
-        let subscriber = tracing_subscriber::registry().with(CapturingLayer(events.clone()));
-        let _default_guard = tracing::subscriber::set_default(subscriber);
-
+        let (default_guard, events) = capture_until_dropped();
         crate::proxy::agent_card_cache::invalidate_all();
         let state = test_outbound_state();
         let mut ctx = test_pipeline_context();
         ctx.virtual_channel
             .target_endpoint = "http://127.0.0.1:1".to_string();
-        attach_target_trust_check_list(&mut ctx, vec![make_test_element("tc-1"), make_test_element("tc-2")]);
+        attach_transit_point_trust_check_list(&mut ctx, vec![make_test_element("tc-1"), make_test_element("tc-2")]);
         ctx.target_agent_card_unavailable = true;
 
         step_trust_check(&state, &mut ctx)
             .await
             .expect("synthesis ok");
 
-        drop(_default_guard);
-        let events = events.lock().unwrap();
+        drop(default_guard);
+        let events = events
+            .lock()
+            .expect("events lock")
+            .clone();
         let agent_card_unavailable_events: Vec<&CapturedEvent> = events
             .iter()
-            .filter(|e| {
-                e.fields
-                    .iter()
-                    .any(|(k, v)| k == "error_code" && v == "AGENT_CARD_UNAVAILABLE")
-            })
+            .filter(|e| field(e, "error_code") == Some("AGENT_CARD_UNAVAILABLE"))
             .collect();
         assert_eq!(agent_card_unavailable_events.len(), 2, "one audit event per synthesized element");
         for ev in agent_card_unavailable_events {
             assert_eq!(ev.level, "WARN", "failures log at WARN so OTEL exporter captures them");
-            let latency = ev
-                .fields
-                .iter()
-                .find(|(k, _)| k == "latency_ms")
-                .map(|(_, v)| v.as_str());
-            assert_eq!(latency, Some("0"), "no network call fired");
+            assert_eq!(field(ev, "latency_ms"), Some("0"), "no network call fired");
         }
     }
 
@@ -11140,7 +11249,7 @@ mod tests {
         crate::proxy::agent_card_cache::invalidate_all();
         let state = test_outbound_state();
         let mut ctx = test_pipeline_context();
-        attach_target_trust_check_list(
+        attach_transit_point_trust_check_list(
             &mut ctx,
             vec![
                 make_test_element_referencing_provider_did("tc-1"),
@@ -11204,7 +11313,7 @@ mod tests {
         crate::proxy::agent_card_cache::invalidate_all();
         let state = test_outbound_state();
         let mut ctx = test_pipeline_context();
-        attach_target_trust_check_list(
+        attach_transit_point_trust_check_list(
             &mut ctx,
             vec![make_test_element_referencing_provider_did("gated"), make_test_element("runnable")],
         );
@@ -11254,7 +11363,7 @@ mod tests {
         crate::proxy::agent_card_cache::invalidate_all();
         let state = test_outbound_state();
         let mut ctx = test_pipeline_context();
-        attach_target_trust_check_list(&mut ctx, vec![make_test_element("tc-1")]);
+        attach_transit_point_trust_check_list(&mut ctx, vec![make_test_element("tc-1")]);
         ctx.target_agent_context = Some(crate::surface_context::AgentContext {
             did_verified: false,
             did_verification: None,

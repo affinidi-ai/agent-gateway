@@ -125,11 +125,74 @@ template syntax.
 
 ![Trust Check flow: inbound request, extract metadata, TRQP query, trust registry, then OPA policy decides](assets/diagrams/trust-check-flow.png)
 
-Each leg carries a `trust_check_list`: `AccessPoint.trust_check_list` for the caller leg
-and `Target.trust_check_list` for the target leg. A list holds at most
-`TRUST_CHECK_LIST_MAX` (10) elements
+Each leg carries a `trust_check_list`:
+
+| List | Runs on |
+| --- | --- |
+| `access_point.trust_check_list` | The caller leg, for requests arriving at the Access Point. |
+| `transit.points[].trust_check_list` | Requests the managed agent sends through that Transit Point, and no other. A2A and AP2 Transit Points only. |
+| `target.trust_check_list` | The managed agent's own target leg: `a2a-proxy://` Targets and Fabric send. |
+
+A Transit Point with an empty list runs no Trust Check on its traffic: no agent-card fetch
+for trust, no identity verification, no TRQP query. A request through a Transit Point sees
+only that Transit Point's results, at `input.trust_check_results.target`, in all three
+outbound OPA scopes (gateway, surface, Transit Point).
+
+A list holds at most `TRUST_CHECK_LIST_MAX` (10) elements
 ([`src/config/agent_surface.rs`](../src/config/agent_surface.rs)). A surface variant
-override replaces the whole list verbatim, never element by element.
+override replaces the whole list verbatim, never element by element; a variant gives its
+Transit Points their own lists through its `transit.points` override.
+
+The management API rejects with `400` a surface whose Managed Agent target is an `http(s)`
+URL and whose `target.trust_check_list` is non-empty, because no stage runs that list for such
+a target. Put those checks on the Transit Points instead.
+
+### Lists stored before per-Transit-Point checks
+
+Surfaces stored before Transit Points had their own lists kept one `target.trust_check_list`
+that ran on every Transit Point. The first time such a surface loads, the gateway copies that
+list onto each of its A2A and AP2 Transit Points (and those of each variant), marks each copy
+with `trust_check_migrated: true`, removes `target.trust_check_list` when the Managed Agent
+target is an `http(s)` URL, sets `trust_check_split: true` on the surface, and saves the file.
+It logs the surface and the Transit Points that received copies. A2A and AP2 Transit Points
+keep their behaviour until an operator edits the surface. The Surface Builder flags each copy
+for review; through the API, remove a copy by saving the Transit Point without
+`trust_check_list`.
+
+MCP and HTTP Transit Points receive no copy, and the gateway logs a warning naming them. The
+old list ran on them too, but their destinations publish no A2A agent card, so its results
+there were `AGENT_CARD_UNAVAILABLE` failures. A policy that denied on those failures blocked
+all of that Transit Point's traffic before and allows it now.
+
+A variant that inherited the base Transit Points but resolves to a different list receives
+its own copy of them in `overrides.transit.points`, so later edits to the base Transit Points
+no longer reach it.
+
+`trust_check_split` marks a surface as already in the per-Transit-Point shape, and every
+management API write sets it. A payload in the old shape saved through the API on an
+`a2a-proxy://` or `fabric://` target is therefore read in the new shape: its
+`target.trust_check_list` applies to the managed agent's own target only. A surface file
+written outside the API in the new shape must set `trust_check_split: true`, or it is migrated
+on load.
+
+The migration is forward-only: a gateway release from before per-Transit-Point lists cannot
+load a surface carrying the new fields. Back up `_storage/agent_surfaces/` before upgrading
+if a rollback may be needed.
+
+### Requiring checks in policy
+
+A Transit Point without checks leaves `input.trust_check_results` absent. Rules that only look
+for failures, such as `every r in input.trust_check_results.target { r.ok }` or a count of
+results with `ok == false` equal to zero, therefore allow every request through a Transit
+Point that has no checks, or whose checks were removed. When a policy requires Trust Checks,
+also require that they ran, or check specific element ids:
+
+```rego
+allow if {
+    count(input.trust_check_results.target) > 0
+    every r in input.trust_check_results.target { r.ok }
+}
+```
 
 Element validation is in
 [`src/trust_registry_verification/trust_check_element.rs`](../src/trust_registry_verification/trust_check_element.rs).
@@ -146,7 +209,7 @@ addressable from policy while `name` is only a label. Counts are code points, no
 When an audit sink selects `trust_check`, each element's outcome is recorded with the
 surface id, the request's trace id and the authenticated caller (on the Access Point, Fabric
 and MCP-proxy paths), so a trust check can be tied to the request and principal that
-triggered it.
+triggered it. On the outbound path the record also names the Transit Point.
 
 ## Failed caller authentication
 

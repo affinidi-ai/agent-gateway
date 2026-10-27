@@ -10,13 +10,23 @@ import { registry } from '../index';
 import { buildCanvasBlob } from '../registry';
 import type { CanvasNode, PayloadContext } from '../types';
 
-function makeCtx(nodes: CanvasNode[]): PayloadContext {
+function makeCtx(nodes: CanvasNode[], targetEndpoint = 'a2a-proxy://proxy-1'): PayloadContext {
+  const all = [
+    {
+      id: 'target',
+      type: 'target',
+      label: '',
+      configured: true,
+      config: { endpoint: targetEndpoint },
+    },
+    ...nodes,
+  ] as CanvasNode[];
   return {
     protocol: 'a2a',
     surfaceMeta: { name: 't', tags: [], status: 'active' },
-    allNodes: nodes,
-    nodesOfType: (type: string) => nodes.filter(n => n.type === type),
-    firstNodeOfType: (type: string) => nodes.find(n => n.type === type),
+    allNodes: all,
+    nodesOfType: (type: string) => all.filter(n => n.type === type),
+    firstNodeOfType: (type: string) => all.find(n => n.type === type),
   } as any;
 }
 
@@ -33,7 +43,8 @@ function makeNode(id: string, slotId: string, config: Record<string, unknown>): 
 }
 
 const AP_SLOT = 'request:trust-check-access_point_trust_check_list';
-const TP_SLOT = 'request:trust-check-target_trust_check_list';
+const MA_SLOT = 'request:trust-check-target_trust_check_list';
+const TP_SLOT = 'request:trust-check-transit_points_trust_check_list';
 
 describe('trustCheckDefinition — incompleteReason', () => {
   it('flags missing registry', () => {
@@ -231,7 +242,7 @@ describe('trustCheckDefinition — authority selection', () => {
   });
 
   it('target leg passes through a stored literal DID verbatim (Authority is now selectable)', () => {
-    const node = makeNode('trust-check-1', TP_SLOT, {
+    const node = makeNode('trust-check-1', MA_SLOT, {
       trust_registry_id: 'tr-1',
       query_type: 'recognition',
       query: {
@@ -245,7 +256,7 @@ describe('trustCheckDefinition — authority selection', () => {
   });
 
   it('target leg passes through a custom template override verbatim (e.g. authority_did)', () => {
-    const node = makeNode('trust-check-1', TP_SLOT, {
+    const node = makeNode('trust-check-1', MA_SLOT, {
       trust_registry_id: 'tr-1',
       query_type: 'recognition',
       query: { authority_id: '{{ input.agent.authority_did }}' },
@@ -269,7 +280,7 @@ describe('trustCheckDefinition — entity_id auto-injection', () => {
   });
 
   it('target leg defaults entity_id to input.agent.did', () => {
-    const node = makeNode('trust-check-1', TP_SLOT, {
+    const node = makeNode('trust-check-1', MA_SLOT, {
       trust_registry_id: 'tr-1',
       query_type: 'recognition',
       query: { authority_id: 'a' },
@@ -332,8 +343,8 @@ describe('trustCheckDefinition — buildPayload', () => {
     expect((slices[0].value as any[])[0]).not.toHaveProperty('phase');
   });
 
-  it('emits a target-leg slice for MA→TP nodes', () => {
-    const node = makeNode('trust-check-2', TP_SLOT, {
+  it('emits a target-leg slice for the Managed Agent leg of an A2A proxy target', () => {
+    const node = makeNode('trust-check-2', MA_SLOT, {
       id: 'tc-target',
       trust_registry_id: 'tr-2',
       query_type: 'recognition',
@@ -362,7 +373,7 @@ describe('trustCheckDefinition — buildPayload', () => {
         query_type: 'recognition',
         query: { authority_id: 'a', entity_id: 'e1' },
       }),
-      makeNode('trust-check-2', TP_SLOT, {
+      makeNode('trust-check-2', MA_SLOT, {
         id: 't1',
         trust_registry_id: 'tr-2',
         query_type: 'recognition',
@@ -505,6 +516,26 @@ describe('trustCheckDefinition — buildPayload', () => {
     const slices = trustCheckDefinition.buildPayload!(makeCtx([node]))!;
     expect(slices[0].path).toBe('target.trust_check_list');
   });
+
+  it('leaves Transit Point lists to the Transit Point factory', () => {
+    const tp = { id: 'tp-1', type: 'transit-point-a2a', label: '', configured: true, config: {} };
+    const node = {
+      ...makeNode('trust-check-tp-1', TP_SLOT, {
+        queries: [{ id: 'q', trust_registry_id: 'tr-1', query_type: 'recognition', query: {} }],
+      }),
+      parentId: 'tp-1',
+    };
+    expect(trustCheckDefinition.buildPayload!(makeCtx([tp as any, node]))).toBeUndefined();
+  });
+
+  it('drops the Managed Agent leg for a URL target', () => {
+    const node = makeNode('trust-check-target', MA_SLOT, {
+      queries: [{ id: 'q', trust_registry_id: 'tr-1', query_type: 'recognition', query: {} }],
+    });
+    expect(
+      trustCheckDefinition.buildPayload!(makeCtx([node], 'https://agent.example.com'))
+    ).toBeUndefined();
+  });
 });
 
 describe('trustCheckDefinition — summary', () => {
@@ -578,7 +609,7 @@ describe('trustCheckDefinition — multiple queries per node', () => {
         _edge: 'ap-ma',
         queries: [{ id: 'c1', trust_registry_id: 'tr-1', query_type: 'recognition', query: {} }],
       }),
-      makeNode('trust-check-target', TP_SLOT, {
+      makeNode('trust-check-target', MA_SLOT, {
         _edge: 'ma-tp',
         queries: [
           {
@@ -702,7 +733,7 @@ describe('trustCheckDefinition — hydrate → buildPayload round-trip', () => {
 describe('trust_check_list — canvas removal clears the config', () => {
   it('rebuilds effective root without trust_check_list when the trust-check node is deleted', () => {
     const ctxWithNode = makeCtx([
-      makeNode('trust-check-target', TP_SLOT, {
+      makeNode('trust-check-target', MA_SLOT, {
         _edge: 'ma-tp',
         queries: [
           {

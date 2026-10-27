@@ -15,6 +15,7 @@ import {
 } from './elements/edges/archetypes';
 import type { DerivedEdge, SlotDirection } from './elements/edges/types';
 import { isSyntheticFabricNodeId } from './elements/synthesizeFabric';
+import { isMigratedTrustCheck } from './elements/trust-check/definition';
 import { fetchRoutingConfig } from './elements/access-point/defaults';
 import {
   POLICY_UNCONFIGURED_DASH,
@@ -1100,13 +1101,12 @@ const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
           // broad valid-drop highlight must honour the same list — otherwise
           // an archetype the drop rejects (e.g. AP→MA for an EXT/TP-only
           // element) still lights up green and confuses the user.
-          const dragSnapArchetypes = _registry.get(type)?.edgeSnap?.archetypes;
           const validEdgeSpan = new Map<string, Set<string>>(); // edgeId → set of node ids
           const validDirections = new Map<string, Set<SlotDirection>>();
           for (const edge of edges) {
             const arch = getArchetype(edge.archetype);
             if (!arch) continue;
-            if (dragSnapArchetypes && !dragSnapArchetypes.includes(edge.archetype)) continue;
+            if (!_registry.snapsToArchetype(type, edge.archetype)) continue;
             // Capability gate: skip edges that don't satisfy the
             // dragged element's `requires.dropOnEdge`. Mirrors the
             // check in useSurfaceBuilder.handleDrop so the highlight
@@ -1167,13 +1167,10 @@ const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
           }
 
           const snap = _registry.get(type)?.edgeSnap;
-          const allowedArchetypes = snap?.archetypes;
           const snapRadius = snap?.radius ?? 50;
-          const archetypeFilter = allowedArchetypes
-            ? (_link: D3Link, s: D3Node, t: D3Node) => {
-                const archId = findArchetypeForPair(s.type, t.type);
-                return !!archId && allowedArchetypes.includes(archId);
-              }
+          const archetypeFilter = snap?.archetypes
+            ? (_link: D3Link, s: D3Node, t: D3Node) =>
+                _registry.snapsToArchetype(type, findArchetypeForPair(s.type, t.type))
             : undefined;
           const nearest = findNearestEdge(
             mx,
@@ -1291,13 +1288,10 @@ const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
         const filter =
           directionality === 'request' || directionality === 'response' ? directionality : 'either';
         const snap = _registry.get(type)?.edgeSnap;
-        const allowedArchetypes = snap?.archetypes;
         const snapRadius = snap?.radius ?? 60;
-        const archetypeFilter = allowedArchetypes
-          ? (_link: D3Link, s: D3Node, t: D3Node) => {
-              const archId = findArchetypeForPair(s.type, t.type);
-              return !!archId && allowedArchetypes.includes(archId);
-            }
+        const archetypeFilter = snap?.archetypes
+          ? (_link: D3Link, s: D3Node, t: D3Node) =>
+              _registry.snapsToArchetype(type, findArchetypeForPair(s.type, t.type))
           : undefined;
         const nearest = findNearestEdge(
           mx,
@@ -3415,6 +3409,31 @@ const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
           .attr('font-weight', '700')
           .attr('fill', NODE_COLORS[d.type] || '#6c757d')
           .text(text);
+      });
+
+    // Warning badge on a Transit Point Trust Check still flagged as a
+    // migrated copy of the old surface-wide list.
+    nodeSelection
+      .filter(
+        d =>
+          d.type === 'trust-check' && isMigratedTrustCheck(nodes.find(n => n.id === d.id)?.config)
+      )
+      .each(function (d) {
+        const g = d3
+          .select(this)
+          .append('g')
+          .attr('class', 'node-migrated-badge')
+          .attr('data-testid', 'surface-node-trust-check-migrated-badge')
+          .attr('transform', `translate(${d.radius * 0.75}, ${-d.radius * 0.75})`);
+        g.append('title').text('Migrated Trust Check: review whether this Transit Point needs it');
+        g.append('circle').attr('r', 7);
+        g.append('text')
+          .attr('text-anchor', 'middle')
+          .attr('dominant-baseline', 'central')
+          .attr('font-size', '10px')
+          .attr('font-weight', '700')
+          .attr('pointer-events', 'none')
+          .text('!');
       });
 
     // Type label above nodes

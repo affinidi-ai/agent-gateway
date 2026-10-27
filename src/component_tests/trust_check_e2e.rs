@@ -185,3 +185,182 @@ async fn no_trust_check_list_allows_through_surface_opa() {
         "allowed request must reach the mock exactly once"
     );
 }
+
+const API_TRUST_REGISTRY_ID: &str = "tr-api";
+
+fn write_trust_registry_fixture(temp_dir: &std::path::Path) {
+    let registry = json!({
+        "id": API_TRUST_REGISTRY_ID,
+        "name": "API registry",
+        "description": "",
+        "oob_url": "https://registry.example/oob",
+        "connection_status": "failed",
+        "status": "disabled",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:00:00Z"
+    });
+    let dir = temp_dir.join("trust_registries");
+    std::fs::create_dir_all(&dir).expect("create trust_registries dir");
+    std::fs::write(
+        dir.join(format!("{API_TRUST_REGISTRY_ID}.json")),
+        serde_json::to_string_pretty(&registry).expect("serialize trust registry"),
+    )
+    .expect("write trust registry fixture");
+}
+
+fn api_trust_check(id: &str) -> serde_json::Value {
+    json!({
+        "id": id,
+        "trust_registry_id": API_TRUST_REGISTRY_ID,
+        "query_type": "recognition",
+        "query": { "authority_id": "did:example:authority", "entity_id": "{{ target.did }}" }
+    })
+}
+
+/// The management API stores every written surface with `trust_check_split`,
+/// keeps per-Transit-Point lists, and refuses a surface-wide target list on an
+/// HTTP(S) Managed Agent target (base or variant) without persisting it.
+#[tokio::test(flavor = "multi_thread")]
+async fn surface_api_writes_per_transit_point_trust_checks() {
+    let mut client = None;
+    let h = GatewayHarness::start(|temp_dir, _, bootstrap| {
+        write_trust_registry_fixture(temp_dir);
+        client = Some(super::helpers::configure_admin_api(bootstrap));
+    })
+    .await;
+    let client = client.expect("admin client");
+    let collection = format!("{}/api/v1/surfaces", h.gateway_base);
+    let send = |request: reqwest::RequestBuilder| async move {
+        let response = request
+            .send()
+            .await
+            .expect("admin API request");
+        let status = response.status().as_u16();
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .unwrap_or(json!(null));
+        (status, body)
+    };
+    let surface = |surface_id: &str, target_list: Vec<serde_json::Value>| {
+        json!({
+            "surface_id": surface_id,
+            "name": surface_id,
+            "status": "disabled",
+            "trust_check_split": false,
+            "access_point": {"listen_address": h.gateway_base, "route": format!("/{surface_id}"), "protocol": "a2a"},
+            "target": {"endpoint": h.mock.url(), "trust_check_list": target_list},
+            "transit": {"points": [{
+                "alias": "partner-a",
+                "target_endpoint": "https://partner.example/a2a",
+                "protocol": "a2a",
+                "trust_check_list": [api_trust_check("partner-recognition")]
+            }]}
+        })
+    };
+    let rejection = "transit.points[].trust_check_list";
+
+    let (status, created) = send(
+        client
+            .post(&collection)
+            .json(&surface("tc-api-split", Vec::new())),
+    )
+    .await;
+    assert_eq!(status, 201, "{created}");
+    assert_eq!(created["trust_check_split"], json!(true));
+    assert_eq!(created["transit"]["points"][0]["trust_check_list"][0]["id"], "partner-recognition");
+    assert!(
+        created["target"]
+            .get("trust_check_list")
+            .is_none(),
+        "{created}"
+    );
+
+    let surface_url = format!("{collection}/tc-api-split");
+    let (status, updated) = send(
+        client
+            .put(&surface_url)
+            .json(&surface("tc-api-split", Vec::new())),
+    )
+    .await;
+    assert_eq!(status, 200, "{updated}");
+    assert_eq!(updated["trust_check_split"], json!(true));
+
+    let (status, patched) = send(
+        client
+            .patch(&surface_url)
+            .header("content-type", "application/merge-patch+json")
+            .json(&json!({"description": "patched", "trust_check_split": false})),
+    )
+    .await;
+    assert_eq!(status, 200, "{patched}");
+    assert_eq!(patched["trust_check_split"], json!(true));
+    assert_eq!(patched["description"], "patched");
+
+    let (status, body) = send(
+        client
+            .post(&collection)
+            .json(&surface("tc-api-legacy", vec![api_trust_check("legacy-target")])),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.to_string()
+            .contains(rejection),
+        "{body}"
+    );
+    let (status, _) = send(client.get(format!("{collection}/tc-api-legacy"))).await;
+    assert_eq!(status, 404, "a rejected create must not persist the surface");
+
+    let (status, body) = send(
+        client
+            .put(&surface_url)
+            .json(&surface("tc-api-split", vec![api_trust_check("legacy-target")])),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.to_string()
+            .contains(rejection),
+        "{body}"
+    );
+
+    let (status, body) = send(
+        client
+            .patch(&surface_url)
+            .header("content-type", "application/merge-patch+json")
+            .json(&json!({"variants": [{
+                "id": "variant-dev", "alias": "dev", "name": "dev", "enabled": true,
+                "overrides": {"target": {"trust_check_list": [api_trust_check("dev-target")]}}
+            }]})),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.to_string()
+            .contains("Variant 'dev'"),
+        "{body}"
+    );
+    assert!(
+        body.to_string()
+            .contains(rejection),
+        "{body}"
+    );
+
+    let (status, stored) = send(client.get(&surface_url)).await;
+    assert_eq!(status, 200, "{stored}");
+    assert_eq!(stored["description"], "patched");
+    assert!(
+        stored["target"]
+            .get("trust_check_list")
+            .is_none(),
+        "{stored}"
+    );
+    assert!(
+        stored
+            .get("variants")
+            .is_none(),
+        "{stored}"
+    );
+    assert_eq!(stored["trust_check_split"], json!(true));
+}

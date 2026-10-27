@@ -134,6 +134,43 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   ids: `networking-retry-status-codes-input` and
   `networking-retry-connection-errors-only-switch`.
 
+## Trust Check
+
+- A Trust Check on a Managed Agent → Transit Point arrow belongs to that Transit Point
+  (slot `request:trust-check-transit_points_trust_check_list`, node
+  `trust-check-<transit point node id>`, parented on the Transit Point). The Transit Point
+  factory writes it to `transit.points[i].trust_check_list`; the trust-check element's own
+  `buildPayload` skips Transit-Point-parented nodes. Offered only on A2A and AP2 Transit Points.
+- The Managed Agent's own target-leg Trust Check sits on the Managed Agent → External Target
+  arrow (slot `request:trust-check-target_trust_check_list`, node `trust-check-target`) and is
+  offered and saved only for `a2a-proxy://` and `fabric://` targets. On a URL target a stored
+  list is shown with `trust-check-panel-managed-agent-target-warning` and is never saved; the
+  API rejects it.
+- Trust Check config comes only from the stored payload (`payloadOwnsConfig`); the canvas blob
+  supplies position only. A blob `parentId` never moves a Trust Check between the Managed Agent
+  and a Transit Point or between Transit Points, and a blob node is matched to a hydrated one
+  only when their slot ids agree, so a stale node from the old shared layout does not come back.
+  An empty Trust Check placeholder in the blob (no queries, `isBlobPlaceholder`) is kept.
+- Trust Check snaps to the Access Point → Managed Agent, Managed Agent → Transit Point and
+  Managed Agent → External Target arrows (`registry.snapsToArchetype`).
+- A Transit Point's `trust_check_migrated: true` moves onto its Trust Check node's config at
+  hydration. A flagged node shows a canvas badge, and its sidebar panel and fullscreen editor
+  show the shared `MigratedTrustCheckWarning` (`elements/trust-check/MigratedTrustCheckWarning.tsx`,
+  an `InfoBanner` warning) with **Keep**. **Keep**, saving edited queries, or removing the node
+  drops the flag from the next save; untouched flagged Transit Points keep it.
+- `MigratedTrustChecksSummary` sits under the canvas top bar in `.surface-canvas-notices`:
+  "N Transit Points have migrated Trust Checks to review" ("1 Transit Point has …" for one),
+  counting the variant on the canvas, hidden at zero.
+
+| Element                            | Test id                                                                              |
+| ---------------------------------- | ------------------------------------------------------------------------------------ |
+| Per-Transit-Point scope line       | `trust-check-panel-transit-point-scope`                                              |
+| Fullscreen leg label               | `trust-check-fullscreen-leg`                                                         |
+| Managed Agent URL-target warning   | `trust-check-panel-managed-agent-target-warning`                                     |
+| Migrated warning and Keep          | `trust-check-panel-migrated-warning`, `trust-check-fullscreen-migrated-warning`, each with `-keep` |
+| Migrated summary                   | `surface-migrated-trust-checks-summary`                                              |
+| Migrated canvas badge              | `surface-node-trust-check-migrated-badge`                                            |
+
 ## Trust Recorder
 
 - The sidebar panel and each entry in its fullscreen editor show the shared

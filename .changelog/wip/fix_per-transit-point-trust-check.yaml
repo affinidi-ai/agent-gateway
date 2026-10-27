@@ -1,0 +1,35 @@
+branch: fix/per-transit-point-trust-check
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-10-26T15:57:29Z'
+      title: ⭐ Run target-leg Trust Checks only on the Transit Point they belong to
+      description: >-
+        Target-leg Trust Checks were stored once per surface and ran on every Transit Point, so a
+        Transit Point with no checks still fetched its destination's agent card and queried the
+        trust registry, and the Surface Builder showed one shared Trust Check on every Managed
+        Agent to Transit Point arrow. Each A2A and AP2 Transit Point now has its own
+        trust_check_list, a request runs only the checks of the Transit Point it goes through, and
+        a Transit Point without checks runs none. Results stay at input.trust_check_results.target,
+        and Trust Check audit records name the Transit Point. target.trust_check_list now applies
+        only to the managed agent's own a2a-proxy or Fabric target, and the management API rejects
+        it on an http(s) target. Surfaces stored before this change are converted when they first
+        load: the old list is copied onto every A2A and AP2 Transit Point, so their behaviour is
+        unchanged, and the Surface Builder flags each copy so operators can keep it or remove it.
+        MCP and HTTP Transit Points receive no copy and are named in a warning log.
+  removed: []
+  security: []
+  breaking:
+    - timestamp: '2026-10-26T15:57:29Z'
+      title: Reject a target Trust Check list on an http(s) Managed Agent target
+      description: >-
+        The management API now answers 400 when a surface or variant has a non-empty
+        target.trust_check_list and its Managed Agent target is an http(s) URL, because that list
+        no longer runs anywhere for such a target; clients must send those checks in
+        transit.points[].trust_check_list. Stored surfaces are converted to the new shape on first
+        load and saved with trust_check_split, so an earlier gateway release cannot load them
+        afterwards. Back up _storage/agent_surfaces/ before upgrading if a rollback may be needed.
+        MCP and HTTP Transit Points no longer run the old surface-wide list; there it could only
+        report AGENT_CARD_UNAVAILABLE, so a policy that denied on that failure now allows their
+        traffic.

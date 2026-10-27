@@ -492,6 +492,7 @@ mod tests {
                 entity_id: None,
                 ok: true,
                 error_code: None,
+                transit_point: None,
             },
             DelegationAuditAction::TraceTerminated {
                 own_trace_id: "own".to_string(),

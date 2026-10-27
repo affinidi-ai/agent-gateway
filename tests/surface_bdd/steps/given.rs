@@ -217,7 +217,8 @@ async fn admin_api_available_without_surface(
     world.surface_config.protocol = "a2a".to_string();
     world
         .surface_config
-        .transit_point = None;
+        .transit_points
+        .clear();
     crate::steps::when::configure_unseeded_route(world, &route);
 
     crate::steps::when::ensure_admin_session(world).await;
@@ -842,19 +843,43 @@ fn transit_point_routes_to_mcp_server(
     transit_point: String,
     server_name: String,
 ) {
+    add_transit_point(world, &transit_point, "mcp", &server_name, TargetActorKind::McpServer, None);
+}
+
+fn add_transit_point(
+    world: &mut SurfaceWorld,
+    alias: &str,
+    protocol: &str,
+    destination: &str,
+    destination_kind: TargetActorKind,
+    surface_binding: Option<String>,
+) {
+    let collaborator_key = if world
+        .surface_config
+        .transit_points
+        .is_empty()
+    {
+        SECONDARY_COLLABORATOR_KEY.to_string()
+    } else {
+        format!("transit-point-{alias}")
+    };
     world
         .actors
-        .register_target_with_key(&server_name, TargetActorKind::McpServer, SECONDARY_COLLABORATOR_KEY);
-    world.register_secondary_collaborator(&server_name, TargetActorKind::McpServer);
-
+        .register_target_with_key(destination, destination_kind, &collaborator_key);
+    world.register_collaborator(&collaborator_key, destination, destination_kind);
     world
         .surface_config
-        .transit_point = Some(SurfaceTransitPointConfig {
-        alias: transit_point,
-        protocol: "mcp".to_string(),
-        header_metadata_mapping: Default::default(),
-        managed_identity: None,
-    });
+        .transit_points
+        .push(SurfaceTransitPointConfig::new(alias, protocol));
+    world
+        .actors
+        .put_transit_point(TransitPointActor {
+            key: alias.to_string(),
+            fixture: None,
+            bootstrapped: false,
+            surface_binding,
+            target_binding: Some(destination.to_string()),
+        });
 }
 
 #[given(expr = "surface {string} has A2A Transit Point {string} to external agent {string}")]
@@ -871,27 +896,14 @@ fn surface_has_a2a_transit_point_to_external_agent(
             .is_some(),
         "surface '{surface_name}' must be defined before adding Transit Point '{transit_point}'"
     );
-    world
-        .actors
-        .register_target_with_key(&external_agent, TargetActorKind::ExternalAgent, SECONDARY_COLLABORATOR_KEY);
-    world.register_secondary_collaborator(&external_agent, TargetActorKind::ExternalAgent);
-    world
-        .surface_config
-        .transit_point = Some(SurfaceTransitPointConfig {
-        alias: transit_point.clone(),
-        protocol: "a2a".to_string(),
-        header_metadata_mapping: Default::default(),
-        managed_identity: None,
-    });
-    world
-        .actors
-        .put_transit_point(TransitPointActor {
-            key: transit_point,
-            fixture: None,
-            bootstrapped: false,
-            surface_binding: Some(surface_name),
-            target_binding: Some(external_agent),
-        });
+    add_transit_point(
+        world,
+        &transit_point,
+        "a2a",
+        &external_agent,
+        TargetActorKind::ExternalAgent,
+        Some(surface_name),
+    );
 }
 
 #[given(expr = "the surface has a transit point {string} to external agent {string}")]
@@ -900,27 +912,7 @@ fn surface_has_transit_point_to_external_agent(
     transit_point: String,
     external_agent: String,
 ) {
-    world
-        .actors
-        .register_target_with_key(&external_agent, TargetActorKind::ExternalAgent, SECONDARY_COLLABORATOR_KEY);
-    world.register_secondary_collaborator(&external_agent, TargetActorKind::ExternalAgent);
-    world
-        .surface_config
-        .transit_point = Some(SurfaceTransitPointConfig {
-        alias: transit_point.clone(),
-        protocol: "a2a".to_string(),
-        header_metadata_mapping: Default::default(),
-        managed_identity: None,
-    });
-    world
-        .actors
-        .put_transit_point(TransitPointActor {
-            key: transit_point,
-            fixture: None,
-            bootstrapped: false,
-            surface_binding: None,
-            target_binding: Some(external_agent),
-        });
+    add_transit_point(world, &transit_point, "a2a", &external_agent, TargetActorKind::ExternalAgent, None);
 }
 
 #[given(expr = "external agent {string} is unreachable")]
@@ -982,7 +974,7 @@ fn external_agent_publishes_card_with_unverifiable_identity_credential(
 #[given(expr = "transit point {string} has a target-leg Trust Check for trust registry {string} of type {string}")]
 fn transit_point_has_target_trust_check(
     world: &mut SurfaceWorld,
-    _transit_point: String,
+    transit_point: String,
     trust_registry_id: String,
     query_type: String,
 ) {
@@ -996,10 +988,30 @@ fn transit_point_has_target_trust_check(
             "entity_id": "did:example:target",
         },
     });
-    world
-        .surface_config
-        .target_trust_check_list
+    transit_point_config_mut(world, &transit_point)
+        .trust_check_list
         .push(element);
+}
+
+#[given(expr = "transit point {string} has a policy that denies unless every target Trust Check succeeded")]
+fn transit_point_has_policy_denying_unless_target_trust_checks_ok(
+    world: &mut SurfaceWorld,
+    transit_point: String,
+) {
+    let policy_id = format!("bdd-trust-check-deny-on-target-failure-{}", uuid::Uuid::new_v4());
+    let rego = r#"package surface.policy
+
+default allow := false
+
+allow if {
+    count([r | r := input.trust_check_results.target[_]; r.ok == false]) == 0
+}
+"#;
+    transit_point_config_mut(world, &transit_point).policy = Some(PolicyDefinitionFixture::new(
+        policy_id,
+        "BDD Transit Point policy: deny unless every target Trust Check succeeded",
+        rego,
+    ));
 }
 
 #[given(expr = "the surface has a policy that denies a target Trust Check reporting error code {string}")]
@@ -1031,17 +1043,12 @@ fn transit_point_config_mut<'a>(
     world: &'a mut SurfaceWorld,
     transit_point: &str,
 ) -> &'a mut SurfaceTransitPointConfig {
-    let configured = world
+    world
         .surface_config
-        .transit_point
-        .as_mut()
-        .unwrap_or_else(|| panic!("transit point '{transit_point}' must be configured before this step"));
-    assert_eq!(
-        configured.alias, transit_point,
-        "configured Transit Point alias is '{}', not '{}'",
-        configured.alias, transit_point
-    );
-    configured
+        .transit_points
+        .iter_mut()
+        .find(|configured| configured.alias == transit_point)
+        .unwrap_or_else(|| panic!("transit point '{transit_point}' must be configured before this step"))
 }
 
 #[given(expr = "transit point {string} maps managed-agent header {string} to A2A metadata field {string}")]

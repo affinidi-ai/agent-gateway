@@ -89,6 +89,12 @@ The CLI consent page (`/cli-consent`) is shown outside the dashboard shell and r
 The secret editor has one save button and never shows a stored secret value; see
 _Secret editor_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#secret-editor).
 
+A Trust Check on a Managed Agent → Transit Point arrow belongs to that Transit Point and saves
+to `transit.points[i].trust_check_list` (A2A and AP2 Transit Points only); the Managed Agent's
+own Trust Check is offered only for `a2a-proxy://` and `fabric://` targets, and Transit Points
+whose list was migrated from the old surface-wide list are flagged for review; see
+_Trust Check_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#trust-check).
+
 The Trust Recorder panel and its entries warn while an entry uses the surface Issuer as its
 Authority and the surface has no Issuer or its Issuer no longer exists; see _Trust Recorder_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#trust-recorder).

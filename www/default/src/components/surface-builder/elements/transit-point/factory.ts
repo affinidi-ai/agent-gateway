@@ -12,6 +12,7 @@ import { workloadBindingFormToApi } from '../workload-binding/config';
 import { getCachedOutboundListenAddresses } from '../access-point/defaults';
 import { headerMetadataMappingToWire } from '../metadata-extraction/definition';
 import { mcpToolGatingConfigToWire } from '../mcp-tool-gating/definition';
+import { isMigratedTrustCheck, transitPointTrustCheckListToWire } from '../trust-check/definition';
 import { DOCS_URL } from '../../../../config/docs';
 
 /**
@@ -339,6 +340,16 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
                   n => n.type === 'mcp-tool-gating' && n.parentId === tp.id
                 );
                 const mcpToolGating = mcpToolGatingConfigToWire(mcpToolGatingNode?.config);
+                // Per-TP target-leg Trust Check (MA→TP request slot), A2A/AP2
+                // only. The trust-check element's own buildPayload skips
+                // TP-parented nodes so this is the only writer.
+                const trustCheckNode = ctx.allNodes.find(
+                  n => n.type === 'trust-check' && n.parentId === tp.id
+                );
+                const trustCheckList =
+                  tpProtocol === 'a2a' || tpProtocol === 'ap2'
+                    ? transitPointTrustCheckListToWire(trustCheckNode)
+                    : undefined;
                 const credentials = transitCredentialsToApi(c.transit_credentials);
                 const headerMetadataNode = ctx.allNodes.find(
                   n => n.type === 'metadata-extraction' && n.parentId === tp.id
@@ -468,6 +479,14 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
                   ...(managedIdentity ? { managed_identity: managedIdentity } : {}),
                   ...(workloadBinding ? { workload_binding: workloadBinding } : {}),
                   ...(mcpToolGating ? { mcp_tool_gating: mcpToolGating } : {}),
+                  ...(trustCheckList
+                    ? {
+                        trust_check_list: trustCheckList,
+                        ...(isMigratedTrustCheck(trustCheckNode?.config)
+                          ? { trust_check_migrated: true }
+                          : {}),
+                      }
+                    : {}),
                   ...(credentials ? { transit_credentials: credentials } : {}),
                 };
               });

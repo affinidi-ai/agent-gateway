@@ -6,7 +6,8 @@
 //! into verbose logging; failures (clean denials *and* stage errors) log at
 //! `WARN` so they reach the OpenTelemetry log exporter.
 //!
-//! Events carry the surface id, leg, trust registry id, query type, outcome
+//! Events carry the surface id, the Transit Point alias on the outbound
+//! path, leg, trust registry id, query type, outcome
 //! flag, error code (when applicable), and per-element latency in
 //! milliseconds. Because the event fires inside the active request span it
 //! auto-correlates to the distributed trace.
@@ -51,6 +52,24 @@ fn result_label(
     }
 }
 
+/// Where a Trust Check ran: the surface and, on the outbound path, the alias
+/// of the Transit Point the request was routed to. A bare surface id converts
+/// into an origin without a Transit Point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrustCheckOrigin<'a> {
+    pub surface_id: &'a str,
+    pub transit_point: Option<&'a str>,
+}
+
+impl<'a> From<&'a str> for TrustCheckOrigin<'a> {
+    fn from(surface_id: &'a str) -> Self {
+        Self {
+            surface_id,
+            transit_point: None,
+        }
+    }
+}
+
 /// Structured input to [`record_trust_check`]. Named fields keep the
 /// call sites self-documenting and let the audit surface grow without
 /// perturbing every caller.
@@ -78,6 +97,9 @@ fn result_label(
 ///   histogram observation is skipped on that path.
 pub struct TrustCheckAuditEvent<'a> {
     pub surface_id: &'a str,
+    /// Alias of the Transit Point the request was routed to; `None` outside
+    /// the outbound path.
+    pub transit_point: Option<&'a str>,
     pub leg: TrustCheckLeg,
     pub element_id: &'a str,
     pub element_name: Option<&'a str>,
@@ -103,6 +125,7 @@ pub struct TrustCheckAuditEvent<'a> {
 pub fn record_trust_check(event: TrustCheckAuditEvent<'_>) {
     let TrustCheckAuditEvent {
         surface_id,
+        transit_point,
         leg,
         element_id,
         element_name,
@@ -122,6 +145,7 @@ pub fn record_trust_check(event: TrustCheckAuditEvent<'_>) {
     let error_code_str = error_code.unwrap_or_default();
     let error_detail_str = error_detail.unwrap_or_default();
     let element_name_str = element_name.unwrap_or_default();
+    let transit_point_str = transit_point.unwrap_or_default();
 
     let duration_secs = match (result, latency_ms) {
         (RESULT_ERROR, 0) => None,
@@ -133,6 +157,7 @@ pub fn record_trust_check(event: TrustCheckAuditEvent<'_>) {
         tracing::debug!(
             target: "trust_check_audit",
             surface_id = surface_id,
+            transit_point = transit_point_str,
             leg = leg_str,
             element_id = element_id,
             element_name = element_name_str,
@@ -148,6 +173,7 @@ pub fn record_trust_check(event: TrustCheckAuditEvent<'_>) {
         tracing::warn!(
             target: "trust_check_audit",
             surface_id = surface_id,
+            transit_point = transit_point_str,
             leg = leg_str,
             element_id = element_id,
             element_name = element_name_str,
@@ -180,6 +206,7 @@ pub fn record_trust_check(event: TrustCheckAuditEvent<'_>) {
         let (authority_display, entity_display) = redacted_ids_for_audit(authority_id, entity_id);
         crate::delegation_vault::audit::audit_trust_check(
             Some(surface_id),
+            transit_point,
             crate::observability::policy_audit::current_span_trace_id().as_deref(),
             leg_str,
             authority_display.as_deref(),
@@ -205,141 +232,16 @@ fn redacted_ids_for_audit(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn leg_labels_are_stable() {
-        assert_eq!(leg_label(TrustCheckLeg::Caller), "caller");
-        assert_eq!(leg_label(TrustCheckLeg::Target), "target");
-    }
-
-    #[test]
-    fn query_type_labels_are_stable() {
-        assert_eq!(query_type_label(TrqpQueryType::Authorization), "authorization");
-        assert_eq!(query_type_label(TrqpQueryType::Recognition), "recognition");
-    }
-
-    #[test]
-    fn result_label_partitions_outcome_space() {
-        assert_eq!(result_label(true, None), RESULT_OK);
-        assert_eq!(result_label(true, Some("ignored")), RESULT_OK);
-        assert_eq!(result_label(false, None), RESULT_ERROR);
-        assert_eq!(result_label(false, Some(NOT_RECOGNIZED)), RESULT_DENIED);
-        assert_eq!(result_label(false, Some(NOT_AUTHORIZED)), RESULT_DENIED);
-        assert_eq!(result_label(false, Some("TRUST_REGISTRY_UNREACHABLE")), RESULT_ERROR);
-        assert_eq!(result_label(false, Some("TRUST_REGISTRY_PARSE_ERROR")), RESULT_ERROR);
-    }
-
-    fn caller_check(surface_id: &'static str) -> TrustCheckAuditEvent<'static> {
-        TrustCheckAuditEvent {
-            surface_id,
-            leg: TrustCheckLeg::Caller,
-            element_id: "tc-1",
-            element_name: None,
-            authority_id: Some("did:authority:a"),
-            entity_id: Some("did:entity:a"),
-            trust_registry_id: "tr-a",
-            query_type: TrqpQueryType::Recognition,
-            ok: false,
-            error_code: Some(NOT_RECOGNIZED),
-            error_detail: None,
-            latency_ms: 3,
-        }
-    }
-
-    #[tokio::test]
-    async fn the_audit_record_carries_the_surface_and_the_caller() {
-        let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
-            subject: "user-1".to_string(),
-            claims: serde_json::json!({"email": "ada@example.com"}),
-        };
-        let caller = crate::delegation_vault::audit::build_caller_context(&identity);
-        let ((), events) = crate::audit::producer::capture(crate::audit::context::with_caller(Some(caller), async {
-            record_trust_check(caller_check("surface-7"));
-        }))
-        .await;
-
-        assert_eq!(events.len(), 1);
-        assert_eq!(
-            events[0]
-                .surface_id
-                .as_deref(),
-            Some("surface-7")
-        );
-        let caller = events[0]
-            .caller
-            .as_ref()
-            .expect("the trust check names its caller");
-        assert_eq!(caller.sub.as_deref(), Some("user-1"));
-        assert_eq!(caller.email.as_deref(), Some("ada@example.com"));
-    }
-
-    #[tokio::test]
-    async fn a_trust_check_outside_a_request_has_no_caller() {
-        let ((), events) = crate::audit::producer::capture(async {
-            record_trust_check(caller_check("surface-7"));
-        })
-        .await;
-        assert_eq!(events.len(), 1);
-        assert!(events[0].caller.is_none());
-    }
-
-    #[test]
-    fn record_does_not_panic_on_any_path() {
-        record_trust_check(TrustCheckAuditEvent {
-            surface_id: "surf-1",
-            leg: TrustCheckLeg::Caller,
-            element_id: "tc-1",
-            element_name: None,
-            authority_id: Some("did:authority:a"),
-            entity_id: Some("did:entity:a"),
-            trust_registry_id: "tr-a",
-            query_type: TrqpQueryType::Recognition,
-            ok: true,
-            error_code: None,
-            error_detail: None,
-            latency_ms: 12,
-        });
-        record_trust_check(TrustCheckAuditEvent {
-            surface_id: "surf-1",
-            leg: TrustCheckLeg::Target,
-            element_id: "tc-2",
-            element_name: Some("primary"),
-            authority_id: Some("did:authority:a"),
-            entity_id: Some("did:entity:b"),
-            trust_registry_id: "tr-a",
-            query_type: TrqpQueryType::Authorization,
-            ok: false,
-            error_code: None,
-            error_detail: None,
-            latency_ms: 8,
-        });
-        record_trust_check(TrustCheckAuditEvent {
-            surface_id: "surf-1",
-            leg: TrustCheckLeg::Caller,
-            element_id: "tc-3",
-            element_name: Some("departmental"),
-            authority_id: Some("did:authority:b"),
-            entity_id: Some("did:entity:c"),
-            trust_registry_id: "tr-b",
-            query_type: TrqpQueryType::Recognition,
-            ok: false,
-            error_code: Some("TRUST_REGISTRY_UNREACHABLE"),
-            error_detail: Some("no active trust registry connection for id 'tr-b'"),
-            latency_ms: 0,
-        });
-    }
-
+pub(crate) mod test_support {
     use std::sync::{Arc, Mutex};
     use tracing::field::{Field, Visit};
     use tracing_subscriber::Layer;
     use tracing_subscriber::layer::{Context, SubscriberExt};
 
     #[derive(Clone, Default)]
-    struct CapturedEvent {
-        level: String,
-        fields: Vec<(String, String)>,
+    pub(crate) struct CapturedEvent {
+        pub(crate) level: String,
+        pub(crate) fields: Vec<(String, String)>,
     }
 
     struct CapturingLayer {
@@ -409,7 +311,7 @@ mod tests {
         }
     }
 
-    fn field<'a>(
+    pub(crate) fn field<'a>(
         ev: &'a CapturedEvent,
         name: &str,
     ) -> Option<&'a str> {
@@ -419,7 +321,21 @@ mod tests {
             .map(|(_, v)| v.as_str())
     }
 
-    fn capture<F: FnOnce()>(f: F) -> Vec<CapturedEvent> {
+    /// Keeps a second dispatcher registered for the life of the test process.
+    /// While only one dispatcher is registered, tracing-core computes a newly
+    /// registered callsite's interest from the registering thread's default
+    /// subscriber, so a parallel test thread without a subscriber can cache
+    /// `never` for a callsite another thread is capturing and its events are
+    /// dropped. With two or more registered, interest is computed from all of
+    /// them.
+    fn share_callsite_interest() {
+        static ANCHOR: std::sync::LazyLock<tracing::Dispatch> =
+            std::sync::LazyLock::new(|| tracing::Dispatch::new(tracing_subscriber::registry()));
+        std::sync::LazyLock::force(&ANCHOR);
+    }
+
+    pub(crate) fn capture<F: FnOnce()>(f: F) -> Vec<CapturedEvent> {
+        share_callsite_interest();
         let events = Arc::new(Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::registry().with(CapturingLayer { events: events.clone() });
         tracing::subscriber::with_default(subscriber, f);
@@ -429,11 +345,221 @@ mod tests {
         guard.clone()
     }
 
+    /// Route trust check audit events on the current thread into the returned
+    /// buffer until the guard drops. Usable across `.await` on a current-thread
+    /// runtime, unlike [`capture`].
+    pub(crate) fn capture_until_dropped() -> (tracing::subscriber::DefaultGuard, Arc<Mutex<Vec<CapturedEvent>>>) {
+        share_callsite_interest();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(CapturingLayer { events: events.clone() });
+        (tracing::subscriber::set_default(subscriber), events)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn leg_labels_are_stable() {
+        assert_eq!(leg_label(TrustCheckLeg::Caller), "caller");
+        assert_eq!(leg_label(TrustCheckLeg::Target), "target");
+    }
+
+    #[test]
+    fn query_type_labels_are_stable() {
+        assert_eq!(query_type_label(TrqpQueryType::Authorization), "authorization");
+        assert_eq!(query_type_label(TrqpQueryType::Recognition), "recognition");
+    }
+
+    #[test]
+    fn result_label_partitions_outcome_space() {
+        assert_eq!(result_label(true, None), RESULT_OK);
+        assert_eq!(result_label(true, Some("ignored")), RESULT_OK);
+        assert_eq!(result_label(false, None), RESULT_ERROR);
+        assert_eq!(result_label(false, Some(NOT_RECOGNIZED)), RESULT_DENIED);
+        assert_eq!(result_label(false, Some(NOT_AUTHORIZED)), RESULT_DENIED);
+        assert_eq!(result_label(false, Some("TRUST_REGISTRY_UNREACHABLE")), RESULT_ERROR);
+        assert_eq!(result_label(false, Some("TRUST_REGISTRY_PARSE_ERROR")), RESULT_ERROR);
+    }
+
+    fn caller_check(surface_id: &'static str) -> TrustCheckAuditEvent<'static> {
+        TrustCheckAuditEvent {
+            surface_id,
+            transit_point: None,
+            leg: TrustCheckLeg::Caller,
+            element_id: "tc-1",
+            element_name: None,
+            authority_id: Some("did:authority:a"),
+            entity_id: Some("did:entity:a"),
+            trust_registry_id: "tr-a",
+            query_type: TrqpQueryType::Recognition,
+            ok: false,
+            error_code: Some(NOT_RECOGNIZED),
+            error_detail: None,
+            latency_ms: 3,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_audit_record_carries_the_surface_and_the_caller() {
+        let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            subject: "user-1".to_string(),
+            claims: serde_json::json!({"email": "ada@example.com"}),
+        };
+        let caller = crate::delegation_vault::audit::build_caller_context(&identity);
+        let ((), events) = crate::audit::producer::capture(crate::audit::context::with_caller(Some(caller), async {
+            record_trust_check(caller_check("surface-7"));
+        }))
+        .await;
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0]
+                .surface_id
+                .as_deref(),
+            Some("surface-7")
+        );
+        let caller = events[0]
+            .caller
+            .as_ref()
+            .expect("the trust check names its caller");
+        assert_eq!(caller.sub.as_deref(), Some("user-1"));
+        assert_eq!(caller.email.as_deref(), Some("ada@example.com"));
+    }
+
+    #[tokio::test]
+    async fn a_trust_check_outside_a_request_has_no_caller() {
+        let ((), events) = crate::audit::producer::capture(async {
+            record_trust_check(caller_check("surface-7"));
+        })
+        .await;
+        assert_eq!(events.len(), 1);
+        assert!(events[0].caller.is_none());
+    }
+
+    #[test]
+    fn record_does_not_panic_on_any_path() {
+        record_trust_check(TrustCheckAuditEvent {
+            surface_id: "surf-1",
+            transit_point: None,
+            leg: TrustCheckLeg::Caller,
+            element_id: "tc-1",
+            element_name: None,
+            authority_id: Some("did:authority:a"),
+            entity_id: Some("did:entity:a"),
+            trust_registry_id: "tr-a",
+            query_type: TrqpQueryType::Recognition,
+            ok: true,
+            error_code: None,
+            error_detail: None,
+            latency_ms: 12,
+        });
+        record_trust_check(TrustCheckAuditEvent {
+            surface_id: "surf-1",
+            transit_point: None,
+            leg: TrustCheckLeg::Target,
+            element_id: "tc-2",
+            element_name: Some("primary"),
+            authority_id: Some("did:authority:a"),
+            entity_id: Some("did:entity:b"),
+            trust_registry_id: "tr-a",
+            query_type: TrqpQueryType::Authorization,
+            ok: false,
+            error_code: None,
+            error_detail: None,
+            latency_ms: 8,
+        });
+        record_trust_check(TrustCheckAuditEvent {
+            surface_id: "surf-1",
+            transit_point: None,
+            leg: TrustCheckLeg::Caller,
+            element_id: "tc-3",
+            element_name: Some("departmental"),
+            authority_id: Some("did:authority:b"),
+            entity_id: Some("did:entity:c"),
+            trust_registry_id: "tr-b",
+            query_type: TrqpQueryType::Recognition,
+            ok: false,
+            error_code: Some("TRUST_REGISTRY_UNREACHABLE"),
+            error_detail: Some("no active trust registry connection for id 'tr-b'"),
+            latency_ms: 0,
+        });
+    }
+
+    use super::test_support::{capture, field};
+
+    fn target_event<'a>(
+        surface_id: &'a str,
+        transit_point: Option<&'a str>,
+        ok: bool,
+    ) -> TrustCheckAuditEvent<'a> {
+        TrustCheckAuditEvent {
+            surface_id,
+            transit_point,
+            leg: TrustCheckLeg::Target,
+            element_id: "tc-tp",
+            element_name: None,
+            authority_id: None,
+            entity_id: None,
+            trust_registry_id: "tr-tp",
+            query_type: TrqpQueryType::Recognition,
+            ok,
+            error_code: (!ok).then_some("AGENT_CARD_UNAVAILABLE"),
+            error_detail: None,
+            latency_ms: 0,
+        }
+    }
+
+    #[test]
+    fn events_carry_the_transit_point_alias_when_set() {
+        let captured = capture(|| {
+            record_trust_check(target_event("surface-tp-ok", Some("partner-a"), true));
+            record_trust_check(target_event("surface-tp-err", Some("partner-b"), false));
+        });
+
+        let ok = captured
+            .iter()
+            .find(|e| field(e, "surface_id") == Some("surface-tp-ok"))
+            .expect("ok event captured");
+        assert_eq!(ok.level, "DEBUG");
+        assert_eq!(field(ok, "transit_point"), Some("partner-a"));
+        let err = captured
+            .iter()
+            .find(|e| field(e, "surface_id") == Some("surface-tp-err"))
+            .expect("error event captured");
+        assert_eq!(err.level, "WARN");
+        assert_eq!(field(err, "transit_point"), Some("partner-b"));
+    }
+
+    #[test]
+    fn events_carry_an_empty_transit_point_outside_the_outbound_path() {
+        let captured = capture(|| record_trust_check(target_event("surface-no-tp", None, false)));
+
+        let ev = captured
+            .iter()
+            .find(|e| field(e, "surface_id") == Some("surface-no-tp"))
+            .expect("event captured");
+        assert_eq!(field(ev, "transit_point"), Some(""));
+    }
+
+    #[test]
+    fn a_surface_id_converts_into_an_origin_without_a_transit_point() {
+        assert_eq!(
+            TrustCheckOrigin::from("surface-1"),
+            TrustCheckOrigin {
+                surface_id: "surface-1",
+                transit_point: None,
+            }
+        );
+    }
+
     #[test]
     fn ok_event_carries_full_structured_context_at_debug() {
         let captured = capture(|| {
             record_trust_check(TrustCheckAuditEvent {
                 surface_id: "surface-a",
+                transit_point: None,
                 leg: TrustCheckLeg::Caller,
                 element_id: "tc-id-a",
                 element_name: Some("primary registry"),
@@ -474,6 +600,7 @@ mod tests {
         let captured = capture(|| {
             record_trust_check(TrustCheckAuditEvent {
                 surface_id: "surface-b",
+                transit_point: None,
                 leg: TrustCheckLeg::Target,
                 element_id: "tc-id-b",
                 element_name: None,
@@ -510,6 +637,7 @@ mod tests {
         let captured = capture(|| {
             record_trust_check(TrustCheckAuditEvent {
                 surface_id: "surface-nr",
+                transit_point: None,
                 leg: TrustCheckLeg::Caller,
                 element_id: "tc-id-nr",
                 element_name: None,
@@ -540,6 +668,7 @@ mod tests {
         let captured = capture(|| {
             record_trust_check(TrustCheckAuditEvent {
                 surface_id: "surface-na",
+                transit_point: None,
                 leg: TrustCheckLeg::Caller,
                 element_id: "tc-id-na",
                 element_name: None,
@@ -569,6 +698,7 @@ mod tests {
         let captured = capture(|| {
             record_trust_check(TrustCheckAuditEvent {
                 surface_id: "surface-c",
+                transit_point: None,
                 leg: TrustCheckLeg::Caller,
                 element_id: "tc-id-c",
                 element_name: Some("departmental"),

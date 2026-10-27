@@ -1791,6 +1791,8 @@ mod tests {
                     require_transit_token: true,
                     extension_inspection: crate::config::types::ExtensionInspectionConfig::default(),
                     fabric_delegated_credentials: false,
+                    trust_check_list: Vec::new(),
+                    trust_check_migrated: false,
                 }],
                 outbound_listen_address: None,
                 shared: SharedTransitConfig::default(),

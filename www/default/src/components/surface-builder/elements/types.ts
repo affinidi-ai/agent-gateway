@@ -478,6 +478,13 @@ export interface NodeDefinition {
   payloadOwnsConfig?: boolean;
 
   /**
+   * With `payloadOwnsConfig`, a blob node whose slice is missing is still
+   * restored when this returns true for its blob config: an unconfigured
+   * placeholder (e.g. from a template) that writes nothing to the payload.
+   */
+  isBlobPlaceholder?: (config: any) => boolean;
+
+  /**
    * Returns the payload slices this element contributes. Called once per
    * surface (not once per node — implementations look up their own nodes via
    * `ctx.nodesOfType(this.type)` when they support multiple instances).

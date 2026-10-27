@@ -243,6 +243,39 @@ fn validate_trust_checks(surface: &AgentSurface) -> Result<(), SurfaceApiError> 
         .map_err(|e| SurfaceApiError::BadRequest(e.to_string()))
 }
 
+/// Reject a non-empty `target.trust_check_list` (base or any variant, enabled
+/// or not) when the Managed Agent target endpoint is `http`/`https`: requests
+/// to that target never run it, and Transit Point traffic runs each Transit
+/// Point's own list.
+fn reject_target_trust_checks_on_http_target(surface: &AgentSurface) -> Result<(), SurfaceApiError> {
+    let offending = |target: &crate::config::agent_surface::Target| {
+        !target
+            .trust_check_list
+            .is_empty()
+            && (target
+                .endpoint
+                .starts_with("http://")
+                || target
+                    .endpoint
+                    .starts_with("https://"))
+    };
+    let message = |label: &str| {
+        SurfaceApiError::BadRequest(format!(
+            "{label}target.trust_check_list is not allowed when the Managed Agent target endpoint is http(s); \
+             configure target-leg Trust Checks per Transit Point in transit.points[].trust_check_list"
+        ))
+    };
+    if offending(&surface.target) {
+        return Err(message(""));
+    }
+    for variant in &surface.variants {
+        if offending(&surface.variant_target(variant)) {
+            return Err(message(&format!("Variant '{}': ", variant.alias)));
+        }
+    }
+    Ok(())
+}
+
 /// Validate Transit Point-scoped Workload Binding on the base surface and
 /// every resolved variant, mapping the structured
 /// [`crate::config::agent_surface::WorkloadBindingSurfaceError`] into a
@@ -963,6 +996,7 @@ pub async fn create_surface(
     surface
         .validate()
         .map_err(|e| SurfaceApiError::BadRequest(e.to_string()))?;
+    reject_target_trust_checks_on_http_target(&surface)?;
 
     // Check for duplicate surface_id
     surface
@@ -989,6 +1023,7 @@ pub async fn create_surface(
         .await
         .map_err(|e| SurfaceApiError::Forbidden(e.message()))?;
 
+    surface.trust_check_split = true;
     store
         .save(&surface)
         .await
@@ -1386,6 +1421,7 @@ async fn validate_and_save_surface(
     validate_surface_mcp_tool_gating(&surface)?;
     validate_resolved_variants(&surface)?;
     validate_trust_checks(&surface)?;
+    reject_target_trust_checks_on_http_target(&surface)?;
     validate_workload_binding_config(&surface)?;
     validate_source_auth(&surface)?;
     surface
@@ -1401,6 +1437,7 @@ async fn validate_and_save_surface(
     refuse_validation_off_by_scoped_caller(&surface, stored_a2a, context, scope, resource_scoped)?;
     validate_mcp_resource_declarations(state, &surface).await?;
 
+    surface.trust_check_split = true;
     store
         .save(&surface)
         .await
@@ -2984,6 +3021,7 @@ mod validation_tests {
             mcp_legacy_metadata_output: None,
             _retired_protocol_mode: Default::default(),
             mcp_http: None,
+            trust_check_split: false,
         }
     }
 
@@ -3693,6 +3731,143 @@ mod validation_tests {
             .caller_authentication = Some(jwt_bearer_auth("Authorization"));
         // MPP-over-MCP carries its credential in the `_meta` body, not a header — unaffected.
         validate_delegation_source_auth(&s).expect("MCP delegated MPP is unaffected by header collision");
+    }
+
+    fn target_trust_check(id: &str) -> crate::trust_registry_verification::TrustCheckElement {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "trust_registry_id": "tr-1",
+            "query_type": "recognition",
+            "query": {
+                "authority_id": "did:web:authority.example",
+                "entity_id": "{{ target.did }}"
+            }
+        }))
+        .expect("trust check element")
+    }
+
+    fn bad_request_message(result: Result<(), SurfaceApiError>) -> String {
+        match result {
+            Err(SurfaceApiError::BadRequest(msg)) => msg,
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    fn variant_with_target(
+        overrides: TargetOverrides,
+        enabled: bool,
+    ) -> SurfaceVariant {
+        SurfaceVariant {
+            id: "v-dev".to_string(),
+            alias: "dev".to_string(),
+            name: "dev".to_string(),
+            description: String::new(),
+            enabled,
+            overrides: SurfaceOverrides {
+                target: Some(overrides),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn target_trust_checks_rejected_on_http_and_https_targets() {
+        for endpoint in ["https://prod.example.com", "http://prod.example.com"] {
+            let mut s = base_surface();
+            s.target.endpoint = endpoint.to_string();
+            s.target.trust_check_list = vec![target_trust_check("target-check")];
+
+            let msg = bad_request_message(reject_target_trust_checks_on_http_target(&s));
+            assert!(msg.starts_with("target.trust_check_list is not allowed"), "{msg}");
+            assert!(msg.contains("transit.points[].trust_check_list"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn target_trust_checks_accepted_on_fabric_and_a2a_proxy_targets() {
+        for endpoint in ["fabric://gateway-1/surface-1", "a2a-proxy://proxy-1"] {
+            let mut s = base_surface();
+            s.target.endpoint = endpoint.to_string();
+            s.target.trust_check_list = vec![target_trust_check("target-check")];
+
+            assert!(reject_target_trust_checks_on_http_target(&s).is_ok(), "{endpoint} must be accepted");
+        }
+    }
+
+    #[test]
+    fn https_target_without_target_list_accepts_transit_point_lists() {
+        let mut s = base_surface();
+        let mut point: crate::config::agent_surface::TransitPoint = serde_json::from_value(serde_json::json!({
+            "alias": "partner-a",
+            "target_endpoint": "https://partner.example/a2a",
+            "protocol": "a2a"
+        }))
+        .expect("transit point");
+        point.trust_check_list = vec![target_trust_check("partner-check")];
+        s.transit = Some(crate::config::agent_surface::TransitConfig {
+            points: vec![point],
+            outbound_listen_address: None,
+            shared: Default::default(),
+        });
+
+        assert!(reject_target_trust_checks_on_http_target(&s).is_ok());
+        assert_eq!(s.validate(), Ok(()));
+    }
+
+    #[test]
+    fn variant_target_trust_checks_rejected_on_https_variant_target() {
+        for enabled in [true, false] {
+            let mut s = base_surface();
+            s.target.endpoint = "fabric://gateway-1/surface-1".to_string();
+            s.variants = vec![variant_with_target(
+                TargetOverrides {
+                    endpoint: Some("https://dev.example.com".to_string()),
+                    trust_check_list: Some(vec![target_trust_check("dev-check")]),
+                    ..Default::default()
+                },
+                enabled,
+            )];
+
+            let msg = bad_request_message(reject_target_trust_checks_on_http_target(&s));
+            assert!(msg.starts_with("Variant 'dev': target.trust_check_list is not allowed"), "{msg}");
+            assert!(msg.contains("transit.points[].trust_check_list"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn variant_inheriting_base_list_onto_https_target_is_rejected() {
+        let mut s = base_surface();
+        s.target.endpoint = "fabric://gateway-1/surface-1".to_string();
+        s.target.trust_check_list = vec![target_trust_check("base-check")];
+        assert!(reject_target_trust_checks_on_http_target(&s).is_ok());
+
+        s.variants = vec![variant_with_target(
+            TargetOverrides {
+                endpoint: Some("https://dev.example.com".to_string()),
+                ..Default::default()
+            },
+            true,
+        )];
+
+        let msg = bad_request_message(reject_target_trust_checks_on_http_target(&s));
+        assert!(msg.starts_with("Variant 'dev': "), "{msg}");
+    }
+
+    #[test]
+    fn variant_clearing_list_on_https_target_is_accepted() {
+        let mut s = base_surface();
+        s.target.endpoint = "fabric://gateway-1/surface-1".to_string();
+        s.target.trust_check_list = vec![target_trust_check("base-check")];
+        s.variants = vec![variant_with_target(
+            TargetOverrides {
+                endpoint: Some("https://dev.example.com".to_string()),
+                trust_check_list: Some(Vec::new()),
+                ..Default::default()
+            },
+            true,
+        )];
+
+        assert!(reject_target_trust_checks_on_http_target(&s).is_ok());
     }
 }
 

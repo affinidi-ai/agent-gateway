@@ -226,10 +226,11 @@ function attemptEdgeDrop(
     else if (slot.payloadPathTemplate === 'identity_slots.external')
       canonicalId = 'identity-external';
   }
-  // Trust Check ids mirror `hydrateLeg` so drop-time and reload-time
+  // Trust Check ids mirror registry hydration so drop-time and reload-time
   // ids match — otherwise the canvas-blob overlay can't reconcile
   // hydrated `trust-check-caller`/`trust-check-target` against a
   // drop-minted id, and duplicates get pushed as extras on every save.
+  // A Transit Point's own list keeps the owner id, `trust-check-<tp id>`.
   if (type === 'trust-check' && slot.payloadPathTemplate) {
     if (slot.payloadPathTemplate === 'access_point.trust_check_list')
       canonicalId = 'trust-check-caller';
