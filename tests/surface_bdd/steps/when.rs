@@ -2384,6 +2384,36 @@ async fn caller_asks_mcp_surface_for_available_tools_with_valid_token(world: &mu
     .await;
 }
 
+#[when("the caller asks the MCP surface for available tools with a token issued for the surface")]
+async fn caller_asks_mcp_surface_for_available_tools_with_token_for_surface(world: &mut SurfaceWorld) {
+    let resource = format!(
+        "{}{}",
+        crate::bdd_support::config::single_surface_fixture::PROTECTED_RESOURCE_PUBLIC_ORIGIN,
+        world.surface_config.route
+    );
+    ask_mcp_surface_for_available_tools_with_audience(world, serde_json::json!(resource)).await;
+}
+
+#[when("the caller asks the MCP surface for available tools with a token issued for another resource")]
+async fn caller_asks_mcp_surface_for_available_tools_with_token_for_another_resource(world: &mut SurfaceWorld) {
+    let resource =
+        format!("{}/elsewhere", crate::bdd_support::config::single_surface_fixture::PROTECTED_RESOURCE_PUBLIC_ORIGIN);
+    ask_mcp_surface_for_available_tools_with_audience(world, serde_json::json!(resource)).await;
+}
+
+async fn ask_mcp_surface_for_available_tools_with_audience(
+    world: &mut SurfaceWorld,
+    audience: serde_json::Value,
+) {
+    ensure_gateway_running(world).await;
+    let token = create_valid_jwt_for_issuer_with_audience(get_jwt_source_auth_issuer(world), audience);
+    ask_mcp_surface_for_available_tools_with_headers(
+        world,
+        vec![("authorization".to_string(), format!("Bearer {}", token))],
+    )
+    .await;
+}
+
 #[when("the caller asks the MCP surface for available tools without an API key")]
 async fn caller_asks_mcp_surface_for_available_tools_without_api_key(world: &mut SurfaceWorld) {
     ask_mcp_surface_for_available_tools_with_headers(world, vec![]).await;

@@ -2084,6 +2084,11 @@ impl AgentSurface {
                                 Target"
                         .into());
                 }
+                if !jwt.audiences.is_empty() {
+                    return Err("requires empty JWT Bearer audiences: tokens must name the protected resource of \
+                                the route they call as their audience"
+                        .into());
+                }
                 Ok(())
             }
             _ => Err("requires a first caller authentication method of JWT Bearer reading the Authorization \
@@ -2536,6 +2541,11 @@ mod tests {
         forwarding["variants"] = serde_json::json!([]);
         forwarding["access_point"]["caller_authentication"] = forwarded;
         assert!(rejected(&forwarding).contains("forward_header"));
+        let mut audience = forwarding.clone();
+        audience["access_point"]["caller_authentication"]["methods"] = serde_json::json!([
+            {"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": ["https://gateway.example/mcp"]}
+        ]);
+        assert!(rejected(&audience).contains("requires empty JWT Bearer audiences"));
         let unknown_field = serde_json::json!({
             "methods": [], "protected_resource": {"resource": "https://gateway.example/mcp", "authorization_servers": [], "issuer": "x"}
         });

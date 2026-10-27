@@ -8,9 +8,10 @@ changes:
         authorization server can set caller_authentication.protected_resource with its resource,
         authorization servers and scopes. The gateway then serves the RFC 9728 document at
         /.well-known/oauth-protected-resource followed by the route, for the base surface and each
-        enabled variant, so an MCP client finds where to get a token. The setting is checked on
-        save like mcp_http.authorization, a PUT that omits it keeps it, and surfaces without it
-        behave as before.
+        enabled variant, so an MCP client finds where to get a token. Each listener publishes only
+        its own surfaces. The setting is checked on save like mcp_http.authorization, a PUT that
+        omits it keeps it while the surface still supports it, and surfaces without it behave as
+        before.
     - timestamp: '2026-10-27T11:14:01Z'
       title: Challenge MCP callers without a valid token to fetch one
       description: >-
@@ -39,4 +40,12 @@ changes:
         that publishes protected resource metadata with JWT Bearer forward_header set is refused
         with 400, and a stored surface with that combination answers 503 instead of forwarding, so
         the caller's Authorization header never reaches the Target.
+    - timestamp: '2026-10-27T17:34:03Z'
+      title: Accept only tokens issued for the MCP surface's own resource
+      description: >-
+        An MCP Access Point that publishes protected resource metadata accepts a JWT Bearer token
+        only when its aud claim names the resource advertised for the route called, the base
+        resource or the variant's own, as the MCP authorization specification requires. A token the
+        same authorization server issued for another resource is answered with the 401 challenge.
+        The JWT Bearer audiences list must be empty on these surfaces.
   breaking: []

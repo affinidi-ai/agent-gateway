@@ -77,6 +77,23 @@ impl ProtectedResourceConfig {
             .resource_server()
             .metadata_document(&self.authorization_servers))
     }
+
+    /// The caller authentication the Access Point enforces with this
+    /// resource: a JWT Bearer token must name it, the resource advertised for
+    /// the route called, as its audience (RFC 8707), so a token the same
+    /// authorization server issued for another resource or variant is refused.
+    pub fn bind_audience(
+        &self,
+        config: crate::source_auth::SourceAuthConfig,
+    ) -> crate::source_auth::SourceAuthConfig {
+        match config {
+            crate::source_auth::SourceAuthConfig::JwtBearer(mut jwt) => {
+                jwt.audiences = vec![self.resource.clone()];
+                crate::source_auth::SourceAuthConfig::JwtBearer(jwt)
+            }
+            other => other,
+        }
+    }
 }
 
 /// An RFC 8414 issuer identifier: an absolute https URL without credentials,
@@ -1570,6 +1587,35 @@ mod tests {
                     .contains_key(header::WWW_AUTHENTICATE)
             );
         }
+    }
+
+    #[test]
+    fn a_discovery_access_point_accepts_only_tokens_for_the_resource_of_the_route_called() {
+        let network = discovery_network();
+        let surface = discovery_surface(
+            jwt_bearer_method(),
+            Some(json!({"resource": "https://gateway.example/mcp/alpha", "authorization_servers": [ISSUER]})),
+        );
+        let method = surface
+            .source_auth()
+            .cloned()
+            .unwrap();
+        for (alias, audience) in
+            [(None, "https://gateway.example/mcp/alpha"), (Some("beta"), "https://gateway.example/mcp/alpha$beta")]
+        {
+            let protected = access_point_protected_resource(&surface, alias, &network)
+                .unwrap()
+                .unwrap();
+            let crate::source_auth::SourceAuthConfig::JwtBearer(bound) = protected.bind_audience(method.clone()) else {
+                panic!("JWT Bearer caller authentication stays JWT Bearer");
+            };
+            assert_eq!(bound.audiences, [audience]);
+        }
+        let api_key: crate::source_auth::SourceAuthConfig = serde_json::from_value(json!(
+            {"type": "api_key", "extraction": {"source": "http_header", "field": "x-api-key"}, "secret_id": "key"}
+        ))
+        .unwrap();
+        assert_eq!(protected_resource("https://gateway.example/mcp/alpha").bind_audience(api_key.clone()), api_key);
     }
 
     #[test]

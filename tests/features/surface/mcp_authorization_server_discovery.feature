@@ -3,8 +3,8 @@ Feature: MCP authorization server discovery
   protected resource metadata (RFC 9728) that names the authorization server
   issuing them, so an MCP client finds where to get a token without manual
   configuration. A caller without a valid token is answered with a challenge
-  that points at that metadata. A surface that does not publish it behaves as
-  before.
+  that points at that metadata. Only tokens issued for the surface itself are
+  accepted. A surface that does not publish it behaves as before.
 
   Background:
     Given MCP surface "alpha" targets MCP server "bravo"
@@ -34,15 +34,16 @@ Feature: MCP authorization server discovery
     And MCP server "bravo" was not called
 
     Examples:
-      | auth condition                        |
-      | with an expired token                 |
-      | with a malformed token                |
-      | with a token from an untrusted issuer |
+      | auth condition                           |
+      | with an expired token                    |
+      | with a malformed token                   |
+      | with a token from an untrusted issuer    |
+      | with a token issued for another resource |
 
   Scenario: A caller with a valid token reaches the MCP server
     Given the surface publishes protected resource metadata naming authorization server "https://idp.example/realms/agents" and scope "tools"
     And MCP server "bravo" publishes a tool catalog
-    When the caller asks the MCP surface for available tools with a valid token
+    When the caller asks the MCP surface for available tools with a token issued for the surface
     Then the response status is 200
     And MCP server "bravo" received the forwarded MCP request
     And the MCP surface returns MCP server "bravo" tool catalog unchanged
@@ -50,7 +51,7 @@ Feature: MCP authorization server discovery
   Scenario: The caller's token never reaches the MCP server
     Given the surface publishes protected resource metadata naming authorization server "https://idp.example/realms/agents" and scope "tools"
     And MCP server "bravo" publishes a tool catalog
-    When the caller asks the MCP surface for available tools with a valid token
+    When the caller asks the MCP surface for available tools with a token issued for the surface
     Then the response status is 200
     And MCP server "bravo" did not receive header "authorization"
 

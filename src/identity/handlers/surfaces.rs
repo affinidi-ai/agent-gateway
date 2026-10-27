@@ -1205,7 +1205,7 @@ fn retain_mcp_settings(
     existing: &AgentSurface,
 ) {
     retain_mcp_http(&mut surface.mcp_http, existing.mcp_http.as_ref());
-    retain_protected_resource(
+    let base_retained = retain_protected_resource(
         surface
             .access_point
             .caller_authentication
@@ -1215,6 +1215,7 @@ fn retain_mcp_settings(
             .caller_authentication
             .as_ref(),
     );
+    let mut retained_aliases = Vec::new();
     let retain_points = |points: &mut [crate::config::agent_surface::TransitPoint],
                          stored: &[crate::config::agent_surface::TransitPoint]| {
         for point in points {
@@ -1234,7 +1235,7 @@ fn retain_mcp_settings(
             .variants
             .iter()
             .find(|previous| previous.id == variant.id);
-        retain_protected_resource(
+        if retain_protected_resource(
             variant
                 .overrides
                 .access_point
@@ -1256,7 +1257,9 @@ fn retain_mcp_settings(
                         .caller_authentication
                         .as_ref()
                 }),
-        );
+        ) {
+            retained_aliases.push(variant.alias.clone());
+        }
         let points = variant
             .overrides
             .transit
@@ -1274,6 +1277,7 @@ fn retain_mcp_settings(
             retain_points(points, stored_points);
         }
     }
+    drop_unsupported_protected_resources(surface, base_retained, &retained_aliases);
 }
 
 /// PUT carries the whole record, so an omitted `mcp_http` — or an `mcp_http`
@@ -1305,11 +1309,12 @@ fn retain_mcp_http(
 /// `caller_authentication` from its methods alone, so a `caller_authentication`
 /// that omits `protected_resource` means "unchanged". Dropping it on an
 /// unrelated edit would silently switch off the discovery the operator set up.
-/// Removal is explicit, via PATCH with a `null`.
+/// Removal is explicit, via PATCH with a `null`. Returns whether a stored
+/// setting was restored.
 fn retain_protected_resource(
     incoming: Option<&mut crate::config::agent_surface::CallerAuthentication>,
     previous: Option<&crate::config::agent_surface::CallerAuthentication>,
-) {
+) -> bool {
     if let (Some(incoming), Some(previous)) = (incoming, previous)
         && incoming
             .protected_resource
@@ -1318,6 +1323,63 @@ fn retain_protected_resource(
         incoming.protected_resource = previous
             .protected_resource
             .clone();
+        return incoming
+            .protected_resource
+            .is_some();
+    }
+    false
+}
+
+/// A restored `protected_resource` is dropped again when the incoming surface
+/// no longer supports it, for example after the dashboard switched the
+/// method, set `forward_header` or audiences, or moved the protocol off MCP.
+/// The dashboard cannot show the setting, so refusing the save over it would
+/// leave its user no way out. A setting sent in the request is still
+/// validated and refused.
+fn drop_unsupported_protected_resources(
+    surface: &mut AgentSurface,
+    base_retained: bool,
+    retained_aliases: &[String],
+) {
+    if base_retained
+        && surface
+            .validate_protected_resource()
+            .is_err()
+        && let Some(caller) = surface
+            .access_point
+            .caller_authentication
+            .as_mut()
+    {
+        caller.protected_resource = None;
+    }
+    for alias in retained_aliases {
+        // A disabled variant does not resolve and is not validated on save.
+        let unsupported = surface
+            .resolve_variant(Some(alias))
+            .is_ok_and(|resolved| {
+                resolved
+                    .validate_protected_resource()
+                    .is_err()
+            });
+        if unsupported
+            && let Some(caller) = surface
+                .variants
+                .iter_mut()
+                .find(|variant| &variant.alias == alias)
+                .and_then(|variant| {
+                    variant
+                        .overrides
+                        .access_point
+                        .as_mut()
+                })
+                .and_then(|access_point| {
+                    access_point
+                        .caller_authentication
+                        .as_mut()
+                })
+        {
+            caller.protected_resource = None;
+        }
     }
 }
 
@@ -2443,7 +2505,7 @@ mod validation_tests {
     }
 
     #[test]
-    fn a_put_that_rebuilds_caller_authentication_keeps_the_protected_resource() {
+    fn a_put_that_rebuilds_caller_authentication_keeps_the_protected_resource_it_still_supports() {
         let protected = serde_json::json!({
             "resource": "https://gateway.example/mcp", "authorization_servers": ["https://idp.example"]
         });
@@ -2484,7 +2546,12 @@ mod validation_tests {
                     }),
             )
         };
-        let mut existing = base_surface();
+        let mcp_surface = || {
+            let mut surface = base_surface();
+            surface.access_point.protocol = SurfaceProtocol::Mcp;
+            surface
+        };
+        let mut existing = mcp_surface();
         existing
             .access_point
             .caller_authentication = Some(caller_authentication(true));
@@ -2494,16 +2561,16 @@ mod validation_tests {
         );
 
         // The dashboard sends caller authentication rebuilt from its methods.
-        let mut rewritten = base_surface();
+        let mut rewritten = mcp_surface();
         rewritten
             .access_point
             .caller_authentication = Some(caller_authentication(false));
         rewritten.variants = vec![variant(false)];
         retain_mcp_settings(&mut rewritten, &existing);
-        assert_eq!(stored_resource(&rewritten), (expected.clone(), expected));
+        assert_eq!(stored_resource(&rewritten), (expected.clone(), expected.clone()));
 
         // Removing caller authentication does not bring the setting back.
-        let mut removed = base_surface();
+        let mut removed = mcp_surface();
         removed.variants = vec![variant(false)];
         retain_mcp_settings(&mut removed, &existing);
         assert!(
@@ -2514,15 +2581,68 @@ mod validation_tests {
         );
 
         // A surface that never published one does not gain one.
-        let mut fresh = base_surface();
+        let mut fresh = mcp_surface();
         fresh
             .access_point
             .caller_authentication = Some(caller_authentication(false));
         fresh.variants = vec![variant(false)];
-        let mut never = base_surface();
+        let mut never = mcp_surface();
         never.variants = vec![variant(false)];
         retain_mcp_settings(&mut fresh, &never);
         assert_eq!(stored_resource(&fresh), (None, None));
+
+        // An edit the stored setting no longer fits drops it instead of
+        // refusing the save over a field the dashboard cannot show.
+        let api_key = serde_json::json!([
+            {"type": "api_key", "extraction": {"source": "http_header", "field": "x-api-key"}, "secret_id": "key"}
+        ]);
+        let forwarding = serde_json::json!([
+            {"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": [], "forward_header": true}
+        ]);
+        let audience = serde_json::json!([
+            {"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": ["https://gateway.example/mcp"]}
+        ]);
+        for changed_methods in [api_key, forwarding, audience] {
+            let changed: crate::config::agent_surface::CallerAuthentication =
+                serde_json::from_value(serde_json::json!({"methods": changed_methods})).unwrap();
+            let mut switched = mcp_surface();
+            switched
+                .access_point
+                .caller_authentication = Some(changed.clone());
+            switched.variants = vec![variant(false)];
+            switched.variants[0]
+                .overrides
+                .access_point
+                .as_mut()
+                .unwrap()
+                .caller_authentication = Some(changed);
+            retain_mcp_settings(&mut switched, &existing);
+            assert_eq!(stored_resource(&switched), (None, None), "{changed_methods}");
+        }
+        let mut a2a = mcp_surface();
+        a2a.access_point.protocol = SurfaceProtocol::A2a;
+        a2a.access_point
+            .caller_authentication = Some(caller_authentication(false));
+        a2a.variants = vec![variant(false)];
+        retain_mcp_settings(&mut a2a, &existing);
+        assert_eq!(stored_resource(&a2a), (None, None));
+
+        // A setting the request itself sends is kept, for validation to refuse.
+        let mut sent = mcp_surface();
+        sent.access_point
+            .caller_authentication = Some(
+            serde_json::from_value(serde_json::json!({
+                "methods": [{"type": "api_key", "extraction": {"source": "http_header", "field": "x-api-key"}, "secret_id": "key"}],
+                "protected_resource": protected.clone()
+            }))
+            .unwrap(),
+        );
+        retain_mcp_settings(&mut sent, &existing);
+        assert_eq!(
+            sent.protected_resource()
+                .cloned(),
+            expected
+        );
     }
 
     fn a2a_block(

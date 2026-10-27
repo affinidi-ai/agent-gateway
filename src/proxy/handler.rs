@@ -1953,6 +1953,10 @@ async fn proxy_handler_with_mcp_runtime(
                 ));
             }
         };
+        let resolved_auth_config = match &protected_resource {
+            Some(protected_resource) => protected_resource.bind_audience(resolved_auth_config),
+            None => resolved_auth_config,
+        };
         let peer_cert = req
             .extensions()
             .get::<crate::source_auth::models::PeerCertInfo>();

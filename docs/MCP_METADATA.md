@@ -1314,8 +1314,14 @@ token. It opts in with `caller_authentication.protected_resource`:
 
 The setting is valid only on an MCP Access Point whose first caller
 authentication method, the one enforced, is JWT Bearer reading the
-`Authorization` header with the `Bearer` scheme without `forward_header`, and
-it cannot be combined with `mcp_http.authorization`. MCP forbids passing a
+`Authorization` header with the `Bearer` scheme, without `forward_header` and
+with empty `audiences`, and it cannot be combined with `mcp_http.authorization`.
+The token audience is bound to the resource instead, as the MCP authorization
+specification requires (RFC 8707): a token is accepted only when its `aud`
+names the resource advertised for the route called, `resource` on the base
+route and `<resource>$<alias>` on a variant. A token the same authorization
+server issued for another resource or variant, or one without `aud`, is
+refused like any other invalid token. MCP forbids passing a
 client's token through to the upstream server, so the caller's `Authorization`
 header never reaches the Target; a stored surface that sets `forward_header`
 anyway, for example one edited on disk, answers `503` and publishes no
@@ -1341,7 +1347,9 @@ set. Only active surfaces and enabled variants publish. When the settings
 claiming a path no longer validate at request time, for example after the
 listener's public URLs changed, the path answers `503`. Documents are read
 from the live surface, so a surface saved through the API publishes without a
-restart. Inbound listeners route both well-known paths whether or not
+restart. Each inbound listener answers only for the Access Points bound to
+it, so the same route on two listeners publishes each listener's own
+document. Inbound listeners route both well-known paths whether or not
 `sts.mcp_issuer` is configured: a path no caller authentication publishes
 falls to the gateway STS document when the profile is configured, and is
 otherwise routed like any other request, as before.
@@ -1352,14 +1360,18 @@ answered before policy with `401`, `application/problem+json`, `no-store`
 and `WWW-Authenticate: Bearer resource_metadata="<absolute metadata URL>"`,
 plus `error="invalid_token"` once a token was presented and `scope` when
 scopes are set. The body's detail is fixed and never says why a token failed.
-The audit records the failure as blocking. A valid token is validated and
-attributed as before, and its identity reaches policy. Failures on Fabric
+The audit records the failure as blocking. A valid token issued for the
+resource is attributed as before, and its identity reaches policy. Failures on Fabric
 receive and server-side errors keep their behaviour, and requested scopes are
 advertised but not enforced.
 
 A PUT whose `caller_authentication` omits `protected_resource` keeps the
 stored setting, as the dashboard rebuilds `caller_authentication` from its
-methods; PATCH with `null` removes it. The dashboard does not edit the setting.
+methods, while the surface still supports it. A PUT that no longer does, for
+example one that switches the method, sets `forward_header` or `audiences`, or
+moves the protocol off MCP, drops it instead of being refused over a setting
+the dashboard cannot show. PATCH with `null` removes it. The dashboard does not
+edit the setting.
 
 ### Tool Parameter Headers
 
