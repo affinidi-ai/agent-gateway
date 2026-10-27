@@ -99,7 +99,7 @@ const initialDashboardStore: DashboardStateStore = {
   currentBucketSeconds: null,
 };
 
-const initialState: AppState = {
+export const initialState: AppState = {
   theme: 'light',
   sidebarCollapsed: localStorage.getItem('dashboard-sidebar-collapsed') === 'true',
   globalState: { ...initialDashboardStore },
@@ -120,7 +120,7 @@ const initialState: AppState = {
   error: null,
 };
 
-function appReducer(state: AppState, action: AppAction): AppState {
+export function appReducer(state: AppState, action: AppAction): AppState {
   switch (action.type) {
     case 'SET_THEME':
       return { ...state, theme: action.payload };

@@ -930,4 +930,214 @@ describe('IdentitiesPage', () => {
       expect(screen.getByText('hash-caller')).toBeInTheDocument();
     });
   });
+  describe('trust recorder status', () => {
+    const recorder = (state: string, extra: Record<string, unknown> = {}) => ({
+      state,
+      reason: null,
+      last_attempt_at: null,
+      entries: [] as unknown[],
+      ...extra,
+    });
+    const make = (did: string, trust_recorder?: unknown) => ({
+      did,
+      name: did,
+      identity_hash: `hash-${did}`,
+      created_at: '2026-01-01T00:00:00Z',
+      ...(trust_recorder ? { trust_recorder } : {}),
+    });
+
+    const recorded = make(
+      'did:key:rec-ok',
+      recorder('recorded', {
+        last_attempt_at: '2026-02-01T00:00:00Z',
+        entries: [
+          {
+            trust_registry_id: 'reg-1',
+            state: 'recorded',
+            reason: null,
+            created: 2,
+            already_existed: 1,
+            failed: 0,
+          },
+        ],
+      })
+    );
+    const failed = make('did:key:rec-failed', recorder('failed', { reason: 'rejected' }));
+    const partial = make('did:key:rec-partial', recorder('partial'));
+    const skipped = make(
+      'did:key:rec-skipped',
+      recorder('skipped', { reason: 'no_surface_issuer' })
+    );
+    const notAttempted = make('did:key:rec-pending', recorder('not_attempted'));
+    const plain = make('did:key:rec-none');
+
+    const buildPage = (identities: any[]) => {
+      const stats = {
+        ...mockAppContext.getCurrentStats(),
+        identities,
+        total_identities: identities.length,
+      };
+      const context = { ...mockAppContext, getCurrentStats: jest.fn(() => stats) };
+      return (
+        <MemoryRouter initialEntries={['/identities']}>
+          <AppContext.Provider value={context}>
+            <Routes>
+              <Route path="/identities" element={<IdentitiesPage />} />
+            </Routes>
+          </AppContext.Provider>
+        </MemoryRouter>
+      );
+    };
+
+    const rowIds = () =>
+      screen.getAllByTestId(/^identities-row-/).map(row => row.getAttribute('data-testid'));
+
+    it('shows a labelled chip per identity that has a recorder and a dash for the rest', async () => {
+      render(buildPage([recorded, failed, partial, skipped, notAttempted, plain]));
+
+      const row = (did: string) => within(screen.getByTestId(`identities-row-${did}`));
+      expect(await screen.findByRole('columnheader', { name: 'Recorder' })).toBeInTheDocument();
+      expect(
+        row('did:key:rec-ok').getByTestId('identities-recorder-chip-recorded')
+      ).toHaveTextContent('Recorded');
+      expect(
+        row('did:key:rec-failed').getByTestId('identities-recorder-chip-failed')
+      ).toHaveTextContent('Failed');
+      expect(
+        row('did:key:rec-partial').getByTestId('identities-recorder-chip-partial')
+      ).toHaveTextContent('Partly recorded');
+      expect(
+        row('did:key:rec-skipped').getByTestId('identities-recorder-chip-skipped')
+      ).toHaveTextContent('Skipped');
+      expect(
+        row('did:key:rec-pending').getByTestId('identities-recorder-chip-not_attempted')
+      ).toHaveTextContent('Not attempted yet');
+      expect(
+        row('did:key:rec-none').queryByTestId(/^identities-recorder-chip-/)
+      ).not.toBeInTheDocument();
+    });
+
+    it('shows no recorder column, chip or filter when no identity has a recorder', async () => {
+      render(buildPage([plain, make('did:key:other')]));
+
+      expect(await screen.findAllByTestId(/^identities-row-/)).toHaveLength(2);
+      expect(screen.queryByRole('columnheader', { name: 'Recorder' })).not.toBeInTheDocument();
+      expect(screen.queryByTestId(/^identities-recorder-chip-/)).not.toBeInTheDocument();
+      expect(screen.queryByTestId('identities-recorder-filter')).not.toBeInTheDocument();
+    });
+
+    it('opens the tooltip details from the chip without expanding the row', async () => {
+      render(buildPage([recorded]));
+
+      const row = await screen.findByTestId('identities-row-did:key:rec-ok');
+      const chip = within(row).getByTestId('identities-recorder-chip-recorded');
+      fireEvent.click(chip);
+      fireEvent.focus(chip);
+
+      expect(row).toHaveAttribute('aria-expanded', 'false');
+      const entry = await screen.findByTestId('identities-recorder-entry-reg-1');
+      expect(entry).toHaveTextContent('created 2, already existed 1, failed 0');
+    });
+
+    it('offers every recorder option on the filter', async () => {
+      render(buildPage([recorded, plain]));
+
+      const select = await screen.findByTestId('identities-recorder-filter');
+      expect(select).toHaveAccessibleName('Recorder');
+      expect(
+        within(select)
+          .getAllByRole('option')
+          .map(o => o.textContent)
+      ).toEqual([
+        'All',
+        'Recorded',
+        'Partly recorded',
+        'Failed',
+        'Skipped',
+        'Not attempted yet',
+        'No recorder',
+      ]);
+      expect(select).toHaveValue('all');
+    });
+
+    it('narrows the list by recorder state and restores it with All', async () => {
+      render(buildPage([recorded, failed, partial, plain]));
+      const select = await screen.findByTestId('identities-recorder-filter');
+      expect(rowIds()).toHaveLength(4);
+
+      fireEvent.change(select, { target: { value: 'failed' } });
+      expect(rowIds()).toEqual(['identities-row-did:key:rec-failed']);
+
+      fireEvent.change(select, { target: { value: 'none' } });
+      expect(rowIds()).toEqual(['identities-row-did:key:rec-none']);
+
+      fireEvent.change(select, { target: { value: 'all' } });
+      expect(rowIds()).toHaveLength(4);
+    });
+
+    it('shows the empty-match message when no identity fits the recorder filter', async () => {
+      render(buildPage([recorded, plain]));
+
+      fireEvent.change(await screen.findByTestId('identities-recorder-filter'), {
+        target: { value: 'skipped' },
+      });
+
+      expect(screen.queryAllByTestId(/^identities-row-/)).toHaveLength(0);
+      expect(screen.getByText('No identities match your search.')).toBeInTheDocument();
+    });
+
+    it('combines the recorder filter with the search', async () => {
+      render(buildPage([recorded, failed, partial]));
+      const select = await screen.findByTestId('identities-recorder-filter');
+
+      fireEvent.change(select, { target: { value: 'failed' } });
+      fireEvent.change(screen.getByPlaceholderText(/Filter Agent Identities/i), {
+        target: { value: 'rec-ok' },
+      });
+      expect(screen.queryAllByTestId(/^identities-row-/)).toHaveLength(0);
+
+      fireEvent.change(screen.getByPlaceholderText(/Filter Agent Identities/i), {
+        target: { value: 'rec-failed' },
+      });
+      expect(rowIds()).toEqual(['identities-row-did:key:rec-failed']);
+    });
+
+    it('applies a live change of an identity recorder status', async () => {
+      const { rerender } = render(buildPage([make('did:key:live', recorder('not_attempted'))]));
+      const row = await screen.findByTestId('identities-row-did:key:live');
+      expect(within(row).getByTestId('identities-recorder-chip-not_attempted')).toBeInTheDocument();
+
+      rerender(buildPage([make('did:key:live', recorder('recorded'))]));
+
+      const updated = screen.getByTestId('identities-row-did:key:live');
+      expect(within(updated).getByTestId('identities-recorder-chip-recorded')).toHaveTextContent(
+        'Recorded'
+      );
+      expect(
+        within(updated).queryByTestId('identities-recorder-chip-not_attempted')
+      ).not.toBeInTheDocument();
+    });
+
+    it('moves an identity in and out of the active filter when its status changes live', async () => {
+      const { rerender } = render(
+        buildPage([
+          make('did:key:live', recorder('failed')),
+          make('did:key:steady', recorder('recorded')),
+        ])
+      );
+      fireEvent.change(await screen.findByTestId('identities-recorder-filter'), {
+        target: { value: 'failed' },
+      });
+      expect(rowIds()).toEqual(['identities-row-did:key:live']);
+
+      rerender(
+        buildPage([
+          make('did:key:live', recorder('recorded')),
+          make('did:key:steady', recorder('failed')),
+        ])
+      );
+
+      expect(rowIds()).toEqual(['identities-row-did:key:steady']);
+    });
+  });
 });

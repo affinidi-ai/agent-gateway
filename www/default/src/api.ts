@@ -13,6 +13,7 @@ import {
   Task,
   TruncateLogsResult,
   TruncateMetricsResult,
+  TrustRecorderStatus,
   TrustRegistry,
   UpdateAccessTokenRequest,
   UserSettingsOverrides,
@@ -533,6 +534,13 @@ class APIClient {
       body: JSON.stringify(toBackendSurface(surface)),
     });
     return fromBackendSurface(s);
+  }
+
+  async getSurfaceTrustRecorderStatus(surfaceId: string): Promise<TrustRecorderStatus | null> {
+    const response = await this.request<{ status: TrustRecorderStatus | null }>(
+      `/surfaces/${encodeURIComponent(surfaceId)}/trust-recorder-status`
+    );
+    return response.status ?? null;
   }
 
   async deleteSurface(surfaceId: string): Promise<void> {
