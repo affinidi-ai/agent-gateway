@@ -6337,191 +6337,126 @@ async fn process_forward_request_with_mcp_runtime(
                         }
                     };
 
-                    // Look for agent identity in response - extensions array contains URIs, data is in metadata
-                    // Response structure can be either:
-                    // - Multi-message: result.history[0].metadata[extension_uri]
-                    // - Single message: result.metadata[extension_uri] (direct Message response)
-                    let message_obj = response_json.get("result").and_then(|r| {
-                        // Try history first (multi-message response)
-                        if let Some(history) = r.get("history").and_then(|h| h.as_array()).and_then(|arr| arr.first()) {
-                            info!("GW2: Found response in result.history[0]");
-                            Some(history)
-                        } else if r.get("metadata").is_some() || r.get("extensions").is_some() {
-                            // Direct message response (single message completion)
-                            info!("GW2: Found response directly in result");
-                            Some(r)
-                        } else {
-                            warn!("GW2: Response has result but no history or metadata");
-                            None
-                        }
-                    });
-
-                    if let Some(message_msg) = message_obj {
-                        if let Some(extensions) =
-                            message_msg.get("extensions").and_then(|e| e.as_array())
-                        {
+                    match crate::proxy::backend_identity::extract_a2a_identity_from_message(&response_json) {
+                        Ok(identity_ext) => {
+                            let identity_ext = &identity_ext;
                             channel_info!(
                                 config_id,
-                                "GW2: Found {} extension URIs in response",
-                                extensions.len()
+                                "GW2: Found identity extension in response metadata: {}",
+                                serde_json::to_string_pretty(identity_ext)
+                                    .unwrap_or_default()
+                                    .chars()
+                                    .take(500)
+                                    .collect::<String>()
                             );
 
-                            // Check if agent-identity extension is declared
-                            let has_identity_ext = extensions.iter().any(|ext| {
-                                ext.as_str()
-                                    == Some(crate::config::AFFINIDI_AGENT_IDENTITY_EXTENSION)
-                            });
-
-                            if has_identity_ext {
+                            // Check if agent already sent a DID
+                            if let Some(did) =
+                                identity_ext.get("did").and_then(|d| d.as_str())
+                            {
+                                agent_identity = Some(did.to_string());
                                 channel_info!(
                                     config_id,
-                                    "GW2: Agent identity extension is declared in response"
+                                    "GW2: Agent identity from DID: {}",
+                                    did
                                 );
-
-                                // Get the actual extension data from metadata
-                                if let Some(metadata) = message_msg.get("metadata") {
-                                    if let Some(identity_ext) = metadata
-                                        .get(crate::config::AFFINIDI_AGENT_IDENTITY_EXTENSION)
-                                    {
-                                        channel_info!(
-                                            config_id,
-                                            "GW2: Found identity extension in response metadata: {}",
-                                            serde_json::to_string_pretty(identity_ext)
-                                                .unwrap_or_default()
-                                                .chars()
-                                                .take(500)
-                                                .collect::<String>()
-                                        );
-
-                                        // Check if agent already sent a DID
-                                        if let Some(did) =
-                                            identity_ext.get("did").and_then(|d| d.as_str())
-                                        {
-                                            agent_identity = Some(did.to_string());
-                                            channel_info!(
-                                                config_id,
-                                                "GW2: Agent identity from DID: {}",
-                                                did
-                                            );
-                                        } else {
-                                            // Agent sent raw payload - compute identity using IdentitySelector
-                                            if let Some(ref selector) = identity_selector {
-                                                channel_info!(
-                                                    config_id,
-                                                    "GW2: Computing agent identity using IdentitySelector"
-                                                );
-                                                match selector
-                                                    .compute_identity(
-                                                        identity_ext,
-                                                        channel_id,
-                                                        surface.config_id().map(str::to_string),
-                                                        surface.issuer_id.clone(),
-                                                        crate::identity::filesystem::IdentityOrigin::Managed,
-                                                    )
-                                                    .await
-                                                {
-                                                    Ok(identity_result) => {
-                                                        agent_identity =
-                                                            Some(identity_result.did.clone());
-                                                        crate::observability::record_caller_did_on_current_span(
-                                                            &identity_result.did,
-                                                        );
-                                                        channel_info!(
-                                                            config_id,
-                                                            "GW2: Agent identity computed: {} (is_new: {})",
-                                                            identity_result.did,
-                                                            identity_result.is_new
-                                                        );
-
-                                                        // Trigger identity.appeared if this is a new identity appearing on the channel
-                                                        if identity_result.is_new
-                                                            && let Some(notif_store) =
-                                                                GLOBAL_NOTIFICATION_STORE.get()
-                                                        {
-                                                            let did_clone =
-                                                                identity_result.did.clone();
-                                                            let channel_id_clone =
-                                                                channel_id.to_string();
-                                                            let notif = (*notif_store).clone();
-                                                            tokio::spawn(async move {
-                                                                crate::integrations::async_triggers::trigger_identity_appeared(
-                                                                        Some(notif.clone()),
-                                                                        &did_clone,
-                                                                        &channel_id_clone,
-                                                                    ).await;
-                                                            });
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        channel_warn!(
-                                                            config_id,
-                                                            "GW2: Failed to compute agent identity: {}",
-                                                            e
-                                                        );
-                                                    }
-                                                }
-                                            }
-
-                                            // Fallback: If no identity selector or computation failed, use SHA256
-                                            if agent_identity.is_none() {
-                                                channel_info!(
-                                                    config_id,
-                                                    "GW2: No IdentitySelector available for response, using SHA256 fallback"
-                                                );
-                                                let identity_value = identity_ext
-                                                    .get("agentIdentity")
-                                                    .or_else(|| identity_ext.get("agentId"))
-                                                    .or_else(|| identity_ext.get("id"))
-                                                    .or_else(|| identity_ext.get("agent_id"));
-
-                                                let hash_input =
-                                                    if let Some(id_val) = identity_value {
-                                                        serde_json::to_string(id_val)
-                                                            .unwrap_or_default()
-                                                    } else {
-                                                        serde_json::to_string(identity_ext)
-                                                            .unwrap_or_default()
-                                                    };
-
-                                                use sha2::{Digest, Sha256};
-                                                let mut hasher = Sha256::new();
-                                                hasher.update(hash_input.as_bytes());
-                                                let hash = hasher.finalize();
-                                                let hash_str = format!("sha256:{:x}", hash);
-                                                agent_identity = Some(hash_str.clone());
-                                                channel_info!(
-                                                    config_id,
-                                                    "GW2: Agent identity computed from SHA256: {}",
-                                                    hash_str
-                                                );
-                                            }
-                                        }
-                                    } else {
-                                        channel_info!(
-                                            config_id,
-                                            "GW2: Identity extension declared but not found in response metadata"
-                                        );
-                                    }
-                                } else {
+                            } else {
+                                // Agent sent raw payload - compute identity using IdentitySelector
+                                if let Some(ref selector) = identity_selector {
                                     channel_info!(
                                         config_id,
-                                        "GW2: No metadata found in response history message"
+                                        "GW2: Computing agent identity using IdentitySelector"
+                                    );
+                                    match selector
+                                        .compute_identity(
+                                            identity_ext,
+                                            channel_id,
+                                            surface.config_id().map(str::to_string),
+                                            surface.issuer_id.clone(),
+                                            crate::identity::filesystem::IdentityOrigin::Managed,
+                                        )
+                                        .await
+                                    {
+                                        Ok(identity_result) => {
+                                            agent_identity =
+                                                Some(identity_result.did.clone());
+                                            crate::observability::record_caller_did_on_current_span(
+                                                &identity_result.did,
+                                            );
+                                            channel_info!(
+                                                config_id,
+                                                "GW2: Agent identity computed: {} (is_new: {})",
+                                                identity_result.did,
+                                                identity_result.is_new
+                                            );
+
+                                            // Trigger identity.appeared if this is a new identity appearing on the channel
+                                            if identity_result.is_new
+                                                && let Some(notif_store) =
+                                                    GLOBAL_NOTIFICATION_STORE.get()
+                                            {
+                                                let did_clone =
+                                                    identity_result.did.clone();
+                                                let channel_id_clone =
+                                                    channel_id.to_string();
+                                                let notif = (*notif_store).clone();
+                                                tokio::spawn(async move {
+                                                    crate::integrations::async_triggers::trigger_identity_appeared(
+                                                            Some(notif.clone()),
+                                                            &did_clone,
+                                                            &channel_id_clone,
+                                                        ).await;
+                                                });
+                                            }
+                                        }
+                                        Err(e) => {
+                                            channel_warn!(
+                                                config_id,
+                                                "GW2: Failed to compute agent identity: {}",
+                                                e
+                                            );
+                                        }
+                                    }
+                                }
+
+                                // Fallback: If no identity selector or computation failed, use SHA256
+                                if agent_identity.is_none() {
+                                    channel_info!(
+                                        config_id,
+                                        "GW2: No IdentitySelector available for response, using SHA256 fallback"
+                                    );
+                                    let identity_value = identity_ext
+                                        .get("agentIdentity")
+                                        .or_else(|| identity_ext.get("agentId"))
+                                        .or_else(|| identity_ext.get("id"))
+                                        .or_else(|| identity_ext.get("agent_id"));
+
+                                    let hash_input =
+                                        if let Some(id_val) = identity_value {
+                                            serde_json::to_string(id_val)
+                                                .unwrap_or_default()
+                                        } else {
+                                            serde_json::to_string(identity_ext)
+                                                .unwrap_or_default()
+                                        };
+
+                                    use sha2::{Digest, Sha256};
+                                    let mut hasher = Sha256::new();
+                                    hasher.update(hash_input.as_bytes());
+                                    let hash = hasher.finalize();
+                                    let hash_str = format!("sha256:{:x}", hash);
+                                    agent_identity = Some(hash_str.clone());
+                                    channel_info!(
+                                        config_id,
+                                        "GW2: Agent identity computed from SHA256: {}",
+                                        hash_str
                                     );
                                 }
-                            } else {
-                                channel_info!(
-                                    config_id,
-                                    "GW2: Agent identity extension not declared in response"
-                                );
                             }
-                        } else {
-                            channel_info!(
-                                config_id,
-                                "GW2: No extensions array found in response history"
-                            );
                         }
-                    } else {
-                        channel_info!(config_id, "GW2: No history found in response");
+                        Err(e) => {
+                            channel_info!(config_id, "GW2: No agent identity in response: {}", e);
+                        }
                     }
                 } else {
                     channel_info!(config_id, "GW2: Failed to parse response as JSON");
@@ -6772,17 +6707,26 @@ async fn process_forward_request_with_mcp_runtime(
                                         Vec::new(),
                                     )
                                     .await
-                                    .map(|(body, proof)| (body, Some(proof)))
+                                    .map(|injected| {
+                                        injected.map_or_else(
+                                            || (response_bytes.clone(), None),
+                                            |(body, proof)| (body, Some(proof)),
+                                        )
+                                    })
                                 };
 
                                 match inject_result {
                                     Ok((modified_bytes, vp_jwt)) => {
                                         // Replace response_body with VP-injected version
                                         response_body = String::from_utf8_lossy(&modified_bytes).to_string();
-                                        info!(
-                                            "GW2: Successfully injected backend agent VP into response for DID: {}",
-                                            agent_did
-                                        );
+                                        if vp_jwt.is_some() {
+                                            info!(
+                                                "GW2: Successfully injected backend agent VP into response for DID: {}",
+                                                agent_did
+                                            );
+                                        } else {
+                                            debug!("GW2: No response location carries the agent identity, VP not injected");
+                                        }
 
                                         // Record the injection in the delegation audit log so it
                                         // surfaces as a `vp_injected` event on the Audit page —

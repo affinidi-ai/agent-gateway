@@ -856,6 +856,28 @@ pub fn extract_a2a_identity_from_message_with_uri(
     json: &JsonValue,
     ext_uri: &str,
 ) -> Result<JsonValue, IdentityExtractionError> {
+    extract_a2a_identity_from_locations(json, ext_uri, response_identity_candidates)
+}
+
+/// Like [`extract_a2a_identity_from_message_with_uri`], but on a response reads
+/// only the agent's message (see [`response_message_candidates`]), never
+/// `artifacts[]`.
+///
+/// Used on the calling side of Fabric, where the peer gateway places the
+/// credential only on that message, so an identity found in an artifact was not
+/// put there by the peer gateway.
+pub fn extract_a2a_identity_from_response_message_with_uri(
+    json: &JsonValue,
+    ext_uri: &str,
+) -> Result<JsonValue, IdentityExtractionError> {
+    extract_a2a_identity_from_locations(json, ext_uri, response_message_candidates)
+}
+
+fn extract_a2a_identity_from_locations(
+    json: &JsonValue,
+    ext_uri: &str,
+    response_candidates: fn(&JsonValue) -> Vec<&JsonValue>,
+) -> Result<JsonValue, IdentityExtractionError> {
     // Request layout: params.message or message
     let request_msg = json
         .get("params")
@@ -871,7 +893,7 @@ pub fn extract_a2a_identity_from_message_with_uri(
     if let Some(result) = json.get("result") {
         let mut first_err: Option<IdentityExtractionError> = None;
 
-        for candidate in response_identity_candidates(result) {
+        for candidate in response_candidates(result) {
             match extract_from_message_obj(candidate, ext_uri) {
                 Ok(payload) => return Ok(payload),
                 // A location that declares the extension but omits the payload is
@@ -942,14 +964,41 @@ pub fn extract_a2a_identity_from_message_with_uri(
 fn response_identity_candidates(result: &JsonValue) -> Vec<&JsonValue> {
     let result = crate::a2a::extensions::unwrap_task_result(result);
 
+    let mut candidates: Vec<&JsonValue> = response_message(result)
+        .into_iter()
+        .collect();
+
+    for artifact in result
+        .get("artifacts")
+        .and_then(|a| a.as_array())
+        .into_iter()
+        .flatten()
+        .chain(result.get("artifact"))
+    {
+        candidates.push(artifact);
+    }
+
+    candidates
+}
+
+/// Location 1 of [`response_identity_candidates`] only: the agent's status
+/// message, without `artifacts[]`.
+fn response_message_candidates(result: &JsonValue) -> Vec<&JsonValue> {
+    response_message(crate::a2a::extensions::unwrap_task_result(result))
+        .into_iter()
+        .collect()
+}
+
+/// The agent's message in an unwrapped response `result`: `result.message`,
+/// `status.message` of a Task or status update, or `result` itself when it is a
+/// bare Message. `None` for an artifact update.
+fn response_message(result: &JsonValue) -> Option<&JsonValue> {
     let kind = result
         .get("kind")
         .and_then(|k| k.as_str())
         .unwrap_or("");
 
-    let mut candidates: Vec<&JsonValue> = Vec::new();
-
-    let primary = result
+    result
         .get("message")
         .or_else(|| match kind {
             // Task response or task status update: identity lives on status.message
@@ -977,22 +1026,7 @@ fn response_identity_candidates(result: &JsonValue) -> Vec<&JsonValue> {
                     Some(result)
                 }
             }
-        });
-    if let Some(msg) = primary {
-        candidates.push(msg);
-    }
-
-    for artifact in result
-        .get("artifacts")
-        .and_then(|a| a.as_array())
-        .into_iter()
-        .flatten()
-        .chain(result.get("artifact"))
-    {
-        candidates.push(artifact);
-    }
-
-    candidates
+        })
 }
 
 /// Shared extraction logic for a single A2A/AP2 message object.
