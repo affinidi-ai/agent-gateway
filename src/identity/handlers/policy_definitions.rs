@@ -9,6 +9,8 @@ use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
+use crate::audit::events::{PolicyChangeAction, PolicyChangeSource};
+use crate::audit::policy_changes;
 use crate::auth::storage::PasskeyStorage;
 use crate::auth_manager::middleware::AuthGuardOk;
 use crate::auth_manager::pat::{PatContext, PatResourceScope};
@@ -215,6 +217,14 @@ pub async fn create_policy_definition(
             error!("Failed to save policy definition: {}", e);
             AppError::InternalError(format!("Failed to save policy definition: {}", e))
         })?;
+    let created = store
+        .get(&response.id)
+        .await
+        .unwrap_or_else(|| response.clone());
+    policy_changes::record(
+        PolicyChangeAction::PolicyCreated,
+        policy_changes::of_definition(&created, PolicyChangeSource::Api),
+    );
 
     state
         .ws_state
@@ -287,6 +297,13 @@ pub async fn update_policy_definition(
             error!("Failed to update policy definition: {}", e);
             AppError::InternalError(format!("Failed to update policy definition: {}", e))
         })?;
+    if let Some(updated) = store
+        .get(&policy_id)
+        .await
+        .and_then(|after| policy_changes::definition_updated(&existing, &after, PolicyChangeSource::Api))
+    {
+        policy_changes::record(PolicyChangeAction::PolicyUpdated, updated);
+    }
 
     // Recompile OPA engines for all surfaces that reference this policy definition
     // in any compiled slot (target, inbound, response, outbound, per-TP) or variant override.
@@ -437,6 +454,10 @@ pub async fn delete_policy_definition(
             error!("Failed to delete policy definition: {}", e);
             AppError::InternalError(format!("Failed to delete policy definition: {}", e))
         })?;
+    policy_changes::record(
+        PolicyChangeAction::PolicyDeleted,
+        policy_changes::of_definition(&policy, PolicyChangeSource::Api),
+    );
 
     state
         .ws_state
