@@ -84,8 +84,8 @@ pub async fn surface_written(
         change.scope = Some(key.scope.to_string());
         change.slot = Some(key.slot);
         change.variant = slot.variant_alias;
+        change.transit_point = key.point;
         match key.slot {
-            PolicySlot::TransitPoint => change.transit_point = slot.place_label,
             PolicySlot::McpTool => change.mcp_tool_name = slot.place_label,
             PolicySlot::McpToolGate => change.gate = slot.place_label,
             _ => {}
@@ -684,6 +684,34 @@ mod tests {
                 "source": "api",
             })
         );
+    }
+
+    #[tokio::test]
+    async fn a_gate_on_a_transit_point_is_recorded_with_its_point() {
+        let after: AgentSurface = serde_json::from_value(serde_json::json!({
+            "surface_id": "s-1",
+            "name": "Orders",
+            "access_point": { "listen_address": "0.0.0.0:8443", "route": "/orders", "protocol": "mcp" },
+            "target": { "endpoint": "https://upstream" },
+            "transit": { "points": [{
+                "alias": "billing", "target_endpoint": "https://dest",
+                "mcp_tool_gating": { "gates": [{
+                    "id": "g-1", "name": "Office hours", "condition_policy_definition_id": "a",
+                    "action": { "effect": "deny", "patterns": ["*"] },
+                }]},
+            }]},
+        }))
+        .unwrap();
+
+        let ((), records) =
+            capture(in_management_request(Actor::user("u-1"), surface_written(None, Some(&after)))).await;
+
+        assert_eq!(records.len(), 1);
+        let json = serde_json::to_value(&records[0]).unwrap();
+        let attached = &json["event"]["policy_attached"];
+        assert_eq!(attached["slot"], "mcp_tool_gate");
+        assert_eq!(attached["transit_point"], "billing");
+        assert_eq!(attached["gate"], "Office hours");
     }
 
     #[tokio::test]

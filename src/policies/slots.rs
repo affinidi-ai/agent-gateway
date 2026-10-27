@@ -2,7 +2,7 @@
 //! keyed by where it sits, so two versions of a surface can be compared slot by
 //! slot.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::audit::events::PolicySlot;
 use crate::config::agent_surface::{AgentSurface, McpToolGatingConfig, McpToolPolicyEntry, PolicyRef, TransitPoint};
@@ -18,7 +18,11 @@ pub struct SlotKey {
     pub slot: PolicySlot,
     /// The decision scope the slot produces ([`PolicyScope::as_str`]).
     pub scope: &'static str,
-    /// The transit point's alias, the tool's name or the gate's id.
+    /// The alias of the transit point the slot sits on.
+    pub point: Option<String>,
+    /// The tool's name or the gate's id. Each entry of a list is enforced, so
+    /// a name or id repeated in one list is numbered from its second use
+    /// (`search#2`).
     pub place: Option<String>,
 }
 
@@ -27,7 +31,7 @@ pub struct SlotKey {
 pub struct SlotPolicy {
     pub policy_definition_id: String,
     pub variant_alias: Option<String>,
-    /// The transit point's alias, the tool's name or the gate's name.
+    /// The tool's name or the gate's name.
     pub place_label: Option<String>,
 }
 
@@ -37,6 +41,7 @@ pub fn policy_slots(surface: &AgentSurface) -> BTreeMap<SlotKey, SlotPolicy> {
     let mut slots = Slots {
         found: BTreeMap::new(),
         variant: None,
+        point: None,
     };
     let target = &surface.target;
     slots.policy(
@@ -127,6 +132,21 @@ struct Slots {
     found: BTreeMap<SlotKey, SlotPolicy>,
     /// The id and alias of the variant being walked.
     variant: Option<(String, String)>,
+    /// The alias of the transit point being walked.
+    point: Option<String>,
+}
+
+/// `name` as a place key: itself on its first use in a list, numbered after.
+fn numbered<'a>(
+    seen: &mut HashMap<&'a str, usize>,
+    name: &'a str,
+) -> String {
+    let count = seen.entry(name).or_default();
+    *count += 1;
+    match *count {
+        1 => name.to_string(),
+        n => format!("{name}#{n}"),
+    }
 }
 
 impl Slots {
@@ -134,7 +154,7 @@ impl Slots {
         &mut self,
         slot: PolicySlot,
         scope: PolicyScope,
-        place: Option<(&str, &str)>,
+        place: Option<(String, &str)>,
         policy_definition_id: &str,
     ) {
         if policy_definition_id.is_empty() {
@@ -147,7 +167,10 @@ impl Slots {
                 .map(|(id, _)| id.clone()),
             slot,
             scope: scope.as_str(),
-            place: place.map(|(key, _)| key.to_string()),
+            point: self.point.clone(),
+            place: place
+                .as_ref()
+                .map(|(key, _)| key.clone()),
         };
         let policy = SlotPolicy {
             policy_definition_id: policy_definition_id.to_string(),
@@ -184,9 +207,11 @@ impl Slots {
         &mut self,
         tools: &[McpToolPolicyEntry],
     ) {
+        let mut seen = HashMap::new();
         for tool in tools {
             let name = tool.tool_name.as_str();
-            self.add(PolicySlot::McpTool, PolicyScope::McpTool, Some((name, name)), &tool.policy_definition_id);
+            let place = numbered(&mut seen, name);
+            self.add(PolicySlot::McpTool, PolicyScope::McpTool, Some((place, name)), &tool.policy_definition_id);
         }
     }
 
@@ -194,6 +219,7 @@ impl Slots {
         &mut self,
         gating: Option<&McpToolGatingConfig>,
     ) {
+        let mut seen = HashMap::new();
         for gate in gating
             .into_iter()
             .flat_map(|gating| &gating.gates)
@@ -207,7 +233,8 @@ impl Slots {
                 } else {
                     &gate.name
                 };
-                self.add(PolicySlot::McpToolGate, PolicyScope::McpTool, Some((&gate.id, label)), id);
+                let place = numbered(&mut seen, &gate.id);
+                self.add(PolicySlot::McpToolGate, PolicyScope::McpTool, Some((place, label)), id);
             }
         }
     }
@@ -217,16 +244,17 @@ impl Slots {
         points: &[TransitPoint],
     ) {
         for point in points {
-            let alias = point.alias.as_str();
+            self.point = Some(point.alias.clone());
             for (scope, policy) in
                 [(PolicyScope::Surface, point.policy.as_ref()), (PolicyScope::Response, point.response_policy.as_ref())]
             {
                 if let Some(policy) = policy {
-                    self.add(PolicySlot::TransitPoint, scope, Some((alias, alias)), &policy.policy_definition_id);
+                    self.add(PolicySlot::TransitPoint, scope, None, &policy.policy_definition_id);
                 }
             }
             self.gates(point.mcp_tool_gating.as_ref());
         }
+        self.point = None;
     }
 }
 
@@ -275,7 +303,19 @@ mod tests {
             variant: variant.map(str::to_string),
             slot,
             scope: scope.as_str(),
+            point: None,
             place: place.map(str::to_string),
+        }
+    }
+
+    /// `key` on the transit point `alias`.
+    fn at_point(
+        key: SlotKey,
+        alias: &str,
+    ) -> SlotKey {
+        SlotKey {
+            point: Some(alias.to_string()),
+            ..key
         }
     }
 
@@ -327,8 +367,8 @@ mod tests {
             (key(None, PolicySlot::McpTool, PolicyScope::McpTool, Some("search")), "tool"),
             (key(None, PolicySlot::McpToolGate, PolicyScope::McpTool, Some("g-1")), "gate"),
             (key(None, PolicySlot::Transit, PolicyScope::Surface, None), "transit"),
-            (key(None, PolicySlot::TransitPoint, PolicyScope::Surface, Some("billing")), "tp-request"),
-            (key(None, PolicySlot::TransitPoint, PolicyScope::Response, Some("billing")), "tp-response"),
+            (at_point(key(None, PolicySlot::TransitPoint, PolicyScope::Surface, None), "billing"), "tp-request"),
+            (at_point(key(None, PolicySlot::TransitPoint, PolicyScope::Response, None), "billing"), "tp-response"),
         ];
         for (key, policy) in &expected {
             assert_eq!(named(&slots, key).as_deref(), Some(*policy), "{key:?}");
@@ -375,7 +415,7 @@ mod tests {
             (key(v, PolicySlot::Response, PolicyScope::Response, None), "v-response"),
             (key(v, PolicySlot::McpTool, PolicyScope::McpTool, Some("search")), "v-tool"),
             (key(v, PolicySlot::Transit, PolicyScope::Surface, None), "v-transit"),
-            (key(v, PolicySlot::TransitPoint, PolicyScope::Surface, Some("billing")), "v-tp"),
+            (at_point(key(v, PolicySlot::TransitPoint, PolicyScope::Surface, None), "billing"), "v-tp"),
         ] {
             assert_eq!(named(&slots, &key).as_deref(), Some(policy), "{key:?}");
         }
@@ -402,6 +442,64 @@ mod tests {
 
         assert_eq!(first.len(), 1);
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn a_gate_on_a_transit_point_has_its_own_slot_beside_a_target_gate_of_the_same_id() {
+        let gate = |policy: &str| {
+            serde_json::json!({ "gates": [{
+                "id": "g-1", "condition_policy_definition_id": policy,
+                "action": { "effect": "deny", "patterns": ["*"] },
+            }]})
+        };
+        let slots = policy_slots(&surface(serde_json::json!({
+            "target": { "mcp_tool_gating": gate("target-gate") },
+            "transit": { "points": [{
+                "alias": "billing", "target_endpoint": "https://dest",
+                "mcp_tool_gating": gate("point-gate"),
+            }]},
+        })));
+
+        assert_eq!(
+            named(&slots, &key(None, PolicySlot::McpToolGate, PolicyScope::McpTool, Some("g-1"))).as_deref(),
+            Some("target-gate")
+        );
+        assert_eq!(
+            named(&slots, &at_point(key(None, PolicySlot::McpToolGate, PolicyScope::McpTool, Some("g-1")), "billing"))
+                .as_deref(),
+            Some("point-gate")
+        );
+        assert_eq!(slots.len(), 2);
+    }
+
+    #[test]
+    fn repeated_tool_names_and_gate_ids_each_keep_a_slot() {
+        let slots = policy_slots(&surface(serde_json::json!({
+            "target": {
+                "mcp_tool_policies": [
+                    { "tool_name": "search", "policy_definition_id": "first-tool" },
+                    { "tool_name": "search", "policy_definition_id": "second-tool" },
+                ],
+                "mcp_tool_gating": { "gates": [
+                    { "id": "g-1", "condition_policy_definition_id": "first-gate",
+                      "action": { "effect": "deny", "patterns": ["*"] } },
+                    { "id": "g-1", "condition_policy_definition_id": "second-gate",
+                      "action": { "effect": "deny", "patterns": ["*"] } },
+                ]},
+            },
+        })));
+
+        let mut named: Vec<&str> = slots
+            .values()
+            .map(|slot| {
+                slot.policy_definition_id
+                    .as_str()
+            })
+            .collect();
+        named.sort();
+        assert_eq!(named, ["first-gate", "first-tool", "second-gate", "second-tool"]);
+        let tool = &slots[&key(None, PolicySlot::McpTool, PolicyScope::McpTool, Some("search#2"))];
+        assert_eq!(tool.place_label.as_deref(), Some("search"));
     }
 
     #[test]

@@ -1341,6 +1341,41 @@ mod tests {
     }
 
     #[test]
+    fn a_gate_condition_shadowed_by_a_gate_of_the_same_id_matches() {
+        let gate = |policy: &str| {
+            serde_json::json!({
+                "id": "g-1", "condition_policy_definition_id": policy,
+                "action": { "effect": "deny", "patterns": ["*"] },
+            })
+        };
+        let repeated: AgentSurface = serde_json::from_value(serde_json::json!({
+            "surface_id": "s-1", "name": "test",
+            "access_point": { "listen_address": AP, "route": "/test", "protocol": "mcp" },
+            "target": {
+                "endpoint": "https://upstream",
+                "mcp_tool_gating": { "gates": [gate("other"), gate(POL)] },
+            },
+        }))
+        .unwrap();
+        let on_a_point: AgentSurface = serde_json::from_value(serde_json::json!({
+            "surface_id": "s-1", "name": "test",
+            "access_point": { "listen_address": AP, "route": "/test", "protocol": "mcp" },
+            "target": {
+                "endpoint": "https://upstream",
+                "mcp_tool_gating": { "gates": [gate(POL)] },
+            },
+            "transit": { "points": [{
+                "alias": "tp-1", "target_endpoint": "https://dest",
+                "mcp_tool_gating": { "gates": [gate("other")] },
+            }]},
+        }))
+        .unwrap();
+
+        assert!(surface_references_policy(&repeated, POL));
+        assert!(surface_references_policy(&on_a_point, POL));
+    }
+
+    #[test]
     fn different_policy_id_not_matched() {
         let s: AgentSurface = serde_json::from_value(serde_json::json!({
             "surface_id": "s-1", "name": "test",
