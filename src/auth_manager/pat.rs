@@ -99,6 +99,7 @@ fn is_handler_enforced_nested_action(
     matches!(
         (kind, tail),
         (ResourceKind::Surfaces, ["variants"])
+            | (ResourceKind::Surfaces, ["trust-recorder-status"])
             | (ResourceKind::Surfaces, ["variants", _])
             | (ResourceKind::Surfaces, ["variants", _, "promote-to-default" | "resolved"])
             | (ResourceKind::SurfaceTemplates, ["export"])
@@ -233,6 +234,14 @@ mod tests {
             }
         );
         assert_eq!(classify_resource_path("/v1/trust-registries/id/future-action"), PathScope::DenyScoped);
+        assert_eq!(
+            classify_resource_path("/v1/surfaces/surface%2Fa/trust-recorder-status"),
+            PathScope::EnforceId {
+                kind: ResourceKind::Surfaces,
+                id: "surface/a".into(),
+            }
+        );
+        assert_eq!(classify_resource_path("/v1/surfaces/id/trust-recorder-status/future"), PathScope::DenyScoped);
         assert_eq!(classify_resource_path("/v1/sts/clients/id/future-action"), PathScope::DenyScoped);
         assert_eq!(classify_resource_path("/v1/gateways/id/connection-points/future-action"), PathScope::DenyScoped);
     }

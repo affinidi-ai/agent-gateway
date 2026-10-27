@@ -652,6 +652,14 @@ pub fn create_identity_api_router(
                 get(handlers::get_surface).layer(require_feature(s.clone(), r.clone(), Feature::SurfacesView)),
             )
             .route(
+                "/v1/surfaces/{surface_id}/trust-recorder-status",
+                get(handlers::get_trust_recorder_status).layer(require_feature(
+                    s.clone(),
+                    r.clone(),
+                    Feature::SurfacesView,
+                )),
+            )
+            .route(
                 "/v1/surfaces/{surface_id}",
                 put(handlers::update_surface).layer(require_feature(s.clone(), r.clone(), Feature::SurfacesEdit)),
             )

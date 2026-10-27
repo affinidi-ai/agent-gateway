@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Tab, Tabs } from 'react-bootstrap';
+import { Form, Tab, Tabs } from 'react-bootstrap';
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { useApp } from '../context/AppContext';
 import { usePermissions } from '../context/PermissionsContext';
@@ -16,6 +16,12 @@ import { DOCS_URL } from '../config/docs';
 import { CopyButton } from '../components/shared/CopyButton';
 import { CredentialPrincipalLabel, IdentityNameCell } from './IdentitiesPage/IdentityNameCell';
 import { IdentityOriginBadge } from './IdentitiesPage/IdentityOriginBadge';
+import { IdentityRecorderChip } from './IdentitiesPage/IdentityRecorderChip';
+import {
+  RECORDER_FILTER_OPTIONS,
+  isRecorderFilter,
+  type RecorderFilter,
+} from './IdentitiesPage/recorderFilter';
 import { useIdentityRows } from './IdentitiesPage/useIdentityRows';
 import IssuersTab from './SettingsPage/IssuersTab';
 import AuthoritiesTab from './SettingsPage/AuthoritiesTab';
@@ -33,6 +39,7 @@ const IdentitiesPage: React.FC = () => {
   const identityRefs = useRef<Record<string, HTMLTableRowElement | null>>({});
   const [searchTerm, setSearchTerm] = useState('');
   const [showUnnamedOnly, setShowUnnamedOnly] = useState(false);
+  const [recorderFilter, setRecorderFilter] = useState<RecorderFilter>('all');
   const [issuersCount, setIssuersCount] = useState(0);
   const [authoritiesCount, setAuthoritiesCount] = useState(0);
 
@@ -146,13 +153,20 @@ const IdentitiesPage: React.FC = () => {
     return Array.from(didMap.values());
   }, [stats?.identities, didWebVhIdentities]);
 
-  const { filteredIdentities, hasNamingMetadata, unnamedCount, liveSurfaceNames, surfaceLinkFor } =
-    useIdentityRows({
-      identities,
-      channels: stats?.channels,
-      searchTerm,
-      showUnnamedOnly,
-    });
+  const {
+    filteredIdentities,
+    hasNamingMetadata,
+    hasRecorderStatus,
+    unnamedCount,
+    liveSurfaceNames,
+    surfaceLinkFor,
+  } = useIdentityRows({
+    identities,
+    channels: stats?.channels,
+    searchTerm,
+    showUnnamedOnly,
+    recorderFilter,
+  });
 
   // Handle deep linking to a specific identity
   useEffect(() => {
@@ -402,6 +416,32 @@ const IdentitiesPage: React.FC = () => {
               Unnamed only ({unnamedCount})
             </button>
           )}
+          {hasRecorderStatus && activeTab === 'identities' && (
+            <div className="d-flex align-items-center ms-3">
+              <label
+                htmlFor="identities-recorder-filter"
+                className="small text-muted mb-0 me-2 text-nowrap"
+              >
+                Recorder
+              </label>
+              <Form.Select
+                id="identities-recorder-filter"
+                size="sm"
+                className="w-auto"
+                value={recorderFilter}
+                onChange={event => {
+                  if (isRecorderFilter(event.target.value)) setRecorderFilter(event.target.value);
+                }}
+                data-testid="identities-recorder-filter"
+              >
+                {RECORDER_FILTER_OPTIONS.map(option => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </Form.Select>
+            </div>
+          )}
         </div>
       </div>
 
@@ -438,7 +478,9 @@ const IdentitiesPage: React.FC = () => {
                         className="ms-2"
                         ariaLabel={`${filteredIdentities.length} agent identities`}
                         suffix={
-                          searchTerm || (hasNamingMetadata && showUnnamedOnly)
+                          searchTerm ||
+                          (hasNamingMetadata && showUnnamedOnly) ||
+                          (hasRecorderStatus && recorderFilter !== 'all')
                             ? ` of ${identities.length}`
                             : undefined
                         }
@@ -465,6 +507,7 @@ const IdentitiesPage: React.FC = () => {
                               <th>Usage Count</th>
                               <th>Last Used</th>
                               <th>Origin</th>
+                              {hasRecorderStatus && <th>Recorder</th>}
                               <th>Actions</th>
                             </tr>
                           </thead>
@@ -672,6 +715,15 @@ const IdentitiesPage: React.FC = () => {
                                         </>
                                       )}
                                     </td>
+                                    {hasRecorderStatus && (
+                                      <td>
+                                        {identity.trust_recorder ? (
+                                          <IdentityRecorderChip status={identity.trust_recorder} />
+                                        ) : (
+                                          <span className="text-muted">-</span>
+                                        )}
+                                      </td>
+                                    )}
                                     <td>
                                       <div className="btn-group btn-group-sm" role="group">
                                         {identity.trust_score !== undefined && (
@@ -711,7 +763,7 @@ const IdentitiesPage: React.FC = () => {
                                   </tr>
                                   {isExpanded && (
                                     <tr className="expanded-detail-row">
-                                      <td colSpan={10} className="p-0">
+                                      <td colSpan={hasRecorderStatus ? 11 : 10} className="p-0">
                                         <div className="p-3">
                                           <div
                                             className="accordion"
