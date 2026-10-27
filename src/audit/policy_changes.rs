@@ -16,7 +16,7 @@ use crate::delegation_vault::audit::{
 use crate::gateways::types::Gateway;
 use crate::observability::PolicyScope;
 use crate::policies::global_policy::{GlobalPolicyAssignments, PLANE_GATEWAY};
-use crate::policies::policy_definitions::{FileSystemPolicyDefinitionStore, PolicyDefinition, PolicyType};
+use crate::policies::policy_definitions::{FileSystemPolicyDefinitionStore, PolicyDefinition, PolicyType, content_hash};
 use crate::policies::slots::{SlotKey, SlotPolicy, policy_slots};
 
 /// The definitions attachment records are named from, set once at start.
@@ -95,7 +95,9 @@ pub async fn surface_written(
 
 /// The policies a gateway write attached and detached, and the attachments it
 /// enabled or disabled. Every policy of a gateway is attached at its target
-/// slot, the primary and each deny-overrides member alike.
+/// slot, the primary and each deny-overrides member alike. A legacy inline
+/// policy, enforced only when no definition is referenced, has no definition
+/// id and is named by the content hash of its Rego.
 pub fn gateway_policy_changes(
     before: Option<&Gateway>,
     after: Option<&Gateway>,
@@ -103,6 +105,80 @@ pub fn gateway_policy_changes(
     let Some(gateway) = after.or(before) else {
         return Vec::new();
     };
+    let at_gateway = || {
+        let mut change = change(PolicyChangeSource::Api);
+        change.target = Some(PolicyTarget {
+            kind: PolicyTargetKind::Gateway,
+            id: Some(gateway.id.clone()),
+            name: Some(gateway.name.clone()),
+        });
+        change.scope = Some(PolicyScope::Gateway.as_str().to_string());
+        change.slot = Some(PolicySlot::Target);
+        change
+    };
+    let mut changes = gateway_definition_changes(before, after, &at_gateway);
+    changes.extend(inline_policy_changes(inline_policy(before), inline_policy(after), &at_gateway));
+    changes
+}
+
+/// The hash of a gateway's inline Rego and whether it is enabled, when the
+/// gateway enforces one: it references no definition and its Rego is not blank.
+fn inline_policy(gateway: Option<&Gateway>) -> Option<(String, bool)> {
+    let config = gateway?
+        .opa_policy_config
+        .as_ref()?;
+    let references = config
+        .policy_definition_id
+        .iter()
+        .chain(&config.policy_definition_ids)
+        .any(|id| !id.is_empty());
+    (!references && !config.policy.trim().is_empty())
+        .then(|| (content_hash(&PolicyType::Gateway, &config.policy), config.enabled))
+}
+
+fn inline_policy_changes(
+    before: Option<(String, bool)>,
+    after: Option<(String, bool)>,
+    at_gateway: &impl Fn() -> PolicyChangeDetails,
+) -> Vec<(PolicyChangeAction, PolicyChangeDetails)> {
+    let inline = |hash: String, enabled: bool| {
+        let mut change = at_gateway();
+        change.policy_name = Some(INLINE_GATEWAY_POLICY.to_string());
+        change.policy_type = Some(policy_type_name(&PolicyType::Gateway).to_string());
+        change.policy_content_hash = Some(hash);
+        change.enabled = Some(enabled);
+        change
+    };
+    match (before, after) {
+        (None, None) => Vec::new(),
+        (None, Some((hash, enabled))) => vec![(PolicyChangeAction::PolicyAttached, inline(hash, enabled))],
+        (Some((hash, enabled)), None) => vec![(PolicyChangeAction::PolicyDetached, inline(hash, enabled))],
+        (Some((previous_hash, was_enabled)), Some((hash, enabled))) => {
+            let mut changes = Vec::new();
+            if previous_hash != hash {
+                let mut updated = inline(hash.clone(), enabled);
+                updated.previous_policy_content_hash = Some(previous_hash);
+                updated.changed = vec![PolicyField::Rego];
+                changes.push((PolicyChangeAction::PolicyUpdated, updated));
+            }
+            if was_enabled != enabled {
+                let mut switched = inline(hash, enabled);
+                switched.previous_enabled = Some(was_enabled);
+                changes.push((PolicyChangeAction::PolicyAttachmentChanged, switched));
+            }
+            changes
+        }
+    }
+}
+
+/// The name decisions of an inline gateway policy carry.
+const INLINE_GATEWAY_POLICY: &str = "Gateway policy";
+
+fn gateway_definition_changes(
+    before: Option<&Gateway>,
+    after: Option<&Gateway>,
+    at_gateway: &impl Fn() -> PolicyChangeDetails,
+) -> Vec<(PolicyChangeAction, PolicyChangeDetails)> {
     let attachments = |gateway: Option<&Gateway>| -> BTreeMap<String, bool> {
         let Some(config) = gateway.and_then(|gateway| {
             gateway
@@ -122,19 +198,8 @@ pub fn gateway_policy_changes(
     diff(attachments(before), attachments(after))
         .into_iter()
         .map(|(action, policy_id, previous, enabled)| {
-            let mut change = change(PolicyChangeSource::Api);
+            let mut change = at_gateway();
             change.policy_definition_id = Some(policy_id);
-            change.target = Some(PolicyTarget {
-                kind: PolicyTargetKind::Gateway,
-                id: Some(gateway.id.clone()),
-                name: Some(gateway.name.clone()),
-            });
-            change.scope = Some(
-                PolicyScope::Gateway
-                    .as_str()
-                    .to_string(),
-            );
-            change.slot = Some(PolicySlot::Target);
             change.enabled = enabled;
             if action == PolicyChangeAction::PolicyAttachmentChanged {
                 change.previous_enabled = previous;
@@ -709,6 +774,103 @@ mod tests {
             ]
         );
         assert!(gateway_policy_changes(Some(&before), Some(&before.clone())).is_empty());
+    }
+
+    fn inline_gateway(
+        enabled: bool,
+        rego: &str,
+    ) -> Gateway {
+        let mut gateway = gateway(enabled, None, &[]);
+        if let Some(config) = gateway
+            .opa_policy_config
+            .as_mut()
+        {
+            config.policy = rego.to_string();
+        }
+        gateway
+    }
+
+    fn inline_hash(rego: &str) -> Option<String> {
+        Some(crate::policies::policy_definitions::content_hash(
+            &crate::policies::policy_definitions::PolicyType::Gateway,
+            rego,
+        ))
+    }
+
+    #[test]
+    fn an_inline_gateway_policy_is_attached_by_its_content_hash() {
+        let changes = gateway_policy_changes(Some(&gateway(true, None, &[])), Some(&inline_gateway(true, "allow")));
+
+        assert_eq!(changes.len(), 1);
+        let (action, attached) = &changes[0];
+        assert_eq!(*action, PolicyChangeAction::PolicyAttached);
+        assert_eq!(attached.policy_definition_id, None);
+        assert_eq!(attached.policy_name.as_deref(), Some("Gateway policy"));
+        assert_eq!(attached.policy_type.as_deref(), Some("gateway"));
+        assert_eq!(attached.policy_content_hash, inline_hash("allow"));
+        assert_eq!(attached.scope.as_deref(), Some("gateway"));
+        assert_eq!(attached.slot, Some(PolicySlot::Target));
+        assert_eq!(attached.enabled, Some(true));
+    }
+
+    #[test]
+    fn changing_an_inline_gateway_policy_is_an_update_of_its_rego() {
+        let changes =
+            gateway_policy_changes(Some(&inline_gateway(true, "allow")), Some(&inline_gateway(true, "deny")));
+
+        assert_eq!(changes.len(), 1);
+        let (action, updated) = &changes[0];
+        assert_eq!(*action, PolicyChangeAction::PolicyUpdated);
+        assert_eq!(updated.changed, vec![PolicyField::Rego]);
+        assert_eq!(updated.policy_content_hash, inline_hash("deny"));
+        assert_eq!(updated.previous_policy_content_hash, inline_hash("allow"));
+        assert_eq!(
+            updated
+                .target
+                .as_ref()
+                .map(|target| target.kind),
+            Some(PolicyTargetKind::Gateway)
+        );
+    }
+
+    #[test]
+    fn replacing_an_inline_gateway_policy_with_a_definition_detaches_the_inline_one() {
+        let changes =
+            gateway_policy_changes(Some(&inline_gateway(true, "allow")), Some(&gateway(true, Some("p"), &[])));
+
+        assert_eq!(
+            changes
+                .iter()
+                .map(|(action, change)| (*action, change.policy_definition_id.clone(), change.policy_content_hash.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (PolicyChangeAction::PolicyAttached, Some("p".to_string()), None),
+                (PolicyChangeAction::PolicyDetached, None, inline_hash("allow")),
+            ]
+        );
+    }
+
+    #[test]
+    fn disabling_an_inline_gateway_policy_changes_its_attachment() {
+        let changes =
+            gateway_policy_changes(Some(&inline_gateway(true, "allow")), Some(&inline_gateway(false, "allow")));
+
+        assert_eq!(summary(changes.clone()), vec![(PolicyChangeAction::PolicyAttachmentChanged, String::new())]);
+        assert_eq!(changes[0].1.enabled, Some(false));
+        assert_eq!(changes[0].1.previous_enabled, Some(true));
+    }
+
+    #[test]
+    fn inline_rego_beside_a_definition_is_not_an_attachment() {
+        let mut referenced = gateway(true, Some("p"), &[]);
+        if let Some(config) = referenced
+            .opa_policy_config
+            .as_mut()
+        {
+            config.policy = "ignored".to_string();
+        }
+
+        assert!(gateway_policy_changes(Some(&gateway(true, Some("p"), &[])), Some(&referenced)).is_empty());
     }
 
     fn assignments(planes: &[(&str, &str, bool)]) -> GlobalPolicyAssignments {

@@ -426,8 +426,15 @@ governance audit event (group Policies; record fields in
 Surface and gateway changes are found by comparing the stored record before and after each
 write in a management request (`src/policies/slots.rs` lists a surface's enforced slots), so
 every API path that writes one is covered. `transit.transit_policy` is not enforced, so it is
-not listed. A refused surface or variant write is not recorded. Changes to a gateway's inline
-Rego (`opa_policy_config.policy` with no definition id) name no definition and are not recorded.
+not listed. A refused surface or variant write is not recorded.
+
+A gateway's legacy inline Rego (`opa_policy_config.policy`, enforced only when the gateway
+references no definition) is recorded too. It has no definition id, so its records carry
+`policy_name` `Gateway policy` and the `policy_content_hash` of the Rego, the same name and
+hash its decisions carry: `policy_attached` when it starts applying, `policy_detached` when it
+stops (including when a definition replaces it), `policy_updated` with `changed: ["rego"]` and
+`previous_policy_content_hash` when its text changes, and `policy_attachment_changed` when it is
+enabled or disabled. Inline Rego beside a definition reference is not enforced and not recorded.
 
 ## Policy decision audit logging
 

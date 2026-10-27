@@ -213,6 +213,9 @@ where a policy applies (group Policies). Each record carries its body in the `ev
   `variant`, `transit_point`, `mcp_tool_name`, `gate` or `plane` naming the place. A replaced
   policy is detached, then its successor attached. A surface target also sets the top-level
   `surface_id` and `channel_name`.
+  A gateway's legacy inline Rego has no definition: its records carry `policy_name`
+  `Gateway policy` and the Rego's `policy_content_hash`, and a change to its text is a
+  `policy_updated` with `changed: ["rego"]` against the gateway.
 - `policy_attachment_changed`: an appliance-wide assignment switched between `enforced` and
   `monitor_only` (`mode`, `previous_mode`), or a gateway's policy was enabled or disabled
   (`enabled`, `previous_enabled`).

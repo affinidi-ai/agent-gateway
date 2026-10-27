@@ -25,6 +25,7 @@ changes:
         (`policy_attached`, `policy_detached`), a switch between enforced and monitor-only or
         enabled and disabled (`policy_attachment_changed`), and a refused change
         (`policy_change_refused`). Records name the actor by id only and never carry Rego text.
+        A gateway's legacy inline Rego is recorded by its content hash.
   fixed:
     - timestamp: '2026-10-27T16:01:00Z'
       title: Recompile surfaces that use an edited definition as an MCP tool policy
