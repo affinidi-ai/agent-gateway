@@ -11,6 +11,15 @@ changes:
         enabled variant, so an MCP client finds where to get a token. The setting is checked on
         save like mcp_http.authorization, a PUT that omits it keeps it, and surfaces without it
         behave as before.
+    - timestamp: '2026-10-27T11:14:01Z'
+      title: Challenge MCP callers without a valid token to fetch one
+      description: >-
+        A direct request to an MCP Access Point that publishes protected resource metadata, whose
+        bearer token is missing or refused, is now answered before policy with 401 and
+        WWW-Authenticate Bearer resource_metadata naming the absolute metadata URL, with
+        error=invalid_token once a token was presented and the scopes when set. MCP clients follow
+        it to the authorization server, get a token and retry. Without this setting a failed
+        credential is still handed to policy.
   changed: []
   fixed:
     - timestamp: '2026-10-27T10:22:00Z'

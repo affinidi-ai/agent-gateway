@@ -1,10 +1,12 @@
 //! RFC 9728 discovery for MCP Access Points whose JWT Bearer caller
 //! authentication accepts tokens from an external authorization server.
 
+use std::sync::atomic::Ordering;
+
 use serde_json::json;
 
-use super::helpers::jwt::{JwksFixture, setup_jwt_bearer_auth_rejects_missing_then_accepts_valid};
-use super::helpers::{GatewayHarness, configure_admin_api};
+use super::helpers::jwt::{JwksFixture, now_secs, setup_jwt_bearer_auth_rejects_missing_then_accepts_valid, sign_jwt};
+use super::helpers::{GatewayHarness, MockServer, configure_admin_api};
 
 const PUBLIC_ORIGIN: &str = "https://gateway.example";
 const AUTHORIZATION_SERVER: &str = "https://idp.example/realms/agents";
@@ -19,7 +21,9 @@ fn protected_resource(route: &str) -> serde_json::Value {
 
 async fn start_discovery_gateway(fixture: &JwksFixture) -> (GatewayHarness, reqwest::Client) {
     let mut admin = None;
-    let harness = GatewayHarness::start(|directory, config, bootstrap| {
+    let tools =
+        MockServer::start_with_response(json!({"jsonrpc": "2.0", "id": 1, "result": {"tools": []}}).to_string()).await;
+    let harness = GatewayHarness::start_with_mock(tools, |directory, config, bootstrap| {
         admin = Some(configure_admin_api(bootstrap));
         let mut network: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&bootstrap.config_files.gateway).unwrap()).unwrap();
@@ -37,6 +41,12 @@ async fn start_discovery_gateway(fixture: &JwksFixture) -> (GatewayHarness, reqw
             .as_mut()
             .unwrap()
             .protected_resource = Some(serde_json::from_value(protected_resource("/smoke")).unwrap());
+        surface.variants = vec![
+            serde_json::from_value(
+                json!({"id": "beta", "alias": "beta", "name": "Beta", "enabled": true, "overrides": {}}),
+            )
+            .unwrap(),
+        ];
     })
     .await;
     (harness, admin.unwrap())
@@ -77,6 +87,19 @@ async fn an_mcp_access_point_publishes_the_protected_resource_its_caller_authent
             "bearer_methods_supported": ["header"],
             "scopes_supported": ["tools"]
         })
+    );
+    let variant = client
+        .get(metadata_url(&harness, "/smoke$beta"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(variant.status(), 200);
+    assert_eq!(
+        variant
+            .json::<serde_json::Value>()
+            .await
+            .unwrap()["resource"],
+        "https://gateway.example/smoke$beta"
     );
     for unpublished in ["", "/elsewhere", "/smoke/tools"] {
         assert_eq!(
@@ -158,5 +181,76 @@ async fn an_mcp_access_point_publishes_the_protected_resource_its_caller_authent
             .await
             .unwrap()
             .contains("authorization_servers")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_caller_without_a_valid_token_is_challenged_to_fetch_one() {
+    let fixture = JwksFixture::start().await;
+    let (harness, _admin) = start_discovery_gateway(&fixture).await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap();
+    let tools_list = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}});
+    let call = |path: &str, token: Option<String>| {
+        let mut request = client
+            .post(format!("{}{path}", harness.gateway_base))
+            .json(&tools_list);
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        }
+        request.send()
+    };
+    let challenge = |route: &str, error: &str| {
+        format!(
+            "Bearer resource_metadata=\"https://gateway.example/.well-known/oauth-protected-resource{route}\"{error}, scope=\"tools\""
+        )
+    };
+
+    let missing = call("/smoke/rpc", None)
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 401);
+    assert_eq!(missing.headers()["www-authenticate"], challenge("/smoke", "").as_str());
+    assert_eq!(missing.headers()["content-type"], "application/problem+json");
+    assert_eq!(missing.headers()["cache-control"], "no-store");
+    let body: serde_json::Value = missing.json().await.unwrap();
+    assert_eq!(body["status"], 401);
+    assert_eq!(body["title"], "Unauthorized");
+
+    let variant = call("/smoke$beta/rpc", None)
+        .await
+        .unwrap();
+    assert_eq!(variant.status(), 401);
+    assert_eq!(variant.headers()["www-authenticate"], challenge("/smoke$beta", "").as_str());
+
+    let expired = sign_jwt(json!({"iss": fixture.issuer, "sub": "user-123", "exp": now_secs() - 600}), &fixture.kid);
+    for invalid in [expired, "not-a-jwt".to_string()] {
+        let response = call("/smoke/rpc", Some(invalid))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 401);
+        assert_eq!(response.headers()["www-authenticate"], challenge("/smoke", ", error=\"invalid_token\"").as_str());
+    }
+    assert_eq!(
+        harness
+            .mock
+            .request_count
+            .load(Ordering::SeqCst),
+        0
+    );
+
+    let valid = sign_jwt(json!({"iss": fixture.issuer, "sub": "user-123", "exp": now_secs() + 300}), &fixture.kid);
+    let accepted = call("/smoke/rpc", Some(valid))
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), 200, "{}", accepted.text().await.unwrap());
+    assert_eq!(
+        harness
+            .mock
+            .request_count
+            .load(Ordering::SeqCst),
+        1
     );
 }

@@ -1797,6 +1797,15 @@ async fn proxy_handler_with_mcp_runtime(
         })
         .transpose()
         .map_err(|_| create_error_response(StatusCode::SERVICE_UNAVAILABLE, "Invalid MCP resource authorization"))?;
+    let protected_resource = crate::mcp::resource_server::access_point_protected_resource(
+        &state.surface,
+        state
+            .active_variant_alias
+            .as_deref(),
+        &state.network_config,
+    )
+    .transpose()
+    .map_err(|_| create_error_response(StatusCode::SERVICE_UNAVAILABLE, "Invalid MCP protected resource"))?;
     let mut source_auth_failure: Option<crate::surface_context::SourceAuthContext> = None;
     let audit_facts = crate::audit::request_events::RequestFacts {
         surface_id: config_id,
@@ -1952,18 +1961,41 @@ async fn proxy_handler_with_mcp_runtime(
             .await
         {
             Ok(identity) => Some(identity),
-            // Caller-attributable failure (missing/invalid credential):
-            // record the outcome for the policy layer and continue with no
-            // asserted caller identity — do not block here.
+            // Caller-attributable failure (missing/invalid credential). An
+            // Access Point that publishes protected resource metadata answers
+            // it with its challenge, so the caller can fetch a token and
+            // retry. Otherwise record the outcome for the policy layer and
+            // continue with no asserted caller identity — do not block here.
             Err(e) if e.is_caller_attributable() => {
-                channel_warn!(config_id, "Source authentication failed (reason={}) — deferring to policy", e);
+                let challenged = protected_resource.is_some();
+                channel_warn!(
+                    config_id,
+                    "Source authentication failed (reason={}) — {}",
+                    e,
+                    if challenged {
+                        "sending the discovery challenge"
+                    } else {
+                        "deferring to policy"
+                    }
+                );
                 crate::audit::request_events::auth_failed(
                     &audit_facts,
                     crate::audit::request_events::source_auth_scheme(&resolved_auth_config),
                     crate::audit::request_events::source_auth_reason(&e),
-                    false,
+                    challenged,
                     client_ip,
                 );
+                if let Some(protected_resource) = &protected_resource {
+                    connection_guard
+                        .decrement()
+                        .await;
+                    let error = if matches!(e, crate::source_auth::errors::SourceAuthError::MissingCredential { .. }) {
+                        crate::mcp::resource_server::ResourceTokenError::Missing
+                    } else {
+                        crate::mcp::resource_server::ResourceTokenError::Invalid
+                    };
+                    return Ok(protected_resource.challenge(error));
+                }
                 source_auth_failure = Some(crate::surface_context::SourceAuthContext::Failed {
                     attempted_method: resolved_auth_config
                         .method_tag()

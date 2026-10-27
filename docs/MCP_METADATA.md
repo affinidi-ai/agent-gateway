@@ -1342,6 +1342,17 @@ restart. Inbound listeners route both well-known paths whether or not
 falls to the gateway STS document when the profile is configured, and is
 otherwise routed like any other request, as before.
 
+A direct request to such an Access Point whose bearer token is missing,
+malformed, expired or otherwise refused by the JWT verification strategy is
+answered before policy with `401`, `application/problem+json`, `no-store`
+and `WWW-Authenticate: Bearer resource_metadata="<absolute metadata URL>"`,
+plus `error="invalid_token"` once a token was presented and `scope` when
+scopes are set. The body's detail is fixed and never says why a token failed.
+The audit records the failure as blocking. A valid token is validated and
+attributed as before, and its identity reaches policy. Failures on Fabric
+receive and server-side errors keep their behaviour, and requested scopes are
+advertised but not enforced.
+
 A PUT whose `caller_authentication` omits `protected_resource` keeps the
 stored setting, as the dashboard rebuilds `caller_authentication` from its
 methods; PATCH with `null` removes it. The dashboard does not edit the setting.

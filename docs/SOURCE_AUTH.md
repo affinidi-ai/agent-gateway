@@ -67,6 +67,10 @@ deny if input.source_auth.method == "failed"
 
 See [`POLICY.md`](POLICY.md#failed-caller-authentication).
 
+A direct request to an MCP Access Point that publishes protected resource metadata is the
+exception: a missing or invalid JWT is refused with a `401` discovery challenge, see
+[`MCP_METADATA.md`](MCP_METADATA.md#authorization-server-discovery-for-caller-authentication).
+
 ### mTLS
 
 Two trust modes, in [`MtlsTrust`](../src/source_auth/models.rs):

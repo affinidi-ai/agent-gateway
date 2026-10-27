@@ -2604,6 +2604,34 @@ fn protected_resource_metadata_lists_scope(
     assert_eq!(get_response_body_value(world)["scopes_supported"], serde_json::json!([scope]));
 }
 
+fn assert_discovery_challenge(
+    world: &SurfaceWorld,
+    error: &str,
+) {
+    let protected = world
+        .surface_config
+        .protected_resource
+        .as_ref()
+        .expect("the surface must publish protected resource metadata");
+    let expected = format!(
+        "Bearer resource_metadata=\"{}/.well-known/oauth-protected-resource{}\"{error}, scope=\"{}\"",
+        crate::bdd_support::config::single_surface_fixture::PROTECTED_RESOURCE_PUBLIC_ORIGIN,
+        world.surface_config.route,
+        protected.scopes.join(" ")
+    );
+    assert_collaborator_header_value(get_response_headers_value(world), "www-authenticate", &expected, "response");
+}
+
+#[then("the response challenges the caller to fetch a token from the surface's protected resource metadata")]
+fn response_challenges_for_a_token(world: &mut SurfaceWorld) {
+    assert_discovery_challenge(world, "");
+}
+
+#[then("the response challenges the caller for a new token because the token is invalid")]
+fn response_challenges_for_a_new_token(world: &mut SurfaceWorld) {
+    assert_discovery_challenge(world, ", error=\"invalid_token\"");
+}
+
 #[then(expr = "the response includes header {string} with value {string}")]
 fn response_includes_header_with_value(
     world: &mut SurfaceWorld,

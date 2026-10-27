@@ -158,7 +158,10 @@ Fabric receive) the stored target credential, or the A2A proxy's Direct Line sec
 is not attached, because it vouches that the gateway vetted the caller. A surface that
 must reject such callers needs a policy that denies `input.source_auth.method == "failed"`.
 Server-side source-auth errors (missing configuration, internal failures) still block
-with `500`.
+with `500`. A direct request to an MCP Access Point that publishes protected resource
+metadata never reaches policy with a failed credential: it is refused with a `401`
+challenge pointing at that metadata, see
+[`MCP_METADATA.md`](MCP_METADATA.md#authorization-server-discovery-for-caller-authentication).
 
 Over Fabric, the sending Gateway strips the credential header its own surface consumed
 before forwarding. A receiving surface that requires source authentication on that same

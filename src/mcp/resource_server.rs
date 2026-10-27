@@ -1028,6 +1028,22 @@ impl McpResourceServerConfig {
         if error == ResourceTokenError::Unavailable {
             return response;
         }
+        let Some(challenge) = self.challenge_header(&metadata, error) else {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        };
+        response
+            .headers_mut()
+            .insert(header::WWW_AUTHENTICATE, challenge);
+        response
+    }
+
+    /// `Bearer resource_metadata="…"` (RFC 9728), with the RFC 6750 error
+    /// code once a token was presented and the scopes the resource requires.
+    fn challenge_header(
+        &self,
+        metadata: &url::Url,
+        error: ResourceTokenError,
+    ) -> Option<HeaderValue> {
         let mut challenge = format!("Bearer resource_metadata=\"{metadata}\"");
         match error {
             ResourceTokenError::Invalid => challenge.push_str(", error=\"invalid_token\""),
@@ -1037,9 +1053,39 @@ impl McpResourceServerConfig {
         if !self.scopes.is_empty() {
             challenge.push_str(&format!(", scope=\"{}\"", self.scopes.join(" ")));
         }
-        let Ok(challenge) = HeaderValue::from_str(&challenge) else {
+        HeaderValue::from_str(&challenge).ok()
+    }
+}
+
+impl ProtectedResourceConfig {
+    /// The answer to a caller whose token is missing or invalid: a problem
+    /// with the RFC 9728 challenge naming this resource's metadata document.
+    /// The detail is fixed, so the response never says why a token failed.
+    pub fn challenge(
+        &self,
+        error: ResourceTokenError,
+    ) -> Response {
+        let resource_server = self.resource_server();
+        let challenge = resource_server
+            .metadata_url()
+            .ok()
+            .and_then(|metadata| resource_server.challenge_header(&metadata, error));
+        let (Some(challenge), ResourceTokenError::Missing | ResourceTokenError::Invalid) = (challenge, error) else {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         };
+        let status = error.status_code();
+        let body = json!({
+            "type": "about:blank",
+            "title": status.canonical_reason(),
+            "status": status.as_u16(),
+            "detail": "A bearer token from an authorization server in the protected resource metadata is required",
+        });
+        let mut response = (
+            status,
+            [(header::CONTENT_TYPE, "application/problem+json"), (header::CACHE_CONTROL, "no-store")],
+            body.to_string(),
+        )
+            .into_response();
         response
             .headers_mut()
             .insert(header::WWW_AUTHENTICATE, challenge);
@@ -1478,6 +1524,52 @@ mod tests {
                 .get("scopes_supported")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn the_discovery_challenge_names_the_metadata_and_never_why_a_token_failed() {
+        let config = protected_resource("https://gateway.example/mcp/alpha");
+        let missing = config.challenge(ResourceTokenError::Missing);
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            missing.headers()[header::WWW_AUTHENTICATE],
+            "Bearer resource_metadata=\"https://gateway.example/.well-known/oauth-protected-resource/mcp/alpha\", \
+             scope=\"tools\""
+        );
+        assert_eq!(missing.headers()[header::CONTENT_TYPE], "application/problem+json");
+        assert_eq!(missing.headers()[header::CACHE_CONTROL], "no-store");
+        let invalid = config.challenge(ResourceTokenError::Invalid);
+        assert_eq!(invalid.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            invalid.headers()[header::WWW_AUTHENTICATE]
+                .to_str()
+                .unwrap()
+                .contains(", error=\"invalid_token\", ")
+        );
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(invalid.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            body,
+            json!({
+                "type": "about:blank",
+                "title": "Unauthorized",
+                "status": 401,
+                "detail": "A bearer token from an authorization server in the protected resource metadata is required"
+            })
+        );
+        for error in [ResourceTokenError::InsufficientScope, ResourceTokenError::Unavailable] {
+            let response = config.challenge(error);
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(
+                !response
+                    .headers()
+                    .contains_key(header::WWW_AUTHENTICATE)
+            );
+        }
     }
 
     #[test]
