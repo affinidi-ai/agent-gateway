@@ -12,7 +12,8 @@ changes:
         and the calling gateway received the raw identity. Both gateways now read the
         same response locations as a direct call: the task's status message, then its
         artifacts. The credential is placed on the status message, and the calling
-        gateway finds and verifies it there.
+        gateway finds and verifies it there. The calling gateway does not read
+        artifacts, so an identity or credential found only in an artifact is ignored.
   removed: []
   security:
     - timestamp: '2026-10-26T00:00:00.000Z'

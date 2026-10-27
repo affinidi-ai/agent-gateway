@@ -557,8 +557,10 @@ issuance and the Trust Recorder, but the artifact keeps its raw extension and no
 added to the reply.
 
 The same locations apply over Fabric. The gateway in front of the Managed Agent resolves the
-identity and places the presentation on the status message, and the calling gateway reads the
-presentation from those locations before verifying it
+identity from them and places the presentation on the status message. The calling gateway reads
+the presentation, or a raw identity extension, only from the status message, and never from
+artifacts: the peer gateway never places a presentation in an artifact, so one found there, or a
+raw identity there, did not come from it and is ignored
 ([`src/proxy/fabric_identity.rs`](../src/proxy/fabric_identity.rs)).
 
 Neither remaining location proves authorship: A2A artifacts carry no author, and the Gateway does not

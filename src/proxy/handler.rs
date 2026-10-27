@@ -16036,7 +16036,11 @@ async fn inject_backend_agent_vp(
 
     match vp_result {
         Ok((modified_body, vp_jwt)) => {
-            info!(channel = channel_name, did = %did, "Backend agent VP injected into response");
+            if vp_jwt.is_some() {
+                info!(channel = channel_name, did = %did, "Backend agent VP injected into response");
+            } else {
+                debug!(channel = channel_name, did = %did, "No response location carries the agent identity, VP not injected");
+            }
             Ok((modified_body, vp_jwt))
         }
         Err(e) => {

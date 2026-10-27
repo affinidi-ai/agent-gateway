@@ -76,21 +76,24 @@ pub async fn extract_fabric_backend_agent_identity(
 /// Extract and verify A2A fabric response VP
 ///
 /// Flow:
-/// 1. Find the credential extension in the response locations the protected
-///    agent authors (see `backend_identity::response_identity_candidates`)
+/// 1. Find the credential extension on the agent's message, where GW2 places it
+///    (see `backend_identity::extract_a2a_identity_from_response_message_with_uri`).
+///    Artifacts are not read: GW2 never puts a credential there.
 /// 2. Verify VP signature using VC issuer
 /// 3. Store verified DID in identity store
-/// 4. Fall back to raw identity if no VP (backward compat)
+/// 4. Fall back to raw identity on the same message if no VP (backward compat)
 async fn extract_a2a_fabric_identity(
     response_json: &JsonValue,
     response_identity_selector: &Option<Arc<crate::identity::IdentitySelector>>,
     surface: &crate::config::agent_surface::AgentSurface,
     channel_name: &str,
 ) -> Result<Option<String>, String> {
-    use crate::proxy::backend_identity::{IdentityExtractionError, extract_a2a_identity_from_message_with_uri};
+    use crate::proxy::backend_identity::{
+        IdentityExtractionError, extract_a2a_identity_from_response_message_with_uri,
+    };
 
     // PRIORITY 1: Check for VP credential extension (GW2 → GW1)
-    match extract_a2a_identity_from_message_with_uri(
+    match extract_a2a_identity_from_response_message_with_uri(
         response_json,
         crate::config::AFFINIDI_AGENT_IDENTITY_CREDENTIAL_EXTENSION,
     ) {
@@ -106,7 +109,7 @@ async fn extract_a2a_fabric_identity(
     }
 
     // PRIORITY 2: Check for raw identity extension
-    let identity_ext = match extract_a2a_identity_from_message_with_uri(
+    let identity_ext = match extract_a2a_identity_from_response_message_with_uri(
         response_json,
         crate::config::AFFINIDI_AGENT_IDENTITY_EXTENSION,
     ) {
@@ -349,5 +352,38 @@ mod tests {
             Err(message) => assert!(message.contains("VP verification failed"), "unexpected error: {message}"),
             other => panic!("expected the credential to be rejected, got {other:?}"),
         }
+    }
+
+    fn v1_task_with_artifact(artifact: JsonValue) -> JsonValue {
+        json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "result": { "task": {
+                "id": "t",
+                "status": { "state": "TASK_STATE_COMPLETED", "message": { "role": "ROLE_AGENT", "parts": [{ "text": "done" }] } },
+                "artifacts": [artifact]
+            } }
+        })
+    }
+
+    #[tokio::test]
+    async fn credential_only_in_an_artifact_is_ignored() {
+        let (issuer, _tmp) = crate::identity::test_helpers::test_vc_issuer().await;
+        let schema = json!({ "type": "object", "properties": { "name": { "type": "string", "x-identity": true } } });
+        let selector = crate::identity::IdentitySelector::new(&schema, Arc::new(issuer)).expect("selector");
+        let response = v1_task_with_artifact(agent_message(
+            CREDENTIAL_URI,
+            json!({ "verifiablePresentation": "not-a-presentation", "did": "did:web:agent" }),
+        ));
+
+        // Had the artifact been read, the bad presentation would fail verification.
+        assert_eq!(extract(&response, &Some(Arc::new(selector))).await, Ok(None));
+    }
+
+    #[tokio::test]
+    async fn raw_identity_only_in_an_artifact_is_ignored() {
+        let response = v1_task_with_artifact(agent_message(IDENTITY_URI, json!({ "did": "did:web:planted" })));
+
+        assert_eq!(extract(&response, &None).await, Ok(None));
     }
 }
