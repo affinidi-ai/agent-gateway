@@ -9090,9 +9090,25 @@ async fn proxy_handler_with_mcp_runtime(
                 // delegation, Elicit mode) can check `capabilities.elicitation`.
                 if let (Some(sid), Some(caps)) = (&registry_sid, mcp_initialize_caps.clone()) {
                     let registry = crate::mcp::elicitation::global_capability_registry().clone();
-                    registry
-                        .record(config_id, sid, caps)
-                        .await;
+                    // A client re-initializing its own session sends that id;
+                    // any other `initialize` must get an id nobody else holds.
+                    let reinitialized = headers
+                        .get("mcp-session-id")
+                        .and_then(|v| v.to_str().ok())
+                        == Some(sid.as_str());
+                    if reinitialized {
+                        registry
+                            .record(config_id, sid, caps)
+                            .await;
+                    } else if !registry
+                        .record_opened(config_id, sid, caps)
+                        .await
+                    {
+                        channel_warn!(
+                            config_id,
+                            "Upstream initialize returned an Mcp-Session-Id already used by another session; Elicit consent is off for that id"
+                        );
+                    }
                 }
                 minted
             } else {
@@ -17218,6 +17234,104 @@ allow if {
         }
     }
 
+    /// An upstream that gives one `Mcp-Session-Id` to two `initialize`s must
+    /// not route one client's consent prompts to the other: the id keeps no
+    /// elicitation capability, so Elicit falls back. A client re-initializing
+    /// the session it holds keeps its capabilities.
+    async fn reused_upstream_session_id_turns_elicitation_off(state: &crate::state::ProxyState) {
+        use axum::response::IntoResponse;
+        use serde_json::json;
+
+        let app = axum::Router::new().fallback(|| async {
+            let mut response = axum::Json(json!({"jsonrpc": "2.0", "id": 1, "result": {
+                "protocolVersion": "2025-11-25", "capabilities": {},
+                "serverInfo": {"name": "target", "version": "1"}
+            }}))
+            .into_response();
+            response
+                .headers_mut()
+                .insert("mcp-session-id", HeaderValue::from_static("fixed-upstream-session"));
+            response
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .ok()
+        });
+
+        let initialize = |surface_id: &'static str, session_id: Option<&'static str>| {
+            let surface = json!({
+                "surface_id": surface_id, "name": surface_id,
+                "access_point": {"listen_address": "https://gateway.example", "route": "/initialize", "protocol": "mcp"},
+                "target": {"endpoint": format!("http://{addr}/mcp")}
+            });
+            let body = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                "protocolVersion": "2025-11-25", "capabilities": {"elicitation": {}},
+                "clientInfo": {"name": "client", "version": "1"}
+            }});
+            let mut request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/initialize")
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream");
+            if let Some(session_id) = session_id {
+                request = request.header("mcp-session-id", session_id);
+            }
+            let request = request
+                .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap();
+            async move {
+                let response = super::multi_channel_proxy_handler(
+                    axum::extract::ConnectInfo(
+                        "127.0.0.1:12345"
+                            .parse()
+                            .unwrap(),
+                    ),
+                    axum::extract::State(direct_router_state(state, serde_json::from_value(surface).unwrap())),
+                    request,
+                )
+                .await;
+                assert_eq!(response.status(), axum::http::StatusCode::OK, "{surface_id}");
+                assert_eq!(
+                    response
+                        .headers()
+                        .get("mcp-session-id")
+                        .and_then(|value| value.to_str().ok()),
+                    Some("fixed-upstream-session"),
+                    "{surface_id}"
+                );
+            }
+        };
+        let registry = crate::mcp::elicitation::global_capability_registry();
+        let elicitation = |surface_id: &'static str| async move {
+            registry
+                .get(surface_id, "fixed-upstream-session")
+                .await
+                .map(|caps| caps.elicitation)
+        };
+
+        initialize("session-id-reused", None).await;
+        assert_eq!(elicitation("session-id-reused").await, Some(true));
+        initialize("session-id-reused", None).await;
+        assert_eq!(elicitation("session-id-reused").await, Some(false));
+        initialize("session-id-reused", Some("fixed-upstream-session")).await;
+        assert_eq!(elicitation("session-id-reused").await, Some(false));
+
+        initialize("session-id-reinitialized", None).await;
+        initialize("session-id-reinitialized", Some("fixed-upstream-session")).await;
+        assert_eq!(elicitation("session-id-reinitialized").await, Some(true));
+
+        for surface_id in ["session-id-reused", "session-id-reinitialized"] {
+            registry
+                .drop_session(surface_id, "fixed-upstream-session")
+                .await;
+        }
+    }
+
     /// The direct Access Point is a transparent proxy for the modern routing
     /// headers: `Mcp-Method`, `Mcp-Name` and `Mcp-Param-*` reach the upstream
     /// unchanged, alongside the version header.
@@ -18912,6 +19026,7 @@ allow if {
         mounted_access_point_uses_the_direct_access_point_policy(&state).await;
         direct_access_point_caps_legacy_initialize(&state).await;
         initialize_wrapped_as_sse_returns_one_session_id(&state).await;
+        reused_upstream_session_id_turns_elicitation_off(&state).await;
         access_point_admission_rejects_every_negative_case(&state).await;
         access_point_refuses_methods_and_bodies_outside_post(&state).await;
         access_point_rejects_a_spoofed_identity_credential(&state).await;

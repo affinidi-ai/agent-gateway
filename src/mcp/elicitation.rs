@@ -18,7 +18,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{Mutex, oneshot};
 use uuid::Uuid;
@@ -408,23 +408,70 @@ impl McpClientCapabilities {
 /// record by choosing the same id.
 #[derive(Debug, Default)]
 pub struct McpCapabilityRegistry {
-    inner: Mutex<HashMap<(String, String), McpClientCapabilities>>,
+    inner: Mutex<CapabilityRecords>,
+}
+
+#[derive(Debug, Default)]
+struct CapabilityRecords {
+    by_session: HashMap<(String, String), McpClientCapabilities>,
+    /// Session ids an upstream handed to more than one `initialize`. They
+    /// stay here after `DELETE`, so a later session that gets the id again
+    /// can't have consent prompts either.
+    reused: HashSet<(String, String)>,
 }
 
 impl McpCapabilityRegistry {
     pub fn new() -> Self {
         Self::default()
     }
+    /// Records capabilities for a client re-initializing a session it
+    /// already holds. A reused id keeps no capabilities.
     pub async fn record(
         &self,
         surface_id: &str,
         session_id: &str,
         caps: McpClientCapabilities,
     ) {
-        self.inner
-            .lock()
-            .await
-            .insert((surface_id.to_string(), session_id.to_string()), caps);
+        let key = (surface_id.to_string(), session_id.to_string());
+        let mut records = self.inner.lock().await;
+        let caps = if records.reused.contains(&key) {
+            McpClientCapabilities::default()
+        } else {
+            caps
+        };
+        records
+            .by_session
+            .insert(key, caps);
+    }
+    /// Records capabilities for a session a new `initialize` opened. Returns
+    /// `false` when the id is already in use: the upstream gave one id to two
+    /// sessions, so prompts on it could reach either client. The id is then
+    /// kept with no capabilities, and Elicit falls back for both clients.
+    pub async fn record_opened(
+        &self,
+        surface_id: &str,
+        session_id: &str,
+        caps: McpClientCapabilities,
+    ) -> bool {
+        let key = (surface_id.to_string(), session_id.to_string());
+        let mut records = self.inner.lock().await;
+        let reused = records.reused.contains(&key)
+            || records
+                .by_session
+                .contains_key(&key);
+        if reused {
+            records
+                .reused
+                .insert(key.clone());
+            records
+                .by_session
+                .insert(key, McpClientCapabilities::default());
+        } else {
+            records
+                .by_session
+                .insert(key, caps);
+        }
+        !reused
     }
     pub async fn get(
         &self,
@@ -434,6 +481,7 @@ impl McpCapabilityRegistry {
         self.inner
             .lock()
             .await
+            .by_session
             .get(&(surface_id.to_string(), session_id.to_string()))
             .cloned()
     }
@@ -445,6 +493,7 @@ impl McpCapabilityRegistry {
         self.inner
             .lock()
             .await
+            .by_session
             .remove(&(surface_id.to_string(), session_id.to_string()));
     }
 }
@@ -823,5 +872,60 @@ mod tests {
                 .await
                 .is_some()
         );
+    }
+
+    /// An upstream that gives one session id to two `initialize`s leaves
+    /// neither client with capabilities, even after `DELETE` or a third
+    /// session on the id. Other surfaces and ids are unaffected.
+    #[tokio::test]
+    async fn capability_registry_refuses_a_reused_session_id() {
+        let reg = McpCapabilityRegistry::new();
+        let eliciting = || McpClientCapabilities {
+            elicitation: true,
+            sampling: false,
+            roots: false,
+        };
+        let elicitation = |surface: &'static str, session: &'static str| {
+            let reg = &reg;
+            async move {
+                reg.get(surface, session)
+                    .await
+                    .map(|caps| caps.elicitation)
+            }
+        };
+
+        assert!(
+            reg.record_opened("surface-a", "fixed", eliciting())
+                .await
+        );
+        assert!(
+            reg.record_opened("surface-b", "fixed", eliciting())
+                .await
+        );
+        assert!(
+            !reg.record_opened("surface-a", "fixed", eliciting())
+                .await
+        );
+        assert_eq!(elicitation("surface-a", "fixed").await, Some(false));
+        assert_eq!(elicitation("surface-b", "fixed").await, Some(true));
+
+        reg.record("surface-a", "fixed", eliciting())
+            .await;
+        assert_eq!(elicitation("surface-a", "fixed").await, Some(false));
+
+        reg.drop_session("surface-a", "fixed")
+            .await;
+        assert_eq!(elicitation("surface-a", "fixed").await, None);
+        assert!(
+            !reg.record_opened("surface-a", "fixed", eliciting())
+                .await
+        );
+        assert_eq!(elicitation("surface-a", "fixed").await, Some(false));
+
+        reg.record("surface-a", "own", eliciting())
+            .await;
+        reg.record("surface-a", "own", eliciting())
+            .await;
+        assert_eq!(elicitation("surface-a", "own").await, Some(true));
     }
 }
