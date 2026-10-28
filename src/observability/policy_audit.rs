@@ -199,10 +199,11 @@ pub async fn in_request<F: std::future::Future>(
         .await
 }
 
-/// `response` with a streamed body read as request `scope`. A streamed body
-/// (an SSE stream) is read after its handler returned, outside the handler's
-/// scope, so the records written per event would otherwise lose the request.
-/// A body of known length is left as it is.
+/// `response` with a streamed body read and dropped as request `scope`. A
+/// streamed body (an SSE stream) is read after its handler returned, outside
+/// the handler's scope, so the records written per event, and those its
+/// observers write when a client disconnects and the body is dropped, would
+/// otherwise lose the request. A body of known length is left as it is.
 pub fn response_in_request(
     scope: Arc<RequestScope>,
     response: axum::response::Response,
@@ -219,11 +220,32 @@ pub fn response_in_request(
         return response;
     }
     response.map(|body| {
-        let mut data = body.into_data_stream();
+        let mut guard = DroppedInRequest {
+            data: Some(body.into_data_stream()),
+            scope,
+        };
         axum::body::Body::from_stream(futures::stream::poll_fn(move |cx| {
-            REQUEST.sync_scope(scope.clone(), || data.poll_next_unpin(cx))
+            let DroppedInRequest { data, scope } = &mut guard;
+            REQUEST.sync_scope(Arc::clone(scope), || match data.as_mut() {
+                Some(data) => data.poll_next_unpin(cx),
+                None => std::task::Poll::Ready(None),
+            })
         }))
     })
+}
+
+/// A streamed body that is dropped inside its request's scope, wherever the
+/// drop happens.
+struct DroppedInRequest<S> {
+    data: Option<S>,
+    scope: Arc<RequestScope>,
+}
+
+impl<S> Drop for DroppedInRequest<S> {
+    fn drop(&mut self) {
+        let data = self.data.take();
+        REQUEST.sync_scope(Arc::clone(&self.scope), move || drop(data));
+    }
 }
 
 /// Spawns `future` as the request being served, so the audit records it

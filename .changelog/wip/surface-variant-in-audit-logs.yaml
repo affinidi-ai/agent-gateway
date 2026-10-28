@@ -31,7 +31,13 @@ changes:
         Policy change records name the variant whose slot was written surface_variant, the name
         every other record uses, and record _base_ for a slot on the base surface, which also
         applies to the variants that inherit it.
-  fixed: []
+  fixed:
+    - timestamp: '2026-10-28T18:00:00Z'
+      title: Keep the surface variant on metrics of a stream the client aborts
+      description: >-
+        A streamed response whose client disconnects before its end now records its connection
+        metric with the request's surface variant and id, as a stream that completes does. The
+        stream was dropped outside its request, so the metric carried no variant.
   removed: []
   security: []
   breaking:
