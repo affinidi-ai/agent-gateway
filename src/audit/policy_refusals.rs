@@ -21,10 +21,11 @@ use crate::delegation_vault::audit::{DelegationAuditAction, PolicyChangeDetails,
 /// and every refusal of it is recorded: by its own layers or handler, and by
 /// authentication before it ([`record_refused`]).
 ///
-/// `PUT /v1/gateways/{id}` is not one. It changes a gateway's policy only when
-/// its body says so, and refusals are recorded without reading bodies, so a
-/// refused gateway edit cannot be told apart from a refused policy change.
-/// Its successful policy changes are recorded with every other gateway write.
+/// `PUT /v1/gateways/{id}` is not one: it edits a gateway's name, description
+/// and status, never its policy. `DELETE /v1/gateways/{id}` is not one either,
+/// though deleting a gateway drops its policies: a refused delete cannot be
+/// called a policy change without reading the stored gateway, so its refusals
+/// are not recorded. A successful delete records each policy it detaches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyWrite {
     CreateDefinition,

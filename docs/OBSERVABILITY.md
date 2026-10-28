@@ -219,7 +219,10 @@ where a policy applies (group Policies). Each record carries its body in the `ev
 - `policy_attachment_changed`: an appliance-wide assignment switched between `enforced` and
   `monitor_only` (`mode`, `previous_mode`), or a gateway's policy was enabled or disabled
   (`enabled`, `previous_enabled`).
-- `policy_change_refused`: one of the changes above was refused with 400, 403, 404, 409 or 422.
+- `policy_change_refused`: one of the changes above was refused with 400, 403, 404, 409 or 422,
+  on a route that only changes policies: the definition, assignment, gateway policy and
+  definition ownership routes. A refused surface or variant write, or a refused gateway delete,
+  is not recorded (see [`POLICY.md`](POLICY.md#policy-change-audit)).
   `action` is the change attempted, `status` the HTTP status and `reason` one of `invalid`,
   `forbidden`, `not_found` or `conflict`. The attempt is read from the route only: ids come from
   the path, bounded to 128 id characters, and replacing the appliance-wide assignments or a
