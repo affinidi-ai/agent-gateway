@@ -340,6 +340,7 @@ impl StreamRuntime {
             limits,
             deadline,
             rejection,
+            scope: crate::observability::policy_audit::RequestScope::fresh(),
         })
     }
 
@@ -590,6 +591,8 @@ pub(crate) struct IncomingStream {
     deadline: tokio::time::Instant,
     /// Answered in place of executing the request.
     rejection: Option<Box<crate::mcp::request_validation::McpRequestValidationError>>,
+    /// The request the Open was admitted as; the served stream runs as it.
+    scope: Arc<crate::observability::policy_audit::RequestScope>,
 }
 
 impl IncomingStream {
@@ -1307,6 +1310,14 @@ mod tests {
                 _ => vec![],
             };
             assert_eq!(routing_refusals, expected_records, "{rejected}: recorded refusal");
+            assert!(
+                records
+                    .iter()
+                    .all(|record| record
+                        .request_id
+                        .is_some()),
+                "{rejected}: an Open refusal records under the Open's request: {records:?}"
+            );
             // Only a missing offer asks the sender to negotiate again.
             let expected = if rejected == "missing-offer" {
                 wire::StreamErrorCode::StaleOffer
@@ -1633,6 +1644,7 @@ mod tests {
             } else {
                 versions
             };
+            let admitted_in = Arc::clone(&incoming.scope);
             let run =
                 Box::pin(incoming.run_with_mcp_runtime(Arc::new(RecordingSink(frames_tx)), receiver_versions, None));
             let consume = async {
@@ -1694,6 +1706,15 @@ mod tests {
             if case == "valid" {
                 assert_eq!(status, 200, "{received}");
                 assert_eq!(received, target_result);
+                let served_variant = crate::observability::policy_audit::in_request(admitted_in, async {
+                    crate::observability::policy_audit::current_request_variant()
+                })
+                .await;
+                assert_eq!(
+                    served_variant.as_deref(),
+                    Some("candidate"),
+                    "the served stream runs as the request its Open was admitted in"
+                );
                 let request = target
                     .last_request_rx
                     .borrow()
