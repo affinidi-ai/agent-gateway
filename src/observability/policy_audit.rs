@@ -243,6 +243,10 @@ struct DroppedInRequest<S> {
 
 impl<S> Drop for DroppedInRequest<S> {
     fn drop(&mut self) {
+        // Entering the scope can panic, and a panic while unwinding aborts.
+        if std::thread::panicking() {
+            return;
+        }
         let data = self.data.take();
         REQUEST.sync_scope(Arc::clone(&self.scope), move || drop(data));
     }
