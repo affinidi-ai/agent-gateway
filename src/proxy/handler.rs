@@ -2799,7 +2799,7 @@ async fn proxy_handler_with_mcp_runtime(
                 None => (None, None, None),
             };
         let gw_policy_name = gw_policy_manager
-            .resolve_policy_name_or_default(gw_policy_def_id.as_deref())
+            .resolve_policy_name(gw_policy_def_id.as_deref())
             .await;
 
         match gw_policy_manager.evaluate_policy_decision(&self_gateway_id, gw_input_value) {
@@ -2809,7 +2809,7 @@ async fn proxy_handler_with_mcp_runtime(
                     allow: true,
                     policy_id: Some(crate::policies::GATEWAY_POLICY_PACKAGE),
                     policy_definition_id: gw_policy_def_id.as_deref(),
-                    policy_name: Some(gw_policy_name.as_str()),
+                    policy_name: gw_policy_name.as_deref(),
                     surface_id: state.surface.config_id(),
                     surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(&trace_id),
@@ -2829,7 +2829,7 @@ async fn proxy_handler_with_mcp_runtime(
                     reason: decision.reason.as_deref(),
                     policy_id: Some(crate::policies::GATEWAY_POLICY_PACKAGE),
                     policy_definition_id: gw_policy_def_id.as_deref(),
-                    policy_name: Some(gw_policy_name.as_str()),
+                    policy_name: gw_policy_name.as_deref(),
                     surface_id: state.surface.config_id(),
                     surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(&trace_id),
@@ -2853,7 +2853,7 @@ async fn proxy_handler_with_mcp_runtime(
                     error: Some(crate::observability::PolicyEvaluationError::EvaluationError),
                     policy_id: Some(crate::policies::GATEWAY_POLICY_PACKAGE),
                     policy_definition_id: gw_policy_def_id.as_deref(),
-                    policy_name: Some(gw_policy_name.as_str()),
+                    policy_name: gw_policy_name.as_deref(),
                     surface_id: state.surface.config_id(),
                     surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(&trace_id),
@@ -5450,7 +5450,7 @@ async fn proxy_handler_with_mcp_runtime(
                     allow: true,
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: inbound_policy_def_id,
-                    policy_name: Some(inbound_policy_name.as_str()),
+                    policy_name: inbound_policy_name.as_deref(),
                     policy_version: inbound_policy_version,
                     policy_content_hash: inbound_policy_hash.as_deref(),
                     surface_id: Some(config_id_str),
@@ -5470,7 +5470,7 @@ async fn proxy_handler_with_mcp_runtime(
                     reason: decision.reason.as_deref(),
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: inbound_policy_def_id,
-                    policy_name: Some(inbound_policy_name.as_str()),
+                    policy_name: inbound_policy_name.as_deref(),
                     policy_version: inbound_policy_version,
                     policy_content_hash: inbound_policy_hash.as_deref(),
                     surface_id: Some(config_id_str),
@@ -5510,7 +5510,7 @@ async fn proxy_handler_with_mcp_runtime(
                     error: Some(crate::observability::PolicyEvaluationError::EvaluationError),
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: inbound_policy_def_id,
-                    policy_name: Some(inbound_policy_name.as_str()),
+                    policy_name: inbound_policy_name.as_deref(),
                     policy_version: inbound_policy_version,
                     policy_content_hash: inbound_policy_hash.as_deref(),
                     surface_id: Some(config_id_str),
@@ -5711,7 +5711,7 @@ async fn proxy_handler_with_mcp_runtime(
                     allow: true,
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: channel_opa_def_id,
-                    policy_name: Some(channel_opa_name.as_str()),
+                    policy_name: channel_opa_name.as_deref(),
                     surface_id: Some(config_id_str),
                     surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(&trace_id),
@@ -5731,7 +5731,7 @@ async fn proxy_handler_with_mcp_runtime(
                     reason: decision.reason.as_deref(),
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: channel_opa_def_id,
-                    policy_name: Some(channel_opa_name.as_str()),
+                    policy_name: channel_opa_name.as_deref(),
                     surface_id: Some(config_id_str),
                     surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(&trace_id),
@@ -5767,7 +5767,7 @@ async fn proxy_handler_with_mcp_runtime(
                     error: Some(crate::observability::PolicyEvaluationError::EvaluationError),
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: channel_opa_def_id,
-                    policy_name: Some(channel_opa_name.as_str()),
+                    policy_name: channel_opa_name.as_deref(),
                     surface_id: Some(config_id_str),
                     surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(&trace_id),
@@ -10888,7 +10888,7 @@ async fn handle_fabric_request(
                     allow: true,
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: inbound_policy_def_id,
-                    policy_name: Some(inbound_policy_name.as_str()),
+                    policy_name: inbound_policy_name.as_deref(),
                     policy_version: inbound_policy_version,
                     policy_content_hash: inbound_policy_hash.as_deref(),
                     surface_id: Some(config_id_str),
@@ -10908,7 +10908,7 @@ async fn handle_fabric_request(
                     reason: decision.reason.as_deref(),
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: inbound_policy_def_id,
-                    policy_name: Some(inbound_policy_name.as_str()),
+                    policy_name: inbound_policy_name.as_deref(),
                     policy_version: inbound_policy_version,
                     policy_content_hash: inbound_policy_hash.as_deref(),
                     surface_id: Some(config_id_str),
@@ -10948,7 +10948,7 @@ async fn handle_fabric_request(
                     error: Some(crate::observability::PolicyEvaluationError::EvaluationError),
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: inbound_policy_def_id,
-                    policy_name: Some(inbound_policy_name.as_str()),
+                    policy_name: inbound_policy_name.as_deref(),
                     policy_version: inbound_policy_version,
                     policy_content_hash: inbound_policy_hash.as_deref(),
                     surface_id: Some(config_id_str),
@@ -11150,7 +11150,7 @@ async fn handle_fabric_request(
                         allow: true,
                         policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                         policy_definition_id: channel_opa_def_id,
-                        policy_name: Some(channel_opa_name.as_str()),
+                        policy_name: channel_opa_name.as_deref(),
                         surface_id: Some(config_id_str),
                         surface_name: Some(state.surface.name.as_str()),
                         trace_id: Some(&trace_id),
@@ -11169,7 +11169,7 @@ async fn handle_fabric_request(
                         reason: decision.reason.as_deref(),
                         policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                         policy_definition_id: channel_opa_def_id,
-                        policy_name: Some(channel_opa_name.as_str()),
+                        policy_name: channel_opa_name.as_deref(),
                         surface_id: Some(config_id_str),
                         surface_name: Some(state.surface.name.as_str()),
                         trace_id: Some(&trace_id),
@@ -11198,7 +11198,7 @@ async fn handle_fabric_request(
                         error: Some(crate::observability::PolicyEvaluationError::EvaluationError),
                         policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                         policy_definition_id: channel_opa_def_id,
-                        policy_name: Some(channel_opa_name.as_str()),
+                        policy_name: channel_opa_name.as_deref(),
                         surface_id: Some(config_id_str),
                         surface_name: Some(state.surface.name.as_str()),
                         trace_id: Some(&trace_id),
@@ -15079,7 +15079,7 @@ async fn evaluate_mcp_proxy_opa_policies(
                     allow: true,
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: inbound_policy_def_id,
-                    policy_name: Some(inbound_policy_name.as_str()),
+                    policy_name: inbound_policy_name.as_deref(),
                     policy_version: inbound_policy_version,
                     policy_content_hash: inbound_policy_hash.as_deref(),
                     surface_id: Some(config_id_str),
@@ -15098,7 +15098,7 @@ async fn evaluate_mcp_proxy_opa_policies(
                     reason: decision.reason.as_deref(),
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: inbound_policy_def_id,
-                    policy_name: Some(inbound_policy_name.as_str()),
+                    policy_name: inbound_policy_name.as_deref(),
                     policy_version: inbound_policy_version,
                     policy_content_hash: inbound_policy_hash.as_deref(),
                     surface_id: Some(config_id_str),
@@ -15126,7 +15126,7 @@ async fn evaluate_mcp_proxy_opa_policies(
                     error: Some(crate::observability::PolicyEvaluationError::EvaluationError),
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: inbound_policy_def_id,
-                    policy_name: Some(inbound_policy_name.as_str()),
+                    policy_name: inbound_policy_name.as_deref(),
                     policy_version: inbound_policy_version,
                     policy_content_hash: inbound_policy_hash.as_deref(),
                     surface_id: Some(config_id_str),
@@ -15207,7 +15207,7 @@ async fn evaluate_mcp_proxy_opa_policies(
                     allow: true,
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: channel_opa_def_id,
-                    policy_name: Some(channel_opa_name.as_str()),
+                    policy_name: channel_opa_name.as_deref(),
                     surface_id: Some(config_id_str),
                     surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(trace_id),
@@ -15226,7 +15226,7 @@ async fn evaluate_mcp_proxy_opa_policies(
                     reason: decision.reason.as_deref(),
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: channel_opa_def_id,
-                    policy_name: Some(channel_opa_name.as_str()),
+                    policy_name: channel_opa_name.as_deref(),
                     policy_version: channel_opa_version,
                     policy_content_hash: channel_opa_hash.as_deref(),
                     surface_id: Some(config_id_str),
@@ -15250,7 +15250,7 @@ async fn evaluate_mcp_proxy_opa_policies(
                     error: Some(crate::observability::PolicyEvaluationError::EvaluationError),
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: channel_opa_def_id,
-                    policy_name: Some(channel_opa_name.as_str()),
+                    policy_name: channel_opa_name.as_deref(),
                     policy_version: channel_opa_version,
                     policy_content_hash: channel_opa_hash.as_deref(),
                     surface_id: Some(config_id_str),
@@ -17354,6 +17354,19 @@ allow if {
             })
             .count();
         assert_eq!(streamed_decisions, 1, "the allow is recorded once per stream: {events:?}\n{body:?}");
+        let decision = events
+            .iter()
+            .find(|event| {
+                matches!(&event.event, crate::delegation_vault::audit::DelegationAuditAction::PolicyDecision { .. })
+            })
+            .unwrap();
+        assert_eq!(
+            decision
+                .channel_name
+                .as_deref(),
+            Some("Streamed ids"),
+            "the decision names the surface"
+        );
         let ids: std::collections::HashSet<_> = events
             .iter()
             .map(|event| event.request_id.clone())

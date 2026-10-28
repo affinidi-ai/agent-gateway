@@ -410,25 +410,26 @@ impl GatewayPolicyManager {
             .map(|c| (c.policy_definition_id.clone(), c.version, c.content_hash.clone()))
     }
 
-    /// Resolve the display name for an optional gateway policy-definition ID,
-    /// falling back to the Rego package name (`gateway.policy`) when no
-    /// definition is attached.
-    pub async fn resolve_policy_name_or_default(
+    /// The display name of a gateway policy definition: its name, or its id
+    /// when the definition is unknown. `None` for an inline policy with no
+    /// definition, whose decisions are then named after the layer ("Gateway
+    /// policy"), as its change records are.
+    pub async fn resolve_policy_name(
         &self,
         def_id: Option<&str>,
-    ) -> String {
+    ) -> Option<String> {
+        let id = def_id?;
         let store = self
             .policy_definition_store
             .read()
             .expect("policy_definition_store lock poisoned")
             .clone();
-        if let Some(id) = def_id
-            && let Some(store) = store
+        if let Some(store) = store
             && let Some(def) = store.get(id).await
         {
-            return def.name;
+            return Some(def.name);
         }
-        super::GATEWAY_POLICY_PACKAGE.to_string()
+        Some(id.to_string())
     }
 
     /// Remove policy for a gateway
@@ -749,9 +750,25 @@ allow if {
         assert!(hash.starts_with("sha256:"));
         assert_eq!(
             manager
-                .resolve_policy_name_or_default(policy_definition_id.as_deref())
+                .resolve_policy_name(policy_definition_id.as_deref())
+                .await
+                .as_deref(),
+            Some("n")
+        );
+        assert_eq!(
+            manager
+                .resolve_policy_name(Some("missing"))
+                .await
+                .as_deref(),
+            Some("missing"),
+            "an unknown definition is named by its id"
+        );
+        assert_eq!(
+            manager
+                .resolve_policy_name(None)
                 .await,
-            "n"
+            None,
+            "an inline policy has no name, so its decisions are named \"Gateway policy\""
         );
     }
 

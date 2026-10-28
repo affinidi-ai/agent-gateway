@@ -488,6 +488,11 @@ impl AccessPointEvents {
                     .surface_id
                     .as_str(),
             ),
+            surface_name: Some(
+                self.request
+                    .channel_name
+                    .as_str(),
+            ),
             trace_id: Some(&self.request.trace_id),
             http_method: Some(&self.request.http_method),
             path: Some(&self.request.path),

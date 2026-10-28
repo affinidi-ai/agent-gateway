@@ -405,8 +405,9 @@ caller the record holds), `EVENT_DATA` (the same as `AUDIT_RECORD`), `APPLIANCE_
 `sub`, API key name, DID, mTLS principal, or on a Transit Point the caller the transit token
 carries), and all four are empty when the request had no caller context (no source auth, or a
 Transit Point whose token carries no caller). The policy variables describe the policy that made
-a `policy_decision` (`AUDIT_POLICY_NAME` falls back to the Rego package when the policy has no
-stored definition) and are empty for other records; see
+a `policy_decision` (`AUDIT_POLICY_NAME` is the definition's name, else its id, else a label
+for the layer when the policy has no stored definition, such as "Gateway policy" or "Surface
+policy") and are empty for other records; see
 [`POLICY.md`](POLICY.md#versioned-policy-definitions) for which decisions carry a revision. A
 string value that is exactly `${AUDIT_RECORD}` or `${EVENT_DATA}` is embedded as a JSON object
 for Webhook and Stream integrations; for Slack and Email, and inside other text, it is inserted

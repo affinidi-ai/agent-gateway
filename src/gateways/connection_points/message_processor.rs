@@ -2456,7 +2456,7 @@ async fn evaluate_gateway_policy_for_fabric(
             None => (None, None, None),
         };
         let gw_policy_name = gw_pm
-            .resolve_policy_name_or_default(gw_policy_def_id.as_deref())
+            .resolve_policy_name(gw_policy_def_id.as_deref())
             .await;
 
         match gw_pm.evaluate_policy_decision(&self_gateway_id, gw_input_value) {
@@ -2467,7 +2467,7 @@ async fn evaluate_gateway_policy_for_fabric(
                     allow: true,
                     policy_id: Some(crate::policies::GATEWAY_POLICY_PACKAGE),
                     policy_definition_id: gw_policy_def_id.as_deref(),
-                    policy_name: Some(gw_policy_name.as_str()),
+                    policy_name: gw_policy_name.as_deref(),
                     surface_id: surface.config_id(),
                     surface_name: Some(surface.name.as_str()),
                     http_method: Some(method),
@@ -2487,7 +2487,7 @@ async fn evaluate_gateway_policy_for_fabric(
                     reason: decision.reason.as_deref(),
                     policy_id: Some(crate::policies::GATEWAY_POLICY_PACKAGE),
                     policy_definition_id: gw_policy_def_id.as_deref(),
-                    policy_name: Some(gw_policy_name.as_str()),
+                    policy_name: gw_policy_name.as_deref(),
                     surface_id: surface.config_id(),
                     surface_name: Some(surface.name.as_str()),
                     http_method: Some(method),
@@ -2507,7 +2507,7 @@ async fn evaluate_gateway_policy_for_fabric(
                     flow: crate::observability::PolicyFlow::Fabric,
                     policy_id: Some(crate::policies::GATEWAY_POLICY_PACKAGE),
                     policy_definition_id: gw_policy_def_id.as_deref(),
-                    policy_name: Some(gw_policy_name.as_str()),
+                    policy_name: gw_policy_name.as_deref(),
                     surface_id: surface.config_id(),
                     surface_name: Some(surface.name.as_str()),
                     http_method: Some(method),
@@ -3172,7 +3172,7 @@ async fn enrich_and_evaluate_surface_policies(
                         allow: true,
                         policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                         policy_definition_id: channel_opa_def_id,
-                        policy_name: Some(channel_opa_name.as_str()),
+                        policy_name: channel_opa_name.as_deref(),
                         surface_id: Some(config_id),
                         surface_name: Some(surface.name.as_str()),
                         http_method: Some(method),
@@ -3192,7 +3192,7 @@ async fn enrich_and_evaluate_surface_policies(
                         reason: decision.reason.as_deref(),
                         policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                         policy_definition_id: channel_opa_def_id,
-                        policy_name: Some(channel_opa_name.as_str()),
+                        policy_name: channel_opa_name.as_deref(),
                         surface_id: Some(config_id),
                         surface_name: Some(surface.name.as_str()),
                         http_method: Some(method),
@@ -3214,7 +3214,7 @@ async fn enrich_and_evaluate_surface_policies(
                             flow: crate::observability::PolicyFlow::Fabric,
                             policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                             policy_definition_id: channel_opa_def_id,
-                            policy_name: Some(channel_opa_name.as_str()),
+                            policy_name: channel_opa_name.as_deref(),
                             surface_id: Some(config_id),
                             surface_name: Some(surface.name.as_str()),
                             http_method: Some(method),

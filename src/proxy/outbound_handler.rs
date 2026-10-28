@@ -2923,11 +2923,11 @@ async fn step_gateway_opa_policy(
     let (policy_definition_id, policy_name, policy_version, policy_hash) = match gw_pm.policy_evidence(&gateway_id) {
         Some((id, version, hash)) => {
             let name = gw_pm
-                .resolve_policy_name_or_default(id.as_deref())
+                .resolve_policy_name(id.as_deref())
                 .await;
             (id, name, version, Some(hash))
         }
-        None => (None, crate::policies::GATEWAY_POLICY_PACKAGE.to_string(), None, None),
+        None => (None, None, None, None),
     };
     let caller = outbound_caller(ctx);
 
@@ -2935,7 +2935,7 @@ async fn step_gateway_opa_policy(
         scope: crate::observability::PolicyScope::Gateway,
         policy_id: crate::policies::GATEWAY_POLICY_PACKAGE,
         policy_definition_id: policy_definition_id.as_deref(),
-        policy_name: Some(policy_name.as_str()),
+        policy_name: policy_name.as_deref(),
         surface_id: ctx.surface.config_id(),
         surface_name: Some(ctx.surface.name.as_str()),
         http_method: ctx.original_method.as_str(),
@@ -3072,7 +3072,7 @@ async fn step_surface_opa_policy(
         scope: crate::observability::PolicyScope::Surface,
         policy_id: crate::policies::SURFACE_POLICY_PACKAGE,
         policy_definition_id: def_id,
-        policy_name: Some(policy_name.as_str()),
+        policy_name: policy_name.as_deref(),
         surface_id: Some(config_id),
         surface_name: Some(ctx.surface.name.as_str()),
         http_method: ctx.original_method.as_str(),
@@ -3215,7 +3215,7 @@ async fn step_transit_point_opa_policy(
         scope: crate::observability::PolicyScope::Surface,
         policy_id: crate::policies::SURFACE_POLICY_PACKAGE,
         policy_definition_id: Some(tp_def_id.as_str()),
-        policy_name: Some(policy_name.as_str()),
+        policy_name: policy_name.as_deref(),
         surface_id: Some(config_id),
         surface_name: Some(ctx.surface.name.as_str()),
         http_method: ctx.original_method.as_str(),
