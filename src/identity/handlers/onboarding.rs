@@ -612,7 +612,7 @@ pub async fn handle_onboarding_message(
         validation_status: "success".to_string(),
         validation_error: None,
         derived_schema: Box::new(derived_schema.clone()),
-        variant_alias: None,
+        surface_variant: None,
     };
 
     // Log the exact WebSocket message being broadcast
@@ -760,7 +760,7 @@ async fn handle_mcp_onboarding_message(
         validation_status: "success".to_string(),
         validation_error: None,
         derived_schema: Box::new(derived_schema),
-        variant_alias: None,
+        surface_variant: None,
     };
     state
         .ws_state

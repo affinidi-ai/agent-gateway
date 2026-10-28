@@ -54,7 +54,9 @@ pub fn build_hierarchical_metrics(
             direction: conn.direction,
             ucp_operation: conn.ucp_operation.clone(),
             transit_point: conn.transit_point.clone(),
-            variant_alias: conn.variant_alias.clone(),
+            surface_variant: conn
+                .surface_variant
+                .clone(),
             metric_type: conn.metric_type,
             correlation_id: conn.correlation_id.clone(),
             agent_identity: conn.agent_identity.clone(),
@@ -124,7 +126,9 @@ pub fn flatten_hierarchical_metrics(data: &MetricsData) -> (Vec<ConnectionMetric
                                 trace_id: trace_id.clone(),
                                 ucp_operation: dp.ucp_operation.clone(),
                                 transit_point: dp.transit_point.clone(),
-                                variant_alias: dp.variant_alias.clone(),
+                                surface_variant: dp
+                                    .surface_variant
+                                    .clone(),
                                 metric_type: dp.metric_type,
                                 correlation_id: dp.correlation_id.clone(),
                                 agent_identity: dp.agent_identity.clone(),

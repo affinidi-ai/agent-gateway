@@ -5917,10 +5917,9 @@ async fn process_forward_request_in_request_scope(
                 let metric_target = target_url.clone();
                 let metric_identity = caller_identity.clone();
                 let metric_trace = audit_trace_id.map(str::to_string).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                let metric_variant = active_variant_alias.clone();
                 Some(move |outcome: crate::mcp::modern_sse::ResponseOutcome| {
                     let latency = start_time.elapsed().as_millis() as u64;
-                    tokio::spawn(async move {
+                    crate::observability::policy_audit::spawn_in_request(async move {
                         guard.decrement().await;
                         if let (Some(monitor), Some(task_id)) = (monitor, tracked_task_id) {
                             monitor.record_bytes(&task_id, request_bytes, outcome.bytes).await;
@@ -5933,12 +5932,12 @@ async fn process_forward_request_in_request_scope(
                             metrics.record_connection_with_bytes_and_ucp(
                                 metric_surface.clone(), metric_source.clone(), metric_target.clone(), result,
                                 Some(latency), metric_identity.clone(), crate::metrics::ConnectionDirection::Request,
-                                metric_trace.clone(), request_bytes, 0, None, None, None, latency, metric_variant.clone(),
+                                metric_trace.clone(), request_bytes, 0, None, None, None, latency,
                             ).await;
                             metrics.record_connection_with_bytes(
                                 metric_surface, metric_target, metric_source, result, Some(latency), metric_identity,
                                 crate::metrics::ConnectionDirection::Response, metric_trace, 0, outcome.bytes, None, None,
-                                latency, metric_variant,
+                                latency,
                             ).await;
                         }
                     });
@@ -6322,7 +6321,6 @@ async fn process_forward_request_in_request_scope(
                     validation_status,
                     None,                    // validation_error
                     caller_identity.clone(), // identity_hash
-                    active_variant_alias.as_deref(),
                 )
                 .await;
 
@@ -6596,7 +6594,6 @@ async fn process_forward_request_in_request_scope(
                         None,
                         None,
                         request_latency_ms,
-                        None,
                     )
                     .await;
 
@@ -6630,7 +6627,6 @@ async fn process_forward_request_in_request_scope(
                         None,
                         None,
                         response_latency_ms,
-                        None,
                     )
                     .await;
 
@@ -7669,17 +7665,6 @@ async fn handle_a2a_proxy_forward(
             .config_id()
             .map(str::to_string)
             .unwrap_or_else(|| channel_id.to_string());
-        let active_variant_alias = message
-            .message_body
-            .get("active_variant_alias")
-            .and_then(|v| v.as_str())
-            .or_else(|| {
-                message
-                    .message_body
-                    .get("virtual_channel_alias")
-                    .and_then(|v| v.as_str())
-            })
-            .map(str::to_string);
 
         metrics_store
             .record_connection_with_bytes(
@@ -7696,7 +7681,6 @@ async fn handle_a2a_proxy_forward(
                 None,
                 None,
                 latency_ms,
-                active_variant_alias.clone(),
             )
             .await;
         metrics_store
@@ -7714,7 +7698,6 @@ async fn handle_a2a_proxy_forward(
                 None,
                 None,
                 latency_ms,
-                active_variant_alias,
             )
             .await;
     }
@@ -7743,7 +7726,6 @@ async fn handle_a2a_proxy_forward(
             validation_status,
             None,
             caller_identity,
-            None,
         )
         .await;
     }
@@ -8079,16 +8061,6 @@ async fn handle_mcp_proxy_forward(
                 let config_id = surface
                     .config_id()
                     .unwrap_or("unknown");
-                let active_variant_alias = message
-                    .message_body
-                    .get("active_variant_alias")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| {
-                        message
-                            .message_body
-                            .get("virtual_channel_alias")
-                            .and_then(|v| v.as_str())
-                    });
                 crate::observability::payload_capture::broadcast_payload_capture_async(
                     &Some(ws_state.clone()),
                     &Some(metrics_store.clone()),
@@ -8099,7 +8071,6 @@ async fn handle_mcp_proxy_forward(
                     "success", // MCP protocol doesn't have A2A extension validation
                     None,
                     None, // identity_hash
-                    active_variant_alias,
                 )
                 .await;
             }
@@ -8157,7 +8128,6 @@ async fn handle_mcp_proxy_forward(
                         None,
                         None,
                         latency_ms,
-                        None,
                     )
                     .await;
 
@@ -8180,7 +8150,6 @@ async fn handle_mcp_proxy_forward(
                         None,
                         None,
                         latency_ms,
-                        None,
                     )
                     .await;
 
@@ -8225,16 +8194,6 @@ async fn handle_mcp_proxy_forward(
 
             // Broadcast payload capture for failed MCP proxy request
             if let (Some(ws_state), Some(metrics_store)) = (GLOBAL_WS_STATE.get(), GLOBAL_METRICS_STORE.get()) {
-                let active_variant_alias = message
-                    .message_body
-                    .get("active_variant_alias")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| {
-                        message
-                            .message_body
-                            .get("virtual_channel_alias")
-                            .and_then(|v| v.as_str())
-                    });
                 crate::observability::payload_capture::broadcast_payload_capture_async(
                     &Some(ws_state.clone()),
                     &Some(metrics_store.clone()),
@@ -8245,7 +8204,6 @@ async fn handle_mcp_proxy_forward(
                     "mcp_error", // Custom status for MCP errors
                     Some(format!("MCP Proxy Error: {}", error_msg)),
                     None,
-                    active_variant_alias,
                 )
                 .await;
             }
@@ -8284,7 +8242,6 @@ async fn handle_mcp_proxy_forward(
                         None,
                         None,
                         latency_ms,
-                        None,
                     )
                     .await;
 
@@ -8307,7 +8264,6 @@ async fn handle_mcp_proxy_forward(
                         None,
                         None,
                         latency_ms,
-                        None,
                     )
                     .await;
 

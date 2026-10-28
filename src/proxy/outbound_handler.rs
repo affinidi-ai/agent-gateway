@@ -5275,12 +5275,9 @@ fn step_record_metrics(
             .virtual_channel
             .alias
             .clone();
-        let variant_alias = ctx
-            .active_variant_alias
-            .clone();
         let metrics = Arc::clone(metrics);
 
-        tokio::spawn(async move {
+        crate::observability::policy_audit::spawn_in_request(async move {
             metrics
                 .record_connection_with_transit_point(
                     channel_config_id,
@@ -5298,7 +5295,6 @@ fn step_record_metrics(
                     None,
                     None,
                     latency_ms,
-                    variant_alias,
                 )
                 .await;
         });

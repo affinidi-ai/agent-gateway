@@ -16,7 +16,6 @@ pub async fn broadcast_payload_capture_async(
     validation_status: &str,
     validation_error: Option<String>,
     identity_hash: Option<String>,
-    variant_alias: Option<&str>,
 ) {
     broadcast_payload_capture_extended(
         ws_state,
@@ -30,12 +29,12 @@ pub async fn broadcast_payload_capture_async(
         validation_status,
         validation_error,
         identity_hash,
-        variant_alias,
     )
     .await;
 }
 
-/// Extended payload capture with 4-stage transformation pipeline
+/// Extended payload capture with 4-stage transformation pipeline. The update
+/// names the surface variant of the request being served, when there is one.
 #[allow(clippy::too_many_arguments)]
 pub async fn broadcast_payload_capture_extended(
     ws_state: &Option<Arc<crate::server::WsState>>,
@@ -49,7 +48,6 @@ pub async fn broadcast_payload_capture_extended(
     validation_status: &str,
     validation_error: Option<String>,
     identity_hash: Option<String>,
-    variant_alias: Option<&str>,
 ) {
     // Store payload in metrics if we have an identity hash
     if let (Some(metrics), Some(hash)) = (metrics_store, &identity_hash) {
@@ -91,7 +89,7 @@ pub async fn broadcast_payload_capture_extended(
             validation_status: validation_status.to_string(),
             validation_error,
             derived_schema: Box::new(default_schema),
-            variant_alias: variant_alias.map(str::to_string),
+            surface_variant: crate::observability::policy_audit::current_request_variant(),
         });
         debug!(
             channel = channel_name,
@@ -101,5 +99,46 @@ pub async fn broadcast_payload_capture_extended(
         );
     } else {
         warn!(channel = channel_name, "Cannot broadcast payload - ws_state is None");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn capture_one(ws: &Option<Arc<crate::server::WsState>>) {
+        broadcast_payload_capture_async(
+            ws,
+            &None,
+            "Orders",
+            "orders",
+            &serde_json::json!({"jsonrpc": "2.0"}),
+            None,
+            "valid",
+            None,
+            None,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_payload_captured_in_a_request_names_its_variant() {
+        use crate::observability::policy_audit::{RequestScope, in_request, set_request_variant};
+        let ws = Arc::new(crate::server::WsState::new(4));
+        let mut updates = ws.subscribe();
+        let ws = Some(ws);
+
+        in_request(RequestScope::new("0123456789abcdef".to_string()), async {
+            set_request_variant("_base_");
+            capture_one(&ws).await;
+        })
+        .await;
+        capture_one(&ws).await;
+
+        let in_request = serde_json::to_value(updates.recv().await.unwrap()).unwrap();
+        let outside = serde_json::to_value(updates.recv().await.unwrap()).unwrap();
+        assert_eq!(in_request["surface_variant"], "_base_", "{in_request}");
+        assert!(in_request.get("variant_alias").is_none(), "{in_request}");
+        assert!(outside.get("surface_variant").is_none(), "{outside}");
     }
 }

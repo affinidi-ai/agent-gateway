@@ -1065,10 +1065,7 @@ pub async fn handle_agent_card(
         } else {
             None
         };
-        let variant_alias = state
-            .active_variant_alias
-            .clone();
-        tokio::spawn(async move {
+        crate::observability::policy_audit::spawn_in_request(async move {
             metrics
                 .record_connection_with_ucp(
                     channel_config_id,
@@ -1083,7 +1080,6 @@ pub async fn handle_agent_card(
                     None,
                     None,
                     0,
-                    variant_alias,
                 )
                 .await;
         });
@@ -1407,14 +1403,11 @@ fn streamed_response_completion(
         .target
         .endpoint
         .clone();
-    let variant = state
-        .active_variant_alias
-        .clone();
     move |outcome: crate::mcp::modern_sse::ResponseOutcome| {
         let latency = start_time
             .elapsed()
             .as_millis() as u64;
-        tokio::spawn(async move {
+        crate::observability::policy_audit::spawn_in_request(async move {
             guard.decrement().await;
             if let (Some(monitor), Some(task_id)) = (monitor, task_id) {
                 monitor
@@ -1446,7 +1439,6 @@ fn streamed_response_completion(
                         None,
                         None,
                         latency,
-                        variant,
                     )
                     .await;
             }
@@ -3266,7 +3258,7 @@ async fn proxy_handler_with_mcp_runtime(
                                 .clone();
                             let metrics_clone = Arc::clone(metrics);
                             let trace_id_clone = trace_id.clone();
-                            tokio::spawn(async move {
+                            crate::observability::policy_audit::spawn_in_request(async move {
                                 metrics_clone
                                     .record_connection(
                                         channel_config_id,
@@ -3280,7 +3272,6 @@ async fn proxy_handler_with_mcp_runtime(
                                         None,
                                         None,
                                         latency_ms,
-                                        None,
                                     )
                                     .await;
                             });
@@ -3357,7 +3348,7 @@ async fn proxy_handler_with_mcp_runtime(
                         .clone();
                     let metrics_clone = Arc::clone(metrics);
                     let trace_id_clone = trace_id.clone();
-                    tokio::spawn(async move {
+                    crate::observability::policy_audit::spawn_in_request(async move {
                         metrics_clone
                             .record_connection(
                                 channel_config_id,
@@ -3371,7 +3362,6 @@ async fn proxy_handler_with_mcp_runtime(
                                 None,
                                 None,
                                 latency_ms,
-                                None,
                             )
                             .await;
                     });
@@ -3797,7 +3787,7 @@ async fn proxy_handler_with_mcp_runtime(
                         .endpoint
                         .clone();
                     let trace_id = uuid::Uuid::new_v4().to_string();
-                    tokio::spawn(async move {
+                    crate::observability::policy_audit::spawn_in_request(async move {
                         metrics
                             .record_connection(
                                 channel_config_id,
@@ -3811,7 +3801,6 @@ async fn proxy_handler_with_mcp_runtime(
                                 None,
                                 None,
                                 latency_ms,
-                                None,
                             )
                             .await;
                     });
@@ -3931,7 +3920,7 @@ async fn proxy_handler_with_mcp_runtime(
                         .clone();
                     let metrics = Arc::clone(metrics);
                     let trace = trace_id.clone();
-                    tokio::spawn(async move {
+                    crate::observability::policy_audit::spawn_in_request(async move {
                         metrics
                             .record_connection(
                                 channel_config_id,
@@ -3945,7 +3934,6 @@ async fn proxy_handler_with_mcp_runtime(
                                 None,
                                 None,
                                 latency_ms,
-                                None,
                             )
                             .await;
                     });
@@ -4482,7 +4470,7 @@ async fn proxy_handler_with_mcp_runtime(
                             .target
                             .endpoint
                             .clone();
-                        tokio::spawn(async move {
+                        crate::observability::policy_audit::spawn_in_request(async move {
                             metrics
                                 .record_connection(
                                     channel_config_id,
@@ -4496,7 +4484,6 @@ async fn proxy_handler_with_mcp_runtime(
                                     None,
                                     None,
                                     latency_ms,
-                                    None,
                                 )
                                 .await;
                         });
@@ -4574,7 +4561,7 @@ async fn proxy_handler_with_mcp_runtime(
                             .target
                             .endpoint
                             .clone();
-                        tokio::spawn(async move {
+                        crate::observability::policy_audit::spawn_in_request(async move {
                             metrics
                                 .record_connection(
                                     channel_config_id,
@@ -4588,7 +4575,6 @@ async fn proxy_handler_with_mcp_runtime(
                                     None,
                                     None,
                                     latency_ms,
-                                    None,
                                 )
                                 .await;
                         });
@@ -4664,9 +4650,6 @@ async fn proxy_handler_with_mcp_runtime(
             source_authenticated: authenticated_identity.is_some(),
             metrics_store: &state.metrics_store,
             ws_state: &state.ws_state,
-            variant_alias: state
-                .active_variant_alias
-                .as_deref(),
         };
 
         let identity_result = match async { inspect_message_extensions(&body_bytes, &inspection_ctx).await }
@@ -4693,7 +4676,7 @@ async fn proxy_handler_with_mcp_runtime(
                         .endpoint
                         .clone();
                     let trace_id = uuid::Uuid::new_v4().to_string();
-                    tokio::spawn(async move {
+                    crate::observability::policy_audit::spawn_in_request(async move {
                         metrics
                             .record_connection(
                                 channel_config_id,
@@ -4707,7 +4690,6 @@ async fn proxy_handler_with_mcp_runtime(
                                 None,
                                 None,
                                 latency_ms,
-                                None,
                             )
                             .await;
                     });
@@ -7583,7 +7565,7 @@ async fn proxy_handler_with_mcp_runtime(
                             .endpoint
                             .clone();
                         let trace = trace_id.clone();
-                        tokio::spawn(async move {
+                        crate::observability::policy_audit::spawn_in_request(async move {
                             metrics
                                 .record_connection(
                                     channel_config_id,
@@ -7597,7 +7579,6 @@ async fn proxy_handler_with_mcp_runtime(
                                     None,
                                     None,
                                     latency_ms,
-                                    None,
                                 )
                                 .await;
                         });
@@ -8505,7 +8486,7 @@ async fn proxy_handler_with_mcp_runtime(
                             .endpoint
                             .clone();
                         let trace_id = uuid::Uuid::new_v4().to_string();
-                        tokio::spawn(async move {
+                        crate::observability::policy_audit::spawn_in_request(async move {
                             metrics
                                 .record_connection(
                                     channel_config_id,
@@ -8519,7 +8500,6 @@ async fn proxy_handler_with_mcp_runtime(
                                     None,
                                     None,
                                     latency_ms,
-                                    None,
                                 )
                                 .await;
                         });
@@ -8775,9 +8755,6 @@ async fn proxy_handler_with_mcp_runtime(
                 "success",
                 None,
                 identity_hash.clone(),
-                state
-                    .active_variant_alias
-                    .as_deref(),
             )
             .await;
         }
@@ -8892,10 +8869,7 @@ async fn proxy_handler_with_mcp_runtime(
             }
 
             // Record single metric with all latency breakdowns
-            let variant_alias = state
-                .active_variant_alias
-                .clone();
-            tokio::spawn(async move {
+            crate::observability::policy_audit::spawn_in_request(async move {
                 metrics
                     .record_connection_with_ucp(
                         channel_config_id,
@@ -8910,7 +8884,6 @@ async fn proxy_handler_with_mcp_runtime(
                         Some(request_latency_ms),
                         Some(channel_response_latency_ms),
                         total_latency_ms,
-                        variant_alias,
                     )
                     .await;
             });
@@ -9804,10 +9777,7 @@ fn handle_upstream_error(
             .clone();
         let hash = identity_hash.clone();
         let ucp_op = ucp_operation.clone();
-        let variant_alias = state
-            .active_variant_alias
-            .clone();
-        tokio::spawn(async move {
+        crate::observability::policy_audit::spawn_in_request(async move {
             metrics
                 .record_connection_with_ucp(
                     channel_config_id,
@@ -9822,7 +9792,6 @@ fn handle_upstream_error(
                     None,
                     None,
                     0,
-                    variant_alias,
                 )
                 .await;
         });
@@ -10392,9 +10361,6 @@ async fn handle_fabric_request(
             source_authenticated: authenticated_identity.is_some(),
             metrics_store: &state.metrics_store,
             ws_state: &state.ws_state,
-            variant_alias: state
-                .active_variant_alias
-                .as_deref(),
         };
         match async { inspect_message_extensions(&body_bytes, &inspection_ctx).await }
             .instrument(inspection_span)
@@ -12615,15 +12581,12 @@ async fn handle_fabric_request(
             let source = source_addr.clone();
             let identity = identity_hash.clone();
             let trace = trace_id.clone();
-            let variant = state
-                .active_variant_alias
-                .clone();
             let request_bytes = body_bytes.len() as u64;
             move |outcome: crate::mcp::modern_sse::ResponseOutcome| {
                 let latency = start_time
                     .elapsed()
                     .as_millis() as u64;
-                tokio::spawn(async move {
+                crate::observability::policy_audit::spawn_in_request(async move {
                     guard.decrement().await;
                     if let (Some(monitor), Some(task_id)) = (monitor, task_id) {
                         monitor
@@ -12655,7 +12618,6 @@ async fn handle_fabric_request(
                                 None,
                                 None,
                                 latency,
-                                variant,
                             )
                             .await;
                     }
@@ -13601,9 +13563,6 @@ async fn handle_fabric_request(
                         validation_status,
                         None, // validation_error
                         identity_hash.clone(),
-                        state
-                            .active_variant_alias
-                            .as_deref(),
                     )
                     .await;
 
@@ -13854,12 +13813,9 @@ async fn handle_fabric_request(
                     let identity = identity_hash.clone();
                     let trace = trace_id.clone();
                     let ucp_op = ucp_operation.clone();
-                    let variant_alias = state
-                        .active_variant_alias
-                        .clone();
 
                     // Record single metric with total latency
-                    tokio::spawn(async move {
+                    crate::observability::policy_audit::spawn_in_request(async move {
                         metrics
                             .record_connection_with_ucp(
                                 channel_config_id,
@@ -13874,7 +13830,6 @@ async fn handle_fabric_request(
                                 None,
                                 None,
                                 latency_ms,
-                                variant_alias,
                             )
                             .await;
                     });
@@ -13929,10 +13884,7 @@ async fn handle_fabric_request(
                     let identity = identity_hash.clone();
                     let trace = trace_id.clone();
                     let ucp_op = ucp_operation.clone();
-                    let variant_alias = state
-                        .active_variant_alias
-                        .clone();
-                    tokio::spawn(async move {
+                    crate::observability::policy_audit::spawn_in_request(async move {
                         metrics
                             .record_connection_with_ucp(
                                 channel_config_id,
@@ -13947,7 +13899,6 @@ async fn handle_fabric_request(
                                 None,
                                 None,
                                 latency_ms,
-                                variant_alias,
                             )
                             .await;
                     });
@@ -13993,10 +13944,7 @@ async fn handle_fabric_request(
                     let identity = identity_hash.clone();
                     let trace = trace_id.clone();
                     let ucp_op = ucp_operation.clone();
-                    let variant_alias = state
-                        .active_variant_alias
-                        .clone();
-                    tokio::spawn(async move {
+                    crate::observability::policy_audit::spawn_in_request(async move {
                         metrics
                             .record_connection_with_ucp(
                                 channel_config_id,
@@ -14011,7 +13959,6 @@ async fn handle_fabric_request(
                                 None,
                                 None,
                                 latency_ms,
-                                variant_alias,
                             )
                             .await;
                     });
@@ -14385,7 +14332,7 @@ fn record_agent_card_gateway_fault(
             .endpoint
             .clone();
         let trace_id = uuid::Uuid::new_v4().to_string();
-        tokio::spawn(async move {
+        crate::observability::policy_audit::spawn_in_request(async move {
             metrics
                 .record_connection(
                     channel_config_id,
@@ -14399,7 +14346,6 @@ fn record_agent_card_gateway_fault(
                     None,
                     None,
                     0,
-                    None,
                 )
                 .await;
         });
@@ -14766,9 +14712,6 @@ async fn record_a2a_proxy_connection_metric(
             None,
             None,
             latency_ms,
-            state
-                .active_variant_alias
-                .clone(),
         )
         .await;
 
@@ -15595,9 +15538,6 @@ async fn handle_mcp_proxy_request(
                 "success", // MCP protocol doesn't have A2A extension validation
                 None,
                 None, // identity_hash - MCP channels might not have identity tracking
-                state
-                    .active_variant_alias
-                    .as_deref(),
             )
             .await;
 
@@ -15616,7 +15556,7 @@ async fn handle_mcp_proxy_request(
                 let trace = trace_id.clone();
 
                 // Record single metric with total latency
-                tokio::spawn(async move {
+                crate::observability::policy_audit::spawn_in_request(async move {
                     metrics
                         .record_connection(
                             channel_config_id,
@@ -15630,7 +15570,6 @@ async fn handle_mcp_proxy_request(
                             None,
                             None,
                             latency_ms,
-                            None,
                         )
                         .await;
                 });
@@ -15676,9 +15615,6 @@ async fn handle_mcp_proxy_request(
                 "mcp_error", // Custom status to differentiate MCP errors from A2A validation failures
                 Some(format!("MCP Proxy Error: {}", e)),
                 None,
-                state
-                    .active_variant_alias
-                    .as_deref(),
             )
             .await;
 
@@ -15697,7 +15633,7 @@ async fn handle_mcp_proxy_request(
                 let trace = trace_id.clone();
 
                 // Record single metric with total latency
-                tokio::spawn(async move {
+                crate::observability::policy_audit::spawn_in_request(async move {
                     metrics
                         .record_connection(
                             channel_config_id,
@@ -15711,7 +15647,6 @@ async fn handle_mcp_proxy_request(
                             None,
                             None,
                             latency_ms,
-                            None,
                         )
                         .await;
                 });
