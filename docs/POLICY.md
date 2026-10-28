@@ -151,7 +151,7 @@ runs that list for such a target. For a variant, only a target list the variant 
 override counts; an inherited list that cannot run on the variant's endpoint is ignored.
 
 A write that does not declare the shape is converted only while the stored surface has no
-Transit Point lists: an undeclared create or `PUT` that carries a `target.trust_check_list` is
+Trust Check lists at all (no `trust_check_split` and no Transit Point lists): an undeclared create or `PUT` that carries a `target.trust_check_list` is
 then treated as the old shape, converted exactly as a stored surface is (below), logged as a
 warning, and saved. Once any of the surface's Transit Points hold lists, an undeclared write
 cannot change Trust Checks. An undeclared `PUT` keeps every stored Transit Point list for each

@@ -400,10 +400,11 @@ const PER_TRANSIT_POINT_REQUIRED: &str = "this surface stores Trust Checks per T
 /// body is never converted. `sent` is the request JSON as the client sent it,
 /// so an absent field can be told from an empty one.
 ///
-/// - Each incoming Transit Point sent without a list (matched by `id`, else
-///   `alias`; a variant's own points against the same stored variant's, by
-///   variant `id`) keeps the stored list and its `trust_check_migrated` flag
-///   as stored; a list that differs from the stored one is refused.
+/// - Each incoming Transit Point sent without a list (matched by `id` when the
+///   client sent one, otherwise by `alias`; a variant's own points against the
+///   same stored variant's, by variant `id`) keeps the stored list and its
+///   `trust_check_migrated` flag as stored; a list that differs from the
+///   stored one is refused.
 /// - A base `target.trust_check_list` (or a variant override's) that is absent
 ///   or `null` keeps the stored one; a sent list, empty included, that differs
 ///   from the stored one is refused.
@@ -421,16 +422,23 @@ fn keep_stored_point_lists(
     fn keep(
         points: &mut [TransitPoint],
         stored_points: &[TransitPoint],
+        sent_points: Option<&Vec<serde_json::Value>>,
     ) -> bool {
-        for point in points.iter_mut() {
-            let stored_point = stored_points
-                .iter()
-                .find(|stored| !point.id.is_empty() && stored.id == point.id)
-                .or_else(|| {
-                    stored_points
-                        .iter()
-                        .find(|stored| stored.alias == point.alias)
-                });
+        for (index, point) in points.iter_mut().enumerate() {
+            let sent_id = sent_points
+                .and_then(|sent| sent.get(index))
+                .and_then(|sent| sent.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|id| !id.is_empty());
+            let stored_point = if sent_id {
+                stored_points
+                    .iter()
+                    .find(|stored| stored.id == point.id)
+            } else {
+                stored_points
+                    .iter()
+                    .find(|stored| stored.alias == point.alias)
+            };
             if point
                 .trust_check_list
                 .is_empty()
@@ -467,8 +475,11 @@ fn keep_stored_point_lists(
         .as_ref()
         .map(|transit| transit.points.as_slice())
         .unwrap_or_default();
+    fn sent_points(value: Option<&serde_json::Value>) -> Option<&Vec<serde_json::Value>> {
+        value.and_then(serde_json::Value::as_array)
+    }
     if let Some(transit) = surface.transit.as_mut()
-        && !keep(&mut transit.points, stored_base_points)
+        && !keep(&mut transit.points, stored_base_points, sent_points(sent.pointer("/transit/points")))
     {
         return Err(refused());
     }
@@ -537,7 +548,15 @@ fn keep_stored_point_lists(
             .transit
             .as_mut()
             .and_then(|transit| transit.points.as_mut())
-            && !keep(points, stored_points)
+            && !keep(
+                points,
+                stored_points,
+                sent_points(
+                    sent_variants
+                        .and_then(|variants| variants.get(index))
+                        .and_then(|variant| variant.pointer("/overrides/transit/points")),
+                ),
+            )
         {
             return Err(refused());
         }
@@ -546,10 +565,10 @@ fn keep_stored_point_lists(
 }
 
 /// Settle the Trust Check lists of a PUT body. A body declaring
-/// `trust_check_split: true` is taken as sent. Otherwise a surface whose stored
-/// Transit Points hold no lists is unsplit and the body is converted with
-/// [`convert_old_shape_body`]; an already split one goes through
-/// [`keep_stored_point_lists`].
+/// `trust_check_split: true` is taken as sent. Otherwise a stored surface with
+/// no Trust Check lists (no stored marker and no Transit Point lists) is
+/// unsplit and the body is converted with [`convert_old_shape_body`]; an
+/// already split one goes through [`keep_stored_point_lists`].
 fn settle_undeclared_put(
     surface: &mut AgentSurface,
     stored: &AgentSurface,
@@ -558,7 +577,7 @@ fn settle_undeclared_put(
     if surface.trust_check_split {
         return Ok(());
     }
-    if stored.has_transit_point_trust_checks() {
+    if stored.trust_check_split || stored.has_transit_point_trust_checks() {
         keep_stored_point_lists(surface, stored, sent)
     } else {
         convert_old_shape_body(surface)
@@ -4324,12 +4343,123 @@ mod validation_tests {
             .collect()
     }
 
+    fn with_stored_point_ids(
+        mut body: AgentSurface,
+        stored: &AgentSurface,
+    ) -> AgentSurface {
+        let stored_points = &stored
+            .transit
+            .as_ref()
+            .unwrap()
+            .points;
+        for (point, stored_point) in body
+            .transit
+            .as_mut()
+            .unwrap()
+            .points
+            .iter_mut()
+            .zip(stored_points)
+        {
+            point.id = stored_point.id.clone();
+        }
+        body
+    }
+
     fn put(
         body: &mut AgentSurface,
         stored: &AgentSurface,
     ) -> Result<(), SurfaceApiError> {
         let sent = serde_json::to_value(&*body).expect("sent");
         settle_undeclared_put(body, stored, &sent)
+    }
+
+    #[test]
+    fn an_undeclared_put_does_not_refill_transit_points_emptied_on_a_marked_surface() {
+        let mut stored = fabric_surface_with_point(Vec::new());
+        stored.trust_check_split = true;
+        let mut body = stored.clone();
+        body.trust_check_split = false;
+
+        put(&mut body, &stored).expect("unchanged body");
+
+        assert!(
+            point(&body)
+                .trust_check_list
+                .is_empty(),
+            "the emptied Transit Point stays empty"
+        );
+        assert!(!point(&body).trust_check_migrated);
+        assert_eq!(body.target.trust_check_list[0].id, "fabric-target");
+    }
+
+    #[test]
+    fn an_unmarked_surface_without_lists_is_still_converted() {
+        let mut stored = fabric_surface_with_point(Vec::new());
+        stored
+            .target
+            .trust_check_list
+            .clear();
+        let mut body = stored.clone();
+        body.target.trust_check_list = vec![target_trust_check("old-shape")];
+
+        put(&mut body, &stored).expect("converted");
+
+        assert_eq!(point(&body).trust_check_list[0].id, "old-shape");
+        assert!(point(&body).trust_check_migrated);
+    }
+
+    #[test]
+    fn a_transit_point_sent_with_a_new_id_does_not_take_a_stored_list_by_alias() {
+        let stored = migrated(fabric_surface_with_point(vec![target_trust_check("copied")]));
+        let mut body = stored.clone();
+        body.transit
+            .as_mut()
+            .unwrap()
+            .points[0]
+            .id = "replacement-point".to_string();
+        {
+            let replacement = &mut body
+                .transit
+                .as_mut()
+                .unwrap()
+                .points[0];
+            replacement
+                .trust_check_list
+                .clear();
+            replacement.trust_check_migrated = false;
+        }
+
+        put(&mut body, &stored).expect("replacement point");
+
+        assert!(
+            point(&body)
+                .trust_check_list
+                .is_empty(),
+            "a point with a different id is a new point, whatever its alias"
+        );
+        assert!(!point(&body).trust_check_migrated);
+    }
+
+    #[test]
+    fn a_transit_point_sent_without_an_id_keeps_the_stored_list_by_alias() {
+        let stored = migrated(fabric_surface_with_point(vec![target_trust_check("copied")]));
+        let mut body = stored.clone();
+        body.transit
+            .as_mut()
+            .unwrap()
+            .points[0]
+            .trust_check_list
+            .clear();
+        let mut sent = serde_json::to_value(&body).unwrap();
+        sent["transit"]["points"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("id");
+
+        settle_undeclared_put(&mut body, &stored, &sent).expect("point without id");
+
+        assert_eq!(point(&body).trust_check_list[0].id, "copied");
+        assert!(point(&body).trust_check_migrated);
     }
 
     #[test]
@@ -4454,7 +4584,7 @@ mod validation_tests {
             .unwrap()
             .points[0]
             .trust_check_migrated = true;
-        let mut body = two_point_fabric_surface(Vec::new(), Vec::new());
+        let mut body = with_stored_point_ids(two_point_fabric_surface(Vec::new(), Vec::new()), &stored);
 
         put(&mut body, &stored).expect("old-shape body");
 
@@ -4481,7 +4611,7 @@ mod validation_tests {
         let mut new_point = two_point_fabric_surface(Vec::new(), vec![target_trust_check("new")]);
         assert_eq!(refused(put(&mut new_point, &stored)), PER_TRANSIT_POINT_REQUIRED);
 
-        let mut same = fabric_surface_with_point(vec![target_trust_check("copied")]);
+        let mut same = with_stored_point_ids(fabric_surface_with_point(vec![target_trust_check("copied")]), &stored);
         put(&mut same, &stored).expect("an unchanged list is accepted");
     }
 
