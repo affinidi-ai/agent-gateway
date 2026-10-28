@@ -161,6 +161,12 @@ pub struct DelegationAuditEvent {
     /// each have their own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    /// The variant of the surface `surface_id` names that served the request:
+    /// the variant's alias, `_base_` when the base surface served it, or
+    /// `_unknown_` when the URL named a variant the surface doesn't have.
+    /// Absent outside surface requests and on a misconfigured default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface_variant: Option<String>,
     /// Additional context
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
@@ -525,8 +531,6 @@ pub enum DelegationAuditAction {
         response_bytes: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ucp_op: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        variant_alias: Option<String>,
     },
     /// A policy definition was created.
     PolicyCreated(Box<PolicyChangeDetails>),
@@ -952,6 +956,7 @@ pub fn audit_event(
         vp_fingerprint: None,
         trace_id: None,
         request_id: None,
+        surface_variant: None,
         detail: None,
     }
 }
@@ -1538,6 +1543,7 @@ pub fn audit_policy_decision(
         vp_fingerprint: None,
         trace_id: trace_id.map(str::to_string),
         request_id: None,
+        surface_variant: None,
         detail: None,
     });
 }
@@ -1587,6 +1593,7 @@ pub fn audit_trust_check(
         vp_fingerprint: None,
         trace_id: trace_id.map(str::to_string),
         request_id: None,
+        surface_variant: None,
         detail: None,
     });
 }
@@ -1631,6 +1638,7 @@ pub fn audit_trace_terminated(
         vp_fingerprint: None,
         trace_id: Some(own_trace_id.to_string()),
         request_id: None,
+        surface_variant: None,
         detail: Some(format!("downstream_trace_id={downstream_trace_id}")),
     });
 }
@@ -1818,6 +1826,7 @@ mod tests {
             vp_fingerprint: None,
             trace_id: Some("own-123".to_string()),
             request_id: None,
+            surface_variant: None,
             detail: Some("downstream_trace_id=down-456".to_string()),
         };
         let json = serde_json::to_string(&event).unwrap();
@@ -2071,7 +2080,6 @@ mod tests {
                     request_bytes: 128,
                     response_bytes: 2048,
                     ucp_op: None,
-                    variant_alias: Some("beta".to_string()),
                 },
                 "request_completed",
             ),
@@ -2270,6 +2278,7 @@ mod tests {
                 vp_fingerprint: None,
                 trace_id: Some("trace-1".to_string()),
                 request_id: None,
+                surface_variant: None,
                 detail: None,
             },
             DelegationAuditEvent {
@@ -2310,6 +2319,7 @@ mod tests {
                 vp_fingerprint: None,
                 trace_id: Some("trace-1".to_string()),
                 request_id: None,
+                surface_variant: None,
                 detail: None,
             },
         ];

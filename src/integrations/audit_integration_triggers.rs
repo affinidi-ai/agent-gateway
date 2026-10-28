@@ -557,7 +557,6 @@ mod tests {
                 request_bytes: 0,
                 response_bytes: 0,
                 ucp_op: None,
-                variant_alias: None,
             },
             DelegationAuditAction::PolicyCreated(policy_change()),
             DelegationAuditAction::PolicyUpdated(policy_change()),
