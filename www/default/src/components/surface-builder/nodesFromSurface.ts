@@ -4,9 +4,14 @@ import type { SurfaceNodeType } from './nodeTypes';
 import { readCanvasSurfaceSize, readCanvasView, registry } from './elements';
 import { computeAutoLayout } from './autoLayout';
 import {
+  managedAgentTargetLegTrustCheckAllowed,
   TRUST_CHECK_CALLER_SLOT_ID,
   TRUST_CHECK_MANAGED_AGENT_SLOT_ID,
 } from './elements/edges/archetypes';
+import {
+  isManagedAgentTrustCheck,
+  managedAgentTrustCheckRunsOnTransitPoints,
+} from './elements/trust-check/definition';
 
 /**
  * Reconstruct the live canvas nodes from a saved AgentSurface payload.
@@ -113,8 +118,42 @@ function placeTrustChecksWithoutPosition(nodes: CanvasNode[]): CanvasNode[] {
   });
 }
 
+/**
+ * Drops the Managed Agent's own Trust Check when its target cannot run it
+ * (not `a2a-proxy://` or `fabric://`) and every Transit Point already runs
+ * the same queries, so no check is lost. Otherwise it stays and blocks Save.
+ */
+function dropRedundantManagedAgentTrustCheck(nodes: CanvasNode[]): CanvasNode[] {
+  const endpoint = nodes.find(n => n.type === 'target')?.config?.endpoint;
+  if (managedAgentTargetLegTrustCheckAllowed(endpoint)) return nodes;
+  const redundant = new Set(
+    nodes
+      .filter(
+        n =>
+          n.type === 'trust-check' &&
+          isManagedAgentTrustCheck(n, nodes) &&
+          managedAgentTrustCheckRunsOnTransitPoints(n.config, nodes)
+      )
+      .map(n => n.id)
+  );
+  if (redundant.size === 0) return nodes;
+  const parentOf = new Map(nodes.map(n => [n.id, n.parentId] as const));
+  const liveParent = (id: string | undefined): string | undefined => {
+    let current = id;
+    while (current && redundant.has(current)) current = parentOf.get(current);
+    return current;
+  };
+  return nodes
+    .filter(n => !redundant.has(n.id))
+    .map(n =>
+      n.parentId && redundant.has(n.parentId) ? { ...n, parentId: liveParent(n.parentId) } : n
+    );
+}
+
 export function hydrateSurfaceCanvas(surface: AgentSurface | null): HydratedSurfaceCanvas {
-  const nodes = placeTrustChecksWithoutPosition(reconstructNodesFromSurface(surface));
+  const nodes = placeTrustChecksWithoutPosition(
+    dropRedundantManagedAgentTrustCheck(reconstructNodesFromSurface(surface))
+  );
   const surfaceSize = readCanvasSurfaceSize(surface);
   const view = readCanvasView(surface);
   const visibleNodes = nodes.filter(node => node.type !== 'target-variant');

@@ -34,7 +34,7 @@ const TrustCheckFullscreenPanel: React.FC<ConfigPanelProps> = ({
   closeFullscreenEditor,
   allNodes,
 }) => {
-  const leg = trustCheckLeg(node);
+  const leg = trustCheckLeg(node, allNodes);
   const readOnlyProtocol = readOnlyTrustCheckProtocol(node, allNodes);
   const isApMa = leg === 'caller';
   const legLabel = isApMa ? 'caller' : 'target';

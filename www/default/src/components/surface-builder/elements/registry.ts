@@ -15,7 +15,7 @@ import {
   TRUST_CHECK_MANAGED_AGENT_SLOT_ID,
   TRUST_CHECK_TRANSIT_POINT_SLOT_ID,
 } from './edges/archetypes';
-import { queriesFromWire } from './trust-check/definition';
+import { queriesFromWire, STORED_TRUST_CHECK_LIST_KEY } from './trust-check/definition';
 import { TRANSIT_POINT_FIELDS } from './agentSurfaceSchema';
 import { transitConfigConfigFromPayload } from './transit-config/definition';
 import { workloadBindingApiToForm } from './workload-binding/config';
@@ -238,7 +238,10 @@ class ElementRegistry {
           return true;
         }
       })
-      .map(dep => ({ severity: dep.severity, message: dep.message }));
+      .map(dep => ({
+        severity: dep.severity,
+        message: typeof dep.message === 'function' ? dep.message(cfg, context, node) : dep.message,
+      }));
   }
 
   /**
@@ -614,11 +617,19 @@ class ElementRegistry {
       edge: 'ap-ma' | 'ma-tp',
       parentId: string,
       slotId: string,
-      migrated = false
+      migrated = false,
+      keepStoredList = false
     ) => {
       const queries = queriesFromWire(raw);
       if (queries.length === 0) return;
-      const config = { _edge: edge, queries, ...(migrated ? { trust_check_migrated: true } : {}) };
+      const config = {
+        _edge: edge,
+        queries,
+        ...(migrated ? { trust_check_migrated: true } : {}),
+        ...(keepStoredList
+          ? { [STORED_TRUST_CHECK_LIST_KEY]: JSON.parse(JSON.stringify(raw)) }
+          : {}),
+      };
       nodes.push({
         id,
         type: 'trust-check',
@@ -868,7 +879,8 @@ class ElementRegistry {
         'ma-tp',
         tpId,
         TRUST_CHECK_TRANSIT_POINT_SLOT_ID,
-        tp?.trust_check_migrated === true
+        tp?.trust_check_migrated === true,
+        tpType !== 'transit-point-a2a' && tpType !== 'transit-point-ap2'
       );
       // Per-TP managed identity (`transit.points[i].managed_identity`).
       // Mirrors the request-slot id produced by the identity element
@@ -1067,7 +1079,14 @@ class ElementRegistry {
         if (!target) {
           if (!bn.type) continue;
           const def = this.get(bn.type);
-          if (def?.payloadOwnsConfig && !def.isBlobPlaceholder?.(bn.config ?? {}, bn, payload)) {
+          const parentType =
+            typeof bn.parentId === 'string'
+              ? (blobById.get(bn.parentId)?.type ?? byId.get(bn.parentId)?.type)
+              : undefined;
+          if (
+            def?.payloadOwnsConfig &&
+            !def.isBlobPlaceholder?.(bn.config ?? {}, { ...bn, parentType }, payload)
+          ) {
             if (typeof bn.parentId === 'string') renameMap.set(bn.id, bn.parentId);
             continue;
           }

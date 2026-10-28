@@ -1,6 +1,5 @@
 import type { PredefinedTrustCheckQuery } from '../../../../types';
 import {
-  findSlotById,
   isTransitPointType,
   managedAgentTargetLegTrustCheckAllowed,
   TRUST_CHECK_CALLER_SLOT_ID,
@@ -414,14 +413,23 @@ export function applyPresetToQuery(
  */
 export type TrustCheckLeg = 'caller' | 'managed-agent' | 'transit-point';
 
-export function trustCheckLeg(node: { slotId?: string; config?: any }): TrustCheckLeg {
+/**
+ * A node parented on a Transit Point is that Transit Point's leg whatever
+ * its slot id says. Otherwise the slot decides, and a node with no known
+ * slot is the caller leg: only a node in the Managed Agent slot is the
+ * Managed Agent's own leg. Pass `allNodes` so the parent's type is known.
+ */
+export function trustCheckLeg(
+  node: { slotId?: string; parentId?: string; config?: any },
+  allNodes?: ReadonlyArray<{ id: string; type: string }>
+): TrustCheckLeg {
+  const parent = node.parentId ? allNodes?.find(n => n.id === node.parentId) : undefined;
+  if (parent && isTransitPointType(parent.type)) return 'transit-point';
   const slotId = node.slotId || '';
   if (slotId === TRUST_CHECK_CALLER_SLOT_ID) return 'caller';
   if (slotId === TRUST_CHECK_MANAGED_AGENT_SLOT_ID) return 'managed-agent';
   if (slotId === TRUST_CHECK_TRANSIT_POINT_SLOT_ID) return 'transit-point';
-  const resolved = slotId ? findSlotById(slotId) : undefined;
-  if (resolved?.archetype.id === 'ap-ma') return 'caller';
-  return node.config?._edge === 'ma-tp' ? 'managed-agent' : 'caller';
+  return 'caller';
 }
 
 function nodeEdge(node: { slotId?: string; config?: any }): 'ap-ma' | 'ma-tp' {
@@ -580,13 +588,61 @@ export function isManagedAgentTrustCheck(
   node: { slotId?: string; parentId?: string; config?: any },
   allNodes: ReadonlyArray<{ id: string; type: string }>
 ): boolean {
-  const parent = node.parentId ? allNodes.find(n => n.id === node.parentId) : undefined;
-  if (parent && isTransitPointType(parent.type)) return false;
-  return trustCheckLeg(node) === 'managed-agent';
+  return trustCheckLeg(node, allNodes) === 'managed-agent';
 }
 
 export const MANAGED_AGENT_TRUST_CHECK_TARGET_MESSAGE =
   "The Managed Agent's own Trust Check runs only on an A2A Proxy or gateway target. Remove it or switch the target.";
+
+export const MANAGED_AGENT_TRUST_CHECK_DUPLICATED_NOTE =
+  "The same checks already run on this surface's Transit Points, so removing it loses nothing.";
+
+function queryKey(q: TrustCheckQueryConfig): string {
+  const query = q.query || {};
+  return JSON.stringify([
+    q.trust_registry_id ?? '',
+    q.query_type === 'recognition' ? 'recognition' : 'authorization',
+    String(query.authority_id ?? '').trim(),
+    String(query.entity_id ?? '').trim(),
+    String(query.action ?? '').trim(),
+    String(query.resource ?? '').trim(),
+  ]);
+}
+
+function sameQueries(a: TrustCheckQueryConfig[], b: TrustCheckQueryConfig[]): boolean {
+  const ka = a.map(queryKey).sort();
+  const kb = b.map(queryKey).sort();
+  return ka.length === kb.length && ka.every((k, i) => k === kb[i]);
+}
+
+/**
+ * True when the surface has Transit Points and every one of them carries a
+ * Trust Check with the same queries as the Managed Agent's own one, so
+ * removing the Managed Agent's copy loses nothing.
+ */
+export function managedAgentTrustCheckRunsOnTransitPoints(
+  config: any,
+  allNodes: ReadonlyArray<{ id: string; type: string; parentId?: string; config?: any }>
+): boolean {
+  const queries = readQueries(config);
+  if (queries.length === 0) return false;
+  const transitPoints = allNodes.filter(n => isTransitPointType(n.type));
+  if (transitPoints.length === 0) return false;
+  return transitPoints.every(tp => {
+    const tc = allNodes.find(n => n.type === 'trust-check' && n.parentId === tp.id);
+    return !!tc && sameQueries(readQueries(tc.config), queries);
+  });
+}
+
+/** The Save-blocking message for the Managed Agent's own Trust Check on an unsupported target. */
+export function managedAgentTrustCheckTargetMessage(
+  config: any,
+  allNodes: ReadonlyArray<{ id: string; type: string; parentId?: string; config?: any }>
+): string {
+  return managedAgentTrustCheckRunsOnTransitPoints(config, allNodes)
+    ? `${MANAGED_AGENT_TRUST_CHECK_TARGET_MESSAGE} ${MANAGED_AGENT_TRUST_CHECK_DUPLICATED_NOTE}`
+    : MANAGED_AGENT_TRUST_CHECK_TARGET_MESSAGE;
+}
 
 /** Mint a fresh empty query for the panel's "+ Add Another Query" action. */
 export function makeDefaultQuery(): TrustCheckQueryConfig {
@@ -633,17 +689,52 @@ function buildEntry(
 }
 
 /**
+ * Config key holding the stored wire list of a read-only Trust Check copy,
+ * saved back exactly as loaded.
+ */
+export const STORED_TRUST_CHECK_LIST_KEY = '_stored_trust_check_list';
+
+/**
  * Wire `trust_check_list` for one Transit Point's Trust Check node, or
  * `undefined` when it has no queries. The Transit Point factory folds it
- * into `transit.points[i]`, the same way it folds the per-TP policy.
+ * into `transit.points[i]`, the same way it folds the per-TP policy. A
+ * read-only copy returns its stored entries unchanged.
  */
 export function transitPointTrustCheckListToWire(
-  node: { id: string; slotId?: string; config?: any } | undefined
+  node: { id: string; slotId?: string; config?: any } | undefined,
+  readOnly = false
 ): Array<Record<string, unknown>> | undefined {
   if (!node) return undefined;
+  const stored = node.config?.[STORED_TRUST_CHECK_LIST_KEY];
+  if (readOnly && Array.isArray(stored) && stored.length > 0) {
+    return JSON.parse(JSON.stringify(stored));
+  }
   const queries = readQueries(node.config);
   if (queries.length === 0) return undefined;
   return queries.map(q => buildEntry({ ...node, slotId: TRUST_CHECK_TRANSIT_POINT_SLOT_ID }, q));
+}
+
+/**
+ * Whether an empty Trust Check placeholder from the canvas blob sits on an
+ * arrow it can be restored to: the caller slot, a Transit Point (by slot or
+ * parent), the Managed Agent slot on an A2A Proxy or gateway target, or a
+ * slotless node on the Access Point. Anything else, such as a slotless
+ * node parented on the Managed Agent, is dropped on load.
+ */
+function placeholderHasArrow(
+  node: { slotId?: string; parentId?: string | null; parentType?: string },
+  payload: any
+): boolean {
+  if (node.parentType && isTransitPointType(node.parentType)) return true;
+  switch (node.slotId) {
+    case TRUST_CHECK_CALLER_SLOT_ID:
+    case TRUST_CHECK_TRANSIT_POINT_SLOT_ID:
+      return true;
+    case TRUST_CHECK_MANAGED_AGENT_SLOT_ID:
+      return managedAgentTargetLegTrustCheckAllowed(payload?.target?.endpoint);
+    default:
+      return node.parentId === 'access-point';
+  }
 }
 
 export const trustCheckDefinition: NodeDefinition = {
@@ -713,7 +804,8 @@ export const trustCheckDefinition: NodeDefinition = {
       check: (_c: any, ctx: SurfaceContext) =>
         managedAgentTargetLegTrustCheckAllowed(ctx.target?.endpoint),
       severity: 'error',
-      message: MANAGED_AGENT_TRUST_CHECK_TARGET_MESSAGE,
+      message: (c: any, ctx: SurfaceContext) =>
+        managedAgentTrustCheckTargetMessage(c, ctx.allNodes),
     },
   ],
   incompleteReason: c => {
@@ -752,9 +844,7 @@ export const trustCheckDefinition: NodeDefinition = {
   },
   payloadOwnsConfig: true,
   isBlobPlaceholder: (c, node, payload) =>
-    readQueries(c).length === 0 &&
-    (node.slotId !== TRUST_CHECK_MANAGED_AGENT_SLOT_ID ||
-      managedAgentTargetLegTrustCheckAllowed(payload?.target?.endpoint)),
+    readQueries(c).length === 0 && placeholderHasArrow(node, payload),
   // Transit Point lists are written by the Transit Point factory, which
   // owns `transit.points[]`; this writes the caller leg, and the Managed
   // Agent's own target leg only for an A2A proxy or gateway target.
@@ -771,7 +861,7 @@ export const trustCheckDefinition: NodeDefinition = {
     const target: Array<Record<string, unknown>> = [];
     for (const node of nodes) {
       if (node.parentId && transitPointIds.has(node.parentId)) continue;
-      const leg = trustCheckLeg(node);
+      const leg = trustCheckLeg(node, ctx.allNodes);
       if (leg === 'transit-point') continue;
       if (leg === 'managed-agent' && !managedAgentLegAllowed) continue;
       const queries = readQueries(node.config);

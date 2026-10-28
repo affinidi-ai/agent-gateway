@@ -50,12 +50,7 @@ async fn a_legacy_surface_file_is_migrated_and_persisted_once() {
 
     let persisted = std::fs::read_to_string(&path).expect("read migrated file");
     let on_disk: serde_json::Value = serde_json::from_str(&persisted).expect("parse migrated file");
-    assert!(
-        on_disk
-            .get("trust_check_split")
-            .is_none(),
-        "no target list remains, so no marker: {on_disk}"
-    );
+    assert_eq!(on_disk["trust_check_split"], json!(true), "Transit Point lists remain, so the marker is stored");
     assert!(
         on_disk["target"]
             .get("trust_check_list")

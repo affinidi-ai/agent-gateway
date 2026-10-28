@@ -94,8 +94,8 @@ to `transit.points[i].trust_check_list` (new ones on A2A and AP2 Transit Points 
 Managed Agent's own Trust Check is offered only for `a2a-proxy://` and `fabric://` targets (on
 any other target it blocks Save), Transit Points whose list was migrated from the old
 surface-wide list are flagged for review (migrated copies can exist on MCP and HTTP Transit
-Points, but new Trust Checks can't be added there), and every surface and template write sends
-`trust_check_split: true`; see
+Points, but new Trust Checks can't be added there), and every surface write and template create
+or update sends `trust_check_split: true`; see
 _Trust Check_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#trust-check).
 
 The Trust Recorder panel and its entries warn while an entry uses the surface Issuer as its

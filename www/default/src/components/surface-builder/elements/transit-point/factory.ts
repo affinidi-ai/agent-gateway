@@ -12,7 +12,11 @@ import { workloadBindingFormToApi } from '../workload-binding/config';
 import { getCachedOutboundListenAddresses } from '../access-point/defaults';
 import { headerMetadataMappingToWire } from '../metadata-extraction/definition';
 import { mcpToolGatingConfigToWire } from '../mcp-tool-gating/definition';
-import { isMigratedTrustCheck, transitPointTrustCheckListToWire } from '../trust-check/definition';
+import {
+  isMigratedTrustCheck,
+  readOnlyTrustCheckProtocol,
+  transitPointTrustCheckListToWire,
+} from '../trust-check/definition';
 import { DOCS_URL } from '../../../../config/docs';
 
 /**
@@ -342,13 +346,18 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
                 const mcpToolGating = mcpToolGatingConfigToWire(mcpToolGatingNode?.config);
                 // Per-TP target-leg Trust Check (MA→TP request slot). New ones
                 // are dropped only on A2A/AP2 Transit Points; on other
-                // protocols the node exists only for a stored migrated copy.
+                // protocols the node is a read-only stored copy, saved back
+                // exactly as loaded.
                 // The trust-check element's own buildPayload skips
                 // TP-parented nodes so this is the only writer.
                 const trustCheckNode = ctx.allNodes.find(
                   n => n.type === 'trust-check' && n.parentId === tp.id
                 );
-                const trustCheckList = transitPointTrustCheckListToWire(trustCheckNode);
+                const trustCheckList = transitPointTrustCheckListToWire(
+                  trustCheckNode,
+                  !!trustCheckNode &&
+                    readOnlyTrustCheckProtocol(trustCheckNode, ctx.allNodes) !== null
+                );
                 const credentials = transitCredentialsToApi(c.transit_credentials);
                 const headerMetadataNode = ctx.allNodes.find(
                   n => n.type === 'metadata-extraction' && n.parentId === tp.id

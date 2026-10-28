@@ -506,7 +506,7 @@ describe('trustCheckDefinition — buildPayload', () => {
     expect(slices[0].path).toBe('access_point.trust_check_list');
   });
 
-  it('honours config._edge when slotId is unknown', () => {
+  it('treats an unknown slot as the caller leg whatever config._edge says', () => {
     const node = makeNode('trust-check-1', 'request:unknown-slot', {
       _edge: 'ma-tp',
       trust_registry_id: 'tr-1',
@@ -514,7 +514,7 @@ describe('trustCheckDefinition — buildPayload', () => {
       query: { authority_id: 'a', entity_id: 'e' },
     });
     const slices = trustCheckDefinition.buildPayload!(makeCtx([node]))!;
-    expect(slices[0].path).toBe('target.trust_check_list');
+    expect(slices.map(sl => sl.path)).toEqual(['access_point.trust_check_list']);
   });
 
   it('leaves Transit Point lists to the Transit Point factory', () => {

@@ -598,48 +598,4 @@ mod tests {
         template.settle_trust_check_shape();
         assert!(template.surface.is_none());
     }
-
-    fn snapshot_with_mcp_list() -> serde_json::Value {
-        serde_json::json!({
-            "trust_check_split": true,
-            "target": {"endpoint": "https://managed.example"},
-            "transit": {"points": [{
-                "alias": "tools", "target_endpoint": "https://t.example/mcp", "protocol": "mcp",
-                "trust_check_migrated": true,
-                "trust_check_list": [{
-                    "id": "copied", "trust_registry_id": "tr-1", "query_type": "recognition",
-                    "query": {"authority_id": "did:example:authority", "entity_id": "{{ target.did }}"}
-                }]
-            }]}
-        })
-    }
-
-    fn stripped_mcp_point() -> serde_json::Value {
-        serde_json::json!({"alias": "tools", "target_endpoint": "https://t.example/mcp", "protocol": "mcp"})
-    }
-
-    #[test]
-    fn a_created_template_drops_mcp_transit_point_lists() {
-        let mut template = serde_json::from_value::<crate::surface_templates::types::CreateSurfaceTemplate>(
-            serde_json::json!({ "name": "Captured", "kind": "full", "surface": snapshot_with_mcp_list() }),
-        )
-        .unwrap()
-        .into_template("template-c".into(), "2026-01-01T00:00:00Z".into());
-        template.settle_trust_check_shape();
-
-        assert_eq!(
-            template
-                .surface
-                .expect("surface")["transit"]["points"][0],
-            stripped_mcp_point()
-        );
-    }
-
-    #[tokio::test]
-    async fn an_updated_template_drops_mcp_transit_point_lists() {
-        let (saved, reloaded) = update_and_reload(snapshot_with_mcp_list()).await;
-
-        assert_eq!(saved["transit"]["points"][0], stripped_mcp_point());
-        assert_eq!(reloaded, saved);
-    }
 }

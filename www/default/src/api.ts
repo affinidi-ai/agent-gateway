@@ -604,7 +604,7 @@ class APIClient {
   async importSurfaceTemplate(payload: unknown): Promise<SurfaceTemplate> {
     return this.request<SurfaceTemplate>('/surface-templates/import', {
       method: 'POST',
-      body: JSON.stringify(templateWithTrustCheckSplit(payload)),
+      body: JSON.stringify(payload),
     });
   }
 

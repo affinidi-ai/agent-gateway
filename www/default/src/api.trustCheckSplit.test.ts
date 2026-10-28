@@ -55,9 +55,10 @@ describe('trust_check_split on Surface Template writes', () => {
     expect(sentBody().surface.trust_check_split).toBe(true);
   });
 
-  it('is set inside the surface when importing a template', async () => {
+  it('is not added when importing a template, so the file is uploaded unchanged', async () => {
     await apiClient.importSurfaceTemplate(template);
-    expect(sentBody().surface.trust_check_split).toBe(true);
+    expect(sentBody()).toEqual(JSON.parse(JSON.stringify(template)));
+    expect(sentBody().surface).not.toHaveProperty('trust_check_split');
   });
 
   it('leaves a template without a surface unchanged', async () => {

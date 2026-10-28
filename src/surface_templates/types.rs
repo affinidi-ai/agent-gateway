@@ -173,9 +173,8 @@ impl SurfaceTemplate {
     /// Settles the Trust Check shape of a surface snapshot written through the
     /// management API. A snapshot carrying `trust_check_split: true` is
     /// already per-Transit-Point; any other snapshot is migrated like a stored
-    /// one. Lists on MCP and HTTP Transit Points are then dropped, because a
-    /// surface created from the template may not carry them. `trust_check_split` is then kept only while a target list remains,
-    /// which is the only case where a later load could migrate it again.
+    /// one. `trust_check_split` is then kept while any Trust Check list
+    /// remains, target or Transit Point, and dropped otherwise.
     pub fn settle_trust_check_shape(&mut self) {
         let Some(blob) = self
             .surface
@@ -191,51 +190,13 @@ impl SurfaceTemplate {
         if !declared_split {
             crate::config::agent_surface::split_template_target_trust_checks(blob);
         }
-        strip_mcp_http_trust_checks(blob);
-        let keep_marker = crate::config::agent_surface::has_target_trust_check_lists(blob);
+        let keep_marker = crate::config::agent_surface::has_trust_check_lists(blob);
         if let Some(obj) = blob.as_object_mut() {
             if keep_marker {
                 obj.insert("trust_check_split".to_string(), serde_json::Value::Bool(true));
             } else {
                 obj.remove("trust_check_split");
             }
-        }
-    }
-}
-
-/// Drop `trust_check_list` and `trust_check_migrated` from every MCP and HTTP
-/// Transit Point of a surface snapshot, base and variant overrides.
-fn strip_mcp_http_trust_checks(blob: &mut serde_json::Value) {
-    let mut point_lists: Vec<&mut serde_json::Value> = Vec::new();
-    let serde_json::Value::Object(obj) = blob else {
-        return;
-    };
-    for (key, value) in obj.iter_mut() {
-        match key.as_str() {
-            "transit" => point_lists.extend(value.get_mut("points")),
-            "variants" => {
-                for variant in value
-                    .as_array_mut()
-                    .into_iter()
-                    .flatten()
-                {
-                    point_lists.extend(variant.pointer_mut("/overrides/transit/points"));
-                }
-            }
-            _ => {}
-        }
-    }
-    for point in point_lists
-        .into_iter()
-        .filter_map(serde_json::Value::as_array_mut)
-        .flatten()
-    {
-        if crate::config::agent_surface::is_a2a_or_ap2_point(point) {
-            continue;
-        }
-        if let Some(point) = point.as_object_mut() {
-            point.remove("trust_check_list");
-            point.remove("trust_check_migrated");
         }
     }
 }
@@ -460,12 +421,7 @@ mod tests {
         assert!(SurfaceTemplate::migrate_raw_json(&mut value).unwrap());
 
         let surface = &value["surface"];
-        assert!(
-            surface
-                .get("trust_check_split")
-                .is_none(),
-            "no target list remains"
-        );
+        assert_eq!(surface["trust_check_split"], serde_json::json!(true), "a Transit Point list remains");
         assert_eq!(surface["transit"]["points"][0]["trust_check_list"][0]["id"], "t1");
         assert_eq!(surface["transit"]["points"][0]["trust_check_migrated"], serde_json::json!(true));
         assert!(
@@ -541,15 +497,8 @@ mod tests {
         );
     }
 
-    fn mcp_point(list: serde_json::Value) -> serde_json::Value {
-        serde_json::json!({
-            "alias": "tools", "target_endpoint": "https://t.example/mcp", "protocol": "mcp",
-            "trust_check_list": list, "trust_check_migrated": true
-        })
-    }
-
     #[test]
-    fn a_legacy_template_copies_only_onto_a2a_and_ap2_points() {
+    fn a_legacy_template_copies_onto_mcp_points_too() {
         let mut value = legacy_surface_template();
         value["surface"]["transit"]["points"]
             .as_array_mut()
@@ -560,74 +509,7 @@ mod tests {
 
         let points = &value["surface"]["transit"]["points"];
         assert_eq!(points[0]["trust_check_list"][0]["id"], "t1");
-        assert_eq!(
-            points[1],
-            serde_json::json!({"alias": "tools", "target_endpoint": "https://t.example/mcp", "protocol": "mcp"}),
-            "MCP Transit Points get nothing from a template conversion"
-        );
-    }
-
-    #[test]
-    fn a_marked_snapshot_drops_lists_from_mcp_and_http_points() {
-        let a2a_list = serde_json::json!([{
-            "id": "keep", "trust_registry_id": "tr-1", "query_type": "recognition",
-            "query": {"authority_id": "did:example:authority", "entity_id": "{{ target.did }}"}
-        }]);
-        let mut template: SurfaceTemplate = serde_json::from_value(serde_json::json!({
-            "id": "user-captured", "name": "Captured", "kind": "full",
-            "surface": {
-                "trust_check_split": true,
-                "target": {"endpoint": "https://managed.example"},
-                "transit": {"points": [
-                    {"alias": "partner", "target_endpoint": "https://a.example/a2a", "protocol": "a2a",
-                     "trust_check_list": a2a_list.clone(), "trust_check_migrated": true},
-                    mcp_point(a2a_list.clone())
-                ]},
-                "variants": [{"id": "v", "alias": "dev", "name": "dev", "enabled": true, "overrides": {
-                    "transit": {"points": [mcp_point(a2a_list.clone()), {
-                        "alias": "pages", "target_endpoint": "https://p.example", "protocol": "http",
-                        "trust_check_list": a2a_list.clone()
-                    }]}
-                }}]
-            }
-        }))
-        .unwrap();
-
-        template.settle_trust_check_shape();
-
-        let surface = template
-            .surface
-            .expect("surface");
-        assert_eq!(surface["transit"]["points"][0]["trust_check_list"], a2a_list, "A2A lists are kept");
-        assert_eq!(surface["transit"]["points"][0]["trust_check_migrated"], serde_json::json!(true));
-        assert_eq!(
-            surface["transit"]["points"][1],
-            serde_json::json!({"alias": "tools", "target_endpoint": "https://t.example/mcp", "protocol": "mcp"})
-        );
-        let variant_points = &surface["variants"][0]["overrides"]["transit"]["points"];
-        assert!(
-            variant_points[0]
-                .get("trust_check_list")
-                .is_none(),
-            "{surface}"
-        );
-        assert!(
-            variant_points[0]
-                .get("trust_check_migrated")
-                .is_none(),
-            "{surface}"
-        );
-        assert!(
-            variant_points[1]
-                .get("trust_check_list")
-                .is_none(),
-            "{surface}"
-        );
-        assert!(
-            surface
-                .get("trust_check_split")
-                .is_none(),
-            "no target list remains"
-        );
+        assert_eq!(points[1]["trust_check_list"][0]["id"], "t1", "templates copy like surfaces");
+        assert_eq!(points[1]["trust_check_migrated"], serde_json::json!(true));
     }
 }

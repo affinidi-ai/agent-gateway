@@ -15,7 +15,7 @@ import {
 } from './elements/edges/archetypes';
 import type { DerivedEdge, SlotDirection } from './elements/edges/types';
 import { isSyntheticFabricNodeId } from './elements/synthesizeFabric';
-import { trustCheckReviewBadge } from './elements/trust-check/definition';
+import { syncTrustCheckReviewBadge } from './elements/trust-check/reviewBadge';
 import { fetchRoutingConfig } from './elements/access-point/defaults';
 import {
   POLICY_UNCONFIGURED_DASH,
@@ -3420,23 +3420,11 @@ const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
     // upgrade: a flagged migrated copy, or a Transit Point whose
     // surface-wide checks were removed.
     nodeSelection.each(function (d) {
-      const badge = trustCheckReviewBadge(nodes.find(n => n.id === d.id));
-      if (!badge) return;
-      const g = d3
-        .select(this)
-        .append('g')
-        .attr('class', 'node-migrated-badge')
-        .attr('data-testid', badge.testid)
-        .attr('transform', `translate(${d.radius * 0.75}, ${-d.radius * 0.75})`);
-      g.append('title').text(badge.title);
-      g.append('circle').attr('r', 7);
-      g.append('text')
-        .attr('text-anchor', 'middle')
-        .attr('dominant-baseline', 'central')
-        .attr('font-size', '10px')
-        .attr('font-weight', '700')
-        .attr('pointer-events', 'none')
-        .text('!');
+      syncTrustCheckReviewBadge(
+        this,
+        nodes.find(n => n.id === d.id),
+        d.radius
+      );
     });
 
     // Type label above nodes
@@ -4571,7 +4559,11 @@ const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
         else ring.attr('stroke-dasharray', null);
       }
 
-      if (trustCheckReviewBadge(n) === null) nodeG.select('.node-migrated-badge').remove();
+      syncTrustCheckReviewBadge(
+        nodeG.node() as Element | null,
+        n,
+        d3Node?.radius || n.radius || NODE_RADIUS[n.type] || 30
+      );
 
       // Sync the incomplete-reason text under the node label. Always
       // reposition `dy` (not only on insert) so resizes and label

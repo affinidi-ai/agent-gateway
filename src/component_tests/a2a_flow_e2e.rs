@@ -2353,7 +2353,7 @@ const ELEMENTS_IDENTITY_URI: &str = "https://fabric.affinidi.io/extensions/agent
 /// `tenant-a`'s surfaces; without one, a token scoped by its required
 /// `x-external-account` header alone. Returns a client that sends the token and
 /// the header.
-fn seed_scoped_access_token(
+pub(super) fn seed_scoped_access_token(
     bootstrap: &crate::config::BootstrapConfig,
     resource_pattern: Option<&str>,
 ) -> reqwest::Client {

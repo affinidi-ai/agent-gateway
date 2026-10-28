@@ -189,8 +189,8 @@ export interface FeatureDependency {
   check: (config: any, ctx: SurfaceContext, node?: DependencyNode) => boolean;
   /** Severity if check returns false while condition holds. */
   severity: 'error' | 'warning';
-  /** Message shown to the user. */
-  message: string;
+  /** Message shown to the user, or a function building it from the surface. */
+  message: string | ((config: any, ctx: SurfaceContext, node?: DependencyNode) => string);
 }
 
 export interface ConfigPanelProps {
@@ -499,11 +499,12 @@ export interface NodeDefinition {
    * With `payloadOwnsConfig`, a blob node whose slice is missing is still
    * restored when this returns true for its blob config: an unconfigured
    * placeholder (e.g. from a template) that writes nothing to the payload.
-   * `node` is the blob node's placement and `payload` the stored surface.
+   * `node` is the blob node's placement (with its parent's type when the
+   * parent is known) and `payload` the stored surface.
    */
   isBlobPlaceholder?: (
     config: any,
-    node: { slotId?: string; parentId?: string | null },
+    node: { slotId?: string; parentId?: string | null; parentType?: string },
     payload: any
   ) => boolean;
 

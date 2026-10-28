@@ -558,12 +558,7 @@ mod tests {
             .surface
             .expect("surface");
 
-        assert!(
-            surface
-                .get("trust_check_split")
-                .is_none(),
-            "no target list remains"
-        );
+        assert_eq!(surface["trust_check_split"], serde_json::json!(true), "Transit Point lists remain");
         assert!(
             surface["target"]
                 .get("trust_check_list")
@@ -572,16 +567,9 @@ mod tests {
         let points = &surface["transit"]["points"];
         assert_eq!(points[0]["trust_check_list"][0]["id"], "target-recognition");
         assert_eq!(points[0]["trust_check_migrated"], serde_json::json!(true));
-        assert!(
-            points[1]
-                .get("trust_check_list")
-                .is_none(),
-            "template MCP Transit Points get no copy"
-        );
-        assert!(
-            points[1]
-                .get("trust_check_migrated")
-                .is_none()
+        assert_eq!(
+            points[1]["trust_check_list"][0]["id"], "target-recognition",
+            "templates copy onto MCP Transit Points too"
         );
 
         let on_disk: serde_json::Value = serde_json::from_str(

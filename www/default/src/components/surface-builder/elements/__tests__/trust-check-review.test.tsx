@@ -6,9 +6,14 @@ import { buildSurfaceContext } from '../surfaceContext';
 import {
   countTrustCheckReviews,
   countTrustCheckReviewsInPayload,
+  MANAGED_AGENT_TRUST_CHECK_DUPLICATED_NOTE,
   MANAGED_AGENT_TRUST_CHECK_TARGET_MESSAGE,
+  STORED_TRUST_CHECK_LIST_KEY,
+  trustCheckLeg,
   trustCheckReviewBadge,
 } from '../trust-check/definition';
+import { syncTrustCheckReviewBadge } from '../trust-check/reviewBadge';
+import { dependencyErrorBlocker } from '../../dependencyBlocker';
 import MigratedTrustChecksSummary from '../trust-check/MigratedTrustChecksSummary';
 import TrustCheckPanel from '../trust-check/TrustCheckPanel';
 import TrustCheckFullscreenPanel from '../trust-check/TrustCheckFullscreenPanel';
@@ -213,6 +218,50 @@ describe('migrated Trust Check copy on an MCP Transit Point', () => {
     expect(screen.getByTestId('trust-check-save')).toBeEnabled();
   });
 
+  it('saves a read-only copy back exactly as stored', () => {
+    const stored = [
+      {
+        id: 'raw-1',
+        trust_registry_id: 'tr-1',
+        query_type: 'authorization',
+        name: '',
+        timeout_secs: 7,
+        query: {
+          authority_id: '  did:web:issuer.example  ',
+          entity_id: '',
+          action: '',
+          resource: '',
+        },
+      },
+    ];
+    const payload = surface([
+      tp('mcp1', { protocol: 'mcp', trust_check_list: stored, trust_check_migrated: true }),
+    ]);
+    const nodes = hydrate(payload);
+    expect(nodes.find(n => n.id === MCP_TC)?.config[STORED_TRUST_CHECK_LIST_KEY]).toEqual(stored);
+    expect(mcpPoint(rebuild(nodes))).toMatchObject({
+      trust_check_list: stored,
+      trust_check_migrated: true,
+    });
+    const kept = withConfig(nodes, MCP_TC, { trust_check_migrated: false });
+    const point = mcpPoint(rebuild(kept));
+    expect(point.trust_check_list).toEqual(stored);
+    expect(point).not.toHaveProperty('trust_check_migrated');
+  });
+
+  it('rebuilds an editable A2A copy from its queries', () => {
+    const payload = surface([
+      tp('a2a1', {
+        trust_check_list: [{ ...entry('a'), timeout_secs: 7 }],
+        trust_check_migrated: true,
+      }),
+    ]);
+    const nodes = hydrate(payload);
+    const tc = nodes.find(n => n.id === 'trust-check-transit-point-a2a-1')!;
+    expect(tc.config).not.toHaveProperty(STORED_TRUST_CHECK_LIST_KEY);
+    expect(rebuild(nodes).transit.points[0].trust_check_list[0]).not.toHaveProperty('timeout_secs');
+  });
+
   it('refuses a new Trust Check dropped on the MCP Transit Point arrow', () => {
     const nodes = hydrate(migratedMcp()).filter(n => n.id !== MCP_TC);
     const edges = deriveEdges(nodes);
@@ -329,6 +378,17 @@ describe("Managed Agent's own Trust Check on an unsupported target", () => {
       config: { _edge: 'ap-ma', queries },
     },
   ];
+  const panelFor = (nodes: CanvasNode[]) => {
+    const tc = nodes.find(n => n.id === 'trust-check-target')!;
+    return {
+      node: tc,
+      config: tc.config,
+      allNodes: nodes,
+      updateField: jest.fn(),
+      updateFields: jest.fn(),
+      openFullscreenEditor: jest.fn(),
+    };
+  };
   const errorsFor = (nodes: CanvasNode[]) => {
     const ctx = buildSurfaceContext('a2a', nodes);
     return nodes.flatMap(n =>
@@ -339,13 +399,141 @@ describe("Managed Agent's own Trust Check on an unsupported target", () => {
     );
   };
 
+  const withTransitPointQueries = (nodes: CanvasNode[], tpQueries: unknown[]) =>
+    nodes.map(n =>
+      n.id === 'trust-check-transit-point-a2a-1'
+        ? { ...n, config: { ...n.config, queries: tpQueries } }
+        : n
+    );
+
   it('blocks Save on a URL target with a message naming both fixes', () => {
-    expect(errorsFor(nodesWith('https://agent.example.com/a2a'))).toEqual([
+    const nodes = withTransitPointQueries(nodesWith('https://agent.example.com/a2a'), [
+      entry('other'),
+    ]);
+    nodes[
+      nodes.findIndex(n => n.id === 'trust-check-transit-point-a2a-1')
+    ].config.queries[0].query = {
+      authority_id: 'did:web:other.example',
+      entity_id: '{{ input.agent.did }}',
+    };
+    expect(errorsFor(nodes)).toEqual([
       ['trust-check-target', MANAGED_AGENT_TRUST_CHECK_TARGET_MESSAGE],
     ]);
     expect(MANAGED_AGENT_TRUST_CHECK_TARGET_MESSAGE).toBe(
       "The Managed Agent's own Trust Check runs only on an A2A Proxy or gateway target. Remove it or switch the target."
     );
+    const panel = panelFor(nodes);
+    render(<TrustCheckPanel {...(panel as any)} />);
+    expect(screen.getByTestId('trust-check-panel-managed-agent-target-warning')).toHaveTextContent(
+      "To check a Transit Point's target, drop a Trust Check on its arrow instead."
+    );
+  });
+
+  it('says removing it loses nothing when every Transit Point runs the same checks', () => {
+    const nodes = nodesWith('https://agent.example.com/a2a');
+    const sameWithOtherIds = [{ ...entry('copied-id'), name: 'copied' }];
+    const copied = withTransitPointQueries(nodes, sameWithOtherIds);
+    expect(errorsFor(copied)).toEqual([
+      [
+        'trust-check-target',
+        "The Managed Agent's own Trust Check runs only on an A2A Proxy or gateway target. Remove it or switch the target. The same checks already run on this surface's Transit Points, so removing it loses nothing.",
+      ],
+    ]);
+    render(<TrustCheckPanel {...(panelFor(copied) as any)} />);
+    const banner = screen.getByTestId('trust-check-panel-managed-agent-target-warning');
+    expect(banner).toHaveTextContent(MANAGED_AGENT_TRUST_CHECK_DUPLICATED_NOTE);
+    expect(banner).not.toHaveTextContent('drop a Trust Check on its arrow instead');
+  });
+
+  it('keeps the plain message when a Transit Point has no copy', () => {
+    const nodes = nodesWith('https://agent.example.com/a2a').filter(
+      n => n.id !== 'trust-check-transit-point-a2a-1'
+    );
+    expect(errorsFor(nodes)).toEqual([
+      ['trust-check-target', MANAGED_AGENT_TRUST_CHECK_TARGET_MESSAGE],
+    ]);
+  });
+
+  it('reports the error as a blocker for Save and variant switching', () => {
+    const nodes = nodesWith('https://agent.example.com/a2a').filter(
+      n => n.id !== 'trust-check-transit-point-a2a-1'
+    );
+    const ctx = buildSurfaceContext('a2a', nodes);
+    const errors = nodes.flatMap(n =>
+      registry
+        .getDependencyWarnings(n.type, n.config, ctx, n)
+        .filter(w => w.severity === 'error')
+        .map(w => ({ nodeId: n.id, nodeType: n.type, message: w.message }))
+    );
+    expect(dependencyErrorBlocker(errors)).toEqual({
+      message: `Trust Check: ${MANAGED_AGENT_TRUST_CHECK_TARGET_MESSAGE}`,
+      nodeId: 'trust-check-target',
+    });
+    expect(dependencyErrorBlocker([])).toBeNull();
+  });
+
+  describe('slotless placeholders from the canvas blob', () => {
+    const placeholder = (id: string, parentId: string) => ({
+      id,
+      type: 'trust-check',
+      label: '',
+      parentId,
+      position: { x: 1, y: 2 },
+      config: { _edge: 'ma-tp', queries: [] },
+    });
+    const load = (blob: unknown[]) =>
+      hydrate({
+        ...surface(
+          [tp('a2a1')],
+          [
+            {
+              id: 'transit-point-a2a-1',
+              type: 'transit-point-a2a',
+              label: '',
+              parentId: 'access-point',
+              config: { id: 'uuid-a2a1' },
+            },
+            ...blob,
+          ]
+        ),
+      });
+    const trustCheckIds = (nodes: CanvasNode[]) =>
+      nodes.filter(n => n.type === 'trust-check').map(n => [n.id, n.parentId]);
+
+    it('drops one parented on the Managed Agent, so it blocks nothing and writes nothing', () => {
+      const nodes = load([placeholder('tc-old', 'target')]);
+      expect(trustCheckIds(nodes)).toEqual([]);
+      expect(errorsFor(nodes)).toEqual([]);
+      const payload = rebuild(nodes);
+      expect(payload.access_point?.trust_check_list).toBeUndefined();
+      expect(payload.target).not.toHaveProperty('trust_check_list');
+    });
+
+    it('keeps one on the Access Point as the caller leg and one on a Transit Point', () => {
+      const nodes = load([
+        placeholder('tc-caller', 'access-point'),
+        placeholder('tc-tp', 'transit-point-a2a-1'),
+      ]);
+      expect(trustCheckIds(nodes)).toEqual([
+        ['tc-caller', 'access-point'],
+        ['tc-tp', 'transit-point-a2a-1'],
+      ]);
+      expect(trustCheckLeg(nodes.find(n => n.id === 'tc-caller')!, nodes)).toBe('caller');
+      expect(trustCheckLeg(nodes.find(n => n.id === 'tc-tp')!, nodes)).toBe('transit-point');
+    });
+  });
+
+  it('resolves the leg from the parent before the slot id', () => {
+    const nodes = nodesWith('fabric://gw-1/surface-a');
+    const tpParentedManagedAgentSlot = {
+      ...nodes.find(n => n.id === 'trust-check-transit-point-a2a-1')!,
+      slotId: TRUST_CHECK_MANAGED_AGENT_SLOT_ID,
+    };
+    expect(trustCheckLeg(tpParentedManagedAgentSlot, nodes)).toBe('transit-point');
+    expect(trustCheckLeg(nodes.find(n => n.id === 'trust-check-target')!, nodes)).toBe(
+      'managed-agent'
+    );
+    expect(trustCheckLeg(nodes.find(n => n.id === 'trust-check-caller')!, nodes)).toBe('caller');
   });
 
   it.each(['a2a-proxy://proxy-1', 'fabric://gw-1/surface-a'])(
@@ -367,5 +555,31 @@ describe("Managed Agent's own Trust Check on an unsupported target", () => {
     const ctx = buildSurfaceContext('a2a', nodes);
     const node = nodes.find(n => n.id === 'trust-check-target')!;
     expect(registry.getDependencyWarnings(node.type, node.config, ctx)).toEqual([]);
+  });
+});
+
+describe('Trust Check review badge sync', () => {
+  const flagged = { type: 'trust-check', config: { queries: [], trust_check_migrated: true } };
+  const kept = { type: 'trust-check', config: { queries: [], trust_check_migrated: false } };
+  const BADGE = 'surface-node-trust-check-migrated-badge';
+
+  it('draws, removes and redraws the badge as the flag toggles with the structure unchanged', () => {
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    const g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+    svg.appendChild(g);
+    document.body.appendChild(svg);
+    syncTrustCheckReviewBadge(g, flagged, 20);
+    expect(screen.getByTestId(BADGE)).toHaveAttribute('transform', 'translate(15, -15)');
+    expect(screen.getByTestId(BADGE)).toHaveTextContent('!');
+    syncTrustCheckReviewBadge(g, kept, 20);
+    expect(screen.queryAllByTestId(BADGE)).toHaveLength(0);
+    syncTrustCheckReviewBadge(g, flagged, 20);
+    syncTrustCheckReviewBadge(g, flagged, 20);
+    expect(screen.queryAllByTestId(BADGE)).toHaveLength(1);
+    svg.remove();
+  });
+
+  it('does nothing without a node group', () => {
+    expect(() => syncTrustCheckReviewBadge(null, flagged, 20)).not.toThrow();
   });
 });

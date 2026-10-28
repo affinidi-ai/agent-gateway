@@ -6,6 +6,8 @@ import InfoBanner from '../../../shared/InfoBanner';
 import type { ConfigPanelProps } from '../types';
 import MigratedTrustCheckWarning from './MigratedTrustCheckWarning';
 import {
+  MANAGED_AGENT_TRUST_CHECK_DUPLICATED_NOTE,
+  managedAgentTrustCheckRunsOnTransitPoints,
   readOnlyTrustCheckMessage,
   readOnlyTrustCheckProtocol,
   isManagedAgentTrustCheck,
@@ -58,7 +60,7 @@ const TrustCheckPanel: React.FC<ConfigPanelProps> = ({
   updateField,
   openFullscreenEditor,
 }) => {
-  const leg = trustCheckLeg(node);
+  const leg = trustCheckLeg(node, allNodes);
   const isApMa = leg === 'caller';
   const legLabel = isApMa ? 'caller' : 'target';
   const legContext = describeLeg(leg);
@@ -158,7 +160,11 @@ const TrustCheckPanel: React.FC<ConfigPanelProps> = ({
             variant="warning"
             collapsible={false}
             className="mt-2"
-            summary="The Managed Agent's own target-leg Trust Check runs only when it targets an A2A Proxy or another gateway. Remove it or switch the target. To check a Transit Point's target, drop a Trust Check on its arrow instead."
+            summary={`The Managed Agent's own target-leg Trust Check runs only when it targets an A2A Proxy or another gateway. Remove it or switch the target. ${
+              allNodes && managedAgentTrustCheckRunsOnTransitPoints(config, allNodes)
+                ? MANAGED_AGENT_TRUST_CHECK_DUPLICATED_NOTE
+                : "To check a Transit Point's target, drop a Trust Check on its arrow instead."
+            }`}
           />
         </div>
       )}

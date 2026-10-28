@@ -1319,3 +1319,96 @@ async fn a2a_proxy_sends_the_direct_line_credential_for_an_authenticated_caller(
         );
     }
 }
+
+/// An undeclared A2A-proxy create carrying a target Trust Check list is
+/// converted without making the omitted A2A settings look sent: its versions
+/// stay fixed at A2A 1.0.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_undeclared_a2a_proxy_create_with_a_target_list_keeps_its_fixed_versions() {
+    let mut client = None;
+    let h = GatewayHarness::start(|temp_dir, _, bootstrap| {
+        write_a2a_proxy_fixtures(temp_dir, "http://127.0.0.1:9", "active", true, 5, 100, 3);
+        super::trust_check_e2e::write_trust_registry_fixture(temp_dir);
+        client = Some(helpers::configure_admin_api(bootstrap));
+    })
+    .await;
+    let client = client.unwrap();
+    let response = client
+        .post(format!("{}/api/v1/surfaces", h.gateway_base))
+        .json(&json!({
+            "name": "proxy-with-checks", "status": "disabled",
+            "access_point": {"listen_address": h.gateway_base, "route": "/proxy-with-checks", "protocol": "a2a",
+                             "a2a": {"validation": "envelope"}},
+            "target": {"endpoint": format!("a2a-proxy://{PROXY_ID}"), "a2a_proxy_id": PROXY_ID,
+                       "trust_check_list": [super::trust_check_e2e::api_trust_check("proxy-target")]},
+            "transit": {"points": [{"alias": "partner", "target_endpoint": "https://partner.example/a2a"}]}
+        }))
+        .send()
+        .await
+        .expect("admin API request");
+    let status = response.status().as_u16();
+    let created: Value = response
+        .json()
+        .await
+        .expect("JSON response");
+
+    assert_eq!(status, 201, "{created}");
+    assert_eq!(created["access_point"]["a2a"]["accepted_versions"], json!(["1.0"]));
+    assert_eq!(created["target"]["trust_check_list"][0]["id"], "proxy-target", "an A2A proxy runs its own list");
+    assert_eq!(created["transit"]["points"][0]["trust_check_list"][0]["id"], "proxy-target");
+    assert_eq!(created["trust_check_split"], json!(true));
+
+    let surface_url = format!(
+        "{}/api/v1/surfaces/{}",
+        h.gateway_base,
+        created["surface_id"]
+            .as_str()
+            .unwrap()
+    );
+    let put = |body: Value| {
+        let request = client
+            .put(&surface_url)
+            .json(&body);
+        async move {
+            let response = request
+                .send()
+                .await
+                .expect("admin API request");
+            let status = response.status().as_u16();
+            (
+                status,
+                response
+                    .json::<Value>()
+                    .await
+                    .unwrap_or(json!(null)),
+            )
+        }
+    };
+    let mut without_target_list = created.clone();
+    without_target_list
+        .as_object_mut()
+        .unwrap()
+        .remove("trust_check_split");
+    without_target_list["target"]
+        .as_object_mut()
+        .unwrap()
+        .remove("trust_check_list");
+    let (status, kept) = put(without_target_list.clone()).await;
+    assert_eq!(status, 200, "{kept}");
+    assert_eq!(kept["target"]["trust_check_list"][0]["id"], "proxy-target", "a missing target list is kept");
+
+    let mut explicit_empty = without_target_list.clone();
+    explicit_empty["target"]["trust_check_list"] = json!([]);
+    let (status, body) = put(explicit_empty).await;
+    assert_eq!(status, 400, "an explicit empty target list on a split surface is refused: {body}");
+    assert!(
+        body.to_string()
+            .contains("send trust_check_split: true"),
+        "{body}"
+    );
+
+    let mut wrong_type = without_target_list;
+    wrong_type["name"] = json!(5);
+    let (status, _) = put(wrong_type).await;
+    assert_eq!(status, 422, "a body of the wrong shape is still rejected as before");
+}
