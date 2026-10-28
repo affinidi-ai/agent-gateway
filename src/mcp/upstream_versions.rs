@@ -41,13 +41,19 @@ struct Versions {
 }
 
 impl Versions {
-    /// A listed `supportedVersions` is authoritative; `-32601` means the
-    /// upstream predates discovery. Any other outcome teaches nothing.
+    /// A listed `supportedVersions`, or a `-32022` refusal's `supported`, is
+    /// authoritative; `-32601` means the upstream predates discovery. Any other
+    /// outcome teaches nothing.
     fn from_discovery(message: &Value) -> Option<Self> {
-        if let Some(supported) = message
-            .pointer("/result/supportedVersions")
-            .and_then(Value::as_array)
-        {
+        let code = message
+            .pointer("/error/code")
+            .and_then(Value::as_i64);
+        let listed = if code == Some(i64::from(error_codes::UNSUPPORTED_PROTOCOL_VERSION)) {
+            message.pointer("/error/data/supported")
+        } else {
+            message.pointer("/result/supportedVersions")
+        };
+        if let Some(supported) = listed.and_then(Value::as_array) {
             let lists = |matches: &dyn Fn(&str) -> bool| {
                 supported
                     .iter()
@@ -59,11 +65,7 @@ impl Versions {
                 modern: lists(&|version| version == MCP_MODERN_VERSION),
             });
         }
-        (message
-            .pointer("/error/code")
-            .and_then(Value::as_i64)
-            == Some(i64::from(error_codes::METHOD_NOT_FOUND)))
-        .then_some(Self { legacy: true, modern: false })
+        (code == Some(i64::from(error_codes::METHOD_NOT_FOUND))).then_some(Self { legacy: true, modern: false })
     }
 
     fn serves(
@@ -245,6 +247,19 @@ mod tests {
         let legacy = key("upstream-versions-method-not-found");
         record_discovery(legacy.clone(), &error(error_codes::METHOD_NOT_FOUND));
         assert_eq!(advertised(&legacy, MODERN_CAPABLE_POLICY), json!(SESSION_VERSIONS));
+    }
+
+    #[test]
+    fn upstream_versions_learn_from_an_unsupported_version_refusal() {
+        let refused = key("upstream-versions-unsupported-refusal");
+        let refusal = McpRequestValidationError::legacy_only(Some(json!(1)));
+        record_discovery(
+            refused.clone(),
+            &json!({"jsonrpc": "2.0", "id": 1, "error": {
+                "code": refusal.code, "message": refusal.message, "data": refusal.data
+            }}),
+        );
+        assert_eq!(advertised(&refused, MODERN_CAPABLE_POLICY), json!(SESSION_VERSIONS));
     }
 
     #[test]

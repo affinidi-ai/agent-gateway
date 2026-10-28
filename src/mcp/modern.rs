@@ -246,6 +246,40 @@ pub fn validate_response<'response>(
     Ok(None)
 }
 
+/// The answer to a request whose upstream error carries another id, or
+/// `"id": null`: `-32022` listing the session revisions, with the request's id.
+///
+/// An upstream that serves only session revisions refuses a request without
+/// `Mcp-Session-Id` before reading its id (`null` from the TypeScript SDK,
+/// `"server-error"` from the Python SDK), so the request's revision is what it
+/// refused. Any other id is treated the same way: the gateway sent the upstream
+/// only this request, and the upstream's error is logged. A result with another
+/// id is still invalid.
+pub fn session_only_refusal(
+    request: &ValidatedModernMessage,
+    response: &Value,
+) -> Option<Value> {
+    let expected_id = request_id(request).ok()?;
+    let envelope = response.as_object()?;
+    if envelope
+        .get("jsonrpc")
+        .and_then(Value::as_str)
+        != Some("2.0")
+        || envelope.contains_key("method")
+        || envelope.contains_key("result")
+        || !envelope
+            .get("error")
+            .is_some_and(Value::is_object)
+        || envelope
+            .get("id")
+            .is_none_or(|id| id == expected_id)
+    {
+        return None;
+    }
+    let refusal = McpRequestValidationError::legacy_only(Some(expected_id.clone()));
+    Some(super::errors::create_mcp_error_envelope(refusal.id, refusal.code, &refusal.message, refusal.data))
+}
+
 pub fn complete_response(
     request: &ValidatedModernMessage,
     mut fields: Map<String, Value>,
@@ -918,5 +952,36 @@ mod tests {
         request.kind = McpMessageKind::Notification;
         request.id = None;
         assert_eq!(complete_response(&request, Map::new()), Err(ModernResponseError::InvalidRequest));
+    }
+
+    #[test]
+    fn an_upstream_error_for_another_id_becomes_a_session_only_refusal() {
+        let mut request = request("server/discover", json!({}));
+        for id in [json!(null), json!("server-error"), json!(7)] {
+            let error = json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32600, "message": "Missing session ID"}});
+            assert_eq!(
+                validate_response(&request, &error, ResultSource::ModernServer),
+                Err(ModernResponseError::IdMismatch)
+            );
+            let refusal = session_only_refusal(&request, &error).expect("{id}");
+            assert_eq!(validate_response(&request, &refusal, ResultSource::ModernServer), Ok(None));
+            assert_eq!(refusal["id"], json!("request"));
+            assert_eq!(refusal["error"]["code"], crate::mcp::error_codes::UNSUPPORTED_PROTOCOL_VERSION);
+            assert_eq!(refusal["error"]["data"]["requested"], crate::mcp::MCP_MODERN_VERSION);
+            assert_eq!(refusal["error"]["data"]["supported"], json!(crate::mcp::request_validation::SESSION_VERSIONS));
+        }
+        for kept in [
+            json!({"jsonrpc": "2.0", "id": "request", "error": {"code": -32600, "message": "own"}}),
+            json!({"jsonrpc": "2.0", "error": {"code": -32600, "message": "no id"}}),
+            json!({"jsonrpc": "2.0", "id": null, "result": {"resultType": "complete"}}),
+            json!({"jsonrpc": "2.0", "id": null, "error": "not an object"}),
+            json!({"jsonrpc": "1.0", "id": null, "error": {"code": -32600, "message": "old"}}),
+        ] {
+            assert_eq!(session_only_refusal(&request, &kept), None, "{kept}");
+        }
+        request.kind = McpMessageKind::Notification;
+        request.id = None;
+        let error = json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32600, "message": "Missing session ID"}});
+        assert_eq!(session_only_refusal(&request, &error), None);
     }
 }

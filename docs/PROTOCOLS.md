@@ -772,6 +772,7 @@ Harness section of [`MCP_METADATA.md`](MCP_METADATA.md).
 | Condition | HTTP / JSON-RPC result |
 | --- | --- |
 | Valid modern request whose upstream answers with a legacy (non-modern) result | HTTP `502` |
+| Modern request whose upstream answers with an error whose id is `null` or another request's, as a session-only upstream does | HTTP `400` (SSE: the upstream's status), `-32022`, listing only the session revisions |
 | Request using an unmodelled revision such as `2099-01-01` | HTTP `400`, `-32022`, listing the revisions the endpoint supports |
 | Malformed modern metadata | HTTP `400`, `-32602` |
 | Missing, malformed, or mismatched mirrored headers | HTTP `400`, `-32020` |
@@ -787,11 +788,12 @@ The `initialize` cap is `cap_legacy_initialize` in `src/mcp/request_validation.r
 after `normalize_bytes` on the direct, Transit Point and Fabric receive paths, so an upstream
 cannot settle a session on a revision the gateway then rejects.
 
-A lone `MCP-Protocol-Version` header naming a session revision remains legacy traffic when modern
-metadata and mirrored method or name headers are absent, and the header reaches the upstream
-unchanged. An `initialize` with such a header is a legacy session opening even when it also sends
-`Mcp-Method` or `Mcp-Name`; those headers are still validated, and `Mcp-Method` must be
-`initialize`. Every supplied `Mcp-Name` is validated, including for
+An `MCP-Protocol-Version` header naming a session revision remains legacy traffic when modern
+metadata is absent, even with mirrored `Mcp-Method` or `Mcp-Name` headers, and the header reaches
+the upstream unchanged. An `initialize` with no `MCP-Protocol-Version` header is a legacy session
+opening on the same terms. Mirrored headers are still validated, and `Mcp-Method` must name the
+request's method, and `Mcp-Name` must match `params.name` on `tools/call` and `prompts/get` or
+`params.uri` on `resources/read`. Every supplied `Mcp-Name` is validated, including for
 methods without a mirrored name source. Complete Base64 sentinel markers trigger decoding; partial
 markers remain plain ASCII, and overlapping markers fail without panicking.
 

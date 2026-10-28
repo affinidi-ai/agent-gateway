@@ -75,10 +75,12 @@ metadata-output preference changes which revisions an endpoint admits.
 
 The session revisions all open a session with `initialize` and carry it in
 `Mcp-Session-Id`, so a request whose `MCP-Protocol-Version` header names one is
-forwarded as legacy traffic with the header unchanged. An `initialize` with such
-a header is a legacy session opening even when it also sends `Mcp-Method` or
-`Mcp-Name`, which must still be well formed, with `Mcp-Method` naming
-`initialize`. Its `params.protocolVersion` reaches the upstream unchanged when it
+forwarded as legacy traffic with the header unchanged, even when it also sends
+`Mcp-Method` or `Mcp-Name`, as long as its `params._meta` carries no modern keys.
+An `initialize` with no `MCP-Protocol-Version` header is a legacy session opening
+on the same terms. Those headers must still be well formed, with `Mcp-Method`
+naming the request's method and `Mcp-Name` matching `params.name` on
+`tools/call` and `prompts/get` or `params.uri` on `resources/read`. Its `params.protocolVersion` reaches the upstream unchanged when it
 names a session revision, so the upstream negotiates it. A gateway-owned MCP
 Proxy answers every `initialize` with `2024-11-05`.
 
@@ -86,6 +88,16 @@ The gateway forwards an admitted modern request and validates the answer as a
 modern result, which needs `resultType` and, for lists, cache hints. A
 legacy-only upstream's answer fails that check, so the modern caller gets HTTP
 `502`, while `2024-11-05` callers on the same endpoint are unaffected.
+
+An upstream that serves only session revisions refuses a request without
+`Mcp-Session-Id` before reading its id, so its error carries `"id": null` or a
+placeholder such as `"server-error"`. When an upstream error's id is `null` or
+does not match the request's, the gateway answers `-32022` with the request's
+id, listing only the session revisions in `data.supported`, and logs the
+upstream's error code and message at `WARN`. A JSON answer gets HTTP `400`; an
+SSE answer keeps the status the upstream already sent, and only its message is
+replaced. An error with the request's id, or with no id, passes through
+unchanged, and a result with another id is still a `502`.
 
 **Compatibility note.** `mcp_protocol_mode` is no longer a setting. Stored
 records and API payloads for surfaces, Transit Points and MCP Proxies that
@@ -601,7 +613,9 @@ fields remain unchanged. No network reference or icon fetching occurs.
 The supported versions a forwarded discovery result delivers to the client are
 remembered for its endpoint: the surface, the Access Point variant or Transit
 Point alias, and the Target. A `-32601` discovery error marks the endpoint as
-legacy-only; any other error, or a result the gateway rejects, records nothing.
+legacy-only, and a `-32022` error records the versions in its `data.supported`,
+including the session-only refusal described above; any other error, or a
+result the gateway rejects, records nothing.
 Entries replace earlier ones, expire after five minutes and are capped at 1024
 endpoints. A later `-32022` from that endpoint lists only the remembered
 versions, keeping the path's versions when nothing is remembered or nothing
@@ -1869,7 +1883,7 @@ Modern admission validates optional request log levels and string/number progres
 
 ### Discovery, subscriptions and variants
 
-Modern MCP discovery and subscriptions run for admitted modern requests on Access Points, gateway-owned Proxies, Transit Points and Fabric framed streams. Forwarded discovery intersects endpoint versions and path capabilities, including the selected authenticated Fabric peer; changed results are private with zero TTL. `mcp::upstream_versions` remembers the versions each forwarded discovery delivered (legacy-only after `-32601`, nothing after other errors) per surface, Access Point variant or Transit Point alias, and Target, bounded to 1024 entries for 300 seconds; a later `-32022` from that endpoint advertises only the path's versions that are also remembered, keeping the full path list when nothing is remembered or none overlap, without changing admission or calling the upstream. Owned catalogs advertise tools-list changes and provide bounded, stream-local subscriptions. Acknowledgement precedes every requested notification, subscription IDs retain their string/integer type, and final subscription results bypass application enrichment. Resource updates match exact parsed URIs or hierarchical child/fragment relationships with unchanged scheme, authority and query; explicit fragments and opaque URIs require exact equality. Matching never grants resource access. Access changes end only the subscriptions on the changed surface or tenant, and appliance-wide changes (gateway and global policy, API keys, vault revocation, appliance-global resources) end all; request-entry revisions and verified JWT/Transit expiry bound access lifetime. Provider-specific opaque sub-resources, other credential revocation, changes to a connection's trusted or attested issuers, cross-process changes and full route/mediator authorization and lifecycle conformance are not verified. See `docs/MCP_METADATA.md`; do not treat helper tests as proof of those.
+Modern MCP discovery and subscriptions run for admitted modern requests on Access Points, gateway-owned Proxies, Transit Points and Fabric framed streams. Forwarded discovery intersects endpoint versions and path capabilities, including the selected authenticated Fabric peer; changed results are private with zero TTL. `mcp::upstream_versions` remembers the versions each forwarded discovery delivered (legacy-only after `-32601`, the listed versions after `-32022`, nothing after other errors) per surface, Access Point variant or Transit Point alias, and Target, bounded to 1024 entries for 300 seconds; a later `-32022` from that endpoint advertises only the path's versions that are also remembered, keeping the full path list when nothing is remembered or none overlap, without changing admission or calling the upstream. Owned catalogs advertise tools-list changes and provide bounded, stream-local subscriptions. Acknowledgement precedes every requested notification, subscription IDs retain their string/integer type, and final subscription results bypass application enrichment. Resource updates match exact parsed URIs or hierarchical child/fragment relationships with unchanged scheme, authority and query; explicit fragments and opaque URIs require exact equality. Matching never grants resource access. Access changes end only the subscriptions on the changed surface or tenant, and appliance-wide changes (gateway and global policy, API keys, vault revocation, appliance-global resources) end all; request-entry revisions and verified JWT/Transit expiry bound access lifetime. Provider-specific opaque sub-resources, other credential revocation, changes to a connection's trusted or attested issuers, cross-process changes and full route/mediator authorization and lifecycle conformance are not verified. See `docs/MCP_METADATA.md`; do not treat helper tests as proof of those.
 
 JWT strategy mutations/reload, provider mutations and explicit vault revocation also invalidate local subscription lifetimes; vault invalidation remains inside the owned mutation task so cancellation cannot release it early. Reads do not invalidate access. Access Points, Transit Points and independent Fabric receivers capture the configured vault's durable revocation epoch before credential evaluation and recheck it every second through one shared watcher per vault, with a one-second read timeout even on quiet streams. A changed epoch closes streams started under an earlier one; corrupt or unavailable state closes every subscription on the vault; initial read failure returns correlated `503`. Separate-process local-filesystem tests cover revocation without a local signal. Remote-filesystem visibility, other credential kinds, cross-process configuration changes and full resource-policy conformance remain required.
 

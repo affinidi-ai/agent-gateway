@@ -276,12 +276,15 @@ pub enum SchemaViolation {
 /// response. The tool-call handler `await`s the receiver; the SSE-response
 /// dispatcher fires `send(...)` when it sees the matching client reply.
 ///
-/// Keyed on the MCP `Mcp-Session-Id` so two concurrent sessions can each have
-/// their own pending elicitations without colliding.
+/// Keyed on surface and `Mcp-Session-Id` so two concurrent sessions can each
+/// have their own pending elicitations without colliding, even when upstreams
+/// on different surfaces choose the same session id.
 #[derive(Debug, Default)]
 pub struct PendingElicitationRegistry {
-    inner: Mutex<HashMap<String, HashMap<String, oneshot::Sender<ElicitationResult>>>>,
+    inner: Mutex<HashMap<(String, String), PendingElicitations>>,
 }
+
+type PendingElicitations = HashMap<String, oneshot::Sender<ElicitationResult>>;
 
 impl PendingElicitationRegistry {
     pub fn new() -> Self {
@@ -292,13 +295,14 @@ impl PendingElicitationRegistry {
     /// `request_id` (use it as the JSON-RPC `id`) and the receiver to await.
     pub async fn register(
         &self,
+        surface_id: &str,
         session_id: &str,
     ) -> (String, oneshot::Receiver<ElicitationResult>) {
         let id = Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
         let mut guard = self.inner.lock().await;
         guard
-            .entry(session_id.to_string())
+            .entry((surface_id.to_string(), session_id.to_string()))
             .or_default()
             .insert(id.clone(), tx);
         (id, rx)
@@ -310,12 +314,13 @@ impl PendingElicitationRegistry {
     /// a different request).
     pub async fn resolve(
         &self,
+        surface_id: &str,
         session_id: &str,
         request_id: &str,
         result: ElicitationResult,
     ) -> bool {
         let mut guard = self.inner.lock().await;
-        if let Some(session_map) = guard.get_mut(session_id)
+        if let Some(session_map) = guard.get_mut(&(surface_id.to_string(), session_id.to_string()))
             && let Some(tx) = session_map.remove(request_id)
         {
             return tx.send(result).is_ok();
@@ -327,25 +332,28 @@ impl PendingElicitationRegistry {
     /// DELETE / transport close). Receivers will observe the channel closing.
     pub async fn drop_session(
         &self,
+        surface_id: &str,
         session_id: &str,
     ) {
         let mut guard = self.inner.lock().await;
-        guard.remove(session_id);
+        guard.remove(&(surface_id.to_string(), session_id.to_string()));
     }
 
-    /// Remove a single pending elicitation by session + request id. Used to
+    /// Remove a single pending elicitation by surface, session and request id. Used to
     /// clean up the registry entry after the waiter has resolved (timeout,
     /// cancel, decline) so stale senders don't leak memory.
     pub async fn remove(
         &self,
+        surface_id: &str,
         session_id: &str,
         request_id: &str,
     ) {
+        let key = (surface_id.to_string(), session_id.to_string());
         let mut guard = self.inner.lock().await;
-        if let Some(session_map) = guard.get_mut(session_id) {
+        if let Some(session_map) = guard.get_mut(&key) {
             session_map.remove(request_id);
             if session_map.is_empty() {
-                guard.remove(session_id);
+                guard.remove(&key);
             }
         }
     }
@@ -395,9 +403,12 @@ impl McpClientCapabilities {
     }
 }
 
+/// Keyed by surface as well as `Mcp-Session-Id`: the id can come from the
+/// upstream, so one upstream must not be able to overwrite another surface's
+/// record by choosing the same id.
 #[derive(Debug, Default)]
 pub struct McpCapabilityRegistry {
-    inner: Mutex<HashMap<String, McpClientCapabilities>>,
+    inner: Mutex<HashMap<(String, String), McpClientCapabilities>>,
 }
 
 impl McpCapabilityRegistry {
@@ -406,32 +417,35 @@ impl McpCapabilityRegistry {
     }
     pub async fn record(
         &self,
+        surface_id: &str,
         session_id: &str,
         caps: McpClientCapabilities,
     ) {
         self.inner
             .lock()
             .await
-            .insert(session_id.to_string(), caps);
+            .insert((surface_id.to_string(), session_id.to_string()), caps);
     }
     pub async fn get(
         &self,
+        surface_id: &str,
         session_id: &str,
     ) -> Option<McpClientCapabilities> {
         self.inner
             .lock()
             .await
-            .get(session_id)
+            .get(&(surface_id.to_string(), session_id.to_string()))
             .cloned()
     }
     pub async fn drop_session(
         &self,
+        surface_id: &str,
         session_id: &str,
     ) {
         self.inner
             .lock()
             .await
-            .remove(session_id);
+            .remove(&(surface_id.to_string(), session_id.to_string()));
     }
 }
 
@@ -449,13 +463,13 @@ static GLOBAL_MCP_CAPABILITY_REGISTRY: std::sync::OnceLock<SharedMcpCapabilityRe
 static GLOBAL_PENDING_ELICITATION_REGISTRY: std::sync::OnceLock<SharedPendingElicitationRegistry> =
     std::sync::OnceLock::new();
 
-/// Process-wide MCP client capability registry, keyed by `Mcp-Session-Id`.
+/// Process-wide MCP client capability registry, keyed by surface and `Mcp-Session-Id`.
 pub fn global_capability_registry() -> &'static SharedMcpCapabilityRegistry {
     GLOBAL_MCP_CAPABILITY_REGISTRY.get_or_init(|| Arc::new(McpCapabilityRegistry::new()))
 }
 
 /// Process-wide registry of in-flight `elicitation/create` requests awaiting
-/// a client response, keyed by `Mcp-Session-Id` and elicitation id.
+/// a client response, keyed by surface, `Mcp-Session-Id` and elicitation id.
 pub fn global_pending_elicitation_registry() -> &'static SharedPendingElicitationRegistry {
     GLOBAL_PENDING_ELICITATION_REGISTRY.get_or_init(|| Arc::new(PendingElicitationRegistry::new()))
 }
@@ -675,6 +689,7 @@ mod tests {
 
         // Round-trip a capability record through the global registry.
         a.record(
+            "global-surface",
             "global-sess-1",
             McpClientCapabilities {
                 elicitation: true,
@@ -684,7 +699,7 @@ mod tests {
         )
         .await;
         let got = b
-            .get("global-sess-1")
+            .get("global-surface", "global-sess-1")
             .await
             .expect("recorded");
         assert!(got.elicitation);
@@ -693,9 +708,12 @@ mod tests {
     #[tokio::test]
     async fn pending_registry_resolves_waiter() {
         let reg = PendingElicitationRegistry::new();
-        let (id, rx) = reg.register("sess-1").await;
+        let (id, rx) = reg
+            .register("surface", "sess-1")
+            .await;
         let resolved = reg
             .resolve(
+                "surface",
                 "sess-1",
                 &id,
                 ElicitationResult::Accept {
@@ -712,7 +730,7 @@ mod tests {
     async fn pending_registry_unknown_id_returns_false() {
         let reg = PendingElicitationRegistry::new();
         let resolved = reg
-            .resolve("sess-1", "nope", ElicitationResult::Decline)
+            .resolve("surface", "sess-1", "nope", ElicitationResult::Decline)
             .await;
         assert!(!resolved);
     }
@@ -720,11 +738,32 @@ mod tests {
     #[tokio::test]
     async fn pending_registry_drop_session_closes_waiters() {
         let reg = PendingElicitationRegistry::new();
-        let (_id, rx) = reg.register("sess-1").await;
-        reg.drop_session("sess-1")
+        let (_id, rx) = reg
+            .register("surface", "sess-1")
+            .await;
+        reg.drop_session("surface", "sess-1")
             .await;
         // The sender was dropped; receiver should observe a closed channel.
         assert!(rx.await.is_err());
+    }
+
+    #[tokio::test]
+    async fn pending_registry_keeps_surfaces_apart() {
+        let reg = PendingElicitationRegistry::new();
+        let (id, rx) = reg
+            .register("surface-a", "shared")
+            .await;
+        assert!(
+            !reg.resolve("surface-b", "shared", &id, ElicitationResult::Decline)
+                .await
+        );
+        reg.drop_session("surface-b", "shared")
+            .await;
+        assert!(
+            reg.resolve("surface-a", "shared", &id, ElicitationResult::Decline)
+                .await
+        );
+        assert!(matches!(rx.await, Ok(ElicitationResult::Decline)));
     }
 
     #[tokio::test]
@@ -735,13 +774,54 @@ mod tests {
             sampling: false,
             roots: true,
         };
-        reg.record("s1", caps.clone())
+        reg.record("surface-a", "s1", caps.clone())
             .await;
-        let got = reg.get("s1").await.unwrap();
+        let got = reg
+            .get("surface-a", "s1")
+            .await
+            .unwrap();
         assert!(got.elicitation);
         assert!(!got.sampling);
         assert!(got.roots);
-        reg.drop_session("s1").await;
-        assert!(reg.get("s1").await.is_none());
+        reg.drop_session("surface-a", "s1")
+            .await;
+        assert!(
+            reg.get("surface-a", "s1")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn capability_registry_keeps_surfaces_apart() {
+        let reg = McpCapabilityRegistry::new();
+        let with = |elicitation| McpClientCapabilities {
+            elicitation,
+            sampling: false,
+            roots: false,
+        };
+        reg.record("surface-a", "shared", with(true))
+            .await;
+        reg.record("surface-b", "shared", with(false))
+            .await;
+        assert!(
+            reg.get("surface-a", "shared")
+                .await
+                .unwrap()
+                .elicitation
+        );
+        assert!(
+            !reg.get("surface-b", "shared")
+                .await
+                .unwrap()
+                .elicitation
+        );
+        reg.drop_session("surface-b", "shared")
+            .await;
+        assert!(
+            reg.get("surface-a", "shared")
+                .await
+                .is_some()
+        );
     }
 }

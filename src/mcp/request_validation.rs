@@ -370,11 +370,25 @@ pub fn validate_mcp_post(
     let method = object
         .get("method")
         .and_then(JsonValue::as_str);
-    if method == Some("initialize") && !body_intent && (!header_intent || has_session_header(headers, policy)) {
-        validate_mirrored_initialize_headers(headers, id)?;
+    let params = object
+        .get("params")
+        .and_then(JsonValue::as_object);
+    let session_header = has_session_header(headers, policy);
+    // 2026-07-28 has no `initialize`, so one without a modern version header or
+    // modern `_meta` opens a session even when it mirrors `Mcp-Method`/`Mcp-Name`.
+    if method == Some("initialize")
+        && !body_intent
+        && (!headers.contains_key(PROTOCOL_VERSION_HEADER) || session_header)
+    {
+        validate_mirrored_headers(headers, "initialize", params, id)?;
         return Ok(McpRequestClassification::Legacy(LegacyRequestKind::Opening));
     }
-    if !header_intent && !body_intent {
+    // Clients such as claude.ai mirror `Mcp-Method` on every request, so a
+    // session revision header keeps the request on the session path.
+    if !body_intent && (!header_intent || session_header) {
+        if let Some(method) = method {
+            validate_mirrored_headers(headers, method, params, id)?;
+        }
         if method.is_some() && !object.contains_key("id") {
             return Ok(McpRequestClassification::UnversionedNotification);
         }
@@ -669,17 +683,25 @@ fn has_modern_header(
         || headers.contains_key(NAME_HEADER)
 }
 
-fn validate_mirrored_initialize_headers(
+fn validate_mirrored_headers(
     headers: &HeaderMap,
+    method: &str,
+    params: Option<&Map<String, JsonValue>>,
     id: Option<JsonValue>,
 ) -> Result<(), Box<McpRequestValidationError>> {
-    if single_header(headers, METHOD_HEADER, id.clone())?.is_some_and(|method| method != "initialize") {
+    if single_header(headers, METHOD_HEADER, id.clone())?.is_some_and(|mirrored| mirrored != method) {
         return Err(header_mismatch(id, "Mcp-Method header does not match method"));
     }
-    single_header(headers, NAME_HEADER, id.clone())?
+    let Some(name) = single_header(headers, NAME_HEADER, id.clone())?
         .map(decode_mirrored_value)
         .transpose()
-        .map_err(|message| header_mismatch(id, message))?;
+        .map_err(|message| header_mismatch(id.clone(), message))?
+    else {
+        return Ok(());
+    };
+    if mirrored_name_source(method, params, id.clone())?.is_some_and(|expected| expected != name) {
+        return Err(header_mismatch(id, "Mcp-Name header does not match request params"));
+    }
     Ok(())
 }
 
@@ -1121,7 +1143,34 @@ mod tests {
 
         let mut method_only = HeaderMap::new();
         method_only.insert(METHOD_HEADER, HeaderValue::from_static("initialize"));
-        assert!(validate(&body, &method_only, MODERN_CAPABLE_POLICY).is_err());
+        let mut modern_meta = body.clone();
+        modern_meta["params"]["_meta"] = json!({CLIENT_CAPABILITIES_META: {}});
+        assert!(validate(&modern_meta, &method_only, MODERN_CAPABLE_POLICY).is_err());
+    }
+
+    /// claude.ai falls back to this after a 2026-07-28 request fails: no
+    /// version header, a mirrored `Mcp-Method`, and an empty `params._meta`.
+    #[test]
+    fn initialize_without_a_version_header_is_legacy_opening_even_with_mirrored_headers() {
+        let mut empty_meta = initialize_body(json!("2025-11-25"));
+        empty_meta["params"]["_meta"] = json!({});
+        for body in [initialize_body(json!("2025-11-25")), empty_meta] {
+            for mirrored in [METHOD_HEADER, NAME_HEADER] {
+                let mut headers = HeaderMap::new();
+                headers.insert(mirrored, HeaderValue::from_static("initialize"));
+                for policy in [LEGACY_ONLY_POLICY, MODERN_CAPABLE_POLICY] {
+                    assert_eq!(
+                        validate(&body, &headers, policy),
+                        Ok(McpRequestClassification::Legacy(LegacyRequestKind::Opening)),
+                        "{mirrored} with {body}"
+                    );
+                }
+            }
+        }
+        let mut wrong_method = HeaderMap::new();
+        wrong_method.insert(METHOD_HEADER, HeaderValue::from_static("tools/call"));
+        let error = validate(&initialize_body(json!("2025-11-25")), &wrong_method, MODERN_CAPABLE_POLICY).unwrap_err();
+        assert_eq!(error.code, error_codes::HEADER_MISMATCH);
     }
 
     #[test]
@@ -1257,6 +1306,83 @@ mod tests {
                     Ok(McpRequestClassification::Legacy(LegacyRequestKind::Session)),
                     "{version}"
                 );
+            }
+        }
+    }
+
+    /// claude.ai mirrors `Mcp-Method` on session requests, including
+    /// `notifications/initialized` right after `initialize`.
+    #[test]
+    fn session_revision_header_with_mirrored_method_is_a_legacy_request() {
+        let request = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}});
+        let notification = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+        for version in SESSION_VERSIONS {
+            for policy in [LEGACY_ONLY_POLICY, MODERN_CAPABLE_POLICY] {
+                for (body, expected) in [
+                    (&request, McpRequestClassification::Legacy(LegacyRequestKind::Session)),
+                    (&notification, McpRequestClassification::UnversionedNotification),
+                ] {
+                    let mut headers = HeaderMap::new();
+                    headers.insert(PROTOCOL_VERSION_HEADER, HeaderValue::from_static(version));
+                    headers.insert(
+                        METHOD_HEADER,
+                        HeaderValue::from_str(
+                            body["method"]
+                                .as_str()
+                                .unwrap(),
+                        )
+                        .unwrap(),
+                    );
+                    let bytes = serde_json::to_vec(body).unwrap();
+                    assert_eq!(
+                        validate_mcp_post(&headers, &bytes, LegacySessionEvidence::Known, policy),
+                        Ok(expected),
+                        "{version}: {body}"
+                    );
+
+                    headers.insert(METHOD_HEADER, HeaderValue::from_static("tools/call"));
+                    let error = validate_mcp_post(&headers, &bytes, LegacySessionEvidence::Known, policy).unwrap_err();
+                    assert_eq!(error.code, error_codes::HEADER_MISMATCH, "{version}: {body}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn session_revision_header_with_mirrored_name_must_match_params() {
+        let call = json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "echo"}});
+        let unnamed = json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {}});
+        let numbered = json!({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": 7}});
+        let listed = json!({"jsonrpc": "2.0", "id": 6, "method": "tools/list", "params": {}});
+        for (body, name, expected) in [
+            (&call, "echo", None),
+            (&call, "=?base64?ZWNobw==?=", None),
+            (&listed, "anything", None),
+            (&call, "delete", Some(error_codes::HEADER_MISMATCH)),
+            (&unnamed, "echo", Some(error_codes::INVALID_PARAMS)),
+            (&numbered, "7", Some(error_codes::INVALID_PARAMS)),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(PROTOCOL_VERSION_HEADER, HeaderValue::from_static("2025-11-25"));
+            headers.insert(
+                METHOD_HEADER,
+                HeaderValue::from_str(
+                    body["method"]
+                        .as_str()
+                        .unwrap(),
+                )
+                .unwrap(),
+            );
+            headers.insert(NAME_HEADER, HeaderValue::from_static(name));
+            let bytes = serde_json::to_vec(body).unwrap();
+            let result = validate_mcp_post(&headers, &bytes, LegacySessionEvidence::Known, MODERN_CAPABLE_POLICY);
+            match expected {
+                None => assert_eq!(
+                    result,
+                    Ok(McpRequestClassification::Legacy(LegacyRequestKind::Session)),
+                    "{name}: {body}"
+                ),
+                Some(code) => assert_eq!(result.unwrap_err().code, code, "{name}: {body}"),
             }
         }
     }
