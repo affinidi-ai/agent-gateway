@@ -1429,12 +1429,15 @@ Server-side errors keep their behaviour, and requested scopes are advertised
 but not enforced.
 
 A PUT whose `caller_authentication` omits `protected_resource` keeps the
-stored setting while the surface still supports it, so a client that does not
-know the setting cannot switch it off by accident. A PUT that no longer
-supports it, for example one that switches the method, sets `forward_header` or
-`audiences`, or moves the protocol off MCP, drops it instead of being refused
-over a setting the client did not send. `null` removes it, sent with PATCH, or
-with PUT in the same request as the rest of the edit.
+stored setting while the Access Point would still serve it, so a client that
+does not know the setting cannot switch it off by accident. A PUT after which
+it would not, for example one that switches the method, sets `forward_header`
+or `audiences`, moves the protocol off MCP, or changes the route or listen
+address the resource names, drops it instead of being refused over a setting
+the client did not send. `null` removes it, sent with PATCH, or with PUT in the
+same request as the rest of the edit. A variant PUT
+(`PUT /v1/surfaces/{id}/variants/{variant_id}`) applies the same rules to the
+variant's own setting in the overrides it sends.
 
 The dashboard edits the setting in the Caller Context editor of an MCP surface
 whose method is JWT Bearer, for the surface and for each variant that overrides

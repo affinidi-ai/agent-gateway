@@ -357,6 +357,86 @@ async fn a_put_removes_discovery_only_where_it_sends_null() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_variant_put_keeps_its_discovery_unless_it_sends_null() {
+    let fixture = JwksFixture::start().await;
+    let (harness, admin) = start_discovery_gateway(&fixture).await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap();
+    let methods = json!([{"type": "jwt_bearer", "jwt_verification_strategy_id": IDP_STRATEGY, "audiences": []}]);
+    let mut own = protected_resource("/varied");
+    own["scopes"] = json!(["beta"]);
+    let surfaces = format!("{}/api/v1/surfaces", harness.gateway_base);
+    let created = admin
+        .post(&surfaces)
+        .json(&json!({
+            "name": "varied",
+            "access_point": {"listen_address": harness.gateway_base.replace("127.0.0.1", "localhost"),
+                "route": "/varied", "protocol": "mcp",
+                "caller_authentication": {"methods": methods, "protected_resource": protected_resource("/varied")}},
+            "target": {"endpoint": harness.mock.url()},
+            "variants": [{"id": "beta", "alias": "beta", "name": "Beta", "enabled": true, "overrides": {
+                "access_point": {"caller_authentication": {"methods": methods, "protected_resource": own}}
+            }}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201, "{}", created.text().await.unwrap());
+    let created: serde_json::Value = created.json().await.unwrap();
+    let url = format!(
+        "{surfaces}/{}/variants/beta",
+        created["surface_id"]
+            .as_str()
+            .unwrap()
+    );
+    let variant_metadata = || {
+        client
+            .get(metadata_url(&harness, "/varied$beta"))
+            .send()
+    };
+
+    // Overrides that leave the setting out keep the variant's own.
+    let kept = admin
+        .put(&url)
+        .json(&json!({"overrides": {"access_point": {"caller_authentication": {"methods": methods}}}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(kept.status(), 200, "{}", kept.text().await.unwrap());
+    let published = variant_metadata()
+        .await
+        .unwrap();
+    assert_eq!(published.status(), 200);
+    assert_eq!(
+        published
+            .json::<serde_json::Value>()
+            .await
+            .unwrap()["scopes_supported"],
+        json!(["beta"])
+    );
+
+    // A null removes it.
+    let removed = admin
+        .put(&url)
+        .json(&json!({"overrides": {"access_point": {"caller_authentication": {
+            "methods": methods, "protected_resource": null
+        }}}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), 200, "{}", removed.text().await.unwrap());
+    assert_eq!(
+        variant_metadata()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_browser_client_reads_the_metadata_from_any_origin() {
     let fixture = JwksFixture::start().await;
     let (harness, _admin) = start_discovery_gateway(&fixture).await;

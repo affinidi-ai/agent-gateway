@@ -11,9 +11,9 @@ changes:
         enabled variant, so an MCP client finds where to get a token. Each listener publishes only
         its own surfaces. The authorization servers must include the issuer of the caller
         authentication's JWT verification strategy. The setting is checked on save like
-        mcp_http.authorization, a PUT that
-        omits it keeps it while the surface still supports it, a PUT or PATCH that sends null
-        removes it, and surfaces without it behave as before.
+        mcp_http.authorization. A PUT of the surface or of a variant that omits it keeps it while the
+        Access Point would still serve it, a PUT or PATCH that sends null removes it, and surfaces
+        without it behave as before.
     - timestamp: '2026-10-27T11:14:01Z'
       title: Challenge MCP callers without a valid token to fetch one
       description: >-
