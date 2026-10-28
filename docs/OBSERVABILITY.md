@@ -227,7 +227,9 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
     A request whose variant can't be resolved is refused, never served by the base surface or
     another variant. A modern MCP POST on the Access Point or the Transit Point is answered with a
     JSON-RPC error with code `-32603` carrying the request's `id` (the body is read only to
-    recover it; a body that can't be read gets the same error without an `id`), and its record
+    recover it, within the smaller of `mcp_http.max_request_bytes` and 16 KiB as the read runs
+    before authentication and rate limiting; a body that can't be read within that gets the same
+    error without an `id`), and its record
     carries `rpc_error_code` `-32603` on both HTTP paths. Other modern MCP requests on the Access
     Point get that error without an `id`, recorded the same way. The record is written once, at
     routing, whatever happens to the body.

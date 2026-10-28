@@ -69,8 +69,10 @@ changes:
         alias the URL named, cut to 32 characters, in requested_variant. On the Access Point and
         the Transit Point, a modern MCP POST (told by its MCP headers) is refused with a JSON-RPC
         error with code -32603 that echoes the request's id, recorded with that rpc_error_code;
-        the body is read only to recover the id, and one that can't be read gets the error
-        without an id, as does any other modern MCP request on the Access Point. Legacy MCP and
+        the body is read only to recover the id, within 16 KiB (or the endpoint's smaller
+        max_request_bytes) since the read runs before authentication, and one that can't be read
+        within that gets the error without an id, as does any other modern MCP request on the
+        Access Point. Legacy MCP and
         other requests get a plain error.
     - timestamp: '2026-10-28T16:10:00Z'
       title: Rename variant_alias to surface_variant on metrics and PayloadCaptured
