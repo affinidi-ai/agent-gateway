@@ -95,12 +95,15 @@ export function actorLabel(actor: PolicyChangeActor, userName?: UserNameResolver
       return actor.user_id
         ? `access token ${actor.id} of ${user(actor.user_id)}`
         : `access token ${actor.id}`;
-    default:
+    case 'system':
       return 'the gateway';
+    default:
+      // A kind this dashboard does not know yet: name it as recorded.
+      return `${String((actor as { kind: unknown }).kind)} ${actor.id}`;
   }
 }
 
-const REFUSED_VERB: Record<PolicyChangeEvent, string> = {
+const REFUSED_VERB: Partial<Record<string, string>> = {
   policy_created: 'Creating',
   policy_updated: 'Updating',
   policy_deleted: 'Deleting',
@@ -161,8 +164,16 @@ function describePolicyChange(
       const parts = changedPartsLabel(change.changed);
       return narrative(`${quoted}${on} changed${versions}${parts ? `: ${parts}` : ''}.`);
     }
-    case 'policy_attached':
-      return narrative(`${versioned} was added to ${where}.`);
+    case 'policy_attached': {
+      // An attachment that decides nothing yet must not read like an enforced one.
+      const inactive =
+        change.mode === 'monitor_only'
+          ? `, ${modeLabel(change.mode)}`
+          : change.enabled === false
+            ? ', disabled'
+            : '';
+      return narrative(`${versioned} was added to ${where}${inactive}.`);
+    }
     case 'policy_detached':
       return narrative(`${versioned} was removed from ${where}.`);
     case 'policy_attachment_changed':
@@ -175,7 +186,7 @@ function describePolicyChange(
     case 'policy_change_refused': {
       const attempted = change.action ?? 'policy_change_refused';
       const owner = attempted === 'policy_updated' && change.changed?.includes('owner');
-      const verb = owner ? 'Reassigning the owner of' : REFUSED_VERB[attempted];
+      const verb = owner ? 'Reassigning the owner of' : (REFUSED_VERB[attempted] ?? 'Changing');
       const object = policy
         ? quoted
         : attempted === 'policy_created'
@@ -196,7 +207,8 @@ function surfaceSlotPhrase(change: PolicyChangeData, slot: string): string {
     return `the MCP tool policy for ${change.mcp_tool_name}`;
   }
   if (change.slot === 'mcp_tool_gate' && change.gate) {
-    return `the condition of MCP tool gate ${change.gate}`;
+    const point = change.transit_point ? ` on transit point ${change.transit_point}` : '';
+    return `the condition of MCP tool gate ${change.gate}${point}`;
   }
   return `its ${slot}`;
 }

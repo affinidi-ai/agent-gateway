@@ -302,6 +302,82 @@ describe('eventNarrative', () => {
       expect(n.summary).toBe('Attaching a policy to the appliance was refused (403, forbidden).');
     });
 
+    it('places a gate condition on its transit point', () => {
+      const n = describeEntry(
+        at({
+          policy_attached: {
+            policy_definition_id: 'office-hours',
+            target: surface,
+            scope: 'mcp_tool',
+            slot: 'mcp_tool_gate',
+            transit_point: 'billing',
+            gate: 'Office hours',
+            actor: user,
+            source: 'api',
+          },
+        })
+      );
+      expect(n.summary).toBe(
+        '“office-hours” was added to surface Orders as the condition of MCP tool gate Office hours on transit point billing.'
+      );
+    });
+
+    it('says when an attached policy is monitor-only or disabled', () => {
+      const attached = (extra: Record<string, unknown>) =>
+        describeEntry(
+          at({
+            policy_attached: {
+              policy_definition_id: 'deny-pii',
+              actor: user,
+              source: 'api',
+              ...extra,
+            },
+          })
+        ).summary;
+
+      expect(
+        attached({
+          target: { kind: 'appliance' },
+          slot: 'plane',
+          plane: 'gateway',
+          mode: 'monitor_only',
+        })
+      ).toBe('“deny-pii” was added to the appliance-wide gateway plane, monitor-only.');
+      expect(
+        attached({
+          target: { kind: 'gateway', id: 'gw-1', name: 'Peer' },
+          slot: 'target',
+          enabled: false,
+        })
+      ).toBe('“deny-pii” was added to gateway Peer, disabled.');
+    });
+
+    it('describes a refusal of an unknown action as a change', () => {
+      const n = describeEntry(
+        at({
+          policy_change_refused: {
+            policy_definition_id: 'deny-pii',
+            action: 'policy_renamed',
+            status: 403,
+            reason: 'forbidden',
+            actor: user,
+            source: 'api',
+          },
+        })
+      );
+      expect(n.summary).toBe('Changing “deny-pii” was refused (403, forbidden).');
+    });
+
+    it('names the gateway only for a system actor, and an unknown actor by kind and id', () => {
+      const created = (actor: unknown) =>
+        describeEntry(
+          at({ policy_created: { policy_definition_id: 'deny-pii', actor, source: 'api' } })
+        ).detail;
+
+      expect(created({ kind: 'system', id: 'gateway' })).toBe('By the gateway.');
+      expect(created({ kind: 'service', id: 'svc-1' })).toBe('By service svc-1.');
+    });
+
     it('names a user actor by username when the resolver knows it, else by id', () => {
       const created = (actor: { kind: 'user'; id: string }) =>
         at({
