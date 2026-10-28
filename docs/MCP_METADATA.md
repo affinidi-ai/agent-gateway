@@ -1387,8 +1387,11 @@ one to eight RFC 8414 issuer identifiers, checked with the issuer rules of
 under the strict posture (HTTPS, a host, no credentials, query, fragment,
 whitespace or control character), printable ASCII, at most 2048 bytes each and
 advertised exactly as written, since clients compare them byte for byte with
-the issuer in the server's own metadata. Tokens are still validated by the JWT verification strategy, so the
-strategy's expected issuer should be one of them. `scopes` are advertised as
+the issuer in the server's own metadata. Tokens are still validated by the JWT verification strategy, so its
+expected issuer must be one of them: a save that leaves it out is refused with
+`400`, because every token a client got from the other servers would be refused.
+A strategy whose issuer changes later fails closed: its surfaces answer the
+`401` challenge until the two agree again. `scopes` are advertised as
 `scopes_supported`. A variant that overrides `caller_authentication` carries
 its own setting or none.
 

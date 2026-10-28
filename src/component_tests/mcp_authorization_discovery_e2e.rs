@@ -10,6 +10,8 @@ use super::helpers::{GatewayHarness, MockServer, configure_admin_api};
 
 const PUBLIC_ORIGIN: &str = "https://gateway.example";
 const AUTHORIZATION_SERVER: &str = "https://idp.example/realms/agents";
+/// A strategy trusting `AUTHORIZATION_SERVER`, for surfaces saved through the API.
+const IDP_STRATEGY: &str = "discovery-idp-strategy";
 
 fn protected_resource(route: &str) -> serde_json::Value {
     json!({
@@ -47,6 +49,21 @@ async fn start_discovery_gateway_with(
             .extend(listeners);
         std::fs::write(&bootstrap.config_files.gateway, serde_json::to_vec(&network).unwrap()).unwrap();
         setup_jwt_bearer_auth_rejects_missing_then_accepts_valid(fixture, directory, config);
+        let strategy = json!({
+            "id": IDP_STRATEGY,
+            "name": "Discovery IdP",
+            "expected_issuer": AUTHORIZATION_SERVER,
+            "jwks_source": {"type": "remote", "jwks_uri": format!("{AUTHORIZATION_SERVER}/jwks")},
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"
+        });
+        std::fs::write(
+            directory
+                .join("jwt_verification_strategies")
+                .join(format!("{IDP_STRATEGY}.json")),
+            serde_json::to_vec(&strategy).unwrap(),
+        )
+        .unwrap();
         let surface = &mut config.surfaces[0];
         surface.access_point.protocol = crate::config::agent_surface::SurfaceProtocol::Mcp;
         surface
@@ -153,7 +170,7 @@ async fn an_mcp_access_point_publishes_the_protected_resource_its_caller_authent
             "name": route.trim_start_matches('/'),
             "access_point": {"listen_address": listen_address, "route": route, "protocol": "mcp",
                 "caller_authentication": {
-                    "methods": [{"type": "jwt_bearer", "jwt_verification_strategy_id": "e2e-jwt-strategy", "audiences": []}],
+                    "methods": [{"type": "jwt_bearer", "jwt_verification_strategy_id": IDP_STRATEGY, "audiences": []}],
                     "protected_resource": protected
                 }},
             "target": {"endpoint": harness.mock.url()}
@@ -212,6 +229,25 @@ async fn an_mcp_access_point_publishes_the_protected_resource_its_caller_authent
             .await
             .unwrap()
             .contains("requires empty JWT Bearer audiences")
+    );
+    // The strategy the harness surface uses trusts the local fixture issuer, not
+    // the advertised server, so every token a client got would be refused.
+    let mut untrusted = surface("/other", protected_resource("/other"));
+    untrusted["access_point"]["caller_authentication"]["methods"][0]["jwt_verification_strategy_id"] =
+        json!("e2e-jwt-strategy");
+    let refused = admin
+        .post(&surfaces)
+        .json(&untrusted)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 400);
+    assert!(
+        refused
+            .text()
+            .await
+            .unwrap()
+            .contains("authorization_servers must include")
     );
     let mut http_issuer = protected_resource("/other");
     http_issuer["authorization_servers"] = json!(["http://idp.example"]);
@@ -399,7 +435,7 @@ async fn the_callers_token_never_reaches_the_target() {
             "access_point": {"listen_address": harness.gateway_base.replace("127.0.0.1", "localhost"),
                 "route": "/forwarding", "protocol": "mcp",
                 "caller_authentication": {
-                    "methods": [{"type": "jwt_bearer", "jwt_verification_strategy_id": "e2e-jwt-strategy",
+                    "methods": [{"type": "jwt_bearer", "jwt_verification_strategy_id": IDP_STRATEGY,
                         "audiences": [], "forward_header": true}],
                     "protected_resource": protected_resource("/forwarding")
                 }},
@@ -490,7 +526,7 @@ async fn the_same_route_on_two_listeners_publishes_each_listeners_own_resource()
             "name": "second",
             "access_point": {"listen_address": second_address, "route": "/smoke", "protocol": "mcp",
                 "caller_authentication": {
-                    "methods": [{"type": "jwt_bearer", "jwt_verification_strategy_id": "e2e-jwt-strategy", "audiences": []}],
+                    "methods": [{"type": "jwt_bearer", "jwt_verification_strategy_id": IDP_STRATEGY, "audiences": []}],
                     "protected_resource": {"resource": "https://other.example/smoke", "authorization_servers": [AUTHORIZATION_SERVER]}
                 }},
             "target": {"endpoint": harness.mock.url()}

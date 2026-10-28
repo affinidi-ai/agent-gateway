@@ -976,6 +976,7 @@ pub async fn create_surface(
         resource_scope(&scope),
         resource_scoped(&delegation),
     )?;
+    validate_protected_resource_issuers(&state, &surface).await?;
     validate_mcp_resource_declarations(&state, &surface).await?;
     if let Ok(Some(_)) = store
         .get(&surface.surface_id)
@@ -1415,6 +1416,53 @@ fn drop_unsupported_protected_resources(
     }
 }
 
+/// The authorization servers an Access Point advertises (base and each enabled
+/// variant) must include the issuer its JWT verification strategy trusts. Only
+/// that issuer's tokens are accepted, so a client following metadata that names
+/// another server gets tokens that are always refused and loops on the 401
+/// challenge. `validate_surface_references` has already checked that the
+/// strategy exists and that the caller may use it.
+async fn validate_protected_resource_issuers(
+    state: &IdentityApiState,
+    surface: &AgentSurface,
+) -> Result<(), SurfaceApiError> {
+    let variants = surface
+        .variants
+        .iter()
+        .filter_map(|variant| {
+            surface
+                .resolve_variant(Some(&variant.alias))
+                .ok()
+                .map(|resolved| (format!("variant '{}': ", variant.alias), resolved))
+        });
+    for (label, resolved) in std::iter::once((String::new(), surface.clone())).chain(variants) {
+        let (Some(protected), Some(crate::source_auth::SourceAuthConfig::JwtBearer(jwt))) =
+            (resolved.protected_resource(), resolved.source_auth())
+        else {
+            continue;
+        };
+        let strategy = state
+            .jwt_verification_strategy_store
+            .as_ref()
+            .ok_or_else(|| SurfaceApiError::InternalError("JWT verification strategy store not initialized".into()))?
+            .get(&jwt.jwt_verification_strategy_id)
+            .await
+            .map_err(|e| SurfaceApiError::InternalError(format!("Failed to load the JWT verification strategy: {e}")))?
+            .ok_or_else(|| SurfaceApiError::BadRequest(format!("{label}JWT verification strategy not found")))?;
+        if !protected
+            .authorization_servers
+            .contains(&strategy.expected_issuer)
+        {
+            return Err(SurfaceApiError::BadRequest(format!(
+                "{label}access_point.caller_authentication.protected_resource: authorization_servers must include \
+                 {}, the issuer the JWT verification strategy trusts",
+                strategy.expected_issuer
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Every `mcp_http.authorization.resource` the surface declares (base, enabled
 /// variants and Transit Points) must be one it serves, and no other stored
 /// surface or MCP Proxy may serve it. Otherwise a declaration could block
@@ -1514,6 +1562,7 @@ async fn validate_and_save_surface(
             .as_ref()
     });
     refuse_validation_off_by_scoped_caller(&surface, stored_a2a, context, scope, resource_scoped)?;
+    validate_protected_resource_issuers(state, &surface).await?;
     validate_mcp_resource_declarations(state, &surface).await?;
 
     store
