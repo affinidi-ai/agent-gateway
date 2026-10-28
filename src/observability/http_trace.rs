@@ -357,6 +357,7 @@ pub async fn trace_http_request(
             caller.auth_method = tracing::field::Empty,
             caller.principal = tracing::field::Empty,
             caller.did = tracing::field::Empty,
+            surface.variant = tracing::field::Empty,
         )
     } else {
         tracing::span!(
@@ -372,6 +373,7 @@ pub async fn trace_http_request(
             caller.auth_method = tracing::field::Empty,
             caller.principal = tracing::field::Empty,
             caller.did = tracing::field::Empty,
+            surface.variant = tracing::field::Empty,
         )
     };
 
@@ -392,6 +394,80 @@ pub async fn trace_http_request(
     }
     .instrument(span)
     .await
+}
+
+/// Captures the spans a future exports, for tests asserting span attributes.
+#[cfg(test)]
+pub(crate) mod span_capture {
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_sdk::Resource;
+    use opentelemetry_sdk::error::OTelSdkError;
+    use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData, SpanExporter};
+    use std::sync::{Arc, Mutex};
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    /// Minimal in-memory span exporter that captures exported spans for
+    /// assertions. Spans are stored after any wrapping exporter (e.g. the
+    /// redacting exporter) has run.
+    #[derive(Debug, Clone)]
+    pub(crate) struct CapturingExporter {
+        pub(crate) spans: Arc<Mutex<Vec<SpanData>>>,
+    }
+
+    impl SpanExporter for CapturingExporter {
+        async fn export(
+            &self,
+            batch: Vec<SpanData>,
+        ) -> Result<(), OTelSdkError> {
+            self.spans
+                .lock()
+                .unwrap()
+                .extend(batch);
+            Ok(())
+        }
+
+        fn set_resource(
+            &mut self,
+            _resource: &Resource,
+        ) {
+        }
+
+        fn shutdown(&mut self) -> Result<(), OTelSdkError> {
+            Ok(())
+        }
+    }
+
+    /// The string value of attribute `key` on `span`.
+    pub(crate) fn span_attr(
+        span: &SpanData,
+        key: &str,
+    ) -> Option<String> {
+        span.attributes
+            .iter()
+            .find(|kv| kv.key.as_str() == key)
+            .map(|kv| kv.value.as_str().to_string())
+    }
+
+    /// Runs `future` with an OpenTelemetry layer and returns the spans it
+    /// exported. Only spans created while polling `future` itself are
+    /// captured, not those of tasks it spawns.
+    pub(crate) async fn capture_spans<F: std::future::Future>(future: F) -> (F::Output, Vec<SpanData>) {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(CapturingExporter { spans: captured.clone() })
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::OpenTelemetryLayer::new(provider.tracer("test")));
+        let output = future
+            .with_subscriber(subscriber)
+            .await;
+        provider
+            .force_flush()
+            .unwrap();
+        let spans = std::mem::take(&mut *captured.lock().unwrap());
+        (output, spans)
+    }
 }
 
 #[cfg(test)]
@@ -462,50 +538,46 @@ mod tests {
 
     // ── Component test: proxied request produces a span with caller.* ──────────
 
-    use opentelemetry_sdk::Resource;
-    use opentelemetry_sdk::error::OTelSdkError;
-    use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData, SpanExporter};
+    use super::span_capture::{CapturingExporter, capture_spans, span_attr};
+    use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData};
     use std::sync::{Arc, Mutex};
 
-    /// Minimal in-memory span exporter that captures exported spans for
-    /// assertions. Spans are stored after any wrapping exporter (e.g. the
-    /// redacting exporter) has run.
-    #[derive(Debug, Clone)]
-    struct CapturingExporter {
-        spans: Arc<Mutex<Vec<SpanData>>>,
-    }
+    #[tokio::test]
+    async fn the_request_span_records_the_variant_routing_set() {
+        use crate::observability::policy_audit::{RequestScope, in_request, set_request_variant};
+        use axum::{Router, body::Body, http::Request, routing::post};
+        use tower::ServiceExt;
 
-    impl SpanExporter for CapturingExporter {
-        async fn export(
-            &self,
-            batch: Vec<SpanData>,
-        ) -> Result<(), OTelSdkError> {
-            self.spans
-                .lock()
-                .unwrap()
-                .extend(batch);
-            Ok(())
-        }
+        super::super::register_channel_prefix("/test-variant-span".to_string(), "Test Variant Span".to_string());
+        let ((), spans) = capture_spans(async {
+            async fn handler() -> &'static str {
+                in_request(RequestScope::fresh(), async {
+                    set_request_variant("beta");
+                    set_request_variant("_base_");
+                })
+                .await;
+                "ok"
+            }
+            let app = Router::new()
+                .route("/test-variant-span", post(handler))
+                .layer(axum::middleware::from_fn(trace_http_request));
+            let request = Request::builder()
+                .method("POST")
+                .uri("/test-variant-span")
+                .body(Body::empty())
+                .unwrap();
+            let _ = app
+                .oneshot(request)
+                .await
+                .unwrap();
+        })
+        .await;
 
-        fn set_resource(
-            &mut self,
-            _resource: &Resource,
-        ) {
-        }
-
-        fn shutdown(&mut self) -> Result<(), OTelSdkError> {
-            Ok(())
-        }
-    }
-
-    fn span_attr(
-        span: &SpanData,
-        key: &str,
-    ) -> Option<String> {
-        span.attributes
+        let http_span = spans
             .iter()
-            .find(|kv| kv.key.as_str() == key)
-            .map(|kv| kv.value.as_str().to_string())
+            .find(|span| span.name == "http.request" || span_attr(span, "http.path").is_some())
+            .expect("the request span was exported");
+        assert_eq!(span_attr(http_span, "surface.variant").as_deref(), Some("beta"));
     }
 
     #[test]

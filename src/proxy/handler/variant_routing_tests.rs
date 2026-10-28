@@ -337,6 +337,51 @@ async fn a_refusal_names_the_variant_it_refused_and_never_the_callers_text() {
 }
 
 #[tokio::test]
+async fn an_access_point_request_exports_its_span_with_the_variant() {
+    use crate::observability::http_trace::span_capture::{capture_spans, span_attr};
+    use tower::ServiceExt;
+
+    crate::observability::register_channel_prefix("/a2a".to_string(), "Orders".to_string());
+    let target = MockServer::start_with_response(
+        json!({"jsonrpc": "2.0", "id": 1, "result": {"kind": "message"}}).to_string(),
+    )
+    .await;
+    let app = axum::Router::new()
+        .fallback(super::multi_channel_proxy_handler)
+        .with_state(router(surface(&target.url(), catalog(), Some("v-prod"))))
+        .layer(axum::middleware::from_fn(crate::observability::http_trace::trace_http_request));
+    let mut request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/a2a$beta/rpc")
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            json!({"jsonrpc": "2.0", "id": 1, "method": "message/send", "params": {"message": {
+                "role": "user", "messageId": "m-1", "parts": [{"kind": "text", "text": "hello"}]
+            }}})
+            .to_string(),
+        ))
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 12345))));
+
+    let (status, spans) = capture_spans(async {
+        app.oneshot(request)
+            .await
+            .unwrap()
+            .status()
+    })
+    .await;
+
+    assert_eq!(status, axum::http::StatusCode::OK);
+    let request_span = spans
+        .iter()
+        .find(|span| span_attr(span, "http.path").is_some())
+        .expect("the request span was exported");
+    assert_eq!(span_attr(request_span, "surface.variant").as_deref(), Some("beta"));
+}
+
+#[tokio::test]
 async fn a_surface_with_variants_but_no_default_serves_an_alias_less_request_from_the_base() {
     let target = MockServer::start_with_response(
         json!({"jsonrpc": "2.0", "id": 1, "result": {"kind": "message"}}).to_string(),

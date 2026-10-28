@@ -6378,6 +6378,7 @@ async fn proxy_handler_with_mcp_runtime(
         });
     }
     if !outbound_credentials.is_empty() {
+        let surface_variant = crate::observability::policy_audit::current_request_variant();
         // Credential delegation requires a verified identity — both source_auth
         // (to know *who* the caller is) and managed_identity / extension inspection
         // (to know *which agent* is acting). Anonymous callers must be rejected.
@@ -6403,6 +6404,7 @@ async fn proxy_handler_with_mcp_runtime(
             warn!(
                 target: "credential_delegation",
                 surface = %channel_name,
+                surface_variant = surface_variant.as_deref(),
                 "Credential delegation requires source authentication — rejecting anonymous request"
             );
             crate::audit::request_events::request_rejected(
@@ -6542,6 +6544,7 @@ async fn proxy_handler_with_mcp_runtime(
                 info!(
                     target: "credential_delegation",
                     surface = %channel_name,
+                    surface_variant = surface_variant.as_deref(),
                     providers = %consent_entries.len(),
                     user_hash = %user_hash,
                     agent_did = %agent_did_for_vault,
@@ -6634,6 +6637,7 @@ async fn proxy_handler_with_mcp_runtime(
                             warn!(
                                 target: "credential_delegation",
                                 surface = %channel_name,
+                                surface_variant = surface_variant.as_deref(),
                                 error = %e,
                                 "Failed to mint consent_required identity VP for audit log"
                             );
@@ -6643,6 +6647,7 @@ async fn proxy_handler_with_mcp_runtime(
                     debug!(
                         target: "credential_delegation",
                         surface = %channel_name,
+                        surface_variant = surface_variant.as_deref(),
                         has_identity_selector = %state.identity_selector.is_some(),
                         has_identity_result = %identity_result.is_some(),
                         "Skipping consent_required VP audit — missing identity selector or resolved agent identity"
@@ -6691,6 +6696,7 @@ async fn proxy_handler_with_mcp_runtime(
                                         debug!(
                                             target: "credential_delegation",
                                             surface = %channel_name,
+                                            surface_variant = surface_variant.as_deref(),
                                             meta_field = %field,
                                             "Injected delegated credential into MCP metadata"
                                         );
@@ -6699,6 +6705,7 @@ async fn proxy_handler_with_mcp_runtime(
                                         warn!(
                                             target: "credential_delegation",
                                             surface = %channel_name,
+                                            surface_variant = surface_variant.as_deref(),
                                             meta_field = %field,
                                             error = %error,
                                             "Failed to inject delegated credential into MCP metadata"
@@ -6718,6 +6725,7 @@ async fn proxy_handler_with_mcp_runtime(
                                 debug!(
                                     target: "credential_delegation",
                                     surface = %channel_name,
+                                    surface_variant = surface_variant.as_deref(),
                                     header = %name,
                                     "Injected delegated credential header"
                                 );
@@ -6730,6 +6738,7 @@ async fn proxy_handler_with_mcp_runtime(
             warn!(
                 target: "credential_delegation",
                 surface = %channel_name,
+                surface_variant = surface_variant.as_deref(),
                 has_user_hash = %delegation_user_hash.is_some(),
                 "Credential delegation configured but stores not available — skipping"
             );
@@ -11195,6 +11204,7 @@ async fn handle_fabric_request(
             debug!(
                 target: "credential_delegation",
                 surface_id = %state.surface.surface_id,
+                surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
                 route = %state.surface.target.endpoint,
                 reason = "fabric_delegated_credentials=false",
                 "Delegated credentials withheld from Fabric peer"

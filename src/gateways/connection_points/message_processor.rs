@@ -3949,7 +3949,8 @@ async fn process_forward_request_in_request_scope(
             otel.kind = "server",
             caller.auth_method = tracing::field::Empty,
             caller.principal = tracing::field::Empty,
-            caller.did = tracing::field::Empty
+            caller.did = tracing::field::Empty,
+            surface.variant = tracing::field::Empty
         );
         let _ = span.set_parent(parent_cx.clone());
 
@@ -3976,7 +3977,8 @@ async fn process_forward_request_in_request_scope(
             otel.kind = "server",
             caller.auth_method = tracing::field::Empty,
             caller.principal = tracing::field::Empty,
-            caller.did = tracing::field::Empty
+            caller.did = tracing::field::Empty,
+            surface.variant = tracing::field::Empty
         )
     };
 

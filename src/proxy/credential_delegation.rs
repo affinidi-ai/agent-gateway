@@ -289,6 +289,7 @@ pub async fn resolve_delegation_credentials(
             Ok(None) => {
                 warn!(
                     target: "credential_delegation",
+                    surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
                     provider_id = %binding.credential_provider_id,
                     "Credential provider not found — skipping binding"
                 );
@@ -304,6 +305,7 @@ pub async fn resolve_delegation_credentials(
             Err(e) => {
                 warn!(
                     target: "credential_delegation",
+                    surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
                     provider_id = %binding.credential_provider_id,
                     error = %e,
                     "Failed to load credential provider"
@@ -327,6 +329,7 @@ pub async fn resolve_delegation_credentials(
                     Ok(api_key) => {
                         debug!(
                             target: "credential_delegation",
+                            surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
                             surface_id = %channel_id,
                             provider_id = %binding.credential_provider_id,
                             "API key resolved — injecting into upstream request"
@@ -356,6 +359,7 @@ pub async fn resolve_delegation_credentials(
                     Err(e) => {
                         warn!(
                             target: "credential_delegation",
+                            surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
                             provider_id = %binding.credential_provider_id,
                             error = %e,
                             "Failed to resolve API key"
@@ -382,6 +386,7 @@ pub async fn resolve_delegation_credentials(
                     Ok(VaultLookupResult::Found(token)) => {
                         debug!(
                             target: "credential_delegation",
+                            surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
                             surface_id = %channel_id,
                             provider_id = %binding.credential_provider_id,
                             "Client credentials token found in vault — injecting"
@@ -392,6 +397,7 @@ pub async fn resolve_delegation_credentials(
                         {
                             warn!(
                                 target: "credential_delegation",
+                                surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
                                 token_id = %token.id,
                                 error = %e,
                                 "Failed to mark client_credentials token as used"
@@ -424,6 +430,7 @@ pub async fn resolve_delegation_credentials(
                     Ok(VaultLookupResult::ExpiredRefreshable(token) | VaultLookupResult::ExpiredNoRefresh(token)) => {
                         debug!(
                             target: "credential_delegation",
+                            surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
                             token_id = %token.id,
                             "Expired client credentials will be replaced atomically"
                         );
@@ -443,6 +450,7 @@ pub async fn resolve_delegation_credentials(
                     Ok(token_response) => {
                         info!(
                             target: "credential_delegation",
+                            surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
                             surface_id = %channel_id,
                             provider_id = %binding.credential_provider_id,
                             "Client credentials token fetched — caching in vault"
@@ -481,6 +489,7 @@ pub async fn resolve_delegation_credentials(
                             Err(error) => {
                                 error!(
                                     target: "credential_delegation",
+                                    surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
                                     surface_id = %channel_id,
                                     provider_id = %binding.credential_provider_id,
                                     error = %error,
@@ -524,6 +533,7 @@ pub async fn resolve_delegation_credentials(
                     Err(e) => {
                         warn!(
                             target: "credential_delegation",
+                            surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
                             surface_id = %channel_id,
                             provider_id = %binding.credential_provider_id,
                             error = %e,
@@ -579,6 +589,7 @@ pub async fn resolve_delegation_credentials(
         if consented_by_other_principal {
             warn!(
                 target: "credential_delegation",
+                surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
                 surface_id = %channel_id,
                 provider_id = %binding.credential_provider_id,
                 user_hash = %user_identity_hash,
@@ -598,6 +609,7 @@ pub async fn resolve_delegation_credentials(
             Ok(VaultLookupResult::Found(token)) => {
                 debug!(
                     target: "credential_delegation",
+                    surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
                     surface_id = %channel_id,
                     provider_id = %binding.credential_provider_id,
                     user_hash = %user_identity_hash,
@@ -611,6 +623,7 @@ pub async fn resolve_delegation_credentials(
                 {
                     warn!(
                         target: "credential_delegation",
+                        surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
                         token_id = %token.id,
                         error = %e,
                         "Failed to mark delegation token as used"
@@ -695,6 +708,7 @@ pub async fn resolve_delegation_credentials(
                 }
                 info!(
                     target: "credential_delegation",
+                    surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
                     surface_id = %channel_id,
                     provider_id = %binding.credential_provider_id,
                     user_hash = %user_identity_hash,
@@ -741,6 +755,7 @@ pub async fn resolve_delegation_credentials(
                                 {
                                     warn!(
                                         target: "credential_delegation",
+                                        surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
                                         token_id = %token.id,
                                         error = %e,
                                         "Failed to mark refreshed token as used"
@@ -749,6 +764,7 @@ pub async fn resolve_delegation_credentials(
 
                                 info!(
                                     target: "credential_delegation",
+                                    surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
                                     surface_id = %channel_id,
                                     provider_id = %binding.credential_provider_id,
                                     "Token refreshed successfully"
@@ -796,6 +812,7 @@ pub async fn resolve_delegation_credentials(
                             Err(e) => {
                                 warn!(
                                     target: "credential_delegation",
+                                    surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
                                     surface_id = %channel_id,
                                     provider_id = %binding.credential_provider_id,
                                     error = %e,
@@ -839,6 +856,7 @@ pub async fn resolve_delegation_credentials(
                     _ => {
                         warn!(
                             target: "credential_delegation",
+                            surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
                             provider_id = %binding.credential_provider_id,
                             "Cannot refresh — credential provider not found"
                         );
@@ -865,6 +883,7 @@ pub async fn resolve_delegation_credentials(
             Ok(VaultLookupResult::ExpiredNoRefresh(_)) | Ok(VaultLookupResult::NotFound) => {
                 info!(
                     target: "credential_delegation",
+                    surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
                     surface_id = %channel_id,
                     provider_id = %binding.credential_provider_id,
                     user_hash = %user_identity_hash,
@@ -928,6 +947,7 @@ pub async fn resolve_delegation_credentials(
             Err(e) => {
                 warn!(
                     target: "credential_delegation",
+                    surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
                     surface_id = %channel_id,
                     provider_id = %binding.credential_provider_id,
                     error = %e,
@@ -1016,6 +1036,7 @@ fn refreshed_token_rejected(
 ) -> DelegationResolution {
     warn!(
         target: "credential_delegation",
+        surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
         provider_id = %binding.credential_provider_id,
         error = %error,
         "Refreshed credential rejected by vault"
@@ -1132,6 +1153,7 @@ async fn build_consent_required(
                 Err(e) => {
                     warn!(
                         target: "credential_delegation",
+                        surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
                         provider_id = %binding.credential_provider_id,
                         error = %e,
                         "Failed to build authorization URL"
@@ -1143,6 +1165,7 @@ async fn build_consent_required(
         _ => {
             warn!(
                 target: "credential_delegation",
+                surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
                 provider_id = %binding.credential_provider_id,
                 "Credential provider not found for consent_required"
             );
@@ -1229,6 +1252,7 @@ async fn try_elicit_flow(
         Err(e) => {
             warn!(
                 target: "credential_delegation",
+                surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
                 provider_id = %binding.credential_provider_id,
                 error = %e,
                 "Elicit: failed to build authorization URL; falling back to consent_required"
@@ -1258,6 +1282,7 @@ async fn try_elicit_flow(
         Err(e) => {
             warn!(
                 target: "credential_delegation",
+                surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
                 error = %e,
                 "Elicit: failed to serialize elicitation/create request"
             );
@@ -1272,6 +1297,7 @@ async fn try_elicit_flow(
         // deliver. Fall back per binding policy.
         debug!(
             target: "credential_delegation",
+            surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
             session_id = %session_id,
             "Elicit: no open SSE stream for session; honouring fallback"
         );
@@ -2058,6 +2084,44 @@ mod tests {
             result_tag(&results[0].result)
         );
         assert_eq!(results[0].action.outcome, DelegationActionOutcome::NotApplicable);
+    }
+
+    #[tokio::test]
+    async fn a_delegation_line_names_the_request_variant() {
+        use crate::observability::policy_audit::{RequestScope, in_request, set_request_variant};
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+        let vault: Arc<dyn DelegationVaultStorage> = MockVaultStore::new(VaultLookupResult::NotFound);
+        let providers: Arc<dyn CredentialProviderStorage> = MockProviderStore::empty();
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+        let bindings = vec![make_binding("cp-1")];
+
+        in_request(RequestScope::new("0123456789abcdef".to_string()), async {
+            set_request_variant("beta");
+            resolve_delegation_credentials(
+                &bindings,
+                "sha256:user1",
+                "did:web:agent.example",
+                "ch-1",
+                None,
+                &vault,
+                &providers,
+                &secrets,
+                "https://gw.example.com",
+                false,
+                None,
+                None,
+            )
+            .await
+        })
+        .await;
+
+        let line = logs
+            .text()
+            .lines()
+            .find(|line| line.contains("Credential provider not found"))
+            .map(str::to_string)
+            .expect("the missing provider is logged");
+        assert!(line.contains("surface_variant=\"beta\""), "{line}");
     }
 
     #[tokio::test]

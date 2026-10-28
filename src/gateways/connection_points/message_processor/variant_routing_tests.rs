@@ -289,13 +289,21 @@ fn every_fabric_receive_record_names_this_gateways_variant() {
             ("no alias, a surface with no variants", "plain", None, "_base_"),
         ] {
             let message = receiver.forward_request_with_body(surface_id, alias, json!("not a JSON-RPC request"));
-            let (_, events) = receiver
-                .receive(&message)
-                .await;
+            let ((_, events), spans) =
+                crate::observability::http_trace::span_capture::capture_spans(receiver.receive(&message)).await;
             assert!(!events.is_empty(), "{case}: the request writes records");
             for event in &events {
                 assert_eq!(event.surface_variant.as_deref(), Some(expected), "{case}: {event:?}");
             }
+            let request_span = spans
+                .iter()
+                .find(|span| span.name == "fabric.forward_request")
+                .unwrap_or_else(|| panic!("{case}: the fabric request span was exported"));
+            assert_eq!(
+                crate::observability::http_trace::span_capture::span_attr(request_span, "surface.variant").as_deref(),
+                Some(expected),
+                "{case}"
+            );
         }
     });
 }

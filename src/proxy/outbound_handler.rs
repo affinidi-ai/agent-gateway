@@ -3890,6 +3890,7 @@ fn log_fabric_delegation_withheld(ctx: &OutboundPipelineContext) {
         target: "credential_delegation",
         request_id = %ctx.request_id,
         surface_id = %ctx.surface.surface_id,
+        surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
         route = %ctx.virtual_channel.alias,
         reason = "fabric_delegated_credentials=false",
         "Delegated credentials withheld from Fabric peer"
@@ -3907,6 +3908,7 @@ async fn step_inject_credentials(
     state: &OutboundProxyState,
     ctx: &mut OutboundPipelineContext,
 ) -> Result<(), OutboundPipelineError> {
+    let surface_variant = crate::observability::policy_audit::current_request_variant();
     let mut outbound_creds = ctx
         .surface
         .transit_point_outbound_credentials(&ctx.virtual_channel);
@@ -3945,6 +3947,7 @@ async fn step_inject_credentials(
             warn!(
                 target: "credential_delegation",
                 request_id = %ctx.request_id,
+                surface_variant = surface_variant.as_deref(),
                 "Credential delegation configured but stores not available — skipping"
             );
             return Ok(());
@@ -3964,6 +3967,7 @@ async fn step_inject_credentials(
             warn!(
                 target: "credential_delegation",
                 request_id = %ctx.request_id,
+                surface_variant = surface_variant.as_deref(),
                 "Transit token does not carry user_identity_hash — cannot look up credentials"
             );
             return Ok(());
@@ -4061,6 +4065,7 @@ async fn step_inject_credentials(
         info!(
             target: "credential_delegation",
             request_id = %ctx.request_id,
+            surface_variant = surface_variant.as_deref(),
             providers = %consent_entries.len(),
             user_hash = %user_hash,
             agent_did = %agent_did,
@@ -4089,6 +4094,7 @@ async fn step_inject_credentials(
                             warn!(
                                 target: "credential_delegation",
                                 request_id = %ctx.request_id,
+                                surface_variant = surface_variant.as_deref(),
                                 meta_field = %field,
                                 "Failed to inject delegated credential into outbound MCP metadata because body is unavailable"
                             );
@@ -4102,6 +4108,7 @@ async fn step_inject_credentials(
                                 debug!(
                                     target: "credential_delegation",
                                     request_id = %ctx.request_id,
+                                    surface_variant = surface_variant.as_deref(),
                                     meta_field = %field,
                                     "Injecting delegated credential into outbound MCP metadata"
                                 );
@@ -4110,6 +4117,7 @@ async fn step_inject_credentials(
                                 warn!(
                                     target: "credential_delegation",
                                     request_id = %ctx.request_id,
+                                    surface_variant = surface_variant.as_deref(),
                                     meta_field = %field,
                                     error = %error,
                                     "Failed to inject delegated credential into outbound MCP metadata"
@@ -4122,6 +4130,7 @@ async fn step_inject_credentials(
                         debug!(
                             target: "credential_delegation",
                             request_id = %ctx.request_id,
+                            surface_variant = surface_variant.as_deref(),
                             header = %name,
                             "Injecting delegated credential header into outbound request"
                         );
@@ -8192,6 +8201,25 @@ mod tests {
                 "{case} modern={modern}"
             );
         }
+    }
+
+    #[test]
+    fn a_credential_delegation_line_names_the_request_variant() {
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+        let ctx = test_pipeline_context();
+
+        crate::observability::policy_audit::with_request_variant("beta", || log_fabric_delegation_withheld(&ctx));
+        log_fabric_delegation_withheld(&ctx);
+
+        let lines: Vec<String> = logs
+            .text()
+            .lines()
+            .filter(|line| line.contains("Delegated credentials withheld"))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("surface_variant=\"beta\""), "{}", lines[0]);
+        assert!(!lines[1].contains("surface_variant"), "{}", lines[1]);
     }
 
     #[tokio::test]

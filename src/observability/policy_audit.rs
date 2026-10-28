@@ -147,15 +147,22 @@ pub fn current_request_id() -> Option<String> {
         .ok()
 }
 
-/// Records the surface variant the request being served resolved to. Only
-/// surface routing calls this; the first value set is kept. Does nothing
-/// outside a request.
+/// Records the surface variant the request being served resolved to, and
+/// stamps it on the current span as `surface.variant`. Only surface routing
+/// calls this, while the request span is current; the first value set is
+/// kept. Does nothing outside a request.
 pub fn set_request_variant(variant: &str) {
-    let _ = REQUEST.try_with(|scope| {
-        scope
-            .variant
-            .set(variant.to_string())
-    });
+    let first = REQUEST
+        .try_with(|scope| {
+            scope
+                .variant
+                .set(variant.to_string())
+                .is_ok()
+        })
+        .unwrap_or(false);
+    if first {
+        tracing::Span::current().record("surface.variant", variant);
+    }
 }
 
 /// The surface variant the request being served resolved to, when routing
@@ -170,6 +177,19 @@ pub fn current_request_variant() -> Option<String> {
         })
         .ok()
         .flatten()
+}
+
+/// Runs `f` as a request that resolved to surface variant `variant`.
+#[cfg(test)]
+pub fn with_request_variant<R>(
+    variant: &str,
+    f: impl FnOnce() -> R,
+) -> R {
+    let scope = RequestScope::fresh();
+    let _ = scope
+        .variant
+        .set(variant.to_string());
+    REQUEST.sync_scope(scope, f)
 }
 
 /// Runs `future` as request `scope`: every audit record it writes carries
@@ -535,6 +555,7 @@ pub fn record_policy_decision(event: PolicyDecisionEvent<'_>) {
         .policy_content_hash
         .unwrap_or_default();
     let policy_name = decision_policy_name(&event);
+    let surface_variant = current_request_variant();
 
     if allowed {
         tracing::debug!(
@@ -546,6 +567,7 @@ pub fn record_policy_decision(event: PolicyDecisionEvent<'_>) {
             policy_definition_id = policy_definition_id,
             deny_reason = reason,
             surface_id = surface_id,
+            surface_variant = surface_variant.as_deref(),
             gateway_did = gateway_did,
             actor_did = caller_did.as_str(),
             caller_auth_method = auth_method,
@@ -568,6 +590,7 @@ pub fn record_policy_decision(event: PolicyDecisionEvent<'_>) {
             policy_definition_id = policy_definition_id,
             deny_reason = reason,
             surface_id = surface_id,
+            surface_variant = surface_variant.as_deref(),
             gateway_did = gateway_did,
             actor_did = caller_did.as_str(),
             caller_auth_method = auth_method,
@@ -1035,7 +1058,7 @@ mod tests {
             let identity = AuthenticatedIdentity::ApiKey {
                 key_name: "alpha-key".to_string(),
             };
-            record_policy_decision(PolicyDecisionEvent {
+            with_request_variant("beta", || record_policy_decision(PolicyDecisionEvent {
                 scope: PolicyScope::Surface,
                 allow: false,
                 reason: Some("trust check failed"),
@@ -1056,7 +1079,7 @@ mod tests {
                 caller: None,
                 error: None,
                 removed_tools: None,
-            });
+            }));
         });
 
         let captured = events.lock().unwrap();
@@ -1066,6 +1089,7 @@ mod tests {
             .expect("policy decision event not captured");
 
         assert_eq!(ev.level, "WARN");
+        assert_eq!(field(ev, "surface_variant"), Some("beta"));
         assert_eq!(field(ev, "policy_decision"), Some("deny"));
         assert_eq!(field(ev, "policy_flow"), Some("transit_point"));
         assert_eq!(field(ev, "deny_reason"), Some("trust check failed"));
@@ -1335,6 +1359,31 @@ mod tests {
 
         assert_eq!(ev.level, "DEBUG");
         assert_eq!(field(ev, "policy_decision"), Some("allow"));
+        assert_eq!(field(ev, "surface_variant"), None, "outside a request there is no variant");
+    }
+
+    #[test]
+    fn an_allow_line_names_the_request_variant() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(CapturingLayer { events: events.clone() });
+
+        tracing::subscriber::with_default(subscriber, || {
+            with_request_variant("_base_", || {
+                record_policy_decision(PolicyDecisionEvent {
+                    scope: PolicyScope::Gateway,
+                    allow: true,
+                    surface_id: Some("surface-b"),
+                    ..Default::default()
+                })
+            });
+        });
+
+        let captured = events.lock().unwrap();
+        let ev = captured
+            .iter()
+            .find(|e| field(e, "policy_scope") == Some("gateway"))
+            .expect("allow decision event not captured");
+        assert_eq!(field(ev, "surface_variant"), Some("_base_"));
     }
 
     #[test]
