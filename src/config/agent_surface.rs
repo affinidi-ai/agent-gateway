@@ -2104,6 +2104,20 @@ impl AgentSurface {
                 resolved
                     .validate_mcp_metadata_base()
                     .map_err(|error| format!("variant '{}': {error}", variant.alias))?;
+                // `/$alias` reaches the Access Point at `/` itself, so the
+                // variant has no path of its own for a resource to name.
+                if resolved.access_point.route == "/"
+                    && resolved
+                        .protected_resource()
+                        .is_some()
+                {
+                    return Err(format!(
+                        "variant '{}': access_point.caller_authentication.protected_resource: a variant of an \
+                         Access Point at / is not reachable at a resource of its own; move the Access Point off \
+                         / or disable the variant",
+                        variant.alias
+                    ));
+                }
             }
         }
         Ok(())
@@ -2524,6 +2538,20 @@ mod tests {
             changed["access_point"]["caller_authentication"]["methods"] = serde_json::json!([method]);
             assert!(rejected(&changed).contains("JWT Bearer"), "{method}");
         }
+        let mut root = stored.clone();
+        root["access_point"]["route"] = serde_json::json!("/");
+        root["access_point"]["caller_authentication"]["protected_resource"]["resource"] =
+            serde_json::json!("https://gateway.example/");
+        assert!(rejected(&root).contains(
+            "variant 'beta': access_point.caller_authentication.protected_resource: a variant of an Access Point at /"
+        ));
+        root["variants"][0]["enabled"] = serde_json::json!(false);
+        assert_eq!(
+            serde_json::from_value::<super::AgentSurface>(root)
+                .unwrap()
+                .validate_mcp_metadata(),
+            Ok(())
+        );
         let mut no_servers = stored.clone();
         no_servers["access_point"]["caller_authentication"]["protected_resource"]["authorization_servers"] =
             serde_json::json!([]);

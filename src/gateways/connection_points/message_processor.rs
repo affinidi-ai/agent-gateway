@@ -4143,6 +4143,13 @@ async fn process_forward_request_with_mcp_runtime(
         Ok(protected_resource) => protected_resource,
         Err(e) => {
             channel_warn!(config_id, "GW2: Invalid MCP protected resource (reason={}) — blocking", e);
+            crate::audit::request_events::auth_failed(
+                &audit_facts,
+                crate::audit::events::AuthScheme::Jwt,
+                "setup_failed",
+                true,
+                None,
+            );
             let error_body = serde_json::json!({
                 "error": "Invalid MCP protected resource",
                 "status": 503,

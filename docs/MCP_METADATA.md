@@ -1376,12 +1376,15 @@ server issued for another resource or variant, or one without `aud`, is
 refused like any other invalid token. MCP forbids passing a
 client's token through to the upstream server, so the caller's `Authorization`
 header never reaches the Target; a stored surface that sets `forward_header`
-anyway, for example one edited on disk, answers `503` and publishes no
-document. `resource` follows the rules of
+anyway, for example one edited on disk, answers `503`, audited as a blocking
+`setup_failed`, and publishes no document; so does any request whose stored
+setting the Access Point can no longer serve. `resource` follows the rules of
 `mcp_http.authorization.resource`: a canonical HTTPS URL on a public origin of
 the Access Point's listener with the route as its path, a distinct `$alias`
 resource for each enabled variant, and refused on save (`400`) when another
-stored surface or MCP Proxy already serves it. `authorization_servers` lists
+stored surface or MCP Proxy already serves it. An Access Point at `/` publishes
+for itself only: `/$alias` reaches the Access Point, not the variant, so a save
+that leaves a variant of it enabled with the setting is refused. `authorization_servers` lists
 one to eight RFC 8414 issuer identifiers, checked with the issuer rules of
 [authorization server metadata discovery](SOURCE_AUTH.md#authorization-server-metadata-module-developer-reference)
 under the strict posture (HTTPS, a host, no credentials, query, fragment,

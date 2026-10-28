@@ -1799,15 +1799,6 @@ async fn proxy_handler_with_mcp_runtime(
         })
         .transpose()
         .map_err(|_| create_error_response(StatusCode::SERVICE_UNAVAILABLE, "Invalid MCP resource authorization"))?;
-    let protected_resource = crate::protocols::protected_resource::access_point_protected_resource(
-        &state.surface,
-        state
-            .active_variant_alias
-            .as_deref(),
-        &state.network_config,
-    )
-    .transpose()
-    .map_err(|_| create_error_response(StatusCode::SERVICE_UNAVAILABLE, "Invalid MCP protected resource"))?;
     let mut source_auth_failure: Option<crate::surface_context::SourceAuthContext> = None;
     let audit_facts = crate::audit::request_events::RequestFacts {
         surface_id: config_id,
@@ -1821,6 +1812,31 @@ async fn proxy_handler_with_mcp_runtime(
             .get::<crate::source_auth::client_ip::ClientIp>()
             .map_or(addr.ip(), |client| client.0),
     );
+    let protected_resource = match crate::protocols::protected_resource::access_point_protected_resource(
+        &state.surface,
+        state
+            .active_variant_alias
+            .as_deref(),
+        &state.network_config,
+    )
+    .transpose()
+    {
+        Ok(protected_resource) => protected_resource,
+        Err(e) => {
+            channel_warn!(config_id, "Invalid MCP protected resource (reason={}) — blocking", e);
+            crate::audit::request_events::auth_failed(
+                &audit_facts,
+                crate::audit::events::AuthScheme::Jwt,
+                "setup_failed",
+                true,
+                client_ip,
+            );
+            connection_guard
+                .decrement()
+                .await;
+            return Err(create_error_response(StatusCode::SERVICE_UNAVAILABLE, "Invalid MCP protected resource"));
+        }
+    };
     let authenticated_identity: Option<crate::source_auth::AuthenticatedIdentity> = if let Some(authorization) =
         &resource_authorization
     {

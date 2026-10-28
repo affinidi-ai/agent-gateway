@@ -341,6 +341,11 @@ pub fn access_point_protected_resource(
     network: &crate::config::NetworkConfig,
 ) -> Option<Result<ProtectedResourceConfig, String>> {
     let configured = surface.protected_resource()?;
+    if alias.is_some() && surface.access_point.route == "/" {
+        // A request for `/$alias` reaches the Access Point at `/` itself, so
+        // a variant of it has no path of its own for a resource to name.
+        return Some(Err("a variant of an Access Point at / is not reachable at a resource of its own".into()));
+    }
     Some(
         surface
             .validate_protected_resource()
@@ -362,6 +367,9 @@ fn caller_authentication_metadata(
     path: &str,
 ) -> Result<Option<Value>, ()> {
     let requested = path.replace("%24", "$");
+    let Some(suffix) = requested.strip_prefix("/.well-known/oauth-protected-resource") else {
+        return Ok(None);
+    };
     let mut found = None;
     for surface in surfaces {
         if surface.status != crate::config::agent_surface::SurfaceStatus::Active
@@ -369,39 +377,53 @@ fn caller_authentication_metadata(
         {
             continue;
         }
-        let aliases = std::iter::once(None).chain(
-            surface
+        // A served resource names the route called, so only the Access Point
+        // whose route the path names, base or enabled variant, is resolved.
+        let route = surface
+            .access_point
+            .route
+            .as_str();
+        let alias = match suffix.strip_prefix(route) {
+            Some("") => None,
+            Some(rest) => match rest.strip_prefix('$') {
+                Some(alias) => Some(alias),
+                None => continue,
+            },
+            None if route == "/" && suffix.is_empty() => None,
+            None => continue,
+        };
+        if let Some(alias) = alias
+            && !surface
                 .variants
                 .iter()
-                .filter(|variant| variant.enabled)
-                .map(|variant| Some(variant.alias.as_str())),
-        );
-        for alias in aliases {
-            let Ok(resolved) = surface.resolve_variant(alias) else {
-                continue;
-            };
-            let claims_path = resolved
-                .protected_resource()
-                .and_then(|configured| {
-                    configured
-                        .for_variant(alias)
-                        .ok()
-                })
-                .and_then(|derived| derived.metadata_url().ok())
-                .is_some_and(|url| url.path() == requested);
-            if !claims_path {
-                continue;
-            }
-            let metadata = access_point_protected_resource(&resolved, alias, network)
-                .and_then(Result::ok)
-                .and_then(|served| served.metadata().ok())
-                .ok_or(())?;
-            if found
-                .replace(metadata)
-                .is_some()
-            {
-                return Err(());
-            }
+                .any(|variant| variant.enabled && variant.alias == alias)
+        {
+            continue;
+        }
+        let Ok(resolved) = surface.resolve_variant(alias) else {
+            continue;
+        };
+        let claims_path = resolved
+            .protected_resource()
+            .and_then(|configured| {
+                configured
+                    .for_variant(alias)
+                    .ok()
+            })
+            .and_then(|derived| derived.metadata_url().ok())
+            .is_some_and(|url| url.path() == requested);
+        if !claims_path {
+            continue;
+        }
+        let metadata = access_point_protected_resource(&resolved, alias, network)
+            .and_then(Result::ok)
+            .and_then(|served| served.metadata().ok())
+            .ok_or(())?;
+        if found
+            .replace(metadata)
+            .is_some()
+        {
+            return Err(());
         }
     }
     Ok(found)
@@ -693,6 +715,17 @@ mod tests {
             access_point_protected_resource(&discovery_surface(jwt_bearer_method(), None), None, &network),
             None
         );
+        // A variant of an Access Point at / has no path of its own.
+        let mut root = discovery_surface(
+            jwt_bearer_method(),
+            Some(json!({"resource": "https://gateway.example/", "authorization_servers": [ISSUER]})),
+        );
+        root.access_point.route = "/".into();
+        assert!(matches!(access_point_protected_resource(&root, None, &network), Some(Ok(_))));
+        let root_beta = root
+            .resolve_variant(Some("beta"))
+            .unwrap();
+        assert!(matches!(access_point_protected_resource(&root_beta, Some("beta"), &network), Some(Err(_))));
         for unserved in [
             json!({"resource": "https://other.example/mcp/alpha", "authorization_servers": [ISSUER]}),
             json!({"resource": "https://gateway.example/mcp/other", "authorization_servers": [ISSUER]}),
@@ -746,6 +779,28 @@ mod tests {
         ] {
             assert_eq!(metadata(unclaimed), Ok(None), "{unclaimed}");
         }
+
+        // An Access Point at / publishes the root form only.
+        let mut root = discovery_surface(
+            jwt_bearer_method(),
+            Some(json!({"resource": "https://gateway.example/", "authorization_servers": [ISSUER]})),
+        );
+        root.access_point.route = "/".into();
+        let root = [std::sync::Arc::new(root)];
+        assert_eq!(
+            caller_authentication_metadata(&root, &network, "/.well-known/oauth-protected-resource")
+                .unwrap()
+                .unwrap()["resource"],
+            "https://gateway.example/"
+        );
+        assert_eq!(
+            caller_authentication_metadata(&root, &network, "/.well-known/oauth-protected-resource/$beta"),
+            Err(())
+        );
+        assert_eq!(
+            caller_authentication_metadata(&root, &network, "/.well-known/oauth-protected-resource/mcp"),
+            Ok(None)
+        );
 
         let mut inactive = discovery_surface(
             jwt_bearer_method(),
