@@ -2060,6 +2060,13 @@ mod tests {
     }
 
     #[test]
+    fn validate_refuses_a_default_on_a_surface_with_no_variants() {
+        let mut s = base_surface();
+        s.default_variant_id = Some("x".to_string());
+        assert_eq!(s.validate_variants(), Err(VariantValidationError::DefaultMissing("x".to_string())));
+    }
+
+    #[test]
     fn validate_allows_none_default_with_variants() {
         // `default_variant_id = None` is valid even when variants[] is
         // non-empty: alias-less URLs resolve to the bare base surface
