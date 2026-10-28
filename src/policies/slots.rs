@@ -1,6 +1,7 @@
-//! Every place a surface names a policy definition that the gateway enforces,
-//! keyed by where it sits, so two versions of a surface can be compared slot by
-//! slot.
+//! Every place a surface names a policy definition, as stored, keyed by where
+//! it sits, so two versions of a surface can be compared slot by slot. The
+//! slots follow what a user wrote on the base surface and in each variant's
+//! overrides, not what a request resolves to.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -35,8 +36,8 @@ pub struct SlotPolicy {
     pub place_label: Option<String>,
 }
 
-/// Every enforced policy reference of `surface` and of each variant override.
-/// The shared `transit_policy` is left out: nothing enforces it.
+/// Every policy reference of `surface` and of each variant override, as
+/// stored. The shared `transit_policy` is left out: nothing ever reads it.
 pub fn policy_slots(surface: &AgentSurface) -> BTreeMap<SlotKey, SlotPolicy> {
     let mut slots = Slots {
         found: BTreeMap::new(),

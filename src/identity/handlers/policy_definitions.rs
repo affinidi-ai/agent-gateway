@@ -55,8 +55,8 @@ pub struct PolicyDefinitionsQuery {
     pub policy_type: Option<String>,
 }
 
-/// Returns `true` when `surface` references `policy_id` in any enforced policy
-/// slot ([`crate::policies::slots::policy_slots`]), including per-variant
+/// Returns `true` when `surface` references `policy_id` in any policy slot
+/// ([`crate::policies::slots::policy_slots`]), including per-variant
 /// overrides, MCP tool policies and gate conditions.
 fn surface_references_policy(
     surface: &crate::config::agent_surface::AgentSurface,

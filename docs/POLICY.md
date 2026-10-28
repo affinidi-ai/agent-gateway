@@ -424,7 +424,7 @@ governance audit event (group Policies; record fields in
 | A change above refused, by the route (role, validation, not found, conflict) or before it (an access token's resource scope, Terms and Conditions not yet accepted) | the definition, assignment, gateway policy and ownership routes | `policy_change_refused` |
 
 Surface and gateway changes are found by comparing the stored record before and after each
-write in a management request (`src/policies/slots.rs` lists a surface's enforced slots), so
+write in a management request (`src/policies/slots.rs` lists a surface's policy slots), so
 every API path that writes one is covered. Each store holds a write lock from that read until the
 write's changes are recorded, so concurrent writes record a chain of changes, each relative to
 the record it replaced, in write order. A slot is told apart by its variant, its transit
@@ -434,6 +434,19 @@ not listed. A refused surface or variant write is not recorded, nor a refused
 `DELETE /v1/gateways/{id}`: a refusal is recorded from the route alone, and whether either one
 would have changed a policy depends on the body or the stored record. A successful one records
 each policy it attaches or detaches.
+
+Change records follow what a user wrote, not what the runtime works out from it. A surface's
+records name the policies set on the base surface and those set in each variant's overrides, as
+stored. They do not record which policy a request ends up under:
+- Promoting a variant to default, or enabling or disabling one, changes which policies serve a
+  route but writes no policy slot, so it records no policy change.
+- A variant saved with `complete: true` (the surface builder saves every variant this way)
+  replaces the base wholesale, so a policy it does not set is cleared for its traffic. Its
+  records show only the policies it sets.
+- A variant's transit overrides (shared or per transit point) are recorded as written, but the
+  runtime compiles transit policies from the base surface only, so they are not enforced.
+
+What actually decided a request is in its `policy_decision` records.
 
 The policy write routes are listed once, in `PolicyWrite` (`src/audit/policy_refusals.rs`); the
 router registers each through it, so a route's own refusals and those made before it by
