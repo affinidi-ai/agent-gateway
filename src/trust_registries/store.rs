@@ -36,9 +36,12 @@ pub trait TrustRegistryStore: Send + Sync {
         id: &str,
     ) -> Result<()>;
 
-    /// Update a trust registry
-    async fn update(
+    /// Update a trust registry only when its record still exists, returning
+    /// whether it was written. A record deleted in the meantime is not recreated,
+    /// so implementations must make the existence check and the write atomic
+    /// with respect to `delete` for the same id.
+    async fn update_if_exists(
         &self,
         trust_registry: &TrustRegistry,
-    ) -> Result<()>;
+    ) -> Result<bool>;
 }

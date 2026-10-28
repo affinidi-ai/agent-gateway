@@ -1835,11 +1835,11 @@ pub async fn run_axum_proxy(
                 .did
                 .domain
                 .clone();
-            Some(Arc::new(crate::trust_registries::TrustRegistryListenerManager::new(
+            Some(crate::trust_registries::TrustRegistryListenerManager::new(
                 domain,
                 trust_registries_storage_path.clone(),
                 Some(secrets_store.clone()),
-            )))
+            ))
         };
 
         if crate::server::mode::is_standby()

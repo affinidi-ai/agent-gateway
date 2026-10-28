@@ -190,9 +190,19 @@ async fn update_status(
     tr.connection_status = new_status;
     tr.updated_at = chrono::Utc::now();
 
-    if let Err(e) = store.update(&tr).await {
-        error!("TR reader: failed to update status for '{}': {}", tr_id, e);
-        return;
+    match store
+        .update_if_exists(&tr)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            debug!("TR reader: trust registry '{}' was deleted; its status was not written", tr_id);
+            return;
+        }
+        Err(e) => {
+            error!("TR reader: failed to update status for '{}': {}", tr_id, e);
+            return;
+        }
     }
 
     info!("TR reader: updated '{}' status to {}", tr_id, status_label);
