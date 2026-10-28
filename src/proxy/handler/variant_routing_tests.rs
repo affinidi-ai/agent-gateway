@@ -359,6 +359,12 @@ async fn the_refusal_warning_names_the_requested_variant_cut_never_the_callers_f
         .collect();
     assert_eq!(warnings.len(), 1, "{text}");
     assert!(warnings[0].contains("WARN"), "{}", warnings[0]);
+    assert!(
+        warnings[0].contains("[CHANNEL:orders] Surface variant cannot be resolved"),
+        "the dashboard's log filter keys on the channel prefix: {}",
+        warnings[0]
+    );
+    assert!(warnings[0].contains("config_id=\"orders\""), "{}", warnings[0]);
     assert!(warnings[0].contains("UnknownVariant"), "{}", warnings[0]);
     assert!(warnings[0].contains(&long[..32]), "{}", warnings[0]);
     assert!(!warnings[0].contains(&long), "the caller's full alias is logged: {}", warnings[0]);
