@@ -21,10 +21,12 @@ Feature: MCP authorization server discovery
 
   Scenario: A caller without a token is told where to get one
     Given the surface publishes protected resource metadata naming authorization server "https://idp.example/realms/agents" and scope "tools"
+    And the VP Audit Log keeps every audit event
     When the caller asks the MCP surface for available tools without a token
     Then the response status is 401
     And the response challenges the caller to fetch a token from the surface's protected resource metadata
     And MCP server "bravo" was not called
+    And the VP Audit Log records a blocking "JWT Bearer" source authentication failure for "a missing credential"
 
   Scenario Outline: A caller with an invalid token is told to get a new one
     Given the surface publishes protected resource metadata naming authorization server "https://idp.example/realms/agents" and scope "tools"
@@ -47,6 +49,18 @@ Feature: MCP authorization server discovery
     Then the response status is 200
     And MCP server "bravo" received the forwarded MCP request
     And the MCP surface returns MCP server "bravo" tool catalog unchanged
+
+  Scenario Outline: The verified caller reaches policy with its token's claims
+    Given the surface publishes protected resource metadata naming authorization server "https://idp.example/realms/agents" and scope "tools"
+    And the surface has a request policy that allows callers in group "research"
+    And MCP server "bravo" publishes a tool catalog
+    When caller "alice" asks the MCP surface for available tools with a token issued for the surface containing group "<group>"
+    Then the response status is <status>
+
+    Examples:
+      | group      | status |
+      | research   | 200    |
+      | operations | 403    |
 
   Scenario: The caller's token never reaches the MCP server
     Given the surface publishes protected resource metadata naming authorization server "https://idp.example/realms/agents" and scope "tools"

@@ -699,6 +699,22 @@ async fn vp_audit_log_records_non_blocking_source_auth_failure(
     .await;
 }
 
+#[then(expr = "the VP Audit Log records a blocking {string} source authentication failure for {string}")]
+async fn vp_audit_log_records_blocking_source_auth_failure(
+    world: &mut SurfaceWorld,
+    auth_type: String,
+    failure: String,
+) {
+    let scheme = audited_auth_scheme(&auth_type);
+    let reason = audited_auth_failure_reason(&failure);
+    let what = format!("a blocking '{auth_type}' source authentication failure for {failure}");
+    expect_vp_audit_record(world, &what, |event| {
+        let recorded = &event["event"]["auth_failed"];
+        recorded["scheme"] == scheme && recorded["reason"] == reason && recorded["blocking"] == true
+    })
+    .await;
+}
+
 /// The audit reason code for a refused request, as the step names the refusal.
 fn audited_refusal_reason(refusal: &str) -> &'static str {
     match refusal {

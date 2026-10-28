@@ -1454,6 +1454,15 @@ empty, `forward_header` off and the `Authorization` header with the `Bearer`
 scheme. A setting the operator switches off is sent as `null` in the PUT that
 saves the rest of the surface, so a save that fails leaves it in place.
 
+Releases before this one load `caller_authentication` with
+`deny_unknown_fields`, so they skip a surface that stores `protected_resource`
+and stop serving it. Before rolling back to such a release, PATCH
+`{"access_point": {"caller_authentication": {"protected_resource": null}}}`
+onto every surface that sets it, and `{"overrides": {"access_point":
+{"caller_authentication": {"protected_resource": null}}}}` onto every variant
+that sets its own, then protect those Access Points another way: without the
+setting, their JWT Bearer method checks no audience.
+
 `make mcp-discovery` ([`scripts/mcp-discovery/`](../scripts/mcp-discovery/README.md))
 runs the flow end to end against Ory Hydra with a scripted client and the
 official MCP client SDK, and `--keep` leaves it running for MCP Inspector.
@@ -1463,8 +1472,7 @@ refused for its audience; the demo's consent app shows how.
 
 The `fabric` CLI sends surface JSON to the gateway as it is, so it sets and
 removes the setting without CLI-specific flags. `--set` sends a JSON Merge
-Patch and `--unset` sends `null`; add `--dry-run` to have the gateway check the
-change without saving it:
+Patch and `--unset` sends `null`:
 
 ```sh
 fabric agent-gateway surfaces update <surface> --set 'access_point.caller_authentication.protected_resource={"resource":"https://gateway.example/mcp/alpha","authorization_servers":["https://idp.example/realms/agents"],"scopes":["tools"]}'

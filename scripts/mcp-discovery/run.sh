@@ -207,7 +207,7 @@ if [[ "${KEEP}" == true ]]; then
 
 Everything is still running. Check with MCP Inspector in another terminal:
 
-  NODE_EXTRA_CA_CERTS="${CA_ROOT}/rootCA.pem" npx @modelcontextprotocol/inspector
+  NODE_EXTRA_CA_CERTS="${CA_ROOT}/rootCA.pem" npx @modelcontextprotocol/inspector@2.12.0
 
   Transport: Streamable HTTP    URL: ${RESOURCE}
   Authentication > OAuth client ID: ${CLIENT_ID}    Scope: tools

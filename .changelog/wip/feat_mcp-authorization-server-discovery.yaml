@@ -33,7 +33,7 @@ changes:
         removes a setting the operator switches off in the same request as the rest of the save,
         so a save that fails changes nothing.
     - timestamp: '2026-10-27T19:34:56Z'
-      title: End-to-end MCP discovery demo against Ory Hydra
+      title: Run MCP discovery end to end against Ory Hydra
       description: >-
         make mcp-discovery starts Ory Hydra in Docker, a login and consent app, an MCP server and
         the gateway, then checks discovery, sign-in, the token audience, token stripping and the

@@ -123,6 +123,13 @@ async fn an_mcp_access_point_publishes_the_protected_resource_its_caller_authent
         .unwrap();
     assert_eq!(published.status(), 200);
     assert_eq!(published.headers()["cache-control"], "no-store");
+    let head = client
+        .head(metadata_url(&harness, "/smoke"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head.status(), 200);
+    assert_eq!(head.headers()["cache-control"], "no-store");
     assert_eq!(
         published
             .json::<serde_json::Value>()
