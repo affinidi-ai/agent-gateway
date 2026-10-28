@@ -467,7 +467,9 @@ impl OutboundPipelineContext {
         // The URL's alias, else the default variant, else the base surface
         // serves the request. A variant that can't be resolved is refused. A
         // modern MCP POST is answered later, once its body is read for the
-        // `id`, on the unresolved surface; every other request now.
+        // `id`, on the unresolved surface; every other request now. So a
+        // request that reaches any later step and names an alias always has
+        // that alias's `active_variant_id`.
         let refuse = |error: &crate::config::agent_surface_variants::VariantResolveError, rpc_error_code| {
             let refusal = crate::audit::request_events::refuse_routing(
                 &crate::audit::request_events::RequestFacts {
