@@ -343,10 +343,32 @@ pub(crate) fn request_id_from_bytes(body: &[u8]) -> Option<JsonValue> {
 /// without one, as a body that can't be read is.
 pub const ROUTING_REFUSAL_ID_READ_LIMIT: usize = 16 * 1024;
 
+/// Answers a modern MCP request refused at routing with
+/// [`McpRequestValidationError::for_routing_refusal`]. `body`, when given, is
+/// read only for the request's `id`, within the endpoint's MCP body limit (from
+/// `mcp_http`, `public_endpoints` and `versions`, as the endpoint builds its
+/// [`super::modern_http::EndpointHttpPolicy`]). An endpoint policy that can't be
+/// built, or a body that can't be read, is answered without an `id`.
+pub(crate) async fn answer_routing_refusal(
+    refusal: &crate::audit::request_events::RoutingRefusal,
+    mcp_http: Option<&crate::config::McpHttpConfig>,
+    public_endpoints: &[String],
+    versions: McpVersionPolicy<'static>,
+    body: Option<axum::body::Body>,
+) -> axum::response::Response {
+    let limit = super::modern_http::EndpointHttpPolicy::with_versions(mcp_http, public_endpoints, versions)
+        .map(|policy| policy.body_limit());
+    let id = match (body, limit) {
+        (Some(body), Ok(limit)) => read_request_id(body, limit).await,
+        _ => None,
+    };
+    (*McpRequestValidationError::for_routing_refusal(refusal, id)).into_response()
+}
+
 /// Reads a refused request's body, within `limit` and
 /// [`ROUTING_REFUSAL_ID_READ_LIMIT`], for its JSON-RPC `id`; `None` when the
 /// body is larger, can't be read or carries no id.
-pub(crate) async fn read_request_id(
+async fn read_request_id(
     body: axum::body::Body,
     limit: usize,
 ) -> Option<JsonValue> {

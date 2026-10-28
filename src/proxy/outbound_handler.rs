@@ -605,7 +605,8 @@ impl OutboundPipelineContext {
         versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
         refusal: &crate::audit::request_events::RoutingRefusal,
     ) -> Response {
-        let policy = crate::mcp::modern_http::EndpointHttpPolicy::with_versions(
+        crate::mcp::request_validation::answer_routing_refusal(
+            refusal,
             self.virtual_channel
                 .mcp_http
                 .as_ref(),
@@ -613,14 +614,11 @@ impl OutboundPipelineContext {
                 .network_config
                 .get_outbound_external_urls(),
             versions,
-        );
-        let id = match (self.request.take(), policy) {
-            (Some(request), Ok(policy)) => {
-                crate::mcp::request_validation::read_request_id(request.into_body(), policy.body_limit()).await
-            }
-            _ => None,
-        };
-        (*crate::mcp::request_validation::McpRequestValidationError::for_routing_refusal(refusal, id)).into_response()
+            self.request
+                .take()
+                .map(Request::into_body),
+        )
+        .await
     }
 }
 

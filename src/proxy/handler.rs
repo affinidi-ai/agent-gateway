@@ -9201,17 +9201,15 @@ async fn refuse_access_point_variant(
     if !modern_mcp {
         return create_error_response(refusal.status(), refusal.message());
     }
-    let id = if req.method() == Method::POST
-        && let Ok(policy) = crate::mcp::modern_http::EndpointHttpPolicy::with_versions(
-            surface.mcp_http.as_ref(),
-            &network_config.get_inbound_external_urls(),
-            versions,
-        ) {
-        crate::mcp::request_validation::read_request_id(req.into_body(), policy.body_limit()).await
-    } else {
-        None
-    };
-    (*crate::mcp::request_validation::McpRequestValidationError::for_routing_refusal(&refusal, id)).into_response()
+    let body = (req.method() == Method::POST).then(|| req.into_body());
+    crate::mcp::request_validation::answer_routing_refusal(
+        &refusal,
+        surface.mcp_http.as_ref(),
+        &network_config.get_inbound_external_urls(),
+        versions,
+        body,
+    )
+    .await
 }
 
 fn normalize_route_for_match(route: &str) -> String {
