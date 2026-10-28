@@ -9179,33 +9179,40 @@ async fn proxy_handler_with_mcp_runtime(
 }
 
 /// Refuses an Access Point request whose surface variant can't be resolved,
-/// recording the refusal once. A modern MCP request, told by its headers as
-/// the body is not read at routing, is answered with a JSON-RPC error without
-/// an `id`; every other request with a plain error.
-fn refuse_access_point_variant(
+/// recording the refusal once. A modern MCP request, told by its headers, is
+/// answered with a JSON-RPC error: a POST's body is read, within the surface's
+/// MCP body limit, only to echo its `id`. Every other request gets a plain
+/// error.
+async fn refuse_access_point_variant(
     surface: &crate::config::agent_surface::AgentSurface,
-    headers: &HeaderMap,
+    network_config: &crate::config::NetworkConfig,
+    versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
+    req: Request,
     error: &crate::config::agent_surface_variants::VariantResolveError,
 ) -> Response {
     let modern_mcp = surface.access_point.protocol == crate::config::agent_surface::SurfaceProtocol::Mcp
-        && crate::mcp::request_validation::has_modern_header(headers);
-    let code = crate::mcp::error_codes::INTERNAL_ERROR;
+        && crate::mcp::request_validation::has_modern_header(req.headers());
     let refusal = crate::audit::request_events::refuse_routing(
         &routing_facts(surface),
         error,
-        modern_mcp.then_some(i64::from(code)),
+        modern_mcp.then_some(i64::from(crate::mcp::error_codes::INTERNAL_ERROR)),
     );
-    if modern_mcp {
-        return crate::mcp::request_validation::McpRequestValidationError {
-            status: refusal.status(),
-            id: None,
-            code,
-            message: refusal.message().to_string(),
-            data: None,
-        }
-        .into_response();
+    if !modern_mcp {
+        return create_error_response(refusal.status(), refusal.message());
     }
-    create_error_response(refusal.status(), refusal.message())
+    let id = if req.method() == Method::POST
+        && let Ok(policy) = crate::mcp::modern_http::EndpointHttpPolicy::with_versions(
+            surface
+                .mcp_http
+                .as_ref(),
+            &network_config.get_inbound_external_urls(),
+            versions,
+        ) {
+        crate::mcp::request_validation::read_request_id(req.into_body(), policy.body_limit()).await
+    } else {
+        None
+    };
+    (*crate::mcp::request_validation::McpRequestValidationError::for_routing_refusal(&refusal, id)).into_response()
 }
 
 fn normalize_route_for_match(route: &str) -> String {
@@ -9362,7 +9369,8 @@ async fn multi_channel_proxy_handler_in_request_scope(
                 }
                 Err(error) => {
                     warn!(surface = %ch.surface.name, error = %error, "Surface variant cannot be resolved");
-                    return refuse_access_point_variant(&ch.surface, req.headers(), &error);
+                    return refuse_access_point_variant(&ch.surface, &state.network_config, mcp_versions, req, &error)
+                        .await;
                 }
             };
 
