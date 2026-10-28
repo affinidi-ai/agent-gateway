@@ -429,13 +429,26 @@ impl PolicyDocument {
 /// File-based storage for versioned, immutable policy documents.
 pub struct FileSystemPolicyDefinitionStore {
     storage: Box<dyn StorageBackend<PolicyDocument>>,
+    /// See [`Self::lock_changes`].
+    changes: tokio::sync::Mutex<()>,
 }
 
 impl FileSystemPolicyDefinitionStore {
     pub async fn new(storage_dir: String) -> Result<Self> {
         let storage_path = PathBuf::from(storage_dir);
         let storage = rwlock_storage(storage_path, "policy_definition").await?;
-        Ok(Self { storage })
+        Ok(Self {
+            storage,
+            changes: tokio::sync::Mutex::new(()),
+        })
+    }
+
+    /// Held by a management write from reading a definition until its change
+    /// is recorded, so two concurrent updates record a chain (the second's
+    /// previous version is the first's new one). The store's own reads and
+    /// saves do not take it.
+    pub async fn lock_changes(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.changes.lock().await
     }
 
     /// Reconcile the in-memory cache with the shared-storage directory, so a

@@ -1,7 +1,7 @@
 import React from 'react';
 import { formatDateTime, timeAgo } from '../../utils/stringUtils';
-import { callerDidOf, policyDecision, trustCheck } from './auditHelpers';
-import { describeEntry } from './eventNarrative';
+import { callerDidOf, policyChange, policyDecision, trustCheck } from './auditHelpers';
+import { actorLabel, describeEntry, type UserNameResolver } from './eventNarrative';
 import type { AuditEntry } from './types';
 
 interface AuditListItemProps {
@@ -9,10 +9,17 @@ interface AuditListItemProps {
   idx: number;
   isSelected: boolean;
   onSelect: () => void;
+  /** Names the users policy changes were made by. */
+  userName?: UserNameResolver;
 }
 
-/** Short "actor" label for the footnote: caller name → caller DID → auth method. */
-function actorOf(entry: AuditEntry): string {
+/**
+ * Short "actor" label for the footnote: who made a policy change, else caller
+ * name → caller DID → auth method.
+ */
+function actorOf(entry: AuditEntry, userName?: UserNameResolver): string {
+  const change = policyChange(entry);
+  if (change) return actorLabel(change.change.actor, userName);
   return (
     entry.caller?.name ||
     entry.caller?.name_redacted ||
@@ -33,8 +40,14 @@ function shortHash(hash: string): string {
  * message, an optional detail line, and a "timestamp · actor" footnote. A
  * trailing arrow turns accent-blue when the row is selected.
  */
-const AuditListItem: React.FC<AuditListItemProps> = ({ entry, idx, isSelected, onSelect }) => {
-  const { title, tone, summary, detail } = describeEntry(entry);
+const AuditListItem: React.FC<AuditListItemProps> = ({
+  entry,
+  idx,
+  isSelected,
+  onSelect,
+  userName,
+}) => {
+  const { title, tone, summary, detail } = describeEntry(entry, userName);
   const pd = policyDecision(entry);
   const tc = trustCheck(entry);
   const verdict = pd?.decision ?? (tc ? (tc.ok ? 'allow' : 'deny') : undefined);
@@ -79,7 +92,7 @@ const AuditListItem: React.FC<AuditListItemProps> = ({ entry, idx, isSelected, o
           <span className="audit-item-foot" title={formatDateTime(entry.timestamp, true)}>
             <span className="audit-item-foot-time">{timeAgo(entry.timestamp)}</span>
             <span aria-hidden="true"> · </span>
-            <span className="audit-item-foot-actor">{actorOf(entry)}</span>
+            <span className="audit-item-foot-actor">{actorOf(entry, userName)}</span>
           </span>
         </span>
         <i

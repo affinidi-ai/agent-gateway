@@ -62,24 +62,27 @@ impl SurfacePolicyManager {
 
     /// Name, enforced version and content hash for a surface policy decision,
     /// from one store lookup. The name is the definition's operator-assigned
-    /// name, its id when the definition is unknown, or the Rego package
-    /// (`surface.policy`) when none is attached; version and hash are `None`
-    /// unless the definition is known, so a decision backed by the built-in
-    /// allow-all default carries no revision evidence.
+    /// name, or its id when the definition is unknown; `None` when none is
+    /// attached, so the decision record names the layer ("Surface policy").
+    /// Version and hash are `None` unless the definition is known, so a
+    /// decision backed by the built-in allow-all default carries no revision
+    /// evidence.
     pub async fn resolve_policy_decision_evidence(
         &self,
         def_id: Option<&str>,
-    ) -> (String, Option<u32>, Option<String>) {
+    ) -> (Option<String>, Option<u32>, Option<String>) {
         let Some(id) = def_id else {
-            return (super::SURFACE_POLICY_PACKAGE.to_string(), None, None);
+            return (None, None, None);
         };
         let attestation = self
             .resolve_policy_attestation(Some(id))
             .await;
         (
-            attestation
-                .name
-                .unwrap_or_else(|| id.to_string()),
+            Some(
+                attestation
+                    .name
+                    .unwrap_or_else(|| id.to_string()),
+            ),
             attestation.version,
             attestation.content_hash,
         )
@@ -1790,7 +1793,7 @@ allow if {
                 .resolve_policy_decision_evidence(Some("deny-def"))
                 .await,
             (
-                "Deny unknown callers".to_string(),
+                Some("Deny unknown callers".to_string()),
                 attestation.version,
                 attestation
                     .content_hash
@@ -1802,15 +1805,15 @@ allow if {
             manager
                 .resolve_policy_decision_evidence(Some("missing"))
                 .await,
-            ("missing".to_string(), None, None),
+            (Some("missing".to_string()), None, None),
             "an unknown definition is named by its id"
         );
         assert_eq!(
             manager
                 .resolve_policy_decision_evidence(None)
                 .await,
-            (crate::policies::SURFACE_POLICY_PACKAGE.to_string(), None, None),
-            "no definition falls back to the Rego package"
+            (None, None, None),
+            "no definition: no name, so the decision record names the layer"
         );
 
         assert_eq!(

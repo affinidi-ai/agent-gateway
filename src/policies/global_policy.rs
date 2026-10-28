@@ -136,12 +136,40 @@ impl StorableEntity for GlobalPolicyDocument {
 /// File-based store for the single global policy-assignments document.
 pub struct FileSystemGlobalPolicyStore {
     storage: Box<dyn StorageBackend<GlobalPolicyDocument>>,
+    /// Held by [`Self::update`] from reading the assignments until the change
+    /// is recorded, so concurrent changes neither lose one another nor record
+    /// against a stale version.
+    writes: tokio::sync::Mutex<()>,
 }
 
 impl FileSystemGlobalPolicyStore {
     pub async fn new(storage_dir: String) -> Result<Self> {
         let storage = rwlock_storage(PathBuf::from(storage_dir), "global_policy").await?;
-        Ok(Self { storage })
+        Ok(Self {
+            storage,
+            writes: tokio::sync::Mutex::new(()),
+        })
+    }
+
+    /// Applies `edit` to the stored assignments and, when it reports a
+    /// change, saves them and records the policies attached, detached or
+    /// switched through `source`. Returns the saved assignments, or `None`
+    /// when `edit` changed nothing.
+    pub async fn update(
+        &self,
+        edit: impl FnOnce(&mut GlobalPolicyAssignments) -> bool,
+        source: crate::audit::events::PolicyChangeSource,
+    ) -> Result<Option<GlobalPolicyAssignments>> {
+        let _write = self.writes.lock().await;
+        let before = self.get().await;
+        let mut after = before.clone();
+        if !edit(&mut after) {
+            return Ok(None);
+        }
+        self.save(after.clone())
+            .await?;
+        crate::audit::policy_changes::assignments_written(&before, &after, source).await;
+        Ok(Some(after))
     }
 
     /// Reconcile the in-memory cache with the shared-storage directory, so a
@@ -587,6 +615,131 @@ pub(crate) mod tests {
             .await
             .expect("save");
         assert_eq!(store.get().await, a);
+    }
+
+    fn on_gateway_plane(policy_ids: &[&str]) -> GlobalPolicyAssignments {
+        let mut assignments = GlobalPolicyAssignments::default();
+        assignments
+            .assignments
+            .insert(
+                PLANE_GATEWAY.to_string(),
+                policy_ids
+                    .iter()
+                    .map(|id| GlobalAssignment {
+                        policy_id: id.to_string(),
+                        monitor_only: false,
+                    })
+                    .collect(),
+            );
+        assignments
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_replacements_record_a_chain_of_changes() {
+        use crate::audit::context::in_management_request;
+        use crate::audit::events::{Actor, PolicyChangeSource};
+        use crate::delegation_vault::audit::action_category;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(
+            FileSystemGlobalPolicyStore::new(
+                dir.path()
+                    .to_string_lossy()
+                    .to_string(),
+            )
+            .await
+            .expect("store"),
+        );
+        let ((), mut records) = crate::audit::producer::capture(in_management_request(Actor::user("u-1"), async {
+            store
+                .update(
+                    |assignments| {
+                        *assignments = on_gateway_plane(&["a"]);
+                        true
+                    },
+                    PolicyChangeSource::Api,
+                )
+                .await
+                .expect("update");
+        }))
+        .await;
+        let replace = |policy: &'static str| {
+            let store = store.clone();
+            in_management_request(Actor::user("u-1"), async move {
+                store
+                    .update(
+                        |assignments| {
+                            *assignments = on_gateway_plane(&[policy]);
+                            true
+                        },
+                        PolicyChangeSource::Api,
+                    )
+                    .await
+                    .expect("update");
+            })
+        };
+        records.extend(crate::audit::producer::capture_spawned(vec![replace("b"), replace("c")]).await);
+
+        let changes: Vec<(&str, String)> = records
+            .iter()
+            .map(|record| {
+                let category = action_category(&record.event);
+                let id = serde_json::to_value(&record.event).unwrap()[category]["policy_definition_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                (category, id)
+            })
+            .collect();
+        assert_eq!(changes.len(), 5, "{changes:?}");
+        let second = changes[1..3]
+            .iter()
+            .find(|(category, _)| *category == "policy_attached")
+            .map(|(_, id)| id.clone())
+            .expect("the second write attaches a policy");
+        let third = if second == "b" {
+            "c"
+        } else {
+            "b"
+        };
+        let write = |range: std::ops::Range<usize>| -> std::collections::BTreeSet<(&str, String)> {
+            changes[range]
+                .iter()
+                .cloned()
+                .collect()
+        };
+        assert_eq!(
+            write(1..3),
+            [("policy_detached", "a".to_string()), ("policy_attached", second.clone())].into(),
+            "{changes:?}"
+        );
+        assert_eq!(
+            write(3..5),
+            [("policy_detached", second), ("policy_attached", third.to_string())].into(),
+            "{changes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_update_that_changes_nothing_saves_and_records_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = FileSystemGlobalPolicyStore::new(
+            dir.path()
+                .to_string_lossy()
+                .to_string(),
+        )
+        .await
+        .expect("store");
+
+        let (updated, records) = crate::audit::producer::capture(crate::audit::context::in_management_request(
+            crate::audit::events::Actor::user("u-1"),
+            store
+                .update(|assignments| assignments.remove_policy("nope"), crate::audit::events::PolicyChangeSource::Api),
+        ))
+        .await;
+
+        assert_eq!(updated.expect("update"), None);
+        assert!(records.is_empty());
     }
 
     pub(crate) async fn store_with(defs: Vec<PolicyDefinition>) -> Arc<FileSystemPolicyDefinitionStore> {

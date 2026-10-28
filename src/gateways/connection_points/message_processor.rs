@@ -2400,6 +2400,7 @@ async fn evaluate_gateway_policy_for_fabric(
             policy_definition_id: gd.policy_id.as_deref(),
             policy_name: global_policy_name,
             surface_id: surface.config_id(),
+            surface_name: Some(surface.name.as_str()),
             http_method: Some(method),
             path: Some(path),
             identity: authenticated_identity,
@@ -2455,7 +2456,7 @@ async fn evaluate_gateway_policy_for_fabric(
             None => (None, None, None),
         };
         let gw_policy_name = gw_pm
-            .resolve_policy_name_or_default(gw_policy_def_id.as_deref())
+            .resolve_policy_name(gw_policy_def_id.as_deref())
             .await;
 
         match gw_pm.evaluate_policy_decision(&self_gateway_id, gw_input_value) {
@@ -2466,8 +2467,9 @@ async fn evaluate_gateway_policy_for_fabric(
                     allow: true,
                     policy_id: Some(crate::policies::GATEWAY_POLICY_PACKAGE),
                     policy_definition_id: gw_policy_def_id.as_deref(),
-                    policy_name: Some(gw_policy_name.as_str()),
+                    policy_name: gw_policy_name.as_deref(),
                     surface_id: surface.config_id(),
+                    surface_name: Some(surface.name.as_str()),
                     http_method: Some(method),
                     path: Some(path),
                     identity: authenticated_identity,
@@ -2485,8 +2487,9 @@ async fn evaluate_gateway_policy_for_fabric(
                     reason: decision.reason.as_deref(),
                     policy_id: Some(crate::policies::GATEWAY_POLICY_PACKAGE),
                     policy_definition_id: gw_policy_def_id.as_deref(),
-                    policy_name: Some(gw_policy_name.as_str()),
+                    policy_name: gw_policy_name.as_deref(),
                     surface_id: surface.config_id(),
+                    surface_name: Some(surface.name.as_str()),
                     http_method: Some(method),
                     path: Some(path),
                     identity: authenticated_identity,
@@ -2504,8 +2507,9 @@ async fn evaluate_gateway_policy_for_fabric(
                     flow: crate::observability::PolicyFlow::Fabric,
                     policy_id: Some(crate::policies::GATEWAY_POLICY_PACKAGE),
                     policy_definition_id: gw_policy_def_id.as_deref(),
-                    policy_name: Some(gw_policy_name.as_str()),
+                    policy_name: gw_policy_name.as_deref(),
                     surface_id: surface.config_id(),
+                    surface_name: Some(surface.name.as_str()),
                     http_method: Some(method),
                     path: Some(path),
                     identity: authenticated_identity,
@@ -3116,6 +3120,7 @@ async fn enrich_and_evaluate_surface_policies(
                 policy_definition_id: gd.policy_id.as_deref(),
                 policy_name: global_policy_name,
                 surface_id: Some(config_id),
+                surface_name: Some(surface.name.as_str()),
                 http_method: Some(method),
                 path: Some(path),
                 identity: authenticated_identity,
@@ -3142,6 +3147,7 @@ async fn enrich_and_evaluate_surface_policies(
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: surface.opa_policy_definition_id(),
                     surface_id: Some(config_id),
+                    surface_name: Some(surface.name.as_str()),
                     http_method: Some(method),
                     path: Some(path),
                     identity: authenticated_identity,
@@ -3166,8 +3172,9 @@ async fn enrich_and_evaluate_surface_policies(
                         allow: true,
                         policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                         policy_definition_id: channel_opa_def_id,
-                        policy_name: Some(channel_opa_name.as_str()),
+                        policy_name: channel_opa_name.as_deref(),
                         surface_id: Some(config_id),
+                        surface_name: Some(surface.name.as_str()),
                         http_method: Some(method),
                         path: Some(path),
                         identity: authenticated_identity,
@@ -3185,8 +3192,9 @@ async fn enrich_and_evaluate_surface_policies(
                         reason: decision.reason.as_deref(),
                         policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                         policy_definition_id: channel_opa_def_id,
-                        policy_name: Some(channel_opa_name.as_str()),
+                        policy_name: channel_opa_name.as_deref(),
                         surface_id: Some(config_id),
+                        surface_name: Some(surface.name.as_str()),
                         http_method: Some(method),
                         path: Some(path),
                         identity: authenticated_identity,
@@ -3206,8 +3214,9 @@ async fn enrich_and_evaluate_surface_policies(
                             flow: crate::observability::PolicyFlow::Fabric,
                             policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                             policy_definition_id: channel_opa_def_id,
-                            policy_name: Some(channel_opa_name.as_str()),
+                            policy_name: channel_opa_name.as_deref(),
                             surface_id: Some(config_id),
+                            surface_name: Some(surface.name.as_str()),
                             http_method: Some(method),
                             path: Some(path),
                             identity: authenticated_identity,
@@ -3800,6 +3809,28 @@ async fn process_forward_request_inner(
 }
 
 async fn process_forward_request_with_mcp_runtime(
+    message: &ReceivedMessage,
+    stream_request: Option<FabricStreamRequest>,
+    mcp_versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
+    mcp_continuations: Option<Arc<crate::mcp::continuations::config::ContinuationRuntime>>,
+) -> ProcessingResult {
+    use crate::observability::policy_audit::{in_request, new_request_id, response_in_request};
+
+    let id = new_request_id();
+    let result = in_request(
+        id.clone(),
+        Box::pin(process_forward_request_in_request_scope(message, stream_request, mcp_versions, mcp_continuations)),
+    )
+    .await;
+    match result {
+        ProcessingResult::StreamingResponse { response } => ProcessingResult::StreamingResponse {
+            response: response_in_request(id, response),
+        },
+        other => other,
+    }
+}
+
+async fn process_forward_request_in_request_scope(
     message: &ReceivedMessage,
     mut stream_request: Option<FabricStreamRequest>,
     mcp_versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
@@ -7002,6 +7033,7 @@ async fn evaluate_mcp_tool_policies_for_fabric(
         scope: crate::observability::PolicyScope::McpTool,
         flow: crate::observability::PolicyFlow::Fabric,
         surface_id: Some(config_id),
+        surface_name: Some(surface.name.as_str()),
         http_method: Some(method),
         path: Some(path),
         identity: authenticated_identity,
@@ -7068,6 +7100,7 @@ async fn evaluate_mcp_tool_policies_for_fabric(
             allow: false,
             reason: Some("Access denied: insufficient permissions for this tool"),
             surface_id: Some(config_id),
+            surface_name: Some(surface.name.as_str()),
             http_method: Some(method),
             path: Some(path),
             identity: authenticated_identity,
@@ -7147,6 +7180,7 @@ async fn evaluate_mcp_tool_policies_for_fabric(
                 .content_hash
                 .as_deref(),
             surface_id: Some(config_id),
+            surface_name: Some(surface.name.as_str()),
             http_method: Some(method),
             path: Some(path),
             identity: authenticated_identity,
@@ -7261,6 +7295,7 @@ async fn evaluate_mcp_tool_gating_call_for_fabric(
             reason: Some("tools/call without a readable tool name under MCP tool gating"),
             policy_id: Some("mcp_tool_gating"),
             surface_id: Some(config_id),
+            surface_name: Some(surface.name.as_str()),
             http_method: Some(method),
             path: Some(path),
             identity: authenticated_identity,
@@ -7311,6 +7346,7 @@ async fn evaluate_mcp_tool_gating_call_for_fabric(
         },
         policy_id: Some("mcp_tool_gating"),
         surface_id: Some(config_id),
+        surface_name: Some(surface.name.as_str()),
         http_method: Some(method),
         path: Some(path),
         identity: authenticated_identity,
@@ -7413,6 +7449,7 @@ fn filter_mcp_tools_list_for_fabric(
             &filtered.kept,
             crate::observability::PolicyDecisionEvent {
                 surface_id: Some(config_id),
+                surface_name: Some(surface.name.as_str()),
                 http_method: Some(method),
                 path: Some(path),
                 actor_did: actor_did.as_deref(),
@@ -11169,6 +11206,69 @@ mod tests {
             }
             other => panic!("expected ForwardResponse, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn fabric_requests_each_carry_their_own_request_id() {
+        // Surface lookup prefers the process-global surface store, which other
+        // tests in this binary can initialise; run in a child process where it
+        // is unset, so the missing surface is reported as not found.
+        if std::env::var_os("ATG_FABRIC_REQUEST_ID_CHILD").is_none() {
+            let test_name = std::thread::current()
+                .name()
+                .unwrap()
+                .to_string();
+            let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test_name, "--nocapture"])
+                .env("ATG_FABRIC_REQUEST_ID_CHILD", "1")
+                .env("RUST_MIN_STACK", "8388608")
+                .kill_on_drop(true)
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated fabric request id check failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        register_gateway(
+            temp.path(),
+            "did:web:peer.example",
+            crate::gateways::types::GatewayStatus::Active,
+            crate::gateways::types::ExposureMode::All,
+            Vec::new(),
+        )
+        .await;
+
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let msg = make_forward_request_msg(temp.path(), Some("did:web:peer.example"), "request-id-missing-surface");
+            let (response, events) = crate::audit::producer::capture(forward_response(&msg)).await;
+            assert_eq!(response["status"], 404, "{response}");
+            assert!(!events.is_empty(), "the refused request is recorded");
+            let ids: std::collections::HashSet<_> = events
+                .iter()
+                .map(|event| {
+                    event
+                        .request_id
+                        .clone()
+                        .expect("every record carries the request id")
+                })
+                .collect();
+            assert_eq!(ids.len(), 1, "one request, one id");
+            seen.extend(ids);
+        }
+        assert!(seen.iter().all(|id| {
+            id.len() == 16
+                && id
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+        }));
+        assert_ne!(seen[0], seen[1], "each request has its own id");
     }
 
     #[tokio::test]

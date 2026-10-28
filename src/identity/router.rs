@@ -10,6 +10,7 @@ use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 use tracing::{debug, error, info};
 
+use crate::audit::policy_refusals::{PolicyWrite, PolicyWriteRoutes};
 use crate::identity::handlers;
 use crate::identity::state::IdentityApiState;
 use crate::metrics::MetricsStore;
@@ -792,24 +793,24 @@ pub fn create_identity_api_router(
                     Feature::PoliciesView,
                 )),
             )
-            .route(
-                "/v1/policy-definitions",
+            .policy_write(
+                PolicyWrite::CreateDefinition,
                 post(handlers::create_policy_definition).layer(require_feature(
                     s.clone(),
                     r.clone(),
                     Feature::PoliciesEdit,
                 )),
             )
-            .route(
-                "/v1/policy-definitions/{policy_id}",
+            .policy_write(
+                PolicyWrite::UpdateDefinition,
                 put(handlers::update_policy_definition).layer(require_feature(
                     s.clone(),
                     r.clone(),
                     Feature::PoliciesEdit,
                 )),
             )
-            .route(
-                "/v1/policy-definitions/{policy_id}",
+            .policy_write(
+                PolicyWrite::DeleteDefinition,
                 delete(handlers::delete_policy_definition).layer(require_feature(
                     s.clone(),
                     r.clone(),
@@ -832,8 +833,8 @@ pub fn create_identity_api_router(
                     Feature::PoliciesView,
                 )),
             )
-            .route(
-                "/v1/policy-assignments",
+            .policy_write(
+                PolicyWrite::Assignments,
                 put(handlers::update_policy_assignments).layer(require_feature(
                     s.clone(),
                     r.clone(),
@@ -848,8 +849,8 @@ pub fn create_identity_api_router(
                     Feature::TenantOwnershipManage,
                 )),
             )
-            .route(
-                "/v1/tenant-ownership/{kind}/{id}",
+            .policy_write(
+                PolicyWrite::ReassignOwner,
                 put(handlers::tenant_ownership::reassign_ownership).layer(require_feature(
                     s.clone(),
                     r.clone(),
@@ -1006,8 +1007,8 @@ pub fn create_identity_api_router(
                     Feature::GatewaysView,
                 ),
             )
-            .route(
-                "/v1/gateways/{id}/policy",
+            .policy_write(
+                PolicyWrite::GatewayPolicy,
                 gate(
                     put(crate::gateways::handlers::update_gateway_policy::<crate::gateways::FileSystemGatewayStore>),
                     Feature::GatewaysEdit,
