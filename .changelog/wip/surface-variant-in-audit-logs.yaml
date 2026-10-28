@@ -1,7 +1,36 @@
 branch: surface-variant-in-audit-logs
 changes:
-  added: []
-  changed: []
+  added:
+    - timestamp: '2026-10-28T17:00:00Z'
+      title: ⭐ Name the surface variant on every audit record and log line of a request
+      description: >-
+        Every audit record written while serving a surface request carries surface_variant: the
+        variant's alias, _base_ when the base surface served it, or _unknown_ when the URL named a
+        variant the surface doesn't have. Policy decisions, refusals, delegation, VP, identity
+        binding, trust check and payment records of a request all carry it, so audits and
+        integrations can tell which variant a request ran on. The policy_audit,
+        identity_binding_audit, trust_check_audit and credential_delegation log lines carry the
+        same field, and the request spans carry surface.variant. Records outside surface requests,
+        and records written before the upgrade, have none.
+    - timestamp: '2026-10-28T17:01:00Z'
+      title: Offer AUDIT_SURFACE_VARIANT to audit integration templates
+      description: >-
+        Audit integration templates can use AUDIT_SURFACE_VARIANT, the record's surface variant,
+        empty outside surface requests and when the surface's default variant is misconfigured.
+    - timestamp: '2026-10-28T17:02:00Z'
+      title: Show the surface variant and refusal details on the Audit Log
+      description: >-
+        The Audit Log shows which variant a request record ran on and says it in the record's
+        description, reads a gateway-wide policy decision as applying to every surface, and
+        describes request refusals with their stage, reason, status and the variant asked for.
+        Policy change records show the slot's variant, or the base surface.
+  changed:
+    - timestamp: '2026-10-28T17:03:00Z'
+      title: Name the variant of a policy change surface_variant, _base_ for base slots
+      description: >-
+        Policy change records name the variant whose slot was written surface_variant, the name
+        every other record uses, and record _base_ for a slot on the base surface, which also
+        applies to the variants that inherit it.
   fixed: []
   removed: []
   security: []
@@ -21,6 +50,15 @@ changes:
         modern MCP request (told by its MCP headers) is refused with a JSON-RPC error with code
         -32603 and no id, recorded with that rpc_error_code; legacy MCP and other requests get a
         plain error.
+    - timestamp: '2026-10-28T16:10:00Z'
+      title: Rename variant_alias to surface_variant on metrics and PayloadCaptured
+      description: >-
+        Connection metrics and the PayloadCaptured WebSocket update name the variant
+        surface_variant instead of variant_alias, and take it from the request, so it matches the
+        request's audit records. The default variant now shows its alias and a surface with no
+        variants shows _base_, where both were empty, so a per-variant series steps at the upgrade
+        for one metrics retention window (6 hours by default). Stored metrics written with
+        variant_alias still load.
     - timestamp: '2026-10-28T16:15:00Z'
       title: Leave http_status off request_rejected records written on Fabric receive
       description: >-

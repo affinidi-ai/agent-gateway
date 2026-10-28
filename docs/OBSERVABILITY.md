@@ -46,8 +46,11 @@ flowchart LR
     G -->|"4 response_payload"| C
 ```
 
-The event also carries validation status, an optional validation error, derived schema, and an
-optional surface-variant alias. Some producers do not have all four observations. Onboarding, for
+The event also carries validation status, an optional validation error, derived schema, and
+`surface_variant`: the variant of the surface request the payload belongs to, as its audit
+records name it (see _Surface variant_ below), absent outside a surface request. Earlier releases
+named it `variant_alias` and left it empty for the default variant and for a surface with no
+variants. Some producers do not have all four observations. Onboarding, for
 example, sets both intermediate fields to `None` because it does not forward the request.
 
 ## WebSocket flow
@@ -106,6 +109,42 @@ When configured, the root HTTP span can also record `caller.auth_method`, `calle
 `caller.did`. Policy decisions are emitted through the policy-audit target with policy scope,
 decision, policy identity, deny reason, surface identity, and caller context; denials are WARN and
 allows are DEBUG.
+
+The request spans (`http.request` on the Access Point and Transit Point, `fabric.forward_request`
+on Fabric receive) record `surface.variant` once routing resolves the request's variant, so
+exported spans carry it. The `policy_audit`, `identity_binding_audit`, `trust_check_audit` and
+`credential_delegation` log lines carry `surface_variant` when the request has one, and leave it
+out otherwise. Both hold the value audit records do (see _Surface variant_ below).
+
+### Surface variant
+
+Every record and log line written while serving a surface request names the variant that served
+it, in one field: `surface_variant` on audit records, metrics, `PayloadCaptured` and log lines,
+`surface.variant` on spans, `AUDIT_SURFACE_VARIANT` for integrations. It holds a configured alias
+or one of two values the gateway writes itself, which start and end with `_` so they never clash
+with an alias:
+
+- the variant's alias: the alias in the URL, else the default variant's alias;
+- `_base_`: the base surface served the request (no alias, and no default variant);
+- `_unknown_`: the URL named a variant the surface doesn't have (`unknown_variant` refusals); the
+  alias asked for is only in the refusal's `requested_variant`.
+
+A `variant_disabled` refusal names the disabled alias, and a `misconfigured_default` refusal names
+none. `surface_variant` is a variant of the surface the record's `surface_id` names: across a
+Fabric hop each gateway records its own surface's variant, so the two hops of one request can name
+different ones, joined by `trace_id`. Records outside surface requests carry none: management API
+records, `consent_granted` (the OAuth callback), settlement-worker `payment` records, config
+reloads and traffic refused before a surface matched. A `policy_decision` of gateway scope on a
+surface request carries the variant it applied to; the policy itself is the same for every
+surface and variant. Records written before this field existed have none.
+
+Connection metrics (`ConnectionMetric` and its stored data points) and the `PayloadCaptured`
+WebSocket update read the same value from the request, so a metric never names a variant its audit
+records don't. Earlier releases named the field `variant_alias` and left it empty for the default
+variant and for a surface with no variants; it now holds the default variant's alias or `_base_`
+there. A metrics snapshot stored with `variant_alias` still loads into `surface_variant`, but
+points recorded before the upgrade keep their old values, so a per-variant series steps at the
+upgrade for one metrics retention window (6 hours by default).
 
 The gateway propagates `X-Gateway-Trace-Id` to a Target where the request path creates that trace
 identifier, allowing gateway and managed-agent logs to be correlated.
@@ -187,9 +226,16 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
 
     A request whose variant can't be resolved is refused, never served by the base surface or
     another variant. A modern MCP request on the Access Point is answered with a JSON-RPC error
-    without an `id`, and its record carries `rpc_error_code` `-32603`. On a Fabric stream the receiving gateway refuses the `Open` and records the
-    refusal; the stream has no status of its own, so the sender answers as it does any refused
-    stream.
+    without an `id`, and its record carries `rpc_error_code` `-32603`.
+
+    On Fabric, the receiving gateway records the refusal (with its reason, and no `http_status`),
+    and the reason stays in that record: it does not cross the wire. What the sending gateway's
+    HTTP caller receives depends on the Fabric path:
+    - a stream: the receiver refuses the `Open` with the stream error `Unavailable`, which carries
+      no status or reason, and the sending gateway answers its caller `502 Bad Gateway`, as it
+      does any stream that could not be opened;
+    - a legacy `ForwardRequest`: the receiver answers with the refusal's status, and the sending
+      gateway passes the peer's `404` or `500` on to its caller.
   - `admission`: `body_too_large`, `protocol_mismatch` (an MCP body on an A2A Access Point or the
     reverse), `invalid_envelope` (not JSON, or not a JSON-RPC request, on every protocol and MCP
     revision), `invalid_request_shape` (A2A fields), `version_unsupported` (A2A or MCP),
@@ -226,7 +272,9 @@ where a policy applies (group Policies). Each record carries its body in the `ev
   surface, a gateway or an appliance-wide plane. `target` is `{kind, id, name}` (`surface`,
   `gateway` or `appliance`); `scope` is the decision scope the slot produces; `slot` is `target`,
   `inbound`, `response`, `transit`, `transit_point`, `mcp_tool`, `mcp_tool_gate` or `plane`, with
-  `variant`, `transit_point`, `mcp_tool_name`, `gate` or `plane` naming the place. A replaced
+  `transit_point`, `mcp_tool_name`, `gate` or `plane` naming the place. On a surface target,
+  `surface_variant` is the slot written: the variant's alias, or `_base_` for a base slot, which
+  also applies to every variant that inherits it; gateway and appliance targets have none. A replaced
   policy is detached, then its successor attached. A surface target also sets the top-level
   `surface_id` and `channel_name`.
   A gateway's legacy inline Rego has no definition: its records carry `policy_name`
@@ -294,7 +342,8 @@ administrator-only by default (see [`INTEGRATIONS.md`](INTEGRATIONS.md#managemen
   when an Access Point request, a Transit Point request or a fabric-received request starts,
   never read from a header or token. Every record of one request shares it, and an Access
   Point request and the Transit Point requests its agent makes each have their own, linked by
-  `trace_id`; a sink counts requests by distinct `request_id`. That includes the records a
+  `trace_id`; a sink counts requests by distinct `request_id`. A record of a surface request also
+  gets the request's `surface_variant` (see _Surface variant_ above). That includes the records a
   streamed response writes per event while it is read (SSE on every path) and the payment
   records an x402 or MPP request writes from background tasks. Records a proxied request produces while credential delegation runs are held
   until the request's identity VP is minted, then stamped with it; any still held when the
@@ -415,7 +464,9 @@ release the lock.
 `EVENT_SUMMARY` (the event's name, then whichever of the surface, decision, policy, reason and
 caller the record holds), `EVENT_DATA` (the same as `AUDIT_RECORD`), `APPLIANCE_ID`,
 `TIMESTAMP` (the record's own timestamp), `AUDIT_RECORD`, `AUDIT_CATEGORY`, `AUDIT_TRACE_ID`, `AUDIT_SURFACE_ID`, `AUDIT_SURFACE_NAME`,
-`AUDIT_PROTOCOL`, `AUDIT_AGENT_DID`, `AUDIT_VIA_FABRIC`, `AUDIT_PRINCIPAL`,
+`AUDIT_SURFACE_VARIANT` (the record's `surface_variant`: the variant's alias, `_base_`,
+`_unknown_` or a refused disabled alias; empty outside surface requests and on a misconfigured
+default), `AUDIT_PROTOCOL`, `AUDIT_AGENT_DID`, `AUDIT_VIA_FABRIC`, `AUDIT_PRINCIPAL`,
 `AUDIT_PRINCIPAL_EMAIL`, `AUDIT_PRINCIPAL_NAME`, `AUDIT_AUTH_METHOD`, `AUDIT_DECISION`,
 `AUDIT_DENY_REASON`, `AUDIT_POLICY_NAME`, `AUDIT_POLICY_VERSION`, `AUDIT_POLICY_CONTENT_HASH`,
 `AUDIT_VP_JWT` and `AUDIT_VP_FINGERPRINT`. `AUDIT_RECORD` is the full record in the
