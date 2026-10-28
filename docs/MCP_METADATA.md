@@ -1404,7 +1404,8 @@ the Access Point's listener, with `no-store`, and at the root form only for a
 surface mounted at `/`. Any origin may read it (`GET` and `HEAD`, CORS
 included), so a browser-based MCP client can fetch it; other methods keep the
 network configuration's `cors` allowlist. That CORS rule is layered on these
-routes only, so a channel that proxies a path under them keeps the allowlist. It holds `resource`, `authorization_servers`,
+routes only, and only on a listener where no channel or proxy route also
+receives them (see below), so a proxied Target's answers keep the allowlist. It holds `resource`, `authorization_servers`,
 `bearer_methods_supported: ["header"]` and `scopes_supported` when scopes are
 set. Only active surfaces and enabled variants publish. When the settings
 claiming a path no longer validate at request time, for example after the
@@ -1414,10 +1415,13 @@ restart. Each inbound listener answers only for the Access Points bound to
 it, so the same route on two listeners publishes each listener's own
 document. Inbound listeners route both well-known paths whether or not
 `sts.mcp_issuer` is configured: a path no caller authentication publishes
-falls to the gateway STS document when the profile is configured, and is
-otherwise a plain `404`, without proxying it or logging and auditing it as a
-request without a route, since MCP clients probe these paths during
-discovery. A listener whose channel, MCP Proxy or route
+falls to the gateway STS document when the profile is configured. Without it,
+the path still goes to the proxy handler, as before, when a channel or proxy
+route catch-all covers it, one with an empty prefix or at `/.well-known`, so a
+pass-through surface there keeps serving its Target's own metadata. Otherwise
+it is a plain `404`, not logged or audited as a request without a route,
+since MCP clients probe these paths during discovery. A listener whose
+channel, MCP Proxy or route
 prefix is `/.well-known/oauth-protected-resource` itself leaves the path to
 that prefix and publishes no documents, with a warning at startup.
 
@@ -1438,12 +1442,16 @@ but not enforced.
 
 A PUT whose `caller_authentication` omits `protected_resource` keeps the
 stored setting while the Access Point would still serve it, so a client that
-does not know the setting cannot switch it off by accident. A PUT after which
-it would not, for example one that switches the method, sets `forward_header`
-or `audiences`, moves the protocol off MCP, or changes the route or listen
-address the resource names, drops it instead of being refused over a setting
-the client did not send. `null` removes it, sent with PATCH, or with PUT in the
-same request as the rest of the edit. A variant PUT
+does not know the setting cannot switch it off by accident. A PUT that changes
+the route or listen address the resource names is refused with `400`, which
+names the setting and asks for a new resource or `null`: dropping the setting
+would leave the JWT Bearer method, whose `audiences` stay empty, checking no
+audience at all. A PUT after which the setting itself no longer fits, one that
+switches the method, sets `forward_header` or `audiences`, or moves the
+protocol off MCP, drops it with a warning in the log instead of being refused
+over a setting the client did not send; the method then checks an audience
+only if the edit set `audiences`. `null` removes it, sent with PATCH, or with
+PUT in the same request as the rest of the edit. A variant PUT
 (`PUT /v1/surfaces/{id}/variants/{variant_id}`) applies the same rules to the
 variant's own setting in the overrides it sends.
 

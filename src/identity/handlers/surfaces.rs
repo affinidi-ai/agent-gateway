@@ -1561,7 +1561,7 @@ pub async fn update_surface(
     {
         surface.mcp_legacy_metadata_output = existing.mcp_legacy_metadata_output;
     }
-    retain_mcp_settings(&mut surface, &existing, &state.network_config);
+    retain_mcp_settings(&mut surface, &existing, &state.network_config)?;
     ProtectedResourceRemovals::of(&sent).apply(&mut surface);
     retain_a2a_settings(&mut surface, &existing);
 
@@ -1758,7 +1758,7 @@ fn retain_mcp_settings(
     surface: &mut AgentSurface,
     existing: &AgentSurface,
     network: &crate::config::NetworkConfig,
-) {
+) -> Result<(), SurfaceApiError> {
     retain_mcp_http(&mut surface.mcp_http, existing.mcp_http.as_ref());
     let base_retained = retain_protected_resource(
         surface
@@ -1832,7 +1832,7 @@ fn retain_mcp_settings(
             retain_points(points, stored_points);
         }
     }
-    drop_unsupported_protected_resources(surface, base_retained, &retained_aliases, network);
+    settle_retained_protected_resources(surface, base_retained, &retained_aliases, network)
 }
 
 /// PUT carries the whole record, so an omitted `mcp_http` — or an `mcp_http`
@@ -1885,26 +1885,47 @@ fn retain_protected_resource(
     false
 }
 
-/// A restored `protected_resource` is dropped again when the Access Point
-/// would no longer serve it, for example after the dashboard switched the
-/// method, set `forward_header` or audiences, moved the protocol off MCP, or
-/// changed the route or listen address the resource names. The client did not
-/// send the setting, so refusing the save over it would leave it no way out. A
-/// setting sent in the request is still validated and refused.
-fn drop_unsupported_protected_resources(
+/// A restored `protected_resource` the Access Point would no longer serve.
+/// When the setting itself no longer fits, after the dashboard switched the
+/// method, set `forward_header` or audiences, or moved the protocol off MCP, it
+/// is dropped with a warning: the client did not send it, and refusing the save
+/// over it would leave the client no way out. When it no longer fits the
+/// Access Point, for example after a route or listen address change, the save
+/// is refused instead: dropping it would leave the JWT Bearer method checking
+/// no audience, so the client must send a new resource or `null`. A setting
+/// sent in the request is validated and refused as usual.
+fn settle_retained_protected_resources(
     surface: &mut AgentSurface,
     base_retained: bool,
     retained_aliases: &[String],
     network: &crate::config::NetworkConfig,
-) {
-    let served = |resolved: &AgentSurface, alias: Option<&str>| {
-        matches!(
-            crate::protocols::protected_resource::access_point_protected_resource(resolved, alias, network),
-            Some(Ok(_))
-        )
+) -> Result<(), SurfaceApiError> {
+    // `true` drops the setting; a setting the Access Point cannot serve
+    // refuses the save.
+    let settle = |resolved: &AgentSurface, alias: Option<&str>| -> Result<bool, SurfaceApiError> {
+        if resolved
+            .validate_protected_resource()
+            .is_err()
+        {
+            warn!(
+                surface_id = %resolved.surface_id,
+                variant = alias.unwrap_or(""),
+                "Dropped a stored protected_resource the edited Access Point no longer supports; its JWT Bearer \
+                 method now checks audiences only if the edit set them"
+            );
+            return Ok(true);
+        }
+        match crate::protocols::protected_resource::access_point_protected_resource(resolved, alias, network) {
+            Some(Err(reason)) => Err(SurfaceApiError::BadRequest(format!(
+                "{}access_point.caller_authentication.protected_resource: the stored setting no longer fits this \
+                 Access Point ({reason}); send protected_resource with a new resource, or null to turn discovery off",
+                alias.map_or_else(String::new, |alias| format!("variant '{alias}': "))
+            ))),
+            _ => Ok(false),
+        }
     };
     if base_retained
-        && !served(surface, None)
+        && settle(surface, None)?
         && let Some(caller) = surface
             .access_point
             .caller_authentication
@@ -1914,10 +1935,10 @@ fn drop_unsupported_protected_resources(
     }
     for alias in retained_aliases {
         // A disabled variant does not resolve and is not validated on save.
-        let unsupported = surface
-            .resolve_variant(Some(alias))
-            .is_ok_and(|resolved| !served(&resolved, Some(alias)));
-        if unsupported
+        let Ok(resolved) = surface.resolve_variant(Some(alias)) else {
+            continue;
+        };
+        if settle(&resolved, Some(alias))?
             && let Some(caller) = surface
                 .variants
                 .iter_mut()
@@ -1937,6 +1958,7 @@ fn drop_unsupported_protected_resources(
             caller.protected_resource = None;
         }
     }
+    Ok(())
 }
 
 /// The authorization servers an Access Point advertises (base and each enabled
@@ -2970,7 +2992,7 @@ pub async fn update_variant(
         }
         variant.overrides = overrides;
     }
-    drop_unsupported_protected_resources(&mut surface, false, &retained, &state.network_config);
+    settle_retained_protected_resources(&mut surface, false, &retained, &state.network_config)?;
 
     let saved = validate_and_save_surface(
         &state,
@@ -3183,7 +3205,7 @@ mod validation_tests {
             allowed_origins: vec!["https://app.example".to_string()],
             ..Default::default()
         });
-        retain_mcp_settings(&mut rewritten, &existing, &discovery_network());
+        retain_mcp_settings(&mut rewritten, &existing, &discovery_network()).unwrap();
         let retained = rewritten
             .mcp_http
             .expect("mcp_http stays present");
@@ -3193,13 +3215,13 @@ mod validation_tests {
         // Omitting the block entirely keeps the stored one unchanged.
         let mut omitted = base_surface();
         omitted.mcp_http = None;
-        retain_mcp_settings(&mut omitted, &existing, &discovery_network());
+        retain_mcp_settings(&mut omitted, &existing, &discovery_network()).unwrap();
         assert_eq!(omitted.mcp_http, existing.mcp_http);
 
         // A surface that never had authorization does not gain one.
         let mut fresh = base_surface();
         fresh.mcp_http = Some(crate::config::McpHttpConfig::default());
-        retain_mcp_settings(&mut fresh, &base_surface(), &discovery_network());
+        retain_mcp_settings(&mut fresh, &base_surface(), &discovery_network()).unwrap();
         assert_eq!(
             fresh
                 .mcp_http
@@ -3275,13 +3297,13 @@ mod validation_tests {
             .access_point
             .caller_authentication = Some(caller_authentication(false));
         rewritten.variants = vec![variant(false)];
-        retain_mcp_settings(&mut rewritten, &existing, &discovery_network());
+        retain_mcp_settings(&mut rewritten, &existing, &discovery_network()).unwrap();
         assert_eq!(stored_resource(&rewritten), (expected.clone(), expected.clone()));
 
         // Removing caller authentication does not bring the setting back.
         let mut removed = mcp_surface();
         removed.variants = vec![variant(false)];
-        retain_mcp_settings(&mut removed, &existing, &discovery_network());
+        retain_mcp_settings(&mut removed, &existing, &discovery_network()).unwrap();
         assert!(
             removed
                 .access_point
@@ -3297,7 +3319,7 @@ mod validation_tests {
         fresh.variants = vec![variant(false)];
         let mut never = mcp_surface();
         never.variants = vec![variant(false)];
-        retain_mcp_settings(&mut fresh, &never, &discovery_network());
+        retain_mcp_settings(&mut fresh, &never, &discovery_network()).unwrap();
         assert_eq!(stored_resource(&fresh), (None, None));
 
         // An edit the stored setting no longer fits drops it instead of
@@ -3327,11 +3349,12 @@ mod validation_tests {
                 .as_mut()
                 .unwrap()
                 .caller_authentication = Some(changed);
-            retain_mcp_settings(&mut switched, &existing, &discovery_network());
+            retain_mcp_settings(&mut switched, &existing, &discovery_network()).unwrap();
             assert_eq!(stored_resource(&switched), (None, None), "{change}");
         }
-        // So does an edit that moves the Access Point off the resource: another
-        // route, or a listen address on a listener without its public origin.
+        // An edit that moves the Access Point off the resource, to another route
+        // or a listener without its public origin, is refused: dropping the
+        // setting would leave the method checking no audience.
         for (change, moved) in [("route", "/mcp/beta"), ("listen_address", "http://localhost:9999")] {
             let mut edited = mcp_surface();
             match change {
@@ -3346,15 +3369,24 @@ mod validation_tests {
                 .access_point
                 .caller_authentication = Some(caller_authentication(false));
             edited.variants = vec![variant(false)];
-            retain_mcp_settings(&mut edited, &existing, &discovery_network());
-            assert_eq!(stored_resource(&edited), (None, None), "{change}");
+            let Err(SurfaceApiError::BadRequest(refused)) =
+                retain_mcp_settings(&mut edited, &existing, &discovery_network())
+            else {
+                panic!("{change}: expected a refusal");
+            };
+            assert!(
+                refused.starts_with(
+                    "access_point.caller_authentication.protected_resource: the stored setting no longer fits"
+                ) && refused.contains("or null to turn discovery off"),
+                "{change}: {refused}"
+            );
         }
         let mut a2a = mcp_surface();
         a2a.access_point.protocol = SurfaceProtocol::A2a;
         a2a.access_point
             .caller_authentication = Some(caller_authentication(false));
         a2a.variants = vec![variant(false)];
-        retain_mcp_settings(&mut a2a, &existing, &discovery_network());
+        retain_mcp_settings(&mut a2a, &existing, &discovery_network()).unwrap();
         assert_eq!(stored_resource(&a2a), (None, None));
 
         // A setting the request itself sends is kept, for validation to refuse.
@@ -3367,7 +3399,7 @@ mod validation_tests {
             }))
             .unwrap(),
         );
-        retain_mcp_settings(&mut sent, &existing, &discovery_network());
+        retain_mcp_settings(&mut sent, &existing, &discovery_network()).unwrap();
         assert_eq!(
             sent.protected_resource()
                 .cloned(),
@@ -3441,7 +3473,7 @@ mod validation_tests {
         assert!(removals.base);
         assert_eq!(removals.variant_ids, vec!["beta".to_string()]);
         let mut put: AgentSurface = serde_json::from_value(body).unwrap();
-        retain_mcp_settings(&mut put, &existing, &discovery_network());
+        retain_mcp_settings(&mut put, &existing, &discovery_network()).unwrap();
         removals.apply(&mut put);
         assert_eq!(resources(&put), (false, vec![false, true]));
 
@@ -3455,7 +3487,7 @@ mod validation_tests {
                     .is_empty()
         );
         let mut put: AgentSurface = serde_json::from_value(body).unwrap();
-        retain_mcp_settings(&mut put, &existing, &discovery_network());
+        retain_mcp_settings(&mut put, &existing, &discovery_network()).unwrap();
         removals.apply(&mut put);
         assert_eq!(resources(&put), (true, vec![true, true]));
     }

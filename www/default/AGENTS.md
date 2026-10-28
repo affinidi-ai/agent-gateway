@@ -144,18 +144,19 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   the resource it advertises, `<resource>$<alias>`, and keeps its own setting. A failed save whose
   message names the setting shows in the section and in the sidebar, which also shows whether
   discovery is on.
-- A PUT that leaves out a stored `protected_resource` keeps it, so Save first removes a setting
-  the operator dropped with a JSON Merge Patch (`removeDroppedProtectedResources`): the surface
-  through `apiClient.patchSurface`, and each variant through `apiClient.patchSurfaceVariant`.
-  When the PUT then fails, its error says the setting was already removed.
+- A PUT that leaves out a stored `protected_resource` keeps it, so Save sends a setting the
+  operator switched off as `protected_resource: null` in the same PUT
+  (`withDroppedProtectedResourcesRemoved`), for the surface and each variant. A save that fails
+  leaves it in place. The default variant's note says it also answers on the surface's route
+  with the resource as written.
 
-| Element                                                   | Test id                                                                                                                                                                                            |
-| --------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Discovery switch, resource, use listener URL              | `caller-auth-discovery-switch`, `caller-auth-discovery-resource-input`, `caller-auth-discovery-use-listener-url-button`                                                                            |
-| List, where `<list>` is `authorization-server` or `scope` | `caller-auth-discovery-<list>-input`, `caller-auth-discovery-add-<list>-button`, `caller-auth-discovery-<list>-<index>`, `caller-auth-discovery-remove-<list>-<index>-button`                      |
-| Variant resource, rules explainer toggle                  | `caller-auth-discovery-variant-resource`, `caller-auth-discovery-context-toggle`                                                                                                                   |
-| Errors                                                    | `caller-auth-discovery-save-error`, `caller-auth-discovery-rules-error`, `caller-auth-discovery-resource-error`, `caller-auth-discovery-<list>s-error`, `caller-auth-discovery-<list>-input-error` |
-| Sidebar status and error                                  | `caller-auth-panel-discovery-status`, `caller-auth-panel-discovery-save-error`                                                                                                                     |
+| Element                                                        | Test id                                                                                                                                                                                            |
+| -------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Discovery switch, resource, use listener URL                   | `caller-auth-discovery-switch`, `caller-auth-discovery-resource-input`, `caller-auth-discovery-use-listener-url-button`                                                                            |
+| List, where `<list>` is `authorization-server` or `scope`      | `caller-auth-discovery-<list>-input`, `caller-auth-discovery-add-<list>-button`, `caller-auth-discovery-<list>-<index>`, `caller-auth-discovery-remove-<list>-<index>-button`                      |
+| Variant resource, default variant note, rules explainer toggle | `caller-auth-discovery-variant-resource`, `caller-auth-discovery-default-variant-note`, `caller-auth-discovery-context-toggle`                                                                     |
+| Errors                                                         | `caller-auth-discovery-save-error`, `caller-auth-discovery-rules-error`, `caller-auth-discovery-resource-error`, `caller-auth-discovery-<list>s-error`, `caller-auth-discovery-<list>-input-error` |
+| Sidebar status and error                                       | `caller-auth-panel-discovery-status`, `caller-auth-panel-discovery-save-error`                                                                                                                     |
 
 ## Trust Check
 

@@ -141,9 +141,10 @@ presentation with `user_hash = SHA256(did)`.
 
 [`src/authz_metadata/`](../src/authz_metadata/) fetches and validates an authorization
 server's metadata document and returns the issuer, the URL the document came from, the
-`token_endpoint` and the `jwks_uri`. An issuer is acceptable only when it has no ASCII
-whitespace or control characters anywhere, leading, trailing or inside; the raw string is
-checked before it is parsed, and a failure is `invalid_url` before any DNS lookup or request.
+`token_endpoint` and the `jwks_uri`. An issuer is acceptable only when it has no whitespace,
+Unicode spaces such as a no-break space or a line separator included, and no control
+character anywhere, leading, trailing or inside; the raw string is checked before it is
+parsed, and a failure is `invalid_url` before any DNS lookup or request.
 Let P be the issuer path with its trailing slashes removed. An origin issuer (empty P, with or
 without a trailing slash) has two attempts, in this order: `{origin}/.well-known/oauth-authorization-server`
 (RFC 8414), then `{origin}/.well-known/openid-configuration`. A path issuer has three: the
@@ -151,7 +152,10 @@ RFC 8414 URL with P inserted after the well-known name
 (`{origin}/.well-known/oauth-authorization-server{P}`), the OpenID Connect URL with P inserted
 (`{origin}/.well-known/openid-configuration{P}`), then the OpenID Connect URL with P appended
 (`{origin}{P}/.well-known/openid-configuration`). The first acceptable document wins. The
-`issuer` in the document must equal the requested issuer byte for byte. `token_endpoint` and `jwks_uri` must be absolute `http` or
+`issuer` in the document must equal the requested issuer byte for byte. `token_endpoint` and
+`jwks_uri` are both required, `jwks_uri` too although RFC 8414 makes it optional, because the
+gateway validates JWT access tokens and needs the issuer's keys; a document without either is
+`invalid_document`. Both must be absolute `http` or
 `https` URLs of at most 2048 characters, with no whitespace, control characters,
 credentials or fragment, not a cloud-metadata address, and not a weaker scheme than the
 issuer: an `https` issuer with an `http` endpoint is an invalid document under every posture.
@@ -178,7 +182,9 @@ applies to the metadata URL at fetch time. It also applies to the discovered
 `localhost` name in a blocked range makes the document invalid. A name that only resolves to
 a private address cannot be known without DNS, so it passes parsing. The caller must therefore
 fetch these URLs with `get_bounded`, or another pinned client, under the same posture, which
-blocks such a name at fetch time.
+blocks such a name at fetch time. The JWT Bearer `JwksFetcher` always uses the
+cloud-metadata-only pinned client, so a `jwks_uri` discovered under `Strict` must not be
+handed to it; fetch it with `get_bounded` under `Strict`.
 
 A failure is a `DiscoveryError`. `failure()` returns the `DiscoveryFailure`, `code()` a
 stable string, `message()` fixed text that is safe in an API response (it never carries a

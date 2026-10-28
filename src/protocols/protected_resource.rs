@@ -429,13 +429,37 @@ fn caller_authentication_metadata(
     Ok(found)
 }
 
+/// Whether a channel or proxy route catch-all on the listener also covers the
+/// protected resource metadata paths: one with an empty prefix or at
+/// `/.well-known`. A path no Access Point publishes then still reaches it, as
+/// it did before these paths were routed here.
+pub fn proxies_metadata_paths(network: &crate::config::NetworkConfig) -> bool {
+    network
+        .channels
+        .iter()
+        .map(|channel| channel.prefix.as_str())
+        .chain(
+            network
+                .routes
+                .values()
+                .filter(|route| route.route_type == crate::config::RouteType::Proxy)
+                .map(|route| route.prefix.as_str()),
+        )
+        .any(|prefix| {
+            prefix != "/.well-known/oauth-protected-resource"
+                && "/.well-known/oauth-protected-resource/".starts_with(&format!("{prefix}/"))
+        })
+}
+
 /// Protected resource metadata on an inbound listener. MCP Access Points
 /// whose caller authentication publishes a document are matched first, then
 /// the gateway STS Resource Server. Without the gateway STS profile, a path no
-/// Access Point publishes is a plain `404`: MCP clients probe these paths
-/// during discovery, so they are not proxied, logged or audited as requests
-/// without a route.
+/// Access Point publishes goes to the proxy handler when a channel or proxy
+/// route covers it ([`proxies_metadata_paths`]), and is otherwise a plain
+/// `404`: MCP clients probe these paths during discovery, so they are not
+/// logged or audited as requests without a route.
 pub async fn protected_resource_metadata(
+    axum::extract::ConnectInfo(address): axum::extract::ConnectInfo<std::net::SocketAddr>,
     axum::extract::State(state): axum::extract::State<crate::state::MultiSurfaceProxyState>,
     request: axum::extract::Request,
 ) -> Response {
@@ -468,6 +492,14 @@ pub async fn protected_resource_metadata(
             let uri = request.uri().clone();
             crate::mcp::resource_server::surface_metadata(axum::extract::State(state), axum::extract::OriginalUri(uri))
                 .await
+        }
+        Ok(None) if proxies_metadata_paths(&state.network_config) => {
+            crate::proxy::handler::multi_channel_proxy_handler(
+                axum::extract::ConnectInfo(address),
+                axum::extract::State(state),
+                request,
+            )
+            .await
         }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
     }

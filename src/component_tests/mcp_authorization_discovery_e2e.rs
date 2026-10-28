@@ -454,6 +454,58 @@ async fn a_variant_put_keeps_its_discovery_unless_it_sends_null() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_catch_all_route_still_receives_metadata_paths_no_surface_publishes() {
+    let upstream =
+        json!({"resource": "https://upstream.example/mcp", "authorization_servers": ["https://idp.example"]});
+    let target = MockServer::start_with_response(upstream.to_string()).await;
+    let harness = GatewayHarness::start_with_mock(target, |_directory, config, bootstrap| {
+        let mut network: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&bootstrap.config_files.gateway).unwrap()).unwrap();
+        network["routes"]["root"] = json!({"type": "proxy", "prefix": ""});
+        std::fs::write(&bootstrap.config_files.gateway, serde_json::to_vec(&network).unwrap()).unwrap();
+        config.surfaces = vec![
+            serde_json::from_value(json!({
+                "name": "pass-through",
+                "access_point": {"listen_address": "inbound_port_placeholder", "route": "/", "protocol": "mcp"},
+                "target": {"endpoint": "inbound_target_placeholder"}
+            }))
+            .unwrap(),
+        ];
+    })
+    .await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap();
+
+    // A pass-through surface at / still gets the path: the answer is its Target's.
+    let response = client
+        .get(metadata_url(&harness, "/mcp"))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.text().await.unwrap();
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap(), upstream);
+
+    // The Target's answers keep the cors allowlist: no origin outside it may read them.
+    let preflight = client
+        .request(reqwest::Method::OPTIONS, metadata_url(&harness, "/mcp"))
+        .header("origin", "https://client.example")
+        .header("access-control-request-method", "GET")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        preflight
+            .headers()
+            .get("access-control-allow-origin")
+            .is_none()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_browser_client_reads_the_metadata_from_any_origin() {
     let fixture = JwksFixture::start().await;
     let (harness, _admin) = start_discovery_gateway(&fixture).await;

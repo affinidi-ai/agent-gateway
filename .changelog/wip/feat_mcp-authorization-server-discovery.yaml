@@ -12,8 +12,9 @@ changes:
         its own surfaces. The authorization servers must include the issuer of the caller
         authentication's JWT verification strategy. The setting is checked on save like
         mcp_http.authorization. A PUT of the surface or of a variant that omits it keeps it while the
-        Access Point would still serve it, a PUT or PATCH that sends null removes it, and surfaces
-        without it behave as before.
+        Access Point would still serve it, and is refused when it moves the route or listen address
+        the setting names. A PUT or PATCH that sends null removes it, and surfaces without it behave
+        as before.
     - timestamp: '2026-10-27T11:14:01Z'
       title: Challenge MCP callers without a valid token to fetch one
       description: >-
@@ -57,7 +58,8 @@ changes:
         refused the preflight, so an MCP client running in a browser on another origin could not
         find the authorization server. Any origin may now read them with GET or HEAD; other
         methods keep the cors allowlist. Without the gateway STS profile, a path no surface
-        publishes is now a plain 404 instead of the static fallback.
+        publishes still reaches a channel or proxy route at the root or at /.well-known, and is
+        otherwise a plain 404 instead of the static fallback.
   removed: []
   security:
     - timestamp: '2026-10-27T11:20:02Z'

@@ -86,8 +86,9 @@ fn proxy_cors_layer(cors_origins: &[String]) -> CorsLayer {
 
 /// CORS for protected resource metadata: browser MCP clients on any origin
 /// read it with `GET` or `HEAD`, and other methods keep the `cors` allowlist.
-/// It is layered on the metadata routes only, so a channel that proxies a path
-/// under them does not open its Target's responses to every origin.
+/// It is layered on the metadata routes only, and only on a listener where no
+/// channel or proxy route also receives these paths, so a proxied Target's
+/// responses are never opened to every origin.
 fn metadata_cors_layer(cors_origins: &[String]) -> CorsLayer {
     cors_layer(cors_origins, true)
 }
@@ -641,7 +642,11 @@ pub async fn run_port_server(
                         "/.well-known/oauth-protected-resource/{*path}",
                         axum::routing::any(crate::protocols::protected_resource::protected_resource_metadata),
                     )
-                    .layer(metadata_cors_layer(&network_config.cors))
+                    .layer(if crate::protocols::protected_resource::proxies_metadata_paths(&network_config) {
+                        proxy_cors_layer(&network_config.cors)
+                    } else {
+                        metadata_cors_layer(&network_config.cors)
+                    })
                     .with_state(state.as_ref().clone()),
             );
         }
@@ -1676,6 +1681,36 @@ mod tests {
         assert!(!allowed(metadata_cors_layer(&cors), "OPTIONS", Some("POST")).await);
         // A channel proxying the same path keeps the allowlist.
         assert!(!allowed(proxy_cors_layer(&cors), "GET", None).await);
+    }
+
+    #[test]
+    fn only_a_catch_all_at_the_root_or_well_known_proxies_the_metadata_paths() {
+        use crate::protocols::protected_resource::proxies_metadata_paths;
+        let mut network = crate::protocols::protected_resource::fixtures::discovery_network();
+        assert!(!proxies_metadata_paths(&network));
+        let channel = |prefix: &str| crate::config::network::ChannelPrefix {
+            id: "channel".into(),
+            name: "channel".into(),
+            prefix: prefix.into(),
+        };
+        for (prefix, proxies) in [
+            ("/.well-known", true),
+            ("/", false),
+            ("/agents", false),
+            ("/.well-known/oauth-protected-resource", false),
+            ("/.well-known/oauth-protected-resource/mcp", false),
+        ] {
+            network.channels = vec![channel(prefix)];
+            assert_eq!(proxies_metadata_paths(&network), proxies, "channel {prefix}");
+        }
+        network.channels = Vec::new();
+        for (prefix, proxies) in [("", true), ("/", false)] {
+            network.routes = serde_json::from_value(serde_json::json!({
+                "root": {"type": "proxy", "prefix": prefix}
+            }))
+            .unwrap();
+            assert_eq!(proxies_metadata_paths(&network), proxies, "proxy route {prefix:?}");
+        }
     }
 
     #[test]
