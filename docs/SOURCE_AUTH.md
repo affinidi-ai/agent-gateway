@@ -31,6 +31,13 @@ Configured on the Access Point as `caller_authentication.methods`. Each method i
 ([`AgentSurface::source_auth`](../src/config/agent_surface_accessors.rs)); later entries
 are accepted and ignored.
 
+A JWT bearer token is accepted only when it is signed with an RS256, RS384, RS512, ES256,
+ES384 or EdDSA key from the strategy's key set, its `iss` equals the strategy's expected
+issuer, it has an `exp` that has not passed and, when it has an `nbf`, that time has come,
+each with 60 seconds of leeway. `aud` must name one of the method's `audiences`; an empty
+list skips that check, except on an MCP Access Point that publishes protected resource
+metadata, where `aud` must name the resource of the route called.
+
 An MCP Access Point whose first method is JWT bearer can also publish RFC 9728 protected
 resource metadata naming the authorization server that issues its tokens, with
 `caller_authentication.protected_resource`. See

@@ -73,4 +73,11 @@ changes:
         resource or the variant's own, as the MCP authorization specification requires. A token the
         same authorization server issued for another resource is answered with the 401 challenge.
         The JWT Bearer audiences list must be empty on these surfaces.
+    - timestamp: '2026-10-28T11:02:53Z'
+      title: Reject JWT Bearer tokens used before their nbf
+      description: >-
+        JWT Bearer caller tokens were accepted before the time in their nbf claim, because the JWT
+        library checks nbf only when asked. A token whose nbf is still more than 60 seconds away is
+        now refused like any other invalid token, on every surface with JWT Bearer caller
+        authentication and on the gateway STS Resource Server.
   breaking: []
