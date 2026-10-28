@@ -17,12 +17,12 @@ changes:
     - timestamp: '2026-10-27T11:14:01Z'
       title: Challenge MCP callers without a valid token to fetch one
       description: >-
-        A direct request to an MCP Access Point that publishes protected resource metadata, whose
-        bearer token is missing or refused, is now answered before policy with 401 and
+        A request to an MCP Access Point that publishes protected resource metadata, whose bearer
+        token is missing or refused, is now answered before policy with 401 and
         WWW-Authenticate Bearer resource_metadata naming the absolute metadata URL, with
-        error=invalid_token once a token was presented and the scopes when set. MCP clients follow
-        it to the authorization server, get a token and retry. Without this setting a failed
-        credential is still handed to policy.
+        error=invalid_token once a token was presented and the scopes when set, whether the request
+        came directly or over Fabric. MCP clients follow it to the authorization server, get a token
+        and retry. Without this setting a failed credential is still handed to policy.
     - timestamp: '2026-10-27T19:07:39Z'
       title: Edit MCP authorization server discovery in the dashboard
       description: >-
@@ -72,7 +72,8 @@ changes:
         only when its aud claim names the resource advertised for the route called, the base
         resource or the variant's own, as the MCP authorization specification requires. A token the
         same authorization server issued for another resource is answered with the 401 challenge.
-        The JWT Bearer audiences list must be empty on these surfaces.
+        This holds for requests that reach the surface over Fabric too. The JWT Bearer audiences
+        list must be empty on these surfaces.
     - timestamp: '2026-10-28T11:02:53Z'
       title: Reject JWT Bearer tokens used before their nbf
       description: >-

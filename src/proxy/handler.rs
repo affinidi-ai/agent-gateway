@@ -1220,10 +1220,12 @@ fn evaluate_ap2_inbound_decision(
 
 async fn resolve_direct_surface_auth_config(
     auth_config: &crate::source_auth::SourceAuthConfig,
+    protected_resource: Option<&crate::protocols::protected_resource::ProtectedResourceConfig>,
     vc_issuer: Option<&crate::identity::VCIssuer>,
     surface_id: &str,
 ) -> crate::source_auth::errors::SourceAuthResult<crate::source_auth::SourceAuthConfig> {
-    crate::source_auth::middleware::resolve_surface_audience(auth_config, vc_issuer, surface_id).await
+    crate::source_auth::middleware::resolve_surface_audience(auth_config, protected_resource, vc_issuer, surface_id)
+        .await
 }
 
 /// Maps the config-level delegated-rail marker onto the audit `PaymentRail`.
@@ -1923,6 +1925,7 @@ async fn proxy_handler_with_mcp_runtime(
         };
         let resolved_auth_config = match resolve_direct_surface_auth_config(
             auth_config,
+            protected_resource.as_ref(),
             state.vc_issuer.as_deref(),
             &state.surface.surface_id,
         )
@@ -1952,10 +1955,6 @@ async fn proxy_handler_with_mcp_runtime(
                     &e,
                 ));
             }
-        };
-        let resolved_auth_config = match &protected_resource {
-            Some(protected_resource) => protected_resource.bind_audience(resolved_auth_config),
-            None => resolved_auth_config,
         };
         let peer_cert = req
             .extensions()
@@ -1993,12 +1992,7 @@ async fn proxy_handler_with_mcp_runtime(
                     connection_guard
                         .decrement()
                         .await;
-                    let error = if matches!(e, crate::source_auth::errors::SourceAuthError::MissingCredential { .. }) {
-                        crate::protocols::protected_resource::ResourceTokenError::Missing
-                    } else {
-                        crate::protocols::protected_resource::ResourceTokenError::Invalid
-                    };
-                    return Ok(protected_resource.challenge(error));
+                    return Ok(protected_resource.caller_challenge(&e));
                 }
                 source_auth_failure = Some(crate::surface_context::SourceAuthContext::Failed {
                     attempted_method: resolved_auth_config
@@ -20092,7 +20086,7 @@ allow if {
             ..Default::default()
         });
 
-        let resolved = resolve_direct_surface_auth_config(&config, Some(&vc_issuer), "direct-surface")
+        let resolved = resolve_direct_surface_auth_config(&config, None, Some(&vc_issuer), "direct-surface")
             .await
             .expect("resolve direct surface audience");
 

@@ -2461,6 +2461,194 @@ allow if {
     assert_ne!(last_body(), Some(denied), "a request the policy rejects never reaches the Target");
 }
 
+#[test]
+fn fabric_receive_binds_tokens_to_the_routes_protected_resource() {
+    if std::env::var_os("ATG_FABRIC_DISCOVERY_CHILD").is_none() {
+        let test_name = std::thread::current()
+            .name()
+            .unwrap()
+            .to_string();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test_name, "--nocapture"])
+            .env("ATG_FABRIC_DISCOVERY_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated Fabric discovery test failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(Box::pin(fabric_discovery_flow()));
+}
+
+/// An MCP Access Point that publishes protected resource metadata answers a
+/// Fabric request as it answers a direct one: a missing token, or one issued
+/// for another resource or variant, gets the 401 challenge, and only a token
+/// for the resource of the route called reaches the Target.
+async fn fabric_discovery_flow() {
+    use std::sync::Arc;
+
+    use crate::component_tests::helpers::jwt::{JwksFixture, now_secs, sign_jwt};
+    use crate::jwt_bearer::storage::{FileSystemJwtVerificationStrategyStore, JwtVerificationStrategyStorage};
+
+    let fixture = JwksFixture::start().await;
+    let target =
+        MockServer::start_with_response(json!({"jsonrpc": "2.0", "id": "call", "result": {"tools": []}}).to_string())
+            .await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let _issuer_dir = install_listener_manager_with_sender(temp_dir.path()).await;
+    let storage_path = temp_dir
+        .path()
+        .join("surfaces");
+    let strategies = Arc::new(
+        FileSystemJwtVerificationStrategyStore::new(
+            temp_dir
+                .path()
+                .join("strategies"),
+        )
+        .await
+        .unwrap(),
+    );
+    let strategy = strategies
+        .create(
+            serde_json::from_value(json!({
+                "id": "idp", "name": "IdP", "expected_issuer": fixture.issuer,
+                "jwks_source": {"type": "remote", "jwks_uri": format!("{}/.well-known/jwks.json", fixture.issuer)},
+                "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let surface: AgentSurface = serde_json::from_value(json!({
+        "surface_id": "fabric-discovery", "name": "Fabric discovery",
+        "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp",
+            "caller_authentication": {
+                "methods": [{"type": "jwt_bearer", "jwt_verification_strategy_id": strategy.id, "audiences": []}],
+                "protected_resource": {"resource": "https://gateway.example/mcp",
+                    "authorization_servers": [crate::protocols::protected_resource::fixtures::ISSUER]}
+            }},
+        "target": {"endpoint": format!("http://{}", target.addr)},
+        "variants": [{"id": "beta", "alias": "beta", "name": "Beta", "enabled": true, "overrides": {}}]
+    }))
+    .unwrap();
+    FileSystemAgentSurfaceStore::new(storage_path.clone())
+        .await
+        .unwrap()
+        .save(&surface)
+        .await
+        .unwrap();
+    super::init_mcp_auth_network(Arc::new(crate::protocols::protected_resource::fixtures::discovery_network()));
+    super::init_source_auth_middleware(Arc::new(crate::source_auth::SourceAuthMiddleware::new(
+        Arc::new(crate::didauth::DidAuthSessionStore::new()),
+        strategies,
+        Arc::new(crate::jwt_bearer::JwksClient::new()),
+        None,
+        Arc::new(dashmap::DashMap::new()),
+        None,
+        None,
+    )))
+    .await;
+
+    let token_for = |audience: &str| {
+        sign_jwt(
+            json!({"iss": fixture.issuer, "sub": "user-123", "aud": audience, "exp": now_secs() + 300}),
+            &fixture.kid,
+        )
+    };
+    let now = super::super::envelope_replay::now_secs();
+    let send = |alias: Option<&str>, token: Option<String>| {
+        let mut headers = json!({"MCP-Protocol-Version": MCP_LEGACY_VERSION});
+        if let Some(token) = token {
+            headers["authorization"] = json!(format!("Bearer {token}"));
+        }
+        let mut body = json!({"channel_id": surface.surface_id, "method": "POST", "path": "/mcp", "headers": headers,
+            "body": {"jsonrpc": "2.0", "id": "call", "method": "tools/list"}});
+        if let Some(alias) = alias {
+            body["virtual_channel_alias"] = json!(alias);
+        }
+        let message = ReceivedMessage::new(
+            "receiver-connection".to_string(),
+            "receiver-gateway".to_string(),
+            MessageType::ForwardRequest.to_string(),
+            uuid::Uuid::new_v4().to_string(),
+            None,
+            Some(SENDER_CONNECTION_POINT_DID.to_string()),
+            vec!["did:web:receiver.example".to_string()],
+            None,
+            Some(now + 60),
+            body,
+            MessageMetadata {
+                encrypted: true,
+                authenticated: true,
+                from_key: None,
+                extra: Value::Null,
+            },
+        )
+        .with_context("agent_surface_storage_path", json!(storage_path));
+        async move {
+            let result = tokio::time::timeout(Duration::from_secs(10), Box::pin(process_forward_request(&message)))
+                .await
+                .expect("Fabric receive handler timed out");
+            let ProcessingResult::RequiresResponse { response_body, .. } = result else {
+                panic!("expected a ForwardResponse, got {result:?}");
+            };
+            response_body
+        }
+    };
+    let reached = || {
+        target
+            .request_count
+            .load(Ordering::SeqCst)
+    };
+
+    let base_metadata = "resource_metadata=\"https://gateway.example/.well-known/oauth-protected-resource/mcp\"";
+    let variant_metadata =
+        "resource_metadata=\"https://gateway.example/.well-known/oauth-protected-resource/mcp$beta\"";
+    for (alias, token, metadata, invalid_token) in [
+        (None, None, base_metadata, false),
+        (None, Some(token_for("https://gateway.example/other")), base_metadata, true),
+        (None, Some(token_for("https://gateway.example/mcp$beta")), base_metadata, true),
+        (Some("beta"), Some(token_for("https://gateway.example/mcp")), variant_metadata, true),
+    ] {
+        let response = send(alias, token).await;
+        assert_eq!(response["status"], 401, "{response}");
+        let challenge = response["headers"]["www-authenticate"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(challenge.starts_with("Bearer ") && challenge.contains(metadata), "{response}");
+        assert_eq!(challenge.contains("error=\"invalid_token\""), invalid_token, "{response}");
+        assert_eq!(reached(), 0, "a refused token never reaches the Target");
+    }
+
+    for (alias, audience) in [(None, "https://gateway.example/mcp"), (Some("beta"), "https://gateway.example/mcp$beta")]
+    {
+        let before = reached();
+        let response = send(alias, Some(token_for(audience))).await;
+        assert_eq!(response["status"], 200, "{response}");
+        assert_eq!(reached(), before + 1, "a token for the route's own resource reaches the Target");
+        let forwarded = target
+            .last_request_rx
+            .borrow()
+            .clone()
+            .unwrap();
+        assert!(
+            !forwarded
+                .headers
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case("authorization")),
+            "the caller's token never reaches the Target"
+        );
+    }
+}
+
 #[derive(Clone, Default)]
 struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 

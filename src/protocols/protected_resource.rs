@@ -275,6 +275,18 @@ impl ProtectedResourceConfig {
             .insert(header::WWW_AUTHENTICATE, challenge);
         response
     }
+
+    /// The challenge for a caller authentication failure the caller caused:
+    /// without `error="invalid_token"` when no credential was sent.
+    pub fn caller_challenge(
+        &self,
+        error: &crate::source_auth::errors::SourceAuthError,
+    ) -> Response {
+        self.challenge(match error {
+            crate::source_auth::errors::SourceAuthError::MissingCredential { .. } => ResourceTokenError::Missing,
+            _ => ResourceTokenError::Invalid,
+        })
+    }
 }
 
 /// An RFC 8414 issuer identifier, by the rules authorization server metadata

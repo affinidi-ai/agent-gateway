@@ -284,10 +284,12 @@ pub fn get_source_auth_middleware() -> Option<Arc<crate::source_auth::SourceAuth
 
 async fn resolve_fabric_surface_auth_config(
     auth_config: &crate::source_auth::SourceAuthConfig,
+    protected_resource: Option<&crate::protocols::protected_resource::ProtectedResourceConfig>,
     vc_issuer: Option<&crate::identity::VCIssuer>,
     surface_id: &str,
 ) -> crate::source_auth::errors::SourceAuthResult<crate::source_auth::SourceAuthConfig> {
-    crate::source_auth::middleware::resolve_surface_audience(auth_config, vc_issuer, surface_id).await
+    crate::source_auth::middleware::resolve_surface_audience(auth_config, protected_resource, vc_issuer, surface_id)
+        .await
 }
 
 /// Initialize the global gateway-level OPA policy manager for GW2.
@@ -4126,6 +4128,31 @@ async fn process_forward_request_with_mcp_runtime(
         via_fabric: true,
     };
     let token_refused = |error| crate::audit::request_events::resource_token_failed(&audit_facts, error, None);
+    // The protected resource the route publishes binds the caller's token
+    // audience here as on the direct path, and its challenge answers a token
+    // that is missing or refused.
+    let protected_resource = match GLOBAL_MCP_AUTH_NETWORK.get() {
+        Some(network) => {
+            crate::protocols::protected_resource::access_point_protected_resource(&surface, variant_alias, network)
+                .transpose()
+        }
+        None if surface.protected_resource().is_some() => Err("network configuration unavailable".to_string()),
+        None => Ok(None),
+    };
+    let protected_resource = match protected_resource {
+        Ok(protected_resource) => protected_resource,
+        Err(e) => {
+            channel_warn!(config_id, "GW2: Invalid MCP protected resource (reason={}) — blocking", e);
+            let error_body = serde_json::json!({
+                "error": "Invalid MCP protected resource",
+                "status": 503,
+            });
+            return ProcessingResult::RequiresResponse {
+                response_type: MessageType::ForwardResponse.to_string(),
+                response_body: error_body,
+            };
+        }
+    };
 
     let mut source_auth_failure: Option<crate::surface_context::SourceAuthContext> = None;
     let mut resource_authorization = None;
@@ -4221,6 +4248,7 @@ async fn process_forward_request_with_mcp_runtime(
                 };
                 let resolved_auth_config = match resolve_fabric_surface_auth_config(
                     auth_config,
+                    protected_resource.as_ref(),
                     GLOBAL_VC_ISSUER.get().map(Arc::as_ref),
                     &surface.surface_id,
                 )
@@ -4251,17 +4279,28 @@ async fn process_forward_request_with_mcp_runtime(
                     .await
                 {
                     Ok(identity) => Some(identity),
-                    // Caller-attributable failure: record the outcome for the
+                    // Caller-attributable failure. An Access Point that
+                    // publishes protected resource metadata answers it with
+                    // its challenge; otherwise record the outcome for the
                     // policy layer and continue with no asserted caller identity.
                     Err(e) if e.is_caller_attributable() => {
-                        channel_warn!(config_id, "GW2: Source authentication failed (reason={}) — deferring to policy", e);
+                        let challenged = protected_resource.is_some();
+                        channel_warn!(
+                            config_id,
+                            "GW2: Source authentication failed (reason={}) — {}",
+                            e,
+                            if challenged { "sending the discovery challenge" } else { "deferring to policy" }
+                        );
                         crate::audit::request_events::auth_failed(
                             &audit_facts,
                             crate::audit::request_events::source_auth_scheme(&resolved_auth_config),
                             crate::audit::request_events::source_auth_reason(&e),
-                            false,
+                            challenged,
                             None,
                         );
+                        if let Some(protected_resource) = &protected_resource {
+                            return axum_response_to_forward_result(protected_resource.caller_challenge(&e)).await;
+                        }
                         source_auth_failure = Some(crate::surface_context::SourceAuthContext::Failed {
                             attempted_method: resolved_auth_config.method_tag().to_string(),
                             reason: e.to_string(),
@@ -9730,7 +9769,7 @@ mod tests {
             ..Default::default()
         });
 
-        let resolved = resolve_fabric_surface_auth_config(&config, Some(&vc_issuer), "fabric-surface")
+        let resolved = resolve_fabric_surface_auth_config(&config, None, Some(&vc_issuer), "fabric-surface")
             .await
             .expect("resolve fabric surface audience");
 
