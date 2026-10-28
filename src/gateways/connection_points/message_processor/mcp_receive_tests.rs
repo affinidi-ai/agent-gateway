@@ -980,6 +980,7 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
                     recorded: "_base_".into(),
                 },
                 capabilities: crate::proxy::fabric_stream::peer::StreamCapabilities::local(true, true),
+                scope: crate::observability::policy_audit::RequestScope::fresh(),
             },
             crate::mcp::request_validation::LEGACY_ONLY_POLICY,
             None,
@@ -1394,6 +1395,7 @@ async fn fabric_consent_flow() {
                     recorded: "_base_".into(),
                 },
                 capabilities: crate::proxy::fabric_stream::peer::StreamCapabilities::local(true, true),
+                scope: crate::observability::policy_audit::RequestScope::fresh(),
             },
         )
     };

@@ -3743,6 +3743,8 @@ pub(crate) struct FabricStreamRequest {
     pub surface: crate::config::agent_surface::AgentSurface,
     pub variant: ForwardedVariant,
     pub capabilities: crate::proxy::fabric_stream::peer::StreamCapabilities,
+    /// The request the stream's Open was admitted as.
+    pub scope: Arc<crate::observability::policy_audit::RequestScope>,
 }
 
 /// The variant of this gateway's surface that serves a forwarded request.
@@ -3790,21 +3792,16 @@ pub(crate) async fn resolve_stream_surface(
     ) {
         Ok(selected) => selected,
         Err(error) => {
-            use crate::observability::policy_audit::{RequestScope, in_request};
-            let trace_id = request.trace_id.to_string();
-            in_request(RequestScope::fresh(), async {
-                crate::audit::request_events::refuse_routing(
-                    &crate::audit::request_events::RequestFacts {
-                        surface_id: &surface.surface_id,
-                        channel_name: &surface.name,
-                        trace_id: Some(&trace_id),
-                        via_fabric: true,
-                    },
-                    &error,
-                    None,
-                )
-            })
-            .await;
+            crate::audit::request_events::refuse_routing(
+                &crate::audit::request_events::RequestFacts {
+                    surface_id: &surface.surface_id,
+                    channel_name: &surface.name,
+                    trace_id: Some(&request.trace_id.to_string()),
+                    via_fabric: true,
+                },
+                &error,
+                None,
+            );
             return Err("Fabric stream variant is unavailable".to_string());
         }
     };
@@ -3848,7 +3845,9 @@ async fn process_forward_request_with_mcp_runtime(
 ) -> ProcessingResult {
     use crate::observability::policy_audit::{RequestScope, in_request, response_in_request};
 
-    let scope = RequestScope::fresh();
+    let scope = stream_request
+        .as_ref()
+        .map_or_else(RequestScope::fresh, |request| Arc::clone(&request.scope));
     let result = in_request(
         scope.clone(),
         Box::pin(process_forward_request_in_request_scope(message, stream_request, mcp_versions, mcp_continuations)),

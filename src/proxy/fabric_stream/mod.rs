@@ -231,8 +231,14 @@ impl StreamRuntime {
             stream_id: frame.stream_id,
             payload: wire::FramePayload::Open { request: request.clone() },
         })?;
-        let (surface, variant) =
-            crate::gateways::connection_points::message_processor::resolve_stream_surface(message, &request).await?;
+        // The Open is one request from here on: a routing refusal records under
+        // it, and the served stream runs as it.
+        let scope = crate::observability::policy_audit::RequestScope::fresh();
+        let (surface, variant) = Box::pin(crate::observability::policy_audit::in_request(
+            Arc::clone(&scope),
+            crate::gateways::connection_points::message_processor::resolve_stream_surface(message, &request),
+        ))
+        .await?;
         if !crate::gateways::connection_points::message_processor::fabric_peer_may_reach_surface(
             peer.tenant_id.as_deref(),
             surface.tenant_id.as_deref(),
@@ -340,7 +346,7 @@ impl StreamRuntime {
             limits,
             deadline,
             rejection,
-            scope: crate::observability::policy_audit::RequestScope::fresh(),
+            scope,
         })
     }
 
@@ -657,6 +663,7 @@ impl IncomingStream {
                         surface: self.surface,
                         variant: self.variant,
                         capabilities: self.capabilities,
+                        scope: self.scope,
                     },
                     versions,
                     continuations,
