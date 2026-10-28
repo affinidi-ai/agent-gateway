@@ -1,0 +1,55 @@
+branch: fix/trust-registry-connection-ownership
+changes:
+  added: []
+  changed:
+    - timestamp: '2026-10-28T16:11:17Z'
+      title: Rebuild a trust registry from its stored keys when it is reconnected
+      description: >-
+        Reconnect no longer falls back to accepting the registry's OOB invitation again.
+        That fallback created a new identity over the stored keys, which the registry
+        admin rejects, and for `did:peer` and `did:webvh` registries it could not be
+        undone. A failed reconnect now returns 502 with the cause and leaves the stored
+        status and identity unchanged; a registry that never connected has to be deleted
+        and recreated. A successful reconnect moves a Failed registry to Connected and
+        keeps any other status, so an Awaiting approval registry is no longer shown as
+        Connected before the registry approves it.
+    - timestamp: '2026-10-28T16:11:17Z'
+      title: Refuse to create or reconnect trust registries on a Standby node
+      description: >-
+        Create and reconnect now return 503 on a Standby node before anything is written,
+        and queries there fail without opening a connection. A Standby node could open
+        sessions under the Active node's DIDs, dropping its sessions, and write Failed into
+        the shared store.
+  fixed:
+    - timestamp: '2026-10-28T16:11:17Z'
+      title: Build each trust registry's connection once, however many queries need it
+      description: >-
+        Trust Checks, Trust Recorders, issuer registration, startup and reconnect could
+        each build a trust registry client at the same time, and the mediator's single
+        websocket per DID made them drop each other's sessions. The gateway now runs one
+        build per registry, which every caller joins and waits for within its own
+        timeout. A build that outlives its caller is still installed for the next query
+        instead of being left half-built, public registries share one temporary connection
+        per DID, and a stored registry is never queried under a throwaway identity.
+    - timestamp: '2026-10-28T16:11:17Z'
+      title: Retry a trust registry in the background after its connection fails
+      description: >-
+        A dropped or failed connection to a connected trust registry no longer marks it
+        Failed. The gateway retries it in the background, 30 seconds after the first
+        failure and doubling up to every 30 minutes, until it connects, is deleted or the
+        node goes to Standby. Reconnect starts a build at once and restarts the backoff.
+        Failed is now set only when the registry rejects the gateway or the first OOB
+        acceptance fails, and Failed registries are neither retried nor queried
+        automatically. A registry marked Failed before this change by a dropped connection
+        stays Failed until it is reconnected from the dashboard.
+    - timestamp: '2026-10-28T16:11:17Z'
+      title: Keep a deleted trust registry deleted
+      description: >-
+        A connection still being built, a status change from the registry or an update
+        could write a deleted trust registry back to storage or open a connection for it.
+        Deleting a registry now stops its builds and retries and fails the queries waiting
+        on it, and every write except create skips a registry that no longer exists. An
+        update of a registry deleted at the same time returns 404.
+  removed: []
+  security: []
+  breaking: []
