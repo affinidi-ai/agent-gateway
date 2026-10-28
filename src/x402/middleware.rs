@@ -585,7 +585,7 @@ async fn dispatch_settlement(
             let channel_id_clone = channel_id.to_string();
             let payload_clone = payload.clone();
             let correlation_id_clone = correlation_id.to_string();
-            tokio::spawn(async move {
+            crate::observability::policy_audit::spawn_in_request(async move {
                 if let Err(e) = settle_payment(
                     &payload_clone,
                     &config_clone,

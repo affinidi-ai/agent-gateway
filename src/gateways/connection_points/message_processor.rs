@@ -3814,17 +3814,20 @@ async fn process_forward_request_with_mcp_runtime(
     mcp_versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
     mcp_continuations: Option<Arc<crate::mcp::continuations::config::ContinuationRuntime>>,
 ) -> ProcessingResult {
-    crate::observability::policy_audit::REQUEST_ID
-        .scope(
-            crate::observability::policy_audit::new_request_id(),
-            Box::pin(process_forward_request_in_request_scope(
-                message,
-                stream_request,
-                mcp_versions,
-                mcp_continuations,
-            )),
-        )
-        .await
+    use crate::observability::policy_audit::{in_request, new_request_id, response_in_request};
+
+    let id = new_request_id();
+    let result = in_request(
+        id.clone(),
+        Box::pin(process_forward_request_in_request_scope(message, stream_request, mcp_versions, mcp_continuations)),
+    )
+    .await;
+    match result {
+        ProcessingResult::StreamingResponse { response } => ProcessingResult::StreamingResponse {
+            response: response_in_request(id, response),
+        },
+        other => other,
+    }
 }
 
 async fn process_forward_request_in_request_scope(

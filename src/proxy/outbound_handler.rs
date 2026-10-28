@@ -706,12 +706,12 @@ async fn outbound_proxy_handler_with_mcp_versions(
     req: Request,
     versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
 ) -> Result<Response, OutboundPipelineError> {
-    crate::observability::policy_audit::REQUEST_ID
-        .scope(
-            crate::observability::policy_audit::new_request_id(),
-            Box::pin(outbound_proxy_handler_in_request_scope(addr, state, req, versions)),
-        )
+    use crate::observability::policy_audit::{in_request, new_request_id, response_in_request};
+
+    let id = new_request_id();
+    in_request(id.clone(), Box::pin(outbound_proxy_handler_in_request_scope(addr, state, req, versions)))
         .await
+        .map(|response| response_in_request(id, response))
 }
 
 async fn outbound_proxy_handler_in_request_scope(

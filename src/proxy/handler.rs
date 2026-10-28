@@ -9275,12 +9275,15 @@ async fn multi_channel_proxy_handler_with_mcp_runtime(
     mcp_versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
     mcp_continuations: Option<Arc<crate::mcp::continuations::config::ContinuationRuntime>>,
 ) -> Response {
-    crate::observability::policy_audit::REQUEST_ID
-        .scope(
-            crate::observability::policy_audit::new_request_id(),
-            Box::pin(multi_channel_proxy_handler_in_request_scope(addr, state, req, mcp_versions, mcp_continuations)),
-        )
-        .await
+    use crate::observability::policy_audit::{in_request, new_request_id, response_in_request};
+
+    let id = new_request_id();
+    let response = in_request(
+        id.clone(),
+        Box::pin(multi_channel_proxy_handler_in_request_scope(addr, state, req, mcp_versions, mcp_continuations)),
+    )
+    .await;
+    response_in_request(id, response)
 }
 
 async fn multi_channel_proxy_handler_in_request_scope(
@@ -17255,6 +17258,114 @@ allow if {
         assert_ne!(seen[0], seen[1], "each request has its own id");
     }
 
+    /// A streamed response is read after the handler returned. The records its
+    /// events write (here, the response-policy allow recorded on the first
+    /// event) still carry the request's id, the one its other records carry.
+    async fn streamed_response_records_carry_the_request_id(state: &crate::state::ProxyState) {
+        use serde_json::json;
+        use std::sync::Arc;
+
+        let event = |result: serde_json::Value| {
+            (std::time::Duration::ZERO, format!("data: {}\n\n", json!({"jsonrpc": "2.0", "id": 1, "result": result})))
+        };
+        let target = crate::component_tests::helpers::MockServer::start_with_finished_stream(
+            "text/event-stream",
+            vec![
+                event(json!({"task": {"id": "t-1", "contextId": "c-1", "status": {"state": "TASK_STATE_SUBMITTED"}}})),
+                event(json!({"statusUpdate": {"taskId": "t-1", "contextId": "c-1",
+                    "status": {"state": "TASK_STATE_COMPLETED"}}})),
+            ],
+        )
+        .await;
+        let directory = tempfile::tempdir().unwrap();
+        let policies = Arc::new(
+            crate::policies::policy_definitions::FileSystemPolicyDefinitionStore::new(
+                directory
+                    .path()
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+            .await
+            .unwrap(),
+        );
+        policies
+            .save(
+                serde_json::from_value(json!({
+                    "id": "allow-responses", "name": "Allow responses", "policy_type": "agent_surface",
+                    "policy": "package surface.policy\ndefault allow = true", "created_at": "2026-10-28T00:00:00Z"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+            "surface_id": "streamed-ids", "name": "Streamed ids",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/a2a", "protocol": "a2a"},
+            "target": {"endpoint": target.url(), "response_policy": {"policy_definition_id": "allow-responses"}}
+        }))
+        .unwrap();
+        let manager = Arc::new(crate::policies::SurfacePolicyManager::new());
+        manager.set_policy_definition_store(policies);
+        manager
+            .update_channel_policy(&surface)
+            .await
+            .unwrap();
+        let state = crate::state::ProxyState {
+            policy_manager: Some(manager),
+            ..state.clone()
+        };
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/a2a")
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream")
+            .header("A2A-Version", "1.0")
+            .body(axum::body::Body::from(
+                json!({"jsonrpc": "2.0", "id": 1, "method": "SendStreamingMessage", "params": {
+                    "message": {"messageId": "m-1", "role": "ROLE_USER", "parts": [{"text": "hi"}]}
+                }})
+                .to_string(),
+            ))
+            .unwrap();
+
+        let (body, events) = crate::audit::producer::capture(async {
+            let response = Box::pin(super::multi_channel_proxy_handler_with_mcp_runtime(
+                "127.0.0.1:12345"
+                    .parse()
+                    .unwrap(),
+                direct_router_state(&state, surface),
+                request,
+                crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+                None,
+            ))
+            .await;
+            axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap()
+        })
+        .await;
+
+        let streamed_decisions = events
+            .iter()
+            .filter(|event| {
+                matches!(&event.event, crate::delegation_vault::audit::DelegationAuditAction::PolicyDecision {
+                    scope, ..
+                } if scope == crate::observability::PolicyScope::Response.as_str())
+            })
+            .count();
+        assert_eq!(streamed_decisions, 1, "the allow is recorded once per stream: {events:?}\n{body:?}");
+        let ids: std::collections::HashSet<_> = events
+            .iter()
+            .map(|event| event.request_id.clone())
+            .collect();
+        assert_eq!(ids.len(), 1, "one request, one id: {ids:?}");
+        assert!(
+            ids.iter()
+                .all(Option::is_some),
+            "every record carries the id: {ids:?}"
+        );
+    }
+
     /// Each refusal the Access Point answers itself is recorded as
     /// `request_rejected` with the status and JSON-RPC code the caller got.
     async fn access_point_records_request_refusals(state: &crate::state::ProxyState) {
@@ -18834,6 +18945,7 @@ allow if {
         proxy_access_point_answers_modern_discovery(&state).await;
         access_point_records_request_refusals(&state).await;
         access_point_requests_each_carry_their_own_request_id(&state).await;
+        streamed_response_records_carry_the_request_id(&state).await;
         let now = crate::proxy::credential_delegation::modern::now_secs().unwrap();
         let runtime = negative_cases::continuation_runtime(now, 300);
         let bearer = issuer.sign_jwt_with_gateway_key_typ(&json!({

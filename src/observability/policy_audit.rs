@@ -125,6 +125,58 @@ pub fn current_request_id() -> Option<String> {
         .ok()
 }
 
+/// Runs `future` as request `id`: every audit record it writes carries the id.
+/// An entry point serves its request through this and passes the response to
+/// [`response_in_request`].
+pub async fn in_request<F: std::future::Future>(
+    id: String,
+    future: F,
+) -> F::Output {
+    REQUEST_ID
+        .scope(id, future)
+        .await
+}
+
+/// `response` with a streamed body read as request `id`. A streamed body (an
+/// SSE stream) is read after its handler returned, outside the handler's
+/// scope, so the records written per event would otherwise lose the id. A
+/// body of known length is left as it is.
+pub fn response_in_request(
+    id: String,
+    response: axum::response::Response,
+) -> axum::response::Response {
+    use axum::body::HttpBody;
+    use futures::StreamExt;
+
+    if response
+        .body()
+        .size_hint()
+        .exact()
+        .is_some()
+    {
+        return response;
+    }
+    response.map(|body| {
+        let mut data = body.into_data_stream();
+        axum::body::Body::from_stream(futures::stream::poll_fn(move |cx| {
+            REQUEST_ID.sync_scope(id.clone(), || data.poll_next_unpin(cx))
+        }))
+    })
+}
+
+/// Spawns `future` as the request being served, so the audit records it
+/// writes carry the request's id, as the task-local does not cross a spawn.
+pub fn spawn_in_request<F>(future: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    match current_request_id() {
+        Some(id) => tokio::spawn(REQUEST_ID.scope(id, future)),
+        None => tokio::spawn(future),
+    }
+}
+
 /// Push a decision into the per-request collector (no-op when no scope is active).
 pub fn push_policy_decision(summary: PolicyDecisionSummary) {
     let _ = POLICY_DECISION_COLLECTOR.try_with(|q| {
@@ -613,6 +665,56 @@ mod tests {
                 assert_eq!(current_request_id().as_deref(), Some("0123456789abcdef"));
             })
             .await;
+    }
+
+    #[tokio::test]
+    async fn a_streamed_body_is_read_as_its_request() {
+        use futures::StreamExt;
+
+        let chunks = futures::stream::repeat_with(|| {
+            Ok::<_, std::convert::Infallible>(bytes::Bytes::from(current_request_id().unwrap_or_default()))
+        })
+        .take(2);
+        let response = axum::response::Response::new(axum::body::Body::from_stream(chunks));
+
+        let response = response_in_request("0123456789abcdef".to_string(), response);
+        let body = axum::body::to_bytes(response.into_body(), 64)
+            .await
+            .unwrap();
+
+        assert_eq!(body, "0123456789abcdef0123456789abcdef");
+    }
+
+    #[test]
+    fn a_body_of_known_length_is_left_as_it_is() {
+        use axum::body::HttpBody;
+
+        let response = axum::response::Response::new(axum::body::Body::from("{}"));
+        let response = response_in_request("0123456789abcdef".to_string(), response);
+
+        assert_eq!(
+            response
+                .body()
+                .size_hint()
+                .exact(),
+            Some(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_task_spawned_in_a_request_keeps_its_id() {
+        let spawned = in_request("0123456789abcdef".to_string(), async {
+            spawn_in_request(async { current_request_id() })
+                .await
+                .unwrap()
+        })
+        .await;
+        let outside = spawn_in_request(async { current_request_id() })
+            .await
+            .unwrap();
+
+        assert_eq!(spawned.as_deref(), Some("0123456789abcdef"));
+        assert_eq!(outside, None);
     }
 
     #[test]

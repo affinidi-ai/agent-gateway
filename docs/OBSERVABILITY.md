@@ -275,7 +275,9 @@ administrator-only by default (see [`INTEGRATIONS.md`](INTEGRATIONS.md#managemen
   when an Access Point request, a Transit Point request or a fabric-received request starts,
   never read from a header or token. Every record of one request shares it, and an Access
   Point request and the Transit Point requests its agent makes each have their own, linked by
-  `trace_id`; a sink counts requests by distinct `request_id`. Records a proxied request produces while credential delegation runs are held
+  `trace_id`; a sink counts requests by distinct `request_id`. That includes the records a
+  streamed response writes per event while it is read (SSE on every path) and the payment
+  records an x402 or MPP request writes from background tasks. Records a proxied request produces while credential delegation runs are held
   until the request's identity VP is minted, then stamped with it; any still held when the
   request ends, on any path, are submitted without a VP. A selected record produced while the
   pipeline is not running is dropped and counted in
