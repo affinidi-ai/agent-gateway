@@ -249,6 +249,7 @@ pub async fn update_policy_definition(
         return Err(AppError::InvalidInput("Policy definition ID mismatch".to_string()));
     }
 
+    let change = store.lock_changes().await;
     let existing = store
         .get(&policy_id)
         .await
@@ -304,6 +305,7 @@ pub async fn update_policy_definition(
     {
         policy_changes::record(PolicyChangeAction::PolicyUpdated, updated);
     }
+    drop(change);
 
     // Recompile OPA engines for all surfaces that reference this policy definition
     // in any compiled slot (target, inbound, response, outbound, per-TP) or variant override.
@@ -429,17 +431,14 @@ pub async fn delete_policy_definition(
     // Prune global assignments before deleting the definition: if the prune
     // fails the definition still exists, so a retry reaches this step again.
     if let Some(gstore) = &state.global_policy_store {
-        let mut assignments = gstore.get().await;
-        let before = assignments.clone();
-        if assignments.remove_policy(&policy_id) {
-            gstore
-                .save(assignments.clone())
-                .await
-                .map_err(|e| {
-                    error!("Failed to remove policy from global assignments: {}", e);
-                    AppError::InternalError(format!("Failed to update global assignments: {}", e))
-                })?;
-            policy_changes::assignments_written(&before, &assignments, PolicyChangeSource::DefinitionDeleted).await;
+        let pruned = gstore
+            .update(|assignments| assignments.remove_policy(&policy_id), PolicyChangeSource::DefinitionDeleted)
+            .await
+            .map_err(|e| {
+                error!("Failed to remove policy from global assignments: {}", e);
+                AppError::InternalError(format!("Failed to update global assignments: {}", e))
+            })?;
+        if let Some(assignments) = pruned {
             if let Some(manager) = &state.global_policy_manager {
                 manager
                     .refresh(&assignments)
@@ -962,12 +961,16 @@ pub async fn update_policy_assignments(
         .global_policy_store
         .as_ref()
         .ok_or_else(|| AppError::InternalError("Global policy store not initialized".to_string()))?;
-    let before = store.get().await;
     store
-        .save(body.clone())
+        .update(
+            |assignments| {
+                *assignments = body.clone();
+                true
+            },
+            PolicyChangeSource::Api,
+        )
         .await
         .map_err(|e| AppError::InternalError(format!("Failed to save global assignments: {}", e)))?;
-    policy_changes::assignments_written(&before, &body, PolicyChangeSource::Api).await;
     if let Some(mgr) = &state.global_policy_manager {
         mgr.refresh(&body).await;
     }

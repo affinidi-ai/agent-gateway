@@ -427,7 +427,9 @@ Surface and gateway changes are found by comparing the stored record before and 
 write in a management request (`src/policies/slots.rs` lists a surface's policy slots), so
 every API path that writes one is covered. Each store holds a write lock from that read until the
 write's changes are recorded, so concurrent writes record a chain of changes, each relative to
-the record it replaced, in write order. A slot is told apart by its variant, its transit
+the record it replaced, in write order. The appliance-wide assignments (set through the API, or
+pruned when a definition is deleted) and definition updates and owner reassignments are locked
+the same way. A slot is told apart by its variant, its transit
 point and its tool name or gate id; every entry of a tool or gate list is enforced, so a name or
 id repeated in one list is a slot of its own. `transit.transit_policy` is not enforced, so it is
 not listed. A refused surface or variant write is not recorded, nor a refused

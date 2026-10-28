@@ -1000,6 +1000,7 @@ async fn persist_tenant_id(
                 .policy_definition_store
                 .as_ref()
                 .ok_or_else(|| unavailable(kind))?;
+            let _change = store.lock_changes().await;
             let before = store.get(id).await;
             let after = store
                 .set_tenant_id(id, tenant_id)
