@@ -792,14 +792,21 @@ impl AgentSurface {
         &self,
         alias: Option<&str>,
     ) -> Result<AgentSurface, VariantResolveError> {
-        let variant = self.select_variant(alias)?;
+        Ok(self.apply_variant(self.select_variant(alias)?))
+    }
 
+    /// This surface with `variant`'s overrides applied, or the base surface
+    /// when `variant` is `None`, without its variant catalog.
+    fn apply_variant(
+        &self,
+        variant: Option<&SurfaceVariant>,
+    ) -> AgentSurface {
         let mut resolved = self.clone();
         resolved.variants.clear();
         resolved.default_variant_id = None;
 
         let Some(variant) = variant else {
-            return Ok(resolved);
+            return resolved;
         };
         let overrides = variant.overrides.clone();
         let complete = overrides.complete;
@@ -826,7 +833,7 @@ impl AgentSurface {
             resolved.canvas = Some(canvas);
         }
 
-        Ok(resolved)
+        resolved
     }
 
     /// The Target `variant` points at, whether or not the variant is enabled.
@@ -867,16 +874,11 @@ impl AgentSurface {
         &self,
         alias: Option<&str>,
     ) -> Result<ServedVariant, VariantResolveError> {
-        let id = self
-            .select_variant(alias)?
-            .map(|variant| variant.id.clone());
-        let surface = self.resolve_variant(alias)?;
+        let variant = self.select_variant(alias)?;
         Ok(ServedVariant {
-            recorded: self
-                .surface_variant(id.as_deref())
-                .to_string(),
-            id,
-            surface,
+            id: variant.map(|variant| variant.id.clone()),
+            recorded: variant.map_or(SurfaceVariant::BASE, |variant| variant.alias.as_str()).to_string(),
+            surface: self.apply_variant(variant),
         })
     }
 
