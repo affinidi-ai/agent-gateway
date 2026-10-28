@@ -1,9 +1,8 @@
 //! x402 middleware for payment processing
 
-use axum::response::Response;
 use std::sync::Arc;
 
-use super::{PaymentPayload, PaymentRequired, create_payment_response, settle_payment, verify_payment};
+use super::{PaymentChallenge, PaymentError, PaymentPayload, create_payment_response, settle_payment, verify_payment};
 use crate::config::types::{
     ChannelProtocol, McpPaymentTriggers, X402Config, X402PaymentRequirement, X402SettlementMode,
 };
@@ -310,18 +309,17 @@ pub fn should_require_payment(
     }
 }
 
-/// Process x402 payment for a request
-#[allow(clippy::result_large_err)] // FIXME: Response is not an error
+/// Process x402 payment for a request. Without a signature the request is
+/// refused with the challenge to pay.
 pub async fn process_payment(
     payment_signature: Option<String>,
     config: &X402Config,
     channel_name: &str,
     channel_id: &str,
-    x402_headers: &crate::config::types::X402Headers,
     resource_url: &str,
     listener_manager: Option<std::sync::Arc<crate::gateways::ConnectionPointListenerManager>>,
     transaction_store: Option<Arc<crate::x402::TransactionStore>>,
-) -> Result<Option<String>, Response> {
+) -> Result<Option<String>, PaymentError> {
     if !config.enabled {
         // Payments not required for this channel
         return Ok(None);
@@ -378,28 +376,28 @@ pub async fn process_payment(
                 }
                 Err(e) => {
                     // Payment verification failed
-                    Err(super::create_invalid_payment_response(&e))
+                    Err(PaymentError::Invalid(e))
                 }
             }
         }
-        None => {
-            let payment_required = PaymentRequired {
-                x402_version: 2,
-                error: Some("Payment required".to_string()),
-                resource: super::ResourceInfo {
-                    url: resource_url.to_string(),
-                    description: "Access to this resource requires payment".to_string(),
-                    mime_type: "application/json".to_string(),
-                },
-                accepts: issued_payment_requirements(config).await,
-                extensions: None,
-            };
-
-            emit_challenge_issued_audit(channel_name, channel_id);
-
-            Err(super::create_402_response(payment_required, &x402_headers.payment_required))
-        }
+        None => Err(PaymentError::Required(challenge(config, channel_name, channel_id, resource_url).await)),
     }
+}
+
+/// The challenge for a request that presented no signature, recording that
+/// it was issued.
+pub async fn challenge(
+    config: &X402Config,
+    channel_name: &str,
+    channel_id: &str,
+    resource_url: &str,
+) -> PaymentChallenge {
+    let challenge = PaymentChallenge {
+        resource_url: resource_url.to_string(),
+        accepts: issued_payment_requirements(config).await,
+    };
+    emit_challenge_issued_audit(channel_name, channel_id);
+    challenge
 }
 
 /// Lowercase the asset and recipient of an EVM (`eip155:*`) requirement; EVM hex addresses are
@@ -531,12 +529,11 @@ pub(crate) async fn issued_payment_requirements(config: &X402Config) -> Vec<X402
 ///
 /// - `Immediate` awaits `settle_payment` inline, bounded by
 ///   `settlement_timeout_ms` (default [`IMMEDIATE_SETTLEMENT_TIMEOUT_MS`]).
-///   Any settlement error or timeout becomes an `Err(Response)` so the
+///   Any settlement error or timeout becomes an invalid payment so the
 ///   caller never grants on an unsettled payment.
 /// - `Deferred` spawns settlement in the background and returns `Ok(false)`
 ///   immediately, preserving grant-before-settle latency.
 /// - `None` is a no-op (verification-only mode).
-#[allow(clippy::result_large_err)] // FIXME: Response is not an error
 async fn dispatch_settlement(
     payload: &PaymentPayload,
     config: &X402Config,
@@ -544,7 +541,7 @@ async fn dispatch_settlement(
     channel_id: &str,
     transaction_store: Option<Arc<crate::x402::TransactionStore>>,
     correlation_id: &str,
-) -> Result<bool, Response> {
+) -> Result<bool, PaymentError> {
     match config.settlement_mode {
         X402SettlementMode::Immediate => {
             let timeout_ms = config
@@ -569,7 +566,7 @@ async fn dispatch_settlement(
                         correlation_id,
                         e.to_string()
                     );
-                    Err(super::create_invalid_payment_response(&format!("Payment settlement failed: {e}")))
+                    Err(PaymentError::Invalid(format!("Payment settlement failed: {e}")))
                 }
                 Err(_) => {
                     channel_warn!(
@@ -578,9 +575,7 @@ async fn dispatch_settlement(
                         timeout_ms,
                         correlation_id
                     );
-                    Err(super::create_invalid_payment_response(&format!(
-                        "Payment settlement timed out after {timeout_ms}ms"
-                    )))
+                    Err(PaymentError::Invalid(format!("Payment settlement timed out after {timeout_ms}ms")))
                 }
             }
         }
@@ -590,7 +585,7 @@ async fn dispatch_settlement(
             let channel_id_clone = channel_id.to_string();
             let payload_clone = payload.clone();
             let correlation_id_clone = correlation_id.to_string();
-            tokio::spawn(async move {
+            crate::observability::policy_audit::spawn_in_request(async move {
                 if let Err(e) = settle_payment(
                     &payload_clone,
                     &config_clone,
@@ -701,7 +696,7 @@ pub fn extract_a2a_message_text(json: &serde_json::Value) -> Option<String> {
 #[cfg(test)]
 mod settlement_gating_tests {
     use super::*;
-    use crate::config::types::{X402Headers, X402SettlementMode, X402VerificationMode};
+    use crate::config::types::{X402SettlementMode, X402VerificationMode};
     use crate::x402::{PaymentResponse, TransactionStore, config_cache};
     use base64::Engine;
     use std::sync::Arc;
@@ -792,25 +787,23 @@ mod settlement_gating_tests {
             payment_requirements: vec![configured_requirement()],
             ..Default::default()
         };
-        let headers = X402Headers::default();
-
         let result = process_payment(
             Some(payment_header("aa")),
             &config,
             "Test Channel",
             "channel-immediate-fail",
-            &headers,
             "/test",
             None,
             Some(store),
         )
         .await;
 
-        assert!(
-            result.is_err(),
-            "expected Err(Response) when immediate settlement fails, got Ok({:?})",
-            result.ok().flatten()
-        );
+        match result {
+            Err(PaymentError::Invalid(message)) => {
+                assert!(message.starts_with("Payment settlement failed"), "{message}")
+            }
+            other => panic!("expected an invalid payment when immediate settlement fails, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -827,14 +820,11 @@ mod settlement_gating_tests {
             payment_requirements: vec![configured_requirement()],
             ..Default::default()
         };
-        let headers = X402Headers::default();
-
         let result = process_payment(
             Some(payment_header("bb")),
             &config,
             "Test Channel",
             "channel-deferred",
-            &headers,
             "/test",
             None,
             Some(store),
@@ -861,14 +851,11 @@ mod settlement_gating_tests {
             payment_requirements: vec![configured_requirement()],
             ..Default::default()
         };
-        let headers = X402Headers::default();
-
         let result = process_payment(
             Some(payment_header("cc")),
             &config,
             "Test Channel",
             "channel-none",
-            &headers,
             "/test",
             None,
             Some(store),
@@ -901,25 +888,18 @@ mod settlement_gating_tests {
             &config,
             "Test Channel",
             "channel-self-payment",
-            &X402Headers::default(),
             "/test",
             None,
             Some(Arc::clone(&store)),
         )
         .await;
 
-        let response = result.expect_err("self-payment must not be granted");
-        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
-            serde_json::json!({
-                "error": "invalid_payment",
-                "message": "Payment does not match any payment requirement issued for this resource"
-            })
-        );
+        match result.expect_err("self-payment must not be granted") {
+            PaymentError::Invalid(message) => {
+                assert_eq!(message, "Payment does not match any payment requirement issued for this resource")
+            }
+            other => panic!("expected an invalid payment, got {other:?}"),
+        }
         let transactions = store.list_all().await;
         assert_eq!(transactions.len(), 1);
         assert!(

@@ -49,5 +49,29 @@ ignore = [
     # ssi / affinidi did-resolver dependency chain.
     # https://rustsec.org/advisories/RUSTSEC-2026-0258
     "RUSTSEC-2026-0258",
+
+    # crypto-bigint 0.3.2 / 0.5.5 — Timing variability in operations intended to
+    # be constant-time. Fix requires ≥0.7.6 with no 0.3.x or 0.5.x backport. The
+    # 0.7.x tree is already bumped to 0.7.10; only the older lines remain.
+    # 0.5.5 transitive via: elliptic-curve 0.13 ← affinidi-did-key,
+    # affinidi-secrets-resolver, alloy
+    # 0.3.2 transitive via: der 0.5 ← rsa 0.6.1 / pkcs8 0.8 ← ssi
+    # https://rustsec.org/advisories/RUSTSEC-2026-0387
+    "RUSTSEC-2026-0387",
+
+    # zstd 0.13.3 / zstd-safe 7.2.4 — memory-safety advisories in the zstd bindings (a reused
+    # context leaking an abandoned stream, `Seekable::decompress` setting a Vec length past its
+    # capacity, uninitialized memory after a failed legacy-frame decompression). Fixed only in
+    # zstd >= 0.14.3 and zstd-safe >= 8.2.0, a new major line: pulsar (up to 6.9.1) and
+    # solana-account-decoder 3.1.14 still require zstd ^0.13. The gateway calls no zstd API
+    # itself; the code is reached only through pulsar message compression and the Solana RPC
+    # client. zstd-sys is updated to 2.1.2 in Cargo.lock, which fixes RUSTSEC-2026-0410.
+    # Revisit when pulsar and solana move to zstd 0.14.
+    # https://rustsec.org/advisories/RUSTSEC-2026-0391
+    "RUSTSEC-2026-0391",
+    # https://rustsec.org/advisories/RUSTSEC-2026-0398
+    "RUSTSEC-2026-0398",
+    # https://rustsec.org/advisories/RUSTSEC-2026-0403
+    "RUSTSEC-2026-0403",
 ]
 informational_warnings = ["unmaintained", "unsound", "notice"]

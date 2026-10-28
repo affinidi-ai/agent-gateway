@@ -16,6 +16,9 @@ use crate::proxy::protocol_router::join_endpoint_path;
 use crate::surfaces::AgentSurfaceStore;
 use crate::{channel_debug, channel_error, channel_info, channel_warn};
 
+mod forward_refusal;
+use forward_refusal::ForwardRefusal;
+
 /// Global metrics store for GW2 - set during initialization
 static GLOBAL_METRICS_STORE: OnceCell<Arc<crate::metrics::MetricsStore>> = OnceCell::const_new();
 
@@ -853,8 +856,8 @@ async fn process_connection_setup(message: &ReceivedMessage) -> ProcessingResult
 
     // Only a sender that proved control of its channel_did on a live
     // invitation may add to the seen set.
-    if let Err(refused) = admit_pairing_envelope(message) {
-        return refused;
+    if let Err(rejection) = super::envelope_replay::admit_pairing_message(message) {
+        return pairing_envelope_refusal(message, rejection);
     }
 
     info!("✓ Acceptor temporary DID: {}", acceptor_temporary_did);
@@ -1130,8 +1133,8 @@ async fn process_connection_accepted(message: &ReceivedMessage) -> ProcessingRes
         }
     };
 
-    if let Err(refused) = admit_pairing_envelope(message) {
-        return refused;
+    if let Err(rejection) = super::envelope_replay::admit_pairing_message(message) {
+        return pairing_envelope_refusal(message, rejection);
     }
 
     info!("✓ Inviter temporary DID: {}", inviter_temporary_did);
@@ -1549,6 +1552,27 @@ async fn process_get_surfaces_response(message: &ReceivedMessage) -> ProcessingR
     ProcessingResult::ProcessedNoResponse
 }
 
+/// The x402 header names the sending gateway uses, from the message context.
+fn fabric_x402_headers(
+    message_context: &std::collections::HashMap<String, Value>
+) -> crate::config::types::X402Headers {
+    let Some(headers_json) = message_context.get("x402_headers") else {
+        return crate::config::types::X402Headers::default();
+    };
+    let header = |name: &str, default: &str| {
+        headers_json
+            .get(name)
+            .and_then(|v| v.as_str())
+            .unwrap_or(default)
+            .to_string()
+    };
+    crate::config::types::X402Headers {
+        payment_signature: header("payment_signature", "PAYMENT-SIGNATURE"),
+        payment_required: header("payment_required", "PAYMENT-REQUIRED"),
+        payment_response: header("payment_response", "PAYMENT-RESPONSE"),
+    }
+}
+
 /// Payment verification for fabric-forwarded requests (x402, MPP, or both).
 /// Extracted from `process_forward_request` to reduce async state-machine size.
 async fn verify_payment_fabric(
@@ -1558,8 +1582,9 @@ async fn verify_payment_fabric(
     headers: Option<&serde_json::Map<String, Value>>,
     body_bytes: &[u8],
     path: &str,
-    message_context: &std::collections::HashMap<String, Value>,
-) -> Result<Option<crate::surface_context::PaymentContext>, ProcessingResult> {
+    x402_headers: &crate::config::types::X402Headers,
+) -> Result<Option<crate::surface_context::PaymentContext>, crate::proxy::handler::surface_payment::SurfacePaymentError>
+{
     let surface_protocol = surface.channel_protocol();
     let x402_required = surface
         .x402_config()
@@ -1572,45 +1597,14 @@ async fn verify_payment_fabric(
         return Ok(None);
     }
 
-    // Extract x402 context if needed
-    let (payment_signature, x402_effective_policy, x402_headers_extracted) = if x402_required {
-        let payment_policy = surface.x402_config().unwrap();
-
-        let effective_policy = std::borrow::Cow::Borrowed(payment_policy);
-
-        // Extract x402 headers from message context
-        let x402_headers = if let Some(headers_json) = message_context.get("x402_headers") {
-            let payment_signature_header = headers_json
-                .get("payment_signature")
-                .and_then(|v| v.as_str())
-                .unwrap_or("PAYMENT-SIGNATURE");
-            let payment_required_header = headers_json
-                .get("payment_required")
-                .and_then(|v| v.as_str())
-                .unwrap_or("PAYMENT-REQUIRED");
-            let payment_response_header = headers_json
-                .get("payment_response")
-                .and_then(|v| v.as_str())
-                .unwrap_or("PAYMENT-RESPONSE");
-
-            crate::config::types::X402Headers {
-                payment_signature: payment_signature_header.to_string(),
-                payment_required: payment_required_header.to_string(),
-                payment_response: payment_response_header.to_string(),
-            }
-        } else {
-            crate::config::types::X402Headers::default()
-        };
-
-        // Extract payment signature from DIDComm headers
-        let payment_signature = headers
+    // Extract payment signature from DIDComm headers
+    let payment_signature = if x402_required {
+        headers
             .and_then(|h| h.get(&x402_headers.payment_signature))
             .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        (payment_signature, Some(effective_policy), Some(x402_headers))
+            .map(|s| s.to_string())
     } else {
-        (None, None, None)
+        None
     };
 
     // Extract MPP credential from DIDComm headers
@@ -1628,24 +1622,21 @@ async fn verify_payment_fabric(
         None
     };
 
-    if x402_required && payment_signature.is_some() {
+    if let Some(config) = surface
+        .x402_config()
+        .filter(|_| x402_required && payment_signature.is_some())
+    {
         channel_info!(
             config_id,
             "Checking x402 payment - has_signature: true, header_name: {}",
-            x402_headers_extracted
-                .as_ref()
-                .map(|h| h.payment_signature.as_str())
-                .unwrap_or("?")
+            x402_headers.payment_signature
         );
 
         match crate::x402::process_payment(
             payment_signature,
-            &x402_effective_policy.unwrap(),
+            config,
             channel_id,
             config_id,
-            x402_headers_extracted
-                .as_ref()
-                .unwrap(),
             path,
             None,
             get_transaction_store(),
@@ -1659,9 +1650,9 @@ async fn verify_payment_fabric(
                     response_header,
                 }))
             }
-            Err(err_response) => {
+            Err(error) => {
                 channel_warn!(config_id, "Payment verification failed for fabric-forwarded request");
-                Err(axum_response_to_forward_result(err_response).await)
+                Err(error.into())
             }
         }
     } else if mpp_required && mpp_credential.is_some() {
@@ -1680,56 +1671,38 @@ async fn verify_payment_fabric(
                 channel_info!(config_id, "MPP payment verified for fabric-forwarded request");
                 Ok(None)
             }
-            Err(err_response) => {
+            Err(error) => {
                 channel_warn!(config_id, "MPP verification failed for fabric-forwarded request");
-                Err(axum_response_to_forward_result(err_response).await)
+                Err(error.into())
             }
         }
     } else {
         channel_warn!(config_id, "Payment required for fabric-forwarded request");
-
-        let err_response = if x402_required {
-            let x402_resp = crate::x402::process_payment(
-                None,
-                &x402_effective_policy.unwrap(),
-                channel_id,
-                config_id,
-                x402_headers_extracted
-                    .as_ref()
-                    .unwrap(),
-                path,
-                None,
-                get_transaction_store(),
-            )
-            .await
-            .unwrap_err();
-            if mpp_required {
-                crate::mpp::fire_challenge_issued_events(config_id, channel_id, path, get_mpp_transaction_store());
-                crate::mpp::errors::add_mpp_challenges_to_response_resolved(
-                    x402_resp,
-                    surface.mpp_config().unwrap(),
-                    path,
-                    &get_secrets_store(),
-                )
-                .await
-            } else {
-                x402_resp
-            }
-        } else {
-            crate::mpp::process_payment(
-                None,
-                surface.mpp_config().unwrap(),
-                channel_id,
-                config_id,
-                path,
-                get_mpp_transaction_store(),
-                &get_secrets_store(),
-            )
-            .await
-            .unwrap_err()
+        let secrets_store = get_secrets_store();
+        let services = crate::proxy::handler::surface_payment::LocalPaymentServices {
+            x402_headers,
+            listener_manager: None,
+            transaction_store: get_transaction_store(),
+            mpp_transaction_store: get_mpp_transaction_store(),
+            secrets_store: &secrets_store,
         };
-
-        Err(axum_response_to_forward_result(err_response).await)
+        match crate::proxy::handler::surface_payment::payment_required(
+            surface
+                .x402_config()
+                .filter(|_| x402_required),
+            surface
+                .mpp_config()
+                .filter(|_| mpp_required),
+            channel_id,
+            config_id,
+            path,
+            &services,
+        )
+        .await
+        {
+            Some(error) => Err(error),
+            None => Ok(None),
+        }
     }
 }
 
@@ -1740,10 +1713,13 @@ async fn process_modern_payment_fabric(
     body: bytes::Bytes,
     path: &str,
     evidence: Option<&crate::mcp::continuations::protected::ContinuationPayment>,
-) -> Result<crate::proxy::handler::surface_payment::SurfacePayment, ProcessingResult> {
+) -> Result<
+    crate::proxy::handler::surface_payment::SurfacePayment,
+    crate::proxy::handler::surface_payment::SurfacePaymentError,
+> {
     use crate::proxy::handler::surface_payment::{LocalPaymentServices, process_local};
 
-    match process_local(
+    process_local(
         surface,
         LocalPaymentServices {
             x402_headers,
@@ -1759,10 +1735,6 @@ async fn process_modern_payment_fabric(
         evidence,
     )
     .await
-    {
-        Ok(payment) => Ok(payment),
-        Err(response) => Err(axum_response_to_forward_result(response).await),
-    }
 }
 
 /// Extract caller identity from inbound fabric request (VP, extensions, MCP _meta).
@@ -1824,23 +1796,15 @@ fn refused_forward_response(
     })
 }
 
-/// Refuses a `forward-request` envelope that is expired, malformed in time or
-/// already processed. Runs after the sender is authorized so only registered
-/// peers can populate the seen set.
+/// How a `forward-request` envelope that is expired, malformed in time or
+/// already processed is answered. Admission runs after the sender is
+/// authorized so only registered peers can populate the seen set.
 ///
 /// A duplicate is dropped without a reply. The mediator re-delivers a message
 /// that was not deleted after dispatch (a reconnect mid-dispatch, a first run
 /// still in progress), and a `forward-response` threaded to the original id
 /// would reach the sender before, or instead of, the real one; the sender's
 /// waiter keeps only the first reply.
-#[allow(clippy::result_large_err)] // ProcessingResult carries a streaming Response
-fn admit_forward_request_envelope(message: &ReceivedMessage) -> Result<(), ProcessingResult> {
-    super::envelope_replay::admit_forward_request(message)
-        .map_err(|rejection| forward_request_envelope_refusal(message, rejection))
-}
-
-/// A duplicate gets no reply, since a reply threaded to the original id would
-/// displace the real response at the sender.
 fn forward_request_envelope_refusal(
     message: &ReceivedMessage,
     rejection: super::envelope_replay::EnvelopeRejection,
@@ -1890,31 +1854,35 @@ pub(crate) async fn forward_request_refusal_before_dispatch(
             response_body: serde_json::json!({ "error": "Missing channel_id in forward-request", "status": 400 }),
         });
     }
-    if let Err(refused) = authorize_fabric_sender(message, channel_id, gateways).await {
-        return Some(refused);
+    if let Err(refusal) = authorize_fabric_sender(message, channel_id, gateways).await {
+        return Some(
+            refusal
+                .into_forward_response(&[])
+                .await,
+        );
     }
     super::envelope_replay::check_forward_request(message)
         .err()
         .map(|rejection| forward_request_envelope_refusal(message, rejection))
 }
 
-/// Refuses a pairing envelope that is expired or already processed.
-/// `connection-setup` runs it after proving control of its `channel_did` on a
-/// live invitation; `connection-accepted` runs it once its sender and
+/// How a pairing envelope that is expired or already processed fails.
+/// `connection-setup` admits it after proving control of its `channel_did` on
+/// a live invitation; `connection-accepted` admits it once its sender and
 /// `channel_did` are present, before its issuer attestation is verified.
-#[allow(clippy::result_large_err)] // ProcessingResult carries a streaming Response
-fn admit_pairing_envelope(message: &ReceivedMessage) -> Result<(), ProcessingResult> {
-    super::envelope_replay::admit_pairing_message(message).map_err(|rejection| {
-        warn!(
-            from = ?message.from_did,
-            message_id = %message.didcomm_message_id,
-            message_type = %message.message_type,
-            "Refusing pairing envelope: {rejection}"
-        );
-        ProcessingResult::Failed {
-            reason: format!("Envelope refused: {rejection}"),
-        }
-    })
+fn pairing_envelope_refusal(
+    message: &ReceivedMessage,
+    rejection: super::envelope_replay::EnvelopeRejection,
+) -> ProcessingResult {
+    warn!(
+        from = ?message.from_did,
+        message_id = %message.didcomm_message_id,
+        message_type = %message.message_type,
+        "Refusing pairing envelope: {rejection}"
+    );
+    ProcessingResult::Failed {
+        reason: format!("Envelope refused: {rejection}"),
+    }
 }
 
 /// An identity presentation is attributed to the sending gateway only when its
@@ -2393,7 +2361,7 @@ async fn evaluate_gateway_policy_for_fabric(
     authenticated_identity: Option<&crate::source_auth::AuthenticatedIdentity>,
     source_auth_context: Option<&crate::surface_context::SourceAuthContext>,
     mcp_context: Option<&crate::surface_context::McpContext>,
-) -> Result<(), ProcessingResult> {
+) -> Result<(), ForwardRefusal> {
     // Appliance-wide (global) gateway policy — enforced deny-overrides ahead of
     // the per-gateway policy, evaluated on every fabric request (public
     // discovery reads included, as on the direct path) regardless of the
@@ -2432,6 +2400,7 @@ async fn evaluate_gateway_policy_for_fabric(
             policy_definition_id: gd.policy_id.as_deref(),
             policy_name: global_policy_name,
             surface_id: surface.config_id(),
+            surface_name: Some(surface.name.as_str()),
             http_method: Some(method),
             path: Some(path),
             identity: authenticated_identity,
@@ -2442,14 +2411,7 @@ async fn evaluate_gateway_policy_for_fabric(
         });
         if !gd.allow {
             info!(channel = config_id, "[GW-POLICY] GW2 fabric path: blocked by appliance-wide gateway policy");
-            return Err(ProcessingResult::RequiresResponse {
-                response_type: MessageType::ForwardResponse.to_string(),
-                response_body: serde_json::json!({
-                    "status": 403,
-                    "body": r#"{"error":"Forbidden","message":"Request blocked by appliance-wide policy"}"#,
-                    "error": "Request blocked by appliance-wide policy",
-                }),
-            });
+            return Err(ForwardRefusal::AppliancePolicyDenied);
         }
     }
 
@@ -2494,7 +2456,7 @@ async fn evaluate_gateway_policy_for_fabric(
             None => (None, None, None),
         };
         let gw_policy_name = gw_pm
-            .resolve_policy_name_or_default(gw_policy_def_id.as_deref())
+            .resolve_policy_name(gw_policy_def_id.as_deref())
             .await;
 
         match gw_pm.evaluate_policy_decision(&self_gateway_id, gw_input_value) {
@@ -2505,8 +2467,9 @@ async fn evaluate_gateway_policy_for_fabric(
                     allow: true,
                     policy_id: Some(crate::policies::GATEWAY_POLICY_PACKAGE),
                     policy_definition_id: gw_policy_def_id.as_deref(),
-                    policy_name: Some(gw_policy_name.as_str()),
+                    policy_name: gw_policy_name.as_deref(),
                     surface_id: surface.config_id(),
+                    surface_name: Some(surface.name.as_str()),
                     http_method: Some(method),
                     path: Some(path),
                     identity: authenticated_identity,
@@ -2524,8 +2487,9 @@ async fn evaluate_gateway_policy_for_fabric(
                     reason: decision.reason.as_deref(),
                     policy_id: Some(crate::policies::GATEWAY_POLICY_PACKAGE),
                     policy_definition_id: gw_policy_def_id.as_deref(),
-                    policy_name: Some(gw_policy_name.as_str()),
+                    policy_name: gw_policy_name.as_deref(),
                     surface_id: surface.config_id(),
+                    surface_name: Some(surface.name.as_str()),
                     http_method: Some(method),
                     path: Some(path),
                     identity: authenticated_identity,
@@ -2534,14 +2498,7 @@ async fn evaluate_gateway_policy_for_fabric(
                     policy_content_hash: gw_policy_hash.as_deref(),
                     ..Default::default()
                 });
-                return Err(ProcessingResult::RequiresResponse {
-                    response_type: MessageType::ForwardResponse.to_string(),
-                    response_body: serde_json::json!({
-                        "status": 403,
-                        "body": r#"{"error":"Forbidden","message":"Request blocked by gateway policy"}"#,
-                        "error": "Request blocked by gateway policy",
-                    }),
-                });
+                return Err(ForwardRefusal::GatewayPolicyDenied);
             }
             Err(e) => {
                 info!(channel = config_id, "[GW-POLICY] GW2: gateway-level policy evaluation error (denying): {}", e);
@@ -2550,8 +2507,9 @@ async fn evaluate_gateway_policy_for_fabric(
                     flow: crate::observability::PolicyFlow::Fabric,
                     policy_id: Some(crate::policies::GATEWAY_POLICY_PACKAGE),
                     policy_definition_id: gw_policy_def_id.as_deref(),
-                    policy_name: Some(gw_policy_name.as_str()),
+                    policy_name: gw_policy_name.as_deref(),
                     surface_id: surface.config_id(),
+                    surface_name: Some(surface.name.as_str()),
                     http_method: Some(method),
                     path: Some(path),
                     identity: authenticated_identity,
@@ -2615,7 +2573,7 @@ fn fabric_surface_policies(
 
 /// Injects custom metadata and trust registry extensions into the request body,
 /// then evaluates surface-level OPA policies. Returns the (potentially modified)
-/// body bytes on allow, or a deny `ProcessingResult`.
+/// body bytes on allow, or why the request was refused.
 async fn enrich_and_evaluate_surface_policies(
     appliance_policy: Option<&crate::policies::GlobalPolicyManager>,
     surface_policy: Option<&crate::policies::SurfacePolicyManager>,
@@ -2624,7 +2582,7 @@ async fn enrich_and_evaluate_surface_policies(
     config_id: &str,
     method: &str,
     path: &str,
-    body_bytes: bytes::Bytes,
+    original_caller_body: &bytes::Bytes,
     headers: Option<&serde_json::Map<String, Value>>,
     from_did: Option<String>,
     payment_context: Option<crate::surface_context::PaymentContext>,
@@ -2638,21 +2596,21 @@ async fn enrich_and_evaluate_surface_policies(
     mcp_binding: Option<&crate::surface_context::IdentityBindingContext>,
     peer_issuers: &crate::gateways::types::PeerIssuers,
     mcp_context: Option<&crate::surface_context::McpContext>,
-) -> Result<bytes::Bytes, ProcessingResult> {
-    let mut body_bytes = body_bytes;
+) -> Result<bytes::Bytes, ForwardRefusal> {
     // Caller-leg Trust Check stage runs further down (post-identity);
     // gateway OPA on GW2 already ran in `evaluate_gateway_policy_for_fabric`
     // and never sees caller-leg results.
     let mut trust_check_results: Option<crate::trust_registry_verification::TrustCheckResultsContext> = None;
 
-    // Snapshot the caller's ORIGINAL body bytes before any GW2-side mutation
-    // (custom metadata / trust-registry injection below). The caller-leg agent
-    // context (esp. `provider_did`) is extracted from the caller's
-    // trust-registry extension in `metadata`, which a later GW2 injection could
-    // overwrite — so the caller Trust Check seam parses these pre-injection
-    // bytes. `Bytes::clone` is a cheap refcount bump. Mirrors the direct-inbound
-    // path, which builds the caller agent context from the pre-injection body.
-    let original_caller_body = body_bytes.clone();
+    // `original_caller_body` stays the caller's ORIGINAL body; GW2-side
+    // mutation (custom metadata / trust-registry injection below) works on this
+    // copy. The caller-leg agent context (esp. `provider_did`) is extracted from
+    // the caller's trust-registry extension in `metadata`, which a later GW2
+    // injection could overwrite — so the caller Trust Check seam parses the
+    // pre-injection bytes. `Bytes::clone` is a cheap refcount bump. Mirrors the
+    // direct-inbound path, which builds the caller agent context from the
+    // pre-injection body.
+    let mut body_bytes = original_caller_body.clone();
 
     // Inject custom metadata if enabled on THIS gateway (GW2)
     if let Some(custom_metadata) = surface.custom_metadata()
@@ -2748,7 +2706,7 @@ async fn enrich_and_evaluate_surface_policies(
             if surface.channel_protocol() == crate::config::ChannelProtocol::Mcp {
                 probe_input.mcp = mcp_context
                     .cloned()
-                    .or_else(|| crate::mcp::build_mcp_context(&original_caller_body));
+                    .or_else(|| crate::mcp::build_mcp_context(original_caller_body));
             }
             // Populate `input.agent` for caller-leg templates (esp.
             // `{{ input.agent.provider_did }}`). `provider_did`/`authority_did`
@@ -2758,7 +2716,7 @@ async fn enrich_and_evaluate_surface_policies(
             // fabric-receive path left `input.agent` empty and every
             // provider_did template failed with TEMPLATE_RESOLUTION_FAILED,
             // while the direct-inbound path worked (it sets `probe_input.agent`).
-            let caller_body_json: Option<serde_json::Value> = serde_json::from_slice(&original_caller_body).ok();
+            let caller_body_json: Option<serde_json::Value> = serde_json::from_slice(original_caller_body).ok();
             probe_input.agent = Some(
                 crate::policies::build_agent_context_for_protocol(
                     surface.channel_protocol(),
@@ -3035,7 +2993,7 @@ async fn enrich_and_evaluate_surface_policies(
                         .map(Arc::new)
                 });
             let binding_result = crate::protocols::extensions::extract_identity_binding_vp(
-                &original_caller_body,
+                original_caller_body,
                 &surface.channel_protocol(),
                 &binding_selector,
                 config_id,
@@ -3063,7 +3021,7 @@ async fn enrich_and_evaluate_surface_policies(
             if let Ok(Some(ref binding)) = binding_result
                 && crate::delegation_vault::audit::identity_binding_vp_audit_enabled()
                 && let Some(vp_jwt) = crate::protocols::extensions::extract_identity_binding_vp_jwt(
-                    &original_caller_body,
+                    original_caller_body,
                     &surface.channel_protocol(),
                 )
             {
@@ -3162,6 +3120,7 @@ async fn enrich_and_evaluate_surface_policies(
                 policy_definition_id: gd.policy_id.as_deref(),
                 policy_name: global_policy_name,
                 surface_id: Some(config_id),
+                surface_name: Some(surface.name.as_str()),
                 http_method: Some(method),
                 path: Some(path),
                 identity: authenticated_identity,
@@ -3172,10 +3131,7 @@ async fn enrich_and_evaluate_surface_policies(
             });
             if !gd.allow {
                 channel_info!(config_id, "GW2: blocked by appliance-wide surface policy");
-                return Err(ProcessingResult::RequiresResponse {
-                    response_type: MessageType::ForwardResponse.to_string(),
-                    response_body: build_surface_policy_denied_forward_body(&body_bytes, gd.reason.as_deref()),
-                });
+                return Err(ForwardRefusal::SurfacePolicyDenied { reason: gd.reason });
             }
         }
 
@@ -3184,7 +3140,6 @@ async fn enrich_and_evaluate_surface_policies(
         if let Some(Err(error)) = policies.surface {
             channel_warn!(config_id, "GW2: OPA is enabled but no compiled policy can run — denying request");
             return Err(fabric_surface_policy_error(
-                &body_bytes,
                 error,
                 crate::observability::PolicyDecisionEvent {
                     scope: crate::observability::PolicyScope::Surface,
@@ -3192,6 +3147,7 @@ async fn enrich_and_evaluate_surface_policies(
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: surface.opa_policy_definition_id(),
                     surface_id: Some(config_id),
+                    surface_name: Some(surface.name.as_str()),
                     http_method: Some(method),
                     path: Some(path),
                     identity: authenticated_identity,
@@ -3216,8 +3172,9 @@ async fn enrich_and_evaluate_surface_policies(
                         allow: true,
                         policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                         policy_definition_id: channel_opa_def_id,
-                        policy_name: Some(channel_opa_name.as_str()),
+                        policy_name: channel_opa_name.as_deref(),
                         surface_id: Some(config_id),
+                        surface_name: Some(surface.name.as_str()),
                         http_method: Some(method),
                         path: Some(path),
                         identity: authenticated_identity,
@@ -3235,8 +3192,9 @@ async fn enrich_and_evaluate_surface_policies(
                         reason: decision.reason.as_deref(),
                         policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                         policy_definition_id: channel_opa_def_id,
-                        policy_name: Some(channel_opa_name.as_str()),
+                        policy_name: channel_opa_name.as_deref(),
                         surface_id: Some(config_id),
+                        surface_name: Some(surface.name.as_str()),
                         http_method: Some(method),
                         path: Some(path),
                         identity: authenticated_identity,
@@ -3245,26 +3203,20 @@ async fn enrich_and_evaluate_surface_policies(
                         policy_content_hash: channel_opa_hash.as_deref(),
                         ..Default::default()
                     });
-                    return Err(ProcessingResult::RequiresResponse {
-                        response_type: MessageType::ForwardResponse.to_string(),
-                        response_body: build_surface_policy_denied_forward_body(
-                            &body_bytes,
-                            decision.reason.as_deref(),
-                        ),
-                    });
+                    return Err(ForwardRefusal::SurfacePolicyDenied { reason: decision.reason });
                 }
                 Err(e) => {
                     channel_warn!(config_id, "GW2: Surface-level OPA policy evaluation error (denying request): {}", e);
                     return Err(fabric_surface_policy_error(
-                        &body_bytes,
                         crate::observability::PolicyEvaluationError::EvaluationError,
                         crate::observability::PolicyDecisionEvent {
                             scope: crate::observability::PolicyScope::Surface,
                             flow: crate::observability::PolicyFlow::Fabric,
                             policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                             policy_definition_id: channel_opa_def_id,
-                            policy_name: Some(channel_opa_name.as_str()),
+                            policy_name: channel_opa_name.as_deref(),
                             surface_id: Some(config_id),
+                            surface_name: Some(surface.name.as_str()),
                             http_method: Some(method),
                             path: Some(path),
                             identity: authenticated_identity,
@@ -3320,15 +3272,16 @@ where
 /// Buffer a legacy Target response for the ForwardResponse, bounded by size and
 /// idle time like the direct path; the forward client's own timeout still caps
 /// the whole exchange. An SSE response is reduced to its final JSON-RPC
-/// response. A failed read answers `502`/`504` rather than passing the Target's
-/// status on with an empty body.
+/// response. A failed read is refused with `ForwardRefusal::TargetBody`, which
+/// answers `502`/`504` rather than passing the Target's status on with an
+/// empty body.
 async fn read_forward_target_body(
     response: reqwest::Response,
     is_sse_response: bool,
     request: &[u8],
     limits: crate::proxy::upstream_body::UpstreamBodyLimits,
     config_id: &str,
-) -> Result<String, ProcessingResult> {
+) -> Result<String, crate::proxy::upstream_body::UpstreamBodyError> {
     let body_error = if is_sse_response {
         channel_info!(config_id, "GW2: Upstream responded with SSE — consuming stream for final response");
         match crate::mcp::sse_transport::consume_sse_response(response, request, limits).await {
@@ -3346,8 +3299,7 @@ async fn read_forward_target_body(
         }
     };
     channel_warn!(config_id, "GW2: Failed to read upstream response: {}", body_error);
-    let (status, message) = body_error.status_and_message();
-    Err(axum_response_to_forward_result(crate::a2a::create_error_response(status, message)).await)
+    Err(body_error)
 }
 
 async fn axum_response_to_forward_result(response: axum::http::Response<axum::body::Body>) -> ProcessingResult {
@@ -3574,20 +3526,10 @@ async fn authorize_fabric_sender(
     message: &ReceivedMessage,
     channel_id: &str,
     gateways: Option<&crate::gateways::FileSystemGatewayStore>,
-) -> Result<(), ProcessingResult> {
-    let refuse = |error: &str| ProcessingResult::RequiresResponse {
-        response_type: MessageType::ForwardResponse.to_string(),
-        response_body: serde_json::json!({
-            "status": 403,
-            "body": serde_json::json!({ "error": "Forbidden", "message": error }).to_string(),
-            "error": error,
-        }),
-    };
-    const UNREGISTERED: &str = "Sender is not a registered gateway";
-
+) -> Result<(), ForwardRefusal> {
     let Some(from_did) = message.from_did.as_deref() else {
         warn!("Refusing forward-request without a sender DID");
-        return Err(refuse(UNREGISTERED));
+        return Err(ForwardRefusal::UnregisteredSender);
     };
     let lookup = if let Some(gateways) = gateways {
         gateways
@@ -3602,7 +3544,7 @@ async fn authorize_fabric_sender(
             }
             Err(e) => {
                 warn!("Refusing forward-request from {}: {}", from_did, e);
-                return Err(refuse(UNREGISTERED));
+                return Err(ForwardRefusal::UnregisteredSender);
             }
         }
     };
@@ -3613,7 +3555,7 @@ async fn authorize_fabric_sender(
                     "Refusing forward-request from gateway {} ({}): channel {} is not exposed to it",
                     gateway.id, from_did, channel_id
                 );
-                return Err(refuse("Channel is not exposed to sender"));
+                return Err(ForwardRefusal::ChannelNotExposed);
             }
             // A tenant-owned peer must not reach another tenant's surface, even
             // in `all` mode. A surface that
@@ -3633,7 +3575,7 @@ async fn authorize_fabric_sender(
                         "Refusing forward-request from gateway {} ({}): channel {} belongs to another tenant",
                         gateway.id, from_did, channel_id
                     );
-                    return Err(refuse("Channel is not exposed to sender"));
+                    return Err(ForwardRefusal::ChannelNotExposed);
                 }
             }
             Ok(())
@@ -3643,15 +3585,15 @@ async fn authorize_fabric_sender(
                 "Refusing forward-request from gateway {} ({}): status is {:?}, not active",
                 gateway.id, from_did, gateway.status
             );
-            Err(refuse(UNREGISTERED))
+            Err(ForwardRefusal::UnregisteredSender)
         }
         Ok(None) => {
             warn!("Refusing forward-request from unregistered sender {}", from_did);
-            Err(refuse(UNREGISTERED))
+            Err(ForwardRefusal::UnregisteredSender)
         }
         Err(e) => {
             warn!("Refusing forward-request from {}: gateway lookup failed: {}", from_did, e);
-            Err(refuse(UNREGISTERED))
+            Err(ForwardRefusal::UnregisteredSender)
         }
     }
 }
@@ -3868,6 +3810,28 @@ async fn process_forward_request_inner(
 
 async fn process_forward_request_with_mcp_runtime(
     message: &ReceivedMessage,
+    stream_request: Option<FabricStreamRequest>,
+    mcp_versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
+    mcp_continuations: Option<Arc<crate::mcp::continuations::config::ContinuationRuntime>>,
+) -> ProcessingResult {
+    use crate::observability::policy_audit::{in_request, new_request_id, response_in_request};
+
+    let id = new_request_id();
+    let result = in_request(
+        id.clone(),
+        Box::pin(process_forward_request_in_request_scope(message, stream_request, mcp_versions, mcp_continuations)),
+    )
+    .await;
+    match result {
+        ProcessingResult::StreamingResponse { response } => ProcessingResult::StreamingResponse {
+            response: response_in_request(id, response),
+        },
+        other => other,
+    }
+}
+
+async fn process_forward_request_in_request_scope(
+    message: &ReceivedMessage,
     mut stream_request: Option<FabricStreamRequest>,
     mcp_versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
     mcp_continuations: Option<Arc<crate::mcp::continuations::config::ContinuationRuntime>>,
@@ -4001,11 +3965,13 @@ async fn process_forward_request_with_mcp_runtime(
         };
     }
 
-    if let Err(refused) = authorize_fabric_sender(message, channel_id, None).await {
-        return refused;
+    if let Err(refusal) = authorize_fabric_sender(message, channel_id, None).await {
+        return refusal
+            .into_forward_response(&[])
+            .await;
     }
-    if let Err(refused) = admit_forward_request_envelope(message) {
-        return refused;
+    if let Err(rejection) = super::envelope_replay::admit_forward_request(message) {
+        return forward_request_envelope_refusal(message, rejection);
     }
 
     // Extract request details
@@ -4634,7 +4600,7 @@ async fn process_forward_request_with_mcp_runtime(
         }
     }
 
-    if let Err(result) = evaluate_gateway_policy_for_fabric(
+    if let Err(refusal) = evaluate_gateway_policy_for_fabric(
         GLOBAL_APPLIANCE_POLICY_MANAGER
             .get()
             .map(Arc::as_ref),
@@ -4650,23 +4616,28 @@ async fn process_forward_request_with_mcp_runtime(
     )
     .await
     {
-        return result;
+        return refusal
+            .into_forward_response(&body_bytes)
+            .await;
     }
 
-    let payment_context = if modern_request.is_some() { None } else { match Box::pin(verify_payment_fabric(
-        &surface,
-        channel_id,
-        config_id,
-        headers.as_ref(),
-        &body_bytes,
-        path,
-        &message.context,
-    ))
-    .await
-    {
-        Ok(ctx) => ctx,
-        Err(result) => return result,
-    }};
+    let payment_context = if modern_request.is_some() { None } else {
+        let x402_headers = fabric_x402_headers(&message.context);
+        match Box::pin(verify_payment_fabric(
+            &surface,
+            channel_id,
+            config_id,
+            headers.as_ref(),
+            &body_bytes,
+            path,
+            &x402_headers,
+        ))
+        .await
+        {
+            Ok(ctx) => ctx,
+            Err(error) => return axum_response_to_forward_result(error.render(&x402_headers)).await,
+        }
+    };
 
     let managed_id = surface.managed_identity();
     // Prefer an explicit `extension_rules`; otherwise synthesise one from the
@@ -4764,7 +4735,7 @@ async fn process_forward_request_with_mcp_runtime(
         config_id,
         method,
         path,
-        body_bytes,
+        &body_bytes,
         headers.as_ref(),
         message.from_did.clone(),
         payment_context.clone(),
@@ -4782,7 +4753,13 @@ async fn process_forward_request_with_mcp_runtime(
     .await
     {
         Ok(bytes) => bytes,
-        Err(result) => return result,
+        // Enrichment adds metadata only, so the caller's request carries the
+        // JSON-RPC id and tool name a denial answers with.
+        Err(refusal) => {
+            return refusal
+                .into_forward_response(&body_bytes)
+                .await;
+        }
     };
 
     // MCP Tool Gating — G2G `tools/call` gate. Runs after the surface OPA gate
@@ -4887,7 +4864,7 @@ async fn process_forward_request_with_mcp_runtime(
                     return axum_response_to_forward_result(ModernDelegationError::Unpaid.response(request)).await;
                 };
                 return match Box::pin(process_modern_payment_fabric(&surface, config, headers, body_bytes, path, None)).await {
-                    Err(result) => result,
+                    Err(error) => axum_response_to_forward_result(error.render(config)).await,
                     Ok(_) => axum_response_to_forward_result(ModernDelegationError::Unpaid.response(request)).await,
                 };
             }
@@ -4939,7 +4916,7 @@ async fn process_forward_request_with_mcp_runtime(
                 body_bytes = payment.body;
                 receipt
             }
-            Err(result) => return result,
+            Err(error) => return axum_response_to_forward_result(error.render(config)).await,
         }
     } else { None };
 
@@ -5868,7 +5845,7 @@ async fn process_forward_request_with_mcp_runtime(
             } else {
                 match read_forward_target_body(response, is_sse_response, &body_bytes, fabric_body_limits(&surface), config_id).await {
                     Ok(body) => (None, body),
-                    Err(result) => return result,
+                    Err(error) => return ForwardRefusal::from(error).into_forward_response(&body_bytes).await,
                 }
             };
             let channel_id_owned = channel_id.to_string();
@@ -6382,191 +6359,126 @@ async fn process_forward_request_with_mcp_runtime(
                         }
                     };
 
-                    // Look for agent identity in response - extensions array contains URIs, data is in metadata
-                    // Response structure can be either:
-                    // - Multi-message: result.history[0].metadata[extension_uri]
-                    // - Single message: result.metadata[extension_uri] (direct Message response)
-                    let message_obj = response_json.get("result").and_then(|r| {
-                        // Try history first (multi-message response)
-                        if let Some(history) = r.get("history").and_then(|h| h.as_array()).and_then(|arr| arr.first()) {
-                            info!("GW2: Found response in result.history[0]");
-                            Some(history)
-                        } else if r.get("metadata").is_some() || r.get("extensions").is_some() {
-                            // Direct message response (single message completion)
-                            info!("GW2: Found response directly in result");
-                            Some(r)
-                        } else {
-                            warn!("GW2: Response has result but no history or metadata");
-                            None
-                        }
-                    });
-
-                    if let Some(message_msg) = message_obj {
-                        if let Some(extensions) =
-                            message_msg.get("extensions").and_then(|e| e.as_array())
-                        {
+                    match crate::proxy::backend_identity::extract_a2a_identity_from_message(&response_json) {
+                        Ok(identity_ext) => {
+                            let identity_ext = &identity_ext;
                             channel_info!(
                                 config_id,
-                                "GW2: Found {} extension URIs in response",
-                                extensions.len()
+                                "GW2: Found identity extension in response metadata: {}",
+                                serde_json::to_string_pretty(identity_ext)
+                                    .unwrap_or_default()
+                                    .chars()
+                                    .take(500)
+                                    .collect::<String>()
                             );
 
-                            // Check if agent-identity extension is declared
-                            let has_identity_ext = extensions.iter().any(|ext| {
-                                ext.as_str()
-                                    == Some(crate::config::AFFINIDI_AGENT_IDENTITY_EXTENSION)
-                            });
-
-                            if has_identity_ext {
+                            // Check if agent already sent a DID
+                            if let Some(did) =
+                                identity_ext.get("did").and_then(|d| d.as_str())
+                            {
+                                agent_identity = Some(did.to_string());
                                 channel_info!(
                                     config_id,
-                                    "GW2: Agent identity extension is declared in response"
+                                    "GW2: Agent identity from DID: {}",
+                                    did
                                 );
-
-                                // Get the actual extension data from metadata
-                                if let Some(metadata) = message_msg.get("metadata") {
-                                    if let Some(identity_ext) = metadata
-                                        .get(crate::config::AFFINIDI_AGENT_IDENTITY_EXTENSION)
-                                    {
-                                        channel_info!(
-                                            config_id,
-                                            "GW2: Found identity extension in response metadata: {}",
-                                            serde_json::to_string_pretty(identity_ext)
-                                                .unwrap_or_default()
-                                                .chars()
-                                                .take(500)
-                                                .collect::<String>()
-                                        );
-
-                                        // Check if agent already sent a DID
-                                        if let Some(did) =
-                                            identity_ext.get("did").and_then(|d| d.as_str())
-                                        {
-                                            agent_identity = Some(did.to_string());
-                                            channel_info!(
-                                                config_id,
-                                                "GW2: Agent identity from DID: {}",
-                                                did
-                                            );
-                                        } else {
-                                            // Agent sent raw payload - compute identity using IdentitySelector
-                                            if let Some(ref selector) = identity_selector {
-                                                channel_info!(
-                                                    config_id,
-                                                    "GW2: Computing agent identity using IdentitySelector"
-                                                );
-                                                match selector
-                                                    .compute_identity(
-                                                        identity_ext,
-                                                        channel_id,
-                                                        surface.config_id().map(str::to_string),
-                                                        surface.issuer_id.clone(),
-                                                        crate::identity::filesystem::IdentityOrigin::Managed,
-                                                    )
-                                                    .await
-                                                {
-                                                    Ok(identity_result) => {
-                                                        agent_identity =
-                                                            Some(identity_result.did.clone());
-                                                        crate::observability::record_caller_did_on_current_span(
-                                                            &identity_result.did,
-                                                        );
-                                                        channel_info!(
-                                                            config_id,
-                                                            "GW2: Agent identity computed: {} (is_new: {})",
-                                                            identity_result.did,
-                                                            identity_result.is_new
-                                                        );
-
-                                                        // Trigger identity.appeared if this is a new identity appearing on the channel
-                                                        if identity_result.is_new
-                                                            && let Some(notif_store) =
-                                                                GLOBAL_NOTIFICATION_STORE.get()
-                                                        {
-                                                            let did_clone =
-                                                                identity_result.did.clone();
-                                                            let channel_id_clone =
-                                                                channel_id.to_string();
-                                                            let notif = (*notif_store).clone();
-                                                            tokio::spawn(async move {
-                                                                crate::integrations::async_triggers::trigger_identity_appeared(
-                                                                        Some(notif.clone()),
-                                                                        &did_clone,
-                                                                        &channel_id_clone,
-                                                                    ).await;
-                                                            });
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        channel_warn!(
-                                                            config_id,
-                                                            "GW2: Failed to compute agent identity: {}",
-                                                            e
-                                                        );
-                                                    }
-                                                }
-                                            }
-
-                                            // Fallback: If no identity selector or computation failed, use SHA256
-                                            if agent_identity.is_none() {
-                                                channel_info!(
-                                                    config_id,
-                                                    "GW2: No IdentitySelector available for response, using SHA256 fallback"
-                                                );
-                                                let identity_value = identity_ext
-                                                    .get("agentIdentity")
-                                                    .or_else(|| identity_ext.get("agentId"))
-                                                    .or_else(|| identity_ext.get("id"))
-                                                    .or_else(|| identity_ext.get("agent_id"));
-
-                                                let hash_input =
-                                                    if let Some(id_val) = identity_value {
-                                                        serde_json::to_string(id_val)
-                                                            .unwrap_or_default()
-                                                    } else {
-                                                        serde_json::to_string(identity_ext)
-                                                            .unwrap_or_default()
-                                                    };
-
-                                                use sha2::{Digest, Sha256};
-                                                let mut hasher = Sha256::new();
-                                                hasher.update(hash_input.as_bytes());
-                                                let hash = hasher.finalize();
-                                                let hash_str = format!("sha256:{:x}", hash);
-                                                agent_identity = Some(hash_str.clone());
-                                                channel_info!(
-                                                    config_id,
-                                                    "GW2: Agent identity computed from SHA256: {}",
-                                                    hash_str
-                                                );
-                                            }
-                                        }
-                                    } else {
-                                        channel_info!(
-                                            config_id,
-                                            "GW2: Identity extension declared but not found in response metadata"
-                                        );
-                                    }
-                                } else {
+                            } else {
+                                // Agent sent raw payload - compute identity using IdentitySelector
+                                if let Some(ref selector) = identity_selector {
                                     channel_info!(
                                         config_id,
-                                        "GW2: No metadata found in response history message"
+                                        "GW2: Computing agent identity using IdentitySelector"
+                                    );
+                                    match selector
+                                        .compute_identity(
+                                            identity_ext,
+                                            channel_id,
+                                            surface.config_id().map(str::to_string),
+                                            surface.issuer_id.clone(),
+                                            crate::identity::filesystem::IdentityOrigin::Managed,
+                                        )
+                                        .await
+                                    {
+                                        Ok(identity_result) => {
+                                            agent_identity =
+                                                Some(identity_result.did.clone());
+                                            crate::observability::record_caller_did_on_current_span(
+                                                &identity_result.did,
+                                            );
+                                            channel_info!(
+                                                config_id,
+                                                "GW2: Agent identity computed: {} (is_new: {})",
+                                                identity_result.did,
+                                                identity_result.is_new
+                                            );
+
+                                            // Trigger identity.appeared if this is a new identity appearing on the channel
+                                            if identity_result.is_new
+                                                && let Some(notif_store) =
+                                                    GLOBAL_NOTIFICATION_STORE.get()
+                                            {
+                                                let did_clone =
+                                                    identity_result.did.clone();
+                                                let channel_id_clone =
+                                                    channel_id.to_string();
+                                                let notif = (*notif_store).clone();
+                                                tokio::spawn(async move {
+                                                    crate::integrations::async_triggers::trigger_identity_appeared(
+                                                            Some(notif.clone()),
+                                                            &did_clone,
+                                                            &channel_id_clone,
+                                                        ).await;
+                                                });
+                                            }
+                                        }
+                                        Err(e) => {
+                                            channel_warn!(
+                                                config_id,
+                                                "GW2: Failed to compute agent identity: {}",
+                                                e
+                                            );
+                                        }
+                                    }
+                                }
+
+                                // Fallback: If no identity selector or computation failed, use SHA256
+                                if agent_identity.is_none() {
+                                    channel_info!(
+                                        config_id,
+                                        "GW2: No IdentitySelector available for response, using SHA256 fallback"
+                                    );
+                                    let identity_value = identity_ext
+                                        .get("agentIdentity")
+                                        .or_else(|| identity_ext.get("agentId"))
+                                        .or_else(|| identity_ext.get("id"))
+                                        .or_else(|| identity_ext.get("agent_id"));
+
+                                    let hash_input =
+                                        if let Some(id_val) = identity_value {
+                                            serde_json::to_string(id_val)
+                                                .unwrap_or_default()
+                                        } else {
+                                            serde_json::to_string(identity_ext)
+                                                .unwrap_or_default()
+                                        };
+
+                                    use sha2::{Digest, Sha256};
+                                    let mut hasher = Sha256::new();
+                                    hasher.update(hash_input.as_bytes());
+                                    let hash = hasher.finalize();
+                                    let hash_str = format!("sha256:{:x}", hash);
+                                    agent_identity = Some(hash_str.clone());
+                                    channel_info!(
+                                        config_id,
+                                        "GW2: Agent identity computed from SHA256: {}",
+                                        hash_str
                                     );
                                 }
-                            } else {
-                                channel_info!(
-                                    config_id,
-                                    "GW2: Agent identity extension not declared in response"
-                                );
                             }
-                        } else {
-                            channel_info!(
-                                config_id,
-                                "GW2: No extensions array found in response history"
-                            );
                         }
-                    } else {
-                        channel_info!(config_id, "GW2: No history found in response");
+                        Err(e) => {
+                            channel_info!(config_id, "GW2: No agent identity in response: {}", e);
+                        }
                     }
                 } else {
                     channel_info!(config_id, "GW2: Failed to parse response as JSON");
@@ -6817,17 +6729,26 @@ async fn process_forward_request_with_mcp_runtime(
                                         Vec::new(),
                                     )
                                     .await
-                                    .map(|(body, proof)| (body, Some(proof)))
+                                    .map(|injected| {
+                                        injected.map_or_else(
+                                            || (response_bytes.clone(), None),
+                                            |(body, proof)| (body, Some(proof)),
+                                        )
+                                    })
                                 };
 
                                 match inject_result {
                                     Ok((modified_bytes, vp_jwt)) => {
                                         // Replace response_body with VP-injected version
                                         response_body = String::from_utf8_lossy(&modified_bytes).to_string();
-                                        info!(
-                                            "GW2: Successfully injected backend agent VP into response for DID: {}",
-                                            agent_did
-                                        );
+                                        if vp_jwt.is_some() {
+                                            info!(
+                                                "GW2: Successfully injected backend agent VP into response for DID: {}",
+                                                agent_did
+                                            );
+                                        } else {
+                                            debug!("GW2: No response location carries the agent identity, VP not injected");
+                                        }
 
                                         // Record the injection in the delegation audit log so it
                                         // surfaces as a `vp_injected` event on the Audit page —
@@ -7112,6 +7033,7 @@ async fn evaluate_mcp_tool_policies_for_fabric(
         scope: crate::observability::PolicyScope::McpTool,
         flow: crate::observability::PolicyFlow::Fabric,
         surface_id: Some(config_id),
+        surface_name: Some(surface.name.as_str()),
         http_method: Some(method),
         path: Some(path),
         identity: authenticated_identity,
@@ -7178,6 +7100,7 @@ async fn evaluate_mcp_tool_policies_for_fabric(
             allow: false,
             reason: Some("Access denied: insufficient permissions for this tool"),
             surface_id: Some(config_id),
+            surface_name: Some(surface.name.as_str()),
             http_method: Some(method),
             path: Some(path),
             identity: authenticated_identity,
@@ -7257,6 +7180,7 @@ async fn evaluate_mcp_tool_policies_for_fabric(
                 .content_hash
                 .as_deref(),
             surface_id: Some(config_id),
+            surface_name: Some(surface.name.as_str()),
             http_method: Some(method),
             path: Some(path),
             identity: authenticated_identity,
@@ -7371,6 +7295,7 @@ async fn evaluate_mcp_tool_gating_call_for_fabric(
             reason: Some("tools/call without a readable tool name under MCP tool gating"),
             policy_id: Some("mcp_tool_gating"),
             surface_id: Some(config_id),
+            surface_name: Some(surface.name.as_str()),
             http_method: Some(method),
             path: Some(path),
             identity: authenticated_identity,
@@ -7421,6 +7346,7 @@ async fn evaluate_mcp_tool_gating_call_for_fabric(
         },
         policy_id: Some("mcp_tool_gating"),
         surface_id: Some(config_id),
+        surface_name: Some(surface.name.as_str()),
         http_method: Some(method),
         path: Some(path),
         identity: authenticated_identity,
@@ -7523,6 +7449,7 @@ fn filter_mcp_tools_list_for_fabric(
             &filtered.kept,
             crate::observability::PolicyDecisionEvent {
                 surface_id: Some(config_id),
+                surface_name: Some(surface.name.as_str()),
                 http_method: Some(method),
                 path: Some(path),
                 actor_did: actor_did.as_deref(),
@@ -7535,36 +7462,25 @@ fn filter_mcp_tools_list_for_fabric(
 
 /// The gateway policy could not decide: record the `error` decision and
 /// block. The engine's error text is logged by the caller, never sent back.
-fn fabric_gateway_policy_error(event: crate::observability::PolicyDecisionEvent<'_>) -> ProcessingResult {
+fn fabric_gateway_policy_error(event: crate::observability::PolicyDecisionEvent<'_>) -> ForwardRefusal {
     crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
         error: Some(crate::observability::PolicyEvaluationError::EvaluationError),
         ..event
     });
-    ProcessingResult::RequiresResponse {
-        response_type: MessageType::ForwardResponse.to_string(),
-        response_body: serde_json::json!({
-            "status": 403,
-            "body": r#"{"error":"Forbidden","message":"Request blocked by gateway policy"}"#,
-            "error": "Request blocked by gateway policy",
-        }),
-    }
+    ForwardRefusal::GatewayPolicyError
 }
 
 /// The surface policy could not run or decide: record the `error` decision
 /// and send the generic denial. Any engine error text is logged by the caller.
 fn fabric_surface_policy_error(
-    body_bytes: &[u8],
     error: crate::observability::PolicyEvaluationError,
     event: crate::observability::PolicyDecisionEvent<'_>,
-) -> ProcessingResult {
+) -> ForwardRefusal {
     crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
         error: Some(error),
         ..event
     });
-    ProcessingResult::RequiresResponse {
-        response_type: MessageType::ForwardResponse.to_string(),
-        response_body: build_surface_policy_denied_forward_body(body_bytes, None),
-    }
+    ForwardRefusal::SurfacePolicyError
 }
 
 /// An MCP tool policy could not run or decide: record the `error` decision
@@ -9445,7 +9361,7 @@ mod tests {
         })
         .await;
         assert_error_decision(&decisions, "gateway", "evaluation_error");
-        assert!(forward_response_body(&result).contains("Request blocked by gateway policy"));
+        assert!(matches!(result, ForwardRefusal::GatewayPolicyError), "{result:?}");
     }
 
     #[tokio::test]
@@ -9453,7 +9369,6 @@ mod tests {
         let body = bytes::Bytes::from_static(br#"{"jsonrpc":"2.0","id":1,"method":"message/send"}"#);
         let (result, decisions) = collect_policy_decisions(|| {
             fabric_surface_policy_error(
-                &body,
                 crate::observability::PolicyEvaluationError::EvaluationError,
                 crate::observability::PolicyDecisionEvent {
                     scope: crate::observability::PolicyScope::Surface,
@@ -9463,17 +9378,20 @@ mod tests {
         })
         .await;
         assert_error_decision(&decisions, "surface", "evaluation_error");
-        let response = forward_response_body(&result);
+        assert!(matches!(result, ForwardRefusal::SurfacePolicyError), "{result:?}");
+        let response = forward_response_body(
+            &result
+                .into_forward_response(&body)
+                .await,
+        );
         assert!(response.contains("Agent trust policy denied the request"));
         assert!(!response.contains("evaluation error"), "no engine detail for the caller: {response}");
     }
 
     #[tokio::test]
     async fn fabric_surface_policy_error_records_why_the_policy_could_not_run() {
-        let body = bytes::Bytes::from_static(br#"{"jsonrpc":"2.0","id":1,"method":"message/send"}"#);
         let (_, decisions) = collect_policy_decisions(|| {
             fabric_surface_policy_error(
-                &body,
                 crate::observability::PolicyEvaluationError::PolicyNotCompiled,
                 crate::observability::PolicyDecisionEvent {
                     scope: crate::observability::PolicyScope::Surface,
@@ -9601,7 +9519,7 @@ mod tests {
             "gated",
             "POST",
             "/rpc",
-            bytes::Bytes::from_static(GATED_BODY),
+            &bytes::Bytes::from_static(GATED_BODY),
             None,
             Some("did:web:peer.example".into()),
             None,
@@ -9624,6 +9542,12 @@ mod tests {
                 matches!(event, crate::delegation_vault::audit::DelegationAuditAction::PolicyDecision { .. })
             })
             .collect();
+        let result = match result {
+            Ok(bytes) => Ok(bytes),
+            Err(refusal) => Err(refusal
+                .into_forward_response(GATED_BODY)
+                .await),
+        };
         (result, decisions)
     }
 
@@ -10641,9 +10565,17 @@ mod tests {
         );
     }
 
-    fn forward_error_of(result: Result<String, ProcessingResult>) -> (u64, String) {
-        match result {
-            Err(ProcessingResult::RequiresResponse { response_type, response_body }) => {
+    /// The forward-response a failed Target body read answers with.
+    async fn forward_error_of(result: Result<String, crate::proxy::upstream_body::UpstreamBodyError>) -> (u64, String) {
+        let error = match result {
+            Ok(body) => panic!("expected a failed read, got {body:?}"),
+            Err(error) => error,
+        };
+        match ForwardRefusal::from(error)
+            .into_forward_response(b"")
+            .await
+        {
+            ProcessingResult::RequiresResponse { response_type, response_body } => {
                 assert_eq!(response_type, MessageType::ForwardResponse.to_string());
                 (
                     response_body["status"]
@@ -10691,7 +10623,7 @@ mod tests {
         let result =
             read_forward_target_body(response, false, b"", limits(100, Some(PATIENT), PATIENT), "surface-1").await;
 
-        let (status, body) = forward_error_of(result);
+        let (status, body) = forward_error_of(result).await;
         assert_eq!(status, 502);
         assert!(body.contains("Upstream response too large"), "{body}");
     }
@@ -10711,7 +10643,7 @@ mod tests {
         )
         .await;
 
-        let (status, body) = forward_error_of(result);
+        let (status, body) = forward_error_of(result).await;
         assert_eq!(status, 504);
         assert!(body.contains("Upstream response timed out"), "{body}");
     }
@@ -10736,7 +10668,7 @@ mod tests {
         let result =
             read_forward_target_body(response, true, b"", limits(event.len(), Some(PATIENT), PATIENT), "surface-1")
                 .await;
-        let (status, body) = forward_error_of(result);
+        let (status, body) = forward_error_of(result).await;
         assert_eq!(status, 502);
         assert!(body.contains("Upstream response too large"), "{body}");
     }
@@ -10879,19 +10811,38 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let msg = make_forward_request_msg(temp.path(), Some("did:web:peer.example"), "surface-1");
 
-        assert!(admit_forward_request_envelope(&msg).is_ok());
+        use crate::gateways::connection_points::envelope_replay::{EnvelopeRejection, admit_forward_request};
+
+        assert!(admit_forward_request(&msg).is_ok());
+        let duplicate = admit_forward_request(&msg).unwrap_err();
+        assert!(matches!(duplicate, EnvelopeRejection::Duplicate { .. }), "{duplicate}");
         assert!(
-            matches!(admit_forward_request_envelope(&msg), Err(ProcessingResult::ProcessedNoResponse)),
+            matches!(forward_request_envelope_refusal(&msg, duplicate), ProcessingResult::ProcessedNoResponse),
             "a duplicate must produce no ForwardResponse"
         );
 
         let mut expired = make_forward_request_msg(temp.path(), Some("did:web:peer.example"), "surface-1");
         expired.expires_time = Some(crate::gateways::connection_points::envelope_replay::now_secs() - 1);
-        match admit_forward_request_envelope(&expired) {
-            Err(ProcessingResult::RequiresResponse { response_body, .. }) => {
+        let rejection = admit_forward_request(&expired).unwrap_err();
+        assert!(matches!(rejection, EnvelopeRejection::Expired { .. }), "{rejection}");
+        match forward_request_envelope_refusal(&expired, rejection) {
+            ProcessingResult::RequiresResponse { response_body, .. } => {
                 assert_eq!(response_body["status"], 504, "{response_body}");
             }
             other => panic!("expected a 504 ForwardResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn refused_pairing_envelope_fails_with_the_rejection() {
+        use crate::gateways::connection_points::envelope_replay::EnvelopeRejection;
+
+        let temp = tempfile::tempdir().unwrap();
+        let msg = make_forward_request_msg(temp.path(), Some("did:web:peer.example"), "surface-1");
+        let rejection = EnvelopeRejection::MissingExpiry;
+        match pairing_envelope_refusal(&msg, rejection.clone()) {
+            ProcessingResult::Failed { reason } => assert_eq!(reason, format!("Envelope refused: {rejection}")),
+            other => panic!("expected Failed, got {other:?}"),
         }
     }
 
@@ -10938,12 +10889,10 @@ mod tests {
                 None,
             )
             .await;
-            match result {
-                Err(ProcessingResult::RequiresResponse { response_body, .. }) => {
-                    assert_eq!(response_body["status"], 403, "{method} {path}")
-                }
-                other => panic!("{method} {path}: expected the appliance-wide deny, got {other:?}"),
-            }
+            assert!(
+                matches!(result, Err(ForwardRefusal::AppliancePolicyDenied)),
+                "{method} {path}: expected the appliance-wide deny, got {result:?}"
+            );
         }
     }
 
@@ -11031,7 +10980,7 @@ mod tests {
                 .await
                 .is_none()
         );
-        assert!(admit_forward_request_envelope(&fresh).is_ok());
+        assert!(crate::gateways::connection_points::envelope_replay::admit_forward_request(&fresh).is_ok());
         // A redelivery of an admitted request gets no reply at all.
         assert!(matches!(refusal(fresh).await, Some(ProcessingResult::ProcessedNoResponse)));
 
@@ -11193,12 +11142,8 @@ mod tests {
             let message = make_forward_request_msg(temp.path(), Some(did), channel);
             match authorize_fabric_sender(&message, channel, None).await {
                 Ok(()) => assert!(admitted, "{did} reached {channel}"),
-                Err(ProcessingResult::RequiresResponse { response_body, .. }) => {
-                    assert!(!admitted, "{did} was refused {channel}: {response_body}");
-                    assert_eq!(response_body["status"], 403);
-                    assert_eq!(response_body["error"], "Channel is not exposed to sender");
-                }
-                Err(other) => panic!("expected a 403 ForwardResponse, got {other:?}"),
+                Err(ForwardRefusal::ChannelNotExposed) => assert!(!admitted, "{did} was refused {channel}"),
+                Err(other) => panic!("expected ChannelNotExposed, got {other:?}"),
             }
         }
 
@@ -11261,6 +11206,69 @@ mod tests {
             }
             other => panic!("expected ForwardResponse, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn fabric_requests_each_carry_their_own_request_id() {
+        // Surface lookup prefers the process-global surface store, which other
+        // tests in this binary can initialise; run in a child process where it
+        // is unset, so the missing surface is reported as not found.
+        if std::env::var_os("ATG_FABRIC_REQUEST_ID_CHILD").is_none() {
+            let test_name = std::thread::current()
+                .name()
+                .unwrap()
+                .to_string();
+            let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test_name, "--nocapture"])
+                .env("ATG_FABRIC_REQUEST_ID_CHILD", "1")
+                .env("RUST_MIN_STACK", "8388608")
+                .kill_on_drop(true)
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated fabric request id check failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        register_gateway(
+            temp.path(),
+            "did:web:peer.example",
+            crate::gateways::types::GatewayStatus::Active,
+            crate::gateways::types::ExposureMode::All,
+            Vec::new(),
+        )
+        .await;
+
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let msg = make_forward_request_msg(temp.path(), Some("did:web:peer.example"), "request-id-missing-surface");
+            let (response, events) = crate::audit::producer::capture(forward_response(&msg)).await;
+            assert_eq!(response["status"], 404, "{response}");
+            assert!(!events.is_empty(), "the refused request is recorded");
+            let ids: std::collections::HashSet<_> = events
+                .iter()
+                .map(|event| {
+                    event
+                        .request_id
+                        .clone()
+                        .expect("every record carries the request id")
+                })
+                .collect();
+            assert_eq!(ids.len(), 1, "one request, one id");
+            seen.extend(ids);
+        }
+        assert!(seen.iter().all(|id| {
+            id.len() == 16
+                && id
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+        }));
+        assert_ne!(seen[0], seen[1], "each request has its own id");
     }
 
     #[tokio::test]

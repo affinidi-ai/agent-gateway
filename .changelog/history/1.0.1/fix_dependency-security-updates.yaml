@@ -1,0 +1,37 @@
+branch: fix/dependency-security-updates
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-10-22T10:30:00Z'
+      title: Build the dashboard with Node.js 22.23.4 to fix CVE-2026-111497
+      description: >-
+        The Docker images and the CI frontend job built the dashboard with Node.js
+        releases affected by CVE-2026-111497, an out-of-bounds write in the Brotli
+        decoder. They now use Node.js 22.23.4, the patched 22.x release; the CI job
+        moves off Node.js 20, which no longer receives fixes.
+    - timestamp: '2026-10-22T10:30:00Z'
+      title: Update dependencies with published security fixes
+      description: >-
+        Updates anyhow to 1.0.104 and event-listener to 5.4.2 to fix soundness
+        advisories RUSTSEC-2026-0190 and RUSTSEC-2026-0221, and applies non-breaking
+        dashboard dependency fixes, including the critical websocket-driver,
+        shell-quote and proxy-addr advisories in the build toolchain. Overrides pin
+        postcss-selector-parser to 7.1.6 or newer and @tootallnate/once to 2.0.1 or
+        newer, clearing GHSA-rj75-hqrm-r3gf and GHSA-vpq2-c234-7xj6 from the build.
+    - timestamp: '2026-10-22T11:30:00Z'
+      title: Upgrade the dashboard to React Router 7.18.4
+      description: >-
+        React Router 6 is affected by GHSA-wrjc-x8rr-h8h6, an open redirect through a
+        backslash in Link and useNavigate targets, and GHSA-337j-9hxr-rhxg, with no 6.x
+        fix. The dashboard now uses React Router 7.18.4, leaving no known advisories in
+        its production dependencies.
+    - timestamp: '2026-10-22T12:00:00Z'
+      title: Upgrade Alloy to 2.5 to drop the unsound lru 0.16 dependency
+      description: >-
+        Alloy 1.x and 2.1 depend on lru 0.16, which is affected by RUSTSEC-2026-0253, a
+        potential use-after-free in LruCache::pop. The gateway and its x402 payment
+        dependencies now share Alloy 2.5, which uses the patched lru 0.18.
+  breaking: []

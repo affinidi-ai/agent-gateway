@@ -4,6 +4,8 @@ import { topAndTail } from '../../utils/stringUtils';
 import { AppButton } from '../shared/AppButton';
 import { CopyButton } from '../shared/CopyButton';
 import { Link } from '../shared/Link';
+import { dropdownMediators } from '../../utils/mediators';
+import { initialMediatorSelection, MediatorOption } from './mediatorOptions';
 
 interface SelectMediatorStepProps {
   onNext: (mediatorId: string) => void;
@@ -16,7 +18,7 @@ const SelectMediatorStep: React.FC<SelectMediatorStepProps> = ({
   onCancel,
   initialMediatorId = null,
 }) => {
-  const [mediators, setMediators] = useState<any[]>([]);
+  const [mediators, setMediators] = useState<MediatorOption[]>([]);
   const [selectedMediator, setSelectedMediator] = useState<string>(initialMediatorId || '');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -31,14 +33,16 @@ const SelectMediatorStep: React.FC<SelectMediatorStepProps> = ({
       setError('');
       const response = await apiClient.get('/mediators/compatible');
       // Backend returns array directly, not wrapped in object
-      const mediatorsList = Array.isArray(response.data) ? response.data : [];
+      const mediatorsList: MediatorOption[] = dropdownMediators(
+        Array.isArray(response.data) ? response.data : []
+      );
       setMediators(mediatorsList);
-
-      // Auto-select the first mediator if there's only one and no initial value
-      if (mediatorsList.length === 1 && !initialMediatorId) {
-        setSelectedMediator(mediatorsList[0].id);
-      }
-    } catch (err: any) {
+      setSelectedMediator(current =>
+        current && mediatorsList.some(mediator => mediator.id === current)
+          ? current
+          : initialMediatorSelection(mediatorsList, initialMediatorId)
+      );
+    } catch (err: unknown) {
       console.error('Failed to load mediators:', err);
       setError('Failed to load mediators. Please try again.');
     } finally {
@@ -74,22 +78,43 @@ const SelectMediatorStep: React.FC<SelectMediatorStepProps> = ({
             <i className="fas fa-exclamation-triangle hero-status-icon warning"></i>
           </div>
           <h5>No Compatible Mediators Available</h5>
+          {error && (
+            <div
+              className="alert alert-danger"
+              role="alert"
+              data-testid="wizard-mediator-load-error"
+            >
+              {error}
+            </div>
+          )}
           <p className="text-muted">
             No mediators are compatible with this gateway. Please{' '}
             <Link href="/mediators/wizard" variant="inline">
               add a mediator
-            </Link>{' '}
-            or contact your administrator.
+            </Link>
+            , refresh the list (a mediator directory can take a moment to answer after the gateway
+            starts), or contact your administrator.
           </p>
-          <AppButton
-            variant="secondary"
-            size="md"
-            data-testid="wizard-cancel"
-            onClick={onCancel}
-            iconStart={<i className="fas fa-arrow-left"></i>}
-          >
-            Back to Connections
-          </AppButton>
+          <div className="d-flex justify-content-center gap-2">
+            <AppButton
+              variant="secondary"
+              size="md"
+              data-testid="wizard-cancel"
+              onClick={onCancel}
+              iconStart={<i className="fas fa-arrow-left"></i>}
+            >
+              Back to Connections
+            </AppButton>
+            <AppButton
+              variant="primary"
+              size="md"
+              data-testid="wizard-mediator-refresh-button"
+              onClick={loadMediators}
+              iconStart={<i className="fas fa-sync"></i>}
+            >
+              Refresh
+            </AppButton>
+          </div>
         </div>
       </div>
     );
@@ -119,8 +144,8 @@ const SelectMediatorStep: React.FC<SelectMediatorStepProps> = ({
             Mediator <span className="text-danger">*</span>
           </label>
           <select
-            data-testid="wizard-mediator-select"
             id="mediator-select"
+            data-testid="connection-point-mediator-select"
             className="form-control dropdown-styling"
             value={selectedMediator}
             onChange={e => setSelectedMediator(e.target.value)}
@@ -132,6 +157,17 @@ const SelectMediatorStep: React.FC<SelectMediatorStepProps> = ({
               </option>
             ))}
           </select>
+          <div className="mt-2">
+            <AppButton
+              variant="secondary"
+              size="sm"
+              data-testid="wizard-mediator-refresh-button"
+              onClick={loadMediators}
+              iconStart={<i className="fas fa-sync"></i>}
+            >
+              Refresh list
+            </AppButton>
+          </div>
 
           {selectedMediator && (
             <div className="mt-3 p-3 border rounded bg-light">

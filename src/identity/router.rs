@@ -10,6 +10,7 @@ use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 use tracing::{debug, error, info};
 
+use crate::audit::policy_refusals::{PolicyWrite, PolicyWriteRoutes};
 use crate::identity::handlers;
 use crate::identity::state::IdentityApiState;
 use crate::metrics::MetricsStore;
@@ -651,6 +652,14 @@ pub fn create_identity_api_router(
                 get(handlers::get_surface).layer(require_feature(s.clone(), r.clone(), Feature::SurfacesView)),
             )
             .route(
+                "/v1/surfaces/{surface_id}/trust-recorder-status",
+                get(handlers::get_trust_recorder_status).layer(require_feature(
+                    s.clone(),
+                    r.clone(),
+                    Feature::SurfacesView,
+                )),
+            )
+            .route(
                 "/v1/surfaces/{surface_id}",
                 put(handlers::update_surface).layer(require_feature(s.clone(), r.clone(), Feature::SurfacesEdit)),
             )
@@ -784,24 +793,24 @@ pub fn create_identity_api_router(
                     Feature::PoliciesView,
                 )),
             )
-            .route(
-                "/v1/policy-definitions",
+            .policy_write(
+                PolicyWrite::CreateDefinition,
                 post(handlers::create_policy_definition).layer(require_feature(
                     s.clone(),
                     r.clone(),
                     Feature::PoliciesEdit,
                 )),
             )
-            .route(
-                "/v1/policy-definitions/{policy_id}",
+            .policy_write(
+                PolicyWrite::UpdateDefinition,
                 put(handlers::update_policy_definition).layer(require_feature(
                     s.clone(),
                     r.clone(),
                     Feature::PoliciesEdit,
                 )),
             )
-            .route(
-                "/v1/policy-definitions/{policy_id}",
+            .policy_write(
+                PolicyWrite::DeleteDefinition,
                 delete(handlers::delete_policy_definition).layer(require_feature(
                     s.clone(),
                     r.clone(),
@@ -824,8 +833,8 @@ pub fn create_identity_api_router(
                     Feature::PoliciesView,
                 )),
             )
-            .route(
-                "/v1/policy-assignments",
+            .policy_write(
+                PolicyWrite::Assignments,
                 put(handlers::update_policy_assignments).layer(require_feature(
                     s.clone(),
                     r.clone(),
@@ -840,8 +849,8 @@ pub fn create_identity_api_router(
                     Feature::TenantOwnershipManage,
                 )),
             )
-            .route(
-                "/v1/tenant-ownership/{kind}/{id}",
+            .policy_write(
+                PolicyWrite::ReassignOwner,
                 put(handlers::tenant_ownership::reassign_ownership).layer(require_feature(
                     s.clone(),
                     r.clone(),
@@ -998,8 +1007,8 @@ pub fn create_identity_api_router(
                     Feature::GatewaysView,
                 ),
             )
-            .route(
-                "/v1/gateways/{id}/policy",
+            .policy_write(
+                PolicyWrite::GatewayPolicy,
                 gate(
                     put(crate::gateways::handlers::update_gateway_policy::<crate::gateways::FileSystemGatewayStore>),
                     Feature::GatewaysEdit,
@@ -1032,6 +1041,11 @@ pub fn create_identity_api_router(
             router = router.layer(Extension(listener_mgr.clone()));
             router = router.layer(Extension(gateway_channel_cache.clone()));
         }
+        router = router.layer(Extension(
+            state
+                .mediator_directory
+                .clone(),
+        ));
 
         // Add connection point store if available (needed for OOB connections and delete)
         if let Some(cp_store) = &connection_point_store {
@@ -1229,6 +1243,7 @@ pub fn create_identity_api_router(
                 .layer(Extension(store.clone()))
                 .layer(Extension(cp_store.clone()))
                 .layer(Extension(listener_mgr.clone()))
+                .layer(Extension(pending_connection_store.clone()))
                 .layer(Extension(notification_store.clone()));
 
             if let (Some(sess_mgr), Some(user_storage)) = (gateway_session_mgr.as_ref(), gateway_user_storage.as_ref())
@@ -1449,7 +1464,12 @@ pub fn create_identity_api_router(
                 .layer(Extension(msg_store))
                 .layer(Extension(surface_store_for_connection_points))
                 .layer(Extension(notification_store.clone()))
-                .layer(Extension(state.event_hook.clone()));
+                .layer(Extension(state.event_hook.clone()))
+                .layer(Extension(
+                    state
+                        .mediator_directory
+                        .clone(),
+                ));
 
             #[cfg(feature = "didwebvh")]
             let router = router
@@ -1548,6 +1568,13 @@ pub fn create_identity_api_router(
     } else {
         Router::new()
     };
+    let mediator_router = mediator_router
+        .layer(Extension(
+            state
+                .mediator_directory
+                .clone(),
+        ))
+        .layer(Extension(Some(pending_connection_store.clone())));
 
     // Reuse the agents-api TR listener manager for issuer trust registry registration
     let issuer_tr_listener_manager = agents_api_listener_manager;

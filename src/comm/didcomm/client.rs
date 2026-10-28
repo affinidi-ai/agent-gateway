@@ -16,6 +16,7 @@ use super::mediator::{
 };
 use crate::comm::client::DIDCommContract;
 use crate::egress::{EgressError, EgressPolicy, bdd_egress_allowlist, guarded_send_inner};
+use crate::gateways::connection_points::first_call_retry::{FirstCallRetry, profile_add};
 use crate::http_client::EXTERNAL_TIMEOUT_SECS;
 
 /// Parse an OOB invitation response body into a DIDComm message.
@@ -178,9 +179,17 @@ impl DIDCommClient {
     }
 
     pub async fn enable_websocket(&mut self) -> Result<(), String> {
-        let profile = self
-            .atm
-            .profile_add(&self.profile, true)
+        self.enable_websocket_with(FirstCallRetry::never())
+            .await
+    }
+
+    /// Like [`Self::enable_websocket`], repeating the call under `retry` while the
+    /// mediator refuses a DID it has not admitted yet.
+    pub async fn enable_websocket_with(
+        &mut self,
+        retry: FirstCallRetry,
+    ) -> Result<(), String> {
+        let profile = profile_add(&self.atm, &self.profile, true, retry)
             .await
             .map_err(|e| format!("Failed to enable WebSocket: {:?}", e))?;
         self.profile = profile;
@@ -188,9 +197,17 @@ impl DIDCommClient {
     }
 
     pub async fn register_profile(&mut self) -> Result<(), String> {
-        let profile = self
-            .atm
-            .profile_add(&self.profile, false)
+        self.register_profile_with(FirstCallRetry::never())
+            .await
+    }
+
+    /// Like [`Self::register_profile`], repeating the call under `retry` while the
+    /// mediator refuses a DID it has not admitted yet.
+    pub async fn register_profile_with(
+        &mut self,
+        retry: FirstCallRetry,
+    ) -> Result<(), String> {
+        let profile = profile_add(&self.atm, &self.profile, false, retry)
             .await
             .map_err(|e| format!("Failed to register profile: {:?}", e))?;
         self.profile = profile;

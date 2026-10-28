@@ -236,14 +236,39 @@ pub async fn set_acl_to_allow_everything_and_more(
     atm: &affinidi_messaging_sdk::ATM,
     profile: Arc<affinidi_messaging_sdk::profiles::ATMProfile>,
 ) -> Result<(), String> {
+    set_acl_to_allow_everything_and_more_retrying(
+        atm,
+        profile,
+        crate::gateways::connection_points::first_call_retry::FirstCallRetry::never(),
+    )
+    .await
+}
+
+/// Like [`set_acl_to_allow_everything_and_more`], for a DID whose first mediator call this
+/// is: the account update, the first call that authenticates, repeats under `retry` while
+/// the mediator refuses a DID it has not admitted yet.
+pub async fn set_acl_to_allow_everything_and_more_retrying(
+    atm: &affinidi_messaging_sdk::ATM,
+    profile: Arc<affinidi_messaging_sdk::profiles::ATMProfile>,
+    retry: crate::gateways::connection_points::first_call_retry::FirstCallRetry,
+) -> Result<(), String> {
     let did = profile.inner.did.to_string();
     info!("set_acl_to_allow_everything_and_more called for did: {}", did);
 
     let mut hasher = Sha256::new();
     hasher.update(did.as_bytes());
     let did_hash = format!("{:x}", hasher.finalize());
-    atm.trust_tasks()
-        .account_update(&profile, Some(did_hash), None, Some(allow_all_acl()?), None)
+    let acl = allow_all_acl()?;
+    retry
+        .run(
+            || async {
+                atm.trust_tasks()
+                    .account_update(&profile, Some(did_hash.clone()), None, Some(acl.clone()), None)
+                    .await
+            },
+            crate::gateways::connection_points::first_call_retry::refused_until_admitted,
+            crate::gateways::connection_points::first_call_retry::timed_out,
+        )
         .await
         .map_err(|e| format!("Failed to update ACL to ALLOW_ALL_ACL_FLAGS: {}", e))?;
 
@@ -492,8 +517,13 @@ fn extract_base_url(url: &str) -> Result<String, String> {
 }
 
 /// Resolve a DID to get its DID document
-async fn resolve_did(did: &str) -> Result<serde_json::Value, String> {
+pub(crate) async fn resolve_did(did: &str) -> Result<serde_json::Value, String> {
     tracing::info!("Resolving DID: {}", did);
+
+    #[cfg(test)]
+    if let Some(document) = test_documents::get(did) {
+        return Ok(document);
+    }
 
     let client = crate::gateways::did_cache::shared_resolver();
 
@@ -506,6 +536,28 @@ async fn resolve_did(did: &str) -> Result<serde_json::Value, String> {
 
     // Convert to JSON for easier manipulation
     serde_json::to_value(&did_document).map_err(|e| format!("Failed to serialize resolved DID document: {}", e))
+}
+
+/// Test-only DID documents returned by [`resolve_did`] without touching the network.
+#[cfg(test)]
+pub(crate) mod test_documents {
+    fn documents() -> &'static dashmap::DashMap<String, serde_json::Value> {
+        static DOCUMENTS: std::sync::OnceLock<dashmap::DashMap<String, serde_json::Value>> = std::sync::OnceLock::new();
+        DOCUMENTS.get_or_init(dashmap::DashMap::new)
+    }
+
+    pub(crate) fn install(
+        did: &str,
+        document: serde_json::Value,
+    ) {
+        documents().insert(did.to_string(), document);
+    }
+
+    pub(super) fn get(did: &str) -> Option<serde_json::Value> {
+        documents()
+            .get(did)
+            .map(|document| document.clone())
+    }
 }
 
 #[cfg(test)]

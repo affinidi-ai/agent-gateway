@@ -273,6 +273,34 @@ async fn issue_for_slot(
     }
 }
 
+/// The slot's identity config: slot-specific first, falling back to the legacy
+/// `managed_identity` alias so unmigrated channels keep working in the
+/// protected slot.
+fn slot_identity_config(
+    surface: &crate::config::agent_surface::AgentSurface,
+    slot: IdentitySlot,
+) -> Option<crate::source_auth::ManagedIdentityConfig> {
+    match slot {
+        IdentitySlot::Protected => surface
+            .protected_identity()
+            .cloned()
+            .or_else(|| surface.managed_identity()),
+        IdentitySlot::External => surface
+            .external_identity()
+            .cloned(),
+    }
+}
+
+/// Whether the slot reads the agent's identity from the response body. A slot
+/// that derives it from a credential, or is not configured, resolves the same
+/// identity whatever the response carries.
+pub fn slot_reads_response_body(
+    surface: &crate::config::agent_surface::AgentSurface,
+    slot: IdentitySlot,
+) -> bool {
+    matches!(slot_identity_config(surface, slot), Some(crate::source_auth::ManagedIdentityConfig::PayloadExtraction(_)))
+}
+
 /// Resolve an agent identity from a response body for a specific channel slot.
 ///
 /// The slot selects which surface accessor to consult (`protected_identity` for
@@ -301,17 +329,7 @@ pub async fn resolve_agent_identity_for_slot(
     {
         return Ok(ProtectedAgentIdentity::Anonymous);
     }
-    // Slot-specific config first; fall back to the legacy `managed_identity`
-    // alias so unmigrated channels keep working in the protected slot.
-    let slot_config: Option<crate::source_auth::ManagedIdentityConfig> = match slot {
-        IdentitySlot::Protected => surface
-            .protected_identity()
-            .cloned()
-            .or_else(|| surface.managed_identity()),
-        IdentitySlot::External => surface
-            .external_identity()
-            .cloned(),
-    };
+    let slot_config = slot_identity_config(surface, slot);
 
     let has_managed_identity = slot_config.is_some();
 
@@ -838,6 +856,28 @@ pub fn extract_a2a_identity_from_message_with_uri(
     json: &JsonValue,
     ext_uri: &str,
 ) -> Result<JsonValue, IdentityExtractionError> {
+    extract_a2a_identity_from_locations(json, ext_uri, response_identity_candidates)
+}
+
+/// Like [`extract_a2a_identity_from_message_with_uri`], but on a response reads
+/// only the agent's message (see [`response_message_candidates`]), never
+/// `artifacts[]`.
+///
+/// Used on the calling side of Fabric, where the peer gateway places the
+/// credential only on that message, so an identity found in an artifact was not
+/// put there by the peer gateway.
+pub fn extract_a2a_identity_from_response_message_with_uri(
+    json: &JsonValue,
+    ext_uri: &str,
+) -> Result<JsonValue, IdentityExtractionError> {
+    extract_a2a_identity_from_locations(json, ext_uri, response_message_candidates)
+}
+
+fn extract_a2a_identity_from_locations(
+    json: &JsonValue,
+    ext_uri: &str,
+    response_candidates: fn(&JsonValue) -> Vec<&JsonValue>,
+) -> Result<JsonValue, IdentityExtractionError> {
     // Request layout: params.message or message
     let request_msg = json
         .get("params")
@@ -853,7 +893,7 @@ pub fn extract_a2a_identity_from_message_with_uri(
     if let Some(result) = json.get("result") {
         let mut first_err: Option<IdentityExtractionError> = None;
 
-        for candidate in response_identity_candidates(result) {
+        for candidate in response_candidates(result) {
             match extract_from_message_obj(candidate, ext_uri) {
                 Ok(payload) => return Ok(payload),
                 // A location that declares the extension but omits the payload is
@@ -888,9 +928,14 @@ pub fn extract_a2a_identity_from_message_with_uri(
 /// 1. **The status message** (`result.message`, or `result.status.message` for a
 ///    Task, or `result` itself when it is a bare Message). This is the agent's
 ///    current message and the most authoritative assertion, so it wins.
-/// 2. **`artifacts[]`**, the task outputs, in document order. `Artifact` declares
-///    the same `metadata` + `extensions` pair as `Message`, and artifacts are
-///    produced by the agent, so an identity asserted there is the agent's.
+/// 2. **`artifacts[]`**, the task outputs, in document order, then the single
+///    `artifact` of a task artifact update. `Artifact` declares the same
+///    `metadata` + `extensions` pair as `Message`, and artifacts are produced by
+///    the agent, so an identity asserted there is the agent's.
+///
+/// A task update read from an event stream (`status-update`, or a v1.0
+/// `statusUpdate` once unwrapped) is read like a Task; an artifact update has no
+/// message, so only its artifact is consulted.
 ///
 /// **`history[]` is deliberately excluded.** A Task's history is the record of
 /// the whole interaction, so it contains the *caller's* messages as well as the
@@ -919,22 +964,50 @@ pub fn extract_a2a_identity_from_message_with_uri(
 fn response_identity_candidates(result: &JsonValue) -> Vec<&JsonValue> {
     let result = crate::a2a::extensions::unwrap_task_result(result);
 
+    let mut candidates: Vec<&JsonValue> = response_message(result)
+        .into_iter()
+        .collect();
+
+    for artifact in result
+        .get("artifacts")
+        .and_then(|a| a.as_array())
+        .into_iter()
+        .flatten()
+        .chain(result.get("artifact"))
+    {
+        candidates.push(artifact);
+    }
+
+    candidates
+}
+
+/// Location 1 of [`response_identity_candidates`] only: the agent's status
+/// message, without `artifacts[]`.
+fn response_message_candidates(result: &JsonValue) -> Vec<&JsonValue> {
+    response_message(crate::a2a::extensions::unwrap_task_result(result))
+        .into_iter()
+        .collect()
+}
+
+/// The agent's message in an unwrapped response `result`: `result.message`,
+/// `status.message` of a Task or status update, or `result` itself when it is a
+/// bare Message. `None` for an artifact update.
+fn response_message(result: &JsonValue) -> Option<&JsonValue> {
     let kind = result
         .get("kind")
         .and_then(|k| k.as_str())
         .unwrap_or("");
 
-    let mut candidates: Vec<&JsonValue> = Vec::new();
-
-    let primary = result
+    result
         .get("message")
         .or_else(|| match kind {
-            // Task response: identity lives on status.message
-            "task" => result
+            // Task response or task status update: identity lives on status.message
+            "task" | "status-update" => result
                 .get("status")
                 .and_then(|s| s.get("message")),
             // Message response: identity lives directly on result
             "message" => Some(result),
+            "artifact-update" => None,
             // No kind field — infer from structure
             _ => {
                 if result.get("status").is_some() {
@@ -942,26 +1015,18 @@ fn response_identity_candidates(result: &JsonValue) -> Vec<&JsonValue> {
                     result
                         .get("status")
                         .and_then(|s| s.get("message"))
+                } else if result
+                    .get("artifact")
+                    .is_some()
+                {
+                    // Looks like an artifact update
+                    None
                 } else {
                     // Treat as a bare Message
                     Some(result)
                 }
             }
-        });
-    if let Some(msg) = primary {
-        candidates.push(msg);
-    }
-
-    for artifact in result
-        .get("artifacts")
-        .and_then(|a| a.as_array())
-        .into_iter()
-        .flatten()
-    {
-        candidates.push(artifact);
-    }
-
-    candidates
+        })
 }
 
 /// Shared extraction logic for a single A2A/AP2 message object.
@@ -1144,6 +1209,28 @@ mod tests {
                 "{kind:?}: {resolved:?}"
             );
         }
+    }
+
+    #[test]
+    fn only_a_payload_extraction_slot_reads_the_response_body() {
+        let payload = payload_extraction_surface("https://agent.example");
+        assert!(slot_reads_response_body(&payload, IdentitySlot::Protected));
+        assert!(!slot_reads_response_body(&payload, IdentitySlot::External));
+        assert!(!slot_reads_response_body(&from_jwt_claim_surface(), IdentitySlot::Protected));
+        assert!(!slot_reads_response_body(
+            &crate::config::agent_surface::AgentSurface::default(),
+            IdentitySlot::Protected
+        ));
+
+        let mut external = crate::config::agent_surface::AgentSurface::default();
+        external
+            .identity_slots
+            .external = payload
+            .identity_slots
+            .protected
+            .clone();
+        assert!(slot_reads_response_body(&external, IdentitySlot::External));
+        assert!(!slot_reads_response_body(&external, IdentitySlot::Protected));
     }
 
     #[test]
@@ -1577,6 +1664,47 @@ mod tests {
             "artifacts": [{ "artifactId": "echo", "parts": [], "metadata": { EXT_URI: { "did": caller_did } } }]
         }));
         assert_eq!(extract_a2a_identity_from_message(&json).unwrap(), json!({ "did": caller_did }));
+    }
+
+    #[test]
+    fn a2a_stream_status_updates_resolve_from_their_status_message() {
+        let message = json!({
+            "role": "ROLE_AGENT",
+            "parts": [],
+            "extensions": [EXT_URI],
+            "metadata": { EXT_URI: { "did": "did:web:status" } }
+        });
+        for result in [
+            json!({ "taskId": "t", "status": { "state": "TASK_STATE_COMPLETED", "message": message } }),
+            json!({ "kind": "status-update", "taskId": "t", "final": true, "status": { "state": "completed", "message": message } }),
+        ] {
+            assert_eq!(
+                extract_a2a_identity_from_message(&json!({ "result": result })).unwrap(),
+                json!({ "did": "did:web:status" })
+            );
+        }
+    }
+
+    #[test]
+    fn a2a_stream_artifact_updates_resolve_from_their_artifact_only() {
+        let artifact =
+            json!({ "artifactId": "a", "parts": [], "metadata": { EXT_URI: { "did": "did:web:artifact" } } });
+        for result in [
+            json!({ "taskId": "t", "artifact": artifact, "metadata": { EXT_URI: { "did": "did:web:event" } } }),
+            json!({ "kind": "artifact-update", "taskId": "t", "artifact": artifact, "metadata": { EXT_URI: { "did": "did:web:event" } } }),
+        ] {
+            assert_eq!(
+                extract_a2a_identity_from_message(&json!({ "result": result })).unwrap(),
+                json!({ "did": "did:web:artifact" }),
+                "the event's own metadata is not a message location"
+            );
+        }
+    }
+
+    #[test]
+    fn a2a_stream_artifact_update_without_identity_errors() {
+        let json = json!({ "result": { "taskId": "t", "artifact": { "artifactId": "a", "parts": [] } } });
+        assert!(matches!(extract_a2a_identity_from_message(&json), Err(IdentityExtractionError::NoMetadata)));
     }
 
     #[test]

@@ -16,6 +16,7 @@ use crate::surfaces::AgentSurfaceStore;
 use crate::tenancy::{
     PatTenantContext, ResourceKind, can_access, can_mutate, scope_allows_resource, tenant_for_create,
 };
+use crate::trust_registry_verification::recorder_status::{RecorderStatus, global_store};
 
 fn tenant_context(context: &Option<Extension<PatTenantContext>>) -> Option<&PatTenantContext> {
     context
@@ -671,6 +672,37 @@ pub async fn get_surface(
         Some(_) => Err(SurfaceApiError::NotFound(format!("Surface '{}' not found", surface_id))),
         None => Err(SurfaceApiError::NotFound(format!("Surface '{}' not found", surface_id))),
     }
+}
+
+#[derive(Serialize)]
+pub struct TrustRecorderStatusResponse {
+    pub status: Option<RecorderStatus>,
+}
+
+/// Last known Trust Recorder outcome of a surface: the most recently attempted of its
+/// managed agents. `status` is `null` until the recorder has run, and while the surface
+/// has no Trust Recorder.
+pub async fn get_trust_recorder_status(
+    Path(surface_id): Path<String>,
+    State(state): State<IdentityApiState>,
+    context: Option<Extension<PatTenantContext>>,
+    scope: Option<Extension<PatResourceScope>>,
+) -> Result<Json<TrustRecorderStatusResponse>, SurfaceApiError> {
+    let (_, surface) =
+        load_surface_or_404(&state, &surface_id, tenant_context(&context), resource_scope(&scope), SurfaceAccess::Read)
+            .await?;
+    let has_recorder = surface
+        .trust_recorder()
+        .is_some_and(|recorder| !recorder.entries.is_empty());
+    let status = match global_store() {
+        Some(store) if has_recorder => {
+            store
+                .latest_for_surface(&surface.surface_id)
+                .await
+        }
+        _ => None,
+    };
+    Ok(Json(TrustRecorderStatusResponse { status }))
 }
 
 /// Validate (and resolve) every x402 payment policy attached to the
@@ -1380,9 +1412,35 @@ async fn validate_and_save_surface(
         crate::trust_registries::reference_fields::spawn_surface_rename_publish(surface.clone());
     }
 
+    if existing.is_some_and(|existing| trust_recorder_changed(existing, &surface))
+        && let Some(recorder_status) = global_store()
+    {
+        recorder_status
+            .clear_surface(&surface.surface_id)
+            .await;
+    }
+
     apply_surface_change(state, SurfaceChange::Upsert(&surface)).await;
 
     Ok(surface)
+}
+
+/// Whether an edit added, removed or changed the entries of the surface's Trust Recorder.
+/// No recorder and a recorder without entries are the same.
+fn trust_recorder_changed(
+    before: &AgentSurface,
+    after: &AgentSurface,
+) -> bool {
+    let entries = |surface: &AgentSurface| {
+        serde_json::to_value(
+            surface
+                .trust_recorder()
+                .map(|recorder| recorder.entries.as_slice())
+                .unwrap_or_default(),
+        )
+        .unwrap_or_default()
+    };
+    entries(before) != entries(after)
 }
 
 /// Per RFC 7396 the media type for a JSON Merge Patch body MUST be
@@ -1578,6 +1636,11 @@ pub async fn delete_surface(
 
             info!("Deleted agent surface '{}' (surface_id={})", surface.name, surface_id);
 
+            if let Some(recorder_status) = global_store() {
+                recorder_status
+                    .clear_surface(&surface_id)
+                    .await;
+            }
             apply_surface_change(&state, SurfaceChange::Delete(&surface_id)).await;
 
             Ok(Json(DeleteSurfaceResponse {
@@ -1639,7 +1702,21 @@ enum SurfaceChange<'a> {
 /// Failures are logged but never propagated: the surface has already
 /// been persisted, so an operator can always recover by hitting
 /// `/v1/config/reload` explicitly.
+///
+/// Holds the surface reload lock; see [`apply_surface_change_while_locked`].
 async fn apply_surface_change(
+    state: &IdentityApiState,
+    change: SurfaceChange<'_>,
+) {
+    let _reloading = state
+        .surface_reload_lock
+        .lock()
+        .await;
+    apply_surface_change_while_locked(state, change).await;
+}
+
+/// [`apply_surface_change`] for a caller already holding the surface reload lock.
+async fn apply_surface_change_while_locked(
     state: &IdentityApiState,
     change: SurfaceChange<'_>,
 ) {
@@ -1800,20 +1877,49 @@ async fn apply_surface_change(
     }
 }
 
-// wraps original function to avoid leaking implementation details
-pub(crate) async fn apply_surface_upsert_from_storage(
-    state: &IdentityApiState,
-    surface: AgentSurface,
-) {
-    apply_surface_change(state, SurfaceChange::Upsert(&surface)).await;
-}
-
-// wraps original function to avoid leaking implementation details
-pub(crate) async fn apply_surface_delete_from_storage(
+/// Apply the surface as currently stored, or remove it when it is no longer stored.
+/// The surface reload lock is held from the read until the change is applied, so a
+/// change raised before a configuration reload cannot overwrite what that reload
+/// applied. An A2A surface stored without its own settings is served with the
+/// carried-over ones, as a load gives them; nothing is written back, because the
+/// load that gives the settings also stores them.
+pub(crate) async fn apply_surface_from_storage(
     state: &IdentityApiState,
     surface_id: &str,
 ) {
-    apply_surface_change(state, SurfaceChange::Delete(surface_id)).await;
+    let Some(store) = state
+        .agent_surface_store
+        .as_deref()
+    else {
+        return;
+    };
+    let _reloading = state
+        .surface_reload_lock
+        .lock()
+        .await;
+    let surface = match store.get(surface_id).await {
+        Ok(Some(surface)) => surface,
+        Ok(None) => {
+            apply_surface_change_while_locked(state, SurfaceChange::Delete(surface_id)).await;
+            return;
+        }
+        Err(error) => {
+            error!(
+                surface = %surface_id,
+                "Could not read the surface to apply a change from storage: {error}. \
+                 Call POST /v1/config/reload for the change to take effect."
+            );
+            return;
+        }
+    };
+    let mut surfaces = vec![surface];
+    crate::surfaces::carry_over_a2a_settings(store, &mut surfaces, false, || {
+        crate::surfaces::RetiredA2aSwitches::read(&state.bootstrap_config)
+    })
+    .await;
+    for surface in &surfaces {
+        apply_surface_change_while_locked(state, SurfaceChange::Upsert(surface)).await;
+    }
 }
 
 /// Trigger a full in-process gateway reload. Used as the slow-path
@@ -3636,5 +3742,76 @@ mod tenancy_tests {
     fn an_appliance_wide_caller_writes_any_surface() {
         assert!(surface_writable(None, "operator-surface", None, None));
         assert!(surface_writable(Some("tenant-a"), "boris-s1", None, None));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::types::{TrustRecorderConfig, TrustRecorderEntry};
+
+    fn entry(registry: &str) -> TrustRecorderEntry {
+        TrustRecorderEntry {
+            trust_registry_id: registry.into(),
+            issuer_did: "did:example:issuer".into(),
+            authority_did: "did:example:authority".into(),
+            include_owned_agent: true,
+            custom_resources: vec![],
+        }
+    }
+
+    fn surface_recording(registries: &[&str]) -> AgentSurface {
+        let mut surface = AgentSurface::default();
+        surface
+            .access_point
+            .trust_recorder = Some(TrustRecorderConfig {
+            entries: registries
+                .iter()
+                .map(|registry| entry(registry))
+                .collect(),
+        });
+        surface
+    }
+
+    #[test]
+    fn an_unchanged_recorder_is_not_a_change() {
+        assert!(!trust_recorder_changed(&surface_recording(&["tr-1"]), &surface_recording(&["tr-1"])));
+        assert!(!trust_recorder_changed(&AgentSurface::default(), &AgentSurface::default()));
+    }
+
+    #[test]
+    fn no_recorder_and_a_recorder_without_entries_are_the_same() {
+        assert!(!trust_recorder_changed(&AgentSurface::default(), &surface_recording(&[])));
+        assert!(!trust_recorder_changed(&surface_recording(&[]), &AgentSurface::default()));
+    }
+
+    #[test]
+    fn adding_removing_or_changing_entries_is_a_change() {
+        assert!(trust_recorder_changed(&AgentSurface::default(), &surface_recording(&["tr-1"])));
+        assert!(trust_recorder_changed(&surface_recording(&["tr-1"]), &AgentSurface::default()));
+        assert!(trust_recorder_changed(&surface_recording(&["tr-1"]), &surface_recording(&["tr-2"])));
+        assert!(trust_recorder_changed(&surface_recording(&["tr-1"]), &surface_recording(&["tr-1", "tr-2"])));
+    }
+
+    #[test]
+    fn an_edit_to_an_entry_field_is_a_change() {
+        let before = surface_recording(&["tr-1"]);
+        let mut after = surface_recording(&["tr-1"]);
+        after
+            .access_point
+            .trust_recorder
+            .as_mut()
+            .unwrap()
+            .entries[0]
+            .authority_did = "did:example:other".into();
+        assert!(trust_recorder_changed(&before, &after));
+    }
+
+    #[test]
+    fn changes_outside_the_recorder_are_not_a_change() {
+        let before = surface_recording(&["tr-1"]);
+        let mut after = surface_recording(&["tr-1"]);
+        after.name = "renamed".into();
+        assert!(!trust_recorder_changed(&before, &after));
     }
 }

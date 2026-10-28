@@ -1,5 +1,6 @@
 import { useCallback, useMemo } from 'react';
 import type { Identity } from '../../types';
+import { matchesRecorderFilter, type RecorderFilter } from './recorderFilter';
 
 type SurfaceRef = Pick<
   Identity,
@@ -19,11 +20,13 @@ interface UseIdentityRowsOptions<T extends Identity> {
   channels?: Array<{ config_id: string; name: string }>;
   searchTerm: string;
   showUnnamedOnly: boolean;
+  recorderFilter?: RecorderFilter;
 }
 
 export interface IdentityRowsView<T extends Identity> {
   filteredIdentities: T[];
   hasNamingMetadata: boolean;
+  hasRecorderStatus: boolean;
   unnamedCount: number;
   liveSurfaceNames: Map<string, string>;
   surfaceLinkFor: (identity: SurfaceRef) => SurfaceLink | null;
@@ -34,6 +37,7 @@ export function useIdentityRows<T extends Identity>({
   channels,
   searchTerm,
   showUnnamedOnly,
+  recorderFilter = 'all',
 }: UseIdentityRowsOptions<T>): IdentityRowsView<T> {
   const hasNamingMetadata = useMemo(
     () =>
@@ -43,6 +47,11 @@ export function useIdentityRows<T extends Identity>({
           identity.display_name !== undefined ||
           identity.name_conflict !== undefined
       ),
+    [identities]
+  );
+
+  const hasRecorderStatus = useMemo(
+    () => identities.some(identity => Boolean(identity.trust_recorder)),
     [identities]
   );
 
@@ -75,6 +84,7 @@ export function useIdentityRows<T extends Identity>({
     const searchLower = searchTerm.trim().toLowerCase();
     return identities.filter(identity => {
       if (hasNamingMetadata && showUnnamedOnly && !isUnnamed(identity)) return false;
+      if (hasRecorderStatus && !matchesRecorderFilter(identity, recorderFilter)) return false;
       if (!searchLower) return true;
       return [
         identity.name,
@@ -86,11 +96,19 @@ export function useIdentityRows<T extends Identity>({
         identity.credential_principal?.name,
       ].some(value => typeof value === 'string' && value.toLowerCase().includes(searchLower));
     });
-  }, [identities, searchTerm, hasNamingMetadata, showUnnamedOnly]);
+  }, [
+    identities,
+    searchTerm,
+    hasNamingMetadata,
+    showUnnamedOnly,
+    hasRecorderStatus,
+    recorderFilter,
+  ]);
 
   return {
     filteredIdentities,
     hasNamingMetadata,
+    hasRecorderStatus,
     unnamedCount,
     liveSurfaceNames,
     surfaceLinkFor,

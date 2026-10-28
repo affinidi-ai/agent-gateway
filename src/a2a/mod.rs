@@ -9,11 +9,12 @@ pub mod errors;
 pub mod extensions;
 pub mod methods;
 pub mod schema;
+pub mod streaming;
 pub mod url_rewriter;
 pub mod validation;
 pub mod version;
 
-pub use methods::{canonical_method, is_a2a_method, recognised_canonical};
+pub use methods::{canonical_method, is_a2a_method, is_streaming_method, recognised_canonical};
 pub use version::{ADVERTISED_VERSION, negotiate_from_headers};
 
 pub use auth::clear_secret_cache;
@@ -29,7 +30,8 @@ pub use errors::{
 
 pub use extensions::{
     inject_credential_into_agent_card, inject_custom_metadata_extension, inject_header_metadata_extension,
-    inject_identity_credential_into_response, replace_credential_in_agent_card, upsert_credential_into_agent_card,
+    inject_identity_credential_into_response, replace_credential_in_agent_card, response_claims_identity,
+    upsert_credential_into_agent_card,
 };
 
 #[cfg(feature = "didwebvh")]

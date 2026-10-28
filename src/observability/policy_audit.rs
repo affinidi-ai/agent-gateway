@@ -42,8 +42,8 @@ pub struct PolicyDecisionSummary {
     /// "access_point" | "transit_point" | "fabric" — which request flow produced
     /// the decision (ingress vs egress vs fabric-received).
     pub flow: &'static str,
-    /// Human-readable policy name. Operator-assigned definition name when set;
-    /// falls back to the Rego package name (e.g. "surface.policy").
+    /// Human-readable policy name: the operator-assigned definition name, else
+    /// the definition id, else a layer label such as "Surface policy".
     pub policy_name: String,
     /// Policy/definition identifier (e.g. the Rego package `gateway.policy` /
     /// `surface.policy`, or the definition id for response/MCP scopes).
@@ -97,6 +97,83 @@ tokio::task_local! {
     /// so a request's audit events + policy decisions share a `trace_id` even
     /// when no OTEL exporter is configured. Absent elsewhere (`try_with` errs).
     pub static REQUEST_TRACE_ID: String;
+
+    /// Id of the gateway request being served, installed at each entry point
+    /// (Access Point, Transit Point, fabric receive, authenticated management
+    /// API request) and stamped on every audit
+    /// record the request produces. Always minted here, never read from a
+    /// header or token.
+    pub static REQUEST_ID: String;
+}
+
+/// A fresh request id: a W3C span id (16 lowercase hex characters, never all
+/// zero).
+pub fn new_request_id() -> String {
+    loop {
+        let bytes = rand::random::<[u8; 8]>();
+        if bytes != [0u8; 8] {
+            return hex::encode(bytes);
+        }
+    }
+}
+
+/// The id of the request being served, when an entry point scoped one.
+pub fn current_request_id() -> Option<String> {
+    REQUEST_ID
+        .try_with(String::clone)
+        .ok()
+}
+
+/// Runs `future` as request `id`: every audit record it writes carries the id.
+/// An entry point serves its request through this and passes the response to
+/// [`response_in_request`].
+pub async fn in_request<F: std::future::Future>(
+    id: String,
+    future: F,
+) -> F::Output {
+    REQUEST_ID
+        .scope(id, future)
+        .await
+}
+
+/// `response` with a streamed body read as request `id`. A streamed body (an
+/// SSE stream) is read after its handler returned, outside the handler's
+/// scope, so the records written per event would otherwise lose the id. A
+/// body of known length is left as it is.
+pub fn response_in_request(
+    id: String,
+    response: axum::response::Response,
+) -> axum::response::Response {
+    use axum::body::HttpBody;
+    use futures::StreamExt;
+
+    if response
+        .body()
+        .size_hint()
+        .exact()
+        .is_some()
+    {
+        return response;
+    }
+    response.map(|body| {
+        let mut data = body.into_data_stream();
+        axum::body::Body::from_stream(futures::stream::poll_fn(move |cx| {
+            REQUEST_ID.sync_scope(id.clone(), || data.poll_next_unpin(cx))
+        }))
+    })
+}
+
+/// Spawns `future` as the request being served, so the audit records it
+/// writes carry the request's id, as the task-local does not cross a spawn.
+pub fn spawn_in_request<F>(future: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    match current_request_id() {
+        Some(id) => tokio::spawn(REQUEST_ID.scope(id, future)),
+        None => tokio::spawn(future),
+    }
 }
 
 /// Push a decision into the per-request collector (no-op when no scope is active).
@@ -262,10 +339,13 @@ pub struct PolicyDecisionEvent<'a> {
     /// policy record. `None` for the built-in allow-all default (no definition).
     pub policy_definition_id: Option<&'a str>,
     /// Human-readable policy name (e.g. the operator-assigned definition name).
-    /// When `None`, falls back to `policy_id` in the VP `policyDecisions` array.
+    /// When `None`, the recorded name falls back to the definition id, then to a
+    /// label for the policy layer.
     pub policy_name: Option<&'a str>,
     /// Surface/channel identifier the decision applies to.
     pub surface_id: Option<&'a str>,
+    /// Name of the surface the decision applies to, recorded as `channel_name`.
+    pub surface_name: Option<&'a str>,
     /// Per-request trace identifier for log/trace correlation.
     pub trace_id: Option<&'a str>,
     /// HTTP method of the request under evaluation.
@@ -319,6 +399,32 @@ pub fn record_tools_list_filtering(
         removed_tools: Some(&removed),
         ..context
     });
+}
+
+/// The best name the gateway knows for the policy that decided: the
+/// operator's definition name, else the definition id, else a readable label
+/// for the layer. A tool policy that matched no definition keeps the tool name.
+fn decision_policy_name(event: &PolicyDecisionEvent<'_>) -> String {
+    fn known(value: Option<&str>) -> Option<&str> {
+        value.filter(|v| !v.is_empty())
+    }
+    if let Some(name) = known(event.policy_name).or(known(event.policy_definition_id)) {
+        return name.to_string();
+    }
+    match known(event.policy_id) {
+        Some(crate::policies::GATEWAY_POLICY_PACKAGE) => "Gateway policy",
+        Some(crate::policies::SURFACE_POLICY_PACKAGE) => "Surface policy",
+        Some("mcp_tool_gating") => "MCP tool gating",
+        Some(other) => other,
+        None => match event.scope {
+            PolicyScope::Gateway => "Gateway policy",
+            PolicyScope::Surface => "Surface policy",
+            PolicyScope::McpTool => "MCP tool policy",
+            PolicyScope::Response => "Response policy",
+            PolicyScope::McpToolList => "MCP tool list filter",
+        },
+    }
+    .to_string()
 }
 
 pub fn record_policy_decision(event: PolicyDecisionEvent<'_>) {
@@ -379,6 +485,7 @@ pub fn record_policy_decision(event: PolicyDecisionEvent<'_>) {
     let policy_content_hash = event
         .policy_content_hash
         .unwrap_or_default();
+    let policy_name = decision_policy_name(&event);
 
     if allowed {
         tracing::debug!(
@@ -433,7 +540,7 @@ pub fn record_policy_decision(event: PolicyDecisionEvent<'_>) {
             scope,
             decision,
             policy_id,
-            event.policy_name,
+            Some(policy_name.as_str()),
             event.policy_definition_id,
             if allowed {
                 None
@@ -445,6 +552,9 @@ pub fn record_policy_decision(event: PolicyDecisionEvent<'_>) {
             } else {
                 Some(surface_id)
             },
+            event
+                .surface_name
+                .filter(|name| !name.is_empty()),
             if caller_did.is_empty() {
                 None
             } else {
@@ -473,17 +583,11 @@ pub fn record_policy_decision(event: PolicyDecisionEvent<'_>) {
     // populated when a scope is active and is never embedded in a minted VP.
     let deny_reason_val = (!allowed && !reason.is_empty()).then(|| reason.to_string());
     let id = compute_decision_id(scope, policy_id, decision, deny_reason_val.as_deref(), resolved_trace_id.as_deref());
-    // Use the operator-assigned definition name when available; fall back to the Rego package name.
-    let policy_name_val = event
-        .policy_name
-        .filter(|n| !n.is_empty())
-        .unwrap_or(policy_id)
-        .to_string();
     push_policy_decision(PolicyDecisionSummary {
         id,
         scope: event.scope.as_str(),
         flow,
-        policy_name: policy_name_val,
+        policy_name,
         policy_id: if policy_id.is_empty() {
             None
         } else {
@@ -532,6 +636,89 @@ mod tests {
         assert_eq!(PolicyScope::Surface.as_str(), "surface");
         assert_eq!(PolicyScope::McpTool.as_str(), "mcp_tool");
         assert_eq!(PolicyScope::Response.as_str(), "response");
+    }
+
+    #[test]
+    fn a_new_request_id_is_a_w3c_span_id() {
+        let ids: Vec<String> = (0..64)
+            .map(|_| new_request_id())
+            .collect();
+        for id in &ids {
+            assert_eq!(id.len(), 16, "{id}");
+            assert!(
+                id.chars()
+                    .all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+                "{id}"
+            );
+            assert_ne!(id, "0000000000000000");
+        }
+        let distinct: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(distinct.len(), ids.len());
+        let thirteenth: std::collections::HashSet<char> = ids
+            .iter()
+            .filter_map(|id| id.chars().nth(12))
+            .collect();
+        assert!(thirteenth.len() > 1, "every character is random, none fixed by a UUID version");
+    }
+
+    #[tokio::test]
+    async fn the_current_request_id_is_the_scoped_one_and_none_outside() {
+        assert_eq!(current_request_id(), None);
+        REQUEST_ID
+            .scope("0123456789abcdef".to_string(), async {
+                assert_eq!(current_request_id().as_deref(), Some("0123456789abcdef"));
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_streamed_body_is_read_as_its_request() {
+        use futures::StreamExt;
+
+        let chunks = futures::stream::repeat_with(|| {
+            Ok::<_, std::convert::Infallible>(bytes::Bytes::from(current_request_id().unwrap_or_default()))
+        })
+        .take(2);
+        let response = axum::response::Response::new(axum::body::Body::from_stream(chunks));
+
+        let response = response_in_request("0123456789abcdef".to_string(), response);
+        let body = axum::body::to_bytes(response.into_body(), 64)
+            .await
+            .unwrap();
+
+        assert_eq!(body, "0123456789abcdef0123456789abcdef");
+    }
+
+    #[test]
+    fn a_body_of_known_length_is_left_as_it_is() {
+        use axum::body::HttpBody;
+
+        let response = axum::response::Response::new(axum::body::Body::from("{}"));
+        let response = response_in_request("0123456789abcdef".to_string(), response);
+
+        assert_eq!(
+            response
+                .body()
+                .size_hint()
+                .exact(),
+            Some(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_task_spawned_in_a_request_keeps_its_id() {
+        let spawned = in_request("0123456789abcdef".to_string(), async {
+            spawn_in_request(async { current_request_id() })
+                .await
+                .unwrap()
+        })
+        .await;
+        let outside = spawn_in_request(async { current_request_id() })
+            .await
+            .unwrap();
+
+        assert_eq!(spawned.as_deref(), Some("0123456789abcdef"));
+        assert_eq!(outside, None);
     }
 
     #[test]
@@ -651,7 +838,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn summary_policy_name_falls_back_to_id_when_unset() {
+    async fn summary_policy_name_falls_back_to_the_layer_label_when_unset() {
         let collector = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         POLICY_DECISION_COLLECTOR
             .scope(collector.clone(), async {
@@ -674,8 +861,7 @@ mod tests {
                 .as_deref(),
             Some("gateway.policy")
         );
-        // With no operator name, the summary name falls back to the policy id.
-        assert_eq!(decisions[0].policy_name, "gateway.policy");
+        assert_eq!(decisions[0].policy_name, "Gateway policy");
     }
 
     use std::sync::{Arc, Mutex};
@@ -768,6 +954,7 @@ mod tests {
                 policy_definition_id: Some("def-uuid-7"),
                 policy_name: None,
                 surface_id: Some("surface-a"),
+                surface_name: Some("Surface A"),
                 trace_id: Some("trace-xyz"),
                 http_method: Some("POST"),
                 path: Some("/v1/agent"),
@@ -876,6 +1063,109 @@ mod tests {
             }
             other => panic!("expected a policy decision, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_decision_names_its_policy_by_the_best_name_known() {
+        let name = |scope, policy_name, policy_definition_id, policy_id| {
+            decision_policy_name(&PolicyDecisionEvent {
+                scope,
+                policy_name,
+                policy_definition_id,
+                policy_id,
+                ..Default::default()
+            })
+        };
+        assert_eq!(
+            name(
+                PolicyScope::Surface,
+                Some("Partner policy"),
+                Some("def-1"),
+                Some(crate::policies::SURFACE_POLICY_PACKAGE)
+            ),
+            "Partner policy"
+        );
+        assert_eq!(
+            name(PolicyScope::Surface, Some(""), Some("def-1"), Some(crate::policies::SURFACE_POLICY_PACKAGE)),
+            "def-1"
+        );
+        for (scope, policy_id, label) in [
+            (PolicyScope::Gateway, Some(crate::policies::GATEWAY_POLICY_PACKAGE), "Gateway policy"),
+            (PolicyScope::Surface, Some(crate::policies::SURFACE_POLICY_PACKAGE), "Surface policy"),
+            (PolicyScope::McpTool, Some("mcp_tool_gating"), "MCP tool gating"),
+            (PolicyScope::McpTool, Some("delete_repo"), "delete_repo"),
+            (PolicyScope::McpTool, None, "MCP tool policy"),
+            (PolicyScope::McpTool, Some(""), "MCP tool policy"),
+            (PolicyScope::Response, None, "Response policy"),
+            (PolicyScope::McpToolList, None, "MCP tool list filter"),
+            (PolicyScope::Gateway, None, "Gateway policy"),
+            (PolicyScope::Surface, None, "Surface policy"),
+        ] {
+            assert_eq!(name(scope, None, None, policy_id), label, "{scope:?} {policy_id:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn every_decision_record_carries_a_policy_name() {
+        let ((), events) = crate::audit::producer::capture(async {
+            record_policy_decision(PolicyDecisionEvent {
+                scope: PolicyScope::Gateway,
+                allow: false,
+                policy_id: Some(crate::policies::GATEWAY_POLICY_PACKAGE),
+                ..Default::default()
+            });
+            record_policy_decision(PolicyDecisionEvent {
+                scope: PolicyScope::McpTool,
+                allow: true,
+                ..Default::default()
+            });
+        })
+        .await;
+
+        let names: Vec<Option<String>> = events
+            .iter()
+            .map(|event| match &event.event {
+                crate::delegation_vault::audit::DelegationAuditAction::PolicyDecision { policy_name, .. } => {
+                    policy_name.clone()
+                }
+                other => panic!("expected a policy decision, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(names, [Some("Gateway policy".to_string()), Some("MCP tool policy".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn a_decision_record_names_its_surface() {
+        let ((), events) = crate::audit::producer::capture(async {
+            record_policy_decision(PolicyDecisionEvent {
+                scope: PolicyScope::Surface,
+                allow: false,
+                surface_id: Some("0b6f7a52-surface-uuid"),
+                surface_name: Some("Payments"),
+                ..Default::default()
+            });
+            record_policy_decision(PolicyDecisionEvent {
+                scope: PolicyScope::Gateway,
+                allow: true,
+                ..Default::default()
+            });
+        })
+        .await;
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0]
+                .channel_name
+                .as_deref(),
+            Some("Payments")
+        );
+        assert_eq!(
+            events[0]
+                .surface_id
+                .as_deref(),
+            Some("0b6f7a52-surface-uuid")
+        );
+        assert_eq!(events[1].channel_name, None, "no surface, no name");
     }
 
     #[tokio::test]

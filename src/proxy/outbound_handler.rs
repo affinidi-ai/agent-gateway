@@ -706,6 +706,20 @@ async fn outbound_proxy_handler_with_mcp_versions(
     req: Request,
     versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
 ) -> Result<Response, OutboundPipelineError> {
+    use crate::observability::policy_audit::{in_request, new_request_id, response_in_request};
+
+    let id = new_request_id();
+    in_request(id.clone(), Box::pin(outbound_proxy_handler_in_request_scope(addr, state, req, versions)))
+        .await
+        .map(|response| response_in_request(id, response))
+}
+
+async fn outbound_proxy_handler_in_request_scope(
+    addr: SocketAddr,
+    state: OutboundProxyState,
+    req: Request,
+    versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
+) -> Result<Response, OutboundPipelineError> {
     let mut subscription_access =
         crate::mcp::subscriptions::SubscriptionLifetime::new(std::time::Duration::from_secs(86_400), None);
     let mut ctx = OutboundPipelineContext::new(addr, req, &state)?;
@@ -2810,6 +2824,7 @@ struct OutboundPolicyAudit<'a> {
     policy_definition_id: Option<&'a str>,
     policy_name: Option<&'a str>,
     surface_id: Option<&'a str>,
+    surface_name: Option<&'a str>,
     http_method: &'a str,
     path: &'a str,
     actor_did: Option<&'a str>,
@@ -2853,6 +2868,7 @@ impl OutboundPolicyAudit<'_> {
             policy_definition_id: self.policy_definition_id,
             policy_name: self.policy_name,
             surface_id: self.surface_id,
+            surface_name: self.surface_name,
             http_method: Some(self.http_method),
             path: Some(self.path),
             actor_did: self.actor_did,
@@ -2907,11 +2923,11 @@ async fn step_gateway_opa_policy(
     let (policy_definition_id, policy_name, policy_version, policy_hash) = match gw_pm.policy_evidence(&gateway_id) {
         Some((id, version, hash)) => {
             let name = gw_pm
-                .resolve_policy_name_or_default(id.as_deref())
+                .resolve_policy_name(id.as_deref())
                 .await;
             (id, name, version, Some(hash))
         }
-        None => (None, crate::policies::GATEWAY_POLICY_PACKAGE.to_string(), None, None),
+        None => (None, None, None, None),
     };
     let caller = outbound_caller(ctx);
 
@@ -2919,8 +2935,9 @@ async fn step_gateway_opa_policy(
         scope: crate::observability::PolicyScope::Gateway,
         policy_id: crate::policies::GATEWAY_POLICY_PACKAGE,
         policy_definition_id: policy_definition_id.as_deref(),
-        policy_name: Some(policy_name.as_str()),
+        policy_name: policy_name.as_deref(),
         surface_id: ctx.surface.config_id(),
+        surface_name: Some(ctx.surface.name.as_str()),
         http_method: ctx.original_method.as_str(),
         path: ctx.request_path.as_str(),
         actor_did: outbound_actor_did(ctx),
@@ -2965,6 +2982,7 @@ fn record_surface_policy_unavailable(
         policy_definition_id,
         policy_name: None,
         surface_id: ctx.surface.config_id(),
+        surface_name: Some(ctx.surface.name.as_str()),
         http_method: ctx.original_method.as_str(),
         path: ctx.request_path.as_str(),
         actor_did: outbound_actor_did(ctx),
@@ -3054,8 +3072,9 @@ async fn step_surface_opa_policy(
         scope: crate::observability::PolicyScope::Surface,
         policy_id: crate::policies::SURFACE_POLICY_PACKAGE,
         policy_definition_id: def_id,
-        policy_name: Some(policy_name.as_str()),
+        policy_name: policy_name.as_deref(),
         surface_id: Some(config_id),
+        surface_name: Some(ctx.surface.name.as_str()),
         http_method: ctx.original_method.as_str(),
         path: ctx.request_path.as_str(),
         actor_did: outbound_actor_did(ctx),
@@ -3196,8 +3215,9 @@ async fn step_transit_point_opa_policy(
         scope: crate::observability::PolicyScope::Surface,
         policy_id: crate::policies::SURFACE_POLICY_PACKAGE,
         policy_definition_id: Some(tp_def_id.as_str()),
-        policy_name: Some(policy_name.as_str()),
+        policy_name: policy_name.as_deref(),
         surface_id: Some(config_id),
+        surface_name: Some(ctx.surface.name.as_str()),
         http_method: ctx.original_method.as_str(),
         path: ctx.request_path.as_str(),
         actor_did: outbound_actor_did(ctx),
@@ -3293,6 +3313,7 @@ async fn step_transit_mcp_tool_gating(
             reason: Some("tools/call without a readable tool name under per-transit-point MCP tool gating"),
             policy_id: Some("mcp_tool_gating"),
             surface_id: Some(config_id),
+            surface_name: Some(ctx.surface.name.as_str()),
             trace_id: Some(ctx.request_id.as_str()),
             http_method: Some(ctx.original_method.as_str()),
             path: Some(ctx.request_path.as_str()),
@@ -3342,6 +3363,7 @@ async fn step_transit_mcp_tool_gating(
         },
         policy_id: Some("mcp_tool_gating"),
         surface_id: Some(config_id),
+        surface_name: Some(ctx.surface.name.as_str()),
         trace_id: Some(ctx.request_id.as_str()),
         http_method: Some(ctx.original_method.as_str()),
         path: Some(ctx.request_path.as_str()),
@@ -3483,6 +3505,7 @@ fn step_transit_point_response_policy(
             .name
             .as_deref(),
         surface_id: Some(config_id),
+        surface_name: Some(ctx.surface.name.as_str()),
         http_method: ctx.original_method.as_str(),
         path: ctx.request_path.as_str(),
         actor_did: outbound_actor_did(ctx),
@@ -5451,6 +5474,7 @@ mod tests {
                     policy_definition_id: None,
                     policy_name: None,
                     surface_id: Some("surf-1"),
+                    surface_name: Some("Surface one"),
                     http_method: "GET",
                     path: "/payments/pioneer/trust",
                     actor_did: Some("did:web:agent"),
@@ -5469,6 +5493,7 @@ mod tests {
                     policy_definition_id: Some("def-uuid-7"),
                     policy_name: Some("Partner egress policy"),
                     surface_id: Some("surf-1"),
+                    surface_name: Some("Surface one"),
                     http_method: "GET",
                     path: "/payments/pioneer/trust",
                     actor_did: Some("did:web:agent"),
@@ -5522,7 +5547,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn outbound_policy_audit_falls_back_to_package_name_when_unnamed() {
+    async fn outbound_policy_audit_falls_back_to_the_definition_id_when_unnamed() {
         use crate::observability::policy_audit::POLICY_DECISION_COLLECTOR;
         use std::sync::Mutex;
 
@@ -5535,6 +5560,7 @@ mod tests {
                     policy_definition_id: Some("def-resp-1"),
                     policy_name: None,
                     surface_id: Some("surf-2"),
+                    surface_name: Some("Surface two"),
                     http_method: "POST",
                     path: "/a2a",
                     actor_did: None,
@@ -5551,8 +5577,7 @@ mod tests {
         let decisions = collector.lock().unwrap();
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].scope, "response");
-        // No operator name → the human-readable name falls back to the package.
-        assert_eq!(decisions[0].policy_name, "surface.policy");
+        assert_eq!(decisions[0].policy_name, "def-resp-1");
         assert!(
             decisions[0]
                 .caller_did
@@ -5574,6 +5599,7 @@ mod tests {
                     policy_definition_id: Some("def-resp-1"),
                     policy_name: None,
                     surface_id: Some("surf-2"),
+                    surface_name: Some("Surface two"),
                     http_method: "POST",
                     path: "/a2a",
                     actor_did: None,
@@ -7711,6 +7737,76 @@ mod tests {
                 "an unmarked {method} without a body is forwarded"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn transit_requests_each_carry_their_own_request_id() {
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+            "surface_id": "request-id-surface", "name": "Request id surface",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "a2a"},
+            "target": {"endpoint": "http://127.0.0.1:1"},
+            "transit": {"opa_policy_definition_id": "def-1", "points": [{"alias": "partner-a", "protocol": "mcp",
+                "require_transit_token": false, "target_endpoint": "http://127.0.0.1:9"}]}
+        }))
+        .unwrap();
+        let state = test_outbound_state();
+        state
+            .channel_state
+            .write()
+            .unwrap()
+            .surface = Arc::new(surface);
+
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/outbound/mcp/partner-a")
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .body(axum::body::Body::from(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).to_string()))
+                .unwrap();
+            let (_, events) = crate::audit::producer::capture(Box::pin(outbound_proxy_handler_with_mcp_versions(
+                "127.0.0.1:12345"
+                    .parse()
+                    .unwrap(),
+                state.clone(),
+                request,
+                crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+            )))
+            .await;
+            let decisions: Vec<_> = events
+                .iter()
+                .filter(|event| {
+                    matches!(event.event, crate::delegation_vault::audit::DelegationAuditAction::PolicyDecision { .. })
+                })
+                .collect();
+            assert_eq!(decisions.len(), 1, "{events:?}");
+            assert_eq!(
+                decisions[0]
+                    .channel_name
+                    .as_deref(),
+                Some("Request id surface")
+            );
+            assert_eq!(
+                decisions[0]
+                    .surface_id
+                    .as_deref(),
+                Some("request-id-surface")
+            );
+            seen.push(
+                decisions[0]
+                    .request_id
+                    .clone()
+                    .expect("the decision carries the request id"),
+            );
+        }
+        assert!(seen.iter().all(|id| {
+            id.len() == 16
+                && id
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+        }));
+        assert_ne!(seen[0], seen[1], "each request has its own id");
     }
 
     // ── detect_protocol_and_operation ───────────────────────────────────────

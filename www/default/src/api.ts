@@ -13,6 +13,7 @@ import {
   Task,
   TruncateLogsResult,
   TruncateMetricsResult,
+  TrustRecorderStatus,
   TrustRegistry,
   UpdateAccessTokenRequest,
   UserSettingsOverrides,
@@ -23,6 +24,20 @@ import type { SurfaceStatus } from './generated/SurfaceStatus';
 import { formatApiError } from './utils/apiError';
 
 const API_BASE = '/api/v1';
+
+/**
+ * A request the server answered with an error status. The message is the
+ * formatted error text, as before; `status` lets a caller tell, say, a 403
+ * from a transient failure without reading the message.
+ */
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    public readonly status: number
+  ) {
+    super(message);
+  }
+}
 
 export const TERMS_ACCEPTANCE_REQUIRED_EVENT = 'terms-acceptance-required';
 export const TERMS_OPERATIONAL_FAILURE_EVENT = 'terms-operational-failure';
@@ -173,7 +188,10 @@ class APIClient {
         } catch (e) {
           console.error('[API] Could not read error response:', e);
         }
-        throw new Error(formatApiError(response.status, errorBody, response.statusText));
+        throw new ApiError(
+          formatApiError(response.status, errorBody, response.statusText),
+          response.status
+        );
       }
 
       // Don't try to parse JSON for 204 No Content responses
@@ -533,6 +551,13 @@ class APIClient {
       body: JSON.stringify(toBackendSurface(surface)),
     });
     return fromBackendSurface(s);
+  }
+
+  async getSurfaceTrustRecorderStatus(surfaceId: string): Promise<TrustRecorderStatus | null> {
+    const response = await this.request<{ status: TrustRecorderStatus | null }>(
+      `/surfaces/${encodeURIComponent(surfaceId)}/trust-recorder-status`
+    );
+    return response.status ?? null;
   }
 
   async deleteSurface(surfaceId: string): Promise<void> {

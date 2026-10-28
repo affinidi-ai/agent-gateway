@@ -41,26 +41,47 @@ pub struct CredentialProviderState {
     pub oauth_callback_route: String,
 }
 
+/// Why a provider's consent strategy or secret reference was rejected.
+#[derive(Debug, thiserror::Error)]
+enum ProviderReferenceError {
+    #[error("Consent identity strategy is invalid or not accessible")]
+    InvalidConsentStrategy,
+    #[error("Identity verification configuration unavailable")]
+    IdentityConfigurationUnavailable,
+    #[error("Secret reference is not accessible")]
+    SecretNotAccessible,
+    #[error("Secret reference lookup failed")]
+    SecretLookupFailed,
+}
+
+impl IntoResponse for ProviderReferenceError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::InvalidConsentStrategy | Self::SecretNotAccessible => {
+                (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": self.to_string() }))).into_response()
+            }
+            Self::IdentityConfigurationUnavailable => {
+                (StatusCode::SERVICE_UNAVAILABLE, self.to_string()).into_response()
+            }
+            Self::SecretLookupFailed => {
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "Internal server error" })))
+                    .into_response()
+            }
+        }
+    }
+}
+
 async fn validate_consent_strategy(
     state: &CredentialProviderState,
     provider: &CredentialProvider,
     context: &Option<Extension<PatTenantContext>>,
     scope: &Option<Extension<PatResourceScope>>,
-) -> Result<(), Response> {
+) -> Result<(), ProviderReferenceError> {
     let Some(id) = provider
         .consent_identity_strategy_id
         .as_deref()
     else {
         return Ok(());
-    };
-    let invalid = || {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "Consent identity strategy is invalid or not accessible"
-            })),
-        )
-            .into_response()
     };
     if id.trim().is_empty()
         || id.len() > 256
@@ -70,18 +91,16 @@ async fn validate_consent_strategy(
             .as_deref()
             .is_none_or(|resource| crate::sts::mcp_profile::canonical_https_url(resource).is_err())
     {
-        return Err(invalid());
+        return Err(ProviderReferenceError::InvalidConsentStrategy);
     }
     let strategy = state
         .identity_strategies
         .as_ref()
-        .ok_or_else(invalid)?
+        .ok_or(ProviderReferenceError::InvalidConsentStrategy)?
         .get(id)
         .await
-        .map_err(|_| {
-            (StatusCode::SERVICE_UNAVAILABLE, "Identity verification configuration unavailable").into_response()
-        })?
-        .ok_or_else(invalid)?;
+        .map_err(|_| ProviderReferenceError::IdentityConfigurationUnavailable)?
+        .ok_or(ProviderReferenceError::InvalidConsentStrategy)?;
     if !can_reference(provider.tenant_id.as_deref(), strategy.tenant_id.as_deref())
         || !scope_allows_resource(
             resource_scope(scope),
@@ -91,19 +110,18 @@ async fn validate_consent_strategy(
         )
         || crate::sts::mcp_profile::canonical_https_url(&strategy.expected_issuer).is_err()
     {
-        return Err(invalid());
+        return Err(ProviderReferenceError::InvalidConsentStrategy);
     }
     Ok(())
 }
 
-#[allow(clippy::result_large_err)] // FIXME: Response is not an error
 async fn validate_secret_references(
     state: &CredentialProviderState,
     tenant_id: Option<&str>,
     references: impl IntoIterator<Item = Option<&str>>,
     context: &Option<Extension<PatTenantContext>>,
     scope: &Option<Extension<PatResourceScope>>,
-) -> Result<(), Response> {
+) -> Result<(), ProviderReferenceError> {
     for secret_id in references
         .into_iter()
         .flatten()
@@ -114,13 +132,9 @@ async fn validate_secret_references(
             .await
             .map_err(|error| {
                 warn!(%error, "Failed to validate credential provider secret reference");
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "Internal server error" })))
-                    .into_response()
+                ProviderReferenceError::SecretLookupFailed
             })?
-            .ok_or_else(|| {
-                (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Secret reference is not accessible" })))
-                    .into_response()
-            })?;
+            .ok_or(ProviderReferenceError::SecretNotAccessible)?;
         if !can_reference(tenant_id, secret.tenant_id.as_deref())
             || !scope_allows_resource(
                 resource_scope(scope),
@@ -129,11 +143,7 @@ async fn validate_secret_references(
                 &secret.secret_id,
             )
         {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": "Secret reference is not accessible" })),
-            )
-                .into_response());
+            return Err(ProviderReferenceError::SecretNotAccessible);
         }
     }
     Ok(())
@@ -248,7 +258,7 @@ pub async fn create_provider(
         return resp;
     }
 
-    if let Err(response) = validate_secret_references(
+    if let Err(error) = validate_secret_references(
         &state,
         req.tenant_id.as_deref(),
         [
@@ -264,7 +274,7 @@ pub async fn create_provider(
     )
     .await
     {
-        return response;
+        return error.into_response();
     }
 
     // Check for duplicate provider_id
@@ -340,8 +350,8 @@ pub async fn create_provider(
         updated_at: now,
     };
 
-    if let Err(response) = validate_consent_strategy(&state, &provider, &context, &scope).await {
-        return response;
+    if let Err(error) = validate_consent_strategy(&state, &provider, &context, &scope).await {
+        return error.into_response();
     }
 
     match state
@@ -533,7 +543,7 @@ pub async fn update_provider(
         updated_at: Utc::now(),
     };
 
-    if let Err(response) = validate_secret_references(
+    if let Err(error) = validate_secret_references(
         &state,
         updated.tenant_id.as_deref(),
         [
@@ -552,11 +562,11 @@ pub async fn update_provider(
     )
     .await
     {
-        return response;
+        return error.into_response();
     }
 
-    if let Err(response) = validate_consent_strategy(&state, &updated, &context, &scope).await {
-        return response;
+    if let Err(error) = validate_consent_strategy(&state, &updated, &context, &scope).await {
+        return error.into_response();
     }
 
     match state
@@ -762,23 +772,18 @@ mod consent_strategy_tests {
         let denied = Some(Extension(PatResourceScope(Arc::new(
             regex::Regex::new(r"\ATENANT:tenant-a:credential-providers:provider\z").unwrap(),
         ))));
+        let invalid = |result: Result<(), ProviderReferenceError>| {
+            matches!(result, Err(ProviderReferenceError::InvalidConsentStrategy))
+        };
         assert!(
             validate_consent_strategy(&state, &provider, &context, &allowed)
                 .await
                 .is_ok()
         );
-        assert!(
-            validate_consent_strategy(&state, &provider, &context, &denied)
-                .await
-                .is_err()
-        );
+        assert!(invalid(validate_consent_strategy(&state, &provider, &context, &denied).await));
         for tenant in [None, Some("tenant-b".into())] {
             provider.tenant_id = tenant;
-            assert!(
-                validate_consent_strategy(&state, &provider, &None, &None)
-                    .await
-                    .is_err()
-            );
+            assert!(invalid(validate_consent_strategy(&state, &provider, &None, &None).await));
         }
         provider.tenant_id = Some("tenant-a".into());
         let mut global = strategy.clone();
@@ -793,50 +798,63 @@ mod consent_strategy_tests {
                 .is_ok()
         );
         provider.provider_type = CredentialProviderType::OAuth2ClientCredentials;
-        assert!(
-            validate_consent_strategy(&state, &provider, &None, &None)
-                .await
-                .is_err()
-        );
+        assert!(invalid(validate_consent_strategy(&state, &provider, &None, &None).await));
         provider.provider_type = CredentialProviderType::OAuth2AuthorizationCode;
         provider.resource = None;
-        assert!(
-            validate_consent_strategy(&state, &provider, &None, &None)
-                .await
-                .is_err()
-        );
+        assert!(invalid(validate_consent_strategy(&state, &provider, &None, &None).await));
         provider.resource = Some("https://provider.example/api".into());
         global.expected_issuer = "http://identity.example/".into();
         strategies
             .update(global)
             .await
             .unwrap();
-        assert!(
-            validate_consent_strategy(&state, &provider, &None, &None)
-                .await
-                .is_err()
-        );
+        assert!(invalid(validate_consent_strategy(&state, &provider, &None, &None).await));
         strategies
             .delete(&strategy.id)
             .await
             .unwrap();
-        assert!(
-            validate_consent_strategy(&state, &provider, &None, &None)
-                .await
-                .is_err()
-        );
+        assert!(invalid(validate_consent_strategy(&state, &provider, &None, &None).await));
         state.identity_strategies = None;
-        assert!(
-            validate_consent_strategy(&state, &provider, &None, &None)
-                .await
-                .is_err()
-        );
+        assert!(invalid(validate_consent_strategy(&state, &provider, &None, &None).await));
         provider.consent_identity_strategy_id = None;
         assert!(
             validate_consent_strategy(&state, &provider, &None, &None)
                 .await
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn reference_errors_render_generic_responses() {
+        for (error, status, body) in [
+            (
+                ProviderReferenceError::InvalidConsentStrategy,
+                StatusCode::BAD_REQUEST,
+                r#"{"error":"Consent identity strategy is invalid or not accessible"}"#,
+            ),
+            (
+                ProviderReferenceError::IdentityConfigurationUnavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Identity verification configuration unavailable",
+            ),
+            (
+                ProviderReferenceError::SecretNotAccessible,
+                StatusCode::BAD_REQUEST,
+                r#"{"error":"Secret reference is not accessible"}"#,
+            ),
+            (
+                ProviderReferenceError::SecretLookupFailed,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                r#"{"error":"Internal server error"}"#,
+            ),
+        ] {
+            let response = error.into_response();
+            assert_eq!(response.status(), status);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(std::str::from_utf8(&bytes).unwrap(), body);
+        }
     }
 
     async fn state_with_provider(

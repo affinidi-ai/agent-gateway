@@ -197,6 +197,47 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
     `untrusted` (it verified, but no trust anchor was available to vouch for its issuer).
     `error_detail` is a short diagnostic and never carries the presentation itself.
 
+**Policy change events.** Raised by management API requests that change a policy definition or
+where a policy applies (group Policies). Each record carries its body in the `event` variant, e.g.
+`"event": {"policy_attached": {...}}`, and every record one request writes shares that request's
+`request_id`. See [`POLICY.md`](POLICY.md#policy-change-audit) for what each covers.
+
+- `policy_created`, `policy_updated`, `policy_deleted`: a policy definition was created, changed
+  or deleted. `policy_updated` names the parts that changed in `changed` (`rego`, `name`,
+  `description`, `enabled`, `sample_input`, `owner`) with `previous_policy_version` and
+  `previous_policy_content_hash`; an update that changes nothing is not recorded.
+- `policy_attached`, `policy_detached`: a policy now applies, or no longer applies, at a slot of a
+  surface, a gateway or an appliance-wide plane. `target` is `{kind, id, name}` (`surface`,
+  `gateway` or `appliance`); `scope` is the decision scope the slot produces; `slot` is `target`,
+  `inbound`, `response`, `transit`, `transit_point`, `mcp_tool`, `mcp_tool_gate` or `plane`, with
+  `variant`, `transit_point`, `mcp_tool_name`, `gate` or `plane` naming the place. A replaced
+  policy is detached, then its successor attached. A surface target also sets the top-level
+  `surface_id` and `channel_name`.
+  A gateway's legacy inline Rego has no definition: its records carry `policy_name`
+  `Gateway policy` and the Rego's `policy_content_hash`, and a change to its text is a
+  `policy_updated` with `changed: ["rego"]` against the gateway.
+- `policy_attachment_changed`: an appliance-wide assignment switched between `enforced` and
+  `monitor_only` (`mode`, `previous_mode`), or a gateway's policy was enabled or disabled
+  (`enabled`, `previous_enabled`).
+- `policy_change_refused`: one of the changes above was refused with 400, 403, 404, 409 or 422,
+  on a route that only changes policies: the definition, assignment, gateway policy and
+  definition ownership routes. A refused surface or variant write, or a refused gateway delete,
+  is not recorded (see [`POLICY.md`](POLICY.md#policy-change-audit)).
+  `action` is the change attempted, `status` the HTTP status and `reason` one of `invalid`,
+  `forbidden`, `not_found` or `conflict`. The attempt is read from the route only: ids come from
+  the path, bounded to 128 id characters, and replacing the appliance-wide assignments or a
+  gateway's policy is recorded as an attempted `policy_attached` with no policy id.
+
+Every record names its `actor`: `{kind: "user", id}` for a signed-in user, `{kind: "pat", id,
+user_id}` for an access token (its id, never its value, and its owner's user id) or
+`{kind: "system", id: "gateway"}`. `source` is `api`, `ownership` (a definition's tenant was
+reassigned) or `definition_deleted` (deleting a definition pruned its appliance-wide
+assignments). Policy ids, versions and content hashes are those `policy_decision` records carry,
+so a change joins to the decisions it causes. No record carries the Rego text, the sample input
+or a request body. Writes made outside a management request (startup migrations, replication)
+record nothing, and neither do writes a configuration reload makes, though the reload is asked
+for through the management API: it is the gateway's own work, not the user's change.
+
 **Volume.** Request events are unbounded by design: each is recorded once per request, with no
 aggregation or sampling. `auth_failed` and the routing `request_rejected` are recorded before
 the surface rate limit is checked, and `rate_limited` once for every request the limit refuses,
@@ -232,7 +273,14 @@ administrator-only by default (see [`INTEGRATIONS.md`](INTEGRATIONS.md#managemen
 - *Producing.* The producer (`src/audit/producer.rs`) is the only place a record is finalised.
   It checks the selections first (one atomic read), gives the record an `event_id` (UUID v4),
   addresses it to the sinks that select its event at that moment, and hands it to the journal
-  without waiting. Records a proxied request produces while credential delegation runs are held
+  without waiting. A record produced while the gateway serves a request also gets that
+  request's `request_id`: 16 lowercase hex characters (the W3C span-id format), minted afresh
+  when an Access Point request, a Transit Point request or a fabric-received request starts,
+  never read from a header or token. Every record of one request shares it, and an Access
+  Point request and the Transit Point requests its agent makes each have their own, linked by
+  `trace_id`; a sink counts requests by distinct `request_id`. That includes the records a
+  streamed response writes per event while it is read (SSE on every path) and the payment
+  records an x402 or MPP request writes from background tasks. Records a proxied request produces while credential delegation runs are held
   until the request's identity VP is minted, then stamped with it; any still held when the
   request ends, on any path, are submitted without a VP. A selected record produced while the
   pipeline is not running is dropped and counted in
@@ -360,8 +408,9 @@ caller the record holds), `EVENT_DATA` (the same as `AUDIT_RECORD`), `APPLIANCE_
 `sub`, API key name, DID, mTLS principal, or on a Transit Point the caller the transit token
 carries), and all four are empty when the request had no caller context (no source auth, or a
 Transit Point whose token carries no caller). The policy variables describe the policy that made
-a `policy_decision` (`AUDIT_POLICY_NAME` falls back to the Rego package when the policy has no
-stored definition) and are empty for other records; see
+a `policy_decision` (`AUDIT_POLICY_NAME` is the definition's name, else its id, else a label
+for the layer when the policy has no stored definition, such as "Gateway policy" or "Surface
+policy") and are empty for other records; see
 [`POLICY.md`](POLICY.md#versioned-policy-definitions) for which decisions carry a revision. A
 string value that is exactly `${AUDIT_RECORD}` or `${EVENT_DATA}` is embedded as a JSON object
 for Webhook and Stream integrations; for Slack and Email, and inside other text, it is inserted

@@ -10,6 +10,12 @@ import { DeleteButton } from '../components/shared/DeleteButton';
 import { EmptyState } from '../components/shared/EmptyState';
 import SearchInput from '../components/shared/SearchInput';
 import { DOCS_URL } from '../config/docs';
+import {
+  canDeleteProvidedMediator,
+  isProvidedMediator,
+  isUnstoredDirectoryMediator,
+  mediatorPageRows,
+} from '../utils/mediators';
 
 interface Mediator {
   id: string;
@@ -21,6 +27,8 @@ interface Mediator {
   did_document?: any;
   created_at: string;
   updated_at: string;
+  provided?: boolean;
+  deletable?: boolean;
 }
 
 function hasDIDCommMessaging(doc: any): boolean {
@@ -42,7 +50,8 @@ const MediatorsPage: React.FC<MediatorsPageProps> = ({ externalSearchTerm, onCou
   const { guard, balloonNode } = useLimitGuard();
   const { hasPermission } = usePermissions();
   const { id: idParam } = useParams<{ id?: string }>();
-  const [mediators, setMediators] = useState<Mediator[]>([]);
+  const [listedMediators, setListedMediators] = useState<Mediator[]>([]);
+  const mediators = useMemo(() => mediatorPageRows(listedMediators), [listedMediators]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
@@ -69,7 +78,11 @@ const MediatorsPage: React.FC<MediatorsPageProps> = ({ externalSearchTerm, onCou
           [decodedId]: new Set(['summary']),
         });
         // Check auth if needed
-        if (mediator.did_document && hasDIDCommMessaging(mediator.did_document)) {
+        if (
+          !mediator.provided &&
+          mediator.did_document &&
+          hasDIDCommMessaging(mediator.did_document)
+        ) {
           checkAuthEndpoints(decodedId, mediator.did_document);
         }
         // Scroll to the mediator after a short delay
@@ -88,7 +101,7 @@ const MediatorsPage: React.FC<MediatorsPageProps> = ({ externalSearchTerm, onCou
       setLoading(true);
       setError(null);
       const response = await apiClient.get('/mediators');
-      setMediators(response.data);
+      setListedMediators(response.data);
     } catch (err: any) {
       setError(err.message || 'Failed to load mediators');
     } finally {
@@ -131,6 +144,7 @@ const MediatorsPage: React.FC<MediatorsPageProps> = ({ externalSearchTerm, onCou
   };
 
   const toggleMediatorDetails = (mediatorId: string, mediator: Mediator) => {
+    if (isUnstoredDirectoryMediator(mediator)) return;
     setExpandedMediatorIds(prev => {
       const newSet = new Set(prev);
       if (newSet.has(mediatorId)) {
@@ -151,7 +165,11 @@ const MediatorsPage: React.FC<MediatorsPageProps> = ({ externalSearchTerm, onCou
           [mediatorId]: new Set(['summary']),
         }));
         // Check auth if needed
-        if (mediator.did_document && hasDIDCommMessaging(mediator.did_document)) {
+        if (
+          !mediator.provided &&
+          mediator.did_document &&
+          hasDIDCommMessaging(mediator.did_document)
+        ) {
           checkAuthEndpoints(mediatorId, mediator.did_document);
         }
         // Navigate to deep link URL
@@ -387,12 +405,16 @@ const MediatorsPage: React.FC<MediatorsPageProps> = ({ externalSearchTerm, onCou
                             ref={el => (mediatorRefs.current[mediator.id] = el)}
                             data-testid={`mediators-row-${mediator.id}`}
                             onClick={() => toggleMediatorDetails(mediator.id, mediator)}
-                            style={{ cursor: 'pointer' }}
+                            style={{
+                              cursor: isUnstoredDirectoryMediator(mediator) ? 'default' : 'pointer',
+                            }}
                           >
                             <td>
-                              <i
-                                className={`fas fa-chevron-${isExpanded ? 'down' : 'right'} me-2`}
-                              ></i>
+                              {!isUnstoredDirectoryMediator(mediator) && (
+                                <i
+                                  className={`fas fa-chevron-${isExpanded ? 'down' : 'right'} me-2`}
+                                ></i>
+                              )}
                               {mediator.name}
                             </td>
                             <td>
@@ -424,7 +446,10 @@ const MediatorsPage: React.FC<MediatorsPageProps> = ({ externalSearchTerm, onCou
                                 data-testid={`mediators-trust-ping-button-${mediator.id}`}
                                 aria-label={`Trust ping ${mediator.name}`}
                                 onClick={e => handleTrustPing(mediator.id, mediator.name, e)}
-                                disabled={pingStatus[mediator.id] === 'pinging'}
+                                disabled={
+                                  isProvidedMediator(mediator) ||
+                                  pingStatus[mediator.id] === 'pinging'
+                                }
                               >
                                 {pingStatus[mediator.id] === 'pinging' ? (
                                   <span
@@ -440,7 +465,7 @@ const MediatorsPage: React.FC<MediatorsPageProps> = ({ externalSearchTerm, onCou
                                   <i className="fas fa-heartbeat" aria-hidden="true"></i>
                                 )}
                               </AppButton>
-                              {hasPermission('mediators.edit') && (
+                              {!isProvidedMediator(mediator) && hasPermission('mediators.edit') && (
                                 <AppButton
                                   variant="outline-primary"
                                   size="sm"
@@ -452,14 +477,16 @@ const MediatorsPage: React.FC<MediatorsPageProps> = ({ externalSearchTerm, onCou
                                   <i className="fas fa-edit" aria-hidden="true"></i>
                                 </AppButton>
                               )}
-                              {hasPermission('mediators.delete') && (
-                                <DeleteButton
-                                  data-testid={`mediators-delete-button-${mediator.id}`}
-                                  onDelete={() => handleDelete(mediator.id)}
-                                  size="sm"
-                                  title="Delete Mediator"
-                                />
-                              )}
+                              {(!isProvidedMediator(mediator) ||
+                                canDeleteProvidedMediator(mediator)) &&
+                                hasPermission('mediators.delete') && (
+                                  <DeleteButton
+                                    data-testid={`mediators-delete-button-${mediator.id}`}
+                                    onDelete={() => handleDelete(mediator.id)}
+                                    size="sm"
+                                    title="Delete Mediator"
+                                  />
+                                )}
                             </td>
                           </tr>
 

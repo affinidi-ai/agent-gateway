@@ -26,6 +26,7 @@ use crate::server::ConnectionGuard;
 use crate::state::{MultiSurfaceProxyState, ProxyState};
 use crate::{channel_debug, channel_error, channel_info, channel_warn};
 
+mod a2a_stream;
 pub(crate) mod surface_payment;
 
 /// Lazy-initialized SSE session manager for MCP proxy:// channels.
@@ -747,7 +748,6 @@ pub async fn handle_agent_card(
                         .unwrap(),
                     &channel_name,
                     config_id,
-                    &state.config.x402_headers,
                     resource_url,
                     state
                         .listener_manager
@@ -761,7 +761,7 @@ pub async fn handle_agent_card(
                 .await
                 {
                     Ok(_) => {}
-                    Err(err_response) => return Err(err_response),
+                    Err(error) => return Err(error.render(&state.config.x402_headers)),
                 }
             } else if mpp_required && mpp_credential.is_some() {
                 // Client sent MPP credential → verify via MPP
@@ -782,76 +782,26 @@ pub async fn handle_agent_card(
                 .await
                 {
                     Ok(_) => {}
-                    Err(err_response) => return Err(err_response),
+                    Err(error) => return Err(error.into_response()),
                 }
-            } else {
+            } else if let Some(error) = surface_payment::payment_required(
                 // No credential → return 402 (combined if both protocols enabled)
-                let err_response = if x402_required {
-                    // Build x402 402 (includes payment requirements normalization)
-                    let x402_resp = crate::x402::process_payment(
-                        None,
-                        state
-                            .surface
-                            .x402_config()
-                            .unwrap(),
-                        &channel_name,
-                        config_id,
-                        &state.config.x402_headers,
-                        resource_url,
-                        state
-                            .listener_manager
-                            .read()
-                            .await
-                            .clone(),
-                        state
-                            .transaction_store
-                            .clone(),
-                    )
-                    .await
-                    .unwrap_err();
-                    if mpp_required {
-                        // Both enabled → add MPP challenge headers to x402 response
-                        crate::mpp::fire_challenge_issued_events(
-                            config_id,
-                            &channel_name,
-                            resource_url,
-                            state
-                                .mpp_transaction_store
-                                .clone(),
-                        );
-                        crate::mpp::errors::add_mpp_challenges_to_response_resolved(
-                            x402_resp,
-                            state
-                                .surface
-                                .mpp_config()
-                                .unwrap(),
-                            resource_url,
-                            &state.secrets_store,
-                        )
-                        .await
-                    } else {
-                        x402_resp
-                    }
-                } else {
-                    // Only MPP → standard MPP 402
-                    crate::mpp::process_payment(
-                        None,
-                        state
-                            .surface
-                            .mpp_config()
-                            .unwrap(),
-                        &channel_name,
-                        config_id,
-                        resource_url,
-                        state
-                            .mpp_transaction_store
-                            .clone(),
-                        &state.secrets_store,
-                    )
-                    .await
-                    .unwrap_err()
-                };
-                return Err(err_response);
+                state
+                    .surface
+                    .x402_config()
+                    .filter(|_| x402_required),
+                state
+                    .surface
+                    .mpp_config()
+                    .filter(|_| mpp_required),
+                &channel_name,
+                config_id,
+                resource_url,
+                &surface_payment::LocalPaymentServices::of(&state).await,
+            )
+            .await
+            {
+                return Err(error.render(&state.config.x402_headers));
             }
         }
     }
@@ -1430,6 +1380,78 @@ fn hold_connection_for_body(
     response: axum::response::Response,
 ) -> axum::response::Response {
     crate::mcp::modern_sse::observe_response(response, move |_| connection_guard.release())
+}
+
+/// Releases the connection and records the request's bytes and connection
+/// metric once a streamed response body ends, fails or is dropped. A body that
+/// did not end cleanly counts as an error.
+fn streamed_response_completion(
+    state: &ProxyState,
+    mut guard: ConnectionGuard,
+    status: StatusCode,
+    source: String,
+    identity: Option<String>,
+    trace: String,
+    start_time: std::time::Instant,
+    request_bytes: u64,
+) -> impl FnOnce(crate::mcp::modern_sse::ResponseOutcome) + Send + 'static {
+    let metrics = state.metrics_store.clone();
+    let monitor = state.task_monitor.clone();
+    let task_id = state.task_id.clone();
+    let surface_id = state
+        .surface
+        .surface_id
+        .clone();
+    let target = state
+        .surface
+        .target
+        .endpoint
+        .clone();
+    let variant = state
+        .active_variant_alias
+        .clone();
+    move |outcome: crate::mcp::modern_sse::ResponseOutcome| {
+        let latency = start_time
+            .elapsed()
+            .as_millis() as u64;
+        tokio::spawn(async move {
+            guard.decrement().await;
+            if let (Some(monitor), Some(task_id)) = (monitor, task_id) {
+                monitor
+                    .record_bytes(&task_id, outcome.bytes, request_bytes)
+                    .await;
+                if !outcome.completed || outcome.failed {
+                    monitor
+                        .increment_errors(&task_id)
+                        .await;
+                }
+            }
+            if let Some(metrics) = metrics {
+                let result = if outcome.completed && !outcome.failed && status.is_success() {
+                    crate::metrics::ConnectionStatus::Success
+                } else {
+                    crate::metrics::ConnectionStatus::Failed
+                };
+                metrics
+                    .record_connection_with_ucp(
+                        surface_id,
+                        source,
+                        target,
+                        result,
+                        Some(latency),
+                        identity,
+                        crate::metrics::ConnectionDirection::Request,
+                        trace,
+                        None,
+                        None,
+                        None,
+                        latency,
+                        variant,
+                    )
+                    .await;
+            }
+        });
+    }
 }
 
 /// The facts for a request refused while routing to `surface`: its trace id
@@ -2720,6 +2742,7 @@ async fn proxy_handler_with_mcp_runtime(
             policy_definition_id: gd.policy_id.as_deref(),
             policy_name: global_policy_name,
             surface_id: state.surface.config_id(),
+            surface_name: Some(state.surface.name.as_str()),
             trace_id: Some(&trace_id),
             http_method: Some(method.as_ref()),
             path: Some(uri.path()),
@@ -2776,7 +2799,7 @@ async fn proxy_handler_with_mcp_runtime(
                 None => (None, None, None),
             };
         let gw_policy_name = gw_policy_manager
-            .resolve_policy_name_or_default(gw_policy_def_id.as_deref())
+            .resolve_policy_name(gw_policy_def_id.as_deref())
             .await;
 
         match gw_policy_manager.evaluate_policy_decision(&self_gateway_id, gw_input_value) {
@@ -2786,8 +2809,9 @@ async fn proxy_handler_with_mcp_runtime(
                     allow: true,
                     policy_id: Some(crate::policies::GATEWAY_POLICY_PACKAGE),
                     policy_definition_id: gw_policy_def_id.as_deref(),
-                    policy_name: Some(gw_policy_name.as_str()),
+                    policy_name: gw_policy_name.as_deref(),
                     surface_id: state.surface.config_id(),
+                    surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(&trace_id),
                     http_method: Some(method.as_ref()),
                     path: Some(uri.path()),
@@ -2805,8 +2829,9 @@ async fn proxy_handler_with_mcp_runtime(
                     reason: decision.reason.as_deref(),
                     policy_id: Some(crate::policies::GATEWAY_POLICY_PACKAGE),
                     policy_definition_id: gw_policy_def_id.as_deref(),
-                    policy_name: Some(gw_policy_name.as_str()),
+                    policy_name: gw_policy_name.as_deref(),
                     surface_id: state.surface.config_id(),
+                    surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(&trace_id),
                     http_method: Some(method.as_ref()),
                     path: Some(uri.path()),
@@ -2828,8 +2853,9 @@ async fn proxy_handler_with_mcp_runtime(
                     error: Some(crate::observability::PolicyEvaluationError::EvaluationError),
                     policy_id: Some(crate::policies::GATEWAY_POLICY_PACKAGE),
                     policy_definition_id: gw_policy_def_id.as_deref(),
-                    policy_name: Some(gw_policy_name.as_str()),
+                    policy_name: gw_policy_name.as_deref(),
                     surface_id: state.surface.config_id(),
+                    surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(&trace_id),
                     http_method: Some(method.as_ref()),
                     path: Some(uri.path()),
@@ -2924,14 +2950,17 @@ async fn proxy_handler_with_mcp_runtime(
             &state.surface.target.endpoint,
             uri.path(),
         );
-    // A compressed extended card cannot be rewritten, so the Target is asked for
-    // an uncompressed one. The same headers are forwarded to fabric targets.
+    let a2a_method = a2a_context
+        .as_ref()
+        .and_then(|context| context.method.as_deref())
+        .filter(|_| is_a2a_surface);
+    let is_a2a_stream_request = a2a_method.is_some_and(crate::a2a::is_streaming_method);
+    // A compressed extended card or event stream cannot be rewritten, so the
+    // Target is asked for an uncompressed one. The same headers are forwarded to
+    // fabric targets.
     if is_rest_extended_card_request
-        || (is_a2a_surface
-            && a2a_context
-                .as_ref()
-                .and_then(|context| context.method.as_deref())
-                .is_some_and(crate::a2a::is_extended_agent_card_method))
+        || is_a2a_stream_request
+        || a2a_method.is_some_and(crate::a2a::is_extended_agent_card_method)
     {
         headers.insert(axum::http::header::ACCEPT_ENCODING, axum::http::HeaderValue::from_static("identity"));
     }
@@ -3227,7 +3256,6 @@ async fn proxy_handler_with_mcp_runtime(
                         .unwrap(),
                     &channel_name,
                     config_id,
-                    &state.config.x402_headers,
                     &resource_url,
                     state
                         .listener_manager
@@ -3239,6 +3267,7 @@ async fn proxy_handler_with_mcp_runtime(
                         .clone(),
                 )
                 .await
+                .map_err(|error| error.render(&state.config.x402_headers))
                 {
                     Ok(response_header) => {
                         body_bytes = modified_body.into();
@@ -3316,80 +3345,32 @@ async fn proxy_handler_with_mcp_runtime(
                         mpp_receipt_header = receipt_header;
                         body_bytes = modified_body.into();
                     }
-                    Err(err_response) => {
+                    Err(error) => {
                         channel_warn!(config_id, "❌ MPP payment verification failed for fabric request");
                         connection_guard
                             .decrement()
                             .await;
-                        return Err(err_response);
+                        return Err(error.into_response());
                     }
                 }
-            } else {
+            } else if let Some(error) = surface_payment::payment_required(
                 // No credential → return 402 (combined if both protocols enabled)
+                state
+                    .surface
+                    .x402_config()
+                    .filter(|_| x402_required),
+                state
+                    .surface
+                    .mpp_config()
+                    .filter(|_| mpp_required),
+                &channel_name,
+                config_id,
+                &resource_url,
+                &surface_payment::LocalPaymentServices::of(&state).await,
+            )
+            .await
+            {
                 channel_warn!(config_id, "❌ Payment required for fabric request");
-
-                let err_response = if x402_required {
-                    let x402_resp = crate::x402::process_payment(
-                        None,
-                        state
-                            .surface
-                            .x402_config()
-                            .unwrap(),
-                        &channel_name,
-                        config_id,
-                        &state.config.x402_headers,
-                        &resource_url,
-                        state
-                            .listener_manager
-                            .read()
-                            .await
-                            .clone(),
-                        state
-                            .transaction_store
-                            .clone(),
-                    )
-                    .await
-                    .unwrap_err();
-                    if mpp_required {
-                        crate::mpp::fire_challenge_issued_events(
-                            config_id,
-                            &channel_name,
-                            &resource_url,
-                            state
-                                .mpp_transaction_store
-                                .clone(),
-                        );
-                        crate::mpp::errors::add_mpp_challenges_to_response_resolved(
-                            x402_resp,
-                            state
-                                .surface
-                                .mpp_config()
-                                .unwrap(),
-                            &resource_url,
-                            &state.secrets_store,
-                        )
-                        .await
-                    } else {
-                        x402_resp
-                    }
-                } else {
-                    crate::mpp::process_payment(
-                        None,
-                        state
-                            .surface
-                            .mpp_config()
-                            .unwrap(),
-                        &channel_name,
-                        config_id,
-                        &resource_url,
-                        state
-                            .mpp_transaction_store
-                            .clone(),
-                        &state.secrets_store,
-                    )
-                    .await
-                    .unwrap_err()
-                };
 
                 if let Some(ref metrics) = state.metrics_store {
                     let latency_ms = start_time
@@ -3430,7 +3411,7 @@ async fn proxy_handler_with_mcp_runtime(
                 connection_guard
                     .decrement()
                     .await;
-                return Err(err_response);
+                return Err(error.render(&state.config.x402_headers));
             }
         }
     }
@@ -3696,6 +3677,7 @@ async fn proxy_handler_with_mcp_runtime(
                             .as_deref(),
                         policy_definition_id: outcome.policy_id.as_deref(),
                         surface_id: Some(config_id),
+                        surface_name: Some(state.surface.name.as_str()),
                         trace_id: Some(&trace_id),
                         http_method: Some(method.as_ref()),
                         path: Some(uri.path()),
@@ -3730,6 +3712,7 @@ async fn proxy_handler_with_mcp_runtime(
                         scope: crate::observability::PolicyScope::McpTool,
                         error: Some(crate::observability::PolicyEvaluationError::EvaluationError),
                         surface_id: Some(config_id),
+                        surface_name: Some(state.surface.name.as_str()),
                         trace_id: Some(&trace_id),
                         http_method: Some(method.as_ref()),
                         path: Some(uri.path()),
@@ -4481,6 +4464,7 @@ async fn proxy_handler_with_mcp_runtime(
                         scope: crate::observability::PolicyScope::McpTool,
                         allow: true,
                         surface_id: Some(config_id),
+                        surface_name: Some(state.surface.name.as_str()),
                         trace_id: Some(&trace_id),
                         http_method: Some(method.as_ref()),
                         path: Some(uri.path()),
@@ -4505,6 +4489,7 @@ async fn proxy_handler_with_mcp_runtime(
                             .as_deref(),
                         policy_definition_id: outcome.policy_id.as_deref(),
                         surface_id: Some(config_id),
+                        surface_name: Some(state.surface.name.as_str()),
                         trace_id: Some(&trace_id),
                         http_method: Some(method.as_ref()),
                         path: Some(uri.path()),
@@ -4571,6 +4556,7 @@ async fn proxy_handler_with_mcp_runtime(
                         scope: crate::observability::PolicyScope::McpTool,
                         error: Some(crate::observability::PolicyEvaluationError::EvaluationError),
                         surface_id: Some(config_id),
+                        surface_name: Some(state.surface.name.as_str()),
                         trace_id: Some(&trace_id),
                         http_method: Some(method.as_ref()),
                         path: Some(uri.path()),
@@ -5429,6 +5415,7 @@ async fn proxy_handler_with_mcp_runtime(
                 policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                 policy_definition_id: inbound_policy_def_id,
                 surface_id: Some(config_id_str),
+                surface_name: Some(state.surface.name.as_str()),
                 trace_id: Some(&trace_id),
                 http_method: Some(method.as_ref()),
                 path: Some(uri.path()),
@@ -5463,10 +5450,11 @@ async fn proxy_handler_with_mcp_runtime(
                     allow: true,
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: inbound_policy_def_id,
-                    policy_name: Some(inbound_policy_name.as_str()),
+                    policy_name: inbound_policy_name.as_deref(),
                     policy_version: inbound_policy_version,
                     policy_content_hash: inbound_policy_hash.as_deref(),
                     surface_id: Some(config_id_str),
+                    surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(&trace_id),
                     http_method: Some(method.as_ref()),
                     path: Some(uri.path()),
@@ -5482,10 +5470,11 @@ async fn proxy_handler_with_mcp_runtime(
                     reason: decision.reason.as_deref(),
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: inbound_policy_def_id,
-                    policy_name: Some(inbound_policy_name.as_str()),
+                    policy_name: inbound_policy_name.as_deref(),
                     policy_version: inbound_policy_version,
                     policy_content_hash: inbound_policy_hash.as_deref(),
                     surface_id: Some(config_id_str),
+                    surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(&trace_id),
                     http_method: Some(method.as_ref()),
                     path: Some(uri.path()),
@@ -5521,10 +5510,11 @@ async fn proxy_handler_with_mcp_runtime(
                     error: Some(crate::observability::PolicyEvaluationError::EvaluationError),
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: inbound_policy_def_id,
-                    policy_name: Some(inbound_policy_name.as_str()),
+                    policy_name: inbound_policy_name.as_deref(),
                     policy_version: inbound_policy_version,
                     policy_content_hash: inbound_policy_hash.as_deref(),
                     surface_id: Some(config_id_str),
+                    surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(&trace_id),
                     http_method: Some(method.as_ref()),
                     path: Some(uri.path()),
@@ -5594,6 +5584,7 @@ async fn proxy_handler_with_mcp_runtime(
             policy_definition_id: gd.policy_id.as_deref(),
             policy_name: global_policy_name,
             surface_id: state.surface.config_id(),
+            surface_name: Some(state.surface.name.as_str()),
             trace_id: Some(&trace_id),
             http_method: Some(method.as_ref()),
             path: Some(uri.path()),
@@ -5676,6 +5667,7 @@ async fn proxy_handler_with_mcp_runtime(
                     .surface
                     .opa_policy_definition_id(),
                 surface_id: Some(config_id_str),
+                surface_name: Some(state.surface.name.as_str()),
                 trace_id: Some(&trace_id),
                 http_method: Some(method.as_ref()),
                 path: Some(uri.path()),
@@ -5719,8 +5711,9 @@ async fn proxy_handler_with_mcp_runtime(
                     allow: true,
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: channel_opa_def_id,
-                    policy_name: Some(channel_opa_name.as_str()),
+                    policy_name: channel_opa_name.as_deref(),
                     surface_id: Some(config_id_str),
+                    surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(&trace_id),
                     http_method: Some(method.as_ref()),
                     path: Some(uri.path()),
@@ -5738,8 +5731,9 @@ async fn proxy_handler_with_mcp_runtime(
                     reason: decision.reason.as_deref(),
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: channel_opa_def_id,
-                    policy_name: Some(channel_opa_name.as_str()),
+                    policy_name: channel_opa_name.as_deref(),
                     surface_id: Some(config_id_str),
+                    surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(&trace_id),
                     http_method: Some(method.as_ref()),
                     path: Some(uri.path()),
@@ -5773,8 +5767,9 @@ async fn proxy_handler_with_mcp_runtime(
                     error: Some(crate::observability::PolicyEvaluationError::EvaluationError),
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: channel_opa_def_id,
-                    policy_name: Some(channel_opa_name.as_str()),
+                    policy_name: channel_opa_name.as_deref(),
                     surface_id: Some(config_id_str),
+                    surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(&trace_id),
                     http_method: Some(method.as_ref()),
                     path: Some(uri.path()),
@@ -5841,6 +5836,7 @@ async fn proxy_handler_with_mcp_runtime(
                 reason: Some("tools/call without a readable tool name under MCP tool gating"),
                 policy_id: Some("mcp_tool_gating"),
                 surface_id: Some(config_id_str),
+                surface_name: Some(state.surface.name.as_str()),
                 trace_id: Some(&trace_id),
                 http_method: Some(method.as_ref()),
                 path: Some(uri.path()),
@@ -5896,6 +5892,7 @@ async fn proxy_handler_with_mcp_runtime(
             },
             policy_id: Some("mcp_tool_gating"),
             surface_id: Some(config_id_str),
+            surface_name: Some(state.surface.name.as_str()),
             trace_id: Some(&trace_id),
             http_method: Some(method.as_ref()),
             path: Some(uri.path()),
@@ -7142,6 +7139,32 @@ async fn proxy_handler_with_mcp_runtime(
         }
     }
 
+    // An A2A event stream may outlast the request timeout: its headers must
+    // arrive within it, the call is bounded by the stream lifetime on top of
+    // it, and the stream itself by the limits in `a2a_stream::stream_limits`.
+    let a2a_stream_header_timeout = if is_a2a_stream_request {
+        let request_secs = state
+            .surface
+            .timeout()
+            .map_or(
+                state
+                    .config
+                    .a2a
+                    .timeout_seconds,
+                |timeout| timeout.request_secs,
+            );
+        upstream_req = upstream_req.timeout(std::time::Duration::from_secs(
+            state
+                .config
+                .a2a
+                .stream_max_lifetime_secs
+                .saturating_add(request_secs),
+        ));
+        Some(std::time::Duration::from_secs(request_secs))
+    } else {
+        None
+    };
+
     // Get circuit breaker if configured
     let circuit_breaker = if state
         .surface
@@ -7244,7 +7267,7 @@ async fn proxy_handler_with_mcp_runtime(
         if let Some(retry_config) = state
             .surface
             .retry()
-            .filter(|_| modern_request.is_none())
+            .filter(|_| modern_request.is_none() && !is_a2a_stream_request)
         {
             let mut attempt = 0;
             let mut _last_error = None;
@@ -7389,6 +7412,12 @@ async fn proxy_handler_with_mcp_runtime(
             .await
             .map_err(|_| {
                 create_error_response(StatusCode::GATEWAY_TIMEOUT, "Modern MCP upstream response headers timed out")
+            })??
+    } else if let Some(header_timeout) = a2a_stream_header_timeout {
+        tokio::time::timeout(header_timeout, send_response)
+            .await
+            .map_err(|_| {
+                create_error_response(StatusCode::GATEWAY_TIMEOUT, "A2A upstream response headers timed out")
             })??
     } else {
         send_response.await?
@@ -7619,6 +7648,107 @@ async fn proxy_handler_with_mcp_runtime(
             }
         }
 
+        // An A2A event stream is forwarded event by event, each event checked
+        // as a non-streaming reply would be. Agent cards keep their own path.
+        let is_agent_card_fetch = crate::proxy::paths::is_well_known_agent_card_path(uri.path())
+            || is_rest_extended_card_request
+            || extended_card_rpc_id.is_some();
+        if is_a2a_surface
+            && !is_agent_card_fetch
+            && upstream_response
+                .status()
+                .is_success()
+            && crate::a2a::streaming::is_event_stream(upstream_response.headers())
+        {
+            info!(
+                channel = channel_name,
+                "Upstream A2A agent responded with an event stream — forwarding it event by event"
+            );
+            let status = upstream_response.status();
+            let mut stream_headers = upstream_response
+                .headers()
+                .clone();
+            if let Some(payment_header) = &payment_response_header {
+                let name = axum::http::HeaderName::from_bytes(
+                    state
+                        .config
+                        .x402_headers
+                        .payment_response
+                        .as_bytes(),
+                );
+                let value = axum::http::HeaderValue::from_str(payment_header);
+                let (Ok(name), Ok(value)) = (name, value) else {
+                    return Err(create_error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Invalid payment response header",
+                    ));
+                };
+                stream_headers.insert(name, value);
+            }
+            for (name, values) in &delegation_receipt_headers {
+                let name = axum::http::HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+                    create_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Invalid delegated receipt header name")
+                })?;
+                for value in values {
+                    let value = axum::http::HeaderValue::from_str(value).map_err(|_| {
+                        create_error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Invalid delegated receipt header value",
+                        )
+                    })?;
+                    stream_headers.append(name.clone(), value);
+                }
+            }
+            let request = a2a_stream::StreamRequest {
+                channel_name: channel_name.to_string(),
+                trace_id: trace_id.clone(),
+                http_method: method.to_string(),
+                path: uri.path().to_string(),
+                status,
+                authenticated_identity: authenticated_identity.clone(),
+                request_identity: identity_result
+                    .as_ref()
+                    .map(|result| ProtectedAgentIdentity::Managed {
+                        did: result.did.clone(),
+                        identity_fields: result.identity_fields.clone(),
+                    }),
+                request_agent_did: request_agent_did.clone(),
+                request_user_hash: request_user_hash.clone(),
+                policy_caller: crate::proxy::response_policy::CallerContext {
+                    did: agent_context
+                        .as_ref()
+                        .and_then(|context| context.did.clone()),
+                    identity_source: caller_identity_source.clone(),
+                    dna_uai: agent_context
+                        .as_ref()
+                        .and_then(|context| context.agent_dna.as_ref())
+                        .map(|dna| dna.uai.clone()),
+                },
+            };
+            let complete = streamed_response_completion(
+                &state,
+                connection_guard,
+                status,
+                source_addr.clone(),
+                identity_hash.clone(),
+                trace_id.clone(),
+                start_time,
+                body_bytes.len() as u64,
+            );
+            let limits = a2a_stream::stream_limits(&state.config.a2a, state.surface.timeout());
+            let processor = a2a_stream::AccessPointEvents::new(state.clone(), request);
+            return Ok(crate::a2a::streaming::event_stream_response(
+                upstream_response.bytes_stream(),
+                status,
+                &stream_headers,
+                limits,
+                crate::a2a::streaming::request_id(&body_bytes),
+                channel_name.to_string(),
+                processor,
+                complete,
+            ));
+        }
+
         let status = upstream_response.status();
         let response_headers = upstream_response
             .headers()
@@ -7665,69 +7795,16 @@ async fn proxy_handler_with_mcp_runtime(
     let modern_completion = modern_upstream
         .as_ref()
         .map(|upstream| {
-            let status = upstream.status();
-            let mut guard = std::mem::replace(&mut connection_guard, ConnectionGuard::new(None, None));
-            let metrics = state.metrics_store.clone();
-            let monitor = state.task_monitor.clone();
-            let task_id = state.task_id.clone();
-            let surface_id = state
-                .surface
-                .surface_id
-                .clone();
-            let target = state
-                .surface
-                .target
-                .endpoint
-                .clone();
-            let source = source_addr.clone();
-            let identity = identity_hash.clone();
-            let trace = trace_id.clone();
-            let variant = state
-                .active_variant_alias
-                .clone();
-            let request_bytes = body_bytes.len() as u64;
-            move |outcome: crate::mcp::modern_sse::ResponseOutcome| {
-                let latency = start_time
-                    .elapsed()
-                    .as_millis() as u64;
-                tokio::spawn(async move {
-                    guard.decrement().await;
-                    if let (Some(monitor), Some(task_id)) = (monitor, task_id) {
-                        monitor
-                            .record_bytes(&task_id, outcome.bytes, request_bytes)
-                            .await;
-                        if !outcome.completed || outcome.failed {
-                            monitor
-                                .increment_errors(&task_id)
-                                .await;
-                        }
-                    }
-                    if let Some(metrics) = metrics {
-                        let result = if outcome.completed && !outcome.failed && status.is_success() {
-                            crate::metrics::ConnectionStatus::Success
-                        } else {
-                            crate::metrics::ConnectionStatus::Failed
-                        };
-                        metrics
-                            .record_connection_with_ucp(
-                                surface_id,
-                                source,
-                                target,
-                                result,
-                                Some(latency),
-                                identity,
-                                crate::metrics::ConnectionDirection::Request,
-                                trace,
-                                None,
-                                None,
-                                None,
-                                latency,
-                                variant,
-                            )
-                            .await;
-                    }
-                });
-            }
+            streamed_response_completion(
+                &state,
+                std::mem::replace(&mut connection_guard, ConnectionGuard::new(None, None)),
+                upstream.status(),
+                source_addr.clone(),
+                identity_hash.clone(),
+                trace_id.clone(),
+                start_time,
+                body_bytes.len() as u64,
+            )
         });
     let discovery_support = crate::mcp::modern::ForwardingSupport {
         versions: mcp_versions,
@@ -8182,6 +8259,7 @@ async fn proxy_handler_with_mcp_runtime(
                             &kept_names,
                             crate::observability::PolicyDecisionEvent {
                                 surface_id: Some(config_id),
+                                surface_name: Some(state.surface.name.as_str()),
                                 trace_id: Some(&trace_id),
                                 http_method: Some(method.as_ref()),
                                 path: Some(uri.path()),
@@ -8573,6 +8651,7 @@ async fn proxy_handler_with_mcp_runtime(
                         .content_hash
                         .as_deref(),
                     surface_id: Some(config_id),
+                    surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(&trace_id),
                     http_method: Some(method.as_ref()),
                     path: Some(uri.path()),
@@ -8602,6 +8681,7 @@ async fn proxy_handler_with_mcp_runtime(
                     .content_hash
                     .as_deref(),
                 surface_id: Some(config_id),
+                surface_name: Some(state.surface.name.as_str()),
                 trace_id: Some(&trace_id),
                 http_method: Some(method.as_ref()),
                 path: Some(uri.path()),
@@ -9189,6 +9269,24 @@ pub async fn multi_channel_proxy_handler(
 }
 
 async fn multi_channel_proxy_handler_with_mcp_runtime(
+    addr: SocketAddr,
+    state: MultiSurfaceProxyState,
+    req: Request,
+    mcp_versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
+    mcp_continuations: Option<Arc<crate::mcp::continuations::config::ContinuationRuntime>>,
+) -> Response {
+    use crate::observability::policy_audit::{in_request, new_request_id, response_in_request};
+
+    let id = new_request_id();
+    let response = in_request(
+        id.clone(),
+        Box::pin(multi_channel_proxy_handler_in_request_scope(addr, state, req, mcp_versions, mcp_continuations)),
+    )
+    .await;
+    response_in_request(id, response)
+}
+
+async fn multi_channel_proxy_handler_in_request_scope(
     addr: SocketAddr,
     state: MultiSurfaceProxyState,
     req: Request,
@@ -10755,6 +10853,7 @@ async fn handle_fabric_request(
                 policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                 policy_definition_id: inbound_policy_def_id,
                 surface_id: Some(config_id_str),
+                surface_name: Some(state.surface.name.as_str()),
                 trace_id: Some(&trace_id),
                 http_method: Some(method.as_ref()),
                 path: Some(uri.path()),
@@ -10789,10 +10888,11 @@ async fn handle_fabric_request(
                     allow: true,
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: inbound_policy_def_id,
-                    policy_name: Some(inbound_policy_name.as_str()),
+                    policy_name: inbound_policy_name.as_deref(),
                     policy_version: inbound_policy_version,
                     policy_content_hash: inbound_policy_hash.as_deref(),
                     surface_id: Some(config_id_str),
+                    surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(&trace_id),
                     http_method: Some(method.as_ref()),
                     path: Some(uri.path()),
@@ -10808,10 +10908,11 @@ async fn handle_fabric_request(
                     reason: decision.reason.as_deref(),
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: inbound_policy_def_id,
-                    policy_name: Some(inbound_policy_name.as_str()),
+                    policy_name: inbound_policy_name.as_deref(),
                     policy_version: inbound_policy_version,
                     policy_content_hash: inbound_policy_hash.as_deref(),
                     surface_id: Some(config_id_str),
+                    surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(&trace_id),
                     http_method: Some(method.as_ref()),
                     path: Some(uri.path()),
@@ -10847,10 +10948,11 @@ async fn handle_fabric_request(
                     error: Some(crate::observability::PolicyEvaluationError::EvaluationError),
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: inbound_policy_def_id,
-                    policy_name: Some(inbound_policy_name.as_str()),
+                    policy_name: inbound_policy_name.as_deref(),
                     policy_version: inbound_policy_version,
                     policy_content_hash: inbound_policy_hash.as_deref(),
                     surface_id: Some(config_id_str),
+                    surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(&trace_id),
                     http_method: Some(method.as_ref()),
                     path: Some(uri.path()),
@@ -11048,8 +11150,9 @@ async fn handle_fabric_request(
                         allow: true,
                         policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                         policy_definition_id: channel_opa_def_id,
-                        policy_name: Some(channel_opa_name.as_str()),
+                        policy_name: channel_opa_name.as_deref(),
                         surface_id: Some(config_id_str),
+                        surface_name: Some(state.surface.name.as_str()),
                         trace_id: Some(&trace_id),
                         http_method: Some(method.as_ref()),
                         path: Some(uri.path()),
@@ -11066,8 +11169,9 @@ async fn handle_fabric_request(
                         reason: decision.reason.as_deref(),
                         policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                         policy_definition_id: channel_opa_def_id,
-                        policy_name: Some(channel_opa_name.as_str()),
+                        policy_name: channel_opa_name.as_deref(),
                         surface_id: Some(config_id_str),
+                        surface_name: Some(state.surface.name.as_str()),
                         trace_id: Some(&trace_id),
                         http_method: Some(method.as_ref()),
                         path: Some(uri.path()),
@@ -11094,8 +11198,9 @@ async fn handle_fabric_request(
                         error: Some(crate::observability::PolicyEvaluationError::EvaluationError),
                         policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                         policy_definition_id: channel_opa_def_id,
-                        policy_name: Some(channel_opa_name.as_str()),
+                        policy_name: channel_opa_name.as_deref(),
                         surface_id: Some(config_id_str),
+                        surface_name: Some(state.surface.name.as_str()),
                         trace_id: Some(&trace_id),
                         http_method: Some(method.as_ref()),
                         path: Some(uri.path()),
@@ -11158,6 +11263,7 @@ async fn handle_fabric_request(
                 reason: Some("tools/call without a readable tool name under MCP tool gating"),
                 policy_id: Some("mcp_tool_gating"),
                 surface_id: Some(config_id_str),
+                surface_name: Some(state.surface.name.as_str()),
                 trace_id: Some(&trace_id),
                 http_method: Some(method.as_ref()),
                 path: Some(uri.path()),
@@ -11214,6 +11320,7 @@ async fn handle_fabric_request(
             },
             policy_id: Some("mcp_tool_gating"),
             surface_id: Some(config_id_str),
+            surface_name: Some(state.surface.name.as_str()),
             trace_id: Some(&trace_id),
             http_method: Some(method.as_ref()),
             path: Some(uri.path()),
@@ -13505,6 +13612,7 @@ async fn handle_fabric_request(
                                         &filtered.kept,
                                         crate::observability::PolicyDecisionEvent {
                                             surface_id: Some(config_id),
+                                            surface_name: Some(state.surface.name.as_str()),
                                             trace_id: Some(&trace_id),
                                             http_method: Some(method.as_ref()),
                                             path: Some(uri.path()),
@@ -14946,6 +15054,7 @@ async fn evaluate_mcp_proxy_opa_policies(
                 policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                 policy_definition_id: inbound_policy_def_id,
                 surface_id: Some(config_id_str),
+                surface_name: Some(state.surface.name.as_str()),
                 trace_id: Some(trace_id),
                 http_method: Some(method),
                 path: Some(uri.path()),
@@ -14970,10 +15079,11 @@ async fn evaluate_mcp_proxy_opa_policies(
                     allow: true,
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: inbound_policy_def_id,
-                    policy_name: Some(inbound_policy_name.as_str()),
+                    policy_name: inbound_policy_name.as_deref(),
                     policy_version: inbound_policy_version,
                     policy_content_hash: inbound_policy_hash.as_deref(),
                     surface_id: Some(config_id_str),
+                    surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(trace_id),
                     http_method: Some(method),
                     path: Some(uri.path()),
@@ -14988,10 +15098,11 @@ async fn evaluate_mcp_proxy_opa_policies(
                     reason: decision.reason.as_deref(),
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: inbound_policy_def_id,
-                    policy_name: Some(inbound_policy_name.as_str()),
+                    policy_name: inbound_policy_name.as_deref(),
                     policy_version: inbound_policy_version,
                     policy_content_hash: inbound_policy_hash.as_deref(),
                     surface_id: Some(config_id_str),
+                    surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(trace_id),
                     http_method: Some(method),
                     path: Some(uri.path()),
@@ -15015,10 +15126,11 @@ async fn evaluate_mcp_proxy_opa_policies(
                     error: Some(crate::observability::PolicyEvaluationError::EvaluationError),
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: inbound_policy_def_id,
-                    policy_name: Some(inbound_policy_name.as_str()),
+                    policy_name: inbound_policy_name.as_deref(),
                     policy_version: inbound_policy_version,
                     policy_content_hash: inbound_policy_hash.as_deref(),
                     surface_id: Some(config_id_str),
+                    surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(trace_id),
                     http_method: Some(method),
                     path: Some(uri.path()),
@@ -15063,6 +15175,7 @@ async fn evaluate_mcp_proxy_opa_policies(
                     .surface
                     .opa_policy_definition_id(),
                 surface_id: Some(config_id_str),
+                surface_name: Some(state.surface.name.as_str()),
                 trace_id: Some(trace_id),
                 http_method: Some(method),
                 path: Some(uri.path()),
@@ -15094,8 +15207,9 @@ async fn evaluate_mcp_proxy_opa_policies(
                     allow: true,
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: channel_opa_def_id,
-                    policy_name: Some(channel_opa_name.as_str()),
+                    policy_name: channel_opa_name.as_deref(),
                     surface_id: Some(config_id_str),
+                    surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(trace_id),
                     http_method: Some(method),
                     path: Some(uri.path()),
@@ -15112,10 +15226,11 @@ async fn evaluate_mcp_proxy_opa_policies(
                     reason: decision.reason.as_deref(),
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: channel_opa_def_id,
-                    policy_name: Some(channel_opa_name.as_str()),
+                    policy_name: channel_opa_name.as_deref(),
                     policy_version: channel_opa_version,
                     policy_content_hash: channel_opa_hash.as_deref(),
                     surface_id: Some(config_id_str),
+                    surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(trace_id),
                     http_method: Some(method),
                     path: Some(uri.path()),
@@ -15135,10 +15250,11 @@ async fn evaluate_mcp_proxy_opa_policies(
                     error: Some(crate::observability::PolicyEvaluationError::EvaluationError),
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: channel_opa_def_id,
-                    policy_name: Some(channel_opa_name.as_str()),
+                    policy_name: channel_opa_name.as_deref(),
                     policy_version: channel_opa_version,
                     policy_content_hash: channel_opa_hash.as_deref(),
                     surface_id: Some(config_id_str),
+                    surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(trace_id),
                     http_method: Some(method),
                     path: Some(uri.path()),
@@ -15266,6 +15382,7 @@ async fn handle_mcp_proxy_request(
                     scope: crate::observability::PolicyScope::McpTool,
                     allow: true,
                     surface_id: Some(config_id),
+                    surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(&trace_id),
                     path: Some(uri.path()),
                     identity: authenticated_identity,
@@ -15289,6 +15406,7 @@ async fn handle_mcp_proxy_request(
                         .content_hash
                         .as_deref(),
                     surface_id: Some(config_id),
+                    surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(&trace_id),
                     path: Some(uri.path()),
                     identity: authenticated_identity,
@@ -15316,6 +15434,7 @@ async fn handle_mcp_proxy_request(
                     scope: crate::observability::PolicyScope::McpTool,
                     error: Some(crate::observability::PolicyEvaluationError::EvaluationError),
                     surface_id: Some(config_id),
+                    surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(&trace_id),
                     path: Some(uri.path()),
                     identity: authenticated_identity,
@@ -15362,6 +15481,7 @@ async fn handle_mcp_proxy_request(
             },
             policy_id: Some("mcp_tool_gating"),
             surface_id: Some(config_id),
+            surface_name: Some(state.surface.name.as_str()),
             trace_id: Some(&trace_id),
             http_method: Some("POST"),
             path: Some(uri.path()),
@@ -15439,6 +15559,7 @@ async fn handle_mcp_proxy_request(
                     &filtered.kept,
                     crate::observability::PolicyDecisionEvent {
                         surface_id: Some(config_id),
+                        surface_name: Some(state.surface.name.as_str()),
                         trace_id: Some(&trace_id),
                         http_method: Some(method.as_str()),
                         path: Some(uri.path()),
@@ -15510,6 +15631,7 @@ async fn handle_mcp_proxy_request(
                             .content_hash
                             .as_deref(),
                         surface_id: Some(config_id),
+                        surface_name: Some(state.surface.name.as_str()),
                         trace_id: Some(&trace_id),
                         http_method: Some("POST"),
                         path: Some(uri.path()),
@@ -15539,6 +15661,7 @@ async fn handle_mcp_proxy_request(
                         .content_hash
                         .as_deref(),
                     surface_id: Some(config_id),
+                    surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(&trace_id),
                     http_method: Some("POST"),
                     path: Some(uri.path()),
@@ -15969,7 +16092,7 @@ async fn inject_backend_agent_vp(
                 inbound_chained_vcs.clone(),
             )
             .await
-            .map(|(body, proof)| (body, Some(proof)))
+            .map(|injected| injected.map_or_else(|| (response_body.clone(), None), |(body, proof)| (body, Some(proof))))
         }
         _ => {
             debug!(channel = channel_name, protocol = ?state.surface.channel_protocol(), "VP injection not supported for this protocol");
@@ -15979,7 +16102,11 @@ async fn inject_backend_agent_vp(
 
     match vp_result {
         Ok((modified_body, vp_jwt)) => {
-            info!(channel = channel_name, did = %did, "Backend agent VP injected into response");
+            if vp_jwt.is_some() {
+                info!(channel = channel_name, did = %did, "Backend agent VP injected into response");
+            } else {
+                debug!(channel = channel_name, did = %did, "No response location carries the agent identity, VP not injected");
+            }
             Ok((modified_body, vp_jwt))
         }
         Err(e) => {
@@ -17046,6 +17173,29 @@ allow if {
         path: &str,
         body: serde_json::Value,
     ) -> (axum::http::StatusCode, Vec<RecordedRefusal>) {
+        let (status, events) = access_point_records(router, path, body).await;
+        let refusals = events
+            .into_iter()
+            .filter_map(|event| match event.event {
+                crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                    stage,
+                    reason,
+                    http_status,
+                    rpc_error_code,
+                } => Some((stage, reason, http_status, rpc_error_code)),
+                _ => None,
+            })
+            .collect();
+        (status, refusals)
+    }
+
+    /// Sends one request through the Access Point and returns its status with
+    /// every audit record it produced.
+    async fn access_point_records(
+        router: crate::state::MultiSurfaceProxyState,
+        path: &str,
+        body: serde_json::Value,
+    ) -> (axum::http::StatusCode, Vec<crate::delegation_vault::audit::DelegationAuditEvent>) {
         let request = axum::http::Request::builder()
             .method("POST")
             .uri(path)
@@ -17066,19 +17216,167 @@ allow if {
                 None,
             )))
             .await;
-        let refusals = events
-            .into_iter()
-            .filter_map(|event| match event.event {
-                crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
-                    stage,
-                    reason,
-                    http_status,
-                    rpc_error_code,
-                } => Some((stage, reason, http_status, rpc_error_code)),
-                _ => None,
+        (response.status(), events)
+    }
+
+    /// Every record an Access Point request produces carries the request's own
+    /// id: 16 lowercase hex characters, fresh for each request.
+    async fn access_point_requests_each_carry_their_own_request_id(state: &crate::state::ProxyState) {
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(serde_json::json!({
+            "surface_id": "request-ids", "name": "Request ids",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/a2a", "protocol": "a2a"},
+            "target": {"endpoint": "http://127.0.0.1:9"}
+        }))
+        .unwrap();
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let (_, events) = access_point_records(
+                direct_router_state(state, surface.clone()),
+                "/elsewhere/rpc",
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "message/send"}),
+            )
+            .await;
+            assert!(!events.is_empty(), "the unroutable request is recorded");
+            let ids: std::collections::HashSet<_> = events
+                .iter()
+                .map(|event| {
+                    event
+                        .request_id
+                        .clone()
+                        .expect("every record carries the request id")
+                })
+                .collect();
+            assert_eq!(ids.len(), 1, "one request, one id");
+            seen.extend(ids);
+        }
+        assert!(seen.iter().all(|id| {
+            id.len() == 16
+                && id
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+        }));
+        assert_ne!(seen[0], seen[1], "each request has its own id");
+    }
+
+    /// A streamed response is read after the handler returned. The records its
+    /// events write (here, the response-policy allow recorded on the first
+    /// event) still carry the request's id, the one its other records carry.
+    async fn streamed_response_records_carry_the_request_id(state: &crate::state::ProxyState) {
+        use serde_json::json;
+        use std::sync::Arc;
+
+        let event = |result: serde_json::Value| {
+            (std::time::Duration::ZERO, format!("data: {}\n\n", json!({"jsonrpc": "2.0", "id": 1, "result": result})))
+        };
+        let target = crate::component_tests::helpers::MockServer::start_with_finished_stream(
+            "text/event-stream",
+            vec![
+                event(json!({"task": {"id": "t-1", "contextId": "c-1", "status": {"state": "TASK_STATE_SUBMITTED"}}})),
+                event(json!({"statusUpdate": {"taskId": "t-1", "contextId": "c-1",
+                    "status": {"state": "TASK_STATE_COMPLETED"}}})),
+            ],
+        )
+        .await;
+        let directory = tempfile::tempdir().unwrap();
+        let policies = Arc::new(
+            crate::policies::policy_definitions::FileSystemPolicyDefinitionStore::new(
+                directory
+                    .path()
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+            .await
+            .unwrap(),
+        );
+        policies
+            .save(
+                serde_json::from_value(json!({
+                    "id": "allow-responses", "name": "Allow responses", "policy_type": "agent_surface",
+                    "policy": "package surface.policy\ndefault allow = true", "created_at": "2026-10-28T00:00:00Z"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+            "surface_id": "streamed-ids", "name": "Streamed ids",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/a2a", "protocol": "a2a"},
+            "target": {"endpoint": target.url(), "response_policy": {"policy_definition_id": "allow-responses"}}
+        }))
+        .unwrap();
+        let manager = Arc::new(crate::policies::SurfacePolicyManager::new());
+        manager.set_policy_definition_store(policies);
+        manager
+            .update_channel_policy(&surface)
+            .await
+            .unwrap();
+        let state = crate::state::ProxyState {
+            policy_manager: Some(manager),
+            ..state.clone()
+        };
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/a2a")
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream")
+            .header("A2A-Version", "1.0")
+            .body(axum::body::Body::from(
+                json!({"jsonrpc": "2.0", "id": 1, "method": "SendStreamingMessage", "params": {
+                    "message": {"messageId": "m-1", "role": "ROLE_USER", "parts": [{"text": "hi"}]}
+                }})
+                .to_string(),
+            ))
+            .unwrap();
+
+        let (body, events) = crate::audit::producer::capture(async {
+            let response = Box::pin(super::multi_channel_proxy_handler_with_mcp_runtime(
+                "127.0.0.1:12345"
+                    .parse()
+                    .unwrap(),
+                direct_router_state(&state, surface),
+                request,
+                crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+                None,
+            ))
+            .await;
+            axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap()
+        })
+        .await;
+
+        let streamed_decisions = events
+            .iter()
+            .filter(|event| {
+                matches!(&event.event, crate::delegation_vault::audit::DelegationAuditAction::PolicyDecision {
+                    scope, ..
+                } if scope == crate::observability::PolicyScope::Response.as_str())
             })
+            .count();
+        assert_eq!(streamed_decisions, 1, "the allow is recorded once per stream: {events:?}\n{body:?}");
+        let decision = events
+            .iter()
+            .find(|event| {
+                matches!(&event.event, crate::delegation_vault::audit::DelegationAuditAction::PolicyDecision { .. })
+            })
+            .unwrap();
+        assert_eq!(
+            decision
+                .channel_name
+                .as_deref(),
+            Some("Streamed ids"),
+            "the decision names the surface"
+        );
+        let ids: std::collections::HashSet<_> = events
+            .iter()
+            .map(|event| event.request_id.clone())
             .collect();
-        (response.status(), refusals)
+        assert_eq!(ids.len(), 1, "one request, one id: {ids:?}");
+        assert!(
+            ids.iter()
+                .all(Option::is_some),
+            "every record carries the id: {ids:?}"
+        );
     }
 
     /// Each refusal the Access Point answers itself is recorded as
@@ -18659,6 +18957,8 @@ allow if {
         modern_extensions_survive_forwarding(&state).await;
         proxy_access_point_answers_modern_discovery(&state).await;
         access_point_records_request_refusals(&state).await;
+        access_point_requests_each_carry_their_own_request_id(&state).await;
+        streamed_response_records_carry_the_request_id(&state).await;
         let now = crate::proxy::credential_delegation::modern::now_secs().unwrap();
         let runtime = negative_cases::continuation_runtime(now, 300);
         let bearer = issuer.sign_jwt_with_gateway_key_typ(&json!({

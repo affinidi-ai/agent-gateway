@@ -34,6 +34,19 @@ Applies to:
    explicitly requested.
 8. Header topbar controls must use the shared topbar action button pattern, a single
    reusable component plus shared CSS state rules, rather than ad-hoc per-button markup.
+9. Mediator lists may contain directory entries (`directory:*` ids), and stored records
+   created from them carry `provided: true`. The Create Connection Point wizard pre-selects the
+   first `directory:` entry (else the only mediator, else nothing; never a stored provided
+   record) and marks it in no other way. The dropdown lists a directory mediator once, as its
+   `directory:` entry. The Mediators page renders every mediator with `provided: true` read-only
+   (no ping or edit; Delete only when the list marks the record `deletable`: the directory
+   stopped offering it, or none is configured), shows no badge or
+   warning for them, and shows the stored `provided` record instead of the entry when one exists
+   for the DID. An operator-added mediator with the same DID is a separate row and never hides
+   the entry. The wizard's mediator step shows a failed load above the empty-list message and
+   offers a Refresh button (`wizard-mediator-refresh-button`) in that state and below the list, since
+   a directory can take a moment to answer after the gateway starts; a load error shows as
+   `wizard-mediator-load-error`.
 
 ## Toasts
 
@@ -147,6 +160,18 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
 | Explainer toggle, body, guide link | `trust-recorder-fullscreen-context-toggle`, `trust-recorder-fullscreen-context-body`, `trust-recorder-fullscreen-context-doclink` |
 | Canvas node, by element type       | `surface-node-<type>`, for example `surface-node-trust-recorder`                                                                  |
 
+### Trust Recorder panel
+
+The Trust Recorder panel (sidebar and fullscreen) shows a **Last outcome** row from
+`GET /surfaces/{id}/trust-recorder-status` (`apiClient.getSurfaceTrustRecorderStatus`), rendered
+by one shared component, `components/trust-recorder/TrustRecorderLastOutcome.tsx`. It reads the
+surface id from `SurfaceMetaContext` and is hidden outside the builder, while a surface is
+being created, and without an id. States: a quiet **Loading…**, **No attempt yet** for a
+`null` status, the state badge with reason text, relative time (absolute in its `title`) and
+the counts summed across entries, and **Status unavailable** when the fetch fails; a failed
+fetch never breaks the panel. Test ids: `trust-recorder-last-outcome` with `-state`,
+`-reason`, `-time`, `-counts`, `-loading`, `-empty`, and `-unavailable`.
+
 ## Access Tokens page
 
 Management personal access tokens live in the Secrets page's **Access Tokens** tab.
@@ -258,6 +283,31 @@ title is `policy-instructions-title`, the arrow `policy-instructions-chevron` si
 button and flips with the state, and the body is `policy-instructions-body`. Build collapsible
 panels the same way, and do not put `role="button"` on a wrapper around a heading.
 
+## Audit page: policy changes
+
+The seven policy change events (`policy_created`, `policy_updated`, `policy_deleted`,
+`policy_attached`, `policy_detached`, `policy_attachment_changed`, `policy_change_refused`) are
+read with `policyChange` (`pages/AuditPage/auditHelpers.ts`), never by indexing `entry.event`
+in components.
+
+- The list row and the panel title use `describeEntry`: one sentence saying which policy changed
+  where, and a detail line naming the actor and why (`definition_deleted`, `ownership`). Refused
+  changes are red, deletions and detachments amber, the rest neutral.
+- The footnote shows the actor instead of the caller. Records hold ids only; `useUserNames`
+  resolves user ids to usernames from `/users` and keeps the id when the list is not readable.
+  It is called once, in `AuditPage`, and asks for the list only when the page shows a policy
+  change and the viewer has `users.view`; the resolver is passed down as the `userName` prop.
+  Don't call it per row. The names are cached per session token, so signing out and in (as
+  anyone) loads them again and never shows the previous session's. Within a session a 403 is
+  kept until the page reloads; any other failure is retried on the next visit. The status comes
+  from `ApiError` (`api.ts`): read `error.status`, not the message text. Only `apiClient`
+  requests the server answers with an error status other than 401 throw it; a 401 (session
+  expired), a timeout and the export and download helpers throw a plain `Error`.
+- The evidence pane shows only **Details** for a change (no request journey or signed
+  presentation), grouped as Change, Policy, Where and Refusal. The policy links to the Policies
+  tab of its type, the target to its surface or gateway page.
+- Every value is rendered as React text; record fields come from the gateway and are untrusted.
+
 ## MCP Proxy write warnings
 
 MCP Proxy create and update responses can carry `warnings`, for example when only the
@@ -273,8 +323,8 @@ modern catalog could be registered. Render them with the shared `WriteWarnings` 
 
 `pages/IdentitiesPage.tsx` orchestrates. Its page-only parts live in
 `pages/IdentitiesPage/`, with tests in `pages/IdentitiesPage/__tests__/`: search,
-unnamed filter, and surface links in the `useIdentityRows` hook, and the row parts
-`IdentityNameCell` and `IdentityOriginBadge`.
+unnamed filter, recorder filter, and surface links in the `useIdentityRows` hook, and the row
+parts `IdentityNameCell`, `IdentityOriginBadge`, and `IdentityRecorderChip`.
 
 - Each DID gets its own row, keyed by the DID, with its own actions (Trust Score, Version History, Configure Policy, Copy link).
   Managed identities that share a surface, such as parallel `from_jwt_claim` DIDs, are
@@ -297,6 +347,27 @@ unnamed filter, and surface links in the `useIdentityRows` hook, and the row par
   `/surfaces/<surface_id>`, and the credential principal as a separate field.
 - When the backend sends none of the naming fields, the page renders as it did without
   them: no name line, filter, or origin badge.
+- **Recorder** status comes from the optional `trust_recorder` field on an identity (types in
+  `types.ts`), present only when the identity's surface has a Trust Recorder. It is the
+  gateway recorder's last known outcome, not a live registry check. When any identity has it,
+  the table gains a **Recorder** column and the filter row gains a **Recorder** select; with
+  none, neither appears and the page looks as before.
+  - The column holds `IdentityRecorderChip`, a shared `Badge` (never colour-only: the text is
+    always shown) in a focusable button, so the tooltip opens on hover and keyboard focus and a
+    click does not expand the row. Labels and tones come from `utils/trustRecorderStatus.ts`:
+    Recorded (success), Partly recorded (warning), Failed (danger), Skipped (secondary), Not
+    attempted yet (light). The tooltip gives the last attempt (relative plus absolute) or
+    "No attempt yet", the overall reason text, and one row per entry with the registry id, its
+    state, its reason, and "created N, already existed N, failed N". Reason codes map to fixed
+    text; no registry error text is ever shown.
+  - The **Recorder** select (`recorderFilter.ts`, a pure predicate) offers All, Recorded,
+    Partly recorded, Failed, Skipped, Not attempted yet, and No recorder (identities without
+    the field). It is page state like the unnamed filter, and combines with the search and the
+    unnamed filter (AND).
+  - A websocket identity update replaces the whole identity, so a changed `trust_recorder`
+    outcome shows without a reload. The backend includes an identity in the delta when its
+    recorder outcome changes; adding or removing a Trust Recorder shows on the next update or
+    reload.
 
 | Element                                       | Test id                                                                                                                            |
 | --------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
@@ -306,6 +377,11 @@ unnamed filter, and surface links in the `useIdentityRows` hook, and the row par
 | Origin badge                                  | `identities-origin-<origin>`                                                                                                       |
 | Surface link, credential principal            | `identities-surface-link`, `identities-credential-principal`                                                                       |
 | Unnamed filter                                | `identities-unnamed-filter-button`                                                                                                 |
+| Recorder filter                               | `identities-recorder-filter`                                                                                                       |
+| Recorder chip                                 | `identities-recorder-chip-<state>`                                                                                                 |
+| Recorder tooltip                              | `identities-recorder-tooltip`                                                                                                      |
+| Tooltip last attempt, reason                  | `identities-recorder-last-attempt`, `identities-recorder-reason`                                                                   |
+| Tooltip registry entry                        | `identities-recorder-entry-<registry id>`                                                                                          |
 
 ## Remote gateway Issuer DIDs
 

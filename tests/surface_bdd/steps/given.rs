@@ -16,7 +16,7 @@ use crate::bdd_support::config::single_surface_fixture::{
 };
 use crate::bdd_support::config::source_auth::caller_authentication_method_json;
 use crate::bdd_support::gateway_process::SURFACE_TEST_AUTH_TOKEN as TEST_AUTH_TOKEN;
-use crate::bdd_support::mock_server::{MockAgentFixture, MockResponse};
+use crate::bdd_support::mock_server::{MockAgentFixture, MockResponse, MockStream};
 use crate::bdd_support::policies::{
     build_gateway_request_path_policy, build_mcp_tool_allow_all_policy, build_mcp_tool_allow_policy,
     build_mcp_tool_deny_all_policy, build_surface_a2a_method_policy, build_surface_request_content_policy,
@@ -109,7 +109,7 @@ pub(crate) fn tracked_surface_id(
         .unwrap_or_else(|| panic!("surface '{surface_name}' must have been created before this step"))
 }
 
-fn current_surface_body(
+pub(crate) fn current_surface_body(
     world: &SurfaceWorld,
     action: &str,
 ) -> serde_json::Value {
@@ -121,7 +121,7 @@ fn current_surface_body(
         .clone()
 }
 
-async fn update_named_surface(
+pub(crate) async fn update_named_surface(
     world: &mut SurfaceWorld,
     surface_name: &str,
     payload: serde_json::Value,
@@ -522,12 +522,8 @@ async fn surface_has_request_policy_allowing_a2a_metadata_field(
     update_named_surface(world, &surface_name, surface, "attaching header metadata policy").await;
 }
 
-#[given(expr = "surface {string} has caller Trust Check that uses A2A metadata field {string}")]
-async fn surface_has_caller_trust_check_using_a2a_metadata_field(
-    world: &mut SurfaceWorld,
-    surface_name: String,
-    field: String,
-) {
+/// Adds a trust registry whose connection fails, so it stays stored but unconnected.
+async fn create_unconnected_trust_registry(world: &mut SurfaceWorld) -> String {
     crate::steps::when::ensure_admin_session(world).await;
     let registry_name = format!("bdd-unreachable-registry-{}", uuid::Uuid::new_v4());
     let admin_client = world
@@ -551,12 +547,21 @@ async fn surface_has_caller_trust_check_using_a2a_metadata_field(
         .send_json::<(), _>(reqwest::Method::GET, "/v1/trust-registries", None)
         .await
         .expect("list Trust Registries through admin API");
-    let trust_registry_id = registries
+    registries
         .iter()
         .find(|registry| registry["name"] == registry_name)
         .and_then(|registry| registry["id"].as_str())
         .expect("created unreachable Trust Registry must remain persisted")
-        .to_string();
+        .to_string()
+}
+
+#[given(expr = "surface {string} has caller Trust Check that uses A2A metadata field {string}")]
+async fn surface_has_caller_trust_check_using_a2a_metadata_field(
+    world: &mut SurfaceWorld,
+    surface_name: String,
+    field: String,
+) {
+    let trust_registry_id = create_unconnected_trust_registry(world).await;
     let policy_id = format!("bdd-header-metadata-trust-check-policy-{}", uuid::Uuid::new_v4());
     let rego = r#"package surface.policy
 
@@ -637,6 +642,70 @@ fn surface_has_caller_trust_check_with_entity_template(
         .surface_config
         .caller_trust_check_list
         .push(element);
+}
+
+const RECORDER_AUTHORITY_DID: &str = "did:web:example.com:authority";
+const SURFACE_ISSUER_AUTHORITY_TEMPLATE: &str = "{{ surface.issuer_did }}";
+
+pub(crate) fn trust_recorder_entry(
+    trust_registry_id: &str,
+    issuer_did: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "trust_registry_id": trust_registry_id,
+        "issuer_did": issuer_did,
+        "authority_did": RECORDER_AUTHORITY_DID,
+        "include_owned_agent": true,
+        "custom_resources": [],
+    })
+}
+
+#[given(expr = "the surface has a Trust Recorder for trust registry {string} with issuer {string}")]
+fn surface_has_trust_recorder(
+    world: &mut SurfaceWorld,
+    trust_registry_id: String,
+    issuer_did: String,
+) {
+    world
+        .surface_config
+        .trust_recorder_entries
+        .push(trust_recorder_entry(&trust_registry_id, &issuer_did));
+}
+
+#[given(expr = "the Trust Recorder for trust registry {string} takes the surface Issuer as its authority")]
+fn trust_recorder_takes_surface_issuer_as_authority(
+    world: &mut SurfaceWorld,
+    trust_registry_id: String,
+) {
+    let entry = world
+        .surface_config
+        .trust_recorder_entries
+        .iter_mut()
+        .find(|entry| entry["trust_registry_id"] == trust_registry_id)
+        .unwrap_or_else(|| panic!("the surface has no Trust Recorder for trust registry {trust_registry_id:?}"));
+    entry["authority_did"] = serde_json::json!(SURFACE_ISSUER_AUTHORITY_TEMPLATE);
+}
+
+#[given(expr = "surface {string} later gets a Trust Recorder for an unconnected trust registry with issuer {string}")]
+async fn surface_later_gets_trust_recorder_for_unconnected_registry(
+    world: &mut SurfaceWorld,
+    surface_name: String,
+    issuer_did: String,
+) {
+    let trust_registry_id = create_unconnected_trust_registry(world).await;
+    let surface_id = tracked_surface_id(world, &surface_name);
+    world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist")
+        .patch_surface(
+            &surface_id,
+            &serde_json::json!({
+                "access_point": { "trust_recorder": { "entries": [trust_recorder_entry(&trust_registry_id, &issuer_did)] } }
+            }),
+        )
+        .await
+        .expect("adding a Trust Recorder through the admin API should succeed");
 }
 
 #[given("the surface has a policy that denies unless every caller Trust Check succeeded")]
@@ -2488,6 +2557,81 @@ fn managed_agent_response_has_identity(
         }
     });
     set_primary_target_response(world, response);
+}
+
+/// A v1.0 task event stream: submitted, working, an artifact, then completed
+/// with `final_message` on its status when one is given.
+fn streamed_task(final_message: Option<serde_json::Value>) -> MockResponse {
+    let event = |result: serde_json::Value| serde_json::json!({ "jsonrpc": "2.0", "id": 1, "result": result });
+    let mut completed = serde_json::json!({ "state": "TASK_STATE_COMPLETED" });
+    if let Some(message) = final_message {
+        completed["message"] = message;
+    }
+    MockResponse::streamed(
+        serde_json::json!([
+            event(serde_json::json!({ "task": {
+                "id": "bdd-task", "contextId": "bdd-context", "status": { "state": "TASK_STATE_SUBMITTED" }
+            } })),
+            event(serde_json::json!({ "statusUpdate": {
+                "taskId": "bdd-task", "contextId": "bdd-context", "status": { "state": "TASK_STATE_WORKING" }
+            } })),
+            event(serde_json::json!({ "artifactUpdate": {
+                "taskId": "bdd-task", "contextId": "bdd-context",
+                "artifact": { "artifactId": "bdd-artifact", "parts": [{ "text": "draft" }] }
+            } })),
+            event(serde_json::json!({ "statusUpdate": {
+                "taskId": "bdd-task", "contextId": "bdd-context", "status": completed
+            } })),
+        ]),
+        MockStream::Events,
+    )
+}
+
+#[given(expr = "managed agent {string} streams a task that completes")]
+fn managed_agent_streams_a_task(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+) {
+    world
+        .actors
+        .expect_target_kind(&agent_name, TargetActorKind::ManagedAgent);
+    set_primary_target_response(world, streamed_task(None));
+}
+
+#[given(expr = "managed agent {string} streams a task whose final status message claims its identity")]
+fn managed_agent_streams_a_task_claiming_identity(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+) {
+    world
+        .actors
+        .expect_target_kind(&agent_name, TargetActorKind::ManagedAgent);
+    let message = serde_json::json!({
+        "messageId": "bdd-agent-message",
+        "role": "ROLE_AGENT",
+        "parts": [{ "text": "done" }],
+        "extensions": [AGENT_IDENTITY_URI],
+        "metadata": {
+            AGENT_IDENTITY_URI: {
+                "softwareInfo": { "name": "managed-agent", "version": "2.0" },
+                "cloudProvider": "local"
+            }
+        }
+    });
+    set_primary_target_response(world, streamed_task(Some(message)));
+}
+
+#[given(expr = "managed agent {string} streams the error {string}")]
+fn managed_agent_streams_an_error(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    message: String,
+) {
+    world
+        .actors
+        .expect_target_kind(&agent_name, TargetActorKind::ManagedAgent);
+    let error = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "error": { "code": -32001, "message": message } });
+    set_primary_target_response(world, MockResponse::streamed(serde_json::json!([error]), MockStream::Events));
 }
 
 #[given(expr = "managed agent {string} publishes the agent-identity extension on its agent card")]

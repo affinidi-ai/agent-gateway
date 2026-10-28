@@ -13,6 +13,11 @@ use crate::storage::filesystem::{StorageBackend, cached_storage};
 /// file operations and caching, eliminating code duplication.
 pub struct FileSystemGatewayStore {
     storage: Box<dyn StorageBackend<Gateway>>,
+    /// Held from reading a gateway before a write until the write's policy
+    /// changes are recorded, so they and the write's stream revocations are
+    /// relative to the record it replaced, and the records of concurrent
+    /// writes come in write order.
+    writes: tokio::sync::Mutex<()>,
 }
 
 impl FileSystemGatewayStore {
@@ -22,7 +27,10 @@ impl FileSystemGatewayStore {
         proxy_did: Option<String>,
     ) -> Result<Self> {
         let storage = cached_storage(storage_dir, "gateway").await?;
-        let store = Self { storage };
+        let store = Self {
+            storage,
+            writes: tokio::sync::Mutex::new(()),
+        };
 
         let all_gateways = store.list_all().await?;
         if all_gateways.is_empty() {
@@ -108,6 +116,7 @@ impl FileSystemGatewayStore {
         &self,
         gateway: &Gateway,
     ) -> Result<()> {
+        let write = self.writes.lock().await;
         let previous = self
             .storage
             .get(&gateway.id)
@@ -115,6 +124,15 @@ impl FileSystemGatewayStore {
         self.storage
             .save(gateway)
             .await?;
+        crate::audit::policy_changes::gateway_written(
+            previous
+                .as_ref()
+                .ok()
+                .and_then(Option::as_ref),
+            Some(gateway),
+        )
+        .await;
+        drop(write);
         self.revoke_change(previous, Some(gateway))
             .await;
         Ok(())
@@ -179,10 +197,20 @@ impl GatewayStore for FileSystemGatewayStore {
         &self,
         id: &str,
     ) -> Result<()> {
+        let write = self.writes.lock().await;
         let previous = self.storage.get(id).await;
         self.storage
             .delete(id)
             .await?;
+        crate::audit::policy_changes::gateway_written(
+            previous
+                .as_ref()
+                .ok()
+                .and_then(Option::as_ref),
+            None,
+        )
+        .await;
+        drop(write);
         self.revoke_change(previous, None)
             .await;
         Ok(())
@@ -214,6 +242,168 @@ pub async fn get_local_gateway_id(store: &Arc<dyn GatewayStore>) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_management_request_records_the_gateway_policies_its_writes_attach_and_detach() {
+        use crate::audit::context::in_management_request;
+        use crate::audit::events::Actor;
+        use crate::audit::producer::capture;
+        use crate::delegation_vault::audit::action_category;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = FileSystemGatewayStore::new(dir.path().to_path_buf(), None)
+            .await
+            .expect("store");
+        let mut peer = Gateway::new("peer".into(), String::new(), "did:web:peer.example".into(), GatewayType::Remote);
+        store
+            .create(&peer)
+            .await
+            .expect("create");
+
+        let ((), records) = capture(in_management_request(Actor::user("u-1"), async {
+            peer.opa_policy_config = Some(super::super::types::GatewayOpaPolicyConfig {
+                enabled: true,
+                policy_definition_id: Some("p".to_string()),
+                ..Default::default()
+            });
+            store
+                .update(&peer)
+                .await
+                .expect("update");
+            store
+                .delete(&peer.id)
+                .await
+                .expect("delete");
+        }))
+        .await;
+
+        let categories: Vec<_> = records
+            .iter()
+            .map(|record| action_category(&record.event))
+            .collect();
+        assert_eq!(categories, vec!["policy_attached", "policy_detached"]);
+    }
+
+    #[tokio::test]
+    async fn concurrent_writes_to_one_gateway_record_a_chain_of_changes() {
+        use crate::audit::context::in_management_request;
+        use crate::audit::events::Actor;
+        use crate::audit::producer::capture;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = FileSystemGatewayStore::new(dir.path().to_path_buf(), None)
+            .await
+            .expect("store");
+        let (a, b, c) = (with_policy("a"), with_policy("b"), with_policy("c"));
+
+        let ((), records) = capture(in_management_request(Actor::user("u-1"), async {
+            store
+                .create(&a)
+                .await
+                .expect("create");
+            let (first, second) = tokio::join!(store.update(&b), store.update(&c));
+            first.expect("update");
+            second.expect("update");
+        }))
+        .await;
+
+        assert_recorded_in_write_order(&records);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn parallel_writes_to_one_gateway_record_their_changes_in_write_order() {
+        use crate::audit::context::in_management_request;
+        use crate::audit::events::Actor;
+        use crate::audit::producer::{capture, capture_spawned};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(
+            FileSystemGatewayStore::new(dir.path().to_path_buf(), None)
+                .await
+                .expect("store"),
+        );
+        let ((), mut records) = capture(in_management_request(Actor::user("u-1"), async {
+            store
+                .create(&with_policy("a"))
+                .await
+                .expect("create");
+        }))
+        .await;
+
+        let write = |policy: &'static str| {
+            let store = store.clone();
+            in_management_request(Actor::user("u-1"), async move {
+                store
+                    .update(&with_policy(policy))
+                    .await
+                    .expect("update");
+            })
+        };
+        records.extend(capture_spawned(vec![write("b"), write("c")]).await);
+
+        assert_recorded_in_write_order(&records);
+    }
+
+    /// Gateway `gw-1` naming the policy definition `id`.
+    fn with_policy(id: &str) -> Gateway {
+        let mut peer = Gateway::new("peer".into(), String::new(), "did:web:peer.example".into(), GatewayType::Remote);
+        peer.id = "gw-1".to_string();
+        peer.opa_policy_config = Some(super::super::types::GatewayOpaPolicyConfig {
+            enabled: true,
+            policy_definition_id: Some(id.to_string()),
+            ..Default::default()
+        });
+        peer
+    }
+
+    /// `records` are those of creating a gateway naming policy `a`, then two
+    /// writes naming `b` and `c` in either order. Each write's records come
+    /// together, in write order, and its detach names the policy the write
+    /// before it attached. Within one write, records are in policy id order.
+    fn assert_recorded_in_write_order(records: &[crate::delegation_vault::audit::DelegationAuditEvent]) {
+        use crate::delegation_vault::audit::action_category;
+        use std::collections::BTreeSet;
+
+        let changes: Vec<(&str, String)> = records
+            .iter()
+            .map(|record| {
+                let category = action_category(&record.event);
+                let id = serde_json::to_value(&record.event).unwrap()[category]["policy_definition_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                (category, id)
+            })
+            .collect();
+        assert_eq!(changes.len(), 5, "{changes:?}");
+        assert_eq!(changes[0], ("policy_attached", "a".to_string()));
+        let write = |range: std::ops::Range<usize>| -> BTreeSet<(&str, String)> {
+            changes[range]
+                .iter()
+                .cloned()
+                .collect()
+        };
+        let second = write(1..3)
+            .into_iter()
+            .find(|(category, _)| *category == "policy_attached")
+            .map(|(_, id)| id)
+            .expect("the second write attaches a policy");
+        let third = if second == "b" {
+            "c"
+        } else {
+            "b"
+        };
+        assert_eq!(
+            write(1..3),
+            BTreeSet::from([("policy_detached", "a".to_string()), ("policy_attached", second.clone())]),
+            "{changes:?}"
+        );
+        assert_eq!(
+            write(3..5),
+            BTreeSet::from([("policy_detached", second), ("policy_attached", third.to_string())]),
+            "{changes:?}"
+        );
+    }
 
     #[tokio::test]
     async fn filesystem_store_get_by_did_returns_issuer_did() {

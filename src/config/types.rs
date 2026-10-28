@@ -344,6 +344,11 @@ pub struct A2aConfig {
     #[serde(default = "default_timeout")]
     pub timeout_seconds: u64,
 
+    /// Longest an A2A event stream is forwarded from a direct Target, in
+    /// seconds (1 to 86400).
+    #[serde(default = "default_a2a_stream_max_lifetime_secs")]
+    pub stream_max_lifetime_secs: u64,
+
     /// Fabric gateway request timeout in milliseconds (for fabric:// flows)
     /// This is how long GW1 will wait for a response from GW2
     #[serde(default = "default_fabric_timeout_ms")]
@@ -390,6 +395,7 @@ impl Default for A2aConfig {
             validate_messages: None,
             max_body_size: default_max_body_size(),
             timeout_seconds: default_timeout(),
+            stream_max_lifetime_secs: default_a2a_stream_max_lifetime_secs(),
             fabric_gateway_timeout_ms: default_fabric_timeout_ms(),
             message_expires_seconds: default_message_expires_seconds(),
             max_inflight_dispatches: default_max_inflight_dispatches(),
@@ -425,6 +431,9 @@ impl A2aConfig {
         }
         if self.max_inflight_dispatches == 0 {
             return Err("a2a.max_inflight_dispatches must be > 0".to_string());
+        }
+        if !(1..=86_400).contains(&self.stream_max_lifetime_secs) {
+            return Err("a2a.stream_max_lifetime_secs must be between 1 and 86400".to_string());
         }
         if let Some(limit) = self.fabric_stream_max_envelope_bytes
             && (!(64 * 1024..=1024 * 1024).contains(&limit) || limit as u64 > self.sdk_inbound_cache_bytes)
@@ -1324,8 +1333,9 @@ pub struct TimeoutConfig {
     #[serde(default = "default_connect_timeout")]
     pub connect_secs: u64,
 
-    /// Idle timeout in seconds (time between data frames of a buffered
-    /// upstream response body; `0` disables it)
+    /// Idle timeout in seconds (how long the upstream may send nothing while a
+    /// buffered response body or a forwarded A2A event stream is read; `0`
+    /// disables it)
     #[serde(default = "default_idle_timeout")]
     pub idle_secs: u64,
 }
@@ -2994,6 +3004,10 @@ fn default_timeout() -> u64 {
     30
 }
 
+fn default_a2a_stream_max_lifetime_secs() -> u64 {
+    3600
+}
+
 fn default_tool_timeout() -> u64 {
     30 // 30 seconds
 }
@@ -3808,6 +3822,29 @@ mod a2a_validate_tests {
     fn validate_ok_when_expires_strictly_greater_than_timeout() {
         let c = cfg(60_000, 90);
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn stream_max_lifetime_defaults_to_an_hour_and_is_bounded() {
+        let from_empty_table: A2aConfig = toml::from_str("").expect("an empty [a2a] table must deserialize");
+        assert_eq!(from_empty_table.stream_max_lifetime_secs, 3600);
+        for good in [1, 3600, 86_400] {
+            let c = A2aConfig {
+                stream_max_lifetime_secs: good,
+                ..A2aConfig::default()
+            };
+            assert_eq!(c.validate(), Ok(()), "{good} should be accepted");
+        }
+        for bad in [0, 86_401] {
+            let c = A2aConfig {
+                stream_max_lifetime_secs: bad,
+                ..A2aConfig::default()
+            };
+            let err = c
+                .validate()
+                .expect_err("out of range");
+            assert!(err.contains("a2a.stream_max_lifetime_secs"), "error should name the setting, got: {err}");
+        }
     }
 
     #[test]

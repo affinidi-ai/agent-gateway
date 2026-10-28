@@ -119,6 +119,94 @@ wider, at 30 times that value.
 Workload Binding supports `caller_source: did`, which tags the Workload Binding
 presentation with `user_hash = SHA256(did)`.
 
+### Authorization server metadata module (developer reference)
+
+[`src/authz_metadata/`](../src/authz_metadata/) fetches and validates an authorization
+server's metadata document and returns the issuer, the URL the document came from, the
+`token_endpoint` and the `jwks_uri`. An issuer is acceptable only when it has no ASCII
+whitespace or control characters anywhere, leading, trailing or inside; the raw string is
+checked before it is parsed, and a failure is `invalid_url` before any DNS lookup or request.
+Let P be the issuer path with its trailing slashes removed. An origin issuer (empty P, with or
+without a trailing slash) has two attempts, in this order: `{origin}/.well-known/oauth-authorization-server`
+(RFC 8414), then `{origin}/.well-known/openid-configuration`. A path issuer has three: the
+RFC 8414 URL with P inserted after the well-known name
+(`{origin}/.well-known/oauth-authorization-server{P}`), the OpenID Connect URL with P inserted
+(`{origin}/.well-known/openid-configuration{P}`), then the OpenID Connect URL with P appended
+(`{origin}{P}/.well-known/openid-configuration`). The first acceptable document wins. The
+`issuer` in the document must equal the requested issuer byte for byte. `token_endpoint` and `jwks_uri` must be absolute `http` or
+`https` URLs of at most 2048 characters, with no whitespace, control characters,
+credentials or fragment, not a cloud-metadata address, and not a weaker scheme than the
+issuer: an `https` issuer with an `http` endpoint is an invalid document under every posture.
+The schemes are compared as parsed, so their case does not matter.
+
+| Limit | Value |
+| --- | --- |
+| Body size | 64 KiB (`MAX_METADATA_BYTES`), set per call by `DiscoveryOptions::max_bytes` |
+| Timeout | 10 s, set per call by `DiscoveryOptions::timeout`, applied once to resolving the host and again to the HTTP request from connecting to reading the last byte. One fetch can take up to twice the timeout, and `discover` can make three fetches for a path issuer and two for an origin issuer, so up to six or four times the timeout in all |
+| Redirects | Refused |
+| DNS | The egress guard can resolve the host more than once; the connection is pinned to the addresses of the last, vetted resolution. An IPv6 literal host cannot be pinned and fails as `blocked`. Pinning does not hold when a proxy is configured: the HTTP client reads `HTTPS_PROXY`, `HTTP_PROXY` and `ALL_PROXY` (also in lower case) and, on macOS and Windows, the system proxy settings. The request then goes to the proxy, which resolves the host again and connects to an address nobody vetted, so address vetting and pinning no longer apply. This is true of the shared pinned egress clients until they call `.no_proxy()` |
+| Status | Only a 2xx response is read |
+
+The caller chooses an `EgressPosture`. `Strict` accepts `https` only: `get_bounded` and
+`discover` refuse an `http` URL or an `http` issuer as `invalid_url` before any DNS lookup or
+request, and an `http` `token_endpoint` or `jwks_uri` makes the document invalid. `Strict` also
+blocks loopback, unspecified, RFC 1918, link-local and unique-local addresses.
+`CloudMetadataOnly` accepts `http` and `https`, for operator-trusted callers such as a local
+authorization server, and blocks only cloud-metadata addresses, allowing loopback and private
+ranges. An `http` issuer, possible only under `CloudMetadataOnly`, may have `http` or `https`
+endpoints. The posture
+applies to the metadata URL at fetch time. It also applies to the discovered
+`token_endpoint` and `jwks_uri` at parse time, where under `Strict` a literal IP host or a
+`localhost` name in a blocked range makes the document invalid. A name that only resolves to
+a private address cannot be known without DNS, so it passes parsing. The caller must therefore
+fetch these URLs with `get_bounded`, or another pinned client, under the same posture, which
+blocks such a name at fetch time.
+
+A failure is a `DiscoveryError`. `failure()` returns the `DiscoveryFailure`, `code()` a
+stable string, `message()` fixed text that is safe in an API response (it never carries a
+resolved address or a transport error) and `detail()` text for logs only. The error's
+`Display` output includes the detail, so it is for logs only too. Both `code()` and
+`message()` reveal the kind of failure, for example that a host is blocked or unreachable, so
+a caller that serves untrusted parties should log them and return one generic message
+instead.
+
+| `code()` | Meaning |
+| --- | --- |
+| `invalid_url` | The URL or issuer is not an absolute `http` or `https` URL without credentials (`https` only under `Strict`), the issuer has a query or fragment, or the issuer contains whitespace or control characters |
+| `blocked` | The egress posture refused the URL or its resolved address, the host name did not resolve, or the host is an IPv6 literal |
+| `unreachable` | Resolving the host timed out, the connection failed or timed out, or the body could not be read in time |
+| `http_status` | The server answered with a status outside 2xx, including a redirect |
+| `too_large` | The body exceeded the size limit |
+| `invalid_document` | The body is not a JSON object, or a required field is missing or unacceptable, including an endpoint with a weaker scheme than the issuer or, under `Strict`, a non-`https` endpoint |
+| `issuer_mismatch` | The document's `issuer` differs from the requested issuer |
+
+`discover` tries the URLs in order and stops at once on `invalid_url`, `blocked` or
+`unreachable`. Otherwise, when every attempt fails, it returns the most specific failure among
+all of them, from least to most specific: `http_status`,
+`too_large`, `invalid_document`, `issuer_mismatch`.
+
+| Function | Use |
+| --- | --- |
+| `discover(issuer, posture, options)` | Fetches and validates, trying the URLs in order |
+| `metadata_urls(issuer)` | Pure: the candidate URLs for an issuer, in order: two for an origin issuer, three for a path issuer |
+| `parse_metadata(body, issuer, metadata_url, posture)` | Pure: validates a document already in hand |
+| `get_bounded(url, posture, options)` | The pinned, bounded GET, reusable for a JWKS fetch |
+
+```rust
+use crate::authz_metadata::{discover, DiscoveryOptions, EgressPosture};
+
+match discover(issuer, EgressPosture::Strict, DiscoveryOptions::default()).await {
+    Ok(metadata) => use_endpoints(&metadata.token_endpoint, &metadata.jwks_uri),
+    Err(error) => {
+        tracing::warn!(code = error.code(), detail = error.detail(), "discovery failed");
+        respond_with("The authorization server could not be reached");
+    }
+}
+```
+
+The module has no metrics, audit or storage coupling and no tenancy or strategy types in its
+signatures, so callers record outcomes themselves from `code()`.
+
 ## Managed identity
 
 A rule that derives the managed agent's DID. `ManagedIdentityConfig`
@@ -208,6 +296,45 @@ dashboard warns on the Trust Recorder panel and on the entry while the surface h
 selected, or its Issuer no longer exists, and an entry's authority is the template, because
 that entry writes nothing. The
 warning does not block saving, and it does not appear for entries with an explicit authority.
+
+### Recorder status
+
+The gateway keeps the Trust Recorder's last known outcome for each managed agent DID on each
+surface ([`recorder_status.rs`](../src/trust_registry_verification/recorder_status.rs)). It is the
+recorder's last outcome, not a live check of the trust registry.
+
+Each entry has one state:
+
+| State | Meaning |
+| --- | --- |
+| Recorded (`recorded`) | At least one record was written or already existed, and none failed. |
+| Partly recorded (`partial`) | Some records were written or already existed and some failed. |
+| Failed (`failed`) | No record was written. The reason is `no_response` (no reply within 10 seconds), `rejected` (the registry sent a problem report) or `error`. |
+| Skipped (`skipped`) | The entry was not written. The reason is `registry_not_found`, `registry_not_connected`, `no_surface_issuer` (the `{{ surface.issuer_did }}` template did not resolve) or `error` (the trust registry lookup failed). |
+| Not attempted yet (`not_attempted`) | The surface has a Trust Recorder and no outcome is stored yet, for example right after it was added. |
+
+An entry that declares no records is not reported. The identity's overall state combines its
+entries: when all entries share a state it is that state, when a written entry is mixed with an
+unwritten one it is Partly recorded, and otherwise Failed ranks above Skipped. Only these
+codes, counts and timestamps are kept; registry error text never reaches the status.
+
+Statuses are stored in `_storage/trust_recorder_status/`, beside the identities directory and
+without a `[storage_paths]` key, so a backup of `_storage` includes them. The recorder runs on
+every response, so a status is written only when the outcome changes. The attempt time is
+held in memory and, after a restart, shows the time of the last change until the next
+attempt. Deleting a surface, or adding, removing or changing the entries of its Trust Recorder,
+clears its statuses, so they show Not attempted yet until the next response. The outcome of a
+run that began before the clear is dropped, so a run still waiting on a trust registry cannot
+bring a cleared status back. A storage failure is logged as a warning and the status reads as
+missing.
+
+Managed identities whose surface has a Trust Recorder carry `trust_recorder` in the identity
+list (`/v1/dashboard/stats` and its live updates), which also pushes an identity whose outcome
+changed. Adding or removing a Trust Recorder, or a change another node wrote to shared storage,
+shows on the next update or reload. `GET /v1/surfaces/{id}/trust-recorder-status` returns
+`{"status": ...}` for a surface: the most recently attempted of its managed agents, or `null`
+before the first attempt and while the surface has no Trust Recorder. It needs the same surface
+access as `GET /v1/surfaces/{id}`.
 
 ## Display names
 

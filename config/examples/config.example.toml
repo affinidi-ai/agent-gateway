@@ -197,6 +197,10 @@ backoff_multiplier = 2.0
 default_version = "1.0"
 max_body_size = 10485760  # 10MB in bytes; also caps buffered upstream responses
 timeout_seconds = 30
+# Longest an A2A event stream from a direct Target is forwarded (1 to 86400
+# seconds). It ends sooner when the Target sends nothing for the surface's
+# networking.timeout.idle_secs.
+stream_max_lifetime_secs = 3600
 
 # Fabric gateway request timeout in milliseconds (how long GW1 waits for GW2)
 fabric_gateway_timeout_ms = 60000  # 60 seconds

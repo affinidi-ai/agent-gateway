@@ -1,6 +1,6 @@
 [package]
 name = "agent-gateway"
-version = "1.0.0"
+version = "1.0.1"
 publish = false
 edition = "2024"
 rust-version = "1.95.0"
@@ -123,8 +123,8 @@ affinidi-messaging-sdk = "0.30.1"
 trust-tasks-rs = "0.24.8"
 
 # Cryptography for x402 payment signing
-alloy-signer = "1.7"
-alloy-signer-local = "1.7"
+alloy-signer = "2.5"
+alloy-signer-local = "2.5"
 affinidi-messaging-didcomm = "0.15.9"
 affinidi-tdk-common = "0.6.11"
 affinidi-did-common = "0.4.3"
@@ -200,7 +200,7 @@ x402-chain-solana = { version = "1.1.3", features = [
 ] }
 
 # Blockchain verification for x402 payments
-alloy = { version = "1.6.3", features = [
+alloy = { version = "2.5", features = [
     "provider-http",
     "rpc-types-eth",
     "transports",

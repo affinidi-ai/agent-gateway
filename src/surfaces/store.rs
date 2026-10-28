@@ -359,9 +359,10 @@ fn request_shape_check_warning(names: &[&str]) -> Option<String> {
 /// seeds the resolved-surface cache from storage, so until then that surface is
 /// served with the defaults.
 ///
-/// With `persist` false (a Standby node, so it cannot overwrite an Active node's edit),
-/// the blocks are set on the surfaces passed in only; the reload that promotes
-/// the node to Active stores them.
+/// With `persist` false (a Standby node, so it cannot overwrite an Active node's edit,
+/// or a storage event being applied, so applying it raises no further event),
+/// the blocks are set on the surfaces passed in only; the next load on an
+/// Active node stores them.
 ///
 /// With `persist`, each surface is read from `store` again just before its
 /// block is saved, and the block is set on the stored copy, which replaces the
@@ -386,7 +387,8 @@ fn request_shape_check_warning(names: &[&str]) -> Option<String> {
 /// those surfaces are stored with settings, each warning is logged once, on the
 /// first load after the upgrade.
 ///
-/// Called from the same load paths as [`strip_unsupported_header_metadata_mappings`].
+/// Called from the same load paths as [`strip_unsupported_header_metadata_mappings`],
+/// and without `persist` when a storage event is applied.
 pub async fn carry_over_a2a_settings<S: AgentSurfaceStore + ?Sized>(
     store: &S,
     surfaces: &mut Vec<AgentSurface>,

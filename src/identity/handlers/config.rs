@@ -64,9 +64,15 @@ pub struct ReloadConfigResponse {
 pub async fn reload_configuration(
     State(state): State<IdentityApiState>
 ) -> Result<Json<ReloadConfigResponse>, AppError> {
-    let (channels_count, surfaces_count, is_fallback, warning) = perform_config_reload(&state)
-        .await
-        .map_err(|e| AppError::InternalError(format!("Failed to reload channels: {}", e)))?;
+    let (channels_count, surfaces_count, is_fallback, warning) = {
+        let _reloading = state
+            .surface_reload_lock
+            .lock()
+            .await;
+        perform_config_reload(&state)
+            .await
+            .map_err(|e| AppError::InternalError(format!("Failed to reload channels: {}", e)))?
+    };
 
     Ok(Json(ReloadConfigResponse {
         channels_count,
@@ -86,9 +92,17 @@ pub async fn reload_configuration(
 /// running proxy without a manual reload.
 ///
 /// Returns `(channels_count, surfaces_count, is_fallback, warning)`.
+///
+/// A reload is the gateway's own work, not a user change, so the writes it
+/// makes record no policy changes (`without_actor`), even though it runs
+/// inside the management request that asked for it.
 pub(crate) async fn perform_config_reload(
     state: &IdentityApiState
 ) -> anyhow::Result<(usize, usize, bool, Option<String>)> {
+    crate::audit::context::without_actor(reload(state)).await
+}
+
+async fn reload(state: &IdentityApiState) -> anyhow::Result<(usize, usize, bool, Option<String>)> {
     info!("Configuration reload requested");
 
     // Drop cached outbound target agent cards so a redeployed surface

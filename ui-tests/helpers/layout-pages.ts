@@ -518,7 +518,7 @@ const CREATE_PAGES: LayoutPage[] = [
         id: 'gateway-publish',
         route: '/gateways/publish',
         testIds: ['page-gateway-publish'],
-        actions: ['wizard-mediator-select', 'wizard-cancel', 'wizard-next'],
+        actions: ['connection-point-mediator-select', 'wizard-cancel', 'wizard-next'],
     },
     {
         id: 'gateway-connect',

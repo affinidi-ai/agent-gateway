@@ -190,6 +190,15 @@ pub struct Gateway {
 }
 
 impl Gateway {
+    /// A pending gateway an earlier run of the process left behind: one created since
+    /// `started_at` belongs to a pairing in flight in this run.
+    pub fn is_left_pending_by_an_earlier_run(
+        &self,
+        started_at: chrono::DateTime<chrono::Utc>,
+    ) -> bool {
+        self.status == GatewayStatus::Pending && self.created_at < started_at
+    }
+
     pub fn new(
         name: String,
         description: String,
@@ -289,6 +298,34 @@ impl StorableEntity for Gateway {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn gateway_with(
+        status: GatewayStatus,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) -> Gateway {
+        let mut gateway =
+            Gateway::new("peer".into(), String::new(), "did:web:peer.example".into(), GatewayType::Remote);
+        gateway.status = status;
+        gateway.created_at = created_at;
+        gateway
+    }
+
+    #[test]
+    fn only_a_pending_gateway_from_before_this_run_is_left_over() {
+        let started_at = chrono::Utc::now();
+        let earlier = started_at - chrono::Duration::minutes(5);
+        let later = started_at + chrono::Duration::seconds(1);
+
+        assert!(gateway_with(GatewayStatus::Pending, earlier).is_left_pending_by_an_earlier_run(started_at));
+        assert!(
+            !gateway_with(GatewayStatus::Pending, later).is_left_pending_by_an_earlier_run(started_at),
+            "a pairing in flight in this run is not left over"
+        );
+        for status in [GatewayStatus::Active, GatewayStatus::AwaitingApproval, GatewayStatus::Failed] {
+            let gateway = gateway_with(status, earlier);
+            assert!(!gateway.is_left_pending_by_an_earlier_run(started_at), "{:?}", gateway.status);
+        }
+    }
 
     fn pre_issuer_did_record_json() -> serde_json::Value {
         serde_json::json!({

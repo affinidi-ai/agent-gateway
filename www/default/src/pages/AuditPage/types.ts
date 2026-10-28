@@ -42,11 +42,70 @@ export interface TraceTerminatedData {
   flow: string;
 }
 
+/** The audit events a management change to a policy, or to where one applies, records. */
+export const POLICY_CHANGE_EVENTS = [
+  'policy_created',
+  'policy_updated',
+  'policy_deleted',
+  'policy_attached',
+  'policy_detached',
+  'policy_attachment_changed',
+  'policy_change_refused',
+] as const;
+
+export type PolicyChangeEvent = (typeof POLICY_CHANGE_EVENTS)[number];
+
+export interface PolicyChangeActor {
+  kind: 'user' | 'pat' | 'system';
+  /** The user id, the access token's id, or `gateway`. */
+  id: string;
+  /** For an access token, the id of the user it belongs to. */
+  user_id?: string | null;
+}
+
+export interface PolicyChangeTarget {
+  kind: 'surface' | 'gateway' | 'appliance';
+  id?: string | null;
+  name?: string | null;
+}
+
+/** The body every policy change event shares. Never carries Rego text. */
+export interface PolicyChangeData {
+  policy_definition_id?: string | null;
+  policy_name?: string | null;
+  policy_type?: string | null;
+  policy_version?: number | null;
+  policy_content_hash?: string | null;
+  previous_policy_version?: number | null;
+  previous_policy_content_hash?: string | null;
+  changed?: string[];
+  target?: PolicyChangeTarget | null;
+  scope?: string | null;
+  slot?: string | null;
+  variant?: string | null;
+  transit_point?: string | null;
+  mcp_tool_name?: string | null;
+  gate?: string | null;
+  plane?: string | null;
+  mode?: string | null;
+  previous_mode?: string | null;
+  enabled?: boolean | null;
+  previous_enabled?: boolean | null;
+  actor: PolicyChangeActor;
+  /** `api`, `ownership` or `definition_deleted`. */
+  source: string;
+  /** On a refusal: the change that was attempted. */
+  action?: PolicyChangeEvent | null;
+  status?: number | null;
+  reason?: string | null;
+}
+
 export type AuditEventField =
   | string
   | { policy_decision: PolicyDecisionData }
   | { trust_check: TrustCheckData }
   | { trace_terminated: TraceTerminatedData }
+  | Partial<Record<PolicyChangeEvent, PolicyChangeData>>
   | Record<string, unknown>;
 
 export interface AuditCaller {

@@ -3,11 +3,11 @@
 //! Reuses the same protocol-specific trigger logic as x402 (MCP tool names,
 //! A2A method filters) but with MPP-specific challenge/credential handling.
 
-use axum::response::Response;
-
+use super::errors::PaymentError;
 use super::types::MppConfig;
 use super::verification::{create_mpp_receipt, verify_mpp_credential};
 use crate::config::types::ChannelProtocol;
+use crate::observability::policy_audit::spawn_in_request;
 
 /// Check if payment is required for this request based on protocol-specific triggers.
 ///
@@ -110,7 +110,7 @@ pub fn fire_challenge_issued_events(
         let ch_name = channel_name.to_string();
         let r_url = resource_url.to_string();
         let trace_id = crate::observability::policy_audit::current_span_trace_id();
-        tokio::spawn(async move {
+        spawn_in_request(async move {
             let _ = store
                 .record_challenge_issued(&ch_id, &ch_name, &r_url, trace_id)
                 .await;
@@ -120,7 +120,7 @@ pub fn fire_challenge_issued_events(
     let ch_id = channel_id.to_string();
     let ch_name = channel_name.to_string();
     let r_url = resource_url.to_string();
-    tokio::spawn(async move {
+    spawn_in_request(async move {
         crate::integrations::mpp_integration_triggers::trigger_mpp_challenge_issued(&ch_id, &ch_name, &r_url).await;
     });
 }
@@ -130,8 +130,8 @@ pub fn fire_challenge_issued_events(
 /// # Returns
 /// - `Ok(Some(receipt_header))` — payment verified, include `Payment-Receipt` header
 /// - `Ok(None)` — payment not required (config disabled)
-/// - `Err(Response)` — 402 challenge or verification failure response
-#[allow(clippy::result_large_err)] // FIXME: Response is not an error
+/// - `Err(PaymentError)` — the challenge to pay, a verification failure, or a
+///   configuration that cannot take payment
 pub async fn process_payment(
     credential: Option<super::types::MppCredential>,
     config: &MppConfig,
@@ -140,21 +140,22 @@ pub async fn process_payment(
     resource_url: &str,
     transaction_store: Option<std::sync::Arc<super::transaction_store::MppTransactionStore>>,
     secrets_store: &Option<std::sync::Arc<dyn crate::secrets::SecretsStore>>,
-) -> Result<Option<String>, Response> {
+) -> Result<Option<String>, PaymentError> {
     if !config.enabled {
         return Ok(None);
     }
 
-    // Capture the request trace id up-front, before any `tokio::spawn` — the
-    // task-local / span context does not cross the spawn boundary, so each
-    // spawned transaction-store write receives an owned clone.
+    // Capture the request trace id up-front, before any spawn — the span
+    // context does not cross the spawn boundary, so each spawned
+    // transaction-store write receives an owned clone. The request id is
+    // carried across by `spawn_in_request`.
     let trace_id = crate::observability::policy_audit::current_span_trace_id();
 
     let resolved_config = match super::secrets::resolve_config_secrets(config, secrets_store).await {
         Ok(resolved) => resolved,
         Err(e) => {
             tracing::error!(channel = channel_name, error = %e, "[mpp] Failed to resolve config secrets");
-            return Err(super::errors::secret_resolution_error_response());
+            return Err(PaymentError::Configuration);
         }
     };
     let config = &resolved_config;
@@ -201,7 +202,7 @@ pub async fn process_payment(
                                     let err_clone = err_msg.clone();
                                     let payer_clone = payer.clone();
                                     let trace_id = trace_id.clone();
-                                    tokio::spawn(async move {
+                                    spawn_in_request(async move {
                                         let _ = store
                                             .record_failed(
                                                 &ch_id,
@@ -221,18 +222,14 @@ pub async fn process_payment(
                                 let m = method_str.clone();
                                 let r_url = resource_url.to_string();
                                 let err_clone = err_msg.clone();
-                                tokio::spawn(async move {
+                                spawn_in_request(async move {
                                     crate::integrations::mpp_integration_triggers::trigger_mpp_verification_failed(
                                         &ch_id, &ch_name, &m, &r_url, &err_clone,
                                     )
                                     .await;
                                 });
 
-                                return Err(super::create_mpp_verification_failed_response(
-                                    config,
-                                    resource_url,
-                                    &err_msg,
-                                ));
+                                return Err(PaymentError::verification_failed(config, resource_url, &err_msg));
                             }
 
                             let reference = proof.reference;
@@ -264,7 +261,7 @@ pub async fn process_payment(
                                 let amt = amount.map(|s| s.to_string());
                                 let cur = currency.map(|s| s.to_string());
                                 let trace_id = trace_id.clone();
-                                tokio::spawn(async move {
+                                spawn_in_request(async move {
                                     let _ = store
                                         .record_verified(
                                             &ch_id,
@@ -287,7 +284,7 @@ pub async fn process_payment(
                             let m = method_str.clone();
                             let r_url = resource_url.to_string();
                             let ref_clone = reference.clone();
-                            tokio::spawn(async move {
+                            spawn_in_request(async move {
                                 crate::integrations::mpp_integration_triggers::trigger_mpp_payment_verified(
                                     &ch_id, &ch_name, &m, &r_url, &ref_clone,
                                 )
@@ -323,7 +320,7 @@ pub async fn process_payment(
                                 let err_msg = e.clone();
                                 let payer_clone = payer.clone();
                                 let trace_id = trace_id.clone();
-                                tokio::spawn(async move {
+                                spawn_in_request(async move {
                                     let _ = store
                                         .record_failed(
                                             &ch_id,
@@ -344,14 +341,14 @@ pub async fn process_payment(
                             let m = method_str.clone();
                             let r_url = resource_url.to_string();
                             let err_msg = e.clone();
-                            tokio::spawn(async move {
+                            spawn_in_request(async move {
                                 crate::integrations::mpp_integration_triggers::trigger_mpp_verification_failed(
                                     &ch_id, &ch_name, &m, &r_url, &err_msg,
                                 )
                                 .await;
                             });
 
-                            Err(super::create_mpp_verification_failed_response(config, resource_url, &e))
+                            Err(PaymentError::verification_failed(config, resource_url, &e))
                         }
                     }
                 }
@@ -372,7 +369,7 @@ pub async fn process_payment(
                         let err_msg = e.clone();
                         let payer_clone = payer.clone();
                         let trace_id = trace_id.clone();
-                        tokio::spawn(async move {
+                        spawn_in_request(async move {
                             let _ = store
                                 .record_failed(&ch_id, &ch_name, &r_url, &m, &err_msg, payer_clone.as_deref(), trace_id)
                                 .await;
@@ -385,46 +382,45 @@ pub async fn process_payment(
                     let m = method_str.clone();
                     let r_url = resource_url.to_string();
                     let err_msg = e.clone();
-                    tokio::spawn(async move {
+                    spawn_in_request(async move {
                         crate::integrations::mpp_integration_triggers::trigger_mpp_verification_failed(
                             &ch_id, &ch_name, &m, &r_url, &err_msg,
                         )
                         .await;
                     });
 
-                    Err(super::create_mpp_verification_failed_response(config, resource_url, &e))
+                    Err(PaymentError::verification_failed(config, resource_url, &e))
                 }
             }
         }
         None => {
             tracing::info!(channel = channel_name, "[mpp] No payment credential — returning 402 challenge");
-
-            // Record challenge in transaction store
-            if let Some(ref store) = transaction_store {
-                let store = store.clone();
-                let ch_id = channel_id.to_string();
-                let ch_name = channel_name.to_string();
-                let r_url = resource_url.to_string();
-                let trace_id = trace_id.clone();
-                tokio::spawn(async move {
-                    let _ = store
-                        .record_challenge_issued(&ch_id, &ch_name, &r_url, trace_id)
-                        .await;
-                });
-            }
-
-            // Fire integration event for challenge issuance
-            let ch_id = channel_id.to_string();
-            let ch_name = channel_name.to_string();
-            let r_url = resource_url.to_string();
-            tokio::spawn(async move {
-                crate::integrations::mpp_integration_triggers::trigger_mpp_challenge_issued(&ch_id, &ch_name, &r_url)
-                    .await;
-            });
-
-            Err(super::create_mpp_402_response(config, resource_url))
+            fire_challenge_issued_events(channel_id, channel_name, resource_url, transaction_store);
+            Err(PaymentError::required(config, resource_url))
         }
     }
+}
+
+/// The challenges for a request that presented no credential, recording that
+/// they were issued.
+pub async fn challenge(
+    config: &MppConfig,
+    channel_name: &str,
+    channel_id: &str,
+    resource_url: &str,
+    transaction_store: Option<std::sync::Arc<super::transaction_store::MppTransactionStore>>,
+    secrets_store: &Option<std::sync::Arc<dyn crate::secrets::SecretsStore>>,
+) -> PaymentError {
+    let config = match super::secrets::resolve_config_secrets(config, secrets_store).await {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            tracing::error!(channel = channel_name, error = %e, "[mpp] Failed to resolve config secrets");
+            return PaymentError::Configuration;
+        }
+    };
+    tracing::info!(channel = channel_name, "[mpp] No payment credential — returning 402 challenge");
+    fire_challenge_issued_events(channel_id, channel_name, resource_url, transaction_store);
+    PaymentError::required(&config, resource_url)
 }
 
 #[cfg(test)]
@@ -541,9 +537,7 @@ mod tests {
     async fn test_process_payment_no_credential_returns_402() {
         let config = test_config();
         let result = process_payment(None, &config, "test", "test-id", "/api/resource", None, &None).await;
-        assert!(result.is_err());
-        let response = result.unwrap_err();
-        assert_eq!(response.status(), axum::http::StatusCode::PAYMENT_REQUIRED);
+        assert!(matches!(result, Err(PaymentError::Required(_))), "{result:?}");
     }
 
     /// As for x402: with A2A method filters configured, a body the filters cannot

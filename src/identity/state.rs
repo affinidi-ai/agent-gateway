@@ -49,8 +49,13 @@ pub struct IdentityApiState {
     /// D will switch the inbound request pipeline to read snapshots from
     /// here instead of re-deriving them from `ChannelMapping`.
     pub resolved_surface_cache: Arc<crate::surfaces::ResolvedSurfaceCache>,
+    /// Held by `POST /v1/config/reload`, by the reload a node runs on becoming
+    /// Active, and while a surface change is applied to the running gateway, so none
+    /// of them overwrites another's running state with an older surface.
+    pub surface_reload_lock: Arc<tokio::sync::Mutex<()>>,
     pub surface_template_store: Option<Arc<crate::surface_templates::FileSystemSurfaceTemplateStore>>,
     pub event_hook: Option<Arc<crate::event_hook::EventHook>>,
+    pub mediator_directory: Option<Arc<crate::event_hook::MediatorDirectory>>,
 
     // DID:webvh support (optional, behind feature gate)
     #[cfg(feature = "didwebvh")]

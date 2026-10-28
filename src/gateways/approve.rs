@@ -257,9 +257,25 @@ pub async fn approve_gateway<
         gateway_connection_point.did_method = connection_point
             .did_method
             .clone();
+        gateway_connection_point.mediator_did = Some(gw_mediator_did.clone());
 
-        cp_store
-            .create(&gateway_connection_point)
+        let announcement = crate::event_hook::CreationGuard::start(
+            listener_manager
+                .as_ref()
+                .and_then(|manager| manager.event_hook().cloned()),
+            crate::event_hook::ConnectionPointPayload::from_record(&gateway_connection_point, None),
+        );
+        let record = gateway_connection_point.clone();
+        let point_store = cp_store.clone();
+        announcement
+            .complete(
+                async move {
+                    point_store
+                        .create(&record)
+                        .await
+                },
+                crate::event_hook::ConnectionPointPayload::from_record(&gateway_connection_point, None),
+            )
             .await
             .map_err(|e| {
                 (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create gateway connection point: {}", e))
