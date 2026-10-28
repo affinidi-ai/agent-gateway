@@ -1,7 +1,13 @@
 import type { PredefinedTrustCheckQuery } from '../../../../types';
-import { findSlotById } from '../edges/archetypes';
+import {
+  isTransitPointType,
+  managedAgentTargetLegTrustCheckAllowed,
+  TRUST_CHECK_CALLER_SLOT_ID,
+  TRUST_CHECK_MANAGED_AGENT_SLOT_ID,
+  TRUST_CHECK_TRANSIT_POINT_SLOT_ID,
+} from '../edges/archetypes';
 import * as Cap from '../capabilities';
-import type { NodeDefinition, PayloadSlice } from '../types';
+import type { DependencyNode, NodeDefinition, PayloadSlice, SurfaceContext } from '../types';
 import TrustCheckPanel from './TrustCheckPanel';
 import TrustCheckFullscreenPanel from './TrustCheckFullscreenPanel';
 import { DOCS_URL } from '../../../../config/docs';
@@ -399,12 +405,35 @@ export function applyPresetToQuery(
   };
 }
 
-function nodeEdge(node: { slotId?: string; config?: any }): 'ap-ma' | 'ma-tp' {
+/**
+ * Which list a Trust Check node writes to: the caller leg
+ * (`access_point.trust_check_list`), the Managed Agent's own target leg
+ * (`target.trust_check_list`), or one Transit Point's target leg
+ * (`transit.points[i].trust_check_list`).
+ */
+export type TrustCheckLeg = 'caller' | 'managed-agent' | 'transit-point';
+
+/**
+ * A node parented on a Transit Point is that Transit Point's leg whatever
+ * its slot id says. Otherwise the slot decides, and a node with no known
+ * slot is the caller leg: only a node in the Managed Agent slot is the
+ * Managed Agent's own leg. Pass `allNodes` so the parent's type is known.
+ */
+export function trustCheckLeg(
+  node: { slotId?: string; parentId?: string; config?: any },
+  allNodes?: ReadonlyArray<{ id: string; type: string }>
+): TrustCheckLeg {
+  const parent = node.parentId ? allNodes?.find(n => n.id === node.parentId) : undefined;
+  if (parent && isTransitPointType(parent.type)) return 'transit-point';
   const slotId = node.slotId || '';
-  const resolved = slotId ? findSlotById(slotId) : undefined;
-  if (resolved?.archetype.id === 'ap-ma') return 'ap-ma';
-  if (resolved?.archetype.id === 'ma-tp') return 'ma-tp';
-  return node.config?._edge === 'ma-tp' ? 'ma-tp' : 'ap-ma';
+  if (slotId === TRUST_CHECK_CALLER_SLOT_ID) return 'caller';
+  if (slotId === TRUST_CHECK_MANAGED_AGENT_SLOT_ID) return 'managed-agent';
+  if (slotId === TRUST_CHECK_TRANSIT_POINT_SLOT_ID) return 'transit-point';
+  return 'caller';
+}
+
+function nodeEdge(node: { slotId?: string; config?: any }): 'ap-ma' | 'ma-tp' {
+  return trustCheckLeg(node) === 'caller' ? 'ap-ma' : 'ma-tp';
 }
 
 /**
@@ -477,6 +506,144 @@ export function readQueries(config: any): TrustCheckQueryConfig[] {
   return [];
 }
 
+/** Read a wire `trust_check_list` into the node's `queries[]` shape. */
+export function queriesFromWire(raw: unknown): TrustCheckQueryConfig[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((e: any) => e && typeof e === 'object')
+    .map((e: any) => ({
+      id: typeof e.id === 'string' ? e.id : undefined,
+      trust_registry_id: typeof e.trust_registry_id === 'string' ? e.trust_registry_id : '',
+      query_type: e.query_type === 'recognition' ? 'recognition' : 'authorization',
+      name: typeof e.name === 'string' ? e.name : undefined,
+      query: e.query || {},
+    }));
+}
+
+/**
+ * True when a Transit Point's Trust Check holds a list the gateway copied
+ * from the old surface-wide list and the operator has not reviewed yet.
+ * Keep, editing the queries, or removing the node clears it.
+ */
+export function isMigratedTrustCheck(config: any): boolean {
+  return config?.trust_check_migrated === true;
+}
+
+/** Number of Transit Points on the canvas whose migrated Trust Check is still flagged. */
+export function countTrustCheckReviews(
+  nodes: ReadonlyArray<{ id: string; type: string; parentId?: string; config?: any }>
+): number {
+  const flagged = new Set<string>();
+  for (const n of nodes) {
+    if (n.type === 'trust-check' && isMigratedTrustCheck(n.config)) {
+      flagged.add(n.parentId ?? n.id);
+    }
+  }
+  return flagged.size;
+}
+
+/** The same count read from a stored or resolved surface payload. */
+export function countTrustCheckReviewsInPayload(payload: any): number {
+  const points: unknown[] = Array.isArray(payload?.transit?.points) ? payload.transit.points : [];
+  return points.filter((tp: any) => !!tp && typeof tp === 'object' && isMigratedTrustCheck(tp))
+    .length;
+}
+
+/** The canvas review badge a node shows for a flagged migrated Trust Check, if any. */
+export function trustCheckReviewBadge(
+  node: { type: string; config?: any } | undefined
+): { testid: string; title: string } | null {
+  if (node?.type !== 'trust-check' || !isMigratedTrustCheck(node.config)) return null;
+  return {
+    testid: 'surface-node-trust-check-migrated-badge',
+    title: 'Migrated Trust Check: review whether this Transit Point needs it',
+  };
+}
+
+/**
+ * The protocol label of the Transit Point a Trust Check hangs off when
+ * that Transit Point takes no new Trust Checks (anything but A2A and AP2),
+ * or null. Such a Trust Check is a migrated copy that can only be kept or
+ * removed.
+ */
+export function readOnlyTrustCheckProtocol(
+  node: { parentId?: string },
+  allNodes: ReadonlyArray<{ id: string; type: string }> | undefined
+): string | null {
+  const parent = node.parentId ? allNodes?.find(n => n.id === node.parentId) : undefined;
+  if (!parent || !isTransitPointType(parent.type)) return null;
+  const protocol = parent.type.slice('transit-point-'.length);
+  return protocol === 'a2a' || protocol === 'ap2' ? null : protocol.toUpperCase();
+}
+
+export function readOnlyTrustCheckMessage(protocol: string): string {
+  return `Trust Checks can't be changed on an ${protocol} Transit Point; keep or remove this migrated copy.`;
+}
+
+/**
+ * True when the node is the Managed Agent's own target-leg Trust Check
+ * (not one hanging off a Transit Point).
+ */
+export function isManagedAgentTrustCheck(
+  node: { slotId?: string; parentId?: string; config?: any },
+  allNodes: ReadonlyArray<{ id: string; type: string }>
+): boolean {
+  return trustCheckLeg(node, allNodes) === 'managed-agent';
+}
+
+export const MANAGED_AGENT_TRUST_CHECK_TARGET_MESSAGE =
+  "The Managed Agent's own Trust Check runs only on an A2A Proxy or gateway target. Remove it or switch the target.";
+
+export const MANAGED_AGENT_TRUST_CHECK_DUPLICATED_NOTE =
+  "The same checks already run on this surface's Transit Points, so removing it loses nothing.";
+
+function queryKey(q: TrustCheckQueryConfig): string {
+  const query = q.query || {};
+  return JSON.stringify([
+    q.trust_registry_id ?? '',
+    q.query_type === 'recognition' ? 'recognition' : 'authorization',
+    String(query.authority_id ?? '').trim(),
+    String(query.entity_id ?? '').trim(),
+    String(query.action ?? '').trim(),
+    String(query.resource ?? '').trim(),
+  ]);
+}
+
+function sameQueries(a: TrustCheckQueryConfig[], b: TrustCheckQueryConfig[]): boolean {
+  const ka = a.map(queryKey).sort();
+  const kb = b.map(queryKey).sort();
+  return ka.length === kb.length && ka.every((k, i) => k === kb[i]);
+}
+
+/**
+ * True when the surface has Transit Points and every one of them carries a
+ * Trust Check with the same queries as the Managed Agent's own one, so
+ * removing the Managed Agent's copy loses nothing.
+ */
+export function managedAgentTrustCheckRunsOnTransitPoints(
+  config: any,
+  allNodes: ReadonlyArray<{ id: string; type: string; parentId?: string; config?: any }>
+): boolean {
+  const queries = readQueries(config);
+  if (queries.length === 0) return false;
+  const transitPoints = allNodes.filter(n => isTransitPointType(n.type));
+  if (transitPoints.length === 0) return false;
+  return transitPoints.every(tp => {
+    const tc = allNodes.find(n => n.type === 'trust-check' && n.parentId === tp.id);
+    return !!tc && sameQueries(readQueries(tc.config), queries);
+  });
+}
+
+/** The Save-blocking message for the Managed Agent's own Trust Check on an unsupported target. */
+export function managedAgentTrustCheckTargetMessage(
+  config: any,
+  allNodes: ReadonlyArray<{ id: string; type: string; parentId?: string; config?: any }>
+): string {
+  return managedAgentTrustCheckRunsOnTransitPoints(config, allNodes)
+    ? `${MANAGED_AGENT_TRUST_CHECK_TARGET_MESSAGE} ${MANAGED_AGENT_TRUST_CHECK_DUPLICATED_NOTE}`
+    : MANAGED_AGENT_TRUST_CHECK_TARGET_MESSAGE;
+}
+
 /** Mint a fresh empty query for the panel's "+ Add Another Query" action. */
 export function makeDefaultQuery(): TrustCheckQueryConfig {
   return {
@@ -521,6 +688,55 @@ function buildEntry(
   return entry;
 }
 
+/**
+ * Config key holding the stored wire list of a read-only Trust Check copy,
+ * saved back exactly as loaded.
+ */
+export const STORED_TRUST_CHECK_LIST_KEY = '_stored_trust_check_list';
+
+/**
+ * Wire `trust_check_list` for one Transit Point's Trust Check node, or
+ * `undefined` when it has no queries. The Transit Point factory folds it
+ * into `transit.points[i]`, the same way it folds the per-TP policy. A
+ * read-only copy returns its stored entries unchanged.
+ */
+export function transitPointTrustCheckListToWire(
+  node: { id: string; slotId?: string; config?: any } | undefined,
+  readOnly = false
+): Array<Record<string, unknown>> | undefined {
+  if (!node) return undefined;
+  const stored = node.config?.[STORED_TRUST_CHECK_LIST_KEY];
+  if (readOnly && Array.isArray(stored) && stored.length > 0) {
+    return JSON.parse(JSON.stringify(stored));
+  }
+  const queries = readQueries(node.config);
+  if (queries.length === 0) return undefined;
+  return queries.map(q => buildEntry({ ...node, slotId: TRUST_CHECK_TRANSIT_POINT_SLOT_ID }, q));
+}
+
+/**
+ * Whether an empty Trust Check placeholder from the canvas blob sits on an
+ * arrow it can be restored to: the caller slot, a Transit Point (by slot or
+ * parent), the Managed Agent slot on an A2A Proxy or gateway target, or a
+ * slotless node on the Access Point. Anything else, such as a slotless
+ * node parented on the Managed Agent, is dropped on load.
+ */
+function placeholderHasArrow(
+  node: { slotId?: string; parentId?: string | null; parentType?: string },
+  payload: any
+): boolean {
+  if (node.parentType && isTransitPointType(node.parentType)) return true;
+  switch (node.slotId) {
+    case TRUST_CHECK_CALLER_SLOT_ID:
+    case TRUST_CHECK_TRANSIT_POINT_SLOT_ID:
+      return true;
+    case TRUST_CHECK_MANAGED_AGENT_SLOT_ID:
+      return managedAgentTargetLegTrustCheckAllowed(payload?.target?.endpoint);
+    default:
+      return node.parentId === 'access-point';
+  }
+}
+
 export const trustCheckDefinition: NodeDefinition = {
   type: 'trust-check',
   label: 'Trust Check',
@@ -546,7 +762,9 @@ export const trustCheckDefinition: NodeDefinition = {
   directionality: 'request',
   edgeSnap: {
     radius: 100000,
-    archetypes: ['ap-ma', 'ma-tp'],
+    archetypes: ['ap-ma', 'ma-tp', 'ma-external'],
+    allows: (archetypeId, ctx) =>
+      archetypeId !== 'ma-external' || managedAgentTargetLegTrustCheckAllowed(ctx.targetEndpoint),
   },
   provides: [Cap.PIPELINE_EDGE, Cap.CONFIGURABLE],
   requires: {
@@ -556,24 +774,40 @@ export const trustCheckDefinition: NodeDefinition = {
     title: 'Trust Check',
     docLink: DOCS_URL.trustElements,
     bodyHtml: `
-      <p>Run one TRQP query per element. Multiple Trust Checks can chain on
-      the same edge: each result is surfaced to your policies on every
-      gateway and surface evaluation, which decide what to do with allow /
-      deny / unreachable.</p>
+      <p>Each Trust Check holds up to 10 TRQP queries, and each leg takes
+      one Trust Check. Every query result is surfaced to your policies on
+      every gateway and surface evaluation, which decide what to do with
+      allow / deny / unreachable.</p>
       <p><strong>Placement determines which leg the query runs on:</strong></p>
       <ul>
         <li><strong>On the Access Point \u2192 Managed Agent edge</strong>:
           the caller leg. Available for all protocols.</li>
-        <li><strong>On the Managed Agent \u2192 Transit Point edge</strong>:
-          the target leg. A2A / AP2 Transit Points only (the MCP target-leg
+        <li><strong>On a Managed Agent \u2192 Transit Point edge</strong>:
+          the target leg of that Transit Point only. Each Transit Point has
+          its own list. A2A / AP2 Transit Points only (the MCP target-leg
           check is not available yet, so the slot is not offered on MCP
           Transit Points).</li>
+        <li><strong>On the Managed Agent \u2192 External Target edge</strong>:
+          the Managed Agent's own target leg. Offered only when the Managed
+          Agent targets an A2A Proxy or another gateway.</li>
       </ul>
       <p>Query templates can reference the policy input via
       <code>{{ input.\u2026 }}</code>; they resolve against the same data
       your policies see at that point.</p>
     `,
   },
+  featureDependencies: [
+    {
+      description: "The Managed Agent's own Trust Check needs an A2A Proxy or gateway target",
+      condition: (c: any, ctx: SurfaceContext, node?: DependencyNode) =>
+        !!node && isManagedAgentTrustCheck({ ...node, config: c }, ctx.allNodes),
+      check: (_c: any, ctx: SurfaceContext) =>
+        managedAgentTargetLegTrustCheckAllowed(ctx.target?.endpoint),
+      severity: 'error',
+      message: (c: any, ctx: SurfaceContext) =>
+        managedAgentTrustCheckTargetMessage(c, ctx.allNodes),
+    },
+  ],
   incompleteReason: c => {
     const queries = readQueries(c);
     if (queries.length === 0) return 'Needs at least one query';
@@ -608,15 +842,31 @@ export const trustCheckDefinition: NodeDefinition = {
     }
     return `${queries.length} queries`;
   },
+  payloadOwnsConfig: true,
+  isBlobPlaceholder: (c, node, payload) =>
+    readQueries(c).length === 0 && placeholderHasArrow(node, payload),
+  // Transit Point lists are written by the Transit Point factory, which
+  // owns `transit.points[]`; this writes the caller leg, and the Managed
+  // Agent's own target leg only for an A2A proxy or gateway target.
   buildPayload: ctx => {
     const nodes = ctx.nodesOfType('trust-check');
     if (nodes.length === 0) return undefined;
+    const transitPointIds = new Set(
+      ctx.allNodes.filter(n => isTransitPointType(n.type)).map(n => n.id)
+    );
+    const managedAgentLegAllowed = managedAgentTargetLegTrustCheckAllowed(
+      ctx.firstNodeOfType('target')?.config?.endpoint
+    );
     const caller: Array<Record<string, unknown>> = [];
     const target: Array<Record<string, unknown>> = [];
     for (const node of nodes) {
+      if (node.parentId && transitPointIds.has(node.parentId)) continue;
+      const leg = trustCheckLeg(node, ctx.allNodes);
+      if (leg === 'transit-point') continue;
+      if (leg === 'managed-agent' && !managedAgentLegAllowed) continue;
       const queries = readQueries(node.config);
       if (queries.length === 0) continue;
-      const bucket = nodeEdge(node) === 'ma-tp' ? target : caller;
+      const bucket = leg === 'managed-agent' ? target : caller;
       for (const q of queries) bucket.push(buildEntry(node, q));
     }
     const slices: PayloadSlice[] = [];

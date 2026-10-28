@@ -103,6 +103,111 @@ describe('fieldGroups', () => {
     expect(groups['Identity'].map(item => item.term)).not.toContain('Caller DID');
   });
 
+  describe('policy changes', () => {
+    it('lays out a policy change as Change, Policy and Where, with links', () => {
+      const entry = baseEntry({
+        event: {
+          policy_attached: {
+            policy_definition_id: 'deny-pii',
+            policy_name: 'Deny PII',
+            policy_type: 'agent_surface',
+            policy_version: 3,
+            policy_content_hash: 'sha256:abc',
+            target: { kind: 'surface', id: 's-1', name: 'Orders' },
+            scope: 'surface',
+            slot: 'transit_point',
+            transit_point: 'billing',
+            variant: 'beta',
+            actor: { kind: 'pat', id: 'tok-1', user_id: 'u-1' },
+            source: 'api',
+          },
+        },
+        request_id: '0123456789abcdef',
+        surface_id: 's-1',
+        channel_name: 'Orders',
+      });
+
+      const groups = Object.fromEntries(
+        fieldGroups(entry, null, null, id => (id === 'u-1' ? 'alice' : undefined)).map(g => [
+          g.label,
+          g.items,
+        ])
+      );
+
+      expect(groups['Change']).toEqual([
+        { term: 'Action', value: 'Policy attached' },
+        { term: 'Actor', value: 'access token tok-1 of alice' },
+        { term: 'Request', value: '0123456789abcdef', mono: true },
+      ]);
+      expect(groups['Policy']).toEqual([
+        { term: 'Policy', value: 'Deny PII', href: '/policies?tab=agent_surface' },
+        { term: 'Policy definition', value: 'deny-pii', mono: true },
+        { term: 'Policy version', value: 'v3' },
+        { term: 'Policy SHA', value: 'sha256:abc', mono: true },
+      ]);
+      expect(groups['Where']).toEqual([
+        { term: 'Target', value: 'surface Orders', href: '/surfaces/s-1' },
+        { term: 'Slot', value: 'transit point request policy' },
+        { term: 'Scope', value: 'Surface' },
+        { term: 'Variant', value: 'beta' },
+        { term: 'Transit point', value: 'billing', mono: true },
+      ]);
+      expect(groups['Identity']).toEqual([]);
+    });
+
+    it('shows the before and after of an update and a refusal', () => {
+      const updated = Object.fromEntries(
+        fieldGroups(
+          baseEntry({
+            event: {
+              policy_attachment_changed: {
+                policy_definition_id: 'g',
+                target: { kind: 'gateway', id: 'gw-1', name: 'Peer' },
+                slot: 'target',
+                enabled: false,
+                previous_enabled: true,
+                actor: { kind: 'user', id: 'u-1' },
+                source: 'api',
+              },
+            },
+          }),
+          null,
+          null
+        ).map(g => [g.label, g.items])
+      );
+      expect(updated['Where']).toEqual(
+        expect.arrayContaining([
+          { term: 'Target', value: 'gateway Peer', href: '/gateways/gw-1' },
+          { term: 'Enabled', value: 'Yes → No' },
+        ])
+      );
+
+      const refused = Object.fromEntries(
+        fieldGroups(
+          baseEntry({
+            event: {
+              policy_change_refused: {
+                policy_definition_id: 'p',
+                action: 'policy_deleted',
+                status: 403,
+                reason: 'forbidden',
+                actor: { kind: 'user', id: 'u-1' },
+                source: 'api',
+              },
+            },
+          }),
+          null,
+          null
+        ).map(g => [g.label, g.items])
+      );
+      expect(refused['Refusal']).toEqual([
+        { term: 'Attempted', value: 'Policy deleted' },
+        { term: 'Status', value: '403' },
+        { term: 'Reason', value: 'forbidden' },
+      ]);
+    });
+  });
+
   describe('trust check rows', () => {
     it('emits Authority and Entity as monospace rows when the wire carries both', () => {
       const tc: TrustCheckData = {

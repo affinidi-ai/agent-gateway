@@ -1,10 +1,22 @@
 import React from 'react';
 import { Form } from 'react-bootstrap';
 import { AppButton } from '../../../shared/AppButton';
-import { findSlotById } from '../edges/archetypes';
+import { managedAgentTargetLegTrustCheckAllowed } from '../edges/archetypes';
 import InfoBanner from '../../../shared/InfoBanner';
 import type { ConfigPanelProps } from '../types';
-import { readQueries, type TrustCheckRecordType } from './definition';
+import MigratedTrustCheckWarning from './MigratedTrustCheckWarning';
+import {
+  MANAGED_AGENT_TRUST_CHECK_DUPLICATED_NOTE,
+  managedAgentTrustCheckRunsOnTransitPoints,
+  readOnlyTrustCheckMessage,
+  readOnlyTrustCheckProtocol,
+  isManagedAgentTrustCheck,
+  isMigratedTrustCheck,
+  readQueries,
+  trustCheckLeg,
+  type TrustCheckLeg,
+  type TrustCheckRecordType,
+} from './definition';
 
 const PREVIEW_MAX = 5;
 
@@ -16,8 +28,8 @@ interface TrustCheckLegContext {
   example: string;
 }
 
-function describeLeg(isApMa: boolean): TrustCheckLegContext {
-  if (isApMa) {
+function describeLeg(leg: TrustCheckLeg): TrustCheckLegContext {
+  if (leg === 'caller') {
     return {
       title: 'How can you trust the sender of an incoming request using Trust Check?',
       summary:
@@ -31,19 +43,33 @@ function describeLeg(isApMa: boolean): TrustCheckLegContext {
   return {
     title: 'How can you trust a destination entity before sending requests using Trust Check?',
     summary: 'Verify the TARGET identity (upstream agent) before the request leaves the gateway.',
-    where: 'Managed Agent → Transit Point (target leg).',
+    where:
+      leg === 'transit-point'
+        ? 'Managed Agent → Transit Point (target leg). Runs only for requests through this Transit Point.'
+        : 'Managed Agent → its A2A Proxy or gateway target (target leg).',
     when: 'When policy needs to confirm the upstream you are about to call is recognised or authorised (e.g. only forward payment requests to issuers recognised by a payment authority).',
     example:
       'Pick the trust anchor to check against: an Issuer (Department) or an Authority. Its DID is stored directly, so the gateway never derives the authority from the target’s own agent card.',
   };
 }
 
-const TrustCheckPanel: React.FC<ConfigPanelProps> = ({ node, config, openFullscreenEditor }) => {
-  const slotId = node.slotId || '';
-  const resolved = slotId ? findSlotById(slotId) : undefined;
-  const isApMa = resolved?.archetype.id === 'ap-ma' || config._edge === 'ap-ma';
+const TrustCheckPanel: React.FC<ConfigPanelProps> = ({
+  node,
+  config,
+  allNodes,
+  updateField,
+  openFullscreenEditor,
+}) => {
+  const leg = trustCheckLeg(node, allNodes);
+  const isApMa = leg === 'caller';
   const legLabel = isApMa ? 'caller' : 'target';
-  const legContext = describeLeg(isApMa);
+  const legContext = describeLeg(leg);
+  const managedAgentEndpoint = allNodes?.find(n => n.type === 'target')?.config?.endpoint;
+  const notSavedForTarget =
+    allNodes !== undefined &&
+    isManagedAgentTrustCheck(node, allNodes) &&
+    !managedAgentTargetLegTrustCheckAllowed(managedAgentEndpoint);
+  const readOnlyProtocol = readOnlyTrustCheckProtocol(node, allNodes);
   const queries = readQueries(config);
   const shown = queries.slice(0, PREVIEW_MAX);
   const remaining = queries.length - shown.length;
@@ -120,7 +146,48 @@ const TrustCheckPanel: React.FC<ConfigPanelProps> = ({ node, config, openFullscr
 
   return (
     <>
+      {leg === 'transit-point' && isMigratedTrustCheck(config) && (
+        <MigratedTrustCheckWarning
+          testid="trust-check-panel-migrated-warning"
+          onKeep={() => updateField('trust_check_migrated', false)}
+        />
+      )}
+      {notSavedForTarget && (
+        <div role="status" data-testid="trust-check-panel-managed-agent-target-warning">
+          <InfoBanner
+            title="This Trust Check blocks Save on a URL target"
+            icon="fa-exclamation-triangle"
+            variant="warning"
+            collapsible={false}
+            className="mt-2"
+            summary={`The Managed Agent's own target-leg Trust Check runs only when it targets an A2A Proxy or another gateway. Remove it or switch the target. ${
+              allNodes && managedAgentTrustCheckRunsOnTransitPoints(config, allNodes)
+                ? MANAGED_AGENT_TRUST_CHECK_DUPLICATED_NOTE
+                : "To check a Transit Point's target, drop a Trust Check on its arrow instead."
+            }`}
+          />
+        </div>
+      )}
+
       <div className="config-section">
+        {leg === 'transit-point' && (
+          <Form.Text
+            className="text-muted d-block mb-1"
+            style={{ fontSize: '11px' }}
+            data-testid="trust-check-panel-transit-point-scope"
+          >
+            Applies to this Transit Point only.
+          </Form.Text>
+        )}
+        {readOnlyProtocol && (
+          <Form.Text
+            className="d-block mb-1"
+            style={{ fontSize: '11px' }}
+            data-testid="trust-check-panel-read-only"
+          >
+            {readOnlyTrustCheckMessage(readOnlyProtocol)}
+          </Form.Text>
+        )}
         <Form.Text
           className="text-muted d-block"
           style={{ fontSize: '11px' }}
@@ -159,7 +226,7 @@ const TrustCheckPanel: React.FC<ConfigPanelProps> = ({ node, config, openFullscr
           iconStart={<i className="fas fa-pen-to-square me-1" aria-hidden="true" />}
           data-testid="trust-check-panel-configure"
         >
-          Configure Queries…
+          {readOnlyProtocol ? 'View Queries…' : 'Configure Queries…'}
         </AppButton>
       </div>
     </>

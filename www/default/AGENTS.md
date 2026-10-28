@@ -157,6 +157,87 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
 | Errors                                                    | `caller-auth-discovery-save-error`, `caller-auth-discovery-rules-error`, `caller-auth-discovery-resource-error`, `caller-auth-discovery-<list>s-error`, `caller-auth-discovery-<list>-input-error` |
 | Sidebar status and error                                  | `caller-auth-panel-discovery-status`, `caller-auth-panel-discovery-save-error`                                                                                                                     |
 
+## Trust Check
+
+- A Trust Check on a Managed Agent → Transit Point arrow belongs to that Transit Point
+  (slot `request:trust-check-transit_points_trust_check_list`, node
+  `trust-check-<transit point node id>`, parented on the Transit Point). The Transit Point
+  factory writes it to `transit.points[i].trust_check_list`; the trust-check element's own
+  `buildPayload` skips Transit-Point-parented nodes. A new one can be dropped only on A2A and AP2
+  Transit Points (`makeSurfaceSlotFilter`). A stored list on an MCP or HTTP Transit Point (a
+  migrated copy) still hydrates onto that Transit Point's arrow and saves back, so it can be
+  kept or removed; once removed it cannot be added there again. Such a copy is read-only
+  (`readOnlyTrustCheckProtocol`): the sidebar panel and fullscreen editor say "Trust Checks can't
+  be changed on an MCP Transit Point; keep or remove this migrated copy.", the sidebar button
+  (`trust-check-panel-configure`) reads "View Queries…" instead of "Configure Queries…", the
+  fullscreen query list sits in a disabled `fieldset` (no field edits, add or remove query) and
+  has no Save. It keeps the stored wire entries (`STORED_TRUST_CHECK_LIST_KEY`) and saves them
+  back exactly as loaded, never rebuilt from the panel's queries. A2A and AP2 copies stay
+  editable and are rebuilt from their queries.
+- A node parented on a Transit Point is that Transit Point's leg whatever its slot id says
+  (`trustCheckLeg(node, allNodes)`); otherwise the slot decides, and a node with no known slot is
+  the caller leg. Only a node in the Managed Agent slot is the Managed Agent's own leg. An empty
+  blob placeholder with no real arrow (no known slot and parented on neither the Access Point
+  nor a Transit Point, such as an old `_edge: 'ma-tp'` placeholder on the Managed Agent) is
+  dropped on load.
+- The Managed Agent's own target-leg Trust Check sits on the Managed Agent → External Target
+  arrow (slot `request:trust-check-target_trust_check_list`, node `trust-check-target`) and is
+  offered and saved only for `a2a-proxy://` and `fabric://` targets. On any other target (for
+  example after switching the endpoint to a URL) the node is an error-severity feature
+  dependency: the canvas rings it, Save and switching variants are blocked with "Remove it or
+  switch the target" (`dependencyErrorBlocker`, the same toast and **Show me**), and the panel
+  shows `trust-check-panel-managed-agent-target-warning`. When every Transit Point already
+  carries the same queries, the message and banner add "The same checks already run on this
+  surface's Transit Points, so removing it loses nothing." Loading such a surface, applying a
+  template or switching variants (`hydrateSurfaceCanvas`) drops that node automatically when the
+  surface has Transit Points and every one carries the same queries (ids and names aside), and
+  reattaches anything chained after it; a node whose queries are missing from any Transit Point,
+  or on a surface with no Transit Points, stays and blocks Save. Editing the endpoint never drops it. Feature-dependency rules receive the
+  node (`getDependencyWarnings(type, config, ctx, node)`) to tell legs apart, and a rule's
+  `message` may be a function of the surface.
+- Every surface write sends `trust_check_split: true` at the top level, and every Surface
+  Template create and update sends it inside `surface` (`withTrustCheckSplit` and
+  `templateWithTrustCheckSplit` in `src/api.ts`). The gateway migrates a write without it that
+  carries `target.trust_check_list` as the old surface-wide shape. A template import uploads the
+  file unchanged, so the gateway converts an old export.
+- Trust Check config comes only from the stored payload (`payloadOwnsConfig`); the canvas blob
+  supplies position only. A blob `parentId` never moves a Trust Check between the Managed Agent
+  and a Transit Point or between Transit Points, and a blob node is matched to a hydrated one
+  only when their slot ids agree or either has no slot id, so a stale node from the old shared
+  layout does not come back. An empty Trust Check placeholder in the blob (no queries, `isBlobPlaceholder`) is kept, except
+  one in the Managed Agent slot when the stored target is not `a2a-proxy://` or `fabric://`, and
+  one with no real arrow (see the leg bullet above).
+- `hydrateSurfaceCanvas` places a Trust Check the blob has no position for at the middle of
+  its arrow, so a migrated per-Transit-Point Trust Check keeps the rest of the saved layout
+  instead of triggering auto-layout.
+- Trust Check snaps to the Access Point → Managed Agent, Managed Agent → Transit Point and
+  Managed Agent → External Target arrows (`registry.snapsToArchetype`). Its `edgeSnap.allows`
+  drops Managed Agent → External Target unless the Managed Agent targets `a2a-proxy://` or
+  `fabric://`; the canvas passes the target endpoint as the snap context, so on a URL target a
+  Trust Check dropped near that arrow snaps to Access Point → Managed Agent or Managed Agent →
+  Transit Point. Elements without `edgeSnap.allows` snap exactly as their archetype list says.
+- A Transit Point's `trust_check_migrated: true` moves onto its Trust Check node's config at
+  hydration. A flagged node shows a canvas badge (`syncTrustCheckReviewBadge`, run by the full
+  canvas rebuild and the config update, so it disappears on **Keep** and returns on undo), and
+  its sidebar panel and fullscreen editor show the shared `MigratedTrustCheckWarning`
+  (`elements/trust-check/MigratedTrustCheckWarning.tsx`, an `InfoBanner` warning) with **Keep**. **Keep**, saving edited queries, or removing the node
+  drops the flag from the next save; untouched flagged Transit Points keep it.
+- `MigratedTrustChecksSummary` sits under the canvas top bar in `.surface-canvas-notices`:
+  "N Transit Points need Trust Check review" ("1 Transit Point needs …" for one), counting each
+  Transit Point with a flagged migrated copy, on the canvas and in every other loaded variant
+  snapshot (it says how many are in other variants), hidden at zero.
+
+| Element                            | Test id                                                                              |
+| ---------------------------------- | ------------------------------------------------------------------------------------ |
+| Per-Transit-Point scope line       | `trust-check-panel-transit-point-scope`                                              |
+| Fullscreen leg label               | `trust-check-fullscreen-leg`                                                         |
+| Managed Agent URL-target warning   | `trust-check-panel-managed-agent-target-warning`                                     |
+| Read-only migrated copy line       | `trust-check-panel-read-only`, `trust-check-fullscreen-read-only`                    |
+| Fullscreen query list             | `trust-check-fullscreen-queries`                                                     |
+| Migrated warning and Keep          | `trust-check-panel-migrated-warning`, `trust-check-fullscreen-migrated-warning`, each with `-keep` |
+| Review summary                     | `surface-migrated-trust-checks-summary`                                              |
+| Migrated canvas badge              | `surface-node-trust-check-migrated-badge`                                            |
+
 ## Trust Recorder
 
 - The sidebar panel and each entry in its fullscreen editor show the shared
@@ -305,6 +386,31 @@ toggles, Enter and Space work natively, and screen readers still announce the he
 title is `policy-instructions-title`, the arrow `policy-instructions-chevron` sits inside the
 button and flips with the state, and the body is `policy-instructions-body`. Build collapsible
 panels the same way, and do not put `role="button"` on a wrapper around a heading.
+
+## Audit page: policy changes
+
+The seven policy change events (`policy_created`, `policy_updated`, `policy_deleted`,
+`policy_attached`, `policy_detached`, `policy_attachment_changed`, `policy_change_refused`) are
+read with `policyChange` (`pages/AuditPage/auditHelpers.ts`), never by indexing `entry.event`
+in components.
+
+- The list row and the panel title use `describeEntry`: one sentence saying which policy changed
+  where, and a detail line naming the actor and why (`definition_deleted`, `ownership`). Refused
+  changes are red, deletions and detachments amber, the rest neutral.
+- The footnote shows the actor instead of the caller. Records hold ids only; `useUserNames`
+  resolves user ids to usernames from `/users` and keeps the id when the list is not readable.
+  It is called once, in `AuditPage`, and asks for the list only when the page shows a policy
+  change and the viewer has `users.view`; the resolver is passed down as the `userName` prop.
+  Don't call it per row. The names are cached per session token, so signing out and in (as
+  anyone) loads them again and never shows the previous session's. Within a session a 403 is
+  kept until the page reloads; any other failure is retried on the next visit. The status comes
+  from `ApiError` (`api.ts`): read `error.status`, not the message text. Only `apiClient`
+  requests the server answers with an error status other than 401 throw it; a 401 (session
+  expired), a timeout and the export and download helpers throw a plain `Error`.
+- The evidence pane shows only **Details** for a change (no request journey or signed
+  presentation), grouped as Change, Policy, Where and Refusal. The policy links to the Policies
+  tab of its type, the target to its surface or gateway page.
+- Every value is rendered as React text; record fields come from the gateway and are untrusted.
 
 ## MCP Proxy write warnings
 

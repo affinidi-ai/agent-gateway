@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::bdd_support::config::DEFAULT_HEADER_METADATA_EXTENSION_URI;
@@ -12,12 +12,12 @@ use crate::bdd_support::config::gateway_bootstrap::GatewayBootstrapSurface;
 use crate::bdd_support::config::mcp_proxy::McpProxyFixture;
 use crate::bdd_support::config::single_surface_fixture::{
     CredentialProviderKind, DelegatedCredentialInjection, DidWebVhIdentityFixture, PROTECTED_RESOURCE_PUBLIC_ORIGIN,
-    SurfaceConfigBuilder, SurfaceSourceAuthConfig,
+    SurfaceConfigBuilder, SurfaceSourceAuthConfig, SurfaceTransitPointConfig,
 };
 use crate::bdd_support::config::target_auth::static_secret_target_auth_json;
 
 struct SingleSurfaceOptions<'a> {
-    outbound: Option<(u16, &'a str)>,
+    outbound: Option<(u16, &'a HashMap<String, String>)>,
     affinidi_terms_url: Option<&'a str>,
 }
 
@@ -67,7 +67,7 @@ pub fn write_single_surface_config_with_outbound_listener(
     gateway_port: u16,
     outbound_port: u16,
     mock_url: &str,
-    transit_target_url: &str,
+    transit_target_urls: &HashMap<String, String>,
     surface_config: &SurfaceConfigBuilder,
     jwks_fixture: Option<&JwksFiles>,
 ) {
@@ -78,10 +78,74 @@ pub fn write_single_surface_config_with_outbound_listener(
         surface_config,
         jwks_fixture,
         SingleSurfaceOptions {
-            outbound: Some((outbound_port, transit_target_url)),
+            outbound: Some((outbound_port, transit_target_urls)),
             affinidi_terms_url: None,
         },
     );
+}
+
+fn transit_point_json(
+    transit_point: &SurfaceTransitPointConfig,
+    target_endpoint: &str,
+) -> serde_json::Value {
+    let mut transit_point_json = serde_json::json!({
+        "name": transit_point.alias,
+        "alias": transit_point.alias,
+        "target_endpoint": target_endpoint,
+        "protocol": transit_point.protocol,
+        "listen_path": format!("/transit/{}", transit_point.alias),
+        "require_transit_token": false
+    });
+    if !transit_point
+        .header_metadata_mapping
+        .headers
+        .is_empty()
+    {
+        transit_point_json["header_metadata_mapping"] = serde_json::json!({
+            "extension_uri": DEFAULT_HEADER_METADATA_EXTENSION_URI,
+            "strip_mapped_headers": transit_point.header_metadata_mapping.strip_mapped_headers,
+            "headers": transit_point.header_metadata_mapping.headers.iter().map(|row| {
+                serde_json::json!({
+                    "header": &row.header,
+                    "field": &row.field,
+                })
+            }).collect::<Vec<_>>()
+        });
+    }
+    if let Some(managed_identity) = &transit_point.managed_identity {
+        let mut properties = serde_json::Map::new();
+        for field in &managed_identity.fields {
+            properties.insert(field.clone(), serde_json::json!({ "type": "string", "x-identity": true }));
+        }
+        transit_point_json["managed_identity"] = serde_json::json!({
+            "type": "payload_extraction",
+            "extension_uri": DEFAULT_HEADER_METADATA_EXTENSION_URI,
+            "meta_field": "agentIdentity",
+            "fields": &managed_identity.fields,
+            "json_schema": {
+                "type": "object",
+                "properties": properties,
+                "required": &managed_identity.fields,
+            }
+        });
+        transit_point_json["identity_injection"] = serde_json::json!({
+            "inject_vp": true,
+        });
+    }
+    if !transit_point
+        .trust_check_list
+        .is_empty()
+    {
+        transit_point_json["trust_check_list"] = serde_json::Value::Array(
+            transit_point
+                .trust_check_list
+                .clone(),
+        );
+    }
+    if let Some(policy) = &transit_point.policy {
+        transit_point_json["policy"] = serde_json::json!({ "policy_definition_id": policy.id });
+    }
+    transit_point_json
 }
 
 fn write_single_surface_config_inner(
@@ -92,9 +156,9 @@ fn write_single_surface_config_inner(
     jwks_fixture: Option<&JwksFiles>,
     options: SingleSurfaceOptions<'_>,
 ) {
-    let (outbound_port, transit_target_url) = options
+    let (outbound_port, transit_target_urls) = options
         .outbound
-        .map_or((None, None), |(port, url)| (Some(port), Some(url)));
+        .map_or((None, None), |(port, urls)| (Some(port), Some(urls)));
     let mut surface_routes = surface_config
         .registered_routes
         .clone();
@@ -227,57 +291,26 @@ fn write_single_surface_config_inner(
             "inject_as": inject_as,
         }));
     }
-    if let Some(transit_point) = &surface_config.transit_point {
+    if !surface_config
+        .transit_points
+        .is_empty()
+    {
         let outbound_port = outbound_port.expect("outbound_port is required when a Transit Point is configured");
-        let target_endpoint =
-            transit_target_url.expect("transit_target_url is required when a Transit Point is configured");
-        let mut transit_point_json = serde_json::json!({
-            "name": transit_point.alias,
-            "alias": transit_point.alias,
-            "target_endpoint": target_endpoint,
-            "protocol": transit_point.protocol,
-            "listen_path": format!("/transit/{}", transit_point.alias),
-            "require_transit_token": false
-        });
-        if !transit_point
-            .header_metadata_mapping
-            .headers
-            .is_empty()
-        {
-            transit_point_json["header_metadata_mapping"] = serde_json::json!({
-                "extension_uri": DEFAULT_HEADER_METADATA_EXTENSION_URI,
-                "strip_mapped_headers": transit_point.header_metadata_mapping.strip_mapped_headers,
-                "headers": transit_point.header_metadata_mapping.headers.iter().map(|row| {
-                    serde_json::json!({
-                        "header": &row.header,
-                        "field": &row.field,
-                    })
-                }).collect::<Vec<_>>()
-            });
-        }
-        if let Some(managed_identity) = &transit_point.managed_identity {
-            let mut properties = serde_json::Map::new();
-            for field in &managed_identity.fields {
-                properties.insert(field.clone(), serde_json::json!({ "type": "string", "x-identity": true }));
-            }
-            transit_point_json["managed_identity"] = serde_json::json!({
-                "type": "payload_extraction",
-                "extension_uri": DEFAULT_HEADER_METADATA_EXTENSION_URI,
-                "meta_field": "agentIdentity",
-                "fields": &managed_identity.fields,
-                "json_schema": {
-                    "type": "object",
-                    "properties": properties,
-                    "required": &managed_identity.fields,
-                }
-            });
-            transit_point_json["identity_injection"] = serde_json::json!({
-                "inject_vp": true,
-            });
-        }
+        let transit_target_urls =
+            transit_target_urls.expect("transit_target_urls are required when a Transit Point is configured");
+        let points = surface_config
+            .transit_points
+            .iter()
+            .map(|transit_point| {
+                let target_endpoint = transit_target_urls
+                    .get(&transit_point.alias)
+                    .unwrap_or_else(|| panic!("no target URL for Transit Point '{}'", transit_point.alias));
+                transit_point_json(transit_point, target_endpoint)
+            })
+            .collect::<Vec<_>>();
         let mut transit_json = serde_json::json!({
             "outbound_listen_address": format!("http://localhost:{outbound_port}"),
-            "points": [transit_point_json]
+            "points": points
         });
         if let Some(policy) = &surface_config.transit_shared_policy {
             transit_json["opa_policy_definition_id"] = serde_json::json!(policy.id);
@@ -289,9 +322,6 @@ fn write_single_surface_config_inner(
     }
     for entry in &surface_config.trust_recorder_entries {
         surface_fixture = surface_fixture.with_trust_recorder_entry(entry.clone());
-    }
-    for element in &surface_config.target_trust_check_list {
-        surface_fixture = surface_fixture.with_target_trust_check_element(element.clone());
     }
     if let Some(identity) = &surface_config.didwebvh_identity {
         surface_fixture = surface_fixture.with_didwebvh_identity_id(
@@ -631,6 +661,11 @@ fn policy_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<PolicyDefinitio
     }
     if let Some(policy) = &surface_config.transit_shared_policy {
         policies.push(policy.clone());
+    }
+    for transit_point in &surface_config.transit_points {
+        if let Some(policy) = &transit_point.policy {
+            policies.push(policy.clone());
+        }
     }
     if let Some(policy) = &surface_config.alternate_variant_inbound_policy {
         policies.push(PolicyDefinitionFixture::new(

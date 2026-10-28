@@ -243,6 +243,453 @@ fn validate_trust_checks(surface: &AgentSurface) -> Result<(), SurfaceApiError> 
         .map_err(|e| SurfaceApiError::BadRequest(e.to_string()))
 }
 
+/// Reject a non-empty `target.trust_check_list` unless the Managed Agent
+/// target runs it on its own target leg (`a2a-proxy://` and `fabric://`): the
+/// base list against the base target, and a list a variant sets in its own
+/// override (enabled or not) against that variant's target. A base list a
+/// variant only inherits is not checked against the variant, since it never
+/// runs there. Transit Point traffic runs each Transit Point's own list.
+fn reject_target_trust_checks_unless_target_runs_them(surface: &AgentSurface) -> Result<(), SurfaceApiError> {
+    let offending = |target: &crate::config::agent_surface::Target| {
+        !target
+            .trust_check_list
+            .is_empty()
+            && !target.runs_own_trust_checks()
+    };
+    let message = |label: &str| {
+        SurfaceApiError::BadRequest(format!(
+            "{label}target.trust_check_list is only allowed for a2a-proxy:// and fabric:// Managed Agent targets; \
+             configure target-leg Trust Checks per Transit Point in transit.points[].trust_check_list"
+        ))
+    };
+    if offending(&surface.target) {
+        return Err(message(""));
+    }
+    for variant in &surface.variants {
+        let sets_own_list = variant
+            .overrides
+            .target
+            .as_ref()
+            .and_then(|target| {
+                target
+                    .trust_check_list
+                    .as_ref()
+            })
+            .is_some_and(|list| !list.is_empty());
+        if sets_own_list && offending(&surface.variant_target(variant)) {
+            return Err(message(&format!("Variant '{}': ", variant.alias)));
+        }
+    }
+    Ok(())
+}
+
+/// Convert a full surface body written in the old shape, where
+/// `target.trust_check_list` ran for every Transit Point, the way a stored
+/// surface is converted on load: the list is copied onto the Transit Points
+/// and cleared unless the Managed Agent target runs it. Only the Trust Check
+/// parts of the conversion are taken, so every other field keeps exactly what
+/// the client sent. A body declaring `trust_check_split: true`, without a
+/// target list, or already carrying Transit Point lists (which the old shape
+/// cannot express) is left as sent. The conversion is logged only when it
+/// changed something.
+fn convert_old_shape_body(surface: &mut AgentSurface) -> Result<(), SurfaceApiError> {
+    if surface.trust_check_split || !surface.has_target_trust_checks() || surface.has_transit_point_trust_checks() {
+        return Ok(());
+    }
+    let mut value = serde_json::to_value(&*surface)
+        .map_err(|e| SurfaceApiError::InternalError(format!("Failed to serialise surface: {}", e)))?;
+    let sent = value.clone();
+    if !crate::config::agent_surface::split_target_trust_checks_per_transit_point(&mut value) {
+        return Ok(());
+    }
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("trust_check_split");
+    }
+    if value == sent {
+        return Ok(());
+    }
+    let converted: AgentSurface = serde_json::from_value(value)
+        .map_err(|e| SurfaceApiError::BadRequest(format!("Converted surface is invalid: {}", e)))?;
+    surface
+        .target
+        .trust_check_list = converted
+        .target
+        .trust_check_list;
+    surface.transit = converted.transit;
+    for (variant, converted) in surface
+        .variants
+        .iter_mut()
+        .zip(converted.variants)
+    {
+        variant.overrides.transit = converted.overrides.transit;
+        if let (Some(target), Some(converted)) = (
+            variant
+                .overrides
+                .target
+                .as_mut(),
+            converted.overrides.target,
+        ) {
+            target.trust_check_list = converted.trust_check_list;
+        }
+    }
+    let migrated = |points: &[crate::config::agent_surface::TransitPoint]| {
+        points
+            .iter()
+            .filter(|point| point.trust_check_migrated)
+            .map(|point| point.alias.clone())
+            .collect::<Vec<_>>()
+    };
+    let mut aliases = surface
+        .transit
+        .as_ref()
+        .map(|transit| migrated(&transit.points))
+        .unwrap_or_default();
+    for variant in &surface.variants {
+        if let Some(points) = variant
+            .overrides
+            .transit
+            .as_ref()
+            .and_then(|transit| transit.points.as_deref())
+        {
+            aliases.extend(migrated(points));
+        }
+    }
+    warn!(
+        surface_id = %surface.surface_id,
+        transit_points = ?aliases,
+        "converted a surface write without trust_check_split: copied target.trust_check_list onto its \
+         Transit Points"
+    );
+    Ok(())
+}
+
+/// A JSON request body as `T`, rejected exactly as [`Json<T>`] would reject
+/// it, together with the JSON the client sent, so a handler can tell an absent
+/// field from an empty one.
+pub struct JsonWithSent<T>(T, serde_json::Value);
+
+impl<S, T> axum::extract::FromRequest<S> for JsonWithSent<T>
+where
+    S: Send + Sync,
+    T: serde::de::DeserializeOwned,
+{
+    type Rejection = Response;
+
+    async fn from_request(
+        request: axum::extract::Request,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let headers = request.headers().clone();
+        let bytes = axum::body::Bytes::from_request(request, state)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        let mut typed = axum::extract::Request::new(axum::body::Body::from(bytes.clone()));
+        *typed.headers_mut() = headers;
+        let Json(value) = Json::<T>::from_request(typed, state)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        let sent = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        Ok(Self(value, sent))
+    }
+}
+
+const PER_TRANSIT_POINT_REQUIRED: &str = "this surface uses the per-Transit-Point Trust Check shape; send \
+                                          trust_check_split: true to change its Trust Check lists \
+                                          (transit.points[].trust_check_list, target.trust_check_list)";
+
+/// Settle a PUT without `trust_check_split: true` on a surface whose stored
+/// Transit Points already hold lists (base or variant override points). Such a
+/// body is never converted. `sent` is the request JSON as the client sent it,
+/// so an absent field can be told from an empty one.
+///
+/// - Each incoming Transit Point sent without a list (matched by `id` when the
+///   client sent one, otherwise by `alias`; a variant's own points against the
+///   same stored variant's, by variant `id`) keeps the stored list and its
+///   `trust_check_migrated` flag as stored; a list that differs from the
+///   stored one is refused.
+/// - A base `target.trust_check_list` (or a variant override's) that is absent
+///   or `null` keeps the stored one; a sent list, empty included, that differs
+///   from the stored one is refused.
+/// - A variant sent without its own Transit Points while the stored variant's
+///   own Transit Points hold lists is refused, since dropping them would drop
+///   their lists.
+///
+/// A client in the old shape cannot express per-Transit-Point lists, so it
+/// keeps them; only a declared write changes or removes them.
+fn keep_stored_point_lists(
+    surface: &mut AgentSurface,
+    stored: &AgentSurface,
+    sent: &serde_json::Value,
+) -> Result<(), SurfaceApiError> {
+    use crate::config::agent_surface::TransitPoint;
+    let refused = || SurfaceApiError::BadRequest(PER_TRANSIT_POINT_REQUIRED.to_string());
+    let sends = |value: Option<&serde_json::Value>| value.is_some_and(|value| !value.is_null());
+    fn keep(
+        points: &mut [TransitPoint],
+        stored_points: &[TransitPoint],
+        sent_points: Option<&Vec<serde_json::Value>>,
+    ) -> bool {
+        for (index, point) in points.iter_mut().enumerate() {
+            let sent_id = sent_points
+                .and_then(|sent| sent.get(index))
+                .and_then(|sent| sent.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|id| !id.is_empty());
+            let stored_point = if sent_id {
+                stored_points
+                    .iter()
+                    .find(|stored| stored.id == point.id)
+            } else {
+                stored_points
+                    .iter()
+                    .find(|stored| stored.alias == point.alias)
+            };
+            if point
+                .trust_check_list
+                .is_empty()
+            {
+                if let Some(stored_point) = stored_point {
+                    point.trust_check_list = stored_point
+                        .trust_check_list
+                        .clone();
+                    point.trust_check_migrated = stored_point.trust_check_migrated;
+                }
+            } else if stored_point.is_none_or(|stored| stored.trust_check_list != point.trust_check_list) {
+                return false;
+            }
+        }
+        true
+    }
+
+    if !sends(sent.pointer("/target/trust_check_list")) {
+        surface
+            .target
+            .trust_check_list = stored
+            .target
+            .trust_check_list
+            .clone();
+    } else if surface
+        .target
+        .trust_check_list
+        != stored.target.trust_check_list
+    {
+        return Err(refused());
+    }
+    let stored_base_points = stored
+        .transit
+        .as_ref()
+        .map(|transit| transit.points.as_slice())
+        .unwrap_or_default();
+    fn sent_points(value: Option<&serde_json::Value>) -> Option<&Vec<serde_json::Value>> {
+        value.and_then(serde_json::Value::as_array)
+    }
+    if let Some(transit) = surface.transit.as_mut()
+        && !keep(&mut transit.points, stored_base_points, sent_points(sent.pointer("/transit/points")))
+    {
+        return Err(refused());
+    }
+
+    let sent_variants = sent
+        .get("variants")
+        .and_then(serde_json::Value::as_array);
+    for (index, variant) in surface
+        .variants
+        .iter_mut()
+        .enumerate()
+    {
+        let stored_variant = stored
+            .variants
+            .iter()
+            .find(|stored| stored.id == variant.id);
+        let stored_target_list = stored_variant
+            .and_then(|stored| {
+                stored
+                    .overrides
+                    .target
+                    .as_ref()
+            })
+            .and_then(|target| {
+                target
+                    .trust_check_list
+                    .clone()
+            });
+        let sent_list = sent_variants
+            .and_then(|variants| variants.get(index))
+            .and_then(|variant| variant.pointer("/overrides/target/trust_check_list"));
+        if !sends(sent_list) {
+            if let Some(list) = stored_target_list {
+                variant
+                    .overrides
+                    .target
+                    .get_or_insert_with(Default::default)
+                    .trust_check_list = Some(list);
+            }
+        } else {
+            let list = variant
+                .overrides
+                .target
+                .as_ref()
+                .and_then(|target| {
+                    target
+                        .trust_check_list
+                        .clone()
+                })
+                .unwrap_or_default();
+            if list != stored_target_list.unwrap_or_default() {
+                return Err(refused());
+            }
+        }
+        let stored_points = stored_variant
+            .and_then(|stored| {
+                stored
+                    .overrides
+                    .transit
+                    .as_ref()
+            })
+            .and_then(|transit| transit.points.as_deref())
+            .unwrap_or_default();
+        let sends_points = variant
+            .overrides
+            .transit
+            .as_ref()
+            .is_some_and(|transit| transit.points.is_some());
+        if !sends_points
+            && stored_points
+                .iter()
+                .any(|point| {
+                    !point
+                        .trust_check_list
+                        .is_empty()
+                })
+        {
+            return Err(refused());
+        }
+        if let Some(points) = variant
+            .overrides
+            .transit
+            .as_mut()
+            .and_then(|transit| transit.points.as_mut())
+            && !keep(
+                points,
+                stored_points,
+                sent_points(
+                    sent_variants
+                        .and_then(|variants| variants.get(index))
+                        .and_then(|variant| variant.pointer("/overrides/transit/points")),
+                ),
+            )
+        {
+            return Err(refused());
+        }
+    }
+    Ok(())
+}
+
+/// Settle the Trust Check lists of a PUT body. A body declaring
+/// `trust_check_split: true` is taken as sent. Otherwise a stored surface with
+/// no Trust Check lists (no stored marker and no Transit Point lists) is
+/// unsplit and the body is converted with [`convert_old_shape_body`]; an
+/// already split one goes through [`keep_stored_point_lists`].
+fn settle_undeclared_put(
+    surface: &mut AgentSurface,
+    stored: &AgentSurface,
+    sent: &serde_json::Value,
+) -> Result<(), SurfaceApiError> {
+    if surface.trust_check_split {
+        return Ok(());
+    }
+    if stored.trust_check_split || stored.has_transit_point_trust_checks() {
+        keep_stored_point_lists(surface, stored, sent)
+    } else {
+        convert_old_shape_body(surface)
+    }
+}
+
+/// Reject a partial write without `trust_check_split: true` that touches
+/// `target.trust_check_list` or `transit.points` (base or variant override)
+/// while the stored surface keeps Trust Checks on its Transit Points: a
+/// client in the old shape cannot edit them without losing them.
+fn reject_undeclared_trust_check_edit(
+    touches_trust_checks: bool,
+    stored: &AgentSurface,
+) -> Result<(), SurfaceApiError> {
+    if touches_trust_checks && stored.has_transit_point_trust_checks() {
+        return Err(SurfaceApiError::BadRequest(PER_TRANSIT_POINT_REQUIRED.to_string()));
+    }
+    Ok(())
+}
+
+/// Whether a merge patch reaches `path`: it sets the path itself, or sets
+/// one of its ancestors to `null`, which removes everything below it.
+fn patch_reaches(
+    patch: &serde_json::Value,
+    path: &[&str],
+) -> bool {
+    let mut current = patch;
+    for key in path {
+        match current.get(key) {
+            None => return false,
+            Some(serde_json::Value::Null) => return true,
+            Some(next) => current = next,
+        }
+    }
+    true
+}
+
+/// Whether a surface merge patch touches `target.trust_check_list` or
+/// `transit.points`, on the base or in a variant override, including through a
+/// `null` ancestor. Replacing the `variants` array touches them whenever a
+/// stored variant override holds Transit Point lists.
+fn patch_touches_trust_checks(
+    patch: &serde_json::Value,
+    stored: &AgentSurface,
+) -> bool {
+    let stored_variant_lists = stored
+        .variants
+        .iter()
+        .any(variant_holds_transit_point_lists);
+    patch_reaches(patch, &["target", "trust_check_list"])
+        || patch_reaches(patch, &["transit", "points"])
+        || match patch.get("variants") {
+            None => false,
+            Some(serde_json::Value::Array(variants)) => {
+                stored_variant_lists
+                    || variants
+                        .iter()
+                        .any(variant_patch_touches_trust_checks)
+            }
+            Some(_) => stored_variant_lists,
+        }
+}
+
+/// Whether a variant merge patch touches `overrides.target.trust_check_list`
+/// or `overrides.transit.points`, including through a `null` ancestor.
+fn variant_patch_touches_trust_checks(variant: &serde_json::Value) -> bool {
+    patch_reaches(variant, &["overrides", "target", "trust_check_list"])
+        || patch_reaches(variant, &["overrides", "transit", "points"])
+}
+
+fn variant_holds_transit_point_lists(variant: &crate::config::agent_surface_variants::SurfaceVariant) -> bool {
+    variant
+        .overrides
+        .transit
+        .as_ref()
+        .and_then(|transit| transit.points.as_deref())
+        .is_some_and(|points| {
+            points.iter().any(|point| {
+                !point
+                    .trust_check_list
+                    .is_empty()
+            })
+        })
+}
+
+/// Whether a write body declares the per-Transit-Point shape with
+/// `trust_check_split: true`.
+fn declares_split(body: &serde_json::Value) -> bool {
+    body.get("trust_check_split") == Some(&serde_json::Value::Bool(true))
+}
+
 /// Validate Transit Point-scoped Workload Binding on the base surface and
 /// every resolved variant, mapping the structured
 /// [`crate::config::agent_surface::WorkloadBindingSurfaceError`] into a
@@ -870,6 +1317,7 @@ pub async fn create_surface(
         .as_ref()
         .ok_or_else(|| SurfaceApiError::InternalError("Agent surface store not initialized".to_string()))?;
     refuse_a2a_settings_sent_on_other_protocols(&surface)?;
+    convert_old_shape_body(&mut surface)?;
 
     // Assign a new ID if not provided
     if surface.surface_id.is_empty() {
@@ -963,6 +1411,7 @@ pub async fn create_surface(
     surface
         .validate()
         .map_err(|e| SurfaceApiError::BadRequest(e.to_string()))?;
+    reject_target_trust_checks_unless_target_runs_them(&surface)?;
 
     // Check for duplicate surface_id
     surface
@@ -990,6 +1439,7 @@ pub async fn create_surface(
         .await
         .map_err(|e| SurfaceApiError::Forbidden(e.message()))?;
 
+    surface.trust_check_split = surface.has_trust_check_lists();
     store
         .save(&surface)
         .await
@@ -1000,30 +1450,6 @@ pub async fn create_surface(
     apply_surface_change(&state, SurfaceChange::Upsert(&surface)).await;
 
     Ok((StatusCode::CREATED, Json(surface)))
-}
-
-/// A PUT body parsed exactly as `Json` parses it, and also kept as JSON, so
-/// the handler can tell an explicit `protected_resource: null` from an
-/// omitted setting, which the parsed value cannot.
-pub struct PutBody<T> {
-    value: T,
-    json: serde_json::Value,
-}
-
-impl<S: Send + Sync, T: serde::de::DeserializeOwned> axum::extract::FromRequest<S> for PutBody<T> {
-    type Rejection = axum::extract::rejection::JsonRejection;
-
-    async fn from_request(
-        request: axum::extract::Request,
-        state: &S,
-    ) -> Result<Self, Self::Rejection> {
-        let (parts, body) = request.into_parts();
-        let bytes =
-            axum::body::Bytes::from_request(axum::extract::Request::from_parts(parts.clone(), body), state).await?;
-        let json = serde_json::from_slice(&bytes).unwrap_or_default();
-        let Json(value) = Json::from_request(axum::extract::Request::from_parts(parts, bytes.into()), state).await?;
-        Ok(Self { value, json })
-    }
 }
 
 /// Whether `access_point` in a PUT body removes its discovery setting.
@@ -1102,7 +1528,7 @@ pub async fn update_surface(
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
-    PutBody { value: mut surface, json }: PutBody<AgentSurface>,
+    JsonWithSent(mut surface, sent): JsonWithSent<AgentSurface>,
 ) -> Result<Json<AgentSurface>, SurfaceApiError> {
     let store = state
         .agent_surface_store
@@ -1127,6 +1553,7 @@ pub async fn update_surface(
     if !surface_writable(existing.tenant_id.as_deref(), &surface_id, tenant_context(&context), resource_scope(&scope)) {
         return Err(SurfaceApiError::Forbidden("surface is outside this token's permitted scope".to_string()));
     }
+    settle_undeclared_put(&mut surface, &existing, &sent)?;
     surface.tenant_id = existing.tenant_id.clone();
     if surface
         .mcp_legacy_metadata_output
@@ -1135,7 +1562,7 @@ pub async fn update_surface(
         surface.mcp_legacy_metadata_output = existing.mcp_legacy_metadata_output;
     }
     retain_mcp_settings(&mut surface, &existing, &state.network_config);
-    ProtectedResourceRemovals::of(&json).apply(&mut surface);
+    ProtectedResourceRemovals::of(&sent).apply(&mut surface);
     retain_a2a_settings(&mut surface, &existing);
 
     let saved = validate_and_save_surface(
@@ -1645,6 +2072,7 @@ async fn validate_and_save_surface(
     validate_surface_mcp_tool_gating(&surface)?;
     validate_resolved_variants(&surface)?;
     validate_trust_checks(&surface)?;
+    reject_target_trust_checks_unless_target_runs_them(&surface)?;
     validate_workload_binding_config(&surface)?;
     validate_source_auth(&surface)?;
     surface
@@ -1661,6 +2089,7 @@ async fn validate_and_save_surface(
     validate_protected_resource_issuers(state, &surface).await?;
     validate_mcp_resource_declarations(state, &surface).await?;
 
+    surface.trust_check_split = surface.has_trust_check_lists();
     store
         .save(&surface)
         .await
@@ -1769,6 +2198,9 @@ pub async fn patch_surface(
     if let Some(obj) = merged.as_object_mut() {
         obj.insert("surface_id".to_string(), serde_json::Value::String(surface_id.clone()));
     }
+    if !declares_split(&patch) {
+        reject_undeclared_trust_check_edit(patch_touches_trust_checks(&patch, &existing), &existing)?;
+    }
 
     let mut surface: AgentSurface = serde_json::from_value(merged)
         .map_err(|e| SurfaceApiError::BadRequest(format!("Merged surface failed to deserialise: {}", e)))?;
@@ -1813,11 +2245,14 @@ pub async fn patch_variant(
     if body.is_empty() {
         return Err(SurfaceApiError::BadRequest("PATCH body must not be empty".to_string()));
     }
-    let patch: serde_json::Value = serde_json::from_slice(&body)
+    let mut patch: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| SurfaceApiError::BadRequest(format!("PATCH body is not valid JSON: {}", e)))?;
-    if !patch.is_object() {
+    let Some(patch_obj) = patch.as_object_mut() else {
         return Err(SurfaceApiError::BadRequest("PATCH body must be a JSON object at the top level".to_string()));
-    }
+    };
+    let declared = patch_obj
+        .remove("trust_check_split")
+        .is_some_and(|marker| marker == serde_json::Value::Bool(true));
 
     let (store, existing) = load_surface_or_404(
         &state,
@@ -1835,6 +2270,9 @@ pub async fn patch_variant(
         .ok_or_else(|| {
             SurfaceApiError::NotFound(format!("Variant '{}' not found on surface '{}'", variant_id, surface_id))
         })?;
+    if !declared {
+        reject_undeclared_trust_check_edit(variant_patch_touches_trust_checks(&patch), &existing)?;
+    }
 
     let mut merged_variant = serde_json::to_value(&existing.variants[variant_index])
         .map_err(|e| SurfaceApiError::InternalError(format!("Failed to serialise variant for merge: {}", e)))?;
@@ -2248,6 +2686,11 @@ pub struct UpdateVariantRequest {
     pub enabled: Option<bool>,
     #[serde(default)]
     pub overrides: Option<SurfaceOverrides>,
+    /// `true` declares `overrides` per-Transit-Point; without it, a body that
+    /// touches the Trust Check lists of a surface that keeps them per Transit
+    /// Point is refused.
+    #[serde(default)]
+    pub trust_check_split: bool,
 }
 
 /// May this caller change or delete the surface? Reading an operator's surface
@@ -2421,7 +2864,7 @@ pub async fn update_variant(
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
-    PutBody { value: body, json }: PutBody<UpdateVariantRequest>,
+    JsonWithSent(body, sent): JsonWithSent<UpdateVariantRequest>,
 ) -> Result<Json<SurfaceVariant>, SurfaceApiError> {
     let (store, mut surface) = load_surface_or_404(
         &state,
@@ -2473,11 +2916,36 @@ pub async fn update_variant(
     if let Some(enabled) = body.enabled {
         variant.enabled = enabled;
     }
+    let stored_variant_lists = existing
+        .variants
+        .iter()
+        .any(|stored| stored.id == variant_id && variant_holds_transit_point_lists(stored));
+    let touches_trust_checks = body
+        .overrides
+        .as_ref()
+        .is_some_and(|overrides| {
+            stored_variant_lists
+                || overrides
+                    .target
+                    .as_ref()
+                    .is_some_and(|target| {
+                        target
+                            .trust_check_list
+                            .is_some()
+                    })
+                || overrides
+                    .transit
+                    .as_ref()
+                    .is_some_and(|transit| transit.points.is_some())
+        });
+    if !body.trust_check_split {
+        reject_undeclared_trust_check_edit(touches_trust_checks, &existing)?;
+    }
     // New overrides replace the stored ones, but keep the stored discovery
     // setting unless they remove it, as a PUT of the whole surface does.
     let mut retained = Vec::new();
     if let Some(mut overrides) = body.overrides {
-        if !removes_protected_resource(json.pointer("/overrides/access_point"))
+        if !removes_protected_resource(sent.pointer("/overrides/access_point"))
             && retain_protected_resource(
                 overrides
                     .access_point
@@ -3524,6 +3992,7 @@ mod validation_tests {
             mcp_legacy_metadata_output: None,
             _retired_protocol_mode: Default::default(),
             mcp_http: None,
+            trust_check_split: false,
         }
     }
 
@@ -4235,6 +4704,788 @@ mod validation_tests {
             .caller_authentication = Some(jwt_bearer_auth("Authorization"));
         // MPP-over-MCP carries its credential in the `_meta` body, not a header — unaffected.
         validate_delegation_source_auth(&s).expect("MCP delegated MPP is unaffected by header collision");
+    }
+
+    fn target_trust_check(id: &str) -> crate::trust_registry_verification::TrustCheckElement {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "trust_registry_id": "tr-1",
+            "query_type": "recognition",
+            "query": {
+                "authority_id": "did:web:authority.example",
+                "entity_id": "{{ target.did }}"
+            }
+        }))
+        .expect("trust check element")
+    }
+
+    fn bad_request_message(result: Result<(), SurfaceApiError>) -> String {
+        match result {
+            Err(SurfaceApiError::BadRequest(msg)) => msg,
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    fn variant_with_target(
+        overrides: TargetOverrides,
+        enabled: bool,
+    ) -> SurfaceVariant {
+        SurfaceVariant {
+            id: "v-dev".to_string(),
+            alias: "dev".to_string(),
+            name: "dev".to_string(),
+            description: String::new(),
+            enabled,
+            overrides: SurfaceOverrides {
+                target: Some(overrides),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn fabric_surface_with_point(
+        point_list: Vec<crate::trust_registry_verification::TrustCheckElement>
+    ) -> AgentSurface {
+        let mut s = base_surface();
+        s.target.endpoint = "fabric://gateway-1/surface-1".to_string();
+        s.target.trust_check_list = vec![target_trust_check("fabric-target")];
+        let mut point: crate::config::agent_surface::TransitPoint = serde_json::from_value(serde_json::json!({
+            "alias": "partner-a",
+            "target_endpoint": "https://partner.example/a2a",
+            "protocol": "a2a"
+        }))
+        .expect("transit point");
+        point.trust_check_list = point_list;
+        s.transit = Some(crate::config::agent_surface::TransitConfig {
+            points: vec![point],
+            outbound_listen_address: None,
+            shared: Default::default(),
+        });
+        s
+    }
+
+    fn point(surface: &AgentSurface) -> &crate::config::agent_surface::TransitPoint {
+        &surface
+            .transit
+            .as_ref()
+            .expect("transit")
+            .points[0]
+    }
+
+    fn migrated(mut surface: AgentSurface) -> AgentSurface {
+        for point in surface
+            .transit
+            .iter_mut()
+            .flat_map(|transit| transit.points.iter_mut())
+        {
+            point.trust_check_migrated = !point
+                .trust_check_list
+                .is_empty();
+        }
+        surface
+    }
+
+    #[test]
+    fn an_undeclared_https_body_is_converted_and_then_passes_the_target_rule() {
+        let mut body = fabric_surface_with_point(Vec::new());
+        body.target.endpoint = "https://prod.example.com".to_string();
+        assert!(reject_target_trust_checks_unless_target_runs_them(&body).is_err());
+
+        convert_old_shape_body(&mut body).expect("converted");
+
+        assert!(
+            body.target
+                .trust_check_list
+                .is_empty()
+        );
+        assert_eq!(point(&body).trust_check_list[0].id, "fabric-target");
+        assert!(point(&body).trust_check_migrated);
+        assert!(reject_target_trust_checks_unless_target_runs_them(&body).is_ok());
+        assert!(body.has_trust_check_lists(), "a Transit Point list remains, so the marker is persisted");
+    }
+
+    #[test]
+    fn declared_bodies_and_bodies_without_target_lists_are_not_converted() {
+        let mut declared = fabric_surface_with_point(Vec::new());
+        declared.trust_check_split = true;
+        convert_old_shape_body(&mut declared).expect("declared");
+        assert!(
+            point(&declared)
+                .trust_check_list
+                .is_empty()
+        );
+
+        let mut without_target_list = fabric_surface_with_point(Vec::new());
+        without_target_list
+            .target
+            .trust_check_list
+            .clear();
+        convert_old_shape_body(&mut without_target_list).expect("no target list");
+        assert!(
+            point(&without_target_list)
+                .trust_check_list
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn conversion_leaves_fields_outside_the_trust_check_lists_as_sent() {
+        let mut body = fabric_surface_with_point(Vec::new());
+        body.target.endpoint = "https://prod.example.com".to_string();
+        body.access_point.a2a = None;
+        let before = body.access_point.clone();
+
+        convert_old_shape_body(&mut body).expect("converted");
+
+        assert_eq!(serde_json::to_value(&body.access_point).unwrap(), serde_json::to_value(&before).unwrap());
+        assert!(
+            body.access_point
+                .a2a
+                .is_none()
+        );
+    }
+
+    fn two_point_fabric_surface(
+        first: Vec<crate::trust_registry_verification::TrustCheckElement>,
+        second: Vec<crate::trust_registry_verification::TrustCheckElement>,
+    ) -> AgentSurface {
+        let mut s = fabric_surface_with_point(first);
+        let mut point: crate::config::agent_surface::TransitPoint = serde_json::from_value(serde_json::json!({
+            "id": "tp-b", "alias": "partner-b", "target_endpoint": "https://b.example/a2a"
+        }))
+        .unwrap();
+        point.trust_check_list = second;
+        s.transit
+            .as_mut()
+            .unwrap()
+            .points
+            .push(point);
+        s
+    }
+
+    fn points_of(surface: &AgentSurface) -> Vec<(Vec<String>, bool)> {
+        surface
+            .transit
+            .as_ref()
+            .unwrap()
+            .points
+            .iter()
+            .map(|p| {
+                (
+                    p.trust_check_list
+                        .iter()
+                        .map(|e| e.id.clone())
+                        .collect(),
+                    p.trust_check_migrated,
+                )
+            })
+            .collect()
+    }
+
+    fn with_stored_point_ids(
+        mut body: AgentSurface,
+        stored: &AgentSurface,
+    ) -> AgentSurface {
+        let stored_points = &stored
+            .transit
+            .as_ref()
+            .unwrap()
+            .points;
+        for (point, stored_point) in body
+            .transit
+            .as_mut()
+            .unwrap()
+            .points
+            .iter_mut()
+            .zip(stored_points)
+        {
+            point.id = stored_point.id.clone();
+        }
+        body
+    }
+
+    fn put(
+        body: &mut AgentSurface,
+        stored: &AgentSurface,
+    ) -> Result<(), SurfaceApiError> {
+        let sent = serde_json::to_value(&*body).expect("sent");
+        settle_undeclared_put(body, stored, &sent)
+    }
+
+    #[test]
+    fn an_undeclared_put_does_not_refill_transit_points_emptied_on_a_marked_surface() {
+        let mut stored = fabric_surface_with_point(Vec::new());
+        stored.trust_check_split = true;
+        let mut body = stored.clone();
+        body.trust_check_split = false;
+
+        put(&mut body, &stored).expect("unchanged body");
+
+        assert!(
+            point(&body)
+                .trust_check_list
+                .is_empty(),
+            "the emptied Transit Point stays empty"
+        );
+        assert!(!point(&body).trust_check_migrated);
+        assert_eq!(body.target.trust_check_list[0].id, "fabric-target");
+    }
+
+    #[test]
+    fn a_body_that_already_carries_transit_point_lists_is_not_converted() {
+        let mut body = two_point_fabric_surface(vec![target_trust_check("own")], Vec::new());
+
+        convert_old_shape_body(&mut body).expect("new-shape body");
+
+        assert_eq!(
+            points_of(&body),
+            vec![(vec!["own".to_string()], false), (Vec::new(), false)],
+            "a Transit Point meant to have no checks is left without them"
+        );
+        assert_eq!(body.target.trust_check_list[0].id, "fabric-target");
+    }
+
+    #[test]
+    fn an_undeclared_put_that_drops_a_variants_transit_points_is_refused() {
+        let mut stored = base_surface();
+        stored.variants = vec![variant_with_points(None, vec![target_trust_check("dev-copy")], true)];
+        let mut body = stored.clone();
+        body.variants[0]
+            .overrides
+            .transit = None;
+
+        assert_eq!(refused(put(&mut body, &stored)), PER_TRANSIT_POINT_REQUIRED);
+
+        let mut kept = stored.clone();
+        put(&mut kept, &stored).expect("variant sent with its Transit Points");
+    }
+
+    #[test]
+    fn an_unmarked_surface_without_lists_is_still_converted() {
+        let mut stored = fabric_surface_with_point(Vec::new());
+        stored
+            .target
+            .trust_check_list
+            .clear();
+        let mut body = stored.clone();
+        body.target.trust_check_list = vec![target_trust_check("old-shape")];
+
+        put(&mut body, &stored).expect("converted");
+
+        assert_eq!(point(&body).trust_check_list[0].id, "old-shape");
+        assert!(point(&body).trust_check_migrated);
+    }
+
+    #[test]
+    fn a_transit_point_sent_with_a_new_id_does_not_take_a_stored_list_by_alias() {
+        let stored = migrated(fabric_surface_with_point(vec![target_trust_check("copied")]));
+        let mut body = stored.clone();
+        body.transit
+            .as_mut()
+            .unwrap()
+            .points[0]
+            .id = "replacement-point".to_string();
+        {
+            let replacement = &mut body
+                .transit
+                .as_mut()
+                .unwrap()
+                .points[0];
+            replacement
+                .trust_check_list
+                .clear();
+            replacement.trust_check_migrated = false;
+        }
+
+        put(&mut body, &stored).expect("replacement point");
+
+        assert!(
+            point(&body)
+                .trust_check_list
+                .is_empty(),
+            "a point with a different id is a new point, whatever its alias"
+        );
+        assert!(!point(&body).trust_check_migrated);
+    }
+
+    #[test]
+    fn a_transit_point_sent_without_an_id_keeps_the_stored_list_by_alias() {
+        let stored = migrated(fabric_surface_with_point(vec![target_trust_check("copied")]));
+        let mut body = stored.clone();
+        body.transit
+            .as_mut()
+            .unwrap()
+            .points[0]
+            .trust_check_list
+            .clear();
+        let mut sent = serde_json::to_value(&body).unwrap();
+        sent["transit"]["points"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("id");
+
+        settle_undeclared_put(&mut body, &stored, &sent).expect("point without id");
+
+        assert_eq!(point(&body).trust_check_list[0].id, "copied");
+        assert!(point(&body).trust_check_migrated);
+    }
+
+    #[test]
+    fn a_missing_base_target_list_keeps_the_stored_one_and_an_explicit_empty_one_is_refused() {
+        let stored = migrated(fabric_surface_with_point(vec![target_trust_check("copied")]));
+        let mut body = fabric_surface_with_point(Vec::new());
+        body.target
+            .trust_check_list
+            .clear();
+
+        let mut missing = body.clone();
+        put(&mut missing, &stored).expect("missing target list");
+        assert_eq!(
+            missing
+                .target
+                .trust_check_list[0]
+                .id,
+            "fabric-target",
+            "the stored target list is kept"
+        );
+
+        let mut sent = serde_json::to_value(&body).unwrap();
+        sent["target"]["trust_check_list"] = serde_json::json!(null);
+        let mut null_list = body.clone();
+        settle_undeclared_put(&mut null_list, &stored, &sent).expect("null target list");
+        assert_eq!(
+            null_list
+                .target
+                .trust_check_list[0]
+                .id,
+            "fabric-target"
+        );
+
+        sent["target"]["trust_check_list"] = serde_json::json!([]);
+        let mut empty = body.clone();
+        assert_eq!(refused(settle_undeclared_put(&mut empty, &stored, &sent)), PER_TRANSIT_POINT_REQUIRED);
+    }
+
+    #[test]
+    fn a_missing_variant_target_list_keeps_the_stored_one_and_an_explicit_empty_one_is_refused() {
+        let mut stored = base_surface();
+        stored.variants = vec![variant_with_points(
+            Some(vec![target_trust_check("dev-target")]),
+            vec![target_trust_check("dev-copy")],
+            true,
+        )];
+        let mut body = base_surface();
+        body.variants = vec![variant_with_points(None, Vec::new(), false)];
+
+        let mut missing = body.clone();
+        put(&mut missing, &stored).expect("missing variant target list");
+        let kept = missing.variants[0]
+            .overrides
+            .target
+            .as_ref()
+            .and_then(|target| {
+                target
+                    .trust_check_list
+                    .clone()
+            })
+            .expect("kept list");
+        assert_eq!(kept[0].id, "dev-target");
+
+        let mut sent = serde_json::to_value(&body).unwrap();
+        sent["variants"][0]["overrides"]["target"]["trust_check_list"] = serde_json::json!([]);
+        let mut empty = body.clone();
+        empty.variants[0]
+            .overrides
+            .target
+            .as_mut()
+            .unwrap()
+            .trust_check_list = Some(Vec::new());
+        assert_eq!(refused(settle_undeclared_put(&mut empty, &stored, &sent)), PER_TRANSIT_POINT_REQUIRED);
+    }
+
+    #[test]
+    fn an_explicit_empty_target_list_matching_an_empty_stored_one_is_accepted() {
+        let mut stored = migrated(fabric_surface_with_point(vec![target_trust_check("copied")]));
+        stored
+            .target
+            .trust_check_list
+            .clear();
+        let mut body = fabric_surface_with_point(Vec::new());
+        body.target
+            .trust_check_list
+            .clear();
+        let mut sent = serde_json::to_value(&body).unwrap();
+        sent["target"]["trust_check_list"] = serde_json::json!([]);
+
+        settle_undeclared_put(&mut body, &stored, &sent).expect("unchanged empty list");
+        assert!(
+            body.target
+                .trust_check_list
+                .is_empty()
+        );
+    }
+
+    fn refused(result: Result<(), SurfaceApiError>) -> String {
+        match result {
+            Err(SurfaceApiError::BadRequest(msg)) => msg,
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_undeclared_get_put_of_a_split_fabric_surface_leaves_an_emptied_point_empty() {
+        let stored = migrated(two_point_fabric_surface(vec![target_trust_check("fabric-target")], Vec::new()));
+        let mut body = stored.clone();
+
+        put(&mut body, &stored).expect("unchanged body");
+
+        assert_eq!(points_of(&body), vec![(vec!["fabric-target".to_string()], true), (Vec::new(), false)]);
+        assert_eq!(body.target.trust_check_list[0].id, "fabric-target");
+    }
+
+    #[test]
+    fn an_undeclared_put_without_point_lists_keeps_stored_lists_and_flags() {
+        let mut stored = two_point_fabric_surface(vec![target_trust_check("copied")], vec![target_trust_check("kept")]);
+        stored
+            .transit
+            .as_mut()
+            .unwrap()
+            .points[0]
+            .trust_check_migrated = true;
+        let mut body = with_stored_point_ids(two_point_fabric_surface(Vec::new(), Vec::new()), &stored);
+
+        put(&mut body, &stored).expect("old-shape body");
+
+        assert_eq!(
+            points_of(&body),
+            vec![(vec!["copied".to_string()], true), (vec!["kept".to_string()], false)],
+            "a Keep-cleared or manually added list survives with its flag as stored"
+        );
+    }
+
+    #[test]
+    fn an_undeclared_put_that_changes_a_list_on_a_split_surface_is_refused() {
+        let stored = migrated(fabric_surface_with_point(vec![target_trust_check("copied")]));
+
+        let mut changed_target = fabric_surface_with_point(Vec::new());
+        changed_target
+            .target
+            .trust_check_list = vec![target_trust_check("other")];
+        assert_eq!(refused(put(&mut changed_target, &stored)), PER_TRANSIT_POINT_REQUIRED);
+
+        let mut changed_point = fabric_surface_with_point(vec![target_trust_check("other")]);
+        assert_eq!(refused(put(&mut changed_point, &stored)), PER_TRANSIT_POINT_REQUIRED);
+
+        let mut new_point = two_point_fabric_surface(Vec::new(), vec![target_trust_check("new")]);
+        assert_eq!(refused(put(&mut new_point, &stored)), PER_TRANSIT_POINT_REQUIRED);
+
+        let mut same = with_stored_point_ids(fabric_surface_with_point(vec![target_trust_check("copied")]), &stored);
+        put(&mut same, &stored).expect("an unchanged list is accepted");
+    }
+
+    #[test]
+    fn stored_lists_are_matched_by_id_then_alias() {
+        let mut stored = migrated(fabric_surface_with_point(vec![target_trust_check("copied")]));
+        stored
+            .transit
+            .as_mut()
+            .unwrap()
+            .points[0]
+            .id = "tp-1".to_string();
+        let mut renamed = fabric_surface_with_point(Vec::new());
+        {
+            let point = &mut renamed
+                .transit
+                .as_mut()
+                .unwrap()
+                .points[0];
+            point.id = "tp-1".to_string();
+            point.alias = "renamed".to_string();
+        }
+
+        put(&mut renamed, &stored).expect("renamed point");
+
+        assert_eq!(points_of(&renamed), vec![(vec!["copied".to_string()], true)]);
+    }
+
+    fn variant_with_points(
+        target_list: Option<Vec<crate::trust_registry_verification::TrustCheckElement>>,
+        point_list: Vec<crate::trust_registry_verification::TrustCheckElement>,
+        migrated: bool,
+    ) -> SurfaceVariant {
+        let mut point: crate::config::agent_surface::TransitPoint = serde_json::from_value(serde_json::json!({
+            "id": "tp-dev", "alias": "dev-partner", "target_endpoint": "https://d.example/a2a"
+        }))
+        .unwrap();
+        point.trust_check_list = point_list;
+        point.trust_check_migrated = migrated;
+        let mut variant = variant_with_target(
+            TargetOverrides {
+                endpoint: Some("fabric://gateway-1/dev".to_string()),
+                trust_check_list: target_list,
+                ..Default::default()
+            },
+            true,
+        );
+        variant.overrides.transit = Some(crate::config::agent_surface_variants::TransitOverrides {
+            points: Some(vec![point]),
+            ..Default::default()
+        });
+        variant
+    }
+
+    fn variant_point(surface: &AgentSurface) -> (Vec<String>, bool) {
+        let point = &surface.variants[0]
+            .overrides
+            .transit
+            .as_ref()
+            .unwrap()
+            .points
+            .as_ref()
+            .unwrap()[0];
+        (
+            point
+                .trust_check_list
+                .iter()
+                .map(|e| e.id.clone())
+                .collect(),
+            point.trust_check_migrated,
+        )
+    }
+
+    #[test]
+    fn variant_points_keep_stored_lists_and_refuse_changes_on_an_undeclared_put() {
+        let mut stored = base_surface();
+        stored.variants = vec![variant_with_points(
+            Some(vec![target_trust_check("dev-target")]),
+            vec![target_trust_check("dev-copy")],
+            true,
+        )];
+
+        let mut kept = base_surface();
+        kept.variants = vec![variant_with_points(Some(vec![target_trust_check("dev-target")]), Vec::new(), false)];
+        put(&mut kept, &stored).expect("old-shape variant body");
+        assert_eq!(variant_point(&kept), (vec!["dev-copy".to_string()], true));
+
+        let mut changed_target = base_surface();
+        changed_target.variants = vec![variant_with_points(Some(vec![target_trust_check("other")]), Vec::new(), false)];
+        assert_eq!(refused(put(&mut changed_target, &stored)), PER_TRANSIT_POINT_REQUIRED);
+
+        let mut changed_point = base_surface();
+        changed_point.variants = vec![variant_with_points(None, vec![target_trust_check("other")], false)];
+        assert_eq!(refused(put(&mut changed_point, &stored)), PER_TRANSIT_POINT_REQUIRED);
+    }
+
+    #[test]
+    fn an_undeclared_put_on_an_unsplit_surface_is_still_converted() {
+        let stored = fabric_surface_with_point(Vec::new());
+        let mut body = fabric_surface_with_point(Vec::new());
+        body.target.endpoint = "https://prod.example.com".to_string();
+
+        put(&mut body, &stored).expect("converted");
+
+        assert_eq!(points_of(&body), vec![(vec!["fabric-target".to_string()], true)]);
+        assert!(
+            body.target
+                .trust_check_list
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_declared_put_is_taken_as_sent() {
+        let stored = migrated(fabric_surface_with_point(vec![target_trust_check("copied")]));
+        let mut body = fabric_surface_with_point(Vec::new());
+        body.trust_check_split = true;
+
+        put(&mut body, &stored).expect("declared");
+
+        assert_eq!(points_of(&body), vec![(Vec::new(), false)]);
+    }
+
+    #[test]
+    fn a_variant_only_inheriting_a_base_list_is_not_checked_against_its_endpoint() {
+        let mut s = base_surface();
+        s.target.endpoint = "a2a-proxy://worker".to_string();
+        s.target.trust_check_list = vec![target_trust_check("proxy-target")];
+        s.variants = vec![variant_with_target(
+            TargetOverrides {
+                endpoint: Some("https://dev.example.com".to_string()),
+                ..Default::default()
+            },
+            true,
+        )];
+        assert!(reject_target_trust_checks_unless_target_runs_them(&s).is_ok());
+
+        s.variants[0]
+            .overrides
+            .target
+            .as_mut()
+            .unwrap()
+            .trust_check_list = Some(vec![target_trust_check("own")]);
+        assert!(reject_target_trust_checks_unless_target_runs_them(&s).is_err());
+    }
+
+    #[test]
+    fn an_undeclared_edit_of_trust_check_lists_is_refused_only_when_points_hold_lists() {
+        let with_lists = migrated(fabric_surface_with_point(vec![target_trust_check("copied")]));
+        let without_lists = fabric_surface_with_point(Vec::new());
+
+        let msg = match reject_undeclared_trust_check_edit(true, &with_lists) {
+            Err(SurfaceApiError::BadRequest(msg)) => msg,
+            other => panic!("expected BadRequest, got {other:?}"),
+        };
+        assert_eq!(
+            msg,
+            "this surface uses the per-Transit-Point Trust Check shape; send trust_check_split: true to \
+             change its Trust Check lists (transit.points[].trust_check_list, target.trust_check_list)"
+        );
+        assert!(reject_undeclared_trust_check_edit(false, &with_lists).is_ok());
+        assert!(reject_undeclared_trust_check_edit(true, &without_lists).is_ok());
+    }
+
+    #[test]
+    fn patches_touch_trust_checks_through_list_paths_or_null_ancestors() {
+        let without_variant_lists = base_surface();
+        for touching in [
+            serde_json::json!({"target": {"trust_check_list": []}}),
+            serde_json::json!({"target": {"trust_check_list": null}}),
+            serde_json::json!({"target": null}),
+            serde_json::json!({"transit": {"points": []}}),
+            serde_json::json!({"transit": null}),
+            serde_json::json!({"variants": [{"overrides": {"target": {"trust_check_list": []}}}]}),
+            serde_json::json!({"variants": [{"overrides": {"transit": {"points": []}}}]}),
+            serde_json::json!({"variants": [{"overrides": {"transit": null}}]}),
+            serde_json::json!({"variants": [{"overrides": {"target": null}}]}),
+            serde_json::json!({"variants": [{"overrides": null}]}),
+        ] {
+            assert!(patch_touches_trust_checks(&touching, &without_variant_lists), "{touching}");
+        }
+        for other in [
+            serde_json::json!({"description": "d"}),
+            serde_json::json!({"target": {"endpoint": "https://x"}}),
+            serde_json::json!({"transit": {"shared": {}}}),
+            serde_json::json!({"variants": [{"overrides": {"target": {"endpoint": "https://x"}}}]}),
+            serde_json::json!({"variants": []}),
+        ] {
+            assert!(!patch_touches_trust_checks(&other, &without_variant_lists), "{other}");
+        }
+        for touching in [
+            serde_json::json!({"overrides": {"transit": {"points": null}}}),
+            serde_json::json!({"overrides": {"transit": null}}),
+            serde_json::json!({"overrides": {"target": null}}),
+            serde_json::json!({"overrides": null}),
+        ] {
+            assert!(variant_patch_touches_trust_checks(&touching), "{touching}");
+        }
+        assert!(!variant_patch_touches_trust_checks(&serde_json::json!({"name": "dev"})));
+        assert!(!variant_patch_touches_trust_checks(&serde_json::json!({"overrides": {"canvas": null}})));
+    }
+
+    #[test]
+    fn replacing_variants_touches_trust_checks_when_a_stored_variant_holds_point_lists() {
+        let mut point: crate::config::agent_surface::TransitPoint = serde_json::from_value(serde_json::json!({
+            "alias": "dev-partner", "target_endpoint": "https://d.example/a2a"
+        }))
+        .unwrap();
+        point.trust_check_list = vec![target_trust_check("dev-copy")];
+        let mut variant = variant_with_target(TargetOverrides::default(), true);
+        variant.overrides.transit = Some(crate::config::agent_surface_variants::TransitOverrides {
+            points: Some(vec![point]),
+            ..Default::default()
+        });
+        let mut stored = base_surface();
+        stored.variants = vec![variant];
+
+        assert!(patch_touches_trust_checks(&serde_json::json!({"variants": []}), &stored));
+        assert!(patch_touches_trust_checks(&serde_json::json!({"variants": null}), &stored));
+        assert!(!patch_touches_trust_checks(&serde_json::json!({"description": "d"}), &stored));
+    }
+
+    #[test]
+    fn target_trust_checks_rejected_unless_the_target_runs_them() {
+        for endpoint in ["https://prod.example.com", "http://prod.example.com", "proxy://mcp-proxy-1", ""] {
+            let mut s = base_surface();
+            s.target.endpoint = endpoint.to_string();
+            s.target.trust_check_list = vec![target_trust_check("target-check")];
+
+            let msg = bad_request_message(reject_target_trust_checks_unless_target_runs_them(&s));
+            assert!(
+                msg.starts_with(
+                    "target.trust_check_list is only allowed for a2a-proxy:// and fabric:// Managed Agent targets"
+                ),
+                "{endpoint}: {msg}"
+            );
+            assert!(msg.contains("transit.points[].trust_check_list"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn target_trust_checks_accepted_on_fabric_and_a2a_proxy_targets() {
+        for endpoint in ["fabric://gateway-1/surface-1", "a2a-proxy://proxy-1"] {
+            let mut s = base_surface();
+            s.target.endpoint = endpoint.to_string();
+            s.target.trust_check_list = vec![target_trust_check("target-check")];
+
+            assert!(reject_target_trust_checks_unless_target_runs_them(&s).is_ok(), "{endpoint} must be accepted");
+        }
+    }
+
+    #[test]
+    fn https_target_without_target_list_accepts_transit_point_lists() {
+        let mut s = base_surface();
+        let mut point: crate::config::agent_surface::TransitPoint = serde_json::from_value(serde_json::json!({
+            "alias": "partner-a",
+            "target_endpoint": "https://partner.example/a2a",
+            "protocol": "a2a"
+        }))
+        .expect("transit point");
+        point.trust_check_list = vec![target_trust_check("partner-check")];
+        s.transit = Some(crate::config::agent_surface::TransitConfig {
+            points: vec![point],
+            outbound_listen_address: None,
+            shared: Default::default(),
+        });
+
+        assert!(reject_target_trust_checks_unless_target_runs_them(&s).is_ok());
+        assert_eq!(s.validate(), Ok(()));
+    }
+
+    #[test]
+    fn variant_target_trust_checks_rejected_on_https_variant_target() {
+        for enabled in [true, false] {
+            let mut s = base_surface();
+            s.target.endpoint = "fabric://gateway-1/surface-1".to_string();
+            s.variants = vec![variant_with_target(
+                TargetOverrides {
+                    endpoint: Some("https://dev.example.com".to_string()),
+                    trust_check_list: Some(vec![target_trust_check("dev-check")]),
+                    ..Default::default()
+                },
+                enabled,
+            )];
+
+            let msg = bad_request_message(reject_target_trust_checks_unless_target_runs_them(&s));
+            assert!(msg.starts_with("Variant 'dev': target.trust_check_list is only allowed"), "{msg}");
+            assert!(msg.contains("transit.points[].trust_check_list"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn variant_clearing_list_on_https_target_is_accepted() {
+        let mut s = base_surface();
+        s.target.endpoint = "fabric://gateway-1/surface-1".to_string();
+        s.target.trust_check_list = vec![target_trust_check("base-check")];
+        s.variants = vec![variant_with_target(
+            TargetOverrides {
+                endpoint: Some("https://dev.example.com".to_string()),
+                trust_check_list: Some(Vec::new()),
+                ..Default::default()
+            },
+            true,
+        )];
+
+        assert!(reject_target_trust_checks_unless_target_runs_them(&s).is_ok());
     }
 }
 

@@ -4,12 +4,16 @@ import '@testing-library/jest-dom';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import AuditPage from '..';
 import { apiClient } from '../../../api';
+import { clearUserNames } from '../useUserNames';
 
+let mockSessionToken: string | null = 'session-1';
 jest.mock('../../../api', () => ({
+  ApiError: jest.requireActual('../../../api').ApiError,
   apiClient: {
     get: jest.fn(),
     listIssuers: jest.fn(() => Promise.resolve([])),
   },
+  sessionManager: { getSessionToken: () => mockSessionToken },
 }));
 
 jest.mock('../../../utils/toaster', () => ({
@@ -367,5 +371,141 @@ describe('AuditPage forwarding', () => {
     await screen.findByTestId('audit-list');
     expect(mockGet).not.toHaveBeenCalledWith('/integrations');
     expect(screen.queryByTestId('audit-forward-button')).not.toBeInTheDocument();
+  });
+});
+
+describe('AuditPage policy changes', () => {
+  const CHANGE_RESPONSE = {
+    events: [
+      {
+        id: 'change-1',
+        timestamp: '2026-10-27T10:00:00Z',
+        event: {
+          policy_attached: {
+            policy_definition_id: 'deny-pii',
+            policy_name: '<img src=x onerror=alert(1)>',
+            policy_type: 'agent_surface',
+            policy_version: 3,
+            target: { kind: 'surface', id: 'surface-1', name: 'Orders' },
+            scope: 'surface',
+            slot: 'inbound',
+            actor: { kind: 'user', id: 'u-1' },
+            source: 'api',
+          },
+        },
+        surface_id: 'surface-1',
+        channel_name: 'Orders',
+        request_id: '0123456789abcdef',
+        via_fabric: false,
+      },
+    ],
+    total: 1,
+    page: 1,
+    limit: 50,
+    category_counts: { policy_attached: 1 },
+  };
+
+  beforeEach(() => {
+    mockPermissions = { 'users.view': true };
+    mockSessionToken = 'session-1';
+    clearUserNames();
+    mockGet.mockReset();
+    mockGet.mockImplementation((url: string) =>
+      Promise.resolve({
+        data: url === '/users' ? [{ user_id: 'u-1', username: 'alice' }] : CHANGE_RESPONSE,
+      })
+    );
+  });
+
+  const usersRequests = () => mockGet.mock.calls.filter(([url]) => url === '/users');
+
+  it('names actors by id without users.view and never asks for the users list', async () => {
+    mockPermissions = {};
+    renderPage();
+
+    const item = await screen.findByTestId('audit-item-0');
+    expect(within(item).getByText('user u-1')).toBeInTheDocument();
+    expect(usersRequests()).toHaveLength(0);
+  });
+
+  it('asks for the users list again in a new session, not with the previous session’s names', async () => {
+    const { unmount } = renderPage();
+    const item = await screen.findByTestId('audit-item-0');
+    await waitFor(() => expect(within(item).getByText('user alice')).toBeInTheDocument());
+    unmount();
+
+    mockSessionToken = 'session-2';
+    mockGet.mockImplementation((url: string) =>
+      Promise.resolve({
+        data: url === '/users' ? [{ user_id: 'u-1', username: 'bob' }] : CHANGE_RESPONSE,
+      })
+    );
+    renderPage();
+
+    const again = await screen.findByTestId('audit-item-0');
+    await waitFor(() => expect(within(again).getByText('user bob')).toBeInTheDocument());
+    expect(usersRequests()).toHaveLength(2);
+  });
+
+  it('describes the change by its actor’s name and shows its details without a request journey', async () => {
+    renderPage();
+
+    const item = await screen.findByTestId('audit-item-0');
+    expect(within(item).getByText('Policy attached')).toBeInTheDocument();
+    expect(
+      within(item).getByText(
+        '“<img src=x onerror=alert(1)>” v3 was added to surface Orders as its inbound policy.'
+      )
+    ).toBeInTheDocument();
+    await waitFor(() => expect(within(item).getByText('user alice')).toBeInTheDocument());
+
+    const evidence = screen.getByTestId('audit-evidence');
+    expect(within(evidence).queryByTestId('audit-journey')).not.toBeInTheDocument();
+    expect(within(evidence).getByText('Where')).toBeInTheDocument();
+    expect(within(evidence).getByText('inbound policy')).toBeInTheDocument();
+  });
+
+  it('asks for the users list once per page load', async () => {
+    renderPage();
+
+    const item = await screen.findByTestId('audit-item-0');
+    await waitFor(() => expect(within(item).getByText('user alice')).toBeInTheDocument());
+    expect(mockGet.mock.calls.filter(([url]) => url === '/users')).toHaveLength(1);
+  });
+
+  it.each([
+    [403, 1],
+    [500, 2],
+  ])(
+    'after the users list fails with %i, a later visit asks for it %i time(s) in all',
+    async (status, calls) => {
+      const { ApiError } = jest.requireActual('../../../api');
+      mockGet.mockImplementation((url: string) =>
+        url === '/users'
+          ? Promise.reject(new ApiError('failed', status))
+          : Promise.resolve({ data: CHANGE_RESPONSE })
+      );
+
+      const { unmount } = renderPage();
+      const item = await screen.findByTestId('audit-item-0');
+      await waitFor(() => expect(within(item).getByText('user u-1')).toBeInTheDocument());
+      unmount();
+      renderPage();
+      await screen.findByTestId('audit-item-0');
+
+      await waitFor(() =>
+        expect(mockGet.mock.calls.filter(([url]) => url === '/users')).toHaveLength(calls)
+      );
+    }
+  );
+
+  it('does not ask for the users list when the page shows no policy change', async () => {
+    mockGet.mockImplementation((url: string) =>
+      Promise.resolve({ data: url === '/users' ? [] : AUDIT_RESPONSE })
+    );
+    renderPage();
+
+    await screen.findByTestId('audit-item-0');
+    expect(mockGet).not.toHaveBeenCalledWith('/users');
   });
 });

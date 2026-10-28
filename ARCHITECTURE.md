@@ -215,7 +215,7 @@ Outbound:
 Resource Server token (on a Transit Point with `mcp_http.authorization`) → transit
 token validation → rate limit → protocol context → Transit Point header mapping
 (A2A and AP2) → outbound extension inspection (A2A) → identity resolution → trusted
-identity → custom metadata → trust context → Trust Check (target leg) → gateway OPA →
+identity → custom metadata → trust context → Trust Check (the Transit Point's own list) → gateway OPA →
 surface OPA → Transit Point OPA → MCP tool gating (`tools/call`) → credential injection →
 forward → response and agent-card rewrite → metrics. The stages from trust context to MCP
 tool gating are skipped for public discovery GETs.

@@ -8,8 +8,9 @@
 //! `_storage/audit/delegation-audit.jsonl` if no log directory is configured.
 
 use crate::audit::events::{
-    AuthScheme, DelegationFailureReason, IdentityBindingFailure, RateLimitScope, RejectionReason, RejectionStage,
-    RequestFailureOutcome, TargetKind,
+    Actor, AuthScheme, DelegationFailureReason, IdentityBindingFailure, PolicyChangeAction, PolicyChangeSource,
+    PolicyField, PolicyMode, PolicySlot, PolicyTargetKind, RateLimitScope, RefusalReason, RejectionReason,
+    RejectionStage, RequestFailureOutcome, TargetKind,
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
@@ -154,6 +155,12 @@ pub struct DelegationAuditEvent {
     /// (policy decisions, VP injection, credential delegation)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
+    /// Id of the gateway request that produced the record: 16 lowercase hex
+    /// characters, one per request. Several records of one request share it,
+    /// and an Access Point request and the Transit Point requests it triggers
+    /// each have their own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
     /// Additional context
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
@@ -243,6 +250,115 @@ pub struct PaymentEventDetails {
     pub remote_status: Option<u16>,
 }
 
+/// The surface, gateway or appliance-wide set a policy is attached to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct PolicyTarget {
+    pub kind: PolicyTargetKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// One management change to a policy definition or to where a policy applies,
+/// shared by every policy change event. The policy fields carry the names and
+/// formats of [`DelegationAuditAction::PolicyDecision`], so a change joins to the
+/// decisions it causes. Never carries the Rego text, the sample input or a
+/// request body.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct PolicyChangeDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_definition_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_name: Option<String>,
+    /// `gateway` or `agent_surface`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_content_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_policy_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_policy_content_hash: Option<String>,
+    /// The parts of the definition an update changed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed: Vec<PolicyField>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<PolicyTarget>,
+    /// The decision scope the slot produces (`PolicyScope::as_str`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<PolicySlot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transit_point: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_tool_name: Option<String>,
+    /// The MCP tool gate's name, or its id when it has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plane: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<PolicyMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_mode: Option<PolicyMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_enabled: Option<bool>,
+    pub actor: Actor,
+    pub source: PolicyChangeSource,
+    /// On a refusal: the change that was attempted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<PolicyChangeAction>,
+    /// On a refusal: the HTTP status the caller received.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<RefusalReason>,
+}
+
+impl PolicyChangeDetails {
+    /// A change by `actor` through `source` with every other field unset.
+    pub fn new(
+        actor: Actor,
+        source: PolicyChangeSource,
+    ) -> Self {
+        Self {
+            policy_definition_id: None,
+            policy_name: None,
+            policy_type: None,
+            policy_version: None,
+            policy_content_hash: None,
+            previous_policy_version: None,
+            previous_policy_content_hash: None,
+            changed: Vec::new(),
+            target: None,
+            scope: None,
+            slot: None,
+            variant: None,
+            transit_point: None,
+            mcp_tool_name: None,
+            gate: None,
+            plane: None,
+            mode: None,
+            previous_mode: None,
+            enabled: None,
+            previous_enabled: None,
+            actor,
+            source,
+            action: None,
+            status: None,
+            reason: None,
+        }
+    }
+}
+
 /// The type of delegation audit action
 // Records are built only for wanted events and serialized straight away, so
 // the size of the `PolicyDecision` variant costs nothing worth boxing for.
@@ -324,6 +440,10 @@ pub enum DelegationAuditAction {
         entity_id: Option<String>,
         ok: bool,
         error_code: Option<String>,
+        /// Alias of the Transit Point the request was routed to; omitted
+        /// outside the outbound path.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transit_point: Option<String>,
     },
     /// Trace terminated at this surface's egress. Records the own → downstream
     /// trace mapping so an operator can bridge the terminated trace from this
@@ -408,6 +528,20 @@ pub enum DelegationAuditAction {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         variant_alias: Option<String>,
     },
+    /// A policy definition was created.
+    PolicyCreated(Box<PolicyChangeDetails>),
+    /// A policy definition was changed (a new version).
+    PolicyUpdated(Box<PolicyChangeDetails>),
+    /// A policy definition was deleted.
+    PolicyDeleted(Box<PolicyChangeDetails>),
+    /// A policy now applies at a slot of a surface, gateway or global plane.
+    PolicyAttached(Box<PolicyChangeDetails>),
+    /// A policy no longer applies at a slot.
+    PolicyDetached(Box<PolicyChangeDetails>),
+    /// An existing attachment's mode or enabled state changed.
+    PolicyAttachmentChanged(Box<PolicyChangeDetails>),
+    /// A policy change was refused; `action` names the change attempted.
+    PolicyChangeRefused(Box<PolicyChangeDetails>),
 }
 
 #[derive(Debug, Deserialize)]
@@ -454,6 +588,13 @@ impl DelegationAuditAction {
                 | Self::IdentityBindingVerified { .. }
                 | Self::RequestFailed { .. }
                 | Self::RequestCompleted { .. }
+                | Self::PolicyCreated(_)
+                | Self::PolicyUpdated(_)
+                | Self::PolicyDeleted(_)
+                | Self::PolicyAttached(_)
+                | Self::PolicyDetached(_)
+                | Self::PolicyAttachmentChanged(_)
+                | Self::PolicyChangeRefused(_)
         )
     }
 }
@@ -810,6 +951,7 @@ pub fn audit_event(
         vp_jwt: None,
         vp_fingerprint: None,
         trace_id: None,
+        request_id: None,
         detail: None,
     }
 }
@@ -1170,6 +1312,13 @@ pub fn action_category(action: &DelegationAuditAction) -> &'static str {
         DelegationAuditAction::DelegationFailed { .. } => "delegation_failed",
         DelegationAuditAction::RequestFailed { .. } => "request_failed",
         DelegationAuditAction::RequestCompleted { .. } => "request_completed",
+        DelegationAuditAction::PolicyCreated(_) => "policy_created",
+        DelegationAuditAction::PolicyUpdated(_) => "policy_updated",
+        DelegationAuditAction::PolicyDeleted(_) => "policy_deleted",
+        DelegationAuditAction::PolicyAttached(_) => "policy_attached",
+        DelegationAuditAction::PolicyDetached(_) => "policy_detached",
+        DelegationAuditAction::PolicyAttachmentChanged(_) => "policy_attachment_changed",
+        DelegationAuditAction::PolicyChangeRefused(_) => "policy_change_refused",
     }
 }
 
@@ -1336,6 +1485,7 @@ pub fn audit_policy_decision(
     policy_definition_id: Option<&str>,
     deny_reason: Option<&str>,
     surface_id: Option<&str>,
+    surface_name: Option<&str>,
     caller_did: Option<&str>,
     http_method: Option<&str>,
     http_path: Option<&str>,
@@ -1375,7 +1525,7 @@ pub fn audit_policy_decision(
         provider_id: None,
         provider_name: None,
         surface_id: surface_id.map(str::to_string),
-        channel_name: None,
+        channel_name: surface_name.map(str::to_string),
         target_endpoint: None,
         protocol: None,
         scopes: None,
@@ -1387,6 +1537,7 @@ pub fn audit_policy_decision(
         vp_jwt: None,
         vp_fingerprint: None,
         trace_id: trace_id.map(str::to_string),
+        request_id: None,
         detail: None,
     });
 }
@@ -1400,6 +1551,7 @@ pub fn audit_policy_decision(
 /// so the emitted JSONL omits them, matching the wire shape.
 pub fn audit_trust_check(
     surface_id: Option<&str>,
+    transit_point: Option<&str>,
     trace_id: Option<&str>,
     leg: &str,
     authority_id: Option<&str>,
@@ -1416,6 +1568,7 @@ pub fn audit_trust_check(
             entity_id: entity_id.map(str::to_string),
             ok,
             error_code: error_code.map(str::to_string),
+            transit_point: transit_point.map(str::to_string),
         },
         agent_did: None,
         agent_identity_did: None,
@@ -1435,6 +1588,7 @@ pub fn audit_trust_check(
         vp_jwt: None,
         vp_fingerprint: None,
         trace_id: trace_id.map(str::to_string),
+        request_id: None,
         detail: None,
     });
 }
@@ -1478,6 +1632,7 @@ pub fn audit_trace_terminated(
         vp_jwt: None,
         vp_fingerprint: None,
         trace_id: Some(own_trace_id.to_string()),
+        request_id: None,
         detail: Some(format!("downstream_trace_id={downstream_trace_id}")),
     });
 }
@@ -1576,6 +1731,56 @@ mod tests {
     }
 
     #[test]
+    fn a_policy_change_is_the_body_of_its_event_and_names_only_its_actor_id() {
+        let mut change = PolicyChangeDetails::new(Actor::user("u-123"), PolicyChangeSource::Api);
+        change.policy_definition_id = Some("deny-pii".to_string());
+        change.policy_version = Some(3);
+        change.target = Some(PolicyTarget {
+            kind: PolicyTargetKind::Surface,
+            id: Some("s-1".to_string()),
+            name: Some("Orders".to_string()),
+        });
+        change.slot = Some(PolicySlot::Inbound);
+        change.mode = Some(PolicyMode::Enforced);
+        let event = audit_event(DelegationAuditAction::PolicyAttached(Box::new(change)), None, None, None, Some("s-1"));
+
+        let json = serde_json::to_value(&event).unwrap();
+
+        assert_eq!(
+            json["event"],
+            serde_json::json!({"policy_attached": {
+                "policy_definition_id": "deny-pii",
+                "policy_version": 3,
+                "target": {"kind": "surface", "id": "s-1", "name": "Orders"},
+                "slot": "inbound",
+                "mode": "enforced",
+                "actor": {"kind": "user", "id": "u-123"},
+                "source": "api",
+            }})
+        );
+        assert!(json.get("detail").is_none());
+    }
+
+    #[test]
+    fn a_policy_change_event_is_categorised_by_its_name_and_kept_in_the_vp_audit_log() {
+        let change = || Box::new(PolicyChangeDetails::new(Actor::system(), PolicyChangeSource::DefinitionDeleted));
+        let actions = [
+            (DelegationAuditAction::PolicyCreated(change()), "policy_created"),
+            (DelegationAuditAction::PolicyUpdated(change()), "policy_updated"),
+            (DelegationAuditAction::PolicyDeleted(change()), "policy_deleted"),
+            (DelegationAuditAction::PolicyAttached(change()), "policy_attached"),
+            (DelegationAuditAction::PolicyDetached(change()), "policy_detached"),
+            (DelegationAuditAction::PolicyAttachmentChanged(change()), "policy_attachment_changed"),
+            (DelegationAuditAction::PolicyChangeRefused(change()), "policy_change_refused"),
+        ];
+        for (action, category) in actions {
+            assert_eq!(action_category(&action), category);
+            assert!(action.is_vp_audit(), "{category}");
+            assert_eq!(serde_json::to_value(&action).unwrap()[category]["source"], "definition_deleted");
+        }
+    }
+
+    #[test]
     fn test_trace_terminated_action_category_and_vp_audit() {
         let action = DelegationAuditAction::TraceTerminated {
             own_trace_id: "own-123".to_string(),
@@ -1614,6 +1819,7 @@ mod tests {
             vp_jwt: None,
             vp_fingerprint: None,
             trace_id: Some("own-123".to_string()),
+            request_id: None,
             detail: Some("downstream_trace_id=down-456".to_string()),
         };
         let json = serde_json::to_string(&event).unwrap();
@@ -1772,6 +1978,7 @@ mod tests {
                 entity_id: Some("did:example:agent".to_string()),
                 ok: false,
                 error_code: Some("QUERY_TIMEOUT".to_string()),
+                transit_point: None,
             }
             .is_vp_audit()
         );
@@ -1944,6 +2151,23 @@ mod tests {
     }
 
     #[test]
+    fn the_request_id_is_written_when_set_and_omitted_when_not() {
+        let mut event = audit_event(DelegationAuditAction::ConsentGranted, None, None, None, None);
+        assert!(
+            serde_json::to_value(&event)
+                .unwrap()
+                .get("request_id")
+                .is_none()
+        );
+
+        event.request_id = Some("0123456789abcdef".to_string());
+        let written = serde_json::to_value(&event).unwrap();
+        assert_eq!(written["request_id"], "0123456789abcdef");
+        let read: DelegationAuditEvent = serde_json::from_value(written).unwrap();
+        assert_eq!(read.request_id.as_deref(), Some("0123456789abcdef"));
+    }
+
+    #[test]
     fn stored_pre_authorize_blocked_line_is_not_an_audit_event() {
         let stored = serde_json::to_string(&audit_event(DelegationAuditAction::ConsentGranted, None, None, None, None))
             .unwrap()
@@ -2046,6 +2270,7 @@ mod tests {
                 vp_jwt: Some(vp),
                 vp_fingerprint: None,
                 trace_id: Some("trace-1".to_string()),
+                request_id: None,
                 detail: None,
             },
             DelegationAuditEvent {
@@ -2085,6 +2310,7 @@ mod tests {
                 vp_jwt: None,
                 vp_fingerprint: None,
                 trace_id: Some("trace-1".to_string()),
+                request_id: None,
                 detail: None,
             },
         ];
@@ -2120,6 +2346,7 @@ mod tests {
                     None,
                     Some("caller not recognised"),
                     Some("surface-1"),
+                    Some("Surface one"),
                     None,
                     Some("POST"),
                     Some("/a2a"),
@@ -2317,7 +2544,16 @@ mod tests {
     #[tokio::test]
     async fn a_trust_check_record_carries_its_surface_and_trace() {
         let ((), events) = crate::audit::producer::capture(async {
-            audit_trust_check(Some("surface-1"), Some("trace-1"), "caller", Some("did:a"), Some("did:e"), true, None);
+            audit_trust_check(
+                Some("surface-1"),
+                None,
+                Some("trace-1"),
+                "caller",
+                Some("did:a"),
+                Some("did:e"),
+                true,
+                None,
+            );
         })
         .await;
         assert_eq!(events.len(), 1);
@@ -2328,6 +2564,62 @@ mod tests {
             Some("surface-1")
         );
         assert_eq!(events[0].trace_id.as_deref(), Some("trace-1"));
+    }
+
+    #[tokio::test]
+    async fn a_trust_check_record_carries_its_transit_point() {
+        let ((), events) = crate::audit::producer::capture(async {
+            audit_trust_check(
+                Some("surface-1"),
+                Some("partner-a"),
+                Some("trace-1"),
+                "target",
+                None,
+                None,
+                false,
+                Some("AGENT_CARD_UNAVAILABLE"),
+            );
+        })
+        .await;
+        assert_eq!(events.len(), 1);
+        let wire = serde_json::to_value(&events[0]).expect("serialize record");
+        assert_eq!(wire["event"]["trust_check"]["transit_point"], serde_json::json!("partner-a"));
+        let again: DelegationAuditEvent = serde_json::from_value(wire).expect("deserialize record");
+        match again.event {
+            DelegationAuditAction::TrustCheck { transit_point, leg, .. } => {
+                assert_eq!(transit_point.as_deref(), Some("partner-a"));
+                assert_eq!(leg, "target");
+            }
+            other => panic!("expected a trust check, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_trust_check_record_without_a_transit_point_omits_it_and_still_reads() {
+        let action = DelegationAuditAction::TrustCheck {
+            leg: "caller".to_string(),
+            authority_id: None,
+            entity_id: None,
+            ok: true,
+            error_code: None,
+            transit_point: None,
+        };
+        let wire = serde_json::to_value(&action).expect("serialize action");
+        assert_eq!(wire["trust_check"]["leg"], serde_json::json!("caller"));
+        assert!(
+            wire["trust_check"]
+                .get("transit_point")
+                .is_none(),
+            "{wire}"
+        );
+
+        match serde_json::from_value::<DelegationAuditAction>(wire).expect("deserialize action") {
+            DelegationAuditAction::TrustCheck { transit_point, ok, .. } => {
+                assert_eq!(transit_point, None);
+                assert!(ok);
+            }
+            other => panic!("expected a trust check, got {other:?}"),
+        }
     }
 
     #[test]

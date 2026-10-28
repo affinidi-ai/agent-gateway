@@ -87,7 +87,6 @@ pub struct TargetFixture {
     pub custom_metadata: Option<Value>,
     pub policy: Option<String>,
     pub response_policy: Option<String>,
-    pub trust_check_list: Vec<Value>,
 }
 
 impl Default for TargetFixture {
@@ -105,7 +104,6 @@ impl Default for TargetFixture {
             custom_metadata: None,
             policy: None,
             response_policy: None,
-            trust_check_list: Vec::new(),
         }
     }
 }
@@ -151,7 +149,6 @@ impl AgentSurfaceFixture {
                 custom_metadata: None,
                 policy: None,
                 response_policy: None,
-                trust_check_list: Vec::new(),
             },
             outbound_credentials: Vec::new(),
             transit: None,
@@ -234,16 +231,6 @@ impl AgentSurfaceFixture {
         self.access_point
             .trust_recorder_entries
             .push(entry);
-        self
-    }
-
-    pub fn with_target_trust_check_element(
-        mut self,
-        element: Value,
-    ) -> Self {
-        self.target
-            .trust_check_list
-            .push(element);
         self
     }
 
@@ -474,17 +461,6 @@ impl AgentSurfaceFixture {
         if let Some(custom_metadata) = &self.target.custom_metadata {
             target["custom_metadata"] = custom_metadata.clone();
         }
-        if !self
-            .target
-            .trust_check_list
-            .is_empty()
-        {
-            target["trust_check_list"] = Value::Array(
-                self.target
-                    .trust_check_list
-                    .clone(),
-            );
-        }
 
         let mut surface = json!({
             "surface_id": self.surface_id,
@@ -605,7 +581,6 @@ impl Default for AgentSurfaceFixture {
                 custom_metadata: None,
                 policy: None,
                 response_policy: None,
-                trust_check_list: Vec::new(),
             },
             outbound_credentials: Vec::new(),
             transit: None,

@@ -1,17 +1,26 @@
 import {
   callerDidOf,
   categoryLabel,
+  changedPartsLabel,
   eventTypeName,
   flowLabel,
+  modeLabel,
+  policyChange,
+  policyChangeTitle,
   policyDecision,
   scopeLabel,
+  slotLabel,
   surfaceIdOf,
+  targetLabel,
   traceTerminated,
   trustCheck,
 } from './auditHelpers';
-import type { AuditEntry } from './types';
+import type { AuditEntry, PolicyChangeActor, PolicyChangeData, PolicyChangeEvent } from './types';
 
 export type EventTone = 'allow' | 'deny' | 'warn' | 'neutral';
+
+/** A user's name for their id, when it is known. */
+export type UserNameResolver = (userId: string) => string | undefined;
 
 export interface EventNarrative {
   title: string;
@@ -63,6 +72,8 @@ function isAllowDecision(decision?: string | null): boolean {
 
 /** Semantic tone for an entry — drives the list-item title colour and accent. */
 export function eventTone(entry: AuditEntry): EventTone {
+  const change = policyChange(entry);
+  if (change) return describePolicyChange(change.name, change.change).tone;
   const pd = policyDecision(entry);
   if (pd) return isAllowDecision(pd.decision) ? 'allow' : 'deny';
   const tc = trustCheck(entry);
@@ -74,13 +85,143 @@ export function eventTone(entry: AuditEntry): EventTone {
   return 'neutral';
 }
 
+/** Who made a policy change, e.g. "user alice" or "access token tok-1 of alice". */
+export function actorLabel(actor: PolicyChangeActor, userName?: UserNameResolver): string {
+  const user = (id: string) => userName?.(id) ?? `user ${id}`;
+  switch (actor.kind) {
+    case 'user':
+      return `user ${userName?.(actor.id) ?? actor.id}`;
+    case 'pat':
+      return actor.user_id
+        ? `access token ${actor.id} of ${user(actor.user_id)}`
+        : `access token ${actor.id}`;
+    case 'system':
+      return 'the gateway';
+    default:
+      // A kind this dashboard does not know yet: name it as recorded.
+      return `${String((actor as { kind: unknown }).kind)} ${actor.id}`;
+  }
+}
+
+const REFUSED_VERB: Partial<Record<string, string>> = {
+  policy_created: 'Creating',
+  policy_updated: 'Updating',
+  policy_deleted: 'Deleting',
+  policy_attached: 'Attaching',
+  policy_detached: 'Detaching',
+  policy_attachment_changed: 'Changing',
+  policy_change_refused: 'Changing',
+};
+
+const SOURCE_CLAUSE: Record<string, string> = {
+  definition_deleted: ', because the policy definition was deleted',
+  ownership: ', by reassigning its owner',
+};
+
+function describePolicyChange(
+  name: PolicyChangeEvent,
+  change: PolicyChangeData,
+  userName?: UserNameResolver
+): EventNarrative {
+  const policy = change.policy_name || change.policy_definition_id;
+  const quoted = policy ? `“${policy}”` : 'a policy';
+  const versioned =
+    typeof change.policy_version === 'number' ? `${quoted} v${change.policy_version}` : quoted;
+  const target = targetLabel(change);
+  const slot = slotLabel(change);
+  const variant = change.variant ? ` (variant ${change.variant})` : '';
+  const where =
+    change.target?.kind === 'surface' && slot
+      ? `${target} as ${surfaceSlotPhrase(change, slot)}${variant}`
+      : `${target ?? 'its target'}${variant}`;
+  const detail = `By ${actorLabel(change.actor, userName)}${SOURCE_CLAUSE[change.source] ?? ''}.`;
+  const tone: EventTone =
+    name === 'policy_change_refused'
+      ? 'deny'
+      : name === 'policy_deleted' || name === 'policy_detached'
+        ? 'warn'
+        : 'neutral';
+  const narrative = (summary: string) => ({
+    title: policyChangeTitle(name),
+    tone,
+    summary,
+    detail,
+  });
+
+  switch (name) {
+    case 'policy_created':
+      return narrative(`Policy definition ${versioned} was created.`);
+    case 'policy_deleted':
+      return narrative(`Policy definition ${quoted} was deleted.`);
+    case 'policy_updated': {
+      const on = !change.policy_definition_id && target ? ` on ${target}` : '';
+      const versions =
+        typeof change.previous_policy_version === 'number' &&
+        typeof change.policy_version === 'number' &&
+        change.previous_policy_version !== change.policy_version
+          ? ` from v${change.previous_policy_version} to v${change.policy_version}`
+          : '';
+      const parts = changedPartsLabel(change.changed);
+      return narrative(`${quoted}${on} changed${versions}${parts ? `: ${parts}` : ''}.`);
+    }
+    case 'policy_attached': {
+      // An attachment that decides nothing yet must not read like an enforced one.
+      const inactive =
+        change.mode === 'monitor_only'
+          ? `, ${modeLabel(change.mode)}`
+          : change.enabled === false
+            ? ', disabled'
+            : '';
+      return narrative(`${versioned} was added to ${where}${inactive}.`);
+    }
+    case 'policy_detached':
+      return narrative(`${versioned} was removed from ${where}.`);
+    case 'policy_attachment_changed':
+      if (change.previous_mode && change.mode) {
+        return narrative(
+          `${quoted} on ${where} switched from ${modeLabel(change.previous_mode)} to ${modeLabel(change.mode)}.`
+        );
+      }
+      return narrative(`${quoted} on ${where} was ${change.enabled ? 'enabled' : 'disabled'}.`);
+    case 'policy_change_refused': {
+      const attempted = change.action ?? 'policy_change_refused';
+      const owner = attempted === 'policy_updated' && change.changed?.includes('owner');
+      const verb = owner ? 'Reassigning the owner of' : (REFUSED_VERB[attempted] ?? 'Changing');
+      const object = policy
+        ? quoted
+        : attempted === 'policy_created'
+          ? 'a policy definition'
+          : `a policy${target ? ` to ${target}` : ''}`;
+      const status = [change.status, change.reason?.replace(/_/g, ' ')].filter(Boolean).join(', ');
+      return narrative(`${verb} ${object} was refused${status ? ` (${status})` : ''}.`);
+    }
+  }
+}
+
+/** A surface slot as the policy a surface holds, e.g. "its inbound policy". */
+function surfaceSlotPhrase(change: PolicyChangeData, slot: string): string {
+  if (change.slot === 'transit_point' && change.transit_point) {
+    return `the ${change.scope === 'response' ? 'response' : 'request'} policy of transit point ${change.transit_point}`;
+  }
+  if (change.slot === 'mcp_tool' && change.mcp_tool_name) {
+    return `the MCP tool policy for ${change.mcp_tool_name}`;
+  }
+  if (change.slot === 'mcp_tool_gate' && change.gate) {
+    const point = change.transit_point ? ` on transit point ${change.transit_point}` : '';
+    return `the condition of MCP tool gate ${change.gate}${point}`;
+  }
+  return `its ${slot}`;
+}
+
 /**
  * Turns an audit entry into a human-friendly title + two-line description used
  * by the master list. Title colour comes from {@link eventTone}; the summary and
  * detail lines read as plain English so an operator can scan the log without
  * decoding badges.
  */
-export function describeEntry(entry: AuditEntry): EventNarrative {
+export function describeEntry(entry: AuditEntry, userName?: UserNameResolver): EventNarrative {
+  const change = policyChange(entry);
+  if (change) return describePolicyChange(change.name, change.change, userName);
   const tone = eventTone(entry);
   const pd = policyDecision(entry);
   const tc = trustCheck(entry);

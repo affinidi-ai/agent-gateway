@@ -6,12 +6,18 @@ use async_trait::async_trait;
 use std::path::PathBuf;
 use tracing::info;
 
+use crate::audit::context::current_actor;
+use crate::audit::policy_changes;
 use crate::config::agent_surface::AgentSurface;
 use crate::storage::filesystem::{StorageBackend, cached_storage};
 
 /// Filesystem-based implementation of AgentSurfaceStore with in-memory cache
 pub struct FileSystemAgentSurfaceStore {
     storage: Box<dyn StorageBackend<AgentSurface>>,
+    /// Held from reading a surface before a write until the write's policy
+    /// changes are recorded, so they are relative to the surface it replaced
+    /// and the records of concurrent writes come in write order.
+    writes: tokio::sync::Mutex<()>,
 }
 
 impl FileSystemAgentSurfaceStore {
@@ -24,7 +30,10 @@ impl FileSystemAgentSurfaceStore {
             .await?
             .len();
         info!("Loaded {} agent surface(s)", count);
-        Ok(Self { storage })
+        Ok(Self {
+            storage,
+            writes: tokio::sync::Mutex::new(()),
+        })
     }
 
     pub fn subscribe(
@@ -41,6 +50,24 @@ impl FileSystemAgentSurfaceStore {
             .refresh_from_disk()
             .await
     }
+
+    /// The stored surface a management request is about to change, so its
+    /// policy attachments can be compared after the write. Not read outside
+    /// one, or inside one under `without_actor` (a config reload), so `None`
+    /// means either a new surface or a write that records nothing;
+    /// `surface_written` checks the actor again and records nothing for the
+    /// second.
+    async fn before_change(
+        &self,
+        surface_id: &str,
+    ) -> Option<AgentSurface> {
+        current_actor()?;
+        self.storage
+            .get(surface_id)
+            .await
+            .ok()
+            .flatten()
+    }
 }
 
 #[async_trait]
@@ -49,9 +76,15 @@ impl AgentSurfaceStore for FileSystemAgentSurfaceStore {
         &self,
         surface: &AgentSurface,
     ) -> Result<()> {
+        let write = self.writes.lock().await;
+        let before = self
+            .before_change(&surface.surface_id)
+            .await;
         self.storage
             .save(surface)
             .await?;
+        policy_changes::surface_written(before.as_ref(), Some(surface)).await;
+        drop(write);
         crate::mcp::subscriptions::invalidate_access(crate::mcp::subscriptions::AccessScope::Surface(
             surface.surface_id.clone(),
         ));
@@ -75,12 +108,206 @@ impl AgentSurfaceStore for FileSystemAgentSurfaceStore {
         &self,
         surface_id: &str,
     ) -> Result<()> {
+        let write = self.writes.lock().await;
+        let before = self
+            .before_change(surface_id)
+            .await;
         self.storage
             .delete(surface_id)
             .await?;
+        policy_changes::surface_written(before.as_ref(), None).await;
+        drop(write);
         crate::mcp::subscriptions::invalidate_access(crate::mcp::subscriptions::AccessScope::Surface(
             surface_id.to_string(),
         ));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audit::context::in_management_request;
+    use crate::audit::events::Actor;
+    use crate::audit::producer::capture;
+    use crate::delegation_vault::audit::action_category;
+
+    fn surface(policy: &str) -> AgentSurface {
+        serde_json::from_value(serde_json::json!({
+            "surface_id": "s-1",
+            "name": "Orders",
+            "access_point": { "listen_address": "0.0.0.0:8443", "route": "/orders", "protocol": "a2a" },
+            "target": { "endpoint": "https://upstream", "policy": { "policy_definition_id": policy } },
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_management_request_records_the_policies_its_writes_attach_and_detach() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileSystemAgentSurfaceStore::new(dir.path().to_path_buf())
+            .await
+            .unwrap();
+
+        let ((), records) = capture(in_management_request(Actor::user("u-1"), async {
+            store
+                .save(&surface("a"))
+                .await
+                .unwrap();
+            store
+                .save(&surface("b"))
+                .await
+                .unwrap();
+            store
+                .delete("s-1")
+                .await
+                .unwrap();
+        }))
+        .await;
+
+        let changes: Vec<_> = records
+            .iter()
+            .map(|record| {
+                let json = serde_json::to_value(&record.event).unwrap();
+                let category = action_category(&record.event);
+                (category, json[category]["policy_definition_id"].clone())
+            })
+            .collect();
+        assert_eq!(
+            changes,
+            vec![
+                ("policy_attached", serde_json::json!("a")),
+                ("policy_detached", serde_json::json!("a")),
+                ("policy_attached", serde_json::json!("b")),
+                ("policy_detached", serde_json::json!("b")),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn writes_outside_a_management_request_record_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileSystemAgentSurfaceStore::new(dir.path().to_path_buf())
+            .await
+            .unwrap();
+
+        let ((), records) = capture(async {
+            store
+                .save(&surface("a"))
+                .await
+                .unwrap();
+        })
+        .await;
+
+        assert!(records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_gateways_own_writes_inside_a_management_request_record_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileSystemAgentSurfaceStore::new(dir.path().to_path_buf())
+            .await
+            .unwrap();
+
+        let ((), records) = capture(in_management_request(
+            Actor::user("u-1"),
+            crate::audit::context::without_actor(async {
+                store
+                    .save(&surface("a"))
+                    .await
+                    .unwrap();
+            }),
+        ))
+        .await;
+
+        assert!(records.is_empty(), "a config reload's writes are not user changes: {records:?}");
+    }
+
+    #[tokio::test]
+    async fn concurrent_writes_to_one_surface_record_a_chain_of_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileSystemAgentSurfaceStore::new(dir.path().to_path_buf())
+            .await
+            .unwrap();
+
+        let ((), records) = capture(in_management_request(Actor::user("u-1"), async {
+            store
+                .save(&surface("a"))
+                .await
+                .unwrap();
+            let (b, c) = (surface("b"), surface("c"));
+            let (first, second) = tokio::join!(store.save(&b), store.save(&c));
+            first.unwrap();
+            second.unwrap();
+        }))
+        .await;
+
+        assert_recorded_in_write_order(&records);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn parallel_writes_to_one_surface_record_their_changes_in_write_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(
+            FileSystemAgentSurfaceStore::new(dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let ((), mut records) = capture(in_management_request(Actor::user("u-1"), async {
+            store
+                .save(&surface("a"))
+                .await
+                .unwrap();
+        }))
+        .await;
+
+        let write = |policy: &'static str| {
+            let store = store.clone();
+            in_management_request(Actor::user("u-1"), async move {
+                store
+                    .save(&surface(policy))
+                    .await
+                    .unwrap();
+            })
+        };
+        records.extend(crate::audit::producer::capture_spawned(vec![write("b"), write("c")]).await);
+
+        assert_recorded_in_write_order(&records);
+    }
+
+    /// `records` are those of creating a surface naming policy `a`, then two
+    /// writes naming `b` and `c` in either order: each write's detach names
+    /// the policy the write before it attached, and records come in write order.
+    fn assert_recorded_in_write_order(records: &[crate::delegation_vault::audit::DelegationAuditEvent]) {
+        let changes: Vec<(&str, String)> = records
+            .iter()
+            .map(|record| {
+                let category = action_category(&record.event);
+                let id = serde_json::to_value(&record.event).unwrap()[category]["policy_definition_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                (category, id)
+            })
+            .collect();
+        let second = changes
+            .get(2)
+            .map(|(_, id)| id.clone())
+            .unwrap_or_default();
+        let third = if second == "b" {
+            "c"
+        } else {
+            "b"
+        };
+        assert_eq!(
+            changes,
+            vec![
+                ("policy_attached", "a".to_string()),
+                ("policy_detached", "a".to_string()),
+                ("policy_attached", second.clone()),
+                ("policy_detached", second),
+                ("policy_attached", third.to_string()),
+            ]
+        );
     }
 }

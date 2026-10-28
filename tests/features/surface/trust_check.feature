@@ -49,6 +49,31 @@ Feature: Trust Check on the Access Point request edge
     And the target Trust Check reported error code "IDENTITY_VP_VERIFICATION_FAILED"
     And external agent "charlie" received only the target Trust Check agent-card fetch
 
+  Scenario: Only the routed Transit Point's checks run
+    Given the surface has a transit point "tp1" to external agent "charlie"
+    And transit point "tp1" has a target-leg Trust Check for trust registry "alpha-registry" of type "recognition"
+    And transit point "tp1" has a policy that denies unless every target Trust Check succeeded
+    And the surface has a transit point "tp2" to external agent "delta"
+    And the VP Audit Log keeps every audit event
+    When managed agent "bravo" sends an A2A message/send request through Transit Point "tp2"
+    Then the response status is 200
+    And external agent "delta" received a forwarded request
+    And external agent "delta" received no Trust Check agent-card fetch
+    And no Trust Check audit event is recorded
+
+  Scenario: A Transit Point's own checks still decide its traffic
+    Given the surface has a transit point "tp1" to external agent "charlie"
+    And transit point "tp1" has a target-leg Trust Check for trust registry "alpha-registry" of type "recognition"
+    And transit point "tp1" has a policy that denies unless every target Trust Check succeeded
+    And the surface has a transit point "tp2" to external agent "delta"
+    And external agent "charlie" is unreachable
+    And the VP Audit Log keeps every audit event
+    When managed agent "bravo" sends an A2A message/send request through Transit Point "tp1"
+    Then the response status is 403
+    And the target Trust Check reported error code "AGENT_CARD_UNAVAILABLE"
+    And external agent "charlie" was not called
+    And external agent "delta" was not called
+
   # ── Template resolution error ──────────────────────────────────────
 
   Scenario: Trust Check surfaces TEMPLATE_RESOLUTION_FAILED when an entity template cannot be resolved from the request

@@ -7,6 +7,7 @@ use super::errors::PaymentError;
 use super::types::MppConfig;
 use super::verification::{create_mpp_receipt, verify_mpp_credential};
 use crate::config::types::ChannelProtocol;
+use crate::observability::policy_audit::spawn_in_request;
 
 /// Check if payment is required for this request based on protocol-specific triggers.
 ///
@@ -109,7 +110,7 @@ pub fn fire_challenge_issued_events(
         let ch_name = channel_name.to_string();
         let r_url = resource_url.to_string();
         let trace_id = crate::observability::policy_audit::current_span_trace_id();
-        tokio::spawn(async move {
+        spawn_in_request(async move {
             let _ = store
                 .record_challenge_issued(&ch_id, &ch_name, &r_url, trace_id)
                 .await;
@@ -119,7 +120,7 @@ pub fn fire_challenge_issued_events(
     let ch_id = channel_id.to_string();
     let ch_name = channel_name.to_string();
     let r_url = resource_url.to_string();
-    tokio::spawn(async move {
+    spawn_in_request(async move {
         crate::integrations::mpp_integration_triggers::trigger_mpp_challenge_issued(&ch_id, &ch_name, &r_url).await;
     });
 }
@@ -144,9 +145,10 @@ pub async fn process_payment(
         return Ok(None);
     }
 
-    // Capture the request trace id up-front, before any `tokio::spawn` — the
-    // task-local / span context does not cross the spawn boundary, so each
-    // spawned transaction-store write receives an owned clone.
+    // Capture the request trace id up-front, before any spawn — the span
+    // context does not cross the spawn boundary, so each spawned
+    // transaction-store write receives an owned clone. The request id is
+    // carried across by `spawn_in_request`.
     let trace_id = crate::observability::policy_audit::current_span_trace_id();
 
     let resolved_config = match super::secrets::resolve_config_secrets(config, secrets_store).await {
@@ -200,7 +202,7 @@ pub async fn process_payment(
                                     let err_clone = err_msg.clone();
                                     let payer_clone = payer.clone();
                                     let trace_id = trace_id.clone();
-                                    tokio::spawn(async move {
+                                    spawn_in_request(async move {
                                         let _ = store
                                             .record_failed(
                                                 &ch_id,
@@ -220,7 +222,7 @@ pub async fn process_payment(
                                 let m = method_str.clone();
                                 let r_url = resource_url.to_string();
                                 let err_clone = err_msg.clone();
-                                tokio::spawn(async move {
+                                spawn_in_request(async move {
                                     crate::integrations::mpp_integration_triggers::trigger_mpp_verification_failed(
                                         &ch_id, &ch_name, &m, &r_url, &err_clone,
                                     )
@@ -259,7 +261,7 @@ pub async fn process_payment(
                                 let amt = amount.map(|s| s.to_string());
                                 let cur = currency.map(|s| s.to_string());
                                 let trace_id = trace_id.clone();
-                                tokio::spawn(async move {
+                                spawn_in_request(async move {
                                     let _ = store
                                         .record_verified(
                                             &ch_id,
@@ -282,7 +284,7 @@ pub async fn process_payment(
                             let m = method_str.clone();
                             let r_url = resource_url.to_string();
                             let ref_clone = reference.clone();
-                            tokio::spawn(async move {
+                            spawn_in_request(async move {
                                 crate::integrations::mpp_integration_triggers::trigger_mpp_payment_verified(
                                     &ch_id, &ch_name, &m, &r_url, &ref_clone,
                                 )
@@ -318,7 +320,7 @@ pub async fn process_payment(
                                 let err_msg = e.clone();
                                 let payer_clone = payer.clone();
                                 let trace_id = trace_id.clone();
-                                tokio::spawn(async move {
+                                spawn_in_request(async move {
                                     let _ = store
                                         .record_failed(
                                             &ch_id,
@@ -339,7 +341,7 @@ pub async fn process_payment(
                             let m = method_str.clone();
                             let r_url = resource_url.to_string();
                             let err_msg = e.clone();
-                            tokio::spawn(async move {
+                            spawn_in_request(async move {
                                 crate::integrations::mpp_integration_triggers::trigger_mpp_verification_failed(
                                     &ch_id, &ch_name, &m, &r_url, &err_msg,
                                 )
@@ -367,7 +369,7 @@ pub async fn process_payment(
                         let err_msg = e.clone();
                         let payer_clone = payer.clone();
                         let trace_id = trace_id.clone();
-                        tokio::spawn(async move {
+                        spawn_in_request(async move {
                             let _ = store
                                 .record_failed(&ch_id, &ch_name, &r_url, &m, &err_msg, payer_clone.as_deref(), trace_id)
                                 .await;
@@ -380,7 +382,7 @@ pub async fn process_payment(
                     let m = method_str.clone();
                     let r_url = resource_url.to_string();
                     let err_msg = e.clone();
-                    tokio::spawn(async move {
+                    spawn_in_request(async move {
                         crate::integrations::mpp_integration_triggers::trigger_mpp_verification_failed(
                             &ch_id, &ch_name, &m, &r_url, &err_msg,
                         )

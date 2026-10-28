@@ -15,6 +15,7 @@ import {
 } from './elements/edges/archetypes';
 import type { DerivedEdge, SlotDirection } from './elements/edges/types';
 import { isSyntheticFabricNodeId } from './elements/synthesizeFabric';
+import { syncTrustCheckReviewBadge } from './elements/trust-check/reviewBadge';
 import { fetchRoutingConfig } from './elements/access-point/defaults';
 import {
   POLICY_UNCONFIGURED_DASH,
@@ -314,7 +315,7 @@ export function computeFeatureErrorIds(nodes: CanvasNode[], protocol: string): S
   const ids = new Set<string>();
   for (const n of nodes) {
     if (n.type === 'surface') continue;
-    const ws = _registry.getDependencyWarnings(n.type, n.config, ctx);
+    const ws = _registry.getDependencyWarnings(n.type, n.config, ctx, n);
     if (ws.some(w => w.severity === 'error')) ids.add(n.id);
   }
   return ids;
@@ -1100,13 +1101,15 @@ const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
           // broad valid-drop highlight must honour the same list — otherwise
           // an archetype the drop rejects (e.g. AP→MA for an EXT/TP-only
           // element) still lights up green and confuses the user.
-          const dragSnapArchetypes = _registry.get(type)?.edgeSnap?.archetypes;
+          const snapContext = {
+            targetEndpoint: nodes.find(n => n.type === 'target')?.config?.endpoint,
+          };
           const validEdgeSpan = new Map<string, Set<string>>(); // edgeId → set of node ids
           const validDirections = new Map<string, Set<SlotDirection>>();
           for (const edge of edges) {
             const arch = getArchetype(edge.archetype);
             if (!arch) continue;
-            if (dragSnapArchetypes && !dragSnapArchetypes.includes(edge.archetype)) continue;
+            if (!_registry.snapsToArchetype(type, edge.archetype, snapContext)) continue;
             // Capability gate: skip edges that don't satisfy the
             // dragged element's `requires.dropOnEdge`. Mirrors the
             // check in useSurfaceBuilder.handleDrop so the highlight
@@ -1167,13 +1170,10 @@ const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
           }
 
           const snap = _registry.get(type)?.edgeSnap;
-          const allowedArchetypes = snap?.archetypes;
           const snapRadius = snap?.radius ?? 50;
-          const archetypeFilter = allowedArchetypes
-            ? (_link: D3Link, s: D3Node, t: D3Node) => {
-                const archId = findArchetypeForPair(s.type, t.type);
-                return !!archId && allowedArchetypes.includes(archId);
-              }
+          const archetypeFilter = snap?.archetypes
+            ? (_link: D3Link, s: D3Node, t: D3Node) =>
+                _registry.snapsToArchetype(type, findArchetypeForPair(s.type, t.type), snapContext)
             : undefined;
           const nearest = findNearestEdge(
             mx,
@@ -1291,13 +1291,12 @@ const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
         const filter =
           directionality === 'request' || directionality === 'response' ? directionality : 'either';
         const snap = _registry.get(type)?.edgeSnap;
-        const allowedArchetypes = snap?.archetypes;
         const snapRadius = snap?.radius ?? 60;
-        const archetypeFilter = allowedArchetypes
-          ? (_link: D3Link, s: D3Node, t: D3Node) => {
-              const archId = findArchetypeForPair(s.type, t.type);
-              return !!archId && allowedArchetypes.includes(archId);
-            }
+        const archetypeFilter = snap?.archetypes
+          ? (_link: D3Link, s: D3Node, t: D3Node) =>
+              _registry.snapsToArchetype(type, findArchetypeForPair(s.type, t.type), {
+                targetEndpoint: nodes.find(n => n.type === 'target')?.config?.endpoint,
+              })
           : undefined;
         const nearest = findNearestEdge(
           mx,
@@ -1367,7 +1366,7 @@ const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
         onDrop(type);
       }
     },
-    [onDrop]
+    [onDrop, nodes]
   );
 
   // ─── Observe container size; trigger a rebuild once it becomes nonzero ────
@@ -3312,7 +3311,7 @@ const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
         const featureReason =
           hasFeatureError && cn
             ? _registry
-                .getDependencyWarnings(d.type, cn.config, buildSurfaceContext(protocol, nodes))
+                .getDependencyWarnings(d.type, cn.config, buildSurfaceContext(protocol, nodes), cn)
                 .find(w => w.severity === 'error')?.message
             : null;
         const reason = incompleteReason || featureReason || null;
@@ -3416,6 +3415,17 @@ const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
           .attr('fill', NODE_COLORS[d.type] || '#6c757d')
           .text(text);
       });
+
+    // Warning badge on a node whose Trust Checks need review after the
+    // upgrade: a flagged migrated copy, or a Transit Point whose
+    // surface-wide checks were removed.
+    nodeSelection.each(function (d) {
+      syncTrustCheckReviewBadge(
+        this,
+        nodes.find(n => n.id === d.id),
+        d.radius
+      );
+    });
 
     // Type label above nodes
     nodeSelection
@@ -4548,6 +4558,12 @@ const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
         else if (shouldAnts) ring.attr('stroke-dasharray', '6 4');
         else ring.attr('stroke-dasharray', null);
       }
+
+      syncTrustCheckReviewBadge(
+        nodeG.node() as Element | null,
+        n,
+        d3Node?.radius || n.radius || NODE_RADIUS[n.type] || 30
+      );
 
       // Sync the incomplete-reason text under the node label. Always
       // reposition `dy` (not only on insert) so resizes and label

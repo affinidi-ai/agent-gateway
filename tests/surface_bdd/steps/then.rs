@@ -107,6 +107,34 @@ fn assert_target_only_discovery(
     );
 }
 
+fn assert_target_no_discovery(
+    target: &ObservedTarget,
+    context: &str,
+) {
+    let discovery_requests: Vec<&crate::bdd_support::mock_server::ReceivedRequest> =
+        get_observed_target_requests(target, context)
+            .iter()
+            .filter(|request| is_agent_card_discovery(request))
+            .collect();
+    assert!(
+        discovery_requests.is_empty(),
+        "{context} should have received no Trust Check agent-card fetch, but received {} discovery request(s): {discovery_requests:?}",
+        discovery_requests.len()
+    );
+}
+
+fn assert_target_received_one_forwarded_request(
+    target: &ObservedTarget,
+    context: &str,
+) {
+    let forwarded_requests: Vec<_> = get_observed_target_requests(target, context)
+        .iter()
+        .filter(|request| !is_agent_card_discovery(request))
+        .cloned()
+        .collect();
+    assert_called_exactly_once(&forwarded_requests, context);
+}
+
 fn is_agent_card_discovery(request: &crate::bdd_support::mock_server::ReceivedRequest) -> bool {
     request
         .method
@@ -378,6 +406,24 @@ fn named_external_agent_received_only_discovery(
 ) {
     let target = get_observed_target_for_actor(world, &actor_name, TargetActorKind::ExternalAgent);
     assert_target_only_discovery(target, &actor_name);
+}
+
+#[then(expr = "external agent {string} received no Trust Check agent-card fetch")]
+fn named_external_agent_received_no_discovery(
+    world: &mut SurfaceWorld,
+    actor_name: String,
+) {
+    let target = get_observed_target_for_actor(world, &actor_name, TargetActorKind::ExternalAgent);
+    assert_target_no_discovery(target, &actor_name);
+}
+
+#[then(expr = "external agent {string} received a forwarded request")]
+fn named_external_agent_received_a_forwarded_request(
+    world: &mut SurfaceWorld,
+    actor_name: String,
+) {
+    let target = get_observed_target_for_actor(world, &actor_name, TargetActorKind::ExternalAgent);
+    assert_target_received_one_forwarded_request(target, &format!("external agent '{actor_name}'"));
 }
 
 #[then(expr = "REST API {string} was not called")]
@@ -953,6 +999,25 @@ async fn caller_trust_check_reported_error_code(
     expected_code: String,
 ) {
     assert_trust_check_error_code(world, "caller", &expected_code).await;
+}
+
+#[then("no Trust Check audit event is recorded")]
+async fn no_trust_check_audit_event_is_recorded(world: &mut SurfaceWorld) {
+    let is_trust_check = |event: &serde_json::Value| {
+        event
+            .get("event")
+            .and_then(|action| action.get("trust_check"))
+            .is_some()
+    };
+    let (found, events) = vp_audit_events_matching(world, is_trust_check).await;
+    assert!(
+        !found,
+        "expected no Trust Check audit event; observed {:?}",
+        events
+            .iter()
+            .filter(|event| is_trust_check(event))
+            .collect::<Vec<_>>()
+    );
 }
 
 async fn assert_trust_check_error_code(

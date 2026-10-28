@@ -187,10 +187,12 @@ async fn publish_audit_record(
 mod tests {
     use super::*;
     use crate::audit::events::{
-        AuthScheme, DelegationFailureReason, IdentityBindingFailure, RateLimitScope, RejectionReason, RejectionStage,
-        RequestFailureOutcome, TargetKind,
+        Actor, AuthScheme, DelegationFailureReason, IdentityBindingFailure, PolicyChangeSource, RateLimitScope,
+        RejectionReason, RejectionStage, RequestFailureOutcome, TargetKind,
     };
-    use crate::delegation_vault::audit::{PaymentEventDetails, PaymentRail, PaymentStage, audit_event};
+    use crate::delegation_vault::audit::{
+        PaymentEventDetails, PaymentRail, PaymentStage, PolicyChangeDetails, audit_event,
+    };
     use std::collections::HashSet;
 
     fn policy_decision(decision: &str) -> DelegationAuditEvent {
@@ -456,7 +458,14 @@ mod tests {
             | DelegationAuditAction::IdentityBindingVerified { .. }
             | DelegationAuditAction::DelegationFailed { .. }
             | DelegationAuditAction::RequestFailed { .. }
-            | DelegationAuditAction::RequestCompleted { .. } => {}
+            | DelegationAuditAction::RequestCompleted { .. }
+            | DelegationAuditAction::PolicyCreated(_)
+            | DelegationAuditAction::PolicyUpdated(_)
+            | DelegationAuditAction::PolicyDeleted(_)
+            | DelegationAuditAction::PolicyAttached(_)
+            | DelegationAuditAction::PolicyDetached(_)
+            | DelegationAuditAction::PolicyAttachmentChanged(_)
+            | DelegationAuditAction::PolicyChangeRefused(_) => {}
         }
     }
 
@@ -483,6 +492,7 @@ mod tests {
                 entity_id: None,
                 ok: true,
                 error_code: None,
+                transit_point: None,
             },
             DelegationAuditAction::TraceTerminated {
                 own_trace_id: "own".to_string(),
@@ -549,7 +559,18 @@ mod tests {
                 ucp_op: None,
                 variant_alias: None,
             },
+            DelegationAuditAction::PolicyCreated(policy_change()),
+            DelegationAuditAction::PolicyUpdated(policy_change()),
+            DelegationAuditAction::PolicyDeleted(policy_change()),
+            DelegationAuditAction::PolicyAttached(policy_change()),
+            DelegationAuditAction::PolicyDetached(policy_change()),
+            DelegationAuditAction::PolicyAttachmentChanged(policy_change()),
+            DelegationAuditAction::PolicyChangeRefused(policy_change()),
         ]
+    }
+
+    fn policy_change() -> Box<PolicyChangeDetails> {
+        Box::new(PolicyChangeDetails::new(Actor::user("u-1"), PolicyChangeSource::Api))
     }
 
     #[test]

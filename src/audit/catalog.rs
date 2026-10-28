@@ -164,6 +164,33 @@ pub const AUDIT_EVENTS: &[AuditEventSpec] = &[
         "A request was refused at routing, admission or forwarding before it reached the target",
         Requests,
     ),
+    event("policy_created", "Policy Created", "A policy definition was created", Policies),
+    event("policy_updated", "Policy Updated", "A policy definition was changed, or its owner was reassigned", Policies),
+    event("policy_deleted", "Policy Deleted", "A policy definition was deleted", Policies),
+    event(
+        "policy_attached",
+        "Policy Attached",
+        "A policy was added to a surface, gateway or appliance-wide plane",
+        Policies,
+    ),
+    event(
+        "policy_detached",
+        "Policy Detached",
+        "A policy was removed from a surface, gateway or appliance-wide plane",
+        Policies,
+    ),
+    event(
+        "policy_attachment_changed",
+        "Policy Attachment Changed",
+        "An attached policy was switched between enforced and monitor-only, or enabled and disabled",
+        Policies,
+    ),
+    event(
+        "policy_change_refused",
+        "Policy Change Refused",
+        "A change to a policy, or to where a policy applies, was refused",
+        Policies,
+    ),
 ];
 
 /// The event's bit in a selection bitmap: its position in [`AUDIT_EVENTS`].
@@ -225,7 +252,18 @@ mod tests {
                 .find(|event| event.category == category)
                 .map(|event| event.group)
         };
-        assert_eq!(group_of("policy_decision"), Some(AuditEventGroup::Policies));
+        for policies in [
+            "policy_decision",
+            "policy_created",
+            "policy_updated",
+            "policy_deleted",
+            "policy_attached",
+            "policy_detached",
+            "policy_attachment_changed",
+            "policy_change_refused",
+        ] {
+            assert_eq!(group_of(policies), Some(AuditEventGroup::Policies), "{policies}");
+        }
         assert_eq!(group_of("trust_check"), Some(AuditEventGroup::Trust));
         assert_eq!(group_of("vp_injected"), Some(AuditEventGroup::Identity));
         assert_eq!(group_of("trace_terminated"), Some(AuditEventGroup::Trace));

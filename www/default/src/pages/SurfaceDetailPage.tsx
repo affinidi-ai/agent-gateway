@@ -17,6 +17,7 @@ import { useSurfaceHistory } from '../components/surface-builder/hooks/useSurfac
 import { useSaveShortcut } from '../components/surface-builder/hooks/useSaveShortcut';
 import { useDiscardWithUndo } from '../components/surface-builder/hooks/useDiscardWithUndo';
 import SurfaceFormShell from '../components/surface-builder/SurfaceFormShell';
+import { dependencyErrorBlocker } from '../components/surface-builder/dependencyBlocker';
 import { useSurfacePolicyDefinitions } from '../components/surface-builder/hooks/useSurfacePolicyDefinitions';
 import { surfacePolicyBlockingReason } from '../components/surface-builder/elements/policy/status';
 import { withA2aValidationSettled } from '../components/surface-builder/elements/access-point/a2aSettings';
@@ -198,6 +199,12 @@ const SurfaceDetailPage: React.FC = () => {
   // inactive variant, but `handleSwitchVariant` is declared further
   // down. Bridge them via this ref so neither has to be hoisted.
   const switchVariantRef = useRef<((variantId: string) => void) | null>(null);
+  // Read by `handleSwitchVariant`, which is memoised: the current
+  // Save-blocking dependency error and the toast that reports it.
+  const variantSwitchBlockerRef = useRef<{ message: string; nodeId: string } | null>(null);
+  const showBlockingToastRef = useRef<
+    ((blocking: { message: string; nodeId?: string; variantId?: string }) => void) | null
+  >(null);
   // Page-level full-surface undo/redo ring buffer is hoisted above
   // the builder so its `canUndo` / `canRedo` flags can drive the
   // builder's toolbar override flags in the same render. The
@@ -266,6 +273,13 @@ const SurfaceDetailPage: React.FC = () => {
     buildVariantsWireSlice,
     getSnapshot: getVariantSnapshot,
   } = variantSnapshots;
+  const activeSnapshotId = variantSnapshots.activeVariantId ?? BASE_VARIANT_ID;
+  const otherVariantSnapshots = variantSnapshots.hasVariants
+    ? [BASE_VARIANT_ID, ...variantSnapshots.variants.map(v => v.id)]
+        .filter(id => id !== activeSnapshotId)
+        .map(id => getVariantSnapshot(id))
+        .filter(snapshot => snapshot !== undefined)
+    : [];
 
   // ---- Page-level full-surface undo / redo ring buffer ----------------
   //
@@ -829,14 +843,8 @@ const SurfaceDetailPage: React.FC = () => {
     // source auth on the surface). Block save so the runtime never
     // sees a half-wired surface — the marching-ants ring on the
     // canvas points the user at the offending node.
-    const firstDepErr = dependencyErrors[0];
-    if (firstDepErr) {
-      const def = registry.get(firstDepErr.nodeType);
-      return {
-        message: `${def?.label ?? firstDepErr.nodeType}: ${firstDepErr.message}`,
-        nodeId: firstDepErr.nodeId,
-      };
-    }
+    const dependencyBlocker = dependencyErrorBlocker(dependencyErrors);
+    if (dependencyBlocker) return dependencyBlocker;
     // Structural validation of the assembled payload — catches shape
     // problems that only surface once individual element slices are
     // stitched together (empty surface name, dangling parents, etc).
@@ -970,8 +978,15 @@ const SurfaceDetailPage: React.FC = () => {
    * target variant's payload (default + overrides) and rebuilds the
    * canvas nodes from it.
    */
+  variantSwitchBlockerRef.current = dependencyErrorBlocker(dependencyErrors);
+  showBlockingToastRef.current = showBlockingToast;
   const handleSwitchVariant = useCallback(
     (newVariantId: string) => {
+      const blocker = variantSwitchBlockerRef.current;
+      if (blocker) {
+        showBlockingToastRef.current?.(blocker);
+        return;
+      }
       const currentPayload = buildPayload({
         surface_id: surfaceId,
         name,
@@ -1647,6 +1662,7 @@ const SurfaceDetailPage: React.FC = () => {
         }
         activeVariantId={variantSnapshots.activeVariantId}
         onSwitchVariant={handleSwitchVariant}
+        otherVariantSnapshots={otherVariantSnapshots}
         onAddVariant={handleAddVariant}
         manageActions={
           <div className="d-flex gap-2">

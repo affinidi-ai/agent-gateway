@@ -47,11 +47,10 @@ pub struct SurfaceConfigBuilder {
     pub required_mcp_identity_field: Option<String>,
     pub constrained_mcp_identity_field: Option<String>,
     pub agent_card_path: Option<String>,
-    pub transit_point: Option<SurfaceTransitPointConfig>,
+    pub transit_points: Vec<SurfaceTransitPointConfig>,
     pub didwebvh_identity: Option<DidWebVhIdentityFixture>,
     pub caller_trust_check_list: Vec<serde_json::Value>,
     pub trust_recorder_entries: Vec<serde_json::Value>,
-    pub target_trust_check_list: Vec<serde_json::Value>,
     pub transit_shared_policy: Option<RequestPolicyFixture>,
     pub mcp_http: Option<serde_json::Value>,
     pub protected_resource: Option<ProtectedResourceFixture>,
@@ -99,11 +98,10 @@ impl Default for SurfaceConfigBuilder {
             required_mcp_identity_field: None,
             constrained_mcp_identity_field: None,
             agent_card_path: None,
-            transit_point: None,
+            transit_points: Vec::new(),
             didwebvh_identity: None,
             caller_trust_check_list: Vec::new(),
             trust_recorder_entries: Vec::new(),
-            target_trust_check_list: Vec::new(),
             transit_shared_policy: None,
             mcp_http: None,
             a2a_settings: None,
@@ -214,6 +212,24 @@ pub struct SurfaceTransitPointConfig {
     pub protocol: String,
     pub header_metadata_mapping: TransitPointHeaderMetadataMappingConfig,
     pub managed_identity: Option<TransitPointManagedIdentityConfig>,
+    pub trust_check_list: Vec<serde_json::Value>,
+    pub policy: Option<RequestPolicyFixture>,
+}
+
+impl SurfaceTransitPointConfig {
+    pub fn new(
+        alias: impl Into<String>,
+        protocol: impl Into<String>,
+    ) -> Self {
+        Self {
+            alias: alias.into(),
+            protocol: protocol.into(),
+            header_metadata_mapping: Default::default(),
+            managed_identity: None,
+            trust_check_list: Vec::new(),
+            policy: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

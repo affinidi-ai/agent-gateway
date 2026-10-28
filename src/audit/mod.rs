@@ -15,6 +15,8 @@ pub mod events;
 pub mod integration_sink;
 pub mod journal;
 pub mod pipeline;
+pub mod policy_changes;
+pub mod policy_refusals;
 pub mod producer;
 pub mod registry;
 pub mod request_events;

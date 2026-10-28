@@ -125,11 +125,114 @@ template syntax.
 
 ![Trust Check flow: inbound request, extract metadata, TRQP query, trust registry, then OPA policy decides](assets/diagrams/trust-check-flow.png)
 
-Each leg carries a `trust_check_list`: `AccessPoint.trust_check_list` for the caller leg
-and `Target.trust_check_list` for the target leg. A list holds at most
-`TRUST_CHECK_LIST_MAX` (10) elements
+Each leg carries a `trust_check_list`:
+
+| List | Runs on |
+| --- | --- |
+| `access_point.trust_check_list` | The caller leg, for requests arriving at the Access Point. |
+| `transit.points[].trust_check_list` | Requests the managed agent sends through that Transit Point, and no other. The Surface Builder adds Trust Checks to A2A and AP2 Transit Points only; on an MCP or HTTP Transit Point it shows a migrated copy read-only, to keep or remove. |
+| `target.trust_check_list` | The managed agent's own target leg: `a2a-proxy://` Targets and Fabric send. |
+
+A Transit Point with an empty list runs no Trust Check on its traffic: no agent-card fetch
+for trust, no identity verification, no TRQP query. A request through a Transit Point sees
+only that Transit Point's results, at `input.trust_check_results.target`, in all three
+outbound OPA scopes (gateway, surface, Transit Point).
+
+A list holds at most `TRUST_CHECK_LIST_MAX` (10) elements
 ([`src/config/agent_surface.rs`](../src/config/agent_surface.rs)). A surface variant
-override replaces the whole list verbatim, never element by element.
+override replaces the whole list verbatim, never element by element; a variant gives its
+Transit Points their own lists through its `transit.points` override.
+
+A write to the management API declares the per-Transit-Point shape with
+`trust_check_split: true`; the Surface Builder always sends it. A declared write is rejected
+with `400` when its `target.trust_check_list` is non-empty and its Managed Agent target is not
+`a2a-proxy://` or `fabric://` (an `http(s)` URL, `proxy://`, or no endpoint), because no stage
+runs that list for such a target. For a variant, only a target list the variant sets in its own
+override counts; an inherited list that cannot run on the variant's endpoint is ignored.
+
+A write that does not declare the shape is converted only while the stored surface has no
+Trust Check lists at all (no `trust_check_split` and no Transit Point lists): an undeclared
+create or `PUT` that carries a `target.trust_check_list` and no Transit Point lists is then
+treated as the old shape, converted exactly as a stored surface is (below), logged as a
+warning, and saved. Once the surface has Trust Check lists, an undeclared write cannot change
+them. An undeclared `PUT` keeps every stored Transit Point list for each Transit Point it sends
+without one, keeps the stored target list when it sends none, and is rejected with `400` if it
+sets a target list or a Transit Point list that differs from the stored one, including an
+explicit empty list, or leaves out a variant's own Transit Points that hold lists. A new
+Transit Point it adds without a list has no Trust Checks. An undeclared `PATCH` or variant write is
+rejected with `400` when it sets or clears a target list or Transit Points, including through a
+parent object such as `transit` or a variant's `overrides`, or by replacing `variants`; a
+variant `PUT` that sends `overrides` for a variant whose Transit Points hold lists counts as
+doing so. Such a write must be resent with `trust_check_split: true`. A `PATCH` that only moves
+an `a2a-proxy://` or `fabric://` target to another endpoint while its target list remains is
+rejected by the first rule until the list is removed.
+
+### Lists stored before per-Transit-Point checks
+
+Surfaces stored before Transit Points had their own lists kept one `target.trust_check_list`
+that ran on every Transit Point. The first time such a surface loads, the gateway copies that
+list onto each of its Transit Points (and those of each variant), marks each copy
+with `trust_check_migrated: true`, removes `target.trust_check_list` unless the Managed Agent
+target is `a2a-proxy://` or `fabric://`, sets `trust_check_split: true`, and saves the file. It logs the surface and the Transit Points that received copies,
+and warns when a list is removed without any Transit Point receiving it. Every Transit Point
+keeps its behaviour until an operator edits the surface. The Surface Builder flags
+each copy for review; through the API, remove a copy by saving the Transit Point without
+`trust_check_list` in a write that declares the shape.
+
+User-saved Surface Templates are converted the same way when they load, and when they are
+created, updated or imported without the marker; an imported export from an earlier release is
+converted. A template's endpoint is usually the `$TARGET_ENDPOINT` placeholder, so a template
+with a placeholder or empty endpoint keeps its `target.trust_check_list`, and its Transit Points
+still receive copies. When the Surface Builder loads a surface, including one created from such
+a template, whose target cannot run its target list and whose Transit Points all carry the same
+checks, it drops the Managed Agent's copy; otherwise the `400` above applies when the surface is
+saved.
+
+MCP and HTTP Transit Points receive a copy too, because the old list ran on them. There it
+usually reports `AGENT_CARD_UNAVAILABLE`, but an HTTP Transit Point whose destination serves an
+A2A agent card runs real identity and TRQP checks. The Surface Builder does not add Trust Checks
+to MCP or HTTP Transit Points and shows such a copy read-only, to keep or remove; the
+management API accepts a list on any Transit Point. Removing a copy during review means that
+Transit Point's traffic is no longer checked, so a policy that denied on its results allows
+it.
+
+A variant that inherited the base Transit Points but resolves to a different list receives
+its own copy of them in `overrides.transit.points`, so later edits to the base Transit Points,
+such as a new Transit Point, a changed destination or rotated credentials, no longer reach it.
+Variants saved by the Surface Builder already carry their own Transit Points and are not
+affected.
+
+`trust_check_split` is stored whenever the surface keeps a `target.trust_check_list` or any of
+its Transit Points has a `trust_check_list`. A surface file written outside the API in the
+per-Transit-Point shape must set it, or a target list in it is converted on load. When the
+marker is set and a target list sits on a target that cannot run it, the gateway logs a warning
+on load and the list never runs.
+
+The conversion is forward-only. A gateway release from before per-Transit-Point lists refuses a
+surface carrying `trust_check_split`, which every surface with Trust Checks on its target or
+Transit Points carries after the upgrade. It still loads a converted template, because it
+stores the template's surface unparsed, so applying it there can fail or create a surface
+without its Transit Point checks. Back up `_storage/agent_surfaces/` and
+`_storage/agent_surface_templates/` before upgrading if a rollback may be needed, and restore
+both on rollback.
+
+### Requiring checks in policy
+
+A Transit Point without checks leaves `input.trust_check_results` absent. Rules that only look
+for failures, such as `every r in input.trust_check_results.target { r.ok }` or a count of
+results with `ok == false` equal to zero, therefore allow every request through a Transit
+Point that has no checks, or whose checks were removed. Such a Transit Point also has no
+verified target identity: `input.agent` is absent in the gateway and surface scopes, and with
+`require_agent_context` the Transit Point scope reads it from the agent card's unsigned DID.
+When a policy requires Trust Checks, also require that they ran, or check specific element
+ids:
+
+```rego
+allow if {
+    count(input.trust_check_results.target) > 0
+    every r in input.trust_check_results.target { r.ok }
+}
+```
 
 Element validation is in
 [`src/trust_registry_verification/trust_check_element.rs`](../src/trust_registry_verification/trust_check_element.rs).
@@ -146,7 +249,7 @@ addressable from policy while `name` is only a label. Counts are code points, no
 When an audit sink selects `trust_check`, each element's outcome is recorded with the
 surface id, the request's trace id and the authenticated caller (on the Access Point, Fabric
 and MCP-proxy paths), so a trust check can be tied to the request and principal that
-triggered it.
+triggered it. On the outbound path the record also names the Transit Point.
 
 ## Failed caller authentication
 
@@ -411,6 +514,63 @@ documented here so operators can assess exposure.
   `handle_fabric_request` after the gateway-plane global gate but before the
   surface-plane global gate in `src/proxy/handler.rs`.
 
+## Policy change audit
+
+Every management change to a policy, or to where a policy applies, can be recorded as a
+governance audit event (group Policies; record fields in
+[`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding)):
+
+| Change | Where | Events |
+| --- | --- | --- |
+| Create, edit, delete a definition | `/v1/policy-definitions` | `policy_created`, `policy_updated`, `policy_deleted` |
+| Reassign a definition's tenant | `PUT /v1/tenant-ownership/policy-definitions/{id}` | `policy_updated` with `changed: ["owner"]` |
+| Add, remove or replace a policy on a surface or variant: target, inbound, response, shared transit, per transit point, MCP tool policy, MCP tool gate condition | any surface or variant write | `policy_attached`, `policy_detached` |
+| Change a gateway's policy or its deny-overrides members, or enable or disable it | any gateway write, e.g. `PUT /v1/gateways/{id}/policy` | `policy_attached`, `policy_detached`, `policy_attachment_changed` |
+| Change the appliance-wide assignments, or switch one between enforced and monitor-only | `PUT /v1/policy-assignments`; deleting a definition prunes it | `policy_attached`, `policy_detached`, `policy_attachment_changed` |
+| A change above refused, by the route (role, validation, not found, conflict) or before it (an access token's resource scope, Terms and Conditions not yet accepted) | the definition, assignment, gateway policy and ownership routes | `policy_change_refused` |
+
+Surface and gateway changes are found by comparing the stored record before and after each
+write in a management request (`src/policies/slots.rs` lists a surface's policy slots), so
+every API path that writes one is covered. Each store holds a write lock from that read until the
+write's changes are recorded, so concurrent writes record a chain of changes, each relative to
+the record it replaced, in write order. The appliance-wide assignments (set through the API, or
+pruned when a definition is deleted) and definition updates and owner reassignments are locked
+the same way. A slot is told apart by its variant, its transit
+point and its tool name or gate id; every entry of a tool or gate list is enforced, so a name or
+id repeated in one list is a slot of its own. `transit.transit_policy` is not enforced, so it is
+not listed. A refused surface or variant write is not recorded, nor a refused
+`DELETE /v1/gateways/{id}`: a refusal is recorded from the route alone, and whether either one
+would have changed a policy depends on the body or the stored record. A successful one records
+each policy it attaches or detaches.
+
+Change records follow what a user wrote, not what the runtime works out from it. A surface's
+records name the policies set on the base surface and those set in each variant's overrides, as
+stored. They do not record which policy a request ends up under:
+- Promoting a variant to default, or enabling or disabling one, changes which policies serve a
+  route but writes no policy slot, so it records no policy change.
+- A variant saved with `complete: true` (the surface builder saves every variant this way)
+  replaces the base wholesale, so a policy it does not set is cleared for its traffic. Its
+  records show only the policies it sets.
+- A variant's transit overrides (shared or per transit point) are recorded as written, but the
+  runtime compiles transit policies from the base surface only, so they are not enforced.
+
+What actually decided a request is in its `policy_decision` records.
+
+The policy write routes are listed once, in `PolicyWrite` (`src/audit/policy_refusals.rs`); the
+router registers each through it, so a route's own refusals and those made before it by
+authentication name the same attempted change.
+
+A gateway's legacy inline Rego (`opa_policy_config.policy`, enforced only when the gateway
+references no definition) is recorded too. It has no definition id, so its records carry
+`policy_name` `Gateway policy` and the `policy_content_hash` of the Rego, the same name and
+hash its decisions carry: `policy_attached` when it starts applying, `policy_detached` when it
+stops (including when a definition replaces it), `policy_updated` with `changed: ["rego"]` and
+`previous_policy_content_hash` when its text changes, and `policy_attachment_changed` when it is
+enabled or disabled. Inline Rego beside a definition reference is not enforced and not recorded.
+An enabled gateway policy with blank inline Rego and no definition denies every request (it
+fails closed), so it is recorded as attached too; a disabled blank one enforces nothing and is
+not, so enabling or disabling it records `policy_attached` or `policy_detached`.
+
 ## Policy decision audit logging
 
 ![The Audit page listing two denied requests, each showing the policy version and content hash that decided it, with the event details panel open](assets/diagrams/screenshot-audit-policy-decision.jpg)
@@ -445,3 +605,14 @@ applies on the direct, Fabric and MCP-proxy paths.
 When the `policy_decision` audit event is selected, the decision is also written to the VP Audit
 Log, and from there forwarded to any Governance Audit integrations (any type). See
 [`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding).
+
+Every decision record names its surface and its policy:
+
+- `surface_id` is the surface UUID and `channel_name` the surface name, on every scope and flow.
+- `policy_name` is never empty: the policy definition's name, else the definition id, else a
+  label for the layer that decided: `Gateway policy`, `Surface policy`, `MCP tool gating`,
+  `MCP tool policy`, `Response policy` or `MCP tool list filter`. A tool policy that matched no
+  definition keeps the tool name.
+- `request_id` identifies the gateway request the decision belongs to; one request yields a
+  decision per policy layer, all with the same `request_id` (see
+  [`OBSERVABILITY.md`](OBSERVABILITY.md)).

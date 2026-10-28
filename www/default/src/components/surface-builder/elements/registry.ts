@@ -1,12 +1,21 @@
 import type { SurfaceNodeType } from '../nodeTypes';
 import type {
+  DependencyNode,
   NodeDefinition,
   PayloadContext,
   PayloadSlice,
   Protocol,
+  SnapContext,
   SurfaceContext,
 } from './types';
-import { getArchetype, ANY_EDGE_MW } from './edges/archetypes';
+import {
+  getArchetype,
+  ANY_EDGE_MW,
+  TRUST_CHECK_CALLER_SLOT_ID,
+  TRUST_CHECK_MANAGED_AGENT_SLOT_ID,
+  TRUST_CHECK_TRANSIT_POINT_SLOT_ID,
+} from './edges/archetypes';
+import { queriesFromWire, STORED_TRUST_CHECK_LIST_KEY } from './trust-check/definition';
 import { TRANSIT_POINT_FIELDS } from './agentSurfaceSchema';
 import { transitConfigConfigFromPayload } from './transit-config/definition';
 import { workloadBindingApiToForm } from './workload-binding/config';
@@ -116,6 +125,23 @@ class ElementRegistry {
   }
 
   /**
+   * Does the element's `edgeSnap` allow-list let it snap to the edge
+   * archetype? Elements without an allow-list snap to any archetype. With
+   * a surface context, the element's `edgeSnap.allows` can narrow the list.
+   */
+  snapsToArchetype(
+    elementType: SurfaceNodeType | string,
+    archetypeId: string | undefined,
+    ctx?: SnapContext
+  ): boolean {
+    const snap = this.get(elementType)?.edgeSnap;
+    const allowed = snap?.archetypes;
+    if (!allowed) return true;
+    if (!archetypeId || !allowed.includes(archetypeId)) return false;
+    return !ctx || !snap?.allows || snap.allows(archetypeId, ctx);
+  }
+
+  /**
    * Can this element be dropped directly on a specific node
    * (as a node-modifier rather than as an edge node)?
    */
@@ -191,7 +217,8 @@ class ElementRegistry {
   getDependencyWarnings(
     type: SurfaceNodeType | string,
     config: any,
-    context: SurfaceContext
+    context: SurfaceContext,
+    node?: DependencyNode
   ): DependencyWarning[] {
     const def = this.get(type);
     if (!def?.featureDependencies) return [];
@@ -199,19 +226,22 @@ class ElementRegistry {
     return def.featureDependencies
       .filter(dep => {
         try {
-          return dep.condition(cfg, context);
+          return dep.condition(cfg, context, node);
         } catch {
           return false;
         }
       })
       .filter(dep => {
         try {
-          return !dep.check(cfg, context);
+          return !dep.check(cfg, context, node);
         } catch {
           return true;
         }
       })
-      .map(dep => ({ severity: dep.severity, message: dep.message }));
+      .map(dep => ({
+        severity: dep.severity,
+        message: typeof dep.message === 'function' ? dep.message(cfg, context, node) : dep.message,
+      }));
   }
 
   /**
@@ -575,58 +605,55 @@ class ElementRegistry {
       }
     }
 
-    // Trust-check: per-leg Vec<TrustCheckElement>. Emit one canvas
-    // node per leg holding all of that leg's queries on
-    // `config.queries`; the panel's "+ Add Another Query" button
-    // appends entries and `buildPayload` fans each back out into the
-    // wire `trust_check_list` array.
-    {
-      const tcDef = this.get('trust-check');
-      if (tcDef) {
-        const hydrateLeg = (
-          path: string,
-          edge: 'ap-ma' | 'ma-tp',
-          parentId: string,
-          slotId: string
-        ) => {
-          const raw = readPath(payload, path);
-          if (!Array.isArray(raw) || raw.length === 0) return;
-          const queries = raw
-            .filter((e: any) => e && typeof e === 'object')
-            .map((e: any) => ({
-              id: typeof e.id === 'string' ? e.id : undefined,
-              trust_registry_id: typeof e.trust_registry_id === 'string' ? e.trust_registry_id : '',
-              query_type: e.query_type === 'recognition' ? 'recognition' : 'authorization',
-              name: typeof e.name === 'string' ? e.name : undefined,
-              query: e.query || {},
-            }));
-          if (queries.length === 0) return;
-          const id = `trust-check-${edge === 'ap-ma' ? 'caller' : 'target'}`;
-          const config = { _edge: edge, queries };
-          nodes.push({
-            id,
-            type: 'trust-check',
-            label: '',
-            configured: this.isConfigured('trust-check', config),
-            config,
-            parentId,
-            slotId,
-          });
-        };
-        hydrateLeg(
-          'access_point.trust_check_list',
-          'ap-ma',
-          'access-point',
-          'request:trust-check-access_point_trust_check_list'
-        );
-        hydrateLeg(
-          'target.trust_check_list',
-          'ma-tp',
-          'target',
-          'request:trust-check-target_trust_check_list'
-        );
-      }
-    }
+    // Trust-check: a Vec<TrustCheckElement> per leg. Emit one canvas
+    // node per list holding all of its queries on `config.queries`; the
+    // panel's "+ Add Another Query" button appends entries and
+    // `buildPayload` fans each back out into the wire `trust_check_list`
+    // array. Each Transit Point's own list is hydrated with the Transit
+    // Point below.
+    const hydrateTrustCheck = (
+      raw: unknown,
+      id: string,
+      edge: 'ap-ma' | 'ma-tp',
+      parentId: string,
+      slotId: string,
+      migrated = false,
+      keepStoredList = false
+    ) => {
+      const queries = queriesFromWire(raw);
+      if (queries.length === 0) return;
+      const config = {
+        _edge: edge,
+        queries,
+        ...(migrated ? { trust_check_migrated: true } : {}),
+        ...(keepStoredList
+          ? { [STORED_TRUST_CHECK_LIST_KEY]: JSON.parse(JSON.stringify(raw)) }
+          : {}),
+      };
+      nodes.push({
+        id,
+        type: 'trust-check',
+        label: '',
+        configured: this.isConfigured('trust-check', config),
+        config,
+        parentId,
+        slotId,
+      });
+    };
+    hydrateTrustCheck(
+      readPath(payload, 'access_point.trust_check_list'),
+      'trust-check-caller',
+      'ap-ma',
+      'access-point',
+      TRUST_CHECK_CALLER_SLOT_ID
+    );
+    hydrateTrustCheck(
+      readPath(payload, 'target.trust_check_list'),
+      'trust-check-target',
+      'ma-tp',
+      'target',
+      TRUST_CHECK_MANAGED_AGENT_SLOT_ID
+    );
 
     // Variants — always emit a surface-wide `target-variant` node,
     // even when the surface has no variants yet. The dedicated
@@ -736,6 +763,8 @@ class ElementRegistry {
       const tpConfig = tp && typeof tp === 'object' ? { ...tp } : tp;
       if (tpConfig && typeof tpConfig === 'object') {
         delete tpConfig.header_metadata_mapping;
+        delete tpConfig.trust_check_list;
+        delete tpConfig.trust_check_migrated;
       }
       nodes.push({
         id: tpId,
@@ -841,6 +870,18 @@ class ElementRegistry {
           slotId: 'request:metadata-extraction',
         });
       }
+      // Per-TP target-leg Trust Check (`transit.points[i].trust_check_list`).
+      // New ones are offered only on A2A/AP2 Transit Points, but a stored
+      // list (a migrated copy on any protocol) is always shown.
+      hydrateTrustCheck(
+        tp?.trust_check_list,
+        `trust-check-${tpId}`,
+        'ma-tp',
+        tpId,
+        TRUST_CHECK_TRANSIT_POINT_SLOT_ID,
+        tp?.trust_check_migrated === true,
+        tpType !== 'transit-point-a2a' && tpType !== 'transit-point-ap2'
+      );
       // Per-TP managed identity (`transit.points[i].managed_identity`).
       // Mirrors the request-slot id produced by the identity element
       // when freshly dropped on the MA→TP edge so it round-trips
@@ -987,6 +1028,7 @@ class ElementRegistry {
         if (removedTps.has(bn.id) || removedTps.has(transitPointOf(bn.parentId))) continue;
         let target = byId.get(bn.id);
         if (target) claimedIds.add(target.id);
+        let restoredFromBlob = false;
         if (!target && bn.type) {
           // Adopt an unclaimed synthesized node of the same type when
           // the blob's id derives from a different archetype slot for
@@ -1007,7 +1049,9 @@ class ElementRegistry {
               !claimedIds.has(n.id) &&
               !byId.has(bn.id) &&
               !blob.nodes.some(b => b.id === n.id) &&
-              (!ownsConfig || transitPointOf(n.parentId) === bnTransitPoint)
+              (!ownsConfig ||
+                (transitPointOf(n.parentId) === bnTransitPoint &&
+                  (!bn.slotId || !n.slotId || n.slotId === bn.slotId)))
           );
           // Prefer slotId-based adoption when the blob carries one and
           // exactly one hydrated candidate owns the same slot. Keeps
@@ -1034,10 +1078,19 @@ class ElementRegistry {
         }
         if (!target) {
           if (!bn.type) continue;
-          if (this.get(bn.type)?.payloadOwnsConfig) {
+          const def = this.get(bn.type);
+          const parentType =
+            typeof bn.parentId === 'string'
+              ? (blobById.get(bn.parentId)?.type ?? byId.get(bn.parentId)?.type)
+              : undefined;
+          if (
+            def?.payloadOwnsConfig &&
+            !def.isBlobPlaceholder?.(bn.config ?? {}, { ...bn, parentType }, payload)
+          ) {
             if (typeof bn.parentId === 'string') renameMap.set(bn.id, bn.parentId);
             continue;
           }
+          restoredFromBlob = true;
           // Compute `configured` from the blob's config rather than
           // hard-coding `true`. Otherwise an element that the user
           // dropped but never finished configuring (no payload slice
@@ -1101,7 +1154,14 @@ class ElementRegistry {
         // the access-point onto the managed agent or onto a freshly
         // dropped middleware node). Always honour an explicit overlay
         // parentId so reloads don't snap edges back to defaults.
-        if (overlay.parentId !== undefined) {
+        // A node whose config the payload owns stays on the path it was
+        // hydrated for: a stale blob parent never moves it between the
+        // Target and a Transit Point, or between Transit Points.
+        const keepsHydratedPath =
+          !restoredFromBlob &&
+          !!this.get(target.type)?.payloadOwnsConfig &&
+          transitPointOf(overlay.parentId) !== transitPointOf(target.parentId);
+        if (overlay.parentId !== undefined && !keepsHydratedPath) {
           target.parentId = overlay.parentId || undefined;
         }
       }

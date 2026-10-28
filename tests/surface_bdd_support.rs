@@ -3,7 +3,7 @@
 #[path = "bdd_support/mod.rs"]
 mod bdd_support;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -293,12 +293,7 @@ fn write_config_seeds_mcp_tool_policy_definition() {
 fn write_config_can_seed_transit_point_with_outbound_listener() {
     let temp_dir = TempDir::new().unwrap();
     let surface_config = SurfaceConfigBuilder {
-        transit_point: Some(SurfaceTransitPointConfig {
-            alias: "alpha".to_string(),
-            protocol: "mcp".to_string(),
-            header_metadata_mapping: Default::default(),
-            managed_identity: None,
-        }),
+        transit_points: vec![SurfaceTransitPointConfig::new("alpha", "mcp")],
         ..SurfaceConfigBuilder::default()
     };
 
@@ -307,7 +302,7 @@ fn write_config_can_seed_transit_point_with_outbound_listener() {
         32005,
         32015,
         "http://127.0.0.1:9",
-        "http://127.0.0.1:10",
+        &HashMap::from([("alpha".to_string(), "http://127.0.0.1:10".to_string())]),
         &surface_config,
         None,
     );
@@ -336,6 +331,75 @@ fn write_config_can_seed_transit_point_with_outbound_listener() {
     assert_eq!(surface_json["transit"]["outbound_listen_address"], "http://localhost:32015");
     assert_eq!(surface_json["transit"]["points"][0]["alias"], "alpha");
     assert_eq!(surface_json["transit"]["points"][0]["target_endpoint"], "http://127.0.0.1:10");
+}
+
+#[test]
+fn write_config_gives_each_transit_point_its_own_destination_trust_checks_and_policy() {
+    let temp_dir = TempDir::new().unwrap();
+    let mut alpha = SurfaceTransitPointConfig::new("alpha", "a2a");
+    alpha
+        .trust_check_list
+        .push(serde_json::json!({ "id": "alpha-check" }));
+    alpha.policy = Some(config::config_tree::PolicyDefinitionFixture::new(
+        "alpha-policy",
+        "Alpha policy",
+        "package surface.policy\n\ndefault allow := true\n",
+    ));
+    let surface_config = SurfaceConfigBuilder {
+        transit_points: vec![alpha, SurfaceTransitPointConfig::new("bravo", "a2a")],
+        ..SurfaceConfigBuilder::default()
+    };
+
+    config::single_surface_writer::write_single_surface_config_with_outbound_listener(
+        temp_dir.path(),
+        32005,
+        32015,
+        "http://127.0.0.1:9",
+        &HashMap::from([
+            ("alpha".to_string(), "http://127.0.0.1:10".to_string()),
+            ("bravo".to_string(), "http://127.0.0.1:11".to_string()),
+        ]),
+        &surface_config,
+        None,
+    );
+
+    let surface_json: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            temp_dir
+                .path()
+                .join("_storage/agent_surfaces/bdd-surface.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let points = &surface_json["transit"]["points"];
+    assert_eq!(points[0]["alias"], "alpha");
+    assert_eq!(points[0]["target_endpoint"], "http://127.0.0.1:10");
+    assert_eq!(points[0]["trust_check_list"][0]["id"], "alpha-check");
+    assert_eq!(points[0]["policy"]["policy_definition_id"], "alpha-policy");
+    assert_eq!(points[1]["alias"], "bravo");
+    assert_eq!(points[1]["target_endpoint"], "http://127.0.0.1:11");
+    assert!(
+        points[1]
+            .get("trust_check_list")
+            .is_none()
+    );
+    assert!(
+        points[1]
+            .get("policy")
+            .is_none()
+    );
+    assert!(
+        surface_json["target"]
+            .get("trust_check_list")
+            .is_none()
+    );
+    assert!(
+        temp_dir
+            .path()
+            .join("_storage/policies/alpha-policy.json")
+            .exists()
+    );
 }
 
 async fn spawn_gateway(seed_surface: bool) -> (TempDir, GatewayProcess) {
