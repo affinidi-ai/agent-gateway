@@ -6,12 +6,14 @@ import AuditPage from '..';
 import { apiClient } from '../../../api';
 import { clearUserNames } from '../useUserNames';
 
+let mockSessionToken: string | null = 'session-1';
 jest.mock('../../../api', () => ({
   ApiError: jest.requireActual('../../../api').ApiError,
   apiClient: {
     get: jest.fn(),
     listIssuers: jest.fn(() => Promise.resolve([])),
   },
+  sessionManager: { getSessionToken: () => mockSessionToken },
 }));
 
 jest.mock('../../../utils/toaster', () => ({
@@ -404,7 +406,8 @@ describe('AuditPage policy changes', () => {
   };
 
   beforeEach(() => {
-    mockPermissions = {};
+    mockPermissions = { 'users.view': true };
+    mockSessionToken = 'session-1';
     clearUserNames();
     mockGet.mockReset();
     mockGet.mockImplementation((url: string) =>
@@ -412,6 +415,36 @@ describe('AuditPage policy changes', () => {
         data: url === '/users' ? [{ user_id: 'u-1', username: 'alice' }] : CHANGE_RESPONSE,
       })
     );
+  });
+
+  const usersRequests = () => mockGet.mock.calls.filter(([url]) => url === '/users');
+
+  it('names actors by id without users.view and never asks for the users list', async () => {
+    mockPermissions = {};
+    renderPage();
+
+    const item = await screen.findByTestId('audit-item-0');
+    expect(within(item).getByText('user u-1')).toBeInTheDocument();
+    expect(usersRequests()).toHaveLength(0);
+  });
+
+  it('asks for the users list again in a new session, not with the previous session’s names', async () => {
+    const { unmount } = renderPage();
+    const item = await screen.findByTestId('audit-item-0');
+    await waitFor(() => expect(within(item).getByText('user alice')).toBeInTheDocument());
+    unmount();
+
+    mockSessionToken = 'session-2';
+    mockGet.mockImplementation((url: string) =>
+      Promise.resolve({
+        data: url === '/users' ? [{ user_id: 'u-1', username: 'bob' }] : CHANGE_RESPONSE,
+      })
+    );
+    renderPage();
+
+    const again = await screen.findByTestId('audit-item-0');
+    await waitFor(() => expect(within(again).getByText('user bob')).toBeInTheDocument());
+    expect(usersRequests()).toHaveLength(2);
   });
 
   it('describes the change by its actor’s name and shows its details without a request journey', async () => {

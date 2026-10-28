@@ -1,6 +1,7 @@
 import React, { useRef, useState } from 'react';
 import { AppButton } from '../../components/shared/AppButton';
 import { Badge } from '../../components/shared/Badge';
+import { usePermissions } from '../../context/PermissionsContext';
 import AuditDetailPanel from './AuditDetailPanel';
 import AuditForwardButton from './AuditForwardButton';
 import AuditFilters from './AuditFilters';
@@ -13,7 +14,10 @@ import { useUserNames } from './useUserNames';
 const AuditPage: React.FC = () => {
   const audit = useAuditLog();
   const [infoOpen, setInfoOpen] = useState(false);
-  const userName = useUserNames(audit.filteredEntries.some(entry => policyChange(entry) != null));
+  const { hasPermission } = usePermissions();
+  const userName = useUserNames(
+    hasPermission('users.view') && audit.filteredEntries.some(entry => policyChange(entry) != null)
+  );
 
   // Compute decision counts from entries
   const decisionCounts = audit.entries.reduce<Record<string, number>>((acc, entry) => {
