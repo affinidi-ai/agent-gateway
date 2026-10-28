@@ -38,6 +38,12 @@ changes:
         A streamed response whose client disconnects before its end now records its connection
         metric with the request's surface variant and id, as a stream that completes does. The
         stream was dropped outside its request, so the metric carried no variant.
+    - timestamp: '2026-10-28T22:30:00Z'
+      title: Reject a default_variant_id that names no variant on a surface without variants
+      description: >-
+        Saving a surface whose default_variant_id names no variant is refused with 400 whether or
+        not the surface has variants. A surface with no variants used to save with a default its
+        requests could never be served by, as every path refuses them with 500.
   removed: []
   security:
     - timestamp: '2026-10-28T18:10:00Z'

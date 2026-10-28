@@ -885,19 +885,12 @@ impl AgentSurface {
     /// - Every variant's `alias` matches [`SurfaceVariant::ALIAS_PATTERN`].
     /// - Aliases are unique within the surface.
     /// - Ids are unique within the surface.
-    /// - `default_variant_id`, when set, matches an existing variant.
+    /// - `default_variant_id`, when set, matches an existing variant, so a
+    ///   surface with no variants has none.
     /// - `default_variant_id = None` is allowed even when `variants[]` is
     ///   non-empty: alias-less requests resolve to the bare base surface
     ///   (the implicit "base" default).
-    ///
-    /// Empty `variants[]` is considered valid for the migration window;
-    /// surfaces written by the new model always carry at least a "default"
-    /// variant.
     pub fn validate_variants(&self) -> Result<(), VariantValidationError> {
-        if self.variants.is_empty() {
-            return Ok(());
-        }
-
         let mut seen_aliases: std::collections::HashSet<&str> = std::collections::HashSet::new();
         let mut seen_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for v in &self.variants {
