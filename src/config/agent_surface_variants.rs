@@ -1287,8 +1287,17 @@ mod tests {
         let beta = s
             .serve_variant(Some("beta"))
             .unwrap();
-        assert!(beta.surface.variants.is_empty(), "the served surface has no catalog");
-        assert_eq!(beta.surface.default_variant_id, None);
+        assert!(
+            beta.surface
+                .variants
+                .is_empty(),
+            "the served surface has no catalog"
+        );
+        assert_eq!(
+            beta.surface
+                .default_variant_id,
+            None
+        );
 
         s.default_variant_id = None;
         assert_eq!(served(&s, None), owned(None, "_base_", "https://prod.example.com"));

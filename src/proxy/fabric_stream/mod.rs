@@ -1320,9 +1320,7 @@ mod tests {
             assert!(
                 records
                     .iter()
-                    .all(|record| record
-                        .request_id
-                        .is_some()),
+                    .all(|record| record.request_id.is_some()),
                 "{rejected}: an Open refusal records under the Open's request: {records:?}"
             );
             // Only a missing offer asks the sender to negotiate again.

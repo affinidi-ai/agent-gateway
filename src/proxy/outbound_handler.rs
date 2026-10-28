@@ -487,20 +487,19 @@ impl OutboundPipelineContext {
         let modern_post = matched_virtual_channel.protocol == crate::config::agent_surface::TransitProtocol::Mcp
             && crate::mcp::request_validation::has_modern_header(&original_headers)
             && original_method == Method::POST;
-        let (active_variant_id, surface, pending_variant_refusal) = match surface_for_resolve
-            .serve_variant(active_variant_alias.as_deref())
-        {
-            Ok(served) => {
-                crate::observability::policy_audit::set_request_variant(&served.recorded);
-                (served.id, Arc::new(served.surface), None)
-            }
-            Err(error) if modern_post => (
-                None,
-                Arc::clone(&surface_for_resolve),
-                Some(refuse(&error, Some(i64::from(crate::mcp::error_codes::INTERNAL_ERROR)))),
-            ),
-            Err(error) => return Err(OutboundPipelineError::VariantRefused(refuse(&error, None))),
-        };
+        let (active_variant_id, surface, pending_variant_refusal) =
+            match surface_for_resolve.serve_variant(active_variant_alias.as_deref()) {
+                Ok(served) => {
+                    crate::observability::policy_audit::set_request_variant(&served.recorded);
+                    (served.id, Arc::new(served.surface), None)
+                }
+                Err(error) if modern_post => (
+                    None,
+                    Arc::clone(&surface_for_resolve),
+                    Some(refuse(&error, Some(i64::from(crate::mcp::error_codes::INTERNAL_ERROR)))),
+                ),
+                Err(error) => return Err(OutboundPipelineError::VariantRefused(refuse(&error, None))),
+            };
 
         let virtual_channel = surface
             .transit_points()
@@ -8243,12 +8242,23 @@ mod tests {
                 assert_eq!(content_type, "application/json", "{label}");
                 assert_eq!(answer["jsonrpc"], "2.0", "{label}: {answer}");
                 let id = (!malformed).then_some("variant");
-                assert_eq!(answer.get("id").and_then(serde_json::Value::as_str), id, "{label}: {answer}");
+                assert_eq!(
+                    answer
+                        .get("id")
+                        .and_then(serde_json::Value::as_str),
+                    id,
+                    "{label}: {answer}"
+                );
                 assert_eq!(answer.get("id").is_some(), id.is_some(), "{label}: no null id: {answer}");
                 assert_eq!(answer["error"]["code"], code, "{label}: {answer}");
             } else {
                 assert_eq!(content_type, "application/problem+json", "{label}");
-                assert!(answer.get("jsonrpc").is_none(), "{label}: {answer}");
+                assert!(
+                    answer
+                        .get("jsonrpc")
+                        .is_none(),
+                    "{label}: {answer}"
+                );
             }
             let refusals: Vec<_> = events
                 .iter()

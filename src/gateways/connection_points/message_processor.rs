@@ -3753,10 +3753,8 @@ pub(crate) struct FabricStreamRequest {
 pub(crate) async fn resolve_stream_surface(
     message: &ReceivedMessage,
     request: &crate::proxy::fabric_stream::wire::OpenRequest,
-) -> Result<
-    (crate::config::agent_surface::AgentSurface, crate::config::agent_surface_variants::ForwardedVariant),
-    String,
-> {
+) -> Result<(crate::config::agent_surface::AgentSurface, crate::config::agent_surface_variants::ForwardedVariant), String>
+{
     let surface = lookup_channel(message, &request.channel_id)
         .await?
         .ok_or("Fabric stream surface is unavailable")?;

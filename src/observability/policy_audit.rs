@@ -826,10 +826,7 @@ mod tests {
         struct RecordOnDrop(Seen);
         impl Drop for RecordOnDrop {
             fn drop(&mut self) {
-                *self
-                    .0
-                    .lock()
-                    .unwrap() = Some((current_request_id(), current_request_variant()));
+                *self.0.lock().unwrap() = Some((current_request_id(), current_request_variant()));
             }
         }
         let seen = Seen::default();
@@ -854,9 +851,7 @@ mod tests {
         drop(body);
 
         assert_eq!(
-            seen.lock()
-                .unwrap()
-                .clone(),
+            seen.lock().unwrap().clone(),
             Some((Some("0123456789abcdef".to_string()), Some("beta".to_string())))
         );
     }

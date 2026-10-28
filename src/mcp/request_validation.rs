@@ -314,9 +314,7 @@ impl McpRequestValidationError {
             status: refusal.status(),
             id,
             code: error_codes::INTERNAL_ERROR,
-            message: refusal
-                .message()
-                .to_string(),
+            message: refusal.message().to_string(),
             data: None,
         })
     }

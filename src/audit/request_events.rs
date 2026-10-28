@@ -509,14 +509,7 @@ mod tests {
             .iter()
             .map(|refusal| (refusal.status().as_u16(), refusal.requested_variant()))
             .collect();
-        assert_eq!(
-            answered,
-            vec![
-                (404, Some("typo")),
-                (404, None),
-                (500, None),
-            ]
-        );
+        assert_eq!(answered, vec![(404, Some("typo")), (404, None), (500, None),]);
         assert_eq!(
             rejected(&events),
             vec![

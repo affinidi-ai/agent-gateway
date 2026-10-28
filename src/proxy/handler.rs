@@ -9203,9 +9203,7 @@ async fn refuse_access_point_variant(
     }
     let id = if req.method() == Method::POST
         && let Ok(policy) = crate::mcp::modern_http::EndpointHttpPolicy::with_versions(
-            surface
-                .mcp_http
-                .as_ref(),
+            surface.mcp_http.as_ref(),
             &network_config.get_inbound_external_urls(),
             versions,
         ) {

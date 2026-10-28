@@ -513,7 +513,12 @@ fn assert_json_rpc_refusal(
     assert_eq!(answered.as_u16(), status, "{case}");
     assert_eq!(content_type, "application/json", "{case}");
     assert_eq!(body["jsonrpc"], "2.0", "{case}: {body}");
-    assert_eq!(body.get("id").and_then(Value::as_str), id, "{case}: {body}");
+    assert_eq!(
+        body.get("id")
+            .and_then(Value::as_str),
+        id,
+        "{case}: {body}"
+    );
     assert_eq!(body.get("id").is_some(), id.is_some(), "{case}: no null id: {body}");
     assert_eq!(body["error"]["code"], code, "{case}: {body}");
     assert!(body.get("result").is_none(), "{case}: {body}");
@@ -551,8 +556,9 @@ async fn an_oversized_modern_mcp_body_is_refused_for_its_variant_without_an_id()
         max_request_bytes: std::num::NonZeroUsize::new(64).unwrap(),
         ..Default::default()
     });
-    let body = json!({"jsonrpc": "2.0", "id": "variant", "method": "tools/list", "params": {"padding": "x".repeat(128)}})
-        .to_string();
+    let body =
+        json!({"jsonrpc": "2.0", "id": "variant", "method": "tools/list", "params": {"padding": "x".repeat(128)}})
+            .to_string();
 
     let answer = send_mcp_request(surface, "POST", "/mcp$missing", true, body).await;
 
