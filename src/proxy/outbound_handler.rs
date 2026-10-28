@@ -478,6 +478,9 @@ impl OutboundPipelineContext {
             .select_variant(active_variant_alias.as_deref())
             .map_err(refuse)?
             .map(|variant| variant.id.clone());
+        crate::observability::policy_audit::set_request_variant(
+            surface_for_resolve.surface_variant(active_variant_id.as_deref()),
+        );
         let surface = Arc::new(
             surface_for_resolve
                 .resolve_variant(active_variant_alias.as_deref())
@@ -8179,6 +8182,12 @@ mod tests {
                 vec![(RejectionStage::Routing, reason, status, requested_variant.map(str::to_string))],
                 "{case} modern={modern}"
             );
+            let expected_variant = match reason {
+                RejectionReason::UnknownVariant => Some("_unknown_"),
+                RejectionReason::VariantDisabled => Some("candidate"),
+                _ => None,
+            };
+            assert_eq!(events[0].surface_variant.as_deref(), expected_variant, "{case} modern={modern}");
             assert_eq!(
                 target
                     .request_count
@@ -8186,6 +8195,58 @@ mod tests {
                 0,
                 "{case} modern={modern}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn every_transit_point_record_names_the_variant_that_served_it() {
+        for (variants, path, expected) in [
+            (
+                json!([{"id": "v-beta", "alias": "beta", "name": "Beta"}]),
+                "/outbound/mcp$beta/partner-a",
+                "beta",
+            ),
+            (json!([]), "/outbound/mcp/partner-a", "_base_"),
+        ] {
+            let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+                "surface_id": "variant-surface", "name": "Variant surface",
+                "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "a2a"},
+                "target": {"endpoint": "http://127.0.0.1:1"},
+                "transit": {
+                    "shared": {"opa_policy_definition_id": "unavailable"},
+                    "points": [{"alias": "partner-a", "protocol": "mcp",
+                        "require_transit_token": false, "target_endpoint": "http://127.0.0.1:1"}]
+                },
+                "variants": variants
+            }))
+            .unwrap();
+            let state = test_outbound_state();
+            state
+                .channel_state
+                .write()
+                .unwrap()
+                .surface = Arc::new(surface);
+            let request = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).to_string(),
+                ))
+                .unwrap();
+            let (_, events) = crate::audit::producer::capture(Box::pin(outbound_proxy_handler_with_mcp_versions(
+                "127.0.0.1:12345"
+                    .parse()
+                    .unwrap(),
+                state,
+                request,
+                crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+            )))
+            .await;
+            assert!(!events.is_empty(), "{path}: the Transit Point request writes records");
+            for event in &events {
+                assert_eq!(event.surface_variant.as_deref(), Some(expected), "{path}: {event:?}");
+            }
         }
     }
 
