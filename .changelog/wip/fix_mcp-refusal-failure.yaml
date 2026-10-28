@@ -29,11 +29,13 @@ changes:
       title: Answer -32022 instead of 502 when a session-only MCP upstream refuses
       description: >-
         A 2026-07-28 request to an upstream that serves only session revisions used to get HTTP 502,
-        because the upstream's "missing session" error carries "id": null or a placeholder id. The
-        gateway now answers -32022 with the request's id and only the session revisions in
-        data.supported (HTTP 400 for a JSON answer), so clients such as claude.ai fall back to a
-        session, and logs the upstream's error at WARN. Discovery also learns the supported versions
-        from a -32022 error, so later -32022 errors from that upstream stop offering 2026-07-28.
+        because the upstream's "missing session" error carries "id": null or a placeholder id. When the
+        upstream answers HTTP 400 with JSON-RPC code -32000 or -32600, the gateway now answers -32022
+        with the request's id and only the session revisions in data.supported, so clients such as
+        claude.ai fall back to a session, and logs the upstream's error at WARN. Other errors without
+        the request's id, such as parse errors, internal errors, rate limits and outages, still get
+        HTTP 502. Discovery also learns the supported versions from a -32022 error, so later -32022
+        errors from that upstream stop offering 2026-07-28.
   removed: []
   security:
     - timestamp: '2026-10-28T00:00:00Z'
@@ -42,5 +44,6 @@ changes:
         The MCP notification streams that carry credential-delegation consent prompts, and the pending
         prompts themselves, are now keyed by surface as well as Mcp-Session-Id. Session ids can now come
         from the upstream, so a client on another surface presenting the same id could otherwise receive
-        another user's authorization URL or cancel their pending prompt.
+        another user's authorization URL or cancel their pending prompt. Sessions are not bound to the
+        caller, so within one surface this relies on the upstream issuing unguessable session ids.
   breaking: []
