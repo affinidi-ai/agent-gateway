@@ -126,10 +126,13 @@ export function readsAuthorizationHeader(config: Record<string, unknown>): boole
   return (header.trim() || 'Authorization').toLowerCase() === 'authorization';
 }
 
-/** True when the JWT Bearer method expects the `Bearer` scheme, as `buildPayload` writes it. */
+/**
+ * True when the JWT Bearer method expects the `Bearer` scheme exactly, as
+ * `buildPayload` writes it: the gateway matches the scheme as written.
+ */
 export function usesBearerScheme(config: Record<string, unknown>): boolean {
   const scheme = typeof config.jwt_token_scheme === 'string' ? config.jwt_token_scheme : 'Bearer';
-  return scheme.trim().toLowerCase() === 'bearer';
+  return scheme === 'Bearer';
 }
 
 /**

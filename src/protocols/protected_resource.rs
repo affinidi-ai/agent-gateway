@@ -371,6 +371,13 @@ pub fn access_point_protected_resource(
     network: &crate::config::NetworkConfig,
 ) -> Option<Result<ProtectedResourceConfig, String>> {
     let configured = surface.protected_resource()?;
+    if let Some(prefix) = metadata_path_owner(network) {
+        // The listener publishes no documents, so a challenge would point at
+        // a path the prefix answers instead.
+        return Some(Err(format!(
+            "the configured prefix {prefix} serves /.well-known/oauth-protected-resource, so no metadata is published"
+        )));
+    }
     if alias.is_some() && surface.access_point.route == "/" {
         // A request for `/$alias` reaches the Access Point at `/` itself, so
         // a variant of it has no path of its own for a resource to name.
@@ -457,6 +464,30 @@ fn caller_authentication_metadata(
         }
     }
     Ok(found)
+}
+
+/// The configured prefix that serves `/.well-known/oauth-protected-resource`
+/// itself, if any. Its routes would collide with the metadata routes, so the
+/// listener leaves the path to it and publishes no metadata documents, and
+/// discovery fails closed on its Access Points.
+pub fn metadata_path_owner(network: &crate::config::NetworkConfig) -> Option<&str> {
+    network
+        .channels
+        .iter()
+        .chain(
+            network
+                .mcp_proxies
+                .iter()
+                .flatten(),
+        )
+        .map(|channel| channel.prefix.as_str())
+        .chain(
+            network
+                .routes
+                .values()
+                .map(|route| route.prefix.as_str()),
+        )
+        .find(|prefix| prefix.trim_end_matches('/') == "/.well-known/oauth-protected-resource")
 }
 
 /// Whether a channel or proxy route catch-all on the listener also covers the
@@ -777,6 +808,14 @@ mod tests {
             access_point_protected_resource(&discovery_surface(jwt_bearer_method(), None), None, &network),
             None
         );
+        // A prefix that serves the metadata path leaves nothing to publish.
+        let mut owned = network.clone();
+        owned.channels = vec![crate::config::network::ChannelPrefix {
+            id: "metadata".into(),
+            name: "metadata".into(),
+            prefix: "/.well-known/oauth-protected-resource".into(),
+        }];
+        assert!(matches!(access_point_protected_resource(&surface, None, &owned), Some(Err(_))));
         // A variant of an Access Point at / has no path of its own.
         let mut root = discovery_surface(
             jwt_bearer_method(),

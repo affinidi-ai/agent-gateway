@@ -112,29 +112,8 @@ fn cors_layer(
             async move { any_origin_reads && reads || is_proxy_cors_origin_allowed(&origin, &method, &path, &origins) }
         }))
         .allow_headers(Any)
-}
-
-/// The configured prefix that serves `/.well-known/oauth-protected-resource`
-/// itself, if any. Its routes would collide with the metadata routes, so the
-/// listener leaves the path to it and publishes no metadata documents.
-fn metadata_path_owner(network_config: &crate::config::NetworkConfig) -> Option<&str> {
-    network_config
-        .channels
-        .iter()
-        .chain(
-            network_config
-                .mcp_proxies
-                .iter()
-                .flatten(),
-        )
-        .map(|channel| channel.prefix.as_str())
-        .chain(
-            network_config
-                .routes
-                .values()
-                .map(|route| route.prefix.as_str()),
-        )
-        .find(|prefix| prefix.trim_end_matches('/') == "/.well-known/oauth-protected-resource")
+        // A browser MCP client reads the 401 challenge to find the metadata.
+        .expose_headers([axum::http::header::WWW_AUTHENTICATE])
 }
 
 pub fn init_certificates_store(store: Arc<dyn crate::certificates::CertificateStore>) {
@@ -626,7 +605,7 @@ pub async fn run_port_server(
         profile.validate_network(&network_config)?;
         app = app.merge(profile.discovery_router()?);
     }
-    match metadata_path_owner(&network_config) {
+    match crate::protocols::protected_resource::metadata_path_owner(&network_config) {
         Some(prefix) => warn!(
             prefix,
             "A configured prefix serves /.well-known/oauth-protected-resource; this listener publishes no protected resource metadata"
@@ -1676,6 +1655,13 @@ mod tests {
         let cors = ["https://dashboard.example.com".to_string()];
 
         assert!(allowed(metadata_cors_layer(&cors), "GET", None).await);
+        let read = Router::new()
+            .route("/{*path}", axum::routing::any(|| async { StatusCode::UNAUTHORIZED }))
+            .layer(proxy_cors_layer(&["https://client.example".to_string()]))
+            .oneshot(request("GET", None))
+            .await
+            .unwrap();
+        assert_eq!(read.headers()[header::ACCESS_CONTROL_EXPOSE_HEADERS], "www-authenticate");
         assert!(allowed(metadata_cors_layer(&cors), "HEAD", None).await);
         assert!(allowed(metadata_cors_layer(&cors), "OPTIONS", Some("GET")).await);
         assert!(!allowed(metadata_cors_layer(&cors), "OPTIONS", Some("POST")).await);
@@ -1715,6 +1701,7 @@ mod tests {
 
     #[test]
     fn a_prefix_at_the_metadata_path_keeps_it() {
+        use crate::protocols::protected_resource::metadata_path_owner;
         let mut network = crate::protocols::protected_resource::fixtures::discovery_network();
         assert_eq!(metadata_path_owner(&network), None);
         for prefix in ["/.well-known", "/.well-known/oauth-protected-resource/mcp", "/agents"] {

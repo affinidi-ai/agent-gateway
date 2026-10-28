@@ -2680,9 +2680,7 @@ impl AgentSurface {
                 if jwt
                     .token_header
                     .eq_ignore_ascii_case("authorization")
-                    && jwt
-                        .token_scheme
-                        .eq_ignore_ascii_case("bearer") =>
+                    && jwt.token_scheme == "Bearer" =>
             {
                 if jwt.forward_header {
                     return Err("cannot be combined with forward_header: the caller's token must not reach the \
@@ -3156,6 +3154,9 @@ mod tests {
             serde_json::json!({"type": "api_key", "extraction": {"source": "http_header", "field": "x-api-key"}, "secret_id": "key"}),
             serde_json::json!({"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": [], "token_header": "x-token"}),
             serde_json::json!({"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": [], "token_scheme": "Token"}),
+            // The token is matched with the scheme as written, so another case
+            // would refuse the `Bearer` clients send.
+            serde_json::json!({"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": [], "token_scheme": "bearer"}),
         ] {
             let mut changed = stored.clone();
             changed["access_point"]["caller_authentication"]["methods"] = serde_json::json!([method]);

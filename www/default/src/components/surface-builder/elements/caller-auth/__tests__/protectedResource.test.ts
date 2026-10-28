@@ -146,6 +146,7 @@ describe('discoveryProblems', () => {
       'Authorization server discovery needs the token in the Authorization header with the Bearer scheme',
     ]);
     expect(fields({ jwt_token_scheme: '' })).toHaveLength(1);
+    expect(fields({ jwt_token_scheme: 'bearer' })).toHaveLength(1);
   });
 
   it('flags a missing, over-long or repeated authorization server list', () => {

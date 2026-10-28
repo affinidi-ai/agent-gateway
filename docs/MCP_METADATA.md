@@ -1395,8 +1395,14 @@ trusts one issuer, so the list must be exactly its expected issuer: a save that
 lists another server, beside it or instead of it, is refused with `400`,
 because every token a client got from that server would be refused. The
 dashboard starts the list with that issuer.
-A strategy whose issuer changes later fails closed: its surfaces answer the
-`401` challenge until the two agree again. `scopes` are advertised as
+A request checks tokens against the strategy's current issuer, not against
+the advertised servers, so after a strategy's issuer changes, tokens from the
+new issuer are accepted while clients that follow the old metadata get tokens
+that are refused; update `authorization_servers` too, which a save of the
+surface requires until the two agree. A listener on which a configured prefix
+serves `/.well-known/oauth-protected-resource` itself publishes no documents,
+so discovery on its Access Points answers `503` and their settings are
+refused on save. `scopes` are advertised as
 `scopes_supported`. A variant that overrides `caller_authentication` carries
 its own setting or none.
 

@@ -62,7 +62,8 @@ changes:
         The /.well-known/oauth-protected-resource documents answered without CORS headers and
         refused the preflight, so an MCP client running in a browser on another origin could not
         find the authorization server. Any origin may now read them with GET or HEAD; other
-        methods keep the cors allowlist. Without the gateway STS profile, a path no surface
+        methods keep the cors allowlist. Responses to allowed origins now expose WWW-Authenticate,
+        so a browser client can read the 401 challenge. Without the gateway STS profile, a path no surface
         publishes still reaches a channel or proxy route at the root or at /.well-known, and is
         otherwise a plain 404 instead of the static fallback.
   removed: []
