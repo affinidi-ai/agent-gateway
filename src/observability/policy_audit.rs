@@ -110,8 +110,7 @@ tokio::task_local! {
 /// zero).
 pub fn new_request_id() -> String {
     loop {
-        let mut bytes = [0u8; 8];
-        bytes.copy_from_slice(&uuid::Uuid::new_v4().as_bytes()[..8]);
+        let bytes = rand::random::<[u8; 8]>();
         if bytes != [0u8; 8] {
             return hex::encode(bytes);
         }
@@ -655,6 +654,11 @@ mod tests {
         }
         let distinct: std::collections::HashSet<&String> = ids.iter().collect();
         assert_eq!(distinct.len(), ids.len());
+        let thirteenth: std::collections::HashSet<char> = ids
+            .iter()
+            .filter_map(|id| id.chars().nth(12))
+            .collect();
+        assert!(thirteenth.len() > 1, "every character is random, none fixed by a UUID version");
     }
 
     #[tokio::test]
