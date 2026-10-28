@@ -8099,17 +8099,20 @@ mod tests {
         )
         .await;
         let versions = crate::mcp::request_validation::MODERN_CAPABLE_POLICY;
-        for (case, modern, status, reason, requested_variant) in [
-            ("empty-catalog", true, 404, RejectionReason::UnknownVariant, Some("unknown")),
-            ("unknown", true, 404, RejectionReason::UnknownVariant, Some("unknown")),
-            ("unknown", false, 404, RejectionReason::UnknownVariant, Some("unknown")),
-            ("disabled", true, 404, RejectionReason::VariantDisabled, None),
-            ("disabled", false, 404, RejectionReason::VariantDisabled, None),
-            ("missing-default", true, 500, RejectionReason::MisconfiguredDefault, None),
-            ("missing-default", false, 500, RejectionReason::MisconfiguredDefault, None),
-            ("empty-catalog-missing-default", false, 500, RejectionReason::MisconfiguredDefault, None),
-            ("disabled-default", true, 404, RejectionReason::VariantDisabled, None),
+        let code = i64::from(crate::mcp::error_codes::INTERNAL_ERROR);
+        for (case, modern, malformed, status, reason, requested_variant) in [
+            ("empty-catalog", true, false, 404, RejectionReason::UnknownVariant, Some("unknown")),
+            ("unknown", true, false, 404, RejectionReason::UnknownVariant, Some("unknown")),
+            ("unknown", true, true, 404, RejectionReason::UnknownVariant, Some("unknown")),
+            ("unknown", false, false, 404, RejectionReason::UnknownVariant, Some("unknown")),
+            ("disabled", true, false, 404, RejectionReason::VariantDisabled, None),
+            ("disabled", false, false, 404, RejectionReason::VariantDisabled, None),
+            ("missing-default", true, false, 500, RejectionReason::MisconfiguredDefault, None),
+            ("missing-default", false, false, 500, RejectionReason::MisconfiguredDefault, None),
+            ("empty-catalog-missing-default", false, false, 500, RejectionReason::MisconfiguredDefault, None),
+            ("disabled-default", true, false, 404, RejectionReason::VariantDisabled, None),
         ] {
+            let label = format!("{case} modern={modern} malformed={malformed}");
             let mut surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
                 "surface_id": "variant-surface", "name": "Variant surface",
                 "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "a2a"},
@@ -8154,8 +8157,13 @@ mod tests {
                     "io.modelcontextprotocol/clientCapabilities": {}
                 }});
             }
+            let body = if malformed {
+                "not json".to_string()
+            } else {
+                body.to_string()
+            };
             let request = request
-                .body(axum::body::Body::from(body.to_string()))
+                .body(axum::body::Body::from(body))
                 .unwrap();
             let (response, events) =
                 crate::audit::producer::capture(Box::pin(outbound_proxy_handler_with_mcp_versions(
@@ -8168,7 +8176,30 @@ mod tests {
                 )))
                 .await;
             let response = response.unwrap_or_else(|error| error.into_response());
-            assert_eq!(response.status().as_u16(), status, "{case} modern={modern}");
+            assert_eq!(response.status().as_u16(), status, "{label}");
+            let content_type = response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            let answer: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 16384)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            if modern {
+                assert_eq!(content_type, "application/json", "{label}");
+                assert_eq!(answer["jsonrpc"], "2.0", "{label}: {answer}");
+                let id = (!malformed).then_some("variant");
+                assert_eq!(answer.get("id").and_then(serde_json::Value::as_str), id, "{label}: {answer}");
+                assert_eq!(answer.get("id").is_some(), id.is_some(), "{label}: no null id: {answer}");
+                assert_eq!(answer["error"]["code"], code, "{label}: {answer}");
+            } else {
+                assert_eq!(content_type, "application/problem+json", "{label}");
+                assert!(answer.get("jsonrpc").is_none(), "{label}: {answer}");
+            }
             let refusals: Vec<_> = events
                 .iter()
                 .filter_map(|event| match &event.event {
@@ -8176,16 +8207,22 @@ mod tests {
                         stage,
                         reason,
                         http_status,
+                        rpc_error_code,
                         requested_variant,
-                        ..
-                    } => Some((*stage, *reason, *http_status, requested_variant.clone())),
+                    } => Some((*stage, *reason, *http_status, *rpc_error_code, requested_variant.clone())),
                     _ => None,
                 })
                 .collect();
             assert_eq!(
                 refusals,
-                vec![(RejectionStage::Routing, reason, Some(status), requested_variant.map(str::to_string))],
-                "{case} modern={modern}"
+                vec![(
+                    RejectionStage::Routing,
+                    reason,
+                    Some(status),
+                    modern.then_some(code),
+                    requested_variant.map(str::to_string)
+                )],
+                "{label}"
             );
             let expected_variant = match reason {
                 RejectionReason::UnknownVariant => Some("_unknown_"),
@@ -8197,14 +8234,14 @@ mod tests {
                     .surface_variant
                     .as_deref(),
                 expected_variant,
-                "{case} modern={modern}"
+                "{label}"
             );
             assert_eq!(
                 target
                     .request_count
                     .load(std::sync::atomic::Ordering::SeqCst),
                 0,
-                "{case} modern={modern}"
+                "{label}"
             );
         }
     }
