@@ -1284,6 +1284,9 @@ mod tests {
         let mut f = Fixture::with_segment_bytes(1);
         let factory = RecordingFactory::default();
         let sinks = registry(&[SinkId::AuditLog, sink.clone()]);
+        f.cursors
+            .set(&sink, 0)
+            .unwrap();
         let manager = tokio::spawn(run_dispatcher(
             factory.clone(),
             sinks,
