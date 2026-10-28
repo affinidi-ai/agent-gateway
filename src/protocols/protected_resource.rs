@@ -44,12 +44,6 @@ pub fn supports_protected_resource(protocol: &SurfaceProtocol) -> bool {
     *protocol == SurfaceProtocol::Mcp
 }
 
-/// Whether `path` is a protected resource metadata document: the root form
-/// or the form followed by a resource path (RFC 9728 section 3.1).
-pub fn is_metadata_path(path: &str) -> bool {
-    path == "/.well-known/oauth-protected-resource" || path.starts_with("/.well-known/oauth-protected-resource/")
-}
-
 /// A resource identifier and the scopes advertised for it: a canonical HTTPS
 /// URL without credentials, query or fragment, and bounded OAuth scope tokens.
 pub fn validate_resource(
@@ -415,10 +409,11 @@ fn caller_authentication_metadata(
 
 /// Protected resource metadata on an inbound listener. MCP Access Points
 /// whose caller authentication publishes a document are matched first, then
-/// the gateway STS Resource Server. Without the gateway STS profile, a request
-/// no Access Point answers is routed like any other request.
+/// the gateway STS Resource Server. Without the gateway STS profile, a path no
+/// Access Point publishes is a plain `404`: MCP clients probe these paths
+/// during discovery, so they are not proxied, logged or audited as requests
+/// without a route.
 pub async fn protected_resource_metadata(
-    axum::extract::ConnectInfo(address): axum::extract::ConnectInfo<std::net::SocketAddr>,
     axum::extract::State(state): axum::extract::State<crate::state::MultiSurfaceProxyState>,
     request: axum::extract::Request,
 ) -> Response {
@@ -452,14 +447,7 @@ pub async fn protected_resource_metadata(
             crate::mcp::resource_server::surface_metadata(axum::extract::State(state), axum::extract::OriginalUri(uri))
                 .await
         }
-        Ok(None) => {
-            crate::proxy::handler::multi_channel_proxy_handler(
-                axum::extract::ConnectInfo(address),
-                axum::extract::State(state),
-                request,
-            )
-            .await
-        }
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
@@ -525,20 +513,6 @@ pub(crate) mod fixtures {
 mod tests {
     use super::fixtures::*;
     use super::*;
-
-    #[test]
-    fn metadata_paths_are_the_root_form_and_its_resource_paths() {
-        for path in ["/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp/alpha"] {
-            assert!(is_metadata_path(path), "{path}");
-        }
-        for path in [
-            "/.well-known/oauth-protected-resource-other",
-            "/mcp/.well-known/oauth-protected-resource",
-            "/.well-known/oauth-authorization-server",
-        ] {
-            assert!(!is_metadata_path(path), "{path}");
-        }
-    }
 
     #[test]
     fn protected_resource_settings_take_only_https_issuers_and_bounded_scopes() {

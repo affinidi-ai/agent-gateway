@@ -43,20 +43,16 @@ fn parse_cors_origins(cors_origins: &[String]) -> Arc<Vec<HeaderValue>> {
 }
 
 /// Any origin may read a public discovery document (`GET`/`HEAD` of a public
-/// path or of protected resource metadata, which browser MCP clients fetch
-/// cross-origin); every other request, including a `POST` to a path that only
-/// ends like one, needs an allowlisted origin. `method` is the method the
-/// request will use: for a preflight, its `Access-Control-Request-Method`.
+/// path); every other request, including a `POST` to a path that only ends
+/// like one, needs an allowlisted origin. `method` is the method the request
+/// will use: for a preflight, its `Access-Control-Request-Method`.
 fn is_proxy_cors_origin_allowed(
     origin: &HeaderValue,
     method: &str,
     path: &str,
     origins: &[HeaderValue],
 ) -> bool {
-    let reads = method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD");
-    if crate::proxy::paths::is_public_request(method, path)
-        || reads && crate::protocols::protected_resource::is_metadata_path(path)
-    {
+    if crate::proxy::paths::is_public_request(method, path) {
         return true;
     }
 
@@ -85,6 +81,21 @@ fn cors_request_method(request_parts: &RequestParts) -> String {
 }
 
 fn proxy_cors_layer(cors_origins: &[String]) -> CorsLayer {
+    cors_layer(cors_origins, false)
+}
+
+/// CORS for protected resource metadata: browser MCP clients on any origin
+/// read it with `GET` or `HEAD`, and other methods keep the `cors` allowlist.
+/// It is layered on the metadata routes only, so a channel that proxies a path
+/// under them does not open its Target's responses to every origin.
+fn metadata_cors_layer(cors_origins: &[String]) -> CorsLayer {
+    cors_layer(cors_origins, true)
+}
+
+fn cors_layer(
+    cors_origins: &[String],
+    any_origin_reads: bool,
+) -> CorsLayer {
     let origins = parse_cors_origins(cors_origins);
 
     CorsLayer::new()
@@ -96,9 +107,33 @@ fn proxy_cors_layer(cors_origins: &[String]) -> CorsLayer {
                 .path()
                 .to_string();
             let method = cors_request_method(request_parts);
-            async move { is_proxy_cors_origin_allowed(&origin, &method, &path, &origins) }
+            let reads = method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD");
+            async move { any_origin_reads && reads || is_proxy_cors_origin_allowed(&origin, &method, &path, &origins) }
         }))
         .allow_headers(Any)
+}
+
+/// The configured prefix that serves `/.well-known/oauth-protected-resource`
+/// itself, if any. Its routes would collide with the metadata routes, so the
+/// listener leaves the path to it and publishes no metadata documents.
+fn metadata_path_owner(network_config: &crate::config::NetworkConfig) -> Option<&str> {
+    network_config
+        .channels
+        .iter()
+        .chain(
+            network_config
+                .mcp_proxies
+                .iter()
+                .flatten(),
+        )
+        .map(|channel| channel.prefix.as_str())
+        .chain(
+            network_config
+                .routes
+                .values()
+                .map(|route| route.prefix.as_str()),
+        )
+        .find(|prefix| prefix.trim_end_matches('/') == "/.well-known/oauth-protected-resource")
 }
 
 pub fn init_certificates_store(store: Arc<dyn crate::certificates::CertificateStore>) {
@@ -590,19 +625,27 @@ pub async fn run_port_server(
         profile.validate_network(&network_config)?;
         app = app.merge(profile.discovery_router()?);
     }
-    app = app.merge(
-        Router::new()
-            .route(
-                "/.well-known/oauth-protected-resource",
-                axum::routing::any(crate::protocols::protected_resource::protected_resource_metadata),
-            )
-            .route(
-                "/.well-known/oauth-protected-resource/{*path}",
-                axum::routing::any(crate::protocols::protected_resource::protected_resource_metadata),
-            )
-            .layer(proxy_cors_layer(&network_config.cors))
-            .with_state(state.as_ref().clone()),
-    );
+    match metadata_path_owner(&network_config) {
+        Some(prefix) => warn!(
+            prefix,
+            "A configured prefix serves /.well-known/oauth-protected-resource; this listener publishes no protected resource metadata"
+        ),
+        None => {
+            app = app.merge(
+                Router::new()
+                    .route(
+                        "/.well-known/oauth-protected-resource",
+                        axum::routing::any(crate::protocols::protected_resource::protected_resource_metadata),
+                    )
+                    .route(
+                        "/.well-known/oauth-protected-resource/{*path}",
+                        axum::routing::any(crate::protocols::protected_resource::protected_resource_metadata),
+                    )
+                    .layer(metadata_cors_layer(&network_config.cors))
+                    .with_state(state.as_ref().clone()),
+            );
+        }
+    }
 
     // Note: SPA-route collision validation is performed once at startup in
     // server::orchestrator before any port is spawned, where a hard exit can
@@ -1597,9 +1640,63 @@ mod tests {
             &origins,
         ));
         assert!(is_proxy_cors_origin_allowed(&origin, "HEAD", "/agents/copilot-worker/discovery", &origins,));
-        for path in ["/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp/alpha"] {
-            assert!(is_proxy_cors_origin_allowed(&origin, "GET", path, &origins), "{path}");
-            assert!(!is_proxy_cors_origin_allowed(&origin, "POST", path, &origins), "{path}");
+    }
+
+    #[tokio::test]
+    async fn only_the_metadata_routes_let_any_origin_read_protected_resource_metadata() {
+        use axum::http::{Request, StatusCode, header};
+        use tower::ServiceExt;
+        let request = |method: &str, preflight_for: Option<&str>| {
+            let mut request = Request::builder()
+                .method(method)
+                .uri("/.well-known/oauth-protected-resource/mcp/alpha")
+                .header(header::ORIGIN, "https://client.example");
+            if let Some(requested) = preflight_for {
+                request = request.header(header::ACCESS_CONTROL_REQUEST_METHOD, requested);
+            }
+            request
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        let allowed = |layer: CorsLayer, method: &'static str, preflight_for: Option<&'static str>| async move {
+            Router::new()
+                .route("/{*path}", axum::routing::any(|| async { StatusCode::OK }))
+                .layer(layer)
+                .oneshot(request(method, preflight_for))
+                .await
+                .unwrap()
+                .headers()
+                .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+        };
+        let cors = ["https://dashboard.example.com".to_string()];
+
+        assert!(allowed(metadata_cors_layer(&cors), "GET", None).await);
+        assert!(allowed(metadata_cors_layer(&cors), "HEAD", None).await);
+        assert!(allowed(metadata_cors_layer(&cors), "OPTIONS", Some("GET")).await);
+        assert!(!allowed(metadata_cors_layer(&cors), "OPTIONS", Some("POST")).await);
+        // A channel proxying the same path keeps the allowlist.
+        assert!(!allowed(proxy_cors_layer(&cors), "GET", None).await);
+    }
+
+    #[test]
+    fn a_prefix_at_the_metadata_path_keeps_it() {
+        let mut network = crate::protocols::protected_resource::fixtures::discovery_network();
+        assert_eq!(metadata_path_owner(&network), None);
+        for prefix in ["/.well-known", "/.well-known/oauth-protected-resource/mcp", "/agents"] {
+            network.channels = vec![crate::config::network::ChannelPrefix {
+                id: "channel".into(),
+                name: "channel".into(),
+                prefix: prefix.into(),
+            }];
+            assert_eq!(metadata_path_owner(&network), None, "{prefix}");
+        }
+        for prefix in ["/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/"] {
+            network.channels = vec![crate::config::network::ChannelPrefix {
+                id: "channel".into(),
+                name: "channel".into(),
+                prefix: prefix.into(),
+            }];
+            assert_eq!(metadata_path_owner(&network), Some(prefix));
         }
     }
 

@@ -56,7 +56,8 @@ changes:
         The /.well-known/oauth-protected-resource documents answered without CORS headers and
         refused the preflight, so an MCP client running in a browser on another origin could not
         find the authorization server. Any origin may now read them with GET or HEAD; other
-        methods keep the cors allowlist.
+        methods keep the cors allowlist. Without the gateway STS profile, a path no surface
+        publishes is now a plain 404 instead of the static fallback.
   removed: []
   security:
     - timestamp: '2026-10-27T11:20:02Z'

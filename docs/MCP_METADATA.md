@@ -1400,7 +1400,8 @@ The document is served at `/.well-known/oauth-protected-resource<route>` and
 the Access Point's listener, with `no-store`, and at the root form only for a
 surface mounted at `/`. Any origin may read it (`GET` and `HEAD`, CORS
 included), so a browser-based MCP client can fetch it; other methods keep the
-network configuration's `cors` allowlist. It holds `resource`, `authorization_servers`,
+network configuration's `cors` allowlist. That CORS rule is layered on these
+routes only, so a channel that proxies a path under them keeps the allowlist. It holds `resource`, `authorization_servers`,
 `bearer_methods_supported: ["header"]` and `scopes_supported` when scopes are
 set. Only active surfaces and enabled variants publish. When the settings
 claiming a path no longer validate at request time, for example after the
@@ -1411,7 +1412,11 @@ it, so the same route on two listeners publishes each listener's own
 document. Inbound listeners route both well-known paths whether or not
 `sts.mcp_issuer` is configured: a path no caller authentication publishes
 falls to the gateway STS document when the profile is configured, and is
-otherwise routed like any other request, as before.
+otherwise a plain `404`, without proxying it or logging and auditing it as a
+request without a route, since MCP clients probe these paths during
+discovery. A listener whose channel, MCP Proxy or route
+prefix is `/.well-known/oauth-protected-resource` itself leaves the path to
+that prefix and publishes no documents, with a warning at startup.
 
 A request to such an Access Point whose bearer token is missing,
 malformed, expired or otherwise refused by the JWT verification strategy is

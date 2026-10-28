@@ -148,18 +148,28 @@ async fn an_mcp_access_point_publishes_the_protected_resource_its_caller_authent
             .unwrap()["resource"],
         "https://gateway.example/smoke$beta"
     );
+    // Without the gateway STS profile, a path nothing publishes is a plain 404:
+    // never proxied, and not answered as a request without a route.
+    let before = harness
+        .mock
+        .request_count
+        .load(Ordering::SeqCst);
     for unpublished in ["", "/elsewhere", "/smoke/tools"] {
-        assert_eq!(
-            client
-                .get(metadata_url(&harness, unpublished))
-                .send()
-                .await
-                .unwrap()
-                .status(),
-            404,
-            "{unpublished}"
-        );
+        let response = client
+            .get(metadata_url(&harness, unpublished))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404, "{unpublished}");
+        assert_eq!(response.text().await.unwrap(), "", "{unpublished}");
     }
+    assert_eq!(
+        harness
+            .mock
+            .request_count
+            .load(Ordering::SeqCst),
+        before
+    );
 
     let surfaces = format!("{}/api/v1/surfaces", harness.gateway_base);
     let listen_address = harness
