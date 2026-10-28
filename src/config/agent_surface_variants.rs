@@ -1089,14 +1089,19 @@ mod tests {
     }
 
     #[test]
-    fn empty_variants_with_alias_pass_through() {
-        // Migration window: when no variants are configured, alias is
-        // ignored instead of returning `UnknownAlias`.
-        let s = base_surface();
-        let resolved = s
-            .resolve_variant(Some("dev"))
-            .expect("resolve");
-        assert_eq!(resolved.target.endpoint, "https://prod.example.com");
+    fn a_surface_with_no_variants_resolves_neither_an_alias_nor_a_dangling_default() {
+        let mut s = base_surface();
+        assert_eq!(
+            s.resolve_variant(Some("dev"))
+                .map(|_| ()),
+            Err(VariantResolveError::UnknownAlias("dev".to_string()))
+        );
+        s.default_variant_id = Some("removed".to_string());
+        assert_eq!(
+            s.resolve_variant(None)
+                .map(|_| ()),
+            Err(VariantResolveError::MisconfiguredDefault("removed".to_string()))
+        );
     }
 
     // ── Resolution by alias ─────────────────────────────────────────────
