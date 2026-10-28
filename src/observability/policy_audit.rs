@@ -98,17 +98,40 @@ tokio::task_local! {
     /// when no OTEL exporter is configured. Absent elsewhere (`try_with` errs).
     pub static REQUEST_TRACE_ID: String;
 
-    /// Id of the gateway request being served, installed at each entry point
+    /// The gateway request being served, installed at each entry point
     /// (Access Point, Transit Point, fabric receive, authenticated management
-    /// API request) and stamped on every audit
-    /// record the request produces. Always minted here, never read from a
-    /// header or token.
-    pub static REQUEST_ID: String;
+    /// API request). Its id and variant are stamped on every audit record the
+    /// request produces.
+    static REQUEST: Arc<RequestScope>;
+}
+
+/// One gateway request: its id, minted here and never read from a header or
+/// token, and the surface variant routing resolved it to, set once routing
+/// knows it.
+#[derive(Debug)]
+pub struct RequestScope {
+    id: String,
+    variant: std::sync::OnceLock<String>,
+}
+
+impl RequestScope {
+    /// A request with id `id` and no variant yet.
+    pub fn new(id: String) -> Arc<Self> {
+        Arc::new(Self {
+            id,
+            variant: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// A request with a fresh id.
+    pub fn fresh() -> Arc<Self> {
+        Self::new(new_request_id())
+    }
 }
 
 /// A fresh request id: a W3C span id (16 lowercase hex characters, never all
 /// zero).
-pub fn new_request_id() -> String {
+fn new_request_id() -> String {
     loop {
         let bytes = rand::random::<[u8; 8]>();
         if bytes != [0u8; 8] {
@@ -119,29 +142,54 @@ pub fn new_request_id() -> String {
 
 /// The id of the request being served, when an entry point scoped one.
 pub fn current_request_id() -> Option<String> {
-    REQUEST_ID
-        .try_with(String::clone)
+    REQUEST
+        .try_with(|scope| scope.id.clone())
         .ok()
 }
 
-/// Runs `future` as request `id`: every audit record it writes carries the id.
-/// An entry point serves its request through this and passes the response to
-/// [`response_in_request`].
+/// Records the surface variant the request being served resolved to. Only
+/// surface routing calls this; the first value set is kept. Does nothing
+/// outside a request.
+pub fn set_request_variant(variant: &str) {
+    let _ = REQUEST.try_with(|scope| {
+        scope
+            .variant
+            .set(variant.to_string())
+    });
+}
+
+/// The surface variant the request being served resolved to, when routing
+/// set one.
+pub fn current_request_variant() -> Option<String> {
+    REQUEST
+        .try_with(|scope| {
+            scope
+                .variant
+                .get()
+                .cloned()
+        })
+        .ok()
+        .flatten()
+}
+
+/// Runs `future` as request `scope`: every audit record it writes carries
+/// the request's id and variant. An entry point serves its request through
+/// this and passes the response to [`response_in_request`].
 pub async fn in_request<F: std::future::Future>(
-    id: String,
+    scope: Arc<RequestScope>,
     future: F,
 ) -> F::Output {
-    REQUEST_ID
-        .scope(id, future)
+    REQUEST
+        .scope(scope, future)
         .await
 }
 
-/// `response` with a streamed body read as request `id`. A streamed body (an
-/// SSE stream) is read after its handler returned, outside the handler's
-/// scope, so the records written per event would otherwise lose the id. A
-/// body of known length is left as it is.
+/// `response` with a streamed body read as request `scope`. A streamed body
+/// (an SSE stream) is read after its handler returned, outside the handler's
+/// scope, so the records written per event would otherwise lose the request.
+/// A body of known length is left as it is.
 pub fn response_in_request(
-    id: String,
+    scope: Arc<RequestScope>,
     response: axum::response::Response,
 ) -> axum::response::Response {
     use axum::body::HttpBody;
@@ -158,21 +206,22 @@ pub fn response_in_request(
     response.map(|body| {
         let mut data = body.into_data_stream();
         axum::body::Body::from_stream(futures::stream::poll_fn(move |cx| {
-            REQUEST_ID.sync_scope(id.clone(), || data.poll_next_unpin(cx))
+            REQUEST.sync_scope(scope.clone(), || data.poll_next_unpin(cx))
         }))
     })
 }
 
 /// Spawns `future` as the request being served, so the audit records it
-/// writes carry the request's id, as the task-local does not cross a spawn.
+/// writes carry the request's id and variant, as the task-local does not
+/// cross a spawn.
 pub fn spawn_in_request<F>(future: F) -> tokio::task::JoinHandle<F::Output>
 where
     F: std::future::Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    match current_request_id() {
-        Some(id) => tokio::spawn(REQUEST_ID.scope(id, future)),
-        None => tokio::spawn(future),
+    match REQUEST.try_with(Arc::clone) {
+        Ok(scope) => tokio::spawn(REQUEST.scope(scope, future)),
+        Err(_) => tokio::spawn(future),
     }
 }
 
@@ -661,14 +710,47 @@ mod tests {
         assert!(thirteenth.len() > 1, "every character is random, none fixed by a UUID version");
     }
 
+    fn request(id: &str) -> Arc<RequestScope> {
+        RequestScope::new(id.to_string())
+    }
+
     #[tokio::test]
     async fn the_current_request_id_is_the_scoped_one_and_none_outside() {
         assert_eq!(current_request_id(), None);
-        REQUEST_ID
-            .scope("0123456789abcdef".to_string(), async {
-                assert_eq!(current_request_id().as_deref(), Some("0123456789abcdef"));
-            })
-            .await;
+        in_request(request("0123456789abcdef"), async {
+            assert_eq!(current_request_id().as_deref(), Some("0123456789abcdef"));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_variant_set_in_a_request_is_read_back() {
+        let variant = in_request(request("0123456789abcdef"), async {
+            assert_eq!(current_request_variant(), None, "routing has not set it yet");
+            set_request_variant("beta");
+            current_request_variant()
+        })
+        .await;
+
+        assert_eq!(variant.as_deref(), Some("beta"));
+    }
+
+    #[tokio::test]
+    async fn a_second_variant_set_in_a_request_is_ignored() {
+        let variant = in_request(request("0123456789abcdef"), async {
+            set_request_variant("beta");
+            set_request_variant("_base_");
+            current_request_variant()
+        })
+        .await;
+
+        assert_eq!(variant.as_deref(), Some("beta"));
+    }
+
+    #[test]
+    fn outside_a_request_there_is_no_variant() {
+        set_request_variant("beta");
+        assert_eq!(current_request_variant(), None);
     }
 
     #[tokio::test]
@@ -676,17 +758,23 @@ mod tests {
         use futures::StreamExt;
 
         let chunks = futures::stream::repeat_with(|| {
-            Ok::<_, std::convert::Infallible>(bytes::Bytes::from(current_request_id().unwrap_or_default()))
+            Ok::<_, std::convert::Infallible>(bytes::Bytes::from(format!(
+                "{}:{};",
+                current_request_id().unwrap_or_default(),
+                current_request_variant().unwrap_or_default()
+            )))
         })
         .take(2);
         let response = axum::response::Response::new(axum::body::Body::from_stream(chunks));
+        let scope = request("0123456789abcdef");
+        in_request(scope.clone(), async { set_request_variant("beta") }).await;
 
-        let response = response_in_request("0123456789abcdef".to_string(), response);
+        let response = response_in_request(scope, response);
         let body = axum::body::to_bytes(response.into_body(), 64)
             .await
             .unwrap();
 
-        assert_eq!(body, "0123456789abcdef0123456789abcdef");
+        assert_eq!(body, "0123456789abcdef:beta;0123456789abcdef:beta;");
     }
 
     #[test]
@@ -694,7 +782,7 @@ mod tests {
         use axum::body::HttpBody;
 
         let response = axum::response::Response::new(axum::body::Body::from("{}"));
-        let response = response_in_request("0123456789abcdef".to_string(), response);
+        let response = response_in_request(request("0123456789abcdef"), response);
 
         assert_eq!(
             response
@@ -706,19 +794,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_task_spawned_in_a_request_keeps_its_id() {
-        let spawned = in_request("0123456789abcdef".to_string(), async {
-            spawn_in_request(async { current_request_id() })
+    async fn a_task_spawned_in_a_request_keeps_its_id_and_variant() {
+        let spawned = in_request(request("0123456789abcdef"), async {
+            set_request_variant("beta");
+            spawn_in_request(async { (current_request_id(), current_request_variant()) })
                 .await
                 .unwrap()
         })
         .await;
-        let outside = spawn_in_request(async { current_request_id() })
+        let outside = spawn_in_request(async { (current_request_id(), current_request_variant()) })
             .await
             .unwrap();
 
-        assert_eq!(spawned.as_deref(), Some("0123456789abcdef"));
-        assert_eq!(outside, None);
+        assert_eq!(spawned, (Some("0123456789abcdef".to_string()), Some("beta".to_string())));
+        assert_eq!(outside, (None, None));
     }
 
     #[test]

@@ -259,6 +259,14 @@ mod tests {
         rx.try_iter().collect()
     }
 
+    async fn in_request<F: std::future::Future>(
+        id: &str,
+        future: F,
+    ) -> F::Output {
+        use crate::observability::policy_audit::{RequestScope, in_request};
+        in_request(RequestScope::new(id.to_string()), future).await
+    }
+
     #[test]
     fn a_record_no_sink_selects_is_never_built() {
         let (producer, rx) = producer(&[(SinkId::AuditLog, &["policy_decision"])]);
@@ -431,11 +439,10 @@ mod tests {
     async fn a_record_submitted_in_a_request_scope_carries_its_request_id() {
         let (producer, rx) = producer(&[(SinkId::AuditLog, &["consent_granted"])]);
 
-        crate::observability::policy_audit::REQUEST_ID
-            .scope("0123456789abcdef".to_string(), async {
-                producer.submit(consent());
-            })
-            .await;
+        in_request("0123456789abcdef", async {
+            producer.submit(consent());
+        })
+        .await;
 
         assert_eq!(
             received(&rx)[0]
@@ -452,11 +459,10 @@ mod tests {
         let mut record = consent();
         record.request_id = Some("fedcba9876543210".to_string());
 
-        crate::observability::policy_audit::REQUEST_ID
-            .scope("0123456789abcdef".to_string(), async {
-                producer.submit(record);
-            })
-            .await;
+        in_request("0123456789abcdef", async {
+            producer.submit(record);
+        })
+        .await;
 
         assert_eq!(
             received(&rx)[0]
@@ -486,15 +492,14 @@ mod tests {
         let (producer, rx) = producer(&[(SinkId::AuditLog, &["consent_granted"])]);
         let deferred = DeferredAudit::new(producer);
 
-        crate::observability::policy_audit::REQUEST_ID
-            .scope("0123456789abcdef".to_string(), async {
-                deferred
-                    .scope(async {
-                        producer.submit(consent());
-                    })
-                    .await;
-            })
-            .await;
+        in_request("0123456789abcdef", async {
+            deferred
+                .scope(async {
+                    producer.submit(consent());
+                })
+                .await;
+        })
+        .await;
         deferred.flush_with_vp("vp");
 
         assert_eq!(

@@ -9244,15 +9244,15 @@ async fn multi_channel_proxy_handler_with_mcp_runtime(
     mcp_versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
     mcp_continuations: Option<Arc<crate::mcp::continuations::config::ContinuationRuntime>>,
 ) -> Response {
-    use crate::observability::policy_audit::{in_request, new_request_id, response_in_request};
+    use crate::observability::policy_audit::{RequestScope, in_request, response_in_request};
 
-    let id = new_request_id();
+    let scope = RequestScope::fresh();
     let response = in_request(
-        id.clone(),
+        scope.clone(),
         Box::pin(multi_channel_proxy_handler_in_request_scope(addr, state, req, mcp_versions, mcp_continuations)),
     )
     .await;
-    response_in_request(id, response)
+    response_in_request(scope, response)
 }
 
 async fn multi_channel_proxy_handler_in_request_scope(

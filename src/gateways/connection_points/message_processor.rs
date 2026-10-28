@@ -3766,11 +3766,11 @@ pub(crate) async fn resolve_stream_surface(
     let (variant_id, surface) = match selected {
         Ok(selected) => selected,
         Err(error) => {
-            use crate::observability::policy_audit::{in_request, new_request_id};
+            use crate::observability::policy_audit::{RequestScope, in_request};
             let trace_id = request
                 .trace_id
                 .to_string();
-            in_request(new_request_id(), async {
+            in_request(RequestScope::fresh(), async {
                 crate::audit::request_events::refuse_routing(
                     &crate::audit::request_events::RequestFacts {
                         surface_id: &surface.surface_id,
@@ -3823,17 +3823,17 @@ async fn process_forward_request_with_mcp_runtime(
     mcp_versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
     mcp_continuations: Option<Arc<crate::mcp::continuations::config::ContinuationRuntime>>,
 ) -> ProcessingResult {
-    use crate::observability::policy_audit::{in_request, new_request_id, response_in_request};
+    use crate::observability::policy_audit::{RequestScope, in_request, response_in_request};
 
-    let id = new_request_id();
+    let scope = RequestScope::fresh();
     let result = in_request(
-        id.clone(),
+        scope.clone(),
         Box::pin(process_forward_request_in_request_scope(message, stream_request, mcp_versions, mcp_continuations)),
     )
     .await;
     match result {
         ProcessingResult::StreamingResponse { response } => ProcessingResult::StreamingResponse {
-            response: response_in_request(id, response),
+            response: response_in_request(scope, response),
         },
         other => other,
     }
