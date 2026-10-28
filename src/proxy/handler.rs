@@ -20787,4 +20787,117 @@ mod fabric_extended_card_tests {
             Some("ada@example.com")
         );
     }
+    #[tokio::test]
+    async fn fabric_send_target_trust_check_runs_the_surface_target_list_only() {
+        let mut peer = fabric_peer_answering(200, json!({"jsonrpc": "2.0", "id": "m-1", "result": {}})).await;
+        let registry_dir = tempfile::tempdir().unwrap();
+        peer.state
+            .trust_registry_listener_manager =
+            Some(Arc::new(crate::trust_registries::TrustRegistryListenerManager::new(
+                "gateway.example".to_string(),
+                registry_dir
+                    .path()
+                    .to_path_buf(),
+                None,
+            )));
+        let element = |id: &str, authority: &str| {
+            json!({
+                "id": id,
+                "trust_registry_id": "tr-none",
+                "query_type": "recognition",
+                "query": {"authority_id": authority, "entity_id": "did:x:entity"}
+            })
+        };
+        let mut surface = (*peer.state.surface).clone();
+        surface
+            .target
+            .trust_check_list = vec![serde_json::from_value(element("fabric-target", "did:x:target")).unwrap()];
+        surface.transit = Some(
+            serde_json::from_value(json!({"points": [{
+                "alias": "partner-a",
+                "target_endpoint": "https://partner.example/a2a",
+                "protocol": "a2a",
+                "trust_check_list": [element("tp-a", "did:x:transit"), element("tp-b", "did:x:transit")]
+            }]}))
+            .unwrap(),
+        );
+        surface
+            .access_point
+            .listen_address = "http://127.0.0.1:1".to_string();
+        let policies = Arc::new(
+            crate::policies::policy_definitions::FileSystemPolicyDefinitionStore::new(
+                registry_dir
+                    .path()
+                    .join("policies")
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+            .await
+            .unwrap(),
+        );
+        let policy: crate::policies::policy_definitions::PolicyDefinition = serde_json::from_value(json!({
+            "id": "allow-all", "name": "Allow all", "policy_type": "agent_surface",
+            "policy": "package surface.policy\ndefault allow = true", "created_at": "2026-09-01T00:00:00Z"
+        }))
+        .unwrap();
+        policies
+            .save(policy.clone())
+            .await
+            .unwrap();
+        surface.target.policy = Some(crate::config::agent_surface::PolicyRef {
+            policy_definition_id: policy.id,
+            require_agent_context: false,
+        });
+        let policy_manager = Arc::new(crate::policies::SurfacePolicyManager::new());
+        policy_manager.set_policy_definition_store(policies);
+        policy_manager
+            .update_channel_policy(&surface)
+            .await
+            .unwrap();
+        peer.state.policy_manager = Some(policy_manager);
+        peer.state.surface = Arc::new(surface);
+        let body = json!({
+            "jsonrpc": "2.0", "id": "m-1", "method": "message/send",
+            "params": {"message": {"role": "user", "parts": [{"kind": "text", "text": "hi"}], "messageId": "m-1"}}
+        });
+
+        let (_, events) = crate::audit::producer::capture(Box::pin(super::handle_fabric_request(
+            peer.state.clone(),
+            "Fabric A2A",
+            axum::http::Method::POST,
+            "https://gateway.example/a2a"
+                .parse()
+                .unwrap(),
+            axum::http::HeaderMap::new(),
+            "127.0.0.1:12345".to_string(),
+            std::time::Instant::now(),
+            super::ConnectionGuard::new(None, None),
+            axum::body::Bytes::from(body.to_string()),
+            "trace-1".to_string(),
+            None,
+            None,
+            None,
+            None,
+            crate::mcp::meta::McpMetadataContext::default(),
+            None,
+            None,
+            None,
+            None,
+        )))
+        .await;
+
+        let trust_checks: Vec<_> = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                crate::delegation_vault::audit::DelegationAuditAction::TrustCheck {
+                    leg,
+                    authority_id,
+                    transit_point,
+                    ..
+                } => Some((leg.clone(), authority_id.clone(), transit_point.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(trust_checks, vec![("target".to_string(), Some("did:x:target".to_string()), None)]);
+    }
 }

@@ -3,6 +3,15 @@ import type { CanvasNode } from './SurfaceCanvas';
 import type { SurfaceNodeType } from './nodeTypes';
 import { readCanvasSurfaceSize, readCanvasView, registry } from './elements';
 import { computeAutoLayout } from './autoLayout';
+import {
+  managedAgentTargetLegTrustCheckAllowed,
+  TRUST_CHECK_CALLER_SLOT_ID,
+  TRUST_CHECK_MANAGED_AGENT_SLOT_ID,
+} from './elements/edges/archetypes';
+import {
+  isManagedAgentTrustCheck,
+  managedAgentTrustCheckRunsOnTransitPoints,
+} from './elements/trust-check/definition';
 
 /**
  * Reconstruct the live canvas nodes from a saved AgentSurface payload.
@@ -78,8 +87,73 @@ export interface HydratedSurfaceCanvas {
   didAutoLayout: boolean;
 }
 
+const EXTERNAL_TARGET_TYPES = new Set(['npc-endpoint', 'local-gateway-hop']);
+
+/** The two anchors of the arrow a Trust Check sits on. */
+function trustCheckArrow(node: CanvasNode, nodes: CanvasNode[]): [string, string] | null {
+  const parent = nodes.find(n => n.id === node.parentId);
+  if (parent && registry.isTransitPointType(parent.type)) return ['target', parent.id];
+  if (node.slotId === TRUST_CHECK_CALLER_SLOT_ID) return ['access-point', 'target'];
+  if (node.slotId === TRUST_CHECK_MANAGED_AGENT_SLOT_ID) {
+    const external = nodes.find(n => n.parentId === 'target' && EXTERNAL_TARGET_TYPES.has(n.type));
+    return external ? ['target', external.id] : null;
+  }
+  return null;
+}
+
+/**
+ * Places a Trust Check the stored layout has no position for (such as one
+ * the gateway moved onto a Transit Point) at the middle of its arrow, so
+ * the rest of the saved layout is kept.
+ */
+function placeTrustChecksWithoutPosition(nodes: CanvasNode[]): CanvasNode[] {
+  const byId = new Map(nodes.map(n => [n.id, n] as const));
+  return nodes.map(node => {
+    if (node.type !== 'trust-check' || node.position) return node;
+    const arrow = trustCheckArrow(node, nodes);
+    const from = arrow ? byId.get(arrow[0])?.position : undefined;
+    const to = arrow ? byId.get(arrow[1])?.position : undefined;
+    if (!from || !to) return node;
+    return { ...node, position: { x: (from.x + to.x) / 2, y: (from.y + to.y) / 2 } };
+  });
+}
+
+/**
+ * Drops the Managed Agent's own Trust Check when its target cannot run it
+ * (not `a2a-proxy://` or `fabric://`) and every Transit Point already runs
+ * the same queries, so no check is lost. Otherwise it stays and blocks Save.
+ */
+function dropRedundantManagedAgentTrustCheck(nodes: CanvasNode[]): CanvasNode[] {
+  const endpoint = nodes.find(n => n.type === 'target')?.config?.endpoint;
+  if (managedAgentTargetLegTrustCheckAllowed(endpoint)) return nodes;
+  const redundant = new Set(
+    nodes
+      .filter(
+        n =>
+          n.type === 'trust-check' &&
+          isManagedAgentTrustCheck(n, nodes) &&
+          managedAgentTrustCheckRunsOnTransitPoints(n.config, nodes)
+      )
+      .map(n => n.id)
+  );
+  if (redundant.size === 0) return nodes;
+  const parentOf = new Map(nodes.map(n => [n.id, n.parentId] as const));
+  const liveParent = (id: string | undefined): string | undefined => {
+    let current = id;
+    while (current && redundant.has(current)) current = parentOf.get(current);
+    return current;
+  };
+  return nodes
+    .filter(n => !redundant.has(n.id))
+    .map(n =>
+      n.parentId && redundant.has(n.parentId) ? { ...n, parentId: liveParent(n.parentId) } : n
+    );
+}
+
 export function hydrateSurfaceCanvas(surface: AgentSurface | null): HydratedSurfaceCanvas {
-  const nodes = reconstructNodesFromSurface(surface);
+  const nodes = placeTrustChecksWithoutPosition(
+    dropRedundantManagedAgentTrustCheck(reconstructNodesFromSurface(surface))
+  );
   const surfaceSize = readCanvasSurfaceSize(surface);
   const view = readCanvasView(surface);
   const visibleNodes = nodes.filter(node => node.type !== 'target-variant');

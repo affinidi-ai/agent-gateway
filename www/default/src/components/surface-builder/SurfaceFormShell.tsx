@@ -117,6 +117,8 @@ export interface SurfaceFormShellProps {
    * snapshot manager which swaps canvas state atomically.
    */
   onSwitchVariant?: (variantId: string) => void;
+  /** Stored snapshots of the variants not shown on the canvas. */
+  otherVariantSnapshots?: ReadonlyArray<unknown>;
   /**
    * Open the variants editor AND seed a new variant. Wired to the
    * widget's zero-state "+" affordance.
@@ -257,6 +259,7 @@ const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
   canvasViewRef,
   activeVariantId,
   onSwitchVariant,
+  otherVariantSnapshots,
   onAddVariant,
   topBanner,
   surfacePolicyLoadState,
@@ -358,6 +361,7 @@ const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
         canvasViewRef={canvasViewRef}
         activeVariantId={activeVariantId}
         onSwitchVariant={onSwitchVariant}
+        otherVariantSnapshots={otherVariantSnapshots}
         onAddVariant={onAddVariant}
         onCreateTemplateFromSelection={
           canEdit ? ids => createTemplateFromSelectionRef.current?.(ids) : undefined

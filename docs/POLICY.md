@@ -125,11 +125,114 @@ template syntax.
 
 ![Trust Check flow: inbound request, extract metadata, TRQP query, trust registry, then OPA policy decides](assets/diagrams/trust-check-flow.png)
 
-Each leg carries a `trust_check_list`: `AccessPoint.trust_check_list` for the caller leg
-and `Target.trust_check_list` for the target leg. A list holds at most
-`TRUST_CHECK_LIST_MAX` (10) elements
+Each leg carries a `trust_check_list`:
+
+| List | Runs on |
+| --- | --- |
+| `access_point.trust_check_list` | The caller leg, for requests arriving at the Access Point. |
+| `transit.points[].trust_check_list` | Requests the managed agent sends through that Transit Point, and no other. The Surface Builder adds Trust Checks to A2A and AP2 Transit Points only; on an MCP or HTTP Transit Point it shows a migrated copy read-only, to keep or remove. |
+| `target.trust_check_list` | The managed agent's own target leg: `a2a-proxy://` Targets and Fabric send. |
+
+A Transit Point with an empty list runs no Trust Check on its traffic: no agent-card fetch
+for trust, no identity verification, no TRQP query. A request through a Transit Point sees
+only that Transit Point's results, at `input.trust_check_results.target`, in all three
+outbound OPA scopes (gateway, surface, Transit Point).
+
+A list holds at most `TRUST_CHECK_LIST_MAX` (10) elements
 ([`src/config/agent_surface.rs`](../src/config/agent_surface.rs)). A surface variant
-override replaces the whole list verbatim, never element by element.
+override replaces the whole list verbatim, never element by element; a variant gives its
+Transit Points their own lists through its `transit.points` override.
+
+A write to the management API declares the per-Transit-Point shape with
+`trust_check_split: true`; the Surface Builder always sends it. A declared write is rejected
+with `400` when its `target.trust_check_list` is non-empty and its Managed Agent target is not
+`a2a-proxy://` or `fabric://` (an `http(s)` URL, `proxy://`, or no endpoint), because no stage
+runs that list for such a target. For a variant, only a target list the variant sets in its own
+override counts; an inherited list that cannot run on the variant's endpoint is ignored.
+
+A write that does not declare the shape is converted only while the stored surface has no
+Trust Check lists at all (no `trust_check_split` and no Transit Point lists): an undeclared
+create or `PUT` that carries a `target.trust_check_list` and no Transit Point lists is then
+treated as the old shape, converted exactly as a stored surface is (below), logged as a
+warning, and saved. Once the surface has Trust Check lists, an undeclared write cannot change
+them. An undeclared `PUT` keeps every stored Transit Point list for each Transit Point it sends
+without one, keeps the stored target list when it sends none, and is rejected with `400` if it
+sets a target list or a Transit Point list that differs from the stored one, including an
+explicit empty list, or leaves out a variant's own Transit Points that hold lists. A new
+Transit Point it adds without a list has no Trust Checks. An undeclared `PATCH` or variant write is
+rejected with `400` when it sets or clears a target list or Transit Points, including through a
+parent object such as `transit` or a variant's `overrides`, or by replacing `variants`; a
+variant `PUT` that sends `overrides` for a variant whose Transit Points hold lists counts as
+doing so. Such a write must be resent with `trust_check_split: true`. A `PATCH` that only moves
+an `a2a-proxy://` or `fabric://` target to another endpoint while its target list remains is
+rejected by the first rule until the list is removed.
+
+### Lists stored before per-Transit-Point checks
+
+Surfaces stored before Transit Points had their own lists kept one `target.trust_check_list`
+that ran on every Transit Point. The first time such a surface loads, the gateway copies that
+list onto each of its Transit Points (and those of each variant), marks each copy
+with `trust_check_migrated: true`, removes `target.trust_check_list` unless the Managed Agent
+target is `a2a-proxy://` or `fabric://`, sets `trust_check_split: true`, and saves the file. It logs the surface and the Transit Points that received copies,
+and warns when a list is removed without any Transit Point receiving it. Every Transit Point
+keeps its behaviour until an operator edits the surface. The Surface Builder flags
+each copy for review; through the API, remove a copy by saving the Transit Point without
+`trust_check_list` in a write that declares the shape.
+
+User-saved Surface Templates are converted the same way when they load, and when they are
+created, updated or imported without the marker; an imported export from an earlier release is
+converted. A template's endpoint is usually the `$TARGET_ENDPOINT` placeholder, so a template
+with a placeholder or empty endpoint keeps its `target.trust_check_list`, and its Transit Points
+still receive copies. When the Surface Builder loads a surface, including one created from such
+a template, whose target cannot run its target list and whose Transit Points all carry the same
+checks, it drops the Managed Agent's copy; otherwise the `400` above applies when the surface is
+saved.
+
+MCP and HTTP Transit Points receive a copy too, because the old list ran on them. There it
+usually reports `AGENT_CARD_UNAVAILABLE`, but an HTTP Transit Point whose destination serves an
+A2A agent card runs real identity and TRQP checks. The Surface Builder does not add Trust Checks
+to MCP or HTTP Transit Points and shows such a copy read-only, to keep or remove; the
+management API accepts a list on any Transit Point. Removing a copy during review means that
+Transit Point's traffic is no longer checked, so a policy that denied on its results allows
+it.
+
+A variant that inherited the base Transit Points but resolves to a different list receives
+its own copy of them in `overrides.transit.points`, so later edits to the base Transit Points,
+such as a new Transit Point, a changed destination or rotated credentials, no longer reach it.
+Variants saved by the Surface Builder already carry their own Transit Points and are not
+affected.
+
+`trust_check_split` is stored whenever the surface keeps a `target.trust_check_list` or any of
+its Transit Points has a `trust_check_list`. A surface file written outside the API in the
+per-Transit-Point shape must set it, or a target list in it is converted on load. When the
+marker is set and a target list sits on a target that cannot run it, the gateway logs a warning
+on load and the list never runs.
+
+The conversion is forward-only. A gateway release from before per-Transit-Point lists refuses a
+surface carrying `trust_check_split`, which every surface with Trust Checks on its target or
+Transit Points carries after the upgrade. It still loads a converted template, because it
+stores the template's surface unparsed, so applying it there can fail or create a surface
+without its Transit Point checks. Back up `_storage/agent_surfaces/` and
+`_storage/agent_surface_templates/` before upgrading if a rollback may be needed, and restore
+both on rollback.
+
+### Requiring checks in policy
+
+A Transit Point without checks leaves `input.trust_check_results` absent. Rules that only look
+for failures, such as `every r in input.trust_check_results.target { r.ok }` or a count of
+results with `ok == false` equal to zero, therefore allow every request through a Transit
+Point that has no checks, or whose checks were removed. Such a Transit Point also has no
+verified target identity: `input.agent` is absent in the gateway and surface scopes, and with
+`require_agent_context` the Transit Point scope reads it from the agent card's unsigned DID.
+When a policy requires Trust Checks, also require that they ran, or check specific element
+ids:
+
+```rego
+allow if {
+    count(input.trust_check_results.target) > 0
+    every r in input.trust_check_results.target { r.ok }
+}
+```
 
 Element validation is in
 [`src/trust_registry_verification/trust_check_element.rs`](../src/trust_registry_verification/trust_check_element.rs).
@@ -146,7 +249,7 @@ addressable from policy while `name` is only a label. Counts are code points, no
 When an audit sink selects `trust_check`, each element's outcome is recorded with the
 surface id, the request's trace id and the authenticated caller (on the Access Point, Fabric
 and MCP-proxy paths), so a trust check can be tied to the request and principal that
-triggered it.
+triggered it. On the outbound path the record also names the Transit Point.
 
 ## Failed caller authentication
 

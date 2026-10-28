@@ -50,6 +50,19 @@ pub(crate) async fn record_replacement_mock_observation(world: &mut SurfaceWorld
     if let Some(observations) = replacement_observation {
         world.record_secondary_observations(Some(observations));
     }
+    record_transit_point_mock_observations(world).await;
+}
+
+async fn record_transit_point_mock_observations(world: &mut SurfaceWorld) {
+    let mut observations = Vec::new();
+    if let Some(infra) = world.infra.as_ref() {
+        for (collaborator_key, mock) in &infra.transit_point_mocks {
+            observations.push((collaborator_key.clone(), read_mock_observation(mock).await));
+        }
+    }
+    for (collaborator_key, observation) in observations {
+        world.record_observations(&collaborator_key, observation);
+    }
 }
 
 pub(crate) async fn ensure_gateway_running(world: &mut SurfaceWorld) {
@@ -202,28 +215,36 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
             .surface_config
             .oauth_callback_base_url = Some(callback_base_url);
     }
-    let replacement_mock = if world
+    let mut replacement_mock = None;
+    let mut transit_point_mocks = std::collections::HashMap::new();
+    let mut transit_target_urls = std::collections::HashMap::new();
+    for transit_point in &world
         .surface_config
-        .transit_point
-        .is_some()
+        .transit_points
     {
-        Some(
-            MockServer::start(
-                world
-                    .collaborator_target(SECONDARY_COLLABORATOR_KEY)
-                    .configured_response
-                    .clone(),
-            )
-            .await,
+        let collaborator_key = world
+            .transit_point_collaborator_key(&transit_point.alias)
+            .to_string();
+        let mock = MockServer::start(
+            world
+                .collaborator_target(&collaborator_key)
+                .configured_response
+                .clone(),
         )
-    } else {
-        None
-    };
-    let (outbound_port, mut outbound_port_reservation) = if world
-        .surface_config
-        .transit_point
-        .is_some()
-    {
+        .await;
+        let target_url = if world.target_is_unreachable(&collaborator_key) {
+            "http://127.0.0.1:1".to_string()
+        } else {
+            mock.url()
+        };
+        transit_target_urls.insert(transit_point.alias.clone(), target_url);
+        if collaborator_key == SECONDARY_COLLABORATOR_KEY {
+            replacement_mock = Some(mock);
+        } else {
+            transit_point_mocks.insert(collaborator_key, mock);
+        }
+    }
+    let (outbound_port, mut outbound_port_reservation) = if !transit_target_urls.is_empty() {
         let (port, reservation) = config::reserve_free_port("gateway outbound port");
         (port, Some(reservation))
     } else {
@@ -255,21 +276,13 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
         (None, None)
     };
 
-    if let Some(transit_target_url) = replacement_mock
-        .as_ref()
-        .map(MockServer::url)
-    {
-        let transit_target_url = if world.target_is_unreachable(SECONDARY_COLLABORATOR_KEY) {
-            "http://127.0.0.1:1".to_string()
-        } else {
-            transit_target_url
-        };
+    if !transit_target_urls.is_empty() {
         config::single_surface_writer::write_single_surface_config_with_outbound_listener(
             temp_dir.path(),
             gateway_port,
             outbound_port,
             &mock.url(),
-            &transit_target_url,
+            &transit_target_urls,
             &world.surface_config,
             jwks_files.as_ref(),
         );
@@ -349,11 +362,7 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
     gateway
         .wait_until_ready()
         .await;
-    if world
-        .surface_config
-        .transit_point
-        .is_some()
-    {
+    if !transit_target_urls.is_empty() {
         gateway
             .wait_for_secondary_port(outbound_port, std::time::Duration::from_secs(15))
             .await
@@ -366,6 +375,7 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
         gateway,
         mock,
         replacement_mock: replacement_mock.or(oauth_mock),
+        transit_point_mocks,
         affinidi_well,
         _jwks_server: jwks_server,
         gateway_port,
@@ -2255,9 +2265,9 @@ async fn managed_agent_sends_a2a_request_through_transit_point_without_header(
 ) {
     let configured_headers = world
         .surface_config
-        .transit_point
-        .as_ref()
-        .filter(|configured| configured.alias == transit_point)
+        .transit_points
+        .iter()
+        .find(|configured| configured.alias == transit_point)
         .map(|configured| {
             configured
                 .header_metadata_mapping

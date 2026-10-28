@@ -34,6 +34,7 @@ export const AGENT_SURFACE_PATHS: ReadonlySet<string> = new Set([
   'mcp_legacy_metadata_output',
   'mcp_http',
   'tags',
+  'trust_check_split',
   'access_point',
   'target',
   'transit',
@@ -130,6 +131,8 @@ export const AGENT_SURFACE_PATHS: ReadonlySet<string> = new Set([
   'transit.points[*].extension_inspection',
   'transit.points[*].require_transit_token',
   'transit.points[*].fabric_delegated_credentials',
+  'transit.points[*].trust_check_list',
+  'transit.points[*].trust_check_migrated',
 ]);
 
 /** Fields of a stored Transit Point: the `X` of every `transit.points[*].X` path. */

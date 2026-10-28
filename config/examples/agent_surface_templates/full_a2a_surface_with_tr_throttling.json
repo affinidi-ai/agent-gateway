@@ -31,19 +31,7 @@
       "endpoint": "",
       "identity_injection": {
         "inject_vp": true
-      },
-      "trust_check_list": [
-        {
-          "id": "trust-check-target-recognition",
-          "trust_registry_id": "",
-          "query_type": "recognition",
-          "query": {
-            "authority_id": "{{ input.agent.provider_did }}",
-            "entity_id": "{{ input.agent.did }}"
-          },
-          "name": "Verify transit target"
-        }
-      ]
+      }
     },
     "transit": {
       "sign_requests": true,
@@ -54,7 +42,19 @@
           "alias": "",
           "target_endpoint": "",
           "protocol": "a2a",
-          "require_transit_token": true
+          "require_transit_token": true,
+          "trust_check_list": [
+            {
+              "id": "trust-check-target-recognition",
+              "trust_registry_id": "",
+              "query_type": "recognition",
+              "query": {
+                "authority_id": "{{ input.agent.provider_did }}",
+                "entity_id": "{{ input.agent.did }}"
+              },
+              "name": "Verify transit target"
+            }
+          ]
         }
       ]
     },
@@ -149,7 +149,7 @@
           "slotId": "response:identity-protected"
         },
         {
-          "id": "trust-check-target",
+          "id": "trust-check-transit-point-a2a-1",
           "type": "trust-check",
           "label": "",
           "parentId": "transit-point-a2a-1",
@@ -173,7 +173,7 @@
               }
             ]
           },
-          "slotId": "request:trust-check-target_trust_check_list"
+          "slotId": "request:trust-check-transit_points_trust_check_list"
         },
         {
           "id": "target-variant",
