@@ -55,13 +55,6 @@ text (`textContent`), never as HTML, so a name or a server error message in a to
 script. Pass plain text only: markup such as `<b>` shows literally, and callers must not
 escape the text themselves.
 
-## Toasts
-
-`showToast` and `showUndoToast` (`utils/toaster.ts`) render the message and the action label as
-text (`textContent`), never as HTML, so a name or a server error message in a toast cannot run
-script. Pass plain text only: markup such as `<b>` shows literally, and callers must not
-escape the text themselves.
-
 ## Test identifiers
 
 Every new interactive element ships with a `data-testid`. Tests under `ui-tests/specs/`
@@ -307,8 +300,9 @@ in components.
   Don't call it per row. The names are cached per session token, so signing out and in (as
   anyone) loads them again and never shows the previous session's. Within a session a 403 is
   kept until the page reloads; any other failure is retried on the next visit. The status comes
-  from `ApiError` (`api.ts`), which every failed `apiClient` request throws: read
-  `error.status`, not the message text.
+  from `ApiError` (`api.ts`): read `error.status`, not the message text. Only `apiClient`
+  requests the server answers with an error status other than 401 throw it; a 401 (session
+  expired), a timeout and the export and download helpers throw a plain `Error`.
 - The evidence pane shows only **Details** for a change (no request journey or signed
   presentation), grouped as Change, Policy, Where and Refusal. The policy links to the Policies
   tab of its type, the target to its surface or gateway page.
