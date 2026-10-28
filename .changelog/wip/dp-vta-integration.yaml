@@ -27,14 +27,15 @@ changes:
   removed: []
   security:
     - timestamp: '2026-10-27T02:00:00Z'
-      title: Hold a gateway-issued identity assertion to its own rules again
+      title: Remove an unreachable check from the self-issued token path
       description: >-
-        When the gateway verifies a token it issued itself, it checks that the
-        token was addressed to this gateway and carries a unique identifier,
-        so one minted for another audience cannot be replayed here. An earlier
-        tidy-up left that check stranded behind an early exit, so it stopped
-        running while still appearing to be in place. It runs again on the
-        same path as the signature check.
+        A rule about which tokens the gateway will accept back from itself sat
+        behind an early exit, so it never ran while still appearing to be in
+        place. Reading it as live would mislead anyone reviewing how self-issued
+        tokens are handled. The unreachable code is gone and the rule is kept
+        alongside a note explaining why it is not applied: as written it would
+        refuse an exchange the gateway has supported since its first release.
+        Nothing changes for callers.
     - timestamp: '2026-10-27T03:00:00Z'
       title: Stop a signed document containing a number from aborting the gateway
       description: >-

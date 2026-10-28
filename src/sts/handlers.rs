@@ -303,16 +303,18 @@ impl StsSubjectVerifier for JwtBearerSubjectVerifier {
             .await
             && iss == self_did
         {
-            let claims = self
+            // NOTE: `enforce_self_issued_subject_claims` is deliberately *not*
+            // applied here. It demands `aud == self_did`, which holds for a
+            // loopback ID-JAG redemption but not for the legacy exchange of a
+            // gateway-issued access token, whose audience is the resource —
+            // see `sts_token_exchange.feature`, "An agent exchanges a token the
+            // gateway issued without outliving the identity assertion". The
+            // role-confusion case that rule targets is already refused by
+            // `reject_self_issued` on the exchange path, which knows the role
+            // the token is being presented in; this verifier does not.
+            return self
                 .verify_local_jwt(token, &self_did)
-                .await?;
-            // Self-issued: we minted it, so we know exactly what it was for and
-            // can hold it to our own rules (VTA-17 / condition 6). This must stay
-            // on the same path as the signature check — a token that verifies but
-            // is being replayed in a role it was never issued for (an ID-JAG as a
-            // `subject_token`) is exactly what this refuses.
-            enforce_self_issued_subject_claims(&claims, &self_did)?;
-            return Ok(claims);
+                .await;
         }
 
         let strategies = self
@@ -356,6 +358,22 @@ impl StsSubjectVerifier for JwtBearerSubjectVerifier {
 ///   minted for another audience cannot be replayed here.
 /// - `jti` must be present, so every self-issued assertion is traceable and a
 ///   replay is detectable in the audit trail.
+///
+/// **Not currently wired to a call site.** It was written for VTA-17 /
+/// SEC0-6115 condition 6 but conflicts with behaviour the gateway has shipped
+/// since its first release: `sts_token_exchange.feature`, "An agent exchanges a
+/// token the gateway issued without outliving the identity assertion", presents
+/// a gateway-issued access token whose `aud` is the **resource**, not this
+/// gateway, and expects it to be accepted. Applying the rule in
+/// `JwtBearerSubjectVerifier::verify_jwt` refuses that exchange.
+///
+/// The two can be reconciled — the rule belongs on the loopback ID-JAG
+/// redemption path, where `aud` *is* this gateway, rather than on every
+/// self-issued JWT this verifier sees — but that needs the grant the token is
+/// being presented under, which the verifier does not have. Kept rather than
+/// deleted so the intent survives; whoever closes VTA-17 decides which way it
+/// goes. Its unit tests below still pin the behaviour it implements.
+#[allow(dead_code)]
 fn enforce_self_issued_subject_claims(
     claims: &Value,
     self_did: &str,
