@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use super::MCP_MODERN_VERSION;
 use super::error_codes;
-use super::request_validation::{McpRequestValidationError, is_session_version};
+use super::request_validation::{McpRequestValidationError, SESSION_VERSIONS};
 
 const TTL: Duration = Duration::from_secs(300);
 const CAPACITY: usize = 1024;
@@ -36,8 +36,19 @@ pub struct UpstreamKey {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Versions {
-    legacy: bool,
+    /// Bit `i` is set when the upstream serves `SESSION_VERSIONS[i]`.
+    session: u8,
     modern: bool,
+}
+
+const _: () = assert!(SESSION_VERSIONS.len() < u8::BITS as usize);
+const ALL_SESSION_VERSIONS: u8 = (1 << SESSION_VERSIONS.len()) - 1;
+
+fn session_bit(version: &str) -> u8 {
+    SESSION_VERSIONS
+        .iter()
+        .position(|session| *session == version)
+        .map_or(0, |index| 1 << index)
 }
 
 impl Versions {
@@ -54,25 +65,27 @@ impl Versions {
             message.pointer("/result/supportedVersions")
         };
         if let Some(supported) = listed.and_then(Value::as_array) {
-            let lists = |matches: &dyn Fn(&str) -> bool| {
+            let listed = || {
                 supported
                     .iter()
                     .filter_map(Value::as_str)
-                    .any(matches)
             };
             return Some(Self {
-                legacy: lists(&is_session_version),
-                modern: lists(&|version| version == MCP_MODERN_VERSION),
+                session: listed().fold(0, |session, version| session | session_bit(version)),
+                modern: listed().any(|version| version == MCP_MODERN_VERSION),
             });
         }
-        (code == Some(i64::from(error_codes::METHOD_NOT_FOUND))).then_some(Self { legacy: true, modern: false })
+        (code == Some(i64::from(error_codes::METHOD_NOT_FOUND))).then_some(Self {
+            session: ALL_SESSION_VERSIONS,
+            modern: false,
+        })
     }
 
     fn serves(
         self,
         version: &str,
     ) -> bool {
-        (self.legacy && is_session_version(version)) || (self.modern && version == MCP_MODERN_VERSION)
+        self.session & session_bit(version) != 0 || (self.modern && version == MCP_MODERN_VERSION)
     }
 }
 
@@ -190,7 +203,7 @@ mod tests {
     use super::*;
     use crate::mcp::MCP_LEGACY_VERSION;
     use crate::mcp::request_validation::{
-        MODERN_CAPABLE_POLICY, MODERN_ONLY_POLICY, McpVersionPolicy, SESSION_VERSIONS,
+        LEGACY_ONLY_POLICY, MODERN_CAPABLE_POLICY, MODERN_ONLY_POLICY, McpVersionPolicy,
     };
 
     fn key(surface_id: &str) -> UpstreamKey {
@@ -233,10 +246,17 @@ mod tests {
         assert_eq!(advertised(&modern_only, MODERN_CAPABLE_POLICY), json!([MCP_MODERN_VERSION]));
         let both = key("upstream-versions-both");
         record_discovery(both.clone(), &discovery(&[MCP_LEGACY_VERSION, MCP_MODERN_VERSION]));
-        assert_eq!(advertised(&both, MODERN_CAPABLE_POLICY), json!(MODERN_CAPABLE_POLICY.supported_versions()));
+        assert_eq!(advertised(&both, MODERN_CAPABLE_POLICY), json!([MCP_LEGACY_VERSION, MCP_MODERN_VERSION]));
         let session_only = key("upstream-versions-session-only");
         record_discovery(session_only.clone(), &discovery(&["2025-06-18"]));
-        assert_eq!(advertised(&session_only, MODERN_CAPABLE_POLICY), json!(SESSION_VERSIONS));
+        assert_eq!(advertised(&session_only, MODERN_CAPABLE_POLICY), json!(["2025-06-18"]));
+        let some_sessions = key("upstream-versions-some-sessions");
+        record_discovery(some_sessions.clone(), &discovery(&["2025-11-25", MCP_MODERN_VERSION, MCP_LEGACY_VERSION]));
+        assert_eq!(
+            advertised(&some_sessions, MODERN_CAPABLE_POLICY),
+            json!([MCP_LEGACY_VERSION, "2025-11-25", MCP_MODERN_VERSION])
+        );
+        assert_eq!(advertised(&some_sessions, LEGACY_ONLY_POLICY), json!([MCP_LEGACY_VERSION, "2025-11-25"]));
         let error = restrict_unsupported(unsupported(MODERN_CAPABLE_POLICY), &modern_only);
         assert_eq!(error.id, Some(json!("request")));
         assert_eq!(error.data.unwrap()["requested"], "2099-01-01");
@@ -322,12 +342,12 @@ mod tests {
         record_discovery(latest.clone(), &error(error_codes::INTERNAL_ERROR));
         assert_eq!(advertised(&latest, MODERN_CAPABLE_POLICY), json!(SESSION_VERSIONS));
         record_discovery(latest.clone(), &discovery(&[MCP_LEGACY_VERSION, MCP_MODERN_VERSION]));
-        assert_eq!(advertised(&latest, MODERN_CAPABLE_POLICY), json!(MODERN_CAPABLE_POLICY.supported_versions()));
+        assert_eq!(advertised(&latest, MODERN_CAPABLE_POLICY), json!([MCP_LEGACY_VERSION, MCP_MODERN_VERSION]));
     }
 
     #[test]
     fn upstream_versions_expire_after_their_ttl() {
-        let modern = Versions { legacy: false, modern: true };
+        let modern = Versions { session: 0, modern: true };
         let start = Instant::now();
         let mut learned = LearnedVersions::new(CAPACITY);
         learned.record(key("expiring"), modern, start);
@@ -339,7 +359,7 @@ mod tests {
 
     #[test]
     fn upstream_versions_stay_within_capacity() {
-        let modern = Versions { legacy: false, modern: true };
+        let modern = Versions { session: 0, modern: true };
         let start = Instant::now();
         let at = |seconds| start + Duration::from_secs(seconds);
         let mut learned = LearnedVersions::new(3);

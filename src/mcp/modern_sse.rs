@@ -1745,7 +1745,8 @@ mod tests {
     }
 
     /// A JSON `400` missing-session refusal becomes `-32022`. The same error
-    /// with another status, or inside an SSE stream, is not rewritten.
+    /// with another status, without a Content-Type, or inside an SSE stream,
+    /// is not rewritten.
     #[tokio::test]
     async fn a_session_only_refusal_answers_minus_32022_only_for_a_json_400() {
         let json_headers = axum::http::HeaderMap::from_iter([(
@@ -1806,6 +1807,19 @@ mod tests {
                 "{status} {upstream}"
             );
         }
+
+        // Both official SDKs send `application/json` with this refusal; without
+        // it the content-type gate answers first and the caller gets a 502.
+        let response = request_response(
+            futures::stream::iter([Ok::<_, io::Error>(Bytes::from(refused(-32000).to_string()))]),
+            axum::http::StatusCode::BAD_REQUEST,
+            &axum::http::HeaderMap::new(),
+            request(),
+            limits(4096),
+            |message| async { Ok(message) },
+        )
+        .await;
+        assert!(matches!(response, Err(SseReadError::UnsupportedContentType)));
 
         let sse_headers = axum::http::HeaderMap::from_iter([(
             axum::http::header::CONTENT_TYPE,

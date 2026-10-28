@@ -1986,13 +1986,16 @@ async fn process_modern_mcp_request_with_headers(
         })?;
     if request.method == "server/discover" {
         let mut response = owned_discovery_response(request, versions, &proxy.name, env!("CARGO_PKG_VERSION"))?;
-        if catalogs.legacy.is_none()
-            && let Some(supported) = response["result"]["supportedVersions"].as_array_mut()
-        {
+        // The owned `initialize` always answers `2024-11-05`, so no other
+        // session revision is offered, and none without a legacy catalog.
+        if let Some(supported) = response["result"]["supportedVersions"].as_array_mut() {
             supported.retain(|version| {
                 !version
                     .as_str()
-                    .is_some_and(crate::mcp::request_validation::is_session_version)
+                    .is_some_and(|version| {
+                        crate::mcp::request_validation::is_session_version(version)
+                            && (catalogs.legacy.is_none() || version != crate::mcp::MCP_LEGACY_VERSION)
+                    })
             });
         }
         return Ok(response);
@@ -4441,7 +4444,10 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(discovery["result"]["capabilities"], serde_json::json!({"tools": {"listChanged": true}}));
-        assert_eq!(discovery["result"]["supportedVersions"], serde_json::json!(versions.supported_versions()));
+        assert_eq!(
+            discovery["result"]["supportedVersions"],
+            serde_json::json!([crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION])
+        );
         let list = super::process_modern_mcp_request(&proxy, &manager, &owned_modern_request("tools/list"), versions)
             .await
             .unwrap();
@@ -4830,6 +4836,68 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn standalone_mcp_http_discovery_offers_only_the_revisions_initialize_negotiates() {
+        use tower::ServiceExt;
+
+        let (router, _sessions, _directory) = standalone_mcp_router().await;
+        let post = |headers: &[(&str, &str)], body: serde_json::Value| {
+            let mut request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/mcp/owned")
+                .header("content-type", "application/json");
+            for (name, value) in headers {
+                request = request.header(*name, *value);
+            }
+            let router = router.clone();
+            async move {
+                let response = router
+                    .oneshot(
+                        request
+                            .body(axum::body::Body::from(body.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                serde_json::from_slice::<serde_json::Value>(
+                    &axum::body::to_bytes(response.into_body(), 8192)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap()
+            }
+        };
+        let mut negotiated = Vec::new();
+        for requested in crate::mcp::request_validation::SESSION_VERSIONS {
+            let initialized = post(
+                &[("mcp-protocol-version", requested)],
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                    "protocolVersion": requested, "capabilities": {},
+                    "clientInfo": {"name": "client", "version": "1.0"}
+                }}),
+            )
+            .await;
+            negotiated.push(initialized["result"]["protocolVersion"].clone());
+        }
+        negotiated.dedup();
+        negotiated.push(serde_json::json!(crate::mcp::MCP_MODERN_VERSION));
+        let discovery = post(
+            &[
+                ("accept", "application/json, text/event-stream"),
+                ("mcp-protocol-version", crate::mcp::MCP_MODERN_VERSION),
+                ("mcp-method", "server/discover"),
+            ],
+            serde_json::json!({"jsonrpc": "2.0", "id": "discover", "method": "server/discover", "params": {"_meta": {
+                "io.modelcontextprotocol/protocolVersion": crate::mcp::MCP_MODERN_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }}}),
+        )
+        .await;
+        assert_eq!(negotiated, [crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION]);
+        assert_eq!(discovery["result"]["supportedVersions"], serde_json::json!(negotiated));
     }
 
     #[test]

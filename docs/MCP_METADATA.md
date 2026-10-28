@@ -98,8 +98,10 @@ gateway answers HTTP `400` and `-32022` with the request's id, listing only the
 session revisions in `data.supported`, and logs the upstream's error code and
 message at `WARN`. Any other error whose id is `null` or another request's,
 such as a parse error, a crashed handler or a rate limit, is a `502`, as is a
-result with another id. SSE answers are never rewritten. An error with the
-request's id, or with no id, passes through unchanged.
+result with another id. SSE answers are never rewritten. The rewrite needs
+`Content-Type: application/json`, which both official SDKs send; a refusal with
+no or another Content-Type is a `502`. An error with the request's id, or with
+no id, passes through unchanged.
 
 **Compatibility note.** `mcp_protocol_mode` is no longer a setting. Stored
 records and API payloads for surfaces, Transit Points and MCP Proxies that
@@ -340,10 +342,10 @@ These choices are deliberate and are not open questions.
 | --- | --- |
 | Top-level `_meta` reads | Retained indefinitely as an Affinidi compatibility extension, not MCP behavior. Canonical output still migrates the envelope. |
 | Unmarked requests | A request carrying no modern metadata and no mirrored method/name headers keeps the local compatibility path. That path is a retained Affinidi behavior; it is not evidence of an established legacy session, and it never makes an invalid modern request valid. |
-| Intermediate revisions | `2025-03-26`, `2025-06-18` and `2025-11-25` are modelled as session revisions, like `2024-11-05`: they use `initialize` and `Mcp-Session-Id`, so they are forwarded as legacy traffic and their header and `initialize` revision reach the upstream unchanged. They are listed in `SESSION_VERSIONS` (`src/mcp/request_validation.rs`), never inferred by comparing date strings. Any other revision is rejected with `-32022` listing the versions actually supported. A legacy `initialize` that asks for a revision the endpoint does not serve (an unknown revision, or `2026-07-28`, which has no handshake) is forwarded asking for the oldest session revision the endpoint serves, `2024-11-05`, on direct Access Points, Transit Points and Fabric receive, so the upstream cannot settle a session whose later requests would be rejected. Gateway-owned MCP Proxies answer every `initialize` with `2024-11-05`. |
+| Intermediate revisions | `2025-03-26`, `2025-06-18` and `2025-11-25` are modelled as session revisions, like `2024-11-05`: they use `initialize` and `Mcp-Session-Id`, so they are forwarded as legacy traffic and their header and `initialize` revision reach the upstream unchanged. They are listed in `SESSION_VERSIONS` (`src/mcp/request_validation.rs`), never inferred by comparing date strings. Any other revision is rejected with `-32022` listing the versions actually supported. A legacy `initialize` that asks for a revision the endpoint does not serve (an unknown revision, or `2026-07-28`, which has no handshake) is forwarded asking for the oldest session revision the endpoint serves, `2024-11-05`, on direct Access Points, Transit Points and Fabric receive, so the upstream cannot settle a session whose later requests would be rejected. Gateway-owned MCP Proxies answer every `initialize` with `2024-11-05`, so their `server/discover` lists only `2024-11-05` and `2026-07-28`. |
 | MCP session ownership | Accepted risk. The client capabilities recorded at `initialize`, the GET notification stream and pending `elicitation/create` prompts are keyed by surface and `Mcp-Session-Id`. The id is the upstream's when it sends one; the gateway mints a UUIDv4 only when it does not. Keying by surface stops one surface reading or overwriting another's session state, but sessions are not bound to the caller: GET, DELETE and the prompt-answer POST accept any presented id without checking who opened the session, and run before surface policy. Within one surface, isolation therefore relies on the upstream issuing unguessable session ids (the TypeScript and Python SDKs use random UUIDs). A caller holding another user's id can take over their stream, receive their consent prompt with its authorization URL, answer or cancel it, or drop the session. An upstream that returns an id already in use on the surface to a new `initialize` has elicitation turned off for that id, so the binding's `elicit_fallback` applies. Binding sessions to the caller's identity at `initialize`, or mapping gateway-minted ids to upstream ids, is the follow-up. |
 | OAuth roles | Per surface, the gateway is the Resource Server, and the Authorization Server only through the opt-in `sts.mcp_issuer` profile. No browser-facing authorization-code or PKCE endpoint is offered, so authorization server metadata advertises only the token-exchange and JWT-bearer ID-JAG grants the profile implements. |
-| Conformance scoring | The published MCP conformance suite is scored only against its frozen `2026-07-28` requirement set, matching the modelled revisions. The frozen `2025-11-25` set is permanently out of scope and is never a release gate. |
+| Conformance scoring | The published MCP conformance suite is scored only against its frozen `2026-07-28` requirement set, the only revision the gateway validates as modern. Session revisions are forwarded, not validated, so the frozen `2025-11-25` set is permanently out of scope and is never a release gate. |
 
 ## Ownership And Verification
 
@@ -1446,7 +1448,7 @@ answer, further refusals go unanswered (see
 | Code | Refusal | Sender |
 | --- | --- | --- |
 | `stale_offer` | The Open names no live capability offer, for example after the receiver restarted or the offer expired | Drops its agreement, so the next request negotiates again |
-| `legacy_only` | Sent by an older peer whose surface does not admit modern MCP | Answers the caller as a legacy-only endpoint would: `400` / `-32022` listing `2024-11-05` |
+| `legacy_only` | Sent by an older peer whose surface does not admit modern MCP | Answers the caller as a legacy-only endpoint would: `400` / `-32022` listing every session revision (`SESSION_VERSIONS`) |
 | `capacity_reached` | A full framed-stream cap, a full Open replay table or the peer's or its tenant's share of it, the peer's Open rate, or a listener already admitting 16 Opens | Keeps its agreement and answers `429` with `Retry-After: 5`. A 1.0.0 sender cannot parse this code and waits for its response deadline instead |
 | `unavailable` | Anything else: route, exposure, tenant, size limits, envelope times, admission timeout | Keeps its agreement and answers `502` |
 | Any other code | Sent by a newer peer | Treated as `unavailable` |

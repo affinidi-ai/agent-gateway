@@ -11,7 +11,7 @@ revision-specific behavior and limitations of the checked-out source.
 | A2A `1.0` | Active, advertised | JSON-RPC messaging, discovery, identity extensions, policy, and proxy targets; implemented against spec revision [`1.0.1`](https://a2a-protocol.org/v1.0.1/specification/) |
 | A2A `0.3` | Accepted | Accepted on each A2A surface that selects it, which is the default except on a new A2A proxy surface. See [A2A Protocol Versions](#a2a-protocol-versions) |
 | MCP `2024-11-05` | Active | Admitted and advertised on every MCP endpoint |
-| MCP `2025-03-26`, `2025-06-18`, `2025-11-25` | Active | Admitted and advertised on every MCP endpoint as session revisions, forwarded like `2024-11-05`. See [MCP Validation Boundary](#mcp-validation-boundary) |
+| MCP `2025-03-26`, `2025-06-18`, `2025-11-25` | Active | Admitted on every MCP endpoint and forwarded as session revisions, like `2024-11-05`. Advertised in discovery on every MCP endpoint except gateway-owned MCP Proxies, which answer `initialize` with `2024-11-05`. Tasks (`tasks/*`) and JSON-RPC batches are not supported (HTTP `422`). See [MCP Validation Boundary](#mcp-validation-boundary) |
 | MCP `2026-07-28` | Active | Admitted and advertised alongside the session revisions on every MCP endpoint |
 | AP2 | Experimental | Disabled by default; production proof signing is not implemented |
 

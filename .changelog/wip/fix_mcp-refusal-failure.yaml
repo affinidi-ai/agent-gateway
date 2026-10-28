@@ -23,8 +23,9 @@ changes:
         When a client accepts SSE and the upstream answers initialize with JSON, the gateway used to
         add its own Mcp-Session-Id next to the upstream's, so clients such as claude.ai sent both back
         and the upstream refused later requests with 404. The gateway now reuses the upstream's id and
-        adds its own only when the upstream sent none. Client capabilities are recorded per surface and
-        session, so credential-delegation consent requests work for these sessions.
+        adds its own only when the upstream sent none. For SSE clients whose upstream answers initialize
+        with JSON, client capabilities are recorded per surface and session, so credential-delegation
+        consent requests work for these sessions.
     - timestamp: '2026-10-28T00:00:00Z'
       title: Answer -32022 instead of 502 when a session-only MCP upstream refuses
       description: >-
