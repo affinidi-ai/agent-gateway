@@ -298,8 +298,10 @@ pub struct PolicyChangeDetails {
     pub scope: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slot: Option<PolicySlot>,
+    /// On a surface slot: the variant whose slot was written, or `_base_` for
+    /// a base slot, which also applies to every variant inheriting it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub variant: Option<String>,
+    pub surface_variant: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transit_point: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -347,7 +349,7 @@ impl PolicyChangeDetails {
             target: None,
             scope: None,
             slot: None,
-            variant: None,
+            surface_variant: None,
             transit_point: None,
             mcp_tool_name: None,
             gate: None,
