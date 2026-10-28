@@ -877,7 +877,9 @@ impl AgentSurface {
         let variant = self.select_variant(alias)?;
         Ok(ServedVariant {
             id: variant.map(|variant| variant.id.clone()),
-            recorded: variant.map_or(SurfaceVariant::BASE, |variant| variant.alias.as_str()).to_string(),
+            recorded: variant
+                .map_or(SurfaceVariant::BASE, |variant| variant.alias.as_str())
+                .to_string(),
             surface: self.apply_variant(variant),
         })
     }

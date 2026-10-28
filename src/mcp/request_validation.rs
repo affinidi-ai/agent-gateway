@@ -1925,11 +1925,7 @@ mod tests {
     async fn a_refused_requests_id_is_read_within_sixteen_kib_and_any_smaller_endpoint_limit() {
         let body = |bytes: usize| {
             let mut envelope = json!({"jsonrpc": "2.0", "id": "variant", "method": "tools/list", "params": {}});
-            let padding = bytes
-                - envelope
-                    .to_string()
-                    .len()
-                - r#""padding":"""#.len();
+            let padding = bytes - envelope.to_string().len() - r#""padding":"""#.len();
             envelope["params"]["padding"] = json!("x".repeat(padding));
             let body = envelope.to_string();
             assert_eq!(body.len(), bytes);
