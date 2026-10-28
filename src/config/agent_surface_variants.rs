@@ -713,6 +713,17 @@ impl std::fmt::Display for VariantResolveError {
 
 impl std::error::Error for VariantResolveError {}
 
+/// The variant that serves a request, and the surface it resolves to.
+#[derive(Debug, Clone)]
+pub struct ServedVariant {
+    /// The variant's id; `None` when the base surface serves the request.
+    pub id: Option<String>,
+    /// What the request records as `surface_variant`.
+    pub recorded: String,
+    /// The surface with the variant's overrides applied and no catalog.
+    pub surface: AgentSurface,
+}
+
 impl AgentSurface {
     /// The variant a request serves, from the alias in its URL: the named
     /// variant, else the default variant, else `None` for the base surface.
@@ -865,6 +876,24 @@ impl AgentSurface {
                     .find(|v| v.id == id)
             })
             .map_or(SurfaceVariant::BASE, |v| v.alias.as_str())
+    }
+
+    /// The variant that serves a request naming `alias`, and the surface it
+    /// resolves to: see [`Self::select_variant`]. Never falls back.
+    pub fn serve_variant(
+        &self,
+        alias: Option<&str>,
+    ) -> Result<ServedVariant, VariantResolveError> {
+        let id = self
+            .select_variant(alias)?
+            .map(|variant| variant.id.clone());
+        Ok(ServedVariant {
+            recorded: self
+                .surface_variant(id.as_deref())
+                .to_string(),
+            id,
+            surface: self.clone(),
+        })
     }
 
     /// Validate the variant catalog on this surface:
@@ -1227,6 +1256,66 @@ mod tests {
         assert_eq!(s.surface_variant(Some("id-prod")), "prod");
         assert_eq!(s.surface_variant(None), "_base_");
         assert_eq!(base_surface().surface_variant(None), "_base_");
+    }
+
+    fn served(
+        s: &AgentSurface,
+        alias: Option<&str>,
+    ) -> Result<(Option<String>, String, String), VariantResolveError> {
+        s.serve_variant(alias)
+            .map(|served| (served.id, served.recorded, served.surface.target.endpoint))
+    }
+
+    fn owned(
+        id: Option<&str>,
+        recorded: &str,
+        endpoint: &str,
+    ) -> Result<(Option<String>, String, String), VariantResolveError> {
+        Ok((id.map(str::to_string), recorded.to_string(), endpoint.to_string()))
+    }
+
+    #[test]
+    fn a_request_is_served_by_the_selected_variant_with_its_overrides_applied() {
+        let mut s = base_surface();
+        s.variants = vec![
+            variant("id-prod", "prod", SurfaceOverrides::default()),
+            variant(
+                "id-beta",
+                "beta",
+                SurfaceOverrides {
+                    target: Some(TargetOverrides {
+                        endpoint: Some("https://beta.example.com".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            ),
+        ];
+        s.default_variant_id = Some("id-prod".to_string());
+
+        assert_eq!(served(&s, Some("beta")), owned(Some("id-beta"), "beta", "https://beta.example.com"));
+        assert_eq!(served(&s, None), owned(Some("id-prod"), "prod", "https://prod.example.com"));
+        let beta = s
+            .serve_variant(Some("beta"))
+            .unwrap();
+        assert!(beta.surface.variants.is_empty(), "the served surface has no catalog");
+        assert_eq!(beta.surface.default_variant_id, None);
+
+        s.default_variant_id = None;
+        assert_eq!(served(&s, None), owned(None, "_base_", "https://prod.example.com"));
+    }
+
+    #[test]
+    fn a_variant_that_cannot_be_served_is_refused_even_on_a_surface_with_no_variants() {
+        let mut s = base_surface();
+        assert_eq!(served(&s, Some("dev")), Err(VariantResolveError::UnknownAlias("dev".to_string())));
+        s.default_variant_id = Some("removed".to_string());
+        assert_eq!(served(&s, None), Err(VariantResolveError::MisconfiguredDefault("removed".to_string())));
+
+        let mut off = variant("id-off", "off", SurfaceOverrides::default());
+        off.enabled = false;
+        s.variants = vec![off];
+        assert_eq!(served(&s, Some("off")), Err(VariantResolveError::DisabledVariant("off".to_string())));
     }
 
     #[test]
