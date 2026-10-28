@@ -104,15 +104,18 @@ that relies on it another way, or disable it, before downgrading.
 
 No request, legacy or modern, falls back to the base surface or another variant
 when the variant it selects can't be resolved. The Access Point, the Transit
-Point and Fabric receive refuse it at routing, before reading the MCP body and
-before Target work, with one status per reason: `404` for an alias the surface
-doesn't have (including on an empty variant catalog) and for a disabled named or
-default variant, and `500` when `default_variant_id` names no variant. On the
-Access Point, a request to an MCP surface carrying the modern MCP headers
-(`MCP-Protocol-Version` other than `2024-11-05`, or `Mcp-Method`) is answered
-with a JSON-RPC error with code `-32603` and no `id`, as the body is not read at
-routing; every other request gets a plain error response. Fabric Open refuses
-the same requests.
+Point and Fabric receive refuse it at routing, before MCP admission and before
+Target work, with one status per reason: `404` for an alias the surface doesn't
+have (including on an empty variant catalog) and for a disabled named or default
+variant, and `500` when `default_variant_id` names no variant. A modern MCP POST
+(`MCP-Protocol-Version` other than `2024-11-05`, or `Mcp-Method`) to an MCP
+Access Point or an MCP Transit Point is answered with a JSON-RPC error with code
+`-32603` carrying the request's `id`. Its body is read, within the endpoint's
+`mcp_http.max_request_bytes`, only to recover that `id`; a body that can't be
+read (oversized, not JSON, or without an `id`) gets the same error without one.
+On the Access Point, any other request carrying the modern MCP headers gets that
+error without an `id`. Every other request gets a plain error response. Fabric
+Open refuses the same requests.
 
 Resolved Access Point, Transit Point and Fabric request snapshots retain the
 selected stable variant ID separately from the materialized surface, whose
