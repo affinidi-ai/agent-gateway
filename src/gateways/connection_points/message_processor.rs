@@ -4140,7 +4140,6 @@ async fn process_forward_request_in_request_scope(
             (variant.id, resolved)
         }
         Err(error) => {
-            channel_warn!(config_id, "GW2: Surface variant cannot be resolved ({})", error);
             let refusal = crate::audit::request_events::refuse_routing(
                 &crate::audit::request_events::RequestFacts {
                     surface_id: &surface.surface_id,
@@ -4151,6 +4150,7 @@ async fn process_forward_request_in_request_scope(
                 &error,
                 None,
             );
+            refusal.warn(&surface);
             return ProcessingResult::RequiresResponse {
                 response_type: MessageType::ForwardResponse.to_string(),
                 response_body: refused_forward_response(

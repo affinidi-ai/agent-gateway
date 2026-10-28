@@ -469,8 +469,7 @@ impl OutboundPipelineContext {
         // modern MCP POST is answered later, once its body is read for the
         // `id`, on the unresolved surface; every other request now.
         let refuse = |error: &crate::config::agent_surface_variants::VariantResolveError, rpc_error_code| {
-            tracing::warn!(surface = %surface_for_resolve.name, error = %error, "Surface variant cannot be resolved");
-            crate::audit::request_events::refuse_routing(
+            let refusal = crate::audit::request_events::refuse_routing(
                 &crate::audit::request_events::RequestFacts {
                     surface_id: &surface_for_resolve.surface_id,
                     channel_name: &surface_for_resolve.name,
@@ -479,7 +478,9 @@ impl OutboundPipelineContext {
                 },
                 error,
                 rpc_error_code,
-            )
+            );
+            refusal.warn(&surface_for_resolve);
+            refusal
         };
         let modern_post = matched_virtual_channel.protocol == crate::config::agent_surface::TransitProtocol::Mcp
             && crate::mcp::request_validation::has_modern_header(&original_headers)

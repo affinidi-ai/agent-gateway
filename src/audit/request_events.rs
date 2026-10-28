@@ -127,8 +127,36 @@ pub struct RoutingRefusal {
 }
 
 impl RoutingRefusal {
+    pub fn reason(&self) -> RejectionReason {
+        self.reason
+    }
+
     pub fn status(&self) -> axum::http::StatusCode {
         self.status
+    }
+
+    /// Logs the refusal of a request to `surface` from what was recorded:
+    /// the reason, the requested alias as cut for the record, and on a
+    /// misconfigured default the configured `default_variant_id`. The
+    /// caller's raw alias is never logged.
+    pub fn warn(
+        &self,
+        surface: &crate::config::agent_surface::AgentSurface,
+    ) {
+        let default_variant_id = (self.reason() == RejectionReason::MisconfiguredDefault)
+            .then_some(
+                surface
+                    .default_variant_id
+                    .as_deref(),
+            )
+            .flatten();
+        tracing::warn!(
+            surface = %surface.name,
+            reason = ?self.reason(),
+            requested_variant = ?self.requested_variant(),
+            default_variant_id = ?default_variant_id,
+            "Surface variant cannot be resolved"
+        );
     }
 
     pub fn requested_variant(&self) -> Option<&str> {
@@ -170,12 +198,7 @@ pub fn refuse_routing(
         VariantResolveError::UnknownAlias(alias) => RoutingRefusal {
             reason: RejectionReason::UnknownVariant,
             status: StatusCode::NOT_FOUND,
-            requested_variant: Some(
-                alias
-                    .chars()
-                    .take(SurfaceVariant::ALIAS_MAX_LEN)
-                    .collect(),
-            ),
+            requested_variant: Some(SurfaceVariant::cut_alias(alias)),
         },
         VariantResolveError::DisabledVariant(_) => RoutingRefusal {
             reason: RejectionReason::VariantDisabled,

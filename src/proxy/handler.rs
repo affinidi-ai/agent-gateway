@@ -9197,6 +9197,7 @@ async fn refuse_access_point_variant(
         error,
         modern_mcp.then_some(i64::from(crate::mcp::error_codes::INTERNAL_ERROR)),
     );
+    refusal.warn(surface);
     if !modern_mcp {
         return create_error_response(refusal.status(), refusal.message());
     }
@@ -9368,7 +9369,6 @@ async fn multi_channel_proxy_handler_in_request_scope(
                     variant_id
                 }
                 Err(error) => {
-                    warn!(surface = %ch.surface.name, error = %error, "Surface variant cannot be resolved");
                     return refuse_access_point_variant(&ch.surface, &state.network_config, mcp_versions, req, &error)
                         .await;
                 }
@@ -9405,12 +9405,13 @@ async fn multi_channel_proxy_handler_in_request_scope(
                         .resolve_variant(virtual_channel_alias.as_deref())
                     {
                         Ok(s) => Arc::new(s),
-                        Err(e) => {
+                        Err(_) => {
                             error!(
                                 surface = %ch.surface.name,
                                 config_id = ?ch.surface.config_id(),
-                                requested_alias = ?virtual_channel_alias,
-                                error = %e,
+                                requested_alias = ?virtual_channel_alias
+                                    .as_deref()
+                                    .map(crate::config::agent_surface_variants::SurfaceVariant::cut_alias),
                                 "❌ VARIANT RESOLVE FAILED on surface mirror"
                             );
                             return create_error_response(

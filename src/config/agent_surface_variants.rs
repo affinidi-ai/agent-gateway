@@ -58,6 +58,15 @@ impl SurfaceVariant {
     /// The longest alias [`Self::ALIAS_PATTERN`] accepts.
     pub const ALIAS_MAX_LEN: usize = 32;
 
+    /// An alias a caller named, cut to [`Self::ALIAS_MAX_LEN`] characters so
+    /// caller-chosen text is bounded wherever it is recorded or logged.
+    pub fn cut_alias(alias: &str) -> String {
+        alias
+            .chars()
+            .take(Self::ALIAS_MAX_LEN)
+            .collect()
+    }
+
     /// The surface variant recorded when the base surface served a request.
     /// No alias can contain `_`, so it never names a real variant.
     pub const BASE: &'static str = "_base_";
