@@ -400,16 +400,27 @@ fn mcp_surface(default_variant_id: Option<&str>) -> AgentSurface {
     .unwrap()
 }
 
-/// Sends a `tools/list` to the MCP Access Point, with the modern MCP headers or
-/// the legacy version header, and returns the status, the content type, the
-/// body and every audit record the request wrote.
+/// Sends a `tools/list` with the id `variant` to the MCP Access Point, with the
+/// modern MCP headers or the legacy version header, and returns the status,
+/// the content type, the body and every audit record the request wrote.
 async fn send_mcp(
     surface: AgentSurface,
     path: &str,
     modern: bool,
 ) -> (axum::http::StatusCode, String, Value, Vec<DelegationAuditEvent>) {
+    let body = json!({"jsonrpc": "2.0", "id": "variant", "method": "tools/list"}).to_string();
+    send_mcp_request(surface, "POST", path, modern, body).await
+}
+
+async fn send_mcp_request(
+    surface: AgentSurface,
+    method: &str,
+    path: &str,
+    modern: bool,
+    body: String,
+) -> (axum::http::StatusCode, String, Value, Vec<DelegationAuditEvent>) {
     let mut request = axum::http::Request::builder()
-        .method("POST")
+        .method(method)
         .uri(path)
         .header("content-type", "application/json")
         .header("accept", "application/json, text/event-stream");
@@ -421,7 +432,7 @@ async fn send_mcp(
         request.header("mcp-protocol-version", crate::mcp::MCP_LEGACY_VERSION)
     };
     let request = request
-        .body(axum::body::Body::from(json!({"jsonrpc": "2.0", "id": "variant", "method": "tools/list"}).to_string()))
+        .body(axum::body::Body::from(body))
         .unwrap();
     let (response, events) =
         crate::audit::producer::capture(Box::pin(super::multi_channel_proxy_handler_with_mcp_runtime(
@@ -470,19 +481,71 @@ fn mcp_refusal_cases() -> [(&'static str, AgentSurface, &'static str, RejectionR
     ]
 }
 
-#[tokio::test]
-async fn a_modern_mcp_variant_refusal_is_a_json_rpc_error_without_an_id() {
+/// Asserts a modern MCP refusal: a JSON-RPC error with `-32603`, the given
+/// `id` (the key absent when `None`), and exactly one routing record.
+fn assert_json_rpc_refusal(
+    case: &str,
+    (answered, content_type, body, events): (axum::http::StatusCode, String, Value, Vec<DelegationAuditEvent>),
+    reason: RejectionReason,
+    status: u16,
+    id: Option<&str>,
+) {
     let code = i64::from(crate::mcp::error_codes::INTERNAL_ERROR);
-    for (case, surface, path, reason, status) in mcp_refusal_cases() {
-        let (answered, content_type, body, events) = send_mcp(surface, path, true).await;
+    assert_eq!(answered.as_u16(), status, "{case}");
+    assert_eq!(content_type, "application/json", "{case}");
+    assert_eq!(body["jsonrpc"], "2.0", "{case}: {body}");
+    assert_eq!(body.get("id").and_then(Value::as_str), id, "{case}: {body}");
+    assert_eq!(body.get("id").is_some(), id.is_some(), "{case}: no null id: {body}");
+    assert_eq!(body["error"]["code"], code, "{case}: {body}");
+    assert!(body.get("result").is_none(), "{case}: {body}");
+    assert_eq!(mcp_refusals(&events), vec![(reason, Some(status), Some(code))], "{case}: one record");
+}
 
-        assert_eq!(answered.as_u16(), status, "{case}");
-        assert_eq!(content_type, "application/json", "{case}");
-        assert_eq!(body["jsonrpc"], "2.0", "{case}: {body}");
-        assert!(body.get("id").is_none(), "{case}: the body was not read, so no id: {body}");
-        assert_eq!(body["error"]["code"], code, "{case}: {body}");
-        assert!(body.get("result").is_none(), "{case}: {body}");
-        assert_eq!(mcp_refusals(&events), vec![(reason, Some(status), Some(code))], "{case}: one record");
+#[tokio::test]
+async fn a_modern_mcp_variant_refusal_echoes_the_request_id() {
+    for (case, surface, path, reason, status) in mcp_refusal_cases() {
+        let answer = send_mcp(surface, path, true).await;
+
+        assert_json_rpc_refusal(case, answer, reason, status, Some("variant"));
+    }
+}
+
+#[tokio::test]
+async fn a_modern_mcp_variant_refusal_without_a_readable_id_answers_without_one() {
+    let bodies = [
+        ("not JSON", "not json".to_string()),
+        ("notification", json!({"jsonrpc": "2.0", "method": "notifications/initialized"}).to_string()),
+    ];
+    for (body_case, body) in bodies {
+        for (case, surface, path, reason, status) in mcp_refusal_cases() {
+            let answer = send_mcp_request(surface, "POST", path, true, body.clone()).await;
+
+            assert_json_rpc_refusal(&format!("{body_case}, {case}"), answer, reason, status, None);
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_oversized_modern_mcp_body_is_refused_for_its_variant_without_an_id() {
+    let mut surface = mcp_surface(Some("v-prod"));
+    surface.mcp_http = Some(crate::config::McpHttpConfig {
+        max_request_bytes: std::num::NonZeroUsize::new(64).unwrap(),
+        ..Default::default()
+    });
+    let body = json!({"jsonrpc": "2.0", "id": "variant", "method": "tools/list", "params": {"padding": "x".repeat(128)}})
+        .to_string();
+
+    let answer = send_mcp_request(surface, "POST", "/mcp$missing", true, body).await;
+
+    assert_json_rpc_refusal("oversized", answer, RejectionReason::UnknownVariant, 404, None);
+}
+
+#[tokio::test]
+async fn a_modern_mcp_get_variant_refusal_answers_without_an_id() {
+    for (case, surface, path, reason, status) in mcp_refusal_cases() {
+        let answer = send_mcp_request(surface, "GET", path, true, String::new()).await;
+
+        assert_json_rpc_refusal(case, answer, reason, status, None);
     }
 }
 
