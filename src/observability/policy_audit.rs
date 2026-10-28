@@ -795,6 +795,50 @@ mod tests {
         assert_eq!(body, "0123456789abcdef:beta;0123456789abcdef:beta;");
     }
 
+    #[tokio::test]
+    async fn a_streamed_body_dropped_before_its_end_is_dropped_as_its_request() {
+        use futures::StreamExt;
+        use http_body_util::BodyExt;
+
+        type Seen = Arc<Mutex<Option<(Option<String>, Option<String>)>>>;
+        struct RecordOnDrop(Seen);
+        impl Drop for RecordOnDrop {
+            fn drop(&mut self) {
+                *self
+                    .0
+                    .lock()
+                    .unwrap() = Some((current_request_id(), current_request_variant()));
+            }
+        }
+        let seen = Seen::default();
+        let observer = RecordOnDrop(Arc::clone(&seen));
+        let chunks = futures::stream::once(async { Ok::<_, std::convert::Infallible>(bytes::Bytes::from("event")) })
+            .chain(futures::stream::pending())
+            .map(move |chunk| {
+                let _ = &observer;
+                chunk
+            });
+        let response = axum::response::Response::new(axum::body::Body::from_stream(chunks));
+        let scope = request("0123456789abcdef");
+        in_request(scope.clone(), async { set_request_variant("beta") }).await;
+        let mut body = response_in_request(scope, response).into_body();
+        let first = body
+            .frame()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.into_data().unwrap(), "event");
+
+        drop(body);
+
+        assert_eq!(
+            seen.lock()
+                .unwrap()
+                .clone(),
+            Some((Some("0123456789abcdef".to_string()), Some("beta".to_string())))
+        );
+    }
+
     #[test]
     fn a_body_of_known_length_is_left_as_it_is() {
         use axum::body::HttpBody;
