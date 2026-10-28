@@ -268,6 +268,95 @@ async fn an_mcp_access_point_publishes_the_protected_resource_its_caller_authent
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_put_removes_discovery_only_where_it_sends_null() {
+    let fixture = JwksFixture::start().await;
+    let (harness, admin) = start_discovery_gateway(&fixture).await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap();
+    let surfaces = format!("{}/api/v1/surfaces", harness.gateway_base);
+    let created = admin
+        .post(&surfaces)
+        .json(&json!({
+            "name": "edited",
+            "access_point": {"listen_address": harness.gateway_base.replace("127.0.0.1", "localhost"),
+                "route": "/edited", "protocol": "mcp",
+                "caller_authentication": {
+                    "methods": [{"type": "jwt_bearer", "jwt_verification_strategy_id": IDP_STRATEGY, "audiences": []}],
+                    "protected_resource": protected_resource("/edited")
+                }},
+            "target": {"endpoint": harness.mock.url()}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    let mut surface: serde_json::Value = created.json().await.unwrap();
+    let url = format!(
+        "{surfaces}/{}",
+        surface["surface_id"]
+            .as_str()
+            .unwrap()
+    );
+
+    // A PUT that leaves the setting out keeps it.
+    surface["description"] = json!("edited without the setting");
+    surface["access_point"]["caller_authentication"]
+        .as_object_mut()
+        .unwrap()
+        .remove("protected_resource");
+    let kept = admin
+        .put(&url)
+        .json(&surface)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(kept.status(), 200, "{}", kept.text().await.unwrap());
+    let published = client
+        .get(metadata_url(&harness, "/edited"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(published.status(), 200);
+
+    // The body is still read as JSON only.
+    let refused = admin
+        .put(&url)
+        .header("content-type", "text/plain")
+        .body(surface.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 415);
+
+    // A null removes it in the same request as the rest of the edit.
+    surface["description"] = json!("edited without discovery");
+    surface["access_point"]["caller_authentication"]["protected_resource"] = json!(null);
+    let removed = admin
+        .put(&url)
+        .json(&surface)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), 200);
+    let saved: serde_json::Value = removed.json().await.unwrap();
+    assert_eq!(saved["description"], "edited without discovery");
+    assert!(
+        saved["access_point"]["caller_authentication"]
+            .get("protected_resource")
+            .is_none(),
+        "{saved}"
+    );
+    let unpublished = client
+        .get(metadata_url(&harness, "/edited"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unpublished.status(), 404);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_browser_client_reads_the_metadata_from_any_origin() {
     let fixture = JwksFixture::start().await;
     let (harness, _admin) = start_discovery_gateway(&fixture).await;

@@ -1,4 +1,4 @@
-import { apiClient, type AgentSurface } from '../../../../api';
+import type { AgentSurface } from '../../../../api';
 
 /**
  * Authorization server discovery (`caller_authentication.protected_resource`):
@@ -274,27 +274,44 @@ export function protectedResourceRemovals(
   return { base: dropsSetting(stored.access_point, next.access_point), variantIds };
 }
 
-const REMOVE_SETTING = { caller_authentication: { protected_resource: null } };
+function withoutSetting(accessPoint: unknown): Record<string, unknown> {
+  const record = asRecord(accessPoint) ?? {};
+  return {
+    ...record,
+    caller_authentication: { ...storedCallerAuthentication(record), protected_resource: null },
+  };
+}
 
 /**
- * Remove, with JSON Merge Patch, every stored discovery setting the next
- * save leaves out, before that save is sent. Variants are patched through
- * their own endpoint, which merges into the variant. Resolves to whether
- * anything was removed.
+ * The save payload with `protected_resource: null` in each
+ * `caller_authentication` that leaves out a stored discovery setting, so the
+ * PUT removes it in the same request as the rest of the edit: a failed save
+ * changes nothing.
  */
-export async function removeDroppedProtectedResources(
-  surfaceId: string,
+export function withDroppedProtectedResourcesRemoved(
   stored: Partial<AgentSurface>,
   next: Partial<AgentSurface>
-): Promise<boolean> {
+): Partial<AgentSurface> {
   const removals = protectedResourceRemovals(stored, next);
-  if (removals.base) {
-    await apiClient.patchSurface(surfaceId, { access_point: REMOVE_SETTING });
-  }
-  for (const variantId of removals.variantIds) {
-    await apiClient.patchSurfaceVariant(surfaceId, variantId, {
-      overrides: { access_point: REMOVE_SETTING },
-    });
-  }
-  return removals.base || removals.variantIds.length > 0;
+  return {
+    ...next,
+    ...(removals.base
+      ? { access_point: withoutSetting(next.access_point) as AgentSurface['access_point'] }
+      : {}),
+    ...(removals.variantIds.length > 0
+      ? {
+          variants: (next.variants ?? []).map(variant =>
+            removals.variantIds.includes(variant.id)
+              ? {
+                  ...variant,
+                  overrides: {
+                    ...variant.overrides,
+                    access_point: withoutSetting(variant.overrides?.access_point),
+                  },
+                }
+              : variant
+          ),
+        }
+      : {}),
+  };
 }

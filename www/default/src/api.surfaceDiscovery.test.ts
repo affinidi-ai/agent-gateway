@@ -69,34 +69,24 @@ describe('surface API and authorization server discovery', () => {
     expect(saved.target.agent_identity).toEqual(agent_identity);
   });
 
-  it('removes the setting with a JSON Merge Patch that keeps the session', async () => {
+  it('sends a null that removes the setting on the same PUT', async () => {
     fetchMock.mockResolvedValue(ok(SURFACE));
 
-    await apiClient.patchSurface('s-1', {
-      access_point: { caller_authentication: { protected_resource: null } },
+    await apiClient.updateSurface('s-1', {
+      ...SURFACE,
+      access_point: {
+        ...SURFACE.access_point,
+        caller_authentication: { methods: [], protected_resource: null },
+      },
     });
 
     const { url, init, body } = sent();
     expect(url).toBe('/api/v1/surfaces/s-1');
-    expect(init.method).toBe('PATCH');
-    expect(init.headers).toEqual({
-      'Content-Type': 'application/merge-patch+json',
-      Authorization: 'Bearer session-1',
+    expect(init.method).toBe('PUT');
+    expect((body.access_point as any).caller_authentication).toEqual({
+      methods: [],
+      protected_resource: null,
     });
-    expect(body).toEqual({ access_point: { caller_authentication: { protected_resource: null } } });
-  });
-
-  it('patches one variant through its own endpoint', async () => {
-    fetchMock.mockResolvedValue(ok(SURFACE));
-
-    await apiClient.patchSurfaceVariant('s-1', 'v/1', {
-      overrides: { access_point: { caller_authentication: { protected_resource: null } } },
-    });
-
-    const { url, init } = sent();
-    expect(url).toBe('/api/v1/surfaces/s-1/variants/v%2F1');
-    expect(init.method).toBe('PATCH');
-    expect(init.headers).toMatchObject({ 'Content-Type': 'application/merge-patch+json' });
   });
 
   it('keeps the JSON content type and session on ordinary requests', async () => {

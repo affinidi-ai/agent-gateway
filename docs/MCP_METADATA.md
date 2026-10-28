@@ -1433,14 +1433,15 @@ stored setting while the surface still supports it, so a client that does not
 know the setting cannot switch it off by accident. A PUT that no longer
 supports it, for example one that switches the method, sets `forward_header` or
 `audiences`, or moves the protocol off MCP, drops it instead of being refused
-over a setting the client did not send. PATCH with `null` removes it.
+over a setting the client did not send. `null` removes it, sent with PATCH, or
+with PUT in the same request as the rest of the edit.
 
 The dashboard edits the setting in the Caller Context editor of an MCP surface
 whose method is JWT Bearer, for the surface and for each variant that overrides
 caller authentication. While discovery is on, the editor keeps `audiences`
 empty, `forward_header` off and the `Authorization` header with the `Bearer`
-scheme. A setting the operator switches off is removed with a merge PATCH
-before the rest of the surface is saved.
+scheme. A setting the operator switches off is sent as `null` in the PUT that
+saves the rest of the surface, so a save that fails leaves it in place.
 
 `make mcp-discovery` ([`scripts/mcp-discovery/`](../scripts/mcp-discovery/README.md))
 runs the flow end to end against Ory Hydra with a scripted client and the

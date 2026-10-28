@@ -24,7 +24,6 @@ import type { SurfaceStatus } from './generated/SurfaceStatus';
 import { formatApiError } from './utils/apiError';
 
 const API_BASE = '/api/v1';
-const MERGE_PATCH_CONTENT_TYPE = 'application/merge-patch+json';
 
 export const TERMS_ACCEPTANCE_REQUIRED_EVENT = 'terms-acceptance-required';
 export const TERMS_OPERATIONAL_FAILURE_EVENT = 'terms-operational-failure';
@@ -534,33 +533,6 @@ class APIClient {
       method: 'PUT',
       body: JSON.stringify(toBackendSurface(surface)),
     });
-    return fromBackendSurface(s);
-  }
-
-  /** JSON Merge Patch (RFC 7396) over a stored surface: `null` removes a field. */
-  async patchSurface(surfaceId: string, patch: Record<string, unknown>): Promise<AgentSurface> {
-    const s = await this.request<AgentSurface>(`/surfaces/${encodeURIComponent(surfaceId)}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': MERGE_PATCH_CONTENT_TYPE },
-      body: JSON.stringify(patch),
-    });
-    return fromBackendSurface(s);
-  }
-
-  /** JSON Merge Patch over one stored variant of a surface. */
-  async patchSurfaceVariant(
-    surfaceId: string,
-    variantId: string,
-    patch: Record<string, unknown>
-  ): Promise<AgentSurface> {
-    const s = await this.request<AgentSurface>(
-      `/surfaces/${encodeURIComponent(surfaceId)}/variants/${encodeURIComponent(variantId)}`,
-      {
-        method: 'PATCH',
-        headers: { 'Content-Type': MERGE_PATCH_CONTENT_TYPE },
-        body: JSON.stringify(patch),
-      }
-    );
     return fromBackendSurface(s);
   }
 
@@ -1258,7 +1230,8 @@ export interface ProtectedResourceConfig {
 
 export interface CallerAuthentication {
   methods: unknown[];
-  protected_resource?: ProtectedResourceConfig;
+  /** `null` on a PUT removes the stored setting; leaving it out keeps it. */
+  protected_resource?: ProtectedResourceConfig | null;
 }
 
 export interface AgentSurface {

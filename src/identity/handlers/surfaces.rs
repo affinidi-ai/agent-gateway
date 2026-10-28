@@ -1002,6 +1002,99 @@ pub async fn create_surface(
     Ok((StatusCode::CREATED, Json(surface)))
 }
 
+/// A PUT body: the surface, parsed exactly as `Json` parses it, and the
+/// discovery settings it removes with an explicit `protected_resource: null`,
+/// which the parsed surface cannot tell from an omitted setting.
+pub struct SurfaceUpdate {
+    surface: AgentSurface,
+    removals: ProtectedResourceRemovals,
+}
+
+impl<S: Send + Sync> axum::extract::FromRequest<S> for SurfaceUpdate {
+    type Rejection = axum::extract::rejection::JsonRejection;
+
+    async fn from_request(
+        request: axum::extract::Request,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let (parts, body) = request.into_parts();
+        let bytes =
+            axum::body::Bytes::from_request(axum::extract::Request::from_parts(parts.clone(), body), state).await?;
+        let removals = serde_json::from_slice(&bytes)
+            .map(|body| ProtectedResourceRemovals::of(&body))
+            .unwrap_or_default();
+        let Json(surface) = Json::from_request(axum::extract::Request::from_parts(parts, bytes.into()), state).await?;
+        Ok(Self { surface, removals })
+    }
+}
+
+/// The discovery settings a PUT removes, for the surface and by variant id. A
+/// PUT that omits a setting keeps it, so `null` is how a PUT removes one, in
+/// the same request as the rest of the edit.
+#[derive(Debug, Default)]
+struct ProtectedResourceRemovals {
+    base: bool,
+    variant_ids: Vec<String>,
+}
+
+impl ProtectedResourceRemovals {
+    fn of(body: &serde_json::Value) -> Self {
+        let removes = |access_point: Option<&serde_json::Value>| {
+            access_point
+                .and_then(|access_point| access_point.pointer("/caller_authentication/protected_resource"))
+                .is_some_and(serde_json::Value::is_null)
+        };
+        Self {
+            base: removes(body.get("access_point")),
+            variant_ids: body
+                .get("variants")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|variant| removes(variant.pointer("/overrides/access_point")))
+                .filter_map(|variant| {
+                    variant
+                        .get("id")?
+                        .as_str()
+                        .map(str::to_string)
+                })
+                .collect(),
+        }
+    }
+
+    /// Clears the removed settings, which retention restored from storage.
+    fn apply(
+        &self,
+        surface: &mut AgentSurface,
+    ) {
+        if self.base
+            && let Some(caller) = surface
+                .access_point
+                .caller_authentication
+                .as_mut()
+        {
+            caller.protected_resource = None;
+        }
+        for variant in &mut surface.variants {
+            if self
+                .variant_ids
+                .contains(&variant.id)
+                && let Some(caller) = variant
+                    .overrides
+                    .access_point
+                    .as_mut()
+                    .and_then(|access_point| {
+                        access_point
+                            .caller_authentication
+                            .as_mut()
+                    })
+            {
+                caller.protected_resource = None;
+            }
+        }
+    }
+}
+
 /// Update an existing agent surface
 pub async fn update_surface(
     Path(surface_id): Path<String>,
@@ -1009,7 +1102,7 @@ pub async fn update_surface(
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
-    Json(mut surface): Json<AgentSurface>,
+    SurfaceUpdate { mut surface, removals }: SurfaceUpdate,
 ) -> Result<Json<AgentSurface>, SurfaceApiError> {
     let store = state
         .agent_surface_store
@@ -1042,6 +1135,7 @@ pub async fn update_surface(
         surface.mcp_legacy_metadata_output = existing.mcp_legacy_metadata_output;
     }
     retain_mcp_settings(&mut surface, &existing);
+    removals.apply(&mut surface);
     retain_a2a_settings(&mut surface, &existing);
 
     let saved = validate_and_save_surface(
@@ -1342,8 +1436,8 @@ fn retain_mcp_http(
 /// `caller_authentication` from its methods alone, so a `caller_authentication`
 /// that omits `protected_resource` means "unchanged". Dropping it on an
 /// unrelated edit would silently switch off the discovery the operator set up.
-/// Removal is explicit, via PATCH with a `null`. Returns whether a stored
-/// setting was restored.
+/// Removal is explicit: a `null`, sent with PUT or PATCH. Returns whether a
+/// stored setting was restored.
 fn retain_protected_resource(
     incoming: Option<&mut crate::config::agent_surface::CallerAuthentication>,
     previous: Option<&crate::config::agent_surface::CallerAuthentication>,
@@ -2758,6 +2852,91 @@ mod validation_tests {
                 .cloned(),
             expected
         );
+    }
+
+    #[test]
+    fn a_put_that_sends_a_null_protected_resource_removes_it() {
+        let protected = serde_json::json!({
+            "resource": "https://gateway.example/mcp", "authorization_servers": ["https://idp.example"]
+        });
+        let caller = |protected_resource: Option<serde_json::Value>| {
+            let mut caller = serde_json::json!({"methods": [
+                {"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": []}
+            ]});
+            if let Some(protected_resource) = protected_resource {
+                caller["protected_resource"] = protected_resource;
+            }
+            caller
+        };
+        let variant = |id: &str, protected_resource: Option<serde_json::Value>| {
+            serde_json::json!({"id": id, "alias": id, "name": id, "enabled": true,
+                "overrides": {"access_point": {"caller_authentication": caller(protected_resource)}}})
+        };
+        let surface =
+            |base: Option<serde_json::Value>, beta: Option<serde_json::Value>, gamma: Option<serde_json::Value>| {
+                serde_json::json!({
+                    "surface_id": "s-1", "name": "s-1",
+                    "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp",
+                        "caller_authentication": caller(base)},
+                    "target": {"endpoint": "https://tools.example/mcp"},
+                    "variants": [variant("beta", beta), variant("gamma", gamma)]
+                })
+            };
+        let existing: AgentSurface =
+            serde_json::from_value(surface(Some(protected.clone()), Some(protected.clone()), Some(protected.clone())))
+                .unwrap();
+        let resources = |surface: &AgentSurface| {
+            let variants = surface
+                .variants
+                .iter()
+                .map(|variant| {
+                    variant
+                        .overrides
+                        .access_point
+                        .as_ref()
+                        .and_then(|access_point| {
+                            access_point
+                                .caller_authentication
+                                .as_ref()
+                        })
+                        .is_some_and(|caller| {
+                            caller
+                                .protected_resource
+                                .is_some()
+                        })
+                })
+                .collect::<Vec<_>>();
+            (
+                surface
+                    .protected_resource()
+                    .is_some(),
+                variants,
+            )
+        };
+
+        // A null removes the setting where it is sent; an omitted one is kept.
+        let body = surface(Some(serde_json::Value::Null), Some(serde_json::Value::Null), None);
+        let removals = ProtectedResourceRemovals::of(&body);
+        assert!(removals.base);
+        assert_eq!(removals.variant_ids, vec!["beta".to_string()]);
+        let mut put: AgentSurface = serde_json::from_value(body).unwrap();
+        retain_mcp_settings(&mut put, &existing);
+        removals.apply(&mut put);
+        assert_eq!(resources(&put), (false, vec![false, true]));
+
+        // Without a null, a PUT removes nothing.
+        let body = surface(None, None, None);
+        let removals = ProtectedResourceRemovals::of(&body);
+        assert!(
+            !removals.base
+                && removals
+                    .variant_ids
+                    .is_empty()
+        );
+        let mut put: AgentSurface = serde_json::from_value(body).unwrap();
+        retain_mcp_settings(&mut put, &existing);
+        removals.apply(&mut put);
+        assert_eq!(resources(&put), (true, vec![true, true]));
     }
 
     fn a2a_block(

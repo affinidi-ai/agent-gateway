@@ -20,7 +20,7 @@ import SurfaceFormShell from '../components/surface-builder/SurfaceFormShell';
 import { useSurfacePolicyDefinitions } from '../components/surface-builder/hooks/useSurfacePolicyDefinitions';
 import { surfacePolicyBlockingReason } from '../components/surface-builder/elements/policy/status';
 import { withA2aValidationSettled } from '../components/surface-builder/elements/access-point/a2aSettings';
-import { removeDroppedProtectedResources } from '../components/surface-builder/elements/caller-auth/protectedResource';
+import { withDroppedProtectedResourcesRemoved } from '../components/surface-builder/elements/caller-auth/protectedResource';
 import {
   DEFAULT_DIDWEBVH_CONFIG,
   type DidwebvhConfig,
@@ -1165,7 +1165,6 @@ const SurfaceDetailPage: React.FC = () => {
     }
     setSaving(true);
     setError(null);
-    let discoveryRemoved = false;
     try {
       let payload: Partial<AgentSurface>;
       {
@@ -1222,8 +1221,8 @@ const SurfaceDetailPage: React.FC = () => {
       payload.issuer_id = issuerId.trim() || undefined;
       payload = withA2aValidationSettled(payload);
       // A PUT that leaves out a stored discovery setting keeps it, so one the
-      // operator removed is cleared first.
-      discoveryRemoved = await removeDroppedProtectedResources(surfaceId, surface, payload);
+      // operator removed is sent as null, removed only if the save succeeds.
+      payload = withDroppedProtectedResourcesRemoved(surface, payload);
       const updated = await apiClient.updateSurface(surfaceId, payload);
       setSurface(updated);
       setJsonOverride(null);
@@ -1323,12 +1322,7 @@ const SurfaceDetailPage: React.FC = () => {
         showToast('error', `Warning: ${w.message}`, { autoRemove: true, duration: 8000 });
       }
     } catch (err: any) {
-      const message = err.message || 'Failed to save surface';
-      setError(
-        discoveryRemoved
-          ? `${message}. Authorization server discovery was removed before the rest of the save failed.`
-          : message
-      );
+      setError(err.message || 'Failed to save surface');
     } finally {
       setSaving(false);
     }

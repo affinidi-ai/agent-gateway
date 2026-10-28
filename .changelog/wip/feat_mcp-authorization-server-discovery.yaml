@@ -12,8 +12,8 @@ changes:
         its own surfaces. The authorization servers must include the issuer of the caller
         authentication's JWT verification strategy. The setting is checked on save like
         mcp_http.authorization, a PUT that
-        omits it keeps it while the surface still supports it, and surfaces without it behave as
-        before.
+        omits it keeps it while the surface still supports it, a PUT or PATCH that sends null
+        removes it, and surfaces without it behave as before.
     - timestamp: '2026-10-27T11:14:01Z'
       title: Challenge MCP callers without a valid token to fetch one
       description: >-
@@ -30,7 +30,8 @@ changes:
         turn on authorization server discovery and set its resource, authorization servers and
         scopes, for the surface and each variant. It keeps token forwarding off and the accepted
         audiences empty while discovery is on, shows the resource each variant advertises, and
-        removes a setting the operator switches off.
+        removes a setting the operator switches off in the same request as the rest of the save,
+        so a save that fails changes nothing.
     - timestamp: '2026-10-27T19:34:56Z'
       title: End-to-end MCP discovery demo against Ory Hydra
       description: >-

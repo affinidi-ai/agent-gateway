@@ -1,4 +1,4 @@
-import { apiClient, type AgentSurface } from '../../../../../api';
+import type { AgentSurface } from '../../../../../api';
 import {
   authorizationServerProblem,
   discoveryProblems,
@@ -6,20 +6,13 @@ import {
   protectedResourcePayload,
   protectedResourceRemovals,
   readProtectedResource,
-  removeDroppedProtectedResources,
   resourceMissesRoute,
   resourceProblem,
   scopeProblem,
   suggestedResource,
   variantResource,
+  withDroppedProtectedResourcesRemoved,
 } from '../protectedResource';
-
-jest.mock('../../../../../api', () => ({
-  apiClient: { patchSurface: jest.fn(), patchSurfaceVariant: jest.fn() },
-}));
-
-const patchSurface = apiClient.patchSurface as jest.Mock;
-const patchSurfaceVariant = apiClient.patchSurfaceVariant as jest.Mock;
 
 const SETTING = {
   resource: 'https://gateway.example/mcp/alpha',
@@ -236,11 +229,6 @@ describe('resource helpers', () => {
 });
 
 describe('removing a stored setting', () => {
-  beforeEach(() => {
-    patchSurface.mockReset().mockResolvedValue({});
-    patchSurfaceVariant.mockReset().mockResolvedValue({});
-  });
-
   it('finds the base and variant settings a save leaves out of the caller authentication it sends', () => {
     const stored = surface({ protected_resource: SETTING }, [
       { id: 'v1', auth: { protected_resource: SETTING } },
@@ -269,39 +257,39 @@ describe('removing a stored setting', () => {
     });
   });
 
-  it('issues a merge PATCH for the base and one per variant before the save', async () => {
+  it('sends null for the base and each variant setting the save leaves out', () => {
+    const stored = surface({ protected_resource: SETTING }, [
+      { id: 'v1', auth: { protected_resource: SETTING } },
+      { id: 'v2', auth: { protected_resource: SETTING } },
+    ]);
+    const next = surface({}, [
+      { id: 'v1', auth: {} },
+      { id: 'v2', auth: { protected_resource: SETTING } },
+    ]);
+
+    const payload = withDroppedProtectedResourcesRemoved(stored, next);
+
+    expect(payload.access_point?.caller_authentication).toEqual({
+      methods,
+      protected_resource: null,
+    });
+    expect(payload.access_point?.route).toBe('/mcp/alpha');
+    expect(payload.variants?.[0].overrides).toEqual({
+      complete: true,
+      access_point: { caller_authentication: { methods, protected_resource: null } },
+    });
+    expect(payload.variants?.[1]).toBe(next.variants?.[1]);
+    expect(next.access_point?.caller_authentication).toEqual({ methods });
+  });
+
+  it('sends the save unchanged when nothing was removed', () => {
     const stored = surface({ protected_resource: SETTING }, [
       { id: 'v1', auth: { protected_resource: SETTING } },
     ]);
-    await expect(
-      removeDroppedProtectedResources('s-1', stored, surface({}, [{ id: 'v1', auth: {} }]))
-    ).resolves.toBe(true);
-
-    expect(patchSurface).toHaveBeenCalledTimes(1);
-    expect(patchSurface).toHaveBeenCalledWith('s-1', {
-      access_point: { caller_authentication: { protected_resource: null } },
-    });
-    expect(patchSurfaceVariant).toHaveBeenCalledTimes(1);
-    expect(patchSurfaceVariant).toHaveBeenCalledWith('s-1', 'v1', {
-      overrides: { access_point: { caller_authentication: { protected_resource: null } } },
-    });
-  });
-
-  it('issues no request when nothing was removed', async () => {
-    const stored = surface({ protected_resource: SETTING });
-    await expect(removeDroppedProtectedResources('s-1', stored, stored)).resolves.toBe(false);
-    expect(patchSurface).not.toHaveBeenCalled();
-    expect(patchSurfaceVariant).not.toHaveBeenCalled();
-  });
-
-  it('stops before the save when a removal is refused', async () => {
-    patchSurface.mockRejectedValue(new Error('Surface not found (404)'));
-    const stored = surface({ protected_resource: SETTING }, [
-      { id: 'v1', auth: { protected_resource: SETTING } },
-    ]);
-    await expect(
-      removeDroppedProtectedResources('s-1', stored, surface({}, [{ id: 'v1', auth: {} }]))
-    ).rejects.toThrow('Surface not found (404)');
-    expect(patchSurfaceVariant).not.toHaveBeenCalled();
+    expect(withDroppedProtectedResourcesRemoved(stored, stored)).toEqual(stored);
+    const withoutCallerAuthentication = surface(undefined, [{ id: 'v1' }]);
+    expect(withDroppedProtectedResourcesRemoved(stored, withoutCallerAuthentication)).toEqual(
+      withoutCallerAuthentication
+    );
   });
 });
