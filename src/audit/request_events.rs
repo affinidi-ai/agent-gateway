@@ -149,14 +149,23 @@ impl RoutingRefusal {
     }
 }
 
-/// Records a routing refusal for `error` and returns how to answer it.
+/// Records a routing refusal for `error` and returns how to answer it. The
+/// request's surface variant is set first: `_unknown_` for an unknown alias,
+/// the disabled variant's alias, or nothing for a misconfigured default. The
+/// alias the caller named goes only to `requested_variant`.
 pub fn refuse_routing(
     facts: &RequestFacts<'_>,
     error: &crate::config::agent_surface_variants::VariantResolveError,
 ) -> RoutingRefusal {
     use crate::config::agent_surface_variants::{SurfaceVariant, VariantResolveError};
+    use crate::observability::policy_audit::set_request_variant;
     use axum::http::StatusCode;
 
+    match error {
+        VariantResolveError::UnknownAlias(_) => set_request_variant(SurfaceVariant::UNKNOWN),
+        VariantResolveError::DisabledVariant(alias) => set_request_variant(alias),
+        VariantResolveError::MisconfiguredDefault(_) => {}
+    }
     let refusal = match error {
         VariantResolveError::UnknownAlias(alias) => RoutingRefusal {
             reason: RejectionReason::UnknownVariant,

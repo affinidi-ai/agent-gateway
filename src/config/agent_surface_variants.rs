@@ -58,6 +58,14 @@ impl SurfaceVariant {
     /// The longest alias [`Self::ALIAS_PATTERN`] accepts.
     pub const ALIAS_MAX_LEN: usize = 32;
 
+    /// The surface variant recorded when the base surface served a request.
+    /// No alias can contain `_`, so it never names a real variant.
+    pub const BASE: &'static str = "_base_";
+
+    /// The surface variant recorded when the URL named a variant the surface
+    /// doesn't have.
+    pub const UNKNOWN: &'static str = "_unknown_";
+
     /// Returns `Ok(())` if the alias matches `ALIAS_PATTERN`. The error
     /// message includes the offending alias for echoing back to the user.
     pub fn validate_alias(alias: &str) -> Result<(), String> {
@@ -830,18 +838,20 @@ impl AgentSurface {
         target
     }
 
-    /// Return the alias of the default variant, if any. Returns `None`
-    /// when the surface has no variants or `default_variant_id` is unset
-    /// or doesn't match.
-    #[allow(dead_code)]
-    pub fn default_variant_alias(&self) -> Option<&str> {
-        let id = self
-            .default_variant_id
-            .as_ref()?;
-        self.variants
-            .iter()
-            .find(|v| &v.id == id)
-            .map(|v| v.alias.as_str())
+    /// The `surface_variant` a request served by variant `variant_id`
+    /// records: that variant's alias, else [`SurfaceVariant::BASE`]. Never
+    /// read from the URL.
+    pub fn surface_variant(
+        &self,
+        variant_id: Option<&str>,
+    ) -> &str {
+        variant_id
+            .and_then(|id| {
+                self.variants
+                    .iter()
+                    .find(|v| v.id == id)
+            })
+            .map_or(SurfaceVariant::BASE, |v| v.alias.as_str())
     }
 
     /// Validate the variant catalog on this surface:
@@ -1195,18 +1205,22 @@ mod tests {
     }
 
     #[test]
-    fn default_variant_alias_lookup() {
+    fn the_recorded_variant_is_the_serving_variants_alias_else_the_base() {
         let mut s = base_surface();
         s.variants = vec![variant("id-prod", "prod", SurfaceOverrides::default())];
         s.default_variant_id = Some("id-prod".to_string());
 
-        assert_eq!(s.default_variant_alias(), Some("prod"));
+        assert_eq!(s.surface_variant(Some("id-prod")), "prod");
+        assert_eq!(s.surface_variant(None), "_base_");
+        assert_eq!(base_surface().surface_variant(None), "_base_");
+    }
 
-        s.default_variant_id = Some("missing".to_string());
-        assert_eq!(s.default_variant_alias(), None);
-
-        s.default_variant_id = None;
-        assert_eq!(s.default_variant_alias(), None);
+    #[test]
+    fn the_special_variants_can_never_be_a_valid_alias() {
+        for special in [SurfaceVariant::BASE, SurfaceVariant::UNKNOWN] {
+            assert!(SurfaceVariant::validate_alias(special).is_err(), "{special}");
+            assert!(special.starts_with('_') && special.ends_with('_'), "{special}");
+        }
     }
 
     // ── Override application semantics ──────────────────────────────────

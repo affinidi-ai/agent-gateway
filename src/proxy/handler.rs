@@ -9340,7 +9340,14 @@ async fn multi_channel_proxy_handler_in_request_scope(
                 .surface
                 .select_variant(virtual_channel_alias.as_deref())
             {
-                Ok(variant) => variant.map(|v| v.id.clone()),
+                Ok(variant) => {
+                    let variant_id = variant.map(|v| v.id.clone());
+                    crate::observability::policy_audit::set_request_variant(
+                        ch.surface
+                            .surface_variant(variant_id.as_deref()),
+                    );
+                    variant_id
+                }
                 Err(error) => {
                     warn!(surface = %ch.surface.name, error = %error, "Surface variant cannot be resolved");
                     let refusal =

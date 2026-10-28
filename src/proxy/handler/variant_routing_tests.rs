@@ -112,6 +112,62 @@ pub(super) fn router(surface: AgentSurface) -> crate::state::MultiSurfaceProxySt
     }
 }
 
+/// [`router`] with an allow-all response policy on the surface, so a served
+/// request writes a policy decision. Returns the directory holding the
+/// policy, which the caller keeps alive.
+pub(super) async fn router_with_decisions(
+    mut surface: AgentSurface
+) -> (crate::state::MultiSurfaceProxyState, tempfile::TempDir) {
+    let directory = tempfile::tempdir().unwrap();
+    let policies = Arc::new(
+        crate::policies::policy_definitions::FileSystemPolicyDefinitionStore::new(
+            directory
+                .path()
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .await
+        .unwrap(),
+    );
+    policies
+        .save(
+            serde_json::from_value(json!({
+                "id": "allow-responses", "name": "Allow responses", "policy_type": "agent_surface",
+                "policy": "package surface.policy\ndefault allow = true", "created_at": "2026-10-28T00:00:00Z"
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    surface
+        .target
+        .response_policy = serde_json::from_value(json!({"policy_definition_id": "allow-responses"})).unwrap();
+    let manager = Arc::new(crate::policies::SurfacePolicyManager::new());
+    manager.set_policy_definition_store(policies);
+    manager
+        .update_channel_policy(&surface)
+        .await
+        .unwrap();
+    let mut router = router(surface);
+    router.policy_manager = Some(manager);
+    (router, directory)
+}
+
+/// The `surface_variant` of every record, and how many records there were.
+pub(super) fn variants(events: &[DelegationAuditEvent]) -> std::collections::BTreeSet<Option<String>> {
+    events
+        .iter()
+        .map(|event| event.surface_variant.clone())
+        .collect()
+}
+
+fn decisions(events: &[DelegationAuditEvent]) -> usize {
+    events
+        .iter()
+        .filter(|event| matches!(event.event, DelegationAuditAction::PolicyDecision { .. }))
+        .count()
+}
+
 /// Sends one A2A message through the Access Point and returns the status with
 /// every audit record the request wrote.
 pub(super) async fn send(
@@ -226,6 +282,58 @@ async fn a_variant_that_cannot_be_resolved_is_refused_with_one_status_per_reason
         0,
         "no refused request reaches the Target"
     );
+}
+
+fn one(variant: &str) -> std::collections::BTreeSet<Option<String>> {
+    std::collections::BTreeSet::from([Some(variant.to_string())])
+}
+
+#[tokio::test]
+async fn every_record_of_a_served_request_names_the_variant_that_served_it() {
+    let target = MockServer::start_with_response(
+        json!({"jsonrpc": "2.0", "id": 1, "result": {"kind": "message"}}).to_string(),
+    )
+    .await;
+    let endpoint = target.url();
+    for (case, surface, path, expected) in [
+        ("named variant", surface(&endpoint, catalog(), Some("v-prod")), "/a2a$beta/rpc", "beta"),
+        ("default variant", surface(&endpoint, catalog(), Some("v-prod")), "/a2a/rpc", "prod"),
+        ("no variants", surface(&endpoint, json!([]), None), "/a2a/rpc", "_base_"),
+        ("variants but no default", surface(&endpoint, catalog(), None), "/a2a/rpc", "_base_"),
+    ] {
+        let (router, _policies) = router_with_decisions(surface).await;
+        let (status, events) = send(router, path).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{case}: {events:?}");
+        assert!(decisions(&events) > 0, "{case}: a decision is recorded");
+        assert_eq!(variants(&events), one(expected), "{case}");
+    }
+}
+
+#[tokio::test]
+async fn a_refusal_names_the_variant_it_refused_and_never_the_callers_text() {
+    let endpoint = "http://127.0.0.1:9";
+    let long = "a".repeat(40);
+    let long_path = format!("/a2a${long}/rpc");
+    let cases = [
+        ("unknown alias", surface(endpoint, catalog(), None), "/a2a$typo/rpc", Some("_unknown_"), Some("typo")),
+        (
+            "alias outside the alias grammar",
+            surface(endpoint, catalog(), None),
+            "/a2a$Bad_Alias/rpc",
+            Some("_unknown_"),
+            Some("Bad_Alias"),
+        ),
+        ("long alias", surface(endpoint, catalog(), None), long_path.as_str(), Some("_unknown_"), Some(&long[..32])),
+        ("disabled alias", surface(endpoint, catalog(), None), "/a2a$off/rpc", Some("off"), None),
+        ("disabled default", surface(endpoint, catalog(), Some("v-off")), "/a2a/rpc", Some("off"), None),
+        ("misconfigured default", surface(endpoint, catalog(), Some("removed")), "/a2a/rpc", None, None),
+    ];
+    for (case, surface, path, variant, requested) in cases {
+        let (_, events) = send(router(surface), path).await;
+        assert_eq!(events.len(), 1, "{case}: {events:?}");
+        assert_eq!(events[0].surface_variant.as_deref(), variant, "{case}");
+        assert_eq!(refusals(&events)[0].3.as_deref(), requested, "{case}");
+    }
 }
 
 #[tokio::test]
