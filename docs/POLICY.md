@@ -151,14 +151,15 @@ runs that list for such a target. For a variant, only a target list the variant 
 override counts; an inherited list that cannot run on the variant's endpoint is ignored.
 
 A write that does not declare the shape is converted only while the stored surface has no
-Trust Check lists at all (no `trust_check_split` and no Transit Point lists): an undeclared create or `PUT` that carries a `target.trust_check_list` is
-then treated as the old shape, converted exactly as a stored surface is (below), logged as a
-warning, and saved. Once any of the surface's Transit Points hold lists, an undeclared write
-cannot change Trust Checks. An undeclared `PUT` keeps every stored Transit Point list for each
-Transit Point it sends without one, keeps the stored target list when it sends none, and is
-rejected with `400` if it sets a target list or a Transit Point list that differs from the
-stored one, including an explicit empty list. A new Transit Point it adds without a list has no
-Trust Checks. An undeclared `PATCH` or variant write is
+Trust Check lists at all (no `trust_check_split` and no Transit Point lists): an undeclared
+create or `PUT` that carries a `target.trust_check_list` and no Transit Point lists is then
+treated as the old shape, converted exactly as a stored surface is (below), logged as a
+warning, and saved. Once the surface has Trust Check lists, an undeclared write cannot change
+them. An undeclared `PUT` keeps every stored Transit Point list for each Transit Point it sends
+without one, keeps the stored target list when it sends none, and is rejected with `400` if it
+sets a target list or a Transit Point list that differs from the stored one, including an
+explicit empty list, or leaves out a variant's own Transit Points that hold lists. A new
+Transit Point it adds without a list has no Trust Checks. An undeclared `PATCH` or variant write is
 rejected with `400` when it sets or clears a target list or Transit Points, including through a
 parent object such as `transit` or a variant's `overrides`, or by replacing `variants`; a
 variant `PUT` that sends `overrides` for a variant whose Transit Points hold lists counts as

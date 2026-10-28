@@ -248,8 +248,9 @@ async fn send(request: reqwest::RequestBuilder) -> (u16, serde_json::Value) {
     (status, body)
 }
 
-const PER_TRANSIT_POINT_REQUIRED: &str = "this surface stores Trust Checks per Transit Point; send trust_check_split: \
-                                          true and set transit.points[].trust_check_list";
+const PER_TRANSIT_POINT_REQUIRED: &str = "this surface uses the per-Transit-Point Trust Check shape; send \
+                                          trust_check_split: true to change its Trust Check lists \
+                                          (transit.points[].trust_check_list, target.trust_check_list)";
 const TARGET_LIST_REJECTED: &str = "target.trust_check_list is only allowed for a2a-proxy:// and fabric:// Managed \
                                     Agent targets";
 

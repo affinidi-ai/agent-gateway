@@ -288,11 +288,12 @@ fn reject_target_trust_checks_unless_target_runs_them(surface: &AgentSurface) ->
 /// surface is converted on load: the list is copied onto the Transit Points
 /// and cleared unless the Managed Agent target runs it. Only the Trust Check
 /// parts of the conversion are taken, so every other field keeps exactly what
-/// the client sent. A body declaring `trust_check_split: true`, or without a
-/// target list, is left as sent. The conversion is logged only when it changed
-/// something.
+/// the client sent. A body declaring `trust_check_split: true`, without a
+/// target list, or already carrying Transit Point lists (which the old shape
+/// cannot express) is left as sent. The conversion is logged only when it
+/// changed something.
 fn convert_old_shape_body(surface: &mut AgentSurface) -> Result<(), SurfaceApiError> {
-    if surface.trust_check_split || !surface.has_target_trust_checks() {
+    if surface.trust_check_split || !surface.has_target_trust_checks() || surface.has_transit_point_trust_checks() {
         return Ok(());
     }
     let mut value = serde_json::to_value(&*surface)
@@ -392,8 +393,9 @@ where
     }
 }
 
-const PER_TRANSIT_POINT_REQUIRED: &str = "this surface stores Trust Checks per Transit Point; send \
-                                          trust_check_split: true and set transit.points[].trust_check_list";
+const PER_TRANSIT_POINT_REQUIRED: &str = "this surface uses the per-Transit-Point Trust Check shape; send \
+                                          trust_check_split: true to change its Trust Check lists \
+                                          (transit.points[].trust_check_list, target.trust_check_list)";
 
 /// Settle a PUT without `trust_check_split: true` on a surface whose stored
 /// Transit Points already hold lists (base or variant override points). Such a
@@ -408,6 +410,9 @@ const PER_TRANSIT_POINT_REQUIRED: &str = "this surface stores Trust Checks per T
 /// - A base `target.trust_check_list` (or a variant override's) that is absent
 ///   or `null` keeps the stored one; a sent list, empty included, that differs
 ///   from the stored one is refused.
+/// - A variant sent without its own Transit Points while the stored variant's
+///   own Transit Points hold lists is refused, since dropping them would drop
+///   their lists.
 ///
 /// A client in the old shape cannot express per-Transit-Point lists, so it
 /// keeps them; only a declared write changes or removes them.
@@ -543,6 +548,22 @@ fn keep_stored_point_lists(
             })
             .and_then(|transit| transit.points.as_deref())
             .unwrap_or_default();
+        let sends_points = variant
+            .overrides
+            .transit
+            .as_ref()
+            .is_some_and(|transit| transit.points.is_some());
+        if !sends_points
+            && stored_points
+                .iter()
+                .any(|point| {
+                    !point
+                        .trust_check_list
+                        .is_empty()
+                })
+        {
+            return Err(refused());
+        }
         if let Some(points) = variant
             .overrides
             .transit
@@ -4393,6 +4414,35 @@ mod validation_tests {
     }
 
     #[test]
+    fn a_body_that_already_carries_transit_point_lists_is_not_converted() {
+        let mut body = two_point_fabric_surface(vec![target_trust_check("own")], Vec::new());
+
+        convert_old_shape_body(&mut body).expect("new-shape body");
+
+        assert_eq!(
+            points_of(&body),
+            vec![(vec!["own".to_string()], false), (Vec::new(), false)],
+            "a Transit Point meant to have no checks is left without them"
+        );
+        assert_eq!(body.target.trust_check_list[0].id, "fabric-target");
+    }
+
+    #[test]
+    fn an_undeclared_put_that_drops_a_variants_transit_points_is_refused() {
+        let mut stored = base_surface();
+        stored.variants = vec![variant_with_points(None, vec![target_trust_check("dev-copy")], true)];
+        let mut body = stored.clone();
+        body.variants[0]
+            .overrides
+            .transit = None;
+
+        assert_eq!(refused(put(&mut body, &stored)), PER_TRANSIT_POINT_REQUIRED);
+
+        let mut kept = stored.clone();
+        put(&mut kept, &stored).expect("variant sent with its Transit Points");
+    }
+
+    #[test]
     fn an_unmarked_surface_without_lists_is_still_converted() {
         let mut stored = fabric_surface_with_point(Vec::new());
         stored
@@ -4769,8 +4819,8 @@ mod validation_tests {
         };
         assert_eq!(
             msg,
-            "this surface stores Trust Checks per Transit Point; send trust_check_split: true and set \
-             transit.points[].trust_check_list"
+            "this surface uses the per-Transit-Point Trust Check shape; send trust_check_split: true to \
+             change its Trust Check lists (transit.points[].trust_check_list, target.trust_check_list)"
         );
         assert!(reject_undeclared_trust_check_edit(false, &with_lists).is_ok());
         assert!(reject_undeclared_trust_check_edit(true, &without_lists).is_ok());
