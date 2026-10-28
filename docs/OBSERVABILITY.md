@@ -168,13 +168,15 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
   rate limit), `sse_sessions` (the legacy SSE session cap) or `fabric_capacity` (a full Fabric
   stream cap on the way to a fabric target). `retry_after_ms` is the wait the caller is given,
   when there is one; the surface limit also sends it as `Retry-After` in whole seconds.
-- `request_rejected`: the Access Point refused the request before or while forwarding it.
-  `http_status` is what the caller received and `rpc_error_code` the JSON-RPC error code, when
-  the refusal was one; legacy MCP refuses a malformed request with HTTP 200 and a JSON-RPC error,
-  so read the two together. `stage` and `reason`:
+- `request_rejected`: the gateway refused the request before or while forwarding it.
+  `http_status` is the HTTP status the caller received, on HTTP paths only (the Access Point and
+  the Transit Point); it is absent on every Fabric refusal (`via_fabric: true`), where no HTTP
+  response is involved. `rpc_error_code` is the JSON-RPC error code, when the refusal was one;
+  legacy MCP refuses a malformed request with HTTP 200 and a JSON-RPC error, so read the two
+  together. `stage` and `reason`:
   - `routing`: `no_route` (no surface matches; recorded against surface `unknown`, with no trace
-    id on the direct path), and the three variant refusals, recorded with the same status on the
-    Access Point, the Transit Point and Fabric receive:
+    id on the direct path), and the three variant refusals, refused for the same reasons on the
+    Access Point, the Transit Point and Fabric receive, with these statuses on the HTTP paths:
     - `unknown_variant` (404): the URL names a variant the surface doesn't have, including on a
       surface with no variants. `requested_variant` holds the alias the URL named, cut to 32
       characters; it is caller-chosen text and appears on no other record.

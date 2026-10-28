@@ -484,9 +484,12 @@ pub enum DelegationAuditAction {
     RequestRejected {
         stage: RejectionStage,
         reason: RejectionReason,
-        /// The HTTP status the caller received. Legacy MCP refuses a malformed
-        /// request with 200 and a JSON-RPC error, so read it with `rpc_error_code`.
-        http_status: u16,
+        /// The HTTP status the caller received, on HTTP paths only; absent on
+        /// Fabric, where no HTTP response is involved. Legacy MCP refuses a
+        /// malformed request with 200 and a JSON-RPC error, so read it with
+        /// `rpc_error_code`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        http_status: Option<u16>,
         /// The JSON-RPC error code the caller received, when the refusal was one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rpc_error_code: Option<i64>,
@@ -2035,7 +2038,7 @@ mod tests {
                 DelegationAuditAction::RequestRejected {
                     stage: RejectionStage::Admission,
                     reason: RejectionReason::BodyTooLarge,
-                    http_status: 413,
+                    http_status: Some(413),
                     rpc_error_code: Some(-32600),
                     requested_variant: None,
                 },
@@ -2110,7 +2113,7 @@ mod tests {
         let stored = serde_json::to_value(DelegationAuditAction::RequestRejected {
             stage: RejectionStage::Admission,
             reason: RejectionReason::ConsentIdentityRequired,
-            http_status: 403,
+            http_status: Some(403),
             rpc_error_code: None,
             requested_variant: None,
         })

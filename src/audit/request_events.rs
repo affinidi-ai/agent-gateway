@@ -85,8 +85,9 @@ pub fn rate_limited(
     })
 }
 
-/// The Access Point refused the request. `http_status` and `rpc_error_code`
-/// are what the caller received.
+/// The gateway refused the request. `http_status` and `rpc_error_code` are
+/// what the caller received; a Fabric refusal records no HTTP status, as no
+/// HTTP response is involved.
 pub fn request_rejected(
     facts: &RequestFacts<'_>,
     stage: RejectionStage,
@@ -109,7 +110,7 @@ fn record_rejection(
         facts.record(DelegationAuditAction::RequestRejected {
             stage,
             reason,
-            http_status,
+            http_status: (!facts.via_fabric).then_some(http_status),
             rpc_error_code,
             requested_variant: requested_variant.map(str::to_string),
         })
@@ -384,7 +385,7 @@ mod tests {
 
     fn rejected(
         events: &[crate::delegation_vault::audit::DelegationAuditEvent]
-    ) -> Vec<(RejectionStage, RejectionReason, u16, Option<i64>)> {
+    ) -> Vec<(RejectionStage, RejectionReason, Option<u16>, Option<i64>)> {
         events
             .iter()
             .map(|event| match &event.event {
@@ -411,11 +412,49 @@ mod tests {
         assert_eq!(
             rejected(&events),
             vec![
-                (RejectionStage::Admission, RejectionReason::InvalidEnvelope, 200, Some(-32700)),
-                (RejectionStage::Forward, RejectionReason::SsrfBlocked, 403, None),
+                (RejectionStage::Admission, RejectionReason::InvalidEnvelope, Some(200), Some(-32700)),
+                (RejectionStage::Forward, RejectionReason::SsrfBlocked, Some(403), None),
             ]
         );
         assert_eq!(events[0].trace_id.as_deref(), Some("trace-1"));
+    }
+
+    #[tokio::test]
+    async fn a_fabric_refusal_records_no_http_status() {
+        use crate::config::agent_surface_variants::VariantResolveError;
+        let fabric = RequestFacts {
+            via_fabric: true,
+            ..facts()
+        };
+        let ((), events) = crate::audit::producer::capture(async {
+            request_rejected(&fabric, RejectionStage::Admission, RejectionReason::BodyTooLarge, 413, None);
+            refuse_routing(&fabric, &VariantResolveError::UnknownAlias("typo".into()));
+            request_rejected(&facts(), RejectionStage::Admission, RejectionReason::BodyTooLarge, 413, None);
+        })
+        .await;
+
+        assert_eq!(
+            rejected(&events),
+            vec![
+                (RejectionStage::Admission, RejectionReason::BodyTooLarge, None, None),
+                (RejectionStage::Routing, RejectionReason::UnknownVariant, None, None),
+                (RejectionStage::Admission, RejectionReason::BodyTooLarge, Some(413), None),
+            ]
+        );
+        let stored = serde_json::to_value(&events[0]).unwrap();
+        assert!(stored["event"]["request_rejected"].get("http_status").is_none(), "{stored}");
+    }
+
+    #[test]
+    fn a_stored_refusal_with_an_http_status_still_reads() {
+        let read: DelegationAuditAction = serde_json::from_value(serde_json::json!({"request_rejected": {
+            "stage": "routing", "reason": "unknown_variant", "http_status": 404, "requested_variant": "typo"
+        }}))
+        .unwrap();
+        match read {
+            DelegationAuditAction::RequestRejected { http_status, .. } => assert_eq!(http_status, Some(404)),
+            other => panic!("expected RequestRejected, got {other:?}"),
+        }
     }
 
     fn requested_variants(events: &[crate::delegation_vault::audit::DelegationAuditEvent]) -> Vec<Option<String>> {
@@ -459,9 +498,9 @@ mod tests {
         assert_eq!(
             rejected(&events),
             vec![
-                (RejectionStage::Routing, RejectionReason::UnknownVariant, 404, None),
-                (RejectionStage::Routing, RejectionReason::VariantDisabled, 404, None),
-                (RejectionStage::Routing, RejectionReason::MisconfiguredDefault, 500, None),
+                (RejectionStage::Routing, RejectionReason::UnknownVariant, Some(404), None),
+                (RejectionStage::Routing, RejectionReason::VariantDisabled, Some(404), None),
+                (RejectionStage::Routing, RejectionReason::MisconfiguredDefault, Some(500), None),
             ]
         );
         assert_eq!(requested_variants(&events), vec![Some("typo".to_string()), None, None]);
@@ -495,7 +534,7 @@ mod tests {
         })
         .await;
 
-        assert_eq!(rejected(&events), vec![(RejectionStage::Routing, RejectionReason::NoRoute, 404, None)]);
+        assert_eq!(rejected(&events), vec![(RejectionStage::Routing, RejectionReason::NoRoute, Some(404), None)]);
         assert_eq!(
             events[0]
                 .surface_id
@@ -527,7 +566,7 @@ mod tests {
 
         assert_eq!(
             rejected(&events),
-            vec![(RejectionStage::Admission, RejectionReason::VersionUnsupported, 400, Some(-32022))]
+            vec![(RejectionStage::Admission, RejectionReason::VersionUnsupported, Some(400), Some(-32022))]
         );
     }
 
@@ -545,10 +584,10 @@ mod tests {
         assert_eq!(
             rejected(&events),
             vec![
-                (RejectionStage::Admission, RejectionReason::InvalidEnvelope, 200, Some(-32700)),
-                (RejectionStage::Admission, RejectionReason::InvalidEnvelope, 200, Some(-32600)),
-                (RejectionStage::Admission, RejectionReason::InvalidEnvelope, 422, None),
-                (RejectionStage::Admission, RejectionReason::InvalidEnvelope, 400, Some(-32600)),
+                (RejectionStage::Admission, RejectionReason::InvalidEnvelope, Some(200), Some(-32700)),
+                (RejectionStage::Admission, RejectionReason::InvalidEnvelope, Some(200), Some(-32600)),
+                (RejectionStage::Admission, RejectionReason::InvalidEnvelope, Some(422), None),
+                (RejectionStage::Admission, RejectionReason::InvalidEnvelope, Some(400), Some(-32600)),
             ]
         );
     }

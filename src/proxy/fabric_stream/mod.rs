@@ -1299,8 +1299,8 @@ mod tests {
                 .collect();
             use crate::audit::request_events::RejectionReason;
             let expected_records = match rejected {
-                "missing-variant" => vec![(RejectionReason::UnknownVariant, 404, Some("missing".to_string()), true)],
-                "disabled-variant" => vec![(RejectionReason::VariantDisabled, 404, None, true)],
+                "missing-variant" => vec![(RejectionReason::UnknownVariant, None, Some("missing".to_string()), true)],
+                "disabled-variant" => vec![(RejectionReason::VariantDisabled, None, None, true)],
                 _ => vec![],
             };
             assert_eq!(routing_refusals, expected_records, "{rejected}: recorded refusal");
@@ -1346,7 +1346,7 @@ mod tests {
                     record.event,
                     crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
                         reason: crate::audit::request_events::RejectionReason::MisconfiguredDefault,
-                        http_status: 500,
+                        http_status: None,
                         ..
                     }
                 )),

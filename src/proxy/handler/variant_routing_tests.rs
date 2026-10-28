@@ -199,7 +199,7 @@ pub(super) async fn send(
     (response.status(), events)
 }
 
-type Refusal = (RejectionStage, RejectionReason, u16, Option<String>);
+type Refusal = (RejectionStage, RejectionReason, Option<u16>, Option<String>);
 
 pub(super) fn refusals(events: &[DelegationAuditEvent]) -> Vec<Refusal> {
     events
@@ -222,7 +222,7 @@ fn refused(
     status: u16,
     requested_variant: Option<&str>,
 ) -> Vec<Refusal> {
-    vec![(RejectionStage::Routing, reason, status, requested_variant.map(str::to_string))]
+    vec![(RejectionStage::Routing, reason, Some(status), requested_variant.map(str::to_string))]
 }
 
 #[tokio::test]
@@ -272,7 +272,7 @@ async fn a_variant_that_cannot_be_resolved_is_refused_with_one_status_per_reason
     ];
     for (case, surface, path, expected) in cases {
         let (status, events) = send(router(surface), path).await;
-        assert_eq!(status.as_u16(), expected[0].2, "{case}: status");
+        assert_eq!(Some(status.as_u16()), expected[0].2, "{case}: status");
         assert_eq!(refusals(&events), expected, "{case}: recorded refusal");
     }
     assert_eq!(

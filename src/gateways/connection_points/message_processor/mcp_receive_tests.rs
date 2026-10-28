@@ -735,10 +735,10 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
         assert_eq!(
             refusals,
             expected_refusal
-                .map(|reason| (reason, expected_status))
+                .map(|reason| (reason, None))
                 .into_iter()
                 .collect::<Vec<_>>(),
-            "recorded refusals for a {expected_status}"
+            "recorded refusals for a {expected_status}, with no HTTP status on Fabric"
         );
     }
     let mut unknown_surface = forward_message(legacy_body, json!({"MCP-Protocol-Version": MCP_LEGACY_VERSION}));

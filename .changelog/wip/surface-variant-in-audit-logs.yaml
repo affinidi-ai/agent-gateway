@@ -18,3 +18,10 @@ changes:
         refusal is recorded as request_rejected at stage routing with reason unknown_variant,
         variant_disabled or the new misconfigured_default; an unknown_variant record carries the
         alias the URL named, cut to 32 characters, in requested_variant.
+    - timestamp: '2026-10-28T16:15:00Z'
+      title: Leave http_status off request_rejected records written on Fabric receive
+      description: >-
+        request_rejected records http_status only on HTTP refusals, at the Access Point and the
+        Transit Point. A refusal on Fabric receive (via_fabric true, a stream or a ForwardRequest)
+        involves no HTTP response and no longer records one. Readers that expected the field on
+        every request_rejected record must treat it as optional; stored records keep theirs.

@@ -525,7 +525,7 @@ mod tests {
             DelegationAuditAction::RequestRejected {
                 stage: RejectionStage::Routing,
                 reason: RejectionReason::NoRoute,
-                http_status: 404,
+                http_status: Some(404),
                 rpc_error_code: None,
                 requested_variant: None,
             },

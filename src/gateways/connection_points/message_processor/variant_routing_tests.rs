@@ -152,7 +152,9 @@ pub(super) fn catalog() -> Value {
     ])
 }
 
-fn refusals(events: &[DelegationAuditEvent]) -> Vec<(RejectionStage, RejectionReason, u16, Option<String>, bool)> {
+fn refusals(
+    events: &[DelegationAuditEvent]
+) -> Vec<(RejectionStage, RejectionReason, Option<u16>, Option<String>, bool)> {
     events
         .iter()
         .filter_map(|event| match &event.event {
@@ -209,35 +211,38 @@ fn fabric_receive_refuses_a_variant_it_cannot_resolve_without_calling_the_upstre
             ("dangling-variants", catalog(), Some("removed")),
         ])
         .await;
-        let routing = |reason, status, requested: Option<&str>| {
-            vec![(RejectionStage::Routing, reason, status, requested.map(str::to_string), true)]
+        let routing = |reason, requested: Option<&str>| {
+            vec![(RejectionStage::Routing, reason, None, requested.map(str::to_string), true)]
         };
-        for (case, surface_id, alias, expected) in [
+        for (case, surface_id, alias, status_answered, expected) in [
             (
                 "unknown alias",
                 "variants",
                 Some("missing"),
-                routing(RejectionReason::UnknownVariant, 404, Some("missing")),
+                404,
+                routing(RejectionReason::UnknownVariant, Some("missing")),
             ),
-            ("disabled alias", "variants", Some("off"), routing(RejectionReason::VariantDisabled, 404, None)),
+            ("disabled alias", "variants", Some("off"), 404, routing(RejectionReason::VariantDisabled, None)),
             (
                 "misconfigured default with no variants",
                 "dangling",
                 None,
-                routing(RejectionReason::MisconfiguredDefault, 500, None),
+                500,
+                routing(RejectionReason::MisconfiguredDefault, None),
             ),
             (
                 "misconfigured default with variants",
                 "dangling-variants",
                 None,
-                routing(RejectionReason::MisconfiguredDefault, 500, None),
+                500,
+                routing(RejectionReason::MisconfiguredDefault, None),
             ),
         ] {
             let (status, events) = receiver
                 .receive(&receiver.forward_request(surface_id, alias))
                 .await;
-            assert_eq!(status, u64::from(expected[0].2), "{case}: status");
-            assert_eq!(refusals(&events), expected, "{case}: recorded refusal");
+            assert_eq!(status, status_answered, "{case}: status");
+            assert_eq!(refusals(&events), expected, "{case}: recorded refusal, with no HTTP status on Fabric");
         }
         assert_eq!(
             receiver

@@ -8184,7 +8184,7 @@ mod tests {
                 .collect();
             assert_eq!(
                 refusals,
-                vec![(RejectionStage::Routing, reason, status, requested_variant.map(str::to_string))],
+                vec![(RejectionStage::Routing, reason, Some(status), requested_variant.map(str::to_string))],
                 "{case} modern={modern}"
             );
             let expected_variant = match reason {

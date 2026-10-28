@@ -16997,7 +16997,12 @@ allow if {
                     http_status,
                     rpc_error_code,
                     ..
-                } => Some((stage, reason, http_status, rpc_error_code)),
+                } => Some((
+                    stage,
+                    reason,
+                    http_status.expect("an Access Point refusal records its HTTP status"),
+                    rpc_error_code,
+                )),
                 _ => None,
             })
             .collect();
