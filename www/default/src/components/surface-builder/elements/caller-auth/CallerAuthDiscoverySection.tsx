@@ -181,6 +181,7 @@ const CallerAuthDiscoverySection: React.FC<CallerAuthDiscoverySectionProps> = ({
   const route: unknown = accessPoint.route;
   const suggested = suggestedResource(accessPoint.listen_address, route);
   const alias = meta?.activeVariantAlias;
+  const isDefaultVariant = !!alias && !!meta?.activeVariantIsDefault;
   const saveError = discoverySaveError(meta?.saveError, setting?.resource);
 
   const update = (next: ProtectedResourceSetting) => updateFields({ protected_resource: next });
@@ -341,10 +342,22 @@ const CallerAuthDiscoverySection: React.FC<CallerAuthDiscoverySectionProps> = ({
               <code className="text-break" data-testid={`${TEST_ID}-variant-resource`}>
                 {variantResource(setting.resource || '<resource>', alias)}
               </code>
-              <small className="form-text text-muted d-block">
-                This variant advertises the resource with <code>${alias}</code> appended and accepts
-                only tokens issued for it. Its discovery setting is its own.
-              </small>
+              {isDefaultVariant ? (
+                <small
+                  className="form-text text-muted d-block"
+                  data-testid={`${TEST_ID}-default-variant-note`}
+                >
+                  As the default variant, it also answers on the surface&apos;s route, where it
+                  advertises the resource above as written. On <code>${alias}</code> it advertises
+                  the resource with <code>${alias}</code> appended. Each accepts only tokens issued
+                  for the resource of the route called. Its discovery setting is its own.
+                </small>
+              ) : (
+                <small className="form-text text-muted d-block">
+                  This variant advertises the resource with <code>${alias}</code> appended and
+                  accepts only tokens issued for it. Its discovery setting is its own.
+                </small>
+              )}
             </div>
           )}
 

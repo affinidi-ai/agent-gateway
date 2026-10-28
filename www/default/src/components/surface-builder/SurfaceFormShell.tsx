@@ -149,6 +149,13 @@ export interface SurfaceFormShellProps {
   saveError?: string | null;
 }
 
+/** True when `variantId` is the default variant in the canvas's variant catalog. */
+function isDefaultVariant(nodes: CanvasNode[], variantId: string | null | undefined): boolean {
+  const defaultId: unknown = nodes.find(n => n.type === 'target-variant')?.config
+    ?.default_variant_id;
+  return !!variantId && defaultId === variantId;
+}
+
 /** Alias of the variant `variantId` in the canvas's variant catalog, if it is a named one. */
 function variantAlias(
   nodes: CanvasNode[],
@@ -743,6 +750,7 @@ const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
         lastActivity,
         surfaceId,
         activeVariantAlias: variantAlias(builder.state.nodes, activeVariantId),
+        activeVariantIsDefault: isDefaultVariant(builder.state.nodes, activeVariantId),
         saveError,
         setName: setMeta.setName,
         setDescription: setMeta.setDescription,

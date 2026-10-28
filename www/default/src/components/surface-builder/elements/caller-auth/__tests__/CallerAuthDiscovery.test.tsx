@@ -209,6 +209,20 @@ describe('Caller Context editor: authorization server discovery', () => {
     expect(screen.getByTestId('caller-auth-discovery-variant-resource')).toHaveTextContent(
       `${RESOURCE}$beta`
     );
+    expect(screen.queryByTestId('caller-auth-discovery-default-variant-note')).toBeNull();
+  });
+
+  it('tells that the default variant also answers on the route with the resource as written', async () => {
+    await openEditor({
+      initial: jwtConfig({ protected_resource: SETTING }),
+      meta: { activeVariantAlias: 'beta', activeVariantIsDefault: true },
+    });
+    expect(screen.getByTestId('caller-auth-discovery-variant-resource')).toHaveTextContent(
+      `${RESOURCE}$beta`
+    );
+    expect(screen.getByTestId('caller-auth-discovery-default-variant-note')).toHaveTextContent(
+      "answers on the surface's route"
+    );
   });
 
   it('shows a refused save next to the setting, and leaves other errors to the page', async () => {

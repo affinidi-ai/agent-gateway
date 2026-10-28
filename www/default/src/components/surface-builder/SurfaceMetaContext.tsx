@@ -46,6 +46,8 @@ export interface SurfaceMetaValue {
   surfaceId?: string;
   /** Alias of the named variant the canvas shows; absent while it shows the base. */
   activeVariantAlias?: string;
+  /** True when that variant is the surface's default, which also answers on its route. */
+  activeVariantIsDefault?: boolean;
   /** Message of the last failed save, so a panel can show it next to the field it names. */
   saveError?: string | null;
   setName: (v: string) => void;
