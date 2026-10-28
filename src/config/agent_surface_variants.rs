@@ -781,14 +781,9 @@ impl AgentSurface {
     }
 
     /// Resolve a variant by alias and return a fully-materialised
-    /// `AgentSurface` with that variant's overrides applied.
-    ///
-    /// - When `alias` is `Some`, the named variant is selected.
-    /// - When `alias` is `None`, the default variant is selected.
-    /// - When the surface has no `variants[]` (or `variants[]` is empty),
-    ///   the surface is returned as-is regardless of `alias`. This
-    ///   preserves "no variants configured" behaviour during the
-    ///   migration window.
+    /// `AgentSurface` with that variant's overrides applied. The variant is
+    /// chosen by [`Self::select_variant`], so both refuse the same requests;
+    /// when it selects none, the base surface is returned.
     ///
     /// The returned surface has its `variants[]` cleared and
     /// `default_variant_id` set to `None` — the runtime never sees the
@@ -797,50 +792,15 @@ impl AgentSurface {
         &self,
         alias: Option<&str>,
     ) -> Result<AgentSurface, VariantResolveError> {
-        if self.variants.is_empty() {
-            let mut clone = self.clone();
-            clone.variants.clear();
-            clone.default_variant_id = None;
-            return Ok(clone);
-        }
-
-        let target_alias = match alias {
-            Some(a) => a.to_string(),
-            None => match &self.default_variant_id {
-                Some(id) => match self
-                    .variants
-                    .iter()
-                    .find(|v| &v.id == id)
-                {
-                    Some(v) => v.alias.clone(),
-                    None => return Err(VariantResolveError::MisconfiguredDefault(id.clone())),
-                },
-                None => {
-                    let mut clone = self.clone();
-                    clone.variants.clear();
-                    clone.default_variant_id = None;
-                    return Ok(clone);
-                }
-            },
-        };
-
-        let variant = match self
-            .variants
-            .iter()
-            .find(|v| v.alias == target_alias)
-        {
-            Some(v) => v,
-            None => return Err(VariantResolveError::UnknownAlias(target_alias)),
-        };
-
-        if !variant.enabled {
-            return Err(VariantResolveError::DisabledVariant(target_alias));
-        }
+        let variant = self.select_variant(alias)?;
 
         let mut resolved = self.clone();
         resolved.variants.clear();
         resolved.default_variant_id = None;
 
+        let Some(variant) = variant else {
+            return Ok(resolved);
+        };
         let overrides = variant.overrides.clone();
         let complete = overrides.complete;
         if let Some(ap) = overrides.access_point {
