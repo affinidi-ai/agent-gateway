@@ -856,6 +856,46 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_streamed_body_dropped_while_panicking_is_dropped_outside_its_request() {
+        use futures::StreamExt;
+
+        type Seen = Arc<Mutex<Option<Option<String>>>>;
+        struct RecordOnDrop(Seen);
+        impl Drop for RecordOnDrop {
+            fn drop(&mut self) {
+                *self
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(current_request_variant());
+            }
+        }
+        let seen = Seen::default();
+        let observer = RecordOnDrop(Arc::clone(&seen));
+        let chunks = futures::stream::pending::<Result<bytes::Bytes, std::convert::Infallible>>().map(move |chunk| {
+            let _ = &observer;
+            chunk
+        });
+        let response = axum::response::Response::new(axum::body::Body::from_stream(chunks));
+        let scope = request("0123456789abcdef");
+        in_request(scope.clone(), async { set_request_variant("beta") }).await;
+        let body = response_in_request(scope, response).into_body();
+
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _body = body;
+            panic!("the request handler panics while holding its body");
+        }));
+
+        assert!(unwound.is_err(), "the panic is caught, not turned into an abort");
+        assert_eq!(
+            seen.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            Some(None),
+            "a body dropped during unwinding never enters the request scope"
+        );
+    }
+
     #[test]
     fn a_body_of_known_length_is_left_as_it_is() {
         use axum::body::HttpBody;
