@@ -1,6 +1,6 @@
 import React from 'react';
 import { apiClient, type AgentSurface, type SurfaceTemplate } from '../../api';
-import type { Protocol } from './elements/types';
+import type { Protocol, SurfaceSigning } from './elements/types';
 import SurfaceBuilder from './SurfaceBuilder';
 import ConfigEditorFullscreen from './ConfigEditorFullscreen';
 import ElementsListTab from './ElementsListTab';
@@ -42,6 +42,7 @@ export interface SurfaceMetaState {
   terminateTraceId: boolean;
   issuerId: string;
   didwebvh: DidwebvhConfig;
+  signing?: SurfaceSigning;
 }
 
 export interface SurfaceMetaSetters {
@@ -54,6 +55,7 @@ export interface SurfaceMetaSetters {
   setTerminateTraceId: (v: boolean) => void;
   setIssuerId: (v: string) => void;
   setDidwebvh: (v: DidwebvhConfig) => void;
+  setSigning: (v: SurfaceSigning | undefined) => void;
 }
 
 interface BuilderShape {
@@ -716,6 +718,7 @@ const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
         terminateTraceId: meta.terminateTraceId,
         issuerId: meta.issuerId,
         didwebvh: meta.didwebvh,
+        signing: meta.signing,
         readOnly: !canEdit,
         protocolLocked,
         isCreate: mode === 'create',
@@ -730,6 +733,7 @@ const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
         setTerminateTraceId: setMeta.setTerminateTraceId,
         setIssuerId: setMeta.setIssuerId,
         setDidwebvh: setMeta.setDidwebvh,
+        setSigning: setMeta.setSigning,
         onSaveAsTemplate: canEdit
           ? () => {
               setActiveTab('templates');

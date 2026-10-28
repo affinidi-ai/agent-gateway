@@ -17,6 +17,7 @@ import { CertificateKind, CERTIFICATE_KIND_LABEL } from '../types';
 import { showToast } from '../utils/toaster';
 import { usePermissions } from '../context/PermissionsContext';
 import AccessTokensTab from './SecretsPage/AccessTokensTab';
+import KeyManagementTab from './SecretsPage/KeyManagementTab';
 
 interface Secret {
   id: string;
@@ -50,7 +51,7 @@ const SecretsPage: React.FC = () => {
   const { hasPermission, loading: permissionsLoading } = usePermissions();
   const [searchParams, setSearchParams] = useSearchParams();
 
-  type TabKey = 'secrets' | 'api-keys' | 'access-tokens' | 'certificates';
+  type TabKey = 'secrets' | 'api-keys' | 'access-tokens' | 'certificates' | 'key-management';
   const [activeTab, setActiveTab] = useState<TabKey>(
     (searchParams.get('tab') as TabKey) || 'secrets'
   );
@@ -965,6 +966,19 @@ const SecretsPage: React.FC = () => {
             }
           >
             <AccessTokensTab searchTerm={searchTerm} />
+          </Tab>
+        )}
+
+        {hasPermission('key_management.view') && (
+          <Tab
+            eventKey="key-management"
+            title={
+              <span data-testid="key-management-tab-trigger">
+                <i className="fas fa-key" aria-hidden="true" /> Key Management
+              </span>
+            }
+          >
+            <KeyManagementTab />
           </Tab>
         )}
       </Tabs>

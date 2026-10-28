@@ -1251,7 +1251,7 @@ async fn fabric_consent_flow() {
         .unwrap();
     let presentation = LocalVpIssuer::new(Arc::new(LocalVpSigner::new()))
         .issue(VpIssuerPayload::Credentials(Credentials {
-            holder_key: Cow::Owned(holder_key),
+            holder_key: Some(Cow::Owned(holder_key)),
             holder_did: Cow::Borrowed(&holder_did),
             verifiable_credentials: Cow::Owned(vec![credential]),
             challenge: None,

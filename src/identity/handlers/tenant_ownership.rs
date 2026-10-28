@@ -361,6 +361,24 @@ async fn load_owned_resource(
             .await
             .map_err(internal)?
             .map(|resource| owned(kind, resource.id, resource.name, resource.tenant_id)),
+        ResourceKind::VtaConnections => state
+            .vta_connection_store
+            .as_ref()
+            .ok_or_else(|| unavailable(kind))?
+            .get(id)
+            .await
+            .map_err(internal)?
+            .map(|resource| OwnedResource {
+                kind,
+                scope_id: resource.id.clone(),
+                id: resource.id.clone(),
+                name: resource.name,
+                tenant_id: resource.tenant_id,
+                // The bootstrap record mirrors the `[vta]` TOML block, which is
+                // appliance-global and re-applied on every boot, so moving it
+                // to a tenant would be undone at the next restart.
+                immutable: resource.id == crate::vta::connections::BOOTSTRAP_CONNECTION_ID,
+            }),
         ResourceKind::PolicyDefinitions => state
             .policy_definition_store
             .as_ref()
@@ -634,6 +652,24 @@ async fn collect_credential_references(
             {
                 let source = endpoint(ResourceKind::StsClients, &client.id, client.tenant_id.clone(), true);
                 add_reference(state, references, source, ResourceKind::Secrets, id, "STS client secret").await?;
+            }
+        }
+    }
+    if let Some(store) = state
+        .vta_connection_store
+        .as_ref()
+    {
+        for connection in store
+            .list()
+            .await
+            .map_err(internal)?
+        {
+            if let Some(id) = connection
+                .control_key_ref
+                .as_deref()
+            {
+                let source = endpoint(ResourceKind::VtaConnections, &connection.id, connection.tenant_id.clone(), true);
+                add_reference(state, references, source, ResourceKind::Secrets, id, "VTA control key").await?;
             }
         }
     }
@@ -982,6 +1018,22 @@ async fn persist_tenant_id(
         ResourceKind::StsClients => {
             let store = state
                 .sts_client_store
+                .as_ref()
+                .ok_or_else(|| unavailable(kind))?;
+            let mut resource = store
+                .get(id)
+                .await
+                .map_err(internal)?
+                .ok_or_else(|| missing(kind, id))?;
+            resource.tenant_id = tenant_id;
+            store
+                .update(resource)
+                .await
+                .map_err(internal)?;
+        }
+        ResourceKind::VtaConnections => {
+            let store = state
+                .vta_connection_store
                 .as_ref()
                 .ok_or_else(|| unavailable(kind))?;
             let mut resource = store

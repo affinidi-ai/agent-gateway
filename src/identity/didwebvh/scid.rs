@@ -23,7 +23,15 @@ pub fn generate_scid(preliminary_entry: &LogEntry) -> Result<String> {
     entry.proof.clear();
 
     // Step 4: Canonicalize via JSON Canonicalization Scheme (RFC 8785)
-    let canonical = serde_jcs::to_string(&entry)?;
+    //
+    // `serde_json_canonicalizer` rather than `serde_jcs`: this binary builds
+    // `serde_json` with `arbitrary_precision`, under which `serde_jcs` routes
+    // every number through an unimplemented path and panics. A log entry's
+    // `state` is a DID document, whose shape is not fully typed here, so a
+    // numeric member in one would otherwise abort the process. Both implement
+    // RFC 8785, so the canonical form — and therefore every SCID already
+    // issued — is unchanged.
+    let canonical = serde_json_canonicalizer::to_string(&entry)?;
 
     // Steps 5-7: SHA-256 multihash, then raw base58btc (no multibase prefix)
     let digest = Sha256::digest(canonical.as_bytes());
@@ -99,6 +107,43 @@ mod tests {
         assert!(scid1.starts_with("Qm"), "SCID must be raw base58btc multihash (starts with 'Qm')");
         // Raw base58btc encoded 34-byte SHA-256 multihash: ~46 base58 chars
         assert!(scid1.len() >= 45 && scid1.len() <= 48, "SCID length unexpected: {}", scid1.len());
+    }
+
+    /// A SCID is the identity of a `did:webvh`, so the canonical bytes it is
+    /// derived from may never move: a different SCID for the same entry is a
+    /// different DID, and every credential naming the old one stops resolving.
+    ///
+    /// Pinned against a fixed entry so that swapping or upgrading the JCS
+    /// implementation is caught here rather than in the field. The value below
+    /// was produced by both the previous (`serde_jcs`) and current
+    /// (`serde_json_canonicalizer`) implementations, verified byte-identical.
+    #[test]
+    fn the_scid_of_a_fixed_entry_never_moves() {
+        let mut entry = create_test_entry();
+        entry.version_time = "2026-01-01T00:00:00Z".to_string();
+
+        assert_eq!(
+            generate_scid(&entry).expect("SCID"),
+            "QmUo4Ni7rQwxSPV78eCFLsKZBKYmtzeCw4U2fHhVTCRSwV",
+            "the canonical form a SCID is derived from must not change"
+        );
+    }
+
+    /// A DID document carries untyped members, so one can legitimately hold a
+    /// number. Canonicalising it must produce a SCID rather than abort the
+    /// process — `serde_jcs` panics on exactly this input under the
+    /// `arbitrary_precision` build this binary uses.
+    #[test]
+    fn a_document_member_that_is_a_number_yields_a_scid_rather_than_panicking() {
+        let mut entry = create_test_entry();
+        entry.version_time = "2026-01-01T00:00:00Z".to_string();
+        entry
+            .state
+            .parameters_set
+            .insert("keyAgreementCount".to_string(), serde_json::json!(2));
+
+        let scid = generate_scid(&entry).expect("a numeric document member must still canonicalise");
+        assert!(scid.starts_with("Qm"), "{scid}");
     }
 
     #[test]

@@ -82,6 +82,23 @@ function mockFetchByUrl() {
     if (url.startsWith('/api/v1/secrets')) {
       return Promise.resolve({ ok: true, json: () => Promise.resolve(mockSecrets) });
     }
+    // The Key Management tab mounts with the page and reads its own inventory.
+    // It needs the real object shape, not the catch-all list: these tests grant
+    // every permission, so the tab renders, and a shape it cannot read takes
+    // the whole Secrets page down with it.
+    if (url.startsWith('/api/v1/key-management/inventory')) {
+      return Promise.resolve({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            tier: 'local',
+            custody_claim: false,
+            connections: [],
+            mappings: [],
+            orphaned_contexts: [],
+          }),
+      });
+    }
     // secrets and everything else
     return Promise.resolve({ ok: true, json: () => Promise.resolve([]) });
   });

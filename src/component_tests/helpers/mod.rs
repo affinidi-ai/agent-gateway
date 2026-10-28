@@ -908,6 +908,7 @@ fn build_bootstrap_config(
         legacy_backup_encryption_keys: None,
         trust_registry: Default::default(),
         tenancy: Default::default(),
+        vta: Default::default(),
         config_dir: None,
         server_mode: crate::server::mode::ServerMode::default(),
         cache_refresh_interval_secs: 0,

@@ -4,6 +4,7 @@ import { registry, buildCanvasBlob, buildSurfaceContext } from '../elements';
 import type { CanvasNode, DropContext } from '../SurfaceCanvas';
 import type { SurfaceNodeType } from '../nodeTypes';
 import type { BaseSurfaceView } from '../elements/types';
+import type { SurfaceSigning } from '../elements/types';
 import { showToast } from '../../../utils/toaster';
 import { deriveEdges } from '../elements/edges/deriveEdges';
 import { synthesizeFabricCanvasNodes } from '../elements/synthesizeFabric';
@@ -1097,6 +1098,13 @@ export function useSurfaceBuilder<T extends SurfaceBuilderState>(
       issuer_id?: string;
       protocol: string;
       status?: string;
+      /**
+       * Which backend signs for this surface. The body below has always
+       * read it; leaving it off this type meant callers could not pass it
+       * and it was silently always `undefined` — invisible because the
+       * dashboard build transpiles rather than type-checks.
+       */
+      signing?: SurfaceSigning;
     }): any => {
       const payload = registry.buildPayload({
         protocol: meta.protocol,
@@ -1106,6 +1114,7 @@ export function useSurfaceBuilder<T extends SurfaceBuilderState>(
           ...(meta.description ? { description: meta.description } : {}),
           tags: meta.tags,
           ...(meta.issuer_id ? { issuer_id: meta.issuer_id } : {}),
+          ...(meta.signing ? { signing: meta.signing } : {}),
           status: meta.status ?? 'active',
         },
         allNodes: state.nodes,

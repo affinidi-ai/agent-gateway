@@ -43,6 +43,7 @@ pub struct IdentityApiState {
     pub jwt_verification_strategy_store: Option<Arc<dyn crate::jwt_bearer::JwtVerificationStrategyStorage>>,
     pub credential_provider_store: Option<Arc<dyn crate::credential_providers::storage::CredentialProviderStorage>>,
     pub sts_client_store: Option<Arc<dyn crate::sts::store::StsClientStorage>>,
+    pub vta_connection_store: Option<Arc<dyn crate::vta::connections::VtaConnectionStorage>>,
     /// Pre-resolved per-variant surface snapshots. Phase C scaffolding —
     /// kept in lockstep with `agent_surface_store` writes by
     /// `crate::identity::handlers::surfaces::apply_surface_change`. Phase

@@ -52,6 +52,8 @@ pub fn test_surface_identity_record(
             last_used_at: now,
         }],
         private_key: None,
+        vta_context_id: None,
+        vta_connection_id: None,
         channel_config_id: Some(surface_id.to_string()),
         is_local: true,
         verified: true,
@@ -147,6 +149,8 @@ impl IdentityStore for MockIdentityStore {
             last_used_at: None,
             channel_usage: vec![],
             private_key: None,
+            vta_context_id: None,
+            vta_connection_id: None,
             channel_config_id,
             is_local: false,
             verified,
@@ -266,7 +270,7 @@ pub async fn signed_agent_presentation() -> SignedAgentPresentation {
         .unwrap();
     let presentation = LocalVpIssuer::new(Arc::new(LocalVpSigner::new()))
         .issue(VpIssuerPayload::Credentials(Credentials {
-            holder_key: Cow::Owned(holder_key),
+            holder_key: Some(Cow::Owned(holder_key)),
             holder_did: Cow::Borrowed(&holder_did),
             verifiable_credentials: Cow::Owned(vec![credential]),
             challenge: None,

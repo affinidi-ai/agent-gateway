@@ -294,6 +294,12 @@ pub(crate) fn pinned_forward_client(
     raw_url: &str,
     timeout: Duration,
 ) -> Result<(Client, PinnedTarget), EgressError> {
+    // A bundled VTA sits on loopback or a private network — addresses this
+    // policy deliberately allows — so without this check an operator-configured
+    // surface could forward to the agent holding this gateway's signing keys
+    // (VTA-21). The VTA is a control-plane dependency; it is never a proxy
+    // target.
+    crate::vta::isolation::assert_not_vta(raw_url).map_err(EgressError::Blocked)?;
     let url = validate_resolved_cloud_metadata_url(raw_url).map_err(EgressError::Blocked)?;
     pin_and_build(url, is_cloud_metadata_resolved_ip, timeout)
 }
@@ -313,6 +319,11 @@ pub(crate) fn pinned_strict_client(
     raw_url: &str,
     timeout: Duration,
 ) -> Result<(Client, PinnedTarget), EgressError> {
+    // Strict already blocks loopback and RFC 1918, but a VTA reached over a
+    // routable address (a compose service on its own network, a remote
+    // appliance) would otherwise pass — and the whole point is that it is not
+    // addressable from the data plane at all.
+    crate::vta::isolation::assert_not_vta(raw_url).map_err(EgressError::Blocked)?;
     let url = validate_resolved_url(raw_url).map_err(EgressError::Blocked)?;
     pin_and_build(url, |ip| EgressPolicy::Strict.is_blocked_ip(ip), timeout)
 }
@@ -800,6 +811,35 @@ mod tests {
                     .unwrap()
             ]
         );
+    }
+
+    /// A bundled VTA sits on exactly the addresses the forward leg allows, so
+    /// without an explicit reservation a surface could proxy a caller straight
+    /// to the agent holding this gateway's signing keys (VTA-21).
+    #[test]
+    fn neither_pinned_client_will_reach_a_reserved_vta() {
+        let _guard = crate::vta::isolation::TEST_LOCK
+            .lock()
+            .unwrap();
+        crate::vta::isolation::clear_reservations();
+        crate::vta::isolation::reserve("http://127.0.0.1:9");
+        crate::vta::isolation::reserve("https://vta.internal");
+
+        for raw in ["http://127.0.0.1:9/ok", "http://127.0.0.1:9/trust-tasks", "https://vta.internal/trust-tasks"] {
+            let result = pinned_forward_client(raw, Duration::from_secs(5));
+            assert!(
+                matches!(result, Err(EgressError::Blocked(_))),
+                "the forward leg reached the VTA at {raw}: {result:?}"
+            );
+            let result = pinned_strict_client(raw, Duration::from_secs(5));
+            assert!(matches!(result, Err(EgressError::Blocked(_))), "strict reached the VTA at {raw}: {result:?}");
+        }
+
+        // An unrelated loopback sidecar on a different port still forwards, so
+        // the block is the VTA's address and not the whole range.
+        crate::vta::isolation::clear_reservations();
+        pinned_forward_client("http://127.0.0.1:9/ok", Duration::from_secs(5))
+            .expect("an unreserved loopback upstream must still forward");
     }
 
     #[test]

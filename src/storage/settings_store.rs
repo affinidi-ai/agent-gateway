@@ -82,6 +82,16 @@ pub struct DashboardSettings {
     #[serde(default)]
     pub feature_flags: HashMap<String, bool>,
 
+    /// Which backend signs for the whole appliance when no surface overrides it.
+    ///
+    /// Lives here rather than in the `[vta]` TOML block so an operator can pair
+    /// a trust agent in the dashboard and point the appliance at it without
+    /// editing a file and restarting. Absent means "whatever `[vta]` resolved",
+    /// which is the pre-existing behaviour, so a gateway that never sets this
+    /// is unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_signing: Option<crate::config::agent_surface::SurfaceSigningConfig>,
+
     /// Whether Prometheus metrics endpoint authentication is enabled
     #[serde(default)]
     pub prometheus_auth_enabled: bool,
@@ -185,6 +195,7 @@ impl Default for DashboardSettings {
             bucket_seconds: default_bucket_seconds(),
             payments_min_display: default_payments_min_display(),
             feature_flags: HashMap::new(),
+            default_signing: None,
             prometheus_auth_enabled: false,
             prometheus_auth_username: String::new(),
             prometheus_auth_password_hash: String::new(),
@@ -633,6 +644,8 @@ impl UserSettingsStore {
                 }
                 flags
             },
+            // Which backend signs is appliance-wide, never a user preference.
+            default_signing: system.default_signing.clone(),
             // System-level: prometheus auth always comes from system settings
             prometheus_auth_enabled: system.prometheus_auth_enabled,
             prometheus_auth_username: system

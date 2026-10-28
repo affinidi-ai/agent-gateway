@@ -117,6 +117,121 @@ pub struct AgentSurface {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_http: Option<super::types::McpHttpConfig>,
+    /// Which signing backend, VTA context and key this surface's credentials
+    /// are signed with (VTA-19). Absent ⇒ inherit the appliance default, which
+    /// is exactly today's behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing: Option<SurfaceSigningConfig>,
+}
+
+/// Which backend holds a surface's signing key. Mirrors
+/// `crate::vta::key_directory::KeyBackend`, but as config vocabulary: a surface
+/// names a backend, the directory resolves it to a connector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SigningBackendKind {
+    /// The gateway's in-process issuer key.
+    Local,
+    /// A Verifiable Trust Agent, addressed by stored connection.
+    Vta,
+    /// An external HSM/KMS signer (VTA-22).
+    Hsm,
+}
+
+/// Per-surface (and per-variant) signing configuration.
+///
+/// **Every field is optional and absent means inherit** from the next level up
+/// — variant, then surface, then the appliance default. A variant is a sparse
+/// delta over its surface everywhere else in the system, so signing follows the
+/// same rule: mapping every variant to its own context by default would
+/// multiply contexts for no isolation benefit.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SurfaceSigningConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<SigningBackendKind>,
+
+    /// Stored VTA connection (VTA-23) this surface signs through. Only
+    /// meaningful for `backend = vta`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_id: Option<String>,
+
+    /// VTA context the surface's keys live in. Absent with `backend = vta`
+    /// means "derive and provision one" — which requires the appliance to be
+    /// able to auto-provision, or it is a configuration error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_id: Option<String>,
+
+    /// The VTA key record id that signs this surface's JWTs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
+}
+
+impl SurfaceSigningConfig {
+    /// `true` when nothing is set — semantically identical to no block at all.
+    pub fn is_empty(&self) -> bool {
+        self.backend.is_none() && self.connection_id.is_none() && self.context_id.is_none() && self.key_id.is_none()
+    }
+
+    /// Reject combinations that cannot be honoured, at write time rather than
+    /// at the first signing call.
+    pub fn validate(&self) -> Result<(), String> {
+        for (field, value) in [
+            ("signing.connection_id", &self.connection_id),
+            ("signing.context_id", &self.context_id),
+            ("signing.key_id", &self.key_id),
+        ] {
+            if let Some(v) = value
+                && v.trim().is_empty()
+            {
+                return Err(format!("{field} must not be empty when present"));
+            }
+        }
+        // The local backend signs with the gateway's own key; there is no
+        // connection to pick, no context to scope it to and no key to name.
+        // Accepting those silently would suggest an isolation that does not
+        // exist.
+        if self.backend == Some(SigningBackendKind::Local) {
+            if self.connection_id.is_some() {
+                return Err("signing.connection_id is not valid for the local backend".to_string());
+            }
+            if self.context_id.is_some() {
+                return Err("signing.context_id is not valid for the local backend".to_string());
+            }
+            if self.key_id.is_some() {
+                return Err("signing.key_id is not valid for the local backend".to_string());
+            }
+        }
+        // A connection or a context only means something against a backend
+        // that has them, and leaving the backend implicit would let an
+        // appliance default of `local` silently ignore both.
+        if self.backend.is_none() && (self.connection_id.is_some() || self.context_id.is_some()) {
+            return Err("signing.backend is required when connection_id or context_id is set".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// Stable, derived name of the VTA context that belongs to a surface or
+/// variant.
+///
+/// Keyed on the **stable UUIDs**, never on `alias`/`name`: a rename must not
+/// orphan a context, because the artifacts that context's key signed have to
+/// stay verifiable. A surface with no tenant is appliance-global and uses the
+/// `_global` segment so a tenant can never collide with it.
+pub fn derived_context_name(
+    tenant_id: Option<&str>,
+    surface_id: &str,
+    variant_id: Option<&str>,
+) -> String {
+    let tenant = tenant_id
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .unwrap_or("_global");
+    match variant_id {
+        Some(variant_id) => format!("ctx:{tenant}/{surface_id}/{variant_id}"),
+        None => format!("ctx:{tenant}/{surface_id}"),
+    }
 }
 
 /// Three independent identity slots covering the proxy pipeline edges.
@@ -840,6 +955,90 @@ impl McpToolGate {
         } else {
             &self.name
         }
+    }
+}
+
+#[cfg(test)]
+mod surface_signing_config_tests {
+    use super::{SigningBackendKind, SurfaceSigningConfig, derived_context_name};
+
+    fn signing(
+        backend: Option<SigningBackendKind>,
+        connection: Option<&str>,
+        context: Option<&str>,
+        key: Option<&str>,
+    ) -> SurfaceSigningConfig {
+        SurfaceSigningConfig {
+            backend,
+            connection_id: connection.map(str::to_string),
+            context_id: context.map(str::to_string),
+            key_id: key.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn an_absent_block_and_an_empty_block_mean_the_same_thing() {
+        assert!(SurfaceSigningConfig::default().is_empty());
+        assert!(!signing(Some(SigningBackendKind::Vta), None, Some("ctx"), Some("k")).is_empty());
+    }
+
+    #[test]
+    fn a_complete_vta_block_validates() {
+        signing(Some(SigningBackendKind::Vta), Some("c1"), Some("ctx"), Some("k"))
+            .validate()
+            .expect("a fully specified vta block is valid");
+    }
+
+    #[test]
+    fn the_local_backend_rejects_connection_context_and_key() {
+        // Accepting these silently would suggest an isolation that the local
+        // key does not provide.
+        for (connection, context, key, expected) in [
+            (Some("c1"), None, None, "connection_id"),
+            (None, Some("ctx"), None, "context_id"),
+            (None, None, Some("k"), "key_id"),
+        ] {
+            let err = signing(Some(SigningBackendKind::Local), connection, context, key)
+                .validate()
+                .expect_err("the local backend has none of these");
+            assert!(err.contains(expected), "unexpected error: {err}");
+        }
+    }
+
+    #[test]
+    fn a_connection_or_context_without_a_backend_is_rejected() {
+        let err = signing(None, Some("c1"), None, None)
+            .validate()
+            .expect_err("an appliance default of local would silently ignore it");
+        assert!(err.contains("signing.backend"), "unexpected error: {err}");
+
+        let err = signing(None, None, Some("ctx"), None)
+            .validate()
+            .expect_err("same for a context");
+        assert!(err.contains("signing.backend"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn blank_values_are_rejected_rather_than_treated_as_absent() {
+        let err = signing(Some(SigningBackendKind::Vta), None, Some("   "), None)
+            .validate()
+            .expect_err("a whitespace context names nothing");
+        assert!(err.contains("signing.context_id"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn a_context_name_never_depends_on_a_renameable_field() {
+        // Both calls use the same ids but stand for a surface renamed in
+        // between; the derived name is identical, so the context survives.
+        assert_eq!(
+            derived_context_name(Some("t1"), "surface-uuid", None),
+            derived_context_name(Some("t1"), "surface-uuid", None)
+        );
+        assert_ne!(
+            derived_context_name(Some("t1"), "surface-uuid", None),
+            derived_context_name(Some("t1"), "surface-uuid", Some("variant-uuid"))
+        );
+        assert_eq!(derived_context_name(None, "s", None), "ctx:_global/s");
     }
 }
 
@@ -3049,6 +3248,7 @@ mod tests {
             mcp_legacy_metadata_output: None,
             _retired_protocol_mode: Default::default(),
             mcp_http: None,
+            signing: None,
         };
 
         assert_eq!(surface.base_url("gw.example.com"), "https://gw.example.com:8443/agents/sales");
@@ -3183,6 +3383,7 @@ mod tests {
             mcp_legacy_metadata_output: None,
             _retired_protocol_mode: Default::default(),
             mcp_http: None,
+            signing: None,
         };
 
         assert!(
@@ -4395,6 +4596,7 @@ mod tests {
             mcp_legacy_metadata_output: None,
             _retired_protocol_mode: Default::default(),
             mcp_http: None,
+            signing: None,
         };
         let value = serde_json::to_value(&surface).expect("surface must serialize");
         assert_eq!(value["issuer_id"], serde_json::json!("issuer-42"));

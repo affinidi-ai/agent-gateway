@@ -1,0 +1,52 @@
+# `[vta]` block for the bundled sidecar (tier T1).
+#
+# Switching this deployment to a customer-operated VTA is a change to
+# `mode`, `base_url` and `vta_did` — nothing else, and no code path differs.
+
+[vta]
+enabled = true
+
+# Appliance signing default, for installs that do not enable `[vta]` at all.
+# `auto` (the default) gives a new install the bundled agent and leaves an
+# existing install on the local key it already signs with. Set it explicitly
+# for a fleet or IaC install so the dashboard is never needed.
+# default_backend = "bundled"
+
+# `embedded` is the wire spelling of the bundled deployment, kept for config
+# written before the shape was named. It means **packaging**, never linking:
+# `vta-service` runs as its own process in this deployment unit.
+mode = "embedded"
+
+# The sidecar is reachable only on the internal compose network, and the
+# gateway reserves this address so no surface, MCP proxy or A2A proxy can be
+# pointed at it (`GET /v1/vta/status` lists the reserved origins).
+base_url = "http://vta:3000"
+
+# Pin the agent. Read this from the sidecar after its first boot
+# (`vta did show`) and record it here; an unpinned VTA means the gateway will
+# sign with whatever answers on that address.
+vta_did = "did:webvh:REPLACE_ME"
+
+context_id = "ctx-gateway"
+signing_key_id = "gateway-jwt-1"
+
+# Capture the public half from `keys/create` when the signing key is internal
+# (non-exportable): the VTA will not return an internal key's record to any
+# caller at any role, so the gateway cannot publish its JWKS without it.
+# signing_key_public = "z6Mk..."
+
+# Persist the control key so the gateway keeps one identity on the VTA across
+# restarts. Written encrypted at rest.
+auth_key_source = "env://TG_VTA_CONTROL_KEY"
+
+# Only the bundled tier may hold super-admin over its VTA — same host, same
+# blast radius — so only here may the gateway create its own contexts.
+auto_provision_contexts = true
+max_contexts = 256
+
+# Bound how much a runaway caller can mint before someone notices.
+sign_quota_max = 600
+sign_quota_window_secs = 60
+
+# Hashes-only, bounded, non-blocking signing audit.
+audit_enabled = true

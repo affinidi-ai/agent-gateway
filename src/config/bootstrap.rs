@@ -295,6 +295,14 @@ impl BootstrapConfig {
                 .clone(),
         );
 
+        // Fail fast on a misconfigured [vta] block: an enabled-but-incomplete
+        // block is a startup error rather than a silent fallback to local
+        // signing (fail closed — see src/config/vta.rs).
+        config
+            .vta
+            .validate()
+            .map_err(|e| anyhow::anyhow!("invalid [vta] configuration: {e}"))?;
+
         Ok(config)
     }
 

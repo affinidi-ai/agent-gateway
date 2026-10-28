@@ -112,7 +112,8 @@ fn constant_time_eq(
 /// Per the spec, the `request` parameter MUST be serialized using JSON
 /// Canonicalization Scheme (JCS) per RFC 8785 before base64url encoding.
 fn encode_payment_request(payment_request: &MppPaymentRequest) -> Result<String, String> {
-    let jcs_bytes = serde_jcs::to_vec(payment_request).map_err(|e| format!("JCS serialization error: {}", e))?;
+    let jcs_bytes =
+        serde_json_canonicalizer::to_vec(payment_request).map_err(|e| format!("JCS serialization error: {}", e))?;
     Ok(base64url_encode_nopad(&jcs_bytes))
 }
 

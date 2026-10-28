@@ -113,6 +113,30 @@ pub struct AgentIdentityRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub private_key: Option<JsonValue>,
 
+    /// The VTA context whose key is this agent's, when the agent's private key
+    /// lives in a Verifiable Trust Agent rather than here (VTA-12).
+    ///
+    /// Mutually exclusive with [`private_key`](Self::private_key) in practice:
+    /// a VTA-backed agent has no local key, and an agent onboarded before the
+    /// migration has no context. Recorded explicitly rather than inferred from
+    /// the absence of a key, because "which agents still have a key on this
+    /// disk" is the question a migration has to be able to answer directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vta_context_id: Option<String>,
+
+    /// Which trust agent that context lives in.
+    ///
+    /// Recorded even while only one is configured, because the alternative is
+    /// inferring it later — and the day a second agent is connected, every
+    /// record written before then would have to be migrated on the assumption
+    /// that it meant the first one. Writing it down now costs a field and
+    /// makes that migration unnecessary.
+    ///
+    /// `None` means an agent onboarded before this was recorded; it resolves
+    /// to the bootstrap connection, which is the only one it could have used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vta_connection_id: Option<String>,
+
     /// The channel config ID where this identity was last used
     #[serde(skip_serializing_if = "Option::is_none")]
     pub channel_config_id: Option<String>,
@@ -437,6 +461,8 @@ impl IdentityStore for FilesystemIdentityStore {
             is_local: false,   // External DID is remote
             verified,          // Track whether VP/VC signature was verified
             origin: Some(IdentityOrigin::ExternalCaller),
+            vta_context_id: None,
+            vta_connection_id: None,
         };
 
         self.create(record).await
@@ -494,6 +520,8 @@ mod tests {
             last_used_at: None,
             channel_usage: vec![],
             private_key: None,
+            vta_context_id: None,
+            vta_connection_id: None,
             channel_config_id: None,
             is_local,
             verified: false,
@@ -535,6 +563,8 @@ mod tests {
             last_used_at: None,
             channel_usage: vec![],
             private_key: None,
+            vta_context_id: None,
+            vta_connection_id: None,
             channel_config_id: None,
             is_local: true,
             verified: true,
@@ -617,6 +647,8 @@ mod tests {
             last_used_at: None,
             channel_usage: vec![],
             private_key: None,
+            vta_context_id: None,
+            vta_connection_id: None,
             channel_config_id: None,
             is_local: true,
             verified: true,
@@ -774,6 +806,63 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// An identity record written before VTA-12 has no `vta_context_id`, and
+    /// must keep loading. A deployment that upgrades and cannot read its own
+    /// agents has lost every managed identity it had.
+    #[test]
+    fn a_record_written_before_vta_backed_agents_still_loads() {
+        let pre_migration = serde_json::json!({
+            "did": "did:webvh:QmSomeScid:example.com:surface:abc",
+            "identity_hash": "hash-1",
+            "created_at": "2026-01-01T00:00:00Z",
+            "identity_fields": { "region": "eu" },
+            "usage_count": 7,
+            "private_key": { "kty": "OKP", "crv": "Ed25519", "x": "pub", "d": "priv" },
+            "is_local": true,
+            "verified": true
+        });
+
+        let record: AgentIdentityRecord =
+            serde_json::from_value(pre_migration).expect("a pre-migration record must still load");
+        assert_eq!(record.vta_context_id, None, "an old record is not VTA-backed");
+        assert!(
+            record.private_key.is_some(),
+            "its gateway-held key must survive the upgrade, or the agent stops being able to present"
+        );
+        assert_eq!(record.usage_count, 7);
+    }
+
+    /// Writing a record that is not VTA-backed must not change the file shape,
+    /// so an upgrade followed by a rollback leaves nothing a prior version
+    /// cannot read.
+    #[test]
+    fn a_non_vta_record_serialises_without_the_new_field() {
+        let record = AgentIdentityRecord {
+            did: "did:webvh:QmSomeScid:example.com:surface:abc".to_string(),
+            identity_hash: "hash-1".to_string(),
+            created_at: chrono::Utc::now(),
+            identity_fields: std::collections::HashMap::new(),
+            usage_count: 0,
+            last_used_at: None,
+            channel_usage: vec![],
+            private_key: None,
+            vta_context_id: None,
+            vta_connection_id: None,
+            channel_config_id: None,
+            is_local: true,
+            verified: true,
+            origin: None,
+        };
+
+        let written = serde_json::to_value(&record).expect("serialise");
+        assert!(
+            written
+                .get("vta_context_id")
+                .is_none(),
+            "an absent context must be absent from the file, not written as null: {written}"
         );
     }
 }

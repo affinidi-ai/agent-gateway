@@ -202,6 +202,7 @@ async fn inject_vp_into_mcp(
             None,
             None,
             inbound_chained_vcs,
+            None,
         )
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create identity presentation: {}", e))?;
