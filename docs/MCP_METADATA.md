@@ -1382,10 +1382,12 @@ document. `resource` follows the rules of
 the Access Point's listener with the route as its path, a distinct `$alias`
 resource for each enabled variant, and refused on save (`400`) when another
 stored surface or MCP Proxy already serves it. `authorization_servers` lists
-one to eight RFC 8414 issuer identifiers: HTTPS URLs without credentials,
-query or fragment, at most 2048 bytes each and advertised exactly as written,
-since clients compare them byte for byte with the issuer in the server's own
-metadata. Tokens are still validated by the JWT verification strategy, so the
+one to eight RFC 8414 issuer identifiers, checked with the issuer rules of
+[authorization server metadata discovery](SOURCE_AUTH.md#authorization-server-metadata-module-developer-reference)
+under the strict posture (HTTPS, a host, no credentials, query, fragment,
+whitespace or control character), printable ASCII, at most 2048 bytes each and
+advertised exactly as written, since clients compare them byte for byte with
+the issuer in the server's own metadata. Tokens are still validated by the JWT verification strategy, so the
 strategy's expected issuer should be one of them. `scopes` are advertised as
 `scopes_supported`. A variant that overrides `caller_authentication` carries
 its own setting or none.

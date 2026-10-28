@@ -42,6 +42,17 @@ pub fn metadata_urls(issuer: &str) -> Result<Vec<String>, DiscoveryError> {
     ])
 }
 
+/// Check `issuer` as [`discover`] does before any request, under `posture`: an absolute
+/// URL with a host and no credentials, query, fragment, whitespace or control character,
+/// `https` only under [`EgressPosture::Strict`] (`invalid_url` otherwise). Resolves no
+/// host and blocks no address. Performs no I/O.
+pub fn validate_issuer(
+    issuer: &str,
+    posture: EgressPosture,
+) -> Result<(), DiscoveryError> {
+    parse_issuer(issuer, posture).map(|_| ())
+}
+
 fn has_whitespace_or_control(value: &str) -> bool {
     value
         .chars()
@@ -411,6 +422,25 @@ mod tests {
             let error = metadata_urls(issuer).unwrap_err();
             assert_eq!(error.failure(), DiscoveryFailure::InvalidUrl, "{issuer}");
             assert_eq!(error.code(), "invalid_url", "{issuer}");
+        }
+    }
+
+    #[test]
+    fn validate_issuer_applies_the_issuer_rules_of_a_posture_without_any_request() {
+        for issuer in ["https://as.example.com", "https://localhost:4444", "https://as.example.com/tenant/"] {
+            assert!(validate_issuer(issuer, EgressPosture::Strict).is_ok(), "{issuer}");
+        }
+        assert!(validate_issuer("http://127.0.0.1:4444", EgressPosture::CloudMetadataOnly).is_ok());
+        for issuer in [
+            "http://as.example.com",
+            "https://as.example.com/?tenant=a",
+            "https://as.example.com/#x",
+            "https://u:p@as.example.com/",
+            "https://as.example.com/tenant\n",
+            "as.example.com",
+        ] {
+            let error = validate_issuer(issuer, EgressPosture::Strict).unwrap_err();
+            assert_eq!(error.failure(), DiscoveryFailure::InvalidUrl, "{issuer:?}");
         }
     }
 

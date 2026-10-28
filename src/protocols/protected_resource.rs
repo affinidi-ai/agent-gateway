@@ -8,6 +8,9 @@
 //! variant resources, metadata URLs, documents and challenges live here so
 //! every protocol that publishes them shares one implementation; the gateway
 //! STS Resource Server (`crate::mcp::resource_server`) uses the same helpers.
+//! The authorization server side, fetching an issuer's own metadata (RFC 8414),
+//! is [`crate::authz_metadata`], whose issuer rules the advertised
+//! authorization servers follow.
 
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -274,24 +277,21 @@ impl ProtectedResourceConfig {
     }
 }
 
-/// An RFC 8414 issuer identifier: an absolute https URL without credentials,
-/// query or fragment. It is advertised exactly as configured, since clients
-/// compare it byte for byte with the issuer in the server's metadata.
+/// An RFC 8414 issuer identifier, by the rules authorization server metadata
+/// discovery applies under the strict posture (`https`, a host, no credentials,
+/// query or fragment), and at most 2048 printable ASCII bytes. It is advertised
+/// exactly as configured, since clients compare it byte for byte with the
+/// issuer in the server's metadata.
 fn validate_authorization_server(issuer: &str) -> Result<(), String> {
-    let invalid = || "authorization_servers entries must be https issuer URLs without credentials, query or fragment";
-    let parsed = url::Url::parse(issuer).map_err(|_| invalid())?;
     if issuer.len() > MAX_AUTHORIZATION_SERVER_BYTES
         || !issuer
             .bytes()
             .all(|byte| byte.is_ascii_graphic())
-        || parsed.scheme() != "https"
-        || parsed.host().is_none()
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-        || parsed.query().is_some()
-        || parsed.fragment().is_some()
+        || crate::authz_metadata::validate_issuer(issuer, crate::authz_metadata::EgressPosture::Strict).is_err()
     {
-        return Err(invalid().into());
+        return Err(
+            "authorization_servers entries must be https issuer URLs without credentials, query or fragment".into()
+        );
     }
     Ok(())
 }

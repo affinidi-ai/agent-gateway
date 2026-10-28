@@ -200,6 +200,7 @@ all of them, from least to most specific: `http_status`,
 | --- | --- |
 | `discover(issuer, posture, options)` | Fetches and validates, trying the URLs in order |
 | `metadata_urls(issuer)` | Pure: the candidate URLs for an issuer, in order: two for an origin issuer, three for a path issuer |
+| `validate_issuer(issuer, posture)` | Pure: the issuer checks `discover` makes before any request; protected resource metadata uses it for the authorization servers it advertises |
 | `parse_metadata(body, issuer, metadata_url, posture)` | Pure: validates a document already in hand |
 | `get_bounded(url, posture, options)` | The pinned, bounded GET, reusable for a JWKS fetch |
 

@@ -20,7 +20,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 #[allow(unused_imports)]
-pub use discovery::{discover, metadata_urls, parse_metadata};
+pub use discovery::{discover, metadata_urls, parse_metadata, validate_issuer};
 #[allow(unused_imports)]
 pub use fetch::get_bounded;
 
