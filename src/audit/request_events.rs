@@ -153,10 +153,13 @@ impl RoutingRefusal {
 /// Records a routing refusal for `error` and returns how to answer it. The
 /// request's surface variant is set first: `_unknown_` for an unknown alias,
 /// the disabled variant's alias, or nothing for a misconfigured default. The
-/// alias the caller named goes only to `requested_variant`.
+/// alias the caller named goes only to `requested_variant`. `rpc_error_code`
+/// is the JSON-RPC error code the caller is answered with, when the refusal
+/// is one.
 pub fn refuse_routing(
     facts: &RequestFacts<'_>,
     error: &crate::config::agent_surface_variants::VariantResolveError,
+    rpc_error_code: Option<i64>,
 ) -> RoutingRefusal {
     use crate::config::agent_surface_variants::{SurfaceVariant, VariantResolveError};
     use crate::observability::policy_audit::set_request_variant;
@@ -196,7 +199,7 @@ pub fn refuse_routing(
         refusal
             .status
             .as_u16(),
-        None,
+        rpc_error_code,
         refusal.requested_variant(),
     );
     refusal
@@ -428,7 +431,7 @@ mod tests {
         };
         let ((), events) = crate::audit::producer::capture(async {
             request_rejected(&fabric, RejectionStage::Admission, RejectionReason::BodyTooLarge, 413, None);
-            refuse_routing(&fabric, &VariantResolveError::UnknownAlias("typo".into()));
+            refuse_routing(&fabric, &VariantResolveError::UnknownAlias("typo".into()), None);
             request_rejected(&facts(), RejectionStage::Admission, RejectionReason::BodyTooLarge, 413, None);
         })
         .await;
@@ -478,7 +481,7 @@ mod tests {
         let (refusals, events) = crate::audit::producer::capture(async {
             errors
                 .iter()
-                .map(|error| refuse_routing(&facts(), error))
+                .map(|error| refuse_routing(&facts(), error, None))
                 .collect::<Vec<_>>()
         })
         .await;
@@ -514,8 +517,8 @@ mod tests {
         let long = "a".repeat(40);
         let accented = "é".repeat(40);
         let (_, events) = crate::audit::producer::capture(async {
-            refuse_routing(&facts(), &VariantResolveError::UnknownAlias(long.clone()));
-            refuse_routing(&facts(), &VariantResolveError::UnknownAlias(accented.clone()));
+            refuse_routing(&facts(), &VariantResolveError::UnknownAlias(long.clone()), None);
+            refuse_routing(&facts(), &VariantResolveError::UnknownAlias(accented.clone()), None);
         })
         .await;
 

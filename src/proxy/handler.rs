@@ -9178,6 +9178,38 @@ async fn proxy_handler_with_mcp_runtime(
     process_response(status, response_headers, response_body).await
 }
 
+/// Refuses an Access Point request whose surface variant can't be resolved,
+/// recording the refusal once. A modern MCP request, told by its headers as
+/// the body is not read at routing, is answered with a JSON-RPC error without
+/// an `id`; every other request with a plain error.
+fn refuse_access_point_variant(
+    surface: &crate::config::agent_surface::AgentSurface,
+    headers: &HeaderMap,
+    error: &crate::config::agent_surface_variants::VariantResolveError,
+) -> Response {
+    let modern_mcp = surface
+        .access_point
+        .protocol
+        == crate::config::agent_surface::SurfaceProtocol::Mcp
+        && crate::mcp::request_validation::has_modern_header(headers);
+    let code = crate::mcp::error_codes::INTERNAL_ERROR;
+    let refusal =
+        crate::audit::request_events::refuse_routing(&routing_facts(surface), error, modern_mcp.then_some(i64::from(code)));
+    if modern_mcp {
+        return crate::mcp::request_validation::McpRequestValidationError {
+            status: refusal.status(),
+            id: None,
+            code,
+            message: refusal
+                .message()
+                .to_string(),
+            data: None,
+        }
+        .into_response();
+    }
+    create_error_response(refusal.status(), refusal.message())
+}
+
 fn normalize_route_for_match(route: &str) -> String {
     let with_leading_slash = if route.starts_with('/') {
         route.to_string()
@@ -9332,9 +9364,7 @@ async fn multi_channel_proxy_handler_in_request_scope(
                 }
                 Err(error) => {
                     warn!(surface = %ch.surface.name, error = %error, "Surface variant cannot be resolved");
-                    let refusal =
-                        crate::audit::request_events::refuse_routing(&routing_facts(&ch.surface), &error);
-                    return create_error_response(refusal.status(), refusal.message());
+                    return refuse_access_point_variant(&ch.surface, req.headers(), &error);
                 }
             };
 

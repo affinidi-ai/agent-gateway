@@ -186,7 +186,8 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
       `default_variant_id` names no variant.
 
     A request whose variant can't be resolved is refused, never served by the base surface or
-    another variant. On a Fabric stream the receiving gateway refuses the `Open` and records the
+    another variant. A modern MCP request on the Access Point is answered with a JSON-RPC error
+    without an `id`, and its record carries `rpc_error_code` `-32603`. On a Fabric stream the receiving gateway refuses the `Open` and records the
     refusal; the stream has no status of its own, so the sender answers as it does any refused
     stream.
   - `admission`: `body_too_large`, `protocol_mismatch` (an MCP body on an A2A Access Point or the

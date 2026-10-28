@@ -631,7 +631,7 @@ fn is_valid_request_id(value: &JsonValue) -> bool {
     value.is_string() || value.as_i64().is_some() || value.as_u64().is_some()
 }
 
-fn has_modern_header(headers: &HeaderMap) -> bool {
+pub(crate) fn has_modern_header(headers: &HeaderMap) -> bool {
     let mut versions = headers
         .get_all(PROTOCOL_VERSION_HEADER)
         .iter();

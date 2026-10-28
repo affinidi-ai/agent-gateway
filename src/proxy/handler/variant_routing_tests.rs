@@ -381,6 +381,117 @@ async fn an_access_point_request_exports_its_span_with_the_variant() {
     assert_eq!(span_attr(request_span, "surface.variant").as_deref(), Some("beta"));
 }
 
+fn mcp_surface(default_variant_id: Option<&str>) -> AgentSurface {
+    serde_json::from_value(json!({
+        "surface_id": "tools", "name": "Tools",
+        "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
+        "target": {"endpoint": "http://127.0.0.1:9"},
+        "variants": catalog(),
+        "default_variant_id": default_variant_id
+    }))
+    .unwrap()
+}
+
+/// Sends a `tools/list` to the MCP Access Point, with the modern MCP headers or
+/// the legacy version header, and returns the status, the content type, the
+/// body and every audit record the request wrote.
+async fn send_mcp(
+    surface: AgentSurface,
+    path: &str,
+    modern: bool,
+) -> (axum::http::StatusCode, String, Value, Vec<DelegationAuditEvent>) {
+    let mut request = axum::http::Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream");
+    request = if modern {
+        request
+            .header("mcp-protocol-version", crate::mcp::MCP_MODERN_VERSION)
+            .header("mcp-method", "tools/list")
+    } else {
+        request.header("mcp-protocol-version", crate::mcp::MCP_LEGACY_VERSION)
+    };
+    let request = request
+        .body(axum::body::Body::from(
+            json!({"jsonrpc": "2.0", "id": "variant", "method": "tools/list"}).to_string(),
+        ))
+        .unwrap();
+    let (response, events) =
+        crate::audit::producer::capture(Box::pin(super::multi_channel_proxy_handler_with_mcp_runtime(
+            "127.0.0.1:12345"
+                .parse()
+                .unwrap(),
+            router(surface),
+            request,
+            crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+            None,
+        )))
+        .await;
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let body = axum::body::to_bytes(response.into_body(), 16384)
+        .await
+        .unwrap();
+    (status, content_type, serde_json::from_slice(&body).unwrap(), events)
+}
+
+fn mcp_refusals(events: &[DelegationAuditEvent]) -> Vec<(RejectionReason, Option<u16>, Option<i64>)> {
+    events
+        .iter()
+        .filter_map(|event| match &event.event {
+            DelegationAuditAction::RequestRejected {
+                reason,
+                http_status,
+                rpc_error_code,
+                ..
+            } => Some((*reason, *http_status, *rpc_error_code)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn mcp_refusal_cases() -> [(&'static str, AgentSurface, &'static str, RejectionReason, u16); 3] {
+    [
+        ("unknown alias", mcp_surface(Some("v-prod")), "/mcp$missing", RejectionReason::UnknownVariant, 404),
+        ("disabled alias", mcp_surface(Some("v-prod")), "/mcp$off", RejectionReason::VariantDisabled, 404),
+        ("misconfigured default", mcp_surface(Some("removed")), "/mcp", RejectionReason::MisconfiguredDefault, 500),
+    ]
+}
+
+#[tokio::test]
+async fn a_modern_mcp_variant_refusal_is_a_json_rpc_error_without_an_id() {
+    let code = i64::from(crate::mcp::error_codes::INTERNAL_ERROR);
+    for (case, surface, path, reason, status) in mcp_refusal_cases() {
+        let (answered, content_type, body, events) = send_mcp(surface, path, true).await;
+
+        assert_eq!(answered.as_u16(), status, "{case}");
+        assert_eq!(content_type, "application/json", "{case}");
+        assert_eq!(body["jsonrpc"], "2.0", "{case}: {body}");
+        assert!(body.get("id").is_none(), "{case}: the body was not read, so no id: {body}");
+        assert_eq!(body["error"]["code"], code, "{case}: {body}");
+        assert!(body.get("result").is_none(), "{case}: {body}");
+        assert_eq!(mcp_refusals(&events), vec![(reason, Some(status), Some(code))], "{case}: one record");
+    }
+}
+
+#[tokio::test]
+async fn a_legacy_mcp_variant_refusal_keeps_its_plain_error() {
+    for (case, surface, path, reason, status) in mcp_refusal_cases() {
+        let (answered, _, body, events) = send_mcp(surface, path, false).await;
+
+        assert_eq!(answered.as_u16(), status, "{case}");
+        assert!(body.get("jsonrpc").is_none(), "{case}: {body}");
+        assert_eq!(body["status"], status, "{case}: {body}");
+        assert_eq!(mcp_refusals(&events), vec![(reason, Some(status), None)], "{case}: one record");
+    }
+}
+
 #[tokio::test]
 async fn a_surface_with_variants_but_no_default_serves_an_alias_less_request_from_the_base() {
     let target = MockServer::start_with_response(

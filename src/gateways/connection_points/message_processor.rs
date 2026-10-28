@@ -3801,6 +3801,7 @@ pub(crate) async fn resolve_stream_surface(
                         via_fabric: true,
                     },
                     &error,
+                    None,
                 )
             })
             .await;
@@ -4148,6 +4149,7 @@ async fn process_forward_request_in_request_scope(
                     via_fabric: true,
                 },
                 &error,
+                None,
             );
             return ProcessingResult::RequiresResponse {
                 response_type: MessageType::ForwardResponse.to_string(),

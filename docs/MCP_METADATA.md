@@ -107,9 +107,12 @@ when the variant it selects can't be resolved. The Access Point, the Transit
 Point and Fabric receive refuse it at routing, before reading the MCP body and
 before Target work, with one status per reason: `404` for an alias the surface
 doesn't have (including on an empty variant catalog) and for a disabled named or
-default variant, and `500` when `default_variant_id` names no variant. The
-refusal is a plain error response, not a JSON-RPC error. Fabric Open refuses the
-same requests.
+default variant, and `500` when `default_variant_id` names no variant. On the
+Access Point, a request to an MCP surface carrying the modern MCP headers
+(`MCP-Protocol-Version` other than `2024-11-05`, or `Mcp-Method`) is answered
+with a JSON-RPC error with code `-32603` and no `id`, as the body is not read at
+routing; every other request gets a plain error response. Fabric Open refuses
+the same requests.
 
 Resolved Access Point, Transit Point and Fabric request snapshots retain the
 selected stable variant ID separately from the materialized surface, whose

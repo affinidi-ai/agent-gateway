@@ -472,6 +472,7 @@ impl OutboundPipelineContext {
                     via_fabric: false,
                 },
                 &error,
+                None,
             ))
         };
         let active_variant_id = surface_for_resolve
