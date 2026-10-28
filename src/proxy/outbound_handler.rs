@@ -69,6 +69,9 @@ pub(crate) enum OutboundPipelineError {
     #[error("Unknown outbound virtual channel alias: '{0}'")]
     UnknownVirtualChannelAlias(String),
 
+    #[error("{}", .0.message())]
+    VariantRefused(crate::audit::request_events::RoutingRefusal),
+
     #[error("Failed to read request body: {0}")]
     BodyReadFailed(String),
 
@@ -179,6 +182,7 @@ impl OutboundPipelineError {
     fn status_code(&self) -> StatusCode {
         match self {
             Self::McpValidation(error) => error.status,
+            Self::VariantRefused(refusal) => refusal.status(),
             Self::McpIdentityInvalid | Self::McpBodyRefused(crate::mcp::tool_analyzer::BodyRefusal::Batch) => {
                 StatusCode::UNPROCESSABLE_ENTITY
             }
@@ -366,7 +370,6 @@ pub struct OutboundPipelineContext {
     /// `None` when the request targets the default variant.
     pub active_variant_alias: Option<String>,
     pub active_variant_id: Option<String>,
-    pub variant_resolution_error: Option<crate::config::agent_surface_variants::VariantResolveError>,
     /// Resolved [`AgentSurface`] for this outbound request, symmetric
     /// to inbound `ProxyState::surface`. Built once per request via
     /// `from_channel_mapping → resolve_variant(alias)` so downstream
@@ -457,45 +460,29 @@ impl OutboundPipelineContext {
             resolve_virtual_channel(path, &surface_for_resolve)?
         };
 
-        // Resolve the variant from the surface. On failure we fall
-        // back to the unresolved base surface so the request still
-        // proceeds.
-        let active_variant_id = match active_variant_alias.as_deref() {
-            Some(alias) => surface_for_resolve
-                .variants
-                .iter()
-                .find(|variant| variant.enabled && variant.alias == alias)
-                .map(|variant| variant.id.clone()),
-            None => surface_for_resolve
-                .default_variant_id
-                .clone(),
+        // The URL's alias, else the default variant, else the base surface
+        // serves the request. A variant that can't be resolved is refused.
+        let refuse = |error: crate::config::agent_surface_variants::VariantResolveError| {
+            tracing::warn!(surface = %surface_for_resolve.name, error = %error, "Surface variant cannot be resolved");
+            OutboundPipelineError::VariantRefused(crate::audit::request_events::refuse_routing(
+                &crate::audit::request_events::RequestFacts {
+                    surface_id: &surface_for_resolve.surface_id,
+                    channel_name: &surface_for_resolve.name,
+                    trace_id: None,
+                    via_fabric: false,
+                },
+                &error,
+            ))
         };
-        let (surface, variant_resolution_error) =
-            match surface_for_resolve.resolve_variant(active_variant_alias.as_deref()) {
-                Ok(resolved) => {
-                    let error = active_variant_alias
-                        .as_deref()
-                        .filter(|alias| {
-                            !surface_for_resolve
-                                .variants
-                                .iter()
-                                .any(|variant| variant.alias == *alias)
-                        })
-                        .map(|alias| {
-                            crate::config::agent_surface_variants::VariantResolveError::UnknownAlias(alias.to_string())
-                        });
-                    (Arc::new(resolved), error)
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        surface = %cs_surface_for_resolve.name,
-                        alias = ?active_variant_alias,
-                        error = %e,
-                        "AgentSurface variant resolution failed; using base surface"
-                    );
-                    (surface_for_resolve, Some(e))
-                }
-            };
+        let active_variant_id = surface_for_resolve
+            .select_variant(active_variant_alias.as_deref())
+            .map_err(refuse)?
+            .map(|variant| variant.id.clone());
+        let surface = Arc::new(
+            surface_for_resolve
+                .resolve_variant(active_variant_alias.as_deref())
+                .map_err(refuse)?,
+        );
 
         let virtual_channel = surface
             .transit_points()
@@ -585,7 +572,6 @@ impl OutboundPipelineContext {
             response_bytes: None,
             active_variant_alias,
             active_variant_id,
-            variant_resolution_error,
             surface,
             identity_rules_engine,
             identity_selector,
@@ -739,28 +725,10 @@ async fn outbound_proxy_handler_in_request_scope(
         return Ok(response);
     }
 
-    if let Some(crate::mcp::request_validation::McpRequestClassification::Modern(request)) = ctx
+    if let Some(crate::mcp::request_validation::McpRequestClassification::Modern(_)) = ctx
         .mcp_classification
         .as_ref()
     {
-        if let Some(error) = ctx
-            .variant_resolution_error
-            .as_ref()
-        {
-            let status = match error {
-                crate::config::agent_surface_variants::VariantResolveError::UnknownAlias(_) => StatusCode::NOT_FOUND,
-                _ => StatusCode::SERVICE_UNAVAILABLE,
-            };
-            return Err(OutboundPipelineError::McpValidation(Box::new(
-                crate::mcp::request_validation::McpRequestValidationError {
-                    status,
-                    id: request.id.clone(),
-                    code: crate::mcp::error_codes::INTERNAL_ERROR,
-                    message: "MCP Transit Point variant is unavailable".into(),
-                    data: None,
-                },
-            )));
-        }
         step_validate_transit_token(&state, &mut ctx).await?;
     }
 
@@ -3936,12 +3904,6 @@ async fn step_inject_credentials(
     state: &OutboundProxyState,
     ctx: &mut OutboundPipelineContext,
 ) -> Result<(), OutboundPipelineError> {
-    if ctx
-        .variant_resolution_error
-        .is_some()
-    {
-        return Ok(());
-    }
     let mut outbound_creds = ctx
         .surface
         .transit_point_outbound_credentials(&ctx.virtual_channel);
@@ -5691,7 +5653,6 @@ mod tests {
             response_bytes: None,
             active_variant_alias: None,
             active_variant_id: None,
-            variant_resolution_error: None,
             surface,
             identity_rules_engine: None,
             identity_selector: None,
@@ -8118,7 +8079,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn modern_transit_variant_failures_never_dispatch_the_base_target() {
+    async fn transit_variant_failures_are_refused_and_never_dispatch_the_base_target() {
+        use crate::audit::request_events::{RejectionReason, RejectionStage};
         let target = crate::component_tests::helpers::MockServer::start_with_response(
             json!({
                 "jsonrpc": "2.0", "id": "variant", "result": {
@@ -8129,7 +8091,17 @@ mod tests {
         )
         .await;
         let versions = crate::mcp::request_validation::MODERN_CAPABLE_POLICY;
-        for case in ["empty-catalog", "unknown", "disabled", "missing-default", "disabled-default"] {
+        for (case, modern, status, reason, requested_variant) in [
+            ("empty-catalog", true, 404, RejectionReason::UnknownVariant, Some("unknown")),
+            ("unknown", true, 404, RejectionReason::UnknownVariant, Some("unknown")),
+            ("unknown", false, 404, RejectionReason::UnknownVariant, Some("unknown")),
+            ("disabled", true, 404, RejectionReason::VariantDisabled, None),
+            ("disabled", false, 404, RejectionReason::VariantDisabled, None),
+            ("missing-default", true, 500, RejectionReason::MisconfiguredDefault, None),
+            ("missing-default", false, 500, RejectionReason::MisconfiguredDefault, None),
+            ("empty-catalog-missing-default", false, 500, RejectionReason::MisconfiguredDefault, None),
+            ("disabled-default", true, 404, RejectionReason::VariantDisabled, None),
+        ] {
             let mut surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
                 "surface_id": "variant-surface", "name": "Variant surface",
                 "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "a2a"},
@@ -8139,10 +8111,10 @@ mod tests {
                 "variants": [{"id": "candidate", "alias": "candidate", "name": "Candidate", "enabled": false}]
             }))
             .unwrap();
-            if case == "empty-catalog" {
+            if case.starts_with("empty-catalog") {
                 surface.variants.clear();
             }
-            if case == "missing-default" {
+            if case.ends_with("missing-default") {
                 surface.default_variant_id = Some("absent".into());
             }
             if case == "disabled-default" {
@@ -8150,7 +8122,7 @@ mod tests {
             }
             let path = match case {
                 "disabled" => "/outbound/mcp$candidate/partner-a",
-                "missing-default" | "disabled-default" => "/outbound/mcp/partner-a",
+                "missing-default" | "disabled-default" | "empty-catalog-missing-default" => "/outbound/mcp/partner-a",
                 _ => "/outbound/mcp$unknown/partner-a",
             };
             let state = test_outbound_state();
@@ -8159,54 +8131,60 @@ mod tests {
                 .write()
                 .unwrap()
                 .surface = Arc::new(surface);
-            let request = Request::builder()
+            let mut request = Request::builder()
                 .method("POST")
                 .uri(path)
-                .header("mcp-method", "tools/list")
-                .header("mcp-protocol-version", crate::mcp::MCP_MODERN_VERSION)
                 .header("content-type", "application/json")
-                .header("accept", "application/json, text/event-stream")
-                .body(axum::body::Body::from(
-                    json!({"jsonrpc": "2.0", "id": "variant", "method": "tools/list", "params": {"_meta": {
-                        "io.modelcontextprotocol/protocolVersion": crate::mcp::MCP_MODERN_VERSION,
-                        "io.modelcontextprotocol/clientCapabilities": {}
-                    }}})
-                    .to_string(),
-                ))
+                .header("accept", "application/json, text/event-stream");
+            let mut body = json!({"jsonrpc": "2.0", "id": "variant", "method": "tools/list"});
+            if modern {
+                request = request
+                    .header("mcp-method", "tools/list")
+                    .header("mcp-protocol-version", crate::mcp::MCP_MODERN_VERSION);
+                body["params"] = json!({"_meta": {
+                    "io.modelcontextprotocol/protocolVersion": crate::mcp::MCP_MODERN_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }});
+            }
+            let request = request
+                .body(axum::body::Body::from(body.to_string()))
                 .unwrap();
-            let response = Box::pin(outbound_proxy_handler_with_mcp_versions(
-                "127.0.0.1:12345"
-                    .parse()
-                    .unwrap(),
-                state,
-                request,
-                versions,
-            ))
-            .await
-            .unwrap_or_else(|error| error.into_response());
+            let (response, events) =
+                crate::audit::producer::capture(Box::pin(outbound_proxy_handler_with_mcp_versions(
+                    "127.0.0.1:12345"
+                        .parse()
+                        .unwrap(),
+                    state,
+                    request,
+                    versions,
+                )))
+                .await;
+            let response = response.unwrap_or_else(|error| error.into_response());
+            assert_eq!(response.status().as_u16(), status, "{case} modern={modern}");
+            let refusals: Vec<_> = events
+                .iter()
+                .filter_map(|event| match &event.event {
+                    crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                        stage,
+                        reason,
+                        http_status,
+                        requested_variant,
+                        ..
+                    } => Some((*stage, *reason, *http_status, requested_variant.clone())),
+                    _ => None,
+                })
+                .collect();
             assert_eq!(
-                response.status(),
-                if matches!(case, "empty-catalog" | "unknown") {
-                    StatusCode::NOT_FOUND
-                } else {
-                    StatusCode::SERVICE_UNAVAILABLE
-                },
-                "{case}"
+                refusals,
+                vec![(RejectionStage::Routing, reason, status, requested_variant.map(str::to_string))],
+                "{case} modern={modern}"
             );
-            let error: serde_json::Value = serde_json::from_slice(
-                &axum::body::to_bytes(response.into_body(), 16384)
-                    .await
-                    .unwrap(),
-            )
-            .unwrap();
-            assert_eq!(error["id"], "variant");
-            assert!(error.get("result").is_none());
             assert_eq!(
                 target
                     .request_count
                     .load(std::sync::atomic::Ordering::SeqCst),
                 0,
-                "{case}"
+                "{case} modern={modern}"
             );
         }
     }
@@ -11747,30 +11725,6 @@ mod tests {
                 expected,
                 "{variant:?}"
             );
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn legacy_requests_get_no_delegated_credentials_after_variant_resolution_fails() {
-        let directory = tempfile::tempdir().unwrap();
-        let state = delegation_state(directory.path(), &[("provider", "transit-access")]).await;
-        let surface = transit_surface(
-            json!([meta_transit_point("partner", "https://partner.example/mcp", false, Some("provider"))]),
-            json!([]),
-        );
-
-        for (error, expected) in [
-            (None, json!("transit-access")),
-            (
-                Some(crate::config::agent_surface_variants::VariantResolveError::UnknownAlias("missing".into())),
-                serde_json::Value::Null,
-            ),
-        ] {
-            let (resolved, partner) = resolved_transit_point(&surface, None, "partner");
-            let mut ctx = legacy_delegation_context(resolved, partner);
-            let failed = error.is_some();
-            ctx.variant_resolution_error = error;
-            assert_eq!(injected_credential(&state, ctx).await, expected, "variant_resolution_failed={failed}");
         }
     }
 }

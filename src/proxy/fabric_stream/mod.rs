@@ -1270,11 +1270,32 @@ mod tests {
                 "disabled-variant" => request["variant_alias"] = json!("disabled"),
                 _ => unreachable!(),
             }
-            let refusal = runtime
-                .prepare_incoming_with_versions(&invalid, &invalid_connection, &invalid_peer, versions)
-                .await
+            let (refusal, records) = crate::audit::producer::capture(
+                runtime.prepare_incoming_with_versions(&invalid, &invalid_connection, &invalid_peer, versions),
+            )
+            .await;
+            let refusal = refusal
                 .err()
                 .unwrap_or_else(|| panic!("{rejected} was admitted"));
+            let routing_refusals: Vec<_> = records
+                .iter()
+                .filter_map(|record| match &record.event {
+                    crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                        reason,
+                        http_status,
+                        requested_variant,
+                        ..
+                    } => Some((*reason, *http_status, requested_variant.clone(), record.via_fabric)),
+                    _ => None,
+                })
+                .collect();
+            use crate::audit::request_events::RejectionReason;
+            let expected_records = match rejected {
+                "missing-variant" => vec![(RejectionReason::UnknownVariant, 404, Some("missing".to_string()), true)],
+                "disabled-variant" => vec![(RejectionReason::VariantDisabled, 404, None, true)],
+                _ => vec![],
+            };
+            assert_eq!(routing_refusals, expected_records, "{rejected}: recorded refusal");
             // Only a missing offer asks the sender to negotiate again.
             let expected = if rejected == "missing-offer" {
                 wire::StreamErrorCode::StaleOffer
@@ -1289,6 +1310,44 @@ mod tests {
                     .unwrap_or_else(|error| panic!("{rejected} consumed admission state: {error}")),
             );
         }
+        let mut dangling = surface.clone();
+        dangling.variants.clear();
+        dangling.default_variant_id = Some("removed".into());
+        store
+            .save(&dangling)
+            .await
+            .unwrap();
+        let (refusal, records) = crate::audit::producer::capture(runtime.prepare_incoming_with_versions(
+            &fresh_message(),
+            &connection,
+            &peer,
+            versions,
+        ))
+        .await;
+        assert_eq!(
+            refusal
+                .err()
+                .expect("a dangling default variant is refused")
+                .code,
+            wire::StreamErrorCode::Unavailable
+        );
+        assert!(
+            records
+                .iter()
+                .any(|record| matches!(
+                    record.event,
+                    crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                        reason: crate::audit::request_events::RejectionReason::MisconfiguredDefault,
+                        http_status: 500,
+                        ..
+                    }
+                )),
+            "{records:?}"
+        );
+        store
+            .save(&surface)
+            .await
+            .unwrap();
         // An Open envelope is admitted like a forward-request: without a valid
         // expiry it is refused, and the refusal consumes no admission state.
         let now_secs = crate::gateways::connection_points::envelope_replay::now_secs();

@@ -38,10 +38,9 @@ pub struct SurfaceVariant {
     pub description: String,
 
     /// Whether this variant accepts traffic. Disabled variants are still
-    /// resolvable for debugging and UI display, but the proxy answers any
-    /// request that selects a disabled variant with HTTP 503 ("listener
-    /// temporarily unavailable") — not 404 — to signal that the route
-    /// exists but is intentionally switched off.
+    /// resolvable for debugging and UI display, but the proxy refuses any
+    /// request that selects a disabled variant with HTTP 404, as it refuses
+    /// an unknown alias: nothing is served at that URL.
     #[serde(default = "default_true")]
     pub enabled: bool,
 
@@ -56,13 +55,16 @@ impl SurfaceVariant {
     #[allow(dead_code)]
     pub const ALIAS_PATTERN: &'static str = r"^[a-z0-9-]{1,32}$";
 
+    /// The longest alias [`Self::ALIAS_PATTERN`] accepts.
+    pub const ALIAS_MAX_LEN: usize = 32;
+
     /// Returns `Ok(())` if the alias matches `ALIAS_PATTERN`. The error
     /// message includes the offending alias for echoing back to the user.
     pub fn validate_alias(alias: &str) -> Result<(), String> {
         if alias.is_empty() {
             return Err("variant alias is required".to_string());
         }
-        if alias.len() > 32 {
+        if alias.len() > Self::ALIAS_MAX_LEN {
             return Err(format!("variant alias '{alias}' must be 32 characters or fewer"));
         }
         for c in alias.chars() {
@@ -673,9 +675,7 @@ pub enum VariantResolveError {
     UnknownAlias(String),
     /// The matched variant is `enabled: false`.
     DisabledVariant(String),
-    /// `default_variant_id` is set but no variant has that id. This is a
-    /// surface-validation failure that the resolver surfaces verbatim so
-    /// the caller can decide whether to fall back to the base.
+    /// `default_variant_id` is set but no variant has that id.
     MisconfiguredDefault(String),
 }
 
@@ -697,6 +697,34 @@ impl std::fmt::Display for VariantResolveError {
 impl std::error::Error for VariantResolveError {}
 
 impl AgentSurface {
+    /// The variant a request serves, from the alias in its URL: the named
+    /// variant, else the default variant, else `None` for the base surface.
+    /// Never falls back: a named variant the surface doesn't have (including
+    /// on a surface with no variants), a disabled one, and a
+    /// `default_variant_id` that names no variant are errors.
+    pub fn select_variant(
+        &self,
+        alias: Option<&str>,
+    ) -> Result<Option<&SurfaceVariant>, VariantResolveError> {
+        let variant = match (alias, self.default_variant_id.as_deref()) {
+            (Some(alias), _) => self
+                .variants
+                .iter()
+                .find(|v| v.alias == alias)
+                .ok_or_else(|| VariantResolveError::UnknownAlias(alias.to_string()))?,
+            (None, Some(id)) => self
+                .variants
+                .iter()
+                .find(|v| v.id == id)
+                .ok_or_else(|| VariantResolveError::MisconfiguredDefault(id.to_string()))?,
+            (None, None) => return Ok(None),
+        };
+        if !variant.enabled {
+            return Err(VariantResolveError::DisabledVariant(variant.alias.clone()));
+        }
+        Ok(Some(variant))
+    }
+
     /// Resolve a variant by alias and return a fully-materialised
     /// `AgentSurface` with that variant's overrides applied.
     ///
@@ -1113,6 +1141,57 @@ mod tests {
             .resolve_variant(None)
             .unwrap_err();
         assert_eq!(err, VariantResolveError::MisconfiguredDefault("does-not-exist".to_string()));
+    }
+
+    fn selected(
+        s: &AgentSurface,
+        alias: Option<&str>,
+    ) -> Result<Option<String>, VariantResolveError> {
+        s.select_variant(alias)
+            .map(|v| v.map(|v| v.id.clone()))
+    }
+
+    #[test]
+    fn a_request_selects_the_named_variant_else_the_default_else_the_base() {
+        let mut s = base_surface();
+        s.variants = vec![
+            variant("id-prod", "prod", SurfaceOverrides::default()),
+            variant("id-beta", "beta", SurfaceOverrides::default()),
+        ];
+        s.default_variant_id = Some("id-prod".to_string());
+        assert_eq!(selected(&s, Some("beta")), Ok(Some("id-beta".to_string())));
+        assert_eq!(selected(&s, None), Ok(Some("id-prod".to_string())));
+
+        s.default_variant_id = None;
+        assert_eq!(selected(&s, None), Ok(None), "variants but no default: the base serves");
+        assert_eq!(selected(&base_surface(), None), Ok(None), "no variants: the base serves");
+    }
+
+    #[test]
+    fn a_variant_that_cannot_be_resolved_is_an_error_never_a_fallback() {
+        let mut s = base_surface();
+        let mut beta = variant("id-beta", "beta", SurfaceOverrides::default());
+        beta.enabled = false;
+        s.variants = vec![variant("id-prod", "prod", SurfaceOverrides::default()), beta];
+        assert_eq!(selected(&s, Some("nope")), Err(VariantResolveError::UnknownAlias("nope".to_string())));
+        assert_eq!(selected(&s, Some("beta")), Err(VariantResolveError::DisabledVariant("beta".to_string())));
+
+        s.default_variant_id = Some("id-beta".to_string());
+        assert_eq!(
+            selected(&s, None),
+            Err(VariantResolveError::DisabledVariant("beta".to_string())),
+            "a disabled default names its own alias"
+        );
+        s.default_variant_id = Some("removed".to_string());
+        assert_eq!(selected(&s, None), Err(VariantResolveError::MisconfiguredDefault("removed".to_string())));
+    }
+
+    #[test]
+    fn a_surface_with_no_variants_refuses_an_alias_and_a_dangling_default() {
+        let mut s = base_surface();
+        assert_eq!(selected(&s, Some("dev")), Err(VariantResolveError::UnknownAlias("dev".to_string())));
+        s.default_variant_id = Some("removed".to_string());
+        assert_eq!(selected(&s, None), Err(VariantResolveError::MisconfiguredDefault("removed".to_string())));
     }
 
     #[test]

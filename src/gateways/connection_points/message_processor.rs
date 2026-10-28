@@ -3752,30 +3752,39 @@ pub(crate) async fn resolve_stream_surface(
     let surface = lookup_channel(message, &request.channel_id)
         .await?
         .ok_or("Fabric stream surface is unavailable")?;
-    let variant_id = match request
+    let alias = request
         .variant_alias
-        .as_deref()
-    {
-        Some(alias) => Some(
+        .as_deref();
+    let selected = surface
+        .select_variant(alias)
+        .map(|variant| variant.map(|v| v.id.clone()))
+        .and_then(|variant_id| {
             surface
-                .variants
-                .iter()
-                .find(|variant| variant.alias == alias)
-                .ok_or("Fabric stream variant is unavailable")?
-                .id
-                .clone(),
-        ),
-        None => surface
-            .default_variant_id
-            .clone(),
+                .resolve_variant(alias)
+                .map(|resolved| (variant_id, resolved))
+        });
+    let (variant_id, surface) = match selected {
+        Ok(selected) => selected,
+        Err(error) => {
+            use crate::observability::policy_audit::{in_request, new_request_id};
+            let trace_id = request
+                .trace_id
+                .to_string();
+            in_request(new_request_id(), async {
+                crate::audit::request_events::refuse_routing(
+                    &crate::audit::request_events::RequestFacts {
+                        surface_id: &surface.surface_id,
+                        channel_name: &surface.name,
+                        trace_id: Some(&trace_id),
+                        via_fabric: true,
+                    },
+                    &error,
+                )
+            })
+            .await;
+            return Err("Fabric stream variant is unavailable".to_string());
+        }
     };
-    let surface = surface
-        .resolve_variant(
-            request
-                .variant_alias
-                .as_deref(),
-        )
-        .map_err(|error| error.to_string())?;
     if surface.status != crate::config::agent_surface::SurfaceStatus::Active
         || surface.channel_protocol() != crate::config::ChannelProtocol::Mcp
     {
@@ -4093,32 +4102,48 @@ async fn process_forward_request_in_request_scope(
         .or_else(|| message.message_body.get("active_variant_alias"))
         .and_then(|v| v.as_str());
 
-    let active_variant_id = match stream_request.as_ref() {
-        Some(request) => request.variant_id.clone(),
-        None => match variant_alias {
-            Some(alias) => surface.variants.iter().find(|variant| variant.enabled && variant.alias == alias)
-                .map(|variant| variant.id.clone()),
-            None => surface.default_variant_id.clone(),
-        },
+    // This gateway's own variant serves the request: the alias the sender
+    // named, else this surface's default variant, else its base. A variant
+    // that can't be resolved is refused, never served by another.
+    let selected = match stream_request.as_ref() {
+        Some(request) => Ok((request.variant_id.clone(), surface.clone())),
+        None => surface
+            .select_variant(variant_alias)
+            .map(|variant| variant.map(|v| v.id.clone()))
+            .and_then(|variant_id| {
+                surface
+                    .resolve_variant(variant_alias)
+                    .map(|resolved| (variant_id, resolved))
+            }),
     };
-
-    let surface = if stream_request.is_some() { surface.clone() } else { match surface.resolve_variant(variant_alias) {
-        Ok(s) => {
-            if let Some(alias) = variant_alias {
-                channel_info!(config_id, "GW2: Applied variant '{}'", alias);
-            }
-            s
-        }
-        Err(e) => {
-            channel_warn!(
-                config_id,
-                "GW2: Variant '{}' not found ({}), using default",
-                variant_alias.unwrap_or(""),
-                e
+    let (active_variant_id, surface) = match selected {
+        Ok(selected) => selected,
+        Err(error) => {
+            channel_warn!(config_id, "GW2: Surface variant cannot be resolved ({})", error);
+            let refusal = crate::audit::request_events::refuse_routing(
+                &crate::audit::request_events::RequestFacts {
+                    surface_id: &surface.surface_id,
+                    channel_name: &surface.name,
+                    trace_id: (!trace_id_field.is_empty()).then_some(trace_id_field),
+                    via_fabric: true,
+                },
+                &error,
             );
-            surface.resolve_variant(None).unwrap_or_else(|_| surface.clone())
+            return ProcessingResult::RequiresResponse {
+                response_type: MessageType::ForwardResponse.to_string(),
+                response_body: refused_forward_response(
+                    refusal
+                        .status()
+                        .as_u16(),
+                    refusal
+                        .status()
+                        .canonical_reason()
+                        .unwrap_or("Error"),
+                    refusal.message(),
+                ),
+            };
         }
-    }};
+    };
 
     // Check if channel is active
     if surface.status != crate::config::agent_surface::SurfaceStatus::Active {
@@ -9304,6 +9329,9 @@ async fn process_x402_settlement_complete(message: &ReceivedMessage) -> Processi
 
 #[cfg(test)]
 mod mcp_receive_tests;
+
+#[cfg(test)]
+mod variant_routing_tests;
 
 #[cfg(test)]
 mod tests {

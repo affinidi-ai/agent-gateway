@@ -94,14 +94,102 @@ pub fn request_rejected(
     http_status: u16,
     rpc_error_code: Option<i64>,
 ) {
+    record_rejection(facts, stage, reason, http_status, rpc_error_code, None)
+}
+
+fn record_rejection(
+    facts: &RequestFacts<'_>,
+    stage: RejectionStage,
+    reason: RejectionReason,
+    http_status: u16,
+    rpc_error_code: Option<i64>,
+    requested_variant: Option<&str>,
+) {
     emit("request_rejected", || {
         facts.record(DelegationAuditAction::RequestRejected {
             stage,
             reason,
             http_status,
             rpc_error_code,
+            requested_variant: requested_variant.map(str::to_string),
         })
     })
+}
+
+/// A request refused at routing because the surface variant it selects can't
+/// be resolved. Only [`refuse_routing`] builds one, and it records the refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutingRefusal {
+    reason: RejectionReason,
+    status: axum::http::StatusCode,
+    requested_variant: Option<String>,
+}
+
+impl RoutingRefusal {
+    pub fn reason(&self) -> RejectionReason {
+        self.reason
+    }
+
+    pub fn status(&self) -> axum::http::StatusCode {
+        self.status
+    }
+
+    pub fn requested_variant(&self) -> Option<&str> {
+        self.requested_variant
+            .as_deref()
+    }
+
+    /// What the caller is told. Both 404s say the same thing: nothing is
+    /// served at that URL.
+    pub fn message(&self) -> &'static str {
+        match self.reason {
+            RejectionReason::MisconfiguredDefault => "Surface variant configuration error",
+            _ => "No surface variant is served at this URL",
+        }
+    }
+}
+
+/// Records a routing refusal for `error` and returns how to answer it.
+pub fn refuse_routing(
+    facts: &RequestFacts<'_>,
+    error: &crate::config::agent_surface_variants::VariantResolveError,
+) -> RoutingRefusal {
+    use crate::config::agent_surface_variants::{SurfaceVariant, VariantResolveError};
+    use axum::http::StatusCode;
+
+    let refusal = match error {
+        VariantResolveError::UnknownAlias(alias) => RoutingRefusal {
+            reason: RejectionReason::UnknownVariant,
+            status: StatusCode::NOT_FOUND,
+            requested_variant: Some(
+                alias
+                    .chars()
+                    .take(SurfaceVariant::ALIAS_MAX_LEN)
+                    .collect(),
+            ),
+        },
+        VariantResolveError::DisabledVariant(_) => RoutingRefusal {
+            reason: RejectionReason::VariantDisabled,
+            status: StatusCode::NOT_FOUND,
+            requested_variant: None,
+        },
+        VariantResolveError::MisconfiguredDefault(_) => RoutingRefusal {
+            reason: RejectionReason::MisconfiguredDefault,
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            requested_variant: None,
+        },
+    };
+    record_rejection(
+        facts,
+        RejectionStage::Routing,
+        refusal.reason,
+        refusal
+            .status
+            .as_u16(),
+        None,
+        refusal.requested_variant(),
+    );
+    refusal
 }
 
 /// The reason for an MCP transport refusal, from the HTTP status and JSON-RPC
@@ -296,6 +384,7 @@ mod tests {
                     reason,
                     http_status,
                     rpc_error_code,
+                    ..
                 } => (*stage, *reason, *http_status, *rpc_error_code),
                 other => panic!("expected RequestRejected, got {other:?}"),
             })
@@ -318,6 +407,76 @@ mod tests {
             ]
         );
         assert_eq!(events[0].trace_id.as_deref(), Some("trace-1"));
+    }
+
+    fn requested_variants(events: &[crate::delegation_vault::audit::DelegationAuditEvent]) -> Vec<Option<String>> {
+        events
+            .iter()
+            .map(|event| match &event.event {
+                DelegationAuditAction::RequestRejected { requested_variant, .. } => requested_variant.clone(),
+                other => panic!("expected RequestRejected, got {other:?}"),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn each_routing_refusal_is_recorded_with_one_status_per_reason() {
+        use crate::config::agent_surface_variants::VariantResolveError;
+        let errors = [
+            VariantResolveError::UnknownAlias("typo".into()),
+            VariantResolveError::DisabledVariant("beta".into()),
+            VariantResolveError::MisconfiguredDefault("removed".into()),
+        ];
+        let (refusals, events) = crate::audit::producer::capture(async {
+            errors
+                .iter()
+                .map(|error| refuse_routing(&facts(), error))
+                .collect::<Vec<_>>()
+        })
+        .await;
+
+        let answered: Vec<_> = refusals
+            .iter()
+            .map(|refusal| (refusal.reason(), refusal.status().as_u16(), refusal.requested_variant()))
+            .collect();
+        assert_eq!(
+            answered,
+            vec![
+                (RejectionReason::UnknownVariant, 404, Some("typo")),
+                (RejectionReason::VariantDisabled, 404, None),
+                (RejectionReason::MisconfiguredDefault, 500, None),
+            ]
+        );
+        assert_eq!(
+            rejected(&events),
+            vec![
+                (RejectionStage::Routing, RejectionReason::UnknownVariant, 404, None),
+                (RejectionStage::Routing, RejectionReason::VariantDisabled, 404, None),
+                (RejectionStage::Routing, RejectionReason::MisconfiguredDefault, 500, None),
+            ]
+        );
+        assert_eq!(requested_variants(&events), vec![Some("typo".to_string()), None, None]);
+        assert_eq!(refusals[0].message(), refusals[1].message(), "both 404s tell the caller the same");
+        assert!(!refusals[0].message().contains("typo"), "the caller's alias is not echoed back");
+    }
+
+    #[tokio::test]
+    async fn a_requested_variant_is_cut_to_the_longest_alias() {
+        use crate::config::agent_surface_variants::VariantResolveError;
+        let long = "a".repeat(40);
+        let accented = "é".repeat(40);
+        let (_, events) = crate::audit::producer::capture(async {
+            refuse_routing(&facts(), &VariantResolveError::UnknownAlias(long.clone()));
+            refuse_routing(&facts(), &VariantResolveError::UnknownAlias(accented.clone()));
+        })
+        .await;
+
+        assert_eq!(requested_variants(&events), vec![Some("a".repeat(32)), Some("é".repeat(32))]);
+    }
+
+    #[test]
+    fn a_misconfigured_default_is_stored_in_snake_case() {
+        assert_eq!(serde_json::to_value(RejectionReason::MisconfiguredDefault).unwrap(), "misconfigured_default");
     }
 
     #[tokio::test]

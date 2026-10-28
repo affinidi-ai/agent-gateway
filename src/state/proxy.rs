@@ -99,11 +99,6 @@ pub struct ProxyState {
     pub active_variant_alias: Option<String>,
     pub active_variant_id: Option<String>,
 
-    /// Set when the requested alias could not select a variant and the
-    /// request fell back to the base surface. Legacy requests keep that
-    /// fallback; admitted modern requests are rejected instead.
-    pub variant_resolution_error: Option<crate::config::agent_surface_variants::VariantResolveError>,
-
     /// Resolved [`AgentSurface`] for this request — the source of
     /// truth for the hot path. Looked up from
     /// [`crate::surfaces::ResolvedSurfaceCache`] by `(surface_id,

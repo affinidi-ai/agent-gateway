@@ -1,0 +1,20 @@
+branch: surface-variant-in-audit-logs
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security: []
+  breaking:
+    - timestamp: '2026-10-28T15:30:00Z'
+      title: ⭐ Refuse requests whose surface variant can't be resolved on every path
+      description: >-
+        A request that names a variant the surface doesn't have (including on a surface with no
+        variants), names a disabled variant, has a disabled default variant, or reaches a surface
+        whose default_variant_id names no variant is now refused on the Access Point, the Transit
+        Point and Fabric receive. It is no longer served by the base surface or the default
+        variant. An unknown or disabled variant gets 404, a misconfigured default 500, for legacy
+        and modern requests alike, in place of the earlier 400, 503 and base-surface fallback. Each
+        refusal is recorded as request_rejected at stage routing with reason unknown_variant,
+        variant_disabled or the new misconfigured_default; an unknown_variant record carries the
+        alias the URL named, cut to 32 characters, in requested_variant.

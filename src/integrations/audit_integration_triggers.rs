@@ -527,6 +527,7 @@ mod tests {
                 reason: RejectionReason::NoRoute,
                 http_status: 404,
                 rpc_error_code: None,
+                requested_variant: None,
             },
             DelegationAuditAction::IdentityBindingFailed {
                 outcome: IdentityBindingFailure::Absent,

@@ -225,14 +225,11 @@ pub async fn prepare_transit(
     })
     .ok_or(ContinuationError::BindingMismatch)?;
     if context
-        .variant_resolution_error
+        .active_variant_alias
         .is_some()
-        || (context
-            .active_variant_alias
-            .is_some()
-            && context
-                .active_variant_id
-                .is_none())
+        && context
+            .active_variant_id
+            .is_none()
     {
         return Err(ContinuationError::BindingMismatch.into());
     }

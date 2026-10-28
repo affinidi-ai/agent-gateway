@@ -2308,37 +2308,6 @@ async fn proxy_handler_with_mcp_runtime(
         Some(crate::mcp::request_validation::McpRequestClassification::Modern(request)) => Some((**request).clone()),
         _ => None,
     };
-    if let Some(request) = modern_request.as_ref()
-        && let Some(error) = state
-            .variant_resolution_error
-            .as_ref()
-    {
-        connection_guard
-            .decrement()
-            .await;
-        let status = match error {
-            crate::config::agent_surface_variants::VariantResolveError::UnknownAlias(_) => {
-                crate::audit::request_events::request_rejected(
-                    &audit_facts,
-                    crate::audit::request_events::RejectionStage::Routing,
-                    crate::audit::request_events::RejectionReason::UnknownVariant,
-                    404,
-                    Some(i64::from(crate::mcp::error_codes::INTERNAL_ERROR)),
-                );
-                StatusCode::NOT_FOUND
-            }
-            // A misconfigured default variant is a gateway fault, not a refusal.
-            _ => StatusCode::SERVICE_UNAVAILABLE,
-        };
-        return Ok(crate::mcp::request_validation::McpRequestValidationError {
-            status,
-            id: request.id.clone(),
-            code: crate::mcp::error_codes::INTERNAL_ERROR,
-            message: "MCP surface variant is unavailable".into(),
-            data: None,
-        }
-        .into_response());
-    }
     let subscription_lifetime = if let Some(request) = modern_request
         .as_ref()
         .filter(|request| request.method == "subscriptions/listen")
@@ -9364,132 +9333,21 @@ async fn multi_channel_proxy_handler_in_request_scope(
         Some(ch) => {
             info!("Matched channel '{}' with route '{}' for path '{}'", ch.surface.name, ch.surface.route(), path);
 
-            // Base-mode (no variants): resolve to base surface, use channel-level
-            // engines, and forward through the normal pipeline below.
-            // Variant-mode (one or more variants): pick by alias or
-            // default_variant_id, use per-variant engines.
-            // `variant_id` is None in base-mode.
-            let mut variant_resolution_error = None;
-            let variant_id: Option<String> = if ch.surface.variants.is_empty() {
-                if let Some(alias) = virtual_channel_alias.as_deref() {
-                    warn!(
-                        surface = %ch.surface.name,
-                        requested_alias = %alias,
-                        "Channel has no variants — alias in path is ignored, routing to base surface"
-                    );
-                    variant_resolution_error = Some(
-                        crate::config::agent_surface_variants::VariantResolveError::UnknownAlias(alias.to_string()),
-                    );
-                } else if let Some(id) = ch
-                    .surface
-                    .default_variant_id
-                    .as_deref()
-                {
-                    variant_resolution_error =
-                        Some(crate::config::agent_surface_variants::VariantResolveError::MisconfiguredDefault(
-                            id.to_string(),
-                        ));
-                }
-                None
-            } else {
-                let candidate = if let Some(alias) = virtual_channel_alias.as_deref() {
-                    ch.surface
-                        .variants
-                        .iter()
-                        .find(|v| v.alias == alias)
-                        .map(|v| v.id.clone())
-                } else {
-                    ch.surface
-                        .default_variant_id
-                        .clone()
-                };
-
-                match candidate {
-                    Some(id) => Some(id),
-                    None => {
-                        if let Some(alias) = virtual_channel_alias.as_deref() {
-                            error!(
-                                surface = %ch.surface.name,
-                                config_id = ?ch.surface.config_id(),
-                                requested_alias = %alias,
-                                available_variants = ?ch.surface.variants.iter().map(|v| &v.alias).collect::<Vec<_>>(),
-                                "❌ ROUTING FAILED: Virtual channel alias not found"
-                            );
-                            crate::audit::request_events::request_rejected(
-                                &routing_facts(&ch.surface),
-                                crate::audit::request_events::RejectionStage::Routing,
-                                crate::audit::request_events::RejectionReason::UnknownVariant,
-                                400,
-                                None,
-                            );
-                            return create_error_response(
-                                StatusCode::BAD_REQUEST,
-                                &format!("Virtual channel alias '{}' not found for this channel", alias),
-                            );
-                        } else {
-                            // No alias in path and no default_variant_id
-                            // configured → route to the bare base surface
-                            // (base is the implicit default). variant_id =
-                            // None drops into channel-level engine handling
-                            // below.
-                            debug!(
-                                surface = %ch.surface.name,
-                                "Alias-less request, no default_variant_id — routing to base surface"
-                            );
-                            None
-                        }
-                    }
+            // The URL's alias, else the default variant, else the base surface
+            // (`variant_id` None) serves the request. A variant that can't be
+            // resolved is refused, never served by the base or another variant.
+            let variant_id = match ch
+                .surface
+                .select_variant(virtual_channel_alias.as_deref())
+            {
+                Ok(variant) => variant.map(|v| v.id.clone()),
+                Err(error) => {
+                    warn!(surface = %ch.surface.name, error = %error, "Surface variant cannot be resolved");
+                    let refusal =
+                        crate::audit::request_events::refuse_routing(&routing_facts(&ch.surface), &error);
+                    return create_error_response(refusal.status(), refusal.message());
                 }
             };
-
-            // Check if variant exists and is enabled (only in variant-mode)
-            if let Some(ref vid) = variant_id {
-                let variant = match ch
-                    .surface
-                    .variants
-                    .iter()
-                    .find(|v| &v.id == vid)
-                {
-                    Some(v) => v,
-                    None => {
-                        error!(
-                            surface = %ch.surface.name,
-                            config_id = ?ch.surface.config_id(),
-                            variant_id = %vid,
-                            "❌ ROUTING FAILED: Variant ID not found in channel's variants list"
-                        );
-                        return create_error_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "Selected variant not found in channel configuration",
-                        );
-                    }
-                };
-
-                if !variant.enabled {
-                    warn!(
-                        surface = %ch.surface.name,
-                        variant_id = %vid,
-                        variant_alias = %variant.alias,
-                        "❌ Virtual channel variant is DISABLED"
-                    );
-                    crate::audit::request_events::request_rejected(
-                        &routing_facts(&ch.surface),
-                        crate::audit::request_events::RejectionStage::Routing,
-                        crate::audit::request_events::RejectionReason::VariantDisabled,
-                        503,
-                        None,
-                    );
-                    return create_error_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        &format!("Virtual channel variant '{}' is disabled", variant.alias),
-                    );
-                }
-
-                info!(
-                    "✓ Using virtual channel variant '{}' (alias: '{}') for channel '{}'",
-                    vid, variant.alias, ch.surface.name
-                );
-            }
 
             // Phase D — prefer the pre-resolved snapshot from
             // `MultiSurfaceProxyState.resolved_surface_cache`, which is
@@ -9665,7 +9523,6 @@ async fn multi_channel_proxy_handler_in_request_scope(
                 vc_issuer: state.vc_issuer.clone(),
                 active_variant_alias: virtual_channel_alias.clone(),
                 active_variant_id: variant_id,
-                variant_resolution_error,
                 surface: resolved_surface,
             };
 
@@ -16384,6 +16241,9 @@ fn compute_transit_token_caller_context(
 }
 
 #[cfg(test)]
+mod variant_routing_tests;
+
+#[cfg(test)]
 mod forward_response_log_tests {
     #[test]
     fn forward_response_log_summary_keeps_header_values_and_body_out() {
@@ -16876,7 +16736,7 @@ allow if {
         }
     }
 
-    async fn modern_access_point_router_keeps_legacy_variant_fallback(state: &crate::state::ProxyState) {
+    async fn access_point_router_refuses_a_variant_it_cannot_resolve(state: &crate::state::ProxyState) {
         use serde_json::json;
         use std::sync::atomic::Ordering;
 
@@ -16909,10 +16769,10 @@ allow if {
         let versions = crate::mcp::request_validation::MODERN_CAPABLE_POLICY;
         for (router, path, modern, expected) in [
             (&router, "/mcp", true, axum::http::StatusCode::OK),
-            (&router, "/mcp$missing", false, axum::http::StatusCode::OK),
+            (&router, "/mcp$missing", false, axum::http::StatusCode::NOT_FOUND),
             (&router, "/mcp$missing", true, axum::http::StatusCode::NOT_FOUND),
-            (&broken, "/broken", false, axum::http::StatusCode::OK),
-            (&broken, "/broken", true, axum::http::StatusCode::SERVICE_UNAVAILABLE),
+            (&broken, "/broken", false, axum::http::StatusCode::INTERNAL_SERVER_ERROR),
+            (&broken, "/broken", true, axum::http::StatusCode::INTERNAL_SERVER_ERROR),
         ] {
             let before = target
                 .request_count
@@ -16962,7 +16822,9 @@ allow if {
             let response: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|error| {
                 panic!("{path} modern={modern} body {text:?}: {error}");
             });
-            assert_eq!(response["id"], "router-request");
+            if expected.is_success() {
+                assert_eq!(response["id"], "router-request");
+            }
             assert_eq!(
                 target
                     .request_count
@@ -17182,6 +17044,7 @@ allow if {
                     reason,
                     http_status,
                     rpc_error_code,
+                    ..
                 } => Some((stage, reason, http_status, rpc_error_code)),
                 _ => None,
             })
@@ -17436,8 +17299,8 @@ allow if {
                 direct_router_state(state, a2a_surface(variants)),
                 "/a2a$missing/rpc",
                 message.clone(),
-                400,
-                (RejectionStage::Routing, RejectionReason::UnknownVariant, 400, None),
+                404,
+                (RejectionStage::Routing, RejectionReason::UnknownVariant, 404, None),
             ),
             (
                 "MCP body on an A2A Access Point",
@@ -18936,10 +18799,9 @@ allow if {
             a2a_proxy_store: None,
             active_variant_alias: None,
             active_variant_id: None,
-            variant_resolution_error: None,
             surface: Arc::new(surface),
         };
-        modern_access_point_router_keeps_legacy_variant_fallback(&state).await;
+        access_point_router_refuses_a_variant_it_cannot_resolve(&state).await;
         mounted_access_point_uses_the_direct_access_point_policy(&state).await;
         direct_access_point_caps_legacy_initialize(&state).await;
         access_point_admission_rejects_every_negative_case(&state).await;
@@ -20743,7 +20605,6 @@ mod fabric_extended_card_tests {
             a2a_proxy_store: None,
             active_variant_alias: None,
             active_variant_id: None,
-            variant_resolution_error: None,
             surface: Arc::new(surface),
         };
         FabricPeer {

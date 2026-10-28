@@ -482,6 +482,10 @@ pub enum DelegationAuditAction {
         /// The JSON-RPC error code the caller received, when the refusal was one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rpc_error_code: Option<i64>,
+        /// On `unknown_variant` only: the alias the URL named, cut to the
+        /// longest alias a variant can have. Caller-chosen text.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        requested_variant: Option<String>,
     },
     IdentityBindingFailed {
         outcome: IdentityBindingFailure,
@@ -2022,6 +2026,7 @@ mod tests {
                     reason: RejectionReason::BodyTooLarge,
                     http_status: 413,
                     rpc_error_code: Some(-32600),
+                    requested_variant: None,
                 },
                 "request_rejected",
             ),
@@ -2097,6 +2102,7 @@ mod tests {
             reason: RejectionReason::ConsentIdentityRequired,
             http_status: 403,
             rpc_error_code: None,
+            requested_variant: None,
         })
         .unwrap();
         assert_eq!(stored["request_rejected"]["stage"], "admission");

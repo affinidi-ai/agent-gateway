@@ -173,7 +173,20 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
   the refusal was one; legacy MCP refuses a malformed request with HTTP 200 and a JSON-RPC error,
   so read the two together. `stage` and `reason`:
   - `routing`: `no_route` (no surface matches; recorded against surface `unknown`, with no trace
-    id on the direct path), `unknown_variant`, `variant_disabled`.
+    id on the direct path), and the three variant refusals, recorded with the same status on the
+    Access Point, the Transit Point and Fabric receive:
+    - `unknown_variant` (404): the URL names a variant the surface doesn't have, including on a
+      surface with no variants. `requested_variant` holds the alias the URL named, cut to 32
+      characters; it is caller-chosen text and appears on no other record.
+    - `variant_disabled` (404): the named variant, or the default variant of an alias-less
+      request, is disabled.
+    - `misconfigured_default` (500): the request names no variant and the surface's
+      `default_variant_id` names no variant.
+
+    A request whose variant can't be resolved is refused, never served by the base surface or
+    another variant. On a Fabric stream the receiving gateway refuses the `Open` and records the
+    refusal; the stream has no status of its own, so the sender answers as it does any refused
+    stream.
   - `admission`: `body_too_large`, `protocol_mismatch` (an MCP body on an A2A Access Point or the
     reverse), `invalid_envelope` (not JSON, or not a JSON-RPC request, on every protocol and MCP
     revision), `invalid_request_shape` (A2A fields), `version_unsupported` (A2A or MCP),
@@ -184,7 +197,7 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
   - `forward`: `ssrf_blocked` (egress policy refuses the target address).
 
   Requests answered before any gateway handler runs (a path under no configured route) and
-  gateway faults (a misconfigured default variant, a failed egress check task) are not recorded.
+  gateway faults (a failed egress check task) are not recorded.
 - `identity_binding_verified` and `identity_binding_failed`: the outcome of checking the identity
   presentation (identity binding VP) a request carries, recorded wherever the gateway checks one:
   A2A requests on the direct path, MCP requests at admission, Transit Point MCP requests, and, on
