@@ -135,9 +135,14 @@ export function usesBearerScheme(config: Record<string, unknown>): boolean {
 /**
  * Every problem the gateway would refuse the discovery setting of a
  * caller-auth config for, in field order. Empty when discovery is off or the
- * method is not JWT Bearer, whose payload carries no setting.
+ * method is not JWT Bearer, whose payload carries no setting. `strategyIssuer`
+ * is the expected issuer of the selected JWT verification strategy, when known:
+ * the authorization servers must be exactly that issuer.
  */
-export function discoveryProblems(config: Record<string, unknown>): DiscoveryProblem[] {
+export function discoveryProblems(
+  config: Record<string, unknown>,
+  strategyIssuer?: string
+): DiscoveryProblem[] {
   const setting = readProtectedResource(config.protected_resource);
   if (!setting || config.method_type !== 'jwt_bearer') return [];
   const problems: DiscoveryProblem[] = [];
@@ -178,6 +183,11 @@ export function discoveryProblems(config: Record<string, unknown>): DiscoveryPro
       problems.push({
         field: DISCOVERY_FIELDS.authorizationServers,
         message: 'List each authorization server once',
+      });
+    } else if (strategyIssuer && (servers.length !== 1 || servers[0] !== strategyIssuer)) {
+      problems.push({
+        field: DISCOVERY_FIELDS.authorizationServers,
+        message: `List only ${strategyIssuer}, the issuer the JWT verification strategy trusts: tokens from any other server are refused`,
       });
     }
   }

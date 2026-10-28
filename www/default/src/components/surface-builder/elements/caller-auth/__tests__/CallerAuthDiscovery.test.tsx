@@ -145,6 +145,30 @@ describe('Caller Context editor: authorization server discovery', () => {
     expect(screen.getByTestId('caller-auth-discovery-resource-input')).toHaveValue(RESOURCE);
   });
 
+  it('starts the authorization servers with the issuer the selected strategy trusts', async () => {
+    (apiClient.fetch as jest.Mock).mockResolvedValue({
+      ok: true,
+      json: () =>
+        Promise.resolve([
+          {
+            id: 'idp',
+            name: 'Identity Provider',
+            expected_issuer: 'https://idp.example/realms/agents',
+          },
+        ]),
+    });
+    const latest = await openEditor({ initial: jwtConfig() });
+
+    fireEvent.click(screen.getByTestId('caller-auth-discovery-switch'));
+
+    expect(latest.config).toMatchObject({
+      protected_resource: {
+        resource: RESOURCE,
+        authorization_servers: ['https://idp.example/realms/agents'],
+      },
+    });
+  });
+
   it('edits the resource, authorization servers and scopes', async () => {
     const latest = await openEditor({ initial: jwtConfig({ protected_resource: SETTING }) });
 

@@ -187,8 +187,8 @@ Several independent layers, evaluated before a request is forwarded.
 A missing or invalid caller credential does not by itself refuse the request. The request
 continues with no caller identity and the failure is passed to policy, so a surface that
 must reject unauthenticated callers needs a policy that denies them. An MCP Access Point
-that publishes protected resource metadata instead refuses a direct request with a `401`
-challenge pointing at that metadata. See
+that publishes protected resource metadata instead refuses the request with a `401`, direct
+or over Fabric; a direct request's challenge points at that metadata. See
 [`POLICY.md`](POLICY.md#failed-caller-authentication).
 
 A policy can express rules such as "only agents using a particular model may call these

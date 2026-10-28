@@ -77,7 +77,8 @@ deny if input.source_auth.method == "failed"
 See [`POLICY.md`](POLICY.md#failed-caller-authentication).
 
 A request to an MCP Access Point that publishes protected resource metadata, direct or over
-Fabric, is the exception: a missing or invalid JWT is refused with a `401` discovery challenge, see
+Fabric, is the exception: a missing or invalid JWT is refused with a `401` (the discovery
+challenge on a direct request), see
 [`MCP_METADATA.md`](MCP_METADATA.md#authorization-server-discovery-for-caller-authentication).
 
 ### mTLS

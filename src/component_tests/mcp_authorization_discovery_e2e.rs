@@ -22,14 +22,14 @@ fn protected_resource(route: &str) -> serde_json::Value {
 }
 
 async fn start_discovery_gateway(fixture: &JwksFixture) -> (GatewayHarness, reqwest::Client) {
-    start_discovery_gateway_with(fixture, false, Vec::new()).await
+    start_discovery_gateway_with(fixture, |_| {}, Vec::new()).await
 }
 
-/// `forward_header` is set in storage, where the API cannot refuse it, and
+/// `edit` changes the surface in storage, where the API cannot refuse it, and
 /// `listeners` are added to the gateway's network configuration.
 async fn start_discovery_gateway_with(
     fixture: &JwksFixture,
-    forward_header: bool,
+    edit: impl FnOnce(&mut crate::config::agent_surface::AgentSurface),
     listeners: Vec<serde_json::Value>,
 ) -> (GatewayHarness, reqwest::Client) {
     let mut admin = None;
@@ -72,20 +72,13 @@ async fn start_discovery_gateway_with(
             .as_mut()
             .unwrap()
             .protected_resource = Some(serde_json::from_value(protected_resource("/smoke")).unwrap());
-        if let Some(crate::source_auth::SourceAuthConfig::JwtBearer(jwt)) = surface
-            .access_point
-            .caller_authentication
-            .as_mut()
-            .and_then(|caller| caller.methods.first_mut())
-        {
-            jwt.forward_header = forward_header;
-        }
         surface.variants = vec![
             serde_json::from_value(
                 json!({"id": "beta", "alias": "beta", "name": "Beta", "enabled": true, "overrides": {}}),
             )
             .unwrap(),
         ];
+        edit(surface);
     })
     .await;
     (harness, admin.unwrap())
@@ -264,8 +257,32 @@ async fn an_mcp_access_point_publishes_the_protected_resource_its_caller_authent
             .text()
             .await
             .unwrap()
-            .contains("authorization_servers must include")
+            .contains("authorization_servers must be exactly")
     );
+    // Another server listed beside the trusted one, first or last, would be
+    // refused too: its tokens never pass the strategy.
+    for servers in [
+        json!(["https://other-idp.example", AUTHORIZATION_SERVER]),
+        json!([AUTHORIZATION_SERVER, "https://other-idp.example"]),
+    ] {
+        let mut listed = protected_resource("/other");
+        listed["authorization_servers"] = servers.clone();
+        let refused = admin
+            .post(&surfaces)
+            .json(&surface("/other", listed))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), 400, "{servers}");
+        assert!(
+            refused
+                .text()
+                .await
+                .unwrap()
+                .contains("authorization_servers must be exactly"),
+            "{servers}"
+        );
+    }
     let mut http_issuer = protected_resource("/other");
     http_issuer["authorization_servers"] = json!(["http://idp.example"]);
     let refused = admin
@@ -693,9 +710,76 @@ async fn the_callers_token_never_reaches_the_target() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_default_variant_answers_on_the_route_with_the_resource_as_written() {
+    let fixture = JwksFixture::start().await;
+    let (harness, _admin) = start_discovery_gateway_with(
+        &fixture,
+        |surface| surface.default_variant_id = Some("beta".to_string()),
+        Vec::new(),
+    )
+    .await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap();
+
+    let published = client
+        .get(metadata_url(&harness, "/smoke"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(published.status(), 200);
+    assert_eq!(
+        published
+            .json::<serde_json::Value>()
+            .await
+            .unwrap()["resource"],
+        "https://gateway.example/smoke"
+    );
+    let call = |audience: &str| {
+        client
+            .post(&harness.gateway_url)
+            .bearer_auth(token_for(&fixture, json!(audience)))
+            .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}))
+            .send()
+    };
+    assert_eq!(
+        call("https://gateway.example/smoke")
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    let refused = call("https://gateway.example/smoke$beta")
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 401);
+    assert!(
+        refused.headers()["www-authenticate"]
+            .to_str()
+            .unwrap()
+            .contains("/.well-known/oauth-protected-resource/smoke\"")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_stored_surface_that_would_forward_the_callers_token_fails_closed() {
     let fixture = JwksFixture::start().await;
-    let (harness, _admin) = start_discovery_gateway_with(&fixture, true, Vec::new()).await;
+    let (harness, _admin) = start_discovery_gateway_with(
+        &fixture,
+        |surface| {
+            if let Some(crate::source_auth::SourceAuthConfig::JwtBearer(jwt)) = surface
+                .access_point
+                .caller_authentication
+                .as_mut()
+                .and_then(|caller| caller.methods.first_mut())
+            {
+                jwt.forward_header = true;
+            }
+        },
+        Vec::new(),
+    )
+    .await;
     let client = reqwest::Client::builder()
         .no_proxy()
         .build()
@@ -735,7 +819,7 @@ async fn the_same_route_on_two_listeners_publishes_each_listeners_own_resource()
     let second_address = format!("http://localhost:{second_port}");
     let (harness, admin) = start_discovery_gateway_with(
         &fixture,
-        false,
+        |_| {},
         vec![json!({
             "id": "second", "name": "Second", "bind_address": "0.0.0.0", "port": second_port, "protocol": "http",
             "external_urls": [second_address, "https://other.example"]

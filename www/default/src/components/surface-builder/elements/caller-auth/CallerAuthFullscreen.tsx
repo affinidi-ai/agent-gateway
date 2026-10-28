@@ -26,6 +26,7 @@ interface Certificate {
 interface JwtVerificationStrategy {
   id: string;
   name: string;
+  expected_issuer?: string;
 }
 
 interface SecretOption {
@@ -411,6 +412,9 @@ const CallerAuthFullscreen: React.FC<ConfigPanelProps> = ({
                 updateFields={updateFields}
                 allNodes={allNodes}
                 hasAttemptedSave={hasAttemptedSave}
+                strategyIssuer={
+                  jwtStrategies.find(s => s.id === config.jwt_strategy_id)?.expected_issuer
+                }
               />
             )}
           </>

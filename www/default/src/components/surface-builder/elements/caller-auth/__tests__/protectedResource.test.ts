@@ -179,6 +179,34 @@ describe('discoveryProblems', () => {
   });
 });
 
+describe('the strategy issuer rule', () => {
+  it('flags authorization servers other than exactly the strategy issuer', () => {
+    const issuer = 'https://idp.example/realms/agents';
+    const servers = (authorization_servers: string[]) =>
+      discoveryProblems(
+        jwtConfig({ protected_resource: { ...SETTING, authorization_servers } }),
+        issuer
+      )
+        .filter(p => p.field === 'protected_resource.authorization_servers')
+        .map(p => p.message);
+    expect(servers([issuer])).toEqual([]);
+    for (const listed of [
+      ['https://other.example'],
+      ['https://other.example', issuer],
+      [issuer, 'https://other.example'],
+    ]) {
+      expect(servers(listed)).toEqual([expect.stringContaining(`List only ${issuer}`)]);
+    }
+    expect(
+      discoveryProblems(
+        jwtConfig({
+          protected_resource: { ...SETTING, authorization_servers: ['https://other.example'] },
+        })
+      )
+    ).toEqual([]);
+  });
+});
+
 describe('resource helpers', () => {
   it('suggests the https listener origin followed by the route', () => {
     expect(suggestedResource('https://gateway.example', '/mcp/alpha')).toBe(

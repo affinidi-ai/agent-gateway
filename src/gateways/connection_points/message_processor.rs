@@ -4104,6 +4104,10 @@ async fn process_forward_request_in_request_scope(
         },
     };
 
+    // The alias the surface was resolved for: `None` once a named alias did
+    // not resolve and the default stands in, whose resource is then the one
+    // a caller's token must name.
+    let mut resolved_alias = variant_alias;
     let surface = if stream_request.is_some() { surface.clone() } else { match surface.resolve_variant(variant_alias) {
         Ok(s) => {
             if let Some(alias) = variant_alias {
@@ -4118,6 +4122,7 @@ async fn process_forward_request_in_request_scope(
                 variant_alias.unwrap_or(""),
                 e
             );
+            resolved_alias = None;
             surface.resolve_variant(None).unwrap_or_else(|_| surface.clone())
         }
     }};
@@ -4164,7 +4169,7 @@ async fn process_forward_request_in_request_scope(
     // that is missing or refused.
     let protected_resource = match GLOBAL_MCP_AUTH_NETWORK.get() {
         Some(network) => {
-            crate::protocols::protected_resource::access_point_protected_resource(&surface, variant_alias, network)
+            crate::protocols::protected_resource::access_point_protected_resource(&surface, resolved_alias, network)
                 .transpose()
         }
         None if surface.protected_resource().is_some() => Err("network configuration unavailable".to_string()),
@@ -4327,7 +4332,7 @@ async fn process_forward_request_in_request_scope(
                             config_id,
                             "GW2: Source authentication failed (reason={}) — {}",
                             e,
-                            if challenged { "sending the discovery challenge" } else { "deferring to policy" }
+                            if challenged { "refusing before policy" } else { "deferring to policy" }
                         );
                         crate::audit::request_events::auth_failed(
                             &audit_facts,
@@ -4337,7 +4342,7 @@ async fn process_forward_request_in_request_scope(
                             None,
                         );
                         if let Some(protected_resource) = &protected_resource {
-                            return axum_response_to_forward_result(protected_resource.caller_challenge(&e)).await;
+                            return axum_response_to_forward_result(protected_resource.fabric_refusal(&e)).await;
                         }
                         source_auth_failure = Some(crate::surface_context::SourceAuthContext::Failed {
                             attempted_method: resolved_auth_config.method_tag().to_string(),

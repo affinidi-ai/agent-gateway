@@ -1962,10 +1962,10 @@ fn settle_retained_protected_resources(
 }
 
 /// The authorization servers an Access Point advertises (base and each enabled
-/// variant) must include the issuer its JWT verification strategy trusts. Only
-/// that issuer's tokens are accepted, so a client following metadata that names
-/// another server gets tokens that are always refused and loops on the 401
-/// challenge. `validate_surface_references` has already checked that the
+/// variant) must be exactly the issuer its JWT verification strategy trusts.
+/// Only that issuer's tokens are accepted, so a client following metadata that
+/// names another server, even listed beside it, gets tokens that are always
+/// refused and loops on the 401 challenge. `validate_surface_references` has already checked that the
 /// strategy exists and that the caller may use it.
 async fn validate_protected_resource_issuers(
     state: &IdentityApiState,
@@ -1994,13 +1994,15 @@ async fn validate_protected_resource_issuers(
             .await
             .map_err(|e| SurfaceApiError::InternalError(format!("Failed to load the JWT verification strategy: {e}")))?
             .ok_or_else(|| SurfaceApiError::BadRequest(format!("{label}JWT verification strategy not found")))?;
-        if !protected
-            .authorization_servers
-            .contains(&strategy.expected_issuer)
+        if protected.authorization_servers
+            != [strategy
+                .expected_issuer
+                .as_str()]
         {
             return Err(SurfaceApiError::BadRequest(format!(
-                "{label}access_point.caller_authentication.protected_resource: authorization_servers must include \
-                 {}, the issuer the JWT verification strategy trusts",
+                "{label}access_point.caller_authentication.protected_resource: authorization_servers must be \
+                 exactly [\"{}\"], the issuer the JWT verification strategy trusts: tokens from any other server \
+                 are refused",
                 strategy.expected_issuer
             )));
         }

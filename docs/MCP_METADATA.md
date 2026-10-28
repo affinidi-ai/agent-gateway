@@ -1390,9 +1390,11 @@ one to eight RFC 8414 issuer identifiers, checked with the issuer rules of
 under the strict posture (HTTPS, a host, no credentials, query, fragment,
 whitespace or control character), printable ASCII, at most 2048 bytes each and
 advertised exactly as written, since clients compare them byte for byte with
-the issuer in the server's own metadata. Tokens are still validated by the JWT verification strategy, so its
-expected issuer must be one of them: a save that leaves it out is refused with
-`400`, because every token a client got from the other servers would be refused.
+the issuer in the server's own metadata. Tokens are still validated by the JWT verification strategy, which
+trusts one issuer, so the list must be exactly its expected issuer: a save that
+lists another server, beside it or instead of it, is refused with `400`,
+because every token a client got from that server would be refused. The
+dashboard starts the list with that issuer.
 A strategy whose issuer changes later fails closed: its surfaces answer the
 `401` challenge until the two agree again. `scopes` are advertised as
 `scopes_supported`. A variant that overrides `caller_authentication` carries
@@ -1432,11 +1434,17 @@ and `WWW-Authenticate: Bearer resource_metadata="<absolute metadata URL>"`,
 plus `error="invalid_token"` once a token was presented and `scope` when
 scopes are set. The body's detail is fixed and never says why a token failed.
 The audit records the failure as blocking. A valid token issued for the
-resource is attributed as before, and its identity reaches policy. A request
-that reaches the Access Point over Fabric gets the same answers: the receiving
-gateway binds the token audience to the same resource and returns the same
-challenge through the sending gateway, because both paths resolve the
-accepted audiences in `source_auth::middleware::resolve_surface_audience`.
+resource is attributed as before, and its identity reaches policy. Over
+Fabric, the receiving gateway binds the token audience to the same resource,
+because both paths resolve the accepted audiences in
+`source_auth::middleware::resolve_surface_audience`; a named variant that does
+not resolve falls back to the default, whose resource then binds. The sending
+gateway strips the caller's own `Authorization` header, so only a credential
+it injects (target authentication or a delegated credential) issued for this
+resource can pass, and a missing or refused one gets a `401` before policy
+with `WWW-Authenticate: Bearer realm="agent-gateway"` (plus
+`error="invalid_token"`), without `resource_metadata`, which would only send
+the remote client to fetch a token that is stripped again.
 Server-side errors keep their behaviour, and requested scopes are advertised
 but not enforced.
 
@@ -1476,7 +1484,9 @@ runs the flow end to end against Ory Hydra with a scripted client and the
 official MCP client SDK, and `--keep` leaves it running for MCP Inspector.
 Hydra ignores the RFC 8707 `resource` parameter MCP clients send, so its consent
 app must grant the resource as the access token audience, or every token is
-refused for its audience; the demo's consent app shows how.
+refused for its audience; the demo's consent app (`login-consent.mjs`, demo
+only) shows how. Hydra also checks each granted audience against the client's
+allowed audiences, so each client must list the resource there.
 
 The `fabric` CLI sends surface JSON to the gateway as it is, so it sets and
 removes the setting without CLI-specific flags. `--set` sends a JSON Merge

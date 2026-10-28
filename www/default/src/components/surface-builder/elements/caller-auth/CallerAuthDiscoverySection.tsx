@@ -162,6 +162,8 @@ export interface CallerAuthDiscoverySectionProps {
   updateFields: (fields: Record<string, unknown>) => void;
   allNodes?: CanvasNode[];
   hasAttemptedSave?: boolean;
+  /** Expected issuer of the selected JWT verification strategy, when known. */
+  strategyIssuer?: string;
 }
 
 /**
@@ -174,6 +176,7 @@ const CallerAuthDiscoverySection: React.FC<CallerAuthDiscoverySectionProps> = ({
   updateFields,
   allNodes,
   hasAttemptedSave,
+  strategyIssuer,
 }) => {
   const meta = useOptionalSurfaceMeta();
   const setting = readProtectedResource(config.protected_resource);
@@ -189,7 +192,11 @@ const CallerAuthDiscoverySection: React.FC<CallerAuthDiscoverySectionProps> = ({
     updateFields(
       on
         ? {
-            protected_resource: { resource: suggested, authorization_servers: [], scopes: [] },
+            protected_resource: {
+              resource: suggested,
+              authorization_servers: strategyIssuer ? [strategyIssuer] : [],
+              scopes: [],
+            },
             audiences: [],
             jwt_forward_header: false,
             jwt_token_header: 'Authorization',
@@ -198,7 +205,7 @@ const CallerAuthDiscoverySection: React.FC<CallerAuthDiscoverySectionProps> = ({
         : { protected_resource: null }
     );
 
-  const problems = setting && hasAttemptedSave ? discoveryProblems(config) : [];
+  const problems = setting && hasAttemptedSave ? discoveryProblems(config, strategyIssuer) : [];
   const errorsFor = (field: string) => problems.filter(p => p.field === field).map(p => p.message);
   const resourceErrors = errorsFor(DISCOVERY_FIELDS.resource);
   if (
@@ -271,8 +278,8 @@ const CallerAuthDiscoverySection: React.FC<CallerAuthDiscoverySectionProps> = ({
                   <code>Bearer</code> scheme, and it is never forwarded to the managed agent.
                 </li>
                 <li>
-                  The JWT verification strategy still checks every token, so its expected issuer
-                  should be one of the authorization servers.
+                  The JWT verification strategy still checks every token, so the authorization
+                  servers must be exactly its expected issuer, or the save is refused.
                 </li>
                 <li>Scopes are advertised to clients but not enforced.</li>
               </ul>

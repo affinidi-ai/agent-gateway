@@ -2488,10 +2488,13 @@ fn fabric_receive_binds_tokens_to_the_routes_protected_resource() {
         .block_on(Box::pin(fabric_discovery_flow()));
 }
 
-/// An MCP Access Point that publishes protected resource metadata answers a
-/// Fabric request as it answers a direct one: a missing token, or one issued
-/// for another resource or variant, gets the 401 challenge, and only a token
-/// for the resource of the route called reaches the Target.
+/// An MCP Access Point that publishes protected resource metadata binds a
+/// Fabric request's token to the resource of the route called, as on the
+/// direct path. The sending gateway strips the caller's own token, so the
+/// `Authorization` here stands for a credential the sender injects: a missing
+/// one, or one issued for another resource or variant, gets a 401 before
+/// policy without `resource_metadata`, and only one for the route's resource,
+/// or the default's when a named alias does not resolve, reaches the Target.
 async fn fabric_discovery_flow() {
     use std::sync::Arc;
 
@@ -2609,27 +2612,31 @@ async fn fabric_discovery_flow() {
             .load(Ordering::SeqCst)
     };
 
-    let base_metadata = "resource_metadata=\"https://gateway.example/.well-known/oauth-protected-resource/mcp\"";
-    let variant_metadata =
-        "resource_metadata=\"https://gateway.example/.well-known/oauth-protected-resource/mcp$beta\"";
-    for (alias, token, metadata, invalid_token) in [
-        (None, None, base_metadata, false),
-        (None, Some(token_for("https://gateway.example/other")), base_metadata, true),
-        (None, Some(token_for("https://gateway.example/mcp$beta")), base_metadata, true),
-        (Some("beta"), Some(token_for("https://gateway.example/mcp")), variant_metadata, true),
+    for (alias, token, invalid_token) in [
+        (None, None, false),
+        (None, Some(token_for("https://gateway.example/other")), true),
+        (None, Some(token_for("https://gateway.example/mcp$beta")), true),
+        (Some("beta"), Some(token_for("https://gateway.example/mcp")), true),
+        // An alias that does not resolve falls back to the default, whose
+        // resource the token must name.
+        (Some("ghost"), Some(token_for("https://gateway.example/mcp$ghost")), true),
     ] {
         let response = send(alias, token).await;
         assert_eq!(response["status"], 401, "{response}");
         let challenge = response["headers"]["www-authenticate"]
             .as_str()
             .unwrap_or_default();
-        assert!(challenge.starts_with("Bearer ") && challenge.contains(metadata), "{response}");
+        assert!(challenge.starts_with("Bearer realm=\"agent-gateway\""), "{response}");
+        assert!(!challenge.contains("resource_metadata"), "{response}");
         assert_eq!(challenge.contains("error=\"invalid_token\""), invalid_token, "{response}");
         assert_eq!(reached(), 0, "a refused token never reaches the Target");
     }
 
-    for (alias, audience) in [(None, "https://gateway.example/mcp"), (Some("beta"), "https://gateway.example/mcp$beta")]
-    {
+    for (alias, audience) in [
+        (None, "https://gateway.example/mcp"),
+        (Some("beta"), "https://gateway.example/mcp$beta"),
+        (Some("ghost"), "https://gateway.example/mcp"),
+    ] {
         let before = reached();
         let response = send(alias, Some(token_for(audience))).await;
         assert_eq!(response["status"], 200, "{response}");

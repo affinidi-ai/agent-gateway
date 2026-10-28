@@ -251,23 +251,28 @@ impl ProtectedResourceConfig {
         let (Some(challenge), ResourceTokenError::Missing | ResourceTokenError::Invalid) = (challenge, error) else {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         };
-        let status = error.status_code();
-        let body = json!({
-            "type": "about:blank",
-            "title": status.canonical_reason(),
-            "status": status.as_u16(),
-            "detail": "A bearer token from an authorization server in the protected resource metadata is required",
-        });
-        let mut response = (
-            status,
-            [(header::CONTENT_TYPE, "application/problem+json"), (header::CACHE_CONTROL, "no-store")],
-            body.to_string(),
+        unauthorized(
+            challenge,
+            "A bearer token from an authorization server in the protected resource metadata is required",
         )
-            .into_response();
-        response
-            .headers_mut()
-            .insert(header::WWW_AUTHENTICATE, challenge);
-        response
+    }
+
+    /// The answer over Fabric to a caller authentication failure: `401`
+    /// before policy, but without `resource_metadata`. The sending gateway
+    /// strips the caller's own token, so only a credential it injects for this
+    /// resource can pass, and sending the remote client to fetch a token for
+    /// this resource would only loop.
+    pub fn fabric_refusal(
+        &self,
+        error: &crate::source_auth::errors::SourceAuthError,
+    ) -> Response {
+        let challenge = match error {
+            crate::source_auth::errors::SourceAuthError::MissingCredential { .. } => {
+                HeaderValue::from_static("Bearer realm=\"agent-gateway\"")
+            }
+            _ => HeaderValue::from_static("Bearer realm=\"agent-gateway\", error=\"invalid_token\""),
+        };
+        unauthorized(challenge, "A bearer token issued for this resource is required")
     }
 
     /// The challenge for a caller authentication failure the caller caused:
@@ -281,6 +286,31 @@ impl ProtectedResourceConfig {
             _ => ResourceTokenError::Invalid,
         })
     }
+}
+
+/// A `401` problem carrying `challenge`, with a fixed detail, so the response
+/// never says why a token failed.
+fn unauthorized(
+    challenge: HeaderValue,
+    detail: &str,
+) -> Response {
+    let status = StatusCode::UNAUTHORIZED;
+    let body = json!({
+        "type": "about:blank",
+        "title": status.canonical_reason(),
+        "status": status.as_u16(),
+        "detail": detail,
+    });
+    let mut response = (
+        status,
+        [(header::CONTENT_TYPE, "application/problem+json"), (header::CACHE_CONTROL, "no-store")],
+        body.to_string(),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(header::WWW_AUTHENTICATE, challenge);
+    response
 }
 
 /// An RFC 8414 issuer identifier, by the rules authorization server metadata
