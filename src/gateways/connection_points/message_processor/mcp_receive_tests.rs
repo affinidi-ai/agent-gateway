@@ -975,7 +975,10 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
                 headers,
                 body,
                 surface: configured.clone(),
-                variant_id: None,
+                variant: super::ForwardedVariant {
+                    id: None,
+                    recorded: "_base_".into(),
+                },
                 capabilities: crate::proxy::fabric_stream::peer::StreamCapabilities::local(true, true),
             },
             crate::mcp::request_validation::LEGACY_ONLY_POLICY,
@@ -1386,7 +1389,10 @@ async fn fabric_consent_flow() {
                     .unwrap()
                     .into(),
                 surface: surface.clone(),
-                variant_id: None,
+                variant: super::ForwardedVariant {
+                    id: None,
+                    recorded: "_base_".into(),
+                },
                 capabilities: crate::proxy::fabric_stream::peer::StreamCapabilities::local(true, true),
             },
         )
@@ -2011,7 +2017,10 @@ async fn fabric_consent_flow() {
             if let Some(alias) = alias {
                 message.message_body["virtual_channel_alias"] = json!(alias);
             }
-            stream.variant_id = Some("credential-variant".into());
+            stream.variant = super::ForwardedVariant {
+                id: Some("credential-variant".into()),
+                recorded: "candidate".into(),
+            };
             (message, stream)
         };
         let before = calls.lock().await.len();

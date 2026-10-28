@@ -231,7 +231,7 @@ impl StreamRuntime {
             stream_id: frame.stream_id,
             payload: wire::FramePayload::Open { request: request.clone() },
         })?;
-        let (surface, variant_id) =
+        let (surface, variant) =
             crate::gateways::connection_points::message_processor::resolve_stream_surface(message, &request).await?;
         if !crate::gateways::connection_points::message_processor::fabric_peer_may_reach_surface(
             peer.tenant_id.as_deref(),
@@ -335,7 +335,7 @@ impl StreamRuntime {
             message,
             headers,
             surface,
-            variant_id,
+            variant,
             declared_bytes: request.body_bytes,
             limits,
             deadline,
@@ -584,7 +584,7 @@ pub(crate) struct IncomingStream {
     message: ReceivedMessage,
     headers: axum::http::HeaderMap,
     surface: crate::config::agent_surface::AgentSurface,
-    variant_id: Option<String>,
+    variant: crate::gateways::connection_points::message_processor::ForwardedVariant,
     declared_bytes: u64,
     limits: crate::config::McpHttpConfig,
     deadline: tokio::time::Instant,
@@ -652,7 +652,7 @@ impl IncomingStream {
                         body,
                         headers: self.headers,
                         surface: self.surface,
-                        variant_id: self.variant_id,
+                        variant: self.variant,
                         capabilities: self.capabilities,
                     },
                     versions,
@@ -1143,6 +1143,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(incoming.surface.surface_id, surface.surface_id);
+        assert_eq!(incoming.variant.recorded, "_base_", "no alias and no default: the base serves");
         assert_eq!(
             incoming
                 .surface
@@ -1197,7 +1198,14 @@ mod tests {
             "https://candidate.example/mcp"
         );
         assert_eq!(variant.message.message_body["virtual_channel_alias"], "candidate");
-        assert_eq!(variant.variant_id.as_deref(), Some("variant"));
+        assert_eq!(
+            variant.variant,
+            crate::gateways::connection_points::message_processor::ForwardedVariant {
+                id: Some("variant".into()),
+                recorded: "candidate".into(),
+            },
+            "a stream whose target pins $candidate records candidate"
+        );
         assert_eq!(
             variant
                 .surface

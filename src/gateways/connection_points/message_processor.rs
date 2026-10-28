@@ -3741,29 +3741,51 @@ pub(crate) struct FabricStreamRequest {
     pub headers: axum::http::HeaderMap,
     pub body: bytes::Bytes,
     pub surface: crate::config::agent_surface::AgentSurface,
-    pub variant_id: Option<String>,
+    pub variant: ForwardedVariant,
     pub capabilities: crate::proxy::fabric_stream::peer::StreamCapabilities,
+}
+
+/// The variant of this gateway's surface that serves a forwarded request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ForwardedVariant {
+    /// The variant's id; `None` when the base surface serves the request.
+    pub id: Option<String>,
+    /// What the request records as `surface_variant`.
+    pub recorded: String,
+}
+
+/// Selects the variant of `surface` that serves a forwarded request naming
+/// `alias`, and the surface it resolves to. The sending gateway's variant is
+/// not consulted: with no alias, this surface's default variant, else its
+/// base, serves the request.
+fn select_forwarded_variant(
+    surface: &crate::config::agent_surface::AgentSurface,
+    alias: Option<&str>,
+) -> Result<(ForwardedVariant, crate::config::agent_surface::AgentSurface), crate::config::agent_surface_variants::VariantResolveError>
+{
+    let id = surface
+        .select_variant(alias)?
+        .map(|v| v.id.clone());
+    let resolved = surface.resolve_variant(alias)?;
+    let recorded = surface
+        .surface_variant(id.as_deref())
+        .to_string();
+    Ok((ForwardedVariant { id, recorded }, resolved))
 }
 
 pub(crate) async fn resolve_stream_surface(
     message: &ReceivedMessage,
     request: &crate::proxy::fabric_stream::wire::OpenRequest,
-) -> Result<(crate::config::agent_surface::AgentSurface, Option<String>), String> {
+) -> Result<(crate::config::agent_surface::AgentSurface, ForwardedVariant), String> {
     let surface = lookup_channel(message, &request.channel_id)
         .await?
         .ok_or("Fabric stream surface is unavailable")?;
-    let alias = request
-        .variant_alias
-        .as_deref();
-    let selected = surface
-        .select_variant(alias)
-        .map(|variant| variant.map(|v| v.id.clone()))
-        .and_then(|variant_id| {
-            surface
-                .resolve_variant(alias)
-                .map(|resolved| (variant_id, resolved))
-        });
-    let (variant_id, surface) = match selected {
+    let (variant, surface) = match select_forwarded_variant(
+        &surface,
+        request
+            .variant_alias
+            .as_deref(),
+    ) {
         Ok(selected) => selected,
         Err(error) => {
             use crate::observability::policy_audit::{RequestScope, in_request};
@@ -3790,7 +3812,7 @@ pub(crate) async fn resolve_stream_surface(
     {
         return Err("Fabric stream requires an active MCP surface".to_string());
     }
-    Ok((surface, variant_id))
+    Ok((surface, variant))
 }
 
 pub(crate) async fn process_stream_forward_request(
@@ -4106,18 +4128,14 @@ async fn process_forward_request_in_request_scope(
     // named, else this surface's default variant, else its base. A variant
     // that can't be resolved is refused, never served by another.
     let selected = match stream_request.as_ref() {
-        Some(request) => Ok((request.variant_id.clone(), surface.clone())),
-        None => surface
-            .select_variant(variant_alias)
-            .map(|variant| variant.map(|v| v.id.clone()))
-            .and_then(|variant_id| {
-                surface
-                    .resolve_variant(variant_alias)
-                    .map(|resolved| (variant_id, resolved))
-            }),
+        Some(request) => Ok((request.variant.clone(), surface.clone())),
+        None => select_forwarded_variant(&surface, variant_alias),
     };
     let (active_variant_id, surface) = match selected {
-        Ok(selected) => selected,
+        Ok((variant, resolved)) => {
+            crate::observability::policy_audit::set_request_variant(&variant.recorded);
+            (variant.id, resolved)
+        }
         Err(error) => {
             channel_warn!(config_id, "GW2: Surface variant cannot be resolved ({})", error);
             let refusal = crate::audit::request_events::refuse_routing(

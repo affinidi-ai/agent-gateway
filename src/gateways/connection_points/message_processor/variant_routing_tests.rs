@@ -75,13 +75,26 @@ impl Receiver {
         surface_id: &str,
         alias: Option<&str>,
     ) -> ReceivedMessage {
+        self.forward_request_with_body(
+            surface_id,
+            alias,
+            json!({"jsonrpc": "2.0", "id": "variant", "method": "tools/list"}),
+        )
+    }
+
+    pub fn forward_request_with_body(
+        &self,
+        surface_id: &str,
+        alias: Option<&str>,
+        request_body: Value,
+    ) -> ReceivedMessage {
         let mut body = json!({
             "channel_id": surface_id,
             "method": "POST",
             "path": "/",
             "trace_id": "0af7651916cd43dd8448eb211c80319c",
             "headers": {"MCP-Protocol-Version": crate::mcp::MCP_LEGACY_VERSION, "content-type": "application/json"},
-            "body": {"jsonrpc": "2.0", "id": "variant", "method": "tools/list"}
+            "body": request_body
         });
         if let Some(alias) = alias {
             body["active_variant_alias"] = json!(alias);
@@ -240,5 +253,49 @@ fn fabric_receive_refuses_a_variant_it_cannot_resolve_without_calling_the_upstre
             .await;
         assert_eq!(status, 200, "{events:?}");
         assert!(refusals(&events).is_empty());
+
+        let variants = |events: &[DelegationAuditEvent]| {
+            events
+                .iter()
+                .map(|event| event.surface_variant.clone())
+                .collect::<Vec<_>>()
+        };
+        let (_, events) = receiver
+            .receive(&receiver.forward_request("variants", Some("missing")))
+            .await;
+        assert_eq!(variants(&events), vec![Some("_unknown_".to_string())]);
+        let (_, events) = receiver
+            .receive(&receiver.forward_request("variants", Some("off")))
+            .await;
+        assert_eq!(variants(&events), vec![Some("off".to_string())]);
+        let (_, events) = receiver
+            .receive(&receiver.forward_request("dangling", None))
+            .await;
+        assert_eq!(variants(&events), vec![None]);
+    });
+}
+
+#[test]
+fn every_fabric_receive_record_names_this_gateways_variant() {
+    isolated("AG_FABRIC_VARIANT_RECORD_CHILD", async {
+        let receiver = Receiver::new(&[
+            ("defaulted", catalog(), Some("v-prod")),
+            ("plain", json!([]), None),
+        ])
+        .await;
+        for (case, surface_id, alias, expected) in [
+            ("the alias the sender named", "defaulted", Some("beta"), "beta"),
+            ("no alias, this surface's default variant", "defaulted", None, "prod"),
+            ("no alias, a surface with no variants", "plain", None, "_base_"),
+        ] {
+            let message = receiver.forward_request_with_body(surface_id, alias, json!("not a JSON-RPC request"));
+            let (_, events) = receiver
+                .receive(&message)
+                .await;
+            assert!(!events.is_empty(), "{case}: the request writes records");
+            for event in &events {
+                assert_eq!(event.surface_variant.as_deref(), Some(expected), "{case}: {event:?}");
+            }
+        }
     });
 }
