@@ -433,17 +433,17 @@ mod tests {
         let captured = capture(|| {
             crate::observability::policy_audit::with_request_variant("beta", || {
                 record_identity_binding(IdentityBindingAuditEvent {
-                surface_id: "surface-a",
-                outcome: IdentityBindingOutcome::Verified,
-                agent_did: Some("did:web:agent.example"),
-                issuer_gateway: Some("did:web:gw1.example"),
-                target: Some("fabric://gw2/alpha"),
-                transit_point: Some("delta"),
-                user_hash: Some("sha256-hash"),
-                assurance: Some("gateway_attested"),
-                delegated: true,
-                caller_field_names: &caller_fields,
-                error_detail: None,
+                    surface_id: "surface-a",
+                    outcome: IdentityBindingOutcome::Verified,
+                    agent_did: Some("did:web:agent.example"),
+                    issuer_gateway: Some("did:web:gw1.example"),
+                    target: Some("fabric://gw2/alpha"),
+                    transit_point: Some("delta"),
+                    user_hash: Some("sha256-hash"),
+                    assurance: Some("gateway_attested"),
+                    delegated: true,
+                    caller_field_names: &caller_fields,
+                    error_detail: None,
                 })
             });
         });

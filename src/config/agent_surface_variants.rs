@@ -714,7 +714,11 @@ impl AgentSurface {
         &self,
         alias: Option<&str>,
     ) -> Result<Option<&SurfaceVariant>, VariantResolveError> {
-        let variant = match (alias, self.default_variant_id.as_deref()) {
+        let variant = match (
+            alias,
+            self.default_variant_id
+                .as_deref(),
+        ) {
             (Some(alias), _) => self
                 .variants
                 .iter()

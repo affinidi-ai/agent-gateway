@@ -40,9 +40,7 @@ impl Receiver {
         sender.issuer_did = Some("did:web:sender-gateway.example".to_string());
         let issuer_dir =
             crate::gateways::test_helpers::install_listener_manager_with_peers(root.path(), &[sender]).await;
-        let storage_path = root
-            .path()
-            .join("surfaces");
+        let storage_path = root.path().join("surfaces");
         let store = FileSystemAgentSurfaceStore::new(storage_path.clone())
             .await
             .unwrap();
@@ -152,9 +150,11 @@ pub(super) fn catalog() -> Value {
     ])
 }
 
-fn refusals(
-    events: &[DelegationAuditEvent]
-) -> Vec<(RejectionStage, RejectionReason, Option<u16>, Option<String>, bool)> {
+/// A recorded refusal: stage, reason, HTTP status, requested variant, and
+/// whether it was recorded as a Fabric refusal.
+type Refusal = (RejectionStage, RejectionReason, Option<u16>, Option<String>, bool);
+
+fn refusals(events: &[DelegationAuditEvent]) -> Vec<Refusal> {
     events
         .iter()
         .filter_map(|event| match &event.event {
@@ -283,11 +283,7 @@ fn fabric_receive_refuses_a_variant_it_cannot_resolve_without_calling_the_upstre
 #[test]
 fn every_fabric_receive_record_names_this_gateways_variant() {
     isolated("AG_FABRIC_VARIANT_RECORD_CHILD", async {
-        let receiver = Receiver::new(&[
-            ("defaulted", catalog(), Some("v-prod")),
-            ("plain", json!([]), None),
-        ])
-        .await;
+        let receiver = Receiver::new(&[("defaulted", catalog(), Some("v-prod")), ("plain", json!([]), None)]).await;
         for (case, surface_id, alias, expected) in [
             ("the alias the sender named", "defaulted", Some("beta"), "beta"),
             ("no alias, this surface's default variant", "defaulted", None, "prod"),
@@ -298,7 +294,13 @@ fn every_fabric_receive_record_names_this_gateways_variant() {
                 crate::observability::http_trace::span_capture::capture_spans(receiver.receive(&message)).await;
             assert!(!events.is_empty(), "{case}: the request writes records");
             for event in &events {
-                assert_eq!(event.surface_variant.as_deref(), Some(expected), "{case}: {event:?}");
+                assert_eq!(
+                    event
+                        .surface_variant
+                        .as_deref(),
+                    Some(expected),
+                    "{case}: {event:?}"
+                );
             }
             let request_span = spans
                 .iter()

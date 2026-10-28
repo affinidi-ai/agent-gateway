@@ -300,7 +300,12 @@ mod tests {
         assert_eq!(variables["AUDIT_TRACE_ID"], "trace-1");
         assert_eq!(variables["AUDIT_SURFACE_ID"], "surface-1");
         assert_eq!(variables["AUDIT_SURFACE_NAME"], "Billing agent");
-        assert_eq!(variables.get("AUDIT_SURFACE_VARIANT").map(String::as_str), Some("beta"));
+        assert_eq!(
+            variables
+                .get("AUDIT_SURFACE_VARIANT")
+                .map(String::as_str),
+            Some("beta")
+        );
         assert_eq!(variables["AUDIT_PROTOCOL"], "a2a");
         assert_eq!(variables["AUDIT_AGENT_DID"], "did:web:agent");
         assert_eq!(variables["AUDIT_VIA_FABRIC"], "false");
@@ -354,7 +359,12 @@ mod tests {
         for variant in ["_base_", "_unknown_"] {
             let mut event = policy_decision("deny");
             event.surface_variant = Some(variant.to_string());
-            assert_eq!(audit_variables(&event).get("AUDIT_SURFACE_VARIANT").map(String::as_str), Some(variant));
+            assert_eq!(
+                audit_variables(&event)
+                    .get("AUDIT_SURFACE_VARIANT")
+                    .map(String::as_str),
+                Some(variant)
+            );
         }
     }
 

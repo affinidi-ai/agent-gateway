@@ -9187,22 +9187,20 @@ fn refuse_access_point_variant(
     headers: &HeaderMap,
     error: &crate::config::agent_surface_variants::VariantResolveError,
 ) -> Response {
-    let modern_mcp = surface
-        .access_point
-        .protocol
-        == crate::config::agent_surface::SurfaceProtocol::Mcp
+    let modern_mcp = surface.access_point.protocol == crate::config::agent_surface::SurfaceProtocol::Mcp
         && crate::mcp::request_validation::has_modern_header(headers);
     let code = crate::mcp::error_codes::INTERNAL_ERROR;
-    let refusal =
-        crate::audit::request_events::refuse_routing(&routing_facts(surface), error, modern_mcp.then_some(i64::from(code)));
+    let refusal = crate::audit::request_events::refuse_routing(
+        &routing_facts(surface),
+        error,
+        modern_mcp.then_some(i64::from(code)),
+    );
     if modern_mcp {
         return crate::mcp::request_validation::McpRequestValidationError {
             status: refusal.status(),
             id: None,
             code,
-            message: refusal
-                .message()
-                .to_string(),
+            message: refusal.message().to_string(),
             data: None,
         }
         .into_response();

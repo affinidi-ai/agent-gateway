@@ -138,7 +138,17 @@ mod tests {
         let in_request = serde_json::to_value(updates.recv().await.unwrap()).unwrap();
         let outside = serde_json::to_value(updates.recv().await.unwrap()).unwrap();
         assert_eq!(in_request["surface_variant"], "_base_", "{in_request}");
-        assert!(in_request.get("variant_alias").is_none(), "{in_request}");
-        assert!(outside.get("surface_variant").is_none(), "{outside}");
+        assert!(
+            in_request
+                .get("variant_alias")
+                .is_none(),
+            "{in_request}"
+        );
+        assert!(
+            outside
+                .get("surface_variant")
+                .is_none(),
+            "{outside}"
+        );
     }
 }

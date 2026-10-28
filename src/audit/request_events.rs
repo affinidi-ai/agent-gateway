@@ -127,10 +127,6 @@ pub struct RoutingRefusal {
 }
 
 impl RoutingRefusal {
-    pub fn reason(&self) -> RejectionReason {
-        self.reason
-    }
-
     pub fn status(&self) -> axum::http::StatusCode {
         self.status
     }
@@ -196,9 +192,7 @@ pub fn refuse_routing(
         facts,
         RejectionStage::Routing,
         refusal.reason,
-        refusal
-            .status
-            .as_u16(),
+        refusal.status.as_u16(),
         rpc_error_code,
         refusal.requested_variant(),
     );
@@ -425,10 +419,7 @@ mod tests {
     #[tokio::test]
     async fn a_fabric_refusal_records_no_http_status() {
         use crate::config::agent_surface_variants::VariantResolveError;
-        let fabric = RequestFacts {
-            via_fabric: true,
-            ..facts()
-        };
+        let fabric = RequestFacts { via_fabric: true, ..facts() };
         let ((), events) = crate::audit::producer::capture(async {
             request_rejected(&fabric, RejectionStage::Admission, RejectionReason::BodyTooLarge, 413, None);
             refuse_routing(&fabric, &VariantResolveError::UnknownAlias("typo".into()), None);
@@ -445,7 +436,12 @@ mod tests {
             ]
         );
         let stored = serde_json::to_value(&events[0]).unwrap();
-        assert!(stored["event"]["request_rejected"].get("http_status").is_none(), "{stored}");
+        assert!(
+            stored["event"]["request_rejected"]
+                .get("http_status")
+                .is_none(),
+            "{stored}"
+        );
     }
 
     #[test]
@@ -488,14 +484,14 @@ mod tests {
 
         let answered: Vec<_> = refusals
             .iter()
-            .map(|refusal| (refusal.reason(), refusal.status().as_u16(), refusal.requested_variant()))
+            .map(|refusal| (refusal.status().as_u16(), refusal.requested_variant()))
             .collect();
         assert_eq!(
             answered,
             vec![
-                (RejectionReason::UnknownVariant, 404, Some("typo")),
-                (RejectionReason::VariantDisabled, 404, None),
-                (RejectionReason::MisconfiguredDefault, 500, None),
+                (404, Some("typo")),
+                (404, None),
+                (500, None),
             ]
         );
         assert_eq!(
@@ -508,7 +504,12 @@ mod tests {
         );
         assert_eq!(requested_variants(&events), vec![Some("typo".to_string()), None, None]);
         assert_eq!(refusals[0].message(), refusals[1].message(), "both 404s tell the caller the same");
-        assert!(!refusals[0].message().contains("typo"), "the caller's alias is not echoed back");
+        assert!(
+            !refusals[0]
+                .message()
+                .contains("typo"),
+            "the caller's alias is not echoed back"
+        );
     }
 
     #[tokio::test]

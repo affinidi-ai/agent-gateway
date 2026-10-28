@@ -597,13 +597,23 @@ mod tests {
                 .request_id
                 .is_some()
         );
-        assert_eq!(pending[0].record.surface_variant, None);
+        assert_eq!(
+            pending[0]
+                .record
+                .surface_variant,
+            None
+        );
     }
 
     #[test]
     fn a_record_without_a_variant_leaves_the_field_out_and_an_old_row_still_reads() {
         let stored = serde_json::to_value(consent()).unwrap();
-        assert!(stored.get("surface_variant").is_none(), "{stored}");
+        assert!(
+            stored
+                .get("surface_variant")
+                .is_none(),
+            "{stored}"
+        );
 
         let read: DelegationAuditEvent = serde_json::from_value(stored).unwrap();
         assert_eq!(read.surface_variant, None);

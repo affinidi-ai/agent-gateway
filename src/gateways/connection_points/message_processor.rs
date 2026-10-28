@@ -3761,8 +3761,10 @@ pub(crate) struct ForwardedVariant {
 fn select_forwarded_variant(
     surface: &crate::config::agent_surface::AgentSurface,
     alias: Option<&str>,
-) -> Result<(ForwardedVariant, crate::config::agent_surface::AgentSurface), crate::config::agent_surface_variants::VariantResolveError>
-{
+) -> Result<
+    (ForwardedVariant, crate::config::agent_surface::AgentSurface),
+    crate::config::agent_surface_variants::VariantResolveError,
+> {
     let id = surface
         .select_variant(alias)?
         .map(|v| v.id.clone());
@@ -3789,9 +3791,7 @@ pub(crate) async fn resolve_stream_surface(
         Ok(selected) => selected,
         Err(error) => {
             use crate::observability::policy_audit::{RequestScope, in_request};
-            let trace_id = request
-                .trace_id
-                .to_string();
+            let trace_id = request.trace_id.to_string();
             in_request(RequestScope::fresh(), async {
                 crate::audit::request_events::refuse_routing(
                     &crate::audit::request_events::RequestFacts {

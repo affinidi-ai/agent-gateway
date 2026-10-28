@@ -706,7 +706,11 @@ mod tests {
         assert_eq!(records.len(), 1);
         let json = serde_json::to_value(&records[0]).unwrap();
         assert_eq!(json["event"]["policy_attached"]["surface_variant"], "beta");
-        assert!(json.get("surface_variant").is_none(), "a management record has no top-level variant: {json}");
+        assert!(
+            json.get("surface_variant")
+                .is_none(),
+            "a management record has no top-level variant: {json}"
+        );
     }
 
     #[tokio::test]

@@ -437,18 +437,18 @@ mod tests {
         let captured = capture(|| {
             crate::observability::policy_audit::with_request_variant("beta", || {
                 record_trust_check(TrustCheckAuditEvent {
-                surface_id: "surface-a",
-                leg: TrustCheckLeg::Caller,
-                element_id: "tc-id-a",
-                element_name: Some("primary registry"),
-                authority_id: Some("did:authority:42"),
-                entity_id: Some("did:entity:42"),
-                trust_registry_id: "tr-42",
-                query_type: TrqpQueryType::Recognition,
-                ok: true,
-                error_code: None,
-                error_detail: None,
-                latency_ms: 17,
+                    surface_id: "surface-a",
+                    leg: TrustCheckLeg::Caller,
+                    element_id: "tc-id-a",
+                    element_name: Some("primary registry"),
+                    authority_id: Some("did:authority:42"),
+                    entity_id: Some("did:entity:42"),
+                    trust_registry_id: "tr-42",
+                    query_type: TrqpQueryType::Recognition,
+                    ok: true,
+                    error_code: None,
+                    error_detail: None,
+                    latency_ms: 17,
                 })
             });
         });

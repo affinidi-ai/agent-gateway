@@ -169,12 +169,7 @@ pub fn set_request_variant(variant: &str) {
 /// set one.
 pub fn current_request_variant() -> Option<String> {
     REQUEST
-        .try_with(|scope| {
-            scope
-                .variant
-                .get()
-                .cloned()
-        })
+        .try_with(|scope| scope.variant.get().cloned())
         .ok()
         .flatten()
 }
@@ -1058,28 +1053,30 @@ mod tests {
             let identity = AuthenticatedIdentity::ApiKey {
                 key_name: "alpha-key".to_string(),
             };
-            with_request_variant("beta", || record_policy_decision(PolicyDecisionEvent {
-                scope: PolicyScope::Surface,
-                allow: false,
-                reason: Some("trust check failed"),
-                policy_id: Some("pol-7"),
-                policy_definition_id: Some("def-uuid-7"),
-                policy_name: None,
-                surface_id: Some("surface-a"),
-                surface_name: Some("Surface A"),
-                trace_id: Some("trace-xyz"),
-                http_method: Some("POST"),
-                path: Some("/v1/agent"),
-                identity: Some(&identity),
-                actor_did: Some("did:example:agent"),
-                gateway_did: Some("did:web:gw1"),
-                flow: PolicyFlow::TransitPoint,
-                policy_version: Some(3),
-                policy_content_hash: Some("sha256:abc123"),
-                caller: None,
-                error: None,
-                removed_tools: None,
-            }));
+            with_request_variant("beta", || {
+                record_policy_decision(PolicyDecisionEvent {
+                    scope: PolicyScope::Surface,
+                    allow: false,
+                    reason: Some("trust check failed"),
+                    policy_id: Some("pol-7"),
+                    policy_definition_id: Some("def-uuid-7"),
+                    policy_name: None,
+                    surface_id: Some("surface-a"),
+                    surface_name: Some("Surface A"),
+                    trace_id: Some("trace-xyz"),
+                    http_method: Some("POST"),
+                    path: Some("/v1/agent"),
+                    identity: Some(&identity),
+                    actor_did: Some("did:example:agent"),
+                    gateway_did: Some("did:web:gw1"),
+                    flow: PolicyFlow::TransitPoint,
+                    policy_version: Some(3),
+                    policy_content_hash: Some("sha256:abc123"),
+                    caller: None,
+                    error: None,
+                    removed_tools: None,
+                })
+            });
         });
 
         let captured = events.lock().unwrap();

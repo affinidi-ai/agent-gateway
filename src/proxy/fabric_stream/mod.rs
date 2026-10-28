@@ -1278,9 +1278,12 @@ mod tests {
                 "disabled-variant" => request["variant_alias"] = json!("disabled"),
                 _ => unreachable!(),
             }
-            let (refusal, records) = crate::audit::producer::capture(
-                runtime.prepare_incoming_with_versions(&invalid, &invalid_connection, &invalid_peer, versions),
-            )
+            let (refusal, records) = crate::audit::producer::capture(runtime.prepare_incoming_with_versions(
+                &invalid,
+                &invalid_connection,
+                &invalid_peer,
+                versions,
+            ))
             .await;
             let refusal = refusal
                 .err()

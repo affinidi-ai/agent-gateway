@@ -139,9 +139,8 @@ pub(super) async fn router_with_decisions(
         )
         .await
         .unwrap();
-    surface
-        .target
-        .response_policy = serde_json::from_value(json!({"policy_definition_id": "allow-responses"})).unwrap();
+    surface.target.response_policy =
+        serde_json::from_value(json!({"policy_definition_id": "allow-responses"})).unwrap();
     let manager = Arc::new(crate::policies::SurfacePolicyManager::new());
     manager.set_policy_definition_store(policies);
     manager
@@ -227,10 +226,9 @@ fn refused(
 
 #[tokio::test]
 async fn a_variant_that_cannot_be_resolved_is_refused_with_one_status_per_reason() {
-    let target = MockServer::start_with_response(
-        json!({"jsonrpc": "2.0", "id": 1, "result": {"kind": "message"}}).to_string(),
-    )
-    .await;
+    let target =
+        MockServer::start_with_response(json!({"jsonrpc": "2.0", "id": 1, "result": {"kind": "message"}}).to_string())
+            .await;
     let endpoint = target.url();
     let cases = [
         (
@@ -290,10 +288,9 @@ fn one(variant: &str) -> std::collections::BTreeSet<Option<String>> {
 
 #[tokio::test]
 async fn every_record_of_a_served_request_names_the_variant_that_served_it() {
-    let target = MockServer::start_with_response(
-        json!({"jsonrpc": "2.0", "id": 1, "result": {"kind": "message"}}).to_string(),
-    )
-    .await;
+    let target =
+        MockServer::start_with_response(json!({"jsonrpc": "2.0", "id": 1, "result": {"kind": "message"}}).to_string())
+            .await;
     let endpoint = target.url();
     for (case, surface, path, expected) in [
         ("named variant", surface(&endpoint, catalog(), Some("v-prod")), "/a2a$beta/rpc", "beta"),
@@ -331,8 +328,20 @@ async fn a_refusal_names_the_variant_it_refused_and_never_the_callers_text() {
     for (case, surface, path, variant, requested) in cases {
         let (_, events) = send(router(surface), path).await;
         assert_eq!(events.len(), 1, "{case}: {events:?}");
-        assert_eq!(events[0].surface_variant.as_deref(), variant, "{case}");
-        assert_eq!(refusals(&events)[0].3.as_deref(), requested, "{case}");
+        assert_eq!(
+            events[0]
+                .surface_variant
+                .as_deref(),
+            variant,
+            "{case}"
+        );
+        assert_eq!(
+            refusals(&events)[0]
+                .3
+                .as_deref(),
+            requested,
+            "{case}"
+        );
     }
 }
 
@@ -342,10 +351,9 @@ async fn an_access_point_request_exports_its_span_with_the_variant() {
     use tower::ServiceExt;
 
     crate::observability::register_channel_prefix("/a2a".to_string(), "Orders".to_string());
-    let target = MockServer::start_with_response(
-        json!({"jsonrpc": "2.0", "id": 1, "result": {"kind": "message"}}).to_string(),
-    )
-    .await;
+    let target =
+        MockServer::start_with_response(json!({"jsonrpc": "2.0", "id": 1, "result": {"kind": "message"}}).to_string())
+            .await;
     let app = axum::Router::new()
         .fallback(super::multi_channel_proxy_handler)
         .with_state(router(surface(&target.url(), catalog(), Some("v-prod"))))
@@ -413,9 +421,7 @@ async fn send_mcp(
         request.header("mcp-protocol-version", crate::mcp::MCP_LEGACY_VERSION)
     };
     let request = request
-        .body(axum::body::Body::from(
-            json!({"jsonrpc": "2.0", "id": "variant", "method": "tools/list"}).to_string(),
-        ))
+        .body(axum::body::Body::from(json!({"jsonrpc": "2.0", "id": "variant", "method": "tools/list"}).to_string()))
         .unwrap();
     let (response, events) =
         crate::audit::producer::capture(Box::pin(super::multi_channel_proxy_handler_with_mcp_runtime(
@@ -494,10 +500,9 @@ async fn a_legacy_mcp_variant_refusal_keeps_its_plain_error() {
 
 #[tokio::test]
 async fn a_surface_with_variants_but_no_default_serves_an_alias_less_request_from_the_base() {
-    let target = MockServer::start_with_response(
-        json!({"jsonrpc": "2.0", "id": 1, "result": {"kind": "message"}}).to_string(),
-    )
-    .await;
+    let target =
+        MockServer::start_with_response(json!({"jsonrpc": "2.0", "id": 1, "result": {"kind": "message"}}).to_string())
+            .await;
     let (status, events) = send(router(surface(&target.url(), catalog(), None)), "/a2a/rpc").await;
 
     assert_eq!(status, axum::http::StatusCode::OK);

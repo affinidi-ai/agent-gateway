@@ -8193,7 +8193,13 @@ mod tests {
                 RejectionReason::VariantDisabled => Some("candidate"),
                 _ => None,
             };
-            assert_eq!(events[0].surface_variant.as_deref(), expected_variant, "{case} modern={modern}");
+            assert_eq!(
+                events[0]
+                    .surface_variant
+                    .as_deref(),
+                expected_variant,
+                "{case} modern={modern}"
+            );
             assert_eq!(
                 target
                     .request_count
@@ -8226,11 +8232,7 @@ mod tests {
     #[tokio::test]
     async fn every_transit_point_record_names_the_variant_that_served_it() {
         for (variants, path, expected) in [
-            (
-                json!([{"id": "v-beta", "alias": "beta", "name": "Beta"}]),
-                "/outbound/mcp$beta/partner-a",
-                "beta",
-            ),
+            (json!([{"id": "v-beta", "alias": "beta", "name": "Beta"}]), "/outbound/mcp$beta/partner-a", "beta"),
             (json!([]), "/outbound/mcp/partner-a", "_base_"),
         ] {
             let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
@@ -8255,9 +8257,7 @@ mod tests {
                 .method("POST")
                 .uri(path)
                 .header("content-type", "application/json")
-                .body(axum::body::Body::from(
-                    json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).to_string(),
-                ))
+                .body(axum::body::Body::from(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).to_string()))
                 .unwrap();
             let (_, events) = crate::audit::producer::capture(Box::pin(outbound_proxy_handler_with_mcp_versions(
                 "127.0.0.1:12345"
@@ -8270,7 +8270,13 @@ mod tests {
             .await;
             assert!(!events.is_empty(), "{path}: the Transit Point request writes records");
             for event in &events {
-                assert_eq!(event.surface_variant.as_deref(), Some(expected), "{path}: {event:?}");
+                assert_eq!(
+                    event
+                        .surface_variant
+                        .as_deref(),
+                    Some(expected),
+                    "{path}: {event:?}"
+                );
             }
         }
     }

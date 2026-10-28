@@ -2312,9 +2312,7 @@ impl MetricsStore {
                 direction: conn.direction,
                 ucp_operation: conn.ucp_operation.clone(),
                 transit_point: conn.transit_point.clone(),
-                surface_variant: conn
-                    .surface_variant
-                    .clone(),
+                surface_variant: conn.surface_variant.clone(),
                 metric_type: conn.metric_type,
                 correlation_id: conn.correlation_id.clone(),
                 agent_identity: conn.agent_identity.clone(),
@@ -2414,9 +2412,7 @@ impl MetricsStore {
                                             trace_id: trace_id.clone(),
                                             ucp_operation: point.ucp_operation.clone(),
                                             transit_point: point.transit_point.clone(),
-                                            surface_variant: point
-                                                .surface_variant
-                                                .clone(),
+                                            surface_variant: point.surface_variant.clone(),
                                             metric_type: point.metric_type,
                                             correlation_id: point.correlation_id.clone(),
                                             agent_identity: point.agent_identity.clone(),
@@ -2592,9 +2588,7 @@ impl MetricsStore {
                 direction: conn.direction,
                 ucp_operation: conn.ucp_operation.clone(),
                 transit_point: conn.transit_point.clone(),
-                surface_variant: conn
-                    .surface_variant
-                    .clone(),
+                surface_variant: conn.surface_variant.clone(),
                 metric_type: conn.metric_type,
                 correlation_id: conn.correlation_id.clone(),
                 agent_identity: conn.agent_identity.clone(),
@@ -2788,7 +2782,11 @@ mod tests {
         assert_eq!(recorded.len(), 1);
         let json = serde_json::to_value(&recorded[0]).unwrap();
         assert_eq!(json["surface_variant"], "beta");
-        assert!(json.get("variant_alias").is_none(), "{json}");
+        assert!(
+            json.get("variant_alias")
+                .is_none(),
+            "{json}"
+        );
     }
 
     #[tokio::test]
@@ -2803,7 +2801,11 @@ mod tests {
                 .await[0],
         )
         .unwrap();
-        assert!(json.get("surface_variant").is_none(), "{json}");
+        assert!(
+            json.get("surface_variant")
+                .is_none(),
+            "{json}"
+        );
     }
 
     #[test]
@@ -2821,7 +2823,11 @@ mod tests {
 
         for json in [serde_json::to_value(&metric).unwrap(), serde_json::to_value(&point).unwrap()] {
             assert_eq!(json["surface_variant"], "beta", "{json}");
-            assert!(json.get("variant_alias").is_none(), "{json}");
+            assert!(
+                json.get("variant_alias")
+                    .is_none(),
+                "{json}"
+            );
         }
     }
 
