@@ -138,7 +138,9 @@ impl RoutingRefusal {
     /// Logs the refusal of a request to `surface` from what was recorded:
     /// the reason, the requested alias as cut for the record, and on a
     /// misconfigured default the configured `default_variant_id`. The
-    /// caller's raw alias is never logged.
+    /// caller's raw alias is never logged. The message carries the
+    /// `[CHANNEL:<config_id>]` prefix the dashboard's channel log filter
+    /// matches.
     pub fn warn(
         &self,
         surface: &crate::config::agent_surface::AgentSurface,
@@ -150,12 +152,16 @@ impl RoutingRefusal {
                     .as_deref(),
             )
             .flatten();
+        let config_id = surface
+            .config_id()
+            .unwrap_or_default();
         tracing::warn!(
+            config_id,
             surface = %surface.name,
             reason = ?self.reason(),
             requested_variant = ?self.requested_variant(),
             default_variant_id = ?default_variant_id,
-            "Surface variant cannot be resolved"
+            "[CHANNEL:{config_id}] Surface variant cannot be resolved"
         );
     }
 
