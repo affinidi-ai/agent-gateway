@@ -308,6 +308,25 @@ in components.
   tab of its type, the target to its surface or gateway page.
 - Every value is rendered as React text; record fields come from the gateway and are untrusted.
 
+## Audit page: surface variants and refusals
+
+Records of a surface request carry `surface_variant`: a configured alias, `_base_` (the base
+surface served it) or `_unknown_` (the URL named a variant the surface doesn't have). Read and
+word it only through `utils/surfaceVariant.ts`, which the Metrics page uses too.
+
+- The Details list shows it as **Variant** under Surface & routing ("Base surface", "Unknown
+  variant" or the alias), and under Where for a policy change.
+- The narratives say "on variant beta", "on the base surface" or "on an unknown variant (“typo”
+  was asked for)", naming the refusal's `requested_variant`. A base slot change reads "on the base
+  surface and the variants that inherit it". A gateway-scope decision reads "Gateway-wide policy
+  “X”, applied to Orders, variant beta", and its Scope row is **Gateway (all surfaces)**.
+- `request_rejected` is read with `requestRejected` (`auditHelpers.ts`), titled **Request
+  refused** in the deny tone, with a Refusal group of Stage, Reason, HTTP status, JSON-RPC error
+  and Requested variant. `http_status` is absent on a Fabric refusal and `rpc_error_code` present
+  only when the caller got a JSON-RPC error; a row shows only when the value is recorded.
+- `requested_variant` is caller-chosen text: render it as React text only.
+- The Metrics page shows the `$alias` badge for a configured alias only, never for `_base_`.
+
 ## MCP Proxy write warnings
 
 MCP Proxy create and update responses can carry `warnings`, for example when only the

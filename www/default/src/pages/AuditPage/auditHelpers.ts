@@ -6,6 +6,7 @@ import {
   type PolicyChangeData,
   type PolicyChangeEvent,
   type PolicyDecisionData,
+  type RequestRejectedData,
   type TraceTerminatedData,
   type TrustCheckData,
   type WorkloadIntent,
@@ -220,6 +221,18 @@ export function traceTerminated(entry: AuditEntry): TraceTerminatedData | null {
     'trace_terminated' in entry.event
   ) {
     return (entry.event as { trace_terminated: TraceTerminatedData }).trace_terminated;
+  }
+  return null;
+}
+
+/** Extracts the RequestRejected payload if present, else null */
+export function requestRejected(entry: AuditEntry): RequestRejectedData | null {
+  if (
+    typeof entry.event === 'object' &&
+    entry.event !== null &&
+    'request_rejected' in entry.event
+  ) {
+    return (entry.event as { request_rejected: RequestRejectedData }).request_rejected;
   }
   return null;
 }

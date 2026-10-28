@@ -103,7 +103,91 @@ describe('fieldGroups', () => {
     expect(groups['Identity'].map(item => item.term)).not.toContain('Caller DID');
   });
 
+  describe('surface variants', () => {
+    it('shows the variant of a surface request under Surface & routing', () => {
+      const routing = (surface_variant?: string) =>
+        groupByLabel(baseEntry({ channel_name: 'Orders', surface_variant }), null, null)[
+          'Surface & routing'
+        ].find(item => item.term === 'Variant');
+
+      expect(routing('beta')).toEqual({ term: 'Variant', value: 'beta' });
+      expect(routing('_base_')).toEqual({ term: 'Variant', value: 'Base surface' });
+      expect(routing('_unknown_')).toEqual({ term: 'Variant', value: 'Unknown variant' });
+      expect(routing(undefined)).toBeUndefined();
+    });
+
+    it('shows a gateway-scope decision as applying to every surface', () => {
+      const pd: PolicyDecisionData = { scope: 'gateway', policy_id: 'g', decision: 'allow' };
+      const groups = groupByLabel(
+        baseEntry({ event: { policy_decision: pd }, surface_variant: 'beta' }),
+        pd,
+        null
+      );
+
+      expect(groups['Policy']).toEqual(
+        expect.arrayContaining([{ term: 'Scope', value: 'Gateway (all surfaces)' }])
+      );
+    });
+
+    it('lays out a refusal with what the caller got and the variant asked for', () => {
+      const unknown = groupByLabel(
+        baseEntry({
+          event: {
+            request_rejected: {
+              stage: 'routing',
+              reason: 'unknown_variant',
+              http_status: 404,
+              rpc_error_code: -32603,
+              requested_variant: 'typo',
+            },
+          },
+          surface_variant: '_unknown_',
+        }),
+        null,
+        null
+      );
+      expect(unknown['Refusal']).toEqual([
+        { term: 'Stage', value: 'routing' },
+        { term: 'Reason', value: 'unknown variant' },
+        { term: 'HTTP status', value: '404' },
+        { term: 'JSON-RPC error', value: '-32603' },
+        { term: 'Requested variant', value: 'typo', mono: true },
+      ]);
+
+      const fabric = groupByLabel(
+        baseEntry({
+          event: { request_rejected: { stage: 'routing', reason: 'misconfigured_default' } },
+          via_fabric: true,
+        }),
+        null,
+        null
+      );
+      expect(fabric['Refusal']).toEqual([
+        { term: 'Stage', value: 'routing' },
+        { term: 'Reason', value: 'misconfigured default' },
+      ]);
+    });
+  });
+
   describe('policy changes', () => {
+    it('shows a base slot change as the base surface', () => {
+      const entry = baseEntry({
+        event: {
+          policy_attached: {
+            policy_definition_id: 'deny-pii',
+            target: { kind: 'surface', id: 's-1', name: 'Orders' },
+            scope: 'surface',
+            slot: 'target',
+            surface_variant: '_base_',
+            actor: { kind: 'user', id: 'u-1' },
+            source: 'api',
+          },
+        },
+      });
+      const where = groupByLabel(entry, null, null)['Where'];
+      expect(where).toEqual(expect.arrayContaining([{ term: 'Variant', value: 'Base surface' }]));
+    });
+
     it('lays out a policy change as Change, Policy and Where, with links', () => {
       const entry = baseEntry({
         event: {
@@ -117,7 +201,7 @@ describe('fieldGroups', () => {
             scope: 'surface',
             slot: 'transit_point',
             transit_point: 'billing',
-            variant: 'beta',
+            surface_variant: 'beta',
             actor: { kind: 'pat', id: 'tok-1', user_id: 'u-1' },
             source: 'api',
           },

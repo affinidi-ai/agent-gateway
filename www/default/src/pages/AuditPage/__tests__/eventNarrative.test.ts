@@ -108,6 +108,101 @@ describe('eventNarrative', () => {
     );
   });
 
+  describe('surface variants', () => {
+    it('names the variant a surface decision applied to', () => {
+      const decision = (surface_variant: string) =>
+        describeEntry(
+          at(
+            {
+              policy_decision: {
+                scope: 'surface',
+                flow: 'access_point',
+                policy_id: 'p',
+                policy_name: 'My Policy',
+                decision: 'allow',
+              },
+            },
+            { channel_name: 'Orders', surface_variant }
+          )
+        ).summary;
+
+      expect(decision('beta')).toBe(
+        'Surface policy “My Policy” on the Access Point leg, on variant beta.'
+      );
+      expect(decision('_base_')).toBe(
+        'Surface policy “My Policy” on the Access Point leg, on the base surface.'
+      );
+    });
+
+    it('reads a gateway-scope decision as global, applied to a surface and variant', () => {
+      const n = describeEntry(
+        at(
+          {
+            policy_decision: {
+              scope: 'gateway',
+              policy_id: 'g',
+              policy_name: 'X',
+              decision: 'deny',
+            },
+          },
+          { channel_name: 'Orders', surface_variant: 'beta' }
+        )
+      );
+      expect(n.summary).toBe('Gateway-wide policy “X”, applied to Orders, variant beta.');
+    });
+
+    it('describes a refusal for an unknown variant with the alias that was asked for', () => {
+      const n = describeEntry(
+        at(
+          {
+            request_rejected: {
+              stage: 'routing',
+              reason: 'unknown_variant',
+              http_status: 404,
+              requested_variant: 'typo',
+            },
+          },
+          { channel_name: 'Orders', surface_variant: '_unknown_' }
+        )
+      );
+      expect(n.tone).toBe('deny');
+      expect(n.title).toBe('Request refused');
+      expect(n.summary).toBe(
+        'Refused at routing on Orders, on an unknown variant (“typo” was asked for): unknown variant.'
+      );
+      expect(n.detail).toBe('The caller got HTTP 404.');
+    });
+
+    it('describes a disabled variant, a modern MCP refusal and a Fabric refusal', () => {
+      const disabled = describeEntry(
+        at(
+          {
+            request_rejected: {
+              stage: 'routing',
+              reason: 'variant_disabled',
+              http_status: 404,
+              rpc_error_code: -32603,
+            },
+          },
+          { channel_name: 'Orders', surface_variant: 'off' }
+        )
+      );
+      expect(disabled.summary).toBe(
+        'Refused at routing on Orders, on variant off: variant disabled.'
+      );
+      expect(disabled.detail).toBe('The caller got HTTP 404 with JSON-RPC error -32603.');
+
+      const fabric = describeEntry(
+        at(
+          { request_rejected: { stage: 'routing', reason: 'misconfigured_default' } },
+          { channel_name: 'Orders', via_fabric: true }
+        )
+      );
+      expect(fabric.summary).toBe('Refused at routing on Orders: misconfigured default.');
+      expect(fabric.detail).toBe('Refused over Fabric, so no HTTP status was recorded.');
+    });
+  });
+
   it('tones unit events semantically', () => {
     expect(eventTone(at('token_injected'))).toBe('allow');
     expect(eventTone(at('consent_required'))).toBe('warn');
@@ -129,7 +224,7 @@ describe('eventNarrative', () => {
             target: surface,
             scope: 'surface',
             slot: 'inbound',
-            variant: 'beta',
+            surface_variant: 'beta',
             actor: user,
             source: 'api',
           },
@@ -138,9 +233,29 @@ describe('eventNarrative', () => {
       expect(n.title).toBe('Policy attached');
       expect(n.tone).toBe('neutral');
       expect(n.summary).toBe(
-        '“Deny PII” v3 was added to surface Orders as its inbound policy (variant beta).'
+        '“Deny PII” v3 was added to surface Orders as its inbound policy, on variant beta.'
       );
       expect(n.detail).toBe('By user u-1.');
+    });
+
+    it('says a change to a base slot is on the base surface and the variants inheriting it', () => {
+      const n = describeEntry(
+        at({
+          policy_detached: {
+            policy_definition_id: 'deny-pii',
+            policy_name: 'Deny PII',
+            target: surface,
+            scope: 'surface',
+            slot: 'target',
+            surface_variant: '_base_',
+            actor: user,
+            source: 'api',
+          },
+        })
+      );
+      expect(n.summary).toBe(
+        '“Deny PII” was removed from surface Orders as its request policy, on the base surface and the variants that inherit it.'
+      );
     });
 
     it('names the actor by username when the resolver knows it', () => {
