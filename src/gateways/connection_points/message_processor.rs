@@ -3741,56 +3741,31 @@ pub(crate) struct FabricStreamRequest {
     pub headers: axum::http::HeaderMap,
     pub body: bytes::Bytes,
     pub surface: crate::config::agent_surface::AgentSurface,
-    pub variant: ForwardedVariant,
+    pub variant: crate::config::agent_surface_variants::ForwardedVariant,
     pub capabilities: crate::proxy::fabric_stream::peer::StreamCapabilities,
     /// The request the stream's Open was admitted as.
     pub scope: Arc<crate::observability::policy_audit::RequestScope>,
 }
 
-/// The variant of this gateway's surface that serves a forwarded request.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ForwardedVariant {
-    /// The variant's id; `None` when the base surface serves the request.
-    pub id: Option<String>,
-    /// What the request records as `surface_variant`.
-    pub recorded: String,
-}
-
-/// Selects the variant of `surface` that serves a forwarded request naming
-/// `alias`, and the surface it resolves to. The sending gateway's variant is
-/// not consulted: with no alias, this surface's default variant, else its
-/// base, serves the request.
-fn select_forwarded_variant(
-    surface: &crate::config::agent_surface::AgentSurface,
-    alias: Option<&str>,
-) -> Result<
-    (ForwardedVariant, crate::config::agent_surface::AgentSurface),
-    crate::config::agent_surface_variants::VariantResolveError,
-> {
-    let id = surface
-        .select_variant(alias)?
-        .map(|v| v.id.clone());
-    let resolved = surface.resolve_variant(alias)?;
-    let recorded = surface
-        .surface_variant(id.as_deref())
-        .to_string();
-    Ok((ForwardedVariant { id, recorded }, resolved))
-}
-
+/// Resolves the surface a Fabric stream Open names, served by the variant its
+/// target pins. The sending gateway's variant is not consulted: with no
+/// alias, this surface's default variant, else its base, serves the stream.
 pub(crate) async fn resolve_stream_surface(
     message: &ReceivedMessage,
     request: &crate::proxy::fabric_stream::wire::OpenRequest,
-) -> Result<(crate::config::agent_surface::AgentSurface, ForwardedVariant), String> {
+) -> Result<
+    (crate::config::agent_surface::AgentSurface, crate::config::agent_surface_variants::ForwardedVariant),
+    String,
+> {
     let surface = lookup_channel(message, &request.channel_id)
         .await?
         .ok_or("Fabric stream surface is unavailable")?;
-    let (variant, surface) = match select_forwarded_variant(
-        &surface,
+    let (variant, surface) = match surface.serve_variant(
         request
             .variant_alias
             .as_deref(),
     ) {
-        Ok(selected) => selected,
+        Ok(served) => served.into_parts(),
         Err(error) => {
             crate::audit::request_events::refuse_routing(
                 &crate::audit::request_events::RequestFacts {
@@ -4131,7 +4106,9 @@ async fn process_forward_request_in_request_scope(
     // that can't be resolved is refused, never served by another.
     let selected = match stream_request.as_ref() {
         Some(request) => Ok((request.variant.clone(), surface.clone())),
-        None => select_forwarded_variant(&surface, variant_alias),
+        None => surface
+            .serve_variant(variant_alias)
+            .map(crate::config::agent_surface_variants::ServedVariant::into_parts),
     };
     let (active_variant_id, surface) = match selected {
         Ok((variant, resolved)) => {

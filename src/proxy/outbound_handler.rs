@@ -485,17 +485,13 @@ impl OutboundPipelineContext {
         let modern_post = matched_virtual_channel.protocol == crate::config::agent_surface::TransitProtocol::Mcp
             && crate::mcp::request_validation::has_modern_header(&original_headers)
             && original_method == Method::POST;
-        let resolved = surface_for_resolve
-            .select_variant(active_variant_alias.as_deref())
-            .map(|variant| variant.map(|variant| variant.id.clone()))
-            .and_then(|variant_id| {
-                crate::observability::policy_audit::set_request_variant(
-                    surface_for_resolve.surface_variant(variant_id.as_deref()),
-                );
-                Ok((variant_id, surface_for_resolve.resolve_variant(active_variant_alias.as_deref())?))
-            });
-        let (active_variant_id, surface, pending_variant_refusal) = match resolved {
-            Ok((variant_id, surface)) => (variant_id, Arc::new(surface), None),
+        let (active_variant_id, surface, pending_variant_refusal) = match surface_for_resolve
+            .serve_variant(active_variant_alias.as_deref())
+        {
+            Ok(served) => {
+                crate::observability::policy_audit::set_request_variant(&served.recorded);
+                (served.id, Arc::new(served.surface), None)
+            }
             Err(error) if modern_post => (
                 None,
                 Arc::clone(&surface_for_resolve),

@@ -591,7 +591,7 @@ pub(crate) struct IncomingStream {
     message: ReceivedMessage,
     headers: axum::http::HeaderMap,
     surface: crate::config::agent_surface::AgentSurface,
-    variant: crate::gateways::connection_points::message_processor::ForwardedVariant,
+    variant: crate::config::agent_surface_variants::ForwardedVariant,
     declared_bytes: u64,
     limits: crate::config::McpHttpConfig,
     deadline: tokio::time::Instant,
@@ -1210,7 +1210,7 @@ mod tests {
         assert_eq!(variant.message.message_body["virtual_channel_alias"], "candidate");
         assert_eq!(
             variant.variant,
-            crate::gateways::connection_points::message_processor::ForwardedVariant {
+            crate::config::agent_surface_variants::ForwardedVariant {
                 id: Some("variant".into()),
                 recorded: "candidate".into(),
             },

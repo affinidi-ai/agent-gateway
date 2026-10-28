@@ -724,6 +724,29 @@ pub struct ServedVariant {
     pub surface: AgentSurface,
 }
 
+impl ServedVariant {
+    /// The variant, apart from the surface it resolves to.
+    pub fn into_parts(self) -> (ForwardedVariant, AgentSurface) {
+        (
+            ForwardedVariant {
+                id: self.id,
+                recorded: self.recorded,
+            },
+            self.surface,
+        )
+    }
+}
+
+/// The variant of this gateway's surface that serves a forwarded request,
+/// carried apart from the resolved surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardedVariant {
+    /// The variant's id; `None` when the base surface serves the request.
+    pub id: Option<String>,
+    /// What the request records as `surface_variant`.
+    pub recorded: String,
+}
+
 impl AgentSurface {
     /// The variant a request serves, from the alias in its URL: the named
     /// variant, else the default variant, else `None` for the base surface.
@@ -887,12 +910,13 @@ impl AgentSurface {
         let id = self
             .select_variant(alias)?
             .map(|variant| variant.id.clone());
+        let surface = self.resolve_variant(alias)?;
         Ok(ServedVariant {
             recorded: self
                 .surface_variant(id.as_deref())
                 .to_string(),
             id,
-            surface: self.clone(),
+            surface,
         })
     }
 

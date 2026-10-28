@@ -9374,19 +9374,11 @@ async fn multi_channel_proxy_handler_in_request_scope(
                 }
             };
 
-            // Phase D — prefer the pre-resolved snapshot from
+            // Prefer the pre-resolved snapshot from
             // `MultiSurfaceProxyState.resolved_surface_cache`, which is
             // populated by `apply_surface_change` whenever a surface is
-            // saved. Falls back to resolving the variant from the
-            // channel's mirror surface when the cache has no entry
-            // (e.g. a legacy JSON-config channel that never came from a
-            // surface, or a startup race before seeding). The mirror
-            // surface is built by `AgentSurface::from_channel_mapping`,
-            // whose `variants[]` projection (see
-            // `virtual_channel_to_surface_variant`) carries every
-            // per-variant field that `apply_variant_overrides` would
-            // write, so `resolve_variant` returns an equivalent
-            // surface.
+            // saved. Falls back to serving the variant from the channel's
+            // surface when the cache has no entry for it.
             let resolved_surface = {
                 let cache_lookup = ch
                     .surface
@@ -9402,9 +9394,9 @@ async fn multi_channel_proxy_handler_in_request_scope(
                 } else {
                     match ch
                         .surface
-                        .resolve_variant(virtual_channel_alias.as_deref())
+                        .serve_variant(virtual_channel_alias.as_deref())
                     {
-                        Ok(s) => Arc::new(s),
+                        Ok(served) => Arc::new(served.surface),
                         Err(_) => {
                             error!(
                                 surface = %ch.surface.name,

@@ -975,7 +975,7 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
                 headers,
                 body,
                 surface: configured.clone(),
-                variant: super::ForwardedVariant {
+                variant: crate::config::agent_surface_variants::ForwardedVariant {
                     id: None,
                     recorded: "_base_".into(),
                 },
@@ -1390,7 +1390,7 @@ async fn fabric_consent_flow() {
                     .unwrap()
                     .into(),
                 surface: surface.clone(),
-                variant: super::ForwardedVariant {
+                variant: crate::config::agent_surface_variants::ForwardedVariant {
                     id: None,
                     recorded: "_base_".into(),
                 },
@@ -2019,7 +2019,7 @@ async fn fabric_consent_flow() {
             if let Some(alias) = alias {
                 message.message_body["virtual_channel_alias"] = json!(alias);
             }
-            stream.variant = super::ForwardedVariant {
+            stream.variant = crate::config::agent_surface_variants::ForwardedVariant {
                 id: Some("credential-variant".into()),
                 recorded: "candidate".into(),
             };
