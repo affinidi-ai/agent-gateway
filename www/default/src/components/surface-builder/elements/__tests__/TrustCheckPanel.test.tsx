@@ -3,7 +3,8 @@ import { render, screen, within, fireEvent } from '@testing-library/react';
 import TrustCheckPanel from '../trust-check/TrustCheckPanel';
 
 const AP_SLOT = 'request:trust-check-access_point_trust_check_list';
-const TP_SLOT = 'request:trust-check-target_trust_check_list';
+const TP_SLOT = 'request:trust-check-transit_points_trust_check_list';
+const MA_SLOT = 'request:trust-check-target_trust_check_list';
 
 function baseProps(slotId: string, config: Record<string, unknown> = {}) {
   return {
@@ -13,7 +14,11 @@ function baseProps(slotId: string, config: Record<string, unknown> = {}) {
       label: '',
       configured: true,
       config,
-      parentId: slotId.includes('access_point') ? 'access-point' : 'target',
+      parentId: slotId.includes('access_point')
+        ? 'access-point'
+        : slotId.includes('transit_points')
+          ? 'tp-1'
+          : 'target',
       slotId,
     } as any,
     config,
@@ -22,6 +27,52 @@ function baseProps(slotId: string, config: Record<string, unknown> = {}) {
     openFullscreenEditor: jest.fn(),
   };
 }
+
+const withTarget = (endpoint: string) => [
+  { id: 'target', type: 'target', label: '', configured: true, config: { endpoint } },
+];
+
+describe('TrustCheckPanel — leg scope', () => {
+  it('states that a Transit Point Trust Check applies to that Transit Point only', () => {
+    render(<TrustCheckPanel {...(baseProps(TP_SLOT) as any)} />);
+
+    expect(screen.getByTestId('trust-check-panel-transit-point-scope')).toHaveTextContent(
+      'Applies to this Transit Point only.'
+    );
+    expect(screen.getByTestId('trust-check-panel-results-ref')).toHaveTextContent(
+      'input.trust_check_results.target[]'
+    );
+  });
+
+  it('shows no Transit Point scope line on the caller leg', () => {
+    render(<TrustCheckPanel {...(baseProps(AP_SLOT) as any)} />);
+
+    expect(screen.queryByTestId('trust-check-panel-transit-point-scope')).toBeNull();
+  });
+
+  it('warns that a Managed Agent target-leg Trust Check blocks Save on a URL target', () => {
+    render(
+      <TrustCheckPanel
+        {...(baseProps(MA_SLOT) as any)}
+        allNodes={withTarget('https://agent.example.com')}
+      />
+    );
+
+    expect(screen.getByTestId('trust-check-panel-managed-agent-target-warning')).toHaveTextContent(
+      'This Trust Check blocks Save on a URL target'
+    );
+    expect(screen.queryByTestId('trust-check-panel-transit-point-scope')).toBeNull();
+  });
+
+  it.each(['a2a-proxy://proxy-1', 'fabric://gw-1/surface'])(
+    'does not warn on the Managed Agent target leg for %s',
+    endpoint => {
+      render(<TrustCheckPanel {...(baseProps(MA_SLOT) as any)} allNodes={withTarget(endpoint)} />);
+
+      expect(screen.queryByTestId('trust-check-panel-managed-agent-target-warning')).toBeNull();
+    }
+  );
+});
 
 describe('TrustCheckPanel — sidebar context block', () => {
   it('renders the per-leg context block on the caller (AP→MA) leg', () => {

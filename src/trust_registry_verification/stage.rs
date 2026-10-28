@@ -10,6 +10,7 @@
 
 use serde_json::{Value, json};
 
+use crate::observability::trust_check_audit::TrustCheckOrigin;
 use crate::trust_registry_verification::metadata_gate::synthesize_metadata_gate_failures;
 use crate::trust_registry_verification::trust_check_element::{
     TrustCheckElement, TrustCheckLeg, TrustCheckResult, TrustCheckResultsContext,
@@ -62,8 +63,8 @@ fn consolidate_trust_check_results(results: &[TrustCheckResult]) -> (usize, usiz
 /// least one element fires; the matching leg of the returned context
 /// carries the results, the other leg is an empty list so OPA rules
 /// don't need null checks.
-pub async fn run_trust_check_stage<C: TrqpClient + ?Sized>(
-    surface_id: &str,
+pub async fn run_trust_check_stage<'o, C: TrqpClient + ?Sized>(
+    origin: impl Into<TrustCheckOrigin<'o>>,
     leg: TrustCheckLeg,
     elements: &[TrustCheckElement],
     input: &Value,
@@ -72,6 +73,7 @@ pub async fn run_trust_check_stage<C: TrqpClient + ?Sized>(
     if elements.is_empty() {
         return None;
     }
+    let origin = origin.into();
     let wrapped = json!({ "input": input });
     // Per-element metadata gate — synthesizes TRUST_REGISTRY_METADATA_UNAVAILABLE
     // for elements whose query template references TR-metadata leaves
@@ -79,11 +81,11 @@ pub async fn run_trust_check_stage<C: TrqpClient + ?Sized>(
     // leg has its own allow-list. Runnable elements (gate-clear) go
     // through the TRQP executor; synthesized entries are merged back at
     // their configured index so the result list preserves order.
-    let (synthesized_by_index, runnable) = synthesize_metadata_gate_failures(surface_id, leg, elements, &wrapped);
+    let (synthesized_by_index, runnable) = synthesize_metadata_gate_failures(origin, leg, elements, &wrapped);
     let executor_results: Vec<TrustCheckResult> = if runnable.is_empty() {
         Vec::new()
     } else {
-        execute_list(surface_id, leg, &runnable, &ExecutionContext { input: &wrapped }, client).await
+        execute_list(origin, leg, &runnable, &ExecutionContext { input: &wrapped }, client).await
     };
     let mut executor_iter = executor_results.into_iter();
     let mut results: Vec<TrustCheckResult> = Vec::with_capacity(synthesized_by_index.len());
@@ -104,7 +106,10 @@ pub async fn run_trust_check_stage<C: TrqpClient + ?Sized>(
     };
     tracing::info!(
         target: "trust_check_audit",
-        surface_id = surface_id,
+        surface_id = origin.surface_id,
+        transit_point = origin
+            .transit_point
+            .unwrap_or_default(),
         leg = leg_label,
         total = results.len(),
         ok = ok_count,

@@ -440,6 +440,10 @@ pub enum DelegationAuditAction {
         entity_id: Option<String>,
         ok: bool,
         error_code: Option<String>,
+        /// Alias of the Transit Point the request was routed to; omitted
+        /// outside the outbound path.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transit_point: Option<String>,
     },
     /// Trace terminated at this surface's egress. Records the own → downstream
     /// trace mapping so an operator can bridge the terminated trace from this
@@ -1547,6 +1551,7 @@ pub fn audit_policy_decision(
 /// so the emitted JSONL omits them, matching the wire shape.
 pub fn audit_trust_check(
     surface_id: Option<&str>,
+    transit_point: Option<&str>,
     trace_id: Option<&str>,
     leg: &str,
     authority_id: Option<&str>,
@@ -1563,6 +1568,7 @@ pub fn audit_trust_check(
             entity_id: entity_id.map(str::to_string),
             ok,
             error_code: error_code.map(str::to_string),
+            transit_point: transit_point.map(str::to_string),
         },
         agent_did: None,
         agent_identity_did: None,
@@ -1972,6 +1978,7 @@ mod tests {
                 entity_id: Some("did:example:agent".to_string()),
                 ok: false,
                 error_code: Some("QUERY_TIMEOUT".to_string()),
+                transit_point: None,
             }
             .is_vp_audit()
         );
@@ -2537,7 +2544,16 @@ mod tests {
     #[tokio::test]
     async fn a_trust_check_record_carries_its_surface_and_trace() {
         let ((), events) = crate::audit::producer::capture(async {
-            audit_trust_check(Some("surface-1"), Some("trace-1"), "caller", Some("did:a"), Some("did:e"), true, None);
+            audit_trust_check(
+                Some("surface-1"),
+                None,
+                Some("trace-1"),
+                "caller",
+                Some("did:a"),
+                Some("did:e"),
+                true,
+                None,
+            );
         })
         .await;
         assert_eq!(events.len(), 1);
@@ -2548,6 +2564,62 @@ mod tests {
             Some("surface-1")
         );
         assert_eq!(events[0].trace_id.as_deref(), Some("trace-1"));
+    }
+
+    #[tokio::test]
+    async fn a_trust_check_record_carries_its_transit_point() {
+        let ((), events) = crate::audit::producer::capture(async {
+            audit_trust_check(
+                Some("surface-1"),
+                Some("partner-a"),
+                Some("trace-1"),
+                "target",
+                None,
+                None,
+                false,
+                Some("AGENT_CARD_UNAVAILABLE"),
+            );
+        })
+        .await;
+        assert_eq!(events.len(), 1);
+        let wire = serde_json::to_value(&events[0]).expect("serialize record");
+        assert_eq!(wire["event"]["trust_check"]["transit_point"], serde_json::json!("partner-a"));
+        let again: DelegationAuditEvent = serde_json::from_value(wire).expect("deserialize record");
+        match again.event {
+            DelegationAuditAction::TrustCheck { transit_point, leg, .. } => {
+                assert_eq!(transit_point.as_deref(), Some("partner-a"));
+                assert_eq!(leg, "target");
+            }
+            other => panic!("expected a trust check, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_trust_check_record_without_a_transit_point_omits_it_and_still_reads() {
+        let action = DelegationAuditAction::TrustCheck {
+            leg: "caller".to_string(),
+            authority_id: None,
+            entity_id: None,
+            ok: true,
+            error_code: None,
+            transit_point: None,
+        };
+        let wire = serde_json::to_value(&action).expect("serialize action");
+        assert_eq!(wire["trust_check"]["leg"], serde_json::json!("caller"));
+        assert!(
+            wire["trust_check"]
+                .get("transit_point")
+                .is_none(),
+            "{wire}"
+        );
+
+        match serde_json::from_value::<DelegationAuditAction>(wire).expect("deserialize action") {
+            DelegationAuditAction::TrustCheck { transit_point, ok, .. } => {
+                assert_eq!(transit_point, None);
+                assert!(ok);
+            }
+            other => panic!("expected a trust check, got {other:?}"),
+        }
     }
 
     #[test]

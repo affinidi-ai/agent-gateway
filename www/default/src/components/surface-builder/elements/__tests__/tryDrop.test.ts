@@ -14,6 +14,10 @@ import {
   EDGE_ARCHETYPES,
   makeSurfaceSlotFilter,
   findEdgeForHit,
+  getSlot,
+  resolvePayloadPath,
+  TRUST_CHECK_MANAGED_AGENT_SLOT_ID,
+  TRUST_CHECK_TRANSIT_POINT_SLOT_ID,
 } from '../edges/archetypes';
 import { synthesizeFabricCanvasNodes, SYNTH_HOP_PREFIX } from '../synthesizeFabric';
 import type { CanvasNode } from '../../SurfaceCanvas';
@@ -60,7 +64,7 @@ describe('archetypes catalogue', () => {
     );
     expect(orderOf('request:rate-limit')).toBeLessThan(orderOf('request:metadata-extraction'));
     expect(orderOf('request:policy')).toBeGreaterThan(
-      orderOf('request:trust-check-target_trust_check_list')
+      orderOf('request:trust-check-transit_points_trust_check_list')
     );
   });
 });
@@ -146,7 +150,7 @@ describe('tryDrop', () => {
     expect(r.ok ? '' : r.reason).toMatch(/transit-wide/i);
   });
 
-  it('routes target-leg Trust Check onto the A2A ma-tp slot', () => {
+  it('routes target-leg Trust Check onto the A2A ma-tp slot owned by the Transit Point', () => {
     const tpEdge = deriveEdges(baseNodes).find(e => e.archetype === 'ma-tp')!;
     const r = tryDrop(
       tpEdge,
@@ -155,7 +159,41 @@ describe('tryDrop', () => {
       undefined,
       makeSurfaceSlotFilter('https://upstream.example/api', true, baseNodes)
     );
-    expect(r).toEqual({ ok: true, slotId: 'request:trust-check-target_trust_check_list' });
+    expect(r).toEqual({ ok: true, slotId: 'request:trust-check-transit_points_trust_check_list' });
+    const slot = getSlot('ma-tp', TRUST_CHECK_TRANSIT_POINT_SLOT_ID)!;
+    expect(slot.ownedBy).toBe('target');
+    expect(slot.cardinality).toBe('one');
+    expect(slot.payloadPathTemplate).toBe('transit.points[{owner}].trust_check_list');
+    expect(resolvePayloadPath(slot, tpEdge)).toBe('transit.points[tp1].trust_check_list');
+  });
+
+  it('gives each Transit Point arrow its own Trust Check slot', () => {
+    const nodes: CanvasNode[] = [
+      node({ id: 'ap', type: 'access-point' }),
+      node({ id: 'ma', type: 'target', parentId: 'ap' }),
+      node({ id: 'tp1', type: 'transit-point-a2a' }),
+      node({ id: 'tp2', type: 'transit-point-ap2' }),
+      node({
+        id: 'trust-check-tp1',
+        type: 'trust-check',
+        parentId: 'tp1',
+        slotId: TRUST_CHECK_TRANSIT_POINT_SLOT_ID,
+      }),
+    ];
+    const filter = makeSurfaceSlotFilter('https://upstream.example/api', true, nodes);
+    const edges = deriveEdges(nodes).filter(e => e.archetype === 'ma-tp');
+    const tp1Edge = edges.find(e => e.endpoints.target === 'tp1')!;
+    const tp2Edge = edges.find(e => e.endpoints.target === 'tp2')!;
+    expect(tp1Edge.slots.get(TRUST_CHECK_TRANSIT_POINT_SLOT_ID)).toEqual(['trust-check-tp1']);
+    expect(tp2Edge.slots.get(TRUST_CHECK_TRANSIT_POINT_SLOT_ID)).toBeUndefined();
+    const onTp1 = tryDrop(tp1Edge, 'trust-check', 'request', undefined, filter);
+    expect(onTp1).toEqual({
+      ok: false,
+      reason: 'Trust check (this Transit Point) already in use; remove it first.',
+      conflictingNodeId: 'trust-check-tp1',
+    });
+    const onTp2 = tryDrop(tp2Edge, 'trust-check', 'request', undefined, filter);
+    expect(onTp2).toEqual({ ok: true, slotId: TRUST_CHECK_TRANSIT_POINT_SLOT_ID });
   });
 
   it('rejects target-leg Trust Check on an MCP Transit Point (no MCP target-leg impl)', () => {
@@ -220,9 +258,46 @@ describe('makeSurfaceSlotFilter (topology-aware slot visibility)', () => {
     expect(filter).toBeUndefined();
   });
 
-  it('returns undefined when the surface already has a TP (outbound pipeline exists)', () => {
-    const filter = makeSurfaceSlotFilter('https://upstream.example/api', true);
+  it('returns undefined when the surface already has a TP and a gateway target', () => {
+    const filter = makeSurfaceSlotFilter('fabric://gw1/svc', true);
     expect(filter).toBeUndefined();
+  });
+
+  it.each([
+    ['a2a-proxy://proxy-1', true],
+    ['fabric://gw1/svc', true],
+    ['https://upstream.example/api', false],
+    ['http://upstream.example/api', false],
+    ['', false],
+  ])('offers the Managed Agent target-leg Trust Check for %s: %s', (endpoint, offered) => {
+    const nodes = apMaTarget(endpoint);
+    const filter = makeSurfaceSlotFilter(endpoint, true, nodes);
+    const maExt = deriveEdges(nodes).find(e => e.archetype === 'ma-external')!;
+    const result = tryDrop(maExt, 'trust-check', 'request', undefined, filter);
+    expect(result).toEqual(
+      offered
+        ? { ok: true, slotId: TRUST_CHECK_MANAGED_AGENT_SLOT_ID }
+        : { ok: false, reason: 'No slot on this edge accepts a trust-check.' }
+    );
+  });
+
+  it('binds the Managed Agent target-leg Trust Check to the ma-external arrow, not to Transit Points', () => {
+    const nodes: CanvasNode[] = [
+      ...apMaTarget('a2a-proxy://proxy-1'),
+      node({ id: 'tp1', type: 'transit-point-a2a' }),
+      node({
+        id: 'trust-check-target',
+        type: 'trust-check',
+        parentId: 'target',
+        slotId: TRUST_CHECK_MANAGED_AGENT_SLOT_ID,
+      }),
+    ];
+    const edges = deriveEdges(nodes);
+    const maExt = edges.find(e => e.archetype === 'ma-external')!;
+    const maTp = edges.find(e => e.archetype === 'ma-tp')!;
+    expect(maExt.slots.get(TRUST_CHECK_MANAGED_AGENT_SLOT_ID)).toEqual(['trust-check-target']);
+    expect(maTp.slots.get(TRUST_CHECK_TRANSIT_POINT_SLOT_ID)).toBeUndefined();
+    expect(maTp.slots.get(TRUST_CHECK_MANAGED_AGENT_SLOT_ID)).toBeUndefined();
   });
 
   it('hides the external identity slot on plain-URL inbound surfaces with no TP', () => {

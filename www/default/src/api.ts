@@ -578,14 +578,14 @@ class APIClient {
   async createSurfaceTemplate(tpl: Partial<SurfaceTemplate>): Promise<SurfaceTemplate> {
     return this.request<SurfaceTemplate>('/surface-templates', {
       method: 'POST',
-      body: JSON.stringify(tpl),
+      body: JSON.stringify(templateWithTrustCheckSplit(tpl)),
     });
   }
 
   async updateSurfaceTemplate(id: string, tpl: Partial<SurfaceTemplate>): Promise<SurfaceTemplate> {
     return this.request<SurfaceTemplate>(`/surface-templates/${encodeURIComponent(id)}`, {
       method: 'PUT',
-      body: JSON.stringify(tpl),
+      body: JSON.stringify(templateWithTrustCheckSplit(tpl)),
     });
   }
 
@@ -1364,8 +1364,26 @@ export interface TransitPoint {
 // the single chokepoint that bridges the two shapes so the UI never leaks
 // backend-specific names and the backend can evolve without churning the UI.
 
+/**
+ * Marks a surface write as using per-Transit-Point Trust Check lists. The
+ * gateway migrates a write without it that carries `target.trust_check_list`
+ * as the old surface-wide shape.
+ */
+export function withTrustCheckSplit<T>(surface: T): T {
+  if (!surface || typeof surface !== 'object' || Array.isArray(surface)) return surface;
+  return { ...surface, trust_check_split: true };
+}
+
+/** A Surface Template write with `trust_check_split` set inside its surface. */
+export function templateWithTrustCheckSplit<T>(template: T): T {
+  if (!template || typeof template !== 'object' || Array.isArray(template)) return template;
+  const surface = (template as { surface?: unknown }).surface;
+  if (!surface || typeof surface !== 'object' || Array.isArray(surface)) return template;
+  return { ...template, surface: withTrustCheckSplit(surface) };
+}
+
 function toBackendSurface(surface: Partial<AgentSurface>): any {
-  if (!surface || !surface.target) return surface;
+  if (!surface || !surface.target) return withTrustCheckSplit(surface);
   const target: any = { ...surface.target };
   const ai: any = (target as any).agent_identity;
   // Preserve any operator-set inject_vp toggle (Managed Agent panel); default
@@ -1384,7 +1402,7 @@ function toBackendSurface(surface: Partial<AgentSurface>): any {
   } else if (existingII && typeof existingII === 'object') {
     target.identity_injection = { inject_vp: injectVp };
   }
-  return { ...surface, target };
+  return withTrustCheckSplit({ ...surface, target });
 }
 
 function fromBackendSurface(surface: AgentSurface): AgentSurface {

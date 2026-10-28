@@ -136,6 +136,35 @@ body.dark-theme .canvas-grid-dot {
   pointer-events: none;
 }
 
+/* Surface-level review notices, under the canvas top bar. */
+.surface-canvas-notices {
+  position: absolute;
+  top: 48px;
+  left: 10px;
+  z-index: 10;
+  max-width: min(360px, calc(100% - 20px));
+  pointer-events: none;
+}
+
+.surface-canvas-notices > * {
+  pointer-events: auto;
+}
+
+.surface-canvas-notices .surface-info-panel {
+  margin: 0;
+}
+
+/* Warning badge on a Trust Check node whose list was migrated. */
+.node-migrated-badge circle {
+  fill: var(--warning);
+  stroke: #ffffff;
+  stroke-width: 1.5;
+}
+
+.node-migrated-badge text {
+  fill: #ffffff;
+}
+
 .surface-canvas-topbar .surface-variants-widget,
 .surface-canvas-topbar .surface-variants-widget-wrapper,
 .surface-canvas-topbar .surface-toolbar-widget,

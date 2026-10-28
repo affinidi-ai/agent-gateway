@@ -457,6 +457,9 @@ fn collect_effective_surface_references(
 
     if let Some(transit) = surface.transit.as_ref() {
         for point in &transit.points {
+            for trust_check in &point.trust_check_list {
+                push_reference(references, ResourceKind::TrustRegistries, &trust_check.trust_registry_id);
+            }
             collect_target_auth_reference(point.target_auth.as_ref(), references);
             collect_identity_injection_references(&point.identity_injection, references);
             if let Some(identity) = point
@@ -698,7 +701,7 @@ fn internal(
 mod tests {
     use super::*;
     use crate::config::agent_surface_variants::{
-        AccessPointOverrides, SurfaceOverrides, SurfaceVariant, TargetOverrides,
+        AccessPointOverrides, SurfaceOverrides, SurfaceVariant, TargetOverrides, TransitOverrides,
     };
     use crate::config::types::{TrustRecorderConfig, TrustRecorderEntry};
     use crate::trust_registry_verification::TrustCheckElement;
@@ -718,6 +721,20 @@ mod tests {
             }
         }))
         .unwrap()
+    }
+
+    fn transit_point(
+        alias: &str,
+        trust_registry_id: &str,
+    ) -> crate::config::agent_surface::TransitPoint {
+        let mut point: crate::config::agent_surface::TransitPoint = serde_json::from_value(serde_json::json!({
+            "alias": alias,
+            "target_endpoint": "https://partner.example/a2a",
+            "protocol": "a2a"
+        }))
+        .unwrap();
+        point.trust_check_list = vec![trust_check(&format!("{alias}-check"), trust_registry_id)];
+        point
     }
 
     #[test]
@@ -772,9 +789,18 @@ mod tests {
                     trust_check_list: Some(vec![trust_check("variant-target", "tr-variant-target")]),
                     ..Default::default()
                 }),
+                transit: Some(TransitOverrides {
+                    points: Some(vec![transit_point("variant-tp", "tr-variant-tp")]),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
         }];
+        surface.transit = Some(crate::config::agent_surface::TransitConfig {
+            points: vec![transit_point("base-tp", "tr-base-tp")],
+            outbound_listen_address: None,
+            shared: Default::default(),
+        });
 
         let references = collect_surface_reference_keys(&surface).unwrap();
         let trust_registries: HashSet<_> = references
@@ -792,6 +818,8 @@ mod tests {
                 "tr-variant-caller",
                 "tr-variant-target",
                 "tr-variant-recorder",
+                "tr-base-tp",
+                "tr-variant-tp",
             ])
         );
     }

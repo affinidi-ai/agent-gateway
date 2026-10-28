@@ -283,6 +283,23 @@ impl SurfaceWorld {
             .unwrap_or(false)
     }
 
+    pub(crate) fn transit_point_collaborator_key(
+        &self,
+        alias: &str,
+    ) -> &str {
+        let destination = self
+            .actors
+            .transit_point(alias)
+            .and_then(|transit_point| {
+                transit_point
+                    .target_binding
+                    .as_deref()
+            })
+            .unwrap_or_else(|| panic!("Transit Point '{alias}' has no destination"));
+        self.actors
+            .target_collaborator_key(destination)
+    }
+
     pub(crate) fn mock_for_target(
         &self,
         actor_name: &str,
@@ -300,7 +317,12 @@ impl SurfaceWorld {
                 .replacement_mock
                 .as_ref()
                 .expect("replacement mock must exist before configuring a secondary target"),
-            other => panic!("no mock server registered for collaborator key '{}' (actor '{}')", other, actor_name),
+            other => infra
+                .transit_point_mocks
+                .get(other)
+                .unwrap_or_else(|| {
+                    panic!("no mock server registered for collaborator key '{}' (actor '{}')", other, actor_name)
+                }),
         }
     }
 
@@ -309,6 +331,16 @@ impl SurfaceWorld {
         observations: TargetObservations,
     ) {
         self.collaborator_mut(PRIMARY_COLLABORATOR_KEY)
+            .target
+            .observations = Some(observations);
+    }
+
+    pub(crate) fn record_observations(
+        &mut self,
+        key: &str,
+        observations: TargetObservations,
+    ) {
+        self.collaborator_mut(key)
             .target
             .observations = Some(observations);
     }
@@ -336,7 +368,7 @@ impl SurfaceWorld {
         }
     }
 
-    fn register_collaborator(
+    pub(crate) fn register_collaborator(
         &mut self,
         key: &str,
         name: &str,
@@ -452,6 +484,8 @@ pub struct ScenarioInfra {
     pub gateway: GatewayProcess,
     pub mock: MockServer,
     pub replacement_mock: Option<MockServer>,
+    /// Destinations of the second and later Transit Points, by collaborator key.
+    pub transit_point_mocks: HashMap<String, MockServer>,
     pub affinidi_well: Option<MockServer>,
     pub _jwks_server: Option<JwksServer>,
     pub gateway_port: u16,
