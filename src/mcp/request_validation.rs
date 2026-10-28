@@ -335,13 +335,22 @@ pub(crate) fn request_id_from_bytes(body: &[u8]) -> Option<JsonValue> {
         })
 }
 
-/// Reads a request body of at most `limit` bytes for its JSON-RPC `id`; `None`
-/// when the body is oversized, can't be read or carries no id.
+/// How much of a refused request's body is read for its JSON-RPC `id`. The
+/// read runs at routing, before source auth and rate limiting, so the bytes a
+/// caller can make the gateway buffer for a request it has already refused are
+/// bounded here, independently of the endpoint's `max_request_bytes`. The `id`
+/// of any real envelope sits well inside 16 KiB; a larger body is answered
+/// without one, as a body that can't be read is.
+pub const ROUTING_REFUSAL_ID_READ_LIMIT: usize = 16 * 1024;
+
+/// Reads a refused request's body, within `limit` and
+/// [`ROUTING_REFUSAL_ID_READ_LIMIT`], for its JSON-RPC `id`; `None` when the
+/// body is larger, can't be read or carries no id.
 pub(crate) async fn read_request_id(
     body: axum::body::Body,
     limit: usize,
 ) -> Option<JsonValue> {
-    let body = axum::body::to_bytes(body, limit)
+    let body = axum::body::to_bytes(body, limit.min(ROUTING_REFUSAL_ID_READ_LIMIT))
         .await
         .ok()?;
     request_id_from_bytes(&body)
