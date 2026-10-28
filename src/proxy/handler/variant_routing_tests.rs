@@ -566,6 +566,17 @@ async fn an_oversized_modern_mcp_body_is_refused_for_its_variant_without_an_id()
 }
 
 #[tokio::test]
+async fn a_modern_mcp_body_over_sixteen_kib_is_refused_for_its_variant_without_an_id() {
+    let body = json!({"jsonrpc": "2.0", "id": "variant", "method": "tools/list",
+        "params": {"padding": "x".repeat(20 * 1024)}})
+    .to_string();
+
+    let answer = send_mcp_request(mcp_surface(Some("v-prod")), "POST", "/mcp$missing", true, body).await;
+
+    assert_json_rpc_refusal("20 KiB under the default limit", answer, RejectionReason::UnknownVariant, 404, None);
+}
+
+#[tokio::test]
 async fn a_modern_mcp_get_variant_refusal_answers_without_an_id() {
     for (case, surface, path, reason, status) in mcp_refusal_cases() {
         let answer = send_mcp_request(surface, "GET", path, true, String::new()).await;

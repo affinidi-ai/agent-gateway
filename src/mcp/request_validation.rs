@@ -1890,6 +1890,27 @@ mod tests {
         assert_eq!(id(b"not json"), None);
     }
 
+    #[tokio::test]
+    async fn a_refused_requests_id_is_read_within_sixteen_kib_and_any_smaller_endpoint_limit() {
+        let body = |bytes: usize| {
+            let mut envelope = json!({"jsonrpc": "2.0", "id": "variant", "method": "tools/list", "params": {}});
+            let padding = bytes
+                - envelope
+                    .to_string()
+                    .len()
+                - r#""padding":"""#.len();
+            envelope["params"]["padding"] = json!("x".repeat(padding));
+            let body = envelope.to_string();
+            assert_eq!(body.len(), bytes);
+            axum::body::Body::from(body)
+        };
+        let one_mib = 1024 * 1024;
+
+        assert_eq!(read_request_id(body(20 * 1024), one_mib).await, None, "over the cap");
+        assert_eq!(read_request_id(body(16 * 1024), one_mib).await, Some(json!("variant")), "at the cap");
+        assert_eq!(read_request_id(body(1024), 64).await, None, "a smaller endpoint limit wins");
+    }
+
     #[test]
     fn a_routing_refusal_answers_internal_error_with_its_status_and_the_request_id() {
         use crate::config::agent_surface_variants::VariantResolveError;

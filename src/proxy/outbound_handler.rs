@@ -8149,19 +8149,20 @@ mod tests {
         .await;
         let versions = crate::mcp::request_validation::MODERN_CAPABLE_POLICY;
         let code = i64::from(crate::mcp::error_codes::INTERNAL_ERROR);
-        for (case, modern, malformed, status, reason, requested_variant) in [
-            ("empty-catalog", true, false, 404, RejectionReason::UnknownVariant, Some("unknown")),
-            ("unknown", true, false, 404, RejectionReason::UnknownVariant, Some("unknown")),
-            ("unknown", true, true, 404, RejectionReason::UnknownVariant, Some("unknown")),
-            ("unknown", false, false, 404, RejectionReason::UnknownVariant, Some("unknown")),
-            ("disabled", true, false, 404, RejectionReason::VariantDisabled, None),
-            ("disabled", false, false, 404, RejectionReason::VariantDisabled, None),
-            ("missing-default", true, false, 500, RejectionReason::MisconfiguredDefault, None),
-            ("missing-default", false, false, 500, RejectionReason::MisconfiguredDefault, None),
-            ("empty-catalog-missing-default", false, false, 500, RejectionReason::MisconfiguredDefault, None),
-            ("disabled-default", true, false, 404, RejectionReason::VariantDisabled, None),
+        for (case, modern, sent, status, reason, requested_variant) in [
+            ("empty-catalog", true, "envelope", 404, RejectionReason::UnknownVariant, Some("unknown")),
+            ("unknown", true, "envelope", 404, RejectionReason::UnknownVariant, Some("unknown")),
+            ("unknown", true, "malformed", 404, RejectionReason::UnknownVariant, Some("unknown")),
+            ("unknown", true, "20 KiB", 404, RejectionReason::UnknownVariant, Some("unknown")),
+            ("unknown", false, "envelope", 404, RejectionReason::UnknownVariant, Some("unknown")),
+            ("disabled", true, "envelope", 404, RejectionReason::VariantDisabled, None),
+            ("disabled", false, "envelope", 404, RejectionReason::VariantDisabled, None),
+            ("missing-default", true, "envelope", 500, RejectionReason::MisconfiguredDefault, None),
+            ("missing-default", false, "envelope", 500, RejectionReason::MisconfiguredDefault, None),
+            ("empty-catalog-missing-default", false, "envelope", 500, RejectionReason::MisconfiguredDefault, None),
+            ("disabled-default", true, "envelope", 404, RejectionReason::VariantDisabled, None),
         ] {
-            let label = format!("{case} modern={modern} malformed={malformed}");
+            let label = format!("{case} modern={modern} body={sent}");
             let mut surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
                 "surface_id": "variant-surface", "name": "Variant surface",
                 "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "a2a"},
@@ -8206,7 +8207,10 @@ mod tests {
                     "io.modelcontextprotocol/clientCapabilities": {}
                 }});
             }
-            let body = if malformed {
+            if sent == "20 KiB" {
+                body["params"]["padding"] = json!("x".repeat(20 * 1024));
+            }
+            let body = if sent == "malformed" {
                 "not json".to_string()
             } else {
                 body.to_string()
@@ -8241,7 +8245,7 @@ mod tests {
             if modern {
                 assert_eq!(content_type, "application/json", "{label}");
                 assert_eq!(answer["jsonrpc"], "2.0", "{label}: {answer}");
-                let id = (!malformed).then_some("variant");
+                let id = (sent == "envelope").then_some("variant");
                 assert_eq!(
                     answer
                         .get("id")
