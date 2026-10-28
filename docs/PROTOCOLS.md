@@ -772,7 +772,8 @@ Harness section of [`MCP_METADATA.md`](MCP_METADATA.md).
 | Condition | HTTP / JSON-RPC result |
 | --- | --- |
 | Valid modern request whose upstream answers with a legacy (non-modern) result | HTTP `502` |
-| Modern request whose upstream answers with an error whose id is `null` or another request's, as a session-only upstream does | HTTP `400` (SSE: the upstream's status), `-32022`, listing only the session revisions |
+| Modern request whose upstream answers HTTP `400` with `-32000` or `-32600` and an id that is `null` or another request's, as a session-only upstream does | HTTP `400`, `-32022`, listing only the session revisions |
+| Modern request whose upstream answers with any other error whose id is `null` or another request's | HTTP `502` |
 | Request using an unmodelled revision such as `2099-01-01` | HTTP `400`, `-32022`, listing the revisions the endpoint supports |
 | Malformed modern metadata | HTTP `400`, `-32602` |
 | Missing, malformed, or mismatched mirrored headers | HTTP `400`, `-32020` |

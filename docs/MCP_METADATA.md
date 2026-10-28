@@ -90,14 +90,16 @@ legacy-only upstream's answer fails that check, so the modern caller gets HTTP
 `502`, while `2024-11-05` callers on the same endpoint are unaffected.
 
 An upstream that serves only session revisions refuses a request without
-`Mcp-Session-Id` before reading its id, so its error carries `"id": null` or a
-placeholder such as `"server-error"`. When an upstream error's id is `null` or
-does not match the request's, the gateway answers `-32022` with the request's
-id, listing only the session revisions in `data.supported`, and logs the
-upstream's error code and message at `WARN`. A JSON answer gets HTTP `400`; an
-SSE answer keeps the status the upstream already sent, and only its message is
-replaced. An error with the request's id, or with no id, passes through
-unchanged, and a result with another id is still a `502`.
+`Mcp-Session-Id` before reading its id, with HTTP `400` and `-32000`,
+`"id": null` (TypeScript SDK) or `-32600` with a placeholder such as
+`"server-error"` (Python SDK). When a JSON answer has HTTP `400`, code `-32000`
+or `-32600`, and an id that is `null` or does not match the request's, the
+gateway answers HTTP `400` and `-32022` with the request's id, listing only the
+session revisions in `data.supported`, and logs the upstream's error code and
+message at `WARN`. Any other error whose id is `null` or another request's,
+such as a parse error, a crashed handler or a rate limit, is a `502`, as is a
+result with another id. SSE answers are never rewritten. An error with the
+request's id, or with no id, passes through unchanged.
 
 **Compatibility note.** `mcp_protocol_mode` is no longer a setting. Stored
 records and API payloads for surfaces, Transit Points and MCP Proxies that
