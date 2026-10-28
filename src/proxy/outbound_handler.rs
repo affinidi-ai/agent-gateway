@@ -371,6 +371,9 @@ pub struct OutboundPipelineContext {
     /// `None` when the request targets the default variant.
     pub active_variant_alias: Option<String>,
     pub active_variant_id: Option<String>,
+    /// A modern MCP POST refused at routing, already recorded. It is answered
+    /// before any other step, once the body has been read for its `id`.
+    pub pending_variant_refusal: Option<crate::audit::request_events::RoutingRefusal>,
     /// Resolved [`AgentSurface`] for this outbound request, symmetric
     /// to inbound `ProxyState::surface`. Built once per request via
     /// `from_channel_mapping → resolve_variant(alias)` so downstream
@@ -462,32 +465,43 @@ impl OutboundPipelineContext {
         };
 
         // The URL's alias, else the default variant, else the base surface
-        // serves the request. A variant that can't be resolved is refused.
-        let refuse = |error: crate::config::agent_surface_variants::VariantResolveError| {
+        // serves the request. A variant that can't be resolved is refused. A
+        // modern MCP POST is answered later, once its body is read for the
+        // `id`, on the unresolved surface; every other request now.
+        let refuse = |error: &crate::config::agent_surface_variants::VariantResolveError, rpc_error_code| {
             tracing::warn!(surface = %surface_for_resolve.name, error = %error, "Surface variant cannot be resolved");
-            OutboundPipelineError::VariantRefused(crate::audit::request_events::refuse_routing(
+            crate::audit::request_events::refuse_routing(
                 &crate::audit::request_events::RequestFacts {
                     surface_id: &surface_for_resolve.surface_id,
                     channel_name: &surface_for_resolve.name,
                     trace_id: None,
                     via_fabric: false,
                 },
-                &error,
-                None,
-            ))
+                error,
+                rpc_error_code,
+            )
         };
-        let active_variant_id = surface_for_resolve
+        let modern_post = matched_virtual_channel.protocol == crate::config::agent_surface::TransitProtocol::Mcp
+            && crate::mcp::request_validation::has_modern_header(&original_headers)
+            && original_method == Method::POST;
+        let resolved = surface_for_resolve
             .select_variant(active_variant_alias.as_deref())
-            .map_err(refuse)?
-            .map(|variant| variant.id.clone());
-        crate::observability::policy_audit::set_request_variant(
-            surface_for_resolve.surface_variant(active_variant_id.as_deref()),
-        );
-        let surface = Arc::new(
-            surface_for_resolve
-                .resolve_variant(active_variant_alias.as_deref())
-                .map_err(refuse)?,
-        );
+            .map(|variant| variant.map(|variant| variant.id.clone()))
+            .and_then(|variant_id| {
+                crate::observability::policy_audit::set_request_variant(
+                    surface_for_resolve.surface_variant(variant_id.as_deref()),
+                );
+                Ok((variant_id, surface_for_resolve.resolve_variant(active_variant_alias.as_deref())?))
+            });
+        let (active_variant_id, surface, pending_variant_refusal) = match resolved {
+            Ok((variant_id, surface)) => (variant_id, Arc::new(surface), None),
+            Err(error) if modern_post => (
+                None,
+                Arc::clone(&surface_for_resolve),
+                Some(refuse(&error, Some(i64::from(crate::mcp::error_codes::INTERNAL_ERROR)))),
+            ),
+            Err(error) => return Err(OutboundPipelineError::VariantRefused(refuse(&error, None))),
+        };
 
         let virtual_channel = surface
             .transit_points()
@@ -577,10 +591,38 @@ impl OutboundPipelineContext {
             response_bytes: None,
             active_variant_alias,
             active_variant_id,
+            pending_variant_refusal,
             surface,
             identity_rules_engine,
             identity_selector,
         })
+    }
+
+    /// Answers a modern MCP POST refused at routing with the JSON-RPC error,
+    /// reading the body within the Transit Point's MCP body limit only to echo
+    /// its `id`. A body that can't be read is answered without one.
+    async fn answer_variant_refusal(
+        &mut self,
+        state: &OutboundProxyState,
+        versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
+        refusal: &crate::audit::request_events::RoutingRefusal,
+    ) -> Response {
+        let policy = crate::mcp::modern_http::EndpointHttpPolicy::with_versions(
+            self.virtual_channel
+                .mcp_http
+                .as_ref(),
+            &state
+                .network_config
+                .get_outbound_external_urls(),
+            versions,
+        );
+        let id = match (self.request.take(), policy) {
+            (Some(request), Ok(policy)) => {
+                crate::mcp::request_validation::read_request_id(request.into_body(), policy.body_limit()).await
+            }
+            _ => None,
+        };
+        (*crate::mcp::request_validation::McpRequestValidationError::for_routing_refusal(refusal, id)).into_response()
     }
 }
 
@@ -714,6 +756,14 @@ async fn outbound_proxy_handler_in_request_scope(
     let mut subscription_access =
         crate::mcp::subscriptions::SubscriptionLifetime::new(std::time::Duration::from_secs(86_400), None);
     let mut ctx = OutboundPipelineContext::new(addr, req, &state)?;
+    if let Some(refusal) = ctx
+        .pending_variant_refusal
+        .take()
+    {
+        return Ok(ctx
+            .answer_variant_refusal(&state, versions, &refusal)
+            .await);
+    }
 
     step_source_auth(&state, &mut ctx).await?;
 
@@ -5661,6 +5711,7 @@ mod tests {
             response_bytes: None,
             active_variant_alias: None,
             active_variant_id: None,
+            pending_variant_refusal: None,
             surface,
             identity_rules_engine: None,
             identity_selector: None,
