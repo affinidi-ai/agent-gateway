@@ -224,7 +224,7 @@ async fn every_stored_surface_admits_modern_and_legacy_mcp() {
             .unwrap();
         assert_eq!(forwarded(), 2, "{mode:?}: 2024-11-05 must reach the Target");
 
-        let refused = send("2025-11-25")
+        let refused = send("2099-01-01")
             .await
             .unwrap();
         assert_eq!(refused.status(), 400, "{mode:?}");
@@ -232,9 +232,14 @@ async fn every_stored_surface_admits_modern_and_legacy_mcp() {
         assert_eq!(refused["error"]["code"], crate::mcp::error_codes::UNSUPPORTED_PROTOCOL_VERSION, "{mode:?}");
         assert_eq!(
             refused["error"]["data"]["supported"],
-            serde_json::json!([crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION])
+            serde_json::json!(
+                crate::mcp::request_validation::runtime_policy_for(
+                    crate::mcp::request_validation::McpPathKind::DirectAccessPoint
+                )
+                .supported_versions()
+            )
         );
-        assert_eq!(forwarded(), 2, "{mode:?}: 2025-11-25 must not reach the Target");
+        assert_eq!(forwarded(), 2, "{mode:?}: 2099-01-01 must not reach the Target");
     }
 }
 

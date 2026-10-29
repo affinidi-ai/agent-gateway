@@ -141,7 +141,7 @@ mod tests {
     use super::request_validation::{
         LEGACY_ONLY_POLICY, LegacySessionEvidence, McpRequestClassification, validate_mcp_post,
     };
-    use super::{MCP_LEGACY_VERSION, MCP_MODERN_VERSION, build_mcp_context, build_validated_mcp_context};
+    use super::{MCP_MODERN_VERSION, build_mcp_context, build_validated_mcp_context};
     use axum::http::HeaderMap;
     use serde_json::json;
 
@@ -182,7 +182,10 @@ mod tests {
             validate_mcp_post(&headers, &bytes, LegacySessionEvidence::Absent, LEGACY_ONLY_POLICY).unwrap_err();
         assert_eq!(rejection.status, axum::http::StatusCode::BAD_REQUEST);
         assert_eq!(rejection.code, -32022);
-        assert_eq!(rejection.data, Some(json!({"requested": MCP_MODERN_VERSION, "supported": [MCP_LEGACY_VERSION]})));
+        assert_eq!(
+            rejection.data,
+            Some(json!({"requested": MCP_MODERN_VERSION, "supported": super::request_validation::SESSION_VERSIONS}))
+        );
         validate_mcp_post(
             &headers,
             &bytes,

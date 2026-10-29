@@ -27,8 +27,11 @@ Validate every MCP POST on direct Access Point, MCP Transit Point, standalone MC
 Proxy and Fabric receive paths, including empty bodies. Wire validation runs before generic method-prefix
 protocol classification, so modern `tasks/*` requests receive MCP errors instead
 of being classified as A2A. The generic family guard still applies to
-legacy/no-signal traffic. A single `MCP-Protocol-Version: 2024-11-05` header
-alone stays legacy; modern body metadata or mirrored method/name headers still
+legacy/no-signal traffic. A single `MCP-Protocol-Version` header naming a
+session revision (`2024-11-05`, `2025-03-26`, `2025-06-18` or `2025-11-25`)
+stays legacy when modern body metadata is absent, even with mirrored
+`Mcp-Method` or `Mcp-Name` headers; those headers are still validated. Without
+a session-revision header, modern body metadata or mirrored method/name headers
 select validation, and duplicate version headers are rejected. Decode `Mcp-Name`
 only when both Base64 sentinel markers are present, using checked extraction so
 overlapping markers return `HeaderMismatch` rather than panicking.
@@ -47,9 +50,10 @@ method returns `400`.
 Validate every supplied `Mcp-Name` before version rejection, including methods
 without a mirrored name source. Well-formed extra headers are tolerated;
 malformed values return HTTP `400` / `HeaderMismatch` (`-32020`). Modern
-per-request metadata declaring the legacy `2024-11-05` version returns HTTP `400`
-/ `Invalid params` (`-32602`) with a mixed-era diagnostic, not an
-unsupported-version response listing that same version as supported. Actual
+per-request metadata declaring any session revision, such as `2024-11-05` or
+`2025-06-18`, returns HTTP `400` / `Invalid params` (`-32602`) with a mixed-era
+diagnostic, not an unsupported-version response listing that same version as
+supported. Actual
 header/body version mismatches still return `HeaderMismatch`.
 
 ## Firewall

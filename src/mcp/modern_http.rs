@@ -833,12 +833,14 @@ mod tests {
         };
 
         assert_eq!(
-            policy.cap_legacy_initialize(initialize("2025-11-25"), &opening, "config", None),
+            policy.cap_legacy_initialize(initialize("2099-01-01"), &opening, "config", None),
             initialize(super::super::MCP_LEGACY_VERSION)
         );
 
-        let served = initialize(super::super::MCP_LEGACY_VERSION);
-        assert_eq!(policy.cap_legacy_initialize(served.clone(), &opening, "config", None), served);
+        for version in super::super::request_validation::SESSION_VERSIONS {
+            let served = initialize(version);
+            assert_eq!(policy.cap_legacy_initialize(served.clone(), &opening, "config", None), served);
+        }
 
         let session = McpRequestClassification::Legacy(LegacyRequestKind::Session);
         let tools_list = bytes::Bytes::from_static(br#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#);
@@ -1190,7 +1192,7 @@ mod tests {
         assert_eq!(
             error.data,
             Some(
-                serde_json::json!({"requested": super::super::MCP_MODERN_VERSION, "supported": [super::super::MCP_LEGACY_VERSION]})
+                serde_json::json!({"requested": super::super::MCP_MODERN_VERSION, "supported": super::super::request_validation::SESSION_VERSIONS})
             )
         );
     }

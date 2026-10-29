@@ -149,7 +149,9 @@ discovery challenge).
 See [`docs/POLICY.md`](docs/POLICY.md#failed-caller-authentication).
 
 **MCP revisions are admitted per transport path.** Every MCP endpoint admits `2026-07-28`
-alongside `2024-11-05`. Resolve versions through `runtime_policy_for` /
+alongside the session revisions listed in [`docs/MCP_METADATA.md`](docs/MCP_METADATA.md#modern-mcp-admission).
+Session revisions are forwarded to the upstream, except that gateway-owned MCP Proxies answer
+`initialize` themselves with `2024-11-05`. Resolve versions through `runtime_policy_for` /
 `admission_policy_for_target` ([`src/mcp/request_validation.rs`](src/mcp/request_validation.rs)),
 never an appliance-wide constant. See [`docs/MCP_METADATA.md`](docs/MCP_METADATA.md).
 

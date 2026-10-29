@@ -586,7 +586,7 @@ mod tests {
         assert_eq!(
             error.data,
             Some(
-                serde_json::json!({"requested": crate::mcp::MCP_MODERN_VERSION, "supported": [crate::mcp::MCP_LEGACY_VERSION]})
+                serde_json::json!({"requested": crate::mcp::MCP_MODERN_VERSION, "supported": crate::mcp::request_validation::SESSION_VERSIONS})
             )
         );
 

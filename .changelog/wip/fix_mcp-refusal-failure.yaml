@@ -1,0 +1,55 @@
+branch: fix/mcp-refusal-failure
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-10-27T00:00:00Z'
+      title: ⭐ Accept MCP clients that send a 2025 MCP-Protocol-Version header
+      description: >-
+        MCP endpoints now accept the session revisions 2025-03-26, 2025-06-18 and 2025-11-25 as well
+        as 2024-11-05, so clients such as claude.ai that send a newer MCP-Protocol-Version header can
+        connect instead of receiving 400 / -32022. These requests are forwarded as legacy session
+        traffic with the header unchanged, and an initialize asking for one of these revisions reaches
+        the upstream unchanged so the upstream negotiates it. A request carrying a session revision header,
+        and an initialize with no MCP-Protocol-Version header, are also accepted when they send
+        Mcp-Method or Mcp-Name, as claude.ai does when it opens a session after a 2026-07-28 request
+        fails. Those headers are still checked: Mcp-Method must name the request's method, and Mcp-Name
+        must match params.name for tools/call and prompts/get or params.uri for resources/read, or the
+        request is refused with 400. Unsupported-version errors and
+        server/discover now list the 2025 revisions, except that server/discover on a gateway-owned MCP
+        Proxy lists at most 2024-11-05 and 2026-07-28, because it answers initialize with 2024-11-05.
+        Any other revision is still refused with -32022.
+    - timestamp: '2026-10-28T00:00:00Z'
+      title: Return one Mcp-Session-Id when an MCP initialize response is wrapped as SSE
+      description: >-
+        When a client accepts SSE and the upstream answers initialize with JSON, the gateway used to
+        add its own Mcp-Session-Id next to the upstream's, so clients such as claude.ai sent both back
+        and the upstream refused later requests with 404. The gateway now reuses the upstream's id and
+        adds its own only when the upstream sent none. For SSE clients whose upstream answers initialize
+        with JSON, client capabilities are recorded per surface and session, so credential-delegation
+        consent requests work for these sessions.
+    - timestamp: '2026-10-28T00:00:00Z'
+      title: Answer -32022 instead of 502 when a session-only MCP upstream refuses
+      description: >-
+        A 2026-07-28 request to an upstream that serves only session revisions used to get HTTP 502,
+        because the upstream's "missing session" error carries "id": null or a placeholder id. When the
+        upstream answers HTTP 400 with JSON-RPC code -32000 or -32600, the gateway now answers -32022
+        with the request's id and only the session revisions in data.supported, so clients such as
+        claude.ai fall back to a session, and logs the upstream's error at WARN. Other errors without
+        the request's id, such as parse errors, internal errors, rate limits and outages, still get
+        HTTP 502. Discovery also learns the supported versions from a -32022 error, so later -32022
+        errors from that upstream stop offering 2026-07-28.
+  removed: []
+  security:
+    - timestamp: '2026-10-28T00:00:00Z'
+      title: Keep MCP consent prompts on the surface whose session asked for them
+      description: >-
+        The MCP notification streams that carry credential-delegation consent prompts, and the pending
+        prompts themselves, are now keyed by surface as well as Mcp-Session-Id. Session ids can now come
+        from the upstream, so a client on another surface presenting the same id could otherwise receive
+        another user's authorization URL or cancel their pending prompt. Sessions are not bound to the
+        caller, so within one surface protection now rests on the upstream's session id generator
+        rather than an id the gateway minted. When an upstream returns a session id already in use on
+        the surface to a new initialize, consent prompts are turned off for that id, even after DELETE
+        and until the gateway restarts, and the binding's elicit_fallback applies.
+  breaking: []

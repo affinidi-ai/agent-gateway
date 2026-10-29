@@ -193,6 +193,255 @@ async fn modern_mcp_follows_the_direct_access_point_policy() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn session_revisions_reach_the_target_unchanged() {
+    let harness = GatewayHarness::start(|_, config, _| {
+        let mut surface = surface_with_deny_all_channel_policy();
+        surface.target.policy = None;
+        config.surfaces = vec![surface];
+    })
+    .await;
+    let client = reqwest::Client::new();
+    for version in ["2025-03-26", "2025-06-18", "2025-11-25"] {
+        let initialize = json!({"jsonrpc": "2.0", "id": "open", "method": "initialize", "params": {
+            "protocolVersion": version, "capabilities": {}, "clientInfo": {"name": "client", "version": "1"}
+        }});
+        let tools_list = json!({"jsonrpc": "2.0", "id": "list", "method": "tools/list", "params": {}});
+        for (body, method_header) in [(&initialize, None), (&initialize, Some("initialize")), (&tools_list, None)] {
+            let before = forwarded(&harness);
+            let mut request = client
+                .post(&harness.gateway_url)
+                .header("mcp-protocol-version", version)
+                .header("accept", "application/json, text/event-stream");
+            if let Some(method) = method_header {
+                request = request.header("mcp-method", method);
+            }
+            let session = (*body == tools_list).then_some("upstream-session");
+            if let Some(session) = session {
+                request = request.header("mcp-session-id", session);
+            }
+            let response = request
+                .json(body)
+                .send()
+                .await
+                .unwrap();
+            let case = format!("{version} {} with Mcp-Method {method_header:?}", body["method"]);
+            assert_eq!(response.status(), 200, "{case}");
+            assert_eq!(forwarded(&harness), before + 1, "{case} must reach the Target");
+            let received = harness
+                .mock
+                .last_request_rx
+                .borrow()
+                .clone()
+                .unwrap();
+            assert_eq!(serde_json::from_str::<serde_json::Value>(&received.body).unwrap(), *body, "{case}");
+            assert_eq!(
+                received
+                    .headers
+                    .get("mcp-protocol-version")
+                    .map(String::as_str),
+                Some(version),
+                "{case}"
+            );
+            assert_eq!(
+                received
+                    .headers
+                    .get("mcp-session-id")
+                    .map(String::as_str),
+                session,
+                "{case}"
+            );
+        }
+    }
+}
+
+/// The claude.ai sequence against a session-only (TypeScript SDK) Target:
+/// a modern `server/discover` is refused, the client falls back to a
+/// `2025-11-25` session over SSE, and the session id it learns from
+/// `initialize` carries `tools/list` and `tools/call` to the same upstream session.
+#[tokio::test(flavor = "multi_thread")]
+async fn session_only_target_serves_discover_fallback_then_one_learned_session() {
+    use axum::response::IntoResponse;
+    use std::sync::{Arc, Mutex};
+
+    type Seen = Vec<(String, Option<String>)>;
+    const UPSTREAM_SESSION: &str = "ts-sdk-session-7f3a";
+    let seen: Arc<Mutex<Seen>> = Arc::default();
+    let target = {
+        let seen = seen.clone();
+        axum::Router::new().fallback(move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+            let seen = seen.clone();
+            async move {
+                let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let method = request["method"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                let session = headers
+                    .get("mcp-session-id")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                seen.lock()
+                    .unwrap()
+                    .push((method.clone(), session.clone()));
+                let reply =
+                    |result: serde_json::Value| json!({"jsonrpc": "2.0", "id": request["id"], "result": result});
+                match (method.as_str(), session.as_deref()) {
+                    ("initialize", None) => {
+                        let mut response = axum::Json(reply(json!({
+                            "protocolVersion": "2025-11-25", "capabilities": {"tools": {}},
+                            "serverInfo": {"name": "ts-sdk-target", "version": "1"}
+                        })))
+                        .into_response();
+                        response
+                            .headers_mut()
+                            .insert("mcp-session-id", axum::http::HeaderValue::from_static(UPSTREAM_SESSION));
+                        response
+                    }
+                    ("tools/list", Some(UPSTREAM_SESSION)) => {
+                        axum::Json(reply(json!({"tools": [{"name": "echo", "inputSchema": {"type": "object"}}]})))
+                            .into_response()
+                    }
+                    ("tools/call", Some(UPSTREAM_SESSION)) => {
+                        axum::Json(reply(json!({"content": [{"type": "text", "text": "echoed"}]}))).into_response()
+                    }
+                    _ => (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        axum::Json(json!({"jsonrpc": "2.0", "id": null, "error": {
+                            "code": -32000, "message": "Bad Request: Mcp-Session-Id header is required"
+                        }})),
+                    )
+                        .into_response(),
+                }
+            }
+        })
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap();
+    let target_url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, target)
+            .await
+            .ok()
+    });
+    let harness = GatewayHarness::start(|_, config, _| {
+        let mut surface = surface_with_deny_all_channel_policy();
+        surface.target.policy = None;
+        surface.target.endpoint = target_url;
+        config.surfaces = vec![surface];
+    })
+    .await;
+    let client = reqwest::Client::new();
+
+    let discover = client
+        .post(&harness.gateway_url)
+        .header("mcp-protocol-version", crate::mcp::MCP_MODERN_VERSION)
+        .header("mcp-method", "server/discover")
+        .header("accept", "application/json, text/event-stream")
+        .json(&json!({"jsonrpc": "2.0", "id": "discover", "method": "server/discover", "params": {"_meta": {
+            "io.modelcontextprotocol/protocolVersion": crate::mcp::MCP_MODERN_VERSION,
+            "io.modelcontextprotocol/clientCapabilities": {}
+        }}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(discover.status(), 400);
+    let refusal: serde_json::Value = discover.json().await.unwrap();
+    assert_eq!(refusal["id"], "discover");
+    assert_eq!(refusal["error"]["code"], -32022);
+    assert_eq!(refusal["error"]["data"]["supported"], json!(crate::mcp::request_validation::SESSION_VERSIONS));
+
+    let initialize = client
+        .post(&harness.gateway_url)
+        .header("mcp-protocol-version", "2025-11-25")
+        .header("mcp-method", "initialize")
+        .header("accept", "application/json, text/event-stream")
+        .json(&json!({"jsonrpc": "2.0", "id": "open", "method": "initialize", "params": {
+            "protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "claude-ai", "version": "1"}
+        }}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(initialize.status(), 200);
+    assert_eq!(
+        initialize
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+    let session_ids: Vec<String> = initialize
+        .headers()
+        .get_all("mcp-session-id")
+        .iter()
+        .map(|value| {
+            value
+                .to_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(session_ids, [UPSTREAM_SESSION], "exactly the upstream session id");
+    let session_id = &session_ids[0];
+    let events = initialize
+        .text()
+        .await
+        .unwrap();
+    let opened: serde_json::Value = events
+        .lines()
+        .find_map(|line| line.strip_prefix("data:"))
+        .map(|data| serde_json::from_str(data.trim()).unwrap())
+        .expect("initialize result event");
+    assert_eq!(opened["id"], "open");
+    assert_eq!(opened["result"]["protocolVersion"], "2025-11-25");
+
+    for (method, name, params) in
+        [("tools/list", None, json!({})), ("tools/call", Some("echo"), json!({"name": "echo", "arguments": {}}))]
+    {
+        let mut request = client
+            .post(&harness.gateway_url)
+            .header("mcp-protocol-version", "2025-11-25")
+            .header("mcp-method", method)
+            .header("mcp-session-id", session_id)
+            .header("accept", "application/json, text/event-stream");
+        if let Some(name) = name {
+            request = request.header("mcp-name", name);
+        }
+        let response = request
+            .json(&json!({"jsonrpc": "2.0", "id": method, "method": method, "params": params}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{method}");
+        let text = response.text().await.unwrap();
+        let body = text
+            .lines()
+            .find_map(|line| line.strip_prefix("data:"))
+            .unwrap_or(&text);
+        let envelope: serde_json::Value = serde_json::from_str(body.trim()).unwrap();
+        assert_eq!(envelope["id"], method, "{method}");
+        assert!(
+            envelope
+                .get("error")
+                .is_none(),
+            "{method}: {envelope}"
+        );
+    }
+
+    let seen = seen.lock().unwrap().clone();
+    let session = Some(session_id.clone());
+    assert_eq!(
+        seen,
+        [
+            ("server/discover".to_string(), None),
+            ("initialize".to_string(), None),
+            ("tools/list".to_string(), session.clone()),
+            ("tools/call".to_string(), session),
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn mcp_resource_authorization_requires_scoped_tokens_and_strips_target_credentials() {
     use super::helpers::jwt::{JwksFixture, now_secs, sign_jwt};
     use std::sync::atomic::Ordering;
@@ -481,7 +730,7 @@ async fn mcp_http_direct_guards_opt_in_before_target_dispatch() {
     })
     .await;
     let body = json!({"jsonrpc": "2.0", "id": "http-guard", "method": "server/discover", "params": {"_meta": {
-        "io.modelcontextprotocol/protocolVersion": "2025-11-25", "io.modelcontextprotocol/clientCapabilities": {}
+        "io.modelcontextprotocol/protocolVersion": "2099-01-01", "io.modelcontextprotocol/clientCapabilities": {}
     }}});
     let client = reqwest::Client::new();
     for (origin, expected_status) in [
@@ -492,7 +741,7 @@ async fn mcp_http_direct_guards_opt_in_before_target_dispatch() {
     ] {
         let mut request = client
             .post(&harness.gateway_url)
-            .header("mcp-protocol-version", "2025-11-25")
+            .header("mcp-protocol-version", "2099-01-01")
             .header("mcp-method", "server/discover")
             .header("accept", "application/json, text/event-stream")
             .json(&body);
@@ -956,14 +1205,14 @@ async fn mcp_wire_validation_precedes_policy_without_rejecting_legacy_headers() 
         .unwrap()
         .remove("name");
     let mut unmodelled_body = modern_body.clone();
-    unmodelled_body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"] = json!("2025-11-25");
+    unmodelled_body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"] = json!("2099-01-01");
     let mut mixed_era_body = list_body.clone();
     mixed_era_body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"] =
         json!(crate::mcp::MCP_LEGACY_VERSION);
     for (body, method, version, name, expected_code, expected_id) in [
         (String::new(), "tools/call", crate::mcp::MCP_MODERN_VERSION, "echo", -32700, None),
         (modern_body.to_string(), "tools/call", crate::mcp::MCP_MODERN_VERSION, "=?base64?=", -32020, Some(json!(8))),
-        (unmodelled_body.to_string(), "tools/call", "2025-11-25", "echo", -32022, Some(json!(8))),
+        (unmodelled_body.to_string(), "tools/call", "2099-01-01", "echo", -32022, Some(json!(8))),
         (list_body.to_string(), "tools/list", crate::mcp::MCP_MODERN_VERSION, "=?base64?=", -32020, Some(json!(8))),
         (
             mixed_era_body.to_string(),
@@ -1023,7 +1272,7 @@ async fn mcp_wire_validation_precedes_protocol_family_detection() {
     let client = reqwest::Client::new();
     let response = client
         .post(&harness.gateway_url)
-        .header("mcp-protocol-version", "2025-11-25")
+        .header("mcp-protocol-version", "2099-01-01")
         .header("mcp-method", "tasks/get")
         .json(&json!({
             "jsonrpc": "2.0",
@@ -1032,7 +1281,7 @@ async fn mcp_wire_validation_precedes_protocol_family_detection() {
             "params": {
                 "taskId": "task-1",
                 "_meta": {
-                    "io.modelcontextprotocol/protocolVersion": "2025-11-25",
+                    "io.modelcontextprotocol/protocolVersion": "2099-01-01",
                     "io.modelcontextprotocol/clientCapabilities": {
                         "extensions": { "io.modelcontextprotocol/tasks": {} }
                     }
@@ -1050,8 +1299,11 @@ async fn mcp_wire_validation_precedes_protocol_family_detection() {
     assert_eq!(
         envelope["error"]["data"],
         json!({
-            "requested": "2025-11-25",
-            "supported": [crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION]
+            "requested": "2099-01-01",
+            "supported": crate::mcp::request_validation::runtime_policy_for(
+                crate::mcp::request_validation::McpPathKind::DirectAccessPoint
+            )
+            .supported_versions()
         })
     );
 

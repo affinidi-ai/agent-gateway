@@ -9748,7 +9748,7 @@ mod tests {
 
     #[tokio::test]
     async fn fabric_mcp_headers_feed_legacy_only_version_rejection() {
-        use crate::mcp::{MCP_LEGACY_VERSION, MCP_MODERN_VERSION};
+        use crate::mcp::MCP_MODERN_VERSION;
         let headers = serde_json::json!({
             "MCP-PROTOCOL-VERSION": MCP_MODERN_VERSION,
             "MCP-METHOD": "tools/list"
@@ -9782,7 +9782,7 @@ mod tests {
             error.data,
             Some(serde_json::json!({
                 "requested": MCP_MODERN_VERSION,
-                "supported": [MCP_LEGACY_VERSION]
+                "supported": crate::mcp::request_validation::SESSION_VERSIONS
             }))
         );
 

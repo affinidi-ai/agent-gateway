@@ -177,12 +177,12 @@ async fn outbound_mcp_listener_preserves_variant_catalog_and_custom_routes() {
                     .load(std::sync::atomic::Ordering::SeqCst);
             let response = client
                 .post(&url)
-                .header("mcp-protocol-version", "2025-11-25")
+                .header("mcp-protocol-version", "2099-01-01")
                 .header("mcp-method", "tools/list")
                 .header("accept", "application/json, text/event-stream")
                 .json(
                     &json!({"jsonrpc": "2.0", "id": "variant-admission", "method": "tools/list", "params": {"_meta": {
-                        "io.modelcontextprotocol/protocolVersion": "2025-11-25",
+                        "io.modelcontextprotocol/protocolVersion": "2099-01-01",
                         "io.modelcontextprotocol/clientCapabilities": {}
                     }}}),
                 )
@@ -242,9 +242,9 @@ async fn outbound_mcp_canonical_metadata_and_modern_rejection() {
         .request_count
         .load(std::sync::atomic::Ordering::SeqCst);
     let response = reqwest::Client::new().post(format!("{}/outbound/smoke/target", harness.outbound_url.as_ref().unwrap()))
-        .header("MCP-Protocol-Version", "2025-11-25").header("Mcp-Method", "tasks/get")
+        .header("MCP-Protocol-Version", "2099-01-01").header("Mcp-Method", "tasks/get")
         .json(&json!({"jsonrpc": "2.0", "id": "modern-transit", "method": "tasks/get", "params": {"taskId": "one", "_meta": {
-            "io.modelcontextprotocol/protocolVersion": "2025-11-25",
+            "io.modelcontextprotocol/protocolVersion": "2099-01-01",
             "io.modelcontextprotocol/clientCapabilities": {}
         }}})).send().await.unwrap();
     assert_eq!(response.status(), 400);
@@ -253,7 +253,10 @@ async fn outbound_mcp_canonical_metadata_and_modern_rejection() {
     assert_eq!(error["error"]["code"], -32022);
     assert_eq!(
         error["error"]["data"],
-        json!({"requested": "2025-11-25", "supported": [crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION]})
+        json!({"requested": "2099-01-01", "supported": crate::mcp::request_validation::runtime_policy_for(
+            crate::mcp::request_validation::McpPathKind::TransitPoint
+        )
+        .supported_versions()})
     );
     assert_eq!(
         harness

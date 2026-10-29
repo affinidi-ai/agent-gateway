@@ -497,7 +497,7 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
         if code == -32022 {
             assert_eq!(
                 envelope["error"]["data"],
-                json!({"requested": MCP_MODERN_VERSION, "supported": [MCP_LEGACY_VERSION]})
+                json!({"requested": MCP_MODERN_VERSION, "supported": crate::mcp::request_validation::SESSION_VERSIONS})
             );
         } else {
             assert!(
@@ -551,7 +551,7 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
     // An initialize for a revision this receiver does not serve reaches the
     // Target asking for one it does, so the session it opens stays usable.
     let initialize = json!({"jsonrpc": "2.0", "id": "legacy-initialize", "method": "initialize", "params": {
-        "protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "client", "version": "1"}
+        "protocolVersion": "2099-01-01", "capabilities": {}, "clientInfo": {"name": "client", "version": "1"}
     }});
     let (forward_response, _) = receive(&forward_message(initialize.clone(), json!({}))).await;
     assert_eq!(forward_response["status"], 200);
@@ -563,6 +563,31 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
     let mut expected = initialize;
     expected["params"]["protocolVersion"] = json!(MCP_LEGACY_VERSION);
     assert_eq!(serde_json::from_str::<Value>(&forwarded.body).unwrap(), expected);
+
+    // A session revision the receiver serves reaches the Target unchanged, so
+    // the Target negotiates it.
+    let session_initialize = json!({"jsonrpc": "2.0", "id": "session-initialize", "method": "initialize", "params": {
+        "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "client", "version": "1"}
+    }});
+    let (forward_response, _) = receive(&forward_message(
+        session_initialize.clone(),
+        json!({"MCP-Protocol-Version": "2025-06-18", "Mcp-Method": "initialize"}),
+    ))
+    .await;
+    assert_eq!(forward_response["status"], 200);
+    let forwarded = target
+        .last_request_rx
+        .borrow()
+        .clone()
+        .expect("initialize reached the Target");
+    assert_eq!(serde_json::from_str::<Value>(&forwarded.body).unwrap(), session_initialize);
+    assert_eq!(
+        forwarded
+            .headers
+            .get("mcp-protocol-version")
+            .map(String::as_str),
+        Some("2025-06-18")
+    );
 
     let caller_body = json!({
         "jsonrpc": "2.0", "id": "legacy-control", "method": "tools/list",
@@ -590,7 +615,7 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
             target
                 .request_count
                 .load(Ordering::SeqCst),
-            index + 3
+            index + 4
         );
         let received = target
             .last_request_rx
@@ -1002,14 +1027,14 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
             }
         );
     }
-    // Includes the capped initialize, the one envelope-replay delivery, the
-    // legacy request whose forwarded Origin is not rechecked, and the unmarked
-    // GET and DELETE without a body.
+    // Includes the capped and the session-revision initialize, the one
+    // envelope-replay delivery, the legacy request whose forwarded Origin is
+    // not rechecked, and the unmarked GET and DELETE without a body.
     assert_eq!(
         target
             .request_count
             .load(Ordering::SeqCst),
-        8
+        9
     );
 
     let mut guarded = surface.clone();

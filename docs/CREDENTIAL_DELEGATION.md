@@ -75,11 +75,19 @@ authenticated caller, the consent mode decides what happens the first time.
 | --- | --- |
 | `on_demand` | The request fails with HTTP 401 and an `application/problem+json` `consent_required` body carrying the authorization URL. The caller has to interpret this payload itself; it is not the MCP elicitation mechanism. |
 | `pre_authorize` | The session is refused at bind or `initialize` time until every binding's token already exists. After that, runtime traffic never sees a consent prompt. |
-| `elicit` | Spec-compliant MCP elicitation. The gateway sends `elicitation/create` back over the open Streamable HTTP or SSE stream, with the authorization URL in the message, and waits up to `elicit_timeout_secs` (300 by default) for the user to finish or decline. |
+| `elicit` | Spec-compliant MCP elicitation. The gateway sends `elicitation/create` back over the open Streamable HTTP or SSE stream, with the authorization URL in the message, and waits up to `elicit_timeout_secs` (300 by default) for the user to finish or decline. Accepted risk: the stream and the pending prompt are keyed by surface and `Mcp-Session-Id`, not bound to the caller, so within one surface a caller holding another user's session id can receive that user's authorization URL, or answer or cancel their prompt. Isolation relies on the upstream issuing unguessable session ids; see "MCP session ownership" under Recorded Decisions in `docs/MCP_METADATA.md`. |
 
 `elicit` needs an MCP client that advertised the `elicitation` capability during
-`initialize`. When it did not, `elicit_fallback` decides: `on_demand`, the default,
-degrades to the 401 response, and `fail` fails the tool call with a JSON-RPC error.
+`initialize`, and a capability record for its session. `elicit_fallback` decides
+what happens when either is missing: `on_demand`, the default, degrades to the 401
+response, and `fail` fails the tool call with a JSON-RPC error. Elicit falls back when:
+
+- the client did not advertise `elicitation`;
+- the upstream returned a session id already in use on the surface (see "MCP session
+  ownership" in `docs/MCP_METADATA.md`);
+- the gateway has no capability record for the session, because the upstream answered
+  `initialize` with SSE, sent an unusable `Mcp-Session-Id`, or the gateway restarted
+  after the session opened.
 
 ## Across Fabric
 

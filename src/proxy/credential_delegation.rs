@@ -1183,7 +1183,7 @@ async fn try_elicit_flow(
     // `initialize`. If it didn't, honour the binding's `elicit_fallback`.
     let cap_registry = crate::mcp::elicitation::global_capability_registry();
     let caps = cap_registry
-        .get(session_id)
+        .get(channel_id, session_id)
         .await;
     let supports_elicitation = caps
         .as_ref()
@@ -1241,7 +1241,7 @@ async fn try_elicit_flow(
     // spec-compliant `elicitation/create` request.
     let pending_registry = crate::mcp::elicitation::global_pending_elicitation_registry();
     let (elicit_id, waiter) = pending_registry
-        .register(session_id)
+        .register(channel_id, session_id)
         .await;
     let request = crate::mcp::elicitation::build_oauth_consent_elicitation(
         serde_json::Value::String(elicit_id.clone()),
@@ -1265,7 +1265,7 @@ async fn try_elicit_flow(
         }
     };
     let sent = sse_registry
-        .send(session_id, axum::response::sse::Event::default().data(serialized))
+        .send(channel_id, session_id, axum::response::sse::Event::default().data(serialized))
         .await;
     if !sent {
         // Client never opened the GET notification stream — we cannot
@@ -1454,7 +1454,7 @@ async fn try_elicit_flow(
     // Clean up the registry entry so the oneshot sender doesn't leak.
     let pending_registry = crate::mcp::elicitation::global_pending_elicitation_registry();
     pending_registry
-        .remove(session_id, &elicit_id)
+        .remove(channel_id, session_id, &elicit_id)
         .await;
 
     result
@@ -2538,6 +2538,7 @@ mod tests {
         let session_id = "session-elicit-no-sse";
         crate::mcp::elicitation::global_capability_registry()
             .record(
+                "ch-1",
                 session_id,
                 crate::mcp::elicitation::McpClientCapabilities {
                     elicitation: true,

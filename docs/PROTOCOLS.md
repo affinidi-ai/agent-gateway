@@ -11,7 +11,8 @@ revision-specific behavior and limitations of the checked-out source.
 | A2A `1.0` | Active, advertised | JSON-RPC messaging, discovery, identity extensions, policy, and proxy targets; implemented against spec revision [`1.0.1`](https://a2a-protocol.org/v1.0.1/specification/) |
 | A2A `0.3` | Accepted | Accepted on each A2A surface that selects it, which is the default except on a new A2A proxy surface. See [A2A Protocol Versions](#a2a-protocol-versions) |
 | MCP `2024-11-05` | Active | Admitted and advertised on every MCP endpoint |
-| MCP `2026-07-28` | Active | Admitted and advertised alongside `2024-11-05` on every MCP endpoint |
+| MCP `2025-03-26`, `2025-06-18`, `2025-11-25` | Active | Admitted on every MCP endpoint and forwarded as session revisions, like `2024-11-05`. Advertised in discovery on every MCP endpoint except gateway-owned MCP Proxies, which answer `initialize` with `2024-11-05`. Tasks (`tasks/*`) and JSON-RPC batches are not supported (HTTP `422`). See [MCP Validation Boundary](#mcp-validation-boundary) |
+| MCP `2026-07-28` | Active | Admitted and advertised on every MCP endpoint, alongside the session revisions that endpoint advertises |
 | AP2 | Experimental | Disabled by default; production proof signing is not implemented |
 
 The hosted documentation is rolling product documentation. Use this matrix and the repository
@@ -762,11 +763,14 @@ Not bounded here: `fabric://` legs.
 
 ## MCP Validation Boundary
 
-`2024-11-05` is active on every MCP endpoint. The Gateway recognizes `2026-07-28` per-request
+The session revisions `2024-11-05`, `2025-03-26`, `2025-06-18` and `2025-11-25` are active on
+every MCP endpoint. They all open a session with `initialize` and carry it in `Mcp-Session-Id`, so
+the gateway forwards them to the upstream, except that gateway-owned MCP Proxies answer
+`initialize` themselves with `2024-11-05`. The Gateway recognizes `2026-07-28` per-request
 metadata and mirrored HTTP headers on direct Access Points, Transit Points, standalone MCP Proxies
-and Fabric receive, and admits and advertises that revision alongside `2024-11-05` on every MCP
-endpoint. Fabric carries it only as framed streams; the buffered Fabric forward stays
-`2024-11-05`-only. Revisions the gateway does not model are rejected as unsupported.
+and Fabric receive, and admits and advertises that revision on every MCP endpoint. A gateway-owned
+MCP Proxy advertises it alongside `2024-11-05` only, or alone when it has no legacy catalog. Fabric carries it only as framed streams; the buffered Fabric forward carries
+the session revisions only. Revisions the gateway does not model are rejected as unsupported.
 
 `2026-07-28` support is measured against the published MCP conformance suite with
 `make mcp-conformance`, which runs the ordinary gateway binary; see
@@ -776,22 +780,29 @@ Harness section of [`MCP_METADATA.md`](MCP_METADATA.md).
 | Condition | HTTP / JSON-RPC result |
 | --- | --- |
 | Valid modern request whose upstream answers with a legacy (non-modern) result | HTTP `502` |
-| Request using an unmodelled revision such as `2025-06-18` | HTTP `400`, `-32022`, listing the revisions the endpoint supports |
+| Modern request whose upstream answers HTTP `400` with `-32000` or `-32600` and an id that is `null` or another request's, as a session-only upstream does | HTTP `400`, `-32022`, listing only the session revisions |
+| Modern request whose upstream answers with any other error whose id is `null` or another request's | HTTP `502` |
+| Request using an unmodelled revision such as `2099-01-01` | HTTP `400`, `-32022`, listing the revisions the endpoint supports |
 | Malformed modern metadata | HTTP `400`, `-32602` |
 | Missing, malformed, or mismatched mirrored headers | HTTP `400`, `-32020` |
 | Modern-signaled POST with an empty body | HTTP `400`, `-32700` |
-| Modern metadata declaring legacy `2024-11-05` | HTTP `400`, `-32602`, mixed-era diagnostic |
+| Modern metadata declaring a session revision such as `2024-11-05` | HTTP `400`, `-32602`, mixed-era diagnostic |
 | Modern POST body with duplicate keys, keys differing only in case, or a case-variant field the gateway reads | HTTP `400`, `-32600` (legacy: HTTP `200`, `-32600`) |
 | PUT, PATCH or an extension method on an Access Point, Transit Point or Fabric receive | HTTP `405`, `Allow: POST, GET, DELETE, HEAD, OPTIONS` |
 | A body on any method but POST, on an Access Point, Transit Point or Fabric receive | HTTP `400`, `-32600` |
+| Legacy `initialize` asking for a session revision | Forwarded unchanged, so the upstream negotiates the revision |
 | Legacy `initialize` asking for a revision the endpoint does not serve | Forwarded asking for `2024-11-05`, so the session settles on a revision the endpoint serves |
 
 The `initialize` cap is `cap_legacy_initialize` in `src/mcp/request_validation.rs`, applied
 after `normalize_bytes` on the direct, Transit Point and Fabric receive paths, so an upstream
-that supports `2025-11-25` cannot settle a session the gateway then rejects.
+cannot settle a session on a revision the gateway then rejects.
 
-A lone `MCP-Protocol-Version: 2024-11-05` header remains legacy traffic when modern metadata and
-mirrored method or name headers are absent. Every supplied `Mcp-Name` is validated, including for
+An `MCP-Protocol-Version` header naming a session revision remains legacy traffic when modern
+metadata is absent, even with mirrored `Mcp-Method` or `Mcp-Name` headers, and the header reaches
+the upstream unchanged. An `initialize` with no `MCP-Protocol-Version` header is a legacy session
+opening on the same terms. Mirrored headers are still validated, and `Mcp-Method` must name the
+request's method, and `Mcp-Name` must match `params.name` on `tools/call` and `prompts/get` or
+`params.uri` on `resources/read`. Every supplied `Mcp-Name` is validated, including for
 methods without a mirrored name source. Complete Base64 sentinel markers trigger decoding; partial
 markers remain plain ASCII, and overlapping markers fail without panicking.
 
