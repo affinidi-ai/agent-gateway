@@ -882,6 +882,126 @@ fn add_transit_point(
         });
 }
 
+#[given(expr = "Transit Point {string} requires a transit token")]
+fn transit_point_requires_a_transit_token(
+    world: &mut SurfaceWorld,
+    transit_point: String,
+) {
+    transit_point_config_mut(world, &transit_point).require_transit_token = true;
+}
+
+#[given("the surface sets source authentication for its Transit Points")]
+fn surface_sets_source_authentication_for_its_transit_points(world: &mut SurfaceWorld) {
+    world
+        .surface_config
+        .transit_source_auth = true;
+}
+
+#[given(expr = "Transit Point {string} injects delegated credentials from API-key provider {string}")]
+fn transit_point_injects_api_key_delegated_credentials(
+    world: &mut SurfaceWorld,
+    transit_point: String,
+    provider: String,
+) {
+    transit_point_config_mut(world, &transit_point).delegated_credentials = true;
+    surface_requires_api_key_delegated_credentials(world, provider);
+}
+
+#[given(
+    expr = "Transit Point {string} injects delegated credentials from credential provider {string}, which the gateway does not have"
+)]
+fn transit_point_injects_delegated_credentials_from_an_unknown_provider(
+    world: &mut SurfaceWorld,
+    transit_point: String,
+    provider: String,
+) {
+    transit_point_config_mut(world, &transit_point).delegated_credentials = true;
+    world
+        .surface_config
+        .credential_delegation = Some(SurfaceCredentialDelegationConfig {
+        provider_id: provider,
+        provider_kind: CredentialProviderKind::Unknown,
+        required_tool: None,
+        inject_as: DelegatedCredentialInjection::BearerHeader,
+        scopes: Vec::new(),
+    });
+}
+
+#[given(expr = "MCP server {string} answers with header {string} set to {string}")]
+fn mcp_server_answers_with_header(
+    world: &mut SurfaceWorld,
+    server_name: String,
+    header: String,
+    value: String,
+) {
+    world
+        .actors
+        .expect_target_kind(&server_name, TargetActorKind::McpServer);
+    let collaborator_key = world
+        .actors
+        .target_collaborator_key(&server_name);
+    let mut response = world
+        .collaborator_target(collaborator_key)
+        .configured_response
+        .clone();
+    response
+        .headers
+        .insert(header, value);
+    set_target_response_for_actor(world, &server_name, response);
+}
+
+#[given(expr = "managed agent {string} holds the transit token the Access Point gave it")]
+async fn managed_agent_holds_the_access_points_transit_token(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+) {
+    world
+        .actors
+        .expect_target_kind(&agent_name, TargetActorKind::ManagedAgent);
+    world.transit_token = Some(crate::steps::when::transit_token_from_the_access_point(world).await);
+}
+
+#[given(expr = "managed agent {string} holds a transit token the gateway issued for surface {string}")]
+async fn managed_agent_holds_a_transit_token_for_another_surface(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    surface_id: String,
+) {
+    managed_agent_holds_the_access_points_transit_token(world, agent_name).await;
+    let token = world
+        .transit_token
+        .clone()
+        .unwrap();
+    world.transit_token = Some(crate::steps::when::reissued_transit_token(
+        world,
+        &token,
+        serde_json::json!({ "surface_id": surface_id }),
+    ));
+}
+
+#[given(expr = "managed agent {string} holds a transit token naming caller {string}")]
+async fn managed_agent_holds_a_transit_token_naming_a_caller(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    caller: String,
+) {
+    use sha2::Digest as _;
+
+    managed_agent_holds_the_access_points_transit_token(world, agent_name).await;
+    let token = world
+        .transit_token
+        .clone()
+        .unwrap();
+    world.transit_token = Some(crate::steps::when::reissued_transit_token(
+        world,
+        &token,
+        serde_json::json!({
+            "sub": format!("did:web:{caller}.example"),
+            "user_identity_hash": format!("{:x}", sha2::Sha256::digest(caller.as_bytes())),
+        }),
+    ));
+}
+
 #[given(expr = "surface {string} has A2A Transit Point {string} to external agent {string}")]
 fn surface_has_a2a_transit_point_to_external_agent(
     world: &mut SurfaceWorld,
@@ -2762,6 +2882,24 @@ fn surface_requires_api_key_delegated_credentials(
             secret_id: format!("bdd-{provider}-api-key"),
             secret_value: "bdd-delegated-api-key".to_string(),
         },
+        required_tool: None,
+        inject_as: DelegatedCredentialInjection::BearerHeader,
+        scopes: Vec::new(),
+    });
+}
+
+#[given(
+    expr = "the surface requires delegated credentials from credential provider {string}, which the gateway does not have"
+)]
+fn surface_requires_delegated_credentials_from_an_unknown_provider(
+    world: &mut SurfaceWorld,
+    provider: String,
+) {
+    world
+        .surface_config
+        .credential_delegation = Some(SurfaceCredentialDelegationConfig {
+        provider_id: provider,
+        provider_kind: CredentialProviderKind::Unknown,
         required_tool: None,
         inject_as: DelegatedCredentialInjection::BearerHeader,
         scopes: Vec::new(),

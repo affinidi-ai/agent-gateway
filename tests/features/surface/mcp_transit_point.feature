@@ -45,3 +45,52 @@ Feature: MCP Transit Point forwarding
     And MCP server "bravo" received forwarded MCP field "params.arguments.limit" unchanged
     And the MCP response id matches MCP server "bravo" forwarded request id
     And the MCP response result matches MCP server "bravo" response result
+
+  Scenario: A transit token the Access Point issued opens its surface's Transit Point
+    Given Transit Point "alpha" requires a transit token
+    And managed agent "example-agent" holds the transit token the Access Point gave it
+    When managed agent "example-agent" asks for available tools through Transit Point "alpha" with its transit token
+    Then the response status is 200
+    And MCP server "bravo" received MCP method "tools/list"
+    And MCP server "bravo" did not receive header "x-transit-token"
+
+  Scenario: A transit token issued for another surface does not open a Transit Point
+    Given Transit Point "alpha" requires a transit token
+    And managed agent "example-agent" holds a transit token the gateway issued for surface "another-surface"
+    When managed agent "example-agent" asks for available tools through Transit Point "alpha" with its transit token
+    Then the response status is 401
+    And MCP server "bravo" was not called
+
+  Scenario: A Transit Point refuses every request while its surface sets source authentication for Transit Points
+    Given the surface sets source authentication for its Transit Points
+    When managed agent "example-agent" asks for available tools through Transit Point "alpha"
+    Then the response status is 503
+    And MCP server "bravo" was not called
+
+  Scenario: A delegated credential reaches the Transit Point's destination and the managed agent cannot replace it
+    Given MCP server "bravo" supports tool invocation
+    And Transit Point "alpha" requires a transit token
+    And Transit Point "alpha" injects delegated credentials from API-key provider "weather"
+    And managed agent "example-agent" holds a transit token naming caller "alice"
+    When managed agent "example-agent" invokes MCP tool "search" through Transit Point "alpha" with its transit token and header "Authorization" set to "Bearer chosen-by-the-agent"
+    Then the response status is 200
+    And MCP server "bravo" received MCP method "tools/call"
+    And MCP server "bravo" received delegated credential for API-key provider "weather"
+
+  Scenario: A Transit Point whose delegated credential cannot be resolved refuses the call
+    Given MCP server "bravo" supports tool invocation
+    And Transit Point "alpha" requires a transit token
+    And Transit Point "alpha" injects delegated credentials from credential provider "retired", which the gateway does not have
+    And managed agent "example-agent" holds a transit token naming caller "alice"
+    When managed agent "example-agent" invokes MCP tool "search" through Transit Point "alpha" with its transit token and header "Authorization" set to "Bearer chosen-by-the-agent"
+    Then the response status is 503
+    And MCP server "bravo" was not called
+
+  Scenario: Cookies and authentication challenges do not cross a Transit Point
+    Given MCP server "bravo" answers with header "set-cookie" set to "vendor_session=1"
+    And MCP server "bravo" answers with header "www-authenticate" set to "Bearer realm=vendor"
+    When managed agent "example-agent" asks for available tools through Transit Point "alpha" with header "cookie" set to "agent_session=1"
+    Then the response status is 200
+    And MCP server "bravo" did not receive header "cookie"
+    And the response does not include header "set-cookie"
+    And the response does not include header "www-authenticate"

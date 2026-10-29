@@ -15,9 +15,17 @@ Feature: MCP credential delegation
     When caller "alice" invokes MCP tool "schedule_meeting" with a valid token and a valid inbound identity payload
     Then the response status is 401
     And the response is a consent required error for OAuth provider "calendar"
+    And the consent required error names neither the caller's identity hash nor the managed agent's DID
     And the response includes an authorization URL for OAuth provider "calendar"
     And the response includes delegated credential scopes "calendar.read calendar.write"
     And the delegation audit trail contains event "consent_required" for OAuth provider "calendar"
+    And MCP server "bravo" was not called
+
+  Scenario: A delegated credential that cannot be resolved refuses the MCP tool call before the MCP server is reached
+    Given the surface requires delegated credentials from credential provider "retired", which the gateway does not have
+    When caller "alice" invokes MCP tool "schedule_meeting" with a valid token
+    Then the response status is 503
+    And the MCP response is a JSON-RPC error with code -32603
     And MCP server "bravo" was not called
 
   Scenario: OAuth consent callback exchanges an authorization code and records the consent grant
