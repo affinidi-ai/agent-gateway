@@ -84,10 +84,19 @@ pub async fn export_storage(
         "",
     );
 
+    let excluded_paths = crate::export::excluded_storage_paths(
+        &state
+            .bootstrap_config
+            .storage_paths,
+        "",
+    );
+
     // Build encrypted export (blocking I/O — run in spawn_blocking)
     let pubkey_pem = req.public_key_pem.clone();
-    let result =
-        tokio::task::spawn_blocking(move || crate::export::build_encrypted_export(&storage_root, &pubkey_pem)).await;
+    let result = tokio::task::spawn_blocking(move || {
+        crate::export::build_encrypted_export(&storage_root, &excluded_paths, &pubkey_pem)
+    })
+    .await;
 
     match result {
         Ok(Ok(encrypted_bytes)) => {
