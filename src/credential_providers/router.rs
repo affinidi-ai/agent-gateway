@@ -22,6 +22,7 @@ pub fn create_credential_providers_router(
         secrets_store,
         identity_strategies,
         oauth_callback_route,
+        issuer_metadata: super::external::strict_issuer_metadata(),
     };
     let gate = guard.as_ref();
     Router::new()
