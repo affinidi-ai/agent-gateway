@@ -585,3 +585,79 @@ async fn a_tenant_token_names_only_its_own_secrets_in_a_transit_points_source_au
         assert_eq!(body["tenant_id"], "tenant-a", "{id}: {body}");
     }
 }
+
+/// A surface whose Transit Point authenticates its callers with `source_auth`
+/// is stored with `transit_point_source_auth: true`, so a release that predates
+/// Transit Point `source_auth` refuses the whole surface instead of serving that
+/// Transit Point without it; the marker follows the Transit Points on every
+/// save, whatever the write sends.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_surface_whose_transit_point_uses_source_auth_is_stored_so_older_releases_refuse_it() {
+    let mut paths = None;
+    let h = GatewayHarness::start(|temp_dir, _, bootstrap| {
+        write_caller_key(temp_dir);
+        paths = Some((
+            configure_admin_api(bootstrap),
+            std::path::PathBuf::from(
+                &bootstrap
+                    .storage_paths
+                    .agent_surfaces,
+            ),
+        ));
+    })
+    .await;
+    let (admin, surfaces_dir) = paths.unwrap();
+    let stored = |surface_id: &str| -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(surfaces_dir.join(format!("{surface_id}.json"))).unwrap()).unwrap()
+    };
+    let key_point = json!({
+        "alias": "partner", "target_endpoint": "https://partner.example/a2a", "protocol": "a2a",
+        "require_transit_token": false,
+        "source_auth": { "type": "api_key", "secret_id": CALLER_KEY_SECRET,
+                         "extraction": { "source": "http_header", "field": "x-api-key" } }
+    });
+    let token_point =
+        json!({ "alias": "partner", "target_endpoint": "https://partner.example/a2a", "protocol": "a2a" });
+    let surface = |id: &str, base: &serde_json::Value, variant: Option<&serde_json::Value>, marker: bool| {
+        let mut body = json!({
+            "surface_id": id, "name": id, "status": "disabled",
+            "access_point": { "listen_address": h.gateway_base, "route": format!("/{id}"), "protocol": "a2a" },
+            "target": { "endpoint": h.mock.url() },
+            "transit": { "points": [base] },
+            "transit_point_source_auth": marker
+        });
+        if let Some(point) = variant {
+            body["variants"] = json!([{ "id": "variant-dev", "alias": "dev", "name": "dev", "enabled": true,
+                "overrides": { "transit": { "points": [point] } } }]);
+        }
+        body
+    };
+    let collection = format!("{}/api/v1/surfaces", h.gateway_base);
+
+    for (id, base, variant) in [("tp-auth-base", &key_point, None), ("tp-auth-variant", &token_point, Some(&key_point))]
+    {
+        let created = admin
+            .post(&collection)
+            .json(&surface(id, base, variant, false))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(created.status(), 201, "{id}: {}", created.text().await.unwrap());
+        assert_eq!(stored(id)["transit_point_source_auth"], true, "{id}: {}", stored(id));
+    }
+
+    let replaced = admin
+        .put(format!("{collection}/tp-auth-base"))
+        .json(&surface("tp-auth-base", &token_point, None, true))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(replaced.status(), 200, "{}", replaced.text().await.unwrap());
+    assert!(
+        stored("tp-auth-base")
+            .get("transit_point_source_auth")
+            .is_none(),
+        "with no Transit Point on source_auth left, an older release may load it again: {}",
+        stored("tp-auth-base")
+    );
+}

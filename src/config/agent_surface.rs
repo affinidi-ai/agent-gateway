@@ -126,6 +126,15 @@ pub struct AgentSurface {
     /// and without it is converted on load.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub trust_check_split: bool,
+
+    /// Whether a Transit Point of this surface, on the base or in a variant,
+    /// authenticates its callers with its own `source_auth`. Stored while one
+    /// does, so a release that predates Transit Point `source_auth`, which
+    /// would serve that Transit Point without it, refuses to load the surface.
+    /// The gateway sets it on every save and on load; a value a write sends is
+    /// ignored.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub transit_point_source_auth: bool,
 }
 
 /// Three independent identity slots covering the proxy pipeline edges.
@@ -1769,7 +1778,49 @@ impl StorableEntity for AgentSurface {
         let stripped = strip_legacy_trust_registry_fields(value);
         let split = split_target_trust_checks_per_transit_point(value);
         warn_target_lists_that_cannot_run(value);
-        Ok(stripped || split)
+        let marked = mark_transit_point_source_auth(value);
+        Ok(stripped || split || marked)
+    }
+}
+
+/// Keep a stored surface's `transit_point_source_auth` in step with its
+/// Transit Points (see [`AgentSurface::has_transit_point_source_auth`]), so a
+/// surface file written outside the API is marked when it is first loaded and
+/// re-persisted. Returns whether the record changed.
+fn mark_transit_point_source_auth(value: &mut serde_json::Value) -> bool {
+    let any_source_auth = |points: Option<&serde_json::Value>| {
+        points
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|points| {
+                points.iter().any(|point| {
+                    point
+                        .get("source_auth")
+                        .is_some_and(|source_auth| !source_auth.is_null())
+                })
+            })
+    };
+    let uses_source_auth = any_source_auth(value.pointer("/transit/points"))
+        || value
+            .get("variants")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|variants| {
+                variants
+                    .iter()
+                    .any(|variant| any_source_auth(variant.pointer("/overrides/transit/points")))
+            });
+    let Some(obj) = value.as_object_mut() else {
+        return false;
+    };
+    let marked = obj.get("transit_point_source_auth") == Some(&serde_json::Value::Bool(true));
+    match (uses_source_auth, marked) {
+        (true, false) => {
+            obj.insert("transit_point_source_auth".to_string(), serde_json::Value::Bool(true));
+            true
+        }
+        (false, true) => obj
+            .remove("transit_point_source_auth")
+            .is_some(),
+        _ => false,
     }
 }
 
@@ -2744,6 +2795,31 @@ impl AgentSurface {
     /// instead of loading it with no checks.
     pub fn has_trust_check_lists(&self) -> bool {
         self.has_target_trust_checks() || self.has_transit_point_trust_checks()
+    }
+
+    /// Whether any Transit Point, on the base or in a variant override,
+    /// authenticates its callers with its own `source_auth`. Such a surface is
+    /// stored with `transit_point_source_auth: true`.
+    pub fn has_transit_point_source_auth(&self) -> bool {
+        let any_source_auth = |points: &[TransitPoint]| {
+            points
+                .iter()
+                .any(|point| point.source_auth.is_some())
+        };
+        self.transit
+            .as_ref()
+            .is_some_and(|transit| any_source_auth(&transit.points))
+            || self
+                .variants
+                .iter()
+                .any(|variant| {
+                    variant
+                        .overrides
+                        .transit
+                        .as_ref()
+                        .and_then(|transit| transit.points.as_deref())
+                        .is_some_and(any_source_auth)
+                })
     }
 
     /// True when the Target is an A2A proxy (`a2a-proxy://`).
@@ -4798,6 +4874,7 @@ mod tests {
             _retired_protocol_mode: Default::default(),
             mcp_http: None,
             trust_check_split: false,
+            transit_point_source_auth: false,
         };
 
         assert_eq!(surface.base_url("gw.example.com"), "https://gw.example.com:8443/agents/sales");
@@ -4941,6 +5018,7 @@ mod tests {
             _retired_protocol_mode: Default::default(),
             mcp_http: None,
             trust_check_split: false,
+            transit_point_source_auth: false,
         };
 
         assert!(
@@ -6429,6 +6507,7 @@ mod tests {
             _retired_protocol_mode: Default::default(),
             mcp_http: None,
             trust_check_split: false,
+            transit_point_source_auth: false,
         };
         let value = serde_json::to_value(&surface).expect("surface must serialize");
         assert_eq!(value["issuer_id"], serde_json::json!("issuer-42"));
@@ -7097,6 +7176,78 @@ mod transit_point_caller_authentication_tests {
         })))
         .unwrap();
         assert_eq!(stored["allow_unauthenticated_callers"], true);
+    }
+
+    /// A stored surface whose Transit Point uses `source_auth`, on the base or
+    /// only in a variant, is marked when loaded so an older release refuses it,
+    /// and the mark is removed once no Transit Point uses `source_auth`.
+    #[test]
+    fn a_loaded_surface_is_marked_while_a_transit_point_uses_source_auth() {
+        let stored = |base: serde_json::Value, variant: Option<serde_json::Value>, marked: bool| {
+            let mut surface = json!({
+                "name": "callers",
+                "access_point": { "listen_address": "0.0.0.0:8443", "route": "/callers", "protocol": "a2a" },
+                "target": { "endpoint": "https://agent.internal" },
+                "transit": { "points": [base] }
+            });
+            if let Some(point) = variant {
+                surface["variants"] = json!([{ "id": "v", "alias": "dev", "name": "dev",
+                    "overrides": { "transit": { "points": [point] } } }]);
+            }
+            if marked {
+                surface["transit_point_source_auth"] = json!(true);
+            }
+            surface
+        };
+        let keyed =
+            json!({ "alias": "partner", "target_endpoint": "https://partner.example", "source_auth": api_key() });
+        let tokened = json!({ "alias": "partner", "target_endpoint": "https://partner.example" });
+
+        for (case, mut record) in [
+            ("base", stored(keyed.clone(), None, false)),
+            ("variant only", stored(tokened.clone(), Some(keyed.clone()), false)),
+        ] {
+            assert!(AgentSurface::migrate_raw_json(&mut record).unwrap(), "{case}: re-persisted");
+            assert_eq!(record["transit_point_source_auth"], true, "{case}");
+            let loaded: AgentSurface = serde_json::from_value(record.clone()).unwrap();
+            assert!(loaded.transit_point_source_auth && loaded.has_transit_point_source_auth(), "{case}");
+            let mut again = record.clone();
+            assert!(!AgentSurface::migrate_raw_json(&mut again).unwrap(), "{case}: already marked");
+            assert_eq!(
+                serde_json::to_value(&loaded).unwrap()["transit_point_source_auth"],
+                true,
+                "{case}: a save keeps the mark"
+            );
+        }
+
+        let mut unused = stored(tokened.clone(), None, true);
+        assert!(AgentSurface::migrate_raw_json(&mut unused).unwrap());
+        assert!(
+            unused
+                .get("transit_point_source_auth")
+                .is_none(),
+            "{unused}"
+        );
+        let mut plain = stored(tokened, None, false);
+        assert!(!AgentSurface::migrate_raw_json(&mut plain).unwrap());
+        assert!(
+            plain
+                .get("transit_point_source_auth")
+                .is_none()
+        );
+
+        let mut renamed = stored(keyed, None, true);
+        let marker = renamed
+            .as_object_mut()
+            .unwrap()
+            .remove("transit_point_source_auth")
+            .unwrap();
+        renamed["a_field_this_release_does_not_know"] = marker;
+        assert!(
+            serde_json::from_value::<AgentSurface>(renamed).is_err(),
+            "a surface is refused for a top-level field its release does not know, which is what makes an older \
+             release refuse the mark"
+        );
     }
 
     #[test]
