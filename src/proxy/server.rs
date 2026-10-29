@@ -1680,7 +1680,13 @@ pub async fn run_outbound_port_server(
         let outbound_surface = surface
             .resolve_variant(None)
             .unwrap_or_else(|_| surface.clone());
-        for e in outbound_surface.validate_outbound() {
+        let mut warnings = outbound_surface.validate_outbound();
+        for warning in surface.validate_outbound() {
+            if !warnings.contains(&warning) {
+                warnings.push(warning);
+            }
+        }
+        for e in warnings {
             tracing::warn!(channel = %outbound_surface.name, "Outbound validation warning: {}", e);
         }
         for open in open_transit_points(&network_config, surface)

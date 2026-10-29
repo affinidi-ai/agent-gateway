@@ -848,6 +848,21 @@ impl AgentSurface {
                 errors.push(format!("{prefix}{error}"));
             }
         }
+        for variant in &self.variants {
+            if variant
+                .overrides
+                .transit
+                .as_ref()
+                .and_then(|transit| transit.shared.as_ref())
+                .is_some_and(|shared| shared.source_auth.is_some())
+            {
+                errors.push(format!(
+                    "variant '{}': {}",
+                    variant.alias,
+                    crate::config::agent_surface::TRANSIT_SOURCE_AUTH_REFUSED
+                ));
+            }
+        }
 
         errors
     }
@@ -1218,5 +1233,32 @@ mod tests {
         );
         assert!(!s.has_agent_keyed_outbound_credentials());
         assert_eq!(providers(s.outbound_credentials()), vec!["vendor"], "the display keeps every binding");
+    }
+
+    #[test]
+    fn validate_outbound_warns_about_transit_source_auth_set_by_a_variant() {
+        let surface: AgentSurface = serde_json::from_value(serde_json::json!({
+            "surface_id": "surf-1", "name": "test", "status": "active",
+            "access_point": { "listen_address": "http://localhost:8080", "route": "/test", "protocol": "a2a" },
+            "target": { "endpoint": "http://localhost:9000" },
+            "transit": { "outbound_listen_address": "http://localhost:9001",
+                "points": [{ "alias": "partner", "target_endpoint": "http://localhost:9002" }] },
+            "variants": [
+                { "id": "v1", "alias": "staging", "name": "Staging", "enabled": true,
+                    "overrides": { "transit": { "shared": { "source_auth": {
+                        "type": "api_key",
+                        "extraction": { "source": "http_header", "field": "X-API-Key" },
+                        "secret_id": "transit-caller-key"
+                    } } } } },
+                { "id": "v2", "alias": "plain", "name": "Plain", "enabled": true,
+                    "overrides": { "transit": { "shared": { "sign_requests": true } } } }
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            surface.validate_outbound(),
+            vec![format!("variant 'staging': {}", crate::config::agent_surface::TRANSIT_SOURCE_AUTH_REFUSED)]
+        );
     }
 }
