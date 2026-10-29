@@ -71,7 +71,7 @@ pub struct OutboundProxyState {
     /// When set, skip path-based virtual-channel resolution and use this
     /// alias directly. Populated at route-registration time when the VC
     /// is mounted at a custom `listen_path` (and therefore the request
-    /// path no longer follows the `/outgoing/<route>/<alias>` convention
+    /// path no longer follows the `/outbound/<route>/<alias>` convention
     /// that [`crate::proxy::outbound_handler::resolve_virtual_channel`]
     /// relies on).
     pub vc_alias_override: Option<String>,

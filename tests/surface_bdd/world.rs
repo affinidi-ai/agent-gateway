@@ -140,6 +140,8 @@ pub struct SurfaceWorld {
     pub a2a_stream_ended: bool,
     /// The query of the last OAuth callback sent with a gateway-issued state.
     pub oauth_callback_query: Option<String>,
+    /// The transit token the managed agent sends on its Transit Point calls.
+    pub transit_token: Option<String>,
     pub temp_dir: TempDir,
     pub debug: bool,
     pub runtimes: RuntimeRegistry,
@@ -203,6 +205,7 @@ impl SurfaceWorld {
             a2a_stream_events: Vec::new(),
             a2a_stream_ended: false,
             oauth_callback_query: None,
+            transit_token: None,
             temp_dir: get_default_temp_dir(),
             debug: is_debug,
             runtimes: RuntimeRegistry::default(),

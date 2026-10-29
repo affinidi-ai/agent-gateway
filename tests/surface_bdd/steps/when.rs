@@ -2152,6 +2152,164 @@ async fn send_mcp_request_through_transit_point_path(
     path: &str,
     body: serde_json::Value,
 ) {
+    send_mcp_request_through_transit_point_path_with_headers(world, agent_name, path, body, Vec::new()).await;
+}
+
+/// The transit token the Access Point hands the managed agent: the caller
+/// sends a request to the surface, and the copy the managed agent receives
+/// carries it.
+pub(crate) async fn transit_token_from_the_access_point(world: &mut SurfaceWorld) -> String {
+    send_request_and_record(world, Vec::new()).await;
+    let forwarded = world
+        .infra
+        .as_ref()
+        .expect("scenario infra must exist")
+        .mock
+        .last_request()
+        .await
+        .expect("the managed agent must receive the caller's request");
+    forwarded
+        .headers
+        .get("x-transit-token")
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!("the Access Point must hand the managed agent a transit token: {:?}", forwarded.headers)
+        })
+}
+
+/// `token` with the claims in `changes` replaced, signed with the gateway's
+/// transit token key and naming it, as the gateway itself would issue it.
+pub(crate) fn reissued_transit_token(
+    world: &SurfaceWorld,
+    token: &str,
+    changes: serde_json::Value,
+) -> String {
+    use base64::Engine as _;
+
+    let key_file = world
+        .infra
+        .as_ref()
+        .expect("scenario infra must exist")
+        ._temp_dir
+        .path()
+        .join("_storage/vc_keys/transit_token_key.json");
+    let stored: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&key_file).expect("read the gateway's transit token key"))
+            .expect("the transit token key file is JSON");
+    let secret = hex::decode(
+        stored["key"]
+            .as_str()
+            .expect("the transit token key file names its key"),
+    )
+    .expect("the transit token key is hexadecimal");
+    let payload = token
+        .split('.')
+        .nth(1)
+        .expect("a transit token is a JWT");
+    let mut claims: serde_json::Value = serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload)
+            .expect("a transit token's claims are base64url"),
+    )
+    .expect("a transit token's claims are JSON");
+    for (name, value) in changes
+        .as_object()
+        .expect("claim changes are a JSON object")
+    {
+        claims[name] = value.clone();
+    }
+    let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+    header.kid = stored["kid"]
+        .as_str()
+        .map(str::to_string);
+    jsonwebtoken::encode(&header, &claims, &jsonwebtoken::EncodingKey::from_secret(&secret))
+        .expect("sign the transit token")
+}
+
+/// The headers a managed agent's Transit Point call carries: its transit token,
+/// and `extra`.
+fn with_transit_token(
+    world: &SurfaceWorld,
+    extra: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    let token = world
+        .transit_token
+        .clone()
+        .expect("the managed agent must hold a transit token");
+    std::iter::once(("x-transit-token".to_string(), token))
+        .chain(extra)
+        .collect()
+}
+
+#[when(expr = "managed agent {string} asks for available tools through Transit Point {string} with its transit token")]
+async fn managed_agent_asks_for_tools_through_transit_point_with_its_token(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    transit_point: String,
+) {
+    let body = build_mcp_list_tools_body_with_id(serde_json::json!("mcp-tools-list-alpha"));
+    let headers = with_transit_token(world, Vec::new());
+    send_mcp_request_through_transit_point_path_with_headers(
+        world,
+        &agent_name,
+        &format!("/transit/{transit_point}"),
+        body,
+        headers,
+    )
+    .await;
+}
+
+#[when(
+    expr = "managed agent {string} invokes MCP tool {string} through Transit Point {string} with its transit token and header {string} set to {string}"
+)]
+async fn managed_agent_invokes_tool_through_transit_point_with_its_token_and_header(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    tool_name: String,
+    transit_point: String,
+    header: String,
+    value: String,
+) {
+    let body = build_mcp_tool_call_body(&tool_name, serde_json::json!({ "limit": 3 }));
+    let headers = with_transit_token(world, vec![(header, value)]);
+    send_mcp_request_through_transit_point_path_with_headers(
+        world,
+        &agent_name,
+        &format!("/transit/{transit_point}"),
+        body,
+        headers,
+    )
+    .await;
+}
+
+#[when(
+    expr = "managed agent {string} asks for available tools through Transit Point {string} with header {string} set to {string}"
+)]
+async fn managed_agent_asks_for_tools_through_transit_point_with_header(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    transit_point: String,
+    header: String,
+    value: String,
+) {
+    let body = build_mcp_list_tools_body_with_id(serde_json::json!("mcp-tools-list-alpha"));
+    send_mcp_request_through_transit_point_path_with_headers(
+        world,
+        &agent_name,
+        &format!("/transit/{transit_point}"),
+        body,
+        vec![(header, value)],
+    )
+    .await;
+}
+
+async fn send_mcp_request_through_transit_point_path_with_headers(
+    world: &mut SurfaceWorld,
+    agent_name: &str,
+    path: &str,
+    body: serde_json::Value,
+    headers: Vec<(String, String)>,
+) {
     world
         .actors
         .expect_target_kind(agent_name, TargetActorKind::ManagedAgent);
@@ -2170,9 +2328,13 @@ async fn send_mcp_request_through_transit_point_path(
     let url = format!("http://127.0.0.1:{}{}", outbound_port, path);
 
     world.sent_body = Some(body.clone());
-    let response = reqwest::Client::new()
+    let mut request = reqwest::Client::new()
         .post(&url)
-        .header("content-type", "application/json")
+        .header("content-type", "application/json");
+    for (name, value) in headers {
+        request = request.header(name, value);
+    }
+    let response = request
         .json(&body)
         .send()
         .await

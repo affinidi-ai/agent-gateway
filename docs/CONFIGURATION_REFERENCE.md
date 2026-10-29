@@ -174,7 +174,7 @@ Network topology and the surfaces served. The largest configuration file; the ex
 
 | Key | Controls |
 | --- | --- |
-| `listeners` | Named bind addresses and ports. Access Points and Transit Points reference these. |
+| `listeners` | Named bind addresses and ports. Access Points and Transit Points reference these. A `bind_address` must be an IPv4 or IPv6 address such as `0.0.0.0`, `127.0.0.1`, `::` or `::1`; any other value stops the gateway from loading its network configuration. Each port is served by one listener task, and the first listener configured on the port decides whether it is inbound or outbound, whether it uses TLS and, for an outbound port, the one address it binds; the other listeners on the port do not change these, so an inbound listener on an outbound port is not served. An inbound port binds the distinct `bind_address` of every inbound listener on it, each on its own address; one of them that an unspecified address on the same port already covers, such as `127.0.0.1` beside `0.0.0.0`, is served through that one. An IPv4 caller accepted on an IPv6 address, such as `::` on a dual-stack host, matches the IPv4 entries of `client_ip.trusted_proxies` and `tls.client_auth.trusted_proxies`. |
 | `channels` | Route prefixes. The legacy wire name for surface routes. The dashboard offers them as an Access Point's **Surface Prefix**, in this order, and preselects the first for a new surface. |
 | `routes` | Route categories and their types, prefixes, and fallbacks |
 | `mcp_proxies` | Route prefixes for MCP proxy endpoints |

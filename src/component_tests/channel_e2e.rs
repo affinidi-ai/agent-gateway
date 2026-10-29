@@ -95,7 +95,7 @@ async fn inbound_request_forwarded_to_target() {
 }
 
 /// A `POST` through the outbound listener is forwarded to the external mock target.
-/// The route pattern is `/outgoing/<channel-route>/<alias>/<path>`.
+/// The route pattern is `/outbound/<channel-route>/<alias>/<path>`.
 #[tokio::test(flavor = "multi_thread")]
 async fn outbound_request_forwarded_to_target() {
     //
@@ -132,6 +132,105 @@ async fn outbound_request_forwarded_to_target() {
 
     assert_response(resp).await;
     assert_forwarded_request(&h.mock, body);
+}
+
+/// The machine's address on its default route, which is not a loopback
+/// address, or `None` on a machine without one. Finding it sends nothing.
+fn non_loopback_local_address() -> Option<std::net::IpAddr> {
+    let local = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    local
+        .connect("192.0.2.1:9")
+        .ok()?;
+    let address = local.local_addr().ok()?.ip();
+    (!address.is_loopback() && !address.is_unspecified()).then_some(address)
+}
+
+/// An inbound listener whose `bind_address` is the loopback address binds there
+/// alone: it answers on `127.0.0.1` and refuses the machine's other address,
+/// when the machine has one.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_inbound_listener_binds_its_configured_address() {
+    let h = GatewayHarness::start(|_, gw_config, bootstrap| {
+        let path = &bootstrap.config_files.gateway;
+        let mut network: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        network["listeners"][0]["bind_address"] = json!("127.0.0.1");
+        std::fs::write(path, serde_json::to_vec(&network).unwrap()).unwrap();
+        gw_config.surfaces = vec![helpers::build_minimal_channel()];
+    })
+    .await;
+    let port: u16 = h
+        .gateway_base
+        .rsplit(':')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    let on_loopback = reqwest::Client::new()
+        .post(&h.gateway_url)
+        .header("content-type", "application/json")
+        .body(r#"{"jsonrpc":"2.0","method":"test","id":1}"#)
+        .send()
+        .await
+        .expect("the listener answers on its bind address");
+    assert_response(on_loopback).await;
+
+    let Some(other_address) = non_loopback_local_address() else {
+        eprintln!("skipped the check that other addresses are refused: this machine has no non-loopback address");
+        return;
+    };
+    let elsewhere =
+        tokio::time::timeout(std::time::Duration::from_secs(2), tokio::net::TcpStream::connect((other_address, port)))
+            .await;
+    assert!(!matches!(elsewhere, Ok(Ok(_))), "the listener must not accept on {other_address}:{port}");
+}
+
+/// Two inbound listeners that share a port with different `bind_address`
+/// values are both served: the gateway answers on `127.0.0.1` and on `::1`.
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_listeners_sharing_a_port_are_each_served_on_their_address() {
+    if std::net::TcpListener::bind("[::1]:0").is_err() {
+        eprintln!("skipped: this host has no IPv6 loopback address");
+        return;
+    }
+    let h = GatewayHarness::start(|_, gw_config, bootstrap| {
+        let path = &bootstrap.config_files.gateway;
+        let mut network: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        network["listeners"][0]["bind_address"] = json!("127.0.0.1");
+        let mut on_ipv6 = network["listeners"][0].clone();
+        on_ipv6["id"] = json!("smoke-test-ipv6");
+        on_ipv6["bind_address"] = json!("::1");
+        network["listeners"]
+            .as_array_mut()
+            .unwrap()
+            .push(on_ipv6);
+        std::fs::write(path, serde_json::to_vec(&network).unwrap()).unwrap();
+        gw_config.surfaces = vec![helpers::build_minimal_channel()];
+    })
+    .await;
+    let path = h
+        .gateway_url
+        .strip_prefix(&h.gateway_base)
+        .unwrap()
+        .to_string();
+    let port = h
+        .gateway_base
+        .rsplit(':')
+        .next()
+        .unwrap()
+        .to_string();
+
+    for base in [format!("http://127.0.0.1:{port}"), format!("http://[::1]:{port}")] {
+        let response = reqwest::Client::new()
+            .post(format!("{base}{path}"))
+            .header("content-type", "application/json")
+            .body(r#"{"jsonrpc":"2.0","method":"test","id":1}"#)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("the listener on {base} must answer: {error}"));
+        assert_response(response).await;
+    }
 }
 
 /// A channel with `source_auth` (JWT Bearer) no longer blocks requests without a
