@@ -1,0 +1,40 @@
+branch: feat/fabric-caller-principal
+changes:
+  added:
+    - timestamp: '2026-10-30T15:00:00.000Z'
+      title: Name the caller the receiving surface verified in a partner's transit token
+      description: >-
+        A transit token issued for a request a paired gateway sent over Fabric named only the
+        peer gateway. When the receiving surface's own `source_auth` or Resource Server token
+        verified a credential on that request, normally the one the peer's `target_auth`
+        presents, the token now carries that caller's identity hash as
+        `fabric.principal_hash`, the value the Access Point would put in `user_identity_hash`
+        for the same credential, and the claims of a verified JWT that the surface's Transit
+        Points allowlist as `caller_context_fields`. A caller DID, presentation or payload
+        identity the peer sends never becomes the principal. A Transit Point policy sees such a
+        caller as `fabric_peer` with `verified: true` and that `user_identity_hash`, so a rule
+        that admits a verified caller by its hash also admits it when it arrives over Fabric;
+        add `not input.transit.caller.fabric` to keep partner requests out. Its audit records
+        name it with `auth_method: fabric_verified`, the peer as `iss` and the claims the receiving
+        surface verified, ahead of a caller the Transit Point verified itself, as a verified
+        Access Point token is. The DID the peer named stays unverified (`did_verified: false`)
+        and never names that caller. The principal is nested under `fabric`, so a release that
+        does not read it sees no principal.
+    - timestamp: '2026-10-30T15:00:00.000Z'
+      title: Release delegated credentials to partner callers on Transit Points that opt in
+      description: >-
+        A Transit Point refused, with `403`, every call carrying a transit token issued for a
+        request that arrived over Fabric when a delegated credential binding applied. A Transit
+        Point that sets the new `delegated_credentials_for_fabric_callers: true` now releases
+        the grant of the caller in the token's `fabric.principal_hash`, and only that caller's;
+        the caller DID the peer named never keys a grant. It is off by default, and only a
+        Transit Point that requires the transit token may set it: the admin API refuses one
+        that does not with `400`. A `PUT` of the surface or of a variant that omits it keeps the
+        stored value while the Transit Point requires the transit token, since the Surface
+        Builder does not show it. Without it, or when the receiving surface verified no caller,
+        the call is refused as before and the log gives the reason.
+  changed: []
+  fixed: []
+  removed: []
+  security: []
+  breaking: []

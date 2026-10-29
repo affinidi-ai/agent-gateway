@@ -751,6 +751,53 @@ impl MultiGatewayHarness {
             .await
     }
 
+    /// Attach the policy definition `policy_definition_id` to Transit Point
+    /// `transit_point_alias` of `surface_id` on gateway `gw_index`.
+    pub async fn set_transit_point_policy(
+        &self,
+        gw_index: usize,
+        surface_id: &str,
+        transit_point_alias: &str,
+        policy_definition_id: &str,
+    ) -> Result<()> {
+        let gateway = self.gw(gw_index);
+        let mut surface = gateway
+            .admin
+            .get_surface(surface_id)
+            .await
+            .with_context(|| format!("fetch surface {surface_id} on gateway {gw_index}"))?;
+        let point = surface
+            .get_mut("transit")
+            .and_then(|transit| transit.get_mut("points"))
+            .and_then(serde_json::Value::as_array_mut)
+            .and_then(|points| {
+                points
+                    .iter_mut()
+                    .find(|point| {
+                        point
+                            .get("alias")
+                            .and_then(serde_json::Value::as_str)
+                            == Some(transit_point_alias)
+                    })
+            })
+            .with_context(|| {
+                format!("surface {surface_id} on gateway {gw_index} has no Transit Point '{transit_point_alias}'")
+            })?;
+        point["policy"] = serde_json::json!({ "policy_definition_id": policy_definition_id });
+        gateway
+            .admin
+            .update_surface(surface_id, &surface)
+            .await
+            .with_context(|| {
+                format!(
+                    "attach a policy to Transit Point {transit_point_alias} of surface {surface_id} on gateway \
+                     {gw_index}"
+                )
+            })?;
+        tokio::time::sleep(CHANNEL_RELOAD_SETTLE).await;
+        Ok(())
+    }
+
     /// Add `surface_id` to the surfaces `gw_index` exposes to `peer_gw`, in
     /// list mode, keeping the surfaces already exposed to it.
     pub async fn expose_surface_to_peer(

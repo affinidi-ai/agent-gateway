@@ -375,7 +375,8 @@ request received by the destination gateway:
    Check, surface policy, and MCP tool gating in that order where configured.
 8. Forward to the local surface Target. When the surface has Transit Points and the Target is an
    HTTP or HTTPS URL, the request carries a transit token this gateway issued for it, naming the
-   peer and the hop count, so the agent can call its own Transit Points (see
+   peer, the hop count and, when step 5 verified one, the caller the surface's own source
+   authentication verified, so the agent can call its own Transit Points (see
    [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)). A public discovery `GET`, such as an agent
    card fetch, carries none, nor does a request relayed to an MCP Target over the legacy HTTP+SSE
    transport.
@@ -451,12 +452,14 @@ forwards only to that Target, a binding with `required_for.tools` applies there 
 whose `params.name` it lists, read after admission has refused batches and ambiguous keys.
 
 When the agent behind the receiving surface then calls one of its own Transit Points with the
-transit token it got for the peer's request, that Transit Point releases it no delegated per-user
-credential: the token names the peer, never a principal, and never keys a vault lookup. A binding
-that applies refuses the call with `403`, and the Transit Point's target is not called; the log
-says delegated credentials are not released for requests that arrived over Fabric. A caller the
-Transit Point's own `source_auth` verified still gets its own grant, and static `target_auth`
-credentials are added as for any caller (see
+transit token it got for the peer's request, that Transit Point releases a delegated per-user
+credential only when it sets `delegated_credentials_for_fabric_callers: true`, and only the grant
+of the caller the receiving surface's own source authentication verified on the request, carried
+as the token's `fabric.principal_hash`. What the peer says about its caller (a caller DID, a
+presentation, a payload identity) never keys a vault lookup. Otherwise a binding that applies
+refuses the call with `403`, and the Transit Point's target is not called; the log gives the
+reason. A caller the Transit Point's own `source_auth` verified still gets its own grant, and
+static `target_auth` credentials are added as for any caller (see
 [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-a-transit-point)).
 
 `make gw-e2e` verifies the Access Point Target case between two gateway binaries
@@ -528,4 +531,6 @@ a token, and until the Transit Point reads it, the hop limit does not hold throu
 (`tests/features/g2g/transit_token_over_fabric.feature`): an agent serving a partner's request
 calls onward through its own Transit Point with the token it was given, in the caller's trace;
 without the token, or with one issued for another surface, the Transit Point answers `401`;
-and two agents passing a request back and forth are stopped with `508` after 8 crossings.
+two agents passing a request back and forth are stopped with `508` after 8 crossings; and a
+Transit Point policy on `input.transit.caller.fabric.peer_issuer_did` admits one partner
+gateway's requests and refuses another's with `403`.

@@ -2160,14 +2160,17 @@ fn retain_mcp_settings(
 }
 
 /// PUT carries the whole record, or a variant PUT its whole overrides, but the
-/// Surface Builder shows neither a Transit Point's `source_auth` nor its
-/// `allow_unauthenticated_callers`, so a save from it omits both. An omitted
+/// Surface Builder shows none of a Transit Point's `source_auth`,
+/// `allow_unauthenticated_callers` and `delegated_credentials_for_fabric_callers`,
+/// so a save from it omits them. An omitted
 /// `source_auth` means unchanged, as an omitted `mcp_http.authorization` does;
 /// removal is explicit: a `null` `source_auth` in the PUT, or a merge PATCH
 /// whose Transit Points leave it out. The save rules then refuse a Transit
 /// Point left authenticating no caller. An omitted
 /// `allow_unauthenticated_callers` is kept while the Transit Point still
-/// authenticates no caller, and dropped once it does.
+/// authenticates no caller, and dropped once it does. An omitted
+/// `delegated_credentials_for_fabric_callers` is kept while the Transit Point
+/// still requires the transit token, and dropped once it does not.
 fn retain_transit_caller_authentication(
     surface: &mut AgentSurface,
     existing: &AgentSurface,
@@ -2215,9 +2218,10 @@ fn retain_transit_caller_authentication(
     }
 }
 
-/// Keeps each Transit Point's stored `source_auth` and
-/// `allow_unauthenticated_callers` that `sent_points`, the JSON the request
-/// sent for `points`, leaves out; see `retain_transit_caller_authentication`.
+/// Keeps each Transit Point's stored `source_auth`,
+/// `allow_unauthenticated_callers` and `delegated_credentials_for_fabric_callers`
+/// that `sent_points`, the JSON the request sent for `points`, leaves out; see
+/// `retain_transit_caller_authentication`.
 fn retain_transit_points_caller_authentication(
     points: &mut [crate::config::agent_surface::TransitPoint],
     stored: &[crate::config::agent_surface::TransitPoint],
@@ -2244,6 +2248,17 @@ fn retain_transit_points_caller_authentication(
         });
         if !sends_open_flag && previous.allow_unauthenticated_callers && !point.authenticates_callers() {
             point.allow_unauthenticated_callers = true;
+        }
+        let sends_fabric_caller_delegation = sent_point.is_some_and(|point| {
+            point
+                .get("delegated_credentials_for_fabric_callers")
+                .is_some()
+        });
+        if !sends_fabric_caller_delegation
+            && previous.delegated_credentials_for_fabric_callers
+            && point.require_transit_token
+        {
+            point.delegated_credentials_for_fabric_callers = true;
         }
     }
 }
@@ -4165,6 +4180,63 @@ mod validation_tests {
         }
     }
 
+    /// The Surface Builder does not show `delegated_credentials_for_fabric_callers`,
+    /// so a PUT, of the surface or a variant within it, that omits it keeps the
+    /// stored value while the Transit Point still requires the transit token; a
+    /// value the request sends is honoured.
+    #[test]
+    fn a_put_that_omits_a_transit_points_fabric_caller_delegation_keeps_it_while_it_applies() {
+        let stored_points = serde_json::json!([
+            { "id": "kept", "alias": "kept", "target_endpoint": "https://kept.example",
+                "delegated_credentials_for_fabric_callers": true },
+            { "id": "cleared", "alias": "cleared", "target_endpoint": "https://cleared.example",
+                "delegated_credentials_for_fabric_callers": true },
+            { "id": "tokenless", "alias": "tokenless", "target_endpoint": "https://tokenless.example",
+                "delegated_credentials_for_fabric_callers": true },
+            { "id": "never", "alias": "never", "target_endpoint": "https://never.example" }
+        ]);
+        let existing = surface_with_transit_points(stored_points.clone(), stored_points);
+        let sent_points = serde_json::json!([
+            { "id": "kept", "alias": "kept", "target_endpoint": "https://kept.example" },
+            { "id": "cleared", "alias": "cleared", "target_endpoint": "https://cleared.example",
+                "delegated_credentials_for_fabric_callers": false },
+            { "id": "tokenless", "alias": "tokenless", "target_endpoint": "https://tokenless.example",
+                "require_transit_token": false, "source_auth": caller_key() },
+            { "id": "never", "alias": "never", "target_endpoint": "https://never.example" }
+        ]);
+        let sent = serde_json::json!({
+            "transit": { "points": sent_points },
+            "variants": [{ "id": "candidate", "overrides": { "transit": { "points": sent_points } } }]
+        });
+        let mut surface = surface_with_transit_points(sent_points.clone(), sent_points);
+
+        retain_transit_caller_authentication(&mut surface, &existing, &sent);
+
+        let variant_points = surface.variants[0]
+            .overrides
+            .transit
+            .as_ref()
+            .and_then(|transit| transit.points.clone())
+            .unwrap();
+        for points in [
+            &surface
+                .transit
+                .as_ref()
+                .unwrap()
+                .points,
+            &variant_points,
+        ] {
+            let opted_in: Vec<bool> = points
+                .iter()
+                .map(|point| point.delegated_credentials_for_fabric_callers)
+                .collect();
+            assert_eq!(opted_in, [true, false, false, false], "kept, cleared, dropped without the token, never set");
+            for point in points {
+                assert_eq!(point.validate_caller_authentication(), Ok(()), "{}", point.alias);
+            }
+        }
+    }
+
     #[test]
     fn a_transit_point_that_cannot_authenticate_its_callers_is_refused_on_the_surface_and_in_a_variant() {
         let valid = serde_json::json!([{ "alias": "partner", "target_endpoint": "https://partner.example" }]);
@@ -4186,6 +4258,16 @@ mod validation_tests {
                         "identity_binding": { "type": "fingerprint" } } }]),
                 valid.clone(),
                 "transit.points[0]: Channel 'callers': mTLS pinned trust requires at least one certificate_id"
+                    .to_string(),
+            ),
+            (
+                "delegated credentials for Fabric callers without the transit token, in a variant",
+                valid.clone(),
+                serde_json::json!([{ "alias": "partner", "target_endpoint": "https://partner.example",
+                    "require_transit_token": false, "source_auth": caller_key(),
+                    "delegated_credentials_for_fabric_callers": true }]),
+                "variant 'candidate' transit.points[0]: Transit Point 'partner' sets \
+                 delegated_credentials_for_fabric_callers but does not require the transit token"
                     .to_string(),
             ),
         ] {

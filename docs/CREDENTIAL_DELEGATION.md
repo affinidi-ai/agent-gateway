@@ -101,12 +101,29 @@ carries, so a `source_auth` caller without a transit token needs a managed ident
 Transit Point.
 
 A transit token the gateway issued for a request that arrived over Fabric (see
-[`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)) keys no grant: it carries no principal, and
-the caller DID in it is the peer gateway's word, so it is never the agent half of a key either.
-A binding that applies to such a call refuses it with `403` and the target is not called; the
-log says delegated credentials are not released for requests that arrived over Fabric. A caller
-the Transit Point's own `source_auth` verified on the same call still keys its own grant, and
-static `target_auth` credentials are added as for any caller.
+[`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)) keys a grant only on a Transit Point that
+sets `delegated_credentials_for_fabric_callers: true` (off by default), and then only by its
+`fabric.principal_hash`: the caller the receiving surface's own `source_auth` or resource token
+verified on that request, the same identity hash its Access Point computes for the same
+credential. The caller DID or pseudonym the peer gateway sent, and a top-level
+`user_identity_hash`, never key a grant, and the caller DID is never the agent half of a key
+either, so such a call needs the Transit Point's managed identity. Because the receiving
+surface normally verifies the credential the peer's `target_auth` presents, a grant keyed this
+way usually belongs to the partner, shared by every request it sends with that credential.
+
+Without the switch, or when the receiving surface verified no caller, a binding that applies
+refuses the call with `403` and the target is not called. The log says delegated credentials
+are not released for requests that arrived over Fabric
+(`reason=delegated_credentials_for_fabric_callers=false`), or that the receiving surface
+verified no caller of the request (`reason=no_fabric_caller_verified`). A caller the Transit
+Point's own `source_auth` verified on the same call keys its own grant when the token does not,
+and static `target_auth` credentials are added as for any caller. A release that predates the
+switch, or `fabric.principal_hash`, releases nothing for a Fabric-issued token.
+
+On a `fabric://` Transit Point the two switches are independent:
+`delegated_credentials_for_fabric_callers` decides whether a Fabric caller's grant is looked up
+at all, and `fabric_delegated_credentials` whether a resolved credential crosses to the next
+peer (see [Across Fabric](#across-fabric)).
 
 ## When a token is missing
 

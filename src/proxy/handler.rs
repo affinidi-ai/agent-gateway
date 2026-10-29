@@ -16470,8 +16470,9 @@ fn source_auth_user_id(identity: Option<&crate::source_auth::AuthenticatedIdenti
 
 /// The caller's identity hash on `surface`: namespaced by how it was
 /// identified and by the surface's tenant, and `None` for a credential that
-/// names no subject.
-fn source_auth_user_hash(
+/// names no subject. The Fabric receive path uses it for the caller its
+/// surface verified, so both put the same value in a transit token.
+pub(crate) fn source_auth_user_hash(
     identity: Option<&crate::source_auth::AuthenticatedIdentity>,
     surface: &crate::config::agent_surface::AgentSurface,
 ) -> Option<String> {
@@ -16484,8 +16485,9 @@ fn source_auth_user_hash(
 /// allowlists (only those with `caller_source = transit_token` and `enabled = true`),
 /// then populates from the authenticated identity's JWT claims (only `JwtBearer`
 /// carries claims today). The TP side re-filters per its own allowlist via
-/// `select_allowlisted`, so a superset in the token is safe.
-fn compute_transit_token_caller_context(
+/// `select_allowlisted`, so a superset in the token is safe. The Fabric receive
+/// path calls it with the caller its own surface verified.
+pub(crate) fn compute_transit_token_caller_context(
     surface: &crate::config::agent_surface::AgentSurface,
     authenticated_identity: Option<&crate::source_auth::AuthenticatedIdentity>,
 ) -> serde_json::Map<String, serde_json::Value> {

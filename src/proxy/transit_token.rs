@@ -151,11 +151,14 @@ pub struct TransitTokenClaims {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub caller_dna_uai: Option<String>,
 
-    /// SHA-256 hash of the authenticated caller identity (for credential vault lookups).
+    /// SHA-256 hash of the caller identity the Access Point authenticated (for
+    /// credential vault lookups). Never set on a token issued for a Fabric
+    /// request, whose principal is `fabric.principal_hash`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_identity_hash: Option<String>,
 
-    /// Allowlisted caller-context fields captured on the Access Point path and
+    /// Allowlisted caller-context fields captured on the Access Point path, or
+    /// for a Fabric request from the JWT the receiving surface verified, and
     /// carried forward for Transit Point Workload Binding. Only the operator-
     /// configured `caller_context_fields` are copied here, verbatim; a value may
     /// be any JSON value. Empty when Workload Binding is not sourcing caller
@@ -180,8 +183,8 @@ pub struct TransitTokenClaims {
 }
 
 /// The `fabric` claim: the peer gateway that sent the request, as the Fabric
-/// handshake verified it, and how many Fabric crossings the request had made
-/// when it arrived.
+/// handshake verified it, how many Fabric crossings the request had made when
+/// it arrived, and the caller the receiving surface verified on it, if any.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FabricTransitClaims {
     /// The id of the sender's Remote gateway record on the issuing gateway.
@@ -191,11 +194,17 @@ pub struct FabricTransitClaims {
     pub peer_issuer_did: Option<String>,
     /// Fabric crossings, the one that delivered the request included.
     pub hops: u8,
+    /// The identity hash of the caller the receiving surface's own
+    /// `source_auth` or resource token verified on the request, never one the
+    /// peer asserted. Nested here, not in `user_identity_hash`, so a release
+    /// that does not read it sees no principal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal_hash: Option<String>,
 }
 
 /// What a token issued on Fabric receive carries about the caller beyond the
-/// `fabric` claim. It never carries a principal: only the peer gateway is
-/// verified.
+/// `fabric` claim. Its only principal is `fabric.principal_hash`, the caller
+/// the receiving surface verified itself.
 pub struct FabricTransitTokenRequest<'request> {
     pub surface_id: &'request str,
     /// The caller DID the peer's request names, when it names one.
@@ -203,6 +212,9 @@ pub struct FabricTransitTokenRequest<'request> {
     pub identity_source: &'request str,
     pub trace_id: Option<&'request str>,
     pub allowed_transit_points: Vec<String>,
+    /// The claims the surface's Transit Points allowlist, taken from the JWT
+    /// the receiving surface verified on the request.
+    pub caller_context_fields: serde_json::Map<String, serde_json::Value>,
     pub fabric: FabricTransitClaims,
 }
 
@@ -294,8 +306,7 @@ impl TransitTokenIssuer {
 
     /// Issue a token for a request that arrived over Fabric, living
     /// `lifetime_secs` as [`Self::issue_with_caller_context`] does. It carries no
-    /// `user_identity_hash`, caller context fields or DNA UAI. Returns the token
-    /// and its `jti`.
+    /// `user_identity_hash` or DNA UAI. Returns the token and its `jti`.
     pub fn issue_for_fabric_request(
         &self,
         request: FabricTransitTokenRequest<'_>,
@@ -320,7 +331,7 @@ impl TransitTokenIssuer {
             ),
             caller_dna_uai: None,
             user_identity_hash: None,
-            caller_context_fields: serde_json::Map::new(),
+            caller_context_fields: request.caller_context_fields,
             allowed_transit_points: request.allowed_transit_points,
             trace_id: request
                 .trace_id
@@ -1242,12 +1253,24 @@ mod tests {
             identity_source: "fabric-presentation",
             trace_id: Some("trace-1"),
             allowed_transit_points: vec!["delta".to_string()],
+            caller_context_fields: serde_json::Map::new(),
             fabric: FabricTransitClaims {
                 peer_gateway_id: "peer-record".to_string(),
                 peer_issuer_did: Some("did:web:partner.example".to_string()),
                 hops: 3,
+                principal_hash: None,
             },
         }
+    }
+
+    /// `fabric_request` for a request whose caller the receiving surface
+    /// verified, with the claims its Transit Points allowlist.
+    fn verified_fabric_request(caller_did: Option<&str>) -> FabricTransitTokenRequest<'_> {
+        let mut request = fabric_request(caller_did);
+        request.fabric.principal_hash = Some("receiver-verified-hash".to_string());
+        request.caller_context_fields =
+            serde_json::Map::from_iter([("email".to_string(), serde_json::json!("ada@example.com"))]);
+        request
     }
 
     /// A token issued on Fabric receive names the peer and the crossings, never a
@@ -1290,6 +1313,7 @@ mod tests {
                 peer_gateway_id: "peer-record".to_string(),
                 peer_issuer_did: Some("did:web:partner.example".to_string()),
                 hops: 3,
+                principal_hash: None,
             })
         );
         assert!(
@@ -1305,8 +1329,38 @@ mod tests {
         );
     }
 
+    /// The caller the receiving surface verified on a Fabric request rides only
+    /// in `fabric.principal_hash`, beside the claims its Transit Points
+    /// allowlist; the top-level `user_identity_hash`, which names a caller an
+    /// Access Point verified, stays empty.
+    #[test]
+    fn a_fabric_token_carries_the_receivers_verified_principal_only_in_its_fabric_claim() {
+        let issuer = test_issuer();
+        let (token, _) = issuer
+            .issue_for_fabric_request(verified_fabric_request(Some("did:web:caller.example")), LIFETIME, 30)
+            .unwrap();
+
+        let claims = issuer
+            .validate_for_transit_point(&token, "surf-001", "delta", LIFETIME)
+            .unwrap();
+        assert_eq!(claims.user_identity_hash, None);
+        assert_eq!(
+            claims
+                .fabric
+                .and_then(|fabric| fabric.principal_hash)
+                .as_deref(),
+            Some("receiver-verified-hash")
+        );
+        assert_eq!(
+            serde_json::Value::Object(claims.caller_context_fields),
+            serde_json::json!({ "email": "ada@example.com" })
+        );
+    }
+
     /// A release that predates the `fabric` claim reads a Fabric token's claims
-    /// without it, and so sees no principal.
+    /// without it, and one that predates `fabric.principal_hash` reads the
+    /// `fabric` claim without it: neither sees a principal, whatever the
+    /// receiving surface verified, so neither keys a delegated credential by it.
     #[test]
     fn a_reader_without_the_fabric_claim_sees_no_principal_in_a_fabric_token() {
         #[derive(Deserialize)]
@@ -1314,16 +1368,46 @@ mod tests {
             sub: Option<String>,
             user_identity_hash: Option<String>,
         }
+        /// The `fabric` claim as the release that introduced it reads it.
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct FirstFabricClaims {
+            peer_gateway_id: String,
+            peer_issuer_did: Option<String>,
+            hops: u8,
+        }
+        #[derive(Deserialize)]
+        struct FirstFabricReleaseClaims {
+            user_identity_hash: Option<String>,
+            fabric: Option<FirstFabricClaims>,
+        }
         let issuer = test_issuer();
-        let (token, _) = issuer
-            .issue_for_fabric_request(fabric_request(Some("did:web:caller.example")), LIFETIME, 30)
-            .unwrap();
         let mut validation = Validation::new(Algorithm::HS256);
         validation.set_issuer(&["gw-test-001"]);
-        let earlier = decode::<EarlierClaims>(&token, &DecodingKey::from_secret(&[7; 32]), &validation)
-            .unwrap()
-            .claims;
-        assert_eq!(earlier.user_identity_hash, None);
-        assert_eq!(earlier.sub.as_deref(), Some("did:web:caller.example"));
+        for request in
+            [fabric_request(Some("did:web:caller.example")), verified_fabric_request(Some("did:web:caller.example"))]
+        {
+            let (token, _) = issuer
+                .issue_for_fabric_request(request, LIFETIME, 30)
+                .unwrap();
+            let earlier = decode::<EarlierClaims>(&token, &DecodingKey::from_secret(&[7; 32]), &validation)
+                .unwrap()
+                .claims;
+            assert_eq!(earlier.user_identity_hash, None);
+            assert_eq!(earlier.sub.as_deref(), Some("did:web:caller.example"));
+
+            let first_fabric =
+                decode::<FirstFabricReleaseClaims>(&token, &DecodingKey::from_secret(&[7; 32]), &validation)
+                    .unwrap()
+                    .claims;
+            assert_eq!(first_fabric.user_identity_hash, None);
+            assert_eq!(
+                first_fabric.fabric,
+                Some(FirstFabricClaims {
+                    peer_gateway_id: "peer-record".to_string(),
+                    peer_issuer_did: Some("did:web:partner.example".to_string()),
+                    hops: 3,
+                })
+            );
+        }
     }
 }
