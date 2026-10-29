@@ -22,6 +22,9 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 /// Default token TTL: 5 minutes (transit should be immediate).
 const DEFAULT_TTL_SECS: u64 = 300;
 
+/// Clock difference tolerated on a token's `iat` and `exp`.
+const CLOCK_LEEWAY_SECS: u64 = 5;
+
 /// File, in the VC key directory, holding the transit token signing key.
 const KEY_FILE_NAME: &str = "transit_token_key.json";
 
@@ -284,7 +287,9 @@ impl TransitTokenIssuer {
     }
 
     /// Validate a transit token and return the claims. A token whose `kid` does not name this
-    /// issuer's key, or that has none, is refused before its signature is checked.
+    /// issuer's key, or that has none, is refused before its signature is checked. A token is
+    /// accepted any number of times until it expires; one issued in the future, living longer
+    /// than this issuer issues, or without a token ID is refused.
     pub fn validate(
         &self,
         token: &str,
@@ -297,20 +302,42 @@ impl TransitTokenIssuer {
         let mut validation = Validation::new(Algorithm::HS256);
         validation.set_issuer(&[&self.gateway_id]);
         validation.validate_exp = true;
+        validation.leeway = CLOCK_LEEWAY_SECS;
 
-        let token_data =
-            decode::<TransitTokenClaims>(token, &key, &validation).context("transit token validation failed")?;
+        let claims = decode::<TransitTokenClaims>(token, &key, &validation)
+            .context("transit token validation failed")?
+            .claims;
 
-        Ok(token_data.claims)
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock error")?
+            .as_secs();
+        if claims.iat > now.saturating_add(CLOCK_LEEWAY_SECS) {
+            anyhow::bail!("transit token is issued in the future");
+        }
+        if claims.exp <= claims.iat || claims.exp - claims.iat > self.ttl_secs {
+            anyhow::bail!("transit token lifetime is not one this gateway issues");
+        }
+        if claims.jti.is_empty() {
+            anyhow::bail!("transit token has no token ID");
+        }
+
+        Ok(claims)
     }
 
-    /// Validate a transit token and check it's authorized for a specific transit point.
+    /// Validate a transit token and check it was issued for `surface_id` and opens the
+    /// Transit Point named `transit_point_name`.
     pub fn validate_for_transit_point(
         &self,
         token: &str,
+        surface_id: &str,
         transit_point_name: &str,
     ) -> Result<TransitTokenClaims> {
         let claims = self.validate(token)?;
+
+        if claims.surface_id.is_empty() || claims.surface_id != surface_id {
+            anyhow::bail!("transit token was issued for another surface");
+        }
 
         // If allowed_transit_points is empty, all are allowed
         if !claims
@@ -382,20 +409,19 @@ mod tests {
             .chain_update(b"transit-token-signing-key:")
             .chain_update(b"gw-test-001")
             .finalize();
-        let claims = claims_for("surf-001", now(), now() + 300);
+        let now = now();
+        let claims = claims_for("surf-001", now, now + 300);
 
         let without_kid = sign_with(Header::new(Algorithm::HS256), &derived, &claims);
         let mut with_kid = Header::new(Algorithm::HS256);
         with_kid.kid = Some("test-kid".to_string());
         let with_our_kid = sign_with(with_kid, &derived, &claims);
 
-        for token in [without_kid, with_our_kid] {
-            assert!(
-                issuer
-                    .validate(&token)
-                    .is_err(),
-                "a token signed with the domain-derived key must be refused"
-            );
+        for (token, reason) in [
+            (without_kid, "transit token is not signed with this gateway's transit token key"),
+            (with_our_kid, "transit token validation failed: InvalidSignature"),
+        ] {
+            assert_eq!(refusal(issuer.validate(&token)), reason, "a token signed with the domain-derived key");
         }
     }
 
@@ -407,7 +433,7 @@ mod tests {
             .issue("surf-001", None, None, None, Some("victim-hash"), None, vec![])
             .unwrap();
 
-        assert!(ours.validate(&token).is_err());
+        assert_eq!(refusal(ours.validate(&token)), "transit token is not signed with this gateway's transit token key");
         assert_eq!(
             theirs
                 .validate(&token)
@@ -423,16 +449,12 @@ mod tests {
         let issuer = test_issuer();
         let mut header = Header::new(Algorithm::HS256);
         header.kid = Some("previous-kid".to_string());
-        let token = sign_with(header, &[7; 32], &claims_for("surf-001", now(), now() + 300));
+        let now = now();
+        let token = sign_with(header, &[7; 32], &claims_for("surf-001", now, now + 300));
 
-        let error = issuer
-            .validate(&token)
-            .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("not signed with this gateway's transit token key"),
-            "{error}"
+        assert_eq!(
+            refusal(issuer.validate(&token)),
+            "transit token is not signed with this gateway's transit token key"
         );
     }
 
@@ -445,11 +467,7 @@ mod tests {
             .issue("surf-001", None, None, None, None, None, vec![])
             .unwrap();
 
-        assert!(
-            issuer
-                .validate(&token)
-                .is_err()
-        );
+        assert_eq!(refusal(issuer.validate(&token)), "transit token validation failed: InvalidSignature");
     }
 
     #[test]
@@ -680,19 +698,19 @@ mod tests {
 
         // Allowed
         let claims = issuer
-            .validate_for_transit_point(&token, "github-api")
+            .validate_for_transit_point(&token, "surf-001", "github-api")
             .unwrap();
         assert_eq!(claims.surface_id, "surf-001");
 
         // Also allowed
         assert!(
             issuer
-                .validate_for_transit_point(&token, "partner")
+                .validate_for_transit_point(&token, "surf-001", "partner")
                 .is_ok()
         );
 
         // Not allowed
-        let result = issuer.validate_for_transit_point(&token, "unauthorized-point");
+        let result = issuer.validate_for_transit_point(&token, "surf-001", "unauthorized-point");
         assert!(result.is_err());
     }
 
@@ -707,9 +725,110 @@ mod tests {
         // Empty allowed_transit_points means all are permitted
         assert!(
             issuer
-                .validate_for_transit_point(&token, "any-point")
+                .validate_for_transit_point(&token, "surf-001", "any-point")
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn refuses_a_token_issued_for_another_surface_on_a_transit_point_of_the_same_alias() {
+        let issuer = test_issuer();
+        let token = issuer
+            .issue("surface-a", None, None, None, Some("victim-hash"), None, vec!["partner".to_string()])
+            .unwrap();
+
+        let error = issuer
+            .validate_for_transit_point(&token, "surface-b", "partner")
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("another surface"),
+            "{error}"
+        );
+        assert!(
+            issuer
+                .validate_for_transit_point(&token, "surface-a", "partner")
+                .is_ok()
+        );
+    }
+
+    /// Why `validated` was refused, with every cause.
+    fn refusal(validated: Result<TransitTokenClaims>) -> String {
+        format!("{:#}", validated.unwrap_err())
+    }
+
+    #[test]
+    fn refuses_a_token_without_a_surface() {
+        let issuer = test_issuer();
+        let now = now();
+        let token = issuer
+            .sign(&claims_for("", now, now + 300))
+            .unwrap();
+
+        assert_eq!(
+            refusal(issuer.validate_for_transit_point(&token, "", "partner")),
+            "transit token was issued for another surface"
+        );
+    }
+
+    #[test]
+    fn refuses_tokens_living_longer_than_the_gateway_issues_or_issued_in_the_future() {
+        let issuer = test_issuer();
+        let now = now();
+        for (case, iat, exp, reason) in [
+            ("thirty days", now, now + 30 * 24 * 3600, "transit token lifetime is not one this gateway issues"),
+            ("one second too long", now - 10, now + 291, "transit token lifetime is not one this gateway issues"),
+            ("issued in the future", now + 60, now + 300, "transit token is issued in the future"),
+            ("expires when issued", now, now, "transit token lifetime is not one this gateway issues"),
+            ("expires before it is issued", now, now - 1, "transit token lifetime is not one this gateway issues"),
+            ("expired beyond the leeway", now - 300, now - 30, "transit token validation failed: ExpiredSignature"),
+        ] {
+            let token = issuer
+                .sign(&claims_for("surf-001", iat, exp))
+                .unwrap();
+            assert_eq!(
+                refusal(issuer.validate_for_transit_point(&token, "surf-001", "partner")),
+                reason,
+                "{case} must be refused for its lifetime"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_a_token_without_a_token_id() {
+        let issuer = test_issuer();
+        let now = now();
+        let mut claims = claims_for("surf-001", now, now + 300);
+        claims.jti = String::new();
+        let token = issuer.sign(&claims).unwrap();
+
+        assert_eq!(refusal(issuer.validate(&token)), "transit token has no token ID");
+    }
+
+    #[test]
+    fn accepts_the_same_token_again_and_again_within_its_lifetime() {
+        let issuer = test_issuer();
+        let token = issuer
+            .issue("surf-001", None, None, None, Some("caller-hash"), None, vec![])
+            .unwrap();
+        let now = now();
+        let near_expiry = issuer
+            .sign(&claims_for("surf-001", now - 298, now + 2))
+            .unwrap();
+
+        for _ in 0..5 {
+            for token in [&token, &near_expiry] {
+                assert_eq!(
+                    issuer
+                        .validate_for_transit_point(token, "surf-001", "partner")
+                        .unwrap()
+                        .surface_id,
+                    "surf-001"
+                );
+            }
+        }
     }
 
     #[test]
@@ -832,12 +951,12 @@ mod tests {
         // Carrying caller context does not widen transit-point authorization.
         assert!(
             issuer
-                .validate_for_transit_point(&token, "delta")
+                .validate_for_transit_point(&token, "surf-001", "delta")
                 .is_ok()
         );
         assert!(
             issuer
-                .validate_for_transit_point(&token, "other")
+                .validate_for_transit_point(&token, "surf-001", "other")
                 .is_err()
         );
     }

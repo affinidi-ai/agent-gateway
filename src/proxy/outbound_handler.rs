@@ -998,10 +998,10 @@ async fn step_validate_transit_token(
         return Err(OutboundPipelineError::TransitTokenInvalid("missing X-Transit-Token header".to_string()));
     };
 
-    // Validate the token and check it's authorized for this specific transit point.
+    // Validate the token and check it was issued for this surface and opens this transit point.
     let transit_point_name = &ctx.virtual_channel.alias;
     let claims = issuer
-        .validate_for_transit_point(token, transit_point_name)
+        .validate_for_transit_point(token, &ctx.surface.surface_id, transit_point_name)
         .map_err(|e| OutboundPipelineError::TransitTokenInvalid(e.to_string()))?;
 
     if modern {
@@ -1011,13 +1011,7 @@ async fn step_validate_transit_token(
                 OutboundPipelineError::TransitTokenInvalid("Transit token validation clock is unavailable".into())
             })?
             .as_secs();
-        if claims.surface_id != ctx.surface.surface_id
-            || claims.surface_id.is_empty()
-            || claims.exp <= now
-            || claims.iat > now
-            || claims.exp <= claims.iat
-            || claims.jti.is_empty()
-        {
+        if claims.exp <= now || claims.iat > now {
             return Err(OutboundPipelineError::TransitTokenInvalid(
                 "Transit token is not live for this surface".into(),
             ));
@@ -10335,7 +10329,7 @@ mod tests {
             let claims: TransitTokenClaims = serde_json::from_value(json!({
                 "iss": "gateway", "surface_id": if case == "other-surface" { "another-surface" } else { "current-surface" },
                 "iat": if case == "future-issued" { now + 120 } else { now - 1 },
-                "exp": if case == "expired" { now - 1 } else { now + 300 },
+                "exp": if case == "expired" { now - 1 } else { now + 299 },
                 "jti": uuid::Uuid::new_v4().to_string(),
                 "allowed_transit_points": [if case == "other-point" { "partner-b" } else { "partner-a" }]
             })).unwrap();
@@ -10444,6 +10438,7 @@ mod tests {
         state.transit_token_issuer = Some(Arc::new(issuer));
 
         let mut ctx = test_pipeline_context();
+        Arc::make_mut(&mut ctx.surface).surface_id = "surf-001".into();
         ctx.original_headers
             .insert("X-Transit-Token", token.parse().unwrap());
 
@@ -10474,6 +10469,7 @@ mod tests {
         state.transit_token_issuer = Some(Arc::new(issuer));
 
         let mut ctx = test_pipeline_context();
+        Arc::make_mut(&mut ctx.surface).surface_id = "surf-001".into();
         ctx.original_headers
             .insert("X-Transit-Token", token.parse().unwrap());
 

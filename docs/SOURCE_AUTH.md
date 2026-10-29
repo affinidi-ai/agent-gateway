@@ -252,6 +252,17 @@ trace, and expires 300 seconds after it is issued. The agent may send the same t
 any number of calls to that surface's Transit Points until then. The header is never
 forwarded to a Transit Point's target.
 
+A Transit Point refuses the call with `401` unless the token:
+
+- is signed with this gateway's key and names it in `kid`, with the gateway's domain as
+  `iss`;
+- was issued for this Transit Point's surface, and lists this Transit Point or lists none;
+- has not expired, is not issued in the future, lives no longer than the 300 seconds the
+  gateway issues, and has a token ID. Expiry and issue time allow 5 seconds of clock
+  difference.
+
+A `2026-07-28` MCP request must also carry exactly one token, and allows no clock difference.
+
 The signing key is 32 random bytes the gateway creates on its first start, in
 `transit_token_key.json` under `[storage_paths] vc_keys`, readable by the owner only and
 encrypted like the gateway's other keys when encryption at rest is on. A key file that

@@ -14,6 +14,14 @@ changes:
         rather than being replaced, and a key directory on a filesystem without hard links
         stops the first start with an error saying so.
     - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Check a transit token's surface and lifetime on every Transit Point request
+      description: >-
+        Every Transit Point request now checks, alongside the transit token's signature,
+        issuer and expiry, that the token's surface is the Transit Point's surface, that its
+        issue time is not in the future, that its lifetime is no longer than the 300 seconds
+        the gateway issues, and that it carries a token ID, with 5 seconds of clock
+        allowance. A token can still be used any number of times until it expires.
+    - timestamp: '2026-10-28T00:00:00.000Z'
       title: Write the gateway's key files atomically with owner-only permissions
       description: >-
         The gateway's key files (DID keys, VC issuer keys and the transit token key) are now
@@ -36,3 +44,10 @@ changes:
         its inbound request. During a rolling upgrade, instances on the old and new versions
         refuse each other's tokens even when they share storage, so upgrade every instance
         sharing storage together.
+    - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Refuse a transit token 5 seconds after it expires instead of 60
+      description: >-
+        A Transit Point accepted a transit token for 60 seconds after its expiry. It now allows
+        5 seconds of clock difference, so a managed agent turn that runs past about 305 seconds
+        has its later Transit Point calls refused until its next inbound request brings a new
+        token.
