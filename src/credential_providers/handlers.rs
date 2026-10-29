@@ -39,6 +39,8 @@ pub struct CredentialProviderState {
     pub secrets_store: Arc<dyn SecretsStore>,
     pub identity_strategies: Option<Arc<dyn crate::jwt_bearer::JwtVerificationStrategyStorage>>,
     pub oauth_callback_route: String,
+    /// Reads the issuer's metadata an external consent provider is checked against.
+    pub issuer_metadata: super::external::IssuerMetadata,
 }
 
 /// Why a provider's consent strategy or secret reference was rejected.
@@ -164,6 +166,40 @@ fn validate_url_fields(fields: &[(&str, Option<&str>)]) -> Option<Response> {
     None
 }
 
+/// The type-specific fields a provider without an issuer needs, if one is missing.
+fn legacy_type_error(provider: &CredentialProvider) -> Option<&'static str> {
+    let blank = |value: Option<&str>| value.is_none_or(|value| value.trim().is_empty());
+    match provider.provider_type {
+        CredentialProviderType::OAuth2AuthorizationCode | CredentialProviderType::OAuth2ClientCredentials => {
+            if blank(
+                provider
+                    .token_endpoint
+                    .as_deref(),
+            ) {
+                return Some("token_endpoint is required for OAuth providers");
+            }
+            if blank(
+                provider
+                    .client_id_secret_ref
+                    .as_deref(),
+            ) || blank(
+                provider
+                    .client_secret_secret_ref
+                    .as_deref(),
+            ) {
+                return Some("client_id_secret_ref and client_secret_secret_ref are required for OAuth providers");
+            }
+            None
+        }
+        CredentialProviderType::ApiKey => blank(
+            provider
+                .api_key_secret_ref
+                .as_deref(),
+        )
+        .then_some("api_key_secret_ref is required for ApiKey providers"),
+    }
+}
+
 /// POST /api/v1/credential-providers
 pub async fn create_provider(
     State(state): State<CredentialProviderState>,
@@ -191,115 +227,6 @@ pub async fn create_provider(
     {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "provider_id is required"})))
             .into_response();
-    }
-
-    // Type-specific validation
-    match &req.provider_type {
-        CredentialProviderType::OAuth2AuthorizationCode | CredentialProviderType::OAuth2ClientCredentials => {
-            if req
-                .token_endpoint
-                .as_deref()
-                .is_none_or(|s| s.trim().is_empty())
-            {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": "token_endpoint is required for OAuth providers"})),
-                )
-                    .into_response();
-            }
-            if req
-                .client_id_secret_ref
-                .as_deref()
-                .is_none_or(|s| s.trim().is_empty())
-                || req
-                    .client_secret_secret_ref
-                    .as_deref()
-                    .is_none_or(|s| s.trim().is_empty())
-            {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": "client_id_secret_ref and client_secret_secret_ref are required for OAuth providers"})),
-                )
-                    .into_response();
-            }
-        }
-        CredentialProviderType::ApiKey => {
-            if req
-                .api_key_secret_ref
-                .as_deref()
-                .is_none_or(|s| s.trim().is_empty())
-            {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": "api_key_secret_ref is required for ApiKey providers"})),
-                )
-                    .into_response();
-            }
-        }
-    }
-
-    if let Some(resource) = &req.resource
-        && crate::sts::mcp_profile::canonical_https_url(resource).is_err()
-    {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "resource must be a canonical HTTPS URI"})))
-            .into_response();
-    }
-
-    // Validate user-supplied URLs before storing them
-    if let Some(resp) = validate_url_fields(&[
-        ("token_endpoint", req.token_endpoint.as_deref()),
-        (
-            "authorization_endpoint",
-            req.authorization_endpoint
-                .as_deref(),
-        ),
-        ("callback_url", req.callback_url.as_deref()),
-    ]) {
-        return resp;
-    }
-
-    if let Err(error) = validate_secret_references(
-        &state,
-        req.tenant_id.as_deref(),
-        [
-            req.client_id_secret_ref
-                .as_deref(),
-            req.client_secret_secret_ref
-                .as_deref(),
-            req.api_key_secret_ref
-                .as_deref(),
-        ],
-        &context,
-        &scope,
-    )
-    .await
-    {
-        return error.into_response();
-    }
-
-    // Check for duplicate provider_id
-    match state
-        .store
-        .find_by_provider_id(&req.provider_id)
-        .await
-    {
-        Ok(Some(_)) => {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": format!("provider_id '{}' already exists", req.provider_id)
-                })),
-            )
-                .into_response();
-        }
-        Ok(None) => {}
-        Err(e) => {
-            warn!(
-                target: "credential_delegation",
-                error = %e,
-                "Failed to check for duplicate provider_id"
-            );
-        }
     }
 
     let provider_id_clean = req
@@ -346,12 +273,136 @@ pub async fn create_provider(
             .api_key_secret_ref
             .map(|s| s.trim().to_string()),
         description: req.description,
+        issuer: req.issuer,
+        revocation_endpoint: req.revocation_endpoint,
+        token_endpoint_auth_method: req.token_endpoint_auth_method,
+        client_id: req.client_id,
         created_at: now,
         updated_at: now,
     };
 
+    if let Err(error) = super::external::validate(&provider) {
+        return error.into_response();
+    }
+    if !provider.is_external_consent()
+        && let Some(message) = legacy_type_error(&provider)
+    {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": message }))).into_response();
+    }
+
+    if let Some(resource) = &provider.resource
+        && crate::sts::mcp_profile::canonical_https_url(resource).is_err()
+    {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "resource must be a canonical HTTPS URI"})))
+            .into_response();
+    }
+
+    // Validate user-supplied URLs before storing them
+    if let Some(resp) = validate_url_fields(&[
+        (
+            "token_endpoint",
+            provider
+                .token_endpoint
+                .as_deref(),
+        ),
+        (
+            "authorization_endpoint",
+            provider
+                .authorization_endpoint
+                .as_deref(),
+        ),
+        (
+            "revocation_endpoint",
+            provider
+                .revocation_endpoint
+                .as_deref(),
+        ),
+        (
+            "callback_url",
+            provider
+                .callback_url
+                .as_deref(),
+        ),
+    ]) {
+        return resp;
+    }
+
+    if let Err(error) = validate_secret_references(
+        &state,
+        provider.tenant_id.as_deref(),
+        [
+            provider
+                .client_id_secret_ref
+                .as_deref(),
+            provider
+                .client_secret_secret_ref
+                .as_deref(),
+            provider
+                .api_key_secret_ref
+                .as_deref(),
+        ],
+        &context,
+        &scope,
+    )
+    .await
+    {
+        return error.into_response();
+    }
+
+    // A provider's slug is unique within its tenant, and among untenanted providers.
+    match state
+        .store
+        .find_by_provider_id(provider.tenant_id.as_deref(), &provider.provider_id)
+        .await
+    {
+        Ok(Some(_)) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": format!("provider_id '{}' already exists", provider.provider_id)
+                })),
+            )
+                .into_response();
+        }
+        Ok(None) => {}
+        Err(e) => {
+            warn!(
+                target: "credential_delegation",
+                error = %e,
+                "Failed to check for duplicate provider_id"
+            );
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Internal server error"})))
+                .into_response();
+        }
+    }
+
     if let Err(error) = validate_consent_strategy(&state, &provider, &context, &scope).await {
         return error.into_response();
+    }
+
+    if let Some(issuer) = provider.issuer.clone() {
+        let metadata = match (state.issuer_metadata)(issuer).await {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                warn!(
+                    target: "credential_delegation",
+                    provider_id = %provider.provider_id,
+                    code = error.code(),
+                    detail = error.detail(),
+                    "Refused a credential provider whose issuer's metadata could not be read"
+                );
+                return super::external::ExternalProviderError::MetadataUnavailable(error.failure()).into_response();
+            }
+        };
+        if let Err(error) = super::external::check_metadata(&provider, &metadata) {
+            warn!(
+                target: "credential_delegation",
+                provider_id = %provider.provider_id,
+                error = ?error,
+                "Refused a credential provider that does not match its issuer's metadata"
+            );
+            return error.into_response();
+        }
     }
 
     match state
@@ -471,6 +522,9 @@ pub async fn update_provider(
         )
             .into_response();
     }
+    if let Err(error) = super::external::refuse_changes(&existing, &req) {
+        return error.into_response();
+    }
 
     if let Some(resource) = &req.resource
         && crate::sts::mcp_profile::canonical_https_url(resource).is_err()
@@ -539,6 +593,10 @@ pub async fn update_provider(
         description: req
             .description
             .or(existing.description),
+        issuer: existing.issuer,
+        revocation_endpoint: existing.revocation_endpoint,
+        token_endpoint_auth_method: existing.token_endpoint_auth_method,
+        client_id: existing.client_id,
         created_at: existing.created_at,
         updated_at: Utc::now(),
     };
@@ -751,6 +809,7 @@ mod consent_strategy_tests {
             ),
             identity_strategies: Some(strategies.clone()),
             oauth_callback_route: "/oauth/callback".into(),
+            issuer_metadata: super::super::external::strict_issuer_metadata(),
         };
         let mut provider: CredentialProvider = serde_json::from_value(json!({
             "id": "provider", "name": "Provider", "provider_id": "provider", "tenant_id": "tenant-a",
@@ -883,6 +942,7 @@ mod consent_strategy_tests {
             ),
             identity_strategies: None,
             oauth_callback_route: "/oauth/callback".into(),
+            issuer_metadata: super::super::external::strict_issuer_metadata(),
         };
         let provider: CredentialProvider = serde_json::from_value(json!({
             "id": "provider", "name": "Operator provider", "provider_id": "provider", "tenant_id": tenant_id,
@@ -992,6 +1052,237 @@ mod consent_strategy_tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+}
+
+#[cfg(test)]
+mod external_provider_tests {
+    use super::*;
+    use crate::authz_metadata::{ClientAuthzMetadata, DiscoveryError, DiscoveryFailure};
+    use crate::credential_providers::external::tests::{external_provider, metadata};
+    use serde_json::json;
+
+    fn answering(
+        answer: Result<ClientAuthzMetadata, DiscoveryFailure>
+    ) -> crate::credential_providers::external::IssuerMetadata {
+        Arc::new(move |_issuer| {
+            let answer = answer
+                .clone()
+                .map_err(|failure| DiscoveryError::new(failure, "detail for logs only"));
+            Box::pin(async move { answer })
+        })
+    }
+
+    async fn state(
+        directory: &tempfile::TempDir,
+        answer: Result<ClientAuthzMetadata, DiscoveryFailure>,
+    ) -> CredentialProviderState {
+        CredentialProviderState {
+            store: Arc::new(
+                super::super::storage::FileSystemCredentialProviderStore::new(
+                    directory
+                        .path()
+                        .join("providers"),
+                )
+                .await
+                .unwrap(),
+            ),
+            secrets_store: Arc::new(
+                crate::secrets::FilesystemSecretsStore::new(
+                    directory
+                        .path()
+                        .join("secrets")
+                        .to_str()
+                        .unwrap(),
+                )
+                .unwrap(),
+            ),
+            identity_strategies: None,
+            oauth_callback_route: "/oauth/callback".into(),
+            issuer_metadata: answering(answer),
+        }
+    }
+
+    fn tenant(tenant_id: &str) -> Option<Extension<PatTenantContext>> {
+        Some(Extension(PatTenantContext {
+            token_id: format!("token-{tenant_id}"),
+            tenant_id: tenant_id.into(),
+        }))
+    }
+
+    fn create_request(change: impl FnOnce(&mut serde_json::Value)) -> Json<CreateCredentialProviderRequest> {
+        let mut body = serde_json::to_value(external_provider()).unwrap();
+        for field in ["id", "tenant_id", "callback_path", "created_at", "updated_at"] {
+            body.as_object_mut()
+                .unwrap()
+                .remove(field);
+        }
+        change(&mut body);
+        Json(serde_json::from_value(body).unwrap())
+    }
+
+    async fn create(
+        state: &CredentialProviderState,
+        tenant_id: &str,
+        request: Json<CreateCredentialProviderRequest>,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = create_provider(State(state.clone()), None, tenant(tenant_id), None, request)
+            .await
+            .into_response();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+    }
+
+    async fn stored(state: &CredentialProviderState) -> Vec<CredentialProvider> {
+        state
+            .store
+            .list()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_provider_that_matches_its_issuers_metadata_is_created_with_its_client_fields() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state(&directory, Ok(metadata())).await;
+        let (status, body) = create(&state, "tenant-a", create_request(|_| {})).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let providers = stored(&state).await;
+        assert_eq!(providers.len(), 1);
+        let provider = &providers[0];
+        assert_eq!(provider.tenant_id.as_deref(), Some("tenant-a"));
+        assert_eq!(provider.issuer.as_deref(), Some("https://203.0.113.10"));
+        assert_eq!(provider.client_id.as_deref(), Some("dcr-client-1"));
+        assert_eq!(provider.token_endpoint_auth_method, Some(super::super::TokenEndpointAuthMethod::None));
+        assert_eq!(
+            provider
+                .revocation_endpoint
+                .as_deref(),
+            Some("https://203.0.113.10/token")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_provider_that_differs_from_its_issuers_metadata_is_refused_and_not_stored() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut moved = metadata();
+        moved.token_endpoint = "https://203.0.113.66/token".into();
+        let state = state(&directory, Ok(moved)).await;
+        let (status, body) = create(&state, "tenant-a", create_request(|_| {})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "provider_metadata_mismatch");
+        assert_eq!(body["field"], "token_endpoint");
+        assert!(
+            stored(&state)
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_provider_whose_issuers_metadata_cannot_be_read_is_refused_without_the_reason() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state(&directory, Err(DiscoveryFailure::Blocked)).await;
+        let (status, body) = create(&state, "tenant-a", create_request(|_| {})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "provider_metadata_unavailable");
+        assert_eq!(body["reason"], "unreachable");
+        assert!(
+            !body
+                .to_string()
+                .contains("detail for logs only")
+        );
+        assert!(
+            stored(&state)
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_provider_that_breaks_a_static_rule_is_refused_before_its_metadata_is_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state(&directory, Err(DiscoveryFailure::Blocked)).await;
+        let (status, body) = create(
+            &state,
+            "tenant-a",
+            create_request(|body| body["additional_params"] = json!({"redirect_uri": "https://attacker.example/"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "invalid_provider");
+        assert!(
+            stored(&state)
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provider_slugs_are_unique_within_a_tenant_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state(&directory, Ok(metadata())).await;
+        assert_eq!(
+            create(&state, "tenant-a", create_request(|_| {}))
+                .await
+                .0,
+            StatusCode::CREATED
+        );
+        let (status, body) = create(&state, "tenant-b", create_request(|_| {})).await;
+        assert_eq!(status, StatusCode::CREATED, "another tenant may use the same slug: {body}");
+        let (status, body) = create(&state, "tenant-a", create_request(|_| {})).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        let (status, _) =
+            create(&state, "tenant-a", create_request(|body| body["provider_id"] = json!(" BORIS-0123456789AB ")))
+                .await;
+        assert_eq!(status, StatusCode::CONFLICT, "slugs compare as stored: trimmed and lower case");
+        assert_eq!(stored(&state).await.len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_update_keeps_an_external_providers_client_but_may_rename_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state(&directory, Ok(metadata())).await;
+        assert_eq!(
+            create(&state, "tenant-a", create_request(|_| {}))
+                .await
+                .0,
+            StatusCode::CREATED
+        );
+        let id = stored(&state).await[0]
+            .id
+            .clone();
+        let put = |body: serde_json::Value| {
+            let state = state.clone();
+            let id = id.clone();
+            async move {
+                update_provider(
+                    State(state),
+                    Path(id),
+                    tenant("tenant-a"),
+                    None,
+                    Json(serde_json::from_value(body).unwrap()),
+                )
+                .await
+                .into_response()
+                .status()
+            }
+        };
+        assert_eq!(put(json!({"client_id": "another-client"})).await, StatusCode::BAD_REQUEST);
+        assert_eq!(put(json!({"token_endpoint": "https://203.0.113.66/token"})).await, StatusCode::BAD_REQUEST);
+        assert_eq!(put(json!({"name": "Linear (work)", "client_id": "dcr-client-1"})).await, StatusCode::OK);
+        let provider = &stored(&state).await[0];
+        assert_eq!(provider.name, "Linear (work)");
+        assert_eq!(provider.client_id.as_deref(), Some("dcr-client-1"));
+        assert_eq!(
+            provider
+                .token_endpoint
+                .as_deref(),
+            Some("https://203.0.113.10/token")
         );
     }
 }

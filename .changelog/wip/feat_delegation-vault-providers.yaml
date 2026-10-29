@@ -1,7 +1,32 @@
 branch: feat/delegation-vault-providers
 changes:
-  added: []
-  changed: []
+  added:
+    - timestamp: '2026-10-30T20:00:00Z'
+      title: Check a credential provider with an issuer against the issuer's metadata
+      description: >-
+        A credential provider can name its authorization server's `issuer`, a plain `client_id`,
+        a `token_endpoint_auth_method` (`none`, `client_secret_basic` or `client_secret_post`)
+        and an RFC 7009 `revocation_endpoint`. Such an external consent provider is checked when
+        it is created: its endpoints must be public `https` URLs, and the gateway reads the
+        issuer's RFC 8414 or OpenID Connect metadata through a pinned fetch under the Strict
+        egress posture, without requiring a `jwks_uri`, and refuses the provider with
+        `provider_metadata_mismatch` unless its authorization, token and revocation endpoints
+        are the ones the metadata names, the server supports its authentication method, and
+        S256 PKCE when the metadata lists PKCE methods. Its issuer, endpoints, client fields,
+        callback URL and resource never change afterwards: an update that sends another value
+        is refused with `provider_field_immutable`, so a token that can edit providers cannot
+        point one whose grants are stored at an endpoint of its choosing. It takes no
+        `additional_params`, `client_id_secret_ref`, consent identity strategy or API key.
+  changed:
+    - timestamp: '2026-10-30T20:00:00Z'
+      title: Make credential provider slugs unique per tenant
+      description: >-
+        A credential provider's `provider_id` is now unique within its tenant, and among the
+        untenanted providers, instead of across the whole appliance, so two tenants may use the
+        same slug and a conflict no longer reveals that another tenant uses one. The duplicate
+        check now compares the slug as it is stored, trimmed and in lower case, so `GitHub` and
+        `github` conflict, and a create whose duplicate check fails is refused instead of
+        proceeding.
   fixed: []
   removed: []
   security: []

@@ -8,7 +8,12 @@
 //!
 //! Client secrets are never stored directly; they reference the secrets store
 //! via secret_id (e.g. "GOOGLE_CLIENT_SECRET").
+//!
+//! A provider with an `issuer` is an external consent provider: checked against
+//! its issuer's metadata when it is created, its endpoints and client fields
+//! fixed for life, and bound only by `consent_mode: external` (see [`external`]).
 
+pub mod external;
 pub mod handlers;
 pub mod router;
 pub mod storage;
@@ -32,6 +37,35 @@ pub enum CredentialProviderType {
     /// Static API key — resolved directly from the secrets store, no OAuth
     #[serde(rename = "api_key")]
     ApiKey,
+}
+
+/// How an external consent provider's client authenticates at the token and
+/// revocation endpoints (RFC 6749 section 2.3, RFC 8414).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenEndpointAuthMethod {
+    /// A public client: `client_id` in the body, no secret.
+    None,
+    /// HTTP Basic with the client id and secret.
+    ClientSecretBasic,
+    /// The client id and secret in the form body.
+    ClientSecretPost,
+}
+
+impl TokenEndpointAuthMethod {
+    /// The method's name in RFC 8414 `token_endpoint_auth_methods_supported`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::ClientSecretBasic => "client_secret_basic",
+            Self::ClientSecretPost => "client_secret_post",
+        }
+    }
+
+    /// Whether the client authenticates with a secret.
+    pub fn uses_secret(self) -> bool {
+        !matches!(self, Self::None)
+    }
 }
 
 /// A configured OAuth 2.0 credential provider
@@ -111,6 +145,25 @@ pub struct CredentialProvider {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 
+    /// The authorization server's issuer. Makes this an external consent
+    /// provider, checked against the issuer's metadata at create.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+
+    /// RFC 7009 revocation endpoint of an external consent provider: the one
+    /// its issuer's metadata names, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revocation_endpoint: Option<String>,
+
+    /// How an external consent provider's client authenticates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_endpoint_auth_method: Option<TokenEndpointAuthMethod>,
+
+    /// An external consent provider's client id, a plain value: a client id is
+    /// not a secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -122,6 +175,15 @@ fn default_true() -> bool {
 impl StorableEntity for CredentialProvider {
     fn id(&self) -> &str {
         &self.id
+    }
+}
+
+impl CredentialProvider {
+    /// Whether this is an external consent provider: one with an `issuer`,
+    /// whose grants are made through external consent and kept in the
+    /// delegation vault by binding.
+    pub fn is_external_consent(&self) -> bool {
+        self.issuer.is_some()
     }
 }
 
@@ -159,6 +221,14 @@ pub struct CreateCredentialProviderRequest {
     pub resource: Option<String>,
     #[serde(default)]
     pub consent_identity_strategy_id: Option<String>,
+    #[serde(default)]
+    pub issuer: Option<String>,
+    #[serde(default)]
+    pub revocation_endpoint: Option<String>,
+    #[serde(default)]
+    pub token_endpoint_auth_method: Option<TokenEndpointAuthMethod>,
+    #[serde(default)]
+    pub client_id: Option<String>,
 }
 
 /// Request to update an existing credential provider
@@ -193,6 +263,18 @@ pub struct UpdateCredentialProviderRequest {
     pub resource: Option<String>,
     #[serde(default)]
     pub consent_identity_strategy_id: Option<String>,
+    /// Never changes a provider: a value other than the stored one is refused.
+    #[serde(default)]
+    pub issuer: Option<String>,
+    /// Never changes a provider: a value other than the stored one is refused.
+    #[serde(default)]
+    pub revocation_endpoint: Option<String>,
+    /// Never changes a provider: a value other than the stored one is refused.
+    #[serde(default)]
+    pub token_endpoint_auth_method: Option<TokenEndpointAuthMethod>,
+    /// Never changes a provider: a value other than the stored one is refused.
+    #[serde(default)]
+    pub client_id: Option<String>,
 }
 
 /// List response item (no sensitive data)
@@ -217,6 +299,14 @@ pub struct CredentialProviderListItem {
     pub resource: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub consent_identity_strategy_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revocation_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_endpoint_auth_method: Option<TokenEndpointAuthMethod>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -241,6 +331,10 @@ impl From<&CredentialProvider> for CredentialProviderListItem {
             consent_identity_strategy_id: p
                 .consent_identity_strategy_id
                 .clone(),
+            issuer: p.issuer.clone(),
+            revocation_endpoint: p.revocation_endpoint.clone(),
+            token_endpoint_auth_method: p.token_endpoint_auth_method,
+            client_id: p.client_id.clone(),
             created_at: p.created_at,
             updated_at: p.updated_at,
         }
@@ -277,6 +371,10 @@ mod tests {
             callback_url: None,
             resource: None,
             consent_identity_strategy_id: None,
+            issuer: None,
+            revocation_endpoint: None,
+            token_endpoint_auth_method: None,
+            client_id: None,
         }
     }
 
@@ -404,6 +502,10 @@ mod tests {
             callback_url: None,
             resource: None,
             consent_identity_strategy_id: None,
+            issuer: None,
+            revocation_endpoint: None,
+            token_endpoint_auth_method: None,
+            client_id: None,
         };
         let json = serde_json::to_string(&provider).unwrap();
         assert!(json.contains("api_key"));

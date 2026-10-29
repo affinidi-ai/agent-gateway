@@ -196,6 +196,7 @@ mod tests {
         }
         async fn find_by_provider_id(
             &self,
+            _tenant_id: Option<&str>,
             _provider_id: &str,
         ) -> anyhow::Result<Option<CredentialProvider>> {
             unimplemented!()

@@ -1645,6 +1645,7 @@ mod tests {
         }
         async fn find_by_provider_id(
             &self,
+            _tenant_id: Option<&str>,
             _provider_id: &str,
         ) -> Result<Option<CredentialProvider>> {
             Ok(None)
@@ -1776,6 +1777,10 @@ mod tests {
             callback_url: None,
             resource: None,
             consent_identity_strategy_id: None,
+            issuer: None,
+            revocation_endpoint: None,
+            token_endpoint_auth_method: None,
+            client_id: None,
         }
     }
 

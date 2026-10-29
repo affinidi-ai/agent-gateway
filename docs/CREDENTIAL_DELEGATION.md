@@ -34,6 +34,60 @@ A provider carries its authorization and token endpoints and its default scopes.
 client ID and client secret are **references** into the secrets store, such as
 `GOOGLE_CLIENT_SECRET`, and are never stored in the provider record itself.
 
+A provider's `provider_id` slug is unique within its tenant, and among the untenanted
+providers: another tenant may use the same slug. The slug is compared as stored, trimmed and
+in lower case.
+
+### External consent providers
+
+A provider with an `issuer` is an external consent provider: one OAuth client of one
+authorization server, whose grants another system obtains through the browser and hands
+to the gateway, which keeps them in the vault by binding. Its fields:
+
+| Field | Rule |
+| --- | --- |
+| `provider_type` | `oauth2_authorization_code` |
+| `issuer` | An `https` issuer without credentials, query or fragment |
+| `authorization_endpoint`, `token_endpoint` | Required |
+| `revocation_endpoint` | The RFC 7009 endpoint, exactly when the issuer's metadata names one |
+| `client_id` | Required, a plain value: a client id is not a secret. `client_id_secret_ref` is refused |
+| `token_endpoint_auth_method` | `none`, `client_secret_basic` or `client_secret_post`. `client_secret_secret_ref` is required for the last two and refused for `none` |
+| `callback_url` | Required, `https`: the redirect URI the other system registered |
+| `resource` | Optional, a canonical `https` URI (RFC 8707) |
+| `additional_params`, `consent_identity_strategy_id`, `api_key_secret_ref` | Refused |
+
+Every endpoint must be `https`, and pass the Strict egress posture: no literal loopback,
+private, link-local or cloud-metadata host, and, as for every provider, no name that resolves
+to one. A provider without an `issuer` cannot set `revocation_endpoint`,
+`token_endpoint_auth_method` or `client_id`.
+
+When the provider is created, the gateway reads the issuer's authorization server metadata
+(RFC 8414, then OpenID Connect discovery) under the client profile of
+[`authz_metadata`](SOURCE_AUTH.md#authorization-server-metadata-module-developer-reference),
+through a pinned, bounded fetch under the Strict posture, and refuses the provider unless:
+
+- the metadata's `issuer` equals the provider's byte for byte;
+- the authorization, token and revocation endpoints are the ones the metadata names, byte for
+  byte, a revocation endpoint included exactly when the metadata names one;
+- `token_endpoint_auth_methods_supported` lists the provider's method, or, when the metadata
+  lists none, the method is `client_secret_basic` (the RFC 8414 default);
+- `code_challenge_methods_supported`, when the metadata lists it, includes `S256`.
+
+| Refusal (`400`) | `code` | Also |
+| --- | --- | --- |
+| A rule in the table above | `invalid_provider` | |
+| The metadata could not be read or is not acceptable | `provider_metadata_unavailable` | `reason`: `invalid_url`, `unreachable`, `http_status`, `too_large`, `invalid_document` or `issuer_mismatch`. A failure before the server answered is always `unreachable`, so the answer never says whether a name resolves to a blocked address; the log has the detail |
+| The provider differs from the metadata | `provider_metadata_mismatch` | `field` names the field |
+| An update changes a fixed field | `provider_field_immutable` | `field` names the field |
+
+`issuer`, the endpoints, `client_id`, `token_endpoint_auth_method`, the secret references,
+`callback_url`, `resource`, `provider_type` and the refused fields never change: an update that
+sends another value is refused, and one that sends the stored value, such as a round trip of
+the whole record, is accepted. The name, description, default scopes and
+`token_refresh_enabled` stay editable. A change to the client or its server is a new
+provider. An existing provider without an `issuer` cannot take one. So a token that can edit
+providers cannot point a provider whose grants are stored at an endpoint of its choosing.
+
 ## Binding a provider to a surface
 
 Each entry in `AgentSurface.outbound_credentials`

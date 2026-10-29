@@ -512,6 +512,12 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   redirects. The fetch has a 5-second timeout and a 64 KiB limit and runs in the
   background, off the request path. A blocked URL or a failed fetch yields no
   name; see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#external-callers).
+- An **external consent provider's issuer metadata** is read when the provider
+  is created (`src/credential_providers/external.rs`), through
+  `authz_metadata::discover_client` under the Strict posture
+  (`egress::pinned_strict_client`): `https` only, internal addresses blocked,
+  redirects refused, a 64 KiB body and a 10-second timeout per step. See
+  [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#external-consent-providers).
 
 Both helpers share one `pin_and_build` body.
 
