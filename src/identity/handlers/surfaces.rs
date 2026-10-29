@@ -718,8 +718,8 @@ fn validate_source_auth(surface: &AgentSurface) -> Result<(), SurfaceApiError> {
 /// working without forcing the dashboard to mint IDs client-side. A
 /// `transit.source_auth`, which the gateway does not enforce, is refused, and
 /// so is a transit token lifetime outside its bounds, unless it is the stored
-/// one (`stored`) below the shortest: a save that keeps it, such as a
-/// dashboard round trip, is accepted, and the gateway holds it to the shortest.
+/// one (`stored`): a save that keeps it, such as a dashboard round trip, is
+/// accepted, and the gateway holds it to the nearer bound.
 fn validate_transit_points(
     surface: &mut AgentSurface,
     min_lifetime_secs: u64,
@@ -758,11 +758,11 @@ fn validate_transit_points(
     let Some(transit) = surface.transit.as_mut() else {
         return Ok(());
     };
-    let kept_below_the_shortest = transit
+    let kept = transit
         .shared
         .transit_token_lifetime_secs
-        .is_some_and(|secs| Some(secs) == stored_lifetime_secs && secs < min_lifetime_secs);
-    if !kept_below_the_shortest {
+        .is_some_and(|secs| Some(secs) == stored_lifetime_secs);
+    if !kept {
         transit
             .shared
             .validate_transit_token_lifetime(min_lifetime_secs)

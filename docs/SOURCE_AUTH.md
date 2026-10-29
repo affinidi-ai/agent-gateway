@@ -313,19 +313,19 @@ A surface whose Transit Points exist only in a variant needs a base `transit` bl
 empty `points`, to carry the lifetime; without one its tokens live as an unset lifetime does.
 The admin API refuses a new lifetime outside the shortest lifetime to 900 seconds with `400`,
 naming `transit_token_min_lifetime_secs`, and one in a variant's overrides with `422`. A save
-that keeps the value already stored is accepted even when that value is below the shortest
-lifetime, so a dashboard save, or a `GET` followed by a `PUT`, of such a surface still works.
+that keeps the value already stored is accepted even when that value is outside the bounds,
+so a dashboard save, or a `GET` followed by a `PUT`, of such a surface still works.
 
-A stored lifetime below the shortest never stops the gateway. At startup, for every stored
-surface, disabled ones included, and on every reload, it is raised to the shortest, with one
-`WARN` per surface naming the surface, the stored value and the shortest; the surface keeps
-its stored value. Such a value arrives when the shortest is raised, when surfaces are restored
+A stored lifetime outside the bounds never stops the gateway. At startup, for every stored
+surface, disabled ones included, and on every reload, one below the shortest is raised to the
+shortest and one above 900 seconds is lowered to 900, with one `WARN` per surface naming the
+surface, the stored value and the lifetime its tokens get; the surface keeps its stored value.
+A value below the shortest arrives when the shortest is raised, when surfaces are restored
 from a backup taken on an appliance with a lower shortest lifetime, or when they are saved
 through another instance with a lower one; set the same value on every instance that shares
-surfaces. A stored lifetime above 900 seconds, which no save accepts, is lowered to 900 by a
-reload, but stops the gateway from starting, naming every such surface (see
-[`CONFIGURATION_RELOAD.md`](CONFIGURATION_RELOAD.md)). The token issuer itself also refuses a
-lifetime outside the bounds.
+surfaces. A value above 900 arrives from a hand edit, or after a rollback from a release that
+allows longer lifetimes (see [`CONFIGURATION_RELOAD.md`](CONFIGURATION_RELOAD.md)). The token
+issuer itself also refuses a lifetime outside the bounds.
 
 The shortest lifetime is a setting of the appliance, `transit_token_min_lifetime_secs` in
 `gateway.json` (see [`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md)): 30 seconds

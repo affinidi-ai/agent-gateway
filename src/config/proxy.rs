@@ -170,42 +170,18 @@ impl GatewayConfig {
         }
     }
 
-    /// Checks every surface's transit token lifetime when the gateway starts,
-    /// disabled ones included. One below `min_secs`, the appliance's
-    /// `transit_token_min_lifetime_secs`, is held to it and logged at `WARN`;
-    /// it never stops the gateway. One above 900 seconds, which no save
-    /// accepts, stops it, naming every such surface.
-    pub fn check_transit_token_lifetimes(
+    /// One line per surface, disabled ones included, whose stored transit token
+    /// lifetime is held to a bound: below `min_secs`, the appliance's
+    /// `transit_token_min_lifetime_secs`, or above 900 seconds. The gateway logs
+    /// each at `WARN` when it starts; none stops it.
+    pub fn transit_token_lifetime_adjustments(
         &self,
         min_secs: u64,
-    ) -> anyhow::Result<()> {
-        use crate::config::agent_surface::MAX_TRANSIT_TOKEN_LIFETIME_SECS;
-        let mut too_long = Vec::new();
-        for surface in &self.surfaces {
-            match surface
-                .transit
-                .as_ref()
-                .and_then(|transit| {
-                    transit
-                        .shared
-                        .transit_token_lifetime_secs
-                }) {
-                Some(secs) if secs > MAX_TRANSIT_TOKEN_LIFETIME_SECS => too_long.push(format!(
-                    "Surface '{}' ({}): transit.transit_token_lifetime_secs is {secs}, above the longest, \
-                     {MAX_TRANSIT_TOKEN_LIFETIME_SECS} seconds",
-                    surface.name, surface.surface_id
-                )),
-                _ => {
-                    if let Some(adjustment) = surface.transit_token_lifetime_adjustment(min_secs) {
-                        warn!("{adjustment}");
-                    }
-                }
-            }
-        }
-        if !too_long.is_empty() {
-            anyhow::bail!("{}", too_long.join("; "));
-        }
-        Ok(())
+    ) -> Vec<String> {
+        self.surfaces
+            .iter()
+            .filter_map(|surface| surface.transit_token_lifetime_adjustment(min_secs))
+            .collect()
     }
 
     /// Validate the configuration
@@ -488,10 +464,10 @@ mod tests {
     use super::*;
 
     /// At startup a stored lifetime below the appliance's shortest is held to it
-    /// and does not stop the gateway, disabled surfaces included; one above 900
-    /// seconds, which no save accepts, does, and every such surface is named.
+    /// and one above 900 seconds to 900, each named in one line, disabled
+    /// surfaces included; a lifetime within the bounds is not named.
     #[test]
-    fn startup_holds_a_lifetime_below_the_shortest_and_refuses_one_above_the_longest() {
+    fn startup_holds_a_stored_lifetime_outside_the_bounds_to_the_nearer_one() {
         let surface_living = |id: &str, secs: u64, status: &str| {
             serde_json::from_value(serde_json::json!({
                 "surface_id": id,
@@ -512,24 +488,28 @@ mod tests {
             surface_living("short", 10, "active"),
             surface_living("short-disabled", 5, "disabled"),
             surface_living("longest", 900, "active"),
-        ];
-        config
-            .check_transit_token_lifetimes(120)
-            .unwrap();
-
-        config.surfaces = vec![
             surface_living("too-long", 901, "active"),
-            surface_living("short", 10, "active"),
             surface_living("too-long-disabled", 1200, "disabled"),
         ];
         assert_eq!(
+            config.transit_token_lifetime_adjustments(120),
+            [
+                "Surface 'short' (short): transit.transit_token_lifetime_secs is 10, below \
+                 transit_token_min_lifetime_secs in gateway.json (120); its transit tokens live 120 seconds",
+                "Surface 'short-disabled' (short-disabled): transit.transit_token_lifetime_secs is 5, below \
+                 transit_token_min_lifetime_secs in gateway.json (120); its transit tokens live 120 seconds",
+                "Surface 'too-long' (too-long): transit.transit_token_lifetime_secs is 901, above the longest, 900 \
+                 seconds; its transit tokens live 900 seconds",
+                "Surface 'too-long-disabled' (too-long-disabled): transit.transit_token_lifetime_secs is 1200, above \
+                 the longest, 900 seconds; its transit tokens live 900 seconds",
+            ]
+        );
+
+        config.surfaces = vec![surface_living("short", 30, "active"), surface_living("longest", 900, "active")];
+        assert!(
             config
-                .check_transit_token_lifetimes(30)
-                .unwrap_err()
-                .to_string(),
-            "Surface 'too-long' (too-long): transit.transit_token_lifetime_secs is 901, above the longest, 900 \
-             seconds; Surface 'too-long-disabled' (too-long-disabled): transit.transit_token_lifetime_secs is 1200, \
-             above the longest, 900 seconds"
+                .transit_token_lifetime_adjustments(30)
+                .is_empty()
         );
     }
 

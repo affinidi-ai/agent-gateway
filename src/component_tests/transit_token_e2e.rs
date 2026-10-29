@@ -603,15 +603,39 @@ fn listener_urls(bootstrap: &crate::config::BootstrapConfig) -> (String, String)
 /// the shortest is refused, with a message naming the setting.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_surface_below_the_shortest_lifetime_is_held_to_it_and_still_saves() {
+    assert_a_stored_lifetime_is_held_and_still_saves(Some(120), 60, 120, 50).await;
+}
+
+/// A surface stored with a lifetime above 900 seconds, such as one a later
+/// release allowed, neither stops the gateway nor blocks its own saves: its
+/// tokens live 900 seconds, a save that keeps the stored value is accepted, and
+/// only a new value above 900 is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_surface_above_the_longest_lifetime_is_held_to_it_and_still_saves() {
+    assert_a_stored_lifetime_is_held_and_still_saves(None, 1000, 900, 1200).await;
+}
+
+/// Starts a gateway whose `transit_token_min_lifetime_secs` is `min_secs` with
+/// the `/lifetime` surface stored at `stored_secs`, and checks the gateway
+/// starts, logs one `WARN` naming the surface, issues tokens living
+/// `issued_secs`, keeps the stored value on a save and refuses `refused_secs`.
+async fn assert_a_stored_lifetime_is_held_and_still_saves(
+    min_secs: Option<u64>,
+    stored_secs: u64,
+    issued_secs: u64,
+    refused_secs: u64,
+) {
     let mock = MockServer::start().await;
     let target = mock.url();
     let mut admin = None;
     let h = GatewayHarness::start_with_outbound_mock(mock, |_, gw_config, bootstrap| {
         admin = Some(helpers::configure_admin_api(bootstrap));
         helpers::configure_gateway_route_prefixes(bootstrap, &[("lifetime", "lifetime", "/lifetime")]);
-        helpers::configure_gateway_setting(bootstrap, "transit_token_min_lifetime_secs", json!(120));
+        if let Some(min_secs) = min_secs {
+            helpers::configure_gateway_setting(bootstrap, "transit_token_min_lifetime_secs", json!(min_secs));
+        }
         let (inbound, outbound) = listener_urls(bootstrap);
-        let stored = lifetime_surface(&inbound, &outbound, &target, Some(60));
+        let stored = lifetime_surface(&inbound, &outbound, &target, Some(stored_secs));
         let surfaces = std::path::Path::new(
             &bootstrap
                 .storage_paths
@@ -624,8 +648,19 @@ async fn a_surface_below_the_shortest_lifetime_is_held_to_it_and_still_saves() {
     .await;
     let admin = admin.unwrap();
 
+    let warning = format!("Surface 'lifetime' (lifetime): transit.transit_token_lifetime_secs is {stored_secs}, ");
+    let warnings = h.startup_warnings();
+    assert_eq!(
+        warnings
+            .matches(&warning)
+            .count(),
+        1,
+        "{warnings}"
+    );
+    assert!(warnings.contains(&format!("its transit tokens live {issued_secs} seconds")), "{warnings}");
+
     let token = transit_token_from_access_point(&h, "/lifetime").await;
-    assert_eq!(lifetime_of(&token), 120, "the stored 60 is held to the shortest lifetime");
+    assert_eq!(lifetime_of(&token), issued_secs, "the stored {stored_secs} is held to {issued_secs}");
     assert_eq!(call_transit_point(&h, "/lifetime", &token).await, 200);
 
     let surface_url = format!("{}/api/v1/surfaces/lifetime", h.gateway_base);
@@ -637,7 +672,7 @@ async fn a_surface_below_the_shortest_lifetime_is_held_to_it_and_still_saves() {
         .json()
         .await
         .unwrap();
-    assert_eq!(stored["transit"]["transit_token_lifetime_secs"], 60, "{stored}");
+    assert_eq!(stored["transit"]["transit_token_lifetime_secs"], stored_secs, "{stored}");
     let round_trip = admin
         .put(&surface_url)
         .json(&stored)
@@ -661,23 +696,27 @@ async fn a_surface_below_the_shortest_lifetime_is_held_to_it_and_still_saves() {
             .body(json!({ "transit": { "transit_token_lifetime_secs": secs } }).to_string())
             .send()
     };
-    let lowered = patch(50).await.unwrap();
-    assert_eq!(lowered.status(), 400);
-    let refusal = lowered.text().await.unwrap();
+    let refused = patch(refused_secs)
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 400);
+    let refusal = refused.text().await.unwrap();
     assert!(
-        refusal.contains("transit.transit_token_lifetime_secs must be from 120 to 900 seconds, not 50")
-            && refusal.contains("transit_token_min_lifetime_secs"),
+        refusal.contains(&format!(
+            "transit.transit_token_lifetime_secs must be from {} to 900 seconds, not {refused_secs}",
+            min_secs.unwrap_or(30)
+        )) && refusal.contains("transit_token_min_lifetime_secs"),
         "{refusal}"
     );
     assert_eq!(
-        patch(60)
+        patch(stored_secs)
             .await
             .unwrap()
             .status(),
         200,
         "the stored value is kept as it is"
     );
-    assert_eq!(lifetime_of(&transit_token_from_access_point(&h, "/lifetime").await), 120);
+    assert_eq!(lifetime_of(&transit_token_from_access_point(&h, "/lifetime").await), issued_secs);
 }
 
 /// The shortest lifetime is the one the gateway started with: a save that
