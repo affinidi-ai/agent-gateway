@@ -290,7 +290,7 @@ const AppContent: React.FC<AuthenticatedAppProps> = ({ onLogout }) => {
                 <Route path="/identities" element={<IdentitiesPage />} />
                 <Route path="/identities/:did" element={<IdentitiesPage />} />
                 <Route
-                  path="/agents"
+                  path="/agent-registry"
                   element={
                     <ProtectedRoute permission="surfaces.view">
                       <AgentsPage />
@@ -298,7 +298,7 @@ const AppContent: React.FC<AuthenticatedAppProps> = ({ onLogout }) => {
                   }
                 />
                 <Route
-                  path="/agents/:agentId"
+                  path="/agent-registry/:agentId"
                   element={
                     <ProtectedRoute permission="surfaces.view">
                       <AgentDetailPage />

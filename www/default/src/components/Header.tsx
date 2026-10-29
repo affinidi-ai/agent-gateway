@@ -108,8 +108,8 @@ const Header: React.FC<HeaderProps> = ({ onLogout }) => {
         return 'Dashboard';
       case '/identities':
         return `${TITLE_PREFIX}Identities`;
-      case '/agents':
-        return `${TITLE_PREFIX}Agents`;
+      case '/agent-registry':
+        return `${TITLE_PREFIX}Agents Registry`;
       case '/surfaces':
         return `${TITLE_PREFIX}Agent Surfaces`;
       case '/connections':
@@ -167,7 +167,7 @@ const Header: React.FC<HeaderProps> = ({ onLogout }) => {
         if (location.pathname.startsWith('/identities/')) {
           return `${TITLE_PREFIX}Identities`;
         }
-        if (location.pathname.startsWith('/agents/')) {
+        if (location.pathname.startsWith('/agent-registry/')) {
           return `${TITLE_PREFIX}Agent Details`;
         }
         // Handle dynamic routes with pattern matching

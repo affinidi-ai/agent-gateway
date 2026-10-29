@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router-dom';
 import { AgentRecord, apiClient } from '../api';
 import { AppButton } from '../components/shared/AppButton';
 import { Badge } from '../components/shared/Badge';
@@ -7,20 +7,14 @@ import { EmptyState } from '../components/shared/EmptyState';
 import SearchInput from '../components/shared/SearchInput';
 import { DOCS_URL } from '../config/docs';
 import { useApp } from '../context/AppContext';
+import AgentsTable from './AgentsPage/AgentsTable';
 import {
-  AgentDid,
-  AgentProtocolBadge,
-  AgentStatusBadge,
-  AgentTrustRegistryBadges,
-} from './AgentsPage/AgentBadges';
-import {
-  UNNAMED_AGENT,
+  AgentStatusFilter,
+  STATUS_FILTER_OPTIONS,
   agentMatchesFilter,
-  lastActivityLabel,
-  listRowSurfaceId,
-  otherSurfacesNote,
-  runtimeLabel,
+  agentMatchesStatus,
 } from './AgentsPage/agentLabels';
+import './AgentsPage/AgentRegistry.css';
 
 /**
  * Agents list page. Read-only: one row per Agent Surface's managed agent,
@@ -36,6 +30,7 @@ const AgentsPage: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
+  const [statusFilter, setStatusFilter] = useState<AgentStatusFilter>('all');
 
   const loadAgents = useCallback(async () => {
     try {
@@ -54,11 +49,15 @@ const AgentsPage: React.FC = () => {
   }, [loadAgents]);
 
   const visible = useMemo(
-    () => agents.filter(agent => agentMatchesFilter(agent, searchTerm)),
-    [agents, searchTerm]
+    () =>
+      agents.filter(
+        agent => agentMatchesFilter(agent, searchTerm) && agentMatchesStatus(agent, statusFilter)
+      ),
+    [agents, searchTerm, statusFilter]
   );
 
-  const openAgent = (agent: AgentRecord) => navigate(`/agents/${encodeURIComponent(agent.id)}`);
+  const openAgent = (agent: AgentRecord) =>
+    navigate(`/agent-registry/${encodeURIComponent(agent.id)}`);
 
   if (loading) {
     return (
@@ -77,17 +76,32 @@ const AgentsPage: React.FC = () => {
     );
   }
 
-  const filtered = searchTerm.trim() !== '';
+  const filtered = searchTerm.trim() !== '' || statusFilter !== 'all';
 
   return (
     <div className="container-fluid" data-testid="page-agents">
       <div className="d-sm-flex align-items-center justify-content-between mb-4">
-        <SearchInput
-          value={searchTerm}
-          onChange={setSearchTerm}
-          placeholder="Filter agents..."
-          data-testid="agents-filter-input"
-        />
+        <div>
+          <SearchInput
+            value={searchTerm}
+            onChange={setSearchTerm}
+            placeholder="Filter agents..."
+            data-testid="agents-filter-input"
+          />
+          <select
+            className="form-control dropdown-styling agents-status-filter"
+            value={statusFilter}
+            onChange={e => setStatusFilter(e.target.value as AgentStatusFilter)}
+            aria-label="Filter by status"
+            data-testid="agents-status-filter"
+          >
+            {STATUS_FILTER_OPTIONS.map(option => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </div>
       </div>
 
       {error && (
@@ -136,83 +150,7 @@ const AgentsPage: React.FC = () => {
               <p>No agents match your filter.</p>
             </div>
           ) : (
-            <div className="table-responsive">
-              <table className="table table-hover table-sm">
-                <thead>
-                  <tr>
-                    <th style={{ width: '28%' }}>Agent</th>
-                    <th style={{ width: '16%' }}>Runtime &amp; protocol</th>
-                    <th style={{ width: '9%' }}>Status</th>
-                    <th style={{ width: '17%' }}>Used by surfaces</th>
-                    <th style={{ width: '15%' }}>Trust registry</th>
-                    <th style={{ width: '15%' }}>Last activity</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {visible.map(agent => (
-                    <tr
-                      key={agent.id}
-                      style={{ cursor: 'pointer' }}
-                      tabIndex={0}
-                      onClick={() => openAgent(agent)}
-                      onKeyDown={e => {
-                        if (e.target === e.currentTarget && (e.key === 'Enter' || e.key === ' ')) {
-                          e.preventDefault();
-                          openAgent(agent);
-                        }
-                      }}
-                      data-testid={`agents-row-${agent.id}`}
-                    >
-                      <td>
-                        <div>
-                          {agent.name ? (
-                            <strong data-testid="agents-name">{agent.name}</strong>
-                          ) : (
-                            <span className="text-muted fst-italic" data-testid="agents-unnamed">
-                              {UNNAMED_AGENT}
-                            </span>
-                          )}
-                        </div>
-                        <AgentDid
-                          did={agent.agent_did}
-                          note={otherSurfacesNote(agent.did_surface_count)}
-                        />
-                      </td>
-                      <td>
-                        <div className="small" data-testid="agents-runtime">
-                          {runtimeLabel(agent.runtime)}
-                        </div>
-                        <AgentProtocolBadge protocol={agent.protocol} runtime={agent.runtime} />
-                      </td>
-                      <td>
-                        <AgentStatusBadge status={agent.status} />
-                      </td>
-                      <td>
-                        <Link
-                          to={`/surfaces/${encodeURIComponent(listRowSurfaceId(agent))}`}
-                          onClick={e => e.stopPropagation()}
-                          data-testid="agents-surface-link"
-                        >
-                          {agent.surface_name}
-                        </Link>
-                      </td>
-                      <td>
-                        <AgentTrustRegistryBadges trust={agent.trust_registry} />
-                      </td>
-                      <td>
-                        <span
-                          className={agent.last_activity_at ? 'small' : 'small text-muted'}
-                          title={agent.last_activity_at ?? undefined}
-                          data-testid="agents-last-activity"
-                        >
-                          {lastActivityLabel(agent.last_activity_at, retentionMinutes)}
-                        </span>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+            <AgentsTable agents={visible} retentionMinutes={retentionMinutes} onOpen={openAgent} />
           )}
         </div>
       </div>

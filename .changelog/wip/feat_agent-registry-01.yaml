@@ -4,7 +4,8 @@ changes:
     - timestamp: '2026-10-29T12:00:00Z'
       title: Add a read-only Agents API with one agent record per surface
       description: >-
-        `GET /v1/agents` lists one agent record per non-deleted surface the caller can access, and
+        `GET /v1/agents` lists one agent record per non-deleted surface the caller can access, except
+        MCP surfaces, which front tool servers rather than agents and return 404 on every route, and
         `GET /v1/agents/{id}` adds the agent's surfaces and its traffic over the metrics retention
         window, with p95 latency taken from the raw inbound latencies. Each record carries the
         target's display name, runtime, protocol, status, configured Trust Registry records, the
@@ -25,12 +26,15 @@ changes:
     - timestamp: '2026-10-29T18:00:00Z'
       title: Add the read-only Agents page and agent details to the dashboard
       description: >-
-        A new **Agents** sidebar entry, above **Surfaces**, lists one row per surface's managed
-        agent with its DID, runtime and protocol, status, surface, configured Trust Registry records
-        and last activity, with a name filter. The details page has **Overview**, **Agent Card**,
-        **Connection**, **Surfaces** and **Traffic** tabs. **Connection** shows how the gateway
-        reaches the agent, with a URL endpoint's credentials and query string hidden. The Agent Card is shown as plain text and labelled as
-        published by the agent and not verified, Trust Registry badges are labelled as configured
+        A new **Agents** sidebar entry, above **Surfaces**, opens `/agent-registry` and lists one
+        row per surface's managed agent with its DID, runtime and protocol, status, surface,
+        configured Trust Registry records and last activity, with a text search and a status
+        filter. The page is not served at `/agents`, which is a gateway channel prefix, and
+        `agent-registry` is reserved so no channel prefix can take it. The details page has
+        **Overview**, **Agent Card**, **Connection**, **Surfaces** and **Traffic** tabs.
+        **Connection** shows how the gateway reaches the agent, with a URL endpoint's credentials
+        and query string hidden. The Agent Card opens as a visual preview with a JSON view, every
+        value is shown as plain text, and it is labelled as published by the agent and not verified, Trust Registry badges are labelled as configured
         and not checked, and traffic is labelled with the metrics retention window. Needs surface
         view permission.
   changed: []

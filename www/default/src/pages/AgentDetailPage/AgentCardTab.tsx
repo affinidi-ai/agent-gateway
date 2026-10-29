@@ -2,6 +2,14 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { AgentCardResponse, apiClient } from '../../api';
 import { AppButton } from '../../components/shared/AppButton';
 import { CopyButton } from '../../components/shared/CopyButton';
+import AgentCardPreview from './AgentCardPreview';
+
+type CardView = 'preview' | 'json';
+
+const CARD_VIEWS: { key: CardView; label: string }[] = [
+  { key: 'preview', label: 'Preview' },
+  { key: 'json', label: 'JSON' },
+];
 
 const UNAVAILABLE_TEXT: Record<'no_agent_card' | 'unsupported_runtime', string> = {
   no_agent_card: "This agent doesn't publish an Agent Card",
@@ -16,6 +24,7 @@ const AgentCardTab: React.FC<{ agentId: string }> = ({ agentId }) => {
   const [response, setResponse] = useState<AgentCardResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [failed, setFailed] = useState(false);
+  const [view, setView] = useState<CardView>('preview');
 
   const loadCard = useCallback(async () => {
     try {
@@ -73,26 +82,48 @@ const AgentCardTab: React.FC<{ agentId: string }> = ({ agentId }) => {
   const json = JSON.stringify(response.card, null, 2);
   return (
     <div className="card" data-testid="agent-card-tab">
-      <div className="card-header py-2 d-flex align-items-center justify-content-between">
-        <span className="badge text-bg-warning" data-testid="agent-card-unverified">
+      <div className="card-header py-2 d-flex flex-wrap gap-2 align-items-center justify-content-between">
+        {/* <span className="badge text-bg-warning" data-testid="agent-card-unverified">
           <i className="fas fa-exclamation-triangle me-1" aria-hidden="true" />
           Published by the agent, not verified
+        </span> */}
+        <span className="d-flex align-items-center gap-2">
+          <span className="btn-group btn-group-sm" role="group" aria-label="Agent Card view">
+            {CARD_VIEWS.map(v => (
+              <button
+                key={v.key}
+                type="button"
+                className={`btn ${view === v.key ? 'btn-primary' : 'btn-outline-secondary'}`}
+                aria-pressed={view === v.key}
+                onClick={() => setView(v.key)}
+                data-testid={`agent-card-view-${v.key}`}
+              >
+                {v.label}
+              </button>
+            ))}
+          </span>
+          <CopyButton
+            text={json}
+            variant="outline-primary"
+            label="Copy JSON"
+            title="Copy JSON"
+            data-testid="agent-card-copy-button"
+          />
         </span>
-        <CopyButton
-          text={json}
-          variant="outline-primary"
-          label="Copy JSON"
-          title="Copy JSON"
-          data-testid="agent-card-copy-button"
-        />
       </div>
-      <pre
-        className="card-body mb-0 small"
-        style={{ maxHeight: '60vh', overflow: 'auto', whiteSpace: 'pre-wrap' }}
-        data-testid="agent-card-json"
-      >
-        {json}
-      </pre>
+      {view === 'preview' ? (
+        <div className="card-body">
+          <AgentCardPreview card={response.card} />
+        </div>
+      ) : (
+        <pre
+          className="card-body mb-0 small"
+          style={{ maxHeight: '60vh', overflow: 'auto', whiteSpace: 'pre-wrap' }}
+          data-testid="agent-card-json"
+        >
+          {json}
+        </pre>
+      )}
     </div>
   );
 };

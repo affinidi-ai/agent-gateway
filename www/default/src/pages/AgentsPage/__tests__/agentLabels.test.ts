@@ -1,12 +1,15 @@
 import type { AgentRecord } from '../../../api';
 import {
   agentMatchesFilter,
+  agentMatchesStatus,
   connectionTarget,
   didSourceLabel,
   formatWindow,
   lastActivityLabel,
   otherSurfacesNote,
   protocolBadgeLabel,
+  protocolBadgeTitle,
+  runtimeIcon,
   runtimeLabel,
   shortenDid,
   statusLabel,
@@ -115,10 +118,27 @@ describe('agentLabels', () => {
     expect(connectionTarget('not a url')).toEqual({ kind: 'unknown' });
   });
 
-  it('filters on the agent name and surface name', () => {
+  it('filters on the agent name, surface name and runtime label', () => {
     expect(agentMatchesFilter(agent(), 'time')).toBe(true);
     expect(agentMatchesFilter(agent(), 'rick')).toBe(true);
+    expect(agentMatchesFilter(agent(), 'direct url')).toBe(true);
+    expect(agentMatchesFilter(agent(), 'a2a-proxy')).toBe(false);
     expect(agentMatchesFilter(agent({ name: null }), 'time')).toBe(false);
     expect(agentMatchesFilter(agent(), '  ')).toBe(true);
+  });
+
+  it('filters on status', () => {
+    expect(agentMatchesStatus(agent(), 'all')).toBe(true);
+    expect(agentMatchesStatus(agent(), 'active')).toBe(true);
+    expect(agentMatchesStatus(agent(), 'disabled')).toBe(false);
+    expect(agentMatchesStatus(agent({ status: 'disabled' }), 'disabled')).toBe(true);
+  });
+
+  it('names the indirect runtimes for the protocol badge', () => {
+    expect(protocolBadgeTitle('url')).toBeUndefined();
+    expect(protocolBadgeTitle('a2a-proxy')).toContain('A2A proxy');
+    expect(protocolBadgeTitle('gateway')).toContain('remote gateway');
+    expect(runtimeIcon('a2a-proxy')).toBe('fa-exchange-alt');
+    expect(runtimeIcon('ftp')).toBe('fa-robot');
   });
 });

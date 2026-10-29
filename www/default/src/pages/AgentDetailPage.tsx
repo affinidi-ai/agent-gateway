@@ -3,13 +3,13 @@ import { Tab, Tabs } from 'react-bootstrap';
 import { useNavigate, useParams } from 'react-router-dom';
 import { AgentDetails, ApiError, apiClient } from '../api';
 import { AppButton } from '../components/shared/AppButton';
-import { AgentProtocolBadge, AgentStatusBadge } from './AgentsPage/AgentBadges';
-import { UNNAMED_AGENT } from './AgentsPage/agentLabels';
 import AgentCardTab from './AgentDetailPage/AgentCardTab';
+import AgentDetailHeader from './AgentDetailPage/AgentDetailHeader';
 import ConnectionTab from './AgentDetailPage/ConnectionTab';
 import OverviewTab from './AgentDetailPage/OverviewTab';
 import SurfacesTab from './AgentDetailPage/SurfacesTab';
 import TrafficTab from './AgentDetailPage/TrafficTab';
+import './AgentsPage/AgentRegistry.css';
 
 /** Read-only details of one agent: Overview, Agent Card, Surfaces and Traffic. */
 const AgentDetailPage: React.FC = () => {
@@ -47,7 +47,7 @@ const AgentDetailPage: React.FC = () => {
       <button
         type="button"
         className="btn btn-sm btn-secondary"
-        onClick={() => navigate('/agents')}
+        onClick={() => navigate('/agent-registry')}
         data-testid="agent-back-button"
       >
         <i className="fas fa-arrow-left" aria-hidden="true" /> Agents
@@ -98,17 +98,7 @@ const AgentDetailPage: React.FC = () => {
     <div className="container-fluid" data-testid="page-agent-details">
       {backButton}
       <div className="card shadow mb-4">
-        <div
-          className="card-header py-3 d-flex flex-wrap align-items-center"
-          style={{ gap: '0.5rem' }}
-        >
-          <h6 className="m-0 font-weight-bold text-primary" data-testid="agent-details-name">
-            <i className="fas fa-robot me-2" aria-hidden="true" />
-            {agent.name ?? <span className="text-muted fst-italic">{UNNAMED_AGENT}</span>}
-          </h6>
-          <AgentStatusBadge status={agent.status} />
-          <AgentProtocolBadge protocol={agent.protocol} runtime={agent.runtime} />
-        </div>
+        <AgentDetailHeader agent={agent} />
         <div className="card-body">
           <Tabs
             defaultActiveKey="overview"

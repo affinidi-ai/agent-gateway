@@ -60,6 +60,12 @@ Applies to:
    offers a Refresh button (`wizard-mediator-refresh-button`) in that state and below the list, since
    a directory can take a moment to answer after the gateway starts; a load error shows as
    `wizard-mediator-load-error`.
+10. Dashboard routes are served from the gateway root, so a top-level route must not share a
+    prefix with a gateway channel (`/agents`, `/payments`, `/routes`, ... in
+    `config/examples/gateway.example.json`). In-app navigation still works, but refresh, deep links
+    and new tabs reach the proxy and return 404. Agent endpoints default to `/agents/<surface-name>`,
+    so `/agents` in particular is never a dashboard route. Add every new top-level route to
+    `SPA_RESERVED_TOP_LEVEL` in `src/proxy/paths.rs`.
 
 ## Toasts
 
@@ -1667,10 +1673,18 @@ to it over `fabric://`) shows the gateway's message.
 
 ## Agents page
 
-`/agents` (`pages/AgentsPage.tsx`) and `/agents/:agentId` (`pages/AgentDetailPage.tsx`, tabs in
-`pages/AgentDetailPage/`) are read-only and need `surfaces.view`. They call only
-`apiClient.listAgents`, `getAgent` and `getAgentCard` (`/v1/agents`), never `/v1/dashboard/stats`.
+`/agent-registry` (`pages/AgentsPage.tsx`, table in `pages/AgentsPage/AgentsTable.tsx`) and
+`/agent-registry/:agentId` (`pages/AgentDetailPage.tsx`, header and tabs in `pages/AgentDetailPage/`)
+are read-only and need `surfaces.view`. They call only `apiClient.listAgents`, `getAgent` and
+`getAgentCard` (`/v1/agents`), never `/v1/dashboard/stats`. There is no create, edit, duplicate,
+disable or rotate action: the API has no write endpoints for agents. Styles are in
+`pages/AgentsPage/AgentRegistry.css`, built on the theme variables with `body.dark-theme` overrides.
 
+- MCP surfaces front tool servers, not agents, so `/v1/agents` leaves them out (`is_listed` in
+  `src/identity/handlers/agents.rs`) and their details and card return 404. The page adds no
+  protocol filter of its own.
+- The list filters client-side by text (name, surface name, runtime label) and by status (All,
+  Active, Disabled). Rows that aren't active are dimmed.
 - Raw API values are never shown. `pages/AgentsPage/agentLabels.ts` maps them: runtime `url`,
   `a2a-proxy`, `gateway` to Direct URL, A2A proxy, Remote gateway, and the protocol badge to `A2A`,
   `A2A via proxy`, `A2A via gateway`. Shared badges are in `pages/AgentsPage/AgentBadges.tsx`.
@@ -1684,20 +1698,25 @@ to it over `fabric://`) shows the gateway's message.
   the viewer has `a2a_proxies.edit` or `gateways.edit`, which those pages need; otherwise the
   id is plain text.
 - Trust Registry badges are configuration, labelled "not checked against the Trust Registry".
-- The Agent Card is untrusted: render it as JSON text only (no HTML, Markdown or links), labelled
-  **Published by the agent, not verified**.
+- The Agent Card is untrusted: render it as plain text only (no HTML, Markdown or links), labelled
+  **Published by the agent, not verified**. The tab opens on a visual **Preview**
+  (`AgentDetailPage/AgentCardPreview.tsx`, reading known A2A card fields defensively, with the URL
+  as text) and toggles to the raw **JSON**.
 - Activity and traffic exist only inside the metrics retention window, so labels name it
   (`None in last 6h`, `Requests (last 6h)`) and the 7-day card shows `—`. **Failed requests** is
   `failed` + `gateway_faults`.
 
-| Element                         | Test id                                                                         |
-| ------------------------------- | ------------------------------------------------------------------------------- |
-| Pages                           | `page-agents`, `page-agent-details`                                             |
-| List row, filter, count, retry  | `agents-row-<id>`, `agents-filter-input`, `agents-count`, `agents-retry-button` |
-| Surface link, DID, copy DID     | `agents-surface-link`, `agents-did`, `agents-copy-did-button`                   |
-| Back, details retry             | `agent-back-button`, `agent-retry-button`                                       |
-| Agent Card states               | `agent-card-json`, `agent-card-unverified`, `agent-card-retry-button`           |
-| Traffic cards                   | `agent-traffic-requests`, `-requests-7d`, `-failed`, `-p95`                     |
+| Element                         | Test id                                                                          |
+| ------------------------------- | -------------------------------------------------------------------------------- |
+| Pages                           | `page-agents`, `page-agent-details`                                              |
+| List row, filter, count, retry  | `agents-row-<id>`, `agents-filter-input`, `agents-count`, `agents-retry-button`  |
+| Status filter                   | `agents-status-filter`                                                           |
+| Surface link, DID, copy DID     | `agents-surface-link`, `agents-did`, `agents-copy-did-button`                    |
+| Back, details retry             | `agent-back-button`, `agent-retry-button`                                        |
+| Details header                  | `agent-details-header`, `-name`, `-status`, `-runtime`                           |
+| Agent Card states               | `agent-card-json`, `agent-card-unverified`, `agent-card-retry-button`            |
+| Agent Card view toggle, preview | `agent-card-view-preview`, `-view-json`, `agent-card-preview`, `-preview-name`   |
+| Traffic cards                   | `agent-traffic-requests`, `-requests-7d`, `-failed`, `-p95`                      |
 | Connection                      | `agent-connection-tab`, `-endpoint`, `-redacted`, `-proxy-link`, `-gateway-link` |
 
 ## Remote gateway Issuer DIDs

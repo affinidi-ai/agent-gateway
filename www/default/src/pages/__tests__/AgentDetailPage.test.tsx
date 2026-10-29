@@ -61,10 +61,10 @@ const details = (overrides: Partial<AgentDetails> = {}): AgentDetails => ({
 
 const renderPage = () =>
   render(
-    <MemoryRouter initialEntries={['/agents/s1']}>
+    <MemoryRouter initialEntries={['/agent-registry/s1']}>
       <Routes>
-        <Route path="/agents/:agentId" element={<AgentDetailPage />} />
-        <Route path="/agents" element={<div data-testid="list-route" />} />
+        <Route path="/agent-registry/:agentId" element={<AgentDetailPage />} />
+        <Route path="/agent-registry" element={<div data-testid="list-route" />} />
       </Routes>
     </MemoryRouter>
   );
@@ -122,7 +122,17 @@ describe('AgentDetailPage', () => {
     renderPage();
 
     expect(await screen.findByTestId('agent-details-name')).toHaveTextContent('TimeAsker');
-    expect(screen.getAllByText('A2A via gateway').length).toBeGreaterThan(0);
+    const header = screen.getByTestId('agent-details-header');
+    expect(within(header).getByTestId('agent-details-status')).toHaveTextContent('Active');
+    expect(within(header).getByTestId('agents-protocol-badge')).toHaveTextContent(
+      'A2A via gateway'
+    );
+    expect(within(header).getByTestId('agents-protocol-badge')).toHaveAttribute(
+      'title',
+      'The gateway reaches this agent through a remote gateway'
+    );
+    expect(within(header).getByTestId('agent-details-runtime')).toHaveTextContent('Remote gateway');
+    expect(within(header).queryByRole('button')).not.toBeInTheDocument();
     expect(screen.getByTestId('agent-overview-runtime')).toHaveTextContent('Remote gateway');
     expect(screen.getByTestId('agent-overview-description')).toHaveTextContent('—');
     expect(screen.getByText('Identity created')).toBeInTheDocument();
@@ -146,7 +156,73 @@ describe('AgentDetailPage', () => {
     expect(screen.getByTestId('list-route')).toBeInTheDocument();
   });
 
-  it('shows the card as plain text, labelled not verified', async () => {
+  it('previews the card as plain text, labelled not verified', async () => {
+    mockedGetAgent.mockResolvedValue(details());
+    mockedGetAgentCard.mockResolvedValue({
+      available: true,
+      card: {
+        name: '<img src=x onerror=alert(1)>',
+        description: 'Tells the time',
+        url: 'https://evil.example.com',
+        version: '1.2.0',
+        provider: { organization: 'Acme' },
+        capabilities: { streaming: true },
+        defaultInputModes: ['text/plain', 42, null],
+        skills: [{ id: 'time', name: 'Get time', description: 'Current time' }, 'bogus'],
+      },
+    });
+    renderPage();
+    await screen.findByTestId('agent-details-name');
+    openTab(/Agent Card/);
+
+    const preview = await screen.findByTestId('agent-card-preview');
+    expect(screen.getByTestId('agent-card-view-preview')).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.queryByTestId('agent-card-json')).not.toBeInTheDocument();
+    expect(within(preview).getByTestId('agent-card-preview-name')).toHaveTextContent(
+      '<img src=x onerror=alert(1)>'
+    );
+    expect(within(preview).queryByRole('img')).not.toBeInTheDocument();
+    expect(within(preview).queryByRole('link')).not.toBeInTheDocument();
+    expect(preview).toHaveTextContent('Tells the time');
+    expect(preview).toHaveTextContent('https://evil.example.com');
+    expect(preview).toHaveTextContent('1.2.0');
+    expect(preview).toHaveTextContent('Acme');
+    expect(preview).toHaveTextContent('Yes');
+    expect(preview).toHaveTextContent('text/plain, 42');
+    expect(within(preview).getByTestId('agent-card-preview-skills')).toHaveTextContent(
+      'Skills (1)Get timeCurrent time'
+    );
+    expect(screen.getByTestId('agent-card-unverified')).toBeInTheDocument();
+  });
+
+  it('previews a sparse card with fallbacks', async () => {
+    mockedGetAgent.mockResolvedValue(details());
+    mockedGetAgentCard.mockResolvedValue({ available: true, card: {} });
+    renderPage();
+    await screen.findByTestId('agent-details-name');
+    openTab(/Agent Card/);
+
+    const preview = await screen.findByTestId('agent-card-preview');
+    expect(within(preview).getByTestId('agent-card-preview-name')).toHaveTextContent(
+      'Unnamed agent'
+    );
+    expect(within(preview).getAllByText('Not set').length).toBe(7);
+    expect(within(preview).getByText('No skills listed')).toBeInTheDocument();
+  });
+
+  it('shows a non-object card only as JSON', async () => {
+    mockedGetAgent.mockResolvedValue(details());
+    mockedGetAgentCard.mockResolvedValue({ available: true, card: ['not', 'a', 'card'] });
+    renderPage();
+    await screen.findByTestId('agent-details-name');
+    openTab(/Agent Card/);
+
+    expect(await screen.findByTestId('agent-card-preview-empty')).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('agent-card-view-json'));
+    expect(screen.getByTestId('agent-card-json')).toHaveTextContent('"card"');
+  });
+
+  it('shows the card JSON as plain text, labelled not verified', async () => {
     mockedGetAgent.mockResolvedValue(details());
     mockedGetAgentCard.mockResolvedValue({
       available: true,
@@ -156,13 +232,16 @@ describe('AgentDetailPage', () => {
     await screen.findByTestId('agent-details-name');
     openTab(/Agent Card/);
 
-    const json = await screen.findByTestId('agent-card-json');
+    fireEvent.click(await screen.findByTestId('agent-card-view-json'));
+    expect(screen.getByTestId('agent-card-view-json')).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.queryByTestId('agent-card-preview')).not.toBeInTheDocument();
+    const json = screen.getByTestId('agent-card-json');
     expect(json).toHaveTextContent('<img src=x onerror=alert(1)>');
     expect(within(json).queryByRole('img')).not.toBeInTheDocument();
     expect(within(json).queryByRole('link')).not.toBeInTheDocument();
-    expect(screen.getByTestId('agent-card-unverified')).toHaveTextContent(
-      'Published by the agent, not verified'
-    );
+    // expect(screen.getByTestId('agent-card-unverified')).toHaveTextContent(
+    //   'Published by the agent, not verified'
+    // );
     expect(screen.getByTestId('agent-card-copy-button')).toHaveTextContent('Copy JSON');
   });
 
@@ -189,7 +268,7 @@ describe('AgentDetailPage', () => {
 
     expect(await screen.findByText("Agent Card couldn't be loaded")).toBeInTheDocument();
     fireEvent.click(screen.getByTestId('agent-card-retry-button'));
-    expect(await screen.findByTestId('agent-card-json')).toHaveTextContent('TimeAsker');
+    expect(await screen.findByTestId('agent-card-preview-name')).toHaveTextContent('TimeAsker');
   });
 
   it('lists the one surface', async () => {

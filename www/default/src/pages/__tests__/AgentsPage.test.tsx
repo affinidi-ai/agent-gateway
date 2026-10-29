@@ -41,10 +41,10 @@ const agent = (overrides: Partial<AgentRecord> = {}): AgentRecord => ({
 
 const renderPage = () =>
   render(
-    <MemoryRouter initialEntries={['/agents']}>
+    <MemoryRouter initialEntries={['/agent-registry']}>
       <Routes>
-        <Route path="/agents" element={<AgentsPage />} />
-        <Route path="/agents/:agentId" element={<div data-testid="details-route" />} />
+        <Route path="/agent-registry" element={<AgentsPage />} />
+        <Route path="/agent-registry/:agentId" element={<div data-testid="details-route" />} />
         <Route path="/surfaces/:surfaceId" element={<div data-testid="surface-route" />} />
       </Routes>
     </MemoryRouter>
@@ -112,6 +112,43 @@ describe('AgentsPage', () => {
     expect(screen.getByTestId('agents-count')).toHaveTextContent('1 of 2');
 
     fireEvent.change(screen.getByTestId('agents-filter-input'), { target: { value: 'nothing' } });
+    expect(screen.getByTestId('agents-no-match')).toBeInTheDocument();
+  });
+
+  it('filters by runtime label', async () => {
+    mockedListAgents.mockResolvedValue([
+      agent(),
+      agent({ id: 's2', name: 'Treasury', surface_name: 'Ops', runtime: 'gateway' }),
+    ]);
+    renderPage();
+    await screen.findByTestId('agents-row-s1');
+
+    fireEvent.change(screen.getByTestId('agents-filter-input'), { target: { value: 'remote' } });
+    expect(screen.queryByTestId('agents-row-s1')).not.toBeInTheDocument();
+    expect(screen.getByTestId('agents-row-s2')).toBeInTheDocument();
+  });
+
+  it('filters by status and dims inactive rows', async () => {
+    mockedListAgents.mockResolvedValue([
+      agent(),
+      agent({ id: 's2', name: 'Treasury', status: 'disabled' }),
+    ]);
+    renderPage();
+    await screen.findByTestId('agents-row-s1');
+    expect(screen.getByTestId('agents-row-s1')).not.toHaveClass('agents-row-dimmed');
+    expect(screen.getByTestId('agents-row-s2')).toHaveClass('agents-row-dimmed');
+
+    const status = screen.getByRole('combobox', { name: 'Filter by status' });
+    fireEvent.change(status, { target: { value: 'disabled' } });
+    expect(screen.queryByTestId('agents-row-s1')).not.toBeInTheDocument();
+    expect(screen.getByTestId('agents-row-s2')).toBeInTheDocument();
+    expect(screen.getByTestId('agents-count')).toHaveTextContent('1 of 2');
+
+    fireEvent.change(status, { target: { value: 'active' } });
+    expect(screen.getByTestId('agents-row-s1')).toBeInTheDocument();
+    expect(screen.queryByTestId('agents-row-s2')).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByTestId('agents-filter-input'), { target: { value: 'treas' } });
     expect(screen.getByTestId('agents-no-match')).toBeInTheDocument();
   });
 

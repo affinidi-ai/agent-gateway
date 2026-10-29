@@ -252,7 +252,9 @@ fn is_listed(
     context: Option<&PatTenantContext>,
     scope: Option<&PatResourceScope>,
 ) -> bool {
+    // An MCP surface fronts a tool server, not an agent.
     surface.status != SurfaceStatus::Deleted
+        && surface.access_point.protocol != SurfaceProtocol::Mcp
         && can_access(surface.tenant_id.as_deref(), context)
         && scope_allows_resource(scope, context, ResourceKind::Surfaces, &surface.surface_id)
 }
@@ -984,6 +986,17 @@ mod tests {
         disabled.status = SurfaceStatus::Disabled;
         assert!(!is_listed(&deleted, None, None));
         assert!(is_listed(&disabled, None, None));
+    }
+
+    #[test]
+    fn test_is_listed_excludes_mcp_surfaces() {
+        let mut mcp = surface("s1");
+        mcp.access_point.protocol = SurfaceProtocol::Mcp;
+        let mut ap2 = surface("s2");
+        ap2.access_point.protocol = SurfaceProtocol::Ap2;
+        assert!(!is_listed(&mcp, None, None));
+        assert!(is_listed(&ap2, None, None));
+        assert!(is_listed(&surface("s3"), None, None));
     }
 
     #[test]

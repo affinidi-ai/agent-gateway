@@ -27,7 +27,7 @@ const Sidebar: React.FC = () => {
       id: 'agents',
       label: 'Agents',
       icon: 'fa-robot',
-      path: '/agents',
+      path: '/agent-registry',
       permission: 'surfaces.view' as const,
     },
     {

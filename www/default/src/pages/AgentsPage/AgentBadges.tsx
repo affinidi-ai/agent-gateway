@@ -7,30 +7,43 @@ import {
   NO_TRUST_REGISTRY,
   TRUST_NOT_CHECKED,
   protocolBadgeLabel,
+  protocolBadgeTitle,
   protocolTone,
+  runtimeIcon,
   shortenDid,
   statusLabel,
   trustRegistryLabels,
 } from './agentLabels';
 
+/** Proxied and remote-gateway agents get the runtime icon and a tooltip saying so. */
 export const AgentProtocolBadge: React.FC<{ protocol: string; runtime: string }> = ({
   protocol,
   runtime,
-}) => (
-  <Badge
-    value={protocolBadgeLabel(protocol, runtime)}
-    tone={protocolTone(protocol)}
-    size="sm"
-    data-testid="agents-protocol-badge"
-  />
-);
+}) => {
+  const title = protocolBadgeTitle(runtime);
+  return (
+    <Badge
+      value={protocolBadgeLabel(protocol, runtime)}
+      tone={protocolTone(protocol)}
+      size="sm"
+      prefix={
+        title ? <i className={`fas ${runtimeIcon(runtime)} me-1`} aria-hidden="true" /> : undefined
+      }
+      title={title}
+      data-testid="agents-protocol-badge"
+    />
+  );
+};
 
-export const AgentStatusBadge: React.FC<{ status: string }> = ({ status }) => (
+export const AgentStatusBadge: React.FC<{ status: string; testId?: string }> = ({
+  status,
+  testId = 'agents-status-badge',
+}) => (
   <Badge
     value={statusLabel(status)}
     tone={status === 'active' ? 'success' : 'secondary'}
     size="sm"
-    data-testid="agents-status-badge"
+    data-testid={testId}
   />
 );
 

@@ -12,6 +12,12 @@ const RUNTIME_LABELS: Record<AgentRuntime, string> = {
   gateway: 'Remote gateway',
 };
 
+const RUNTIME_ICONS: Record<AgentRuntime, string> = {
+  url: 'fa-link',
+  'a2a-proxy': 'fa-exchange-alt',
+  gateway: 'fa-network-wired',
+};
+
 const PROTOCOL_LABELS: Record<string, string> = {
   a2a: 'A2A',
   ap2: 'AP2',
@@ -37,6 +43,10 @@ export function runtimeLabel(runtime: string): string {
   return RUNTIME_LABELS[runtime as AgentRuntime] ?? 'Unknown runtime';
 }
 
+export function runtimeIcon(runtime: string): string {
+  return RUNTIME_ICONS[runtime as AgentRuntime] ?? 'fa-robot';
+}
+
 export function protocolLabel(protocol: string): string {
   return PROTOCOL_LABELS[protocol] ?? 'Other protocol';
 }
@@ -51,6 +61,13 @@ export function protocolBadgeLabel(protocol: string, runtime: string): string {
   if (runtime === 'a2a-proxy') return `${label} via proxy`;
   if (runtime === 'gateway') return `${label} via gateway`;
   return label;
+}
+
+/** Tooltip for the protocol badge when the gateway doesn't call the agent directly. */
+export function protocolBadgeTitle(runtime: string): string | undefined {
+  if (runtime === 'a2a-proxy') return 'The gateway reaches this agent through an A2A proxy';
+  if (runtime === 'gateway') return 'The gateway reaches this agent through a remote gateway';
+  return undefined;
 }
 
 export function statusLabel(status: string): string {
@@ -144,9 +161,22 @@ export function didSourceLabel(agent: AgentRecord): string | null {
 export function agentMatchesFilter(agent: AgentRecord, term: string): boolean {
   const needle = term.trim().toLowerCase();
   if (!needle) return true;
-  return [agent.name ?? '', agent.surface_name].some(value => value.toLowerCase().includes(needle));
+  return [agent.name ?? '', agent.surface_name, runtimeLabel(agent.runtime)].some(value =>
+    value.toLowerCase().includes(needle)
+  );
 }
 
+export type AgentStatusFilter = 'all' | 'active' | 'disabled';
+
+export const STATUS_FILTER_OPTIONS: { value: AgentStatusFilter; label: string }[] = [
+  { value: 'all', label: 'All statuses' },
+  { value: 'active', label: 'Active' },
+  { value: 'disabled', label: 'Disabled' },
+];
+
+export function agentMatchesStatus(agent: AgentRecord, filter: AgentStatusFilter): boolean {
+  return filter === 'all' || agent.status === filter;
+}
 /**
  * The surface behind a list row. Iteration 1 maps one surface to one agent and
  * the opaque `id` is that surface's id; the details response carries real
