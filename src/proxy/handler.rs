@@ -10330,15 +10330,20 @@ fn mpp_retry_forward_request_body(
     trace_id: &str,
     deadline_ms: u64,
 ) -> serde_json::Value {
-    serde_json::json!({
-        "channel_id": route.channel_id,
-        "method": method.as_str(),
-        "path": path,
-        "headers": headers,
-        "body": body,
-        "trace_id": trace_id,
-        "deadline_ms": deadline_ms,
-    })
+    crate::proxy::fabric_forward::with_pinned_alias(
+        serde_json::json!({
+            "channel_id": route.channel_id,
+            "method": method.as_str(),
+            "path": path,
+            "headers": headers,
+            "body": body,
+            "trace_id": trace_id,
+            "deadline_ms": deadline_ms,
+        }),
+        route
+            .variant_alias
+            .as_deref(),
+    )
 }
 
 /// Handle requests through the fabric:// protocol by forwarding via gateway
@@ -12293,10 +12298,6 @@ async fn handle_fabric_request(
         }
     };
 
-    let virtual_channel_alias = fabric_route
-        .variant_alias
-        .clone();
-
     let (modern_upstream, forward_result) = if modern_request.is_some() {
         crate::mcp::modern_http::strip_protocol_session_headers(&mut stream_headers);
         let stream_target = &fabric_route.stream_target;
@@ -12365,20 +12366,21 @@ async fn handle_fabric_request(
             MessageType::ForwardRequest
                 .as_str()
                 .to_string(),
-            serde_json::json!({
-                "channel_id": channel_id,
-                "method": method.as_str(),
-                "path": path_and_query,
-                "headers": headers_map,
-                "body": body_value,
-                "trace_id": egress_trace_id.clone(),
-                "otel_context": otel_context,
-                "deadline_ms": deadline_ms,
-                // The alias the Target pins, under both names the receiving
-                // gateway reads.
-                "virtual_channel_alias": virtual_channel_alias,
-                "active_variant_alias": virtual_channel_alias,
-            }),
+            crate::proxy::fabric_forward::with_pinned_alias(
+                serde_json::json!({
+                    "channel_id": channel_id,
+                    "method": method.as_str(),
+                    "path": path_and_query,
+                    "headers": headers_map,
+                    "body": body_value,
+                    "trace_id": egress_trace_id.clone(),
+                    "otel_context": otel_context,
+                    "deadline_ms": deadline_ms,
+                }),
+                fabric_route
+                    .variant_alias
+                    .as_deref(),
+            ),
         )
         .from(
             gateway_listener

@@ -490,6 +490,25 @@ pub(crate) fn pinned_alias(channel: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// The `ForwardRequest` body `fields` with its alias fields set to the alias
+/// the Target pins, under both names the receiving gateway reads, or `null`
+/// when it pins none. Every `ForwardRequest` along a `fabric://` Target sets
+/// them here, so a retry asks the peer for the same variant as the first send.
+pub(crate) fn with_pinned_alias(
+    fields: serde_json::Value,
+    variant_alias: Option<&str>,
+) -> serde_json::Value {
+    match fields {
+        serde_json::Value::Object(mut body) => {
+            for field in ["virtual_channel_alias", "active_variant_alias"] {
+                body.insert(field.to_string(), serde_json::json!(variant_alias));
+            }
+            serde_json::Value::Object(body)
+        }
+        other => other,
+    }
+}
+
 /// The body of the `ForwardRequest` sending `req` to `channel`, the part of
 /// the `fabric://` Target after the gateway id, with the alias it pins.
 fn forward_request_body(
@@ -499,17 +518,18 @@ fn forward_request_body(
     deadline_ms: u64,
 ) -> serde_json::Value {
     let (channel_id, variant_alias) = pinned_alias(channel);
-    serde_json::json!({
-        "channel_id": channel_id,
-        "method": req.method.as_str(),
-        "path": req.path,
-        "headers": req.headers,
-        "body": body,
-        "trace_id": req.trace_id,
-        "deadline_ms": deadline_ms,
-        "virtual_channel_alias": variant_alias,
-        "active_variant_alias": variant_alias,
-    })
+    with_pinned_alias(
+        serde_json::json!({
+            "channel_id": channel_id,
+            "method": req.method.as_str(),
+            "path": req.path,
+            "headers": req.headers,
+            "body": body,
+            "trace_id": req.trace_id,
+            "deadline_ms": deadline_ms,
+        }),
+        variant_alias,
+    )
 }
 
 /// Forward a prepared request to a remote gateway channel over `fabric://`

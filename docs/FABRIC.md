@@ -408,7 +408,8 @@ unless the sending route's `fabric://` Target pins one of its variants:
 `fabric://<gateway>/<surface>$<alias>`. A pinned alias is sent with the request, as
 `active_variant_alias` (and `virtual_channel_alias`) on a buffered `ForwardRequest` and as the
 `variant_alias` of a framed stream's `Open`, and the receiving gateway serves and records that
-variant. This applies to an Access Point's Target and to a Transit Point's endpoint alike. To send
+variant. The `ForwardRequest` an Access Point resends after MPP auto-pay pays a `402` carries the
+same alias. This applies to an Access Point's Target and to a Transit Point's endpoint alike. To send
 one variant of the sending surface to a particular peer variant, override that variant's Target
 with the pinned URL. A pinned alias the receiving surface doesn't have, or has disabled, is refused
 there (`unknown_variant` or `variant_disabled`); the sending gateway passes the `404` on to its
