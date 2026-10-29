@@ -199,6 +199,13 @@ impl EncryptionService {
         self.enabled
     }
 
+    /// Whether what this service writes is encrypted: enabled with a key, from
+    /// the environment, a file or KMS. The development `local` key source is
+    /// enabled but writes plaintext, so it is not.
+    pub fn encrypts_at_rest(&self) -> bool {
+        self.enabled && !matches!(self.cipher, FieldCipher::LocalTrace(_))
+    }
+
     /// Encrypt a string value (for field-level encryption)
     pub fn encrypt_field(
         &self,

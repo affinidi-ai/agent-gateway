@@ -1,12 +1,13 @@
 //! Filesystem storage for delegation vault tokens
 
+use super::grants::{DelegatedGrant, EncryptionRequired, GRANTS_DIRECTORY, GrantKey, StoredGrant};
 use super::{DelegationToken, VaultLookupResult};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use std::fs::{File, OpenOptions};
 use std::path::PathBuf;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::storage::filesystem::{StorageBackend, uncached_storage};
 
@@ -120,6 +121,35 @@ pub trait DelegationVaultStorage: Send + Sync {
     ) -> Result<DelegationToken, RefreshError> {
         Err(RefreshError::Unavailable)
     }
+
+    /// The grant stored under `key`, read with one lookup by its record id.
+    /// Fails with [`EncryptionRequired`] while at-rest encryption is not active.
+    async fn grant(
+        &self,
+        _key: &GrantKey,
+    ) -> Result<Option<DelegatedGrant>> {
+        anyhow::bail!("This vault does not keep grants by binding")
+    }
+
+    /// Store `grant` under its key, replacing a grant of the same key, which is
+    /// returned so the caller can revoke its tokens. The record id is derived
+    /// from the key; the grant's own `id` is ignored. Fails with
+    /// [`EncryptionRequired`] while at-rest encryption is not active.
+    #[allow(dead_code)]
+    async fn store_grant(
+        &self,
+        _grant: DelegatedGrant,
+    ) -> Result<StoredGrant> {
+        anyhow::bail!("This vault does not keep grants by binding")
+    }
+
+    /// Record that a grant was used, when the vault is not busy.
+    async fn mark_grant_used(
+        &self,
+        _id: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Filesystem-backed delegation vault using uncached storage (security-sensitive)
@@ -129,17 +159,30 @@ pub struct FileSystemDelegationVaultStore {
     mutation_lock_path: PathBuf,
     consents: consent::ConsentStorage,
     refreshes: std::sync::Arc<dyn StorageBackend<refresh::RefreshRecord>>,
+    grants: std::sync::Arc<dyn StorageBackend<DelegatedGrant>>,
+    /// Whether the vault's stores were created with at-rest encryption active.
+    encrypted: bool,
 }
 
 impl FileSystemDelegationVaultStore {
     pub async fn new(path: PathBuf) -> Result<Self> {
+        let encrypted = crate::storage::filesystem::at_rest_encryption_active();
         // Use uncached storage for security — tokens should not linger in memory
         let storage = uncached_storage(path.clone(), "delegation_token").await?;
-        info!(
-            target: "credential_delegation",
-            path = %path.display(),
-            "Delegation vault store initialized (uncached, encrypted)"
-        );
+        if encrypted {
+            info!(
+                target: "credential_delegation",
+                path = %path.display(),
+                "Delegation vault store initialized (uncached, encrypted at rest)"
+            );
+        } else {
+            warn!(
+                target: "credential_delegation",
+                path = %path.display(),
+                "Delegation vault store initialized (uncached, NOT encrypted at rest): delegated tokens are written in \
+                 plaintext, and grants by binding are refused until [encryption] is enabled with a key"
+            );
+        }
         Ok(Self {
             storage: storage.into(),
             mutation_lock_path: path.join(".mutation.lock"),
@@ -147,7 +190,41 @@ impl FileSystemDelegationVaultStore {
             refreshes: uncached_storage(path.join("refresh_claims"), "delegation_refresh")
                 .await?
                 .into(),
+            grants: uncached_storage(path.join(GRANTS_DIRECTORY), "delegated_grant")
+                .await?
+                .into(),
+            encrypted,
         })
+    }
+
+    fn require_encryption(&self) -> Result<()> {
+        if self.encrypted {
+            Ok(())
+        } else {
+            Err(EncryptionRequired.into())
+        }
+    }
+
+    /// The grant stored under `key`'s record id, if its own key is `key`.
+    async fn grant_locked(
+        &self,
+        key: &GrantKey,
+    ) -> Result<Option<DelegatedGrant>> {
+        let Some(grant) = self
+            .grants
+            .get(&key.record_id())
+            .await?
+        else {
+            return Ok(None);
+        };
+        if grant.key() != *key || grant.id != key.record_id() {
+            warn!(
+                target: "credential_delegation",
+                "A delegated grant record does not belong to the key it is stored under; it is not used"
+            );
+            return Ok(None);
+        }
+        Ok(Some(grant))
     }
 
     async fn mutate<Output, Operation, Pending>(
@@ -640,6 +717,74 @@ impl DelegationVaultStorage for FileSystemDelegationVaultStore {
         .await
         .map_err(|_| RefreshError::Unavailable)?
     }
+
+    async fn grant(
+        &self,
+        key: &GrantKey,
+    ) -> Result<Option<DelegatedGrant>> {
+        self.require_encryption()?;
+        self.grant_locked(key).await
+    }
+
+    async fn store_grant(
+        &self,
+        mut grant: DelegatedGrant,
+    ) -> Result<StoredGrant> {
+        self.require_encryption()?;
+        let key = grant.key();
+        grant.id = key.record_id();
+        self.mutate(move |store| async move {
+            let _access_change = crate::mcp::subscriptions::AccessChange::begin(
+                crate::mcp::subscriptions::AccessScope::owned_by(grant.tenant_id.as_deref()),
+            );
+            let replaced = store
+                .grant_locked(&key)
+                .await?;
+            grant.updated_at = match replaced.as_ref() {
+                Some(previous) => next_version(previous.updated_at)?,
+                None => Utc::now(),
+            };
+            store
+                .grants
+                .save_atomic(&grant)
+                .await
+                .context("Failed to store delegated grant")?;
+            info!(
+                target: "credential_delegation",
+                grant_id = %grant.id,
+                surface_id = %grant.surface_id,
+                hop = %grant.hop,
+                credential_provider_id = %grant.credential_provider_id,
+                replaced = replaced.is_some(),
+                "Delegated grant stored in vault"
+            );
+            Ok(StoredGrant { grant, replaced })
+        })
+        .await
+    }
+
+    async fn mark_grant_used(
+        &self,
+        id: &str,
+    ) -> Result<()> {
+        let id = id.to_string();
+        let recorded = self
+            .try_mutate(move |store| async move {
+                if let Some(mut grant) = store.grants.get(&id).await? {
+                    grant.last_used_at = Some(Utc::now());
+                    store
+                        .grants
+                        .save_atomic(&grant)
+                        .await?;
+                }
+                Ok(())
+            })
+            .await?;
+        if recorded.is_none() {
+            debug!(target: "credential_delegation", "Skipped recording a grant's last use; the vault is busy");
+        }
+        Ok(())
+    }
 }
 
 fn same_owner(
@@ -1095,6 +1240,226 @@ mod tests {
                 .unwrap()
                 .user_identity_hash,
             stored.user_identity_hash
+        );
+    }
+
+    /// Grants by binding are kept only while at-rest encryption is active.
+    fn with_at_rest_encryption() {
+        unsafe {
+            std::env::set_var("DELEGATED_GRANTS_TEST_MASTER_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+        }
+        crate::storage::filesystem::init_global_encryption(crate::config::EncryptionConfig {
+            enabled: true,
+            key_env_var: "DELEGATED_GRANTS_TEST_MASTER_KEY".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+    }
+
+    async fn encrypted_vault(directory: &std::path::Path) -> FileSystemDelegationVaultStore {
+        with_at_rest_encryption();
+        FileSystemDelegationVaultStore::new(directory.into())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_grant_is_found_by_its_key_and_by_no_other() {
+        use crate::delegation_vault::grants::tests::{grant, key};
+        let directory = tempfile::tempdir().unwrap();
+        let vault = encrypted_vault(directory.path()).await;
+        let stored = vault
+            .store_grant(grant(&key(), "owner-access"))
+            .await
+            .unwrap();
+        assert_eq!(stored.grant.id, key().record_id());
+        assert!(stored.replaced.is_none());
+        let found = vault
+            .grant(&key())
+            .await
+            .unwrap()
+            .expect("the grant is found under its key");
+        assert_eq!(found.access_token, "owner-access");
+        let caller =
+            GrantKey::caller(Some("tenant-a"), "surface", "transit-point-id", "provider", &"a".repeat(64)).unwrap();
+        for other in [
+            GrantKey { tenant_id: None, ..key() },
+            GrantKey {
+                tenant_id: Some("tenant-b".into()),
+                ..key()
+            },
+            GrantKey {
+                surface_id: "other-surface".into(),
+                ..key()
+            },
+            GrantKey {
+                hop: "other-transit-point".into(),
+                ..key()
+            },
+            GrantKey {
+                credential_provider_id: "other-provider".into(),
+                ..key()
+            },
+            caller,
+        ] {
+            assert!(
+                vault
+                    .grant(&other)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{other:?}"
+            );
+        }
+        assert!(
+            vault
+                .list_all()
+                .await
+                .unwrap()
+                .is_empty(),
+            "grants are not agent-keyed tokens"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_grant_is_written_encrypted_under_an_id_that_names_nothing() {
+        use crate::delegation_vault::grants::tests::{grant, key};
+        let directory = tempfile::tempdir().unwrap();
+        let vault = encrypted_vault(directory.path()).await;
+        vault
+            .store_grant(grant(&key(), "owner-access"))
+            .await
+            .unwrap();
+        let files: Vec<_> = std::fs::read_dir(
+            directory
+                .path()
+                .join("delegated_grants"),
+        )
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+        assert_eq!(files.len(), 1, "{files:?}");
+        let name = files[0]
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(name, format!("{}.json.enc", key().record_id()));
+        let content = std::fs::read_to_string(&files[0]).unwrap();
+        for plaintext in ["owner-access", "owner-access-refresh", "transit-point-id", "tenant-a"] {
+            assert!(!content.contains(plaintext), "the file shows {plaintext}");
+        }
+    }
+
+    #[tokio::test]
+    async fn without_at_rest_encryption_grants_are_neither_stored_nor_read() {
+        use crate::delegation_vault::grants::tests::{grant, key};
+        let directory = tempfile::tempdir().unwrap();
+        let vault = FileSystemDelegationVaultStore::new(directory.path().into())
+            .await
+            .unwrap();
+        let refused = vault
+            .store_grant(grant(&key(), "owner-access"))
+            .await
+            .unwrap_err();
+        assert!(refused.is::<EncryptionRequired>(), "{refused}");
+        assert!(
+            vault
+                .grant(&key())
+                .await
+                .unwrap_err()
+                .is::<EncryptionRequired>()
+        );
+        assert!(
+            !directory
+                .path()
+                .join("delegated_grants")
+                .join(format!("{}.json", key().record_id()))
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn storing_a_grant_again_replaces_it_and_returns_the_one_replaced() {
+        use crate::delegation_vault::grants::tests::{grant, key};
+        let directory = tempfile::tempdir().unwrap();
+        let vault = encrypted_vault(directory.path()).await;
+        let first = vault
+            .store_grant(grant(&key(), "first-access"))
+            .await
+            .unwrap()
+            .grant;
+        let second = vault
+            .store_grant(grant(&key(), "second-access"))
+            .await
+            .unwrap();
+        assert_eq!(
+            second
+                .replaced
+                .as_ref()
+                .map(|grant| grant.access_token.as_str()),
+            Some("first-access")
+        );
+        assert!(second.grant.updated_at > first.updated_at);
+        assert_eq!(
+            vault
+                .grant(&key())
+                .await
+                .unwrap()
+                .unwrap()
+                .access_token,
+            "second-access"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_record_under_another_keys_id_is_never_returned() {
+        use crate::delegation_vault::grants::tests::{grant, key};
+        let directory = tempfile::tempdir().unwrap();
+        let vault = encrypted_vault(directory.path()).await;
+        let mut planted = grant(
+            &GrantKey {
+                surface_id: "attacker-surface".into(),
+                ..key()
+            },
+            "planted-access",
+        );
+        planted.id = key().record_id();
+        vault
+            .grants
+            .save_atomic(&planted)
+            .await
+            .unwrap();
+        assert!(
+            vault
+                .grant(&key())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn using_a_grant_records_when() {
+        use crate::delegation_vault::grants::tests::{grant, key};
+        let directory = tempfile::tempdir().unwrap();
+        let vault = encrypted_vault(directory.path()).await;
+        vault
+            .store_grant(grant(&key(), "access"))
+            .await
+            .unwrap();
+        vault
+            .mark_grant_used(&key().record_id())
+            .await
+            .unwrap();
+        assert!(
+            vault
+                .grant(&key())
+                .await
+                .unwrap()
+                .unwrap()
+                .last_used_at
+                .is_some()
         );
     }
 }
