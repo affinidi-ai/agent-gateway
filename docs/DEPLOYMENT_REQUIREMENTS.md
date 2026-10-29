@@ -127,7 +127,10 @@ you open any listener:
 - **Keep port 9000 private.** It adds your Transit Points' credentials to the calls it
   forwards, so only your managed agents should reach it. Set its `bind_address` to an
   internal address, and remove the `localhost` entries from `external_urls` in
-  production.
+  production. An inbound listener whose `external_urls` share a host name with the
+  outbound listener's also forwards `/outbound/*` to it, so its Transit Points are then
+  reachable wherever that inbound listener is; give the outbound listener a host name of
+  its own to keep them private.
 
 You also need:
 

@@ -59,11 +59,11 @@ A binding carries no destination, so where it applies depends on the hop.
   `tools` binding that lists a JSON-RPC method, such as `tools/call` or `message/send`,
   does not apply there either.
 
-An `all` binding applies on every Transit Point of the surface, so every partner upstream
-behind them receives the delegated credential. A surface with no `outbound_credentials` reads
-each Transit Point's `transit_credentials` as an `all` binding, which therefore also reaches
-every Transit Point, not only the one that declares it. Use `all` only when every Transit
-Point's upstream should hold the credential.
+An `all` binding in `outbound_credentials` applies on every Transit Point of the surface, so
+every partner upstream behind them receives the delegated credential; use it only when every
+Transit Point's upstream should hold the credential. A surface with no `outbound_credentials`
+applies each Transit Point's own `transit_credentials` on that Transit Point only. A surface
+with `outbound_credentials` ignores `transit_credentials`.
 
 ### Credential headers on a Transit Point
 
