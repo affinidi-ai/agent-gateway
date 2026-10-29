@@ -1528,19 +1528,21 @@ mod tests {
             assert_eq!(result.is_ok(), admitted, "peer tenant {peer_tenant:?}");
         }
         // A peer that may not reach the surface is refused before its alias is
-        // resolved, so it records nothing on the surface's tenant.
-        for (peer_tenant, message, recorded) in [
-            (Some("tenant-b"), "Fabric stream peer or route is unavailable", vec![]),
+        // resolved, so it records and logs nothing on the surface's tenant.
+        for (peer_tenant, message, recorded, warnings) in [
+            (Some("tenant-b"), "Fabric stream peer or route is unavailable", vec![], 0),
             (
                 Some("tenant-a"),
                 "Fabric stream variant is unavailable",
                 vec![crate::audit::request_events::RejectionReason::UnknownVariant],
+                1,
             ),
         ] {
             let mut tenant_peer = peer.clone();
             tenant_peer.tenant_id = peer_tenant.map(str::to_string);
             let mut unknown = fresh_message();
             unknown.message_body["payload"]["request"]["variant_alias"] = json!("missing");
+            let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
             let (result, records) = crate::audit::producer::capture(runtime.prepare_incoming_with_versions(
                 &unknown,
                 &connection,
@@ -1563,6 +1565,20 @@ mod tests {
                 })
                 .collect();
             assert_eq!(reasons, recorded, "peer tenant {peer_tenant:?}: {records:?}");
+            let text = logs.text();
+            let refusal_lines: Vec<&str> = text
+                .lines()
+                .filter(|line| line.contains("Surface variant cannot be resolved"))
+                .collect();
+            assert_eq!(refusal_lines.len(), warnings, "peer tenant {peer_tenant:?}: {text}");
+            for line in refusal_lines {
+                assert!(line.contains("WARN"), "{line}");
+                assert!(
+                    line.contains("[CHANNEL:surface] Surface variant cannot be resolved"),
+                    "the dashboard's log filter keys on the channel prefix: {line}"
+                );
+                assert!(line.contains("UnknownVariant"), "{line}");
+            }
         }
         store
             .save(&surface)
