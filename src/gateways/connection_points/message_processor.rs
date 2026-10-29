@@ -3752,14 +3752,20 @@ pub(crate) struct FabricStreamRequest {
 /// Resolves the surface a Fabric stream Open names, served by the variant its
 /// target pins. The sending gateway's variant is not consulted: with no
 /// alias, this surface's default variant, else its base, serves the stream.
+/// A peer that may not reach the surface is refused before the alias is
+/// resolved, so its Open records nothing on the surface's tenant.
 pub(crate) async fn resolve_stream_surface(
     message: &ReceivedMessage,
     request: &crate::proxy::fabric_stream::wire::OpenRequest,
+    peer_tenant_id: Option<&str>,
 ) -> Result<(crate::config::agent_surface::AgentSurface, crate::config::agent_surface_variants::ForwardedVariant), String>
 {
     let surface = lookup_channel(message, &request.channel_id)
         .await?
         .ok_or("Fabric stream surface is unavailable")?;
+    if !fabric_peer_may_reach_surface(peer_tenant_id, surface.tenant_id.as_deref()) {
+        return Err("Fabric stream peer or route is unavailable".to_string());
+    }
     let (variant, surface) = match surface.serve_variant(
         request
             .variant_alias

@@ -236,15 +236,13 @@ impl StreamRuntime {
         let scope = crate::observability::policy_audit::RequestScope::fresh();
         let (surface, variant) = Box::pin(crate::observability::policy_audit::in_request(
             Arc::clone(&scope),
-            crate::gateways::connection_points::message_processor::resolve_stream_surface(message, &request),
+            crate::gateways::connection_points::message_processor::resolve_stream_surface(
+                message,
+                &request,
+                peer.tenant_id.as_deref(),
+            ),
         ))
         .await?;
-        if !crate::gateways::connection_points::message_processor::fabric_peer_may_reach_surface(
-            peer.tenant_id.as_deref(),
-            surface.tenant_id.as_deref(),
-        ) {
-            return Err("Fabric stream peer or route is unavailable".into());
-        }
         if !versions.supports_modern(crate::mcp::MCP_MODERN_VERSION) {
             return Err(OpenRefusal::new(
                 wire::StreamErrorCode::LegacyOnly,
