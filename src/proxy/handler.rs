@@ -9494,7 +9494,12 @@ async fn multi_channel_proxy_handler_in_request_scope(
                     variant_id
                 }
                 Err(error) => {
-                    return refuse_access_point_variant(&ch.surface, &state.network_config, mcp_versions, req, &error)
+                    // The refusal may wait on the caller's body, so it must not
+                    // hold the surface list a surface update writes to.
+                    let surface = Arc::clone(&ch.surface);
+                    drop(sorted_channels);
+                    drop(channels);
+                    return refuse_access_point_variant(&surface, &state.network_config, mcp_versions, req, &error)
                         .await;
                 }
             };
