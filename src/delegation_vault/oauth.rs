@@ -378,11 +378,7 @@ async fn scoped_token_grant(
     secrets: &Arc<dyn SecretsStore>,
     client: &reqwest::Client,
 ) -> Result<Option<OAuthTokenResponse>> {
-    let endpoint = provider
-        .token_endpoint
-        .as_deref()
-        .ok_or_else(|| anyhow!("Missing refresh endpoint"))?;
-    crate::url_validation::validate_oauth_endpoint_url(endpoint).map_err(|_| anyhow!("Invalid refresh endpoint"))?;
+    let endpoint = validated_token_endpoint(provider)?;
     let resource = provider
         .resource
         .as_deref()
@@ -406,50 +402,191 @@ async fn scoped_token_grant(
         )
         .await?,
     );
+    let scope = scopes.join(" ");
+    let mut params = vec![
+        (
+            "grant_type",
+            if refresh_token.is_some() {
+                "refresh_token"
+            } else {
+                "client_credentials"
+            },
+        ),
+        ("client_id", client_id.as_str()),
+        ("client_secret", client_secret.as_str()),
+        ("resource", resource),
+        ("scope", scope.as_str()),
+    ];
+    if let Some(refresh_token) = refresh_token {
+        params.push(("refresh_token", refresh_token));
+    }
+    request_token(provider, endpoint, &params, refresh_token.is_some(), client).await
+}
+
+const JWT_BEARER_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:jwt-bearer";
+const JWT_CLIENT_ASSERTION_TYPE: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
+
+/// Fetch a token with a JWT Bearer grant (RFC 7523 section 2.1): the signed JWT is the
+/// grant, and no client credentials are sent.
+pub async fn fetch_jwt_bearer_token(
+    provider: &CredentialProvider,
+    scopes: &[String],
+    secrets: &Arc<dyn SecretsStore>,
+    client: &reqwest::Client,
+) -> Result<OAuthTokenResponse> {
+    let endpoint = validated_token_endpoint(provider)?;
+    let claims =
+        super::jwt_assertion::grant_assertion_claims(provider, scopes, Utc::now().timestamp()).map_err(|e| anyhow!(e))?;
+    let assertion = signed_assertion(provider, &claims, secrets).await?;
+    let mut params = vec![("grant_type", JWT_BEARER_GRANT_TYPE), ("assertion", assertion.as_str())];
+    if let Some(resource) = provider.resource.as_deref() {
+        params.push(("resource", resource));
+    }
+    request_token(provider, endpoint, &params, false, client)
+        .await?
+        .ok_or_else(|| anyhow!("Provider credential grant rejected"))
+}
+
+/// Fetch a token with a Client Credentials grant whose client authenticates with a
+/// signed JWT (`private_key_jwt`, RFC 7523 section 2.2) instead of a client secret.
+pub async fn fetch_client_credentials_jwt_auth_token(
+    provider: &CredentialProvider,
+    scopes: &[String],
+    secrets: &Arc<dyn SecretsStore>,
+    client: &reqwest::Client,
+) -> Result<OAuthTokenResponse> {
+    let endpoint = validated_token_endpoint(provider)?;
+    let client_id = resolve_secret(
+        secrets,
+        provider
+            .client_id_secret_ref
+            .as_deref()
+            .ok_or_else(|| anyhow!("Missing provider client"))?,
+    )
+    .await?;
+    let claims = super::jwt_assertion::client_auth_assertion_claims(provider, &client_id, Utc::now().timestamp())
+        .map_err(|e| anyhow!(e))?;
+    let assertion = signed_assertion(provider, &claims, secrets).await?;
+    let scope = scopes.join(" ");
+    let mut params = vec![
+        ("grant_type", "client_credentials"),
+        ("client_id", client_id.as_str()),
+        ("client_assertion_type", JWT_CLIENT_ASSERTION_TYPE),
+        ("client_assertion", assertion.as_str()),
+    ];
+    if !scope.is_empty() {
+        params.push(("scope", scope.as_str()));
+    }
+    if let Some(resource) = provider.resource.as_deref() {
+        params.push(("resource", resource));
+    }
+    request_token(provider, endpoint, &params, false, client)
+        .await?
+        .ok_or_else(|| anyhow!("Provider credential grant rejected"))
+}
+
+/// Sign `claims` with the provider's key, holding the PEM key and certificate in
+/// zeroizing buffers for the duration.
+async fn signed_assertion(
+    provider: &CredentialProvider,
+    claims: &super::jwt_assertion::AssertionClaims,
+    secrets: &Arc<dyn SecretsStore>,
+) -> Result<zeroize::Zeroizing<String>> {
+    let algorithm = provider
+        .jwt_signing_algorithm()
+        .ok_or_else(|| anyhow!("Provider does not sign assertions"))?;
+    let key = zeroize::Zeroizing::new(
+        resolve_secret(
+            secrets,
+            provider
+                .jwt
+                .jwt_signing_key_secret_ref
+                .as_deref()
+                .ok_or_else(|| anyhow!("Missing provider signing key"))?,
+        )
+        .await?,
+    );
+    let certificate = match provider
+        .jwt
+        .jwt_certificate_secret_ref
+        .as_deref()
+    {
+        Some(secret_ref) => Some(zeroize::Zeroizing::new(resolve_secret(secrets, secret_ref).await?)),
+        None => None,
+    };
+    super::jwt_assertion::sign_assertion(
+        &key,
+        algorithm,
+        super::jwt_assertion::AssertionHeader {
+            key_id: provider
+                .jwt
+                .jwt_key_id
+                .as_deref(),
+            certificate_pem: certificate
+                .as_ref()
+                .map(|certificate| certificate.as_str()),
+        },
+        claims,
+    )
+    .map(zeroize::Zeroizing::new)
+    .map_err(|e| anyhow!(e))
+}
+
+fn validated_token_endpoint(provider: &CredentialProvider) -> Result<&str> {
+    let endpoint = provider
+        .token_endpoint
+        .as_deref()
+        .ok_or_else(|| anyhow!("Missing provider token endpoint"))?;
+    crate::url_validation::validate_oauth_endpoint_url(endpoint).map_err(|_| anyhow!("Invalid provider token endpoint"))?;
+    Ok(endpoint)
+}
+
+/// POST a token request and read its JSON response, at most 64 KiB within 30 seconds.
+/// The access token must be a non-empty Bearer with an `expires_in` of up to 366 days.
+/// When `refresh` is set an `invalid_grant` answer is `Ok(None)`; any other refusal is
+/// an error, and only its OAuth `error` fields are logged.
+async fn request_token(
+    provider: &CredentialProvider,
+    endpoint: &str,
+    params: &[(&str, &str)],
+    refresh: bool,
+    client: &reqwest::Client,
+) -> Result<Option<OAuthTokenResponse>> {
     let operation = async {
-        let scope = scopes.join(" ");
-        let mut params = vec![
-            (
-                "grant_type",
-                if refresh_token.is_some() {
-                    "refresh_token"
-                } else {
-                    "client_credentials"
-                },
-            ),
-            ("client_id", client_id.as_str()),
-            ("client_secret", client_secret.as_str()),
-            ("resource", resource),
-            ("scope", scope.as_str()),
-        ];
-        if let Some(refresh_token) = refresh_token {
-            params.push(("refresh_token", refresh_token));
-        }
         let mut response = client
             .post(endpoint)
             .header("accept", "application/json")
-            .form(&params)
+            .form(params)
             .send()
             .await
-            .context("Provider refresh request failed")?;
+            .context("Provider token request failed")?;
         let status = response.status();
         let mut bytes = zeroize::Zeroizing::new(Vec::new());
         while let Some(chunk) = response
             .chunk()
             .await
-            .context("Provider refresh response failed")?
+            .context("Provider token response failed")?
         {
             anyhow::ensure!(
                 bytes
                     .len()
                     .saturating_add(chunk.len())
                     <= 64 * 1024,
-                "Provider refresh response too large"
+                "Provider token response too large"
             );
             bytes.extend_from_slice(&chunk);
         }
-        let value: serde_json::Value = serde_json::from_slice(&bytes).context("Invalid provider refresh response")?;
-        if refresh_token.is_some()
+        if !status.is_success() {
+            warn!(
+                target: "credential_delegation",
+                provider_id = %provider.provider_id,
+                status = %status,
+                reason = %token_error_reason(&String::from_utf8_lossy(&bytes)),
+                "Provider token request rejected"
+            );
+        }
+        let value: serde_json::Value = serde_json::from_slice(&bytes).context("Invalid provider token response")?;
+        if refresh
             && status == reqwest::StatusCode::BAD_REQUEST
             && value
                 .get("error")
@@ -458,9 +595,8 @@ async fn scoped_token_grant(
         {
             return Ok(None);
         }
-        anyhow::ensure!(status.is_success(), "Provider refresh rejected");
-        let response: OAuthTokenResponse =
-            serde_json::from_value(value).context("Invalid provider refresh response")?;
+        anyhow::ensure!(status.is_success(), "Provider token request rejected");
+        let response: OAuthTokenResponse = serde_json::from_value(value).context("Invalid provider token response")?;
         anyhow::ensure!(
             !response
                 .access_token
@@ -475,13 +611,13 @@ async fn scoped_token_grant(
                     .refresh_token
                     .as_deref()
                     .is_none_or(|token| !token.is_empty()),
-            "Invalid provider refresh credential"
+            "Invalid provider token credential"
         );
         Ok(Some(response))
     };
     tokio::time::timeout(std::time::Duration::from_secs(30), operation)
         .await
-        .context("Provider refresh timed out")?
+        .context("Provider token request timed out")?
 }
 
 /// Build a consent-required payload for protocol-aware signaling
@@ -996,6 +1132,270 @@ mod tests {
             token_error_reason(r#"{"error":{"code":"nested-secret-marker"}}"#),
             "no OAuth error code in response"
         );
+    }
+
+    mod jwt_grants {
+        use super::super::*;
+        use crate::delegation_vault::jwt_assertion::test_keys;
+        use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
+        use serde_json::{Value, json};
+        use std::collections::HashMap;
+
+        struct TokenEndpoint {
+            client: reqwest::Client,
+            requests: tokio::sync::mpsc::Receiver<HashMap<String, String>>,
+            _server: tokio::task::JoinSet<()>,
+        }
+
+        async fn token_endpoint(
+            status: u16,
+            body: Value,
+        ) -> TokenEndpoint {
+            let (sender, requests) = tokio::sync::mpsc::channel(4);
+            let app = axum::Router::new().fallback(axum::routing::post(
+                move |axum::Form(form): axum::Form<HashMap<String, String>>| {
+                    let sender = sender.clone();
+                    let body = body.clone();
+                    async move {
+                        sender
+                            .send(form)
+                            .await
+                            .unwrap();
+                        (axum::http::StatusCode::from_u16(status).unwrap(), axum::Json(body))
+                    }
+                },
+            ));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .unwrap();
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .proxy(reqwest::Proxy::http(format!("http://{}", listener.local_addr().unwrap())).unwrap())
+                .build()
+                .unwrap();
+            let mut server = tokio::task::JoinSet::new();
+            server.spawn(async move {
+                axum::serve(listener, app)
+                    .await
+                    .unwrap();
+            });
+            TokenEndpoint {
+                client,
+                requests,
+                _server: server,
+            }
+        }
+
+        struct Fixture {
+            secrets: Arc<dyn SecretsStore>,
+            key: test_keys::TestKey,
+            certificate: String,
+            _directory: tempfile::TempDir,
+        }
+
+        async fn fixture() -> Fixture {
+            let directory = tempfile::tempdir().unwrap();
+            let secrets: Arc<dyn SecretsStore> = Arc::new(
+                crate::secrets::FilesystemSecretsStore::new(
+                    directory
+                        .path()
+                        .join("secrets")
+                        .to_str()
+                        .unwrap(),
+                )
+                .unwrap(),
+            );
+            let key = test_keys::rsa_pkcs8();
+            let certificate = test_keys::certificate_pem();
+            for (secret_id, value) in [
+                ("SIGNING_KEY", key.private_pem.as_str()),
+                ("CERTIFICATE", certificate.as_str()),
+                ("CLIENT_ID", "client-123"),
+            ] {
+                secrets
+                    .create(crate::secrets::CreateSecretRequest {
+                        tenant_id: None,
+                        name: secret_id.into(),
+                        secret_id: secret_id.into(),
+                        description: None,
+                        value: value.into(),
+                        secret_type: "General".into(),
+                        tags: vec![],
+                    })
+                    .await
+                    .unwrap();
+            }
+            Fixture {
+                secrets,
+                key,
+                certificate,
+                _directory: directory,
+            }
+        }
+
+        fn provider(body: Value) -> CredentialProvider {
+            let mut value = json!({
+                "id": "cp", "name": "Provider", "provider_id": "provider",
+                "token_endpoint": "http://192.0.2.1/token",
+                "jwt_signing_key_secret_ref": "SIGNING_KEY",
+                "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+            });
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(
+                    body.as_object()
+                        .unwrap()
+                        .clone(),
+                );
+            serde_json::from_value(value).unwrap()
+        }
+
+        fn claims(
+            assertion: &str,
+            public_pem: &str,
+            algorithm: Algorithm,
+        ) -> Value {
+            let mut validation = Validation::new(algorithm);
+            validation.set_audience(&["http://192.0.2.1/token"]);
+            decode::<Value>(assertion, &DecodingKey::from_rsa_pem(public_pem.as_bytes()).unwrap(), &validation)
+                .unwrap()
+                .claims
+        }
+
+        fn issued() -> Value {
+            json!({"access_token": "issued-access", "token_type": "bearer", "expires_in": 3599})
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_jwt_bearer_grant_posts_only_the_signed_assertion() {
+            let fixture = fixture().await;
+            let mut endpoint = token_endpoint(200, issued()).await;
+            let provider = provider(json!({
+                "provider_type": "oauth2_jwt_bearer",
+                "jwt_issuer": "agent@project.iam.gserviceaccount.com",
+                "jwt_key_id": "google-key-id"
+            }));
+            let scopes = vec!["https://www.googleapis.com/auth/cloud-platform".to_string()];
+            let response = fetch_jwt_bearer_token(&provider, &scopes, &fixture.secrets, &endpoint.client)
+                .await
+                .unwrap();
+            assert_eq!(response.access_token, "issued-access");
+            assert_eq!(response.expires_in, Some(3599));
+            let form = endpoint
+                .requests
+                .recv()
+                .await
+                .unwrap();
+            let mut keys: Vec<_> = form
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(keys, ["assertion", "grant_type"]);
+            assert_eq!(form["grant_type"], "urn:ietf:params:oauth:grant-type:jwt-bearer");
+            assert_eq!(
+                decode_header(&form["assertion"])
+                    .unwrap()
+                    .kid
+                    .as_deref(),
+                Some("google-key-id")
+            );
+            let claims = claims(&form["assertion"], &fixture.key.public_pem, Algorithm::RS256);
+            assert_eq!(claims["iss"], "agent@project.iam.gserviceaccount.com");
+            assert_eq!(claims["scope"], "https://www.googleapis.com/auth/cloud-platform");
+            assert_eq!(
+                claims["exp"].as_i64().unwrap() - claims["iat"].as_i64().unwrap(),
+                300
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_jwt_bearer_grant_sends_the_resource_only_when_configured() {
+            let fixture = fixture().await;
+            let mut endpoint = token_endpoint(200, issued()).await;
+            let provider = provider(json!({
+                "provider_type": "oauth2_jwt_bearer", "jwt_issuer": "sa@example",
+                "resource": "https://api.example/"
+            }));
+            fetch_jwt_bearer_token(&provider, &[], &fixture.secrets, &endpoint.client)
+                .await
+                .unwrap();
+            let form = endpoint
+                .requests
+                .recv()
+                .await
+                .unwrap();
+            assert_eq!(form["resource"], "https://api.example/");
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_client_credentials_jwt_grant_authenticates_with_a_client_assertion() {
+            let fixture = fixture().await;
+            let mut endpoint = token_endpoint(200, issued()).await;
+            let provider = provider(json!({
+                "provider_type": "oauth2_client_credentials_jwt_auth",
+                "client_id_secret_ref": "CLIENT_ID",
+                "jwt_certificate_secret_ref": "CERTIFICATE"
+            }));
+            let scopes = vec!["api://foundry/.default".to_string()];
+            let response = fetch_client_credentials_jwt_auth_token(&provider, &scopes, &fixture.secrets, &endpoint.client)
+                .await
+                .unwrap();
+            assert_eq!(response.access_token, "issued-access");
+            let form = endpoint
+                .requests
+                .recv()
+                .await
+                .unwrap();
+            let mut keys: Vec<_> = form
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(keys, ["client_assertion", "client_assertion_type", "client_id", "grant_type", "scope"]);
+            assert_eq!(form["grant_type"], "client_credentials");
+            assert_eq!(form["client_id"], "client-123");
+            assert_eq!(form["scope"], "api://foundry/.default");
+            assert_eq!(form["client_assertion_type"], "urn:ietf:params:oauth:client-assertion-type:jwt-bearer");
+            let header = decode_header(&form["client_assertion"]).unwrap();
+            assert_eq!(header.alg, Algorithm::PS256);
+            assert_eq!(
+                header.x5t_s256,
+                Some(crate::delegation_vault::jwt_assertion::certificate_thumbprint(&fixture.certificate).unwrap())
+            );
+            let claims = claims(&form["client_assertion"], &fixture.key.public_pem, Algorithm::PS256);
+            assert_eq!(claims["iss"], "client-123");
+            assert_eq!(claims["sub"], "client-123");
+            assert!(claims["jti"].as_str().is_some_and(|jti| !jti.is_empty()));
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_refused_or_incomplete_token_response_is_an_error_without_key_material() {
+            let fixture = fixture().await;
+            let provider = provider(json!({"provider_type": "oauth2_jwt_bearer", "jwt_issuer": "sa@example"}));
+            for (status, body) in [
+                (400, json!({"error": "invalid_grant", "error_description": "Invalid JWT Signature."})),
+                (200, json!({"access_token": "issued-access", "token_type": "Bearer"})),
+                (200, json!({"access_token": "issued-access", "token_type": "mac", "expires_in": 60})),
+                (200, json!({"access_token": "", "token_type": "Bearer", "expires_in": 60})),
+            ] {
+                let endpoint = token_endpoint(status, body).await;
+                let error = fetch_jwt_bearer_token(&provider, &[], &fixture.secrets, &endpoint.client)
+                    .await
+                    .unwrap_err();
+                let text = format!("{error:#}");
+                assert!(!text.contains("PRIVATE KEY"), "{text}");
+                assert!(!text.contains("issued-access"), "{text}");
+            }
+            let mut unknown_key = provider.clone();
+            unknown_key.jwt.jwt_signing_key_secret_ref = Some("CERTIFICATE".into());
+            let endpoint = token_endpoint(200, issued()).await;
+            let error = fetch_jwt_bearer_token(&unknown_key, &[], &fixture.secrets, &endpoint.client)
+                .await
+                .unwrap_err();
+            assert_eq!(error.to_string(), "signing key must be a PEM private key matching the signing algorithm");
+        }
     }
 
     #[test]

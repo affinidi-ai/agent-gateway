@@ -165,6 +165,10 @@ pub enum DelegationActionOutcome {
     ApiKeyResolutionFailed,
     /// OAuth2 client-credentials token fetch failed.
     ClientCredentialsFailed,
+    /// OAuth2 JWT Bearer grant failed.
+    JwtBearerFailed,
+    /// OAuth2 client-credentials token fetch with a JWT client assertion failed.
+    ClientCredentialsJwtAuthFailed,
 }
 
 /// Audit-grade per-binding record produced by the resolver.
@@ -2711,6 +2715,8 @@ mod tests {
             (DelegationActionOutcome::LookupError, "lookup_error"),
             (DelegationActionOutcome::ApiKeyResolutionFailed, "api_key_resolution_failed"),
             (DelegationActionOutcome::ClientCredentialsFailed, "client_credentials_failed"),
+            (DelegationActionOutcome::JwtBearerFailed, "jwt_bearer_failed"),
+            (DelegationActionOutcome::ClientCredentialsJwtAuthFailed, "client_credentials_jwt_auth_failed"),
         ];
         for (outcome, expected) in outcomes_and_strs {
             let v = serde_json::to_value(outcome).unwrap();
