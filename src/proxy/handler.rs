@@ -6318,6 +6318,9 @@ async fn proxy_handler_with_mcp_runtime(
             Some(egress_trace_id.as_str()),
             allowed_points,
             caller_context_fields,
+            state
+                .surface
+                .transit_token_lifetime_secs(),
         ) {
             Ok(token) => {
                 upstream_req = upstream_req.header("X-Transit-Token", &token);

@@ -716,7 +716,8 @@ fn validate_source_auth(surface: &AgentSurface) -> Result<(), SurfaceApiError> {
 /// be non-empty, and be unique within the surface. Also assigns a fresh
 /// UUID `id` to any TP that was sent without one so older payloads keep
 /// working without forcing the dashboard to mint IDs client-side. A
-/// `transit.source_auth`, which the gateway does not enforce, is refused.
+/// `transit.source_auth`, which the gateway does not enforce, is refused, and
+/// so is a transit token lifetime outside its bounds.
 fn validate_transit_points(surface: &mut AgentSurface) -> Result<(), SurfaceApiError> {
     let surface_sets_source_auth = surface
         .transit
@@ -744,6 +745,10 @@ fn validate_transit_points(surface: &mut AgentSurface) -> Result<(), SurfaceApiE
     let Some(transit) = surface.transit.as_mut() else {
         return Ok(());
     };
+    transit
+        .shared
+        .validate_transit_token_lifetime()
+        .map_err(SurfaceApiError::BadRequest)?;
     let mut seen = std::collections::HashSet::with_capacity(transit.points.len());
     for (idx, tp) in transit
         .points

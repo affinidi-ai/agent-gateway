@@ -64,6 +64,12 @@ fn write_target_secret(storage_path: &str) {
 }
 
 async fn start_gateway() -> GatewayHarness {
+    start_gateway_with_transit_token_lifetime(None).await
+}
+
+/// A gateway whose `/smoke` surface sets `lifetime_secs` as its transit token
+/// lifetime, beside a second surface on `/other`.
+async fn start_gateway_with_transit_token_lifetime(lifetime_secs: Option<u64>) -> GatewayHarness {
     GatewayHarness::start_with_outbound_mock(MockServer::start().await, |_, gw_config, bootstrap| {
         write_target_secret(
             &bootstrap
@@ -74,10 +80,15 @@ async fn start_gateway() -> GatewayHarness {
             bootstrap,
             &[("smoke", "smoke", "/smoke"), ("other", "other", "/other")],
         );
-        gw_config.surfaces = vec![
-            surface_with_static_target_credential("transit-token-surface", "/smoke"),
-            surface_with_static_target_credential("transit-token-other-surface", "/other"),
-        ];
+        let mut surface = surface_with_static_target_credential("transit-token-surface", "/smoke");
+        surface
+            .transit
+            .as_mut()
+            .unwrap()
+            .shared
+            .transit_token_lifetime_secs = lifetime_secs;
+        gw_config.surfaces =
+            vec![surface, surface_with_static_target_credential("transit-token-other-surface", "/other")];
     })
     .await
 }
@@ -117,25 +128,34 @@ async fn transit_token_from_access_point(
         .expect("the managed agent must receive a transit token")
 }
 
+/// The status a call to the surface's Transit Point is answered with, once the
+/// outbound listener, which a surface save rebinds, accepts the connection.
 async fn call_transit_point(
     h: &GatewayHarness,
     route: &str,
     token: &str,
 ) -> reqwest::StatusCode {
-    client()
-        .post(format!(
-            "{}/outbound{route}/target",
-            h.outbound_url
-                .as_ref()
-                .unwrap()
-        ))
-        .header("content-type", "application/json")
-        .header("x-transit-token", token)
-        .body(r#"{"jsonrpc":"2.0","method":"test","id":2}"#)
-        .send()
-        .await
-        .unwrap()
-        .status()
+    let url = format!(
+        "{}/outbound{route}/target",
+        h.outbound_url
+            .as_ref()
+            .unwrap()
+    );
+    for _ in 0..100 {
+        match client()
+            .post(&url)
+            .header("content-type", "application/json")
+            .header("x-transit-token", token)
+            .body(r#"{"jsonrpc":"2.0","method":"test","id":2}"#)
+            .send()
+            .await
+        {
+            Ok(response) => return response.status(),
+            Err(error) if error.is_connect() => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+            Err(error) => panic!("{url}: {error}"),
+        }
+    }
+    panic!("the outbound listener must accept a connection to {url}");
 }
 
 fn token_part(
@@ -363,4 +383,231 @@ async fn a_transit_token_opens_an_mcp_transit_point_for_a_whole_mcp_exchange() {
             "{method}"
         );
     }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// How long `token` was issued to live, in seconds.
+fn lifetime_of(token: &str) -> u64 {
+    let claims = token_part(token, 1);
+    claims["exp"]
+        .as_u64()
+        .unwrap()
+        - claims["iat"]
+            .as_u64()
+            .unwrap()
+}
+
+/// `token` issued at `iat` to expire at `exp`, signed with the key the gateway
+/// signs its transit tokens with.
+fn reissued(
+    token: &str,
+    iat: u64,
+    exp: u64,
+) -> String {
+    let mut claims: crate::proxy::transit_token::TransitTokenClaims =
+        serde_json::from_value(token_part(token, 1)).unwrap();
+    claims.iat = iat;
+    claims.exp = exp;
+    crate::proxy::server::get_transit_token_issuer()
+        .expect("the gateway's transit token issuer")
+        .sign(&claims)
+        .unwrap()
+}
+
+/// The Access Point hands the managed agent a token living the lifetime its
+/// surface sets, and the Transit Point accepts a token for that whole lifetime:
+/// 400 seconds into 600 it reaches the target with the Transit Point's
+/// credential, while one past its lifetime, or living longer than the surface
+/// allows, is refused before the target.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transit_token_opens_its_transit_point_for_the_lifetime_its_surface_sets() {
+    let h = start_gateway_with_transit_token_lifetime(Some(600)).await;
+    let token = transit_token_from_access_point(&h, "/smoke").await;
+    assert_eq!(lifetime_of(&token), 600);
+    let now = unix_now();
+    let before = h
+        .mock
+        .request_count
+        .load(Ordering::SeqCst);
+
+    assert_eq!(call_transit_point(&h, "/smoke", &reissued(&token, now - 400, now + 200)).await, 200);
+    let received = h
+        .mock
+        .last_request_rx
+        .borrow()
+        .clone()
+        .unwrap();
+    assert_eq!(
+        received
+            .headers
+            .get("authorization")
+            .map(String::as_str),
+        Some(format!("Bearer {TARGET_SECRET}").as_str())
+    );
+    for (case, iat, exp) in
+        [("past its lifetime", now - 610, now - 10), ("living longer than its surface allows", now, now + 601)]
+    {
+        assert_eq!(call_transit_point(&h, "/smoke", &reissued(&token, iat, exp)).await, 401, "{case}");
+    }
+    assert_eq!(
+        h.mock
+            .request_count
+            .load(Ordering::SeqCst),
+        before + 1,
+        "a refused call must not reach the target"
+    );
+}
+
+/// The admin API refuses a transit token lifetime outside 30 to 900 seconds,
+/// and one set in a variant. Lengthening a surface's lifetime keeps the
+/// shorter tokens already issued; shortening it refuses the tokens issued for
+/// longer at once, while the Access Point issues tokens for the new lifetime.
+#[tokio::test(flavor = "multi_thread")]
+async fn changing_a_surfaces_transit_token_lifetime_applies_to_the_tokens_already_issued() {
+    let mut admin = None;
+    let h = GatewayHarness::start_with_outbound(|_, _, bootstrap| {
+        admin = Some(helpers::configure_admin_api(bootstrap));
+        helpers::configure_gateway_route_prefixes(bootstrap, &[("lifetime", "lifetime", "/lifetime")]);
+    })
+    .await;
+    let admin = admin.unwrap();
+    let listener = |url: &str| {
+        format!(
+            "http://localhost:{}",
+            url.rsplit(':')
+                .next()
+                .unwrap()
+        )
+    };
+    let collection = format!("{}/api/v1/surfaces", h.gateway_base);
+    let payload = json!({
+        "name": "lifetime",
+        "access_point": { "listen_address": listener(&h.gateway_base), "route": "/lifetime", "protocol": "a2a" },
+        "target": { "endpoint": h.mock.url() },
+        "transit": {
+            "outbound_listen_address": listener(h.outbound_url.as_deref().unwrap()),
+            "points": [{ "alias": "target", "target_endpoint": h.mock.url(), "require_transit_token": true }]
+        }
+    });
+
+    for secs in [29, 901] {
+        let mut refused = payload.clone();
+        refused["transit"]["transit_token_lifetime_secs"] = json!(secs);
+        let response = admin
+            .post(&collection)
+            .json(&refused)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400, "{secs}");
+        assert!(
+            response
+                .text()
+                .await
+                .unwrap()
+                .contains(&format!("transit.transit_token_lifetime_secs must be from 30 to 900 seconds, not {secs}")),
+            "{secs}"
+        );
+    }
+    let mut in_a_variant = payload.clone();
+    in_a_variant["variants"] = json!([{
+        "id": "longer", "alias": "longer", "name": "Longer",
+        "overrides": { "transit": { "shared": { "transit_token_lifetime_secs": 900 } } }
+    }]);
+    let response = admin
+        .post(&collection)
+        .json(&in_a_variant)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 422);
+    assert!(
+        response
+            .text()
+            .await
+            .unwrap()
+            .contains("unknown field `transit_token_lifetime_secs`")
+    );
+
+    let created = admin
+        .post(&collection)
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    let stored: serde_json::Value = created.json().await.unwrap();
+    assert!(
+        stored["transit"]
+            .get("transit_token_lifetime_secs")
+            .is_none(),
+        "{stored}"
+    );
+    let surface_url = format!(
+        "{collection}/{}",
+        stored["surface_id"]
+            .as_str()
+            .unwrap()
+    );
+    let set_lifetime = |secs: u64| {
+        admin
+            .patch(&surface_url)
+            .header("content-type", "application/merge-patch+json")
+            .body(json!({ "transit": { "transit_token_lifetime_secs": secs } }).to_string())
+            .send()
+    };
+
+    let issued_for_300 = transit_token_from_access_point(&h, "/lifetime").await;
+    assert_eq!(lifetime_of(&issued_for_300), 300);
+    assert_eq!(call_transit_point(&h, "/lifetime", &issued_for_300).await, 200);
+
+    let lengthened = set_lifetime(600)
+        .await
+        .unwrap();
+    assert_eq!(lengthened.status(), 200);
+    assert_eq!(
+        lengthened
+            .json::<serde_json::Value>()
+            .await
+            .unwrap()["transit"]["transit_token_lifetime_secs"],
+        600
+    );
+    let issued_for_600 = transit_token_from_access_point(&h, "/lifetime").await;
+    assert_eq!(lifetime_of(&issued_for_600), 600);
+    assert_eq!(call_transit_point(&h, "/lifetime", &issued_for_600).await, 200);
+    assert_eq!(call_transit_point(&h, "/lifetime", &issued_for_300).await, 200, "a shorter token is kept");
+
+    let refused = set_lifetime(901)
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 400);
+    assert_eq!(call_transit_point(&h, "/lifetime", &issued_for_600).await, 200, "a refused change changes nothing");
+
+    assert_eq!(
+        set_lifetime(300)
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    let before = h
+        .mock
+        .request_count
+        .load(Ordering::SeqCst);
+    assert_eq!(call_transit_point(&h, "/lifetime", &issued_for_600).await, 401, "a longer token is refused");
+    assert_eq!(
+        h.mock
+            .request_count
+            .load(Ordering::SeqCst),
+        before,
+        "a refused call must not reach the target"
+    );
+    assert_eq!(call_transit_point(&h, "/lifetime", &issued_for_300).await, 200);
+    assert_eq!(lifetime_of(&transit_token_from_access_point(&h, "/lifetime").await), 300);
 }

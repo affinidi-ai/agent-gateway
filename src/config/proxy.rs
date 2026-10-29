@@ -192,6 +192,14 @@ impl GatewayConfig {
             // Validate authentication configuration
             validate_source_auth_surface(surface)?;
 
+            if let Some(transit) = &surface.transit
+                && let Err(error) = transit
+                    .shared
+                    .validate_transit_token_lifetime()
+            {
+                anyhow::bail!("Channel '{}'{}: {}", surface.name, channel_id, error);
+            }
+
             // Validate MPP configuration if present
             if let Some(mpp_config) = surface.mpp_config() {
                 for warning in mpp_config.validate(&surface.name) {
@@ -425,4 +433,45 @@ fn validate_allowed_algorithms(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_refuses_a_surface_whose_transit_token_lifetime_is_out_of_bounds() {
+        let tls = tempfile::tempdir().unwrap();
+        let mut config = GatewayConfig::default_config();
+        for file in ["cert.pem", "key.pem"] {
+            std::fs::write(tls.path().join(file), "").unwrap();
+        }
+        config.tls.cert_path = tls.path().join("cert.pem");
+        config.tls.key_path = tls.path().join("key.pem");
+        let surface_living = |secs: u64| {
+            serde_json::from_value(serde_json::json!({
+                "surface_id": "lifetime-surface",
+                "name": "lifetime",
+                "access_point": { "listen_address": "0.0.0.0:8443", "route": "/lifetime", "protocol": "a2a" },
+                "target": { "endpoint": "https://agent.internal" },
+                "transit": {
+                    "transit_token_lifetime_secs": secs,
+                    "points": [{ "alias": "partner", "target_endpoint": "https://partner.example" }]
+                }
+            }))
+            .unwrap()
+        };
+
+        config.surfaces = vec![surface_living(900)];
+        config.validate().unwrap();
+        config.surfaces = vec![surface_living(901)];
+        assert_eq!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string(),
+            "Channel 'lifetime' (lifetime-surface.json): transit.transit_token_lifetime_secs must be from 30 to 900 \
+             seconds, not 901"
+        );
+    }
 }

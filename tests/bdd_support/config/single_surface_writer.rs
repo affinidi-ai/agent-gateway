@@ -339,6 +339,9 @@ fn write_single_surface_config_inner(
                 "secret_id": "bdd-transit-caller-key"
             });
         }
+        if let Some(secs) = surface_config.transit_token_lifetime_secs {
+            transit_json["transit_token_lifetime_secs"] = serde_json::json!(secs);
+        }
         surface_fixture = surface_fixture.with_transit(transit_json);
     }
     for element in &surface_config.caller_trust_check_list {

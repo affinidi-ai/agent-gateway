@@ -1,0 +1,21 @@
+branch: feat/transit-token-lifetime
+changes:
+  added:
+    - timestamp: '2026-10-29T06:36:45.000Z'
+      title: Set how long a surface's transit tokens live, from 30 to 900 seconds
+      description: >-
+        Transit tokens always lived 300 seconds, so a managed agent's turn that ran longer,
+        such as a long tool call, lost its Transit Points part way. A surface's
+        `transit.transit_token_lifetime_secs` now sets how long the tokens its Access Point
+        issues live, from 30 to 900 seconds, and 300 when unset. A Transit Point checks a
+        token against the lifetime its surface sets when the token is presented, so
+        shortening the lifetime refuses the tokens already issued for longer at once, and
+        lengthening it never extends a token already issued. The admin API refuses a lifetime
+        outside the bounds, or one set in a variant, and a surface stored with one outside
+        them stops the gateway from starting. A longer lifetime lets whoever holds a token
+        use the surface's Transit Points as its caller for longer.
+  changed: []
+  fixed: []
+  removed: []
+  security: []
+  breaking: []
