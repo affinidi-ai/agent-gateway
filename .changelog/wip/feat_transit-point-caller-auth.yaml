@@ -26,8 +26,9 @@ changes:
         resource metadata names for the base surface or a variant), or when its strategy names
         the same issuer as another
         strategy the surface accepts, as callers verified through either share delegated
-        credentials. A dashboard save, and a `PUT` of one variant, keeps a Transit Point's
-        `source_auth`.
+        credentials. A `PUT` of the surface or of one variant that omits a Transit Point's
+        `source_auth`, as a dashboard save does, keeps it; `"source_auth": null` removes it,
+        and a Transit Point that is then left authenticating no caller is refused with `400`.
     - timestamp: '2026-10-29T12:00:00.000Z'
       title: Warn when an open Transit Point is reachable from other hosts
       description: >-
