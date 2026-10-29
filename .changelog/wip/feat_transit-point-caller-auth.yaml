@@ -87,6 +87,8 @@ changes:
         the whole surface instead of serving it open. Upgrade every node that shares storage
         before giving a Transit Point `source_auth`, and do not roll back below this release
         while one uses it: first remove `source_auth` from each such Transit Point and turn its
-        transit token back on, or delete the surface, then check the stored records carry no
-        `transit_point_source_auth`. Surface Templates are stored unparsed, so back them up
-        before upgrading if a rollback may be needed.
+        transit token back on, or delete the surface, then check no surface carries
+        `transit_point_source_auth`. A Surface Template's surface is marked the same way, so an
+        older release's admin API refuses a surface created from it; the dashboard rebuilds a
+        template's surface without the mark, so remove `source_auth` from such templates too
+        before rolling back, or back them up before upgrading.

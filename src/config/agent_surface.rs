@@ -1800,8 +1800,9 @@ impl StorableEntity for AgentSurface {
 /// Keep a stored surface's `transit_point_source_auth` in step with its
 /// Transit Points (see [`AgentSurface::has_transit_point_source_auth`]), so a
 /// surface file written outside the API is marked when it is first loaded and
-/// re-persisted. Returns whether the record changed.
-fn mark_transit_point_source_auth(value: &mut serde_json::Value) -> bool {
+/// re-persisted. A Surface Template's surface snapshot is marked the same way.
+/// Returns whether the record changed.
+pub(crate) fn mark_transit_point_source_auth(value: &mut serde_json::Value) -> bool {
     let any_source_auth = |points: Option<&serde_json::Value>| {
         points
             .and_then(serde_json::Value::as_array)
