@@ -45,11 +45,10 @@ pub enum WsUpdate {
         validation_status: String,
         validation_error: Option<String>,
         derived_schema: Box<serde_json::Value>,
-        /// Active surface variant alias resolved during request handling.
-        /// `None` when the channel has no variants or the call site has no
-        /// variant context.
+        /// The surface variant of the request the payload belongs to, as its
+        /// audit records name it. `None` outside a surface request.
         #[serde(skip_serializing_if = "Option::is_none")]
-        variant_alias: Option<String>,
+        surface_variant: Option<String>,
     },
     /// Temporary channel expired and was deleted
     ChannelExpired { config_id: String, channel_name: String },

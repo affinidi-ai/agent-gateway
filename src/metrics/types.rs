@@ -102,12 +102,12 @@ pub struct ConnectionMetric {
     /// Access Point. Used to slice surface dashboards per-AP/per-TP.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub transit_point: Option<String>,
-    /// Active surface variant alias. Identifies which variant of the
-    /// channel handled the connection so dashboards can slice
-    /// per-variant. `None` for channels with no variants or recorders
-    /// that don't supply one.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub variant_alias: Option<String>,
+    /// The surface variant that served the request, as its audit records
+    /// name it: the variant's alias, or `_base_` when the base surface
+    /// served it. `None` outside a surface request. Snapshots written
+    /// before the rename stored it as `variant_alias`.
+    #[serde(skip_serializing_if = "Option::is_none", default, alias = "variant_alias")]
+    pub surface_variant: Option<String>,
     #[serde(default = "default_metric_type")]
     pub metric_type: MetricType,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -145,9 +145,9 @@ pub struct ConnectionDataPoint {
     pub ucp_operation: Option<String>, // UCP operation type (e.g., "discovery", "checkout", "payment")
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub transit_point: Option<String>,
-    /// Active surface variant alias. See `ConnectionMetric::variant_alias`.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub variant_alias: Option<String>,
+    /// The surface variant. See `ConnectionMetric::surface_variant`.
+    #[serde(skip_serializing_if = "Option::is_none", default, alias = "variant_alias")]
+    pub surface_variant: Option<String>,
     #[serde(default = "default_metric_type")]
     pub metric_type: MetricType,
     #[serde(skip_serializing_if = "Option::is_none")]

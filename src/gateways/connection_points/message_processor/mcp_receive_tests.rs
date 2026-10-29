@@ -760,10 +760,10 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
         assert_eq!(
             refusals,
             expected_refusal
-                .map(|reason| (reason, expected_status))
+                .map(|reason| (reason, None))
                 .into_iter()
                 .collect::<Vec<_>>(),
-            "recorded refusals for a {expected_status}"
+            "recorded refusals for a {expected_status}, with no HTTP status on Fabric"
         );
     }
     let mut unknown_surface = forward_message(legacy_body, json!({"MCP-Protocol-Version": MCP_LEGACY_VERSION}));
@@ -1000,8 +1000,12 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
                 headers,
                 body,
                 surface: configured.clone(),
-                variant_id: None,
+                variant: crate::config::agent_surface_variants::ForwardedVariant {
+                    id: None,
+                    recorded: "_base_".into(),
+                },
                 capabilities: crate::proxy::fabric_stream::peer::StreamCapabilities::local(true, true),
+                scope: crate::observability::policy_audit::RequestScope::fresh(),
             },
             crate::mcp::request_validation::LEGACY_ONLY_POLICY,
             None,
@@ -1411,8 +1415,12 @@ async fn fabric_consent_flow() {
                     .unwrap()
                     .into(),
                 surface: surface.clone(),
-                variant_id: None,
+                variant: crate::config::agent_surface_variants::ForwardedVariant {
+                    id: None,
+                    recorded: "_base_".into(),
+                },
                 capabilities: crate::proxy::fabric_stream::peer::StreamCapabilities::local(true, true),
+                scope: crate::observability::policy_audit::RequestScope::fresh(),
             },
         )
     };
@@ -2036,7 +2044,10 @@ async fn fabric_consent_flow() {
             if let Some(alias) = alias {
                 message.message_body["virtual_channel_alias"] = json!(alias);
             }
-            stream.variant_id = Some("credential-variant".into());
+            stream.variant = crate::config::agent_surface_variants::ForwardedVariant {
+                id: Some("credential-variant".into()),
+                recorded: "candidate".into(),
+            };
             (message, stream)
         };
         let before = calls.lock().await.len();
@@ -2518,8 +2529,9 @@ fn fabric_receive_binds_tokens_to_the_routes_protected_resource() {
 /// direct path. The sending gateway strips the caller's own token, so the
 /// `Authorization` here stands for a credential the sender injects: a missing
 /// one, or one issued for another resource or variant, gets a 401 before
-/// policy without `resource_metadata`, and only one for the route's resource,
-/// or the default's when a named alias does not resolve, reaches the Target.
+/// policy without `resource_metadata`, and only one for the route's resource
+/// reaches the Target. A named alias that does not resolve is refused before
+/// any token is read, never served by the default.
 async fn fabric_discovery_flow() {
     use std::sync::Arc;
 
@@ -2642,9 +2654,6 @@ async fn fabric_discovery_flow() {
         (None, Some(token_for("https://gateway.example/other")), true),
         (None, Some(token_for("https://gateway.example/mcp$beta")), true),
         (Some("beta"), Some(token_for("https://gateway.example/mcp")), true),
-        // An alias that does not resolve falls back to the default, whose
-        // resource the token must name.
-        (Some("ghost"), Some(token_for("https://gateway.example/mcp$ghost")), true),
     ] {
         let response = send(alias, token).await;
         assert_eq!(response["status"], 401, "{response}");
@@ -2657,11 +2666,8 @@ async fn fabric_discovery_flow() {
         assert_eq!(reached(), 0, "a refused token never reaches the Target");
     }
 
-    for (alias, audience) in [
-        (None, "https://gateway.example/mcp"),
-        (Some("beta"), "https://gateway.example/mcp$beta"),
-        (Some("ghost"), "https://gateway.example/mcp"),
-    ] {
+    for (alias, audience) in [(None, "https://gateway.example/mcp"), (Some("beta"), "https://gateway.example/mcp$beta")]
+    {
         let before = reached();
         let response = send(alias, Some(token_for(audience))).await;
         assert_eq!(response["status"], 200, "{response}");
@@ -2678,6 +2684,15 @@ async fn fabric_discovery_flow() {
                 .any(|name| name.eq_ignore_ascii_case("authorization")),
             "the caller's token never reaches the Target"
         );
+    }
+
+    // A named alias that does not resolve is refused, whatever the token
+    // names, and never reaches the Target.
+    for audience in ["https://gateway.example/mcp", "https://gateway.example/mcp$ghost"] {
+        let before = reached();
+        let response = send(Some("ghost"), Some(token_for(audience))).await;
+        assert_eq!(response["status"], 404, "{response}");
+        assert_eq!(reached(), before, "an unresolved alias never reaches the Target");
     }
 }
 
