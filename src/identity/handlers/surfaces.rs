@@ -860,9 +860,10 @@ async fn transit_point_warnings(
     headers
 }
 
-/// `surface` and each of its enabled variants as it resolves.
-fn surface_views(surface: &AgentSurface) -> Vec<AgentSurface> {
-    std::iter::once(surface.clone())
+/// `surface` and each of its enabled variants as it resolves, with the
+/// variant's alias.
+fn surface_views(surface: &AgentSurface) -> Vec<(Option<String>, AgentSurface)> {
+    std::iter::once((None, surface.clone()))
         .chain(
             surface
                 .variants
@@ -871,15 +872,19 @@ fn surface_views(surface: &AgentSurface) -> Vec<AgentSurface> {
                     surface
                         .resolve_variant(Some(&variant.alias))
                         .ok()
+                        .map(|view| (Some(variant.alias.clone()), view))
                 }),
         )
         .collect()
 }
 
 /// The `jwt_bearer` configurations a view's Access Point accepts, and those of
-/// its Transit Points with each Transit Point's alias.
+/// its Transit Points with each Transit Point's alias. An Access Point that
+/// publishes protected resource metadata accepts only the resource of the
+/// route called (`alias`) as the audience, as at runtime.
 fn jwt_bearer_methods(
-    view: &AgentSurface
+    view: &AgentSurface,
+    alias: Option<&str>,
 ) -> (Vec<crate::jwt_bearer::models::JwtBearerAuthConfig>, Vec<(String, crate::jwt_bearer::models::JwtBearerAuthConfig)>)
 {
     use crate::source_auth::SourceAuthConfig;
@@ -887,12 +892,23 @@ fn jwt_bearer_methods(
         SourceAuthConfig::JwtBearer(config) => Some(config.clone()),
         _ => None,
     };
+    let protected_resource = view
+        .protected_resource()
+        .and_then(|protected| {
+            protected
+                .for_variant(alias)
+                .ok()
+        });
     let access_point = view
         .access_point
         .caller_authentication
         .iter()
         .flat_map(|authentication| authentication.methods.iter())
-        .filter_map(jwt)
+        .map(|method| match &protected_resource {
+            Some(protected) => protected.bind_audience(method.clone()),
+            None => method.clone(),
+        })
+        .filter_map(|method| jwt(&method))
         .collect();
     let transit_points = view
         .transit_points()
@@ -922,8 +938,8 @@ async fn jwt_strategy_issuers(
     else {
         return issuers;
     };
-    for view in surface_views(surface) {
-        let (access_point, transit_points) = jwt_bearer_methods(&view);
+    for (alias, view) in surface_views(surface) {
+        let (access_point, transit_points) = jwt_bearer_methods(&view, alias.as_deref());
         for config in access_point.iter().chain(
             transit_points
                 .iter()
@@ -952,8 +968,8 @@ fn shared_issuer_warnings(
     issuers: &std::collections::HashMap<String, String>,
 ) -> Vec<String> {
     let mut warnings = Vec::new();
-    for view in surface_views(surface) {
-        let (access_point, transit_points) = jwt_bearer_methods(&view);
+    for (alias, view) in surface_views(surface) {
+        let (access_point, transit_points) = jwt_bearer_methods(&view, alias.as_deref());
         let accepted: Vec<&str> = access_point
             .iter()
             .chain(
@@ -994,14 +1010,24 @@ fn shared_issuer_warnings(
 }
 
 /// Each Transit Point, on the surface or in an enabled variant, whose
-/// `jwt_bearer` accepts tokens issued for the Access Point: the same JWT
-/// verification strategy and an audience both name. A caller of the Access
-/// Point could then call that Transit Point directly, with its credentials.
+/// `jwt_bearer` accepts tokens issued for the Access Point, base or enabled
+/// variant: the same JWT verification strategy and an audience both name. An
+/// Access Point that publishes protected resource metadata accepts the resource
+/// of each route, so a Transit Point that names any of them is one. A caller of
+/// the Access Point could then call that Transit Point directly, with its
+/// credentials.
 fn shared_audience_warnings(surface: &AgentSurface) -> Vec<String> {
+    let views: Vec<_> = surface_views(surface)
+        .into_iter()
+        .map(|(alias, view)| jwt_bearer_methods(&view, alias.as_deref()))
+        .collect();
+    let access_point: Vec<_> = views
+        .iter()
+        .flat_map(|(access_point, _)| access_point.iter())
+        .collect();
     let mut warnings = Vec::new();
-    for view in surface_views(surface) {
-        let (access_point, transit_points) = jwt_bearer_methods(&view);
-        for (alias, transit_point) in &transit_points {
+    for (_, transit_points) in &views {
+        for (alias, transit_point) in transit_points {
             for accepted in access_point
                 .iter()
                 .filter(|accepted| accepted.jwt_verification_strategy_id == transit_point.jwt_verification_strategy_id)
@@ -3975,6 +4001,71 @@ mod validation_tests {
             ("an API key", caller_key()),
         ] {
             assert!(shared_audience_warnings(&surface_with(transit_point_auth)).is_empty(), "{case}");
+        }
+    }
+
+    /// An MCP Access Point that publishes protected resource metadata accepts
+    /// a token whose audience is the resource of the route called, the base
+    /// resource or a variant's own, and lists no audiences itself. A save warns
+    /// of a Transit Point whose `jwt_bearer`, with the same strategy, names
+    /// either resource.
+    #[test]
+    fn a_save_warns_of_a_transit_point_that_accepts_the_tokens_of_an_access_points_protected_resource() {
+        let jwt = |audiences: serde_json::Value| serde_json::json!({ "type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": audiences });
+        let surface_with = |variant_enabled: bool, transit_point_auth: serde_json::Value| -> AgentSurface {
+            serde_json::from_value(serde_json::json!({
+                "name": "tools",
+                "access_point": { "listen_address": "0.0.0.0:8443", "route": "/mcp", "protocol": "mcp",
+                    "caller_authentication": {
+                        "methods": [jwt(serde_json::json!([]))],
+                        "protected_resource": { "resource": "https://gateway.example/mcp",
+                            "authorization_servers": ["https://idp.example"] }
+                    } },
+                "target": { "endpoint": "https://tools.internal/mcp" },
+                "transit": { "outbound_listen_address": "http://localhost:9111", "points": [
+                    { "alias": "crm", "target_endpoint": "https://crm.example", "protocol": "mcp",
+                        "require_transit_token": false, "source_auth": transit_point_auth }
+                ] },
+                "variants": [{ "id": "beta", "alias": "beta", "name": "Beta", "enabled": variant_enabled }]
+            }))
+            .unwrap()
+        };
+        let warning = |audience: &str| {
+            format!(
+                "Transit Point 'crm' accepts the Access Point's own tokens (JWT verification strategy 'idp', \
+                 audience '{audience}'), so a caller of the Access Point can call it directly; give it an audience \
+                 of its own"
+            )
+        };
+
+        assert_eq!(
+            shared_audience_warnings(&surface_with(true, jwt(serde_json::json!(["https://gateway.example/mcp"])))),
+            vec![warning("https://gateway.example/mcp")]
+        );
+        assert_eq!(
+            shared_audience_warnings(&surface_with(true, jwt(serde_json::json!(["https://gateway.example/mcp$beta"])))),
+            vec![warning("https://gateway.example/mcp$beta")]
+        );
+        // A Transit Point only the variant defines, naming the base resource.
+        let mut variant_only = surface_with(true, jwt(serde_json::json!(["api://crm-transit"])));
+        variant_only.variants[0]
+            .overrides
+            .transit = Some(
+            serde_json::from_value(serde_json::json!({ "points": [
+                { "alias": "crm", "target_endpoint": "https://crm.example", "protocol": "mcp",
+                    "require_transit_token": false, "source_auth": jwt(serde_json::json!(["https://gateway.example/mcp"])) }
+            ] }))
+            .unwrap(),
+        );
+        assert_eq!(shared_audience_warnings(&variant_only), vec![warning("https://gateway.example/mcp")]);
+        for (case, surface) in [
+            ("an audience of its own", surface_with(true, jwt(serde_json::json!(["api://crm-transit"])))),
+            (
+                "a disabled variant's resource",
+                surface_with(false, jwt(serde_json::json!(["https://gateway.example/mcp$beta"]))),
+            ),
+        ] {
+            assert!(shared_audience_warnings(&surface).is_empty(), "{case}");
         }
     }
 

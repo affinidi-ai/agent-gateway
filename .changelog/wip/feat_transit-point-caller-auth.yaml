@@ -22,7 +22,9 @@ changes:
         are checked on save as an Access Point's are, so a tenant access token can name only its
         own or appliance-wide ones. A `jwt_bearer` must name an audience, and a save answers
         with a `Warning` header when it accepts the Access Point's own tokens (the same
-        strategy and a shared audience), or when its strategy names the same issuer as another
+        strategy and a shared audience, such as the resource an MCP Access Point's protected
+        resource metadata names for the base surface or a variant), or when its strategy names
+        the same issuer as another
         strategy the surface accepts, as callers verified through either share delegated
         credentials. A dashboard save keeps a Transit Point's `source_auth`.
     - timestamp: '2026-10-29T12:00:00.000Z'
