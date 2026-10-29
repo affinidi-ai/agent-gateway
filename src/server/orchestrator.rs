@@ -1720,6 +1720,16 @@ pub async fn run_axum_proxy(
                 .install()?;
         }
 
+        crate::gateways::connection_points::message_processor::init_target_credential_resolver(
+            crate::proxy::target_credentials::TargetCredentialResolver::new(
+                Some(secrets_store.clone()),
+                credential_provider_store
+                    .clone()
+                    .map(|store| store as Arc<dyn crate::credential_providers::storage::CredentialProviderStorage>),
+                crate::delegation_vault::gateway_token::target_token_cache(),
+            ),
+        );
+
         // Initialize global credential delegation stores for proxy pipeline access
         if let (Some(cp_store), Some(dv_store)) = (&credential_provider_store, &delegation_vault_store) {
             let base_url = format!("https://{}", network_config.did.domain);
@@ -3351,6 +3361,10 @@ pub async fn run_axum_proxy(
                     .clone(),
                 vault_rbac_guard.clone(),
                 Some(source_auth_middleware.provider_store()),
+                identity_state
+                    .agent_surface_store
+                    .clone()
+                    .map(|store| store as Arc<dyn crate::surfaces::AgentSurfaceStore>),
             );
 
             let dv_state = crate::delegation_vault::handlers::DelegationVaultState {
@@ -4062,6 +4076,7 @@ pub async fn run_axum_proxy(
             let tr_store_for_mode = trust_registry_store.clone();
             let ws_state_for_mode = ws_state.clone();
             let pending_for_mode = pending_surface_events.clone();
+            let jwks_for_mode = source_auth_middleware.jwks_client();
 
             let mode_task = tokio::spawn(async move {
                 loop {
@@ -4077,7 +4092,12 @@ pub async fn run_axum_proxy(
                             // before reactivating listeners, so a promoted standby
                             // never accepts fabric traffic against stale surfaces,
                             // gateway/surface OPA, MCP gating, or global policy.
-                            rederive_planes_on_activation(&identity_state_for_mode, &gateway_store_for_mode).await;
+                            rederive_planes_on_activation(
+                                &identity_state_for_mode,
+                                &gateway_store_for_mode,
+                                &jwks_for_mode,
+                            )
+                            .await;
 
                             // A node that booted Standby migrates the previous version's
                             // integrations now; routes and sinks are already built, so they
@@ -4269,13 +4289,15 @@ pub async fn run_axum_proxy(
 /// listeners is not enough: request-time PEPs read from derived state (channel
 /// runtime, surface + gateway OPA engines, MCP gating, appliance-wide policy)
 /// that a periodic cache refresh never rebuilds. This reconciles each cached
-/// store with disk and then rebuilds every derived plane, so a promoted node
-/// serves the active writer's latest state on its first request — even when the
-/// periodic `cache_refresh_interval_secs` loop is disabled. Best-effort: a
-/// failure in one plane is logged and does not abort the others.
+/// store with disk, drops cached JWKS key sets, and then rebuilds every derived
+/// plane, so a promoted node serves the active writer's latest state on its
+/// first request — even when the periodic `cache_refresh_interval_secs` loop is
+/// disabled. Best-effort: a failure in one plane is logged and does not abort
+/// the others.
 async fn rederive_planes_on_activation(
     identity_state: &crate::identity::IdentityApiState,
     gateway_store: &Option<Arc<crate::gateways::FileSystemGatewayStore>>,
+    jwks_client: &crate::jwt_bearer::JwksClient,
 ) {
     // 1. Reconcile every cached store this promotion reads from with disk.
     if let Some(store) = identity_state
@@ -4312,6 +4334,18 @@ async fn rederive_planes_on_activation(
     {
         warn!("Gateway store refresh on activation failed: {e}");
     }
+    reconcile_caller_and_target_credentials(
+        identity_state
+            .jwt_verification_strategy_store
+            .as_deref(),
+        identity_state
+            .credential_provider_store
+            .as_deref(),
+        jwks_client,
+    )
+    .await;
+
+    crate::delegation_vault::gateway_token::target_token_cache().invalidate_all();
 
     // 2. Rebuild channels + surfaces from the refreshed surfaces on disk.
     let reloading = identity_state
@@ -4401,6 +4435,31 @@ async fn rederive_planes_on_activation(
             .refresh(&store.get().await)
             .await;
     }
+}
+
+/// Reconcile the JWT verification strategy and credential provider stores with
+/// disk, then drop every cached JWKS key set so the next token is checked
+/// against keys fetched for the reconciled strategies.
+async fn reconcile_caller_and_target_credentials(
+    strategies: Option<&dyn crate::jwt_bearer::JwtVerificationStrategyStorage>,
+    providers: Option<&dyn crate::credential_providers::storage::CredentialProviderStorage>,
+    jwks_client: &crate::jwt_bearer::JwksClient,
+) {
+    if let Some(store) = strategies
+        && let Err(e) = store
+            .refresh_from_disk()
+            .await
+    {
+        warn!("JWT verification strategy store refresh on activation failed: {e}");
+    }
+    if let Some(store) = providers
+        && let Err(e) = store
+            .refresh_from_disk()
+            .await
+    {
+        warn!("Credential provider store refresh on activation failed: {e}");
+    }
+    jwks_client.clear().await;
 }
 
 /// Initialize passkey authentication state
@@ -4508,9 +4567,12 @@ async fn initialize_saml_state(
 
 #[cfg(test)]
 mod tests {
-    use super::{count_remote_gateways, count_user_connection_points};
+    use super::{count_remote_gateways, count_user_connection_points, reconcile_caller_and_target_credentials};
+    use crate::credential_providers::storage::{CredentialProviderStorage, FileSystemCredentialProviderStore};
     use crate::gateways::connection_points::types::{ConnectionPointType, GatewayConnectionPoint};
     use crate::gateways::types::{Gateway, GatewayType};
+    use crate::jwt_bearer::models::{JwksSource, JwtVerificationStrategy};
+    use crate::jwt_bearer::{FileSystemJwtVerificationStrategyStore, JwksClient, JwtVerificationStrategyStorage};
 
     fn cp(cp_type: ConnectionPointType) -> GatewayConnectionPoint {
         GatewayConnectionPoint::new(
@@ -4526,6 +4588,103 @@ mod tests {
             cp_type,
             String::new(),
         )
+    }
+
+    #[tokio::test]
+    async fn activation_reconciles_strategies_and_providers_and_drops_cached_jwks() {
+        let storage = tempfile::TempDir::new().unwrap();
+        let strategies_dir = storage
+            .path()
+            .join("strategies");
+        let providers_dir = storage
+            .path()
+            .join("providers");
+        let active_strategies = FileSystemJwtVerificationStrategyStore::new(strategies_dir.clone())
+            .await
+            .unwrap();
+        let active_providers = FileSystemCredentialProviderStore::new(providers_dir.clone())
+            .await
+            .unwrap();
+        let auth_server = crate::component_tests::helpers::mock_auth_server::MockAuthServer::start().await;
+        let strategy = active_strategies
+            .create(JwtVerificationStrategy {
+                name: "Hydra".to_string(),
+                expected_issuer: auth_server
+                    .issuer()
+                    .to_string(),
+                jwks_source: JwksSource::Remote {
+                    jwks_uri: auth_server.jwks_uri(),
+                },
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let provider: crate::credential_providers::CredentialProvider = serde_json::from_value(serde_json::json!({
+            "id": "provider-a",
+            "name": "Calendar",
+            "provider_id": "calendar",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"
+        }))
+        .unwrap();
+        active_providers
+            .create(provider.clone())
+            .await
+            .unwrap();
+
+        let standby_strategies = FileSystemJwtVerificationStrategyStore::new(strategies_dir)
+            .await
+            .unwrap();
+        let standby_providers = FileSystemCredentialProviderStore::new(providers_dir)
+            .await
+            .unwrap();
+        let standby_jwks = JwksClient::new();
+        standby_jwks
+            .get_key(&strategy, &auth_server.jwks_uri(), "rs256-0")
+            .await
+            .unwrap();
+
+        active_strategies
+            .update(JwtVerificationStrategy {
+                expected_issuer: "https://rotated.example.com".to_string(),
+                ..strategy.clone()
+            })
+            .await
+            .unwrap();
+        active_providers
+            .update(crate::credential_providers::CredentialProvider {
+                name: "Renamed".to_string(),
+                ..provider
+            })
+            .await
+            .unwrap();
+        let stale = standby_strategies
+            .get(&strategy.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stale.expected_issuer, auth_server.issuer());
+
+        reconcile_caller_and_target_credentials(Some(&standby_strategies), Some(&standby_providers), &standby_jwks)
+            .await;
+
+        let reconciled = standby_strategies
+            .get(&strategy.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reconciled.expected_issuer, "https://rotated.example.com");
+        let reconciled_provider = standby_providers
+            .get("provider-a")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reconciled_provider.name, "Renamed");
+        assert!(
+            !standby_jwks
+                .is_cached(&strategy.id)
+                .await
+        );
     }
 
     #[test]

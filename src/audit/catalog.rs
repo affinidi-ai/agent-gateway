@@ -3,7 +3,7 @@
 
 use serde::Serialize;
 
-use AuditEventGroup::{Auth, Delegation, Identity, Payments, Policies, Requests, Trace, Trust};
+use AuditEventGroup::{Auth, Configuration, Delegation, Identity, Payments, Policies, Requests, Trace, Trust};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -16,6 +16,7 @@ pub enum AuditEventGroup {
     Delegation,
     Payments,
     Requests,
+    Configuration,
 }
 
 impl AuditEventGroup {
@@ -29,6 +30,7 @@ impl AuditEventGroup {
             Delegation => "delegation",
             Payments => "payments",
             Requests => "requests",
+            Configuration => "configuration",
         }
     }
 
@@ -43,6 +45,7 @@ impl AuditEventGroup {
             Delegation => "Delegation",
             Payments => "Payments",
             Requests => "Requests",
+            Configuration => "Configuration",
         }
     }
 }
@@ -191,6 +194,30 @@ pub const AUDIT_EVENTS: &[AuditEventSpec] = &[
         "A change to a policy, or to where a policy applies, was refused",
         Policies,
     ),
+    event(
+        "delegation_failed",
+        "Delegation Failed",
+        "A credential could not be obtained for a delegation binding: the signed assertion or the token endpoint failed",
+        Delegation,
+    ),
+    event(
+        "verification_strategy_changed",
+        "Verification Strategy Changed",
+        "A JWT verification strategy, a trust anchor for caller tokens, was created, updated, re-pinned or deleted",
+        Configuration,
+    ),
+    event(
+        "credential_provider_changed",
+        "Credential Provider Changed",
+        "A credential provider was created, updated or deleted",
+        Configuration,
+    ),
+    event(
+        "target_auth_changed",
+        "Target Authentication Changed",
+        "The credential a surface presents to its Target was set, changed or removed",
+        Configuration,
+    ),
 ];
 
 /// The event's bit in a selection bitmap: its position in [`AUDIT_EVENTS`].
@@ -278,6 +305,7 @@ mod tests {
             "token_injected",
             "token_refreshed",
             "token_not_found",
+            "delegation_failed",
             "token_revoked",
             "user_tokens_revoked",
             "refresh_failed",
@@ -294,8 +322,20 @@ mod tests {
     }
 
     #[test]
+    fn management_plane_trust_changes_are_listed_under_configuration() {
+        for category in ["verification_strategy_changed", "credential_provider_changed", "target_auth_changed"] {
+            let entry = AUDIT_EVENTS
+                .iter()
+                .find(|event| event.category == category)
+                .unwrap_or_else(|| panic!("{category} is offered"));
+            assert_eq!(entry.group, AuditEventGroup::Configuration, "{category}");
+        }
+        assert_eq!(AuditEventGroup::Configuration.label(), "Configuration");
+    }
+
+    #[test]
     fn record_types_the_gateway_does_not_produce_are_not_offered() {
-        for unproduced in ["delegation_failed", "request_failed", "request_completed"] {
+        for unproduced in ["request_failed", "request_completed"] {
             assert_eq!(event_bit(unproduced), None, "{unproduced}");
         }
     }

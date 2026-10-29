@@ -8,7 +8,7 @@ use axum::{
 use serde::Deserialize;
 use url::Url;
 
-use crate::credential_providers::{CredentialProvider, CredentialProviderType};
+use crate::credential_providers::{CredentialProvider, ProviderGrant};
 use crate::mcp::continuations::ContinuationError;
 use crate::mcp::continuations::protected::ConsentTicket;
 
@@ -165,9 +165,7 @@ async fn authorize_ticket(
         .await
         .map_err(|_| ContinuationError::Unavailable)?
         .ok_or(ContinuationError::NotFound)?;
-    if provider_digest(&provider)? != ticket.provider_digest
-        || !crate::tenancy::can_reference(surface.tenant_id.as_deref(), provider.tenant_id.as_deref())
-    {
+    if provider_digest(&provider)? != ticket.provider_digest || !provider.usable_by(surface.tenant_id.as_deref()) {
         return Err(ContinuationError::BindingMismatch);
     }
     let strategy_id = provider
@@ -221,6 +219,7 @@ async fn connect(
             .map_err(failure)?;
         let client_id = super::oauth::resolve_secret(
             &state.vault.secrets_store,
+            &provider,
             provider
                 .client_id_secret_ref
                 .as_deref()
@@ -423,7 +422,11 @@ pub fn authorization_url(
     client_id: &str,
     callback_state: &str,
 ) -> Result<Url, ContinuationError> {
-    if provider.provider_type != CredentialProviderType::OAuth2AuthorizationCode
+    let consent_provider = match provider.provider_type.grant() {
+        ProviderGrant::UserConsent => true,
+        ProviderGrant::GatewayToken | ProviderGrant::StaticKey => false,
+    };
+    if !consent_provider
         || provider.id != ticket.binding.provider_id
         || client_id.is_empty()
         || client_id.len() > 4096
@@ -563,6 +566,7 @@ pub async fn exchange_code(
     crate::sts::mcp_profile::canonical_https_url(resource).map_err(|_| ContinuationError::InvalidRecord)?;
     let client_id = super::oauth::resolve_secret(
         secrets,
+        provider,
         provider
             .client_id_secret_ref
             .as_deref()
@@ -573,6 +577,7 @@ pub async fn exchange_code(
     let client_secret = zeroize::Zeroizing::new(
         super::oauth::resolve_secret(
             secrets,
+            provider,
             provider
                 .client_secret_secret_ref
                 .as_deref()

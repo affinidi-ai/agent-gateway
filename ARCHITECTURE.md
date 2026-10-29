@@ -155,6 +155,7 @@ logic.
 | Headers | Trace ID, `did:webvh` identity headers, and caller-info headers | [`src/proxy/handler.rs`](src/proxy/handler.rs) |
 | Transit token | The token a managed agent echoes back on its Transit Point calls | [`src/proxy/transit_token.rs`](src/proxy/transit_token.rs) |
 | Credential delegation | Injecting delegated OAuth tokens, or signalling consent | [`src/proxy/credential_delegation.rs`](src/proxy/credential_delegation.rs) |
+| Target authentication | The gateway's own credential for the Target (a static secret, or a provider's API key or cached gateway token), never sent for a caller nobody vouched for. On an `http(s)` Target, a credentialed request whose URL leaves the Target base path (the agent card URLs excepted) is answered `502` whatever the fallback. Resolved after delegation, so a header carries at most one credential | [`src/proxy/target_credentials.rs`](src/proxy/target_credentials.rs) |
 | VP injection | The deferred identity presentation added to the upstream request | [`src/identity/`](src/identity/) |
 | Forward | Vetting the target and sending the request | [`src/egress.rs`](src/egress.rs) |
 | Upstream response bounds | Buffering the upstream response within `[a2a] max_body_size`, the target's `networking.timeout.idle_secs` and its request timeout; `502` over the size, `504` on a stall. An MCP event-stream passthrough is not buffered. | [`src/proxy/upstream_body.rs`](src/proxy/upstream_body.rs) |
@@ -207,7 +208,8 @@ dispatch) → forward-target egress check → body-size limit → local x402/MPP
 policies → extension inspection → caller identity → custom metadata → Trust Check (caller
 leg) → Access Point OPA → appliance-wide surface policy → surface OPA → MCP tool gating
 (`tools/call`) → identity and caller-info headers → transit token generation → MCP custom
-metadata → credential delegation and consent → deferred VP injection → forward → resolve
+metadata → credential delegation and consent → Target authentication → deferred VP injection →
+forward → resolve
 protected identity → response processing, including the `tools/list` filter → metrics.
 
 Outbound:
@@ -216,8 +218,8 @@ Resource Server token (on a Transit Point with `mcp_http.authorization`) → tra
 token validation → rate limit → protocol context → Transit Point header mapping
 (A2A and AP2) → outbound extension inspection (A2A) → identity resolution → trusted
 identity → custom metadata → trust context → Trust Check (the Transit Point's own list) → gateway OPA →
-surface OPA → Transit Point OPA → MCP tool gating (`tools/call`) → credential injection →
-forward → response and agent-card rewrite → metrics. The stages from trust context to MCP
+surface OPA → Transit Point OPA → MCP tool gating (`tools/call`) → credential injection and
+Target authentication → forward → response and agent-card rewrite → metrics. The stages from trust context to MCP
 tool gating are skipped for public discovery GETs.
 
 This page is the authority on pipeline ordering. When it disagrees with a summary
@@ -307,7 +309,7 @@ Breaking one of these is a correctness bug, not a style question.
 | DashMap is authoritative at runtime; disk is written immediately. | Reads and writes would disagree after a reload. |
 | Identity attribution fails closed. A presentation that does not verify never becomes the caller identity. | An unverified DID would reach policy as if it were proven. |
 | Every event of a forwarded A2A event stream gets the response checks a non-streaming reply gets before it is sent, and one that fails them ends the stream. | Streaming would bypass the response policy and the agent identity credential. |
-| A caller whose source authentication failed is never forwarded with the surface's stored target credential, or the A2A proxy's Direct Line secret, on the inbound and Fabric forwarding paths (direct, `proxy://` MCP, `a2a-proxy://`, Fabric send, Fabric receive). Transit Point listeners do not authenticate callers, so this does not cover them. | An unauthenticated caller would reach the Target with the operator's credential. |
+| A caller whose source authentication failed is never forwarded with the surface's Target Authentication credential, or the A2A proxy's Direct Line secret, on the inbound and Fabric forwarding paths (direct, `proxy://` MCP, `a2a-proxy://`, Fabric send, Fabric receive). Transit Point listeners do not authenticate callers, so this does not cover them. | An unauthenticated caller would reach the Target with the operator's credential. |
 | The Agent Surface is the only routing unit. | Routing behaviour would drift away from what an operator configured. |
 | x402 verification and settlement use the surface's configured payment requirement, or on a fabric facilitator the requirement the requesting peer sends; a credential's `accepted` must name it exactly. | A caller could name its own recipient and amount and still be granted the resource. |
 
@@ -321,7 +323,7 @@ from.
 
 | Module | Owns | Document |
 | --- | --- | --- |
-| [`proxy/`](src/proxy/) | Both pipelines, surface manager, listener lifecycle, response policy, bounded upstream response reads | [Inbound path](#inbound-path), [Outbound path](#outbound-path) |
+| [`proxy/`](src/proxy/) | Both pipelines, surface manager, listener lifecycle, response policy, bounded upstream response reads, Target authentication resolution, the gateway's own agent card reads | [Inbound path](#inbound-path), [Outbound path](#outbound-path) |
 | [`server/`](src/server/) | Startup orchestration, TLS, WebSocket, active/standby mode | [`CONFIGURATION_RELOAD.md`](docs/CONFIGURATION_RELOAD.md) |
 | [`state/`](src/state/) | Per-surface runtime state shared across handlers | [`DESIGN_PATTERNS.md`](docs/DESIGN_PATTERNS.md) |
 | [`protocols/`](src/protocols/) | Protocol-agnostic extension inspection, metadata injection, header rules, and RFC 9728 protected resource metadata and challenges shared by A2A, MCP, and others (the resource side; the authorization server side is `authz_metadata/`) | [`PROTOCOLS.md`](docs/PROTOCOLS.md) |
@@ -350,7 +352,7 @@ from.
 | [`source_auth/`](src/source_auth/) | JWT bearer, API key, DID Auth, mTLS on the inbound edge | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md) |
 | [`event_hook/`](src/event_hook/) | Operator-configured notifications of Connection Point lifecycle events to a receiver: signed, sequenced, delivered from background tasks with retries, nothing persisted. `directory.rs` is the cached client of the operator-configured mediator directory, whose entries `mediators/` lists next to stored records | [`INTEGRATIONS.md`](docs/INTEGRATIONS.md#event-hook), [`INTEGRATIONS.md`](docs/INTEGRATIONS.md#mediator-directory) |
 | [`didauth/`](src/didauth/) | The DID Auth challenge and JWS ceremony | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#did-auth) |
-| [`jwt_bearer/`](src/jwt_bearer/) | JWT verification strategies and JWKS fetching | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md) |
+| [`jwt_bearer/`](src/jwt_bearer/) | JWT verification strategies, JWKS fetching, and authorization server discovery and pinning, which run through `authz_metadata` | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md) |
 | [`authz_metadata/`](src/authz_metadata/) | Fetching and validating an authorization server's metadata document (RFC 8414, then OpenID Connect discovery) through a pinned, bounded GET, for callers that need an issuer's token endpoint and JWKS URI, and the issuer rules protected resource metadata (`protocols/protected_resource.rs`) applies to the authorization servers it advertises | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#authorization-server-metadata-module-developer-reference) |
 | [`api_keys/`](src/api_keys/) | Data-plane API keys | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md) |
 | [`certificates/`](src/certificates/) | TLS and mTLS certificate records | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#mtls) |
@@ -394,9 +396,9 @@ from.
 | [`surface_templates/`](src/surface_templates/) | Built-in and user surface templates | [`templates README`](config/examples/agent_surface_templates/README.md) |
 | [`agents_api/`](src/agents_api/) | Agent self-registration: `/agents-api/v1/onboard` mints a DID from identity fields, with `sign-jwt` and `verify-jwt` | Source only: [`src/agents_api/handlers/onboard.rs`](src/agents_api/handlers/onboard.rs). The onboarding capture endpoint is in `identity/`; see [`AGENT_ONBOARDING_CAPTURE.md`](docs/AGENT_ONBOARDING_CAPTURE.md). |
 | [`terms/`](src/terms/) | Terms versions, acceptance records, consent gating | [`TERMS_AND_CONSENT.md`](docs/TERMS_AND_CONSENT.md) |
-| [`credential_providers/`](src/credential_providers/) | OAuth credential provider records | [`CREDENTIAL_DELEGATION.md`](docs/CREDENTIAL_DELEGATION.md) |
-| [`delegation_vault/`](src/delegation_vault/) | Per-caller OAuth tokens, the consent flow, and the shape of governance audit records. Tokens are encrypted only when encryption at rest is enabled. | [`CREDENTIAL_DELEGATION.md`](docs/CREDENTIAL_DELEGATION.md) |
-| [`audit/`](src/audit/) | Governance audit pipeline: event catalog, per-sink selection, producer, durable journal, and per-sink delivery to the VP Audit Log and Governance Audit integrations | [`OBSERVABILITY.md`](docs/OBSERVABILITY.md#governance-audit-forwarding) |
+| [`credential_providers/`](src/credential_providers/) | OAuth credential provider records and RFC 7523 JWT bearer assertion signing | [`CREDENTIAL_DELEGATION.md`](docs/CREDENTIAL_DELEGATION.md) |
+| [`delegation_vault/`](src/delegation_vault/) | Per-caller OAuth tokens, the consent flow, pinned and bounded gateway grants (Client Credentials and JWT bearer), the per-replica gateway token cache for Target authentication, and the shape of governance audit records. Tokens are encrypted only when encryption at rest is enabled. | [`CREDENTIAL_DELEGATION.md`](docs/CREDENTIAL_DELEGATION.md) |
+| [`audit/`](src/audit/) | Governance audit pipeline: event catalog, configuration change events (strategies, credential providers, Target Authentication), per-sink selection, producer, durable journal, and per-sink delivery to the VP Audit Log and Governance Audit integrations | [`OBSERVABILITY.md`](docs/OBSERVABILITY.md#governance-audit-forwarding) |
 | [`integrations/`](src/integrations/) | Webhooks, notifications, and outbound integrations | [`INTEGRATIONS.md`](docs/INTEGRATIONS.md) |
 | [`secrets/`](src/secrets/) | Secret records and the loader schemes | [`CONFIGURATION_REFERENCE.md`](docs/CONFIGURATION_REFERENCE.md#secret-references) |
 
@@ -407,10 +409,10 @@ from.
 | [`config/`](src/config/) | Bootstrap parsing, `AgentSurface`, variants, limits, loaders | [`CONFIGURATION_RELOAD.md`](docs/CONFIGURATION_RELOAD.md) |
 | [`storage/`](src/storage/) | Store traits, filesystem JSON, config cache, DID artifacts | [`DESIGN_PATTERNS.md`](docs/DESIGN_PATTERNS.md) |
 | [`encryption/`](src/encryption/) | Encryption at rest and key sources | [`CONFIGURATION_REFERENCE.md`](docs/CONFIGURATION_REFERENCE.md#configtoml) |
-| [`backup_restore/`](src/backup_restore/) | `.agbak` backup and restore | [`DEVELOPMENT.md`](docs/development/DEVELOPMENT.md) |
+| [`backup_restore/`](src/backup_restore/) | `.agbak` backup and restore, the manifest's release stamp and the refusal of a backup from a newer release | [`DEVELOPMENT.md`](docs/development/DEVELOPMENT.md) |
 | [`export/`](src/export/) | Redacted `.atgx` storage export | [`DEVELOPMENT.md`](docs/development/DEVELOPMENT.md) |
 | [`observability/`](src/observability/) | Tracing, policy audit events, dashboard event stream, identity view and caller names | [`OBSERVABILITY.md`](docs/OBSERVABILITY.md) |
-| [`metrics/`](src/metrics/) | Metric collection, retention, aggregation | [`OBSERVABILITY.md`](docs/OBSERVABILITY.md) |
+| [`metrics/`](src/metrics/) | Metric collection, retention, aggregation, and the gateway token, JWKS fetch and discovery counters | [`OBSERVABILITY.md`](docs/OBSERVABILITY.md) |
 | [`component_tests/`](src/component_tests/) | Cross-module tests that need no Docker | [`CONTRIBUTING.md`](CONTRIBUTING.md) |
 
 ## Where to look

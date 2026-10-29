@@ -232,6 +232,40 @@ lazy_static! {
         h
     };
 
+    /// Gateway token requests (labeled by grant, result).
+    /// `grant` = `client_credentials` | `jwt_bearer`; `result` = `ok` or a fixed failure category.
+    pub static ref TOKEN_FETCH: IntCounterVec = {
+        let opts = Opts::new(
+            names::TOKEN_FETCH_TOTAL,
+            "Gateway token requests (grant = client_credentials|jwt_bearer; result = ok|failure category)",
+        );
+        let counter = IntCounterVec::new(opts, &["grant", "result"]).unwrap();
+        REGISTRY.register(Box::new(counter.clone())).unwrap();
+        counter
+    };
+
+    /// JWKS fetches for the signing key cache (labeled by result: `ok` or a fixed failure code).
+    pub static ref JWKS_FETCH: IntCounterVec = {
+        let opts = Opts::new(
+            names::JWKS_FETCH_TOTAL,
+            "JWKS fetches for the signing key cache (result = ok|failure code)",
+        );
+        let counter = IntCounterVec::new(opts, &["result"]).unwrap();
+        REGISTRY.register(Box::new(counter.clone())).unwrap();
+        counter
+    };
+
+    /// Authorization server metadata discovery attempts (labeled by result: `ok` or a fixed failure code).
+    pub static ref DISCOVERY: IntCounterVec = {
+        let opts = Opts::new(
+            names::DISCOVERY_TOTAL,
+            "Authorization server metadata discovery attempts (result = ok|failure code)",
+        );
+        let counter = IntCounterVec::new(opts, &["result"]).unwrap();
+        REGISTRY.register(Box::new(counter.clone())).unwrap();
+        counter
+    };
+
     /// AWS KMS per-value envelope operation outcomes (labeled by op, result).
     /// `op` = `generate_data_key` | `decrypt`; `result` = `ok` | `error`.
     pub static ref KMS_OPERATION: IntCounterVec = {
@@ -684,6 +718,30 @@ pub fn track_sts_token_exchange(
         .observe(duration_secs);
 }
 
+/// Track one gateway token request. Both labels are fixed strings so cardinality stays bounded.
+pub fn track_token_fetch(
+    grant: &'static str,
+    result: &'static str,
+) {
+    TOKEN_FETCH
+        .with_label_values(&[grant, result])
+        .inc();
+}
+
+/// Track one JWKS fetch for the signing key cache.
+pub fn track_jwks_fetch(result: &'static str) {
+    JWKS_FETCH
+        .with_label_values(&[result])
+        .inc();
+}
+
+/// Track one authorization server metadata discovery.
+pub fn track_discovery(result: &'static str) {
+    DISCOVERY
+        .with_label_values(&[result])
+        .inc();
+}
+
 /// Track an AWS KMS per-value envelope operation.
 ///
 /// `op`     = `generate_data_key` | `decrypt`
@@ -865,8 +923,8 @@ pub fn set_active_users(count: i64) {
 mod tests {
     use super::{
         A2A_PROTOCOL_VERSION, AUDIT_PIPELINE_STARTED, AUDIT_SINK_REBUILD_FAILED, get_metrics, names,
-        set_audit_pipeline_started, track_a2a_protocol_version, track_audit_sink_rebuild_failed,
-        track_fabric_forward_received,
+        set_audit_pipeline_started, track_a2a_protocol_version, track_audit_sink_rebuild_failed, track_discovery,
+        track_fabric_forward_received, track_jwks_fetch, track_token_fetch,
     };
 
     #[test]
@@ -886,6 +944,22 @@ mod tests {
         track_audit_sink_rebuild_failed();
         assert!(AUDIT_SINK_REBUILD_FAILED.get() > before);
         assert!(get_metrics().contains("agent_gateway_audit_sink_rebuild_failed_total"));
+    }
+
+    #[test]
+    fn trust_plane_counters_expose_only_their_fixed_labels() {
+        assert_eq!(names::TOKEN_FETCH_TOTAL, "agent_gateway_token_fetch_total");
+        track_token_fetch("ut_grant", "ut_result");
+        track_jwks_fetch("ut_jwks");
+        track_discovery("ut_discovery");
+        let exposition = get_metrics();
+        for line in [
+            "agent_gateway_token_fetch_total{grant=\"ut_grant\",result=\"ut_result\"} 1",
+            "agent_gateway_jwks_fetch_total{result=\"ut_jwks\"} 1",
+            "agent_gateway_discovery_total{result=\"ut_discovery\"} 1",
+        ] {
+            assert!(exposition.contains(line), "missing {line} in:\n{exposition}");
+        }
     }
 
     #[test]

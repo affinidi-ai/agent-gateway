@@ -10,6 +10,7 @@
 //! - DelegationCredential VC issuance
 
 pub mod audit;
+pub mod gateway_token;
 pub mod handlers;
 pub mod modern_consent;
 pub mod notifier;
@@ -99,6 +100,33 @@ impl DelegationToken {
             Some(exp) => Utc::now() >= exp,
             None => false, // No expiry info — assume valid
         }
+    }
+
+    /// Whether the token has a recorded expiry that is still in the future.
+    pub fn is_provably_valid(
+        &self,
+        now: DateTime<Utc>,
+    ) -> bool {
+        self.expires_at
+            .is_some_and(|expires_at| now < expires_at)
+    }
+
+    /// Whether a gateway token is due for a new grant: within
+    /// `min(300 s, lifetime / 2)` of expiry, or with no recorded expiry.
+    ///
+    /// The lifetime runs from `consent_granted_at`, which a gateway grant sets to the
+    /// time the token was issued. `created_at` is not used because a vault record keeps
+    /// it from the first token it ever held when a new token replaces the old one.
+    pub fn needs_refresh(
+        &self,
+        now: DateTime<Utc>,
+    ) -> bool {
+        let Some(expires_at) = self.expires_at else {
+            return true;
+        };
+        let lifetime = (expires_at - self.consent_granted_at).num_seconds();
+        let margin = gateway_token::refresh_margin_secs(lifetime);
+        now >= expires_at - chrono::Duration::seconds(margin)
     }
 
     /// Check if a refresh is possible
@@ -286,6 +314,14 @@ mod tests {
     }
 
     #[test]
+    fn provably_valid_requires_a_future_expiry() {
+        let now = Utc::now();
+        assert!(make_token(Some(3600), false).is_provably_valid(now));
+        assert!(!make_token(Some(-60), false).is_provably_valid(now));
+        assert!(!make_token(None, false).is_provably_valid(now));
+    }
+
+    #[test]
     fn test_can_refresh_with_refresh_token() {
         let token = make_token(Some(-60), true);
         assert!(token.can_refresh(), "Expired token with refresh_token should be refreshable");
@@ -301,6 +337,28 @@ mod tests {
     fn test_can_refresh_valid_token_with_refresh_token() {
         let token = make_token(Some(3600), true);
         assert!(token.can_refresh(), "Token with refresh_token should report can_refresh regardless of expiry");
+    }
+
+    #[test]
+    fn test_needs_refresh_uses_a_five_minute_margin_for_long_tokens() {
+        let token = make_token(Some(3600), false);
+        let issued = token.consent_granted_at;
+        assert!(!token.needs_refresh(issued + Duration::seconds(3299)));
+        assert!(token.needs_refresh(issued + Duration::seconds(3300)));
+        assert!(!token.is_expired());
+    }
+
+    #[test]
+    fn test_needs_refresh_uses_half_the_life_of_a_short_token() {
+        let token = make_token(Some(60), false);
+        let issued = token.consent_granted_at;
+        assert!(!token.needs_refresh(issued + Duration::seconds(29)));
+        assert!(token.needs_refresh(issued + Duration::seconds(30)));
+    }
+
+    #[test]
+    fn test_needs_refresh_without_expiry_is_due() {
+        assert!(make_token(None, false).needs_refresh(Utc::now()));
     }
 
     #[test]

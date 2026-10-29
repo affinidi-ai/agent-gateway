@@ -28,6 +28,7 @@ SHELL := /bin/bash
         ui-test ui-test-headed ui-test-report \
 		itest-a2a itest-a2a-setup itest-a2a-run itest-a2a-teardown itest-a2a-clean itest-a2a-shopping \
 		gw-e2e mcp-conformance mcp-conformance-legacy mcp-discovery \
+		oidc-demo-up oidc-demo-down oidc-demo-seed oidc-demo-run oidc-demo-smoke oidc-ui-e2e \
 		mediator mediator-start mediator-up mediator-stop mediator-down
 
 # Default target
@@ -711,6 +712,28 @@ mcp-conformance-legacy: ## Run only the MCP legacy (2024-11-05) compatibility ch
 # ARGS="--keep" leaves it running for MCP Inspector. See scripts/mcp-discovery/README.md.
 mcp-discovery: ## Run MCP authorization server discovery end to end against Ory Hydra (ARGS="--keep")
 	@./scripts/mcp-discovery/run.sh $(ARGS)
+
+# ==============================================================================
+# OIDC demo (Ory Hydra) - see docs/development/OIDC_DEMO.md
+# ==============================================================================
+
+oidc-demo-up: ## Start the OIDC demo's two Hydra containers and the mock agent (ARGS=--no-hop2)
+	@./scripts/oidc-demo/up.sh $(ARGS)
+
+oidc-demo-down: ## Stop the OIDC demo's containers, mock agent and gateway
+	@./scripts/oidc-demo/down.sh
+
+oidc-demo-seed: ## Seed a running OIDC demo gateway through the management API (ARGS=--dry-run to preview)
+	@./scripts/oidc-demo/seed.sh $(ARGS)
+
+oidc-demo-run: ## Run the whole OIDC demo: services, native gateway, seed, hop 2 checks (OIDC_DEMO_KEEP=1 keeps it up)
+	@./scripts/oidc-demo/run.sh $(ARGS)
+
+oidc-demo-smoke: ## Check the OIDC demo's Hydra instances, mock agent and seed dry run (no gateway needed)
+	@./scripts/oidc-demo/smoke.sh
+
+oidc-ui-e2e: ## Live OIDC UI tests: headless Chromium, the real dashboard, two Ory Hydra containers and the mock agent (ARGS="<spec or --grep ...>")
+	@./scripts/oidc-demo/run-ui-e2e.sh $(ARGS)
 
 # ==============================================================================
 # Storage Commands

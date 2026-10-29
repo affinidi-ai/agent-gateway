@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { Form } from 'react-bootstrap';
 import { apiClient } from '../../../../api';
 import FieldHelp from '../../../shared/FieldHelp';
+import { filterProvidersForUse, keptProviderLabel } from '../../../../utils/credentialProviders';
 
 interface CredentialProviderOption {
   id: string;
@@ -135,6 +136,8 @@ const TransitCredentialBindingSection: React.FC<Props> = ({ value, onChange }) =
     };
   }, []);
 
+  const eligible = filterProvidersForUse(providers, 'legacy_delegation');
+
   const enabled = value !== null && value !== undefined;
 
   const toggle = () => {
@@ -166,7 +169,7 @@ const TransitCredentialBindingSection: React.FC<Props> = ({ value, onChange }) =
 
       {enabled && value && (
         <div className="mt-2">
-          <Form.Group className="mb-2">
+          <Form.Group className="mb-2" controlId="surface-tp-credential-binding-provider">
             <Form.Label className="small text-muted mb-0">Credential Provider</Form.Label>
             <Form.Select
               size="sm"
@@ -175,12 +178,19 @@ const TransitCredentialBindingSection: React.FC<Props> = ({ value, onChange }) =
               disabled={loading}
             >
               <option value="">{loading ? '-- Loading… --' : '-- Select provider --'}</option>
-              {providers.map(p => (
+              {eligible.map(p => (
                 <option key={p.id} value={p.id}>
                   {p.name}
                   {p.provider_id ? ` (${p.provider_id})` : ''}
                 </option>
               ))}
+              {value.credential_provider_id &&
+                !loading &&
+                !eligible.some(p => p.id === value.credential_provider_id) && (
+                  <option value={value.credential_provider_id}>
+                    {keptProviderLabel(providers, value.credential_provider_id)}
+                  </option>
+                )}
             </Form.Select>
             {(() => {
               const selected = providers.find(p => p.id === value.credential_provider_id);

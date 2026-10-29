@@ -44,6 +44,7 @@ pub enum RejectionReason {
     ExtensionRejected,
     SsrfBlocked,
     ConsentIdentityRequired,
+    TargetAuthUnavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,6 +68,8 @@ pub enum DelegationFailureReason {
     CredentialsUnavailable,
     AnonymousCaller,
     ContinuationError,
+    AssertionFailed,
+    TokenEndpointFailed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,4 +228,20 @@ pub enum RefusalReason {
     Invalid,
     /// 409: the change conflicts with what is stored.
     Conflict,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigChange {
+    Created,
+    Updated,
+    Deleted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetAuthKind {
+    CredentialLookup,
+    StaticSecret,
+    CredentialProvider,
 }

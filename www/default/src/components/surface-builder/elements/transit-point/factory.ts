@@ -18,6 +18,7 @@ import {
   transitPointTrustCheckListToWire,
 } from '../trust-check/definition';
 import { DOCS_URL } from '../../../../config/docs';
+import { hasUnpickedTargetAuth } from '../../../../utils/targetAuth';
 
 /**
  * Pattern that a transit point alias MUST match. Mirrors the backend
@@ -233,14 +234,6 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
         message:
           'No outbound listener is configured. Add an outbound listener before using a transit point.',
       },
-      {
-        description: 'OAuth Client Credentials auth is not yet wired through the proxy runtime',
-        condition: c => c?.auth_type === 'oauth_client_credentials',
-        check: () => false,
-        severity: 'error',
-        message:
-          'OAuth Client Credentials is not yet supported. The selection will be dropped on save. Pick Bearer, API Key, or Custom Header.',
-      },
     ],
     ConfigPanel: TransitPointPanel,
     summary: c =>
@@ -414,6 +407,7 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
                     // its bearer / api_key / custom_header presets onto
                     // header_name + header_format pairs that the proxy
                     // injects verbatim.
+                    if (hasUnpickedTargetAuth(c)) return { target_auth: c.target_auth };
                     const t = c.auth_type;
                     if (!t || t === 'none') return {};
                     const secretId = typeof c.auth_secret === 'string' ? c.auth_secret.trim() : '';
@@ -447,9 +441,6 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
                           '{value}';
                         break;
                       default:
-                        // Methods the runtime cannot inject yet (e.g.
-                        // oauth_client_credentials) are dropped here
-                        // rather than emitting an invalid wire shape.
                         return {};
                     }
                     return {

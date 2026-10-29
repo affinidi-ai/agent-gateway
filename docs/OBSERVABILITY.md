@@ -84,6 +84,39 @@ with `method_era` showing which method names they send. Requests later refused b
 request-shape validation are counted under their negotiated version. Fabric traffic is counted on
 the sending gateway only (see [Fabric coverage gap](PROTOCOLS.md#fabric-coverage-gap)).
 
+## Trust plane metrics
+
+Prometheus counters for the OAuth and OIDC trust plane. Every label value is a fixed code, so
+cardinality is bounded. A failure label is one of the same codes the API and audit records use;
+none carries a URL, host, issuer, token or provider name.
+
+| Metric | Labels | Counted |
+| --- | --- | --- |
+| `agent_gateway_token_fetch_total` | `grant`: `client_credentials`, `jwt_bearer`, `unsupported` (a provider type the gateway never grants for). `result`: `ok`, `unsupported`, `secret_unavailable`, `forbidden`, `unavailable`, `invalid_response`, `assertion_failed` | Each gateway token request that was not answered from cache or held back by the retry backoff. `unavailable` covers an unreachable endpoint, a refused grant and a timeout; `assertion_failed` is a JWT bearer assertion that could not be signed |
+| `agent_gateway_jwks_fetch_total` | `result`: `ok`, `invalid_url`, `blocked`, `unreachable`, `http_error`, `too_large`, `invalid_document` | Each network fetch of a remote strategy's key set, successful or failed. A host that does not resolve counts as `blocked`. A cache hit, a static key set and the validate-jwks-uri probe are not counted |
+| `agent_gateway_discovery_total` | `result`: `ok`, `invalid_url`, `blocked`, `unreachable`, `http_status`, `too_large`, `invalid_document`, `issuer_mismatch` | Each authorization server metadata discovery, whether from a probe, a save or a re-discovery after an issuer change |
+
+Alert on `agent_gateway_token_fetch_total{result!="ok"}` and
+`agent_gateway_jwks_fetch_total{result!="ok"}` as a rate against their `ok` series: a gateway
+that cannot reach an authorization server refuses callers (JWKS) or, after a failed token fetch,
+either answers 502 (Target Authentication with the default `reject` fallback) or sends the request
+without the credential (an `outbound_credentials` binding, or `fallback: passthrough`), while the
+rest of the appliance looks healthy.
+
+A record the gateway cannot read at load is skipped and counted in
+`agent_gateway_storage_load_errors_total{entity, reason}`. `reason` is `invalid_json`,
+`migration_failed`, `decrypt_failed` (an encrypted record that could not be decrypted),
+`encrypted_but_encryption_disabled` (an encrypted record while encryption at rest is off) or
+`unreadable_record` (a well-formed record this release cannot interpret, which is what a record
+written by a newer release looks like). The `entity` `dynamodb_channel` counts a DynamoDB channel
+item that could not be parsed; the other channels still load.
+
+The counter increments for each unreadable record on every load or refresh scan, and a lookup
+that misses the cache runs a scan too, so after a downgrade each request that names a dropped
+record adds to it. Its value and rate are not a count of bad records: alert on it being non-zero
+or rising for a sustained period, for example after an upgrade or a rollback; see
+[Rollback](adrs/0002-hop-two-target-authentication.md#migration-and-change-management).
+
 ## Logging initialization
 
 Logging is initialized after the encryption service so secret-backed OTLP headers can be resolved.
@@ -181,7 +214,16 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
     headers, HTTP method, per-request capabilities, `_meta`), `extension_rejected` (request
     extension rules, and an inbound identity that is missing or invalid),
     `consent_identity_required` (credential delegation for an anonymous caller).
-  - `forward`: `ssrf_blocked` (egress policy refuses the target address).
+  - `forward`: `ssrf_blocked` (egress policy refuses the target address),
+    `target_auth_unavailable` (Target Authentication failed to produce a credential: a missing
+    secret or provider, or a failed token request, when the surface's fallback is `reject`; or a
+    failure the fallback never covers: a header conflict, an invalid header, a credential outside
+    the Target base path, an unsupported provider type, leg or injection, a provider or secret
+    the surface's tenant may not use, or a Target endpoint a credential provider may not be sent
+    to; `http_status` is 502, the status the gateway answers with, including on the agent card
+    route's fetch). The receiving gateway's card read for its policy context answers no caller
+    and is not recorded. A credential deliberately withheld, and a failure under
+    `fallback: passthrough` that the fallback covers, is not recorded.
 
   Requests answered before any gateway handler runs (a path under no configured route) and
   gateway faults (a misconfigured default variant, a failed egress check task) are not recorded.
@@ -237,6 +279,46 @@ so a change joins to the decisions it causes. No record carries the Rego text, t
 or a request body. Writes made outside a management request (startup migrations, replication)
 record nothing, and neither do writes a configuration reload makes, though the reload is asked
 for through the management API: it is the gateway's own work, not the user's change.
+
+**Delegation failures.** `delegation_failed` is recorded when the gateway cannot obtain a
+credential for an `outbound_credentials` binding of a client-credentials or JWT bearer
+provider, and the request is left without it. `reason` is `assertion_failed` (the JWT bearer
+assertion could not be signed: an unreadable or mismatched signing key), `token_endpoint_failed`
+(the token endpoint was unreachable, refused the grant, timed out, or returned an invalid
+response) or `credentials_unavailable` (a secret is missing, belongs to another tenant, the
+token endpoint is blocked by the egress policy, or the provider cannot grant for this use).
+`detail` is the grant and a fixed failure category, for example `jwt_bearer_unavailable`; the
+token endpoint's text never reaches the record. The same failure also records `token_not_found`
+with the same detail. The
+actor (`caller.auth_method`) is `gateway`, because the gateway acts for itself, not for the
+caller. A stale cached token that is still valid is injected instead, and nothing is recorded.
+
+**Configuration events.** Group `configuration`. Each is recorded after the management API saves
+the change, with the actor in `caller`: `auth_method` is `session` for a signed-in user or
+`access_token` for a personal access token, `sub` is the user and `token_id` the token. A change
+the API refuses (permission, tenant, validation) records nothing. Records carry identifiers and
+fixed values only, never a secret, key or token.
+- `verification_strategy_changed`: a JWT verification strategy was created, updated or deleted.
+  `change` is `created`, `updated` or `deleted`; the record carries `strategy_id`, `name`,
+  `expected_issuer`, `jwks_source` (`remote` or `static`), `pinned` (the strategy holds pinned
+  authorization server metadata after the change, so always `false` for a delete) and
+  `pin_changed` (the pinned metadata differs from before, which covers a first pin, a re-pin after
+  discovery and clearing the pin; a delete of a pinned strategy reports `true`).
+- `credential_provider_changed`: a credential provider was created, updated or deleted. The
+  provider's `provider_id` and `provider_name` are on the record, with `provider_type`.
+- `target_auth_changed`: the Target Authentication of a surface, or of a variant that sets its
+  own, was set, changed or removed through a surface or variant write. `change` is `created`
+  (set), `updated` or `deleted` (removed). The surface is on the record; `method` is `credential_lookup`, `static_secret` or `credential_provider`, and
+  `credential_provider_id` names the provider when there is one. A variant's change carries its
+  `variant_id` and the `variant_alias` it had then, and both are absent for the surface's own.
+  Variants are matched by id, so deleting, adding, reordering or promoting a variant never
+  attributes a change to another one: deleting a variant that had its own Target Authentication
+  records one `deleted` event for it. A variant that takes the surface's Target Authentication
+  before and after records nothing, because the surface's own event covers it. A write that
+  leaves every Target Authentication as it was records nothing.
+
+Changes made by editing `_storage/` on disk, by a backup restore, or through the legacy MCP proxy
+routes are not recorded.
 
 **Volume.** Request events are unbounded by design: each is recorded once per request, with no
 aggregation or sampling. `auth_failed` and the routing `request_rejected` are recorded before

@@ -23,6 +23,7 @@ use crate::bdd_support::config::fabric_surface_fixture::SurfaceSpec;
 use crate::bdd_support::config::modern_consent::{
     ModernConsentFixture, oauth_endpoint_allowlist, write_modern_consent_config,
 };
+use crate::bdd_support::config::target_auth::{TargetTokenProviderFixture, write_target_token_provider};
 use crate::bdd_support::gateway_process::GatewayProcess;
 use crate::bdd_support::json_rpc::McpVersion;
 use crate::bdd_support::mock_server::MockServer;
@@ -117,6 +118,8 @@ pub struct GatewayPlan {
     pub fabric_receive_only: Option<McpVersion>,
     /// Modern MCP consent for the gateway's surfaces with delegated credentials.
     pub modern_consent: Option<ModernConsentFixture>,
+    /// The credential provider whose gateway token surfaces send to their Target.
+    pub target_token_provider: Option<TargetTokenProviderFixture>,
 }
 
 impl GatewayPlan {
@@ -975,6 +978,9 @@ async fn spawn_node(
     if let Some(consent) = &plan.modern_consent {
         write_modern_consent_config(temp_dir.path(), consent);
     }
+    if let Some(provider) = &plan.target_token_provider {
+        write_target_token_provider(temp_dir.path(), provider);
+    }
 
     let config_path = temp_dir
         .path()
@@ -984,8 +990,31 @@ async fn spawn_node(
         reservation.release_listener();
     }
     let mut extra_env: HashMap<String, String> = HashMap::new();
-    if let Some(allowlist) = egress_allowlist {
-        extra_env.insert("AG_BDD_EGRESS_ALLOWLIST".to_string(), allowlist.to_string());
+    let mut egress_entries: Vec<String> = egress_allowlist
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    if plan
+        .target_token_provider
+        .is_some()
+    {
+        egress_entries.extend(
+            surfaces
+                .iter()
+                .filter(|surface| {
+                    surface
+                        .target_token_provider
+                        .is_some()
+                })
+                .map(|surface| {
+                    surface
+                        .target_endpoint
+                        .clone()
+                }),
+        );
+    }
+    if !egress_entries.is_empty() {
+        extra_env.insert("AG_BDD_EGRESS_ALLOWLIST".to_string(), egress_entries.join(","));
     }
     match &plan.fabric_receive_only {
         None => {}
@@ -996,8 +1025,22 @@ async fn spawn_node(
             bail!("setup failed: gateway {index} cannot be limited to MCP protocol version {other} over Fabric")
         }
     }
-    if let Some(consent) = &plan.modern_consent {
-        extra_env.insert("AG_BDD_OAUTH_ENDPOINT_ALLOWLIST".to_string(), oauth_endpoint_allowlist(consent));
+    let oauth_endpoints: Vec<String> = plan
+        .modern_consent
+        .iter()
+        .map(oauth_endpoint_allowlist)
+        .chain(
+            plan.target_token_provider
+                .iter()
+                .map(|provider| {
+                    provider
+                        .token_endpoint
+                        .clone()
+                }),
+        )
+        .collect();
+    if !oauth_endpoints.is_empty() {
+        extra_env.insert("AG_BDD_OAUTH_ENDPOINT_ALLOWLIST".to_string(), oauth_endpoints.join(","));
     }
     let mut gateway = GatewayProcess::start_g2g_with_env(&config_path, temp_dir.path(), &extra_env);
     gateway = gateway

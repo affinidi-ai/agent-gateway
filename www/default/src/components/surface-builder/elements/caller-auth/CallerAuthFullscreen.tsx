@@ -170,6 +170,7 @@ const CallerAuthFullscreen: React.FC<ConfigPanelProps> = ({
             <button
               type="button"
               className="btn btn-sm btn-outline-secondary"
+              data-testid="caller-auth-close-button"
               onClick={closeFullscreenEditor}
             >
               <i className="fas fa-times me-1" /> Close tab
@@ -212,6 +213,7 @@ const CallerAuthFullscreen: React.FC<ConfigPanelProps> = ({
                 JWT Verification Strategy <span className="text-danger">*</span>
               </label>
               <select
+                data-testid="caller-auth-jwt-strategy"
                 className="form-control dropdown-styling"
                 value={config.jwt_strategy_id || ''}
                 onChange={e => updateField('jwt_strategy_id', e.target.value)}

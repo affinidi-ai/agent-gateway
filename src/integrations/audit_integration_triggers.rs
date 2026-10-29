@@ -187,8 +187,8 @@ async fn publish_audit_record(
 mod tests {
     use super::*;
     use crate::audit::events::{
-        Actor, AuthScheme, DelegationFailureReason, IdentityBindingFailure, PolicyChangeSource, RateLimitScope,
-        RejectionReason, RejectionStage, RequestFailureOutcome, TargetKind,
+        Actor, AuthScheme, ConfigChange, DelegationFailureReason, IdentityBindingFailure, PolicyChangeSource,
+        RateLimitScope, RejectionReason, RejectionStage, RequestFailureOutcome, TargetAuthKind, TargetKind,
     };
     use crate::delegation_vault::audit::{
         PaymentEventDetails, PaymentRail, PaymentStage, PolicyChangeDetails, audit_event,
@@ -465,7 +465,10 @@ mod tests {
             | DelegationAuditAction::PolicyAttached(_)
             | DelegationAuditAction::PolicyDetached(_)
             | DelegationAuditAction::PolicyAttachmentChanged(_)
-            | DelegationAuditAction::PolicyChangeRefused(_) => {}
+            | DelegationAuditAction::PolicyChangeRefused(_)
+            | DelegationAuditAction::VerificationStrategyChanged { .. }
+            | DelegationAuditAction::CredentialProviderChanged { .. }
+            | DelegationAuditAction::TargetAuthChanged { .. } => {}
         }
     }
 
@@ -566,6 +569,26 @@ mod tests {
             DelegationAuditAction::PolicyDetached(policy_change()),
             DelegationAuditAction::PolicyAttachmentChanged(policy_change()),
             DelegationAuditAction::PolicyChangeRefused(policy_change()),
+            DelegationAuditAction::VerificationStrategyChanged {
+                change: ConfigChange::Created,
+                strategy_id: "strategy-1".to_string(),
+                name: "Auth0".to_string(),
+                expected_issuer: "https://issuer.example/".to_string(),
+                jwks_source: "remote".to_string(),
+                pinned: true,
+                pin_changed: true,
+            },
+            DelegationAuditAction::CredentialProviderChanged {
+                change: ConfigChange::Updated,
+                provider_type: "oauth2_jwt_bearer".to_string(),
+            },
+            DelegationAuditAction::TargetAuthChanged {
+                change: ConfigChange::Deleted,
+                method: TargetAuthKind::CredentialProvider,
+                credential_provider_id: Some("provider-1".to_string()),
+                variant_id: None,
+                variant_alias: None,
+            },
         ]
     }
 
@@ -575,7 +598,7 @@ mod tests {
 
     #[test]
     fn the_event_catalog_lists_every_audit_record_category_the_gateway_produces() {
-        let unproduced = ["delegation_failed", "request_failed", "request_completed"];
+        let unproduced = ["request_failed", "request_completed"];
         let actions = every_action();
         actions
             .iter()

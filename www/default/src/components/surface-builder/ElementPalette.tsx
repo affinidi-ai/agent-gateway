@@ -145,6 +145,7 @@ const ElementPalette: React.FC<ElementPaletteProps> = ({
           help?.type === def.type ? 'palette-item--help-open' : ''
         }`}
         draggable={!disabled}
+        data-testid={`palette-item-${def.type}`}
         onDragStart={e => handleDragStart(e, def)}
         onMouseDown={e => handleMouseDown(e, def)}
         onClick={e => handleClick(e, def)}
@@ -169,6 +170,7 @@ const ElementPalette: React.FC<ElementPaletteProps> = ({
       <React.Fragment key={cat}>
         <h6
           className="palette-section-header"
+          data-testid={`palette-section-${cat}`}
           onClick={() => toggleSection(cat)}
           style={{ cursor: 'pointer', userSelect: 'none' }}
         >

@@ -82,13 +82,16 @@ fn mcp_proxy_writable(
         && scope_allows_resource(scope, context, ResourceKind::McpProxies, &proxy.id)
 }
 
+/// A tenant caller sends only its own tenant's secret to the endpoint it discovers, never an
+/// appliance-wide one, as with a surface's `static_secret` Target Authentication.
 fn discovery_secret_allowed(
     tenant_id: Option<&str>,
     secret_id: &str,
     context: Option<&PatTenantContext>,
     scope: Option<&PatResourceScope>,
 ) -> bool {
-    can_access(tenant_id, context) && scope_allows_resource(scope, context, ResourceKind::Secrets, secret_id)
+    context.is_none_or(|context| tenant_id == Some(context.tenant_id.as_str()))
+        && scope_allows_resource(scope, context, ResourceKind::Secrets, secret_id)
 }
 
 // Import rmcp-openapi for MCP Server functionality
@@ -4992,6 +4995,9 @@ mod tests {
         assert!(discovery_secret_allowed(Some("tenant-a"), "secret-a", Some(&context), Some(&scope)));
         assert!(!discovery_secret_allowed(Some("tenant-b"), "secret-a", Some(&context), Some(&scope)));
         assert!(!discovery_secret_allowed(Some("tenant-a"), "secret-b", Some(&context), Some(&scope)));
+        assert!(!discovery_secret_allowed(None, "secret-a", Some(&context), Some(&scope)));
+        assert!(discovery_secret_allowed(None, "secret-a", None, None));
+        assert!(discovery_secret_allowed(Some("tenant-b"), "secret-a", None, None));
 
         proxy.tenant_id = Some("tenant-b".to_string());
         assert!(!mcp_proxy_allowed(&proxy, Some(&context), Some(&scope)));

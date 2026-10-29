@@ -133,6 +133,100 @@ fn lenient_router_segments(path: &str) -> Option<Vec<String>> {
     Some(segments)
 }
 
+/// The upstream URLs at which this gateway fetches the surface's agent card: the
+/// override path on the Target origin when `override_agent_card_location` is set,
+/// otherwise the Target endpoint followed by `/.well-known/agent-card.json` and by
+/// `/.well-known/agent.json`.
+pub fn agent_card_urls(surface: &crate::config::agent_surface::AgentSurface) -> Vec<url::Url> {
+    let endpoint = &surface.target.endpoint;
+    let candidates = match surface
+        .agent_card_location_path()
+        .filter(|_| surface.override_agent_card_location())
+    {
+        Some(custom_path) => vec![crate::proxy::protocol_router::override_agent_card_url(endpoint, custom_path)],
+        None => ["/.well-known/agent-card.json", "/.well-known/agent.json"]
+            .into_iter()
+            .map(|path| crate::proxy::protocol_router::join_endpoint_path(endpoint, path))
+            .collect(),
+    };
+    candidates
+        .iter()
+        .filter_map(|candidate| url::Url::parse(candidate).ok())
+        .collect()
+}
+
+/// Whether `destination` is exactly one of the surface's agent card URLs, the
+/// only requests the gateway sends to its Target on its own behalf.
+pub fn is_agent_card_url(
+    surface: &crate::config::agent_surface::AgentSurface,
+    destination: &str,
+) -> bool {
+    url::Url::parse(destination)
+        .is_ok_and(|parsed| parsed.fragment().is_none() && agent_card_urls(surface).contains(&parsed))
+}
+
+/// Whether a request is the gateway's own card fetch: a `GET` whose upstream URL,
+/// query included, is exactly one of the surface's agent card URLs.
+pub fn is_gateway_card_fetch(
+    surface: &crate::config::agent_surface::AgentSurface,
+    method: &str,
+    upstream_url: &str,
+) -> bool {
+    method.eq_ignore_ascii_case("GET") && is_agent_card_url(surface, upstream_url)
+}
+
+/// Whether a Target credential may travel to `destination`: one of the surface's
+/// agent card URLs, or a URL on the Target endpoint's origin whose path stays under
+/// the Target base path both as the URL parser resolves it and as lenient routers
+/// resolve the raw and the decoded path. Unparseable input, or a `..` above the
+/// root, is outside.
+pub fn is_within_target_base(
+    surface: &crate::config::agent_surface::AgentSurface,
+    destination: &str,
+) -> bool {
+    if is_agent_card_url(surface, destination) {
+        return true;
+    }
+    let Ok(parsed) = url::Url::parse(destination) else {
+        return false;
+    };
+    let Ok(target) = url::Url::parse(&surface.target.endpoint) else {
+        return false;
+    };
+    if parsed.origin() != target.origin() {
+        return false;
+    }
+    let Some(base) = lenient_router_segments(target.path()) else {
+        return false;
+    };
+    [
+        lenient_router_segments(parsed.path()),
+        lenient_router_segments(&percent_decode_lossy(parsed.path())),
+        lenient_router_segments(raw_url_path(destination)),
+    ]
+    .iter()
+    .all(|segments| {
+        segments
+            .as_deref()
+            .is_some_and(|segments| segments.starts_with(&base))
+    })
+}
+
+/// The path of a URL exactly as written, before the URL parser resolves any dot
+/// segment: from the first `/` after the authority up to the query or fragment.
+fn raw_url_path(url: &str) -> &str {
+    let after_scheme = url
+        .split_once("://")
+        .map_or(url, |(_, rest)| rest);
+    let path_and_rest = after_scheme
+        .find('/')
+        .map_or("/", |start| &after_scheme[start..]);
+    path_and_rest
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("/")
+}
+
 /// Whether a request is a public discovery read that bypasses the request
 /// gates: a `GET` or `HEAD` for a public path. A request with another method
 /// whose path only ends like a discovery document, such as an MCP POST to
@@ -217,6 +311,134 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn surface_with_target(
+        endpoint: &str,
+        agent_card_path: Option<&str>,
+    ) -> crate::config::agent_surface::AgentSurface {
+        serde_json::from_value(serde_json::json!({
+            "name": "confined",
+            "access_point": {
+                "listen_address": "127.0.0.1:0",
+                "route": "/agent",
+                "protocol": "a2a",
+                "agent_card_path": agent_card_path
+            },
+            "target": { "endpoint": endpoint }
+        }))
+        .expect("surface JSON")
+    }
+
+    #[test]
+    fn test_agent_card_urls_follow_the_override_or_the_endpoint() {
+        let default = surface_with_target("https://agent.example/api", None);
+        assert_eq!(
+            agent_card_urls(&default)
+                .iter()
+                .map(url::Url::as_str)
+                .collect::<Vec<_>>(),
+            vec![
+                "https://agent.example/api/.well-known/agent-card.json",
+                "https://agent.example/api/.well-known/agent.json"
+            ]
+        );
+        let overridden = surface_with_target("https://agent.example/api", Some("cards/agent.json?v=2"));
+        assert_eq!(
+            agent_card_urls(&overridden)
+                .iter()
+                .map(url::Url::as_str)
+                .collect::<Vec<_>>(),
+            vec!["https://agent.example/cards/agent.json?v=2"]
+        );
+    }
+
+    #[test]
+    fn test_only_the_agent_card_urls_are_agent_card_urls() {
+        let surface = surface_with_target("https://agent.example/api", None);
+        for card in [
+            "https://agent.example/api/.well-known/agent-card.json",
+            "https://agent.example/api/.well-known/agent.json",
+        ] {
+            assert!(is_agent_card_url(&surface, card), "{card}");
+        }
+        for other in [
+            "https://agent.example/api/admin/reports/discovery",
+            "https://agent.example/api/x/.well-known/agent-card.json",
+            "https://agent.example/api/.well-known/agent-card.json?x=1",
+            "https://agent.example/api/.well-known/agent-card.json#x",
+            "https://agent.example/api/.well-known/ucp",
+            "https://other.example/api/.well-known/agent-card.json",
+            "not a url",
+        ] {
+            assert!(!is_agent_card_url(&surface, other), "{other}");
+        }
+    }
+
+    #[test]
+    fn test_gateway_card_fetch_is_a_get_of_a_card_url() {
+        let surface = surface_with_target("https://agent.example/api", None);
+        let card = "https://agent.example/api/.well-known/agent-card.json";
+        assert!(is_gateway_card_fetch(&surface, "GET", card));
+        assert!(is_gateway_card_fetch(&surface, "get", card));
+        for method in ["HEAD", "POST", "DELETE"] {
+            assert!(!is_gateway_card_fetch(&surface, method, card), "{method}");
+        }
+        assert!(!is_gateway_card_fetch(&surface, "GET", &format!("{card}?x=1")));
+        assert!(!is_gateway_card_fetch(&surface, "GET", "https://agent.example/api/discovery"));
+    }
+
+    #[test]
+    fn test_paths_under_the_target_base_keep_the_credential() {
+        let surface = surface_with_target("https://agent.example/api/", None);
+        for destination in [
+            "https://agent.example/api",
+            "https://agent.example/api/",
+            "https://agent.example/api/v1/message:send?x=1",
+            "https://agent.example/api/./tasks",
+            "https://agent.example/api/a/../tasks",
+            "https://agent.example/api/.well-known/agent-card.json",
+        ] {
+            assert!(is_within_target_base(&surface, destination), "{destination}");
+        }
+    }
+
+    #[test]
+    fn test_paths_that_climb_out_of_the_target_base_lose_the_credential() {
+        let surface = surface_with_target("https://agent.example/api", None);
+        for destination in [
+            "https://agent.example/api/../admin",
+            "https://agent.example/api/%2e%2e/admin",
+            "https://agent.example/api/%2E%2E/admin",
+            "https://agent.example/api/..%2fadmin",
+            "https://agent.example/api/..%5cadmin",
+            "https://agent.example/api/..;/admin",
+            "https://agent.example/api/%252e%252e/admin",
+            "https://agent.example/admin",
+            "https://agent.example/apiary",
+            "https://other.example/api/tasks",
+            "http://agent.example/api/tasks",
+            "https://agent.example:8443/api/tasks",
+            "not a url",
+        ] {
+            assert!(!is_within_target_base(&surface, destination), "{destination}");
+        }
+    }
+
+    #[test]
+    fn test_root_target_refuses_only_a_climb_above_the_root() {
+        let surface = surface_with_target("https://agent.example", None);
+        assert!(is_within_target_base(&surface, "https://agent.example/anything/here"));
+        assert!(!is_within_target_base(&surface, "https://agent.example/%2e%2e/etc"));
+    }
+
+    #[test]
+    fn test_override_card_url_outside_the_base_keeps_the_credential_only_exactly() {
+        let surface = surface_with_target("https://agent.example/api", Some("/card.json"));
+        assert!(is_within_target_base(&surface, "https://agent.example/card.json"));
+        assert!(!is_within_target_base(&surface, "https://agent.example/card.json?x=1"));
+        assert!(!is_within_target_base(&surface, "https://agent.example/card.json#frag"));
+        assert!(!is_within_target_base(&surface, "https://agent.example/other.json"));
+    }
 
     #[test]
     fn only_a_get_or_head_for_a_public_path_is_a_public_request() {

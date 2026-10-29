@@ -184,6 +184,26 @@ attributed to the authenticated actor and records whether it was orphan cleanup.
 ### References between records
 
 - A tenant-owned resource may reference same-tenant or global dependencies.
+- Exception: a credential provider may reference only secrets of its own tenant, because
+  the gateway sends them to the provider's token endpoint or to a Target. A tenant provider
+  that names a global secret, or a global provider that names a tenant secret, is refused on
+  create and update, and a stored one fails at use, for every provider type. See
+  [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#credential-providers).
+- Exception: a surface sends only its own tenant's credentials to its Target and Transit
+  Points, including when they are `fabric://` routes, and a global surface only global ones, because the gateway sends their values to
+  endpoints the surface's owner chose. This covers a `static_secret` Target Authentication
+  secret, on the Target and on Transit Points; a `credential_provider` Target Authentication
+  provider; and an `outbound_credentials` or `transit_credentials` binding to an `api_key`,
+  `oauth2_client_credentials` or `oauth2_jwt_bearer` provider. A binding to an
+  `oauth2_authorization_code` provider may still use a global provider, because the token it
+  injects is the consenting user's. A stored record that breaks the rule is refused at use:
+  Target Authentication fails closed, a legacy binding is skipped with the reason
+  `provider_forbidden`, and a modern delegation binding is refused as a binding mismatch. See
+  [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#target-authentication-through-a-provider)
+  and [Binding a provider to a surface](CREDENTIAL_DELEGATION.md#binding-a-provider-to-a-surface).
+- Moving a record to another tenant is refused with 409 when it would break any of these rules,
+  and so is changing a provider bound by a surface of another tenant to a type that sends the
+  gateway's own credential.
 - A global resource may reference only global dependencies.
 - A referenced resource must also match the PAT pattern before the write is persisted.
   For a Connection Point created on a mediator the mediator directory offers, the pattern must
@@ -202,7 +222,9 @@ PAT's feature scopes both apply. A scoped PAT may create or update tokens only w
 non-empty subset of its own scopes.
 
 Resource-scoped PAT routing is fail-closed for unknown nested tenant-resource
-paths: only an audited allowlist of handler-enforced actions may proceed. Mediator
+paths: only an audited allowlist of handler-enforced actions may proceed. A surface's
+`trust-recorder-status` read (`surfaces.view`) is checked against the surface id in the path, so a
+resource-scoped PAT reaches it only for its own surfaces. Mediator
 trust-ping, Issuer Trust Registry retry, and Trust Registry record-list/reconnect
 enforce owning-record tenancy plus canonical scope; Trust Registry
 list/get/action routes also carry explicit feature guards. Tenant-ownership
@@ -210,7 +232,8 @@ impact reads filter the root and every graph edge by tenant/scope, and
 resource-scoped PATs cannot reassign ownership. Surface reference validation
 includes the caller Trust Check list, the Managed Agent target list, each Transit
 Point's Trust Check list and every Trust Recorder entry. MCP tool discovery
-requires MCP Proxy edit plus Secret view authority, validates raw endpoints with
+requires MCP Proxy edit plus Secret view authority, lets a tenant caller send only its own
+tenant's secret, validates raw endpoints with
 `validate_resolved_url`, dials through a per-request Strict-pinned,
 redirect-disabled client (`egress::pinned_strict_client`), independently
 authorizes stored Proxy and Secret references, and requires resource-scoped PATs

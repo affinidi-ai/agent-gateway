@@ -181,7 +181,8 @@ fn prepare_restore_upload_with_keys(
         Some(manifest) => {
             let manifest =
                 super::manifest::validate_parsed_backup_manifest(manifest, target_domain).map_err(|error| {
-                    preparation_error(error, "manifest_invalid", Some(key_source), source_domain.clone())
+                    let category = super::manifest::manifest_failure_category(&error);
+                    preparation_error(error, category, Some(key_source), source_domain.clone())
                 })?;
             (decrypted.bytes, manifest)
         }

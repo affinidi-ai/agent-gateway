@@ -112,6 +112,19 @@ pub struct ProxyState {
     pub surface: Arc<crate::config::agent_surface::AgentSurface>,
 }
 
+impl ProxyState {
+    /// The Target Authentication resolver for this request, sharing the replica's
+    /// gateway token cache.
+    pub fn target_credentials(&self) -> crate::proxy::target_credentials::TargetCredentialResolver {
+        crate::proxy::target_credentials::TargetCredentialResolver::new(
+            self.secrets_store.clone(),
+            self.credential_provider_store
+                .clone(),
+            crate::delegation_vault::gateway_token::target_token_cache(),
+        )
+    }
+}
+
 /// Surface info with routing support (includes rules engines and identity selector)
 #[derive(Clone)]
 pub struct SurfaceInfo {

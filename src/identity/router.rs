@@ -889,22 +889,19 @@ pub fn create_identity_api_router(
     let sts_trust_registry_listener_manager = trust_registry_listener_manager.clone();
 
     // Create JWT verification strategy management routes (admin-only)
-    let oidc_provider_router = if let (Some(store), Some(storage), Some(sess_mgr)) =
-        (jwt_verification_strategy_store, passkey_storage_for_manager.as_ref(), session_manager_for_manager.as_ref())
-    {
-        let state: crate::jwt_bearer::handlers::JwtVerificationStrategyState = store;
+    let oidc_provider_router = if let (Some(store), Some(jwks), Some(storage), Some(sess_mgr)) = (
+        jwt_verification_strategy_store,
+        jwks_client,
+        passkey_storage_for_manager.as_ref(),
+        session_manager_for_manager.as_ref(),
+    ) {
+        let state = crate::jwt_bearer::handlers::JwtVerificationStrategyState::new(store, jwks);
         info!("JWT verification strategy management routes registered");
-        let router = crate::jwt_bearer::router::create_jwt_verification_strategies_router(state)
+        crate::jwt_bearer::router::create_jwt_verification_strategies_router(state)
             .layer(middleware::from_fn(crate::auth_manager::middleware::extract_user_id))
             .layer(Extension(sess_mgr.clone()))
             .layer(Extension(storage.clone()))
-            .layer(Extension(rbac_config.clone()));
-        // Attach the JwksClient Extension when available so the validate-jwks-uri handler can use it.
-        if let Some(client) = jwks_client {
-            router.layer(Extension(client))
-        } else {
-            router
-        }
+            .layer(Extension(rbac_config.clone()))
     } else {
         Router::new()
     };

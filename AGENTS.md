@@ -32,7 +32,7 @@ Project glossary (ubiquitous language) lives in [`CONTEXT.md`](CONTEXT.md). Use 
 9. **Single Rust binary** (`agent-gateway`), source in `src/`, DashMap cache + filesystem JSON storage, surfaces hot-reloadable. No restart unless modifying startup-only config. Runs in Active or Standby mode (`server_mode` in bootstrap config, default `active`). Health is `GET /api/v1/health` (200 Active-and-ready, 503 Standby); liveness is `GET /api/v1/alive` (always 200); router-relative paths are `/v1/health` and `/v1/alive`. See [`docs/CONFIGURATION_RELOAD.md`](docs/CONFIGURATION_RELOAD.md#server-mode) for the modes and `cache_refresh_interval_secs`.
 10. **`AgentSurface`** (`src/config/agent_surface.rs`) is the central routing unit. All proxy behavior hangs off it. Read the surface before touching the pipeline. (Channel-shaped accessors on `AgentSurface`, mirroring the legacy `ChannelMapping` field shapes, live in `src/config/agent_surface_accessors.rs` for mechanical call-site sweeps.)
 11. **OPA = Regorus** (Rust-native Rego, no external process). Gateway-level before surface-level.
-12. **DashMap is authoritative at runtime.** Disk writes immediate. Manual `_storage/` edits need restart or `POST /v1/config/reload` — unless `cache_refresh_interval_secs` > 0, in which case **DashMap-backed** cached stores pick up external/manual disk writes within that interval (their serialized refresh scans reconcile cache with disk). RwLock-backed stores (policy definitions, global policies) do not poll on this interval and reconcile from disk on restart; explicit configuration reload uses their current in-memory state.
+12. **DashMap is authoritative at runtime.** Disk writes immediate. Manual `_storage/` edits need restart or `POST /v1/config/reload` — unless `cache_refresh_interval_secs` > 0, in which case **DashMap-backed** cached stores pick up external/manual disk writes within that interval (their serialized refresh scans reconcile cache with disk). RwLock-backed stores (policy definitions, global policies) do not poll on this interval and reconcile from disk on restart and when the node becomes Active; explicit configuration reload uses their current in-memory state.
 13. **Leave code better** — DRY, no dead code, single-responsibility functions.
 14. **Always test** — positive and negative cases.
 
@@ -86,6 +86,12 @@ _Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-bui
 
 The CLI consent page (`/cli-consent`) is shown outside the dashboard shell and reuses the login card styles from `www/default/src/pages/LoginPage.module.css`; see _CLI consent page_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#cli-consent-page).
 
+The Managed Agent's Target Authentication offers a **Credential Provider** type, and the Credential
+Provider page has a **JWT Bearer** type; both, the `credential_providers.*` permission gating,
+and the rule that unsupported Target Authentication variants are saved unchanged live in
+_Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder) and
+_Credential providers_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#credential-providers).
+
 The secret editor has one save button and never shows a stored secret value; see
 _Secret editor_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#secret-editor).
 
@@ -106,10 +112,14 @@ The Identities page shows a Trust Recorder status chip and a Recorder filter, an
 Recorder panel shows a Last outcome row; see _Identities page_ and _Trust Recorder panel_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#trust-recorder-panel).
 
+The JWT verification strategy editor discovers and pins an authorization server, and the strategy
+list marks a strategy with a pinned server **Discovered**; see _JWT verification strategies_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#jwt-verification-strategies).
+
 The Caller Context editor of an MCP surface with JWT Bearer edits authorization server
 discovery (`caller_authentication.protected_resource`), and Save removes a setting the
 operator switched off in the same PUT; see _Authorization server discovery_ in
-[`www/default/AGENTS.md`](www/default/AGENTS.md).
+[`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
 Keep `AGENTS.md` and any local `AGENTS.md` in sync in the same change when UI patterns evolve. Instruction drift is a blocker.
 

@@ -12,6 +12,7 @@ use crate::bdd_support::config::fabric_surface_fixture::{
     TransitPointHeaderMetadataMappingRowSpec, TransitPointSpec,
 };
 use crate::bdd_support::config::modern_consent::ModernConsentFixture;
+use crate::bdd_support::config::target_auth::TargetTokenProviderFixture;
 use crate::bdd_support::json_rpc::{
     IdentityBindingProof, McpVersion, build_mcp_echo_response_body, build_target_ok_response,
 };
@@ -953,6 +954,41 @@ pub async fn mediator_lost_every_account(world: &mut G2gWorld) {
         .flush_store()
         .await
         .unwrap_or_else(|error| panic!("{error:#}"));
+}
+
+/// Target Authentication through a client credentials provider: the gateway
+/// obtains its own token from the OAuth provider and sends it to the Target.
+#[given(expr = "surface {string} sends its Target a gateway token from OAuth provider {string}")]
+async fn surface_sends_gateway_token(
+    world: &mut G2gWorld,
+    surface_name: String,
+    provider_name: String,
+) {
+    if !world
+        .oauth_providers
+        .contains_key(&provider_name)
+    {
+        let provider = OidcProvider::start().await;
+        world
+            .oauth_providers
+            .insert(provider_name.clone(), provider);
+    }
+    let (gw_index, surface_id) = world.surface(&surface_name);
+    let token_endpoint = world.oauth_providers[&provider_name].token_endpoint();
+    let plan = world
+        .topology
+        .plan_mut(gw_index);
+    plan.target_token_provider = Some(TargetTokenProviderFixture {
+        provider_id: provider_name.clone(),
+        token_endpoint,
+        client_id: OIDC_CLIENT_ID.to_string(),
+        client_secret: OIDC_CLIENT_SECRET.to_string(),
+    });
+    plan.surfaces
+        .iter_mut()
+        .find(|surface| surface.surface_id == surface_id)
+        .unwrap_or_else(|| panic!("surface '{surface_id}' not declared on gateway {gw_index}"))
+        .target_token_provider = Some(provider_name);
 }
 
 /// The OAuth provider is also the identity provider callers sign in with, so

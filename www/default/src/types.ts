@@ -1,5 +1,6 @@
 import React from 'react';
 import type { ChannelProtocol } from './generated/ChannelProtocol';
+import type { TargetAuthWire } from './utils/targetAuth';
 
 // API Response Types
 export type ChannelType = 'user' | 'onboarding' | 'system' | 'transit';
@@ -581,17 +582,7 @@ export interface DashboardStats {
     default_virtual_channel?: string;
     issuer_id?: string;
     outbound_listen_address?: string;
-    target_auth?: {
-      method: {
-        static_secret?: {
-          secret_id: string;
-          header_name: string;
-          header_format: string;
-        };
-      };
-      target_identifier?: string;
-      fallback?: string;
-    };
+    target_auth?: TargetAuthWire;
   }>;
   ports: {
     proxy_channels: string[];

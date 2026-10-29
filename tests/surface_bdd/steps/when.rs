@@ -335,6 +335,17 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
     if let Some(reservation) = &mut outbound_port_reservation {
         reservation.release_listener();
     }
+    if let Some(token_auth) = &world
+        .surface_config
+        .target_token_auth
+    {
+        oauth_endpoint_allowlist.push(
+            token_auth
+                .provider
+                .token_endpoint
+                .clone(),
+        );
+    }
     let mut gateway_env = if oauth_endpoint_allowlist.is_empty() {
         std::collections::HashMap::new()
     } else {
@@ -343,6 +354,13 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
             oauth_endpoint_allowlist.join(","),
         )])
     };
+    if world
+        .surface_config
+        .target_token_auth
+        .is_some()
+    {
+        gateway_env.insert("AG_BDD_EGRESS_ALLOWLIST".to_string(), mock.url());
+    }
     if world.terms_enabled {
         gateway_env.insert("AFFINIDI_TERMS_REFRESH_INTERVAL_SECONDS".to_string(), "1".to_string());
     }
@@ -1806,7 +1824,7 @@ async fn request_with_invalid_api_key(world: &mut SurfaceWorld) {
 }
 
 #[when("the caller sends a request to the surface with a valid API key")]
-async fn request_with_valid_api_key(world: &mut SurfaceWorld) {
+pub(crate) async fn request_with_valid_api_key(world: &mut SurfaceWorld) {
     let header = build_valid_api_key_source_auth_header(world);
     send_request_and_record(world, vec![header]).await;
 }
@@ -1852,7 +1870,7 @@ async fn fetch_protected_resource_metadata(world: &mut SurfaceWorld) {
 }
 
 #[when("the caller fetches the agent card")]
-async fn fetch_agent_card(world: &mut SurfaceWorld) {
+pub(crate) async fn fetch_agent_card(world: &mut SurfaceWorld) {
     fetch_agent_card_with_headers(world, vec![]).await;
 }
 

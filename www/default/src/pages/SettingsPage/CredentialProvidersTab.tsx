@@ -9,12 +9,14 @@ import { DeleteButton } from '../../components/shared/DeleteButton';
 import { EmptyState } from '../../components/shared/EmptyState';
 import { DOCS_URL } from '../../config/docs';
 import { formatDateTime } from '../../utils/stringUtils';
+import { formatApiError } from '../../utils/apiError';
+import { providerTypeBadgeClass, providerTypeLabel } from '../../utils/credentialProviders';
 
 interface CredentialProviderListItem {
   id: string;
   name: string;
   provider_id: string;
-  provider_type: 'oauth2_authorization_code' | 'oauth2_client_credentials' | 'api_key';
+  provider_type: string;
   token_endpoint?: string;
   default_scopes: string[];
   token_refresh_enabled: boolean;
@@ -22,18 +24,6 @@ interface CredentialProviderListItem {
   created_at: string;
   updated_at: string;
 }
-
-const PROVIDER_TYPE_LABELS: Record<string, string> = {
-  oauth2_authorization_code: 'Authorization Code',
-  oauth2_client_credentials: 'Client Credentials',
-  api_key: 'API Key',
-};
-
-const PROVIDER_TYPE_COLORS: Record<string, string> = {
-  oauth2_authorization_code: 'text-bg-info',
-  oauth2_client_credentials: 'text-bg-primary',
-  api_key: 'text-bg-warning',
-};
 
 interface CredentialProvidersTabProps {
   externalSearchTerm?: string;
@@ -49,16 +39,23 @@ const CredentialProvidersTab: React.FC<CredentialProvidersTabProps> = ({
   const [providers, setProviders] = useState<CredentialProviderListItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const [internalSearchTerm, setInternalSearchTerm] = useState('');
   const externalProvided = externalSearchTerm !== undefined;
   const searchTerm = externalProvided ? externalSearchTerm! : internalSearchTerm;
   const setSearchTerm = setInternalSearchTerm;
 
-  const canEdit = hasPermission('settings.edit');
+  const canView = hasPermission('credential_providers.view');
+  const canEdit = hasPermission('credential_providers.edit');
+  const canDelete = hasPermission('credential_providers.delete');
 
   useEffect(() => {
-    loadProviders();
-  }, []);
+    if (canView) {
+      loadProviders();
+    } else {
+      setLoading(false);
+    }
+  }, [canView]);
 
   const loadProviders = async () => {
     setLoading(true);
@@ -78,17 +75,20 @@ const CredentialProvidersTab: React.FC<CredentialProvidersTabProps> = ({
   };
 
   const handleDelete = async (provider: CredentialProviderListItem) => {
+    setDeleteError(null);
     try {
       const response = await apiClient.fetch(
         `/api/v1/credential-providers/${encodeURIComponent(provider.id)}`,
         { method: 'DELETE' }
       );
       if (!response.ok) {
-        throw new Error(`Delete failed: ${response.statusText}`);
+        throw new Error(
+          formatApiError(response.status, await response.text(), response.statusText)
+        );
       }
       setProviders(prev => prev.filter(p => p.id !== provider.id));
     } catch (e: any) {
-      alert(`Failed to delete provider: ${e.message}`);
+      setDeleteError(`Failed to delete provider "${provider.name}": ${e.message}`);
     }
   };
 
@@ -145,9 +145,30 @@ const CredentialProvidersTab: React.FC<CredentialProvidersTabProps> = ({
         </div>
       </div>
       <div className="card-body">
-        {loading && (
+        {!canView && (
+          <div
+            className="alert alert-secondary mb-0"
+            role="status"
+            data-testid="credential-providers-no-access"
+          >
+            Your role cannot view credential providers.
+          </div>
+        )}
+
+        {canView && loading && (
           <div className="text-center py-4">
             <div className="spinner-border text-primary" role="status" />
+          </div>
+        )}
+
+        {deleteError && (
+          <div
+            className="alert alert-danger"
+            role="alert"
+            data-testid="credential-provider-delete-error"
+          >
+            <i className="fas fa-exclamation-triangle me-2"></i>
+            {deleteError}
           </div>
         )}
 
@@ -161,7 +182,7 @@ const CredentialProvidersTab: React.FC<CredentialProvidersTabProps> = ({
           </div>
         )}
 
-        {!loading && !error && providers.length === 0 && (
+        {canView && !loading && !error && providers.length === 0 && (
           <EmptyState
             icon="fa-id-card"
             title="No credential providers yet"
@@ -170,14 +191,14 @@ const CredentialProvidersTab: React.FC<CredentialProvidersTabProps> = ({
           />
         )}
 
-        {!loading && !error && providers.length > 0 && filtered.length === 0 && (
+        {canView && !loading && !error && providers.length > 0 && filtered.length === 0 && (
           <div className="text-center text-muted py-5">
             <i className="fas fa-search fa-3x mb-3" aria-hidden="true" />
             <p className="mb-0">No credential providers match your search.</p>
           </div>
         )}
 
-        {!loading && !error && filtered.length > 0 && (
+        {canView && !loading && !error && filtered.length > 0 && (
           <div className="table-responsive">
             <table className="table table-hover">
               <thead>
@@ -210,10 +231,8 @@ const CredentialProvidersTab: React.FC<CredentialProvidersTabProps> = ({
                       <code className="text-muted">{provider.provider_id}</code>
                     </td>
                     <td>
-                      <span
-                        className={`badge ${PROVIDER_TYPE_COLORS[provider.provider_type] ?? 'text-bg-secondary'}`}
-                      >
-                        {PROVIDER_TYPE_LABELS[provider.provider_type] ?? provider.provider_type}
+                      <span className={`badge ${providerTypeBadgeClass(provider.provider_type)}`}>
+                        {providerTypeLabel(provider.provider_type)}
                       </span>
                     </td>
                     <td>
@@ -238,7 +257,7 @@ const CredentialProvidersTab: React.FC<CredentialProvidersTabProps> = ({
                       <small>{formatDateTime(provider.updated_at)}</small>
                     </td>
                     <td onClick={e => e.stopPropagation()}>
-                      {canEdit && (
+                      {canDelete && (
                         <DeleteButton
                           onDelete={() => handleDelete(provider)}
                           className="btn-sm"

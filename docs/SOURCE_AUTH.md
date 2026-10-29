@@ -58,7 +58,7 @@ identity, and policy sees `input.source_auth` as
 `{"method": "failed", "attempted_method": ..., "reason": ...}`. Only server-side errors,
 such as missing configuration or an internal failure, block the request with `500`
 ([`errors.rs`](../src/source_auth/errors.rs)). Such a request is forwarded without the
-surface's stored target credential, or the A2A proxy's Direct Line secret, on each inbound
+surface's Target Authentication credential, or the A2A proxy's Direct Line secret, on each inbound
 and Fabric forwarding path: direct inbound, `proxy://` MCP Targets, `a2a-proxy://` Targets,
 Fabric send and Fabric receive. Transit Point listeners do not authenticate callers, so this
 does not cover them. A surface that must reject unauthenticated callers therefore
@@ -80,6 +80,87 @@ A request to an MCP Access Point that publishes protected resource metadata, dir
 Fabric, is the exception: a missing or invalid JWT is refused with a `401` (the discovery
 challenge on a direct request), see
 [`MCP_METADATA.md`](MCP_METADATA.md#authorization-server-discovery-for-caller-authentication).
+
+A surface whose JWT verification strategy no longer exists, for example because it was deleted
+while the surface still references it, cannot authenticate any caller. The strategy is looked
+up only after a token is found, so a request with no token is still a missing credential,
+handled as above, while a request that presents one is refused with `500`. Deleting a strategy is not
+refused while a surface uses it; the dashboard asks for confirmation first and lists the
+surfaces whose Access Point or Surface Variants reference it.
+
+### JWT bearer signing keys
+
+A strategy with a remote `jwks_uri` has its JSON Web Key Set fetched and cached by
+[`JwksClient`](../src/jwt_bearer/jwks.rs). Each node keeps its own cache.
+
+| Behaviour | Rule |
+| --- | --- |
+| Cache key | One key set per strategy, used only while the strategy's `jwks_uri` and `updated_at` match the ones it was fetched for. A strategy edited on any node, through the API or on disk, is a cache miss once the node reads the edited record. |
+| Eviction | Updating or deleting a strategy through the API evicts its key set. A standby that becomes Active drops every cached key set (see [Server mode](CONFIGURATION_RELOAD.md#server-mode)). |
+| Lifetime | `Cache-Control: max-age`, clamped to between 60 seconds and 24 hours; 24 hours when the header is absent. |
+| Unknown `kid` | A token whose `kid` is not in a fresh key set triggers at most one refetch per strategy every 60 seconds. Inside that window it fails as `Key not found for kid`, an invalid credential like any other. |
+| Concurrency | Concurrent requests for one strategy share one fetch. |
+| Fetch failure | The next fetch waits 10 seconds. When a refresh of an expired key set fails, the last good set keeps serving for up to one hour past its expiry; after that, or with no good set, the request is refused with `500`. |
+| Limits | A response body over 64 KiB, more than 64 keys, a repeated `kid`, or a key without a `kid` in a set of several keys is a failed fetch. `POST /v1/jwt-verification-strategies/validate-jwks-uri` applies the same limits. |
+
+The fetch is pinned to the vetted address under the cloud-metadata-only posture, with no
+redirects ([`fetch.rs`](../src/jwt_bearer/fetch.rs); see
+[`POLICY.md`](POLICY.md#other-pinned-egress-sinks)). A strategy with a static key set is never
+fetched or cached. Each network fetch of a strategy's key set, successful or failed, is counted
+by result in `agent_gateway_jwks_fetch_total`
+([`OBSERVABILITY.md`](OBSERVABILITY.md#trust-plane-metrics)); a cache hit and the
+`validate-jwks-uri` probe are not counted. A host that does not resolve fails as `blocked`, and
+resolving it times out after 10 seconds as `unreachable`.
+
+### Authorization server discovery
+
+A strategy can pin its authorization server's metadata. Discovery runs through the shared
+[authorization server metadata module](#authorization-server-metadata-module-developer-reference)
+with `expected_issuer` as the issuer, so the document's `issuer` must equal it byte for byte,
+trailing slash included, and name a `token_endpoint` and a `jwks_uri` that do not use a weaker
+scheme than the issuer. The pin, `authorization_server`, holds `issuer`, `metadata_url` (the
+document that answered), `token_endpoint` and `jwks_uri`. It does not change `jwks_source`,
+and token verification does not read it.
+
+| Request | Behaviour |
+| --- | --- |
+| `POST /v1/jwt-verification-strategies/discover` with `{"issuer": ...}` | Returns the metadata a save would pin, and stores nothing |
+| Save with `discover_metadata: true` | Discovers and pins. If discovery fails, the save is refused with `422` and nothing is stored |
+| Save with `discover_metadata: false` | Clears the pin |
+| Save without `discover_metadata` | Keeps the pin, if any. When a pinned strategy's issuer or remote `jwks_uri` changed, discovers again. If that fails, or the caller is past the probe limit, the save still answers `200` and logs a warning; the old pin is kept only when its issuer still equals the expected issuer (only the remote `jwks_uri` changed) and is cleared otherwise. A tenant-scoped caller that moves the issuer to an `http` URL always has its pin cleared: the strict posture refuses the issuer as `invalid_url` before any request |
+
+`POST /v1/jwt-verification-strategies/validate-jwks-uri` stays for strategies whose
+`jwks_uri` is entered by hand; `discover` returns the discovered `jwks_uri` as well.
+
+Both endpoints, and a save that discovers, make an outbound request on the caller's behalf, so
+they share one set of rules ([`handlers.rs`](../src/jwt_bearer/handlers.rs)):
+
+| Rule | Detail |
+| --- | --- |
+| Permission | `jwt_verification_strategies.edit` |
+| Egress posture | The cloud-metadata-only posture (cloud metadata blocked; http, loopback and RFC 1918 allowed), and the strict posture for a tenant-scoped PAT, which also blocks loopback, RFC 1918, link-local and unique-local addresses. Under the strict posture discovery and `validate-jwks-uri` accept `https` only: an `http` issuer or JWKS URI fails with `invalid_url` before any lookup, and an `http` endpoint in the document makes it invalid. Each request is pinned to the vetted address unless a proxy is configured (see the module's [DNS limit](#authorization-server-metadata-module-developer-reference)), does not follow redirects, and reads at most 64 KiB. A discovery fetch has 10 seconds to resolve the host and 10 more for the request, and discovery makes up to three fetches for an issuer with a path and two for one without, so it takes at most 60 or 40 seconds. |
+| Limit | Up to 10 probes per user at once, replenished at one every 6 seconds; past that, `429` with code `rate_limited`. A save that cannot re-discover because of the limit keeps its pin only when the issuer is unchanged, and clears it otherwise. |
+| Errors | A fixed `code` and message, never the resolved address or the transport error. Discovery uses the [module's codes](#authorization-server-metadata-module-developer-reference): `invalid_url`, `blocked` (also a host name that does not resolve), `unreachable`, `http_status`, `too_large`, `invalid_document`, `issuer_mismatch`. `validate-jwks-uri` uses `invalid_url`, `blocked` (also a host name that does not resolve), `unreachable`, `http_error`, `too_large`, `invalid_document`. `discover` and saves answer `422`; `validate-jwks-uri` answers `400` with `valid: false`. |
+| Audit | Each probe logs an `audit` event `jwt_verification_strategy.probe` with the probe kind (`discover`, `jwks_uri` or `save`), the caller, the tenant, the posture, the host and the result: `ok` or the failure code, which a failed probe also logs in a warning. The `discover` and `save` probes record the discovery codes, so a metadata server that answers outside 2xx is recorded as `http_status`. The `jwks_uri` probe records `http_error` for the same answer, so a rule that matches failed probes by result must match both. |
+
+Every discovery is also counted in `agent_gateway_discovery_total`
+([trust plane metrics](OBSERVABILITY.md#trust-plane-metrics)), and each strategy create, update
+or delete records a `verification_strategy_changed` configuration event that says whether the
+pin changed ([governance audit forwarding](OBSERVABILITY.md#governance-audit-forwarding)).
+
+**Microsoft Entra.** Only tenant-specific authorities work, such as
+`https://login.microsoftonline.com/<tenant id>/v2.0`. The multi-tenant authorities (`common`,
+`organizations`) advertise `{tenantid}` in their issuer, which fails the exact match, and a
+strategy whose `expected_issuer` contains `{` or `}` is refused with `400`: the gateway never
+matches issuer templates.
+
+**Other consumers of a strategy.** STS subject and ID-JAG verification ([`STS.md`](STS.md))
+selects a strategy by `expected_issuer` and checks no audience; modern consent verifies the
+provider's ID token against `consent_identity_strategy_id` with the client id as audience
+([`MCP_METADATA.md`](MCP_METADATA.md)); credential providers reference a strategy only through
+that field. None of them reads `authorization_server`, so a pin never changes which tokens
+they accept. The field is left out of the stored record when unset, so a strategy saved before
+the field existed keeps the digest that a consent record bound to it.
 
 ### mTLS
 
@@ -183,9 +264,11 @@ applies to the metadata URL at fetch time. It also applies to the discovered
 `localhost` name in a blocked range makes the document invalid. A name that only resolves to
 a private address cannot be known without DNS, so it passes parsing. The caller must therefore
 fetch these URLs with `get_bounded`, or another pinned client, under the same posture, which
-blocks such a name at fetch time. The JWT Bearer `JwksFetcher` always uses the
-cloud-metadata-only pinned client, so a `jwks_uri` discovered under `Strict` must not be
-handed to it; fetch it with `get_bounded` under `Strict`.
+blocks such a name at fetch time. The JWT Bearer `JwksClient` fetches a strategy's key set
+for verification (`get_key`) only under the cloud-metadata-only posture; only `fetch_jwks`,
+used by `validate-jwks-uri`, takes the caller's posture. So a `jwks_uri` discovered under
+`Strict` must not be handed to the verification cache; fetch it with `get_bounded` under
+`Strict`.
 
 A failure is a `DiscoveryError`. `failure()` returns the `DiscoveryFailure`, `code()` a
 stable string, `message()` fixed text that is safe in an API response (it never carries a

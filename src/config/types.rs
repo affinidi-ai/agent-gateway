@@ -642,7 +642,7 @@ impl std::fmt::Display for ChannelProtocol {
 /// Configures how the gateway injects credentials into requests
 /// to external target services/agents. This is used when the gateway
 /// needs to authenticate WITH external endpoints on behalf of managed agents.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TargetAuthConfig {
     /// Method for obtaining credentials
     pub method: TargetAuthMethod,
@@ -678,6 +678,17 @@ pub enum TargetAuthMethod {
         /// The placeholder {value} will be replaced with the secret value
         #[serde(default = "default_header_format")]
         header_format: String,
+    },
+    /// Use a gateway token or API key from a credential provider
+    CredentialProvider {
+        /// Credential provider record id
+        credential_provider_id: String,
+        /// Scopes to request; empty means the provider's default scopes
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        scopes: Vec<String>,
+        /// How the credential is sent; `meta` is not allowed
+        #[serde(default)]
+        inject_as: CredentialInjection,
     },
 }
 
@@ -1162,7 +1173,7 @@ pub enum ElicitFallback {
 }
 
 /// How to inject delegated credentials into outbound requests
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CredentialInjection {
     /// Authorization: Bearer {token}

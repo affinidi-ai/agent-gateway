@@ -333,22 +333,7 @@ async fn modern_fabric_response_preserves_every_result_field() {
 
 #[tokio::test]
 async fn fabric_mcp_requests_are_validated_on_receive() {
-    if std::env::var_os("AG_MCP_RECEIVE_REGRESSION_CHILD").is_none() {
-        let test_name = std::thread::current()
-            .name()
-            .expect("test thread name")
-            .to_string();
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", &test_name, "--nocapture"])
-            .env("AG_MCP_RECEIVE_REGRESSION_CHILD", "1")
-            .output()
-            .expect("run receiver regression with isolated globals");
-        assert!(
-            output.status.success(),
-            "isolated receiver regression failed:\n{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+    if crate::gateways::test_helpers::rerun_in_isolated_process() {
         return;
     }
 
@@ -2713,22 +2698,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
 async fn fabric_receive_logs_forwarded_header_names_without_values() {
     use tracing::instrument::WithSubscriber;
 
-    if std::env::var_os("AG_MCP_RECEIVE_REGRESSION_CHILD").is_none() {
-        let test_name = std::thread::current()
-            .name()
-            .expect("test thread name")
-            .to_string();
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", &test_name, "--nocapture"])
-            .env("AG_MCP_RECEIVE_REGRESSION_CHILD", "1")
-            .output()
-            .expect("run receiver regression with isolated globals");
-        assert!(
-            output.status.success(),
-            "isolated receiver regression failed:\n{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+    if crate::gateways::test_helpers::rerun_in_isolated_process() {
         return;
     }
 

@@ -7,6 +7,7 @@ import { formatDateTime, topAndTail } from '../../utils/stringUtils';
 import { AppButton } from '../../components/shared/AppButton';
 import { EmptyState } from '../../components/shared/EmptyState';
 import { DOCS_URL } from '../../config/docs';
+import { surfacesUsingStrategy, type SurfaceRef } from '../../utils/strategyUsage';
 
 export interface JwksSource {
   type: 'remote' | 'static';
@@ -19,6 +20,7 @@ export interface JwtVerificationStrategy {
   name: string;
   expected_issuer: string;
   jwks_source: JwksSource;
+  authorization_server?: { issuer: string } | null;
   created_at: string;
   updated_at: string;
 }
@@ -42,6 +44,9 @@ const StrategiesTab: React.FC<StrategiesTabProps> = ({
   const searchTerm = externalProvided ? externalSearchTerm! : internalSearchTerm;
   const setSearchTerm = setInternalSearchTerm;
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [confirming, setConfirming] = useState<JwtVerificationStrategy | null>(null);
+  const [usedBy, setUsedBy] = useState<SurfaceRef[] | 'loading' | 'unknown'>('loading');
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   const canEdit = hasPermission('jwt_verification_strategies.edit');
   const canDelete = hasPermission('jwt_verification_strategies.delete');
@@ -67,15 +72,22 @@ const StrategiesTab: React.FC<StrategiesTabProps> = ({
     }
   };
 
-  const handleDelete = async (strategy: JwtVerificationStrategy) => {
-    if (
-      !window.confirm(
-        `Delete JWT verification strategy "${strategy.name}"?\n\nWarning: any channel still referencing this strategy will return 403.`
-      )
-    ) {
-      return;
+  const askDelete = async (strategy: JwtVerificationStrategy) => {
+    setConfirming(strategy);
+    setDeleteError(null);
+    setUsedBy('loading');
+    try {
+      const response = await apiClient.fetch('/api/v1/surfaces');
+      if (!response.ok) throw new Error(response.statusText);
+      setUsedBy(surfacesUsingStrategy(await response.json(), strategy.id));
+    } catch {
+      setUsedBy('unknown');
     }
+  };
+
+  const handleDelete = async (strategy: JwtVerificationStrategy) => {
     setDeletingId(strategy.id);
+    setDeleteError(null);
     try {
       const response = await apiClient.fetch(
         `/api/v1/jwt-verification-strategies/${encodeURIComponent(strategy.id)}`,
@@ -85,8 +97,9 @@ const StrategiesTab: React.FC<StrategiesTabProps> = ({
         throw new Error(`Delete failed: ${response.statusText}`);
       }
       setStrategies(prev => prev.filter(s => s.id !== strategy.id));
+      setConfirming(null);
     } catch (e: any) {
-      alert(`Failed to delete strategy: ${e.message}`);
+      setDeleteError(e.message ?? 'Delete failed');
     } finally {
       setDeletingId(null);
     }
@@ -150,6 +163,66 @@ const StrategiesTab: React.FC<StrategiesTabProps> = ({
             </div>
           )}
 
+          {confirming && (
+            <div
+              className="alert alert-warning"
+              role="alertdialog"
+              aria-labelledby="strategy-delete-title"
+              data-testid="strategy-delete-confirm"
+            >
+              <strong id="strategy-delete-title">
+                Delete JWT verification strategy &quot;{confirming.name}&quot;?
+              </strong>
+              <p className="mb-1 mt-2">A surface that still references it cannot verify tokens.</p>
+              <div aria-live="polite">
+                {usedBy === 'loading' && <p className="mb-1">Checking which surfaces use it…</p>}
+                {usedBy === 'unknown' && (
+                  <p className="mb-1">Could not check which surfaces use it.</p>
+                )}
+                {Array.isArray(usedBy) && usedBy.length === 0 && (
+                  <p className="mb-1">No surface uses it.</p>
+                )}
+                {Array.isArray(usedBy) && usedBy.length > 0 && (
+                  <>
+                    <p className="mb-1">
+                      Used by {usedBy.length} {usedBy.length === 1 ? 'surface' : 'surfaces'}:
+                    </p>
+                    <ul className="mb-2">
+                      {usedBy.map(surface => (
+                        <li key={surface.id}>{surface.name}</li>
+                      ))}
+                    </ul>
+                  </>
+                )}
+              </div>
+              {deleteError && (
+                <div className="text-danger mb-2" role="alert" data-testid="strategy-delete-error">
+                  {deleteError}
+                </div>
+              )}
+              <AppButton
+                variant="danger"
+                size="sm"
+                className="me-2"
+                data-testid="strategy-delete-confirm-button"
+                onClick={() => handleDelete(confirming)}
+                loading={deletingId === confirming.id}
+                loadingLabel="Deleting"
+              >
+                Delete strategy
+              </AppButton>
+              <AppButton
+                variant="secondary"
+                size="sm"
+                data-testid="strategy-delete-cancel-button"
+                onClick={() => setConfirming(null)}
+                disabled={deletingId === confirming.id}
+              >
+                Cancel
+              </AppButton>
+            </div>
+          )}
+
           {loading && (
             <div className="text-center py-4">
               <div className="spinner-border text-primary" role="status" />
@@ -202,11 +275,21 @@ const StrategiesTab: React.FC<StrategiesTabProps> = ({
                   {filtered.map(strategy => (
                     <tr
                       key={strategy.id}
+                      data-testid={`strategy-row-${strategy.id}`}
                       onClick={() => navigate(`/jwt-verification-strategies/${strategy.id}`)}
                       style={{ cursor: 'pointer' }}
                     >
                       <td>
                         <strong>{strategy.name}</strong>
+                        {strategy.authorization_server && (
+                          <span
+                            className="badge text-bg-success ms-2"
+                            data-testid="strategy-discovered-badge"
+                            title="An authorization server is pinned from discovery"
+                          >
+                            Discovered
+                          </span>
+                        )}
                         <div>
                           <small className="text-muted">
                             {topAndTail(strategy.expected_issuer, 30, 20)}
@@ -264,10 +347,14 @@ const StrategiesTab: React.FC<StrategiesTabProps> = ({
                           <AppButton
                             variant="outline-danger"
                             size="sm"
-                            onClick={() => handleDelete(strategy)}
+                            onClick={e => {
+                              e.stopPropagation();
+                              askDelete(strategy);
+                            }}
                             disabled={deletingId === strategy.id}
                             title="Delete"
                             aria-label={`Delete strategy ${strategy.name}`}
+                            data-testid={`strategy-delete-button-${strategy.id}`}
                             loading={deletingId === strategy.id}
                             loadingLabel="Deleting"
                           >

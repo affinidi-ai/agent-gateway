@@ -8,7 +8,9 @@ ignore = [
 
     # rsa 0.6.1 / 0.9.10 — Marvin Attack timing sidechannel (no fix available)
     # 0.6.1 transitive via: ssi-jwk → ssi
-    # 0.9.10 transitive via: jsonwebtoken, openidconnect, reqsign
+    # 0.9.10 transitive via: jsonwebtoken, openidconnect, reqsign; also a
+    # dev-dependency that generates test keys. The gateway's own RSA private-key
+    # operation, the RS256 JWT bearer assertion, is signed with ring, not rsa.
     "RUSTSEC-2023-0071",
 
     # rustls-webpki 0.101.7 — CRL parsing panic (fix requires ≥0.103.13)

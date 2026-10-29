@@ -257,9 +257,9 @@ Source auth does not refuse a request whose credential is missing or invalid. Th
 request continues with no caller identity, `input.source_auth` is
 `{"method": "failed", "attempted_method": ..., "reason": ...}`. On every forwarding
 path (direct inbound, `proxy://` MCP Targets, `a2a-proxy://` Targets, Fabric send and
-Fabric receive, the last for surfaces without protected resource metadata) the stored
-target credential, or the A2A proxy's Direct Line secret, is not attached, because it
-vouches that the gateway vetted the caller. A surface that
+Fabric receive, the last for surfaces without protected resource metadata) the surface's
+Target Authentication credential, or the A2A proxy's Direct Line secret, is not attached,
+because it vouches that the gateway vetted the caller. A surface that
 must reject such callers needs a policy that denies `input.source_auth.method == "failed"`.
 Server-side source-auth errors (missing configuration, internal failures) still block
 with `500`. A request to an MCP Access Point that publishes protected resource
@@ -356,28 +356,47 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   `AG_TEST_MODE=true`, `AG_BDD_EGRESS_ALLOWLIST` can admit an exact loopback
   fixture (never cloud metadata); the MCP conformance runner uses this for its
   REST fixture.
+- `egress::pinned_configured_client` also pins every **credential provider token
+  request** the gateway sends: Client Credentials and JWT bearer grants, the
+  legacy consent flow's code exchange and refresh, and the refresh of a modern
+  delegated credential (`src/delegation_vault/gateway_token.rs`,
+  `src/delegation_vault/oauth.rs`). Redirects are off and the response is read
+  to at most 64 KiB. See
+  [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#gateway-grants).
 - `egress::pinned_forward_client` (cloud-metadata-only) pins the **JWKS** fetch
-  (`src/jwt_bearer/jwks.rs`, fresh client per fetch) and the **x402
-  remote-facilitator** client (`src/x402/remote_facilitator.rs`, re-pinned per
-  construction, resolve/pin on `spawn_blocking` off the async runtime).
+  (`src/jwt_bearer/fetch.rs`) and **authorization server discovery**
+  (`src/authz_metadata/`), each with a fresh client per fetch and a 64 KiB body
+  cap. The management probes that fetch on a caller's behalf (`discover`,
+  `validate-jwks-uri` and a save that discovers) use `egress::pinned_strict_client`
+  instead when the caller is a tenant-scoped PAT, under which discovery and the
+  JWKS URI check accept `https` only. The probes need the edit permission, are
+  limited per user and answer with fixed error codes; see
+  [`SOURCE_AUTH.md`](SOURCE_AUTH.md#authorization-server-discovery).
+- `egress::pinned_forward_client` also pins the **x402 remote-facilitator** client
+  (`src/x402/remote_facilitator.rs`, re-pinned per construction, resolve/pin on
+  `spawn_blocking` off the async runtime).
 - `egress::pinned_forward_client` pins the **event hook** call (`src/event_hook/transport.rs`),
   the operator-configured `AG_EVENT_HOOK_URL` ([`INTEGRATIONS.md`](INTEGRATIONS.md#event-hook)):
   loopback and private receivers are allowed, cloud metadata is blocked, redirects are not followed.
   The mediator directory request (`AG_MEDIATOR_DIRECTORY_URL`, [`INTEGRATIONS.md`](INTEGRATIONS.md#mediator-directory))
   uses the same client and the same rules.
 - `egress::pinned_forward_client` also pins the **agent-card fetch** from an
-  `http(s)` surface target whenever it carries `target.auth`
+  `http(s)` surface target whenever it attaches the surface's Target
+  Authentication credential
   (`src/proxy/handler.rs::fetch_agent_card_from_surface_target`), so the
   credential cannot follow a 3xx to another host. A 3xx answers `502`
   "Upstream redirected"; a blocked target answers `403` "Request blocked by
   egress policy". It shares the `pinned_target_client` helper with the
-  inbound forward step. Without `target.auth` the fetch
+  inbound forward step. Without a credential the fetch
   uses the shared proxy client, which returns a 3xx rather than following it
   but is not pinned.
 - Fabric receive's **agent-card hop** to the local Target, made for the GW2
-  policy context, uses the forward's `forward_client_for`
-  (`egress::pinned_forward_client` for an `http(s)` Target), so it is pinned
-  and does not follow redirects. A blocked target or a redirect yields no card.
+  policy context, goes through `fetch_target_card`
+  (`src/proxy/target_card.rs`): each of the surface's agent card URLs in turn,
+  on `egress::pinned_forward_client`, so it is pinned and does not follow
+  redirects, with the surface's Target Authentication attached as the gateway
+  itself. A URL that is blocked or answers a redirect is skipped, and a
+  fallback that refuses to fetch without the credential yields no card.
 - The Transit Point's **agent-card fetch** for target-leg Trust Check and
   agent context (`src/proxy/outbound_handler.rs::fetch_agent_card`) pins each
   well-known URL with `egress::pinned_forward_client`, the forward step's
@@ -506,6 +525,18 @@ documented here so operators can assess exposure.
   to loopback, an unspecified address or cloud metadata after validation is
   refused. It does not refuse a rebind to an RFC 1918 address, because that
   policy allows RFC 1918.
+- **Token endpoints may resolve to RFC 1918 addresses.** Credential provider
+  token requests use the Configured policy, which refuses loopback, unspecified
+  and cloud metadata addresses but allows private ones, so an IdP on a private
+  network keeps working. On a multi-tenant appliance a tenant administrator can
+  therefore point a Client Credentials or JWT bearer provider at an internal
+  service and have the gateway POST a token request to it; JWT bearer endpoints
+  must be https. The response body is never returned, logged or recorded, so the
+  request is blind.
+- **The modern consent callback's code exchange is not pinned.** It checks the
+  token endpoint with `validate_oauth_endpoint_url` and then sends on the shared
+  external client (`src/delegation_vault/modern_consent.rs`), so a host whose DNS
+  answer changes between the check and the connection can be reached.
 - **The process-wide Legacy-SSE session cache** (keyed by `base_url`) can reuse a
   non-discovery session's client for a discovery GET. The POST origin-lock closes
   the metadata vector regardless, but the reused GET leg is not pinned.

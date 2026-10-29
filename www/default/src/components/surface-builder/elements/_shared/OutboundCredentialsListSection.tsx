@@ -4,6 +4,7 @@ import { apiClient } from '../../../../api';
 import AddResourceLink from '../../../shared/AddResourceLink';
 import { deepLinks } from '../../../../utils/deepLinks';
 import FieldHelp from '../../../shared/FieldHelp';
+import { filterProvidersForUse, keptProviderLabel } from '../../../../utils/credentialProviders';
 
 interface CredentialProviderOption {
   id: string;
@@ -166,6 +167,8 @@ const OutboundCredentialsListSection: React.FC<Props> = ({ rows, onChange }) => 
     };
   }, []);
 
+  const eligible = filterProvidersForUse(providers, 'legacy_delegation');
+
   const addRow = () => onChange([...rows, { ...EMPTY_ROW }]);
 
   const removeRow = (idx: number) => onChange(rows.filter((_, i) => i !== idx));
@@ -204,7 +207,7 @@ const OutboundCredentialsListSection: React.FC<Props> = ({ rows, onChange }) => 
             <i className="fas fa-trash" />
           </button>
 
-          <Form.Group className="mb-2">
+          <Form.Group className="mb-2" controlId={`outbound-credentials-${idx}-provider`}>
             <Form.Label className="small text-muted mb-0">Credential Provider</Form.Label>
             <Form.Select
               size="sm"
@@ -213,22 +216,22 @@ const OutboundCredentialsListSection: React.FC<Props> = ({ rows, onChange }) => 
               disabled={loading}
             >
               <option value="">{loading ? '-- Loading… --' : '-- Select provider --'}</option>
-              {providers.map(p => (
+              {eligible.map(p => (
                 <option key={p.id} value={p.id}>
                   {p.name}
                   {p.provider_id ? ` (${p.provider_id})` : ''}
                 </option>
               ))}
               {row.credential_provider_id &&
-                !providers.some(p => p.id === row.credential_provider_id) && (
+                !eligible.some(p => p.id === row.credential_provider_id) && (
                   <option value={row.credential_provider_id}>
-                    {row.credential_provider_id} (not in list)
+                    {keptProviderLabel(providers, row.credential_provider_id)}
                   </option>
                 )}
             </Form.Select>
             {!loading && (
               <Form.Text className="text-muted d-block" style={{ fontSize: '10px' }}>
-                {providers.length === 0
+                {eligible.length === 0
                   ? 'No credential providers configured yet. '
                   : "Don't see the one you need? "}
                 <AddResourceLink

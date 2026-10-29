@@ -411,6 +411,7 @@ const RouteListenerSection: React.FC<RouteListenerSectionProps> = ({
             </div>
             <Form.Select
               size="sm"
+              data-testid="route-listener-listen-address"
               value={selectedHostPort}
               onChange={e => handleHostPortChange(e.target.value)}
               disabled={!routingConfig || availableAddresses.length === 0}
@@ -447,6 +448,7 @@ const RouteListenerSection: React.FC<RouteListenerSectionProps> = ({
           </div>
           <Form.Select
             size="sm"
+            data-testid="route-listener-surface-prefix"
             value={selectedPrefix}
             onChange={e => writeRouteParts(e.target.value, customPath)}
             disabled={!routingConfig || channelPrefixes.length === 0}
@@ -483,6 +485,7 @@ const RouteListenerSection: React.FC<RouteListenerSectionProps> = ({
           <Form.Control
             size="sm"
             type="text"
+            data-testid="route-listener-custom-path"
             placeholder="my-agent/v1"
             value={customPath.startsWith('/') ? customPath.substring(1) : customPath}
             isInvalid={!!hasAttemptedSave && !!pathError}

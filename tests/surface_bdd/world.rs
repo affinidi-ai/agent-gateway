@@ -11,13 +11,14 @@ use crate::bdd_support::actors::{
 use crate::bdd_support::gateway_process::GatewayProcess;
 use crate::bdd_support::jwt::JwksServer;
 use crate::bdd_support::mock_server::{MockResponse, MockServer, ReceivedRequest};
+use crate::bdd_support::oidc::OidcProvider;
 use crate::bdd_support::temp::TempDirGuard;
 
 pub use crate::bdd_support::config::single_surface_fixture::{
     ApiKeyProviderSourceAuthConfig, ApiKeySourceAuthConfig, CredentialProviderKind, DelegatedCredentialInjection,
     JwtSourceAuthConfig, RequestPolicyFixture, SurfaceConfigBuilder, SurfaceCredentialDelegationConfig,
-    SurfaceCustomMetadataConfig, SurfaceSourceAuthConfig, SurfaceTargetAuthConfig, SurfaceTransitPointConfig,
-    TransitPointHeaderMetadataMappingRow, TransitPointManagedIdentityConfig,
+    SurfaceCustomMetadataConfig, SurfaceSourceAuthConfig, SurfaceTargetAuthConfig, SurfaceTargetTokenAuthConfig,
+    SurfaceTransitPointConfig, TransitPointHeaderMetadataMappingRow, TransitPointManagedIdentityConfig,
 };
 
 use tempfile::TempDir;
@@ -140,6 +141,8 @@ pub struct SurfaceWorld {
     pub a2a_stream_ended: bool,
     /// The query of the last OAuth callback sent with a gateway-issued state.
     pub oauth_callback_query: Option<String>,
+    /// OAuth providers that grant the gateway its own access token, by name.
+    pub oauth_providers: HashMap<String, OidcProvider>,
     pub temp_dir: TempDir,
     pub debug: bool,
     pub runtimes: RuntimeRegistry,
@@ -203,6 +206,7 @@ impl SurfaceWorld {
             a2a_stream_events: Vec::new(),
             a2a_stream_ended: false,
             oauth_callback_query: None,
+            oauth_providers: HashMap::new(),
             temp_dir: get_default_temp_dir(),
             debug: is_debug,
             runtimes: RuntimeRegistry::default(),

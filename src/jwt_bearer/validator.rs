@@ -89,7 +89,7 @@ impl JwtBearerVerifier {
         let jwk = match &strategy.jwks_source {
             JwksSource::Remote { jwks_uri } => {
                 self.jwks_client
-                    .get_key(&strategy.id, jwks_uri, &kid)
+                    .get_key(strategy, jwks_uri, &kid)
                     .await?
             }
             JwksSource::Static { jwks } => crate::jwt_bearer::jwks::get_static_key(jwks, &kid)?,
@@ -296,7 +296,6 @@ BNGV7kU9kiKxYO6H5k+Yb+kp
     fn make_strategy() -> JwtVerificationStrategy {
         JwtVerificationStrategy {
             id: "test-strategy-id".to_string(),
-            tenant_id: None,
             name: "Test IdP".to_string(),
             expected_issuer: "https://issuer.example.com".to_string(),
             jwks_source: JwksSource::Remote {
@@ -304,6 +303,7 @@ BNGV7kU9kiKxYO6H5k+Yb+kp
             },
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            ..Default::default()
         }
     }
 
@@ -603,12 +603,12 @@ BNGV7kU9kiKxYO6H5k+Yb+kp
         };
         JwtVerificationStrategy {
             id: "static-strategy-id".to_string(),
-            tenant_id: None,
             name: "Static Test IdP".to_string(),
             expected_issuer: "https://issuer.example.com".to_string(),
             jwks_source: JwksSource::Static { jwks: vec![jwk] },
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            ..Default::default()
         }
     }
 

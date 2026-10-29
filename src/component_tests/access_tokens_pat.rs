@@ -1482,13 +1482,17 @@ async fn jwt_strategies_app() -> JwtStrategiesApp {
     let auth =
         AuthGuardState::new(sessions.clone(), Some(users.clone()), Arc::new(crate::terms::TermsManager::disabled()))
             .with_pat_authenticator(Some(store.clone()));
-    let app = crate::jwt_bearer::router::create_jwt_verification_strategies_router(strategies.clone())
-        .layer(middleware::from_fn(crate::auth_manager::middleware::extract_user_id))
-        .layer(middleware::from_fn_with_state(auth, require_session_auth))
-        .layer(Extension(sessions.clone()))
-        .layer(Extension(users))
-        .layer(Extension(Arc::new(crate::rbac::RbacConfig::default())))
-        .layer(Extension(Arc::new(crate::jwt_bearer::JwksClient::new())));
+    let app = crate::jwt_bearer::router::create_jwt_verification_strategies_router(
+        crate::jwt_bearer::handlers::JwtVerificationStrategyState::new(
+            strategies.clone(),
+            Arc::new(crate::jwt_bearer::JwksClient::new()),
+        ),
+    )
+    .layer(middleware::from_fn(crate::auth_manager::middleware::extract_user_id))
+    .layer(middleware::from_fn_with_state(auth, require_session_auth))
+    .layer(Extension(sessions.clone()))
+    .layer(Extension(users))
+    .layer(Extension(Arc::new(crate::rbac::RbacConfig::default())));
     JwtStrategiesApp {
         app,
         store,
@@ -1673,27 +1677,22 @@ async fn jwt_strategy_update_lets_a_pat_with_the_edit_scope_change_a_strategy() 
 }
 
 #[tokio::test]
-async fn jwks_uri_validation_refuses_a_pat_without_the_view_scope() {
+async fn outbound_probes_refuse_a_pat_with_only_the_view_scope() {
     let fixture = jwt_strategies_app().await;
-    let secret = create_owned_token(&fixture.store, &fixture.user_id, &["surfaces.view"]).await;
+    let secret = create_owned_token(&fixture.store, &fixture.user_id, &["jwt_verification_strategies.view"]).await;
 
-    assert_eq!(
-        json_request(
-            &fixture.app,
-            "POST",
-            "/v1/jwt-verification-strategies/validate-jwks-uri",
-            &secret,
-            serde_json::json!({ "uri": "not-a-url" })
-        )
-        .await,
-        StatusCode::FORBIDDEN
-    );
+    for (path, body) in [
+        ("/v1/jwt-verification-strategies/validate-jwks-uri", serde_json::json!({ "uri": "not-a-url" })),
+        ("/v1/jwt-verification-strategies/discover", serde_json::json!({ "issuer": "not-a-url" })),
+    ] {
+        assert_eq!(json_request(&fixture.app, "POST", path, &secret, body).await, StatusCode::FORBIDDEN, "{path}");
+    }
 }
 
 #[tokio::test]
-async fn jwks_uri_validation_lets_a_pat_with_the_view_scope_reach_the_probe() {
+async fn outbound_probes_let_a_pat_with_the_edit_scope_reach_the_probe() {
     let fixture = jwt_strategies_app().await;
-    let secret = create_owned_token(&fixture.store, &fixture.user_id, &["jwt_verification_strategies.view"]).await;
+    let secret = create_owned_token(&fixture.store, &fixture.user_id, &["jwt_verification_strategies.edit"]).await;
 
     assert_eq!(
         json_request(
@@ -1705,6 +1704,17 @@ async fn jwks_uri_validation_lets_a_pat_with_the_view_scope_reach_the_probe() {
         )
         .await,
         StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        json_request(
+            &fixture.app,
+            "POST",
+            "/v1/jwt-verification-strategies/discover",
+            &secret,
+            serde_json::json!({ "issuer": "not-a-url" })
+        )
+        .await,
+        StatusCode::UNPROCESSABLE_ENTITY
     );
 }
 
@@ -1738,7 +1748,6 @@ async fn seed_strategy(
     use crate::jwt_bearer::JwtVerificationStrategyStorage;
     strategies
         .create(crate::jwt_bearer::models::JwtVerificationStrategy {
-            id: String::new(),
             tenant_id: tenant_id.map(str::to_string),
             name: "Seeded strategy".to_string(),
             expected_issuer: "https://operator.example.com".to_string(),
@@ -1747,6 +1756,7 @@ async fn seed_strategy(
             },
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            ..Default::default()
         })
         .await
         .expect("seed strategy")

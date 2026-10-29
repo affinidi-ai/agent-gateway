@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Authorization server metadata discovery (RFC 8414, then OpenID Connect Discovery).
 //!
 //! [`discover`] fetches the metadata document of an issuer through a pinned,
@@ -58,6 +57,16 @@ pub enum EgressPosture {
     /// RFC 1918, link-local and unique-local addresses. An `http` URL fails with
     /// `invalid_url` before its host is resolved. For callers that must not reach the appliance's own network.
     Strict,
+}
+
+impl EgressPosture {
+    /// The name of the posture in logs: `cloud_metadata_only` or `strict`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CloudMetadataOnly => "cloud_metadata_only",
+            Self::Strict => "strict",
+        }
+    }
 }
 
 /// Limits applied to one discovery or bounded fetch.
@@ -180,7 +189,7 @@ impl DiscoveryError {
         self.failure.message()
     }
 
-    /// What went wrong in detail, for logs only.
+    #[cfg(test)]
     pub fn detail(&self) -> &str {
         &self.detail
     }
@@ -206,6 +215,12 @@ mod tests {
         assert_eq!(options.max_bytes, 64 * 1024);
         assert_eq!(options.max_bytes, MAX_METADATA_BYTES);
         assert_eq!(options.timeout, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn each_posture_has_its_log_name() {
+        assert_eq!(EgressPosture::CloudMetadataOnly.as_str(), "cloud_metadata_only");
+        assert_eq!(EgressPosture::Strict.as_str(), "strict");
     }
 
     #[test]

@@ -88,6 +88,14 @@ both routers deny every request instead of serving unauthenticated. The built-in
 `payments.view` and `payments.retry` to `poweruser` and `payments.edit` / `payments.delete` to
 `administrator`; the base `user` role holds no payments permission.
 
+## JWT verification strategy probes
+
+`POST /v1/jwt-verification-strategies/discover` and
+`POST /v1/jwt-verification-strategies/validate-jwks-uri` need `jwt_verification_strategies.edit`,
+not `.view`, because each makes an outbound request on the caller's behalf; a viewer-only user or
+a view-scoped token gets 403. See
+[`SOURCE_AUTH.md`](SOURCE_AUTH.md#authorization-server-discovery).
+
 ## Integrations
 
 Every route under `/v1/integrations` needs one of `integrations.view` (lists, reads and the

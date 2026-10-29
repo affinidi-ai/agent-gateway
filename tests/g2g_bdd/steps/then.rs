@@ -615,6 +615,41 @@ async fn mcp_server_did_not_receive_caller_access_token(
     );
 }
 
+#[then(expr = "managed agent {string} received the gateway token from OAuth provider {string} as a bearer token")]
+async fn managed_agent_received_gateway_token(
+    world: &mut G2gWorld,
+    target_name: String,
+    provider: String,
+) {
+    world
+        .topology
+        .actors
+        .expect_target_kind(&target_name, TargetActorKind::ManagedAgent);
+    let access_token = oauth_provider(world, &provider).access_token();
+    let request = last_request_for(world, &target_name).await;
+    assert_header_value(
+        &request.headers,
+        "authorization",
+        &format!("Bearer {access_token}"),
+        &format!("managed agent '{target_name}'"),
+    );
+}
+
+#[then(expr = "managed agent {string} did not receive the gateway token from OAuth provider {string}")]
+async fn managed_agent_did_not_receive_gateway_token(
+    world: &mut G2gWorld,
+    target_name: String,
+    provider: String,
+) {
+    let access_token = oauth_provider(world, &provider).access_token();
+    let (_, _, mock) = mock_for(world, &target_name);
+    assert_requests_omit_value(
+        &mock.requests().await,
+        access_token,
+        &format!("managed agent '{target_name}' (gateway token from '{provider}')"),
+    );
+}
+
 #[then(regex = r#"^OAuth provider "([^"]+)" received (\d+) token requests?$"#)]
 async fn oauth_provider_received_token_requests(
     world: &mut G2gWorld,

@@ -1097,4 +1097,43 @@ mod tests {
             stored.user_identity_hash
         );
     }
+
+    #[tokio::test]
+    async fn test_replaced_gateway_token_measures_its_refresh_margin_from_its_own_grant() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FileSystemDelegationVaultStore::new(directory.path().into())
+            .await
+            .unwrap();
+        let now = Utc::now();
+        let mut first = super::super::tests::make_token(Some(60), false);
+        first.consent_granted_at = now - Duration::seconds(1_000);
+        first.created_at = first.consent_granted_at;
+        first.expires_at = Some(first.consent_granted_at + Duration::seconds(60));
+        let first = store
+            .store(first)
+            .await
+            .unwrap();
+
+        let mut replacement = super::super::tests::make_token(Some(60), false);
+        replacement.id = uuid::Uuid::new_v4().to_string();
+        replacement.access_token = "replacement-gateway-token".into();
+        let replacement = store
+            .store(replacement)
+            .await
+            .unwrap();
+
+        assert_eq!(replacement.id, first.id);
+        assert_eq!(replacement.created_at, first.created_at);
+        let VaultLookupResult::Found(current) = store
+            .lookup(&first.agent_did, &first.user_identity_hash, &first.credential_provider_id)
+            .await
+            .unwrap()
+        else {
+            panic!("the replacement must be found and valid");
+        };
+        assert_eq!(current.access_token, "replacement-gateway-token");
+        assert!(!current.needs_refresh(Utc::now()));
+        assert!(!current.needs_refresh(current.consent_granted_at + Duration::seconds(29)));
+        assert!(current.needs_refresh(current.consent_granted_at + Duration::seconds(30)));
+    }
 }

@@ -61,12 +61,17 @@ Every new interactive element ships with a `data-testid`. Tests under `ui-tests/
 are the consumer; the convention is documented in
 [`ui-tests/README.md`](../../ui-tests/README.md).
 
-| Element       | Pattern                                                                              |
-| ------------- | ------------------------------------------------------------------------------------ |
-| Page root     | `page-<area>`                                                                        |
-| Action button | `<area>-<verb>-button`                                                               |
-| List item     | `<area>-card-<id>` or `<area>-row-<id>`                                              |
-| Wizard        | `wizard-<name>`, `wizard-step-<name>`, `wizard-next`, `wizard-back`, `wizard-submit` |
+| Element                 | Pattern                                                                                                                                                   |
+| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Page root               | `page-<area>`                                                                                                                                             |
+| Action button           | `<area>-<verb>-button`                                                                                                                                    |
+| List item               | `<area>-card-<id>` or `<area>-row-<id>`                                                                                                                   |
+| Wizard                  | `wizard-<name>`, `wizard-step-<name>`, `wizard-next`, `wizard-back`, `wizard-submit`                                                                      |
+| Form field              | `<form>-<field>`, for example `strategy-issuer`, `provider-token-endpoint`                                                                                |
+| Canvas                  | `surface-node-<type>`, `surface-canvas` (the canvas svg), `canvas-link` (each pipeline link)                                                              |
+| Element palette         | `palette-section-<category>` (section header), `palette-item-<type>`                                                                                      |
+| Surface Builder actions | `surface-starter-use-<templateId>`, `surface-create-button` and `surface-welcome-dismiss` (Add Surface page), `surface-save-button` (surface detail page) |
+| Caller Context editor   | `caller-auth-configure` (panel button), `caller-auth-jwt-strategy` (strategy select), `caller-auth-close-button`                                          |
 
 ## CLI consent page
 
@@ -111,6 +116,34 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   always-visible warning names the receiving gateway. Test ids:
   `<managed-agent|transit-point>-fabric-delegated-credentials-switch` and
   `-warning`. There is no surface-wide switch.
+- **Target Authentication** on the Managed Agent has None plus six types. Four are header presets
+  backed by a secret (`static_secret`). **Credential Provider** writes `{ credential_provider:
+  { credential_provider_id, scopes, inject_as } }` (field types in `utils/targetAuth.ts`,
+  config mapping in `managed-agent/targetAuthConfig.ts`). The provider picker
+  (`_shared/CredentialProviderPicker.tsx`, test id `target-auth-credential-provider-select`)
+  lists only providers whose type `permits` Target Authentication, so Authorization Code
+  providers are absent. A saved provider that is missing or not allowed shows a warning and is
+  kept until the operator picks another; the client cannot see the type at validation, so
+  the gateway rejects that combination on save and stays the authoritative check.
+  Scopes (`target-auth-scopes`, empty means the provider's default scopes) and the header shape (`target-auth-inject-as`: Authorization
+  Bearer, or a custom header with `target-auth-inject-name` and `-format`, which must
+  contain `{value}`, and a name other than `Host`, `Content-Length`, `Transfer-Encoding` or
+  `Connection`) sit beside it. The option is offered only for a direct URL, in both the
+  sidebar and the fullscreen editor: a `fabric://` target cannot use a provider on the sending
+  gateway. Save is blocked (`managedAgentDefinition.validate`) while the type is Credential
+  Provider and no provider is picked, the custom header name or `{value}` format is wrong, the
+  URL is not `https://`, or the endpoint is not a direct URL. The sixth type, **Unsupported method
+  (kept as saved)**, is never chosen by hand. Any `target.auth` variant the dashboard cannot
+  edit (an unknown method, `credential_lookup`, a `credential_provider` with an `inject_as`
+  type other than `bearer_header` or `custom_header`, or with fields the form does not model)
+  is hydrated into `target_auth_raw` and written
+  back byte for byte on save, unless the operator picks another type or None. A Transit Point
+  keeps its `target_auth` unchanged on save for every method while no `auth_type` is picked
+  (`hasUnpickedTargetAuth`, so a surface never opened in the panel loses nothing; the panel's
+  own notice uses `hasPreservedTargetAuth` and covers only the variants it cannot edit), and has no credential provider option because the backend rejects
+  one there.
+- The route controls of the Access Point panel have test ids: `route-listener-listen-address`,
+  `route-listener-surface-prefix` and `route-listener-custom-path`.
 - **Entry point URL** is the label for an Access Point's composed URL, with "The URL used to
   access this gateway" behind its `FieldHelp`. It shows at the top of the Access Point panel
   and as a banner along the top of the canvas, both rendered by `RouteListenerBanner`
@@ -364,6 +397,85 @@ Management personal access tokens live in the Secrets page's **Access Tokens** t
 
 Keep labels associated, timestamps exact, and clipboard failures visible.
 
+## JWT verification strategies
+
+- A failed save shows the gateway's message in `strategy-error` (role `alert`).
+- The editor (`EditJwtVerificationStrategyPage.tsx`) sends `discover_metadata` explicitly:
+  `true` after **Discover** (`strategy-discover-button`), `false` after **Clear pinned
+  metadata** (`strategy-pinned-clear`) or when the keys become static while a server is pinned,
+  and omitted otherwise, which keeps the pin. Discover posts `{ issuer }` to
+  `/api/v1/jwt-verification-strategies/discover`, needs Remote URL keys and an `https` issuer
+  (the editor refuses any other issuer in `strategy-discover-error` without calling the gateway,
+  which itself requires `https` only when the caller uses a tenant-scoped token, the strict
+  posture), and shows the result in the pinned card (`strategy-pinned-server`: issuer, metadata URL, token
+  endpoint, JWKS URI). A discovered JWKS URI replaces the typed one. Editing the issuer or JWKS
+  URI after Discover drops the result; a pin that no longer matches the issuer or JWKS URI shows
+  `strategy-pinned-stale`, which says that saving a changed issuer or JWKS URI tries discovery
+  again and, when that fails, still saves and clears the pin when the issuer changed (it keeps
+  the pin when only the JWKS URI changed), and that Discover pins matching metadata.
+  A failed discovery shows one generic `strategy-discover-error` alert, never the gateway's
+  detail.
+- The **Check URI** save gate applies only to a JWKS URI the operator typed or changed, not to a
+  discovered or unchanged one.
+- The authorization server fields (`authorization_server`) follow the gateway's discovery
+  response, which returns the pinned metadata at the top level of the body.
+- The list marks a strategy with a pinned server with a **Discovered** badge
+  (`strategy-discovered-badge`). Deleting asks in the page (`strategy-delete-confirm`, role
+  `alertdialog`, confirm and cancel buttons), lists the surfaces whose Access Point or variants
+  use the strategy (read from `/api/v1/surfaces`; "Could not check" when that fails), and states
+  that a caller presenting a token is refused with `500` and a caller without one is left to the
+  surface's policy (see `docs/SOURCE_AUTH.md#source-authentication`). A refused delete shows
+  inline in `strategy-delete-error`.
+- Provider-neutral trust is configured through JWT verification strategies and credential
+  providers; the dashboard has no OIDC Providers page.
+
+## Credential providers
+
+- One descriptor, `PROVIDER_TYPE_CAPABILITIES` in `utils/credentialProviders.ts`, is a
+  `Record<CredentialProviderType, ...>` so TypeScript rejects a type with no entry. The form
+  (`EditCredentialProviderPage`), the list (`CredentialProvidersTab`) and the pickers read it
+  for labels, badge colors, which fields apply, and which uses a type permits
+  (`providerPermits`, `filterProvidersForUse`). Never compare `provider_type` to a string
+  elsewhere. Request building and validation live in the same module
+  (`validateProviderForm`, `buildProviderBody`, `providerFormFromWire`).
+- **JWT Bearer** (`oauth2_jwt_bearer`) shows `jwt-bearer-section`: Signing Key Secret
+  (required), Algorithm (RS256 or ES256), Key ID, Assertion Issuer (required) and Subject.
+  The client ID and client secret references are optional and sent only as a pair. There is no
+  audience field: the assertion audience is always the token endpoint. The section carries an
+  always-visible `jwt-bearer-encryption-banner` because encryption at rest is off by default.
+  The signing key is an ordinary secret (type Certificate or General); the dashboard has no
+  separate private-key secret type. The assertion settings travel in a nested `jwt_bearer`
+  object (`signing_key_secret_ref`, `signing_algorithm`, `assertion_issuer`,
+  `assertion_subject`, `key_id`), which a save replaces as a whole. Clearing the optional
+  client references on an existing provider sends them as `null`; the gateway removes both
+  stored references (an omitted field keeps them), and the next grant sends no client
+  authentication.
+- Create and update both send `provider_type`, so changing the Provider Type of an existing
+  provider saves the new type; the gateway answers 409 while a surface uses the provider in a way
+  the new type cannot serve: Target Authentication with Authorization Code, or a delegation
+  binding that breaks the JWT Bearer binding rule (an https leg and caller authentication), or a
+  surface of another tenant uses the provider and the new type sends the gateway's own
+  credential (see `docs/CREDENTIAL_DELEGATION.md#binding-a-provider-to-a-surface`). A provider
+  whose `provider_type` the dashboard does not know opens read-only with `provider-unknown-type` (disabled form, no save button, no
+  `Cmd+S` save), so it can never be saved with a guessed type.
+- The delegation pickers (the surface-level outbound bindings and the Transit Point
+  credential binding) list only providers whose type permits `legacy_delegation`, and keep a
+  saved provider that is no longer allowed selectable with a `not usable here` label
+  (`keptProviderLabel`). They do not check the JWT Bearer binding rule; the gateway refuses such
+  a surface on save with 400. The Credential Delegation sidebar panel only looks up the bound
+  providers' callback URLs and does not filter.
+- The list deletes with the two-step `DeleteButton`. A refused delete (`409` while a surface
+  still uses the provider) shows the gateway's reason and status inline in
+  `credential-provider-delete-error` (role `alert`), never a native alert.
+- The strategy editor's **Discover** button calls `/discover`; see _JWT verification
+  strategies_.
+- Permissions: the list, add, delete, and the provider picker use `credential_providers.view`,
+  `.edit` and `.delete` (administrator by default, matching `src/rbac/mod.rs`), not
+  `settings.edit`. `/credential-providers/new` needs `.edit`, `/credential-providers/:id` needs
+  `.view` and shows the form read-only without `.edit`. Without `.view` the list shows a
+  notice and the Target Authentication picker keeps the saved provider id read-only, because a
+  role that can edit surfaces cannot list providers.
+
 ## Secret editor
 
 - `/secrets/new` and `/secrets/:id` have one save button, at the bottom of the form beside
@@ -374,6 +486,17 @@ Keep labels associated, timestamps exact, and clipboard failures visible.
   the value field is disabled with a **Stored value is hidden** placeholder until **Update
   Secret Value** is checked. Unchecking it, or a successful save, clears the entered value
   and returns the field to that hidden state.
+- Deleting a secret warns first when credential providers reference it, in the Secrets list and
+  in the editor (`hooks/useSecretDeleteGuard.tsx`; the guard is rendered once per page as
+  `warningNode`). The two-step delete button still comes first. The hook then reads the providers
+  (`providersUsingSecret` in `utils/credentialProviders.ts`: the list, then each provider, because
+  the list omits secret references) and, when any reference the secret's Secret ID, shows
+  `secret-delete-warning` (role `alertdialog`) naming them (`secret-delete-warning-provider`), with
+  `secret-delete-warning-confirm-button` (**Delete secret anyway**) and
+  `secret-delete-warning-cancel-button`. The gateway does not block the delete, so confirming
+  deletes. A secret nothing references deletes at once; a failed read shows
+  `secret-delete-warning-unknown` and still allows the delete; without `credential_providers.view`
+  there is no check.
 - **Show the value you entered** (`secret-value-reveal-checkbox`) appears only while the
   value field is editable, and reveals only what was typed or generated on this page. The
   value field is `secret-value-input`.

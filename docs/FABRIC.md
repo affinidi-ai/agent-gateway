@@ -396,6 +396,46 @@ with `Retry-After: 5`; the receiving gateway refuses with `capacity_reached`. Th
 does not recheck the caller's browser Origin against its own `mcp_http.allowed_origins`; it trusts
 the paired sending gateway's check, as it trusts that peer for every other forwarded header.
 
+### Target authentication over Fabric
+
+A provider's credential never crosses Fabric. A surface whose Target is `fabric://` cannot save
+`credential_provider` Target Authentication, and a record loaded from disk fails with 502
+whatever its fallback. The receiving gateway resolves its own surface's `credential_provider`
+for its `https` Target, with the same caller gate and path confinement as a local request: DIDComm
+proves the sending gateway, not the caller, so the receiving surface needs its own caller
+authentication. A forwarded `GET` counts as the gateway's own card fetch, and carries the
+credential without a caller, only when its upstream URL, query included, is exactly one of the
+receiving surface's agent card URLs. On a surface with Target Authentication the receiving gateway
+then sends a `GET` it builds itself: no caller body, and of the caller's headers only `Accept`,
+`Accept-Language` and `User-Agent`, with the credential set last. A method override header, a body
+or a peer's `Authorization` therefore never rides on a credentialed request. Any other public
+discovery read, including the card path with a query, skips caller authentication and is forwarded
+without the credential, whatever Target Authentication method the surface uses.
+
+On a forwarded call the receiving gateway sends at most one credential under a header name. When a
+header that arrived in the `ForwardRequest` (after the source-auth credential and mapped headers are
+stripped), or a delegated credential the receiving gateway injects, has the Target Authentication
+header's name, a `static_secret` header is not added, because the receiving gateway cannot tell a
+delegated credential from another caller header and per-caller authority wins. A
+`credential_provider` header instead fails the call with `HeaderConflict`: 502 whatever the
+fallback, with a `token_not_found` audit event whose detail is `target_auth_header_conflict`. Use a
+`custom_header` for one of them when a surface needs both.
+
+The receiving gateway's agent card read for its surface policy context uses `fetch_target_card`
+([`src/proxy/target_card.rs`](../src/proxy/target_card.rs)). It resolves the credential with the
+same function as the card route (`card_fetch_credential`): each agent card URL in turn, with the
+surface's Target Authentication and fallback. When the
+surface's fallback refuses to read the card without the credential, the read yields no card, the
+surface policy runs without card context, and no rejection is recorded. A forwarded call that
+fails Target Authentication is answered with a 502 `ForwardResponse` whose problem `detail` is
+`Target authentication failed`. A modern delegated credential the receiving gateway cannot
+inject is answered with a 500 problem `ForwardResponse` (`Invalid delegated credential metadata`
+or `Invalid delegated credential header`). A `static_secret` Target Authentication on the sending
+gateway travels in the `ForwardRequest`, unless a modern delegated credential on the same leg
+already uses its header name, in which case the delegated credential takes its place. The sending gateway's own card read for a `fabric://` surface goes through its
+Access Point and the Fabric, so the receiving gateway attaches the credential. See
+[Target Authentication through a provider](CREDENTIAL_DELEGATION.md#target-authentication-through-a-provider).
+
 ### Delegated credentials over Fabric
 
 A sending surface's `outbound_credentials` reach a `fabric://` peer only when the route to that

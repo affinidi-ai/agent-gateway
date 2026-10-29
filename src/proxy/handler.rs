@@ -568,51 +568,22 @@ impl CallerAssertion {
     }
 }
 
-pub(crate) async fn inject_target_auth_header(
-    target_auth: &crate::config::TargetAuthConfig,
-    secrets_store: &Option<Arc<dyn crate::secrets::SecretsStore>>,
-    channel_name: &str,
-    caller: CallerAssertion,
-) -> anyhow::Result<Option<(String, String)>> {
-    use crate::config::TargetAuthMethod;
-
-    if !caller.permits_target_credential() {
-        warn!(
-            channel = %channel_name,
-            "Refusing to inject target credentials: the caller was not authenticated"
-        );
-        return Ok(None);
-    }
-
-    match &target_auth.method {
-        TargetAuthMethod::StaticSecret {
-            secret_id,
-            header_name,
-            header_format,
-        } => {
-            let store = secrets_store
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("Secrets store not available"))?;
-
-            let secret = store
-                .get_by_secret_id(secret_id)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to load secret '{}': {}", secret_id, e))?
-                .ok_or_else(|| anyhow::anyhow!("Secret with secret_id '{}' not found", secret_id))?;
-
-            // Format the header value
-            let header_value = header_format.replace("{value}", &secret.value);
-
-            debug!(channel = channel_name, secret_id = %secret_id, header = %header_name, "Resolved target auth secret");
-
-            Ok(Some((header_name.clone(), header_value)))
-        }
-        TargetAuthMethod::CredentialLookup => {
-            // CredentialLookup method not yet implemented - using Secrets approach instead
-            warn!(channel = channel_name, "CredentialLookup method not implemented, skipping target auth injection");
-            Ok(None)
-        }
-    }
+/// Whether the surface authenticates its callers: caller authentication with at
+/// least one method, or MCP resource authorization.
+pub(crate) fn surface_authenticates_callers(surface: &crate::config::agent_surface::AgentSurface) -> bool {
+    surface
+        .access_point
+        .caller_authentication
+        .as_ref()
+        .is_some_and(|authentication| {
+            !authentication
+                .methods
+                .is_empty()
+        })
+        || surface
+            .mcp_http
+            .as_ref()
+            .is_some_and(|http| http.authorization.is_some())
 }
 
 /// Load and prepare DID:webvh identity context for a channel request
@@ -840,39 +811,22 @@ pub async fn handle_agent_card(
     let agent_card_was_synthesized = prepared_a2a_proxy_agent_card.is_some();
 
     // Build target URL, respecting override_agent_card_location if configured
-    let target_url = if prepared_a2a_proxy_agent_card.is_none()
-        && state
-            .surface
-            .override_agent_card_location()
-        && state
-            .surface
-            .agent_card_location_path()
-            .is_some()
-    {
-        let custom_path = state
-            .surface
-            .agent_card_location_path()
-            .unwrap();
-        let endpoint = &state.surface.target.endpoint;
-        let origin = if let Some(scheme_end) = endpoint.find("://") {
-            let after_scheme = &endpoint[scheme_end + 3..];
-            let authority_end = after_scheme
-                .find('/')
-                .unwrap_or(after_scheme.len());
-            &endpoint[..scheme_end + 3 + authority_end]
-        } else {
-            endpoint.as_str()
-        };
-        if custom_path.starts_with('/') {
-            format!("{}{}", origin, custom_path)
-        } else {
-            format!("{}/{}", origin, custom_path)
+    let target_url = match state
+        .surface
+        .agent_card_location_path()
+        .filter(|_| {
+            prepared_a2a_proxy_agent_card.is_none()
+                && state
+                    .surface
+                    .override_agent_card_location()
+        }) {
+        Some(custom_path) => {
+            crate::proxy::protocol_router::override_agent_card_url(&state.surface.target.endpoint, custom_path)
         }
-    } else {
-        crate::proxy::protocol_router::join_endpoint_path(
+        None => crate::proxy::protocol_router::join_endpoint_path(
             &state.surface.target.endpoint,
             "/.well-known/agent-card.json",
-        )
+        ),
     };
 
     let (mut agent_card, prepared_identity) = if let Some(prepared) = prepared_a2a_proxy_agent_card {
@@ -1587,7 +1541,7 @@ fn sse_session_limit_response(
     (StatusCode::TOO_MANY_REQUESTS, "Too many active SSE sessions").into_response()
 }
 
-async fn proxy_handler_with_mcp_runtime(
+pub(crate) async fn proxy_handler_with_mcp_runtime(
     addr: SocketAddr,
     state: ProxyState,
     req: Request,
@@ -6458,39 +6412,8 @@ async fn proxy_handler_with_mcp_runtime(
         }
     }
 
-    // Inject target authentication credentials (if configured)
-    if let Some(target_auth) = state.surface.target_auth() {
-        let caller_assertion = CallerAssertion::for_forwarded_request(method.as_str(), uri.path(), source_auth_failed);
-        match inject_target_auth_header(target_auth, &state.secrets_store, &channel_name, caller_assertion).await {
-            Ok(Some((header_name, header_value))) => {
-                upstream_req = upstream_req.header(&header_name, &header_value);
-                debug!(channel = channel_name, header = %header_name, "Injected target authentication header");
-            }
-            Ok(None) => {
-                // CredentialLookup method not implemented, skip
-            }
-            Err(e) => {
-                error!(channel = channel_name, error = %e, "Failed to resolve target authentication");
-                // Check fallback behavior
-                match target_auth.fallback {
-                    crate::config::TargetAuthFallback::Reject => {
-                        return Ok(create_error_response(
-                            StatusCode::BAD_GATEWAY,
-                            &format!("Target authentication failed: {}", e),
-                        ));
-                    }
-                    crate::config::TargetAuthFallback::Passthrough => {
-                        warn!(
-                            channel = channel_name,
-                            "Target auth failed but passthrough enabled, continuing without credentials"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
     // ── Credential delegation: inject delegated OAuth tokens or signal consent ──
+    let mut delegated_headers: Vec<axum::http::HeaderName> = Vec::new();
     let mut delegation_actions_for_vp: Option<serde_json::Value> = None;
     let mut outbound_credentials = state
         .surface
@@ -6622,6 +6545,15 @@ async fn proxy_handler_with_mcp_runtime(
                     false, // via_fabric = false (direct HTTP path)
                     Some(&delegation_audit_ctx),
                     delegation_consent_principal.as_deref(),
+                    state
+                        .surface
+                        .tenant_id
+                        .as_deref(),
+                    crate::proxy::target_credentials::permits_jwt_bearer_leg(
+                        &state.surface,
+                        &state.surface.target.endpoint,
+                        Some(&target_url),
+                    ),
                 ))
                 .await;
 
@@ -6839,7 +6771,19 @@ async fn proxy_handler_with_mcp_runtime(
                                 name,
                                 value,
                             } => {
-                                upstream_req = upstream_req.header(name, value);
+                                let (Ok(header_name), Ok(header_value)) = (
+                                    axum::http::HeaderName::from_bytes(name.as_bytes()),
+                                    axum::http::HeaderValue::from_str(value),
+                                ) else {
+                                    return Err(create_error_response(
+                                        StatusCode::INTERNAL_SERVER_ERROR,
+                                        "Invalid delegated credential header",
+                                    ));
+                                };
+                                let mut delegated = HeaderMap::new();
+                                delegated.insert(header_name.clone(), header_value);
+                                upstream_req = upstream_req.headers(delegated);
+                                delegated_headers.push(header_name);
                                 debug!(
                                     target: "credential_delegation",
                                     surface = %channel_name,
@@ -6890,6 +6834,11 @@ async fn proxy_handler_with_mcp_runtime(
                 }
             }
         }
+        delegated_headers.extend(
+            injection_headers
+                .keys()
+                .cloned(),
+        );
         upstream_req = upstream_req
             .headers(injection_headers)
             .body(body_bytes.clone());
@@ -6900,6 +6849,36 @@ async fn proxy_handler_with_mcp_runtime(
                 .map(|id| serde_json::json!({"providerId": id, "outcome": "token_injected"}))
                 .collect(),
         ));
+    }
+
+    if let Some(target_auth) = state.surface.target_auth() {
+        let resolution = state
+            .target_credentials()
+            .resolve(
+                target_auth,
+                &crate::proxy::target_credentials::TargetAuthContext {
+                    surface: &state.surface,
+                    destination: &target_url,
+                    leg: crate::proxy::target_credentials::TargetLeg::HttpTarget,
+                    caller: CallerAssertion::for_forwarded_request(method.as_str(), uri.path(), source_auth_failed),
+                    via_fabric: false,
+                    trace_id: Some(&egress_trace_id),
+                    occupied_headers: &delegated_headers,
+                },
+            )
+            .await;
+        match crate::proxy::target_credentials::apply_target_auth_fallback(target_auth, resolution) {
+            crate::proxy::target_credentials::TargetAuthDecision::Inject(credential) => {
+                upstream_req = credential.set_on(upstream_req);
+            }
+            crate::proxy::target_credentials::TargetAuthDecision::Continue => {}
+            crate::proxy::target_credentials::TargetAuthDecision::Reject => {
+                return Ok(create_error_response(
+                    StatusCode::BAD_GATEWAY,
+                    crate::proxy::target_credentials::TARGET_AUTH_FAILED,
+                ));
+            }
+        }
     }
 
     // ── deferred request VP injection ───────────────────────────────────────
@@ -12208,65 +12187,69 @@ async fn handle_fabric_request(
         })
         .collect();
 
+    let modern_credentials = match modern_delegation.as_ref() {
+        Some(prepared) => {
+            body_bytes = prepared
+                .inject_body_credentials(&body_bytes)
+                .map_err(|_| {
+                    create_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Invalid delegated credential metadata")
+                })?;
+            Some(
+                prepared
+                    .credential_headers()
+                    .map_err(|_| {
+                        create_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Invalid delegated credential header")
+                    })?,
+            )
+        }
+        None => None,
+    };
+
     // Inject target authentication credentials into the forwarded headers so
     // GW2 delivers them to the upstream service.
     if let Some(target_auth) = state.surface.target_auth() {
-        match inject_target_auth_header(
-            target_auth,
-            &state.secrets_store,
-            channel_name,
-            CallerAssertion::for_forwarded_request(method.as_str(), uri.path(), source_auth_failed),
-        )
-        .await
-        {
-            Ok(Some((header_name, header_value))) => {
+        let occupied_headers: Vec<axum::http::HeaderName> = modern_credentials
+            .iter()
+            .flat_map(|credentials| credentials.keys().cloned())
+            .collect();
+        let resolution = state
+            .target_credentials()
+            .resolve(
+                target_auth,
+                &crate::proxy::target_credentials::TargetAuthContext {
+                    surface: &state.surface,
+                    destination: &state.surface.target.endpoint,
+                    leg: crate::proxy::target_credentials::TargetLeg::FabricForward,
+                    caller: CallerAssertion::for_forwarded_request(method.as_str(), uri.path(), source_auth_failed),
+                    via_fabric: true,
+                    trace_id: Some(&trace_id),
+                    occupied_headers: &occupied_headers,
+                },
+            )
+            .await;
+        match crate::proxy::target_credentials::apply_target_auth_fallback(target_auth, resolution) {
+            crate::proxy::target_credentials::TargetAuthDecision::Inject(credential) => {
                 if modern_request.is_some() {
-                    let name = axum::http::HeaderName::from_bytes(header_name.as_bytes()).map_err(|_| {
-                        create_error_response(StatusCode::BAD_GATEWAY, "Invalid Target authentication header")
-                    })?;
-                    let value = axum::http::HeaderValue::from_str(&header_value).map_err(|_| {
-                        create_error_response(StatusCode::BAD_GATEWAY, "Invalid Target authentication value")
-                    })?;
-                    stream_headers.insert(name, value);
+                    stream_headers.insert(credential.name.clone(), credential.value.clone());
                 }
-                headers_map.insert(header_name.to_uppercase(), header_value);
+                let (name, value) = credential.into_pair();
+                headers_map.insert(name.to_uppercase(), value);
                 channel_info!(config_id, "Injected target auth header into fabric ForwardRequest");
             }
-            Ok(None) => {}
-            Err(e) => {
-                error!(channel = channel_name, error = %e, "Failed to resolve target auth for fabric forwarding");
-                match target_auth.fallback {
-                    crate::config::TargetAuthFallback::Reject => {
-                        connection_guard
-                            .decrement()
-                            .await;
-                        return Err(create_error_response(
-                            StatusCode::BAD_GATEWAY,
-                            &format!("Target authentication failed: {}", e),
-                        ));
-                    }
-                    crate::config::TargetAuthFallback::Passthrough => {
-                        warn!(
-                            channel = channel_name,
-                            "Target auth failed but passthrough enabled, continuing without credentials"
-                        );
-                    }
-                }
+            crate::proxy::target_credentials::TargetAuthDecision::Continue => {}
+            crate::proxy::target_credentials::TargetAuthDecision::Reject => {
+                connection_guard
+                    .decrement()
+                    .await;
+                return Err(create_error_response(
+                    StatusCode::BAD_GATEWAY,
+                    crate::proxy::target_credentials::TARGET_AUTH_FAILED,
+                ));
             }
         }
     }
 
-    if let Some(prepared) = modern_delegation.as_ref() {
-        body_bytes = prepared
-            .inject_body_credentials(&body_bytes)
-            .map_err(|_| {
-                create_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Invalid delegated credential metadata")
-            })?;
-        let credentials = prepared
-            .credential_headers()
-            .map_err(|_| {
-                create_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Invalid delegated credential header")
-            })?;
+    if let Some(credentials) = modern_credentials {
         for (name, value) in credentials.iter() {
             stream_headers.insert(name.clone(), value.clone());
         }
@@ -14751,7 +14734,18 @@ async fn fetch_agent_card_from_surface_target(
             create_error_response(StatusCode::BAD_GATEWAY, "Invalid JSON from upstream")
         })
     } else {
-        let credential = agent_card_target_credential(state, source_addr, channel_name).await?;
+        let credential = crate::proxy::target_card::card_fetch_credential(
+            &state.target_credentials(),
+            &state.surface,
+            target_url,
+            false,
+            crate::proxy::target_card::CardRead::AnswersCaller,
+        )
+        .await
+        .map_err(|_| {
+            record_agent_card_gateway_fault(state, source_addr);
+            create_error_response(StatusCode::BAD_GATEWAY, crate::proxy::target_credentials::TARGET_AUTH_FAILED)
+        })?;
         let mut req = match credential {
             Some(_) => pinned_target_client(
                 state,
@@ -14779,9 +14773,9 @@ async fn fetch_agent_card_from_surface_target(
                 req = req.header(key.as_str(), value.as_bytes());
             }
         }
-        if let Some((header_name, header_value)) = &credential {
-            req = req.header(header_name.as_str(), header_value.as_str());
-            debug!(channel = channel_name, header = %header_name, "Injected target authentication header on agent card fetch");
+        if let Some(credential) = credential {
+            debug!(channel = channel_name, header = %credential.name, "Injected target authentication header on agent card fetch");
+            req = credential.set_on(req);
         }
 
         let response = req
@@ -14830,41 +14824,6 @@ async fn fetch_agent_card_from_surface_target(
     }
 }
 
-/// The surface's target credential for the gateway's own agent-card fetch, or
-/// `None` when the surface has none. Honours `target.auth.fallback` exactly as
-/// the forwarded path does: `reject` fails the card with 502 rather than asking
-/// the target without the credential it requires.
-async fn agent_card_target_credential(
-    state: &ProxyState,
-    source_addr: &str,
-    channel_name: &str,
-) -> Result<Option<(String, String)>, Response> {
-    let Some(target_auth) = state.surface.target_auth() else {
-        return Ok(None);
-    };
-    match inject_target_auth_header(target_auth, &state.secrets_store, channel_name, CallerAssertion::GatewayOriginated)
-        .await
-    {
-        Ok(credential) => Ok(credential),
-        Err(e) => {
-            error!(channel = channel_name, error = %e, "Failed to resolve target authentication for agent card fetch");
-            match target_auth.fallback {
-                crate::config::TargetAuthFallback::Reject => {
-                    record_agent_card_gateway_fault(state, source_addr);
-                    Err(create_error_response(StatusCode::BAD_GATEWAY, "Target authentication failed"))
-                }
-                crate::config::TargetAuthFallback::Passthrough => {
-                    warn!(
-                        channel = channel_name,
-                        "Target auth failed but passthrough enabled, fetching agent card without credentials"
-                    );
-                    Ok(None)
-                }
-            }
-        }
-    }
-}
-
 /// A redirect-disabled client pinned to the vetted address of `target_url`, or
 /// the 403 to answer when egress policy blocks it. Pinning stops DNS rebinding
 /// between vetting and connect; disabling redirects stops a 3xx from sending
@@ -14907,7 +14866,7 @@ async fn pinned_target_client(
 /// credential. The caller is anonymous, so only content negotiation passes;
 /// nothing the caller sends can override the credential or ride along on a
 /// request the gateway has authenticated.
-fn is_forwarded_on_credentialed_card_fetch(name: &str) -> bool {
+pub(crate) fn is_forwarded_on_credentialed_card_fetch(name: &str) -> bool {
     ["accept", "accept-language", "user-agent"]
         .iter()
         .any(|allowed| name.eq_ignore_ascii_case(allowed))
@@ -15611,37 +15570,37 @@ async fn handle_mcp_proxy_request(
     }
 
     // Resolve target auth header if configured on the channel
-    let target_auth_header = if let Some(target_auth) = state.surface.target_auth() {
-        match inject_target_auth_header(
-            target_auth,
-            &state.secrets_store,
-            channel_name,
-            CallerAssertion::for_forwarded_request(method.as_str(), uri.path(), source_auth_failed),
-        )
-        .await
-        {
-            Ok(header) => header,
-            Err(e) => {
-                error!(channel = channel_name, error = %e, "Failed to resolve target auth for MCP proxy");
-                match target_auth.fallback {
-                    crate::config::TargetAuthFallback::Reject => {
-                        return Err(create_error_response(
-                            StatusCode::BAD_GATEWAY,
-                            "Target authentication configuration error",
-                        ));
-                    }
-                    crate::config::TargetAuthFallback::Passthrough => {
-                        warn!(
-                            channel = channel_name,
-                            "Target auth failed but passthrough enabled, continuing without credentials"
-                        );
-                        None
-                    }
+    let target_auth_header = match state.surface.target_auth() {
+        Some(target_auth) => {
+            let resolution = state
+                .target_credentials()
+                .resolve(
+                    target_auth,
+                    &crate::proxy::target_credentials::TargetAuthContext {
+                        surface: &state.surface,
+                        destination: &state.surface.target.endpoint,
+                        leg: crate::proxy::target_credentials::TargetLeg::McpProxy,
+                        caller: CallerAssertion::for_forwarded_request(method.as_str(), uri.path(), source_auth_failed),
+                        via_fabric: false,
+                        trace_id: Some(&trace_id),
+                        occupied_headers: &[],
+                    },
+                )
+                .await;
+            match crate::proxy::target_credentials::apply_target_auth_fallback(target_auth, resolution) {
+                crate::proxy::target_credentials::TargetAuthDecision::Inject(credential) => {
+                    Some(credential.into_pair())
+                }
+                crate::proxy::target_credentials::TargetAuthDecision::Continue => None,
+                crate::proxy::target_credentials::TargetAuthDecision::Reject => {
+                    return Err(create_error_response(
+                        StatusCode::BAD_GATEWAY,
+                        crate::proxy::target_credentials::TARGET_AUTH_FAILED,
+                    ));
                 }
             }
         }
-    } else {
-        None
+        None => None,
     };
 
     // Use the MCP proxy request handler with full policy support (timeout, retry, circuit breaker, mirroring)

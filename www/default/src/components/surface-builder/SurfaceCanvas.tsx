@@ -2525,6 +2525,7 @@ const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
       .enter()
       .append('line')
       .attr('class', 'link')
+      .attr('data-testid', 'canvas-link')
       .attr('stroke-width', d => (d.type === 'middleware' ? 1.5 : 2))
       .attr('stroke', d => {
         if (d.type === 'middleware') {
@@ -4994,7 +4995,7 @@ const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
     >
-      <svg ref={svgRef} />
+      <svg ref={svgRef} data-testid="surface-canvas" />
       {variantNode && (
         <div
           style={{

@@ -1488,12 +1488,12 @@ pub(crate) fn gateway_self_trust_strategy(
     let now = chrono::Utc::now();
     Ok(crate::jwt_bearer::models::JwtVerificationStrategy {
         id: "sts-gateway-self-trust".to_string(),
-        tenant_id: None,
         name: "gateway self-trust (auto)".to_string(),
         expected_issuer: issuer.to_string(),
         jwks_source: crate::jwt_bearer::models::JwksSource::Static { jwks: parsed },
         created_at: now,
         updated_at: now,
+        ..Default::default()
     })
 }
 
@@ -3323,5 +3323,59 @@ mod tests {
     #[test]
     fn decode_unverified_issuer_rejects_non_jwt() {
         assert_eq!(decode_unverified_issuer("not-a-jwt"), None);
+    }
+
+    #[tokio::test]
+    async fn the_subject_verifier_ignores_pinned_metadata() {
+        use crate::component_tests::helpers::mock_auth_server::MockAuthServer;
+        use crate::jwt_bearer::JwtVerificationStrategyStorage;
+        use crate::jwt_bearer::models::{AuthorizationServerMetadata, JwksSource, JwtVerificationStrategy};
+
+        let server = MockAuthServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            crate::jwt_bearer::FileSystemJwtVerificationStrategyStore::new(dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let elsewhere = "https://elsewhere.example/";
+        store
+            .create(JwtVerificationStrategy {
+                name: "Subject issuer".into(),
+                expected_issuer: server.issuer().to_string(),
+                jwks_source: JwksSource::Remote { jwks_uri: server.jwks_uri() },
+                authorization_server: Some(AuthorizationServerMetadata {
+                    issuer: elsewhere.into(),
+                    metadata_url: format!("{elsewhere}.well-known/oauth-authorization-server"),
+                    token_endpoint: format!("{elsewhere}token"),
+                    jwks_uri: format!("{elsewhere}jwks.json"),
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let (vc_issuer, _issuer_dir) = crate::identity::test_helpers::test_vc_issuer().await;
+        let verifier = JwtBearerSubjectVerifier::new(
+            Arc::new(crate::jwt_bearer::JwtBearerVerifier::new(Arc::new(crate::jwt_bearer::JwksClient::new()))),
+            store,
+            Arc::new(vc_issuer),
+        );
+        let now = chrono::Utc::now().timestamp();
+        let key = server.signing_key();
+
+        let subject = json!({ "iss": server.issuer(), "sub": "agent-a", "exp": now + 300 });
+        let claims = verifier
+            .verify_jwt(&key.sign(&subject))
+            .await
+            .unwrap();
+        assert_eq!(claims, subject);
+
+        let pinned_issuer = json!({ "iss": elsewhere, "sub": "agent-a", "exp": now + 300 });
+        assert!(matches!(
+            verifier
+                .verify_jwt(&key.sign(&pinned_issuer))
+                .await,
+            Err(StsError::InvalidGrant(_))
+        ));
     }
 }

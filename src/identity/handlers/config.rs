@@ -62,8 +62,12 @@ pub struct ReloadConfigResponse {
 
 /// Reload configuration from DynamoDB
 pub async fn reload_configuration(
-    State(state): State<IdentityApiState>
+    State(state): State<IdentityApiState>,
+    context: Option<axum::Extension<crate::tenancy::PatTenantContext>>,
 ) -> Result<Json<ReloadConfigResponse>, AppError> {
+    if context.is_none() {
+        crate::delegation_vault::gateway_token::target_token_cache().invalidate_all();
+    }
     let (channels_count, surfaces_count, is_fallback, warning) = {
         let _reloading = state
             .surface_reload_lock

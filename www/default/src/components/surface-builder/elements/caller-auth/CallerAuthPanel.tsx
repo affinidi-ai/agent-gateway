@@ -110,6 +110,7 @@ const CallerAuthPanel: React.FC<ConfigPanelProps> = ({
         )}
         <button
           className="btn btn-outline-primary btn-sm w-100 mt-2"
+          data-testid="caller-auth-configure"
           onClick={() => openFullscreenEditor?.()}
           disabled={!openFullscreenEditor}
         >

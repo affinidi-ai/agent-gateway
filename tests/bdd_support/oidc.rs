@@ -1,12 +1,13 @@
 //! A local OpenID provider for real-process scenarios. It signs the caller's
 //! identity token, serves the authorization and token endpoints of the
 //! authorization-code flow with S256 PKCE, and answers a code with an access,
-//! refresh and ID token for the subject signed in at the provider.
+//! refresh and ID token for the subject signed in at the provider. Its token
+//! endpoint also grants the gateway its own access token for client credentials.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use axum::extract::{Form, Query, State};
 use axum::http::{StatusCode, header};
@@ -39,6 +40,7 @@ struct ProviderState {
     signed_in: Mutex<Option<String>>,
     grants: Mutex<HashMap<String, Grant>>,
     token_requests: AtomicU64,
+    token_endpoint_down: AtomicBool,
     next_code: AtomicU64,
     access_token: String,
     refresh_token: String,
@@ -164,6 +166,13 @@ impl OidcProvider {
         &self.state.refresh_token
     }
 
+    /// Make the token endpoint answer `503` to every request from now on.
+    pub fn take_token_endpoint_down(&self) {
+        self.state
+            .token_endpoint_down
+            .store(true, Ordering::SeqCst);
+    }
+
     pub fn token_request_count(&self) -> u64 {
         self.state
             .token_requests
@@ -237,17 +246,36 @@ async fn token(
     state
         .token_requests
         .fetch_add(1, Ordering::SeqCst);
+    if state
+        .token_endpoint_down
+        .load(Ordering::SeqCst)
+    {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": "temporarily_unavailable"})))
+            .into_response();
+    }
     let invalid_grant =
         || (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid_grant"}))).into_response();
     let field = |name: &str| {
         form.get(name)
             .map(String::as_str)
     };
-    if field("grant_type") != Some("authorization_code")
-        || field("client_id") != Some(OIDC_CLIENT_ID)
-        || field("client_secret") != Some(OIDC_CLIENT_SECRET)
-    {
+    if field("client_id") != Some(OIDC_CLIENT_ID) || field("client_secret") != Some(OIDC_CLIENT_SECRET) {
         return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "invalid_client"}))).into_response();
+    }
+    match field("grant_type") {
+        Some("authorization_code") => {}
+        Some("client_credentials") => {
+            return Json(serde_json::json!({
+                "access_token": state.access_token,
+                "token_type": "Bearer",
+                "expires_in": 3600,
+            }))
+            .into_response();
+        }
+        _ => {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "unsupported_grant_type"})))
+                .into_response();
+        }
     }
     let grant = match field("code") {
         Some(code) => state
@@ -283,4 +311,45 @@ async fn token(
         "expires_in": 3600,
     }))
     .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn client_credentials(provider: &OidcProvider) -> reqwest::Response {
+        reqwest::Client::new()
+            .post(provider.token_endpoint())
+            .form(&[
+                ("grant_type", "client_credentials"),
+                ("client_id", OIDC_CLIENT_ID),
+                ("client_secret", OIDC_CLIENT_SECRET),
+            ])
+            .send()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn client_credentials_grant_returns_the_gateway_access_token_and_counts_the_request() {
+        let provider = OidcProvider::start().await;
+
+        let response = client_credentials(&provider).await;
+
+        assert_eq!(response.status(), 200);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["access_token"], provider.access_token());
+        assert_eq!(provider.token_request_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn token_endpoint_answers_503_once_taken_down_and_still_counts_requests() {
+        let provider = OidcProvider::start().await;
+        provider.take_token_endpoint_down();
+
+        let response = client_credentials(&provider).await;
+
+        assert_eq!(response.status(), 503);
+        assert_eq!(provider.token_request_count(), 1);
+    }
 }

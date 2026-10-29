@@ -66,6 +66,13 @@ npm run test:ui
 make ui-test
 ```
 
+### Live OIDC suite
+
+`make oidc-ui-e2e` runs `playwright.oidc-live.config.ts` and the specs under `specs/oidc-live/`
+against two live Ory Hydra instances and the mock A2A agent, with a gateway of its own. It is a
+separate Playwright config, so `make ui-test` neither runs nor waits for it. See
+[`docs/development/TESTING.md`](../docs/development/TESTING.md#live-oidc-dashboard-tests).
+
 ### Run in Headed Mode (Visible Browser)
 
 ```bash
@@ -136,12 +143,17 @@ ui-tests/
 │   ├── channels.spec.ts      # Channel management tests
 │   ├── api-keys.spec.ts      # API Keys page tests
 │   ├── credentials.spec.ts   # Outbound Credentials tests
-│   └── accessibility.spec.ts # WCAG accessibility tests
+│   ├── strategy-discovery.spec.ts   # JWT strategy discovery, list and delete
+│   ├── credential-providers.spec.ts # JWT bearer credential provider form, create and reopen
+│   ├── surface-builder-save.spec.ts # Surface Builder create with Target Authentication
+│   ├── accessibility.spec.ts # WCAG accessibility tests
+│   └── oidc-live/            # Live Ory Hydra suite, run by make oidc-ui-e2e
 ├── helpers/                  # Test utilities
 │   ├── test-auth.ts          # Authentication helpers
 │   ├── screenshots.ts        # Screenshot utilities
 │   ├── wait.ts               # Custom wait functions
-│   └── index.ts              # Helper exports
+│   ├── index.ts              # Helper exports
+│   └── oidc-live/            # Helpers for the live OIDC suite
 ├── test_results/             # Test output (gitignored)
 │   ├── screenshots/          # Test screenshots
 │   ├── traces/               # Playwright traces
@@ -152,6 +164,7 @@ ui-tests/
 ├── global-setup.ts           # Test suite setup
 ├── global-teardown.ts        # Test suite teardown
 ├── playwright.config.ts      # Playwright configuration
+├── playwright.oidc-live.config.ts # Live OIDC suite configuration
 ├── package.json              # Dependencies
 └── tsconfig.json             # TypeScript config
 ```

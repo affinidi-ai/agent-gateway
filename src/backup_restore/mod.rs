@@ -482,7 +482,7 @@ fn check_and_restore_backup_with_keys(
                     source_domain: parsed_source_domain.as_deref(),
                     target_domain: Some(target_domain),
                     outcome: "failure",
-                    failure_category: Some("manifest_invalid"),
+                    failure_category: Some(manifest::manifest_failure_category(&e)),
                     archive_size_bytes: Some(zip_data.len()),
                 });
                 eprintln!("ERROR: Backup manifest validation failed: {e}");

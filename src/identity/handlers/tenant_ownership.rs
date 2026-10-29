@@ -16,11 +16,11 @@ use crate::mediators::MediatorStore;
 use crate::surface_templates::filesystem::SurfaceTemplateStore;
 use crate::surfaces::AgentSurfaceStore;
 use crate::tenancy::{
-    PatTenantContext, ResourceKind, can_access, can_reference, scope_allows_resource, validate_tenant_id,
+    PatTenantContext, ResourceKind, can_access, can_reference_with_rule, scope_allows_resource, validate_tenant_id,
 };
 use crate::trust_registries::TrustRegistryStore;
 
-use super::surface_tenancy::collect_surface_reference_keys;
+use super::surface_tenancy::{SurfaceReferenceKey, collect_surface_reference_keys};
 
 #[derive(Debug)]
 pub enum OwnershipApiError {
@@ -80,6 +80,10 @@ pub struct OwnershipReference {
     pub source: OwnershipEndpoint,
     pub target: OwnershipEndpoint,
     pub context: String,
+    /// The target must stay in the source's own tenant, never appliance-wide for a
+    /// tenant source.
+    #[serde(skip)]
+    pub same_tenant: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -217,6 +221,12 @@ pub async fn reassign_ownership(
 
     let previous_tenant_id = resource.tenant_id;
     persist_tenant_id(&state, kind, &id, request.tenant_id.clone()).await?;
+    let tokens = crate::delegation_vault::gateway_token::target_token_cache();
+    match kind {
+        ResourceKind::Secrets => tokens.invalidate_secret(&resource.scope_id),
+        ResourceKind::CredentialProviders => tokens.invalidate_provider(&resource.id),
+        _ => {}
+    }
 
     Ok(Json(OwnershipReassignmentResponse {
         kind: kind.to_string(),
@@ -437,13 +447,15 @@ async fn collect_references(state: &IdentityApiState) -> Result<Vec<OwnershipRef
             for reference in collect_surface_reference_keys(&surface).map_err(|error| {
                 OwnershipApiError::Internal(format!("Failed to inspect Surface references: {:?}", error))
             })? {
-                add_reference(
+                let same_tenant = reference.same_tenant || sends_gateway_credential(state, &reference).await?;
+                add_reference_with_rule(
                     state,
                     &mut references,
                     source.clone(),
                     reference.kind,
                     &reference.id,
                     "surface configuration",
+                    same_tenant,
                 )
                 .await?;
             }
@@ -508,6 +520,33 @@ async fn collect_references(state: &IdentityApiState) -> Result<Vec<OwnershipRef
     Ok(references)
 }
 
+/// Whether a surface's binding names a provider that sends the gateway's own credential,
+/// which must stay in the surface's tenant.
+async fn sends_gateway_credential(
+    state: &IdentityApiState,
+    reference: &SurfaceReferenceKey,
+) -> Result<bool, OwnershipApiError> {
+    if reference.kind != ResourceKind::CredentialProviders {
+        return Ok(false);
+    }
+    let Some(store) = state
+        .credential_provider_store
+        .as_ref()
+    else {
+        return Ok(false);
+    };
+    Ok(store
+        .get(&reference.id)
+        .await
+        .map_err(internal)?
+        .is_some_and(|provider| {
+            provider
+                .provider_type
+                .grant()
+                .sends_gateway_credential()
+        }))
+}
+
 async fn collect_connection_point_references(
     state: &IdentityApiState,
     references: &mut Vec<OwnershipReference>,
@@ -567,27 +606,19 @@ async fn collect_credential_references(
             .map_err(internal)?
         {
             let source = endpoint(ResourceKind::CredentialProviders, &provider.id, provider.tenant_id.clone(), true);
-            for id in [
-                provider
-                    .client_id_secret_ref
-                    .as_deref(),
-                provider
-                    .client_secret_secret_ref
-                    .as_deref(),
-                provider
-                    .api_key_secret_ref
-                    .as_deref(),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                add_reference(
+            let secret_refs: Vec<String> = provider
+                .secret_refs()
+                .map(str::to_string)
+                .collect();
+            for id in &secret_refs {
+                add_reference_with_rule(
                     state,
                     references,
                     source.clone(),
                     ResourceKind::Secrets,
                     id,
                     "credential provider secret",
+                    true,
                 )
                 .await?;
             }
@@ -681,6 +712,18 @@ async fn add_reference(
     id: &str,
     context: &str,
 ) -> Result<(), OwnershipApiError> {
+    add_reference_with_rule(state, references, source, kind, id, context, false).await
+}
+
+async fn add_reference_with_rule(
+    state: &IdentityApiState,
+    references: &mut Vec<OwnershipReference>,
+    source: OwnershipEndpoint,
+    kind: ResourceKind,
+    id: &str,
+    context: &str,
+    same_tenant: bool,
+) -> Result<(), OwnershipApiError> {
     if id.trim().is_empty() {
         return Ok(());
     }
@@ -712,6 +755,7 @@ async fn add_reference(
         source,
         target,
         context: context.to_string(),
+        same_tenant,
     });
     Ok(())
 }
@@ -748,7 +792,7 @@ fn reassignment_conflicts(
             };
             let reason = if !reference.target.exists {
                 Some("Referenced resource does not exist".to_string())
-            } else if !can_reference(source_tenant, target_tenant) {
+            } else if !can_reference_with_rule(source_tenant, target_tenant, reference.same_tenant) {
                 Some("The proposed tenant would make this reference cross-tenant".to_string())
             } else {
                 None
@@ -1158,6 +1202,7 @@ mod tests {
             source: endpoint(ResourceKind::Surfaces, "surface-1", source_tenant.map(str::to_string), true),
             target: endpoint(ResourceKind::Secrets, "secret-1", target_tenant.map(str::to_string), true),
             context: "test".to_string(),
+            same_tenant: false,
         }
     }
 
@@ -1199,6 +1244,42 @@ mod tests {
                 .into_response()
                 .status(),
             StatusCode::CONFLICT
+        );
+    }
+
+    #[test]
+    fn same_tenant_reference_refuses_an_appliance_wide_target_for_a_tenant_source() {
+        let strict = OwnershipReference {
+            same_tenant: true,
+            ..edge(Some("tenant-a"), None)
+        };
+        assert_eq!(
+            reassignment_conflicts(
+                std::slice::from_ref(&strict),
+                ResourceKind::Surfaces,
+                "surface-1",
+                Some("tenant-c")
+            )
+            .len(),
+            1
+        );
+        assert_eq!(
+            reassignment_conflicts(std::slice::from_ref(&strict), ResourceKind::Secrets, "secret-1", Some("tenant-b"))
+                .len(),
+            1
+        );
+        let aligned = OwnershipReference {
+            same_tenant: true,
+            ..edge(Some("tenant-a"), Some("tenant-a"))
+        };
+        assert!(reassignment_conflicts(&[aligned], ResourceKind::Surfaces, "surface-1", Some("tenant-a")).is_empty());
+        let moved_together = OwnershipReference {
+            same_tenant: true,
+            ..edge(None, None)
+        };
+        assert_eq!(
+            reassignment_conflicts(&[moved_together], ResourceKind::Surfaces, "surface-1", Some("tenant-a")).len(),
+            1
         );
     }
 

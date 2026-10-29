@@ -1424,6 +1424,7 @@ MC4CAQAwBQYDK2VwBCIEIPiOVQaSEcxl/NogGyUAX88ouBy1bWJFMp4gi0pcCgcY
                 },
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
+                authorization_server: None,
             })
             .await
             .unwrap();

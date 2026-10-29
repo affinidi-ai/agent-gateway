@@ -7,6 +7,9 @@
 pub(crate) mod audit_events;
 pub(crate) mod formatted_logs;
 pub mod jwt;
+pub(crate) mod mock_auth_server;
+pub(crate) mod oidc_keys;
+pub(crate) mod test_mode;
 pub(crate) mod thread_subscriber;
 
 use std::collections::HashMap;
@@ -179,6 +182,25 @@ pub fn free_port() -> (u16, ReservedPort) {
 
 // ── mock target server ───────────────────────────────────────────────────────
 
+/// The request's headers by name. A header sent more than once keeps every value,
+/// joined with `, ` in the order received, so a test can see a duplicate.
+fn received_headers(headers: &axum::http::HeaderMap) -> HashMap<String, String> {
+    let mut received: HashMap<String, String> = HashMap::new();
+    for (name, value) in headers {
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        received
+            .entry(name.as_str().to_string())
+            .and_modify(|joined| {
+                joined.push_str(", ");
+                joined.push_str(value);
+            })
+            .or_insert_with(|| value.to_string());
+    }
+    received
+}
+
 /// The details of a request received by the mock server.
 #[derive(Clone, Debug)]
 pub struct ReceivedRequest {
@@ -285,15 +307,7 @@ impl MockServer {
                     counter.fetch_add(1, Ordering::SeqCst);
                     let method = req.method().to_string();
                     let path = req.uri().path().to_string();
-                    let headers: HashMap<String, String> = req
-                        .headers()
-                        .iter()
-                        .filter_map(|(k, v)| {
-                            v.to_str()
-                                .ok()
-                                .map(|v| (k.as_str().to_string(), v.to_string()))
-                        })
-                        .collect();
+                    let headers = received_headers(req.headers());
                     let body = axum::body::to_bytes(req.into_body(), usize::MAX)
                         .await
                         .unwrap_or_default();
@@ -389,15 +403,7 @@ impl MockServer {
                         counter.fetch_add(1, Ordering::SeqCst);
                         let method = req.method().to_string();
                         let path = req.uri().path().to_string();
-                        let headers: HashMap<String, String> = req
-                            .headers()
-                            .iter()
-                            .filter_map(|(k, v)| {
-                                v.to_str()
-                                    .ok()
-                                    .map(|v| (k.as_str().to_string(), v.to_string()))
-                            })
-                            .collect();
+                        let headers = received_headers(req.headers());
                         let body = axum::body::to_bytes(req.into_body(), usize::MAX)
                             .await
                             .unwrap_or_default();
@@ -473,15 +479,7 @@ impl MockServer {
                         counter.fetch_add(1, Ordering::SeqCst);
                         let method = req.method().to_string();
                         let path = req.uri().path().to_string();
-                        let headers: HashMap<String, String> = req
-                            .headers()
-                            .iter()
-                            .filter_map(|(k, v)| {
-                                v.to_str()
-                                    .ok()
-                                    .map(|v| (k.as_str().to_string(), v.to_string()))
-                            })
-                            .collect();
+                        let headers = received_headers(req.headers());
                         let body = axum::body::to_bytes(req.into_body(), usize::MAX)
                             .await
                             .unwrap_or_default();
@@ -968,6 +966,78 @@ pub fn configure_admin_api(bootstrap: &BootstrapConfig) -> reqwest::Client {
         .no_proxy()
         .default_headers(headers)
         .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap()
+}
+
+/// Seed an administrator and an access token they own into the gateway's stores
+/// before it boots: with `resource_pattern`, a token scoped to tenant
+/// `tenant-a`'s surfaces; without one, a token scoped by its required
+/// `x-external-account` header alone. Returns a client that sends the token and
+/// the header.
+pub(crate) fn seed_scoped_access_token(
+    bootstrap: &crate::config::BootstrapConfig,
+    resource_pattern: Option<&str>,
+) -> reqwest::Client {
+    let now = chrono::Utc::now();
+    let owner = "tenant-token-owner";
+    let user: crate::auth::storage::UserData = serde_json::from_value(serde_json::json!({
+        "user_id": owner, "username": owner, "passkeys": [], "role": "administrator", "status": "approved",
+        "created_at": now, "updated_at": now
+    }))
+    .unwrap();
+    let passkeys = std::path::Path::new(
+        &bootstrap
+            .storage_paths
+            .passkeys,
+    );
+    std::fs::create_dir_all(passkeys).unwrap();
+    std::fs::write(passkeys.join(format!("{owner}.json")), serde_json::to_vec(&user).unwrap()).unwrap();
+
+    let (id, secret) = crate::access_tokens::generate_token();
+    let token = crate::access_tokens::AccessToken {
+        id: id.clone(),
+        name: "tenant token".to_string(),
+        description: String::new(),
+        token_hash: crate::access_tokens::store::hash_secret(&secret),
+        user_id: owner.to_string(),
+        scopes: Vec::new(),
+        resource_pattern: resource_pattern.map(str::to_string),
+        required_headers: vec![crate::auth_manager::resource_scope::RequiredHeader {
+            name: "x-external-account".to_string(),
+            pattern: "tenant-a".to_string(),
+        }],
+        created_by: owner.to_string(),
+        parent_token_id: None,
+        delegation_depth: 0,
+        created_at: now,
+        last_used_at: None,
+        expires_at: None,
+        revoked_at: None,
+        rotation_generation: 0,
+        rotated_at: None,
+        rotated_by: None,
+    };
+    let tokens = std::path::Path::new(
+        &bootstrap
+            .storage_paths
+            .secrets,
+    )
+    .parent()
+    .unwrap()
+    .join("access_tokens");
+    std::fs::create_dir_all(&tokens).unwrap();
+    std::fs::write(tokens.join(format!("{id}.json")), serde_json::to_vec(&token).unwrap()).unwrap();
+
+    let mut headers = reqwest::header::HeaderMap::new();
+    let mut authorization = reqwest::header::HeaderValue::from_str(&format!("Bearer {secret}")).unwrap();
+    authorization.set_sensitive(true);
+    headers.insert(reqwest::header::AUTHORIZATION, authorization);
+    headers.insert("x-external-account", reqwest::header::HeaderValue::from_static("tenant-a"));
+    reqwest::Client::builder()
+        .no_proxy()
+        .default_headers(headers)
+        .timeout(std::time::Duration::from_secs(10))
         .build()
         .unwrap()
 }

@@ -23,9 +23,9 @@ configuration types define their own parsing rules, so this page is not a comple
 `server_mode` selects the `active` or `standby` mode (see [Server mode](#server-mode)). In a
 shared-storage deployment, `cache_refresh_interval_secs` controls periodic reconciliation for
 DashMap-backed filesystem caches; `0` disables that refresh. Policy-definition and global-policy
-stores are not part of the periodic cache-refresh loop and reconcile from disk at startup. An
-explicit configuration reload uses their current in-memory state rather than refreshing those two
-stores from disk.
+stores are not part of the periodic cache-refresh loop and reconcile from disk at startup and when
+the node becomes Active. An explicit configuration reload uses their current in-memory state
+rather than refreshing those two stores from disk.
 
 ## A2A settings
 
@@ -62,6 +62,11 @@ The runtime implementation is in
 | `reload_channels_with_fallback` | `POST /v1/config/reload` | Loads the requested configuration and uses the cached snapshot only when loading the requested source fails. |
 | `reload_single_channel` | `reload_single_channel_with_fallback` | Rebuilds one surface and swaps it into the current inbound listener state. |
 | `reload_single_channel_with_fallback` | `POST /v1/config/reload/{config_id}` and surface mutation paths | Serializes and applies the single-surface update; a source-load error is returned rather than silently substituting another surface. |
+
+`POST /v1/config/reload` by a caller with no tenant context, and Standby to Active activation,
+also drop every cached Target Authentication gateway token on this replica, so the next request
+on each key makes one grant. A reload by a tenant-scoped caller, and a surface change, keep them.
+See [Gateway token cache](CREDENTIAL_DELEGATION.md#gateway-token-cache).
 
 ```mermaid
 flowchart TD
@@ -160,6 +165,11 @@ pipeline: the node admits traffic after one start attempt and, if that start is 
 integrations cannot be listed, or the other node still holds the journal), keeps trying in the
 background.
 
+Also on becoming Active, before it admits traffic, a node reconciles its policy definition, global
+policy, Agent Surface, gateway, JWT verification strategy and credential provider stores with disk,
+drops its cached JWKS key sets, and rebuilds the surfaces and policy engines from the reconciled
+records. The delegation vault reads tokens from disk on every lookup, so it needs no reconcile.
+
 Both modes build the source authentication middleware at startup, so a node whose JWT
 verification strategy store cannot be opened refuses to start in either mode (see
 [Source authentication](SOURCE_AUTH.md#source-authentication)).
@@ -173,16 +183,17 @@ Set `cache_refresh_interval_secs` in the bootstrap config (default `0` = disable
 **DashMap-backed** cached filesystem store periodically reconciles its cache with disk and picks up
 changes written by another node sharing the storage. Only DashMap-backed stores refresh on this
 interval; the RwLock-backed policy-definition and global-policy stores are **not** on the periodic
-loop and reconcile with disk only at startup; an explicit reload uses their in-memory state. Each
-store's periodic scans are serialized by a shared per-store lock, so two overlapping refreshes can
-never apply out of order and revert a record to an older on-disk snapshot.
+loop and reconcile with disk at startup and when the node becomes Active; an explicit reload uses
+their in-memory state. Each store's periodic scans are serialized by a shared per-store lock, so two
+overlapping refreshes can never apply out of order and revert a record to an older on-disk snapshot.
 
 Nodes sharing storage must run the same version. A newer node can write a field an older one
 rejects; the older node's refresh then drops that record from its cache while it is still serving.
 Per-surface A2A settings are such a field: a newer node writes `access_point.a2a` into stored A2A
 surfaces on its first start. Upgrade nodes that share storage together, or set
 `cache_refresh_interval_secs` to `0` on the older node until it is upgraded (see
-[A2A surface settings](PROTOCOLS.md#a2a-surface-settings)).
+[A2A surface settings](PROTOCOLS.md#a2a-surface-settings)). The same applies to JWT verification
+strategy and credential provider records, which a standby also reconciles when it becomes Active.
 
 ## Fabric envelope lifetime
 

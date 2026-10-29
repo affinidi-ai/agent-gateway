@@ -86,6 +86,9 @@ export default defineConfig({
     // Test directory
     testDir: './specs',
 
+    // The live OIDC suite has its own config (playwright.oidc-live.config.ts)
+    testIgnore: ['**/oidc-live/**'],
+
     // Output directory for test artifacts
     outputDir: path.join(RESULT_DIR, 'test-output'),
 
@@ -202,6 +205,7 @@ export default defineConfig({
             name: 'setup',
             testDir: '.',
             testMatch: /.*\.setup\.ts/,
+            testIgnore: ['**/oidc-live/**'],
             use: {
                 // Don't use saved storage state for setup
                 storageState: undefined,

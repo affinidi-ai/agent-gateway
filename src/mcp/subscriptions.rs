@@ -1088,7 +1088,7 @@ mod tests {
                         .unwrap();
                 }
                 "reload" => strategies
-                    .reload()
+                    .refresh_from_disk()
                     .await
                     .unwrap(),
                 "delete" => strategies

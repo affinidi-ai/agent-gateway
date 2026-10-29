@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useLimitGuard } from '../hooks/useLimitGuard';
+import { useSecretDeleteGuard } from '../hooks/useSecretDeleteGuard';
 import { Tab, Tabs } from 'react-bootstrap';
 import { AppButton } from '../components/shared/AppButton';
 import { Badge } from '../components/shared/Badge';
@@ -47,6 +48,7 @@ const PAGE_SIZE = 10;
 const SecretsPage: React.FC = () => {
   const navigate = useNavigate();
   const { guard, balloonNode } = useLimitGuard();
+  const { guardDelete, warningNode } = useSecretDeleteGuard();
   const { hasPermission, loading: permissionsLoading } = usePermissions();
   const [searchParams, setSearchParams] = useSearchParams();
 
@@ -158,23 +160,28 @@ const SecretsPage: React.FC = () => {
     }
   };
 
-  const handleDelete = async (secretId: string) => {
-    try {
-      const response = await apiClient.fetch(`/api/v1/secrets/${secretId}`, {
-        method: 'DELETE',
-      });
+  const handleDelete = (secret: Secret) =>
+    guardDelete(secret, async () => {
+      try {
+        const response = await apiClient.fetch(`/api/v1/secrets/${secret.id}`, {
+          method: 'DELETE',
+        });
 
-      if (response.ok) {
-        loadSecrets();
-      } else {
-        // A secret an integration endpoint references answers 409 naming the endpoints.
-        const reason = formatApiError(response.status, await response.text(), response.statusText);
-        showToast('error', `Delete failed: ${reason}`, { autoRemove: false });
+        if (response.ok) {
+          loadSecrets();
+        } else {
+          // A secret an integration endpoint references answers 409 naming the endpoints.
+          const reason = formatApiError(
+            response.status,
+            await response.text(),
+            response.statusText
+          );
+          showToast('error', `Delete failed: ${reason}`, { autoRemove: false });
+        }
+      } catch (error) {
+        console.error('Failed to delete secret:', error);
       }
-    } catch (error) {
-      console.error('Failed to delete secret:', error);
-    }
-  };
+    });
 
   const handleDeleteApiKey = async (agentId: string, keyId: string) => {
     try {
@@ -409,6 +416,7 @@ const SecretsPage: React.FC = () => {
               {balloonNode}
             </div>
             <div className="card-body">
+              {warningNode}
               {loading ? (
                 <div
                   style={{
@@ -491,7 +499,7 @@ const SecretsPage: React.FC = () => {
                           </td>
                           <td>
                             <DeleteButton
-                              onDelete={() => handleDelete(secret.id)}
+                              onDelete={() => handleDelete(secret)}
                               className="btn-sm"
                               title="Delete secret"
                             />

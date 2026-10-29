@@ -21,7 +21,7 @@ use crate::bdd_support::config::policy_definitions::{
     PolicyDefinitionFixtureKind, inbound_policy_definition_id, policy_definition_id as kinded_policy_definition_id,
 };
 use crate::bdd_support::config::source_auth::api_key_source_auth_method_json;
-use crate::bdd_support::config::target_auth::static_secret_target_auth_json;
+use crate::bdd_support::config::target_auth::{credential_provider_target_auth_json, static_secret_target_auth_json};
 
 /// Write the full config tree for one gateway listening on `gateway_port` and
 /// exposing `surfaces`.
@@ -186,6 +186,9 @@ fn build_surface_fixture(
             &target_auth.header_format,
             &target_auth.fallback,
         ));
+    }
+    if let Some(provider_id) = &surface.target_token_provider {
+        fixture = fixture.with_target_auth(credential_provider_target_auth_json(provider_id, "reject"));
     }
     if let Some(policy) = &surface.mcp_tool_policy {
         fixture = fixture.with_mcp_tool_policy(&policy.allowed_tool, &policy.policy_definition_id);

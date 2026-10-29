@@ -144,6 +144,27 @@ pub async fn agent_card_fetched_from_surface(
     world.response_content_type = content_type;
 }
 
+#[when(expr = "the caller reads public path {string} from gateway {int} surface {string}")]
+pub async fn public_path_read_from_surface(
+    world: &mut G2gWorld,
+    path: String,
+    gw_index: usize,
+    surface_name: String,
+) {
+    world.start().await;
+    let (_gw, surface_id) = world.surface(&surface_name);
+    let port = world
+        .harness()
+        .gw(gw_index)
+        .port;
+    let response = Client::new()
+        .get(format!("http://127.0.0.1:{port}/{surface_id}{path}"))
+        .send()
+        .await
+        .expect("caller request must succeed at the transport layer");
+    world.response_status = Some(response.status().as_u16());
+}
+
 /// Send a Fabric A2A request carrying a specific JSON-RPC method name.
 ///
 /// Proves a v1.0 method survives the DIDComm hop between gateways unchanged: the

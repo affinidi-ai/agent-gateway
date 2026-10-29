@@ -1681,6 +1681,7 @@ const SurfaceDetailPage: React.FC = () => {
                 className="btn btn-primary btn-sm"
                 onClick={handleSave}
                 disabled={saving || deleting}
+                data-testid="surface-save-button"
                 title={saveDisabledReason || (saving ? 'Saving…' : 'Save changes')}
               >
                 {saving ? <i className="fas fa-spinner fa-spin" /> : <i className="fas fa-save" />}

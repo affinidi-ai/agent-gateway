@@ -96,6 +96,10 @@ static GLOBAL_CREDENTIAL_PROVIDER_STORE: OnceCell<
     Arc<dyn crate::credential_providers::storage::CredentialProviderStorage>,
 > = OnceCell::const_new();
 
+/// Target Authentication resolver for GW2, shared with the proxy pipeline's token cache
+static GLOBAL_TARGET_CREDENTIALS: OnceCell<crate::proxy::target_credentials::TargetCredentialResolver> =
+    OnceCell::const_new();
+
 /// Global delegation vault store for GW2 - for outbound credential delegation token lookup
 static GLOBAL_DELEGATION_VAULT_STORE: OnceCell<Arc<dyn crate::delegation_vault::storage::DelegationVaultStorage>> =
     OnceCell::const_new();
@@ -374,6 +378,47 @@ fn get_credential_provider_store() -> Option<Arc<dyn crate::credential_providers
     GLOBAL_CREDENTIAL_PROVIDER_STORE
         .get()
         .cloned()
+}
+
+/// Initialize the Target Authentication resolver for GW2.
+pub fn init_target_credential_resolver(resolver: crate::proxy::target_credentials::TargetCredentialResolver) {
+    let _ = GLOBAL_TARGET_CREDENTIALS.set(resolver);
+}
+
+/// The Target Authentication resolver for GW2: the one built at startup, or one
+/// over the GW2 stores that are initialized.
+fn target_credential_resolver() -> crate::proxy::target_credentials::TargetCredentialResolver {
+    GLOBAL_TARGET_CREDENTIALS
+        .get()
+        .cloned()
+        .unwrap_or_else(|| {
+            crate::proxy::target_credentials::TargetCredentialResolver::new(
+                get_secrets_store(),
+                get_credential_provider_store(),
+                crate::delegation_vault::gateway_token::target_token_cache(),
+            )
+        })
+}
+
+/// A ForwardResponse answering 502 with the fixed Target Authentication failure body.
+fn target_auth_failed_forward_response() -> ProcessingResult {
+    let detail = crate::proxy::target_credentials::TARGET_AUTH_FAILED;
+    ProcessingResult::RequiresResponse {
+        response_type: MessageType::ForwardResponse.to_string(),
+        response_body: serde_json::json!({
+            "status": 502,
+            "headers": {
+                "content-type": "application/problem+json",
+            },
+            "body": serde_json::json!({
+                "type": "about:blank",
+                "title": "Bad Gateway",
+                "status": 502,
+                "detail": detail,
+            }).to_string(),
+            "error": detail,
+        }),
+    }
 }
 
 /// Initialize the global delegation vault store for GW2.
@@ -2912,43 +2957,19 @@ async fn enrich_and_evaluate_surface_policies(
             .flatten()
             .map(|prepared| prepared.card)
         } else {
-            let card_url = if surface.override_agent_card_location()
-                && surface
-                    .agent_card_location_path()
-                    .is_some()
-            {
-                let custom_path = surface
-                    .agent_card_location_path()
-                    .unwrap();
-                let target_endpoint = surface.target_endpoint();
-                let origin = if let Some(scheme_end) = target_endpoint.find("://") {
-                    let after_scheme = &target_endpoint[scheme_end + 3..];
-                    let authority_end = after_scheme
-                        .find('/')
-                        .unwrap_or(after_scheme.len());
-                    &target_endpoint[..scheme_end + 3 + authority_end]
-                } else {
-                    target_endpoint
-                };
-                if custom_path.starts_with('/') {
-                    format!("{}{}", origin, custom_path)
-                } else {
-                    format!("{}/{}", origin, custom_path)
-                }
-            } else {
-                format!(
-                    "{}/.well-known/agent.json",
-                    surface
-                        .target_endpoint()
-                        .trim_end_matches('/')
-                )
-            };
-            channel_info!(config_id, "GW2: Fetching agent card from: {}", card_url);
+            channel_info!(config_id, "GW2: Fetching agent card from the Target");
             let timeout = GLOBAL_FORWARD_TIMEOUT
                 .get()
                 .copied()
                 .unwrap_or(std::time::Duration::from_secs(30));
-            fetch_agent_card(&card_url, timeout, fabric_body_limits(surface), config_id).await
+            crate::proxy::target_card::fetch_target_card(
+                &target_credential_resolver(),
+                surface,
+                true,
+                timeout,
+                fabric_body_limits(surface),
+            )
+            .await
         };
         channel_info!(config_id, "GW2: Agent card obtained: {}", card_json.is_some());
         let agent_ctx =
@@ -3669,63 +3690,6 @@ fn fabric_body_limits(
             .get()
             .map_or(30, std::time::Duration::as_secs),
     )
-}
-
-/// Fetch the local Target's agent card for the GW2 policy context, through the
-/// same pinned, redirect-free client as the forward and within the buffered
-/// response bounds. Any failure, including a blocked target or a redirect,
-/// yields no card.
-async fn fetch_agent_card(
-    card_url: &str,
-    timeout: std::time::Duration,
-    limits: crate::proxy::upstream_body::UpstreamBodyLimits,
-    config_id: &str,
-) -> Option<serde_json::Value> {
-    let client = match forward_client_for(card_url, timeout).await {
-        Ok(client) => client,
-        Err(error) => {
-            channel_warn!(config_id, "GW2: Agent card target {} blocked by egress policy: {}", card_url, error);
-            return None;
-        }
-    };
-    let response = match client
-        .get(card_url)
-        .send()
-        .await
-    {
-        Ok(response) => response,
-        Err(e) => {
-            channel_warn!(config_id, "GW2: Agent card fetch request failed (url={}): {}", card_url, e);
-            return None;
-        }
-    };
-    channel_info!(config_id, "GW2: Agent card fetch HTTP status: {}", response.status());
-    if !response.status().is_success() {
-        channel_warn!(config_id, "GW2: Agent card fetch returned non-success status: {}", response.status());
-        return None;
-    }
-    let body = match crate::proxy::upstream_body::read_bounded(response, limits).await {
-        Ok(body) => body,
-        Err(e) => {
-            channel_warn!(config_id, "GW2: Failed to read agent card: {}", e);
-            return None;
-        }
-    };
-    match serde_json::from_slice::<serde_json::Value>(&body) {
-        Ok(card) => {
-            channel_info!(
-                config_id,
-                "GW2: Agent card fetched successfully: name={:?} url={:?}",
-                card.get("name"),
-                card.get("url")
-            );
-            Some(card)
-        }
-        Err(e) => {
-            channel_warn!(config_id, "GW2: Failed to parse agent card JSON: {}", e);
-            None
-        }
-    }
 }
 
 fn egress_blocked_forward_response() -> ProcessingResult {
@@ -4887,7 +4851,7 @@ async fn process_forward_request_in_request_scope(
                 agent_did: caller_identity.as_deref().ok_or(ContinuationError::BindingMismatch)?,
                 profile: network.sts.mcp_issuer.as_ref().ok_or(ContinuationError::Unavailable)?,
                 vault: vault.as_ref(), providers: providers.as_ref(), strategies: strategies.as_ref(),
-                secrets: secrets.as_ref(), provider_http: None,
+                secrets: secrets.as_ref(), grant_egress: None,
             }.prepare_with_payment(request, crate::proxy::credential_delegation::modern::now_secs()?,
                 modern_payment.as_ref().is_some_and(|(headers, config)| {
                     crate::proxy::handler::surface_payment::LocalPayment::inspect(
@@ -5121,6 +5085,7 @@ async fn process_forward_request_in_request_scope(
             body_bytes,
             caller_identity,
             source_auth_failed,
+            audit_trace_id,
         )
         .await;
     }
@@ -5129,32 +5094,16 @@ async fn process_forward_request_in_request_scope(
     // When override_agent_card_location is enabled and this is an agent card request,
     // use the custom path relative to the target's origin (scheme + host + port),
     // stripping any sub-path from target_endpoint.
-    let target_url = if is_agent_card_request
-        && surface.override_agent_card_location()
-        && surface.agent_card_location_path().is_some()
-    {
-        let custom_path = surface.agent_card_location_path().unwrap();
-        let target_endpoint = surface.target_endpoint();
-        let origin = if let Some(scheme_end) = target_endpoint.find("://") {
-            let after_scheme = &target_endpoint[scheme_end + 3..];
-            let authority_end = after_scheme.find('/').unwrap_or(after_scheme.len());
-            &target_endpoint[..scheme_end + 3 + authority_end]
-        } else {
-            target_endpoint
-        };
-        let url = if custom_path.starts_with('/') {
-            format!("{}{}", origin, custom_path)
-        } else {
-            format!("{}/{}", origin, custom_path)
-        };
-        channel_info!(
-            config_id,
-            "Agent card location override applied: {} (origin={}, custom_path={})",
-            url, origin, custom_path
-        );
-        url
-    } else {
-        join_endpoint_path(surface.target_endpoint(), path)
+    let override_path = surface
+        .agent_card_location_path()
+        .filter(|_| is_agent_card_request && surface.override_agent_card_location());
+    let target_url = match override_path {
+        Some(custom_path) => {
+            let url = crate::proxy::protocol_router::override_agent_card_url(surface.target_endpoint(), custom_path);
+            channel_info!(config_id, "Agent card location override applied: {}", url);
+            url
+        }
+        None => join_endpoint_path(surface.target_endpoint(), path),
     };
 
     channel_info!(
@@ -5202,6 +5151,16 @@ async fn process_forward_request_in_request_scope(
 
     let mut req = client.request(http_method.clone(), &target_url);
 
+    // The gateway's own card fetch carries the Target credential, so it sends a GET
+    // it builds itself: no caller body and only content-negotiation headers.
+    let gateway_card_fetch =
+        surface.target_auth().is_some() && crate::proxy::paths::is_gateway_card_fetch(&surface, method, &target_url);
+    if gateway_card_fetch {
+        body_bytes = bytes::Bytes::new();
+    }
+    let mut forwarded_headers: Vec<axum::http::HeaderName> = Vec::new();
+    let mut delegated_headers: Vec<axum::http::HeaderName> = Vec::new();
+
     // Track if content-type was set
     let mut has_content_type = false;
 
@@ -5213,6 +5172,9 @@ async fn process_forward_request_in_request_scope(
     if let Some(ref headers_map) = headers {
         channel_info!(config_id, "  ↳ Adding {} headers", headers_map.len());
         for (key, value) in headers_map {
+            if gateway_card_fetch && !crate::proxy::handler::is_forwarded_on_credentialed_card_fetch(key) {
+                continue;
+            }
             let key_lower = key.to_lowercase();
             if key_lower == "content-type" {
                 has_content_type = true;
@@ -5264,80 +5226,15 @@ async fn process_forward_request_in_request_scope(
                 None => value.as_str().into_iter().collect(),
             };
             channel_info!(config_id, "    Header: {}", key);
+            if let Ok(name) = axum::http::HeaderName::from_bytes(key.as_bytes()) {
+                forwarded_headers.push(name);
+            }
             for value_str in values {
                 req = req.header(key.as_str(), value_str);
             }
         }
     } else {
         channel_info!(config_id, "  ↳ No headers to add");
-    }
-
-    // Inject target authentication credentials (if configured on the channel)
-    if let Some(target_auth) = surface.target_auth() {
-        // Build a secrets store from the storage path passed via message context
-        let secrets_store: Option<Arc<dyn crate::secrets::SecretsStore>> = match message
-            .context
-            .get("secrets_storage_path")
-            .and_then(|v| v.as_str())
-        {
-            Some(path) => match crate::secrets::FilesystemSecretsStore::new_async(path).await {
-                Ok(store) => Some(Arc::new(store) as Arc<dyn crate::secrets::SecretsStore>),
-                Err(e) => {
-                    channel_warn!(config_id, "Failed to create secrets store for target auth: {}", e);
-                    None
-                }
-            },
-            None => {
-                channel_warn!(config_id, "No secrets_storage_path in message context for target auth");
-                None
-            }
-        };
-
-        let caller = if is_agent_card_request {
-            crate::proxy::handler::CallerAssertion::GatewayOriginated
-        } else {
-            crate::proxy::handler::CallerAssertion::for_forwarded_request(method, path, source_auth_failed)
-        };
-        match crate::proxy::handler::inject_target_auth_header(target_auth, &secrets_store, &surface.name, caller)
-        .await
-        {
-            Ok(Some((header_name, header_value))) => {
-                req = req.header(&header_name, &header_value);
-                channel_info!(config_id, "Injected target authentication header: {}", header_name);
-            }
-            Ok(None) => {
-                // CredentialLookup method not implemented, skip
-            }
-            Err(e) => {
-                channel_error!(config_id, "Failed to resolve target authentication: {}", e);
-                match target_auth.fallback {
-                    crate::config::TargetAuthFallback::Reject => {
-                        return ProcessingResult::RequiresResponse {
-                            response_type: MessageType::ForwardResponse.to_string(),
-                            response_body: serde_json::json!({
-                                "status": 502,
-                                "headers": {
-                                    "content-type": "application/problem+json",
-                                },
-                                "body": serde_json::json!({
-                                    "type": "about:blank",
-                                    "title": "Bad Gateway",
-                                    "status": 502,
-                                    "detail": "Target authentication configuration error",
-                                }).to_string(),
-                                "error": "Target authentication configuration error",
-                            }),
-                        };
-                    }
-                    crate::config::TargetAuthFallback::Passthrough => {
-                        channel_warn!(
-                            config_id,
-                            "Target auth failed but passthrough enabled, continuing without credentials"
-                        );
-                    }
-                }
-            }
-        }
     }
 
     // Inject custom metadata for MCP protocol
@@ -5365,7 +5262,7 @@ async fn process_forward_request_in_request_scope(
     }
 
     // ── Credential delegation: inject delegated OAuth tokens or signal consent ──
-    if !outbound_creds.is_empty() {
+    if !outbound_creds.is_empty() && !gateway_card_fetch {
         // Derive user identity hash from caller_identity (already a DID or identity hash from VP)
         // or fall back to authenticated_identity from source_auth
         let delegation_user_hash: Option<String> = caller_identity.clone().or_else(|| {
@@ -5427,6 +5324,12 @@ async fn process_forward_request_in_request_scope(
                     // verified against the consenting issuer, so it can never unlock
                     // a modern consent record.
                     None,
+                    surface.tenant_id.as_deref(),
+                    crate::proxy::target_credentials::permits_jwt_bearer_leg(
+                        &surface,
+                        surface.target_endpoint(),
+                        Some(&target_url),
+                    ),
                 )
                 .await;
 
@@ -5533,7 +5436,20 @@ async fn process_forward_request_in_request_scope(
                                 }
                             }
                             crate::proxy::credential_delegation::ResolvedCredentialInjection::Header { name, value } => {
-                                req = req.header(name, value);
+                                let (Ok(header_name), Ok(header_value)) = (
+                                    axum::http::HeaderName::from_bytes(name.as_bytes()),
+                                    axum::http::HeaderValue::from_str(value),
+                                ) else {
+                                    return axum_response_to_forward_result(crate::a2a::create_error_response(
+                                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                                        "Invalid delegated credential header",
+                                    ))
+                                    .await;
+                                };
+                                let mut delegated = axum::http::HeaderMap::new();
+                                delegated.insert(header_name.clone(), header_value);
+                                req = req.headers(delegated);
+                                delegated_headers.push(header_name);
                                 channel_info!(
                                     config_id,
                                     "GW2: Injected delegated credential header: {}",
@@ -5554,17 +5470,60 @@ async fn process_forward_request_in_request_scope(
 
     if let Some(prepared) = modern_delegation.as_ref() {
         let injected = prepared.inject_body_credentials(&body_bytes)
-            .and_then(|body| prepared.credential_headers().map(|headers| (body, headers)));
+            .map_err(|_| "Invalid delegated credential metadata")
+            .and_then(|body| {
+                prepared.credential_headers()
+                    .map(|headers| (body, headers))
+                    .map_err(|_| "Invalid delegated credential header")
+            });
         match injected {
             Ok((body, headers)) => {
                 body_bytes = body;
+                delegated_headers.extend(headers.keys().cloned());
                 req = req.headers(headers);
             }
-            Err(error) => {
-                let request = &prepared.request;
-                return axum_response_to_forward_result(
-                    crate::proxy::credential_delegation::modern::ModernDelegationError::from(error).response(request),
-                ).await;
+            Err(message) => {
+                return axum_response_to_forward_result(crate::a2a::create_error_response(
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    message,
+                ))
+                .await;
+            }
+        }
+    }
+
+    if let Some(target_auth) = surface.target_auth() {
+        let (caller, occupied_headers) = if gateway_card_fetch {
+            (crate::proxy::handler::CallerAssertion::GatewayOriginated, Vec::new())
+        } else {
+            forwarded_headers.extend(delegated_headers);
+            (
+                crate::proxy::handler::CallerAssertion::for_forwarded_request(method, path, source_auth_failed),
+                forwarded_headers,
+            )
+        };
+        let resolution = target_credential_resolver()
+            .resolve(
+                target_auth,
+                &crate::proxy::target_credentials::TargetAuthContext {
+                    surface: &surface,
+                    destination: &target_url,
+                    leg: crate::proxy::target_credentials::TargetLeg::HttpTarget,
+                    caller,
+                    via_fabric: true,
+                    trace_id: audit_trace_id,
+                    occupied_headers: &occupied_headers,
+                },
+            )
+            .await;
+        match crate::proxy::target_credentials::apply_target_auth_fallback(target_auth, resolution) {
+            crate::proxy::target_credentials::TargetAuthDecision::Inject(credential) => {
+                channel_info!(config_id, "Injected target authentication header: {}", credential.name);
+                req = credential.set_on(req);
+            }
+            crate::proxy::target_credentials::TargetAuthDecision::Continue => {}
+            crate::proxy::target_credentials::TargetAuthDecision::Reject => {
+                return target_auth_failed_forward_response();
             }
         }
     }
@@ -7859,6 +7818,7 @@ async fn handle_mcp_proxy_forward(
     body_bytes: bytes::Bytes,
     caller_identity: Option<String>,
     source_auth_failed: bool,
+    trace_id: Option<&str>,
 ) -> ProcessingResult {
     // Record fields in the span
     tracing::Span::current().record("channel_id", channel_id);
@@ -8012,60 +7972,37 @@ async fn handle_mcp_proxy_forward(
     // Get policy manager for circuit breaker support
     let policy_manager = GLOBAL_POLICY_MANAGER.get();
 
-    // Resolve target auth header if configured on the channel
-    let target_auth_header = if let Some(target_auth) = surface.target_auth() {
-        let secrets_store: Option<Arc<dyn crate::secrets::SecretsStore>> = match message
-            .context
-            .get("secrets_storage_path")
-            .and_then(|v| v.as_str())
-        {
-            Some(path) => match crate::secrets::FilesystemSecretsStore::new_async(path).await {
-                Ok(store) => Some(Arc::new(store) as Arc<dyn crate::secrets::SecretsStore>),
-                Err(e) => {
-                    channel_warn!(config_id, "Failed to create secrets store for MCP proxy target auth: {}", e);
-                    None
+    let target_auth_header = match surface.target_auth() {
+        Some(target_auth) => {
+            let resolution = target_credential_resolver()
+                .resolve(
+                    target_auth,
+                    &crate::proxy::target_credentials::TargetAuthContext {
+                        surface,
+                        destination: surface.target_endpoint(),
+                        leg: crate::proxy::target_credentials::TargetLeg::McpProxy,
+                        caller: crate::proxy::handler::CallerAssertion::for_forwarded_request(
+                            method,
+                            path,
+                            source_auth_failed,
+                        ),
+                        via_fabric: true,
+                        trace_id,
+                        occupied_headers: &[],
+                    },
+                )
+                .await;
+            match crate::proxy::target_credentials::apply_target_auth_fallback(target_auth, resolution) {
+                crate::proxy::target_credentials::TargetAuthDecision::Inject(credential) => {
+                    Some(credential.into_pair())
                 }
-            },
-            None => {
-                channel_warn!(config_id, "No secrets_storage_path in message context for MCP proxy target auth");
-                None
-            }
-        };
-
-        match crate::proxy::handler::inject_target_auth_header(
-            target_auth,
-            &secrets_store,
-            &surface.name,
-            crate::proxy::handler::CallerAssertion::for_forwarded_request(method, path, source_auth_failed),
-        )
-        .await
-        {
-            Ok(header) => header,
-            Err(e) => {
-                channel_error!(config_id, "Failed to resolve target auth for MCP proxy: {}", e);
-                match target_auth.fallback {
-                    crate::config::TargetAuthFallback::Reject => {
-                        let error_body = serde_json::json!({
-                            "error": "Target authentication configuration error",
-                            "status": 502,
-                        });
-                        return ProcessingResult::RequiresResponse {
-                            response_type: MessageType::ForwardResponse.to_string(),
-                            response_body: error_body,
-                        };
-                    }
-                    crate::config::TargetAuthFallback::Passthrough => {
-                        channel_warn!(
-                            config_id,
-                            "Target auth failed but passthrough enabled, continuing without credentials"
-                        );
-                        None
-                    }
+                crate::proxy::target_credentials::TargetAuthDecision::Continue => None,
+                crate::proxy::target_credentials::TargetAuthDecision::Reject => {
+                    return target_auth_failed_forward_response();
                 }
             }
         }
-    } else {
-        None
+        None => None,
     };
 
     // Use handle_mcp_request_with_policies to apply all surface policies
@@ -9355,6 +9292,9 @@ async fn process_x402_settlement_complete(message: &ReceivedMessage) -> Processi
 
 #[cfg(test)]
 mod mcp_receive_tests;
+
+#[cfg(test)]
+mod target_auth_receive_tests;
 
 #[cfg(test)]
 mod tests {
@@ -10722,35 +10662,6 @@ mod tests {
         let (status, body) = forward_error_of(result).await;
         assert_eq!(status, 502);
         assert!(body.contains("Upstream response too large"), "{body}");
-    }
-
-    /// The GW2 agent-card hop uses the forward's pinned, redirect-free client
-    /// and its body bounds: a redirect or an oversized card yields no card.
-    #[tokio::test]
-    async fn agent_card_fetch_is_bounded_and_does_not_follow_redirects() {
-        use crate::proxy::upstream_body::tests::{PATIENT, limits};
-        let app = axum::Router::new()
-            .route("/card", axum::routing::get(|| async { r#"{"name":"card"}"# }))
-            .route("/big", axum::routing::get(|| async { format!(r#"{{"name":"{}"}}"#, "x".repeat(4096)) }))
-            .route(
-                "/redirect",
-                axum::routing::get(|| async {
-                    (axum::http::StatusCode::FOUND, [(axum::http::header::LOCATION, "/card")])
-                }),
-            );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
-        let address = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await });
-        let fetch = |path: &str| {
-            let url = format!("http://{address}{path}");
-            async move { fetch_agent_card(&url, PATIENT, limits(1024, Some(PATIENT), PATIENT), "surface-1").await }
-        };
-
-        assert_eq!(fetch("/card").await, Some(serde_json::json!({"name": "card"})));
-        assert_eq!(fetch("/big").await, None, "an oversized card was read");
-        assert_eq!(fetch("/redirect").await, None, "the redirect was followed");
     }
 
     #[tokio::test]

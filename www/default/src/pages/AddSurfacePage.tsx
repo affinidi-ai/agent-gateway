@@ -729,6 +729,7 @@ const AddSurfacePage: React.FC = () => {
                             disabled={applying}
                             aria-label={`Use template ${tpl.name}`}
                             title={`Use template ${tpl.name}`}
+                            data-testid={`surface-starter-use-${tpl.id}`}
                             onClick={e => {
                               e.stopPropagation();
                               void handleApplyStarterTemplate(tpl);
@@ -838,6 +839,7 @@ const AddSurfacePage: React.FC = () => {
               type="button"
               className="btn btn-success btn-sm"
               onClick={handleCreate}
+              data-testid="surface-create-button"
               disabled={saving || !!saveDisabledReason}
               title={saveDisabledReason || (saving ? 'Creating…' : 'Create surface')}
             >
@@ -896,6 +898,7 @@ const AddSurfacePage: React.FC = () => {
                   type="button"
                   className="btn btn-sm btn-primary"
                   onClick={handleCloseWelcome}
+                  data-testid="surface-welcome-dismiss"
                 >
                   Got it
                 </button>

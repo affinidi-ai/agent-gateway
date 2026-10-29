@@ -14,7 +14,9 @@ use crate::bdd_support::config::single_surface_fixture::{
     CredentialProviderKind, DelegatedCredentialInjection, DidWebVhIdentityFixture, PROTECTED_RESOURCE_PUBLIC_ORIGIN,
     SurfaceConfigBuilder, SurfaceSourceAuthConfig, SurfaceTransitPointConfig,
 };
-use crate::bdd_support::config::target_auth::static_secret_target_auth_json;
+use crate::bdd_support::config::target_auth::{
+    credential_provider_target_auth_json, static_secret_target_auth_json, write_target_token_provider,
+};
 
 struct SingleSurfaceOptions<'a> {
     outbound: Option<(u16, &'a HashMap<String, String>)>,
@@ -242,6 +244,14 @@ fn write_single_surface_config_inner(
             &target_auth.header_name,
             &target_auth.header_format,
             &target_auth.fallback,
+        ));
+    }
+    if let Some(token_auth) = &surface_config.target_token_auth {
+        surface_fixture = surface_fixture.with_target_auth(credential_provider_target_auth_json(
+            &token_auth
+                .provider
+                .provider_id,
+            &token_auth.fallback,
         ));
     }
     if let Some(policy) = &surface_config.mcp_tool_policy {
@@ -474,6 +484,9 @@ fn write_single_surface_config_inner(
     }
 
     write_gateway_config_tree(base_dir, &config_tree, true);
+    if let Some(token_auth) = &surface_config.target_token_auth {
+        write_target_token_provider(base_dir, &token_auth.provider);
+    }
     if surface_config
         .protected_resource
         .is_some()

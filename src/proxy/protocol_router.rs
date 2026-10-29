@@ -17,6 +17,29 @@ pub(crate) fn join_endpoint_path(
     }
 }
 
+/// The agent card URL for an `agent_card_location_path` override: the path on the
+/// Target endpoint's origin (scheme, host and port), whatever the endpoint's own path.
+pub(crate) fn override_agent_card_url(
+    target_endpoint: &str,
+    custom_path: &str,
+) -> String {
+    let origin = match target_endpoint.find("://") {
+        Some(scheme_end) => {
+            let after_scheme = &target_endpoint[scheme_end + 3..];
+            let authority_end = after_scheme
+                .find('/')
+                .unwrap_or(after_scheme.len());
+            &target_endpoint[..scheme_end + 3 + authority_end]
+        }
+        None => target_endpoint,
+    };
+    if custom_path.starts_with('/') {
+        format!("{origin}{custom_path}")
+    } else {
+        format!("{origin}/{custom_path}")
+    }
+}
+
 /// Simple protocol routing function - extensible by adding new conditions
 pub fn route_protocol_request(
     target_endpoint: &str,
@@ -49,31 +72,11 @@ pub fn route_protocol_request(
             // Allow for default relative-to-root path of .well-known/agent-card.json to be overridden by config
             let target_url = if path_and_query.starts_with("/.well-known/") {
                 // Check if agent card location override is enabled
-                if override_agent_card_location
-                    && agent_card_location_path.is_some()
-                    && let Some(custom_path) = agent_card_location_path
-                {
-                    // Use custom agent card location - append the custom path to the ORIGIN
-                    // of the target endpoint (scheme + host + port), stripping any sub-path.
-                    // This supports upstreams that serve their agent card at the server root
-                    // rather than relative to the API sub-path.
-                    let custom_path_clean = if custom_path.starts_with('/') {
-                        custom_path.to_string()
-                    } else {
-                        format!("/{}", custom_path)
-                    };
-                    // Extract origin from target_endpoint (everything up to the path)
-                    let origin = if let Some(scheme_end) = target_endpoint.find("://") {
-                        let after_scheme = &target_endpoint[scheme_end + 3..];
-                        if let Some(path_start) = after_scheme.find('/') {
-                            &target_endpoint[..scheme_end + 3 + path_start]
-                        } else {
-                            target_endpoint
-                        }
-                    } else {
-                        target_endpoint
-                    };
-                    format!("{}{}", origin, custom_path_clean)
+                if override_agent_card_location && let Some(custom_path) = agent_card_location_path {
+                    // The custom agent card location is appended to the ORIGIN of the
+                    // target endpoint, for upstreams that serve their card at the server
+                    // root rather than relative to the API sub-path.
+                    override_agent_card_url(target_endpoint, custom_path)
                 } else {
                     // Default behavior: Per A2A spec Section 5.3, the agent card lives at
                     // {agent_base_url}/.well-known/agent-card.json where agent_base_url is the

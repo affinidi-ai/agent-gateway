@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::bdd_support::config::config_tree::PolicyDefinitionFixture;
+use crate::bdd_support::config::target_auth::TargetTokenProviderFixture;
 
 /// The public https origin a surface's protected resource is published under.
 pub const PROTECTED_RESOURCE_PUBLIC_ORIGIN: &str = "https://gateway.bdd.example";
@@ -28,6 +29,7 @@ pub struct SurfaceConfigBuilder {
     pub mcp_inbound_identity: bool,
     pub mcp_inbound_identity_strip_raw: bool,
     pub target_auth: Option<SurfaceTargetAuthConfig>,
+    pub target_token_auth: Option<SurfaceTargetTokenAuthConfig>,
     pub mcp_tool_policy: Option<McpToolPolicyFixture>,
     pub mcp_tool_gating: Option<serde_json::Value>,
     pub mcp_tool_gating_condition_policy: Option<RequestPolicyFixture>,
@@ -78,6 +80,7 @@ impl Default for SurfaceConfigBuilder {
             mcp_inbound_identity: false,
             mcp_inbound_identity_strip_raw: false,
             target_auth: None,
+            target_token_auth: None,
             mcp_tool_policy: None,
             mcp_tool_gating: None,
             mcp_tool_gating_condition_policy: None,
@@ -139,6 +142,13 @@ impl DidWebVhIdentityFixture {
         self.agent_dna = Some(agent_dna.into());
         self
     }
+}
+
+/// Target Authentication through a client credentials provider.
+#[derive(Debug, Clone)]
+pub struct SurfaceTargetTokenAuthConfig {
+    pub provider: TargetTokenProviderFixture,
+    pub fallback: String,
 }
 
 #[derive(Debug, Clone)]
