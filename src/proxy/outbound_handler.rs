@@ -8164,6 +8164,8 @@ mod tests {
             ("unknown", true, "envelope", 404, RejectionReason::UnknownVariant, Some("unknown")),
             ("unknown", true, "malformed", 404, RejectionReason::UnknownVariant, Some("unknown")),
             ("unknown", true, "20 KiB", 404, RejectionReason::UnknownVariant, Some("unknown")),
+            ("unknown", true, "GET", 404, RejectionReason::UnknownVariant, Some("unknown")),
+            ("unknown", true, "DELETE", 404, RejectionReason::UnknownVariant, Some("unknown")),
             ("unknown", false, "envelope", 404, RejectionReason::UnknownVariant, Some("unknown")),
             ("disabled", true, "envelope", 404, RejectionReason::VariantDisabled, None),
             ("disabled", false, "envelope", 404, RejectionReason::VariantDisabled, None),
@@ -8202,8 +8204,12 @@ mod tests {
                 .write()
                 .unwrap()
                 .surface = Arc::new(surface);
+            let method = match sent {
+                "GET" | "DELETE" => sent,
+                _ => "POST",
+            };
             let mut request = Request::builder()
-                .method("POST")
+                .method(method)
                 .uri(path)
                 .header("content-type", "application/json")
                 .header("accept", "application/json, text/event-stream");
@@ -8220,10 +8226,10 @@ mod tests {
             if sent == "20 KiB" {
                 body["params"]["padding"] = json!("x".repeat(20 * 1024));
             }
-            let body = if sent == "malformed" {
-                "not json".to_string()
-            } else {
-                body.to_string()
+            let body = match sent {
+                "malformed" => "not json".to_string(),
+                "GET" | "DELETE" => String::new(),
+                _ => body.to_string(),
             };
             let request = request
                 .body(axum::body::Body::from(body))

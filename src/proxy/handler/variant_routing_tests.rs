@@ -660,6 +660,16 @@ async fn a_surface_update_does_not_wait_for_a_refusal_reading_its_body() {
 }
 
 #[tokio::test]
+async fn a_modern_mcp_variant_refusal_of_any_method_echoes_the_id_its_body_carries() {
+    let body = json!({"jsonrpc": "2.0", "id": "variant", "method": "tools/list"}).to_string();
+    for (case, surface, path, reason, status) in mcp_refusal_cases() {
+        let answer = send_mcp_request(surface, "DELETE", path, true, body.clone()).await;
+
+        assert_json_rpc_refusal(&format!("DELETE, {case}"), answer, reason, status, Some("variant"));
+    }
+}
+
+#[tokio::test]
 async fn a_modern_mcp_get_variant_refusal_answers_without_an_id() {
     for (case, surface, path, reason, status) in mcp_refusal_cases() {
         let answer = send_mcp_request(surface, "GET", path, true, String::new()).await;
