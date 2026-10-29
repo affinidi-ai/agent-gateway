@@ -1,6 +1,6 @@
 //! Filesystem storage for delegation vault tokens
 
-use super::grants::{DelegatedGrant, EncryptionRequired, GRANTS_DIRECTORY, GrantKey, StoredGrant};
+use super::grants::{DelegatedGrant, EncryptionRequired, EphemeralPepper, GRANTS_DIRECTORY, GrantKey, StoredGrant};
 use super::{DelegationToken, VaultLookupResult};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -123,7 +123,9 @@ pub trait DelegationVaultStorage: Send + Sync {
     }
 
     /// The grant stored under `key`, read with one lookup by its record id.
-    /// Fails with [`EncryptionRequired`] while at-rest encryption is not active.
+    /// Fails with [`EncryptionRequired`] while at-rest encryption is not active,
+    /// and with [`EphemeralPepper`] while the identity hash pepper is not
+    /// configured.
     async fn grant(
         &self,
         _key: &GrantKey,
@@ -133,8 +135,8 @@ pub trait DelegationVaultStorage: Send + Sync {
 
     /// Store `grant` under its key, replacing a grant of the same key, which is
     /// returned so the caller can revoke its tokens. The record id is derived
-    /// from the key; the grant's own `id` is ignored. Fails with
-    /// [`EncryptionRequired`] while at-rest encryption is not active.
+    /// from the key; the grant's own `id` is ignored. Fails as [`Self::grant`]
+    /// does.
     #[allow(dead_code)]
     async fn store_grant(
         &self,
@@ -143,11 +145,20 @@ pub trait DelegationVaultStorage: Send + Sync {
         anyhow::bail!("This vault does not keep grants by binding")
     }
 
-    /// Every grant made with one credential provider.
+    /// Every grant made with one credential provider, by the provider its own
+    /// record names, whether or not its id is its key's under the current
+    /// pepper, so a grant written under an earlier pepper can still be revoked
+    /// and deleted. Fails with [`EncryptionRequired`] while at-rest encryption
+    /// is not active.
     async fn provider_grants(
         &self,
         _credential_provider_id: &str,
     ) -> Result<Vec<DelegatedGrant>> {
+        anyhow::bail!("This vault does not keep grants by binding")
+    }
+
+    /// Every grant stored, as [`Self::provider_grants`] lists them.
+    async fn all_grants(&self) -> Result<Vec<DelegatedGrant>> {
         anyhow::bail!("This vault does not keep grants by binding")
     }
 
@@ -178,11 +189,15 @@ pub struct FileSystemDelegationVaultStore {
     grants: std::sync::Arc<dyn StorageBackend<DelegatedGrant>>,
     /// Whether the vault's stores were created with at-rest encryption active.
     encrypted: bool,
+    /// Whether the identity hash pepper, which grant ids derive from, was
+    /// configured rather than generated for this process.
+    stable_grant_ids: bool,
 }
 
 impl FileSystemDelegationVaultStore {
     pub async fn new(path: PathBuf) -> Result<Self> {
         let encrypted = crate::storage::filesystem::at_rest_encryption_active();
+        let stable_grant_ids = crate::identity::credential_identity::pepper_is_configured();
         // Use uncached storage for security — tokens should not linger in memory
         let storage = uncached_storage(path.clone(), "delegation_token").await?;
         if encrypted {
@@ -199,6 +214,14 @@ impl FileSystemDelegationVaultStore {
                  plaintext, and grants by binding are refused until [encryption] is enabled with a key"
             );
         }
+        if !stable_grant_ids {
+            warn!(
+                target: "credential_delegation",
+                "AG_IDENTITY_HASH_PEPPER is not set: grants by binding are neither stored nor released, since their \
+                 ids derive from the identity hash pepper and one generated for this process changes on restart; \
+                 set AG_IDENTITY_HASH_PEPPER to the same value on every node"
+            );
+        }
         Ok(Self {
             storage: storage.into(),
             mutation_lock_path: path.join(".mutation.lock"),
@@ -210,6 +233,7 @@ impl FileSystemDelegationVaultStore {
                 .await?
                 .into(),
             encrypted,
+            stable_grant_ids,
         })
     }
 
@@ -218,6 +242,17 @@ impl FileSystemDelegationVaultStore {
             Ok(())
         } else {
             Err(EncryptionRequired.into())
+        }
+    }
+
+    /// Storing or releasing a grant needs at-rest encryption and a configured
+    /// identity hash pepper.
+    fn require_grant_storage(&self) -> Result<()> {
+        self.require_encryption()?;
+        if self.stable_grant_ids {
+            Ok(())
+        } else {
+            Err(EphemeralPepper.into())
         }
     }
 
@@ -738,7 +773,7 @@ impl DelegationVaultStorage for FileSystemDelegationVaultStore {
         &self,
         key: &GrantKey,
     ) -> Result<Option<DelegatedGrant>> {
-        self.require_encryption()?;
+        self.require_grant_storage()?;
         self.grant_locked(key).await
     }
 
@@ -746,7 +781,7 @@ impl DelegationVaultStorage for FileSystemDelegationVaultStore {
         &self,
         mut grant: DelegatedGrant,
     ) -> Result<StoredGrant> {
-        self.require_encryption()?;
+        self.require_grant_storage()?;
         let key = grant.key();
         grant.id = key.record_id();
         self.mutate(move |store| async move {
@@ -783,15 +818,17 @@ impl DelegationVaultStorage for FileSystemDelegationVaultStore {
         &self,
         credential_provider_id: &str,
     ) -> Result<Vec<DelegatedGrant>> {
-        self.require_encryption()?;
         Ok(self
-            .grants
-            .list_all()
+            .all_grants()
             .await?
             .into_iter()
             .filter(|grant| grant.credential_provider_id == credential_provider_id)
-            .filter(|grant| grant.id == grant.key().record_id())
             .collect())
+    }
+
+    async fn all_grants(&self) -> Result<Vec<DelegatedGrant>> {
+        self.require_encryption()?;
+        self.grants.list_all().await
     }
 
     async fn delete_grant(
@@ -1311,9 +1348,86 @@ mod tests {
 
     async fn encrypted_vault(directory: &std::path::Path) -> FileSystemDelegationVaultStore {
         with_at_rest_encryption();
+        crate::identity::credential_identity::configure_pepper_for_tests(true);
         FileSystemDelegationVaultStore::new(directory.into())
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn while_the_pepper_is_ephemeral_grants_are_neither_stored_nor_released() {
+        use crate::delegation_vault::grants::tests::{grant, key};
+        let directory = tempfile::tempdir().unwrap();
+        let vault = encrypted_vault(directory.path()).await;
+        vault
+            .store_grant(grant(&key(), "owner-access"))
+            .await
+            .unwrap();
+        crate::identity::credential_identity::configure_pepper_for_tests(false);
+        let restarted = FileSystemDelegationVaultStore::new(directory.path().into())
+            .await
+            .unwrap();
+        let refused = restarted
+            .store_grant(grant(&key(), "other-access"))
+            .await
+            .unwrap_err();
+        assert!(refused.is::<EphemeralPepper>(), "{refused}");
+        assert!(
+            restarted
+                .grant(&key())
+                .await
+                .unwrap_err()
+                .is::<EphemeralPepper>()
+        );
+        assert_eq!(
+            restarted
+                .provider_grants("provider")
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "grants can still be listed, so they can be revoked and removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_providers_grants_include_those_stored_under_another_pepper() {
+        use crate::delegation_vault::grants::tests::{grant, key};
+        let directory = tempfile::tempdir().unwrap();
+        let vault = encrypted_vault(directory.path()).await;
+        let mut earlier = grant(&key(), "earlier-access");
+        earlier.id = format!("grant-{}", "e".repeat(64));
+        vault
+            .grants
+            .save_atomic(&earlier)
+            .await
+            .unwrap();
+        let listed = vault
+            .provider_grants("provider")
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, earlier.id);
+        assert!(
+            vault
+                .grant(&key())
+                .await
+                .unwrap()
+                .is_none(),
+            "a grant whose id is not its key's under this pepper is never released"
+        );
+        vault
+            .delete_grant(&earlier.id)
+            .await
+            .unwrap()
+            .expect("the grant is deleted by the id it was stored under");
+        assert!(
+            vault
+                .provider_grants("provider")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -1497,12 +1611,14 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(
+        assert_eq!(
             vault
                 .provider_grants("provider")
                 .await
                 .unwrap()
-                .is_empty()
+                .len(),
+            1,
+            "its provider's listing names it, so deleting the provider removes it"
         );
     }
 

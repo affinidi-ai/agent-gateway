@@ -31,6 +31,13 @@ const RECORD_ID_PREFIX: &str = "grant-";
 #[error("Delegated grants are kept only while at-rest encryption is enabled with a key")]
 pub struct EncryptionRequired;
 
+/// The vault refuses to store or release a grant while the identity hash
+/// pepper was generated for this process: a grant's id derives from it, so the
+/// next restart would orphan the grant.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("Delegated grants are kept only while AG_IDENTITY_HASH_PEPPER sets the identity hash pepper")]
+pub struct EphemeralPepper;
+
 /// What a grant is stored and found under.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrantKey {
