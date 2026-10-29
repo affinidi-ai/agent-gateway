@@ -10,8 +10,29 @@ changes:
         client with a signed JWT and certificate thumbprint instead of a client secret
         (private_key_jwt, for example an Entra certificate credential). The private key and
         certificate are secret references, checked to be PEM when the provider is saved.
+    - timestamp: '2026-10-29T23:30:00Z'
+      title: Let target authentication use a credential provider
+      description: >-
+        A Target or Transit Point target_auth can use method credential_provider to send a
+        client credentials, JWT Bearer, Client Credentials JWT or API key provider's token,
+        Authorization Bearer by default. Issued tokens are cached in the delegation vault per
+        surface and renewed before they expire. The dashboard offers it on the Managed Agent
+        and Transit Point, and a surface save refuses an authorization-code provider.
   changed: []
-  fixed: []
+  fixed:
+    - timestamp: '2026-10-29T23:30:00Z'
+      title: Fetch an agent card protected by an expiring OAuth token
+      description: >-
+        The gateway's agent card fetch can now present a credential provider's token, so
+        agents whose card sits behind an Entra or Google OAuth token, such as Foundry and
+        Vertex AI Agent Engine agents, publish their card through the gateway.
+    - timestamp: '2026-10-29T23:30:00Z'
+      title: Renew delegated service tokens before they expire
+      description: >-
+        Client-credentials delegation tokens are renewed 60 seconds before they expire, and a
+        token response without expires_in is refused instead of being cached forever. A failed
+        token request now logs the token endpoint's error instead of returning it in the
+        delegation audit detail.
   removed: []
   security: []
   breaking: []
