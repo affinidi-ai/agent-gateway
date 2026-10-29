@@ -130,7 +130,8 @@ The Surface Detail **Agent Cards** view, for A2A and AP2 surfaces only, sits aft
 before Monitoring. It shows the Managed Agent Card beside the Gateway-Served Agent Card, with each
 difference marked by colour and an icon with a text label, the raw JSON of both, the card fetch
 status with its cause and HTTP status, a Refresh action, the served card discovery URL with a copy
-action and a link back to the Surface view. `CallerAuthDiscoverySection` is the one caller-auth
+action and a link back to the Surface view. When the fetch fails, it shows the card the gateway
+last served, marked as possibly from earlier, and no comparison. `CallerAuthDiscoverySection` is the one caller-auth
 declaration section for A2A, AP2 and MCP: it sets the required scopes, shows the authorization
 server, scopes and audience the served card or metadata carries, and keeps the explicit MCP
 discovery setting; the declaration outcome chip shows the result. Surface Detail shows surface save

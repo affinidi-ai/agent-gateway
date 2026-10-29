@@ -76,30 +76,50 @@ function oversizeBytes(p: SupportedAgentCardPreview): number | null {
   return omitted.length > 0 ? Math.max(...omitted) : null;
 }
 
+function servedPanelOnFailure(
+  preview: SupportedAgentCardPreview,
+  lastServed: ServedCardSnapshot | null
+): RawCardPanel {
+  const { after, after_bytes: afterBytes, display_limit_bytes: limit } = preview;
+  if (after !== null) {
+    const reason =
+      preview.fetch.status === 'not_served'
+        ? 'the gateway will not serve the card it fetched'
+        : 'the latest fetch failed';
+    return {
+      card: after,
+      note: `The card the gateway serves for this surface, as it last served it. It may be from earlier, because ${reason}.`,
+    };
+  }
+  if (afterBytes !== null && afterBytes > limit) {
+    return {
+      card: null,
+      missing: `The card the gateway serves is ${kb(afterBytes)} KB, more than the ${kb(limit)} KB the dashboard shows. Open the card URL to read it.`,
+    };
+  }
+  if (lastServed) {
+    const fetched = formatRelativeTime(lastServed.fetchedAt);
+    return {
+      card: lastServed.card,
+      note: fetched
+        ? `The last card the gateway served, fetched ${fetched}.`
+        : 'The last card the gateway served.',
+    };
+  }
+  return { card: null, missing: 'The gateway serves no card while the fetch fails.' };
+}
+
 function failedCardPanels(
   preview: SupportedAgentCardPreview,
   lastServed: ServedCardSnapshot | null
 ): { managed: RawCardPanel; served: RawCardPanel } {
   const failure = describeFetchFailure(preview.fetch);
-  const managed: RawCardPanel = {
-    card: preview.before,
-    missing: failure ? `Not available: ${failure}.` : 'Not available.',
-  };
-  if (!lastServed) {
-    return {
-      managed,
-      served: { card: null, missing: 'The gateway serves no card while the fetch fails.' },
-    };
-  }
-  const fetched = formatRelativeTime(lastServed.fetchedAt);
   return {
-    managed,
-    served: {
-      card: lastServed.card,
-      note: fetched
-        ? `The last card the gateway served, fetched ${fetched}.`
-        : 'The last card the gateway served.',
+    managed: {
+      card: preview.before,
+      missing: failure ? `Not available: ${failure}.` : 'Not available.',
     },
+    served: servedPanelOnFailure(preview, lastServed),
   };
 }
 

@@ -336,11 +336,17 @@ surface, never the unsaved form.
 - A failed or not-served fetch shows a danger alert with the cause text (`agent-card-failed`,
   `agent-card-failed-cause`) and opens both raw panels. The managed panel reads "Not available:
   <cause — HTTP n>." (`agent-card-raw-before-missing`), or shows the managed card when the gateway
-  fetched it but will not serve it. The served panel keeps the last Gateway-Served Agent Card the
-  dashboard saw for this surface (`useAgentCardPreview` `lastServed`, never carried to another
-  surface) with "The last card the gateway served, fetched <time>." (`agent-card-raw-after-note`),
-  or says "The gateway serves no card while the fetch fails." (`agent-card-raw-after-missing`) when
-  it has seen none, as on a first load that fails.
+  fetched it but will not serve it. The served panel shows, in this order: the card the gateway
+  returns in `after` whatever the fetch status, with "The card the gateway serves for this surface,
+  as it last served it. It may be from earlier, because the latest fetch failed." (or "because the
+  gateway will not serve the card it fetched.") as `agent-card-raw-after-note`; when `after` is
+  `null` because the card is over the display limit, "The card the gateway serves is N KB, more
+  than the N KB the dashboard shows. Open the card URL to read it."; on a gateway that returns no
+  served card, the last Gateway-Served Agent Card the dashboard saw for this surface
+  (`useAgentCardPreview` `lastServed`, never carried to another surface) with "The last card the
+  gateway served, fetched <time>."; otherwise "The gateway serves no card while the fetch fails."
+  (`agent-card-raw-after-missing`). A failed or not-served fetch shows no comparison, summary or
+  **Added** marks, because there is no managed card from the same fetch to compare against.
 - Other states, each with its own test id and fixed copy: create mode or no id
   (`agent-card-unsaved`, "Save the surface to see its agent cards."), unsaved edits
   (`agent-card-unsaved-changes`, a banner above the content; moving or zooming the canvas does not

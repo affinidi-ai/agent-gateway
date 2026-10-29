@@ -277,6 +277,127 @@ describe('AgentCardTab, failed fetches', () => {
   });
 });
 
+describe('AgentCardTab, the served card on a failed fetch', () => {
+  const failedWithServed = (served: Record<string, unknown> = AFTER_CARD) => ({
+    ...failedBody('needs_token', 401),
+    after: served,
+    after_bytes: 2950,
+  });
+  const SERVED_NOTE =
+    'The card the gateway serves for this surface, as it last served it. It may be from earlier, because the latest fetch failed.';
+
+  it('shows the card the gateway serves when the first load fails', async () => {
+    await showBody(failedWithServed());
+    expect(screen.getByTestId('agent-card-failed')).toHaveAttribute('role', 'alert');
+    expect(screen.getByTestId('agent-card-raw-toggle')).toHaveAttribute('aria-expanded', 'true');
+    expect(JSON.parse(screen.getByTestId('agent-card-raw-after').textContent ?? '')).toEqual(
+      AFTER_CARD
+    );
+    expect(screen.getByTestId('agent-card-raw-after-note')).toHaveTextContent(SERVED_NOTE);
+    expect(screen.getByTestId('agent-card-copy-after-button')).toBeInTheDocument();
+    expect(screen.queryByTestId('agent-card-raw-after-missing')).not.toBeInTheDocument();
+    expect(screen.getByTestId('agent-card-raw-before-missing')).toHaveTextContent(
+      'Not available: Needs a token — HTTP 401.'
+    );
+  });
+
+  it('marks nothing as added when there is no managed card to compare', async () => {
+    await showBody(failedWithServed());
+    expect(screen.queryByTestId('agent-card-summary')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('agent-card-row-signin')).not.toBeInTheDocument();
+    expect(screen.queryByText('Added')).not.toBeInTheDocument();
+    expect(screen.queryAllByTestId(/^agent-card-row-/)).toHaveLength(0);
+    expect(screen.queryByTestId('agent-card-legend')).not.toBeInTheDocument();
+  });
+
+  it('prefers the served card a failed Refresh returns over the one the dashboard saw', async () => {
+    await showBody(previewBody());
+    mockFetch.mockResolvedValueOnce(reply(200, failedWithServed(BEFORE_CARD)));
+    fireEvent.click(screen.getByTestId('agent-card-refresh-button'));
+    await screen.findByTestId('agent-card-failed');
+    expect(JSON.parse(screen.getByTestId('agent-card-raw-after').textContent ?? '')).toEqual(
+      BEFORE_CARD
+    );
+    expect(screen.getByTestId('agent-card-raw-after-note')).toHaveTextContent(SERVED_NOTE);
+    expect(screen.getByTestId('agent-card-raw-after-note')).not.toHaveTextContent('fetched');
+    expect(screen.getByTestId('agent-card-refresh-status')).toHaveTextContent(
+      'Card refreshed. The card fetch is failing.'
+    );
+  });
+
+  it('still shows the served card when the tab mounts again after a failure', async () => {
+    mockFetch.mockResolvedValue(reply(200, failedWithServed()));
+    const view = renderTab();
+    await screen.findByTestId('agent-card-raw-after');
+    view.unmount();
+    renderTab();
+    await screen.findByTestId('agent-card-header');
+    expect(JSON.parse(screen.getByTestId('agent-card-raw-after').textContent ?? '')).toEqual(
+      AFTER_CARD
+    );
+    expect(screen.getByTestId('agent-card-raw-after-note')).toHaveTextContent(SERVED_NOTE);
+  });
+
+  it('says why a served card may be from earlier when the gateway will not serve the new one', async () => {
+    await showBody(
+      previewBody({
+        fetch: { status: 'not_served', cause: 'rewrite_failed', http_status: null, duration_ms: 5 },
+      })
+    );
+    expect(JSON.parse(screen.getByTestId('agent-card-raw-before').textContent ?? '')).toEqual(
+      BEFORE_CARD
+    );
+    expect(JSON.parse(screen.getByTestId('agent-card-raw-after').textContent ?? '')).toEqual(
+      AFTER_CARD
+    );
+    expect(screen.getByTestId('agent-card-raw-after-note')).toHaveTextContent(
+      'It may be from earlier, because the gateway will not serve the card it fetched.'
+    );
+    expect(screen.queryByTestId('agent-card-summary')).not.toBeInTheDocument();
+  });
+
+  it('says the gateway serves no card when a failed fetch returns none', async () => {
+    await showBody(
+      previewBody({
+        fetch: { status: 'not_served', cause: 'rewrite_failed', http_status: null, duration_ms: 5 },
+        after: null,
+        after_bytes: null,
+      })
+    );
+    expect(screen.getByTestId('agent-card-raw-after-missing')).toHaveTextContent(
+      'The gateway serves no card while the fetch fails.'
+    );
+    expect(screen.queryByTestId('agent-card-raw-after')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('agent-card-raw-after-note')).not.toBeInTheDocument();
+  });
+
+  it('points at the card URL when the served card is over the display limit', async () => {
+    await showBody({ ...failedBody('needs_token', 401), after_bytes: 300000 });
+    expect(screen.getByTestId('agent-card-raw-after-missing')).toHaveTextContent(
+      'The card the gateway serves is 293 KB, more than the 256 KB the dashboard shows. Open the card URL to read it.'
+    );
+    expect(screen.queryByTestId('agent-card-raw-after')).not.toBeInTheDocument();
+  });
+
+  it('keeps the card the dashboard saw on a gateway that returns no served card', async () => {
+    await showBody(previewBody());
+    const withoutAfter = failedBody('auth_failed', 401, {
+      kind: 'credential_provider',
+      result: 'sent',
+    });
+    delete withoutAfter.after;
+    mockFetch.mockResolvedValueOnce(reply(200, withoutAfter));
+    fireEvent.click(screen.getByTestId('agent-card-refresh-button'));
+    await screen.findByTestId('agent-card-failed');
+    expect(JSON.parse(screen.getByTestId('agent-card-raw-after').textContent ?? '')).toEqual(
+      AFTER_CARD
+    );
+    expect(screen.getByTestId('agent-card-raw-after-note')).toHaveTextContent(
+      'The last card the gateway served, fetched'
+    );
+  });
+});
+
 describe('AgentCardTab, comparison', () => {
   it('shows the Managed Agent Card beside the Gateway-Served Agent Card', async () => {
     await showBody(previewBody());
