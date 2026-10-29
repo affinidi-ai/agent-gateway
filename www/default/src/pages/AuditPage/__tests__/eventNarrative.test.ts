@@ -258,6 +258,26 @@ describe('eventNarrative', () => {
       );
     });
 
+    it('names the variant of a change stored before the rename, which calls it variant', () => {
+      const n = describeEntry(
+        at({
+          policy_attached: {
+            policy_definition_id: 'deny-pii',
+            policy_name: 'Deny PII',
+            target: surface,
+            scope: 'surface',
+            slot: 'inbound',
+            variant: 'beta',
+            actor: user,
+            source: 'api',
+          },
+        })
+      );
+      expect(n.summary).toBe(
+        '“Deny PII” was added to surface Orders as its inbound policy, on variant beta.'
+      );
+    });
+
     it('names the actor by username when the resolver knows it', () => {
       const n = describeEntry(
         at({

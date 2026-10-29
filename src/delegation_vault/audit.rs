@@ -1779,6 +1779,29 @@ mod tests {
     }
 
     #[test]
+    fn a_stored_policy_change_that_names_its_variant_variant_reads_back_as_surface_variant() {
+        let stored = serde_json::json!({
+            "policy_definition_id": "deny-pii",
+            "slot": "inbound",
+            "variant": "beta",
+            "actor": {"kind": "user", "id": "u-123"},
+            "source": "api",
+        });
+
+        let change: PolicyChangeDetails = serde_json::from_value(stored).unwrap();
+
+        assert_eq!(
+            change
+                .surface_variant
+                .as_deref(),
+            Some("beta")
+        );
+        let written = serde_json::to_value(&change).unwrap();
+        assert_eq!(written["surface_variant"], "beta");
+        assert!(written.get("variant").is_none(), "{written}");
+    }
+
+    #[test]
     fn a_policy_change_event_is_categorised_by_its_name_and_kept_in_the_vp_audit_log() {
         let change = || Box::new(PolicyChangeDetails::new(Actor::system(), PolicyChangeSource::DefinitionDeleted));
         let actions = [

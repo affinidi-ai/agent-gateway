@@ -188,6 +188,24 @@ describe('fieldGroups', () => {
       expect(where).toEqual(expect.arrayContaining([{ term: 'Variant', value: 'Base surface' }]));
     });
 
+    it('shows the variant of a change stored before the rename, which calls it variant', () => {
+      const entry = baseEntry({
+        event: {
+          policy_attached: {
+            policy_definition_id: 'deny-pii',
+            target: { kind: 'surface', id: 's-1', name: 'Orders' },
+            scope: 'surface',
+            slot: 'inbound',
+            variant: 'beta',
+            actor: { kind: 'user', id: 'u-1' },
+            source: 'api',
+          },
+        },
+      });
+      const where = groupByLabel(entry, null, null)['Where'];
+      expect(where).toEqual(expect.arrayContaining([{ term: 'Variant', value: 'beta' }]));
+    });
+
     it('lays out a policy change as Change, Policy and Where, with links', () => {
       const entry = baseEntry({
         event: {
