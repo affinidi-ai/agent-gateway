@@ -64,5 +64,11 @@ changes:
         the same time returns 404. A delete whose record cannot be removed returns 500 and
         keeps the registry and its keys usable.
   removed: []
-  security: []
+  security:
+    - timestamp: '2026-10-29T15:00:00Z'
+      title: Update libz-sys to 1.1.31
+      description: >-
+        libz-sys 1.1.29, which the Kafka client links, has a build script that leaks
+        environment variables into its build directory (rust-lang/libz-sys#280), and
+        cargo-audit reports it. The lockfile now uses the patched 1.1.31.
   breaking: []
