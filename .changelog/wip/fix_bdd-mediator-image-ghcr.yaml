@@ -1,0 +1,16 @@
+branch: fix/bdd-mediator-image-ghcr
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-10-29T12:00:00Z'
+      title: Pull the BDD mediator image from GHCR
+      description: >-
+        The gateway-to-gateway BDD job pulled the mediator from ECR Public without logging in, and
+        failed with "toomanyrequests: Data limit exceeded" when the shared GitHub runner IP had used
+        its anonymous monthly quota. CI and scripts/g2g-mediator.sh now pull the same release tag
+        from ghcr.io/affinidi/messaging-mediator, which is public and multi-arch. The EC2 mediator
+        scripts still use ECR Public.
+  removed: []
+  security: []
+  breaking: []
