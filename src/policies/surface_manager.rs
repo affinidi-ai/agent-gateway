@@ -1261,8 +1261,8 @@ impl SurfacePolicyManager {
         }
     }
 
-    /// Remove all policies, MCP tool gating and rate limiters for a channel,
-    /// its variants and its Transit Points.
+    /// Remove all policies, MCP tool gating, rate limiters and the circuit
+    /// breaker for a channel, its variants and its Transit Points.
     pub async fn remove_channel(
         &self,
         channel_id: &str,
@@ -1291,8 +1291,13 @@ impl SurfacePolicyManager {
         // Drop any per-VC limiters installed for this channel.
         let prefix = format!("vc:{}:", channel_id);
         limiters.retain(|k, _| !k.starts_with(&prefix));
+        drop(limiters);
+        self.circuit_breakers
+            .write()
+            .await
+            .remove(channel_id);
 
-        info!(channel_id = %channel_id, "Removed all policies and rate limiters");
+        info!(channel_id = %channel_id, "Removed all policies, rate limiters and circuit breaker");
     }
 
     /// Load a policy engine directly from Rego text (test helper).
@@ -1556,12 +1561,12 @@ allow if {
     }
 
     #[tokio::test]
-    async fn removing_a_surface_evicts_its_transit_point_policies_gates_and_limiters() {
+    async fn removing_a_surface_evicts_its_transit_point_policies_gates_limiters_and_circuit_breaker() {
         let manager = SurfacePolicyManager::new();
         let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(serde_json::json!({
             "surface_id": "doomed", "name": "doomed", "description": "", "status": "active",
             "access_point": { "listen_address": "0.0.0.0:8443", "route": "/doomed", "protocol": "mcp" },
-            "target": { "endpoint": "http://localhost:9000" },
+            "target": { "endpoint": "http://localhost:9000", "networking": { "circuit_breaker": { "failure_threshold": 5 } } },
             "transit": { "points": [{
                 "alias": "partner", "target_endpoint": "https://partner.example.com/mcp", "protocol": "mcp",
                 "rate_limit": { "requests": 10, "window_secs": 60 },
@@ -1588,10 +1593,23 @@ allow if {
                 .await
                 .contains_key("vc:doomed:partner")
         );
+        assert!(
+            manager
+                .get_circuit_breaker("doomed")
+                .await
+                .is_some()
+        );
 
         manager
             .remove_channel("doomed")
             .await;
+
+        assert!(
+            manager
+                .get_circuit_breaker("doomed")
+                .await
+                .is_none()
+        );
 
         assert!(!manager.has_transit_mcp_tool_gating("doomed", "partner"));
         assert!(
