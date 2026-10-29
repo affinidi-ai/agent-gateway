@@ -3528,12 +3528,13 @@ pub(crate) fn fabric_peer_may_reach_surface(
 }
 
 /// `gateways` is a store to read instead of loading the directory from the
-/// message's storage root; the authoritative check passes `None`.
+/// message's storage root; the authoritative check passes `None`. Returns the
+/// sender's Remote gateway record.
 async fn authorize_fabric_sender(
     message: &ReceivedMessage,
     channel_id: &str,
     gateways: Option<&crate::gateways::FileSystemGatewayStore>,
-) -> Result<(), ForwardRefusal> {
+) -> Result<crate::gateways::types::Gateway, ForwardRefusal> {
     let Some(from_did) = message.from_did.as_deref() else {
         warn!("Refusing forward-request without a sender DID");
         return Err(ForwardRefusal::UnregisteredSender);
@@ -3585,7 +3586,7 @@ async fn authorize_fabric_sender(
                     return Err(ForwardRefusal::ChannelNotExposed);
                 }
             }
-            Ok(())
+            Ok(gateway)
         }
         Ok(Some(gateway)) => {
             warn!(
@@ -3747,6 +3748,180 @@ fn egress_blocked_forward_response() -> ProcessingResult {
     ProcessingResult::RequiresResponse {
         response_type: MessageType::ForwardResponse.to_string(),
         response_body: refused_forward_response(403, "Forbidden", "Request blocked by egress policy"),
+    }
+}
+
+/// Reads the Fabric hop count the peer sent, then removes it, and every
+/// transit token the peer forwarded, from the request's headers: the buffered
+/// map and a framed stream's headers alike, in any case. A framed stream's
+/// count is read from its typed headers.
+fn take_fabric_hops_and_peer_transit_tokens(
+    headers: Option<&mut serde_json::Map<String, Value>>,
+    stream_headers: Option<&mut axum::http::HeaderMap>,
+) -> Result<u8, crate::proxy::fabric_hops::FabricHopsRefusal> {
+    use crate::proxy::fabric_hops::{FABRIC_HOPS_HEADER, is_fabric_hops_header, received_fabric_hops};
+    let hops = match (stream_headers.as_deref(), headers.as_deref()) {
+        (Some(stream), _) => received_fabric_hops(
+            stream
+                .get_all(FABRIC_HOPS_HEADER)
+                .iter()
+                .map(|value| {
+                    value
+                        .to_str()
+                        .unwrap_or_default()
+                }),
+        ),
+        (None, Some(headers)) => received_fabric_hops(
+            headers
+                .iter()
+                .filter(|(name, _)| is_fabric_hops_header(name))
+                .flat_map(|(_, value)| match value {
+                    Value::Array(values) => values
+                        .iter()
+                        .map(|value| {
+                            value
+                                .as_str()
+                                .unwrap_or_default()
+                        })
+                        .collect(),
+                    value => vec![
+                        value
+                            .as_str()
+                            .unwrap_or_default(),
+                    ],
+                }),
+        ),
+        (None, None) => received_fabric_hops([]),
+    };
+    if let Some(headers) = headers {
+        headers.retain(|name, _| !is_fabric_hops_header(name) && !name.eq_ignore_ascii_case("x-transit-token"));
+    }
+    if let Some(stream) = stream_headers {
+        stream.remove(FABRIC_HOPS_HEADER);
+        stream.remove("x-transit-token");
+    }
+    hops
+}
+
+/// The answer to a request whose Fabric hop count refuses it, recorded as a
+/// `request_rejected` against the surface the peer addressed.
+fn fabric_hops_refusal(
+    channel_id: &str,
+    trace_id: Option<&str>,
+    refusal: crate::proxy::fabric_hops::FabricHopsRefusal,
+) -> ProcessingResult {
+    use crate::audit::request_events::{RejectionReason, RejectionStage, RequestFacts, request_rejected};
+    use crate::proxy::fabric_hops::FabricHopsRefusal;
+    let (status, error, message, reason) = match refusal {
+        FabricHopsRefusal::Malformed => {
+            (400, "Bad Request", "Invalid X-Gateway-Fabric-Hops header", RejectionReason::FabricHopsInvalid)
+        }
+        FabricHopsRefusal::TooMany => {
+            (508, "Loop Detected", "The request passed through too many gateways", RejectionReason::FabricChainTooLong)
+        }
+    };
+    warn!(channel_id = ?channel_id, status, "Refusing fabric forward-request: {message}");
+    request_rejected(
+        &RequestFacts {
+            surface_id: channel_id,
+            channel_name: channel_id,
+            trace_id,
+            via_fabric: true,
+        },
+        RejectionStage::Routing,
+        reason,
+        status,
+        None,
+    );
+    ProcessingResult::RequiresResponse {
+        response_type: MessageType::ForwardResponse.to_string(),
+        response_body: refused_forward_response(status, error, message),
+    }
+}
+
+/// Who sent a request over Fabric, for the transit token issued with it: the
+/// peer the handshake verified, and the caller the peer's request names.
+pub(super) struct FabricReceiveCaller<'caller> {
+    pub peer_gateway_id: &'caller str,
+    pub peer_issuer_did: Option<&'caller str>,
+    pub hops: u8,
+    pub caller_identity: Option<&'caller str>,
+    pub verification: crate::surface_context::IdentityVerification,
+}
+
+/// The `sub` and `identity_source` of a transit token issued on Fabric
+/// receive: the caller only when it is a DID, never a payload pseudonym, and
+/// `fabric-presentation` only when a connection issuer's presentation carried
+/// it.
+pub(super) fn fabric_caller_did_and_source(
+    caller_identity: Option<&str>,
+    verification: crate::surface_context::IdentityVerification,
+) -> (Option<&str>, crate::proxy::caller_identity::IdentitySource) {
+    use crate::proxy::caller_identity::IdentitySource;
+    let did = caller_identity.filter(|identity| identity.starts_with("did:"));
+    let source = if did.is_some() && verification == crate::surface_context::IdentityVerification::Vp {
+        IdentitySource::FabricPresentation
+    } else {
+        IdentitySource::FabricAsserted
+    };
+    (did, source)
+}
+
+/// The transit token the managed agent behind `surface` gets with a request a
+/// Fabric peer sent, as the Access Point gives one with a direct request: when
+/// the surface has Transit Points and `target_url`, the Target, is the agent
+/// itself, by HTTP or HTTPS. A Target the gateway runs has no agent to hold
+/// one. `max_lifetime_secs` is the appliance's `transit_token_max_lifetime_secs`.
+/// Returns the token and its `jti`; one that cannot be issued is logged and
+/// the request goes on without it.
+pub(super) fn fabric_receive_transit_token(
+    issuer: Option<&crate::proxy::transit_token::TransitTokenIssuer>,
+    max_lifetime_secs: Option<u64>,
+    surface: &crate::config::agent_surface::AgentSurface,
+    target_url: &str,
+    caller: &FabricReceiveCaller<'_>,
+    trace_id: Option<&str>,
+) -> Option<(String, String)> {
+    let agent_target = url::Url::parse(target_url).is_ok_and(|url| matches!(url.scheme(), "http" | "https"));
+    if surface
+        .transit_points()
+        .is_empty()
+        || !agent_target
+    {
+        return None;
+    }
+    let (Some(issuer), Some(max_lifetime_secs)) = (issuer, max_lifetime_secs) else {
+        warn!(surface_id = %surface.surface_id, "Transit token issuance is unavailable; forwarding the fabric request without one");
+        return None;
+    };
+    let (caller_did, identity_source) = fabric_caller_did_and_source(caller.caller_identity, caller.verification);
+    let identity_source = identity_source.to_string();
+    let request = crate::proxy::transit_token::FabricTransitTokenRequest {
+        surface_id: &surface.surface_id,
+        caller_did,
+        identity_source: &identity_source,
+        trace_id,
+        allowed_transit_points: surface
+            .transit_points()
+            .iter()
+            .map(|point| point.alias.clone())
+            .collect(),
+        fabric: crate::proxy::transit_token::FabricTransitClaims {
+            peer_gateway_id: caller
+                .peer_gateway_id
+                .to_string(),
+            peer_issuer_did: caller
+                .peer_issuer_did
+                .map(str::to_string),
+            hops: caller.hops,
+        },
+    };
+    match issuer.issue_for_fabric_request(request, surface.issued_transit_token_lifetime_secs(max_lifetime_secs)) {
+        Ok(issued) => Some(issued),
+        Err(error) => {
+            warn!(surface_id = %surface.surface_id, error = %error, "Failed to issue a transit token for a fabric request");
+            None
+        }
     }
 }
 
@@ -3995,11 +4170,14 @@ async fn process_forward_request_in_request_scope(
         };
     }
 
-    if let Err(refusal) = authorize_fabric_sender(message, channel_id, None).await {
-        return refusal
-            .into_forward_response(&[])
-            .await;
-    }
+    let sender = match authorize_fabric_sender(message, channel_id, None).await {
+        Ok(sender) => sender,
+        Err(refusal) => {
+            return refusal
+                .into_forward_response(&[])
+                .await;
+        }
+    };
     if let Err(rejection) = super::envelope_replay::admit_forward_request(message) {
         return forward_request_envelope_refusal(message, rejection);
     }
@@ -4020,6 +4198,24 @@ async fn process_forward_request_in_request_scope(
         .get("headers")
         .and_then(|v| v.as_object())
         .cloned();
+    let audit_trace_id = message
+        .message_body
+        .get("otel_context")
+        .and_then(|ctx| ctx.get("trace_id"))
+        .and_then(|value| value.as_str())
+        .or_else(|| (!trace_id_field.is_empty()).then_some(trace_id_field));
+
+    // The hop count and any transit token the peer sent never reach the agent;
+    // this gateway issues the agent's token itself.
+    let fabric_hops = match take_fabric_hops_and_peer_transit_tokens(
+        headers.as_mut(),
+        stream_request
+            .as_mut()
+            .map(|request| &mut request.headers),
+    ) {
+        Ok(hops) => hops,
+        Err(refusal) => return fabric_hops_refusal(channel_id, audit_trace_id, refusal),
+    };
 
     // Extract body from DIDComm message - it's stored as a JSON value, not a string
     let mut body_bytes = match stream_request.as_ref() {
@@ -4193,12 +4389,6 @@ async fn process_forward_request_in_request_scope(
     // Caller-attributable failures are non-blocking: the outcome is handed to the
     // policy layer via `source_auth_context` below. Only server-side failures
     // (setup/config resolution, internal errors) still block here (now 500).
-    let audit_trace_id = message
-        .message_body
-        .get("otel_context")
-        .and_then(|ctx| ctx.get("trace_id"))
-        .and_then(|value| value.as_str())
-        .or_else(|| (!trace_id_field.is_empty()).then_some(trace_id_field));
     // The caller connected to the sending gateway, so its address is not known here.
     let audit_facts = crate::audit::request_events::RequestFacts {
         surface_id: config_id,
@@ -5656,8 +5846,31 @@ async fn process_forward_request_in_request_scope(
     } else {
         crate::observability::policy_audit::current_span_trace_id()
     };
-    if let Some(tid) = onward_trace_id {
+    if let Some(tid) = onward_trace_id.as_deref() {
         req = req.header("X-Gateway-Trace-Id", tid);
+    }
+
+    // The managed agent's transit token for its own Transit Points, as the
+    // Access Point issues one: the peer is the caller it names, the onward trace
+    // is the one its Transit Point calls continue.
+    if let Some((token, jti)) = fabric_receive_transit_token(
+        crate::proxy::server::get_transit_token_issuer().as_deref(),
+        GLOBAL_MCP_AUTH_NETWORK
+            .get()
+            .map(|network| network.transit_token_max_lifetime_secs),
+        &surface,
+        &target_url,
+        &FabricReceiveCaller {
+            peer_gateway_id: &sender.id,
+            peer_issuer_did: sender.issuer_did.as_deref(),
+            hops: fabric_hops,
+            caller_identity: caller_identity.as_deref(),
+            verification: caller_identity_verification,
+        },
+        onward_trace_id.as_deref(),
+    ) {
+        req = req.header("X-Transit-Token", token);
+        channel_debug!(config_id, "Injected a transit token for the fabric request (jti={})", jti);
     }
 
     // Send the request
@@ -9349,6 +9562,9 @@ async fn process_x402_settlement_complete(message: &ReceivedMessage) -> Processi
 mod mcp_receive_tests;
 
 #[cfg(test)]
+mod fabric_transit_tests;
+
+#[cfg(test)]
 mod variant_routing_tests;
 
 #[cfg(test)]
@@ -11187,7 +11403,7 @@ mod tests {
         ] {
             let message = make_forward_request_msg(temp.path(), Some(did), channel);
             match authorize_fabric_sender(&message, channel, None).await {
-                Ok(()) => assert!(admitted, "{did} reached {channel}"),
+                Ok(_) => assert!(admitted, "{did} reached {channel}"),
                 Err(ForwardRefusal::ChannelNotExposed) => assert!(!admitted, "{did} was refused {channel}"),
                 Err(other) => panic!("expected ChannelNotExposed, got {other:?}"),
             }

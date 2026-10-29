@@ -172,6 +172,38 @@ pub struct TransitTokenClaims {
     /// the same end-to-end `trace_id` instead of minting a fresh one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
+
+    /// Present only on a token issued for a request that arrived over Fabric. A
+    /// release that predates it ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fabric: Option<FabricTransitClaims>,
+}
+
+/// The `fabric` claim: the peer gateway that sent the request, as the Fabric
+/// handshake verified it, and how many Fabric crossings the request had made
+/// when it arrived.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FabricTransitClaims {
+    /// The id of the sender's Remote gateway record on the issuing gateway.
+    pub peer_gateway_id: String,
+    /// The sender's issuer DID, once pairing established it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_issuer_did: Option<String>,
+    /// Fabric crossings, the one that delivered the request included.
+    pub hops: u8,
+}
+
+/// What a token issued on Fabric receive carries about the caller beyond the
+/// `fabric` claim. It never carries a principal: only the peer gateway is
+/// verified.
+pub struct FabricTransitTokenRequest<'request> {
+    pub surface_id: &'request str,
+    /// The caller DID the peer's request names, when it names one.
+    pub caller_did: Option<&'request str>,
+    pub identity_source: &'request str,
+    pub trace_id: Option<&'request str>,
+    pub allowed_transit_points: Vec<String>,
+    pub fabric: FabricTransitClaims,
 }
 
 /// Issues and validates transit tokens.
@@ -237,6 +269,66 @@ impl TransitTokenIssuer {
         caller_context_fields: serde_json::Map<String, serde_json::Value>,
         lifetime_secs: u64,
     ) -> Result<String> {
+        let (iat, exp) = Self::validity(lifetime_secs)?;
+        let claims = TransitTokenClaims {
+            iss: self.gateway_id.clone(),
+            sub: caller_did.map(|s| s.to_string()),
+            surface_id: surface_id.to_string(),
+            iat,
+            exp,
+            jti: uuid::Uuid::new_v4().to_string(),
+            identity_source: identity_source.map(|s| s.to_string()),
+            caller_dna_uai: caller_dna_uai.map(|s| s.to_string()),
+            user_identity_hash: user_identity_hash.map(|s| s.to_string()),
+            caller_context_fields,
+            trace_id: trace_id.map(|s| s.to_string()),
+            allowed_transit_points,
+            fabric: None,
+        };
+
+        self.sign(&claims)
+    }
+
+    /// Issue a token for a request that arrived over Fabric, living
+    /// `lifetime_secs` as [`Self::issue_with_caller_context`] does. It carries no
+    /// `user_identity_hash`, caller context fields or DNA UAI. Returns the token
+    /// and its `jti`.
+    pub fn issue_for_fabric_request(
+        &self,
+        request: FabricTransitTokenRequest<'_>,
+        lifetime_secs: u64,
+    ) -> Result<(String, String)> {
+        let (iat, exp) = Self::validity(lifetime_secs)?;
+        let jti = uuid::Uuid::new_v4().to_string();
+        let claims = TransitTokenClaims {
+            iss: self.gateway_id.clone(),
+            sub: request
+                .caller_did
+                .map(str::to_string),
+            surface_id: request.surface_id.to_string(),
+            iat,
+            exp,
+            jti: jti.clone(),
+            identity_source: Some(
+                request
+                    .identity_source
+                    .to_string(),
+            ),
+            caller_dna_uai: None,
+            user_identity_hash: None,
+            caller_context_fields: serde_json::Map::new(),
+            allowed_transit_points: request.allowed_transit_points,
+            trace_id: request
+                .trace_id
+                .map(str::to_string),
+            fabric: Some(request.fabric),
+        };
+        Ok((self.sign(&claims)?, jti))
+    }
+
+    /// The `iat` and `exp` of a token issued now that lives `lifetime_secs`,
+    /// which must be from 30 to 900 seconds.
+    fn validity(lifetime_secs: u64) -> Result<(u64, u64)> {
         use crate::config::agent_surface::{MAX_TRANSIT_TOKEN_LIFETIME_SECS, MIN_TRANSIT_TOKEN_LIFETIME_SECS};
         if !(MIN_TRANSIT_TOKEN_LIFETIME_SECS..=MAX_TRANSIT_TOKEN_LIFETIME_SECS).contains(&lifetime_secs) {
             anyhow::bail!(
@@ -248,23 +340,7 @@ impl TransitTokenIssuer {
             .duration_since(UNIX_EPOCH)
             .context("system clock error")?
             .as_secs();
-
-        let claims = TransitTokenClaims {
-            iss: self.gateway_id.clone(),
-            sub: caller_did.map(|s| s.to_string()),
-            surface_id: surface_id.to_string(),
-            iat: now,
-            exp: now + lifetime_secs,
-            jti: uuid::Uuid::new_v4().to_string(),
-            identity_source: identity_source.map(|s| s.to_string()),
-            caller_dna_uai: caller_dna_uai.map(|s| s.to_string()),
-            user_identity_hash: user_identity_hash.map(|s| s.to_string()),
-            caller_context_fields,
-            trace_id: trace_id.map(|s| s.to_string()),
-            allowed_transit_points,
-        };
-
-        self.sign(&claims)
+        Ok((now, now + lifetime_secs))
     }
 
     /// Sign `claims` with this issuer's key, naming it in the `kid` header.
@@ -406,6 +482,7 @@ mod tests {
             caller_context_fields: serde_json::Map::new(),
             allowed_transit_points: vec![],
             trace_id: None,
+            fabric: None,
         }
     }
 
@@ -711,6 +788,7 @@ mod tests {
             caller_context_fields: serde_json::Map::new(),
             trace_id: None,
             allowed_transit_points: vec![],
+            fabric: None,
         };
 
         let token = issuer.sign(&claims).unwrap();
@@ -1139,5 +1217,93 @@ mod tests {
                 .validate_for_transit_point(&token, "surf-001", "other", LIFETIME)
                 .is_err()
         );
+    }
+
+    fn fabric_request(caller_did: Option<&str>) -> FabricTransitTokenRequest<'_> {
+        FabricTransitTokenRequest {
+            surface_id: "surf-001",
+            caller_did,
+            identity_source: "fabric-presentation",
+            trace_id: Some("trace-1"),
+            allowed_transit_points: vec!["delta".to_string()],
+            fabric: FabricTransitClaims {
+                peer_gateway_id: "peer-record".to_string(),
+                peer_issuer_did: Some("did:web:partner.example".to_string()),
+                hops: 3,
+            },
+        }
+    }
+
+    /// A token issued on Fabric receive names the peer and the crossings, never a
+    /// principal, lives the lifetime asked for, and opens only the Transit Points
+    /// it lists.
+    #[test]
+    fn a_fabric_token_carries_the_peer_and_its_crossings_and_no_principal() {
+        let issuer = test_issuer();
+        let (token, jti) = issuer
+            .issue_for_fabric_request(fabric_request(Some("did:web:caller.example")), 120)
+            .unwrap();
+
+        let claims = issuer
+            .validate_for_transit_point(&token, "surf-001", "delta", 120)
+            .unwrap();
+        assert_eq!(claims.jti, jti);
+        assert_eq!(claims.exp - claims.iat, 120);
+        assert_eq!(claims.sub.as_deref(), Some("did:web:caller.example"));
+        assert_eq!(
+            claims
+                .identity_source
+                .as_deref(),
+            Some("fabric-presentation")
+        );
+        assert_eq!(claims.trace_id.as_deref(), Some("trace-1"));
+        assert_eq!(claims.user_identity_hash, None);
+        assert!(
+            claims
+                .caller_context_fields
+                .is_empty()
+        );
+        assert_eq!(claims.caller_dna_uai, None);
+        assert_eq!(
+            claims.fabric,
+            Some(FabricTransitClaims {
+                peer_gateway_id: "peer-record".to_string(),
+                peer_issuer_did: Some("did:web:partner.example".to_string()),
+                hops: 3,
+            })
+        );
+        assert!(
+            issuer
+                .validate_for_transit_point(&token, "surf-001", "other", 120)
+                .is_err()
+        );
+        assert!(
+            issuer
+                .issue_for_fabric_request(fabric_request(None), 1000)
+                .is_err(),
+            "the lifetime bounds apply"
+        );
+    }
+
+    /// A release that predates the `fabric` claim reads a Fabric token's claims
+    /// without it, and so sees no principal.
+    #[test]
+    fn a_reader_without_the_fabric_claim_sees_no_principal_in_a_fabric_token() {
+        #[derive(Deserialize)]
+        struct EarlierClaims {
+            sub: Option<String>,
+            user_identity_hash: Option<String>,
+        }
+        let issuer = test_issuer();
+        let (token, _) = issuer
+            .issue_for_fabric_request(fabric_request(Some("did:web:caller.example")), LIFETIME)
+            .unwrap();
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.set_issuer(&["gw-test-001"]);
+        let earlier = decode::<EarlierClaims>(&token, &DecodingKey::from_secret(&[7; 32]), &validation)
+            .unwrap()
+            .claims;
+        assert_eq!(earlier.user_identity_hash, None);
+        assert_eq!(earlier.sub.as_deref(), Some("did:web:caller.example"));
     }
 }

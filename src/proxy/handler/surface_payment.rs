@@ -78,7 +78,7 @@ fn delegation_headers(
     let header_metadata_mapping = surface
         .access_point
         .header_metadata_mapping_if_supported();
-    headers
+    let mut delegated = headers
         .iter()
         .filter_map(|(name, value)| {
             let value = value.to_str().ok()?;
@@ -96,7 +96,9 @@ fn delegation_headers(
             };
             forwarded.then(|| (name.as_str().to_uppercase(), value.to_string()))
         })
-        .collect()
+        .collect();
+    crate::proxy::fabric_hops::set_fabric_hops(&mut delegated, crate::proxy::fabric_hops::FIRST_FABRIC_HOP);
+    delegated
 }
 
 pub(super) async fn delegate(
@@ -844,17 +846,43 @@ mod tests {
 
         assert_eq!(
             names(delegation_headers(&surface("X-API-Key"), &request("Bearer caller-access-token"))),
-            ["payment-signature=payment-proof", "x-request-note=kept"]
+            ["payment-signature=payment-proof", "x-gateway-fabric-hops=1", "x-request-note=kept"]
         );
         assert_eq!(
             names(delegation_headers(&surface("X-API-Key"), &request("Payment caller-credential"))),
-            ["authorization=Payment caller-credential", "payment-signature=payment-proof", "x-request-note=kept"]
+            [
+                "authorization=Payment caller-credential",
+                "payment-signature=payment-proof",
+                "x-gateway-fabric-hops=1",
+                "x-request-note=kept"
+            ]
         );
         assert!(
             !delegation_headers(&surface("Authorization"), &request("Payment caller-credential"))
                 .contains_key("AUTHORIZATION"),
             "the header source_auth reads never crosses"
         );
+    }
+
+    /// A delegated payment crosses Fabric from an Access Point, so it carries
+    /// the first crossing, never a count the caller sent.
+    #[test]
+    fn a_delegated_payment_carries_the_first_fabric_crossing() {
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+            "surface_id": "paid", "name": "Paid", "access_point": {
+                "listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"
+            }, "target": {"endpoint": "https://target.example/mcp"}
+        }))
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-gateway-fabric-hops", "7".parse().unwrap());
+        let delegated = delegation_headers(&surface, &headers);
+        let hops: Vec<_> = delegated
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("x-gateway-fabric-hops"))
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(hops, ["1"]);
     }
 
     #[tokio::test]

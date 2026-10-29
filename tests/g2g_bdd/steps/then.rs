@@ -688,6 +688,70 @@ async fn forwarded_messages_for(
         .collect()
 }
 
+#[then(expr = "managed agent {string} received a transit token for the request gateway {int} sent")]
+pub async fn managed_agent_received_a_transit_token_for_the_peers_request(
+    world: &mut G2gWorld,
+    agent_name: String,
+    sending_gw: usize,
+) {
+    let token = crate::steps::when::transit_token_received_by(world, &agent_name).await;
+    let payload = token
+        .split('.')
+        .nth(1)
+        .unwrap_or_else(|| panic!("the transit token is not a JWT: {token}"));
+    let claims: Value = serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload)
+            .expect("the transit token payload is base64url"),
+    )
+    .expect("the transit token payload is JSON");
+    let (receiving_gw, _) = world.target(&agent_name);
+    let peer = world
+        .harness()
+        .remote_gateway_record(receiving_gw, sending_gw)
+        .await
+        .unwrap_or_else(|error| panic!("{error:#}"));
+    assert_eq!(claims["fabric"]["peer_gateway_id"], peer.id, "{claims}");
+    assert_eq!(claims["fabric"]["hops"], 1, "{claims}");
+    assert!(
+        claims
+            .get("user_identity_hash")
+            .is_none(),
+        "a peer's request carries no principal: {claims}"
+    );
+}
+
+#[then(expr = "managed agent {string} received the trace id managed agent {string} received")]
+pub async fn managed_agent_received_the_same_trace_id(
+    world: &mut G2gWorld,
+    agent_name: String,
+    other_agent: String,
+) {
+    let trace_id = |requests: Vec<crate::bdd_support::mock_server::ReceivedRequest>| {
+        requests
+            .last()
+            .and_then(|request| {
+                request
+                    .headers
+                    .get("x-gateway-trace-id")
+                    .cloned()
+            })
+    };
+    let received = trace_id(forwarded_messages_for(world, &agent_name).await);
+    assert!(received.is_some(), "managed agent '{agent_name}' received no trace id");
+    assert_eq!(received, trace_id(forwarded_messages_for(world, &other_agent).await));
+}
+
+#[then(expr = "the relay was refused with status {int} after {int} Transit Point calls crossed Fabric")]
+pub async fn the_relay_was_refused_after_calls(
+    world: &mut G2gWorld,
+    status: u16,
+    calls: usize,
+) {
+    assert_eq!(world.relayed_transit_point_calls, Some(calls), "body={:?}", world.response_body);
+    assert_eq!(world.response_status, Some(status), "body={:?}", world.response_body);
+}
+
 #[then(regex = r#"^managed agent "([^"]+)" did not receive a forwarded message$"#)]
 pub async fn actor_did_not_receive_forwarded_message(
     world: &mut G2gWorld,

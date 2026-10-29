@@ -1,0 +1,44 @@
+branch: feat/fabric-receive-transit-token
+changes:
+  added:
+    - timestamp: '2026-10-30T09:00:00.000Z'
+      title: ⭐ Give managed agents a transit token for requests from paired gateways
+      description: >-
+        A request a paired gateway sent over Fabric reached the managed agent without a transit
+        token, so the agent could not call its own Transit Points while serving it, and a chain
+        of three or more organisations stopped there. The receiving gateway now issues the agent
+        a transit token for every such request it forwards to an HTTP or HTTPS Target of a
+        surface with Transit Points, with the same key and lifetime setting as its Access Point,
+        on buffered requests and framed streams alike. The token names the peer gateway (its
+        Remote gateway record and issuer DID) and the Fabric crossings the request made, and the
+        caller DID only when the peer's request names a DID. It never carries a principal, so a
+        Transit Point releases no delegated per-user credential for it, and a Transit Point
+        policy sees the peer as the caller, with `verification` set to `fabric_peer` and the peer
+        in `input.transit.caller.fabric`. Static `target_auth` credentials are added as for any
+        caller. `proxy://` and `a2a-proxy://` Targets never get a token.
+    - timestamp: '2026-10-30T09:00:00.000Z'
+      title: Refuse requests that cross Fabric more than 8 times
+      description: >-
+        Agents that call each other through their gateways could pass a request back and forth
+        without end. Every Fabric send now sets `X-Gateway-Fabric-Hops`, the crossings the
+        request has made, and the receiving gateway carries the count in the transit token it
+        issues, so an agent cannot lower it. A request past 8 crossings is refused with `508`,
+        and one whose count is not an integer from 1 to 255 with `400`, before surface lookup,
+        each recorded as a `request_rejected` audit event (`fabric_chain_too_long`,
+        `fabric_hops_invalid`). A Transit Point to a peer gateway refuses a call that would pass
+        the limit with `508` before forwarding it. A request from a gateway that does not send
+        the header counts as its first crossing.
+  changed:
+    - timestamp: '2026-10-30T09:00:00.000Z'
+      title: Serve Transit Point calls from agents handling requests from partner gateways
+      description: >-
+        A Transit Point that requires a transit token answered `401` to a managed agent serving
+        a request from a paired gateway, because the agent had no token to send. It now serves
+        that agent with the token its gateway issued for the request. The agent receives only
+        that token: an `X-Transit-Token` the peer gateway sent is removed on receive. No
+        `X-Gateway-Fabric-Hops` a caller, agent or peer sends is forwarded, to an HTTP target or
+        over Fabric.
+  fixed: []
+  removed: []
+  security: []
+  breaking: []

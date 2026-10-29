@@ -432,6 +432,14 @@ pub async fn surface_has_a2a_transit_point_over_fabric(
         });
 }
 
+#[given(expr = "Transit Point {string} requires a transit token")]
+pub async fn transit_point_requires_a_transit_token(
+    world: &mut G2gWorld,
+    transit_point: String,
+) {
+    transit_point_spec_mut(world, &transit_point).require_transit_token = true;
+}
+
 #[given(expr = "transit point {string} maps managed-agent header {string} to A2A metadata field {string}")]
 pub async fn transit_point_maps_managed_agent_header_to_a2a_metadata_field(
     world: &mut G2gWorld,

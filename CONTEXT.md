@@ -63,6 +63,8 @@ Use **Target** only for the managed-agent component of a surface. A Transit Poin
 | **G2G**                                 | A Gateway-to-Gateway call routed through the fabric.                                                                                                                                                                                                  |
 | **Fabric route**                        | A `fabric://{gateway_id}/{surface_id}` Target endpoint. The DIDComm request field `channel_id` is the legacy wire name for the destination surface identifier.                                                                                        |
 | **Envelope replay protection**          | The receiving gateway's rule that a fabric envelope carries a bounded expiry and is processed at most once per sender and message id. See [`docs/FABRIC.md`](docs/FABRIC.md#fabric-receive-pipeline). _Avoid: nonce check, dedup._ |
+| **Fabric hops**                         | How many Fabric crossings a request has made, its own included: sent between gateways as `X-Gateway-Fabric-Hops` and carried inside a gateway by the transit token it issues for a Fabric request. A request past 8 crossings is refused with `508`. See [`docs/FABRIC.md`](docs/FABRIC.md#chains-across-gateways). _Avoid: TTL, depth._ |
+| **Fabric caller**                       | The verified caller of a request that arrived over Fabric: the peer gateway the handshake authenticated, never the user or agent the peer says it acts for. A Transit Point's policy sees it as `fabric_peer`. _Avoid: partner user, remote principal._ |
 
 ## Identity
 
@@ -160,7 +162,7 @@ Gateway OPA runs before surface-level or transit-level OPA, and a gateway deny i
 | **Settlement**         | The step that finalises a verified x402 payment or records it for deferred completion.                                                                                                                                                                                          |
 | **Auto-pay**           | Automatic fulfilment of a payment challenge from a target endpoint up to a configured cap.                                                                                                                                                                                   |
 | **Transit token mode** | How caller context is carried across transit calls.                                                                                                                                                                                                                             |
-| **Transit token**      | A short-lived token the gateway injects on inbound traffic and the managed agent echoes when calling a Transit Point. It carries caller context, the originating surface, and the permitted Transit Points. |
+| **Transit token**      | A short-lived token the gateway injects on inbound traffic, through its Access Point or from a Fabric peer, and the managed agent echoes when calling a Transit Point. It carries caller context, the originating surface, and the permitted Transit Points; one issued on Fabric receive names the peer gateway and the Fabric hops. |
 
 ## Storage and lifecycle
 
