@@ -104,6 +104,13 @@ const CallerAuthFullscreen: React.FC<ConfigPanelProps> = ({
   const hasDiscovery = readProtectedResource(config.protected_resource) !== null;
   const discoveryOn = method === 'jwt_bearer' && hasDiscovery;
   const showsDiscovery = method === 'jwt_bearer' && (protocol === 'mcp' || hasDiscovery);
+  const commitAudienceInput = () => {
+    const value = audienceInput.trim();
+    if (!discoveryOn && value && !audiences.includes(value)) {
+      updateField('audiences', [...audiences, value]);
+    }
+    setAudienceInput('');
+  };
   // While discovery is on, each control the gateway constrains is locked once
   // it holds the required value, and stays editable until then.
   const tokenHeaderLocked = discoveryOn && readsAuthorizationHeader(config);
@@ -283,14 +290,11 @@ const CallerAuthFullscreen: React.FC<ConfigPanelProps> = ({
                   disabled={discoveryOn}
                   value={audienceInput}
                   onChange={e => setAudienceInput(e.target.value)}
+                  onBlur={commitAudienceInput}
                   onKeyDown={e => {
                     if (e.key === 'Enter' || e.key === ',') {
                       e.preventDefault();
-                      const val = audienceInput.trim();
-                      if (val && !audiences.includes(val)) {
-                        updateField('audiences', [...audiences, val]);
-                      }
-                      setAudienceInput('');
+                      commitAudienceInput();
                     }
                   }}
                 />
@@ -298,13 +302,7 @@ const CallerAuthFullscreen: React.FC<ConfigPanelProps> = ({
                   type="button"
                   className="btn btn-outline-secondary"
                   disabled={discoveryOn}
-                  onClick={() => {
-                    const val = audienceInput.trim();
-                    if (val && !audiences.includes(val)) {
-                      updateField('audiences', [...audiences, val]);
-                    }
-                    setAudienceInput('');
-                  }}
+                  onClick={commitAudienceInput}
                 >
                   Add
                 </button>

@@ -145,6 +145,18 @@ describe('Caller Context editor: authorization server discovery', () => {
     expect(screen.getByTestId('caller-auth-discovery-resource-input')).toHaveValue(RESOURCE);
   });
 
+  it('commits an audience typed before saving and clears the empty-audience warning', async () => {
+    const latest = await openEditor({ initial: jwtConfig() });
+    const input = screen.getByPlaceholderText('e.g. https://api.example.com');
+
+    fireEvent.change(input, { target: { value: ' https://api.example.com ' } });
+    fireEvent.blur(input);
+
+    expect(latest.config?.audiences).toEqual(['https://api.example.com']);
+    expect(screen.getByText('https://api.example.com')).toBeInTheDocument();
+    expect(screen.queryByText(/No audience configured/)).toBeNull();
+  });
+
   it('starts the authorization servers with the issuer the selected strategy trusts', async () => {
     (apiClient.fetch as jest.Mock).mockResolvedValue({
       ok: true,
