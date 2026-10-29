@@ -6,6 +6,11 @@
 //! the issuer, the URL the document was read from, the token endpoint and the
 //! JWKS URI. [`parse_metadata`] validates a document without any I/O.
 //!
+//! [`discover_client`] and [`parse_client_metadata`] read the same documents for
+//! an OAuth client of the server, the client profile: the JWKS URI is optional,
+//! and they also return the authorization, revocation and registration endpoints
+//! and the methods the server says it supports.
+//!
 //! The module records no metrics and writes no audit events: callers record the
 //! outcome themselves from [`DiscoveryError::code`].
 
@@ -20,7 +25,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 #[allow(unused_imports)]
-pub use discovery::{discover, metadata_urls, parse_metadata, validate_issuer};
+pub use discovery::{discover, discover_client, metadata_urls, parse_client_metadata, parse_metadata, validate_issuer};
 #[allow(unused_imports)]
 pub use fetch::get_bounded;
 
@@ -39,6 +44,37 @@ pub struct AuthzServerMetadata {
     /// The `jwks_uri` of the document: an absolute http(s) URL. Required although
     /// RFC 8414 makes it optional, because the gateway validates JWT access tokens.
     pub jwks_uri: String,
+}
+
+/// The authorization server metadata an OAuth client of the server is checked
+/// against (the client profile).
+///
+/// Every endpoint passes the same checks as [`AuthzServerMetadata`]'s. The
+/// `jwks_uri` is optional here, since a client that never validates the server's
+/// JWTs does not need its keys, and many servers publish none.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClientAuthzMetadata {
+    /// The discovered `issuer`, equal byte for byte to the requested issuer.
+    pub issuer: String,
+    /// The URL the metadata document was read from.
+    pub metadata_url: String,
+    /// The `authorization_endpoint` of the document. Required.
+    pub authorization_endpoint: String,
+    /// The `token_endpoint` of the document. Required.
+    pub token_endpoint: String,
+    /// The RFC 7009 `revocation_endpoint`, when the document names one.
+    pub revocation_endpoint: Option<String>,
+    /// The RFC 7591 `registration_endpoint`, when the document names one.
+    pub registration_endpoint: Option<String>,
+    /// The `jwks_uri`, when the document names one.
+    pub jwks_uri: Option<String>,
+    /// `code_challenge_methods_supported`, when the document lists it.
+    pub code_challenge_methods_supported: Option<Vec<String>>,
+    /// `token_endpoint_auth_methods_supported`, when the document lists it.
+    /// RFC 8414 reads its absence as `client_secret_basic` only.
+    pub token_endpoint_auth_methods_supported: Option<Vec<String>>,
+    /// RFC 9207 `authorization_response_iss_parameter_supported`; `false` when absent.
+    pub authorization_response_iss_parameter_supported: bool,
 }
 
 /// Which schemes and addresses a fetch, and the endpoints of a discovered document, may use.
@@ -104,7 +140,9 @@ pub enum DiscoveryFailure {
     /// The body exceeds the size limit. Code `too_large`.
     TooLarge,
     /// The body is not a JSON object with acceptable `issuer`, `token_endpoint` and
-    /// `jwks_uri` members. Code `invalid_document`.
+    /// `jwks_uri` members, or, for the client profile, acceptable `issuer`,
+    /// `authorization_endpoint` and `token_endpoint` members and optional members.
+    /// Code `invalid_document`.
     InvalidDocument,
     /// The document's `issuer` differs from the requested issuer. Code `issuer_mismatch`.
     IssuerMismatch,

@@ -164,6 +164,18 @@ credentials or fragment, not a cloud-metadata address, and not a weaker scheme t
 issuer: an `https` issuer with an `http` endpoint is an invalid document under every posture.
 The schemes are compared as parsed, so their case does not matter.
 
+The client profile (`discover_client`, `parse_client_metadata`) reads the same documents
+for an OAuth client of the server, such as a credential provider checked against its
+issuer (see [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#external-consent-providers)).
+It requires `authorization_endpoint` and `token_endpoint`, and makes `jwks_uri` optional:
+many authorization servers publish none, and a client that never validates the server's JWTs
+does not need its keys. It also returns `revocation_endpoint`, `registration_endpoint`,
+`code_challenge_methods_supported`, `token_endpoint_auth_methods_supported` and
+`authorization_response_iss_parameter_supported` when the document has them. Every endpoint
+it reads passes the endpoint rules above, the method lists must be arrays of strings and the
+flag a boolean, and a member that is `null` counts as absent. The inbound profile
+(`discover`, `parse_metadata`) is unchanged and still requires `jwks_uri`.
+
 | Limit | Value |
 | --- | --- |
 | Body size | 64 KiB (`MAX_METADATA_BYTES`), set per call by `DiscoveryOptions::max_bytes` |
@@ -215,6 +227,8 @@ all of them, from least to most specific: `http_status`,
 | Function | Use |
 | --- | --- |
 | `discover(issuer, posture, options)` | Fetches and validates, trying the URLs in order |
+| `discover_client(issuer, posture, options)` | As `discover`, under the client profile |
+| `parse_client_metadata(body, issuer, metadata_url, posture)` | Pure: validates a document already in hand under the client profile |
 | `metadata_urls(issuer)` | Pure: the candidate URLs for an issuer, in order: two for an origin issuer, three for a path issuer |
 | `validate_issuer(issuer, posture)` | Pure: the issuer checks `discover` makes before any request; protected resource metadata uses it for the authorization servers it advertises |
 | `parse_metadata(body, issuer, metadata_url, posture)` | Pure: validates a document already in hand |
