@@ -1321,10 +1321,75 @@ fn validate_surface_mcp_tool_gating(surface: &AgentSurface) -> Result<(), Surfac
             ));
         }
     }
+    errors.extend(variant_transit_point_enforcement_overrides(surface));
     if !errors.is_empty() {
         return Err(SurfaceApiError::BadRequest(errors.join("; ")));
     }
     Ok(())
+}
+
+/// A variant's Transit Point is enforced with the MCP tool gating, policy and
+/// response policy of the surface's Transit Point of the same alias, so one that
+/// sets any of them to something else is refused rather than silently ignored.
+fn variant_transit_point_enforcement_overrides(surface: &AgentSurface) -> Vec<String> {
+    let mut errors = Vec::new();
+    for variant in &surface.variants {
+        let Some(points) = variant
+            .overrides
+            .transit
+            .as_ref()
+            .and_then(|transit| transit.points.as_ref())
+        else {
+            continue;
+        };
+        for point in points {
+            let base = surface
+                .transit_points()
+                .iter()
+                .find(|base| base.alias == point.alias);
+            let changed = [
+                (
+                    "mcp_tool_gating",
+                    gating_in_force(Some(point)).is_some() && gating_in_force(Some(point)) != gating_in_force(base),
+                ),
+                ("policy", changes_policy(point.policy.as_ref(), base.and_then(|base| base.policy.as_ref()))),
+                (
+                    "response_policy",
+                    changes_policy(point.response_policy.as_ref(), base.and_then(|base| base.response_policy.as_ref())),
+                ),
+            ];
+            for (field, changed) in changed {
+                if changed {
+                    errors.push(format!(
+                        "Surface '{}': variant '{}' transit point '{}' sets '{field}', which a variant cannot change; \
+                         set it on the surface's transit point '{}' instead",
+                        surface.name, variant.alias, point.alias, point.alias
+                    ));
+                }
+            }
+        }
+    }
+    errors
+}
+
+fn gating_in_force(
+    point: Option<&crate::config::agent_surface::TransitPoint>
+) -> Option<&crate::config::agent_surface::McpToolGatingConfig> {
+    point
+        .and_then(|point| point.mcp_tool_gating.as_ref())
+        .filter(|gating| !gating.is_empty())
+}
+
+fn changes_policy(
+    set: Option<&crate::config::agent_surface::PolicyRef>,
+    enforced: Option<&crate::config::agent_surface::PolicyRef>,
+) -> bool {
+    set.is_some_and(|set| {
+        !enforced.is_some_and(|enforced| {
+            set.policy_definition_id == enforced.policy_definition_id
+                && set.require_agent_context == enforced.require_agent_context
+        })
+    })
 }
 
 /// Create a new agent surface
@@ -5659,6 +5724,89 @@ mod tests {
         refresh_surface_policies(&manager, SurfaceChange::Delete("doomed")).await;
 
         assert!(!manager.has_transit_mcp_tool_gating("doomed", "partner"));
+    }
+
+    fn surface_with_variant_transit_points(points: serde_json::Value) -> AgentSurface {
+        serde_json::from_value(serde_json::json!({
+            "surface_id": "gated", "name": "gated", "description": "", "status": "active",
+            "access_point": { "listen_address": "0.0.0.0:8443", "route": "/gated", "protocol": "mcp" },
+            "target": { "endpoint": "http://localhost:9000" },
+            "transit": { "points": [{
+                "alias": "partner", "target_endpoint": "https://partner.example.com/mcp", "protocol": "mcp",
+                "policy": { "policy_definition_id": "partner-policy" },
+                "mcp_tool_gating": { "gates": [{ "id": "g1", "name": "no admin",
+                    "action": { "effect": "deny", "patterns": ["^admin_"] } }] }
+            }] },
+            "variants": [{ "id": "v-dev", "alias": "dev", "name": "dev", "enabled": true,
+                "overrides": { "transit": { "points": points } } }]
+        }))
+        .unwrap()
+    }
+
+    fn variant_point(settings: serde_json::Value) -> serde_json::Value {
+        let mut point = serde_json::json!({
+            "alias": "partner", "target_endpoint": "https://partner-dev.example.com/mcp", "protocol": "mcp"
+        });
+        point
+            .as_object_mut()
+            .unwrap()
+            .extend(
+                settings
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            );
+        point
+    }
+
+    #[test]
+    fn a_variant_transit_point_may_restate_or_omit_the_surface_transit_point_enforcement() {
+        let restated = variant_point(serde_json::json!({
+            "policy": { "policy_definition_id": "partner-policy" },
+            "mcp_tool_gating": { "gates": [{ "id": "g1", "name": "no admin",
+                "action": { "effect": "deny", "patterns": ["^admin_"] } }] }
+        }));
+        let omitted = variant_point(serde_json::json!({}));
+
+        for points in [serde_json::json!([restated]), serde_json::json!([omitted])] {
+            let surface = surface_with_variant_transit_points(points.clone());
+            assert!(validate_surface_mcp_tool_gating(&surface).is_ok(), "{points}");
+        }
+    }
+
+    #[test]
+    fn a_variant_transit_point_that_changes_the_surface_transit_point_enforcement_is_refused() {
+        let other_gating = serde_json::json!({ "gates": [{ "id": "g2", "name": "no delete",
+            "action": { "effect": "deny", "patterns": ["^delete_"] } }] });
+        for (field, point) in [
+            ("mcp_tool_gating", variant_point(serde_json::json!({ "mcp_tool_gating": other_gating }))),
+            ("policy", variant_point(serde_json::json!({ "policy": { "policy_definition_id": "dev-policy" } }))),
+            (
+                "policy",
+                variant_point(serde_json::json!({
+                    "policy": { "policy_definition_id": "partner-policy", "require_agent_context": true }
+                })),
+            ),
+            (
+                "response_policy",
+                variant_point(serde_json::json!({ "response_policy": { "policy_definition_id": "dev-response" } })),
+            ),
+            (
+                "policy",
+                serde_json::json!({
+                    "alias": "dev-only", "target_endpoint": "https://dev-only.example.com/mcp", "protocol": "mcp",
+                    "policy": { "policy_definition_id": "partner-policy" }
+                }),
+            ),
+        ] {
+            let surface = surface_with_variant_transit_points(serde_json::json!([point]));
+
+            let Err(SurfaceApiError::BadRequest(message)) = validate_surface_mcp_tool_gating(&surface) else {
+                panic!("a variant transit point changing '{field}' must be refused: {point}");
+            };
+            assert!(message.contains("variant 'dev'"), "{message}");
+            assert!(message.contains(&format!("sets '{field}'")), "{message}");
+        }
     }
 
     #[tokio::test]
