@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use super::{DelegationToken, VaultLookupResult, oauth, storage::DelegationVaultStorage};
 use crate::credential_providers::{CredentialProvider, CredentialProviderType, storage::CredentialProviderStorage};
@@ -29,18 +29,31 @@ pub struct ServiceTokenKey<'a> {
     pub identity: &'a str,
 }
 
-pub enum ServiceToken {
-    /// A static credential read from the secrets store, never cached.
-    Static(zeroize::Zeroizing<String>),
-    /// A token an issuer returned, from the vault cache or just fetched and stored.
-    Issued { token: DelegationToken, cached: bool },
+pub struct ServiceToken {
+    value: zeroize::Zeroizing<String>,
+    /// The vault row of a token an issuer returned; `None` for a static credential read
+    /// from the secrets store, which is never cached.
+    pub issued: Option<IssuedToken>,
+}
+
+pub struct IssuedToken {
+    pub id: String,
+    /// Whether it came from the vault cache rather than a token request just now.
+    pub cached: bool,
 }
 
 impl ServiceToken {
     pub fn value(&self) -> &str {
-        match self {
-            Self::Static(value) => value,
-            Self::Issued { token, .. } => &token.access_token,
+        &self.value
+    }
+
+    fn issued(
+        token: DelegationToken,
+        cached: bool,
+    ) -> Self {
+        Self {
+            value: zeroize::Zeroizing::new(token.access_token),
+            issued: Some(IssuedToken { id: token.id, cached }),
         }
     }
 }
@@ -87,10 +100,13 @@ pub async fn acquire(
         if value.is_empty() {
             return Err(ServiceTokenError::SecretUnavailable);
         }
-        return Ok(ServiceToken::Static(zeroize::Zeroizing::new(value)));
+        return Ok(ServiceToken {
+            value: zeroize::Zeroizing::new(value),
+            issued: None,
+        });
     }
     if let Some(token) = cached_token(provider, scopes, context, key, now).await? {
-        return Ok(ServiceToken::Issued { token, cached: true });
+        return Ok(ServiceToken::issued(token, true));
     }
     let client = match context.http {
         Some(client) => client.clone(),
@@ -172,7 +188,7 @@ pub async fn acquire(
         })
         .await
         .map_err(|_| ServiceTokenError::StoreUnavailable)?;
-    Ok(ServiceToken::Issued { token, cached: false })
+    Ok(ServiceToken::issued(token, false))
 }
 
 async fn cached_token(
@@ -182,20 +198,23 @@ async fn cached_token(
     key: ServiceTokenKey<'_>,
     now: DateTime<Utc>,
 ) -> Result<Option<DelegationToken>, ServiceTokenError> {
-    let VaultLookupResult::Found(token) = context
+    let token = match context
         .vault
         .lookup(key.agent_did, key.identity, &provider.id)
         .await
         .map_err(|_| ServiceTokenError::StoreUnavailable)?
-    else {
-        return Ok(None);
+    {
+        VaultLookupResult::Found(token) => token,
+        VaultLookupResult::ExpiredRefreshable(token) | VaultLookupResult::ExpiredNoRefresh(token) => {
+            debug!(target: "credential_delegation", token_id = %token.id, "Cached service token expired, requesting a new one");
+            return Ok(None);
+        }
+        VaultLookupResult::NotFound => return Ok(None),
     };
     let usable = token.agent_did == key.agent_did
         && token.user_identity_hash == key.identity
         && token.credential_provider_id == provider.id
-        && !token
-            .access_token
-            .is_empty()
+        && !token.access_token.is_empty()
         && token
             .token_type
             .eq_ignore_ascii_case("Bearer")
@@ -392,11 +411,13 @@ mod tests {
     }
 
     fn issued(token: Result<ServiceToken, ServiceTokenError>) -> (String, bool) {
-        match token {
-            Ok(ServiceToken::Issued { token, cached }) => (token.access_token, cached),
-            Ok(ServiceToken::Static(_)) => panic!("expected an issued token"),
-            Err(error) => panic!("expected an issued token, got {error}"),
-        }
+        let token = token.unwrap_or_else(|error| panic!("expected an issued token, got {error}"));
+        let cached = token
+            .issued
+            .as_ref()
+            .expect("expected an issued token")
+            .cached;
+        (token.value().to_string(), cached)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -419,10 +440,26 @@ mod tests {
             ),
         ] {
             let fixture = Fixture::new().await;
-            let provider = fixture.provider(settings).await;
+            let provider = fixture
+                .provider(settings)
+                .await;
             let now = Utc::now();
-            assert_eq!(issued(fixture.acquire(&provider, &["read"], now).await), ("issued".into(), false));
-            assert_eq!(issued(fixture.acquire(&provider, &["read"], now).await), ("issued".into(), true));
+            assert_eq!(
+                issued(
+                    fixture
+                        .acquire(&provider, &["read"], now)
+                        .await
+                ),
+                ("issued".into(), false)
+            );
+            assert_eq!(
+                issued(
+                    fixture
+                        .acquire(&provider, &["read"], now)
+                        .await
+                ),
+                ("issued".into(), true)
+            );
             let requests = fixture.requests();
             assert_eq!(requests.len(), 1, "{grant_type}");
             assert_eq!(requests[0]["grant_type"], grant_type);
@@ -451,7 +488,7 @@ mod tests {
                 .acquire(&provider, &[], Utc::now())
                 .await
                 .unwrap();
-            assert!(matches!(token, ServiceToken::Static(_)));
+            assert!(token.issued.is_none());
             assert_eq!(token.value(), "static-key");
         }
         assert!(fixture.requests().is_empty());
@@ -473,12 +510,30 @@ mod tests {
                              "client_secret_secret_ref": "CLIENT_SECRET"}))
             .await;
         let now = Utc::now();
-        issued(fixture.acquire(&provider, &[], now).await);
+        issued(
+            fixture
+                .acquire(&provider, &[], now)
+                .await,
+        );
         let later = now + chrono::Duration::seconds(3600 - 90);
-        assert!(issued(fixture.acquire(&provider, &[], later).await).1);
+        assert!(
+            issued(
+                fixture
+                    .acquire(&provider, &[], later)
+                    .await
+            )
+            .1
+        );
         fixture.respond(json!({"access_token": "renewed", "token_type": "Bearer", "expires_in": 3600}));
         let almost = now + chrono::Duration::seconds(3600 - 30);
-        assert_eq!(issued(fixture.acquire(&provider, &[], almost).await), ("renewed".into(), false));
+        assert_eq!(
+            issued(
+                fixture
+                    .acquire(&provider, &[], almost)
+                    .await
+            ),
+            ("renewed".into(), false)
+        );
         assert_eq!(fixture.requests().len(), 2);
     }
 
@@ -514,7 +569,9 @@ mod tests {
             .provider(json!({"provider_type": "oauth2_client_credentials", "client_id_secret_ref": "CLIENT_ID",
                              "client_secret_secret_ref": "CLIENT_SECRET"}))
             .await;
-        fixture.respond(json!({"access_token": "wide", "token_type": "Bearer", "expires_in": 3600, "scope": "read write"}));
+        fixture.respond(
+            json!({"access_token": "wide", "token_type": "Bearer", "expires_in": 3600, "scope": "read write"}),
+        );
         assert_eq!(
             fixture
                 .acquire(&provider, &["read"], Utc::now())
@@ -522,7 +579,14 @@ mod tests {
                 .err(),
             Some(ServiceTokenError::ScopeMismatch)
         );
-        assert_eq!(issued(fixture.acquire(&provider, &[], Utc::now()).await), ("wide".into(), false));
+        assert_eq!(
+            issued(
+                fixture
+                    .acquire(&provider, &[], Utc::now())
+                    .await
+            ),
+            ("wide".into(), false)
+        );
         let VaultLookupResult::Found(stored) = fixture
             .vault
             .lookup(KEY.agent_did, KEY.identity, "provider")

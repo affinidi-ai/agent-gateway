@@ -1638,11 +1638,24 @@ mod tests {
                 .load(Ordering::SeqCst)
         };
 
-        assert_eq!(context.service_credential(&selected[0], now).await.ok(), Some("first-access".to_string()));
+        assert_eq!(
+            context
+                .service_credential(&selected[0], now)
+                .await
+                .ok(),
+            Some("first-access".to_string())
+        );
         assert_eq!(calls(), 1);
-        assert_eq!(context.service_credential(&selected[0], now).await.ok(), Some("first-access".to_string()));
+        assert_eq!(
+            context
+                .service_credential(&selected[0], now)
+                .await
+                .ok(),
+            Some("first-access".to_string())
+        );
         assert_eq!(calls(), 1);
-        let cache_identity = format!("__mcp_client_credentials__:{}", hex::encode(provider_digest(&selected[0].provider).unwrap()));
+        let cache_identity =
+            format!("__mcp_client_credentials__:{}", hex::encode(provider_digest(&selected[0].provider).unwrap()));
         let VaultLookupResult::Found(cached) = vault
             .lookup("did:web:agent.example", &cache_identity, "provider")
             .await
@@ -1663,7 +1676,13 @@ mod tests {
             .response
             .lock()
             .unwrap() = json!({"access_token": "second-access", "token_type": "Bearer", "expires_in": 3600});
-        assert_eq!(context.service_credential(&selected[0], now).await.ok(), Some("second-access".to_string()));
+        assert_eq!(
+            context
+                .service_credential(&selected[0], now)
+                .await
+                .ok(),
+            Some("second-access".to_string())
+        );
         assert_eq!(calls(), 2);
 
         vault
@@ -1675,7 +1694,12 @@ mod tests {
             .lock()
             .unwrap() =
             json!({"access_token": "wrong-scope", "token_type": "Bearer", "expires_in": 3600, "scope": "read write"});
-        assert!(matches!(context.service_credential(&selected[0], now).await, Err(ContinuationError::Denied)));
+        assert!(matches!(
+            context
+                .service_credential(&selected[0], now)
+                .await,
+            Err(ContinuationError::Denied)
+        ));
         assert_eq!(calls(), 3);
         tasks.shutdown().await;
     }

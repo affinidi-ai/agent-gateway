@@ -12,7 +12,7 @@ use crate::credential_providers::CredentialProviderType;
 use crate::credential_providers::storage::CredentialProviderStorage;
 use crate::delegation_vault::audit::{self, AuditCallerContext, DelegationAuditAction};
 use crate::delegation_vault::service_token::{
-    self, ServiceToken, ServiceTokenContext, ServiceTokenError, ServiceTokenKey,
+    self, IssuedToken, ServiceTokenContext, ServiceTokenError, ServiceTokenKey,
 };
 use crate::delegation_vault::{DelegationToken, VaultLookupResult, oauth, storage::DelegationVaultStorage};
 use crate::secrets::SecretsStore;
@@ -458,13 +458,20 @@ pub async fn resolve_delegation_credentials(
                 };
                 let acquired = service_token::acquire(&provider, effective_scopes, &context, key, Utc::now())
                     .await
-                    .and_then(|token| match token {
-                        ServiceToken::Issued { token, cached } => Ok((token, cached)),
-                        ServiceToken::Static(_) => Err(ServiceTokenError::Unsupported),
+                    .and_then(|mut token| match token.issued.take() {
+                        Some(IssuedToken { id, cached }) => Ok((id, cached, token)),
+                        None => Err(ServiceTokenError::Unsupported),
                     });
                 match acquired {
-                    Ok((token, cached)) => {
-                        let detail = format!("{grant}_{}", if cached { "cached" } else { "fresh" });
+                    Ok((token_id, cached, token)) => {
+                        let detail = format!(
+                            "{grant}_{}",
+                            if cached {
+                                "cached"
+                            } else {
+                                "fresh"
+                            }
+                        );
                         debug!(
                             target: "credential_delegation",
                             surface_id = %channel_id,
@@ -474,12 +481,12 @@ pub async fn resolve_delegation_credentials(
                         );
                         if cached
                             && let Err(e) = vault_store
-                                .mark_used(&token.id)
+                                .mark_used(&token_id)
                                 .await
                         {
                             warn!(
                                 target: "credential_delegation",
-                                token_id = %token.id,
+                                token_id = %token_id,
                                 error = %e,
                                 "Failed to mark service token as used"
                             );
@@ -492,13 +499,13 @@ pub async fn resolve_delegation_credentials(
                                 Some(&binding.credential_provider_id),
                                 Some(channel_id),
                             );
-                            evt.token_id = Some(token.id.clone());
+                            evt.token_id = Some(token_id.clone());
                             evt.via_fabric = via_fabric;
                             evt.detail = Some(detail.clone());
                             enrich_audit_event(&mut evt, audit_ctx, binding, Some(&provider.name));
                             evt
                         });
-                        let headers = build_injection_headers(&binding.inject_as, &token.access_token);
+                        let headers = build_injection_headers(&binding.inject_as, token.value());
                         results.push(DelegationResolution::new(
                             binding,
                             Some(&provider.name),
