@@ -2556,20 +2556,35 @@ async fn apply_surface_change_while_locked(
         }
     }
 
-    // Compile / refresh the OPA policy for the surface-derived channel.
     // The reload paths above register the ChannelMapping with the runtime
     // but do NOT invoke SurfacePolicyManager — so without this, an active
     // surface with `policy_definition_id` set would have `opa_enabled=true`
     // on the channel but no compiled engine, producing the misleading
     // "OPA policy enforcement is enabled but no policy is loaded" 403.
-    if let SurfaceChange::Upsert(surface) = change
-        && surface.status == crate::config::agent_surface::SurfaceStatus::Active
-        && let Err(e) = state
-            .policy_manager
-            .update_channel_policy(surface)
-            .await
-    {
-        warn!("Failed to compile OPA policy for surface '{surface_id}': {e}");
+    refresh_surface_policies(&state.policy_manager, change).await;
+}
+
+/// Compile or refresh the OPA policy of an upserted active surface, or evict
+/// every policy, tool gate and rate limiter of a deleted one.
+async fn refresh_surface_policies(
+    policy_manager: &crate::policies::SurfacePolicyManager,
+    change: SurfaceChange<'_>,
+) {
+    match change {
+        SurfaceChange::Upsert(surface) => {
+            if surface.status == crate::config::agent_surface::SurfaceStatus::Active
+                && let Err(e) = policy_manager
+                    .update_channel_policy(surface)
+                    .await
+            {
+                warn!("Failed to compile OPA policy for surface '{}': {e}", surface.surface_id);
+            }
+        }
+        SurfaceChange::Delete(id) => {
+            policy_manager
+                .remove_channel(id)
+                .await;
+        }
     }
 }
 
@@ -5594,6 +5609,28 @@ mod tests {
                 .collect(),
         });
         surface
+    }
+
+    #[tokio::test]
+    async fn deleting_a_surface_evicts_its_transit_point_tool_gating() {
+        let manager = crate::policies::SurfacePolicyManager::new();
+        let surface: AgentSurface = serde_json::from_value(serde_json::json!({
+            "surface_id": "doomed", "name": "doomed", "description": "", "status": "active",
+            "access_point": { "listen_address": "0.0.0.0:8443", "route": "/doomed", "protocol": "mcp" },
+            "target": { "endpoint": "http://localhost:9000" },
+            "transit": { "points": [{
+                "alias": "partner", "target_endpoint": "https://partner.example.com/mcp", "protocol": "mcp",
+                "mcp_tool_gating": { "gates": [{ "id": "g1", "name": "no admin",
+                    "action": { "effect": "deny", "patterns": ["^admin_"] } }] }
+            }] }
+        }))
+        .unwrap();
+        refresh_surface_policies(&manager, SurfaceChange::Upsert(&surface)).await;
+        assert!(manager.has_transit_mcp_tool_gating("doomed", "partner"));
+
+        refresh_surface_policies(&manager, SurfaceChange::Delete("doomed")).await;
+
+        assert!(!manager.has_transit_mcp_tool_gating("doomed", "partner"));
     }
 
     #[test]

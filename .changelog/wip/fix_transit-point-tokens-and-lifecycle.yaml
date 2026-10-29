@@ -22,6 +22,23 @@ changes:
         the gateway issues, and that it carries a token ID, with 5 seconds of clock
         allowance. A token can still be used any number of times until it expires.
     - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Take a deleted surface's Transit Points out of service at once
+      description: >-
+        Deleting a surface now retires its outbound state at once, so every route still
+        holding it, on a new or a kept-alive connection, answers `404`, and evicts its
+        compiled policies, MCP tool gating and rate limiters, those of its Transit Points
+        included. A surface without variants is deleted without rebinding the outbound
+        listener it shares with other surfaces, so their Transit Points are not interrupted;
+        deleting a surface with variants takes a full reload, which rebinds every listener.
+        Disabling a surface or removing all its Transit Points retires that state the same
+        way, including on connections kept alive on a TLS outbound listener.
+    - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Refuse a gated Transit Point tool call when its tool gating is not in force
+      description: >-
+        A Transit Point whose configuration sets MCP tool gating that is not in force, as
+        when its surface is deleted while a `tools/call` is in flight, now refuses every
+        `tools/call` and answers `tools/list` with an empty tool list.
+    - timestamp: '2026-10-28T00:00:00.000Z'
       title: Write the gateway's key files atomically with owner-only permissions
       description: >-
         The gateway's key files (DID keys, VC issuer keys and the transit token key) are now
@@ -58,3 +75,12 @@ changes:
         5 seconds of clock difference, so a managed agent turn that runs past about 305 seconds
         has its later Transit Point calls refused until its next inbound request brings a new
         token.
+    - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Set Transit Point tool gating on the surface's Transit Point, not a variant's
+      description: >-
+        MCP tool gating is compiled from a surface's own Transit Points only, so a variant's
+        Transit Point is gated by the surface's Transit Point of the same alias. A variant
+        Transit Point that sets `mcp_tool_gating` where the surface's Transit Point of that
+        alias sets none, or that the surface does not have, now refuses every `tools/call`
+        and answers `tools/list` with no tools, as a per-Transit-Point policy set only on a
+        variant is already refused. Move such gating to the surface's Transit Point.

@@ -29,6 +29,12 @@ Feature: MCP Transit Point forwarding
     Then the response status is 404
     And MCP server "bravo" was not called
 
+  Scenario: A deleted surface's Transit Point stops answering
+    Given the operator has deleted the surface
+    When managed agent "example-agent" asks for available tools through Transit Point "alpha"
+    Then the response status is 404
+    And MCP server "bravo" was not called
+
   Scenario: MCP tool invocation reaches the external MCP server through a Transit Point
     Given MCP server "bravo" supports tool invocation
     When managed agent "example-agent" invokes MCP tool "search" through Transit Point "alpha" with a result limit of 3

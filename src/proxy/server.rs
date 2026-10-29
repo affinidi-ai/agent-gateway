@@ -1303,6 +1303,27 @@ fn get_or_create_outbound_channel_state(
     }
 }
 
+/// Take the shared outbound state for `config_id` out of service. Routes still
+/// holding it, on a listener being rebuilt or a connection kept alive past the
+/// rebuild, then refuse every request as for a surface without Transit Points.
+pub(crate) fn retire_outbound_channel_state(
+    states: &mut std::collections::HashMap<String, Arc<std::sync::RwLock<crate::state::OutboundSurfaceState>>>,
+    config_id: &str,
+) {
+    let Some(retired) = states.remove(config_id) else {
+        return;
+    };
+    let mut state = retired
+        .write()
+        .expect("outbound channel_state lock poisoned");
+    let mut surface = (*state.surface).clone();
+    surface.transit = None;
+    surface.variants.clear();
+    state.surface = Arc::new(surface);
+    state.identity_rules_engine = None;
+    state.identity_selector = None;
+}
+
 /// Run a simple outbound-only port listener.
 ///
 /// This is the server-side counterpart of the outbound pipeline.  Unlike

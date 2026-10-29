@@ -1369,6 +1369,8 @@ async fn wait_for_gateway_http(
     loop {
         match client.get(&url).send().await {
             Ok(_) => break,
+            // The port accepts connections but does not speak plain HTTP: a TLS listener.
+            Err(error) if !error.is_connect() && !error.is_timeout() => break,
             Err(_) if tokio::time::Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }

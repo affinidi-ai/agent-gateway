@@ -404,11 +404,34 @@ impl SurfaceTaskManager {
         // clear, a stale surface — e.g. a transit point whose `target_endpoint`
         // was switched from `fabric://…` back to a direct URL — would survive
         // the reload and the gateway would keep routing to the old destination.
+        // The state of a surface that no longer serves Transit Points, because it
+        // was deleted, disabled or emptied, is retired rather than dropped, so a
+        // route or connection that outlives its listener cannot keep using it.
         {
             let mut outbound_states = self
                 .outbound_channel_states
                 .write()
                 .expect("outbound_channel_states lock poisoned");
+            let retired: Vec<String> = outbound_states
+                .keys()
+                .filter(|config_id| {
+                    !new_config
+                        .surfaces
+                        .iter()
+                        .any(|surface| {
+                            surface.config_id() == Some(config_id.as_str())
+                                && surface.status == crate::config::agent_surface::SurfaceStatus::Active
+                                && surface
+                                    .transit
+                                    .as_ref()
+                                    .is_some_and(|transit| !transit.points.is_empty())
+                        })
+                })
+                .cloned()
+                .collect();
+            for config_id in retired {
+                crate::proxy::server::retire_outbound_channel_state(&mut outbound_states, &config_id);
+            }
             outbound_states.clear();
         }
 
@@ -1402,6 +1425,18 @@ impl SurfaceTaskManager {
                     .as_ref()
                     .is_some_and(|t| !t.points.is_empty())
             });
+        if previous_surface_has_outbound
+            && !surface_has_outbound
+            && let Some(config_id) = new_surface.config_id()
+        {
+            crate::proxy::server::retire_outbound_channel_state(
+                &mut self
+                    .outbound_channel_states
+                    .write()
+                    .expect("outbound_channel_states lock poisoned"),
+                config_id,
+            );
+        }
         if surface_has_outbound || previous_surface_has_outbound {
             self.restart_outbound_listener_for_channel(&new_surface, previous_surface.as_ref(), metrics_store)
                 .await?;
@@ -1413,9 +1448,11 @@ impl SurfaceTaskManager {
     /// Surgically remove a single channel from the running gateway by
     /// `config_id` without restarting any port listener. Used by the
     /// surface-delete fast path so deleting one surface does not tear
-    /// down every other channel's tasks. Returns `Ok(true)` if the
-    /// channel was found and removed, `Ok(false)` if it was not present
-    /// (caller can fall back to a full reload if needed).
+    /// down every other channel's tasks. Its Transit Points stop answering at
+    /// once: the outbound state every route of theirs holds is retired, so
+    /// the outbound listeners other surfaces share stay bound. Returns
+    /// `Ok(true)` if the channel was found and removed, `Ok(false)` if it was
+    /// not present (caller can fall back to a full reload if needed).
     pub async fn remove_single_channel(
         &self,
         config_id: &str,
@@ -1493,14 +1530,15 @@ impl SurfaceTaskManager {
         drop(port_states);
 
         // Step 3: drop the outbound channel state if this channel had
-        // outbound enabled.
-        {
-            let mut states = self
+        // outbound enabled, retiring it, so every route still holding it, on
+        // a new or a kept-alive connection, refuses each request.
+        crate::proxy::server::retire_outbound_channel_state(
+            &mut self
                 .outbound_channel_states
                 .write()
-                .expect("outbound_channel_states lock poisoned");
-            states.remove(config_id);
-        }
+                .expect("outbound_channel_states lock poisoned"),
+            config_id,
+        );
 
         // Step 4: clean up every TaskInfo for this channel (AP + TPs).
         if let Some(ref monitor) = task_monitor {

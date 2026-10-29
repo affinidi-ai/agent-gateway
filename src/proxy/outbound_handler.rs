@@ -3254,6 +3254,33 @@ async fn step_transit_point_opa_policy(
     Ok(())
 }
 
+/// The MCP tool gating in force for this request's Transit Point, when it gates
+/// anything.
+fn compiled_transit_mcp_tool_gating(
+    state: &OutboundProxyState,
+    ctx: &OutboundPipelineContext,
+) -> Option<Arc<crate::policies::mcp_tool_gating::CompiledMcpToolGating>> {
+    state
+        .policy_manager
+        .as_ref()?
+        .compiled_mcp_tool_gating_for_transit(
+            ctx.surface
+                .config_id()
+                .unwrap_or("unknown"),
+            &ctx.virtual_channel.alias,
+        )
+        .filter(|gating| !gating.is_empty())
+}
+
+/// Whether this request's Transit Point is configured with MCP tool gating that
+/// gates anything.
+fn transit_mcp_tool_gating_configured(ctx: &OutboundPipelineContext) -> bool {
+    ctx.virtual_channel
+        .mcp_tool_gating
+        .as_ref()
+        .is_some_and(|gating| !gating.is_empty())
+}
+
 /// [10.6] Per-Transit-Point MCP Tool Gating — `tools/call` leg.
 ///
 /// Blocks an outbound `tools/call` toward this transit point when the TP's
@@ -3263,6 +3290,8 @@ async fn step_transit_point_opa_policy(
 /// that have gating installed; absent gating passes through, while a
 /// `tools/call` whose tool name can't be read is blocked. The gate condition is evaluated against the same outbound
 /// `PolicyInput` the transit-point OPA gate sees, with `mcp.method` pinned to
+/// `tools/call`. A Transit Point whose configuration has gating that is not in
+/// force, such as one deleted while the request was in flight, blocks every
 /// `tools/call`.
 async fn step_transit_mcp_tool_gating(
     state: &OutboundProxyState,
@@ -3274,9 +3303,6 @@ async fn step_transit_mcp_tool_gating(
     if ctx.operation.as_deref() != Some("tools/call") {
         return Ok(());
     }
-    let Some(pm) = state.policy_manager.as_ref() else {
-        return Ok(());
-    };
     let config_id = ctx
         .surface
         .config_id()
@@ -3285,10 +3311,15 @@ async fn step_transit_mcp_tool_gating(
         .virtual_channel
         .alias
         .as_str();
-    let Some(gating) = pm
-        .compiled_mcp_tool_gating_for_transit(config_id, alias)
-        .filter(|g| !g.is_empty())
-    else {
+    let Some(gating) = compiled_transit_mcp_tool_gating(state, ctx) else {
+        if transit_mcp_tool_gating_configured(ctx) {
+            warn!(
+                request_id = %ctx.request_id,
+                alias = %alias,
+                "Per-transit-point MCP tool gating is configured but not in force; blocking tools/call"
+            );
+            return Err(OutboundPipelineError::TransitMcpToolGated);
+        }
         return Ok(());
     };
 
@@ -4787,21 +4818,24 @@ fn filter_transit_mcp_tools_list(
     if ctx.operation.as_deref() != Some("tools/list") {
         return body_bytes;
     }
-    let Some(pm) = state.policy_manager.as_ref() else {
-        return body_bytes;
-    };
-    let config_id = ctx
-        .surface
-        .config_id()
-        .unwrap_or("unknown");
     let alias = ctx
         .virtual_channel
         .alias
         .as_str();
-    let Some(gating) = pm
-        .compiled_mcp_tool_gating_for_transit(config_id, alias)
-        .filter(|g| !g.is_empty())
-    else {
+    let Some(gating) = compiled_transit_mcp_tool_gating(state, ctx) else {
+        if transit_mcp_tool_gating_configured(ctx) {
+            warn!(
+                request_id = %ctx.request_id,
+                alias = %alias,
+                "Per-transit-point MCP tool gating is configured but not in force; failing closed (empty tool list)"
+            );
+            return Bytes::from(crate::mcp::fail_closed_tools_list(
+                ctx.body_bytes
+                    .as_deref()
+                    .unwrap_or_default(),
+                ctx.mcp_metadata_context,
+            ));
+        }
         return body_bytes;
     };
     if body_bytes.is_empty() {
@@ -8289,6 +8323,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_retired_outbound_state_refuses_every_route_still_holding_it() {
+        let mut held_by_listen_path_route = test_outbound_state();
+        held_by_listen_path_route.vc_alias_override = Some("partner-a".into());
+        let held_by_outbound_route = test_outbound_state();
+        held_by_listen_path_route.channel_state = held_by_outbound_route
+            .channel_state
+            .clone();
+        let mut states = std::collections::HashMap::from([(
+            "surface-being-deleted".to_string(),
+            held_by_outbound_route
+                .channel_state
+                .clone(),
+        )]);
+
+        crate::proxy::server::retire_outbound_channel_state(&mut states, "surface-being-deleted");
+
+        assert!(states.is_empty());
+        for (state, path) in [
+            (&held_by_outbound_route, "/outbound/surfaces/order/partner-a/message/send"),
+            (&held_by_outbound_route, "/outbound/surfaces/order$dev/partner-a/message/send"),
+            (&held_by_listen_path_route, "/custom/partner-a"),
+        ] {
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(path)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let result = OutboundPipelineContext::new(
+                "127.0.0.1:12345"
+                    .parse()
+                    .unwrap(),
+                request,
+                state,
+            );
+            assert!(matches!(result, Err(OutboundPipelineError::OutboundDisabled)), "{path}");
+        }
+    }
+
     // ── step_source_auth (MVP: no-op) ──────────────────────────────────────
 
     #[tokio::test]
@@ -10481,6 +10554,52 @@ mod tests {
             }
             other => panic!("unexpected error: {:?}", other),
         }
+    }
+
+    /// A Transit Point configured with MCP tool gating that is not in force, as
+    /// when its surface was deleted while the request was in flight, refuses a
+    /// `tools/call` and lists no tools.
+    #[tokio::test]
+    async fn a_transit_point_whose_tool_gating_is_not_in_force_fails_closed() {
+        let mut state = test_outbound_state();
+        state.policy_manager = Some(Arc::new(crate::policies::SurfacePolicyManager::new()));
+        let gated = |operation: &str| {
+            let mut ctx = test_pipeline_context();
+            ctx.virtual_channel.protocol = crate::config::agent_surface::TransitProtocol::Mcp;
+            ctx.operation = Some(operation.to_string());
+            ctx.body_bytes = Some(Bytes::from(
+                json!({"jsonrpc": "2.0", "id": 9, "method": operation, "params": {"name": "admin_reset"}}).to_string(),
+            ));
+            ctx.virtual_channel
+                .mcp_tool_gating = Some(
+                serde_json::from_value(json!({"gates": [{"id": "g1", "name": "no admin",
+                    "action": {"effect": "deny", "patterns": ["^admin_"]}}]}))
+                .unwrap(),
+            );
+            ctx
+        };
+
+        let mut call = gated("tools/call");
+        assert!(matches!(
+            step_transit_mcp_tool_gating(&state, &mut call).await,
+            Err(OutboundPipelineError::TransitMcpToolGated)
+        ));
+        let listed = filter_transit_mcp_tools_list(
+            &state,
+            &gated("tools/list"),
+            Bytes::from(json!({"jsonrpc": "2.0", "id": 9, "result": {"tools": [{"name": "admin_reset"}]}}).to_string()),
+        );
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&listed).unwrap()["result"]["tools"], json!([]));
+
+        let mut ungated = gated("tools/call");
+        ungated
+            .virtual_channel
+            .mcp_tool_gating = None;
+        assert!(
+            step_transit_mcp_tool_gating(&state, &mut ungated)
+                .await
+                .is_ok()
+        );
     }
 
     // ── step_collect_trust_context ─────────────────────────────────────────
