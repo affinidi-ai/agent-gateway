@@ -1457,12 +1457,26 @@ impl TransitPoint {
         {
             return Some(format!("Transit Point '{alias}' sets both source_auth and mcp_http.authorization; keep one"));
         }
-        (!transit_point_supports_source_auth(source_auth)).then(|| {
-            format!(
+        if !transit_point_supports_source_auth(source_auth) {
+            return Some(format!(
                 "Transit Point '{alias}' source_auth must be api_key or api_key_provider read from an HTTP header, \
                  jwt_bearer without forward_header, or mtls"
-            )
-        })
+            ));
+        }
+        match source_auth {
+            SourceAuthConfig::JwtBearer(config)
+                if config
+                    .audiences
+                    .iter()
+                    .all(|audience| audience.trim().is_empty()) =>
+            {
+                Some(format!(
+                    "Transit Point '{alias}' source_auth jwt_bearer must name the audiences it accepts, so a token \
+                     issued for another service, such as the Access Point, is refused"
+                ))
+            }
+            _ => None,
+        }
     }
 
     /// Refuses a Transit Point whose caller authentication cannot be enforced
@@ -7153,6 +7167,19 @@ mod transit_point_caller_authentication_tests {
         let refusal = "Transit Point 'partner' sets both source_auth and mcp_http.authorization; keep one";
         assert_eq!(both.unenforceable_caller_authentication(), Some(refusal.to_string()));
         assert_eq!(both.validate_caller_authentication(), Err(refusal.to_string()));
+
+        let no_audience = "Transit Point 'partner' source_auth jwt_bearer must name the audiences it accepts, so a \
+                           token issued for another service, such as the Access Point, is refused";
+        for audiences in [json!([]), json!(["", "  "])] {
+            let point = point(json!({ "require_transit_token": false, "source_auth": {
+                "type": "jwt_bearer", "jwt_verification_strategy_id": "entra", "audiences": audiences
+            }}));
+            assert_eq!(point.unenforceable_caller_authentication(), Some(no_audience.to_string()), "{audiences}");
+        }
+        let named = point(json!({ "require_transit_token": false, "source_auth": {
+            "type": "jwt_bearer", "jwt_verification_strategy_id": "entra", "audiences": ["api://crm-transit"]
+        }}));
+        assert_eq!(named.unenforceable_caller_authentication(), None);
     }
 
     #[test]

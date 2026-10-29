@@ -830,21 +830,24 @@ fn validate_transit_point_caller_authentication(surface: &AgentSurface) -> Resul
     Ok(())
 }
 
-/// A saved surface, with the [`open_transit_point_warnings`] it calls for.
+/// A saved surface, with the [`transit_point_warnings`] it calls for.
 type SavedSurface = (axum::http::HeaderMap, Json<AgentSurface>);
 
 /// `Warning` headers (code 299) naming each Transit Point of `surface` that
-/// serves callers it does not authenticate where other hosts reach it.
-fn open_transit_point_warnings(
+/// serves callers it does not authenticate where other hosts reach it, and
+/// each that accepts the Access Point's own tokens
+/// ([`shared_audience_warnings`]).
+fn transit_point_warnings(
     network_config: &crate::config::NetworkConfig,
     surface: &AgentSurface,
 ) -> axum::http::HeaderMap {
     let mut headers = axum::http::HeaderMap::new();
-    for exposure in crate::proxy::server::open_transit_points(network_config, surface)
+    for warning in crate::proxy::server::open_transit_points(network_config, surface)
         .iter()
         .filter_map(crate::proxy::server::OpenTransitPoint::exposure)
+        .chain(shared_audience_warnings(surface))
     {
-        let quoted = exposure
+        let quoted = warning
             .replace('\\', "\\\\")
             .replace('"', "\\\"");
         if let Ok(value) = axum::http::HeaderValue::from_str(&format!("299 - \"{quoted}\"")) {
@@ -852,6 +855,73 @@ fn open_transit_point_warnings(
         }
     }
     headers
+}
+
+/// Each Transit Point, on the surface or in an enabled variant, whose
+/// `jwt_bearer` accepts tokens issued for the Access Point: the same JWT
+/// verification strategy and an audience both name. A caller of the Access
+/// Point could then call that Transit Point directly, with its credentials.
+fn shared_audience_warnings(surface: &AgentSurface) -> Vec<String> {
+    use crate::source_auth::SourceAuthConfig;
+    let jwt = |config: &SourceAuthConfig| match config {
+        SourceAuthConfig::JwtBearer(config) => Some(config.clone()),
+        _ => None,
+    };
+    let views = std::iter::once(Some(surface.clone())).chain(
+        surface
+            .variants
+            .iter()
+            .map(|variant| {
+                surface
+                    .resolve_variant(Some(&variant.alias))
+                    .ok()
+            }),
+    );
+    let mut warnings = Vec::new();
+    for view in views.flatten() {
+        let access_point: Vec<_> = view
+            .access_point
+            .caller_authentication
+            .iter()
+            .flat_map(|authentication| authentication.methods.iter())
+            .filter_map(jwt)
+            .collect();
+        for point in view.transit_points() {
+            let Some(transit_point) = point
+                .source_auth
+                .as_ref()
+                .and_then(jwt)
+            else {
+                continue;
+            };
+            for accepted in access_point
+                .iter()
+                .filter(|accepted| accepted.jwt_verification_strategy_id == transit_point.jwt_verification_strategy_id)
+            {
+                let Some(audience) = transit_point
+                    .audiences
+                    .iter()
+                    .find(|audience| {
+                        accepted
+                            .audiences
+                            .contains(audience)
+                    })
+                else {
+                    continue;
+                };
+                let warning = format!(
+                    "Transit Point '{}' accepts the Access Point's own tokens (JWT verification strategy '{}', \
+                     audience '{audience}'), so a caller of the Access Point can call it directly; give it an \
+                     audience of its own",
+                    point.alias, transit_point.jwt_verification_strategy_id
+                );
+                if !warnings.contains(&warning) {
+                    warnings.push(warning);
+                }
+            }
+        }
+    }
+    warnings
 }
 
 /// Identity of the listener a surface route is served on.
@@ -1568,7 +1638,7 @@ pub async fn create_surface(
 
     apply_surface_change(&state, SurfaceChange::Upsert(&surface)).await;
 
-    Ok((StatusCode::CREATED, open_transit_point_warnings(&state.network_config, &surface), Json(surface)))
+    Ok((StatusCode::CREATED, transit_point_warnings(&state.network_config, &surface), Json(surface)))
 }
 
 /// Whether `access_point` in a PUT body removes its discovery setting.
@@ -1664,7 +1734,7 @@ pub async fn update_surface(
         resource_scoped(&delegation),
     )
     .await?;
-    Ok((open_transit_point_warnings(&state.network_config, &saved), Json(saved)))
+    Ok((transit_point_warnings(&state.network_config, &saved), Json(saved)))
 }
 
 /// PUT carries the whole record, so an omitted
@@ -2465,7 +2535,7 @@ pub async fn patch_surface(
         resource_scoped(&delegation),
     )
     .await?;
-    Ok((open_transit_point_warnings(&state.network_config, &saved), Json(saved)))
+    Ok((transit_point_warnings(&state.network_config, &saved), Json(saved)))
 }
 
 /// `PATCH /v1/surfaces/{id}/variants/{variant_id}`
@@ -2544,7 +2614,7 @@ pub async fn patch_variant(
         resource_scoped(&delegation),
     )
     .await?;
-    Ok((open_transit_point_warnings(&state.network_config, &saved), Json(saved)))
+    Ok((transit_point_warnings(&state.network_config, &saved), Json(saved)))
 }
 
 /// Delete an agent surface (hard delete: removes from cache + filesystem).
@@ -3110,7 +3180,7 @@ pub async fn create_variant(
 
     info!("Created variant '{}' (id={}) on surface '{}'", new_variant.alias, new_variant.id, surface_id);
 
-    Ok((StatusCode::CREATED, open_transit_point_warnings(&state.network_config, &saved), Json(new_variant)))
+    Ok((StatusCode::CREATED, transit_point_warnings(&state.network_config, &saved), Json(new_variant)))
 }
 
 /// `PUT /v1/surfaces/{id}/variants/{variant_id}`
@@ -3258,7 +3328,7 @@ pub async fn update_variant(
 
     info!("Updated variant '{}' (id={}) on surface '{}'", updated.alias, updated.id, surface_id);
 
-    Ok((open_transit_point_warnings(&state.network_config, &saved), Json(updated)))
+    Ok((transit_point_warnings(&state.network_config, &saved), Json(updated)))
 }
 
 /// `DELETE /v1/surfaces/{id}/variants/{variant_id}`
@@ -3384,7 +3454,7 @@ pub async fn promote_variant_to_default(
 
     info!("Promoted variant '{}' (id={}) to default on surface '{}'", variant_alias, variant_id, surface_id);
 
-    Ok((open_transit_point_warnings(&state.network_config, &saved), Json(saved)))
+    Ok((transit_point_warnings(&state.network_config, &saved), Json(saved)))
 }
 
 /// `GET /v1/surfaces/{id}/variants/{alias}/resolved`
@@ -3774,6 +3844,47 @@ mod validation_tests {
             "type": "api_key", "extraction": { "source": "http_header", "field": "X-API-Key" },
             "secret_id": "partner-callers"
         })
+    }
+
+    /// A save warns of a Transit Point whose `jwt_bearer` accepts tokens issued
+    /// for the Access Point: the same strategy and an audience both name.
+    #[test]
+    fn a_save_warns_of_a_transit_point_that_accepts_the_access_points_own_tokens() {
+        let jwt = |strategy: &str, audiences: serde_json::Value| serde_json::json!({ "type": "jwt_bearer", "jwt_verification_strategy_id": strategy, "audiences": audiences });
+        let surface_with = |transit_point_auth: serde_json::Value| {
+            let mut surface = surface_with_transit_points(
+                serde_json::json!([{ "alias": "crm", "target_endpoint": "https://crm.example",
+                    "require_transit_token": false, "source_auth": transit_point_auth }]),
+                serde_json::json!(null),
+            );
+            surface.variants.clear();
+            surface
+                .access_point
+                .caller_authentication = Some(
+                serde_json::from_value(serde_json::json!({
+                    "methods": [jwt("entra", serde_json::json!(["{{ surface.agent_did }}", "api://agent"]))]
+                }))
+                .unwrap(),
+            );
+            surface
+        };
+
+        assert_eq!(
+            shared_audience_warnings(&surface_with(jwt("entra", serde_json::json!(["{{ surface.agent_did }}"])))),
+            vec![
+                "Transit Point 'crm' accepts the Access Point's own tokens (JWT verification strategy 'entra', \
+                 audience '{{ surface.agent_did }}'), so a caller of the Access Point can call it directly; give it \
+                 an audience of its own"
+                    .to_string()
+            ]
+        );
+        for (case, transit_point_auth) in [
+            ("an audience of its own", jwt("entra", serde_json::json!(["api://crm-transit"]))),
+            ("another strategy", jwt("partner", serde_json::json!(["{{ surface.agent_did }}"]))),
+            ("an API key", caller_key()),
+        ] {
+            assert!(shared_audience_warnings(&surface_with(transit_point_auth)).is_empty(), "{case}");
+        }
     }
 
     #[test]
