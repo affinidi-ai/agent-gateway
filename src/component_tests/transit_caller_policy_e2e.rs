@@ -12,7 +12,7 @@ const POLICY_ID: &str = "only-alice-at-the-transit-point";
 const STRATEGY_ID: &str = "transit-caller-strategy";
 
 /// The identity hash of a JWT caller on a surface with no tenant, computed as
-/// an operator would: `printf '["jwt_bearer","<iss>",null,"<sub>"]' | shasum -a 256`.
+/// an operator would: `printf '%s' '["jwt_bearer","<iss>",null,"<sub>"]' | shasum -a 256`.
 fn jwt_caller_hash(
     issuer: &str,
     subject: &str,

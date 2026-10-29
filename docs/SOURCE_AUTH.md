@@ -281,10 +281,12 @@ its Transit Points refuse every request with `503` in the same way.
 
 The Surface Builder shows neither a Transit Point's `source_auth` nor its
 `allow_unauthenticated_callers`. A `PUT` that omits `source_auth`, as a dashboard save does,
-keeps the stored one; a merge `PATCH` whose `transit.points` leave it out removes it, since a
-merge patch replaces the whole list. A `PUT` that omits `allow_unauthenticated_callers` keeps
-it while the Transit Point still authenticates no caller, and drops it once the Transit Point
-authenticates its callers. A `PUT` matches each Transit Point to the stored one by `id`, and a
+keeps the stored one, and so does a `PUT` of one variant
+(`PUT /v1/surfaces/{id}/variants/{variant_id}`) for the Transit Points its overrides list;
+a merge `PATCH` of the surface or the variant whose `transit.points` leave it out removes it,
+since a merge patch replaces the whole list. A `PUT` that omits
+`allow_unauthenticated_callers` keeps it while the Transit Point still authenticates no
+caller, and drops it once the Transit Point authenticates its callers. A `PUT` matches each Transit Point to the stored one by `id`, and a
 Transit Point sent without an `id` gets a new one, so a `PUT` that omits both the `id` and
 `source_auth` drops the stored `source_auth`: a Transit Point that still requires a transit
 token is saved, authenticated by the token alone, and one that does not is refused with `400`.

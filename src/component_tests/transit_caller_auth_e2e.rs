@@ -878,3 +878,99 @@ async fn a_surface_whose_transit_point_uses_source_auth_is_stored_so_older_relea
         stored("tp-auth-base")
     );
 }
+
+/// A `PUT` of one variant whose Transit Points leave out `source_auth` and
+/// `allow_unauthenticated_callers` keeps the stored values, as a `PUT` of the
+/// whole surface does; a merge `PATCH` whose Transit Points leave
+/// `source_auth` out removes it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_variant_put_that_omits_a_transit_points_caller_authentication_keeps_it() {
+    let mut admin = None;
+    let h = GatewayHarness::start(|temp_dir, _, bootstrap| {
+        write_caller_key(temp_dir);
+        admin = Some(configure_admin_api(bootstrap));
+    })
+    .await;
+    let admin = admin.unwrap();
+    let key = json!({ "type": "api_key", "secret_id": CALLER_KEY_SECRET,
+                      "extraction": { "source": "http_header", "field": "x-api-key" } });
+    let point = |id: &str, extra: serde_json::Value| {
+        let mut point = json!({ "id": id, "alias": id, "target_endpoint": format!("https://{id}.example/a2a"),
+            "protocol": "a2a", "require_transit_token": false });
+        point
+            .as_object_mut()
+            .unwrap()
+            .extend(
+                extra
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            );
+        point
+    };
+    let collection = format!("{}/api/v1/surfaces", h.gateway_base);
+    let created = admin
+        .post(&collection)
+        .json(&json!({
+            "surface_id": "tp-variant-put", "name": "tp-variant-put", "status": "disabled",
+            "access_point": { "listen_address": h.gateway_base, "route": "/tp-variant-put", "protocol": "a2a" },
+            "target": { "endpoint": h.mock.url() },
+            "variants": [{ "id": "variant-dev", "alias": "dev", "name": "dev", "enabled": true,
+                "overrides": { "transit": { "points": [
+                    point("keyed", json!({ "source_auth": key })),
+                    point("open", json!({ "allow_unauthenticated_callers": true }))
+                ] } } }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201, "{}", created.text().await.unwrap());
+    let variant_url = format!("{collection}/tp-variant-put/variants/variant-dev");
+    let saved_points = |variant: &serde_json::Value| variant["overrides"]["transit"]["points"].clone();
+
+    let kept = admin
+        .put(&variant_url)
+        .json(&json!({ "name": "dev, renamed", "overrides": { "transit": { "points": [
+            point("keyed", json!({})),
+            point("open", json!({}))
+        ] } } }))
+        .send()
+        .await
+        .unwrap();
+    let status = kept.status();
+    let kept: serde_json::Value = kept.json().await.unwrap();
+    assert_eq!(status, 200, "{kept}");
+    assert_eq!(kept["name"], "dev, renamed");
+    assert_eq!(saved_points(&kept)[0]["source_auth"], key, "{kept}");
+    assert_eq!(saved_points(&kept)[1]["allow_unauthenticated_callers"], true, "{kept}");
+
+    let removed = admin
+        .patch(&variant_url)
+        .header("content-type", "application/merge-patch+json")
+        .body(
+            json!({ "overrides": { "transit": { "points": [
+                point("keyed", json!({ "require_transit_token": true })),
+                point("open", json!({ "allow_unauthenticated_callers": true }))
+            ] } } })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let status = removed.status();
+    let removed: serde_json::Value = removed.json().await.unwrap();
+    assert_eq!(status, 200, "{removed}");
+    let variant = removed["variants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|variant| variant["id"] == "variant-dev")
+        .unwrap()
+        .clone();
+    assert!(
+        saved_points(&variant)[0]
+            .get("source_auth")
+            .is_none(),
+        "{variant}"
+    );
+}
