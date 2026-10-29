@@ -21624,14 +21624,13 @@ mod fabric_extended_card_tests {
         let mut peer = fabric_peer_answering(200, json!({"jsonrpc": "2.0", "id": "m-1", "result": {}})).await;
         let registry_dir = tempfile::tempdir().unwrap();
         peer.state
-            .trust_registry_listener_manager =
-            Some(Arc::new(crate::trust_registries::TrustRegistryListenerManager::new(
-                "gateway.example".to_string(),
-                registry_dir
-                    .path()
-                    .to_path_buf(),
-                None,
-            )));
+            .trust_registry_listener_manager = Some(crate::trust_registries::TrustRegistryListenerManager::new(
+            "gateway.example".to_string(),
+            registry_dir
+                .path()
+                .to_path_buf(),
+            None,
+        ));
         let element = |id: &str, authority: &str| {
             json!({
                 "id": id,
