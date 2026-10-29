@@ -1,4 +1,4 @@
-branch: main
+branch: feat/agent-pay-int
 changes:
   added:
     - timestamp: '2026-10-26T00:00:00Z'
@@ -79,6 +79,12 @@ changes:
         The gateway now writes the payments ledger rows it still holds in memory when it receives
         `SIGTERM` or `SIGINT`, waiting at most 5 seconds, and then ends with status 143 or 130 as
         an unhandled signal would. Before, a stopped gateway lost the rows of its last second.
+    - timestamp: '2026-10-29T00:00:00Z'
+      title: Deliver payment events through the integration event catalog
+      description: >-
+        The ten `payment.*` events are part of the event catalog, so an event set selects them like
+        any other event and every active integration holding one receives it. An appliance-wide
+        `payment` integration from an earlier build keeps receiving all of them after the upgrade.
   changed:
     - timestamp: '2026-10-26T00:00:00Z'
       title: Write payment ledger money rows and claim keys to disk before forwarding
@@ -257,19 +263,6 @@ changes:
       description: >-
         The MPP posture check on save only ever saw disabled policies, which charge nothing, and
         refused the save of a surface that kept one with a risky posture. It is removed.
-    - timestamp: '2026-10-21T00:00:00Z'
-      title: Stop listing every integration for each payment event
-      description: >-
-        A payment gate decision no longer lists and decrypts every integration from storage and
-        spawns a task. The integrations that receive payment events are listed once a minute and
-        again when an integration changes, nothing is spawned while none is active, and a surface
-        that still carries a legacy payment policy raises its unavailable event at most once a
-        minute.
-    - timestamp: '2026-10-21T00:00:00Z'
-      title: Offer the payment integration category in the example gateway.json
-      description: >-
-        The shipped `gateway.example.json` carries the built-in `payment` integration category, so
-        an install made from it no longer warns about the missing category at every load.
     - timestamp: '2026-10-21T00:00:00Z'
       title: Give a payment credential back when its request fails before dispatch
       description: >-
