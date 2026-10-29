@@ -62,9 +62,20 @@ static IPV4_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b\d{1,3}\.\d{1,
 
 static DID_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"did:[a-z]+:[A-Za-z0-9._:%-]+").unwrap());
 
+/// File names, in either the plaintext or the `.enc` form, of key files that are
+/// excluded from export wherever they are stored.
+const EXCLUDED_FILES: &[&str] = &["transit_token_key.json"];
+
 /// Returns true if the given directory name should be excluded from export.
 pub fn is_excluded_dir(dir_name: &str) -> bool {
     EXCLUDED_DIRS.contains(&dir_name)
+}
+
+/// Returns true if the given file name should be excluded from export.
+pub fn is_excluded_file(file_name: &str) -> bool {
+    EXCLUDED_FILES
+        .iter()
+        .any(|excluded| file_name.starts_with(excluded))
 }
 
 /// Produce a short correlation-safe hash of a DID value.

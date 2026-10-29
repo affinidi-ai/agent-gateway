@@ -201,7 +201,8 @@ async fn async_main() -> Result<()> {
                 .agent_surfaces,
             &args.base_folder,
         );
-        export::export_storage(&storage_root, output_path)?;
+        let excluded_paths = export::excluded_storage_paths(&bootstrap_config.storage_paths, &args.base_folder);
+        export::export_storage(&storage_root, &excluded_paths, output_path)?;
         return Ok(());
     }
 
