@@ -8480,16 +8480,9 @@ mod tests {
         held_by_listen_path_route.channel_state = held_by_outbound_route
             .channel_state
             .clone();
-        let mut states = std::collections::HashMap::from([(
-            "surface-being-deleted".to_string(),
-            held_by_outbound_route
-                .channel_state
-                .clone(),
-        )]);
 
-        crate::proxy::server::retire_outbound_channel_state(&mut states, "surface-being-deleted");
+        crate::proxy::server::retire_outbound_channel_state(&held_by_outbound_route.channel_state);
 
-        assert!(states.is_empty());
         for (state, path) in [
             (&held_by_outbound_route, "/outbound/surfaces/order/partner-a/message/send"),
             (&held_by_outbound_route, "/outbound/surfaces/order$dev/partner-a/message/send"),

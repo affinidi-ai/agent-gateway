@@ -301,6 +301,49 @@ async fn disabling_a_surface_or_emptying_its_transit_points_refuses_a_kept_alive
     }
 }
 
+/// Removing one of a surface's Transit Points refuses it on a TLS connection
+/// kept alive across the change, while the Transit Point that stays keeps
+/// answering on that connection.
+#[tokio::test(flavor = "multi_thread")]
+async fn removing_one_transit_point_refuses_it_on_a_kept_alive_connection_and_keeps_the_other() {
+    let (h, admin, connector) = gateway_with_tls_outbound_listener(&[("links", "links", "/links")]).await;
+    let surface = create_surface(&h, &admin, "/links", "https", &["unlinked", "kept"]).await;
+    let mut kept_alive = kept_alive_tls_connection(&h, &connector, "/outbound/links/unlinked").await;
+    assert_eq!(send_on(&mut kept_alive, "localhost", "/outbound/links/kept").await, Some(200));
+
+    let mut updated = surface.clone();
+    updated["transit"]["points"] = json!(
+        surface["transit"]["points"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|point| point["alias"] == "kept")
+            .cloned()
+            .collect::<Vec<_>>()
+    );
+    let put = admin
+        .put(surface_url(&h, &surface))
+        .json(&updated)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put.status(), 200);
+    let calls_at_unlink = h
+        .mock
+        .request_count
+        .load(Ordering::SeqCst);
+
+    assert_eq!(send_on(&mut kept_alive, "localhost", "/outbound/links/unlinked").await, Some(404));
+    assert_eq!(
+        h.mock
+            .request_count
+            .load(Ordering::SeqCst),
+        calls_at_unlink,
+        "the removed Transit Point must not reach its target"
+    );
+    assert_eq!(send_on(&mut kept_alive, "localhost", "/outbound/links/kept").await, Some(200));
+}
+
 /// Deleting one surface leaves the outbound listener it shares with another
 /// surface bound: a connection kept alive to the other surface's Transit
 /// Point, which a rebind would close, keeps answering.

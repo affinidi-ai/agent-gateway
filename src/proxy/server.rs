@@ -1393,16 +1393,12 @@ async fn bind_inbound_listeners(addresses: &[SocketAddr]) -> anyhow::Result<Vec<
     Ok(listeners)
 }
 
-/// Take the shared outbound state for `config_id` out of service. Routes still
-/// holding it, on a listener being rebuilt or a connection kept alive past the
-/// rebuild, then refuse every request as for a surface without Transit Points.
-pub(crate) fn retire_outbound_channel_state(
-    states: &mut std::collections::HashMap<String, Arc<std::sync::RwLock<crate::state::OutboundSurfaceState>>>,
-    config_id: &str,
-) {
-    let Some(retired) = states.remove(config_id) else {
-        return;
-    };
+/// Take a surface's shared outbound state out of service in place. Every route
+/// still holding it, on a listener being rebuilt or a connection kept alive
+/// past the rebuild, then refuses each request as for a surface without
+/// Transit Points, until the surface's Transit Points, if it regains them, are
+/// written back into the same state.
+pub(crate) fn retire_outbound_channel_state(retired: &std::sync::RwLock<crate::state::OutboundSurfaceState>) {
     let mut state = retired
         .write()
         .expect("outbound channel_state lock poisoned");

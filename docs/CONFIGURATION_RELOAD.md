@@ -84,13 +84,15 @@ A full reload is disruptive to the listener tasks, even though it does not resta
 Gateway process:
 
 1. Load the configured source and inject active Agent Surface records.
-2. Abort existing inbound and outbound port-listener tasks and clear their stored runtime states.
-   The outbound state of a surface that no longer has active Transit Points is retired first, so
-   a connection that outlives its old listener cannot keep using it.
+2. Abort existing inbound and outbound port-listener tasks and clear the inbound listeners'
+   stored runtime states.
 3. Clear stale task-monitor entries and wait briefly for listening sockets to be released.
 4. Replace the shared `GatewayConfig` and save the successful snapshot to the configuration cache.
 5. Reload network configuration, group active surfaces by listener, and rebuild derived surface
-   state.
+   state. Each surface's outbound state is updated in place rather than replaced: a surface that
+   still has Transit Points on an outbound listener gets its new configuration written into its
+   state, and the state of one that no longer has any, because it was deleted, disabled or
+   emptied, is retired, so its routes refuse each request with `404`.
 6. Bind new inbound and outbound listeners, retaining each inbound listener's
    `MultiSurfaceProxyState` for later single-surface updates. An outbound port with no active
    Transit Points is bound with no proxy routes, as at startup, so its liveness route remains
@@ -99,6 +101,11 @@ Gateway process:
 Requests using a listener while it is stopped and rebound can be interrupted. Process-wide services
 that are not owned by those listener tasks continue running, but their routers are attached to the
 new listeners when those listeners are created.
+
+A plain HTTP listener closes the connections kept alive on it when it stops. A TLS listener's
+connections outlive it, still served by its old routes; because those routes hold the outbound
+state updated in step 5, a removed Transit Point refuses the next request on such a connection
+with `404`, and a changed one is served with its new configuration.
 
 If the requested configuration source cannot be loaded,
 `reload_channels_with_fallback` attempts to load the cached `GatewayConfig`. If neither source is

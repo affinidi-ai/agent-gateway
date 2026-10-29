@@ -33,6 +33,13 @@ changes:
         Disabling a surface or removing all its Transit Points retires that state the same
         way, including on connections kept alive on a TLS outbound listener.
     - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Apply a Transit Point change to connections kept alive across a reload
+      description: >-
+        A reload now writes each surface's new configuration into the outbound state that
+        connections kept alive on a TLS outbound listener hold, before the API answers, so
+        on those connections a removed Transit Point answers `404` and a changed target or
+        token requirement takes effect, as on new connections.
+    - timestamp: '2026-10-28T00:00:00.000Z'
       title: Refuse a gated Transit Point tool call when its tool gating is not in force
       description: >-
         A Transit Point whose configuration sets MCP tool gating that is not in force, as
