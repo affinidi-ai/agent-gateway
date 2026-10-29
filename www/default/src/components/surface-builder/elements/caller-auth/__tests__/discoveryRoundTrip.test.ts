@@ -66,6 +66,17 @@ describe('authorization server discovery round-trip', () => {
     );
   });
 
+  it('round-trips accepted audiences through the caller-auth wire shape', () => {
+    const method = { ...METHOD, audiences: ['https://api.example.com'] };
+    const surface = stored({ methods: [method] });
+    const { nodes, payload } = rebuild(surface);
+
+    expect(callerAuthNode(nodes)?.config.audiences).toEqual(['https://api.example.com']);
+    expect(payload.access_point.caller_authentication.methods[0].audiences).toEqual([
+      'https://api.example.com',
+    ]);
+  });
+
   it('saves a setting without scopes without inventing any', () => {
     const setting = {
       resource: SETTING.resource,
