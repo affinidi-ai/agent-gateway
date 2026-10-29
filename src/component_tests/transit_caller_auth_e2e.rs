@@ -44,15 +44,24 @@ fn surface(transit_point: serde_json::Value) -> crate::config::agent_surface::Ag
 }
 
 fn write_caller_key(temp_dir: &std::path::Path) {
+    write_api_key_secret(temp_dir, CALLER_KEY_SECRET, None);
+}
+
+fn write_api_key_secret(
+    temp_dir: &std::path::Path,
+    secret_id: &str,
+    tenant_id: Option<&str>,
+) {
     let dir = temp_dir.join("secrets");
     std::fs::create_dir_all(&dir).expect("create secrets dir");
     let now = chrono::Utc::now().to_rfc3339();
     std::fs::write(
-        dir.join("transit-caller-key.json"),
+        dir.join(format!("{secret_id}-record.json")),
         json!({
-            "id": "transit-caller-key",
+            "id": format!("{secret_id}-record"),
+            "tenant_id": tenant_id,
             "name": "Transit Point caller key",
-            "secret_id": CALLER_KEY_SECRET,
+            "secret_id": secret_id,
             "description": null,
             "value": CALLER_KEY,
             "secret_type": "ApiKey",
@@ -506,4 +515,73 @@ async fn a_transit_point_that_authenticates_no_caller_must_be_marked_open_and_an
         .await
         .unwrap();
     assert_eq!(stored["transit"]["points"][0]["allow_unauthenticated_callers"], true, "{stored}");
+}
+
+/// A tenant access token can point a Transit Point's `source_auth` only at its
+/// own or appliance-wide secrets, on the base and in a variant, as it can on an
+/// Access Point.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tenant_token_names_only_its_own_secrets_in_a_transit_points_source_auth() {
+    let mut tenant = None;
+    let h = GatewayHarness::start(|temp_dir, _, bootstrap| {
+        for (secret_id, tenant_id) in
+            [("tenant-a-key", Some("tenant-a")), ("tenant-b-key", Some("tenant-b")), ("appliance-key", None)]
+        {
+            write_api_key_secret(temp_dir, secret_id, tenant_id);
+        }
+        configure_admin_api(bootstrap);
+        tenant = Some(super::a2a_flow_e2e::seed_scoped_access_token(
+            bootstrap,
+            Some("TENANT:${x-external-account}:(?:surfaces:.*|secrets:.*)"),
+        ));
+    })
+    .await;
+    let tenant = tenant.expect("tenant client");
+    let collection = format!("{}/api/v1/surfaces", h.gateway_base);
+    let surface = |id: &str, base_secret: &str, variant_secret: &str| {
+        let point = |alias: &str, secret_id: &str| {
+            json!({
+                "alias": alias, "target_endpoint": "https://partner.example/a2a", "protocol": "a2a",
+                "require_transit_token": false,
+                "source_auth": { "type": "api_key", "secret_id": secret_id,
+                                 "extraction": { "source": "http_header", "field": "x-api-key" } }
+            })
+        };
+        json!({
+            "surface_id": id, "name": id, "status": "disabled",
+            "access_point": { "listen_address": h.gateway_base, "route": format!("/{id}"), "protocol": "a2a" },
+            "target": { "endpoint": h.mock.url() },
+            "transit": { "points": [point("base-partner", base_secret)] },
+            "variants": [{ "id": "variant-dev", "alias": "dev", "name": "dev", "enabled": true,
+                "overrides": { "transit": { "points": [point("dev-partner", variant_secret)] } } }]
+        })
+    };
+
+    for (id, base, variant) in
+        [("tp-key-base-b", "tenant-b-key", "tenant-a-key"), ("tp-key-variant-b", "tenant-a-key", "tenant-b-key")]
+    {
+        let response = tenant
+            .post(&collection)
+            .json(&surface(id, base, variant))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert_eq!(status, 400, "{id}: another tenant's secret must be refused: {body}");
+        assert!(body.contains("Secret reference is not accessible"), "{id}: {body}");
+    }
+
+    for (id, secret) in [("tp-key-own", "tenant-a-key"), ("tp-key-appliance", "appliance-key")] {
+        let response = tenant
+            .post(&collection)
+            .json(&surface(id, secret, secret))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(status, 201, "{id}: {body}");
+        assert_eq!(body["tenant_id"], "tenant-a", "{id}: {body}");
+    }
 }

@@ -461,6 +461,9 @@ fn collect_effective_surface_references(
                 push_reference(references, ResourceKind::TrustRegistries, &trust_check.trust_registry_id);
             }
             collect_target_auth_reference(point.target_auth.as_ref(), references);
+            if let Some(source_auth) = point.source_auth.as_ref() {
+                collect_source_auth_references(source_auth, references);
+            }
             collect_identity_injection_references(&point.identity_injection, references);
             if let Some(identity) = point
                 .managed_identity
@@ -822,5 +825,73 @@ mod tests {
                 "tr-variant-tp",
             ])
         );
+    }
+
+    /// A Transit Point's own `source_auth` names secrets, JWT strategies, API-key
+    /// parents and certificates that are checked like an Access Point's.
+    #[test]
+    fn collects_transit_point_source_auth_references_from_the_base_and_variants() {
+        let point = |alias: &str, source_auth: serde_json::Value| -> crate::config::agent_surface::TransitPoint {
+            serde_json::from_value(serde_json::json!({
+                "alias": alias, "target_endpoint": "https://partner.example/a2a", "protocol": "a2a",
+                "source_auth": source_auth
+            }))
+            .unwrap()
+        };
+        let header = serde_json::json!({"source": "http_header", "field": "x-api-key"});
+        let transit = Some(crate::config::agent_surface::TransitConfig {
+            points: vec![
+                point("key", serde_json::json!({"type": "api_key", "extraction": header, "secret_id": "tp-secret"})),
+                point(
+                    "jwt",
+                    serde_json::json!({"type": "jwt_bearer", "jwt_verification_strategy_id": "tp-strategy",
+                                       "audiences": ["tp-audience"]}),
+                ),
+                point(
+                    "mtls",
+                    serde_json::json!({"type": "mtls", "trust": {"type": "pinned", "certificate_ids": ["tp-cert"]},
+                                       "identity_binding": {"type": "fingerprint"}}),
+                ),
+            ],
+            outbound_listen_address: None,
+            shared: Default::default(),
+        });
+        let variants = vec![SurfaceVariant {
+            id: "variant-id".into(),
+            alias: "variant".into(),
+            name: "Variant".into(),
+            description: String::new(),
+            enabled: true,
+            overrides: SurfaceOverrides {
+                transit: Some(TransitOverrides {
+                    points: Some(vec![point(
+                        "provider",
+                        serde_json::json!({"type": "api_key_provider", "extraction": header,
+                                           "agent_id": "tp-key-parent"}),
+                    )]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        }];
+        let surface = AgentSurface {
+            transit,
+            variants,
+            ..Default::default()
+        };
+
+        let references: HashSet<_> = collect_surface_reference_keys(&surface)
+            .unwrap()
+            .into_iter()
+            .map(|reference| (reference.kind.as_str(), reference.id))
+            .collect();
+        for (kind, id) in [
+            (ResourceKind::Secrets, "tp-secret"),
+            (ResourceKind::JwtVerificationStrategies, "tp-strategy"),
+            (ResourceKind::Certificates, "tp-cert"),
+            (ResourceKind::ApiKeys, "tp-key-parent"),
+        ] {
+            assert!(references.contains(&(kind.as_str(), id.to_string())), "{kind} {id} missing from {references:?}");
+        }
     }
 }
