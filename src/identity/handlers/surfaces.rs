@@ -1461,7 +1461,8 @@ fn removes_protected_resource(access_point: Option<&serde_json::Value>) -> bool 
 
 /// The discovery settings a PUT removes, for the surface and by variant id. A
 /// PUT that omits a setting keeps it, so `null` is how a PUT removes one, in
-/// the same request as the rest of the edit.
+/// the same request as the rest of the edit. Retention skips them, so a stored
+/// setting the PUT removes is never restored and checked against the edit.
 #[derive(Debug, Default)]
 struct ProtectedResourceRemovals {
     base: bool,
@@ -1485,38 +1486,6 @@ impl ProtectedResourceRemovals {
                         .map(str::to_string)
                 })
                 .collect(),
-        }
-    }
-
-    /// Clears the removed settings, which retention restored from storage.
-    fn apply(
-        &self,
-        surface: &mut AgentSurface,
-    ) {
-        if self.base
-            && let Some(caller) = surface
-                .access_point
-                .caller_authentication
-                .as_mut()
-        {
-            caller.protected_resource = None;
-        }
-        for variant in &mut surface.variants {
-            if self
-                .variant_ids
-                .contains(&variant.id)
-                && let Some(caller) = variant
-                    .overrides
-                    .access_point
-                    .as_mut()
-                    .and_then(|access_point| {
-                        access_point
-                            .caller_authentication
-                            .as_mut()
-                    })
-            {
-                caller.protected_resource = None;
-            }
         }
     }
 }
@@ -1561,8 +1530,7 @@ pub async fn update_surface(
     {
         surface.mcp_legacy_metadata_output = existing.mcp_legacy_metadata_output;
     }
-    retain_mcp_settings(&mut surface, &existing, &state.network_config)?;
-    ProtectedResourceRemovals::of(&sent).apply(&mut surface);
+    retain_mcp_settings(&mut surface, &existing, &state.network_config, &ProtectedResourceRemovals::of(&sent))?;
     retain_a2a_settings(&mut surface, &existing);
 
     let saved = validate_and_save_surface(
@@ -1758,18 +1726,20 @@ fn retain_mcp_settings(
     surface: &mut AgentSurface,
     existing: &AgentSurface,
     network: &crate::config::NetworkConfig,
+    removals: &ProtectedResourceRemovals,
 ) -> Result<(), SurfaceApiError> {
     retain_mcp_http(&mut surface.mcp_http, existing.mcp_http.as_ref());
-    let base_retained = retain_protected_resource(
-        surface
-            .access_point
-            .caller_authentication
-            .as_mut(),
-        existing
-            .access_point
-            .caller_authentication
-            .as_ref(),
-    );
+    let base_retained = !removals.base
+        && retain_protected_resource(
+            surface
+                .access_point
+                .caller_authentication
+                .as_mut(),
+            existing
+                .access_point
+                .caller_authentication
+                .as_ref(),
+        );
     let mut retained_aliases = Vec::new();
     let retain_points = |points: &mut [crate::config::agent_surface::TransitPoint],
                          stored: &[crate::config::agent_surface::TransitPoint]| {
@@ -1790,29 +1760,33 @@ fn retain_mcp_settings(
             .variants
             .iter()
             .find(|previous| previous.id == variant.id);
-        if retain_protected_resource(
-            variant
-                .overrides
-                .access_point
-                .as_mut()
-                .and_then(|access_point| {
-                    access_point
-                        .caller_authentication
-                        .as_mut()
-                }),
-            stored
-                .and_then(|previous| {
-                    previous
-                        .overrides
-                        .access_point
-                        .as_ref()
-                })
-                .and_then(|access_point| {
-                    access_point
-                        .caller_authentication
-                        .as_ref()
-                }),
-        ) {
+        if !removals
+            .variant_ids
+            .contains(&variant.id)
+            && retain_protected_resource(
+                variant
+                    .overrides
+                    .access_point
+                    .as_mut()
+                    .and_then(|access_point| {
+                        access_point
+                            .caller_authentication
+                            .as_mut()
+                    }),
+                stored
+                    .and_then(|previous| {
+                        previous
+                            .overrides
+                            .access_point
+                            .as_ref()
+                    })
+                    .and_then(|access_point| {
+                        access_point
+                            .caller_authentication
+                            .as_ref()
+                    }),
+            )
+        {
             retained_aliases.push(variant.alias.clone());
         }
         let points = variant
@@ -3207,7 +3181,8 @@ mod validation_tests {
             allowed_origins: vec!["https://app.example".to_string()],
             ..Default::default()
         });
-        retain_mcp_settings(&mut rewritten, &existing, &discovery_network()).unwrap();
+        retain_mcp_settings(&mut rewritten, &existing, &discovery_network(), &ProtectedResourceRemovals::default())
+            .unwrap();
         let retained = rewritten
             .mcp_http
             .expect("mcp_http stays present");
@@ -3217,13 +3192,15 @@ mod validation_tests {
         // Omitting the block entirely keeps the stored one unchanged.
         let mut omitted = base_surface();
         omitted.mcp_http = None;
-        retain_mcp_settings(&mut omitted, &existing, &discovery_network()).unwrap();
+        retain_mcp_settings(&mut omitted, &existing, &discovery_network(), &ProtectedResourceRemovals::default())
+            .unwrap();
         assert_eq!(omitted.mcp_http, existing.mcp_http);
 
         // A surface that never had authorization does not gain one.
         let mut fresh = base_surface();
         fresh.mcp_http = Some(crate::config::McpHttpConfig::default());
-        retain_mcp_settings(&mut fresh, &base_surface(), &discovery_network()).unwrap();
+        retain_mcp_settings(&mut fresh, &base_surface(), &discovery_network(), &ProtectedResourceRemovals::default())
+            .unwrap();
         assert_eq!(
             fresh
                 .mcp_http
@@ -3299,13 +3276,15 @@ mod validation_tests {
             .access_point
             .caller_authentication = Some(caller_authentication(false));
         rewritten.variants = vec![variant(false)];
-        retain_mcp_settings(&mut rewritten, &existing, &discovery_network()).unwrap();
+        retain_mcp_settings(&mut rewritten, &existing, &discovery_network(), &ProtectedResourceRemovals::default())
+            .unwrap();
         assert_eq!(stored_resource(&rewritten), (expected.clone(), expected.clone()));
 
         // Removing caller authentication does not bring the setting back.
         let mut removed = mcp_surface();
         removed.variants = vec![variant(false)];
-        retain_mcp_settings(&mut removed, &existing, &discovery_network()).unwrap();
+        retain_mcp_settings(&mut removed, &existing, &discovery_network(), &ProtectedResourceRemovals::default())
+            .unwrap();
         assert!(
             removed
                 .access_point
@@ -3321,7 +3300,7 @@ mod validation_tests {
         fresh.variants = vec![variant(false)];
         let mut never = mcp_surface();
         never.variants = vec![variant(false)];
-        retain_mcp_settings(&mut fresh, &never, &discovery_network()).unwrap();
+        retain_mcp_settings(&mut fresh, &never, &discovery_network(), &ProtectedResourceRemovals::default()).unwrap();
         assert_eq!(stored_resource(&fresh), (None, None));
 
         // An edit the stored setting no longer fits drops it instead of
@@ -3351,7 +3330,8 @@ mod validation_tests {
                 .as_mut()
                 .unwrap()
                 .caller_authentication = Some(changed);
-            retain_mcp_settings(&mut switched, &existing, &discovery_network()).unwrap();
+            retain_mcp_settings(&mut switched, &existing, &discovery_network(), &ProtectedResourceRemovals::default())
+                .unwrap();
             assert_eq!(stored_resource(&switched), (None, None), "{change}");
         }
         // An edit that moves the Access Point off the resource, to another route
@@ -3371,9 +3351,12 @@ mod validation_tests {
                 .access_point
                 .caller_authentication = Some(caller_authentication(false));
             edited.variants = vec![variant(false)];
-            let Err(SurfaceApiError::BadRequest(refused)) =
-                retain_mcp_settings(&mut edited, &existing, &discovery_network())
-            else {
+            let Err(SurfaceApiError::BadRequest(refused)) = retain_mcp_settings(
+                &mut edited,
+                &existing,
+                &discovery_network(),
+                &ProtectedResourceRemovals::default(),
+            ) else {
                 panic!("{change}: expected a refusal");
             };
             assert!(
@@ -3388,7 +3371,7 @@ mod validation_tests {
         a2a.access_point
             .caller_authentication = Some(caller_authentication(false));
         a2a.variants = vec![variant(false)];
-        retain_mcp_settings(&mut a2a, &existing, &discovery_network()).unwrap();
+        retain_mcp_settings(&mut a2a, &existing, &discovery_network(), &ProtectedResourceRemovals::default()).unwrap();
         assert_eq!(stored_resource(&a2a), (None, None));
 
         // A setting the request itself sends is kept, for validation to refuse.
@@ -3401,7 +3384,7 @@ mod validation_tests {
             }))
             .unwrap(),
         );
-        retain_mcp_settings(&mut sent, &existing, &discovery_network()).unwrap();
+        retain_mcp_settings(&mut sent, &existing, &discovery_network(), &ProtectedResourceRemovals::default()).unwrap();
         assert_eq!(
             sent.protected_resource()
                 .cloned(),
@@ -3475,9 +3458,23 @@ mod validation_tests {
         assert!(removals.base);
         assert_eq!(removals.variant_ids, vec!["beta".to_string()]);
         let mut put: AgentSurface = serde_json::from_value(body).unwrap();
-        retain_mcp_settings(&mut put, &existing, &discovery_network()).unwrap();
-        removals.apply(&mut put);
+        retain_mcp_settings(&mut put, &existing, &discovery_network(), &removals).unwrap();
         assert_eq!(resources(&put), (false, vec![false, true]));
+
+        // Also with a route or listen address change, which a restored
+        // setting would no longer fit: a removed one is never restored.
+        for (field, moved) in [("route", "/mcp/moved"), ("listen_address", "http://localhost:9999")] {
+            let mut body = surface(Some(serde_json::Value::Null), Some(serde_json::Value::Null), None);
+            body["access_point"][field] = serde_json::json!(moved);
+            body["variants"]
+                .as_array_mut()
+                .unwrap()
+                .truncate(1);
+            let removals = ProtectedResourceRemovals::of(&body);
+            let mut put: AgentSurface = serde_json::from_value(body).unwrap();
+            retain_mcp_settings(&mut put, &existing, &discovery_network(), &removals).unwrap();
+            assert_eq!(resources(&put), (false, vec![false]), "{field}");
+        }
 
         // Without a null, a PUT removes nothing.
         let body = surface(None, None, None);
@@ -3489,8 +3486,7 @@ mod validation_tests {
                     .is_empty()
         );
         let mut put: AgentSurface = serde_json::from_value(body).unwrap();
-        retain_mcp_settings(&mut put, &existing, &discovery_network()).unwrap();
-        removals.apply(&mut put);
+        retain_mcp_settings(&mut put, &existing, &discovery_network(), &removals).unwrap();
         assert_eq!(resources(&put), (true, vec![true, true]));
     }
 

@@ -1494,7 +1494,8 @@ switches the method, sets `forward_header` or `audiences`, or moves the
 protocol off MCP, drops it with a warning in the log instead of being refused
 over a setting the client did not send; the method then checks an audience
 only if the edit set `audiences`. `null` removes it, sent with PATCH, or with
-PUT in the same request as the rest of the edit. A variant PUT
+PUT in the same request as the rest of the edit, a route or listen address
+change included. A variant PUT
 (`PUT /v1/surfaces/{id}/variants/{variant_id}`) applies the same rules to the
 variant's own setting in the overrides it sends.
 

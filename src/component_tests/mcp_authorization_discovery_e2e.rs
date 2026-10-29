@@ -364,8 +364,10 @@ async fn a_put_removes_discovery_only_where_it_sends_null() {
         .unwrap();
     assert_eq!(refused.status(), 415);
 
-    // A null removes it in the same request as the rest of the edit.
+    // A null removes it in the same request as the rest of the edit, a route
+    // change the stored setting would no longer fit included.
     surface["description"] = json!("edited without discovery");
+    surface["access_point"]["route"] = json!("/edited-moved");
     surface["access_point"]["caller_authentication"]["protected_resource"] = json!(null);
     let removed = admin
         .put(&url)
@@ -373,9 +375,11 @@ async fn a_put_removes_discovery_only_where_it_sends_null() {
         .send()
         .await
         .unwrap();
-    assert_eq!(removed.status(), 200);
+    let status = removed.status();
     let saved: serde_json::Value = removed.json().await.unwrap();
+    assert_eq!(status, 200, "{saved}");
     assert_eq!(saved["description"], "edited without discovery");
+    assert_eq!(saved["access_point"]["route"], "/edited-moved");
     assert!(
         saved["access_point"]["caller_authentication"]
             .get("protected_resource")
