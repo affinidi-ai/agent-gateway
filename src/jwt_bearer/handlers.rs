@@ -25,7 +25,10 @@ use crate::authz_metadata::{DiscoveryError, DiscoveryOptions, EgressPosture};
 use crate::jwt_bearer::{
     JwksClient, JwtVerificationStrategyStorage,
     fetch::posture_for_caller,
-    models::{AuthorizationServerMetadata, JwksSource, JwtVerificationStrategy, validate_expected_issuer},
+    models::{
+        AuthorizationServerMetadata, JwksSource, JwtVerificationStrategy, normalize_scope_claims,
+        validate_expected_issuer,
+    },
 };
 use crate::rbac::{Feature, RbacConfig};
 use crate::tenancy::{
@@ -99,6 +102,9 @@ pub struct JwtVerificationStrategyRequest {
     /// and omitted keeps it, re-discovering when the issuer or JWKS URI changes.
     #[serde(default)]
     pub discover_metadata: Option<bool>,
+    /// Claims read for granted scopes. Omitted keeps the stored list.
+    #[serde(default)]
+    pub scope_claims: Option<Vec<String>>,
 }
 
 /// Error response body.
@@ -283,6 +289,15 @@ pub async fn create_strategy(
     if let Err(message) = validate_expected_issuer(&body.expected_issuer) {
         return (StatusCode::BAD_REQUEST, ErrorBody::json(message)).into_response();
     }
+    let scope_claims = match body
+        .scope_claims
+        .take()
+        .map(normalize_scope_claims)
+        .transpose()
+    {
+        Ok(claims) => claims.flatten(),
+        Err(message) => return (StatusCode::BAD_REQUEST, ErrorBody::json(message)).into_response(),
+    };
 
     body.tenant_id = match tenant_for_create(body.tenant_id.take(), pat.is_some(), tenant_context(&context)) {
         Ok(tenant_id) => tenant_id,
@@ -321,6 +336,7 @@ pub async fn create_strategy(
         expected_issuer: body.expected_issuer,
         jwks_source: body.jwks_source,
         authorization_server,
+        scope_claims,
         ..Default::default()
     };
 
@@ -489,11 +505,21 @@ pub async fn update_strategy(
     if let Err(message) = validate_expected_issuer(&body.expected_issuer) {
         return (StatusCode::BAD_REQUEST, ErrorBody::json(message)).into_response();
     }
+    let scope_claims = match body
+        .scope_claims
+        .map(normalize_scope_claims)
+        .transpose()
+    {
+        Ok(Some(claims)) => claims,
+        Ok(None) => existing.scope_claims.clone(),
+        Err(message) => return (StatusCode::BAD_REQUEST, ErrorBody::json(message)).into_response(),
+    };
 
     let mut updated = JwtVerificationStrategy {
         name: body.name,
         expected_issuer: body.expected_issuer,
         jwks_source: body.jwks_source,
+        scope_claims,
         updated_at: chrono::Utc::now(),
         ..existing.clone()
     };
@@ -2378,6 +2404,101 @@ mod tests {
                 .expected_issuer,
             "https://operator.example.com"
         );
+    }
+
+    #[tokio::test]
+    async fn scope_claims_are_validated_stored_and_kept_when_omitted() {
+        let store = Arc::new(MemStore::default());
+        store
+            .inner
+            .insert("strategy-a".to_string(), seeded_strategy(None));
+        let (router, _dir) = admin_router(store.clone()).await;
+        let base = strategy_body("https://operator.example.com", "https://operator.example.com/.well-known/jwks.json");
+
+        let (status, _, _) = put_or_post(
+            &router,
+            "PUT",
+            "/v1/jwt-verification-strategies/strategy-a",
+            with(base.clone(), "scope_claims", serde_json::json!(["scp", "scp"])),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            stored(&store)
+                .await
+                .scope_claims,
+            None
+        );
+
+        let (status, body, _) = put_or_post(
+            &router,
+            "PUT",
+            "/v1/jwt-verification-strategies/strategy-a",
+            with(base.clone(), "scope_claims", serde_json::json!(["scp", "roles"])),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["scope_claims"], serde_json::json!(["scp", "roles"]));
+
+        let (status, _, _) =
+            put_or_post(&router, "PUT", "/v1/jwt-verification-strategies/strategy-a", base.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            stored(&store)
+                .await
+                .scope_claims,
+            Some(vec!["scp".to_string(), "roles".to_string()])
+        );
+
+        let (status, body, _) = put_or_post(
+            &router,
+            "PUT",
+            "/v1/jwt-verification-strategies/strategy-a",
+            with(base, "scope_claims", serde_json::json!(["scope", "scp"])),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.get("scope_claims")
+                .is_none()
+        );
+        assert_eq!(
+            stored(&store)
+                .await
+                .scope_claims,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn create_stores_custom_scope_claims_and_refuses_invalid_ones() {
+        let store = Arc::new(MemStore::default());
+        let (router, _dir) = admin_router(store.clone()).await;
+        let base = strategy_body("https://operator.example.com", "https://operator.example.com/.well-known/jwks.json");
+
+        let (status, _, _) = post_json(
+            &router,
+            "/v1/jwt-verification-strategies",
+            with(base.clone(), "scope_claims", serde_json::json!([])),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(store.inner.is_empty());
+
+        let (status, body, _) = post_json(
+            &router,
+            "/v1/jwt-verification-strategies",
+            with(base, "scope_claims", serde_json::json!(["roles"])),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["scope_claims"], serde_json::json!(["roles"]));
+        let saved = store
+            .get(body["id"].as_str().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.scope_claims, Some(vec!["roles".to_string()]));
     }
 
     #[tokio::test]

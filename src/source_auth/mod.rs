@@ -10,8 +10,12 @@
 //! - [`middleware`]   — `SourceAuthMiddleware` — the unified authentication gate
 //! - [`mtls`]         — mTLS verification helpers (pure logic; no I/O)
 //! - [`client_ip`]    — the caller's IP for per-client limits, trusting forwarded headers only from trusted proxies
+//! - [`declaration`]  — the resource server declaration an Access Point publishes for the route called
+//! - [`challenge`]    — what a refused caller receives, and which Target challenges reach it
 
+pub mod challenge;
 pub mod client_ip;
+pub mod declaration;
 pub mod errors;
 pub mod middleware;
 pub mod mtls;

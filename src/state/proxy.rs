@@ -104,6 +104,11 @@ pub struct ProxyState {
     /// fallback; admitted modern requests are rejected instead.
     pub variant_resolution_error: Option<crate::config::agent_surface_variants::VariantResolveError>,
 
+    /// Whether the Access Point variant this request selected declares itself
+    /// a protected resource, resolved once per request. `None` when the state
+    /// was not built for a routed request, which reads as no declaration.
+    pub access_point_declaration: Option<Arc<crate::source_auth::declaration::DeclarationOutcome>>,
+
     /// Resolved [`AgentSurface`] for this request — the source of
     /// truth for the hot path. Looked up from
     /// [`crate::surfaces::ResolvedSurfaceCache`] by `(surface_id,

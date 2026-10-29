@@ -199,6 +199,17 @@ storage unencrypted.
 One listener can serve several Access Points, and one transit listener several Transit
 Points. A request is matched to its surface by route.
 
+Some paths are reserved. A `channels` or `proxy` route prefix that shadows a dashboard page, or a
+`channels`, `routes` (of any type, `redirect` and `static` included) or `mcp_proxies` prefix
+at or under `/.well-known/oauth-protected-resource`, stops the gateway at startup with exit
+code `2` and a banner naming each prefix. Every inbound listener serves protected resource
+metadata on that path itself (see
+[`MCP_METADATA.md`](MCP_METADATA.md#authorization-server-discovery-for-caller-authentication)).
+A configuration reload refuses a `gateway.json` with such a metadata path prefix and keeps the
+running configuration (see [Reserved routes](CONFIGURATION_RELOAD.md#reserved-routes)). A
+stored surface whose route is at or under this path is logged as an error and not mounted;
+change its route.
+
 ![An inbound listener route-matching to two Access Points, and an outbound listener route-matching to two Transit Points](assets/diagrams/listeners-route-matching.png)
 
 The type is [`NetworkConfig`](../src/config/network.rs). Surfaces themselves are stored

@@ -24,8 +24,15 @@ pub(crate) fn set_thread_default<S>(subscriber: S) -> DefaultGuard
 where
     S: tracing::Subscriber + Send + Sync + 'static,
 {
+    set_thread_dispatch(&Dispatch::new(subscriber))
+}
+
+/// Sets `dispatch` as the current thread's default until the guard drops.
+/// Threads that share one `dispatch` share its spans, so a span may close on a
+/// thread other than the one that opened it.
+pub(crate) fn set_thread_dispatch(dispatch: &Dispatch) -> DefaultGuard {
     EXTRA_DISPATCHER.get_or_init(|| Dispatch::new(NoSubscriber::new()));
-    tracing::subscriber::set_default(subscriber)
+    tracing::dispatcher::set_default(dispatch)
 }
 
 #[cfg(test)]

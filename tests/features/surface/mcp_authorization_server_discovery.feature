@@ -2,9 +2,13 @@ Feature: MCP authorization server discovery
   An MCP surface whose source authentication takes JWT Bearer tokens can publish
   protected resource metadata (RFC 9728) that names the authorization server
   issuing them, so an MCP client finds where to get a token without manual
-  configuration. A caller without a valid token is answered with a challenge
-  that points at that metadata. Only tokens issued for the surface itself are
-  accepted. A surface that does not publish it behaves as before.
+  configuration. The metadata lists the scopes the surface requires and then
+  the scopes it advertises. A caller without a valid token is answered with a
+  challenge that points at that metadata, and names the scopes the surface
+  requires, if any. A token's scopes are read from its scope or scp claim, and
+  a token short of a required scope is refused with 403 before policy.
+  Only tokens issued for the surface itself are accepted. A surface that does
+  not publish it behaves as before.
 
   Background:
     Given MCP surface "alpha" targets MCP server "bravo"
@@ -18,6 +22,13 @@ Feature: MCP authorization server discovery
     And the protected resource metadata names the surface as the resource
     And the protected resource metadata names authorization server "https://idp.example/realms/agents"
     And the protected resource metadata lists scope "tools"
+
+  Scenario: The protected resource metadata lists the required scopes before the advertised ones
+    Given the surface publishes protected resource metadata naming authorization server "https://idp.example/realms/agents" and scope "tools"
+    And the surface requires scopes "tools.call tools"
+    When the caller fetches the protected resource metadata of the surface
+    Then the response status is 200
+    And the protected resource metadata lists scopes "tools.call tools"
 
   Scenario: A caller without a token is told where to get one
     Given the surface publishes protected resource metadata naming authorization server "https://idp.example/realms/agents" and scope "tools"
@@ -41,6 +52,50 @@ Feature: MCP authorization server discovery
       | with a malformed token                   |
       | with a token from an untrusted issuer    |
       | with a token issued for another resource |
+
+  Scenario: A caller without a token is told the scopes the surface requires
+    Given the surface publishes protected resource metadata naming authorization server "https://idp.example/realms/agents" and scope "tools"
+    And the surface requires scopes "tools.call tools.read"
+    When the caller asks the MCP surface for available tools without a token
+    Then the response status is 401
+    And the response challenges the caller to fetch a token from the surface's protected resource metadata
+    And MCP server "bravo" was not called
+
+  Scenario: A token short of a required scope is refused before policy
+    Given the surface publishes protected resource metadata naming authorization server "https://idp.example/realms/agents" and scope "tools"
+    And the surface requires scopes "tools.call"
+    And the VP Audit Log keeps every audit event
+    When the caller asks the MCP surface for available tools with a token issued for the surface
+    Then the response status is 403
+    And the response challenges the caller for a token granting the scopes the surface requires
+    And MCP server "bravo" was not called
+    And the VP Audit Log records a blocking "JWT Bearer" source authentication failure for "a scope shortfall"
+
+  Scenario Outline: A token granting only some of the required scopes is refused whichever claim carries them
+    Given the surface publishes protected resource metadata naming authorization server "https://idp.example/realms/agents" and scope "tools"
+    And the surface requires scopes "tools.call tools.read"
+    When the caller asks the MCP surface for available tools with a token issued for the surface granting scopes "tools.read" in its "<claim>" claim
+    Then the response status is 403
+    And the response challenges the caller for a token granting the scopes the surface requires
+    And MCP server "bravo" was not called
+
+    Examples:
+      | claim |
+      | scope |
+      | scp   |
+
+  Scenario Outline: A token granting every required scope reaches the MCP server whichever claim carries them
+    Given the surface publishes protected resource metadata naming authorization server "https://idp.example/realms/agents" and scope "tools"
+    And the surface requires scopes "tools.call tools.read"
+    And MCP server "bravo" publishes a tool catalog
+    When the caller asks the MCP surface for available tools with a token issued for the surface granting scopes "tools.read tools.call extra" in its "<claim>" claim
+    Then the response status is 200
+    And MCP server "bravo" received the forwarded MCP request
+
+    Examples:
+      | claim |
+      | scope |
+      | scp   |
 
   Scenario: A caller with a valid token reaches the MCP server
     Given the surface publishes protected resource metadata naming authorization server "https://idp.example/realms/agents" and scope "tools"

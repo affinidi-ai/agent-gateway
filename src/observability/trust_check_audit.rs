@@ -406,6 +406,7 @@ mod tests {
         let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
             subject: "user-1".to_string(),
             claims: serde_json::json!({"email": "ada@example.com"}),
+            strategy: None,
         };
         let caller = crate::delegation_vault::audit::build_caller_context(&identity);
         let ((), events) = crate::audit::producer::capture(crate::audit::context::with_caller(Some(caller), async {

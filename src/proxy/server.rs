@@ -605,37 +605,31 @@ pub async fn run_port_server(
         profile.validate_network(&network_config)?;
         app = app.merge(profile.discovery_router()?);
     }
-    match crate::protocols::protected_resource::metadata_path_owner(&network_config) {
-        Some(prefix) => warn!(
-            prefix,
-            "A configured prefix serves /.well-known/oauth-protected-resource; this listener publishes no protected resource metadata"
-        ),
-        None => {
-            app = app.merge(
-                Router::new()
-                    .route(
-                        "/.well-known/oauth-protected-resource",
-                        axum::routing::any(crate::protocols::protected_resource::protected_resource_metadata),
-                    )
-                    .route(
-                        "/.well-known/oauth-protected-resource/{*path}",
-                        axum::routing::any(crate::protocols::protected_resource::protected_resource_metadata),
-                    )
-                    .layer(if crate::protocols::protected_resource::proxies_metadata_paths(&network_config) {
-                        proxy_cors_layer(&network_config.cors)
-                    } else {
-                        metadata_cors_layer(&network_config.cors)
-                    })
-                    .with_state(state.as_ref().clone()),
-            );
-        }
-    }
+    app = app.merge(
+        Router::new()
+            .route(
+                crate::proxy::paths::PROTECTED_RESOURCE_METADATA_PATH,
+                axum::routing::any(crate::protocols::protected_resource::protected_resource_metadata),
+            )
+            .route(
+                &format!("{}/{{*path}}", crate::proxy::paths::PROTECTED_RESOURCE_METADATA_PATH),
+                axum::routing::any(crate::protocols::protected_resource::protected_resource_metadata),
+            )
+            .layer(if crate::protocols::protected_resource::proxies_metadata_paths(&network_config) {
+                proxy_cors_layer(&network_config.cors)
+            } else {
+                metadata_cors_layer(&network_config.cors)
+            })
+            .with_state(state.as_ref().clone()),
+    );
 
-    // Note: SPA-route collision validation is performed once at startup in
-    // server::orchestrator before any port is spawned, where a hard exit can
-    // be issued. We intentionally do NOT re-run it here so a hot-reload that
-    // introduces a collision rejects the reload (caller logs the error) but
-    // does not kill the live process.
+    // Note: SPA-route and protected resource metadata path collision
+    // validation is performed once at startup in server::orchestrator before
+    // any port is spawned, where a hard exit can be issued, and again by a
+    // configuration reload before it swaps the configuration. We intentionally
+    // do NOT re-run it here so a hot-reload that introduces a collision
+    // rejects the reload (caller logs the error) but does not kill the live
+    // process.
 
     // Merge DID router first (at root level) to ensure did:web routes are accessible
     if let Some(ref did_router_ref) = did_router {
@@ -1696,29 +1690,6 @@ mod tests {
             }))
             .unwrap();
             assert_eq!(proxies_metadata_paths(&network), proxies, "proxy route {prefix:?}");
-        }
-    }
-
-    #[test]
-    fn a_prefix_at_the_metadata_path_keeps_it() {
-        use crate::protocols::protected_resource::metadata_path_owner;
-        let mut network = crate::protocols::protected_resource::fixtures::discovery_network();
-        assert_eq!(metadata_path_owner(&network), None);
-        for prefix in ["/.well-known", "/.well-known/oauth-protected-resource/mcp", "/agents"] {
-            network.channels = vec![crate::config::network::ChannelPrefix {
-                id: "channel".into(),
-                name: "channel".into(),
-                prefix: prefix.into(),
-            }];
-            assert_eq!(metadata_path_owner(&network), None, "{prefix}");
-        }
-        for prefix in ["/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/"] {
-            network.channels = vec![crate::config::network::ChannelPrefix {
-                id: "channel".into(),
-                name: "channel".into(),
-                prefix: prefix.into(),
-            }];
-            assert_eq!(metadata_path_owner(&network), Some(prefix));
         }
     }
 

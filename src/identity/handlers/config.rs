@@ -109,6 +109,13 @@ pub(crate) async fn perform_config_reload(
 async fn reload(state: &IdentityApiState) -> anyhow::Result<(usize, usize, bool, Option<String>)> {
     info!("Configuration reload requested");
 
+    ensure_metadata_path_free(
+        &state
+            .bootstrap_config
+            .load_network_config()
+            .map_err(|e| anyhow::anyhow!("Failed to load network configuration: {}", e))?,
+    )?;
+
     // Drop cached outbound target agent cards so a redeployed surface
     // (new endpoint, new agent_card_path) never serves stale metadata
     // to `step_collect_trust_context`.
@@ -153,6 +160,25 @@ async fn reload(state: &IdentityApiState) -> anyhow::Result<(usize, usize, bool,
     }
 
     Ok((channels_count, surfaces_count, is_fallback, warning))
+}
+
+/// Refuses a reload while a prefix in gateway.json lies at or under the protected
+/// resource metadata path. Every listener mounts the metadata routes itself, so the
+/// respawned listener could not start; the running configuration stays in place.
+fn ensure_metadata_path_free(network: &crate::config::NetworkConfig) -> anyhow::Result<()> {
+    let collisions = crate::proxy::paths::check_metadata_path_collisions(network.route_prefixes());
+    if collisions.is_empty() {
+        return Ok(());
+    }
+    let prefixes = collisions
+        .into_iter()
+        .map(|(prefix, _)| format!("'{prefix}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    anyhow::bail!(
+        "prefix {prefixes} collides with reserved route '{}'; rename it in gateway.json",
+        crate::proxy::paths::PROTECTED_RESOURCE_METADATA_PATH
+    )
 }
 
 /// Build the base `GatewayConfig` from the configured channel source
@@ -344,11 +370,15 @@ async fn inject_surfaces_into_config(
                             .iter()
                             .map(|s| s.surface_id.clone())
                             .collect();
+                        channels.retain(crate::proxy::paths::surface_route_is_mountable);
                         for surface in &surfaces {
                             if surface.status != crate::config::agent_surface::SurfaceStatus::Active {
                                 continue;
                             }
                             if existing_surface_ids.contains(&surface.surface_id) {
+                                continue;
+                            }
+                            if !crate::proxy::paths::surface_route_is_mountable(surface) {
                                 continue;
                             }
                             channels.push(surface.clone());
@@ -740,4 +770,75 @@ pub async fn get_networking_config(
             .client_auth
             .clone(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn network(
+        channel_prefix: &str,
+        route_type: &str,
+        route_prefix: &str,
+    ) -> crate::config::NetworkConfig {
+        serde_json::from_value(serde_json::json!({
+            "did": { "domain": "test.local" },
+            "webauthn": { "rp_id": "localhost", "external_origin": "https://localhost" },
+            "integration": { "types": [], "categories": [] },
+            "listeners": [],
+            "channels": [{ "id": "ch", "name": "ch", "prefix": channel_prefix }],
+            "routes": {
+                "extra": { "type": route_type, "prefix": route_prefix, "target": "https://docs.example", "path": "./www" }
+            },
+        }))
+        .expect("network config")
+    }
+
+    #[test]
+    fn a_reload_is_refused_while_a_prefix_takes_the_metadata_path() {
+        for (config, named) in [
+            (
+                network("/.well-known/oauth-protected-resource", "proxy", "/proxy"),
+                "'/.well-known/oauth-protected-resource'",
+            ),
+            (
+                network("/agents", "redirect", "/.well-known/oauth-protected-resource"),
+                "'/.well-known/oauth-protected-resource'",
+            ),
+            (
+                network("/agents", "static", "/.well-known/oauth-protected-resource/docs"),
+                "'/.well-known/oauth-protected-resource/docs'",
+            ),
+            (
+                network(
+                    "/.well-known/oauth-protected-resource/agent",
+                    "proxy",
+                    "/.well-known/oauth-protected-resource/docs",
+                ),
+                "'/.well-known/oauth-protected-resource/agent', '/.well-known/oauth-protected-resource/docs'",
+            ),
+        ] {
+            let error = ensure_metadata_path_free(&config)
+                .expect_err("a prefix at the metadata path")
+                .to_string();
+            assert_eq!(
+                error,
+                format!(
+                    "prefix {named} collides with reserved route '/.well-known/oauth-protected-resource'; \
+                     rename it in gateway.json"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn a_reload_proceeds_when_no_prefix_takes_the_metadata_path() {
+        for config in [
+            network("/agents", "proxy", "/proxy"),
+            network("", "static", "/.well-known"),
+            network("/.well-known", "redirect", "/.well-known/oauth-protected-resources"),
+        ] {
+            assert!(ensure_metadata_path_free(&config).is_ok());
+        }
+    }
 }

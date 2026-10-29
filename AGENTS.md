@@ -159,8 +159,11 @@ are `data.gateway.policy.deny_reason` and `data.surface.policy.deny_reason`.
 let OPA decide instead: Trust Check, and caller source authentication. A surface that must
 reject unauthenticated callers needs a policy denying `input.source_auth.method == "failed"`.
 An MCP Access Point that publishes protected resource metadata is the exception: a request to
-it, direct or over Fabric, is refused before policy with a `401` (direct requests get the
-discovery challenge).
+it, direct or over Fabric, is refused before policy with a `401`, or a `403` for a token short
+of the method's `required_scopes` (direct requests get the discovery challenge). Every challenge
+the gateway builds goes through `mark_gateway_challenge`
+([`src/protocols/protected_resource.rs`](src/protocols/protected_resource.rs)); relayed Target
+challenges other than `Payment` are dropped on such an Access Point and on a `fabric://` Target.
 See [`docs/POLICY.md`](docs/POLICY.md#failed-caller-authentication).
 
 **MCP revisions are admitted per transport path.** Every MCP endpoint admits `2026-07-28`

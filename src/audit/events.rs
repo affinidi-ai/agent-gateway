@@ -13,6 +13,18 @@ pub enum AuthScheme {
     McpResourceToken,
 }
 
+impl AuthScheme {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Jwt => "jwt",
+            Self::ApiKey => "api_key",
+            Self::DidAuth => "did_auth",
+            Self::Mtls => "mtls",
+            Self::McpResourceToken => "mcp_resource_token",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RateLimitScope {
@@ -244,4 +256,29 @@ pub enum TargetAuthKind {
     CredentialLookup,
     StaticSecret,
     CredentialProvider,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AuthScheme;
+
+    const SCHEMES: [AuthScheme; 5] =
+        [AuthScheme::Jwt, AuthScheme::ApiKey, AuthScheme::DidAuth, AuthScheme::Mtls, AuthScheme::McpResourceToken];
+
+    #[test]
+    fn auth_scheme_labels_are_fixed() {
+        let labels: Vec<&str> = SCHEMES
+            .iter()
+            .map(|scheme| scheme.as_str())
+            .collect();
+        assert_eq!(labels, ["jwt", "api_key", "did_auth", "mtls", "mcp_resource_token"]);
+    }
+
+    #[test]
+    fn auth_scheme_labels_match_the_audit_record_names() {
+        for scheme in SCHEMES {
+            assert_eq!(serde_json::to_value(scheme).unwrap(), serde_json::json!(scheme.as_str()));
+        }
+        assert_ne!(AuthScheme::Jwt.as_str(), AuthScheme::McpResourceToken.as_str());
+    }
 }

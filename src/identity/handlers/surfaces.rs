@@ -140,6 +140,22 @@ fn reject_public_predicate_route(surface: &AgentSurface) -> Result<(), SurfaceAp
     Ok(())
 }
 
+/// Refuse a surface whose route is the protected resource metadata path or below it.
+/// Every inbound listener answers GET on that path itself, so the Access Point and its
+/// card could not be reached there.
+fn reject_protected_resource_metadata_route(surface: &AgentSurface) -> Result<(), SurfaceApiError> {
+    let route = surface
+        .access_point
+        .route
+        .as_str();
+    if crate::proxy::paths::is_protected_resource_metadata_route(route) {
+        return Err(SurfaceApiError::BadRequest(format!(
+            "route '{route}' is the protected resource metadata path every listener serves. Choose a different route."
+        )));
+    }
+    Ok(())
+}
+
 fn validate_required_fields(
     surface: &AgentSurface,
     label: &str,
@@ -1528,101 +1544,18 @@ pub async fn create_surface(
         return Err(SurfaceApiError::Forbidden("surface is outside this token's permitted scope".to_string()));
     }
 
-    // Ensure route starts with / BEFORE the shape check so the
-    // historical "missing slash is auto-fixed" behaviour is preserved.
-    if !surface
-        .access_point
-        .route
-        .is_empty()
-        && !surface
-            .access_point
-            .route
-            .starts_with('/')
-    {
-        surface.access_point.route = format!("/{}", surface.access_point.route);
-    }
-
-    // Required-field shape check on the base surface.
-    validate_required_fields(&surface, "")?;
-    validate_identity_extraction(&surface, "")?;
-    reject_public_predicate_route(&surface)?;
-
-    // Block cloud-metadata URLs on target endpoint (SSRF protection)
-    if (surface
-        .target
-        .endpoint
-        .starts_with("http://")
-        || surface
-            .target
-            .endpoint
-            .starts_with("https://"))
-        && let Err(e) = crate::url_validation::reject_cloud_metadata_url(&surface.target.endpoint)
-    {
-        return Err(SurfaceApiError::BadRequest(format!("target.endpoint: {}", e)));
-    }
-
-    // Validate variant alias uniqueness
-    validate_variant_aliases(&surface)?;
-
-    // Validate transit point aliases (URL-safe, non-empty, unique) and
-    // backfill missing UUIDs.
-    validate_transit_points(&mut surface)?;
-    validate_target_authentication(&surface)?;
-
-    super::surface_tenancy::validate_surface_references(
+    validate_surface_for_save(
         &state,
-        &surface,
-        tenant_context(&context),
-        resource_scope(&scope),
-    )
-    .await?;
-    validate_jwt_bearer_bindings(&state, &surface).await?;
-
-    // Reject overlapping outbound listener routes before they can reach
-    // the Axum router and panic the gateway on rebuild.
-    validate_listen_path_collisions(&surface, store, &state.network_config).await?;
-
-    // Reject duplicate access point routes — two surfaces on the same
-    // (listen_address, route) would cause one to silently never receive traffic.
-    validate_access_point_route_collisions(&surface, store, &state.network_config).await?;
-
-    // Validate and resolve x402 payment policies (base + every variant).
-    // This is the trust boundary for wallet addresses on the surface API.
-    validate_surface_payment_policies(&mut surface).await?;
-
-    // Validate MPP crypto-verification posture (base + every variant).
-    validate_surface_mpp_posture(&surface)?;
-
-    // Reject an A2A + jwt_bearer(Authorization) surface that delegates to a
-    // remote MPP rail before it can be saved unreachable.
-    validate_delegation_source_auth(&surface)?;
-
-    // Validate MCP Tool Gating regex patterns (base + every variant).
-    validate_surface_mcp_tool_gating(&surface)?;
-
-    // Re-run the shape check against every resolved variant so a
-    // variant override can't blank out a required field unnoticed.
-    validate_resolved_variants(&surface)?;
-
-    surface
-        .validate()
-        .map_err(|e| SurfaceApiError::BadRequest(e.to_string()))?;
-    reject_target_trust_checks_unless_target_runs_them(&surface)?;
-
-    // Check for duplicate surface_id
-    surface
-        .validate_mcp_metadata()
-        .map_err(SurfaceApiError::BadRequest)?;
-    normalize_a2a_settings(&mut surface, None).map_err(SurfaceApiError::BadRequest)?;
-    refuse_validation_off_by_scoped_caller(
-        &surface,
+        store,
+        &mut surface,
         None,
         tenant_context(&context),
         resource_scope(&scope),
         resource_scoped(&delegation),
-    )?;
-    validate_protected_resource_issuers(&state, &surface).await?;
-    validate_mcp_resource_declarations(&state, &surface).await?;
+    )
+    .await?;
+
+    // Check for duplicate surface_id
     if let Ok(Some(_)) = store
         .get(&surface.surface_id)
         .await
@@ -2187,14 +2120,16 @@ async fn validate_protected_resource_issuers(
 /// variants and Transit Points) must be one it serves, and no other stored
 /// surface or MCP Proxy may serve it. Otherwise a declaration could block
 /// another tenant's STS clients, or two endpoints would accept the same
-/// tokens (`crate::sts::resource_owners`).
+/// tokens (`crate::sts::resource_owners`). No declaring MCP Proxy may use the
+/// Access Point's route or a Surface Variant path either, or the listener would
+/// find two protected resource metadata documents there.
 async fn validate_mcp_resource_declarations(
     state: &IdentityApiState,
     surface: &AgentSurface,
 ) -> Result<(), SurfaceApiError> {
     use crate::sts::resource_owners::{ApplianceResourceOwners, ResourceDeclarationError, ResourceEndpoint};
     let declarations = crate::mcp::resource_server::surface_resource_declarations(surface, &state.network_config);
-    ApplianceResourceOwners::new(
+    let owners = ApplianceResourceOwners::new(
         state
             .agent_surface_store
             .clone()
@@ -2204,13 +2139,95 @@ async fn validate_mcp_resource_declarations(
             .clone()
             .map(|store| store as std::sync::Arc<dyn crate::mcp_proxies::McpProxyStore>),
         state.network_config.clone(),
-    )
-    .ensure_endpoint_may_declare(&ResourceEndpoint::Surface(surface.surface_id.clone()), &declarations)
+    );
+    async {
+        owners
+            .ensure_endpoint_may_declare(&ResourceEndpoint::Surface(surface.surface_id.clone()), &declarations)
+            .await?;
+        owners
+            .ensure_surface_metadata_paths_free(surface)
+            .await
+    }
     .await
     .map_err(|error| match error {
         ResourceDeclarationError::Unavailable => SurfaceApiError::InternalError(error.to_string()),
         _ => SurfaceApiError::BadRequest(error.to_string()),
     })
+}
+
+/// Every check a surface write runs, for create, update, patch and the variant
+/// routes alike. Unlike the checks at startup it reads the stores: references,
+/// route collisions, payment recipients, JWT strategies and MCP resource owners.
+async fn validate_surface_for_save(
+    state: &IdentityApiState,
+    store: &std::sync::Arc<crate::surfaces::FileSystemAgentSurfaceStore>,
+    surface: &mut AgentSurface,
+    existing: Option<&AgentSurface>,
+    context: Option<&PatTenantContext>,
+    scope: Option<&PatResourceScope>,
+    resource_scoped: bool,
+) -> Result<(), SurfaceApiError> {
+    // Ensure route starts with / BEFORE the shape check so the
+    // historical "missing slash is auto-fixed" behaviour is preserved.
+    if !surface
+        .access_point
+        .route
+        .is_empty()
+        && !surface
+            .access_point
+            .route
+            .starts_with('/')
+    {
+        surface.access_point.route = format!("/{}", surface.access_point.route);
+    }
+
+    validate_required_fields(surface, "")?;
+    validate_identity_extraction(surface, "")?;
+    reject_public_predicate_route(surface)?;
+    reject_protected_resource_metadata_route(surface)?;
+
+    if (surface
+        .target
+        .endpoint
+        .starts_with("http://")
+        || surface
+            .target
+            .endpoint
+            .starts_with("https://"))
+        && let Err(e) = crate::url_validation::reject_cloud_metadata_url(&surface.target.endpoint)
+    {
+        return Err(SurfaceApiError::BadRequest(format!("target.endpoint: {}", e)));
+    }
+
+    validate_variant_aliases(surface)?;
+    validate_transit_points(surface)?;
+    validate_target_authentication(surface)?;
+    super::surface_tenancy::validate_surface_references(state, surface, context, scope).await?;
+    validate_jwt_bearer_bindings(state, surface).await?;
+    validate_listen_path_collisions(surface, store, &state.network_config).await?;
+    validate_access_point_route_collisions(surface, store, &state.network_config).await?;
+    validate_surface_payment_policies(surface).await?;
+    validate_surface_mpp_posture(surface)?;
+    validate_delegation_source_auth(surface)?;
+    validate_surface_mcp_tool_gating(surface)?;
+    validate_resolved_variants(surface)?;
+    validate_trust_checks(surface)?;
+    reject_target_trust_checks_unless_target_runs_them(surface)?;
+    validate_workload_binding_config(surface)?;
+    validate_source_auth(surface)?;
+    surface
+        .validate_mcp_metadata()
+        .map_err(SurfaceApiError::BadRequest)?;
+    normalize_a2a_settings(surface, existing).map_err(SurfaceApiError::BadRequest)?;
+    let stored_a2a = existing.and_then(|existing| {
+        existing
+            .access_point
+            .a2a
+            .as_ref()
+    });
+    refuse_validation_off_by_scoped_caller(surface, stored_a2a, context, scope, resource_scoped)?;
+    validate_protected_resource_issuers(state, surface).await?;
+    validate_mcp_resource_declarations(state, surface).await
 }
 
 /// Target Authentication of the surface and of each variant, resolved the way the proxy sees it,
@@ -2274,66 +2291,7 @@ async fn validate_and_save_surface(
     resource_scoped: bool,
     actor: &ManagementActor,
 ) -> Result<AgentSurface, SurfaceApiError> {
-    // Ensure route starts with / BEFORE the shape check so the
-    // historical "missing slash is auto-fixed" behaviour is preserved.
-    if !surface
-        .access_point
-        .route
-        .is_empty()
-        && !surface
-            .access_point
-            .route
-            .starts_with('/')
-    {
-        surface.access_point.route = format!("/{}", surface.access_point.route);
-    }
-
-    validate_required_fields(&surface, "")?;
-    validate_identity_extraction(&surface, "")?;
-    reject_public_predicate_route(&surface)?;
-
-    if (surface
-        .target
-        .endpoint
-        .starts_with("http://")
-        || surface
-            .target
-            .endpoint
-            .starts_with("https://"))
-        && let Err(e) = crate::url_validation::reject_cloud_metadata_url(&surface.target.endpoint)
-    {
-        return Err(SurfaceApiError::BadRequest(format!("target.endpoint: {}", e)));
-    }
-
-    validate_variant_aliases(&surface)?;
-    validate_transit_points(&mut surface)?;
-    validate_target_authentication(&surface)?;
-    super::surface_tenancy::validate_surface_references(state, &surface, context, scope).await?;
-    validate_jwt_bearer_bindings(state, &surface).await?;
-    validate_listen_path_collisions(&surface, store, &state.network_config).await?;
-    validate_access_point_route_collisions(&surface, store, &state.network_config).await?;
-    validate_surface_payment_policies(&mut surface).await?;
-    validate_surface_mpp_posture(&surface)?;
-    validate_delegation_source_auth(&surface)?;
-    validate_surface_mcp_tool_gating(&surface)?;
-    validate_resolved_variants(&surface)?;
-    validate_trust_checks(&surface)?;
-    reject_target_trust_checks_unless_target_runs_them(&surface)?;
-    validate_workload_binding_config(&surface)?;
-    validate_source_auth(&surface)?;
-    surface
-        .validate_mcp_metadata()
-        .map_err(SurfaceApiError::BadRequest)?;
-    normalize_a2a_settings(&mut surface, existing).map_err(SurfaceApiError::BadRequest)?;
-    let stored_a2a = existing.and_then(|existing| {
-        existing
-            .access_point
-            .a2a
-            .as_ref()
-    });
-    refuse_validation_off_by_scoped_caller(&surface, stored_a2a, context, scope, resource_scoped)?;
-    validate_protected_resource_issuers(state, &surface).await?;
-    validate_mcp_resource_declarations(state, &surface).await?;
+    validate_surface_for_save(state, store, &mut surface, existing, context, scope, resource_scoped).await?;
 
     surface.trust_check_split = surface.has_trust_check_lists();
     store
@@ -4986,6 +4944,32 @@ mod validation_tests {
     }
 
     #[test]
+    fn a_route_on_the_protected_resource_metadata_path_is_refused() {
+        for route in [
+            "/.well-known/oauth-protected-resource",
+            "/.well-known/oauth-protected-resource/",
+            "/.well-known/oauth-protected-resource/agent",
+        ] {
+            let surface = surface_with_route("s1", "alpha", "0.0.0.0:8443", route);
+            match reject_protected_resource_metadata_route(&surface) {
+                Err(SurfaceApiError::BadRequest(message)) => assert!(
+                    message.contains(&format!("route '{route}'")) && message.contains("protected resource metadata"),
+                    "{route}: {message}"
+                ),
+                other => panic!("{route}: expected BadRequest, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_route_beside_the_protected_resource_metadata_path_is_accepted() {
+        for route in ["/agent", "/.well-known/oauth-protected-resources", "/api/.well-known/oauth-protected-resource"] {
+            let surface = surface_with_route("s1", "alpha", "0.0.0.0:8443", route);
+            assert!(reject_protected_resource_metadata_route(&surface).is_ok(), "{route}");
+        }
+    }
+
+    #[test]
     fn ap_route_collision_accepts_unique_routes() {
         let a = surface_with_route("s1", "alpha", "0.0.0.0:8443", "/api/v1");
         let b = surface_with_route("s2", "beta", "0.0.0.0:8443", "/api/v2");
@@ -5242,12 +5226,10 @@ mod validation_tests {
 
     // ── DID Auth source-auth validation on the surface save path ─────────
     //
-    // These tests pin the exact scenario the review flagged: `PUT/PATCH
-    // /v1/surfaces/...` used to skip the DID Auth invariants that
-    // `GatewayConfig::validate` enforces at boot, letting the JSON API
-    // persist values that would then blow up on the next process restart.
-    // `validate_source_auth` (called from `validate_and_save_surface`) now
-    // gates the save on the same helper used at boot time.
+    // `validate_source_auth`, called from `validate_surface_for_save` on every
+    // surface write including POST, gates the save on the same helper
+    // `GatewayConfig::validate` runs at boot, so the JSON API cannot persist
+    // values that the next process restart would refuse.
 
     fn didauth_surface(cfg: crate::source_auth::models::DidAuthAuthConfig) -> AgentSurface {
         use crate::config::agent_surface::CallerAuthentication;
@@ -5333,6 +5315,71 @@ mod validation_tests {
         let s = didauth_surface(cfg);
         let err = validate_source_auth(&s).expect_err("non-DID string must fail on save");
         assert!(matches!(err, SurfaceApiError::BadRequest(_)));
+    }
+
+    fn jwt_scoped_surface(required_scopes: &[&str]) -> AgentSurface {
+        use crate::config::agent_surface::CallerAuthentication;
+        use crate::jwt_bearer::models::JwtBearerAuthConfig;
+        use crate::source_auth::models::SourceAuthConfig;
+        let mut s = base_surface();
+        s.access_point
+            .caller_authentication = Some(CallerAuthentication {
+            protected_resource: None,
+            methods: vec![SourceAuthConfig::JwtBearer(JwtBearerAuthConfig {
+                jwt_verification_strategy_id: "strategy-1".into(),
+                required_scopes: required_scopes
+                    .iter()
+                    .map(|scope| scope.to_string())
+                    .collect(),
+                ..Default::default()
+            })],
+        });
+        s
+    }
+
+    #[test]
+    fn source_auth_validation_accepts_scope_tokens() {
+        validate_source_auth(&jwt_scoped_surface(&[])).expect("no required scopes must pass");
+        validate_source_auth(&jwt_scoped_surface(&["a2a:invoke", "billing.read"])).expect("scope tokens must pass");
+    }
+
+    #[test]
+    fn source_auth_validation_rejects_required_scopes_unsafe_for_a_header() {
+        for bad in [&["two words"][..], &["quo\"te"], &["back\\slash"], &["dup", "dup"], &[""]] {
+            match validate_source_auth(&jwt_scoped_surface(bad)) {
+                Err(SurfaceApiError::BadRequest(msg)) => assert!(msg.contains("required_scopes"), "{bad:?}: {msg}"),
+                other => panic!("{bad:?}: expected BadRequest, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn source_auth_validation_checks_required_scopes_on_variants() {
+        use crate::config::agent_surface_variants::AccessPointOverrides;
+        let variant = |required_scopes: &[&str]| SurfaceVariant {
+            id: "variant-1".into(),
+            alias: "partner".into(),
+            name: "Partner".into(),
+            description: String::new(),
+            enabled: true,
+            overrides: SurfaceOverrides {
+                access_point: Some(AccessPointOverrides {
+                    caller_authentication: jwt_scoped_surface(required_scopes)
+                        .access_point
+                        .caller_authentication,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        };
+        let mut s = base_surface();
+        s.variants = vec![variant(&["bad scope"])];
+        match validate_source_auth(&s) {
+            Err(SurfaceApiError::BadRequest(msg)) => assert!(msg.contains("required_scopes"), "{msg}"),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+        s.variants = vec![variant(&["partner.read"])];
+        validate_source_auth(&s).expect("a variant with scope tokens must pass");
     }
 
     #[test]

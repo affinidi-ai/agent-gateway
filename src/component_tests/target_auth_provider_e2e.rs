@@ -837,6 +837,7 @@ impl HopTwo {
             active_variant_alias: None,
             active_variant_id: None,
             variant_resolution_error: None,
+            access_point_declaration: None,
             surface: Arc::new(surface),
         };
         Self {

@@ -1289,6 +1289,119 @@ async fn inbound_a2a_tampered_jwt_forwarded_reaches_target() {
     assert_mock_received_request(&h.mock, &request_str);
 }
 
+// ── Auth: required scopes ────────────────────────────────────────────────────
+
+const SCOPE_POLICY_ID: &str = "e2e-scope-policy";
+
+/// Admits a caller whose token grants `a2a:invoke` to the expected client through the
+/// expected strategy, and a failed caller only when its token was short of a scope, so
+/// an admission shows the exact failure kind reached OPA.
+const SCOPE_POLICY_REGO: &str = r#"package surface.policy
+
+default allow := false
+
+allow if {
+    input.source_auth.method == "jwt_bearer"
+    "a2a:invoke" in input.source_auth.scopes
+    input.source_auth.strategy_id == "e2e-jwt-strategy"
+    input.source_auth.client_id == "billing-client"
+}
+
+allow if {
+    input.source_auth.method == "failed"
+    input.source_auth.kind == "insufficient_scope"
+}
+"#;
+
+/// An Access Point with `required_scopes` that does not declare an authorization
+/// server publishes the granted scopes, the client id and the verifying strategy to
+/// policy, and publishes a token short of a required scope as a failed caller of kind
+/// `insufficient_scope` instead of refusing it.
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_a2a_required_scopes_are_published_to_policy() {
+    let fixture = JwksFixture::start().await;
+    let h = GatewayHarness::start(|temp_dir, gw_config, _bootstrap| {
+        setup_jwt_bearer_auth_rejects_missing_then_accepts_valid(&fixture, temp_dir, gw_config);
+        let dir = temp_dir.join("policy_definitions");
+        std::fs::create_dir_all(&dir).expect("create policy_definitions dir");
+        std::fs::write(
+            dir.join(format!("{SCOPE_POLICY_ID}.json")),
+            json!({
+                "id": SCOPE_POLICY_ID, "name": "Scopes", "description": "Requires a2a:invoke.",
+                "policy_type": "agent_surface", "policy": SCOPE_POLICY_REGO, "enabled": true,
+                "created_at": "2026-01-01T00:00:00Z"
+            })
+            .to_string(),
+        )
+        .expect("write policy definition");
+        let mut surface = serde_json::to_value(&gw_config.surfaces[0]).expect("serialize surface");
+        surface["access_point"]["caller_authentication"]["methods"][0]["required_scopes"] = json!(["a2a:invoke"]);
+        surface["access_point"]["inbound_policy"] = json!({ "policy_definition_id": SCOPE_POLICY_ID });
+        gw_config.surfaces = vec![serde_json::from_value(surface).expect("scoped surface")];
+    })
+    .await;
+
+    let request_str = serde_json::to_string(&a2a_request_body()).unwrap();
+    let send = |token: Option<String>| {
+        let mut request = reqwest::Client::new()
+            .post(&h.gateway_url)
+            .header("content-type", "application/json")
+            .body(request_str.clone());
+        if let Some(token) = token {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        async move {
+            request
+                .send()
+                .await
+                .expect("request")
+        }
+    };
+    let token = |client_id: &str, scope: &str| {
+        sign_jwt(
+            json!({
+                "iss": fixture.issuer,
+                "sub": client_id,
+                "client_id": client_id,
+                "scope": scope,
+                "exp": now_secs() + 300,
+                "iat": now_secs(),
+            }),
+            &fixture.kid,
+        )
+    };
+    let target_requests = || {
+        h.mock
+            .request_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+    };
+
+    let admitted = send(Some(token("billing-client", "read a2a:invoke"))).await;
+    assert_eq!(admitted.status(), 200, "a token with the required scope is admitted");
+    assert_mock_received_request(&h.mock, &request_str);
+    assert_eq!(target_requests(), 1);
+
+    let other_client = send(Some(token("other-client", "a2a:invoke"))).await;
+    assert_eq!(other_client.status(), 403, "policy reads the client id");
+    assert_eq!(target_requests(), 1);
+
+    let short = send(Some(token("billing-client", "read"))).await;
+    assert_eq!(short.status(), 200, "a scope shortfall reaches policy as kind insufficient_scope");
+    assert_eq!(target_requests(), 2);
+
+    for (label, credential) in [("missing", None), ("invalid", Some("not-a-jwt".to_string()))] {
+        let refused = send(credential).await;
+        assert_eq!(refused.status(), 403, "{label}: only a scope shortfall is admitted");
+        assert!(
+            !refused
+                .headers()
+                .contains_key("www-authenticate"),
+            "{label}: an Access Point that does not declare never challenges"
+        );
+    }
+    assert_eq!(target_requests(), 2);
+}
+
 // ── Strict request-shape validation (opt-in) ─────────────────────────────────
 
 /// A2A marks `messageId` required, so a message without one is refused at the

@@ -70,7 +70,9 @@ See [Gateway token cache](CREDENTIAL_DELEGATION.md#gateway-token-cache).
 
 ```mermaid
 flowchart TD
-    P["POST /v1/config/reload"] --> C[Invalidate the agent-card cache]
+    P["POST /v1/config/reload"] --> RR{"gateway.json leaves the<br/>metadata path free?"}
+    RR -- no --> RE["Error; the running<br/>configuration stays"]
+    RR -- yes --> C[Invalidate the agent-card cache]
     C --> M["Migrate any legacy<br/>channel.policy definitions"]
     M --> L["Build the configuration: surfaces from<br/>_storage/agent_surfaces/, the rest from memory"]
     L --> OK{Built?}
@@ -108,6 +110,20 @@ If the requested configuration source cannot be loaded,
 `reload_channels_with_fallback` attempts to load the cached `GatewayConfig`. If neither source is
 available, reload returns an error. A failure after listener teardown is not converted into the old
 live listener set.
+
+### Reserved routes
+
+Every inbound listener mounts the protected resource metadata paths,
+`/.well-known/oauth-protected-resource` and every path below it, so a reload first reads
+`gateway.json` and refuses to continue when a `channels`, `routes` (of any type) or
+`mcp_proxies` prefix lies at or under that path. Nothing is torn down: the running
+configuration and listeners stay, and `POST /v1/config/reload` answers `500` whose `details`
+end with `prefix '<prefix>' collides with reserved route '/.well-known/oauth-protected-resource';
+rename it in gateway.json`. The same prefix stops a gateway at startup with exit code `2` (see
+[`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md#gatewayjson)). A stored Agent Surface
+whose route lies at or under the path is logged as an error and left out of the reloaded
+surface set, at startup as on reload; saving such a surface through the API is refused with
+`400`.
 
 With `channel_config_source = "local"`, a reload first re-reads the Agent Surface records from disk,
 and each record that changed on disk is then also applied as a single-surface change, as a change

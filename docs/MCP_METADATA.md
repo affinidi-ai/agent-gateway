@@ -1199,9 +1199,9 @@ authentication, so it cannot be combined with
 | Setting | `mcp_http.authorization`, with `sts.mcp_issuer` in the network configuration | `access_point.caller_authentication.protected_resource` on a JWT Bearer caller authentication |
 | Who issues tokens | The gateway's STS profile | An authorization server you run, for example Ory Hydra, Auth0 or Microsoft Entra ID |
 | Clients | Pre-registered confidential clients that exchange tokens with the gateway STS (token exchange, ID-JAG redemption) | Standard MCP clients that discover the authorization server and sign in there |
-| Token check | EdDSA `at+jwt` from the profile issuer, audience equal to the resource, every configured scope required | The JWT verification strategy, audience equal to the resource; scopes are advertised, not required |
-| Refusal | `401`, or `403 insufficient_scope` for a missing scope, with a challenge | `401` with a challenge |
-| Metadata names | The gateway STS profile issuer | The configured authorization servers |
+| Token check | EdDSA `at+jwt` from the profile issuer, audience equal to the resource, every configured scope required | The JWT verification strategy, audience equal to the resource, and every scope in the method's `required_scopes`; `protected_resource.scopes` are advertised, not required |
+| Refusal | `401`, or `403 insufficient_scope` for a missing scope, with a challenge | `401`, or `403 insufficient_scope` for a missing required scope, with a challenge |
+| Metadata names | The gateway STS profile issuer | The configured authorization servers, and the union of `required_scopes` and `protected_resource.scopes` as `scopes_supported` |
 
 Use the gateway STS when the callers are services that already exchange tokens
 with the gateway, for example agents acting for a user through delegation and
@@ -1329,7 +1329,12 @@ Saving a surface or standalone Proxy checks this against the stored network
 configuration and returns `400` when a declared resource is not the
 endpoint's own, or when another stored surface or Proxy, enabled or not,
 already serves it. Changing a route or Proxy path therefore also needs a new
-`resource`. Surfaces loaded at startup or on reload are checked only at
+`resource`. A standalone Proxy that declares a resource is also refused with
+`400` when its path holds `$` or `%24`, or is the route or a `<route>$alias`
+path of any stored surface, enabled or not; saving a surface whose route or
+Surface Variant path such a Proxy already uses is refused the same way.
+Every listener serves the metadata of every standalone Proxy, so otherwise
+the two would claim one metadata path. Surfaces loaded at startup or on reload are checked only at
 request time, where a mismatched resource fails closed with `503`. Explicit
 surface aliases receive distinct `$alias` resource URIs; Transit
 aliases occur in the surface portion of the outbound path. A custom Transit
@@ -1357,6 +1362,12 @@ audience-bound credential, never the ingress caller token.
 
 Protected-resource metadata is read from live endpoint configuration at
 `/.well-known/oauth-protected-resource/<endpoint-path>`, with `no-store`.
+Every inbound listener serves that path. The same path serves the document
+of an MCP Access Point with
+[`caller_authentication.protected_resource`](#authorization-server-discovery-for-caller-authentication),
+and a path two endpoints claim answers `503`. A standalone Proxy or surface
+route whose path holds `$` or `%24` publishes no document, so it cannot answer
+for a surface's variant URL.
 The root document exists only for a configured root resource, never an
 arbitrary surface. Documents include the exact resource, one configured AS
 issuer, header-only bearer support and configured scopes. Unknown, disabled
@@ -1382,7 +1393,9 @@ token. It opts in with `caller_authentication.protected_resource`:
     "route": "/mcp/alpha",
     "protocol": "mcp",
     "caller_authentication": {
-      "methods": [{ "type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": [] }],
+      "methods": [
+        { "type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": [], "required_scopes": ["tools"] }
+      ],
       "protected_resource": {
         "resource": "https://gateway.example/mcp/alpha",
         "authorization_servers": ["https://idp.example/realms/agents"],
@@ -1428,12 +1441,10 @@ A request checks tokens against the strategy's current issuer, not against
 the advertised servers, so after a strategy's issuer changes, tokens from the
 new issuer are accepted while clients that follow the old metadata get tokens
 that are refused; update `authorization_servers` too, which a save of the
-surface requires until the two agree. A listener on which a configured prefix
-serves `/.well-known/oauth-protected-resource` itself publishes no documents,
-so discovery on its Access Points answers `503` and their settings are
-refused on save. `scopes` are advertised as
-`scopes_supported`. A variant that overrides `caller_authentication` carries
-its own setting or none.
+surface requires until the two agree. `scopes` are only advertised:
+`scopes_supported` lists them together with the method's `required_scopes`,
+which the Access Point enforces (see below). A variant that overrides
+`caller_authentication` carries its own setting or none.
 
 The document is served at `/.well-known/oauth-protected-resource<route>` and
 `/.well-known/oauth-protected-resource<route>$<alias>` (`%24` accepted) on
@@ -1443,8 +1454,8 @@ included), so a browser-based MCP client can fetch it; other methods keep the
 network configuration's `cors` allowlist. That CORS rule is layered on these
 routes only, and only on a listener where no channel or proxy route also
 receives them (see below), so a proxied Target's answers keep the allowlist. It holds `resource`, `authorization_servers`,
-`bearer_methods_supported: ["header"]` and `scopes_supported` when scopes are
-set. Only active surfaces and enabled variants publish. When the settings
+`bearer_methods_supported: ["header"]` and `scopes_supported`, the union of
+`required_scopes` and `scopes`, when either lists a scope. Only active surfaces and enabled variants publish. When the settings
 claiming a path no longer validate at request time, for example after the
 listener's public URLs changed, the path answers `503`. Documents are read
 from the live surface, so a surface saved through the API publishes without a
@@ -1457,18 +1468,35 @@ the path still goes to the proxy handler, as before, when a channel or proxy
 route catch-all covers it, one with an empty prefix or at `/.well-known`, so a
 pass-through surface there keeps serving its Target's own metadata. Otherwise
 it is a plain `404`, not logged or audited as a request without a route,
-since MCP clients probe these paths during discovery. A listener whose
-channel, MCP Proxy or route
-prefix is `/.well-known/oauth-protected-resource` itself leaves the path to
-that prefix and publishes no documents, with a warning at startup.
+since MCP clients probe these paths during discovery.
+
+Every inbound listener mounts both well-known paths, so nothing else may be
+routed at or under `/.well-known/oauth-protected-resource`. A channel, MCP
+Proxy or route prefix of any type there in `gateway.json` stops the gateway at
+startup with exit code `2` and refuses a
+[configuration reload](CONFIGURATION_RELOAD.md#reserved-routes), which keeps
+the running configuration. A surface whose route is there is refused on save
+with `400`, and one already stored is logged as an error and not mounted. A
+standalone MCP Proxy whose path is there is refused with `400`.
 
 A request to such an Access Point whose bearer token is missing,
 malformed, expired or otherwise refused by the JWT verification strategy is
 answered before policy with `401`, `application/problem+json`, `no-store`
 and `WWW-Authenticate: Bearer resource_metadata="<absolute metadata URL>"`,
-plus `error="invalid_token"` once a token was presented and `scope` when
-scopes are set. The body's detail is fixed and never says why a token failed.
-The audit records the failure as blocking. A valid token issued for the
+plus `error="invalid_token"` once a token was presented and
+`scope="<required_scopes>"` when the method lists
+[`required_scopes`](SOURCE_AUTH.md#required-scopes). A verified token that
+lacks one of them is answered before policy with `403` and the same challenge
+with `error="insufficient_scope"`, for example:
+
+```http
+WWW-Authenticate: Bearer resource_metadata="https://gateway.example/.well-known/oauth-protected-resource/mcp/alpha", error="insufficient_scope", scope="tools"
+```
+
+`protected_resource.scopes` never appear in the challenge, and a method
+without `required_scopes` sends no `scope`. The body's detail is fixed and
+never says why a token failed. The audit records the failure as blocking,
+with the reason `insufficient_scope` for a scope shortfall. A valid token issued for the
 resource is attributed as before, and its identity reaches policy. Over
 Fabric, the receiving gateway binds the token audience to the same resource,
 because both paths resolve the accepted audiences in
@@ -1478,10 +1506,20 @@ gateway strips the caller's own `Authorization` header, so only a credential
 it injects (target authentication or a delegated credential) issued for this
 resource can pass, and a missing or refused one gets a `401` before policy
 with `WWW-Authenticate: Bearer realm="agent-gateway"` (plus
-`error="invalid_token"`), without `resource_metadata`, which would only send
-the remote client to fetch a token that is stripped again.
-Server-side errors keep their behaviour, and requested scopes are advertised
-but not enforced.
+`error="invalid_token"`), and one short of a required scope a `403` with
+`Bearer realm="agent-gateway", error="insufficient_scope"`, without
+`resource_metadata`, which would only send the remote client to fetch a token
+that is stripped again. The sending gateway drops that challenge as a
+[relayed challenge](SOURCE_AUTH.md#relayed-challenges), so its own caller gets
+`502` for the `401` and a `403` without a challenge for the `403`.
+Server-side errors keep their behaviour: a setting the Access Point can no
+longer serve answers `503` with no challenge.
+
+The gateway is the resource server on such an Access Point and never forwards
+the caller's token, so a challenge in the Target's response is addressed to
+the gateway, not the caller. Every Target challenge except `Payment` is
+dropped, and a Target `401` left with no challenge becomes `502`; see
+[Relayed challenges](SOURCE_AUTH.md#relayed-challenges).
 
 A PUT whose `caller_authentication` omits `protected_resource` keeps the
 stored setting while the Access Point would still serve it, so a client that
@@ -1513,7 +1551,9 @@ and stop serving it. Before rolling back to such a release, PATCH
 onto every surface that sets it, and `{"overrides": {"access_point":
 {"caller_authentication": {"protected_resource": null}}}}` onto every variant
 that sets its own, then protect those Access Points another way: without the
-setting, their JWT Bearer method checks no audience.
+setting, their JWT Bearer method checks no audience. Those releases also
+check no scope on any Access Point; see
+[Required scopes](SOURCE_AUTH.md#required-scopes).
 
 `make mcp-discovery` ([`scripts/mcp-discovery/`](../scripts/mcp-discovery/README.md))
 runs the flow end to end against Ory Hydra with a scripted client and the

@@ -28,6 +28,24 @@ pub fn is_public_path(path: &str) -> bool {
         || path.ends_with("/discovery")
 }
 
+/// The RFC 9728 well-known prefix every inbound listener serves protected resource
+/// metadata under.
+pub const PROTECTED_RESOURCE_METADATA_PATH: &str = "/.well-known/oauth-protected-resource";
+
+/// Whether `route` is the protected resource metadata path or lies below it, where an
+/// Access Point could never be reached.
+pub fn is_protected_resource_metadata_route(route: &str) -> bool {
+    route
+        .strip_prefix(PROTECTED_RESOURCE_METADATA_PATH)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// Whether `route` holds the `$` (or `%24`) that separates a Surface Variant alias, so
+/// it would overlap another surface's variant URLs.
+pub fn route_holds_variant_separator(route: &str) -> bool {
+    route.contains('$') || route.contains("%24")
+}
+
 /// Whether `path` requests a well-known agent card (`agent-card.json` or the
 /// legacy `agent.json`).
 pub fn is_well_known_agent_card_path(path: &str) -> bool {
@@ -308,6 +326,42 @@ where
     collisions
 }
 
+/// Validate that no prefix lies at or below the protected resource metadata path.
+/// Every inbound listener mounts the metadata routes itself and they take every
+/// method on that path, so a route there could never be reached, and two routes
+/// over one path would stop the listener from starting.
+///
+/// Returns the list of conflicting `(prefix, metadata_path)` pairs. Empty on success.
+pub fn check_metadata_path_collisions<'a, I>(prefixes: I) -> Vec<(String, String)>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    prefixes
+        .into_iter()
+        .filter(|prefix| is_protected_resource_metadata_route(prefix))
+        .map(|prefix| (prefix.to_string(), PROTECTED_RESOURCE_METADATA_PATH.to_string()))
+        .collect()
+}
+
+/// Whether a stored surface's Access Point route may be mounted. A route at or under
+/// the protected resource metadata path is logged and left unmounted, because the
+/// metadata routes answer every request there.
+pub fn surface_route_is_mountable(surface: &crate::config::agent_surface::AgentSurface) -> bool {
+    let route = surface
+        .access_point
+        .route
+        .as_str();
+    if !is_protected_resource_metadata_route(route) {
+        return true;
+    }
+    tracing::error!(
+        surface_id = %surface.surface_id,
+        route,
+        "Surface route is at or under {PROTECTED_RESOURCE_METADATA_PATH}, so the surface is not mounted; change its route"
+    );
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,6 +381,37 @@ mod tests {
             "target": { "endpoint": endpoint }
         }))
         .expect("surface JSON")
+    }
+
+    #[test]
+    fn only_the_metadata_path_and_paths_below_it_are_metadata_routes() {
+        for route in [
+            "/.well-known/oauth-protected-resource",
+            "/.well-known/oauth-protected-resource/",
+            "/.well-known/oauth-protected-resource/agent",
+        ] {
+            assert!(is_protected_resource_metadata_route(route), "{route}");
+        }
+        for route in [
+            "/agent",
+            "/.well-known/oauth-protected-resources",
+            "/agent/.well-known/oauth-protected-resource",
+            "/.well-known",
+            "",
+            "/",
+        ] {
+            assert!(!is_protected_resource_metadata_route(route), "{route}");
+        }
+    }
+
+    #[test]
+    fn only_a_route_with_a_dollar_or_its_encoding_holds_the_variant_separator() {
+        for route in ["/smoke$dev", "/smoke%24dev", "/$"] {
+            assert!(route_holds_variant_separator(route), "{route}");
+        }
+        for route in ["/smoke", "/smoke-dev/24", "/smoke%2F24"] {
+            assert!(!route_holds_variant_separator(route), "{route}");
+        }
     }
 
     #[test]
@@ -677,5 +762,52 @@ mod tests {
     fn collision_is_case_insensitive() {
         let hits = check_spa_route_collisions(["/X402Payments"]);
         assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn spa_collision_ignores_the_metadata_path() {
+        assert!(check_spa_route_collisions(["/.well-known/oauth-protected-resource/agent"]).is_empty());
+    }
+
+    #[test]
+    fn collision_detects_the_protected_resource_metadata_path() {
+        let hits = check_metadata_path_collisions([
+            "/.well-known/oauth-protected-resource",
+            "/.well-known/oauth-protected-resource/agent",
+            "/.well-known/agent",
+            "/.well-known",
+            "/x402payments",
+            "",
+        ]);
+        assert_eq!(
+            hits,
+            vec![
+                ("/.well-known/oauth-protected-resource".to_string(), PROTECTED_RESOURCE_METADATA_PATH.to_string()),
+                (
+                    "/.well-known/oauth-protected-resource/agent".to_string(),
+                    PROTECTED_RESOURCE_METADATA_PATH.to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn only_a_surface_outside_the_metadata_path_is_mountable() {
+        let at = |route: &str| {
+            let mut surface = surface_with_target("https://agent.example/api", None);
+            surface.access_point.route = route.to_string();
+            surface
+        };
+        for route in ["/agent", "/.well-known/agent", "/"] {
+            assert!(surface_route_is_mountable(&at(route)), "{route}");
+        }
+        for route in ["/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/agent"] {
+            assert!(!surface_route_is_mountable(&at(route)), "{route}");
+        }
+    }
+
+    #[test]
+    fn metadata_collision_ignores_unrelated_prefixes() {
+        assert!(check_metadata_path_collisions(["/agent", "/", "/.well-known/oauth-protected-resources"]).is_empty());
     }
 }

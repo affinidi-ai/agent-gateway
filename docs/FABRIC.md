@@ -359,9 +359,14 @@ request received by the destination gateway:
    validation. DIDComm authentication proves the sending Gateway; source authentication separately
    evaluates caller evidence presented to the destination surface. On an MCP surface that
    publishes protected resource metadata, a missing or refused token is answered here with a
-   `401` before policy, without `resource_metadata`: the sending Gateway strips the caller's
+   `401` before policy, and a token short of the method's `required_scopes` with a `403`
+   `error="insufficient_scope"`, both with `realm="agent-gateway"` and without
+   `resource_metadata`: the sending Gateway strips the caller's
    own `Authorization` header, so only a credential it injects, issued for this surface's
-   resource, can pass. There is no A2A counterpart:
+   resource, can pass. The sending Gateway drops these challenges, like every relayed challenge
+   other than `Payment` on a `fabric://` Target, so its caller gets `502` for the `401` and a
+   `403` without a challenge
+   (see [Relayed challenges](SOURCE_AUTH.md#relayed-challenges)). There is no A2A counterpart:
    `A2A-Version` is negotiated and A2A requests are validated on the sending gateway, not here
    (see below).
 5. Build policy input containing the authenticated sending Gateway and any source-auth result. An

@@ -17,8 +17,9 @@ use crate::bdd_support::collaborators::{
     assert_request_content_type_starts_with,
 };
 use crate::bdd_support::json_rpc::McpVersion;
+use crate::bdd_support::mock_server::target_challenges;
 
-use crate::world::{ObservedTarget, SurfaceWorld, identity_schema_has_field};
+use crate::world::{ObservedTarget, SurfaceSourceAuthConfig, SurfaceWorld, identity_schema_has_field};
 
 const HEADER_METADATA_URI: &str = "https://fabric.affinidi.io/extensions/header-metadata/v1";
 
@@ -725,6 +726,7 @@ fn audited_auth_failure_reason(failure: &str) -> &'static str {
     match failure {
         "a missing credential" => "missing_credential",
         "an invalid credential" => "invalid_credential",
+        "a scope shortfall" => "insufficient_scope",
         other => panic!("no audited reason for the source authentication failure '{other}'"),
     }
 }
@@ -2677,29 +2679,47 @@ fn protected_resource_metadata_names_authorization_server(
     assert_eq!(get_response_body_value(world)["authorization_servers"], serde_json::json!([authorization_server]));
 }
 
-#[then(expr = "the protected resource metadata lists scope {string}")]
-fn protected_resource_metadata_lists_scope(
+#[then(regex = r#"^the protected resource metadata lists scopes? "([^"]+)"$"#)]
+fn protected_resource_metadata_lists_scopes(
     world: &mut SurfaceWorld,
-    scope: String,
+    scopes: String,
 ) {
-    assert_eq!(get_response_body_value(world)["scopes_supported"], serde_json::json!([scope]));
+    let expected: Vec<&str> = scopes
+        .split_whitespace()
+        .collect();
+    assert_eq!(get_response_body_value(world)["scopes_supported"], serde_json::json!(expected));
 }
 
+/// The challenge names the surface's metadata and, in `scope=`, only the scopes its
+/// caller authentication requires; the scopes the metadata advertises are not named.
 fn assert_discovery_challenge(
     world: &SurfaceWorld,
     error: &str,
 ) {
-    let protected = world
+    assert!(
+        world
+            .surface_config
+            .protected_resource
+            .is_some(),
+        "the surface must publish protected resource metadata"
+    );
+    let required = match &world
         .surface_config
-        .protected_resource
-        .as_ref()
-        .expect("the surface must publish protected resource metadata");
-    let expected = format!(
-        "Bearer resource_metadata=\"{}/.well-known/oauth-protected-resource{}\"{error}, scope=\"{}\"",
+        .source_auth
+    {
+        Some(SurfaceSourceAuthConfig::JwtBearer(config)) => config
+            .required_scopes
+            .join(" "),
+        _ => panic!("JWT Bearer source authentication must be configured"),
+    };
+    let mut expected = format!(
+        "Bearer resource_metadata=\"{}/.well-known/oauth-protected-resource{}\"{error}",
         crate::bdd_support::config::single_surface_fixture::PROTECTED_RESOURCE_PUBLIC_ORIGIN,
         world.surface_config.route,
-        protected.scopes.join(" ")
     );
+    if !required.is_empty() {
+        expected.push_str(&format!(", scope=\"{required}\""));
+    }
     assert_collaborator_header_value(get_response_headers_value(world), "www-authenticate", &expected, "response");
 }
 
@@ -2711,6 +2731,28 @@ fn response_challenges_for_a_token(world: &mut SurfaceWorld) {
 #[then("the response challenges the caller for a new token because the token is invalid")]
 fn response_challenges_for_a_new_token(world: &mut SurfaceWorld) {
     assert_discovery_challenge(world, ", error=\"invalid_token\"");
+}
+
+#[then("the response challenges the caller for a token granting the scopes the surface requires")]
+fn response_challenges_for_the_required_scopes(world: &mut SurfaceWorld) {
+    assert_discovery_challenge(world, ", error=\"insufficient_scope\"");
+}
+
+#[then(expr = "the response relays only the {string} challenges of MCP server {string}")]
+fn response_relays_only_mcp_server_challenges(
+    world: &mut SurfaceWorld,
+    schemes: String,
+    server_name: String,
+) {
+    world
+        .actors
+        .expect_target_kind(&server_name, TargetActorKind::McpServer);
+    assert_collaborator_header_value(
+        get_response_headers_value(world),
+        "www-authenticate",
+        &target_challenges(&schemes, &server_name),
+        "response",
+    );
 }
 
 #[then(expr = "the response includes header {string} with value {string}")]

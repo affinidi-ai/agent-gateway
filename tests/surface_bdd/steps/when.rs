@@ -1378,7 +1378,7 @@ pub(crate) async fn read_surface_through_admin_api(world: &mut SurfaceWorld) {
     fetch_created_surface(world, "reading the surface through the admin API").await;
 }
 
-#[when(expr = "the operator creates a valid surface for route {string}")]
+#[when(regex = r#"^the operator (?:creates a|attempts to create an otherwise) valid surface for route "([^"]+)"$"#)]
 async fn valid_surface_create_request_submitted(
     world: &mut SurfaceWorld,
     route: String,
@@ -2470,6 +2470,25 @@ async fn caller_asks_mcp_surface_for_available_tools_with_token_for_surface_cont
         &caller,
         serde_json::json!({ "aud": caller_token_audience(world), "groups": [group] }),
     );
+    ask_mcp_surface_for_available_tools_with_headers(
+        world,
+        vec![("authorization".to_string(), format!("Bearer {}", token))],
+    )
+    .await;
+}
+
+#[when(
+    expr = "the caller asks the MCP surface for available tools with a token issued for the surface granting scopes {string} in its {string} claim"
+)]
+async fn caller_asks_mcp_surface_for_available_tools_with_token_granting_scopes(
+    world: &mut SurfaceWorld,
+    scopes: String,
+    claim: String,
+) {
+    ensure_gateway_running(world).await;
+    let mut claims = serde_json::json!({ "aud": caller_token_audience(world) });
+    claims[claim.as_str()] = serde_json::json!(scopes);
+    let token = create_valid_jwt_for_subject(get_jwt_source_auth_issuer(world), "test-user", claims);
     ask_mcp_surface_for_available_tools_with_headers(
         world,
         vec![("authorization".to_string(), format!("Bearer {}", token))],

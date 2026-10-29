@@ -36,7 +36,9 @@ ES384 or EdDSA key from the strategy's key set, its `iss` equals the strategy's 
 issuer, it has an `exp` that has not passed and, when it has an `nbf`, that time has come,
 each with 60 seconds of leeway. `aud` must name one of the method's `audiences`; an empty
 list skips that check, except on an MCP Access Point that publishes protected resource
-metadata, where `aud` must name the resource of the route called.
+metadata, where `aud` must name the resource of the route called. A method that lists
+`required_scopes` also needs a token that grants each of them; see
+[Required scopes](#required-scopes).
 
 An MCP Access Point whose first method is JWT bearer can also publish RFC 9728 protected
 resource metadata naming the authorization server that issues its tokens, with
@@ -52,10 +54,11 @@ than serving surfaces whose caller authentication would be skipped. A request, d
 over Fabric, that reaches a surface with caller authentication configured while no middleware
 is installed is refused with `500` rather than forwarded unauthenticated.
 
-A missing or invalid credential does not refuse the request. That includes an mTLS
-certificate that lacks the configured binding field. The request continues with no caller
-identity, and policy sees `input.source_auth` as
-`{"method": "failed", "attempted_method": ..., "reason": ...}`. Only server-side errors,
+A missing or invalid credential, or a JWT short of a required scope, does not refuse the
+request. That includes an mTLS certificate that lacks the configured binding field. The
+request continues with no caller identity, and policy sees `input.source_auth` as
+`{"method": "failed", "attempted_method": ..., "kind": ..., "reason": ...}`, where `kind` is
+`missing`, `invalid` or `insufficient_scope`. Only server-side errors,
 such as missing configuration or an internal failure, block the request with `500`
 ([`errors.rs`](../src/source_auth/errors.rs)). Such a request is forwarded without the
 surface's Target Authentication credential, or the A2A proxy's Direct Line secret, on each inbound
@@ -77,8 +80,9 @@ deny if input.source_auth.method == "failed"
 See [`POLICY.md`](POLICY.md#failed-caller-authentication).
 
 A request to an MCP Access Point that publishes protected resource metadata, direct or over
-Fabric, is the exception: a missing or invalid JWT is refused with a `401` (the discovery
-challenge on a direct request), see
+Fabric, is the exception: a missing or invalid JWT is refused with a `401`, and one short of a
+required scope with a `403` (the discovery challenge on a direct request); see
+[Caller challenge](#caller-challenge) and
 [`MCP_METADATA.md`](MCP_METADATA.md#authorization-server-discovery-for-caller-authentication).
 
 A surface whose JWT verification strategy no longer exists, for example because it was deleted
@@ -161,6 +165,101 @@ provider's ID token against `consent_identity_strategy_id` with the client id as
 that field. None of them reads `authorization_server`, so a pin never changes which tokens
 they accept. The field is left out of the stored record when unset, so a strategy saved before
 the field existed keeps the digest that a consent record bound to it.
+
+### Required scopes
+
+A `jwt_bearer` method can list `required_scopes`. After the token verifies (signature, issuer,
+expiry and audience), the Access Point reads the scopes it grants
+([`access_token.rs`](../src/jwt_bearer/access_token.rs)) and checks them in
+[`middleware.rs`](../src/source_auth/middleware.rs). The check is not part of token
+validation, so STS, modern consent and credential providers are unaffected.
+
+| Rule | Detail |
+| --- | --- |
+| Granted scopes | The first claim in the strategy's `scope_claims` (default `scope`, then `scp`) that the token carries decides. A string is split on spaces, an array of strings is used as is, and any other shape grants nothing. |
+| Shortfall | A token that lacks any required scope is a failed caller of kind `insufficient_scope`, handed to policy like a missing or invalid token, except on an MCP Access Point that publishes protected resource metadata, which refuses it with `403` (see [Caller challenge](#caller-challenge)). The `auth_failed` audit reason is `insufficient_scope`, and each shortfall is counted in `agent_gateway_scope_denied_total` ([`OBSERVABILITY.md`](OBSERVABILITY.md#trust-plane-metrics)). |
+| Access tokens only | With `required_scopes` set, a token carrying `nonce` or `at_hash`, or whose JOSE `typ` header is present and is not `at+jwt`, `application/at+jwt` or `JWT` (case-insensitive), fails as `invalid`. A method without `required_scopes` keeps accepting such tokens. |
+| Saving | Each entry must be an RFC 6749 scope token (`%x21 / %x23-5B / %x5D-7E`) of 1 to 128 characters, with at most 32 entries and no duplicates, on the base Access Point and on every Surface Variant. Otherwise the save is refused with `400`, and a configuration file is refused at startup. |
+
+A strategy's `scope_claims` lists the claims read for granted scopes, in order: 1 to 8 names,
+each 1 to 256 printable ASCII characters without spaces, none repeated, or the save is refused
+with `400`. Microsoft Entra app-only tokens, for example, carry their permissions in `roles`.
+A save that omits the field keeps the stored list, and one that sends `["scope", "scp"]`
+stores the default as absent, so a strategy that never customises it keeps its stored record,
+and the digest a consent record binds to it, unchanged. Only Access Points read it.
+
+An ID token is signed by the same issuer as an access token, and its audience can be the
+Access Point URL: any Google service account can mint a Google ID token for an audience it
+chooses. Such a token carries no scope, so requiring a scope refuses it. An Access Point that
+trusts a Google issuer, or any issuer that mints ID tokens for arbitrary audiences, needs
+`required_scopes` or a policy on `client_id` or `subject`.
+
+A verified caller's policy input carries `scopes` and `client_id` normalised across
+providers, and the id and tenant of the strategy that verified the token; see
+[`POLICY.md`](POLICY.md#jwt-bearer-caller-input).
+
+Releases before this one ignore a method's `required_scopes` and a strategy's
+`scope_claims` on every `jwt_bearer` Access Point, and drop them when they save the record.
+After a rollback those Access Points accept tokens without the scope, ID tokens included,
+with no warning, and the metadata keeps listing the scopes as supported. Before rolling back,
+disable each Access Point that relies on `required_scopes`, or protect it with a surface
+policy those releases can evaluate: one that checks the raw `scope` or `scp` claim in
+`input.source_auth.claims`, since they publish neither `input.source_auth.scopes` nor the
+`insufficient_scope` kind. Set `required_scopes` again after upgrading.
+
+### Caller challenge
+
+An Access Point declares when it publishes protected resource metadata for the route called:
+an MCP Access Point with `caller_authentication.protected_resource`. The request path resolves
+the declaration once per request
+([`declaration.rs`](../src/source_auth/declaration.rs)), and its challenge names that
+metadata, so a client finds the authorization server from the refusal alone (RFC 6750 and
+RFC 9728):
+
+| Failure kind | Answer |
+| --- | --- |
+| `missing` | `401`, `WWW-Authenticate: Bearer resource_metadata="<metadata URL>"`, plus `scope="<required_scopes>"` when the method lists any |
+| `invalid` | `401`, the same challenge with `error="invalid_token"` after `resource_metadata` |
+| `insufficient_scope` | `403`, the same challenge with `error="insufficient_scope"` after `resource_metadata` |
+
+An MCP Access Point sends it at the source authentication stage, before policy. On the
+receiving gateway of a Fabric route the challenge names `realm="agent-gateway"` instead of
+`resource_metadata`; see
+[`MCP_METADATA.md`](MCP_METADATA.md#authorization-server-discovery-for-caller-authentication).
+A server-side error is never challenged: it answers `500`, or `503` when the Access Point can
+no longer serve its setting.
+
+Every policy stage that refuses a caller answers through one mapping
+([`challenge.rs`](../src/source_auth/challenge.rs),
+[`caller_denial.rs`](../src/proxy/caller_denial.rs)): a caller whose source authentication
+failed, on a declaring Access Point, gets the challenge above, and every other refused caller
+gets the stage's `403` with no challenge. Each challenge the gateway builds carries the
+`GatewayChallenge` marker
+([`protected_resource.rs`](../src/protocols/protected_resource.rs)), so the filter below keeps
+it.
+
+### Relayed challenges
+
+When the Access Point declares, or the Target is a `fabric://` route, every
+`WWW-Authenticate` challenge in the Target's response except `Payment` is removed before the
+caller sees it ([`strip_relayed_challenges`](../src/source_auth/challenge.rs)). The gateway is
+then the resource server, or the Target is another gateway answering the sending gateway's
+credential, so `Bearer`, `DPoP`, `Basic` and the rest name an authorization the caller cannot
+use through the gateway.
+
+| Target response | Caller gets |
+| --- | --- |
+| A challenge the gateway built itself | Unchanged |
+| A header value listing several challenges | Only its `Payment` challenges |
+| A `401` left with no challenge | `502` with the detail `The target refused the gateway's authorization`: the Target refused the gateway's own credential, which the caller cannot fix, and a `401` without a challenge would send an OAuth or MCP client back to its own authorization server |
+| Any other status | The same status, without the dropped challenges |
+| A `401` that carried no challenge at all | Unchanged |
+
+Each response that loses a challenge logs a warning naming the surface, the status, the
+dropped schemes and whether it became `502`. Over the Fabric, the receiving gateway's own `401`
+or `403` reaches the sending gateway as a relayed challenge, so the caller gets `502` or a
+`403` without it. Every other Access Point passes the Target's challenges and status through
+unchanged, including one whose `jwt_bearer` method forwards the caller's own token.
 
 ### mTLS
 

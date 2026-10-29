@@ -3680,10 +3680,9 @@ pub async fn run_axum_proxy(
             crate::config::group_outbound_vcs_by_port(&all_surfaces, &outbound_ports, map_outbound_address_to_port)
         };
 
-        // Fail fast on configuration errors that would shadow dashboard SPA
-        // routes — admin must rename the offending prefix and restart.
-        // Running with these silently would replace dashboard pages with
-        // proxy 404s, which is much worse than refusing to start.
+        // Fail fast on prefixes that would shadow dashboard SPA routes or the
+        // protected resource metadata routes every listener mounts; the admin
+        // must rename the offending prefix and restart.
         {
             let mut all_prefixes: Vec<&str> = network_config
                 .channels
@@ -3695,11 +3694,12 @@ pub async fn run_axum_proxy(
                     all_prefixes.push(route_cfg.prefix.as_str());
                 }
             }
-            let collisions = crate::proxy::paths::check_spa_route_collisions(all_prefixes);
+            let mut collisions = crate::proxy::paths::check_spa_route_collisions(all_prefixes);
+            collisions.extend(crate::proxy::paths::check_metadata_path_collisions(network_config.route_prefixes()));
             if !collisions.is_empty() {
                 let detail = collisions
                     .iter()
-                    .map(|(p, spa)| format!("    - prefix '{}' shadows SPA route '{}'", p, spa))
+                    .map(|(p, reserved)| format!("    - prefix '{}' collides with reserved route '{}'", p, reserved))
                     .collect::<Vec<_>>()
                     .join("\n");
                 let banner = format!(
@@ -3707,9 +3707,9 @@ pub async fn run_axum_proxy(
                      ============================================================\n\
                      FATAL: Gateway configuration error\n\
                      ============================================================\n\
-                     One or more channel/proxy prefixes collide with reserved\n\
-                     dashboard SPA routes. Starting in this state would replace\n\
-                     dashboard pages with proxy 404s, so the server is exiting.\n\n\
+                     One or more prefixes collide with reserved routes: dashboard\n\
+                     SPA pages, or the protected resource metadata path every\n\
+                     listener serves. The server is exiting.\n\n\
                      Collisions:\n{}\n\n\
                      Fix: rename each offending prefix (e.g. '/svc/<name>') in\n\
                      your gateway.json and restart.\n\
@@ -3862,6 +3862,7 @@ pub async fn run_axum_proxy(
                     }
                 }
             }
+            channels.retain(crate::proxy::paths::surface_route_is_mountable);
 
             let port_task_id = format!("port-{}-{}", port, uuid::Uuid::new_v4());
             let tls_acceptor = tls_acceptor.clone();

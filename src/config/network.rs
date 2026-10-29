@@ -248,6 +248,28 @@ impl NetworkConfig {
             .collect()
     }
 
+    /// Every prefix a listener mounts: channels, every route whatever its type, and MCP
+    /// proxies.
+    pub fn route_prefixes(&self) -> Vec<&str> {
+        let channels = self
+            .channels
+            .iter()
+            .map(|channel| channel.prefix.as_str());
+        let routes = self
+            .routes
+            .values()
+            .map(|route| route.prefix.as_str());
+        let mcp_proxies = self
+            .mcp_proxies
+            .iter()
+            .flatten()
+            .map(|proxy| proxy.prefix.as_str());
+        channels
+            .chain(routes)
+            .chain(mcp_proxies)
+            .collect()
+    }
+
     /// Get external URLs from inbound listeners only
     pub fn get_inbound_external_urls(&self) -> Vec<String> {
         self.listeners
@@ -722,5 +744,45 @@ mod url_mapping_tests {
         .expect("network config without mcp_proxies should deserialize");
 
         assert!(cfg.mcp_proxies.is_none());
+    }
+
+    #[test]
+    fn route_prefixes_cover_channels_every_route_type_and_mcp_proxies() {
+        let cfg: NetworkConfig = serde_json::from_value(serde_json::json!({
+            "did": { "domain": "test.local" },
+            "webauthn": { "rp_id": "localhost", "external_origin": "https://localhost" },
+            "integration": { "types": [], "categories": [] },
+            "listeners": [],
+            "channels": [{ "id": "ch", "name": "ch", "prefix": "/channel" }],
+            "routes": {
+                "proxy": { "type": "proxy", "prefix": "/proxy" },
+                "identity": { "type": "identity_api", "prefix": "/api" },
+                "docs": { "type": "redirect", "prefix": "/docs", "target": "https://docs.example" },
+                "assets": { "type": "static", "prefix": "/assets", "path": "./www" }
+            },
+            "mcp_proxies": [{ "id": "mcp", "name": "mcp", "prefix": "/.well-known/oauth-protected-resource/mcp" }],
+        }))
+        .expect("network config");
+
+        let mut prefixes = cfg.route_prefixes();
+        prefixes.sort_unstable();
+        assert_eq!(
+            prefixes,
+            ["/.well-known/oauth-protected-resource/mcp", "/api", "/assets", "/channel", "/docs", "/proxy"]
+        );
+
+        let empty: NetworkConfig = serde_json::from_value(serde_json::json!({
+            "did": { "domain": "test.local" },
+            "webauthn": { "rp_id": "localhost", "external_origin": "https://localhost" },
+            "integration": { "types": [], "categories": [] },
+            "listeners": [],
+            "routes": {},
+        }))
+        .expect("network config");
+        assert!(
+            empty
+                .route_prefixes()
+                .is_empty()
+        );
     }
 }

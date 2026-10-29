@@ -45,6 +45,8 @@ pub mod prom {
     pub const JWKS_FETCH_TOTAL: &str = "agent_gateway_jwks_fetch_total";
     // Authorization server metadata discovery attempts.
     pub const DISCOVERY_TOTAL: &str = "agent_gateway_discovery_total";
+    // Requests whose caller token lacked a required scope, whether refused or left to surface policy.
+    pub const SCOPE_DENIED_TOTAL: &str = "agent_gateway_scope_denied_total";
 
     // AWS KMS per-value envelope operations (GenerateDataKey / Decrypt)
     pub const KMS_OPERATION_TOTAL: &str = "agent_gateway_kms_operation_total";

@@ -14,6 +14,10 @@
 //! cannot claim a URI it does not serve, so one tenant cannot block another's
 //! clients by declaring its resource. Saving a surface or MCP Proxy refuses a
 //! declaration it does not serve, or one another endpoint already serves.
+//!
+//! Protected resource metadata paths are checked apart from these claims, so
+//! they never change who may mint for a resource: a declaring MCP Proxy and a
+//! surface's Access Point may not share a path.
 
 use std::sync::Arc;
 
@@ -53,6 +57,10 @@ pub enum ResourceDeclarationError {
     NotServed(String),
     /// Another stored endpoint already serves the resource.
     AlreadyServed(String),
+    /// A declaring MCP Proxy's path holds the Surface Variant separator.
+    PathHoldsVariantSeparator(String),
+    /// A surface and a declaring MCP Proxy would publish metadata at one path.
+    MetadataPathInUse(String),
     Unavailable,
 }
 
@@ -70,6 +78,16 @@ impl std::fmt::Display for ResourceDeclarationError {
             Self::AlreadyServed(resource) => {
                 write!(f, "MCP resource '{resource}' is already served by another endpoint")
             }
+            Self::PathHoldsVariantSeparator(path) => write!(
+                f,
+                "MCP Proxy path '{path}' must not contain '$' or '%24' while it declares \
+                 mcp_http.authorization, because '$' separates a Surface Variant alias"
+            ),
+            Self::MetadataPathInUse(path) => write!(
+                f,
+                "path '{path}' is already used by another endpoint, so protected resource metadata could not be \
+                 published for both"
+            ),
             Self::Unavailable => write!(f, "MCP resource ownership is unavailable"),
         }
     }
@@ -163,6 +181,88 @@ impl ApplianceResourceOwners {
         }
         Ok(())
     }
+
+    /// Refuses a declaring MCP Proxy at a path holding `$` or `%24`, or at the route
+    /// or a Surface Variant path of any stored surface, enabled or not. Every
+    /// listener serves metadata for every MCP Proxy, so a shared path would leave
+    /// the surface's metadata unavailable or let the proxy answer for its variant.
+    pub async fn ensure_proxy_metadata_path_free(
+        &self,
+        proxy: &crate::mcp_proxies::types::McpProxy,
+    ) -> Result<(), ResourceDeclarationError> {
+        let Some(path) = proxy_metadata_path(proxy) else {
+            return Ok(());
+        };
+        if crate::proxy::paths::route_holds_variant_separator(&path) {
+            return Err(ResourceDeclarationError::PathHoldsVariantSeparator(path));
+        }
+        let Some(surfaces) = self.surfaces.as_ref() else {
+            return Ok(());
+        };
+        let surfaces = surfaces
+            .list_all()
+            .await
+            .map_err(endpoints_unavailable)?;
+        if surfaces
+            .iter()
+            .any(|surface| surface_metadata_paths(surface).any(|used| used == path))
+        {
+            return Err(ResourceDeclarationError::MetadataPathInUse(path));
+        }
+        Ok(())
+    }
+
+    /// Refuses a surface whose route or Surface Variant path a stored declaring MCP
+    /// Proxy, enabled or not, already uses.
+    pub async fn ensure_surface_metadata_paths_free(
+        &self,
+        surface: &crate::config::agent_surface::AgentSurface,
+    ) -> Result<(), ResourceDeclarationError> {
+        let Some(proxies) = self.proxies.as_ref() else {
+            return Ok(());
+        };
+        let used = proxies
+            .list_all()
+            .await
+            .map_err(endpoints_unavailable)?
+            .iter()
+            .filter_map(proxy_metadata_path)
+            .collect::<std::collections::HashSet<_>>();
+        match surface_metadata_paths(surface).find(|path| used.contains(path)) {
+            Some(path) => Err(ResourceDeclarationError::MetadataPathInUse(path)),
+            None => Ok(()),
+        }
+    }
+}
+
+fn endpoints_unavailable(error: anyhow::Error) -> ResourceDeclarationError {
+    tracing::error!(%error, "Failed to read endpoints while checking protected resource metadata paths");
+    ResourceDeclarationError::Unavailable
+}
+
+/// The path an MCP Proxy publishes protected resource metadata at, when it declares
+/// `mcp_http.authorization`.
+fn proxy_metadata_path(proxy: &crate::mcp_proxies::types::McpProxy) -> Option<String> {
+    proxy
+        .mcp_http
+        .as_ref()?
+        .authorization
+        .as_ref()
+        .map(|_| proxy.full_path())
+}
+
+/// The paths a surface's Access Point may publish protected resource metadata at: its
+/// route and `<route>$alias` for every Surface Variant, enabled or not.
+fn surface_metadata_paths(surface: &crate::config::agent_surface::AgentSurface) -> impl Iterator<Item = String> + '_ {
+    use crate::protocols::protected_resource::access_point_path;
+    std::iter::once(None)
+        .chain(
+            surface
+                .variants
+                .iter()
+                .map(|variant| Some(variant.alias.as_str())),
+        )
+        .filter_map(|alias| access_point_path(surface, alias))
 }
 
 #[async_trait]
@@ -471,6 +571,231 @@ pub(crate) mod tests {
                 .ensure_endpoint_may_declare(&endpoint(&resaved), &declarations(&resaved))
                 .await,
             Ok(())
+        );
+    }
+
+    pub(crate) struct Proxies(pub(crate) Vec<crate::mcp_proxies::types::McpProxy>);
+
+    #[async_trait]
+    impl crate::mcp_proxies::McpProxyStore for Proxies {
+        async fn create(
+            &self,
+            _proxy: &crate::mcp_proxies::types::McpProxy,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn get(
+            &self,
+            _id: &str,
+        ) -> anyhow::Result<Option<crate::mcp_proxies::types::McpProxy>> {
+            Ok(None)
+        }
+
+        async fn list_all(&self) -> anyhow::Result<Vec<crate::mcp_proxies::types::McpProxy>> {
+            Ok(self.0.clone())
+        }
+
+        async fn delete(
+            &self,
+            _id: &str,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn update(
+            &self,
+            _proxy: &crate::mcp_proxies::types::McpProxy,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct UnreadableStores;
+
+    #[async_trait]
+    impl crate::surfaces::AgentSurfaceStore for UnreadableStores {
+        async fn save(
+            &self,
+            _surface: &crate::config::agent_surface::AgentSurface,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn get(
+            &self,
+            _surface_id: &str,
+        ) -> anyhow::Result<Option<crate::config::agent_surface::AgentSurface>> {
+            Ok(None)
+        }
+
+        async fn list_all(&self) -> anyhow::Result<Vec<crate::config::agent_surface::AgentSurface>> {
+            anyhow::bail!("store unavailable")
+        }
+
+        async fn delete(
+            &self,
+            _surface_id: &str,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl crate::mcp_proxies::McpProxyStore for UnreadableStores {
+        async fn create(
+            &self,
+            _proxy: &crate::mcp_proxies::types::McpProxy,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn get(
+            &self,
+            _id: &str,
+        ) -> anyhow::Result<Option<crate::mcp_proxies::types::McpProxy>> {
+            Ok(None)
+        }
+
+        async fn list_all(&self) -> anyhow::Result<Vec<crate::mcp_proxies::types::McpProxy>> {
+            anyhow::bail!("store unavailable")
+        }
+
+        async fn delete(
+            &self,
+            _id: &str,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn update(
+            &self,
+            _proxy: &crate::mcp_proxies::types::McpProxy,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn declaring_proxy(path: &str) -> crate::mcp_proxies::types::McpProxy {
+        let mut proxy = plain_proxy(path);
+        proxy.mcp_http = Some(
+            serde_json::from_value(serde_json::json!({
+                "authorization": {"resource": format!("https://gw.example{path}"), "scopes": []}
+            }))
+            .expect("test mcp_http must deserialize"),
+        );
+        proxy
+    }
+
+    fn plain_proxy(path: &str) -> crate::mcp_proxies::types::McpProxy {
+        crate::mcp_proxies::types::McpProxy::new(
+            "proxy".into(),
+            String::new(),
+            "https://api.example".into(),
+            String::new(),
+            String::new(),
+            path.into(),
+        )
+    }
+
+    pub(crate) fn with_variants(
+        mut surface: crate::config::agent_surface::AgentSurface
+    ) -> crate::config::agent_surface::AgentSurface {
+        surface.variants = serde_json::from_value(serde_json::json!([
+            { "id": "v-dev", "alias": "dev", "name": "dev", "enabled": true, "overrides": {} },
+            { "id": "v-off", "alias": "off", "name": "off", "enabled": false, "overrides": {} }
+        ]))
+        .expect("test variants must deserialize");
+        surface
+    }
+
+    fn metadata_owners(
+        surfaces: Vec<crate::config::agent_surface::AgentSurface>,
+        proxies: Vec<crate::mcp_proxies::types::McpProxy>,
+    ) -> ApplianceResourceOwners {
+        ApplianceResourceOwners::new(Some(Arc::new(Surfaces(surfaces))), Some(Arc::new(Proxies(proxies))), network())
+    }
+
+    #[tokio::test]
+    async fn a_declaring_proxy_cannot_publish_metadata_at_a_surface_path() {
+        let owners = metadata_owners(
+            vec![with_variants(surface(Some("tenant-a"), "disabled", "/smoke", "https://gw.example/smoke"))],
+            vec![],
+        );
+        for (proxy, expected) in [
+            (declaring_proxy("/smoke"), Err(ResourceDeclarationError::MetadataPathInUse("/smoke".into()))),
+            (
+                declaring_proxy("/smoke$dev"),
+                Err(ResourceDeclarationError::PathHoldsVariantSeparator("/smoke$dev".into())),
+            ),
+            (
+                declaring_proxy("/smoke%24off"),
+                Err(ResourceDeclarationError::PathHoldsVariantSeparator("/smoke%24off".into())),
+            ),
+            (declaring_proxy("/other"), Ok(())),
+            (plain_proxy("/smoke"), Ok(())),
+            (plain_proxy("/smoke$dev"), Ok(())),
+        ] {
+            let path = proxy.full_path();
+            assert_eq!(
+                owners
+                    .ensure_proxy_metadata_path_free(&proxy)
+                    .await,
+                expected,
+                "{path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_surface_cannot_take_a_path_a_declaring_proxy_publishes_metadata_at() {
+        let owners = metadata_owners(
+            vec![],
+            vec![declaring_proxy("/smoke"), declaring_proxy("/base$off"), plain_proxy("/plain")],
+        );
+        let route = |route: &str| surface(Some("tenant-a"), "active", route, &format!("https://gw.example{route}"));
+        for (surface, expected) in [
+            (route("/smoke"), Err(ResourceDeclarationError::MetadataPathInUse("/smoke".into()))),
+            (with_variants(route("/base")), Err(ResourceDeclarationError::MetadataPathInUse("/base$off".into()))),
+            (route("/base"), Ok(())),
+            (route("/plain"), Ok(())),
+        ] {
+            let path = surface
+                .access_point
+                .route
+                .clone();
+            assert_eq!(
+                owners
+                    .ensure_surface_metadata_paths_free(&surface)
+                    .await,
+                expected,
+                "{path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unreadable_stores_fail_metadata_path_checks_closed() {
+        let owners =
+            ApplianceResourceOwners::new(Some(Arc::new(UnreadableStores)), Some(Arc::new(UnreadableStores)), network());
+        assert_eq!(
+            owners
+                .ensure_proxy_metadata_path_free(&declaring_proxy("/smoke"))
+                .await,
+            Err(ResourceDeclarationError::Unavailable)
+        );
+        assert_eq!(
+            owners
+                .ensure_surface_metadata_paths_free(&surface(None, "active", "/smoke", "https://gw.example/smoke"))
+                .await,
+            Err(ResourceDeclarationError::Unavailable)
+        );
+        assert_eq!(
+            owners
+                .ensure_proxy_metadata_path_free(&plain_proxy("/smoke"))
+                .await,
+            Ok(()),
+            "a proxy that declares nothing publishes no metadata"
         );
     }
 }

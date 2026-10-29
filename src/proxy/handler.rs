@@ -1204,12 +1204,11 @@ fn evaluate_ap2_inbound_decision(
 
 async fn resolve_direct_surface_auth_config(
     auth_config: &crate::source_auth::SourceAuthConfig,
-    protected_resource: Option<&crate::protocols::protected_resource::ProtectedResourceConfig>,
+    declaration: Option<&crate::source_auth::declaration::Declaration>,
     vc_issuer: Option<&crate::identity::VCIssuer>,
     surface_id: &str,
 ) -> crate::source_auth::errors::SourceAuthResult<crate::source_auth::SourceAuthConfig> {
-    crate::source_auth::middleware::resolve_surface_audience(auth_config, protected_resource, vc_issuer, surface_id)
-        .await
+    crate::source_auth::middleware::resolve_surface_audience(auth_config, declaration, vc_issuer, surface_id).await
 }
 
 /// Maps the config-level delegated-rail marker onto the audit `PaymentRail`.
@@ -1796,17 +1795,12 @@ pub(crate) async fn proxy_handler_with_mcp_runtime(
             .get::<crate::source_auth::client_ip::ClientIp>()
             .map_or(addr.ip(), |client| client.0),
     );
-    let protected_resource = match crate::protocols::protected_resource::access_point_protected_resource(
-        &state.surface,
-        state
-            .active_variant_alias
-            .as_deref(),
-        &state.network_config,
-    )
-    .transpose()
-    {
-        Ok(protected_resource) => protected_resource,
-        Err(e) => {
+    let access_point_declaration = state
+        .access_point_declaration
+        .clone();
+    let declaration = match access_point_declaration.as_deref() {
+        Some(crate::source_auth::declaration::DeclarationOutcome::Declare(declaration)) => Some(declaration),
+        Some(crate::source_auth::declaration::DeclarationOutcome::Unservable(e)) => {
             channel_warn!(config_id, "Invalid MCP protected resource (reason={}) — blocking", e);
             crate::audit::request_events::auth_failed(
                 &audit_facts,
@@ -1820,6 +1814,7 @@ pub(crate) async fn proxy_handler_with_mcp_runtime(
                 .await;
             return Err(create_error_response(StatusCode::SERVICE_UNAVAILABLE, "Invalid MCP protected resource"));
         }
+        _ => None,
     };
     let authenticated_identity: Option<crate::source_auth::AuthenticatedIdentity> = if let Some(authorization) =
         &resource_authorization
@@ -1925,7 +1920,7 @@ pub(crate) async fn proxy_handler_with_mcp_runtime(
         };
         let resolved_auth_config = match resolve_direct_surface_auth_config(
             auth_config,
-            protected_resource.as_ref(),
+            declaration,
             state.vc_issuer.as_deref(),
             &state.surface.surface_id,
         )
@@ -1970,7 +1965,7 @@ pub(crate) async fn proxy_handler_with_mcp_runtime(
             // retry. Otherwise record the outcome for the policy layer and
             // continue with no asserted caller identity — do not block here.
             Err(e) if e.is_caller_attributable() => {
-                let challenged = protected_resource.is_some();
+                let challenged = declaration.is_some();
                 channel_warn!(
                     config_id,
                     "Source authentication failed (reason={}) — {}",
@@ -1988,18 +1983,14 @@ pub(crate) async fn proxy_handler_with_mcp_runtime(
                     challenged,
                     client_ip,
                 );
-                if let Some(protected_resource) = &protected_resource {
+                if let Some(declaration) = declaration {
                     connection_guard
                         .decrement()
                         .await;
-                    return Ok(protected_resource.caller_challenge(&e));
+                    return Ok(declaration.caller_challenge(&e));
                 }
-                source_auth_failure = Some(crate::surface_context::SourceAuthContext::Failed {
-                    attempted_method: resolved_auth_config
-                        .method_tag()
-                        .to_string(),
-                    reason: e.to_string(),
-                });
+                source_auth_failure =
+                    crate::surface_context::SourceAuthContext::failed(resolved_auth_config.method_tag(), &e);
                 None
             }
             // Server-side failure (config not found, internal) — keep
@@ -2785,7 +2776,11 @@ pub(crate) async fn proxy_handler_with_mcp_runtime(
             connection_guard
                 .decrement()
                 .await;
-            return Err(create_error_response(StatusCode::FORBIDDEN, "Request blocked by appliance-wide policy"));
+            return Err(crate::proxy::caller_denial::deny_caller(
+                &state,
+                crate::source_auth::challenge::CallerDenial::AppliancePolicy,
+                source_auth_context.as_ref(),
+            ));
         }
     }
 
@@ -2874,7 +2869,11 @@ pub(crate) async fn proxy_handler_with_mcp_runtime(
                 connection_guard
                     .decrement()
                     .await;
-                return Err(create_error_response(StatusCode::FORBIDDEN, "Request blocked by gateway policy"));
+                return Err(crate::proxy::caller_denial::deny_caller(
+                    &state,
+                    crate::source_auth::challenge::CallerDenial::GatewayPolicy,
+                    source_auth_context.as_ref(),
+                ));
             }
             Err(e) => {
                 channel_warn!(config_id, "Gateway policy evaluation error (denying request): {}", e);
@@ -2898,7 +2897,11 @@ pub(crate) async fn proxy_handler_with_mcp_runtime(
                 connection_guard
                     .decrement()
                     .await;
-                return Err(create_error_response(StatusCode::FORBIDDEN, "Request blocked by gateway policy"));
+                return Err(crate::proxy::caller_denial::deny_caller(
+                    &state,
+                    crate::source_auth::challenge::CallerDenial::GatewayPolicy,
+                    source_auth_context.as_ref(),
+                ));
             }
         }
     }
@@ -5456,13 +5459,11 @@ pub(crate) async fn proxy_handler_with_mcp_runtime(
             connection_guard
                 .decrement()
                 .await;
-            return Err(axum::response::Response::builder()
-                .status(axum::http::StatusCode::FORBIDDEN)
-                .header("Content-Type", "application/json")
-                .body(axum::body::Body::from(
-                    r#"{"error":"Forbidden","message":"Agent trust policy denied the request"}"#,
-                ))
-                .unwrap());
+            return Err(crate::proxy::caller_denial::deny_caller(
+                &state,
+                crate::source_auth::challenge::CallerDenial::SurfacePolicy,
+                source_auth_context.as_ref(),
+            ));
         };
         let (inbound_policy_name, inbound_policy_version, inbound_policy_hash) = policy_manager
             .resolve_policy_decision_evidence(inbound_policy_def_id)
@@ -5521,13 +5522,11 @@ pub(crate) async fn proxy_handler_with_mcp_runtime(
                         decision.reason.as_deref(),
                     ));
                 }
-                return Err(axum::response::Response::builder()
-                    .status(axum::http::StatusCode::FORBIDDEN)
-                    .header("Content-Type", "application/json")
-                    .body(axum::body::Body::from(
-                        r#"{"error":"Forbidden","message":"Agent trust policy denied the request"}"#,
-                    ))
-                    .unwrap());
+                return Err(crate::proxy::caller_denial::deny_caller(
+                    &state,
+                    crate::source_auth::challenge::CallerDenial::SurfacePolicy,
+                    source_auth_context.as_ref(),
+                ));
             }
             Err(e) => {
                 channel_warn!(
@@ -5561,13 +5560,11 @@ pub(crate) async fn proxy_handler_with_mcp_runtime(
                         Some("policy evaluation error"),
                     ));
                 }
-                return Err(axum::response::Response::builder()
-                    .status(axum::http::StatusCode::FORBIDDEN)
-                    .header("Content-Type", "application/json")
-                    .body(axum::body::Body::from(
-                        r#"{"error":"Forbidden","message":"Agent trust policy denied the request"}"#,
-                    ))
-                    .unwrap());
+                return Err(crate::proxy::caller_denial::deny_caller(
+                    &state,
+                    crate::source_auth::challenge::CallerDenial::SurfacePolicy,
+                    source_auth_context.as_ref(),
+                ));
             }
         }
     }
@@ -5630,7 +5627,11 @@ pub(crate) async fn proxy_handler_with_mcp_runtime(
             if crate::mcp::is_tools_call_request(&body_bytes) {
                 return Err(crate::mcp::build_tools_call_policy_denied_response(&body_bytes, gd.reason.as_deref()));
             }
-            return Err(create_error_response(StatusCode::FORBIDDEN, "Request blocked by appliance-wide policy"));
+            return Err(crate::proxy::caller_denial::deny_caller(
+                &state,
+                crate::source_auth::challenge::CallerDenial::AppliancePolicy,
+                source_auth_context.as_ref(),
+            ));
         }
     }
 
@@ -5714,13 +5715,11 @@ pub(crate) async fn proxy_handler_with_mcp_runtime(
                     Some("no policy is loaded for this channel"),
                 ));
             }
-            return Err(axum::response::Response::builder()
-                .status(axum::http::StatusCode::FORBIDDEN)
-                .header("Content-Type", "application/json")
-                .body(axum::body::Body::from(
-                    r#"{"error":"Forbidden","message":"OPA policy enforcement is enabled but no policy is loaded for this channel"}"#,
-                ))
-                .unwrap());
+            return Err(crate::proxy::caller_denial::deny_caller(
+                &state,
+                crate::source_auth::challenge::CallerDenial::SurfacePolicyUnloaded,
+                source_auth_context.as_ref(),
+            ));
         };
         let channel_opa_def_id = state
             .surface
@@ -5782,13 +5781,11 @@ pub(crate) async fn proxy_handler_with_mcp_runtime(
                         decision.reason.as_deref(),
                     ));
                 }
-                return Err(axum::response::Response::builder()
-                    .status(axum::http::StatusCode::FORBIDDEN)
-                    .header("Content-Type", "application/json")
-                    .body(axum::body::Body::from(
-                        r#"{"error":"Forbidden","message":"Agent trust policy denied the request"}"#,
-                    ))
-                    .unwrap());
+                return Err(crate::proxy::caller_denial::deny_caller(
+                    &state,
+                    crate::source_auth::challenge::CallerDenial::SurfacePolicy,
+                    source_auth_context.as_ref(),
+                ));
             }
             Err(e) => {
                 channel_warn!(config_id_str, "Surface-level OPA policy evaluation error (denying request): {}", e);
@@ -5818,13 +5815,11 @@ pub(crate) async fn proxy_handler_with_mcp_runtime(
                         Some("policy evaluation error"),
                     ));
                 }
-                return Err(axum::response::Response::builder()
-                    .status(axum::http::StatusCode::FORBIDDEN)
-                    .header("Content-Type", "application/json")
-                    .body(axum::body::Body::from(
-                        r#"{"error":"Forbidden","message":"Agent trust policy denied the request"}"#,
-                    ))
-                    .unwrap());
+                return Err(crate::proxy::caller_denial::deny_caller(
+                    &state,
+                    crate::source_auth::challenge::CallerDenial::SurfacePolicy,
+                    source_auth_context.as_ref(),
+                ));
             }
         }
     }
@@ -6453,25 +6448,19 @@ pub(crate) async fn proxy_handler_with_mcp_runtime(
                 surface = %channel_name,
                 "Credential delegation requires source authentication — rejecting anonymous request"
             );
+            let refusal = crate::proxy::caller_denial::deny_caller(
+                &state,
+                crate::source_auth::challenge::CallerDenial::IdentityRequired,
+                source_auth_context.as_ref(),
+            );
             crate::audit::request_events::request_rejected(
                 &audit_facts,
                 crate::audit::request_events::RejectionStage::Admission,
                 crate::audit::request_events::RejectionReason::ConsentIdentityRequired,
-                403,
+                refusal.status().as_u16(),
                 None,
             );
-            let body = serde_json::json!({
-                "type": "https://affinidi.com/atg/errors/identity-required",
-                "title": "Identity Required for Credential Delegation",
-                "status": 403,
-                "detail": "This channel requires credential delegation which needs authenticated source identity. \
-                           Configure source authentication and agent identity management on this channel.",
-            });
-            return Ok(Response::builder()
-                .status(StatusCode::FORBIDDEN)
-                .header("content-type", "application/problem+json")
-                .body(Body::from(serde_json::to_string(&body).unwrap()))
-                .unwrap());
+            return Ok(refusal);
         }
 
         if let (Some(user_hash), Some(vault_store), Some(provider_store), Some(secrets_store), Some(base_url)) = (
@@ -9695,6 +9684,14 @@ async fn multi_channel_proxy_handler_in_request_scope(
                 )
             };
 
+            let access_point_declaration = crate::source_auth::declaration::resolve_surface_declaration(
+                &resolved_surface,
+                virtual_channel_alias.as_deref(),
+                &state.network_config,
+            );
+            let declares =
+                matches!(access_point_declaration, crate::source_auth::declaration::DeclarationOutcome::Declare(_));
+
             // Create single-channel ProxyState for this request with effective channel and variant engines
             let proxy_state = ProxyState {
                 config: state.config.clone(),
@@ -9761,6 +9758,7 @@ async fn multi_channel_proxy_handler_in_request_scope(
                 active_variant_alias: virtual_channel_alias.clone(),
                 active_variant_id: variant_id,
                 variant_resolution_error,
+                access_point_declaration: Some(Arc::new(access_point_declaration)),
                 surface: resolved_surface,
             };
 
@@ -9808,11 +9806,32 @@ async fn multi_channel_proxy_handler_in_request_scope(
             let policy_collector = std::sync::Arc::new(std::sync::Mutex::new(Vec::<
                 crate::observability::policy_audit::PolicyDecisionSummary,
             >::new()));
-            let result = Box::pin(crate::observability::policy_audit::POLICY_DECISION_COLLECTOR.scope(
+            let drops_upstream_challenges =
+                crate::proxy::caller_denial::drops_upstream_challenges(&proxy_state.surface, declares);
+            let mut result = Box::pin(crate::observability::policy_audit::POLICY_DECISION_COLLECTOR.scope(
                 policy_collector,
                 proxy_handler_with_mcp_runtime(addr, proxy_state, new_req, mcp_versions, mcp_continuations),
             ))
             .await;
+            if drops_upstream_challenges {
+                let (Ok(response) | Err(response)) = &mut result;
+                let relayed_status = response.status();
+                let stripped = crate::source_auth::challenge::strip_relayed_challenges(response);
+                if !stripped
+                    .dropped_schemes
+                    .is_empty()
+                {
+                    channel_warn!(
+                        channel_config_id,
+                        "Dropped relayed Target challenges (status={}, schemes={}, became_bad_gateway={})",
+                        relayed_status,
+                        stripped
+                            .dropped_schemes
+                            .join(","),
+                        stripped.became_bad_gateway
+                    );
+                }
+            }
             match result {
                 Ok(response) => {
                     channel_info!(
@@ -10959,13 +10978,11 @@ async fn handle_fabric_request(
             connection_guard
                 .decrement()
                 .await;
-            return Err(axum::response::Response::builder()
-                .status(axum::http::StatusCode::FORBIDDEN)
-                .header("Content-Type", "application/json")
-                .body(axum::body::Body::from(
-                    r#"{"error":"Forbidden","message":"Agent trust policy denied the request"}"#,
-                ))
-                .unwrap());
+            return Err(crate::proxy::caller_denial::deny_caller(
+                &state,
+                crate::source_auth::challenge::CallerDenial::SurfacePolicy,
+                source_auth_context.as_ref(),
+            ));
         };
         let (inbound_policy_name, inbound_policy_version, inbound_policy_hash) = policy_manager
             .resolve_policy_decision_evidence(inbound_policy_def_id)
@@ -11024,13 +11041,11 @@ async fn handle_fabric_request(
                         decision.reason.as_deref(),
                     ));
                 }
-                return Err(axum::response::Response::builder()
-                    .status(axum::http::StatusCode::FORBIDDEN)
-                    .header("Content-Type", "application/json")
-                    .body(axum::body::Body::from(
-                        r#"{"error":"Forbidden","message":"Agent trust policy denied the request"}"#,
-                    ))
-                    .unwrap());
+                return Err(crate::proxy::caller_denial::deny_caller(
+                    &state,
+                    crate::source_auth::challenge::CallerDenial::SurfacePolicy,
+                    source_auth_context.as_ref(),
+                ));
             }
             Err(e) => {
                 channel_warn!(
@@ -11064,13 +11079,11 @@ async fn handle_fabric_request(
                         Some("policy evaluation error"),
                     ));
                 }
-                return Err(axum::response::Response::builder()
-                    .status(axum::http::StatusCode::FORBIDDEN)
-                    .header("Content-Type", "application/json")
-                    .body(axum::body::Body::from(
-                        r#"{"error":"Forbidden","message":"Agent trust policy denied the request"}"#,
-                    ))
-                    .unwrap());
+                return Err(crate::proxy::caller_denial::deny_caller(
+                    &state,
+                    crate::source_auth::challenge::CallerDenial::SurfacePolicy,
+                    source_auth_context.as_ref(),
+                ));
             }
         }
     }
@@ -11278,13 +11291,11 @@ async fn handle_fabric_request(
                     connection_guard
                         .decrement()
                         .await;
-                    return Err(axum::response::Response::builder()
-                        .status(axum::http::StatusCode::FORBIDDEN)
-                        .header("Content-Type", "application/json")
-                        .body(axum::body::Body::from(
-                            r#"{"error":"Forbidden","message":"Agent trust policy denied the request"}"#,
-                        ))
-                        .unwrap());
+                    return Err(crate::proxy::caller_denial::deny_caller(
+                        &state,
+                        crate::source_auth::challenge::CallerDenial::SurfacePolicy,
+                        source_auth_context.as_ref(),
+                    ));
                 }
                 Err(e) => {
                     channel_warn!(config_id_str, "Surface-level OPA policy evaluation error (denying request): {}", e);
@@ -11307,13 +11318,11 @@ async fn handle_fabric_request(
                     connection_guard
                         .decrement()
                         .await;
-                    return Err(axum::response::Response::builder()
-                        .status(axum::http::StatusCode::FORBIDDEN)
-                        .header("Content-Type", "application/json")
-                        .body(axum::body::Body::from(
-                            r#"{"error":"Forbidden","message":"Agent trust policy denied the request"}"#,
-                        ))
-                        .unwrap());
+                    return Err(crate::proxy::caller_denial::deny_caller(
+                        &state,
+                        crate::source_auth::challenge::CallerDenial::SurfacePolicy,
+                        source_auth_context.as_ref(),
+                    ));
                 }
             }
         }
@@ -16559,6 +16568,7 @@ mod tests {
         resolve_direct_surface_auth_config, resolve_legacy_mcp_session, route_tail_to_uri_path,
         should_forward_ap_request_header_with_mapping,
     };
+    use crate::component_tests::helpers::direct_router_state;
     use axum::http::{HeaderMap, HeaderValue};
     use base64::Engine;
     use std::collections::HashMap;
@@ -16630,6 +16640,10 @@ allow if {
         crate::surface_context::SourceAuthContext::JwtBearer {
             subject: "alice".to_string(),
             claims: serde_json::json!({ "role": role }),
+            scopes: Vec::new(),
+            client_id: None,
+            strategy_id: None,
+            strategy_tenant_id: None,
         }
     }
 
@@ -16875,79 +16889,6 @@ allow if {
             let (content_type, vary) = agent_card_response_headers(request_headers);
             assert_eq!(content_type, "application/json");
             assert_eq!(vary, vec!["A2A-Version, Accept".to_string()]);
-        }
-    }
-
-    fn direct_router_state(
-        state: &crate::state::ProxyState,
-        surface: crate::config::agent_surface::AgentSurface,
-    ) -> crate::state::MultiSurfaceProxyState {
-        use std::sync::Arc;
-
-        crate::state::MultiSurfaceProxyState {
-            config: state.config.clone(),
-            network_config: state.network_config.clone(),
-            client: state.client.clone(),
-            channels: Arc::new(tokio::sync::RwLock::new(vec![crate::state::SurfaceInfo {
-                surface: Arc::new(surface),
-                identity_rules_engine: None,
-                identity_selector: None,
-                protected_rules_engine: None,
-                protected_selector: None,
-                external_rules_engine: None,
-                external_selector: None,
-                task_id: "router-fixture".into(),
-                variant_engines: HashMap::new(),
-            }])),
-            metrics_store: state.metrics_store.clone(),
-            task_monitor: state.task_monitor.clone(),
-            ws_state: state.ws_state.clone(),
-            listener_manager: state.listener_manager.clone(),
-            secrets_store: state.secrets_store.clone(),
-            certificates_store: state
-                .certificates_store
-                .clone(),
-            vc_issuer: state.vc_issuer.clone(),
-            policy_manager: state.policy_manager.clone(),
-            gateway_policy_manager: state
-                .gateway_policy_manager
-                .clone(),
-            didauth_session_store: state
-                .didauth_session_store
-                .clone(),
-            transaction_store: state
-                .transaction_store
-                .clone(),
-            mpp_transaction_store: state
-                .mpp_transaction_store
-                .clone(),
-            trust_registry_listener_manager: state
-                .trust_registry_listener_manager
-                .clone(),
-            source_auth_middleware: state
-                .source_auth_middleware
-                .clone(),
-            #[cfg(feature = "didwebvh")]
-            didwebvh_identity_store: state
-                .didwebvh_identity_store
-                .clone(),
-            #[cfg(feature = "didwebvh")]
-            didwebvh_log_manager: state
-                .didwebvh_log_manager
-                .clone(),
-            credential_provider_store: state
-                .credential_provider_store
-                .clone(),
-            delegation_vault_store: state
-                .delegation_vault_store
-                .clone(),
-            gateway_base_url: state.gateway_base_url.clone(),
-            transit_token_issuer: state
-                .transit_token_issuer
-                .clone(),
-            mcp_proxy_store: state.mcp_proxy_store.clone(),
-            a2a_proxy_store: state.a2a_proxy_store.clone(),
-            resolved_surface_cache: Arc::new(crate::surfaces::ResolvedSurfaceCache::new()),
         }
     }
 
@@ -19266,6 +19207,7 @@ allow if {
             active_variant_alias: None,
             active_variant_id: None,
             variant_resolution_error: None,
+            access_point_declaration: None,
             surface: Arc::new(surface),
         };
         modern_access_point_router_keeps_legacy_variant_fallback(&state).await;
@@ -19825,6 +19767,7 @@ allow if {
         let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
             subject: "user".into(),
             claims: json!({"iss": "https://gateway.example/api/oauth2/mcp", "sub": "user", "scope": "read"}),
+            strategy: None,
         };
         let binding = crate::mcp::continuations::delegation::make_binding(
             "deployment",
@@ -20985,6 +20928,15 @@ mod fabric_extended_card_tests {
         status: u16,
         body: serde_json::Value,
     ) -> FabricPeer {
+        fabric_peer_answering_with_headers(status, json!({"content-type": "application/json"}), body).await
+    }
+
+    /// [`fabric_peer_answering`] with the ForwardResponse `headers` given.
+    async fn fabric_peer_answering_with_headers(
+        status: u16,
+        headers: serde_json::Value,
+        body: serde_json::Value,
+    ) -> FabricPeer {
         let root = tempfile::tempdir().unwrap();
         let peer_did = format!("did:example:peer-{}", uuid::Uuid::new_v4());
         let peer = crate::gateways::types::Gateway::new(
@@ -21033,7 +20985,7 @@ mod fabric_extended_card_tests {
                 vec!["did:example:connection-point".into()],
                 None,
                 None,
-                json!({"status": status, "headers": {"content-type": "application/json"}, "body": reply_body}),
+                json!({"status": status, "headers": headers, "body": reply_body}),
                 crate::gateways::connection_points::messages::MessageMetadata {
                     encrypted: true,
                     authenticated: true,
@@ -21102,6 +21054,7 @@ mod fabric_extended_card_tests {
             active_variant_alias: None,
             active_variant_id: None,
             variant_resolution_error: None,
+            access_point_declaration: None,
             surface: Arc::new(surface),
         };
         FabricPeer {
@@ -21147,6 +21100,86 @@ mod fabric_extended_card_tests {
         let body =
             serde_json::from_slice(&bytes).unwrap_or_else(|_| panic!("{status}: {}", String::from_utf8_lossy(&bytes)));
         (status, body)
+    }
+
+    async fn send_through_router(peer: &FabricPeer) -> axum::response::Response {
+        let router = crate::component_tests::helpers::direct_router_state(&peer.state, (*peer.state.surface).clone());
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/a2a")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                json!({"jsonrpc": "2.0", "id": "m-1", "method": "message/send", "params": {"message": {
+                    "role": "user", "messageId": "m-1", "parts": [{"kind": "text", "text": "hi"}]
+                }}})
+                .to_string(),
+            ))
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            Box::pin(super::multi_channel_proxy_handler_with_mcp_runtime(
+                "127.0.0.1:12345"
+                    .parse()
+                    .unwrap(),
+                router,
+                request,
+                crate::mcp::request_validation::McpVersionPolicy::new(
+                    &[crate::mcp::MCP_MODERN_VERSION],
+                    &[crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION],
+                ),
+                None,
+            )),
+        )
+        .await
+        .expect("the Fabric leg answers")
+    }
+
+    #[test]
+    fn a_fabric_route_relays_only_payment_challenges_from_the_peer() {
+        run_on_large_stack(async {
+            const BEARER: &str =
+                "Bearer resource_metadata=\"https://gw2.example/.well-known/oauth-protected-resource/a\"";
+            const PAYMENT: &str = "Payment id=\"p1\", realm=\"gw2\", method=\"tempo\"";
+            let both = format!("{BEARER}, {PAYMENT}");
+            for (status, relayed, expected_status, expected_challenges) in [
+                (402, PAYMENT, 402, vec![PAYMENT]),
+                (402, both.as_str(), 402, vec![PAYMENT]),
+                (401, both.as_str(), 401, vec![PAYMENT]),
+                (401, BEARER, 502, vec![]),
+            ] {
+                let peer = fabric_peer_answering_with_headers(
+                    status,
+                    json!({"content-type": "application/json", "www-authenticate": relayed}),
+                    json!({"jsonrpc": "2.0", "id": "m-1", "error": {"code": -32000, "message": "refused"}}),
+                )
+                .await;
+
+                let response = send_through_router(&peer).await;
+
+                let challenges: Vec<String> = response
+                    .headers()
+                    .get_all(axum::http::header::WWW_AUTHENTICATE)
+                    .iter()
+                    .map(|value| {
+                        value
+                            .to_str()
+                            .unwrap()
+                            .to_string()
+                    })
+                    .collect();
+                assert_eq!(
+                    (response.status().as_u16(), challenges),
+                    (
+                        expected_status,
+                        expected_challenges
+                            .iter()
+                            .map(|c| c.to_string())
+                            .collect()
+                    ),
+                    "peer status {status} with {relayed}"
+                );
+            }
+        });
     }
 
     #[test]
@@ -21366,6 +21399,7 @@ mod fabric_extended_card_tests {
         let caller = crate::source_auth::AuthenticatedIdentity::JwtBearer {
             subject: "user-123".to_string(),
             claims: json!({"iss": "https://idp.example.com", "email": "ada@example.com"}),
+            strategy: None,
         };
 
         let (result, events) = crate::audit::producer::capture(Box::pin(super::handle_fabric_request(

@@ -2,6 +2,7 @@
 
 pub mod agent_card_cache;
 pub mod backend_identity;
+pub(crate) mod caller_denial;
 pub mod caller_identity;
 pub mod channel_logging;
 pub mod credential_delegation;

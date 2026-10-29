@@ -18,7 +18,8 @@ use crate::api_keys::ApiKeyValidator;
 use crate::certificates::CertificateStore;
 use crate::didauth::sessions::DidAuthSessionStore;
 use crate::jwt_bearer::{
-    JwksClient, JwtBearerVerifier, JwtVerificationStrategyStorage, errors::JwtBearerError, models::JwtBearerAuthConfig,
+    JwksClient, JwtBearerVerifier, JwtVerificationStrategyStorage, access_token, errors::JwtBearerError,
+    models::JwtBearerAuthConfig,
 };
 use crate::secrets::SecretsStore;
 use crate::source_auth::errors::{SourceAuthError, SourceAuthResult};
@@ -29,16 +30,21 @@ pub const SURFACE_AGENT_DID_AUDIENCE: &str = "{{ surface.agent_did }}";
 
 /// The audiences a surface's caller authentication accepts on the route
 /// called. The direct path and Fabric receive both resolve them here, so the
-/// protected resource the route publishes, if any, is the only audience either
+/// resource a declaring route publishes, if any, is the only audience either
 /// path accepts.
 pub async fn resolve_surface_audience(
     config: &SourceAuthConfig,
-    protected_resource: Option<&crate::protocols::protected_resource::ProtectedResourceConfig>,
+    declaration: Option<&crate::source_auth::declaration::Declaration>,
     vc_issuer: Option<&crate::identity::VCIssuer>,
     surface_id: &str,
 ) -> SourceAuthResult<SourceAuthConfig> {
-    if let Some(protected_resource) = protected_resource {
-        return Ok(protected_resource.bind_audience(config.clone()));
+    if let Some(declaration) = declaration {
+        return Ok(match config {
+            SourceAuthConfig::JwtBearer(jwt_config) => {
+                SourceAuthConfig::JwtBearer(declaration.bind_audience(jwt_config))
+            }
+            other => other.clone(),
+        });
     }
     let SourceAuthConfig::JwtBearer(jwt_config) = config else {
         return Ok(config.clone());
@@ -94,6 +100,34 @@ fn select_surface_agent_did(
         })
         .max_by_key(|record| record.last_used_at)
         .map(|record| record.did)
+}
+
+/// Refuse a verified token that does not grant every `required_scopes` entry.
+///
+/// An Access Point that requires scopes expects access tokens, so a token shaped as
+/// an ID token fails as invalid before its scopes are read.
+fn check_required_scopes(
+    config: &JwtBearerAuthConfig,
+    token: &str,
+    claims: &serde_json::Value,
+    scope_claims: &[String],
+) -> SourceAuthResult<()> {
+    if config
+        .required_scopes
+        .is_empty()
+    {
+        return Ok(());
+    }
+    access_token::check_access_token_shape(token, claims)?;
+    let granted = access_token::granted_scopes(claims, scope_claims);
+    let missing: Vec<String> = access_token::missing_scopes(&granted, &config.required_scopes)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(SourceAuthError::InsufficientScope { missing })
 }
 
 /// Per-cert cache entry: PEM-decoded DER bytes + SHA-256 fingerprint,
@@ -249,6 +283,10 @@ impl SourceAuthMiddleware {
             .await
             .map_err(SourceAuthError::from)?;
 
+        // 4. Access Point rules, kept out of `validate`, which other flows share
+        let scope_claims = jwt_strategy.effective_scope_claims();
+        check_required_scopes(config, token, &claims, &scope_claims)?;
+
         let subject = claims
             .get("sub")
             .and_then(|v| v.as_str())
@@ -261,7 +299,15 @@ impl SourceAuthMiddleware {
             "JWT Bearer source authentication succeeded"
         );
 
-        Ok(AuthenticatedIdentity::JwtBearer { subject, claims })
+        Ok(AuthenticatedIdentity::JwtBearer {
+            subject,
+            claims,
+            strategy: Some(crate::source_auth::models::VerifyingStrategy {
+                id: jwt_strategy.id,
+                tenant_id: jwt_strategy.tenant_id,
+                scope_claims,
+            }),
+        })
     }
 
     // ── API Key (SecretsStore) ─────────────────────────────────────────────
@@ -579,7 +625,7 @@ fn mtls_failure_reason(err: &SourceAuthError) -> &'static str {
             }
         }
         SourceAuthError::ConfigNotFound { .. } => "trust_misconfigured",
-        SourceAuthError::Internal { .. } => "internal_error",
+        SourceAuthError::Internal { .. } | SourceAuthError::InsufficientScope { .. } => "internal_error",
     }
 }
 
@@ -699,23 +745,85 @@ mod tests {
         assert_eq!(select_surface_agent_did(records, "shop-agent"), None);
     }
 
+    fn declaration(resource: &str) -> crate::source_auth::declaration::Declaration {
+        crate::source_auth::declaration::Declaration {
+            resource: resource.to_string(),
+            authorization_servers: vec!["https://as.example".to_string()],
+            required_scopes: vec![],
+            advertised_scopes: vec![],
+        }
+    }
+
     #[tokio::test]
-    async fn a_published_protected_resource_is_the_only_audience_accepted() {
+    async fn binding_the_declared_resource_keeps_the_required_scopes() {
         let config = SourceAuthConfig::JwtBearer(JwtBearerAuthConfig {
-            audiences: vec![SURFACE_AGENT_DID_AUDIENCE.to_string(), "https://other.example/mcp".to_string()],
+            jwt_verification_strategy_id: "strategy-1".to_string(),
+            audiences: vec!["https://other.example/mcp".to_string()],
+            required_scopes: vec!["tools:call".to_string(), "read".to_string()],
             ..Default::default()
         });
-        let protected =
-            crate::protocols::protected_resource::fixtures::protected_resource("https://gateway.example/mcp/alpha");
 
-        let resolved = resolve_surface_audience(&config, Some(&protected), None, "alpha")
-            .await
-            .expect("bind the protected resource");
+        let resolved =
+            resolve_surface_audience(&config, Some(&declaration("https://gateway.example/mcp/alpha")), None, "alpha")
+                .await
+                .expect("bind the declared resource");
 
         let SourceAuthConfig::JwtBearer(resolved) = resolved else {
             panic!("expected JWT bearer config");
         };
         assert_eq!(resolved.audiences, vec!["https://gateway.example/mcp/alpha"]);
+        assert_eq!(resolved.required_scopes, vec!["tools:call", "read"]);
+        assert_eq!(resolved.jwt_verification_strategy_id, "strategy-1");
+    }
+
+    #[tokio::test]
+    async fn a_declared_resource_is_the_only_audience_accepted() {
+        let config = SourceAuthConfig::JwtBearer(JwtBearerAuthConfig {
+            audiences: vec![SURFACE_AGENT_DID_AUDIENCE.to_string(), "https://other.example/mcp".to_string()],
+            ..Default::default()
+        });
+
+        let resolved =
+            resolve_surface_audience(&config, Some(&declaration("https://gateway.example/mcp/alpha")), None, "alpha")
+                .await
+                .expect("bind the declared resource");
+
+        let SourceAuthConfig::JwtBearer(resolved) = resolved else {
+            panic!("expected JWT bearer config");
+        };
+        assert_eq!(resolved.audiences, vec!["https://gateway.example/mcp/alpha"]);
+    }
+
+    #[tokio::test]
+    async fn without_a_declaration_the_configured_audiences_are_kept() {
+        let config = SourceAuthConfig::JwtBearer(JwtBearerAuthConfig {
+            audiences: vec!["https://other.example/mcp".to_string(), "my-audience".to_string()],
+            ..Default::default()
+        });
+
+        let resolved = resolve_surface_audience(&config, None, None, "alpha")
+            .await
+            .expect("keep the configured audiences");
+
+        let SourceAuthConfig::JwtBearer(resolved) = resolved else {
+            panic!("expected JWT bearer config");
+        };
+        assert_eq!(resolved.audiences, vec!["https://other.example/mcp", "my-audience"]);
+    }
+
+    #[tokio::test]
+    async fn a_declaration_leaves_a_method_without_audiences_unchanged() {
+        let config = SourceAuthConfig::ApiKey(ApiKeyAuthConfig {
+            extraction: CredentialExtraction::HttpHeader { field: "X-API-Key".to_string() },
+            secret_id: "my-secret".to_string(),
+        });
+
+        let resolved =
+            resolve_surface_audience(&config, Some(&declaration("https://gateway.example/mcp/alpha")), None, "alpha")
+                .await
+                .expect("keep the api key method");
+
+        assert_eq!(resolved, config);
     }
 
     // ── In-memory Secrets Store ─────────────────────────────────────────────
@@ -1392,8 +1500,17 @@ MC4CAQAwBQYDK2VwBCIEIPiOVQaSEcxl/NogGyUAX88ouBy1bWJFMp4gi0pcCgcY
         claims: serde_json::Value,
         kid: &str,
     ) -> String {
+        make_typed_token(claims, kid, None)
+    }
+
+    fn make_typed_token(
+        claims: serde_json::Value,
+        kid: &str,
+        typ: Option<&str>,
+    ) -> String {
         let mut header = JwtHeader::new(Algorithm::EdDSA);
         header.kid = Some(kid.to_string());
+        header.typ = typ.map(str::to_string);
         let key = EncodingKey::from_ed_pem(ED25519_PRIVATE_PEM.as_bytes()).unwrap();
         encode(&header, &claims, &key).unwrap()
     }
@@ -1409,23 +1526,29 @@ MC4CAQAwBQYDK2VwBCIEIPiOVQaSEcxl/NogGyUAX88ouBy1bWJFMp4gi0pcCgcY
         String, // strategy_id
         crate::jwt_bearer::test_utils::TestServer,
     ) {
+        jwt_test_setup_with(|_| {}).await
+    }
+
+    async fn jwt_test_setup_with(
+        customise: impl FnOnce(&mut JwtVerificationStrategy)
+    ) -> (SourceAuthMiddleware, String, crate::jwt_bearer::test_utils::TestServer) {
         let kid = "source-auth-test-key";
         let (base, server) = start_jwks_server(ed25519_jwks_body(kid, ED25519_JWK_X), Some(3600)).await;
 
         let strategy_store = Arc::new(InMemoryStrategyStore::new());
+        let mut strategy = JwtVerificationStrategy {
+            name: "Test EdDSA IdP".to_string(),
+            expected_issuer: "https://issuer.example.com".to_string(),
+            jwks_source: JwksSource::Remote {
+                jwks_uri: format!("{}/.well-known/jwks.json", base),
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            ..Default::default()
+        };
+        customise(&mut strategy);
         let strategy = strategy_store
-            .create(JwtVerificationStrategy {
-                id: String::new(),
-                tenant_id: None,
-                name: "Test EdDSA IdP".to_string(),
-                expected_issuer: "https://issuer.example.com".to_string(),
-                jwks_source: JwksSource::Remote {
-                    jwks_uri: format!("{}/.well-known/jwks.json", base),
-                },
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-                authorization_server: None,
-            })
+            .create(strategy)
             .await
             .unwrap();
 
@@ -1455,7 +1578,7 @@ MC4CAQAwBQYDK2VwBCIEIPiOVQaSEcxl/NogGyUAX88ouBy1bWJFMp4gi0pcCgcY
         );
 
         let config = SourceAuthConfig::JwtBearer(JwtBearerAuthConfig {
-            jwt_verification_strategy_id: strategy_id,
+            jwt_verification_strategy_id: strategy_id.clone(),
             audiences: vec!["my-audience".to_string()],
             ..Default::default()
         });
@@ -1466,7 +1589,15 @@ MC4CAQAwBQYDK2VwBCIEIPiOVQaSEcxl/NogGyUAX88ouBy1bWJFMp4gi0pcCgcY
             .await;
         let identity = result.expect("should succeed");
         match identity {
-            AuthenticatedIdentity::JwtBearer { subject, claims } => {
+            AuthenticatedIdentity::JwtBearer { subject, claims, strategy } => {
+                assert_eq!(
+                    strategy,
+                    Some(crate::source_auth::models::VerifyingStrategy {
+                        id: strategy_id.clone(),
+                        tenant_id: None,
+                        scope_claims: vec!["scope".to_string(), "scp".to_string()],
+                    })
+                );
                 assert_eq!(subject, "user-1");
                 assert_eq!(
                     claims
@@ -1487,6 +1618,60 @@ MC4CAQAwBQYDK2VwBCIEIPiOVQaSEcxl/NogGyUAX88ouBy1bWJFMp4gi0pcCgcY
             }
             other => panic!("expected JwtBearer identity, got: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn jwt_identity_names_the_verifying_strategy_its_tenant_and_scope_claims() {
+        let kid = "source-auth-test-key";
+        let (mw, strategy_id, _server) = jwt_test_setup_with(|strategy| {
+            strategy.tenant_id = Some("tenant-a".to_string());
+            strategy.scope_claims = Some(vec!["roles".to_string()]);
+        })
+        .await;
+        let token = make_typed_token(
+            json!({
+                "iss": "https://issuer.example.com",
+                "sub": "client-1",
+                "aud": "my-audience",
+                "exp": now_secs() + 3600,
+                "iat": now_secs(),
+            }),
+            kid,
+            Some("at+jwt"),
+        );
+        let config = SourceAuthConfig::JwtBearer(JwtBearerAuthConfig {
+            jwt_verification_strategy_id: strategy_id.clone(),
+            audiences: vec!["my-audience".to_string()],
+            ..Default::default()
+        });
+
+        let identity = mw
+            .authenticate(&config, &bearer(&token), "test-channel", "test-surface-id", None)
+            .await
+            .expect("should succeed");
+        let AuthenticatedIdentity::JwtBearer { subject, strategy, .. } = identity else {
+            panic!("expected JwtBearer identity, got: {identity:?}");
+        };
+        assert_eq!(subject, "client-1");
+        assert_eq!(
+            strategy,
+            Some(crate::source_auth::models::VerifyingStrategy {
+                id: strategy_id.clone(),
+                tenant_id: Some("tenant-a".to_string()),
+                scope_claims: vec!["roles".to_string()],
+            })
+        );
+
+        let wrong_audience = SourceAuthConfig::JwtBearer(JwtBearerAuthConfig {
+            jwt_verification_strategy_id: strategy_id,
+            audiences: vec!["other-audience".to_string()],
+            ..Default::default()
+        });
+        assert!(matches!(
+            mw.authenticate(&wrong_audience, &bearer(&token), "test-channel", "test-surface-id", None)
+                .await,
+            Err(SourceAuthError::InvalidCredential { .. })
+        ));
     }
 
     #[tokio::test]
@@ -1622,6 +1807,207 @@ MC4CAQAwBQYDK2VwBCIEIPiOVQaSEcxl/NogGyUAX88ouBy1bWJFMp4gi0pcCgcY
             .to_str()
             .unwrap();
         assert_eq!(forwarded, raw_header);
+    }
+
+    // ── Required scopes ─────────────────────────────────────────────────────
+
+    const ACCESS_POINT_URL: &str = "https://gw.example/agents/billing";
+
+    fn scoped_config(
+        strategy_id: String,
+        required: &[&str],
+    ) -> SourceAuthConfig {
+        SourceAuthConfig::JwtBearer(JwtBearerAuthConfig {
+            jwt_verification_strategy_id: strategy_id,
+            audiences: vec![ACCESS_POINT_URL.to_string()],
+            required_scopes: required
+                .iter()
+                .map(|scope| scope.to_string())
+                .collect(),
+            ..Default::default()
+        })
+    }
+
+    fn access_token(extra: serde_json::Value) -> serde_json::Value {
+        let mut claims = json!({
+            "iss": "https://issuer.example.com",
+            "sub": "client-1",
+            "aud": ACCESS_POINT_URL,
+            "exp": now_secs() + 3600,
+            "iat": now_secs(),
+        });
+        for (name, value) in extra
+            .as_object()
+            .expect("object")
+        {
+            claims[name] = value.clone();
+        }
+        claims
+    }
+
+    async fn authenticate_token(
+        mw: &SourceAuthMiddleware,
+        config: &SourceAuthConfig,
+        token: &str,
+    ) -> SourceAuthResult<AuthenticatedIdentity> {
+        mw.authenticate(config, &bearer(token), "test-channel", "test-surface-id", None)
+            .await
+    }
+
+    #[tokio::test]
+    async fn required_scopes_granted_as_scope_or_scp_string_or_array_authenticate() {
+        let kid = "source-auth-test-key";
+        let (mw, strategy_id, _server) = jwt_test_setup_with(|strategy| {
+            strategy.tenant_id = Some("tenant-a".to_string());
+        })
+        .await;
+        let config = scoped_config(strategy_id.clone(), &["a2a:invoke", "read"]);
+
+        for grant in [
+            json!({"scope": "read a2a:invoke extra"}),
+            json!({"scope": ["a2a:invoke", "read"]}),
+            json!({"scp": "a2a:invoke read"}),
+            json!({"scp": ["read", "a2a:invoke"]}),
+        ] {
+            let token = make_typed_token(access_token(grant.clone()), kid, Some("at+jwt"));
+            match authenticate_token(&mw, &config, &token).await {
+                Ok(AuthenticatedIdentity::JwtBearer { subject, strategy, .. }) => {
+                    assert_eq!(subject, "client-1");
+                    assert_eq!(
+                        strategy,
+                        Some(crate::source_auth::models::VerifyingStrategy {
+                            id: strategy_id.clone(),
+                            tenant_id: Some("tenant-a".to_string()),
+                            scope_claims: vec!["scope".to_string(), "scp".to_string()],
+                        })
+                    );
+                }
+                other => panic!("{grant}: expected JwtBearer identity, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn required_scopes_shortfall_is_insufficient_scope() {
+        let kid = "source-auth-test-key";
+        let (mw, strategy_id, _server) = jwt_test_setup().await;
+        let config = scoped_config(strategy_id, &["a2a:invoke", "read"]);
+
+        for (grant, missing) in [
+            (json!({"scope": "read"}), vec!["a2a:invoke"]),
+            (json!({"scp": ["other"]}), vec!["a2a:invoke", "read"]),
+            (json!({}), vec!["a2a:invoke", "read"]),
+            (json!({"scope": 42, "scp": "a2a:invoke read"}), vec!["a2a:invoke", "read"]),
+        ] {
+            let token = make_token(access_token(grant.clone()), kid);
+            match authenticate_token(&mw, &config, &token).await {
+                Err(SourceAuthError::InsufficientScope { missing: reported }) => {
+                    assert_eq!(reported, missing, "{grant}")
+                }
+                other => panic!("{grant}: expected InsufficientScope, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn required_scopes_read_the_strategy_scope_claims() {
+        let kid = "source-auth-test-key";
+        let (mw, strategy_id, _server) = jwt_test_setup_with(|strategy| {
+            strategy.scope_claims = Some(vec!["roles".to_string()]);
+        })
+        .await;
+        let config = scoped_config(strategy_id, &["Task.Run"]);
+
+        let app_only = make_token(access_token(json!({"roles": ["Task.Run"]})), kid);
+        let AuthenticatedIdentity::JwtBearer { subject, .. } = authenticate_token(&mw, &config, &app_only)
+            .await
+            .expect("the roles claim grants the scope")
+        else {
+            panic!("expected JwtBearer identity");
+        };
+        assert_eq!(subject, "client-1");
+
+        let scp_only = make_token(access_token(json!({"scp": "Task.Run"})), kid);
+        match authenticate_token(&mw, &config, &scp_only).await {
+            Err(SourceAuthError::InsufficientScope { missing }) => assert_eq!(missing, vec!["Task.Run"]),
+            other => panic!("expected InsufficientScope, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn google_id_token_for_the_access_point_audience_is_refused_when_scopes_are_required() {
+        let kid = "source-auth-test-key";
+        let (mw, strategy_id, _server) = jwt_test_setup_with(|strategy| {
+            strategy.expected_issuer = "https://accounts.google.com".to_string();
+        })
+        .await;
+        let id_token = make_typed_token(
+            json!({
+                "iss": "https://accounts.google.com",
+                "aud": ACCESS_POINT_URL,
+                "azp": "attacker@other-project.iam.gserviceaccount.com",
+                "email": "attacker@other-project.iam.gserviceaccount.com",
+                "email_verified": true,
+                "sub": "112233445566778899000",
+                "exp": now_secs() + 3600,
+                "iat": now_secs(),
+            }),
+            kid,
+            Some("JWT"),
+        );
+
+        let scoped = scoped_config(strategy_id.clone(), &["a2a:invoke"]);
+        match authenticate_token(&mw, &scoped, &id_token).await {
+            Err(error) => assert_eq!(
+                error.failure_kind(),
+                Some(crate::source_auth::errors::SourceAuthFailureKind::InsufficientScope)
+            ),
+            Ok(identity) => panic!("a Google ID token must not authenticate, got {identity:?}"),
+        }
+
+        let unscoped = scoped_config(strategy_id, &[]);
+        assert!(
+            authenticate_token(&mw, &unscoped, &id_token)
+                .await
+                .is_ok(),
+            "an Access Point without required scopes keeps today's acceptance"
+        );
+    }
+
+    #[tokio::test]
+    async fn id_token_shapes_are_invalid_when_scopes_are_required() {
+        let kid = "source-auth-test-key";
+        let (mw, strategy_id, _server) = jwt_test_setup().await;
+        let scoped = scoped_config(strategy_id.clone(), &["read"]);
+        let unscoped = scoped_config(strategy_id, &[]);
+
+        for (claims, typ) in [
+            (access_token(json!({"scope": "read", "nonce": "n-1"})), Some("JWT")),
+            (access_token(json!({"scope": "read", "at_hash": "h"})), None),
+            (access_token(json!({"scope": "read"})), Some("id+jwt")),
+        ] {
+            let token = make_typed_token(claims.clone(), kid, typ);
+            assert!(
+                matches!(
+                    authenticate_token(&mw, &scoped, &token).await,
+                    Err(SourceAuthError::InvalidCredential { .. })
+                ),
+                "{claims} {typ:?}"
+            );
+            assert!(
+                authenticate_token(&mw, &unscoped, &token)
+                    .await
+                    .is_ok(),
+                "{claims} {typ:?}"
+            );
+        }
+
+        let rfc9068 = make_typed_token(access_token(json!({"scope": "read"})), kid, Some("application/at+jwt"));
+        assert!(
+            authenticate_token(&mw, &scoped, &rfc9068)
+                .await
+                .is_ok()
+        );
     }
 
     // ── Credential extraction unit tests ────────────────────────────────────

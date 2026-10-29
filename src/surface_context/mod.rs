@@ -331,9 +331,22 @@ pub struct SurfaceRoutingContext {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum SourceAuthContext {
+    /// A caller whose token a JWT verification strategy verified.
+    ///
+    /// `scopes` and `client_id` are normalised across providers. `strategy_id` and
+    /// `strategy_tenant_id` name the strategy that verified the token: a tenant can
+    /// create a strategy with any issuer, so a gateway policy that trusts an issuer
+    /// keys on them, never on the `iss` claim.
     JwtBearer {
         subject: String,
         claims: serde_json::Value,
+        scopes: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        client_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        strategy_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        strategy_tenant_id: Option<String>,
     },
     ApiKey {
         key_name: String,
@@ -349,27 +362,60 @@ pub enum SourceAuthContext {
         sans: crate::source_auth::models::MtlsSans,
     },
     /// Source authentication was configured and attempted, but the caller's
-    /// credential failed to verify (missing or invalid). The request is NOT
-    /// blocked at the source-auth stage; instead this outcome is handed to the
-    /// policy layer, which decides whether to allow or deny. Policies branch on
-    /// `input.source_auth.method == "failed"`.
+    /// credential was missing, invalid or short of a required scope (`kind`).
+    /// The request is NOT blocked at the source-auth stage; instead this outcome
+    /// is handed to the policy layer, which decides whether to allow or deny.
+    /// Policies branch on `input.source_auth.method == "failed"`.
     ///
     /// Note: the inner field is `attempted_method` (not `method`) to avoid
     /// colliding with the `#[serde(tag = "method")]` discriminant.
     Failed {
         attempted_method: String,
+        kind: crate::source_auth::errors::SourceAuthFailureKind,
         reason: String,
     },
+}
+
+impl SourceAuthContext {
+    /// The `Failed` context for a caller-attributable error, `None` for a
+    /// server-side error, which blocks instead.
+    pub fn failed(
+        attempted_method: &str,
+        error: &crate::source_auth::errors::SourceAuthError,
+    ) -> Option<Self> {
+        Some(SourceAuthContext::Failed {
+            attempted_method: attempted_method.to_string(),
+            kind: error.failure_kind()?,
+            reason: error.to_string(),
+        })
+    }
 }
 
 impl From<&crate::source_auth::AuthenticatedIdentity> for SourceAuthContext {
     fn from(identity: &crate::source_auth::AuthenticatedIdentity) -> Self {
         use crate::source_auth::AuthenticatedIdentity;
         match identity {
-            AuthenticatedIdentity::JwtBearer { subject, claims } => SourceAuthContext::JwtBearer {
-                subject: subject.clone(),
-                claims: claims.clone(),
-            },
+            AuthenticatedIdentity::JwtBearer { subject, claims, strategy } => {
+                let scopes = match strategy {
+                    Some(strategy) => crate::jwt_bearer::access_token::granted_scopes(claims, &strategy.scope_claims),
+                    None => crate::jwt_bearer::access_token::granted_scopes(
+                        claims,
+                        &crate::jwt_bearer::models::DEFAULT_SCOPE_CLAIMS,
+                    ),
+                };
+                SourceAuthContext::JwtBearer {
+                    subject: subject.clone(),
+                    claims: claims.clone(),
+                    scopes,
+                    client_id: crate::jwt_bearer::access_token::client_id(claims),
+                    strategy_id: strategy
+                        .as_ref()
+                        .map(|strategy| strategy.id.clone()),
+                    strategy_tenant_id: strategy
+                        .as_ref()
+                        .and_then(|strategy| strategy.tenant_id.clone()),
+                }
+            }
             AuthenticatedIdentity::ApiKey { key_name } => SourceAuthContext::ApiKey { key_name: key_name.clone() },
             AuthenticatedIdentity::DidAuth { did } => SourceAuthContext::DidAuth { did: did.clone() },
             AuthenticatedIdentity::Mtls {
@@ -684,17 +730,75 @@ mod tests {
 
     #[test]
     fn source_auth_failed_variant_serializes_without_tag_collision() {
-        let ctx = SourceAuthContext::Failed {
-            attempted_method: "jwt_bearer".to_string(),
-            reason: "Token has expired".to_string(),
-        };
+        let ctx = SourceAuthContext::failed(
+            "jwt_bearer",
+            &crate::source_auth::errors::SourceAuthError::InvalidCredential {
+                reason: "Token has expired".to_string(),
+            },
+        )
+        .expect("caller-attributable");
         let value = serde_json::to_value(&ctx).unwrap();
         assert_eq!(value["method"], "failed");
         assert_eq!(value["attempted_method"], "jwt_bearer");
-        assert_eq!(value["reason"], "Token has expired");
+        assert_eq!(value["kind"], "invalid");
+        assert_eq!(value["reason"], "Invalid credential: Token has expired");
         // The `#[serde(tag = "method")]` discriminant must not be clobbered by an
         // inner field — the inner field is deliberately named `attempted_method`.
         assert_ne!(value["method"], "jwt_bearer");
+    }
+
+    #[test]
+    fn source_auth_failed_carries_the_failure_kind_and_skips_server_errors() {
+        use crate::source_auth::errors::SourceAuthError;
+        let kind = |error: SourceAuthError| {
+            SourceAuthContext::failed("jwt_bearer", &error)
+                .map(|ctx| serde_json::to_value(ctx).unwrap()["kind"].clone())
+        };
+        assert_eq!(kind(SourceAuthError::MissingCredential { reason: "x".into() }), Some(serde_json::json!("missing")));
+        assert_eq!(kind(SourceAuthError::InvalidCredential { reason: "x".into() }), Some(serde_json::json!("invalid")));
+        assert_eq!(
+            kind(SourceAuthError::InsufficientScope {
+                missing: vec!["a2a:invoke".into()]
+            }),
+            Some(serde_json::json!("insufficient_scope"))
+        );
+        assert_eq!(kind(SourceAuthError::Internal { reason: "x".into() }), None);
+        assert_eq!(kind(SourceAuthError::ConfigNotFound { id: "x".into() }), None);
+    }
+
+    #[test]
+    fn jwt_bearer_context_publishes_scopes_client_id_and_strategy() {
+        use crate::source_auth::models::{AuthenticatedIdentity, VerifyingStrategy};
+        let identity = AuthenticatedIdentity::JwtBearer {
+            subject: "svc".to_string(),
+            claims: serde_json::json!({"sub": "svc", "scp": "read", "roles": ["Task.Run", "Admin"], "azp": "app-1", "appid": "legacy"}),
+            strategy: Some(VerifyingStrategy {
+                id: "strategy-1".to_string(),
+                tenant_id: Some("tenant-a".to_string()),
+                scope_claims: vec!["roles".to_string(), "scp".to_string()],
+            }),
+        };
+        let value = serde_json::to_value(SourceAuthContext::from(&identity)).unwrap();
+        assert_eq!(value["method"], "jwt_bearer");
+        assert_eq!(value["scopes"], serde_json::json!(["Admin", "Task.Run"]));
+        assert_eq!(value["client_id"], "app-1");
+        assert_eq!(value["strategy_id"], "strategy-1");
+        assert_eq!(value["strategy_tenant_id"], "tenant-a");
+        assert_eq!(value["claims"]["scp"], "read");
+    }
+
+    #[test]
+    fn jwt_bearer_context_without_a_strategy_reads_the_default_scope_claims() {
+        let identity = crate::source_auth::models::AuthenticatedIdentity::JwtBearer {
+            subject: "user".to_string(),
+            claims: serde_json::json!({"sub": "user", "scope": "write read", "roles": ["Admin"]}),
+            strategy: None,
+        };
+        let value = serde_json::to_value(SourceAuthContext::from(&identity)).unwrap();
+        assert_eq!(value["scopes"], serde_json::json!(["read", "write"]));
+        for absent in ["client_id", "strategy_id", "strategy_tenant_id"] {
+            assert!(value.get(absent).is_none(), "{absent}");
+        }
     }
 
     #[test]

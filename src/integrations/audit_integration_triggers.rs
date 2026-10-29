@@ -235,6 +235,7 @@ mod tests {
         crate::delegation_vault::audit::build_caller_context(&crate::source_auth::AuthenticatedIdentity::JwtBearer {
             subject: "user-123".to_string(),
             claims: serde_json::json!({"iss": "https://idp.example.com", "email": email, "name": name}),
+            strategy: None,
         })
     }
 

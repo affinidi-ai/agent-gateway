@@ -1091,7 +1091,7 @@ pub fn vp_fingerprint(vp_jwt: &str) -> String {
 /// Build an `AuditCallerContext` from a source-auth identity
 pub fn build_caller_context(identity: &crate::source_auth::AuthenticatedIdentity) -> AuditCallerContext {
     match identity {
-        crate::source_auth::AuthenticatedIdentity::JwtBearer { subject, claims } => {
+        crate::source_auth::AuthenticatedIdentity::JwtBearer { subject, claims, .. } => {
             let iss = claims
                 .get("iss")
                 .and_then(|v| v.as_str())
@@ -1734,6 +1734,7 @@ mod tests {
                 "email": "alice@example.com",
                 "name": "Alice Example"
             }),
+            strategy: None,
         };
 
         let caller = build_caller_context(&identity);
@@ -2394,6 +2395,7 @@ mod tests {
         let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
             subject: "user-123".to_string(),
             claims: serde_json::json!({"email": "ada@example.com", "name": "Ada Lovelace"}),
+            strategy: None,
         };
         let ((), events) = crate::audit::producer::capture(async {
             let decide = |caller| {
@@ -2556,6 +2558,7 @@ mod tests {
         let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
             subject: "user-1".to_string(),
             claims: serde_json::json!({}),
+            strategy: None,
         };
         let event = vp_injected_event(injection(Some(build_caller_context(&identity))));
 
@@ -2586,6 +2589,7 @@ mod tests {
         let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
             subject: "user-2".to_string(),
             claims: serde_json::json!({}),
+            strategy: None,
         };
         let event = crate::audit::context::with_caller(Some(build_caller_context(&identity)), async {
             vp_injected_event(injection(None))

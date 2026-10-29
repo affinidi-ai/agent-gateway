@@ -266,6 +266,17 @@ lazy_static! {
         counter
     };
 
+    /// Caller tokens that lacked a required scope, refused or left to policy (labeled by scheme).
+    pub static ref SCOPE_DENIED: IntCounterVec = {
+        let opts = Opts::new(
+            names::SCOPE_DENIED_TOTAL,
+            "Caller tokens that lacked a required scope, whether refused or left to surface policy (scheme = the caller authentication scheme)",
+        );
+        let counter = IntCounterVec::new(opts, &["scheme"]).unwrap();
+        REGISTRY.register(Box::new(counter.clone())).unwrap();
+        counter
+    };
+
     /// AWS KMS per-value envelope operation outcomes (labeled by op, result).
     /// `op` = `generate_data_key` | `decrypt`; `result` = `ok` | `error`.
     pub static ref KMS_OPERATION: IntCounterVec = {
@@ -742,6 +753,13 @@ pub fn track_discovery(result: &'static str) {
         .inc();
 }
 
+/// Track a caller token that lacked a required scope.
+pub fn track_scope_denied(scheme: &'static str) {
+    SCOPE_DENIED
+        .with_label_values(&[scheme])
+        .inc();
+}
+
 /// Track an AWS KMS per-value envelope operation.
 ///
 /// `op`     = `generate_data_key` | `decrypt`
@@ -924,7 +942,7 @@ mod tests {
     use super::{
         A2A_PROTOCOL_VERSION, AUDIT_PIPELINE_STARTED, AUDIT_SINK_REBUILD_FAILED, get_metrics, names,
         set_audit_pipeline_started, track_a2a_protocol_version, track_audit_sink_rebuild_failed, track_discovery,
-        track_fabric_forward_received, track_jwks_fetch, track_token_fetch,
+        track_fabric_forward_received, track_jwks_fetch, track_scope_denied, track_token_fetch,
     };
 
     #[test]
@@ -952,11 +970,13 @@ mod tests {
         track_token_fetch("ut_grant", "ut_result");
         track_jwks_fetch("ut_jwks");
         track_discovery("ut_discovery");
+        track_scope_denied("ut_scheme");
         let exposition = get_metrics();
         for line in [
             "agent_gateway_token_fetch_total{grant=\"ut_grant\",result=\"ut_result\"} 1",
             "agent_gateway_jwks_fetch_total{result=\"ut_jwks\"} 1",
             "agent_gateway_discovery_total{result=\"ut_discovery\"} 1",
+            "agent_gateway_scope_denied_total{scheme=\"ut_scheme\"} 1",
         ] {
             assert!(exposition.contains(line), "missing {line} in:\n{exposition}");
         }

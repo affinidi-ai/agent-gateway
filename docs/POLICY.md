@@ -253,9 +253,12 @@ triggered it. On the outbound path the record also names the Transit Point.
 
 ## Failed caller authentication
 
-Source auth does not refuse a request whose credential is missing or invalid. The
-request continues with no caller identity, `input.source_auth` is
-`{"method": "failed", "attempted_method": ..., "reason": ...}`. On every forwarding
+Source auth does not refuse a request whose credential is missing or invalid, or whose
+JWT lacks a required scope. The request continues with no caller identity,
+`input.source_auth` is
+`{"method": "failed", "attempted_method": ..., "kind": ..., "reason": ...}`. `kind` is
+`missing`, `invalid` or `insufficient_scope`; `reason` is free text for logs and policy
+authors and is never sent to the caller. On every forwarding
 path (direct inbound, `proxy://` MCP Targets, `a2a-proxy://` Targets, Fabric send and
 Fabric receive, the last for surfaces without protected resource metadata) the surface's
 Target Authentication credential, or the A2A proxy's Direct Line secret, is not attached,
@@ -264,8 +267,9 @@ must reject such callers needs a policy that denies `input.source_auth.method ==
 Server-side source-auth errors (missing configuration, internal failures) still block
 with `500`. A request to an MCP Access Point that publishes protected resource
 metadata never reaches policy with a failed credential, direct or over Fabric: a direct
-request is refused with a `401` challenge pointing at that metadata, and a Fabric request
-with a `401` without it, see
+request is refused with a `401` challenge pointing at that metadata, or a `403` with
+`error="insufficient_scope"` for a scope shortfall, and a Fabric request with the same status
+without it, see [caller challenge](SOURCE_AUTH.md#caller-challenge) and
 [`MCP_METADATA.md`](MCP_METADATA.md#authorization-server-discovery-for-caller-authentication).
 
 Over Fabric, the sending Gateway strips the credential header its own surface consumed
@@ -273,6 +277,41 @@ before forwarding. A receiving surface without protected resource metadata that 
 source authentication on that same header therefore sees every Fabric caller as failed and
 forwards without its target credential; one with the metadata refuses them with `401`. Require caller authentication on one side of the Fabric hop, or use a
 different credential header on each side.
+
+## JWT bearer caller input
+
+A caller whose token a JWT verification strategy verified has `input.source_auth.method ==
+"jwt_bearer"` and these fields ([`surface_context/mod.rs`](../src/surface_context/mod.rs)):
+
+| Field | Value |
+| --- | --- |
+| `subject`, `claims` | The `sub` claim and every verified claim |
+| `scopes` | Granted scopes, sorted and de-duplicated: the first of the strategy's `scope_claims` (default `scope`, then `scp`) that the token carries, as a space-separated string or an array of strings. Empty when none is granted. |
+| `client_id` | `client_id`, then `azp`, then `appid`; absent when the token has none |
+| `strategy_id`, `strategy_tenant_id` | The strategy that verified the token, and its tenant (absent for an operator strategy) |
+
+A tenant can create a strategy with any `expected_issuer` and key set, so the `iss` claim
+does not say which strategy vouched for a token. A gateway policy that trusts an issuer keys
+on `strategy_id` (and an absent `strategy_tenant_id` for operator strategies), never on
+`claims.iss`:
+
+```rego
+package gateway.policy
+
+default allow := false
+
+allow if {
+    input.source_auth.strategy_id == "corporate-idp"
+    not input.source_auth.strategy_tenant_id
+    "a2a:invoke" in input.source_auth.scopes
+}
+```
+
+Tokens the MCP Resource Server verifies for `mcp_http.authorization` have no strategy: their
+input carries `scopes` from `scope` or `scp` and no `strategy_id`. A method's
+[`required_scopes`](SOURCE_AUTH.md#required-scopes) are checked before policy, so a caller
+short of one reaches policy as a failed caller of kind `insufficient_scope`, not as
+`jwt_bearer`.
 
 ## Caller identity verification in policy input
 

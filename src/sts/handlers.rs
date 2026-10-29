@@ -3326,7 +3326,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_subject_verifier_ignores_pinned_metadata() {
+    async fn the_subject_verifier_ignores_pinned_metadata_and_scope_claims() {
         use crate::component_tests::helpers::mock_auth_server::MockAuthServer;
         use crate::jwt_bearer::JwtVerificationStrategyStorage;
         use crate::jwt_bearer::models::{AuthorizationServerMetadata, JwksSource, JwtVerificationStrategy};
@@ -3350,6 +3350,7 @@ mod tests {
                     token_endpoint: format!("{elsewhere}token"),
                     jwks_uri: format!("{elsewhere}jwks.json"),
                 }),
+                scope_claims: Some(vec!["roles".into()]),
                 ..Default::default()
             })
             .await

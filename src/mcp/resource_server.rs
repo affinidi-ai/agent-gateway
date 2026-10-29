@@ -41,7 +41,7 @@ pub async fn transit_metadata(
     };
     let Some(suffix) = uri
         .path()
-        .strip_prefix("/.well-known/oauth-protected-resource")
+        .strip_prefix(crate::proxy::paths::PROTECTED_RESOURCE_METADATA_PATH)
     else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -174,29 +174,41 @@ impl ResourceServerAuthContext {
     }
 }
 
-pub async fn surface_metadata(
-    axum::extract::State(state): axum::extract::State<crate::state::MultiSurfaceProxyState>,
-    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
-) -> Response {
-    let Some(profile) = state
+/// What the endpoints of one inbound listener answer at a protected resource
+/// metadata path.
+#[derive(Debug, PartialEq)]
+pub(crate) enum MetadataMatch {
+    None,
+    Metadata(Value),
+    Unavailable,
+}
+
+impl MetadataMatch {
+    /// The answer for a path two endpoints may claim: one claim stands, two
+    /// leave the path unavailable.
+    fn and(
+        self,
+        other: Self,
+    ) -> Self {
+        match (self, other) {
+            (Self::None, found) | (found, Self::None) => found,
+            _ => Self::Unavailable,
+        }
+    }
+}
+
+/// RFC 9728 metadata a listener's endpoints publish at `requested_path`, the
+/// resource path a metadata path names, read from live configuration on every
+/// request.
+pub(crate) async fn served_metadata(
+    state: &crate::state::MultiSurfaceProxyState,
+    requested_path: &str,
+) -> MetadataMatch {
+    let profile = state
         .network_config
         .sts
         .mcp_issuer
-        .as_ref()
-    else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let Some(suffix) = uri
-        .path()
-        .strip_prefix("/.well-known/oauth-protected-resource")
-    else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let requested_path = if suffix.is_empty() {
-        "/"
-    } else {
-        suffix
-    };
+        .as_ref();
     let surfaces = state
         .channels
         .read()
@@ -204,154 +216,260 @@ pub async fn surface_metadata(
         .iter()
         .map(|channel| channel.surface.clone())
         .collect::<Vec<_>>();
-    let mut result = None;
+    let proxies = match (profile, state.mcp_proxy_store.as_ref()) {
+        (Some(_), Some(store)) => {
+            use crate::mcp_proxies::McpProxyStore;
+            let Ok(proxies) = store.list_all().await else {
+                return MetadataMatch::Unavailable;
+            };
+            proxies
+        }
+        _ => Vec::new(),
+    };
+    listener_metadata(&surfaces, &proxies, requested_path, profile, &state.network_config)
+}
+
+/// The one document served at `requested_path` among the surfaces and, when the
+/// gateway STS issuer is set, the standalone MCP Proxies. A path more than one
+/// endpoint claims is unavailable.
+pub(crate) fn listener_metadata(
+    surfaces: &[std::sync::Arc<crate::config::agent_surface::AgentSurface>],
+    proxies: &[crate::mcp_proxies::types::McpProxy],
+    requested_path: &str,
+    profile: Option<&McpIssuerProfile>,
+    network: &crate::config::NetworkConfig,
+) -> MetadataMatch {
+    let found = surfaces_metadata(surfaces, requested_path, profile, network);
+    match profile {
+        Some(profile) => found.and(proxies_metadata(proxies, requested_path, profile, network)),
+        None => found,
+    }
+}
+
+/// The one standalone MCP Proxy document served at `requested_path`, naming the
+/// gateway's STS issuer. A proxy path holding the Surface Variant separator is
+/// never published, so it cannot answer for a surface's variant URL.
+fn proxies_metadata(
+    proxies: &[crate::mcp_proxies::types::McpProxy],
+    requested_path: &str,
+    profile: &McpIssuerProfile,
+    network: &crate::config::NetworkConfig,
+) -> MetadataMatch {
+    let mut result = MetadataMatch::None;
+    for proxy in proxies {
+        let path = proxy.full_path();
+        if proxy.status != crate::mcp_proxies::types::McpProxyStatus::Active
+            || path != requested_path
+            || crate::proxy::paths::route_holds_variant_separator(&path)
+        {
+            continue;
+        }
+        let Some(authorization) = proxy
+            .mcp_http
+            .as_ref()
+            .and_then(|http| http.authorization.as_ref())
+        else {
+            continue;
+        };
+        let found = match authorization
+            .validate_endpoint(&network.get_inbound_external_urls(), requested_path)
+            .and_then(|()| authorization.metadata(profile))
+        {
+            Ok(metadata) => MetadataMatch::Metadata(metadata),
+            Err(_) => MetadataMatch::Unavailable,
+        };
+        result = result.and(found);
+    }
+    result
+}
+
+/// The one surface document served at `requested_path`; a path more than one
+/// surface claims is unavailable, whatever their protocols. A route holding the
+/// Surface Variant separator is never published, so it cannot answer for
+/// another surface's variant URL.
+fn surfaces_metadata(
+    surfaces: &[std::sync::Arc<crate::config::agent_surface::AgentSurface>],
+    requested_path: &str,
+    profile: Option<&McpIssuerProfile>,
+    network: &crate::config::NetworkConfig,
+) -> MetadataMatch {
+    let mut result = MetadataMatch::None;
     for surface in surfaces {
         if surface.status != crate::config::agent_surface::SurfaceStatus::Active
-            || surface.access_point.protocol != crate::config::agent_surface::SurfaceProtocol::Mcp
+            || crate::proxy::paths::route_holds_variant_separator(&surface.access_point.route)
         {
             continue;
         }
-        let Some(authorization) = surface
-            .mcp_http
-            .as_ref()
-            .and_then(|http| http.authorization.as_ref())
-        else {
-            continue;
-        };
-        let Ok(resource) = canonical_https_url(&authorization.resource) else {
-            continue;
-        };
-        let prefix = if resource.path() == "/" {
-            ""
-        } else {
-            resource.path()
-        };
-        let Some(parsed) = crate::proxy::route_variant::parse_route_with_variant(requested_path, prefix) else {
-            continue;
-        };
-        let exact_resource = parsed.tail.is_empty() || (resource.path() == "/" && parsed.tail == "/");
-        if !exact_resource {
-            continue;
-        }
-        if let Some(alias) = parsed.alias {
-            if !surface
-                .variants
-                .iter()
-                .any(|variant| variant.alias == alias && variant.enabled)
-            {
-                continue;
-            }
-        } else if surface
-            .default_variant_id
-            .as_ref()
-            .is_some_and(|id| {
-                !surface
-                    .variants
-                    .iter()
-                    .any(|variant| &variant.id == id && variant.enabled)
-            })
-        {
-            continue;
-        }
-        let Ok(resolved) = surface.resolve_variant(parsed.alias) else {
-            continue;
-        };
-        let Some(authorization) = resolved
-            .mcp_http
-            .as_ref()
-            .and_then(|http| http.authorization.as_ref())
-        else {
-            continue;
-        };
-        let Ok(authorization) = authorization.for_variant(parsed.alias) else {
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        };
-        let origins = state
-            .network_config
-            .map_url_to_port(
-                &resolved
-                    .access_point
-                    .listen_address,
-            )
-            .and_then(|port| {
-                state
-                    .network_config
-                    .get_listener_by_port(port)
-            })
-            .map(|listener| listener.external_urls.clone())
-            .unwrap_or_default();
-        let expected_path = match parsed.alias {
-            Some(alias) => format!("{}${alias}", resolved.access_point.route),
-            None => resolved
-                .access_point
-                .route
-                .clone(),
-        };
-        if expected_path != requested_path
-            || authorization
-                .validate_endpoint(&origins, &expected_path)
-                .is_err()
-            || resolved
-                .source_auth()
-                .is_some()
-            || profile
-                .validate_network(&state.network_config)
-                .is_err()
-        {
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        }
-        let Ok(metadata) = authorization.metadata(profile) else {
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        };
-        if result
-            .replace(metadata)
-            .is_some()
-        {
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        }
-    }
-    if let Some(store) = state.mcp_proxy_store.as_ref() {
-        use crate::mcp_proxies::McpProxyStore;
-        let Ok(proxies) = store.list_all().await else {
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        };
-        for proxy in proxies {
-            if proxy.status != crate::mcp_proxies::types::McpProxyStatus::Active || proxy.full_path() != requested_path
-            {
-                continue;
-            }
-            let Some(authorization) = proxy
+        let mcp_authorization = surface.access_point.protocol == crate::config::agent_surface::SurfaceProtocol::Mcp
+            && surface
                 .mcp_http
                 .as_ref()
-                .and_then(|http| http.authorization.as_ref())
-            else {
-                continue;
-            };
-            if authorization
-                .validate_endpoint(
-                    &state
-                        .network_config
-                        .get_inbound_external_urls(),
-                    requested_path,
-                )
-                .is_err()
-            {
-                return StatusCode::SERVICE_UNAVAILABLE.into_response();
-            }
-            let Ok(metadata) = authorization.metadata(profile) else {
-                return StatusCode::SERVICE_UNAVAILABLE.into_response();
-            };
-            if result
-                .replace(metadata)
-                .is_some()
-            {
-                return StatusCode::SERVICE_UNAVAILABLE.into_response();
-            }
+                .is_some_and(|http| http.authorization.is_some());
+        let found = match (mcp_authorization, profile) {
+            (true, Some(profile)) => mcp_surface_metadata(surface, requested_path, profile, network),
+            (true, None) => MetadataMatch::None,
+            (false, _) => declared_surface_metadata(surface, requested_path, network),
+        };
+        result = result.and(found);
+        if result == MetadataMatch::Unavailable {
+            return result;
         }
     }
-    match result {
-        Some(metadata) => ([(header::CACHE_CONTROL, "no-store")], axum::Json(metadata)).into_response(),
-        None => StatusCode::NOT_FOUND.into_response(),
+    result
+}
+
+/// The document an Access Point whose declaration resolves to declare
+/// publishes at its own path, for the base route or an enabled Surface
+/// Variant's `$alias`. An explicit `protected_resource` claims only the path of
+/// the resource it names.
+fn declared_surface_metadata(
+    surface: &crate::config::agent_surface::AgentSurface,
+    requested_path: &str,
+    network: &crate::config::NetworkConfig,
+) -> MetadataMatch {
+    use crate::source_auth::declaration::{DeclarationOutcome, resolve_surface_declaration};
+
+    let route = match surface
+        .access_point
+        .route
+        .as_str()
+    {
+        "" => "/",
+        route => route,
+    };
+    let alias = match requested_path.strip_prefix(route) {
+        Some("") => None,
+        Some(rest) => match rest.strip_prefix('$') {
+            Some(alias) => Some(alias),
+            None => return MetadataMatch::None,
+        },
+        None => return MetadataMatch::None,
+    };
+    if let Some(alias) = alias
+        && !surface
+            .variants
+            .iter()
+            .any(|variant| variant.enabled && variant.alias == alias)
+    {
+        return MetadataMatch::None;
+    }
+    let Ok(resolved) = surface.resolve_variant(alias) else {
+        return MetadataMatch::None;
+    };
+    let claims_path = resolved
+        .protected_resource()
+        .is_none_or(|configured| {
+            configured
+                .for_variant(alias)
+                .ok()
+                .and_then(|served| url::Url::parse(&served.resource).ok())
+                .is_some_and(|resource| resource.path() == requested_path)
+        });
+    if !claims_path {
+        return MetadataMatch::None;
+    }
+    match resolve_surface_declaration(&resolved, alias, network) {
+        DeclarationOutcome::Declare(declaration) => MetadataMatch::Metadata(declaration.metadata()),
+        DeclarationOutcome::Unservable(_) => MetadataMatch::Unavailable,
+        DeclarationOutcome::PassThrough => MetadataMatch::None,
+    }
+}
+
+/// The document an MCP surface with `mcp_http.authorization` publishes, naming
+/// the gateway's STS issuer.
+fn mcp_surface_metadata(
+    surface: &crate::config::agent_surface::AgentSurface,
+    requested_path: &str,
+    profile: &McpIssuerProfile,
+    network: &crate::config::NetworkConfig,
+) -> MetadataMatch {
+    let Some(authorization) = surface
+        .mcp_http
+        .as_ref()
+        .and_then(|http| http.authorization.as_ref())
+    else {
+        return MetadataMatch::None;
+    };
+    let Ok(resource) = canonical_https_url(&authorization.resource) else {
+        return MetadataMatch::None;
+    };
+    let prefix = if resource.path() == "/" {
+        ""
+    } else {
+        resource.path()
+    };
+    let Some(parsed) = crate::proxy::route_variant::parse_route_with_variant(requested_path, prefix) else {
+        return MetadataMatch::None;
+    };
+    let exact_resource = parsed.tail.is_empty() || (resource.path() == "/" && parsed.tail == "/");
+    if !exact_resource {
+        return MetadataMatch::None;
+    }
+    if let Some(alias) = parsed.alias {
+        if !surface
+            .variants
+            .iter()
+            .any(|variant| variant.alias == alias && variant.enabled)
+        {
+            return MetadataMatch::None;
+        }
+    } else if surface
+        .default_variant_id
+        .as_ref()
+        .is_some_and(|id| {
+            !surface
+                .variants
+                .iter()
+                .any(|variant| &variant.id == id && variant.enabled)
+        })
+    {
+        return MetadataMatch::None;
+    }
+    let Ok(resolved) = surface.resolve_variant(parsed.alias) else {
+        return MetadataMatch::None;
+    };
+    let Some(authorization) = resolved
+        .mcp_http
+        .as_ref()
+        .and_then(|http| http.authorization.as_ref())
+    else {
+        return MetadataMatch::None;
+    };
+    let Ok(authorization) = authorization.for_variant(parsed.alias) else {
+        return MetadataMatch::Unavailable;
+    };
+    let origins = network
+        .map_url_to_port(
+            &resolved
+                .access_point
+                .listen_address,
+        )
+        .and_then(|port| network.get_listener_by_port(port))
+        .map(|listener| listener.external_urls.clone())
+        .unwrap_or_default();
+    let expected_path = match parsed.alias {
+        Some(alias) => format!("{}${alias}", resolved.access_point.route),
+        None => resolved
+            .access_point
+            .route
+            .clone(),
+    };
+    if expected_path != requested_path
+        || authorization
+            .validate_endpoint(&origins, &expected_path)
+            .is_err()
+        || resolved
+            .source_auth()
+            .is_some()
+        || profile
+            .validate_network(network)
+            .is_err()
+    {
+        return MetadataMatch::Unavailable;
+    }
+    match authorization.metadata(profile) {
+        Ok(metadata) => MetadataMatch::Metadata(metadata),
+        Err(_) => MetadataMatch::Unavailable,
     }
 }
 
@@ -612,7 +730,11 @@ impl McpResourceServerConfig {
             .and_then(Value::as_str)
             .ok_or(ResourceTokenError::Invalid)?
             .to_string();
-        Ok(crate::source_auth::AuthenticatedIdentity::JwtBearer { subject, claims })
+        Ok(crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            subject,
+            claims,
+            strategy: None,
+        })
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -713,10 +835,183 @@ impl McpResourceServerConfig {
         let Some(challenge) = protected_resource::challenge_header(&metadata, error, &self.scopes) else {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         };
+        protected_resource::mark_gateway_challenge(&mut response, challenge);
         response
-            .headers_mut()
-            .insert(header::WWW_AUTHENTICATE, challenge);
-        response
+    }
+}
+
+#[cfg(test)]
+mod listener_metadata_tests {
+    use std::sync::Arc;
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::config::agent_surface::AgentSurface;
+    use crate::protocols::protected_resource::fixtures::{
+        ISSUER, discovery_network, discovery_surface, jwt_bearer_method,
+    };
+
+    const STS_ISSUER: &str = "https://gateway.example/api/oauth2/mcp";
+
+    fn network() -> crate::config::NetworkConfig {
+        let mut network = discovery_network();
+        network.routes =
+            serde_json::from_value(json!({"identity": {"type": "identity_api", "prefix": "/api"}})).unwrap();
+        network
+    }
+
+    fn sts() -> McpIssuerProfile {
+        McpIssuerProfile { issuer: STS_ISSUER.into() }
+    }
+
+    /// An MCP Access Point at `route` whose caller authentication publishes
+    /// the resource of its route.
+    fn explicit(route: &str) -> Arc<AgentSurface> {
+        let mut surface = discovery_surface(
+            jwt_bearer_method(),
+            Some(json!({"resource": format!("https://gateway.example{route}"), "authorization_servers": [ISSUER]})),
+        );
+        surface.access_point.route = route.into();
+        Arc::new(surface)
+    }
+
+    /// An MCP surface at `route` whose resource the gateway STS issues tokens for.
+    fn sts_resource(route: &str) -> Arc<AgentSurface> {
+        Arc::new(
+            serde_json::from_value(json!({
+                "surface_id": "sts", "name": "sts",
+                "access_point": {"listen_address": "https://gateway.example", "route": route, "protocol": "mcp"},
+                "target": {"endpoint": "https://tools.example/mcp"},
+                "mcp_http": {"authorization": {"resource": format!("https://gateway.example{route}"), "scopes": []}},
+                "variants": [{"id": "beta", "alias": "beta", "name": "Beta", "enabled": true, "overrides": {}}]
+            }))
+            .unwrap(),
+        )
+    }
+
+    fn declaring_proxy(path: &str) -> crate::mcp_proxies::types::McpProxy {
+        let mut proxy = crate::mcp_proxies::types::McpProxy::new(
+            "proxy".into(),
+            String::new(),
+            "https://api.example".into(),
+            String::new(),
+            String::new(),
+            path.into(),
+        );
+        proxy.mcp_http = serde_json::from_value(
+            json!({"authorization": {"resource": format!("https://gateway.example{path}"), "scopes": []}}),
+        )
+        .unwrap();
+        proxy
+    }
+
+    fn served(
+        surfaces: &[Arc<AgentSurface>],
+        proxies: &[crate::mcp_proxies::types::McpProxy],
+        path: &str,
+        profile: Option<&McpIssuerProfile>,
+    ) -> MetadataMatch {
+        listener_metadata(surfaces, proxies, path, profile, &network())
+    }
+
+    fn explicit_document(resource: &str) -> MetadataMatch {
+        MetadataMatch::Metadata(json!({
+            "resource": resource,
+            "authorization_servers": [ISSUER],
+            "bearer_methods_supported": ["header"]
+        }))
+    }
+
+    fn sts_document(resource: &str) -> MetadataMatch {
+        MetadataMatch::Metadata(json!({
+            "resource": resource,
+            "authorization_servers": [STS_ISSUER],
+            "bearer_methods_supported": ["header"]
+        }))
+    }
+
+    #[test]
+    fn an_explicit_access_point_publishes_its_own_authorization_servers_with_or_without_the_sts_issuer() {
+        let surfaces = [explicit("/smoke")];
+        for profile in [None, Some(&sts())] {
+            assert_eq!(served(&surfaces, &[], "/smoke", profile), explicit_document("https://gateway.example/smoke"));
+            assert_eq!(
+                served(&surfaces, &[], "/smoke$beta", profile),
+                explicit_document("https://gateway.example/smoke$beta")
+            );
+            for path in ["/", "/smoke/tools", "/smok", "/smoke$off", "/other"] {
+                assert_eq!(served(&surfaces, &[], path, profile), MetadataMatch::None, "{path}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_mcp_resource_server_keeps_the_sts_issuer_and_needs_it() {
+        let surfaces = [sts_resource("/smoke")];
+        assert_eq!(served(&surfaces, &[], "/smoke", Some(&sts())), sts_document("https://gateway.example/smoke"));
+        assert_eq!(
+            served(&surfaces, &[], "/smoke$beta", Some(&sts())),
+            sts_document("https://gateway.example/smoke$beta")
+        );
+        assert_eq!(served(&surfaces, &[], "/smoke", None), MetadataMatch::None);
+    }
+
+    #[test]
+    fn a_route_holding_the_variant_separator_cannot_claim_another_surfaces_variant() {
+        let claimant = explicit("/smoke$beta");
+        assert_eq!(served(std::slice::from_ref(&claimant), &[], "/smoke$beta", None), MetadataMatch::None);
+        assert_eq!(
+            served(&[explicit("/smoke"), claimant], &[], "/smoke$beta", None),
+            explicit_document("https://gateway.example/smoke$beta")
+        );
+    }
+
+    #[test]
+    fn a_path_two_surfaces_claim_is_unavailable_whatever_their_settings() {
+        for pair in [[explicit("/smoke"), sts_resource("/smoke")], [explicit("/smoke"), explicit("/smoke")]] {
+            assert_eq!(served(&pair, &[], "/smoke", Some(&sts())), MetadataMatch::Unavailable);
+        }
+        assert_eq!(
+            served(&[explicit("/smoke"), explicit("/other")], &[], "/smoke", None),
+            explicit_document("https://gateway.example/smoke")
+        );
+    }
+
+    #[test]
+    fn a_declaring_mcp_proxy_names_the_sts_issuer_and_needs_it() {
+        let proxies = [declaring_proxy("/tools")];
+        assert_eq!(served(&[], &proxies, "/tools", Some(&sts())), sts_document("https://gateway.example/tools"));
+        assert_eq!(served(&[], &proxies, "/tools", None), MetadataMatch::None);
+        assert_eq!(served(&[], &proxies, "/other", Some(&sts())), MetadataMatch::None);
+        let mut disabled = declaring_proxy("/tools");
+        disabled.status = crate::mcp_proxies::types::McpProxyStatus::Disabled;
+        assert_eq!(served(&[], &[disabled], "/tools", Some(&sts())), MetadataMatch::None);
+        let mut unserved = declaring_proxy("/tools");
+        unserved.endpoint_path = "/moved".into();
+        assert_eq!(served(&[], &[unserved], "/moved", Some(&sts())), MetadataMatch::Unavailable);
+    }
+
+    #[test]
+    fn a_proxy_path_holding_the_variant_separator_cannot_take_over_a_surface_variant() {
+        let squatter = [declaring_proxy("/smoke$beta")];
+        assert_eq!(served(&[], &squatter, "/smoke$beta", Some(&sts())), MetadataMatch::None);
+        assert_eq!(
+            served(&[explicit("/smoke")], &squatter, "/smoke$beta", Some(&sts())),
+            explicit_document("https://gateway.example/smoke$beta")
+        );
+    }
+
+    #[test]
+    fn a_path_an_access_point_shares_with_a_declaring_proxy_is_unavailable() {
+        let surfaces = [explicit("/smoke")];
+        let proxies = [declaring_proxy("/smoke")];
+        assert_eq!(served(&surfaces, &proxies, "/smoke", Some(&sts())), MetadataMatch::Unavailable);
+        assert_eq!(
+            served(&surfaces, &proxies, "/smoke", None),
+            explicit_document("https://gateway.example/smoke"),
+            "without the STS issuer no MCP Proxy publishes"
+        );
     }
 }
 
@@ -728,6 +1023,45 @@ mod tests {
     use crate::protocols::protected_resource::fixtures::{
         ISSUER, discovery_network, discovery_surface, jwt_bearer_method,
     };
+
+    #[test]
+    fn mcp_metadata_keeps_its_exact_serialization() {
+        let profile = McpIssuerProfile {
+            issuer: "https://gateway.example/api/oauth2/mcp".into(),
+        };
+        let scoped = McpResourceServerConfig {
+            resource: "https://gateway.example/surfaces/alpha".into(),
+            scopes: vec!["read".into(), "write".into()],
+        };
+        assert_eq!(
+            serde_json::to_string(
+                &scoped
+                    .metadata(&profile)
+                    .unwrap()
+            )
+            .unwrap(),
+            r#"{"resource":"https://gateway.example/surfaces/alpha","authorization_servers":["https://gateway.example/api/oauth2/mcp"],"bearer_methods_supported":["header"],"scopes_supported":["read","write"]}"#
+        );
+        let root = McpResourceServerConfig {
+            resource: "https://gateway.example/".into(),
+            scopes: Vec::new(),
+        };
+        assert_eq!(
+            serde_json::to_string(
+                &root
+                    .metadata(&profile)
+                    .unwrap()
+            )
+            .unwrap(),
+            r#"{"resource":"https://gateway.example/","authorization_servers":["https://gateway.example/api/oauth2/mcp"],"bearer_methods_supported":["header"]}"#
+        );
+        assert_eq!(
+            root.metadata_url()
+                .unwrap()
+                .as_str(),
+            "https://gateway.example/.well-known/oauth-protected-resource"
+        );
+    }
 
     #[test]
     fn a_declaration_counts_as_served_only_on_its_own_origin_and_path() {
@@ -953,6 +1287,43 @@ mod tests {
                 .headers()
                 .contains_key(header::WWW_AUTHENTICATE)
         );
+        assert!(!protected_resource::is_gateway_challenge(&unavailable));
+    }
+
+    #[test]
+    fn resource_server_challenges_are_marked_as_the_gateways_with_unchanged_values() {
+        let config = McpResourceServerConfig {
+            resource: "https://gateway.example/surfaces/alpha".into(),
+            scopes: vec!["read".into(), "write".into()],
+        };
+        let metadata =
+            "Bearer resource_metadata=\"https://gateway.example/.well-known/oauth-protected-resource/surfaces/alpha\"";
+        for (error, status, challenge) in [
+            (ResourceTokenError::Missing, StatusCode::UNAUTHORIZED, format!("{metadata}, scope=\"read write\"")),
+            (
+                ResourceTokenError::Invalid,
+                StatusCode::UNAUTHORIZED,
+                format!("{metadata}, error=\"invalid_token\", scope=\"read write\""),
+            ),
+            (
+                ResourceTokenError::InsufficientScope,
+                StatusCode::FORBIDDEN,
+                format!("{metadata}, error=\"insufficient_scope\", scope=\"read write\""),
+            ),
+        ] {
+            let response = config.challenge(error);
+            assert_eq!(response.status(), status, "{error:?}");
+            assert_eq!(response.headers()[header::WWW_AUTHENTICATE], challenge.as_str());
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            assert!(protected_resource::is_gateway_challenge(&response), "{error:?}");
+        }
+        let unservable = McpResourceServerConfig {
+            resource: "http://gateway.example/surfaces/alpha".into(),
+            scopes: Vec::new(),
+        };
+        let refused = unservable.challenge(ResourceTokenError::Missing);
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!protected_resource::is_gateway_challenge(&refused));
     }
 
     #[test]

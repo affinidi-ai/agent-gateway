@@ -291,9 +291,9 @@ fn validate_source_auth_surface(surface: &crate::config::agent_surface::AgentSur
 ///
 /// Runs on **both** persistence paths:
 /// - boot-time / TOML: called from [`GatewayConfig::validate`];
-/// - HTTP API (`PUT/PATCH /v1/surfaces/...`): called from
-///   `identity::handlers::surfaces::validate_and_save_surface` before
-///   `store.save`.
+/// - HTTP API (every surface write: POST, PUT, PATCH and the variant routes):
+///   called from `identity::handlers::surfaces::validate_surface_for_save`
+///   before `store.save`.
 ///
 /// Enforces the mTLS trust rules the runtime relies on plus every
 /// `DidAuthAuthConfig` invariant (see [`validate_did_auth_config`]) so a
@@ -301,6 +301,8 @@ fn validate_source_auth_surface(surface: &crate::config::agent_surface::AgentSur
 /// the next process restart.
 pub fn validate_source_auth_config(surface: &crate::config::agent_surface::AgentSurface) -> anyhow::Result<()> {
     use crate::source_auth::models::{MtlsTrust, SourceAuthConfig};
+
+    validate_jwt_bearer_required_scopes(surface)?;
 
     let Some(src) = surface.source_auth() else {
         return Ok(());
@@ -338,6 +340,35 @@ pub fn validate_source_auth_config(surface: &crate::config::agent_surface::Agent
         },
         SourceAuthConfig::JwtBearer(_) | SourceAuthConfig::ApiKey(_) | SourceAuthConfig::ApiKeyProvider(_) => {}
         SourceAuthConfig::DidAuth(cfg) => validate_did_auth_config(cfg, &surface.name)?,
+    }
+    Ok(())
+}
+
+/// Refuse `required_scopes` that are not RFC 6749 scope tokens on any `jwt_bearer`
+/// method of the base Access Point or a Surface Variant.
+fn validate_jwt_bearer_required_scopes(surface: &crate::config::agent_surface::AgentSurface) -> anyhow::Result<()> {
+    let variant_auth = surface
+        .variants
+        .iter()
+        .filter_map(|variant| {
+            variant
+                .overrides
+                .access_point
+                .as_ref()?
+                .caller_authentication
+                .as_ref()
+        });
+    let methods = surface
+        .access_point
+        .caller_authentication
+        .iter()
+        .chain(variant_auth)
+        .flat_map(|auth| auth.methods.iter());
+    for method in methods {
+        if let crate::source_auth::models::SourceAuthConfig::JwtBearer(cfg) = method {
+            crate::jwt_bearer::access_token::validate_required_scopes(&cfg.required_scopes)
+                .map_err(|reason| anyhow::anyhow!("Channel '{}': {reason}", surface.name))?;
+        }
     }
     Ok(())
 }
@@ -425,4 +456,92 @@ fn validate_allowed_algorithms(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::agent_surface::{AgentSurface, CallerAuthentication};
+    use crate::config::agent_surface_variants::{AccessPointOverrides, SurfaceOverrides, SurfaceVariant};
+    use crate::jwt_bearer::models::JwtBearerAuthConfig;
+    use crate::source_auth::models::SourceAuthConfig;
+
+    fn jwt_auth(required_scopes: &[&str]) -> CallerAuthentication {
+        CallerAuthentication {
+            methods: vec![SourceAuthConfig::JwtBearer(JwtBearerAuthConfig {
+                jwt_verification_strategy_id: "strategy-1".to_string(),
+                required_scopes: required_scopes
+                    .iter()
+                    .map(|scope| scope.to_string())
+                    .collect(),
+                ..Default::default()
+            })],
+            protected_resource: None,
+        }
+    }
+
+    fn surface(base_scopes: &[&str]) -> AgentSurface {
+        let mut surface = GatewayConfig::default_config().surfaces[0].clone();
+        surface
+            .access_point
+            .caller_authentication = Some(jwt_auth(base_scopes));
+        surface
+    }
+
+    fn with_variant(
+        mut surface: AgentSurface,
+        variant_scopes: &[&str],
+    ) -> AgentSurface {
+        surface
+            .variants
+            .push(SurfaceVariant {
+                id: "variant-1".to_string(),
+                alias: "strict".to_string(),
+                name: "Strict".to_string(),
+                description: String::new(),
+                enabled: true,
+                overrides: SurfaceOverrides {
+                    access_point: Some(AccessPointOverrides {
+                        caller_authentication: Some(jwt_auth(variant_scopes)),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            });
+        surface
+    }
+
+    #[test]
+    fn well_formed_required_scopes_pass_on_the_base_and_variants() {
+        let scoped = with_variant(surface(&["a2a:invoke", "mcp.tools"]), &["admin"]);
+        assert!(validate_source_auth_config(&scoped).is_ok());
+        assert!(validate_source_auth_config(&surface(&[])).is_ok());
+    }
+
+    #[test]
+    fn a_malformed_base_scope_is_refused_with_the_surface_name() {
+        for bad in ["has space", "quote\"", "back\\slash", ""] {
+            let err = validate_source_auth_config(&surface(&[bad])).expect_err(bad);
+            assert_eq!(
+                err.to_string(),
+                "Channel 'default-agent': required_scopes entries must be OAuth scope tokens of 1 to 128 characters",
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_repeated_base_scope_is_refused() {
+        let err = validate_source_auth_config(&surface(&["read", "read"])).expect_err("duplicate");
+        assert_eq!(err.to_string(), "Channel 'default-agent': required_scopes must not repeat a scope");
+    }
+
+    #[test]
+    fn a_malformed_variant_scope_is_refused() {
+        let err = validate_source_auth_config(&with_variant(surface(&["read"]), &["bad scope"])).expect_err("variant");
+        assert_eq!(
+            err.to_string(),
+            "Channel 'default-agent': required_scopes entries must be OAuth scope tokens of 1 to 128 characters"
+        );
+    }
 }

@@ -294,11 +294,12 @@ pub enum SurfaceSourceAuthConfig {
     ApiKeyProvider(ApiKeyProviderSourceAuthConfig),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct JwtSourceAuthConfig {
     pub jwks_url: String,
     pub issuer: String,
     pub audiences: Vec<String>,
+    pub required_scopes: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -504,6 +505,7 @@ mod tests {
             jwks_url: "https://issuer.example/.well-known/jwks.json".to_string(),
             issuer: "https://issuer.example".to_string(),
             audiences: Vec::new(),
+            ..super::JwtSourceAuthConfig::default()
         });
         let api_key = super::SurfaceSourceAuthConfig::ApiKey(super::ApiKeySourceAuthConfig {
             header_name: "x-api-key".to_string(),
@@ -522,6 +524,11 @@ mod tests {
             super::SurfaceSourceAuthConfig::JwtBearer(config) => {
                 assert_eq!(config.jwks_url, "https://issuer.example/.well-known/jwks.json");
                 assert_eq!(config.issuer, "https://issuer.example");
+                assert!(
+                    config
+                        .required_scopes
+                        .is_empty()
+                );
             }
             super::SurfaceSourceAuthConfig::ApiKey(_) | super::SurfaceSourceAuthConfig::ApiKeyProvider(_) => {
                 panic!("expected JWT Bearer config");

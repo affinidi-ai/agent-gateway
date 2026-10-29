@@ -295,7 +295,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pinned_metadata_does_not_change_consent_identity_checks() {
+    async fn pinned_metadata_and_scope_claims_do_not_change_consent_identity_checks() {
         let mut fixture = consent_fixture();
         let plain = fixture
             .verify(&fixture.claims)
@@ -309,6 +309,7 @@ mod tests {
             token_endpoint: "https://elsewhere.example/token".into(),
             jwks_uri: "https://elsewhere.example/jwks.json".into(),
         });
+        fixture.strategy.scope_claims = Some(vec!["roles".into()]);
 
         assert_eq!(
             fixture

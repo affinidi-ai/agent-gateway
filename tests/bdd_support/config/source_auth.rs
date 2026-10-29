@@ -18,11 +18,17 @@ pub fn api_key_source_auth_method_json(
 
 pub fn caller_authentication_method_json(config: &SurfaceSourceAuthConfig) -> Value {
     match config {
-        SurfaceSourceAuthConfig::JwtBearer(cfg) => json!({
-            "type": "jwt_bearer",
-            "jwt_verification_strategy_id": "bdd-jwt-strategy",
-            "audiences": &cfg.audiences,
-        }),
+        SurfaceSourceAuthConfig::JwtBearer(cfg) => {
+            let mut method = json!({
+                "type": "jwt_bearer",
+                "jwt_verification_strategy_id": "bdd-jwt-strategy",
+                "audiences": &cfg.audiences,
+            });
+            if !cfg.required_scopes.is_empty() {
+                method["required_scopes"] = json!(&cfg.required_scopes);
+            }
+            method
+        }
         SurfaceSourceAuthConfig::ApiKey(cfg) => api_key_source_auth_method_json(&cfg.header_name, &cfg.secret_id),
         SurfaceSourceAuthConfig::ApiKeyProvider(cfg) => json!({
             "type": "api_key_provider",
@@ -48,6 +54,21 @@ mod tests {
     }
 
     #[test]
+    fn jwt_method_lists_required_scopes_and_audiences() {
+        use crate::bdd_support::config::single_surface_fixture::{JwtSourceAuthConfig, SurfaceSourceAuthConfig};
+
+        let jwt = SurfaceSourceAuthConfig::JwtBearer(JwtSourceAuthConfig {
+            audiences: vec!["https://gw.example/a".to_string()],
+            required_scopes: vec!["agent.invoke".to_string()],
+            ..JwtSourceAuthConfig::default()
+        });
+        let method = super::caller_authentication_method_json(&jwt);
+
+        assert_eq!(method["required_scopes"], serde_json::json!(["agent.invoke"]));
+        assert_eq!(method["audiences"], serde_json::json!(["https://gw.example/a"]));
+    }
+
+    #[test]
     fn caller_authentication_method_json_covers_all_source_auth_variants() {
         use crate::bdd_support::config::single_surface_fixture::{
             ApiKeyProviderSourceAuthConfig, ApiKeySourceAuthConfig, JwtSourceAuthConfig, SurfaceSourceAuthConfig,
@@ -57,6 +78,7 @@ mod tests {
             jwks_url: "https://example.test/.well-known/jwks.json".to_string(),
             issuer: "https://example.test/".to_string(),
             audiences: vec![],
+            ..JwtSourceAuthConfig::default()
         });
         let api_key = SurfaceSourceAuthConfig::ApiKey(ApiKeySourceAuthConfig {
             header_name: "x-api-key".to_string(),
@@ -72,6 +94,11 @@ mod tests {
         });
 
         assert_eq!(super::caller_authentication_method_json(&jwt)["type"], "jwt_bearer");
+        assert!(
+            super::caller_authentication_method_json(&jwt)
+                .get("required_scopes")
+                .is_none()
+        );
         assert_eq!(super::caller_authentication_method_json(&api_key)["type"], "api_key");
         assert_eq!(super::caller_authentication_method_json(&api_key_provider)["type"], "api_key_provider");
     }

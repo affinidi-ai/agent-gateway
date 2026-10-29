@@ -1362,6 +1362,7 @@ mod tests {
             let caller = AuthenticatedIdentity::JwtBearer {
                 subject: "user".into(),
                 claims: json!({"iss": profile.issuer, "sub": "user", "scope": "read"}),
+                strategy: None,
             };
             let now = now_secs().unwrap();
             let service = ContinuationService::new(
@@ -1664,6 +1665,7 @@ mod tests {
         let caller = AuthenticatedIdentity::JwtBearer {
             subject: "user".into(),
             claims: json!({"iss": profile.issuer, "sub": "user", "scope": "read"}),
+            strategy: None,
         };
         let service = ContinuationService::new(
             ContinuationCipher::new(
@@ -2089,6 +2091,7 @@ mod tests {
             let caller = AuthenticatedIdentity::JwtBearer {
                 subject: "user".into(),
                 claims: json!({"iss": profile.issuer, "sub": "user", "scope": "read"}),
+                strategy: None,
             };
             let now = now_secs().unwrap();
             let service = ContinuationService::new(
@@ -2236,6 +2239,7 @@ mod tests {
         let caller = AuthenticatedIdentity::JwtBearer {
             subject: "user".into(),
             claims: json!({"iss": profile.issuer, "sub": "user", "scope": "read"}),
+            strategy: None,
         };
         let service = ContinuationService::new(
             ContinuationCipher::new(
@@ -2423,6 +2427,7 @@ mod tests {
         let caller = AuthenticatedIdentity::JwtBearer {
             subject: "user".into(),
             claims: json!({"iss": profile.issuer, "sub": "user", "scope": "read"}),
+            strategy: None,
         };
         let service = ContinuationService::new(
             ContinuationCipher::new(

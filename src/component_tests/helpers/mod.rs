@@ -1371,18 +1371,51 @@ impl Drop for GatewayServer {
     }
 }
 
+thread_local! {
+    static GATEWAY_LOG: std::cell::RefCell<Option<tracing::subscriber::DefaultGuard>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A dispatcher writing `info` and higher events to `log` as the gateway's log
+/// file renders them.
+fn gateway_log_dispatch(log: std::fs::File) -> tracing::Dispatch {
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let layer = tracing_subscriber::fmt::layer()
+        .event_format(crate::observability::SimpleFormat)
+        .with_writer(Arc::new(log))
+        .with_ansi(false)
+        .with_filter(tracing_subscriber::filter::LevelFilter::INFO);
+    tracing::Dispatch::new(tracing_subscriber::registry().with(layer))
+}
+
+/// Runs the gateway on its own thread and runtime. With `log`, every thread of
+/// that runtime writes its log there instead of to the test output.
 fn spawn_gateway_server(
     gw_config: GatewayConfig,
     bootstrap: BootstrapConfig,
+    log: Option<std::fs::File>,
 ) -> GatewayServer {
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let thread = std::thread::Builder::new()
         .name("gw-harness".to_string())
         .stack_size(8 * 1024 * 1024)
         .spawn(move || {
-            let rt = tokio::runtime::Builder::new_multi_thread()
+            let log = log.map(gateway_log_dispatch);
+            let _log = log
+                .as_ref()
+                .map(thread_subscriber::set_thread_dispatch);
+            let mut runtime = tokio::runtime::Builder::new_multi_thread();
+            runtime
                 .enable_all()
-                .thread_stack_size(8 * 1024 * 1024)
+                .thread_stack_size(8 * 1024 * 1024);
+            if let Some(log) = log {
+                runtime
+                    .on_thread_start(move || GATEWAY_LOG.set(Some(thread_subscriber::set_thread_dispatch(&log))))
+                    .on_thread_stop(|| GATEWAY_LOG.set(None));
+            }
+            let rt = runtime
                 .build()
                 .expect("build gateway harness runtime");
             rt.block_on(async move {
@@ -1423,6 +1456,7 @@ pub struct GatewayHarness {
     _port_guard: ReservedPort,
     _outbound_port_guard: Option<ReservedPort>,
     _gw_server: GatewayServer,
+    log: Option<PathBuf>,
 }
 
 async fn wait_for_gateway_http(
@@ -1494,7 +1528,7 @@ impl GatewayHarness {
         let mode_boot_guard = crate::server::mode::TEST_GUARD
             .lock()
             .await;
-        let gw_server = spawn_gateway_server(gw_config, bootstrap);
+        let gw_server = spawn_gateway_server(gw_config, bootstrap, None);
 
         wait_for_gateway_http(channel_port, "gateway").await;
         drop(mode_boot_guard);
@@ -1508,6 +1542,7 @@ impl GatewayHarness {
             _port_guard: port_guard,
             _outbound_port_guard: None,
             _gw_server: gw_server,
+            log: None,
         }
     }
 
@@ -1516,6 +1551,39 @@ impl GatewayHarness {
     pub async fn start_with_mock<F>(
         mock: MockServer,
         setup: F,
+    ) -> Self
+    where
+        F: FnOnce(&std::path::Path, &mut GatewayConfig, &mut BootstrapConfig),
+    {
+        Self::boot_with_mock(mock, setup, false).await
+    }
+
+    /// Same as [`start_with_mock`](Self::start_with_mock), keeping the
+    /// gateway's log for [`logs`](Self::logs).
+    pub(crate) async fn start_with_mock_and_logs<F>(
+        mock: MockServer,
+        setup: F,
+    ) -> Self
+    where
+        F: FnOnce(&std::path::Path, &mut GatewayConfig, &mut BootstrapConfig),
+    {
+        Self::boot_with_mock(mock, setup, true).await
+    }
+
+    /// The `info` and higher lines the gateway logged so far, as its log file
+    /// renders them.
+    pub(crate) fn logs(&self) -> String {
+        let log = self
+            .log
+            .as_ref()
+            .expect("start the harness with start_with_mock_and_logs to read its logs");
+        std::fs::read_to_string(log).expect("read the gateway log")
+    }
+
+    async fn boot_with_mock<F>(
+        mock: MockServer,
+        setup: F,
+        keep_log: bool,
     ) -> Self
     where
         F: FnOnce(&std::path::Path, &mut GatewayConfig, &mut BootstrapConfig),
@@ -1530,6 +1598,13 @@ impl GatewayHarness {
             .tempdir()
             .expect("tempdir");
         let gateway_json = write_gateway_json(temp.path(), channel_port, None);
+        let log = keep_log.then(|| {
+            temp.path()
+                .join("gateway.log")
+        });
+        let log_file = log
+            .as_ref()
+            .map(|path| std::fs::File::create(path).expect("create the gateway log"));
 
         let mut bootstrap = build_bootstrap_config(&temp, gateway_json);
         let mut gw_config = build_gateway_config(&bootstrap);
@@ -1548,7 +1623,7 @@ impl GatewayHarness {
         let mode_boot_guard = crate::server::mode::TEST_GUARD
             .lock()
             .await;
-        let gw_server = spawn_gateway_server(gw_config, bootstrap);
+        let gw_server = spawn_gateway_server(gw_config, bootstrap, log_file);
 
         wait_for_gateway_http(channel_port, "gateway").await;
         drop(mode_boot_guard);
@@ -1562,6 +1637,7 @@ impl GatewayHarness {
             _port_guard: port_guard,
             _outbound_port_guard: None,
             _gw_server: gw_server,
+            log,
         }
     }
 
@@ -1611,7 +1687,7 @@ impl GatewayHarness {
         let mode_boot_guard = crate::server::mode::TEST_GUARD
             .lock()
             .await;
-        let gw_server = spawn_gateway_server(gw_config, bootstrap);
+        let gw_server = spawn_gateway_server(gw_config, bootstrap, None);
 
         wait_for_gateway_http(channel_port, "gateway").await;
         wait_for_gateway_http(outbound_port, "outbound listener").await;
@@ -1626,6 +1702,7 @@ impl GatewayHarness {
             _port_guard: port_guard,
             _outbound_port_guard: Some(outbound_port_guard),
             _gw_server: gw_server,
+            log: None,
         }
     }
 
@@ -1669,7 +1746,7 @@ impl GatewayHarness {
         let mode_boot_guard = crate::server::mode::TEST_GUARD
             .lock()
             .await;
-        let gw_server = spawn_gateway_server(gw_config, bootstrap);
+        let gw_server = spawn_gateway_server(gw_config, bootstrap, None);
 
         wait_for_gateway_http(channel_port, "gateway").await;
         wait_for_gateway_http(outbound_port, "outbound listener").await;
@@ -1684,6 +1761,7 @@ impl GatewayHarness {
             _port_guard: port_guard,
             _outbound_port_guard: Some(outbound_port_guard),
             _gw_server: gw_server,
+            log: None,
         }
     }
 }
@@ -1715,4 +1793,77 @@ pub fn configure_gateway_route_prefixes(
         serde_json::to_string_pretty(&gateway_json).expect("serialize gateway network config"),
     )
     .expect("write gateway network config");
+}
+
+/// A listener's state holding one running surface, as the listener builds it from
+/// `state`'s stores.
+pub(crate) fn direct_router_state(
+    state: &crate::state::ProxyState,
+    surface: AgentSurface,
+) -> crate::state::MultiSurfaceProxyState {
+    crate::state::MultiSurfaceProxyState {
+        config: state.config.clone(),
+        network_config: state.network_config.clone(),
+        client: state.client.clone(),
+        channels: Arc::new(tokio::sync::RwLock::new(vec![crate::state::SurfaceInfo {
+            surface: Arc::new(surface),
+            identity_rules_engine: None,
+            identity_selector: None,
+            protected_rules_engine: None,
+            protected_selector: None,
+            external_rules_engine: None,
+            external_selector: None,
+            task_id: "router-fixture".into(),
+            variant_engines: HashMap::new(),
+        }])),
+        metrics_store: state.metrics_store.clone(),
+        task_monitor: state.task_monitor.clone(),
+        ws_state: state.ws_state.clone(),
+        listener_manager: state.listener_manager.clone(),
+        secrets_store: state.secrets_store.clone(),
+        certificates_store: state
+            .certificates_store
+            .clone(),
+        vc_issuer: state.vc_issuer.clone(),
+        policy_manager: state.policy_manager.clone(),
+        gateway_policy_manager: state
+            .gateway_policy_manager
+            .clone(),
+        didauth_session_store: state
+            .didauth_session_store
+            .clone(),
+        transaction_store: state
+            .transaction_store
+            .clone(),
+        mpp_transaction_store: state
+            .mpp_transaction_store
+            .clone(),
+        trust_registry_listener_manager: state
+            .trust_registry_listener_manager
+            .clone(),
+        source_auth_middleware: state
+            .source_auth_middleware
+            .clone(),
+        #[cfg(feature = "didwebvh")]
+        didwebvh_identity_store: state
+            .didwebvh_identity_store
+            .clone(),
+        #[cfg(feature = "didwebvh")]
+        didwebvh_log_manager: state
+            .didwebvh_log_manager
+            .clone(),
+        credential_provider_store: state
+            .credential_provider_store
+            .clone(),
+        delegation_vault_store: state
+            .delegation_vault_store
+            .clone(),
+        gateway_base_url: state.gateway_base_url.clone(),
+        transit_token_issuer: state
+            .transit_token_issuer
+            .clone(),
+        mcp_proxy_store: state.mcp_proxy_store.clone(),
+        a2a_proxy_store: state.a2a_proxy_store.clone(),
+        resolved_surface_cache: Arc::new(crate::surfaces::ResolvedSurfaceCache::new()),
+    }
 }

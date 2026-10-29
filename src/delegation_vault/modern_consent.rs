@@ -837,6 +837,7 @@ mod tests {
         let caller = crate::source_auth::AuthenticatedIdentity::JwtBearer {
             subject: subject.clone(),
             claims: json!({"iss": profile.issuer, "sub": subject, "scope": "read", "exp": now + 300}),
+            strategy: None,
         };
         let request = ValidatedModernMessage {
             protocol_version: crate::mcp::MCP_MODERN_VERSION.into(),

@@ -25,6 +25,12 @@ impl Default for JwksSource {
 /// Authorization server metadata pinned on a strategy by discovery.
 pub use crate::authz_metadata::AuthzServerMetadata as AuthorizationServerMetadata;
 
+/// Claims read for granted scopes when a strategy sets no `scope_claims`.
+pub const DEFAULT_SCOPE_CLAIMS: [&str; 2] = ["scope", "scp"];
+
+const MAX_SCOPE_CLAIMS: usize = 8;
+const MAX_CLAIM_NAME_LEN: usize = 256;
+
 /// A registered JWT verification strategy configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct JwtVerificationStrategy {
@@ -43,10 +49,15 @@ pub struct JwtVerificationStrategy {
     /// Where to find the JWKS (static inline keys or a remote URL).
     pub jwks_source: JwksSource,
 
-    /// Authorization server metadata pinned by discovery. STS, consent and credential
-    /// provider flows ignore it.
+    /// Authorization server metadata pinned by discovery. Read only by Access Points;
+    /// STS, consent and credential provider flows ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authorization_server: Option<AuthorizationServerMetadata>,
+
+    /// Claims read for granted scopes, in order. Absent means [`DEFAULT_SCOPE_CLAIMS`].
+    /// Read only by Access Points.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_claims: Option<Vec<String>>,
 
     /// When this strategy was created.
     pub created_at: DateTime<Utc>,
@@ -63,6 +74,18 @@ impl JwtVerificationStrategy {
             JwksSource::Static { .. } => None,
         }
     }
+
+    /// The claims read for granted scopes, in order.
+    pub fn effective_scope_claims(&self) -> Vec<String> {
+        self.scope_claims
+            .clone()
+            .unwrap_or_else(|| {
+                DEFAULT_SCOPE_CLAIMS
+                    .iter()
+                    .map(|claim| claim.to_string())
+                    .collect()
+            })
+    }
 }
 
 /// Refuse an empty issuer and an issuer template such as Entra's `{tenantid}`.
@@ -77,6 +100,38 @@ pub fn validate_expected_issuer(issuer: &str) -> Result<(), &'static str> {
         return Err("expected_issuer must be one concrete issuer, not a template such as {tenantid}");
     }
     Ok(())
+}
+
+/// Validate `scope_claims`, returning `None` when it equals the default.
+///
+/// Storing the default as absent keeps the record, and every digest computed over it,
+/// unchanged for strategies that do not customise it.
+pub fn normalize_scope_claims(claims: Vec<String>) -> Result<Option<Vec<String>>, &'static str> {
+    if claims.is_empty() || claims.len() > MAX_SCOPE_CLAIMS {
+        return Err("scope_claims must list between 1 and 8 claim names");
+    }
+    let mut seen = std::collections::HashSet::new();
+    for claim in &claims {
+        let well_formed = !claim.is_empty()
+            && claim.len() <= MAX_CLAIM_NAME_LEN
+            && claim
+                .chars()
+                .all(|c| c.is_ascii_graphic());
+        if !well_formed {
+            return Err("scope_claims entries must be 1 to 256 printable ASCII characters without spaces");
+        }
+        if !seen.insert(claim.as_str()) {
+            return Err("scope_claims must not repeat a claim name");
+        }
+    }
+    if claims
+        .iter()
+        .map(String::as_str)
+        .eq(DEFAULT_SCOPE_CLAIMS)
+    {
+        return Ok(None);
+    }
+    Ok(Some(claims))
 }
 
 /// JWT Bearer-specific authentication configuration attached to a channel or pipe.
@@ -105,6 +160,10 @@ pub struct JwtBearerAuthConfig {
     /// Defaults to `false`.
     #[serde(default)]
     pub forward_header: bool,
+
+    /// Scopes every token must grant. Empty means no scope is required.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_scopes: Vec<String>,
 }
 
 fn default_token_header() -> String {
@@ -123,6 +182,7 @@ impl Default for JwtBearerAuthConfig {
             token_header: default_token_header(),
             token_scheme: default_token_scheme(),
             forward_header: false,
+            required_scopes: Vec::new(),
         }
     }
 }
@@ -187,11 +247,12 @@ mod tests {
         });
         let strategy: JwtVerificationStrategy = serde_json::from_value(stored.clone()).unwrap();
         assert_eq!(strategy.authorization_server, None);
+        assert_eq!(strategy.scope_claims, None);
         assert_eq!(serde_json::to_value(&strategy).unwrap(), stored);
     }
 
     #[test]
-    fn pinned_metadata_round_trips() {
+    fn pinned_metadata_and_scope_claims_round_trip() {
         let strategy = JwtVerificationStrategy {
             authorization_server: Some(AuthorizationServerMetadata {
                 issuer: "https://issuer.example.com".to_string(),
@@ -199,10 +260,48 @@ mod tests {
                 token_endpoint: "https://issuer.example.com/token".to_string(),
                 jwks_uri: "https://issuer.example.com/jwks.json".to_string(),
             }),
+            scope_claims: Some(vec!["roles".to_string(), "scp".to_string()]),
             ..make_strategy()
         };
         let back: JwtVerificationStrategy = serde_json::from_str(&serde_json::to_string(&strategy).unwrap()).unwrap();
         assert_eq!(back.authorization_server, strategy.authorization_server);
+        assert_eq!(back.scope_claims, strategy.scope_claims);
+    }
+
+    #[test]
+    fn effective_scope_claims_fall_back_to_scope_then_scp() {
+        assert_eq!(make_strategy().effective_scope_claims(), vec!["scope".to_string(), "scp".to_string()]);
+        let custom = JwtVerificationStrategy {
+            scope_claims: Some(vec!["roles".to_string()]),
+            ..make_strategy()
+        };
+        assert_eq!(custom.effective_scope_claims(), vec!["roles".to_string()]);
+    }
+
+    #[test]
+    fn scope_claims_are_validated_and_the_default_is_stored_as_absent() {
+        let claims = |names: &[&str]| -> Vec<String> {
+            names
+                .iter()
+                .map(|name| name.to_string())
+                .collect()
+        };
+        assert_eq!(normalize_scope_claims(claims(&["scope", "scp"])), Ok(None));
+        assert_eq!(normalize_scope_claims(claims(&["scp", "scope"])), Ok(Some(claims(&["scp", "scope"]))));
+        assert_eq!(normalize_scope_claims(claims(&["scp", "roles"])), Ok(Some(claims(&["scp", "roles"]))));
+        let too_many: Vec<String> = (0..9)
+            .map(|i| format!("c{i}"))
+            .collect();
+        for bad in [
+            Vec::new(),
+            too_many,
+            claims(&["scp", "scp"]),
+            claims(&[""]),
+            claims(&["has space"]),
+            vec!["x".repeat(257)],
+        ] {
+            assert!(normalize_scope_claims(bad.clone()).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

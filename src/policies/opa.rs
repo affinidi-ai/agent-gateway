@@ -681,6 +681,150 @@ allow if {
         assert!(!decision.allow);
     }
 
+    fn jwt_source_auth_input(
+        claims: serde_json::Value,
+        strategy: Option<crate::source_auth::models::VerifyingStrategy>,
+    ) -> serde_json::Value {
+        let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            subject: "client-1".to_string(),
+            claims,
+            strategy,
+        };
+        serde_json::json!({
+            "source_auth": crate::surface_context::SourceAuthContext::from(&identity),
+        })
+    }
+
+    #[test]
+    fn test_opa_source_auth_scopes_from_scope_or_scp_as_string_or_array() {
+        let engine = OpaEngine::new();
+        engine
+            .load_policy(
+                "test",
+                r#"
+package surface.policy
+
+default allow = false
+
+allow if {
+    input.source_auth.method == "jwt_bearer"
+    "a2a:invoke" in input.source_auth.scopes
+    input.source_auth.client_id == "app-1"
+}
+"#,
+            )
+            .unwrap();
+
+        for claims in [
+            serde_json::json!({"scope": "read a2a:invoke", "client_id": "app-1"}),
+            serde_json::json!({"scope": ["a2a:invoke"], "azp": "app-1"}),
+            serde_json::json!({"scp": "a2a:invoke", "appid": "app-1"}),
+            serde_json::json!({"scp": ["read", "a2a:invoke"], "client_id": "app-1", "azp": "other"}),
+        ] {
+            let decision = engine
+                .evaluate(jwt_source_auth_input(claims.clone(), None))
+                .unwrap();
+            assert!(decision.allow, "{claims}");
+        }
+
+        for claims in [
+            serde_json::json!({"scope": "read", "client_id": "app-1"}),
+            serde_json::json!({"scp": "a2a:invoke", "client_id": "app-2"}),
+            serde_json::json!({"scope": {"a2a:invoke": true}, "client_id": "app-1"}),
+            serde_json::json!({"roles": ["a2a:invoke"], "client_id": "app-1"}),
+        ] {
+            let decision = engine
+                .evaluate(jwt_source_auth_input(claims.clone(), None))
+                .unwrap();
+            assert!(!decision.allow, "{claims}");
+        }
+    }
+
+    #[test]
+    fn test_opa_gateway_policy_keys_on_the_verifying_strategy_not_the_issuer() {
+        let engine = OpaEngine::new();
+        engine
+            .load_policy(
+                "test",
+                r#"
+package surface.policy
+
+default allow = false
+
+allow if {
+    input.source_auth.strategy_id == "operator-strategy"
+    not input.source_auth.strategy_tenant_id
+}
+"#,
+            )
+            .unwrap();
+        let strategy = |id: &str, tenant: Option<&str>| crate::source_auth::models::VerifyingStrategy {
+            id: id.to_string(),
+            tenant_id: tenant.map(str::to_string),
+            scope_claims: vec!["scope".to_string()],
+        };
+        let claims = serde_json::json!({"iss": "https://trusted.example", "scope": "read"});
+
+        let operator = engine
+            .evaluate(jwt_source_auth_input(claims.clone(), Some(strategy("operator-strategy", None))))
+            .unwrap();
+        assert!(operator.allow);
+
+        let tenant = engine
+            .evaluate(jwt_source_auth_input(claims, Some(strategy("tenant-strategy", Some("tenant-b")))))
+            .unwrap();
+        assert!(!tenant.allow, "a tenant strategy with the same issuer must not match");
+    }
+
+    #[test]
+    fn test_opa_failed_caller_kind_distinguishes_insufficient_scope() {
+        let engine = OpaEngine::new();
+        engine
+            .load_policy(
+                "test",
+                r#"
+package surface.policy
+
+default allow = true
+
+allow := false if input.source_auth.method == "failed"
+
+deny_reason := "insufficient scope" if input.source_auth.kind == "insufficient_scope"
+"#,
+            )
+            .unwrap();
+        let failed = |error: crate::source_auth::errors::SourceAuthError| {
+            serde_json::json!({
+                "source_auth": crate::surface_context::SourceAuthContext::failed("jwt_bearer", &error)
+                    .expect("caller-attributable"),
+            })
+        };
+
+        let short = engine
+            .evaluate(failed(crate::source_auth::errors::SourceAuthError::InsufficientScope {
+                missing: vec!["a2a:invoke".to_string()],
+            }))
+            .unwrap();
+        assert!(!short.allow);
+        assert_eq!(short.reason.as_deref(), Some("insufficient scope"));
+
+        let missing = engine
+            .evaluate(failed(crate::source_auth::errors::SourceAuthError::MissingCredential {
+                reason: "Missing bearer token".to_string(),
+            }))
+            .unwrap();
+        assert!(!missing.allow);
+        assert_eq!(missing.reason.as_deref(), Some("Policy denied request"));
+
+        let invalid = engine
+            .evaluate(failed(crate::source_auth::errors::SourceAuthError::InvalidCredential {
+                reason: "Invalid audience".to_string(),
+            }))
+            .unwrap();
+        assert!(!invalid.allow);
+        assert_eq!(invalid.reason.as_deref(), Some("Policy denied request"));
+    }
+
     #[test]
     fn test_filter_tools() {
         let engine = OpaEngine::new();

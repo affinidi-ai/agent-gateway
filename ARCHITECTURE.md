@@ -65,7 +65,10 @@ the stores, listeners, and middleware.
 8. Build the source authentication middleware, then the management and dashboard routers,
    and hand them to the surface task manager. Startup aborts if the JWT verification
    strategy store cannot be opened.
-9. Bind listeners and start each surface.
+9. Bind listeners and start each surface. A prefix that shadows a dashboard page or the
+   protected resource metadata path every listener serves stops the gateway with exit code
+   `2` first, and a stored surface whose route is at or under that path is skipped; see
+   [`CONFIGURATION_REFERENCE.md`](docs/CONFIGURATION_REFERENCE.md#gatewayjson).
 10. Mark the process ready, at which point `/api/v1/health` returns 200.
 
 Connection points come up before the management router and before any surface listener,
@@ -129,7 +132,7 @@ logic.
 
 | Stage | Owns | Lives in |
 | --- | --- | --- |
-| Source authentication | Establishing the caller's identity. A missing or invalid credential is passed to policy, not refused, except on an MCP Access Point that publishes protected resource metadata, which answers with a `401` discovery challenge | [`src/source_auth/`](src/source_auth/), [`src/protocols/protected_resource.rs`](src/protocols/protected_resource.rs) |
+| Source authentication | Establishing the caller's identity. A missing or invalid credential, or a JWT short of a required scope, is passed to policy, not refused, except on an MCP Access Point that publishes protected resource metadata, which answers with a `401` discovery challenge, or `403` with `error="insufficient_scope"` for a scope shortfall | [`src/source_auth/`](src/source_auth/), [`src/source_auth/declaration.rs`](src/source_auth/declaration.rs), [`src/protocols/protected_resource.rs`](src/protocols/protected_resource.rs) |
 | Resource Server token | Replaces source authentication on an MCP surface that sets `mcp_http.authorization`: a bearer token for this resource and its scopes is required, and a missing, invalid or insufficient one is refused at once with a `WWW-Authenticate` challenge, not passed to policy | [`src/mcp/resource_server.rs`](src/mcp/resource_server.rs) |
 | Rate limiting | Per-surface request limits | [`src/policies/rate_limiter.rs`](src/policies/rate_limiter.rs) |
 | Body extraction | Reading the request body once | [`src/proxy/handler.rs`](src/proxy/handler.rs) |
@@ -151,6 +154,7 @@ logic.
 | Access Point OPA | `access_point.inbound_policy`, its own deny gate, independent of the surface policy | [`src/policies/surface_manager.rs`](src/policies/surface_manager.rs) |
 | Appliance-wide surface policy | The global surface-plane set, deny-overrides, ahead of the surface's own policy | [`src/policies/global_policy.rs`](src/policies/global_policy.rs) |
 | Surface OPA | The per-surface policy gate | [`src/policies/surface_manager.rs`](src/policies/surface_manager.rs) |
+| Caller refusal | The answer to a caller a policy stage refuses: the declaration's `Bearer` challenge for a caller whose source authentication failed on a declaring Access Point, otherwise the stage's `403`. Responses drop relayed challenges other than `Payment` when the Access Point declares or the Target is another gateway | [`src/proxy/caller_denial.rs`](src/proxy/caller_denial.rs), [`src/source_auth/challenge.rs`](src/source_auth/challenge.rs) |
 | MCP tool gating | The allow/deny firewall over tool names | [`src/policies/mcp_tool_gating.rs`](src/policies/mcp_tool_gating.rs) |
 | Headers | Trace ID, `did:webvh` identity headers, and caller-info headers | [`src/proxy/handler.rs`](src/proxy/handler.rs) |
 | Transit token | The token a managed agent echoes back on its Transit Point calls | [`src/proxy/transit_token.rs`](src/proxy/transit_token.rs) |
@@ -310,6 +314,7 @@ Breaking one of these is a correctness bug, not a style question.
 | Identity attribution fails closed. A presentation that does not verify never becomes the caller identity. | An unverified DID would reach policy as if it were proven. |
 | Every event of a forwarded A2A event stream gets the response checks a non-streaming reply gets before it is sent, and one that fails them ends the stream. | Streaming would bypass the response policy and the agent identity credential. |
 | A caller whose source authentication failed is never forwarded with the surface's Target Authentication credential, or the A2A proxy's Direct Line secret, on the inbound and Fabric forwarding paths (direct, `proxy://` MCP, `a2a-proxy://`, Fabric send, Fabric receive). Transit Point listeners do not authenticate callers, so this does not cover them. | An unauthenticated caller would reach the Target with the operator's credential. |
+| Every `Bearer` `WWW-Authenticate` challenge the gateway builds on an Access Point carries the `GatewayChallenge` marker (`mark_gateway_challenge` in `src/protocols/protected_resource.rs`); `Payment` challenges are kept by scheme. | The relayed-challenge filter would drop the gateway's own challenge and turn its `401` into a `502`. |
 | The Agent Surface is the only routing unit. | Routing behaviour would drift away from what an operator configured. |
 | x402 verification and settlement use the surface's configured payment requirement, or on a fabric facilitator the requirement the requesting peer sends; a credential's `accepted` must name it exactly. | A caller could name its own recipient and amount and still be granted the resource. |
 
@@ -338,7 +343,7 @@ from.
 | --- | --- | --- |
 | [`a2a/`](src/a2a/) | A2A-specific schema, auth, errors, agent-card URL rewriting, event-stream forwarding | [`PROTOCOLS.md`](docs/PROTOCOLS.md) |
 | [`a2a_proxies/`](src/a2a_proxies/) | Exposing a non-A2A agent as an A2A endpoint | [`PROTOCOLS.md`](docs/PROTOCOLS.md) |
-| [`mcp/`](src/mcp/) | MCP wire handling, metadata, transports | [`MCP_TOOL_GATING.md`](docs/MCP_TOOL_GATING.md), [`PROTOCOLS.md`](docs/PROTOCOLS.md) |
+| [`mcp/`](src/mcp/) | MCP wire handling, metadata, transports, and matching the protected resource metadata every inbound listener serves to the surface or MCP Proxy that publishes it | [`MCP_TOOL_GATING.md`](docs/MCP_TOOL_GATING.md), [`PROTOCOLS.md`](docs/PROTOCOLS.md) |
 | [`mcp_proxies/`](src/mcp_proxies/) | Exposing REST APIs as MCP tool servers | [`PROTOCOLS.md`](docs/PROTOCOLS.md) |
 | [`ap2/`](src/ap2/) | AP2, experimental and disabled by default | [`PROTOCOLS.md`](docs/PROTOCOLS.md) |
 | [`comm/`](src/comm/) | DIDComm message construction and handling | [`FABRIC.md`](docs/FABRIC.md) |
@@ -349,10 +354,10 @@ from.
 | Module | Owns | Document |
 | --- | --- | --- |
 | [`identity/`](src/identity/) | Agent DIDs, `did:webvh` logs, credential issuance, VP verification, display names (including dashboard-only managed-agent Agent Card names) | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#managed-identity), [`POLICY.md`](docs/POLICY.md) |
-| [`source_auth/`](src/source_auth/) | JWT bearer, API key, DID Auth, mTLS on the inbound edge | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md) |
+| [`source_auth/`](src/source_auth/) | JWT bearer, API key, DID Auth, mTLS on the inbound edge, required scopes, the Access Point's declaration, the caller challenge and the relayed-challenge filter | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md) |
 | [`event_hook/`](src/event_hook/) | Operator-configured notifications of Connection Point lifecycle events to a receiver: signed, sequenced, delivered from background tasks with retries, nothing persisted. `directory.rs` is the cached client of the operator-configured mediator directory, whose entries `mediators/` lists next to stored records | [`INTEGRATIONS.md`](docs/INTEGRATIONS.md#event-hook), [`INTEGRATIONS.md`](docs/INTEGRATIONS.md#mediator-directory) |
 | [`didauth/`](src/didauth/) | The DID Auth challenge and JWS ceremony | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#did-auth) |
-| [`jwt_bearer/`](src/jwt_bearer/) | JWT verification strategies, JWKS fetching, and authorization server discovery and pinning, which run through `authz_metadata` | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md) |
+| [`jwt_bearer/`](src/jwt_bearer/) | JWT verification strategies, JWKS fetching, authorization server discovery and pinning, which run through `authz_metadata`, and the access token rules Access Points apply (granted scopes, client id, ID token refusal) | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md) |
 | [`authz_metadata/`](src/authz_metadata/) | Fetching and validating an authorization server's metadata document (RFC 8414, then OpenID Connect discovery) through a pinned, bounded GET, for callers that need an issuer's token endpoint and JWKS URI, and the issuer rules protected resource metadata (`protocols/protected_resource.rs`) applies to the authorization servers it advertises | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#authorization-server-metadata-module-developer-reference) |
 | [`api_keys/`](src/api_keys/) | Data-plane API keys | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md) |
 | [`certificates/`](src/certificates/) | TLS and mTLS certificate records | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#mtls) |

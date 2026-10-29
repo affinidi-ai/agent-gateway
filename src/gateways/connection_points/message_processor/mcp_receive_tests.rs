@@ -1633,6 +1633,7 @@ async fn fabric_consent_flow() {
         let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
             subject: "user".into(),
             claims: json!({"iss": "https://receiver.example/api/oauth2/mcp", "sub": "user", "scope": "read"}),
+            strategy: None,
         };
         let binding = crate::mcp::continuations::delegation::make_binding(
             "receiver",
@@ -2503,8 +2504,10 @@ fn fabric_receive_binds_tokens_to_the_routes_protected_resource() {
 /// direct path. The sending gateway strips the caller's own token, so the
 /// `Authorization` here stands for a credential the sender injects: a missing
 /// one, or one issued for another resource or variant, gets a 401 before
-/// policy without `resource_metadata`, and only one for the route's resource,
-/// or the default's when a named alias does not resolve, reaches the Target.
+/// policy without `resource_metadata`, one for the route's resource that lacks
+/// a required scope gets a 403, and only one for the route's resource with the
+/// required scope, or the default's when a named alias does not resolve,
+/// reaches the Target.
 async fn fabric_discovery_flow() {
     use std::sync::Arc;
 
@@ -2544,7 +2547,8 @@ async fn fabric_discovery_flow() {
         "surface_id": "fabric-discovery", "name": "Fabric discovery",
         "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp",
             "caller_authentication": {
-                "methods": [{"type": "jwt_bearer", "jwt_verification_strategy_id": strategy.id, "audiences": []}],
+                "methods": [{"type": "jwt_bearer", "jwt_verification_strategy_id": strategy.id, "audiences": [],
+                    "required_scopes": ["mcp:tools"]}],
                 "protected_resource": {"resource": "https://gateway.example/mcp",
                     "authorization_servers": [crate::protocols::protected_resource::fixtures::ISSUER]}
             }},
@@ -2570,12 +2574,14 @@ async fn fabric_discovery_flow() {
     )))
     .await;
 
-    let token_for = |audience: &str| {
-        sign_jwt(
-            json!({"iss": fixture.issuer, "sub": "user-123", "aud": audience, "exp": now_secs() + 300}),
-            &fixture.kid,
-        )
+    let token_with = |audience: &str, scope: Option<&str>| {
+        let mut claims = json!({"iss": fixture.issuer, "sub": "user-123", "aud": audience, "exp": now_secs() + 300});
+        if let Some(scope) = scope {
+            claims["scope"] = json!(scope);
+        }
+        sign_jwt(claims, &fixture.kid)
     };
+    let token_for = |audience: &str| token_with(audience, Some("mcp:tools"));
     let now = super::super::envelope_replay::now_secs();
     let send = |alias: Option<&str>, token: Option<String>| {
         let mut headers = json!({"MCP-Protocol-Version": MCP_LEGACY_VERSION});
@@ -2640,6 +2646,16 @@ async fn fabric_discovery_flow() {
         assert!(!challenge.contains("resource_metadata"), "{response}");
         assert_eq!(challenge.contains("error=\"invalid_token\""), invalid_token, "{response}");
         assert_eq!(reached(), 0, "a refused token never reaches the Target");
+    }
+
+    for scope in [None, Some("mcp:read")] {
+        let response = send(None, Some(token_with("https://gateway.example/mcp", scope))).await;
+        assert_eq!(response["status"], 403, "{response}");
+        assert_eq!(
+            response["headers"]["www-authenticate"], "Bearer realm=\"agent-gateway\", error=\"insufficient_scope\"",
+            "{response}"
+        );
+        assert_eq!(reached(), 0, "a token short of the required scope never reaches the Target");
     }
 
     for (alias, audience) in [
