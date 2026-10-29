@@ -687,6 +687,75 @@ mod tests {
         );
     }
 
+    fn surface_with_default(
+        id: &str,
+        variants: serde_json::Value,
+        default_variant_id: &str,
+    ) -> AgentSurface {
+        serde_json::from_value(serde_json::json!({
+            "surface_id": id,
+            "name": format!("{id}-name"),
+            "access_point": {
+                "listen_address": "0.0.0.0:8443",
+                "route": format!("/agents/{id}"),
+                "protocol": "a2a"
+            },
+            "target": { "endpoint": "https://a2a.internal/a2a" },
+            "variants": variants,
+            "default_variant_id": default_variant_id
+        }))
+        .expect("test surface should deserialize")
+    }
+
+    #[tokio::test]
+    async fn drops_and_persists_the_default_of_a_surface_without_variants() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = test_store(dir.path()).await;
+        let mut channels = vec![surface_with_default("s-none", serde_json::json!([]), "removed")];
+
+        clear_dangling_default_variants(&store, &mut channels)
+            .await
+            .expect("cleanup should succeed");
+
+        assert_eq!(channels[0].default_variant_id, None);
+        let served = channels[0]
+            .serve_variant(None)
+            .expect("the base surface serves an alias-less request");
+        assert_eq!(served.recorded, crate::config::agent_surface_variants::SurfaceVariant::BASE);
+        let reloaded = store
+            .get("s-none")
+            .await
+            .expect("get should succeed")
+            .expect("surface should exist");
+        assert_eq!(reloaded.default_variant_id, None);
+    }
+
+    #[tokio::test]
+    async fn keeps_the_default_of_a_surface_with_variants() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = test_store(dir.path()).await;
+        let variants = serde_json::json!([{ "id": "v-1", "alias": "beta", "name": "Beta" }]);
+        let mut channels = vec![
+            surface_with_default("s-valid", variants.clone(), "v-1"),
+            surface_with_default("s-dangling", variants, "removed"),
+        ];
+
+        clear_dangling_default_variants(&store, &mut channels)
+            .await
+            .expect("cleanup should succeed");
+
+        assert_eq!(channels[0].default_variant_id.as_deref(), Some("v-1"));
+        assert_eq!(channels[1].default_variant_id.as_deref(), Some("removed"));
+        assert!(
+            store
+                .get("s-dangling")
+                .await
+                .expect("get should succeed")
+                .is_none(),
+            "a surface left as it is is not rewritten"
+        );
+    }
+
     fn a2a_surface(
         id: &str,
         endpoint: &str,
