@@ -655,6 +655,85 @@ async fn a_transit_point_that_authenticates_no_caller_must_be_marked_open_and_an
     assert_eq!(stored["transit"]["points"][0]["allow_unauthenticated_callers"], true, "{stored}");
 }
 
+/// A save answers with a `Warning` header when a Transit Point accepts JWTs
+/// from an issuer through one JWT verification strategy and the surface
+/// accepts that issuer through another: the identity hash keys a JWT caller by
+/// issuer and subject, so callers verified through either share delegated
+/// credentials. One strategy for the issuer, or another issuer, gets none.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_save_warns_of_a_transit_point_strategy_that_shares_an_issuer_with_another() {
+    const ISSUER: &str = "https://login.example.com";
+    let mut admin = None;
+    let h = GatewayHarness::start(|temp_dir, _, bootstrap| {
+        admin = Some(configure_admin_api(bootstrap));
+        let dir = temp_dir.join("jwt_verification_strategies");
+        std::fs::create_dir_all(&dir).expect("create strategy dir");
+        for (id, issuer, jwks_uri) in [
+            ("workforce", ISSUER, "https://login.example.com/keys"),
+            ("partner-keys", ISSUER, "https://partner.example/keys"),
+            ("partner-issuer", "https://partner.example", "https://partner.example/keys"),
+        ] {
+            let strategy = json!({
+                "id": id, "name": id, "expected_issuer": issuer,
+                "jwks_source": { "type": "remote", "jwks_uri": jwks_uri },
+                "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"
+            });
+            std::fs::write(dir.join(format!("{id}.json")), strategy.to_string()).expect("write strategy");
+        }
+    })
+    .await;
+    let admin = admin.unwrap();
+    let save = |id: &str, transit_point_strategy: &str| {
+        admin
+            .post(format!("{}/api/v1/surfaces", h.gateway_base))
+            .json(&json!({
+                "surface_id": id, "name": id, "status": "disabled",
+                "access_point": { "listen_address": h.gateway_base, "route": format!("/{id}"), "protocol": "a2a",
+                    "caller_authentication": { "methods": [{ "type": "jwt_bearer",
+                        "jwt_verification_strategy_id": "workforce", "audiences": ["api://agent"] }] } },
+                "target": { "endpoint": h.mock.url() },
+                "transit": { "points": [{ "alias": "crm", "target_endpoint": "https://crm.example/a2a",
+                    "protocol": "a2a", "require_transit_token": false,
+                    "source_auth": { "type": "jwt_bearer", "jwt_verification_strategy_id": transit_point_strategy,
+                        "audiences": ["api://crm-transit"] } }] }
+            }))
+            .send()
+    };
+    let warnings = |response: &reqwest::Response| -> Vec<String> {
+        response
+            .headers()
+            .get_all("warning")
+            .iter()
+            .map(|value| {
+                value
+                    .to_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    };
+
+    let shared = save("shared-issuer", "partner-keys")
+        .await
+        .unwrap();
+    assert_eq!(shared.status(), 201);
+    assert_eq!(
+        warnings(&shared),
+        [format!(
+            "299 - \"Transit Point 'crm' accepts tokens from issuer '{ISSUER}' through JWT verification strategy \
+             'partner-keys', and this surface accepts that issuer through 'workforce' too: a caller with the same \
+             subject through either is one caller, with the same delegated credentials; use one strategy per issuer\""
+        )]
+    );
+    for (id, strategy) in [("one-strategy", "workforce"), ("another-issuer", "partner-issuer")] {
+        let response = save(id, strategy)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 201, "{id}");
+        assert!(warnings(&response).is_empty(), "{id}: {:?}", warnings(&response));
+    }
+}
+
 /// A tenant access token can point a Transit Point's `source_auth` only at its
 /// own or appliance-wide secrets, on the base and in a variant, as it can on an
 /// Access Point.
