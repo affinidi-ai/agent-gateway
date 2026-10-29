@@ -24,14 +24,7 @@ changes:
         description, reads a gateway-wide policy decision as applying to every surface, and
         describes request refusals with their stage, reason, status and the variant asked for.
         Policy change records show the slot's variant, or the base surface.
-  changed:
-    - timestamp: '2026-10-28T17:03:00Z'
-      title: Name the variant of a policy change surface_variant, _base_ for base slots
-      description: >-
-        Policy change records name the variant whose slot was written surface_variant, the name
-        every other record uses, and record _base_ for a slot on the base surface, which also
-        applies to the variants that inherit it. Records stored with variant still read, and the
-        Audit Log shows their variant.
+  changed: []
   fixed:
     - timestamp: '2026-10-28T18:00:00Z'
       title: Keep the surface variant on metrics of a stream the client aborts
@@ -45,7 +38,12 @@ changes:
         Saving a surface whose default_variant_id names no variant is refused with 400 whether or
         not the surface has variants. A surface with no variants used to save with a default its
         requests could never be served by, as every path refuses them with 500.
-  removed: []
+  removed:
+    - timestamp: '2026-10-29T13:30:00Z'
+      title: Drop variant_alias from request_completed audit records
+      description: >-
+        The request_completed audit record no longer declares a variant_alias field. No release
+        ever wrote it; the record's variant is surface_variant, as on every other request record.
   security:
     - timestamp: '2026-10-28T18:10:00Z'
       title: Log a refused variant alias cut to 32 characters, never as the caller sent it
@@ -84,6 +82,15 @@ changes:
         variants shows _base_, where both were empty, so a per-variant series steps at the upgrade
         for one metrics retention window (6 hours by default). Stored metrics written with
         variant_alias still load.
+    - timestamp: '2026-10-28T17:03:00Z'
+      title: Name the variant of a policy change surface_variant, _base_ for base slots
+      description: >-
+        Policy change records name the variant whose slot was written surface_variant, the name
+        every other record uses, instead of variant, and record _base_ for a slot on the base
+        surface, which also applies to the variants that inherit it. Readers of policy change
+        records, such as audit integrations and log consumers, must switch from variant to
+        surface_variant. Records stored with variant still read, as surface_variant, and the
+        Audit Log shows their variant.
     - timestamp: '2026-10-29T13:00:00Z'
       title: ⭐ Send a peer gateway only the variant alias its fabric:// Target pins
       description: >-
