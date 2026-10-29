@@ -301,7 +301,7 @@ const EVENTS: &[EventSpec] = &[
         CONNECTION_POINT,
         "connection_point.updated",
         "Connection Point Updated",
-        "A connection point's name, description or enabled state was changed",
+        "A connection point's name, description, enabled state or exposed surfaces were changed",
         &[CONNECTION_POINT_VARIABLES],
     ),
     spec(

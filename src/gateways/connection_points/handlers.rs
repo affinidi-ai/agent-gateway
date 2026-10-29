@@ -1487,12 +1487,15 @@ pub async fn update_connection_point_exposed_channels<S: ConnectionPointStore>(
         }
     }
 
+    let old_connection_point = connection_point.clone();
     connection_point.exposed_channels = req.exposed_channels.clone();
 
     store
         .update(&connection_point)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update connection point: {}", e)))?;
+
+    crate::integrations::trigger_connection_point_updated(&old_connection_point, &connection_point);
 
     if connection_point
         .exposed_channels

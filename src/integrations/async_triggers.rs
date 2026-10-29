@@ -1,8 +1,6 @@
-/// Helper functions to trigger integration events asynchronously and non-blocking
-///
-/// All triggers are wrapped in tokio::spawn with semaphore-based concurrency control
-/// to prevent resource exhaustion under high load.
-/// If integrations fail (e.g., webhook offline), the system continues normally.
+//! Identity integration triggers, each run in a tokio task of its own so the caller never
+//! waits and a failing integration never affects it.
+
 use std::sync::Arc;
 
 /// Trigger identity created event (non-blocking)

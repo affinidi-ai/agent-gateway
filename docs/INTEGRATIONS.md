@@ -118,13 +118,19 @@ so no `user.approved` follows. A later SAML sign-in that changes the user's role
 primary flag raises `user.updated`. Every SAML sign-in then raises `user.login`, in that order
 ([`saml/user_provisioning.rs`](../src/auth/saml/user_provisioning.rs)).
 
-The connection point management API raises `connection_point.created`, `updated` (a change to
-the name, description or enabled state) and `deleted`, as the gateway API raises the gateway
-events. Connection points the gateway creates or removes itself, such as those of a pairing or
-an expired invitation, raise none of them. `connection_point.connected` is raised when another
-gateway pairs through a connection point's invitation with its secret; a failed attempt raises
-nothing ([`connection_point_integration_triggers.rs`](../src/integrations/connection_point_integration_triggers.rs),
+The connection point management API raises `connection_point.created`, `updated` and `deleted`,
+as the gateway API raises the gateway events. `updated` is raised when a save changes the name,
+description, enabled state or exposed surfaces; a save that changes none of them raises nothing,
+and so does a reconnect. Connection points the gateway creates or removes itself, such as those
+of a pairing or an expired invitation, raise none of them. `connection_point.connected` is
+raised when another gateway pairs through a connection point's invitation with its secret; a
+failed attempt raises nothing ([`connection_point_integration_triggers.rs`](../src/integrations/connection_point_integration_triggers.rs),
 [`webhook.rs`](../src/gateways/connection_points/webhook.rs)).
+
+These integration events are separate from the [event hook](#event-hook) calls of the same
+names. The event hook's `created` and `deleted` also report the connection points the gateway
+creates and removes itself, and its `connected` reports a listener's first mediator connection,
+not a pairing.
 
 ## Templates
 

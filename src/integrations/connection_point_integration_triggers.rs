@@ -9,10 +9,14 @@ pub fn trigger_connection_point_created(connection_point: &GatewayConnectionPoin
     dispatch("connection_point.created", connection_point_values(None, Some(connection_point)));
 }
 
+/// Raises nothing when the change leaves what an integration sees as it was.
 pub fn trigger_connection_point_updated(
     old_connection_point: &GatewayConnectionPoint,
     new_connection_point: &GatewayConnectionPoint,
 ) {
+    if shared_state(old_connection_point) == shared_state(new_connection_point) {
+        return;
+    }
     dispatch(
         "connection_point.updated",
         connection_point_values(Some(old_connection_point), Some(new_connection_point)),
@@ -80,6 +84,7 @@ fn shared_state(connection_point: &GatewayConnectionPoint) -> serde_json::Value 
         "description": connection_point.description,
         "cp_type": connection_point.cp_type,
         "enabled": connection_point.enabled,
+        "exposed_channels": connection_point.exposed_channels,
         "did_method": connection_point.did_method,
         "use_count": connection_point.use_count,
         "expires_at": connection_point.expires_at,
@@ -92,6 +97,7 @@ fn shared_state(connection_point: &GatewayConnectionPoint) -> serde_json::Value 
 mod tests {
     use super::*;
     use crate::gateways::connection_points::types::ConnectionPointType;
+    use crate::integrations::delivery::dispatch::dispatched;
 
     const SECRET: &str = "pairing-secret-7f3a";
     const OOB_URL: &str = "https://mediator.example/oob?_oobid=oob-7f3a";
@@ -172,7 +178,7 @@ mod tests {
 
         for state in [&values["OLD_STATE"], &values["NEW_STATE"]] {
             let state = json(state);
-            for field in ["secret", "oob_id", "oob_url", "oob_message", "exposed_channels", "runtime_status"] {
+            for field in ["secret", "oob_id", "oob_url", "oob_message", "runtime_status"] {
                 assert!(state.get(field).is_none(), "{field}");
             }
         }
@@ -180,5 +186,35 @@ mod tests {
             assert!(!value.contains(SECRET), "{name}");
             assert!(!value.contains("oob-7f3a"), "{name}");
         }
+    }
+
+    #[test]
+    fn the_state_names_the_exposed_surfaces() {
+        let mut exposing = connection_point("Orders");
+        exposing.exposed_channels = vec!["surface-1".to_string()];
+
+        let values = connection_point_values(None, Some(&exposing));
+
+        assert_eq!(json(&values["NEW_STATE"])["exposed_channels"], json!(["surface-1"]));
+    }
+
+    #[tokio::test]
+    async fn an_update_that_changes_nothing_raises_nothing() {
+        let unchanged = connection_point("Orders");
+
+        trigger_connection_point_updated(&unchanged, &unchanged.clone());
+
+        assert!(dispatched::with("CP_ID", &unchanged.id).is_empty());
+    }
+
+    #[tokio::test]
+    async fn changing_the_exposed_surfaces_raises_updated() {
+        let old = connection_point("Orders");
+        let mut new = old.clone();
+        new.exposed_channels = vec!["surface-1".to_string()];
+
+        trigger_connection_point_updated(&old, &new);
+
+        assert_eq!(dispatched::with("CP_ID", &old.id), ["connection_point.updated"]);
     }
 }
