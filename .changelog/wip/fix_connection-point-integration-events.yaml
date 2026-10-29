@@ -1,0 +1,20 @@
+branch: fix/connection-point-integration-events
+changes:
+  added: []
+  changed:
+    - timestamp: '2026-10-28T12:00:00.000Z'
+      title: Say when Connection Point Connected is raised in the integration catalog
+      description: The catalog described connection_point.connected as someone connecting through a connection point with its secret. It now says it is raised when another gateway pairs through a connection point's invitation with its secret, which is the only time it is sent; a failed attempt sends nothing. See docs/INTEGRATIONS.md.
+  fixed:
+    - timestamp: '2026-10-28T12:00:00.000Z'
+      title: ⭐ Deliver connection point created, updated and deleted events to integrations
+      description: Creating, editing or deleting a connection point through the management API only logged that its integration trigger was not implemented, and the integration catalog offered no such events, so no email, Slack, webhook or stream integration could be told about them. The catalog now lists connection_point.created, connection_point.updated (a change to the name, description or enabled state) and connection_point.deleted, and each is delivered to every active integration whose event set holds it, like the gateway events. They carry the connection point's id, name, description, DID, gateway and mediator, with OLD_STATE and NEW_STATE. Connection points the gateway creates or removes itself, such as those of a pairing or an expired invitation, raise none of them. Add the events to an event set to receive them; upgrading does not add them to existing event sets. See docs/INTEGRATIONS.md.
+  removed:
+    - timestamp: '2026-10-28T12:00:00.000Z'
+      title: Remove the unused connection_point.error integration trigger
+      description: A connection_point.error trigger was declared but never raised, and the integration catalog did not list it, so no integration could receive it. It is removed; nothing that was delivered before changes.
+  security:
+    - timestamp: '2026-10-28T12:00:00.000Z'
+      title: Keep connection point invitations and secrets out of integration events
+      description: The OLD_STATE and NEW_STATE of connection point events hold only the connection point's id, gateway, mediator, DID, name, description, type, enabled state, DID method, use count and dates. Its invitation (oob_id, oob_url, oob_message) and its secret are never sent to an integration, since whoever holds them can connect through it.
+  breaking: []
