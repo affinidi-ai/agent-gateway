@@ -193,6 +193,48 @@ pub(crate) fn transit_point_lists(
     lists
 }
 
+/// Every credential provider the surface binds, in its base or any variant,
+/// read from the stored lists without resolving the variants, so a surface
+/// whose variants cannot be resolved still names the providers it binds.
+pub(crate) fn bound_credential_provider_ids(surface: &AgentSurface) -> HashSet<&str> {
+    let outbound = surface
+        .outbound_credentials
+        .iter()
+        .chain(
+            surface
+                .variants
+                .iter()
+                .filter_map(|variant| {
+                    variant
+                        .overrides
+                        .outbound_credentials
+                        .as_ref()
+                })
+                .flatten(),
+        )
+        .map(|binding| {
+            binding
+                .credential_provider_id
+                .as_str()
+        });
+    let transit = transit_point_lists(surface)
+        .into_iter()
+        .flat_map(|(_, points)| points.iter())
+        .filter_map(|point| {
+            point
+                .transit_credentials
+                .as_ref()
+        })
+        .map(|binding| {
+            binding
+                .credential_provider_id
+                .as_str()
+        });
+    outbound
+        .chain(transit)
+        .collect()
+}
+
 /// A Transit Point id with a `consent_mode: external` binding anywhere in the
 /// surface names one Transit Point: once per list, and with the same
 /// `target_endpoint` and `transit_credentials` in every list that has it. Its

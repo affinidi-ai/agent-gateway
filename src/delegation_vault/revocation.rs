@@ -1,25 +1,37 @@
 //! RFC 7009 revocation of a grant by binding at its authorization server.
 //!
 //! The grant's refresh token is revoked, with `token_type_hint=refresh_token`,
-//! or its access token when it has none. The client authenticates as its
-//! provider's `token_endpoint_auth_method` says. The call goes through the
-//! pinned, Strict, `https`-only egress client, with a short timeout, and its
-//! response body is never read, echoed or logged. Revocation is best effort:
-//! its outcome is returned and audited, and a failed revocation never keeps a
-//! grant that is being removed.
+//! then its access token, with `token_type_hint=access_token`, so a server that
+//! does not cascade the first revocation still ends the second; a grant with no
+//! refresh token has only its access token revoked. A server that does not
+//! revoke access tokens answers that request with an error, which changes
+//! nothing else. The client authenticates as its provider's
+//! `token_endpoint_auth_method` says. The calls go through the pinned, Strict,
+//! `https`-only egress client, with a short timeout, and no response body is
+//! ever read, echoed or logged. Revocation is best effort: its outcome is
+//! returned, logged and audited with the actor that caused it, and a failed
+//! revocation never keeps a grant that is being removed. [`remove_grants`]
+//! revokes and deletes many grants at most [`REVOCATION_CONCURRENCY`] at a time.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
+use futures::StreamExt as _;
 
+use super::audit::AuditCallerContext;
 use super::grants::DelegatedGrant;
+use super::storage::DelegationVaultStorage;
 use crate::credential_providers::{CredentialProvider, TokenEndpointAuthMethod};
 use crate::secrets::SecretsStore;
 
 const REVOCATION_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// What became of one revocation.
+/// The most grants [`remove_grants`] revokes at once.
+pub const REVOCATION_CONCURRENCY: usize = 8;
+
+/// What became of one revocation request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RevocationOutcome {
     /// The authorization server answered 2xx.
@@ -47,21 +59,74 @@ impl RevocationOutcome {
     }
 }
 
-/// Revoke `grant` at `provider`'s revocation endpoint and audit the outcome.
+/// What revoking one grant came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GrantRevocation {
+    /// The refresh token's outcome, or the access token's for a grant with no
+    /// refresh token.
+    pub outcome: RevocationOutcome,
+    /// The access token's outcome, for a grant whose refresh token was revoked
+    /// first.
+    pub access_token: Option<RevocationOutcome>,
+}
+
+impl GrantRevocation {
+    fn failed(outcome: RevocationOutcome) -> Self {
+        Self { outcome, access_token: None }
+    }
+
+    /// The audit record's `detail`: `vendor_revocation:<outcome>`, then
+    /// `,access_token:<outcome>` when the access token was revoked as well.
+    fn detail(self) -> String {
+        match self.access_token {
+            Some(access_token) => {
+                format!("vendor_revocation:{},access_token:{}", self.outcome.as_str(), access_token.as_str())
+            }
+            None => format!("vendor_revocation:{}", self.outcome.as_str()),
+        }
+    }
+}
+
+/// Revoke `grant` at `provider`'s revocation endpoint, then log and audit the
+/// outcome, naming `actor`, the management caller whose change removed it.
 pub async fn revoke_grant(
     provider: &CredentialProvider,
     grant: &DelegatedGrant,
     secrets: &Arc<dyn SecretsStore>,
     exact_allowlist: Option<&str>,
-) -> RevocationOutcome {
-    let outcome = revoke(provider, grant, secrets, exact_allowlist).await;
-    tracing::info!(
-        target: "credential_delegation",
-        grant_id = %grant.id,
-        credential_provider_id = %provider.id,
-        outcome = outcome.as_str(),
-        "Revoked a delegated grant at its authorization server"
-    );
+    actor: Option<&AuditCallerContext>,
+) -> GrantRevocation {
+    let revocation = revoke(provider, grant, secrets, exact_allowlist).await;
+    let outcome = revocation.outcome.as_str();
+    let access_token = revocation
+        .access_token
+        .map(RevocationOutcome::as_str);
+    match revocation.outcome {
+        RevocationOutcome::Revoked => tracing::info!(
+            target: "credential_delegation",
+            grant_id = %grant.id,
+            credential_provider_id = %provider.id,
+            outcome,
+            access_token,
+            "Revoked a delegated grant at its authorization server"
+        ),
+        RevocationOutcome::NotSupported => tracing::info!(
+            target: "credential_delegation",
+            grant_id = %grant.id,
+            credential_provider_id = %provider.id,
+            outcome,
+            "A delegated grant's provider names no revocation endpoint, so the grant is removed without revoking it"
+        ),
+        RevocationOutcome::Refused | RevocationOutcome::Unreachable | RevocationOutcome::ClientUnavailable => {
+            tracing::warn!(
+                target: "credential_delegation",
+                grant_id = %grant.id,
+                credential_provider_id = %provider.id,
+                outcome,
+                "A delegated grant could not be revoked at its authorization server; it is removed all the same"
+            )
+        }
+    }
     super::audit::emit("token_revoked", || {
         let mut event = super::audit::audit_event(
             super::audit::DelegationAuditAction::TokenRevoked,
@@ -72,10 +137,51 @@ pub async fn revoke_grant(
         );
         event.token_id = Some(grant.id.clone());
         event.provider_name = Some(provider.name.clone());
-        event.detail = Some(format!("vendor_revocation:{}", outcome.as_str()));
+        event.detail = Some(revocation.detail());
+        event.caller = actor.cloned();
         event
     });
-    outcome
+    revocation
+}
+
+/// Revoke at its authorization server, then delete, each of `grants`, at most
+/// [`REVOCATION_CONCURRENCY`] at a time. Each grant's provider is looked up in
+/// `providers` by its record id; a grant whose provider is not there is deleted
+/// without revocation. A grant is deleted whatever its revocation came to.
+/// Every grant is tried; the call fails if any could not be deleted.
+pub async fn remove_grants(
+    vault: &Arc<dyn DelegationVaultStorage>,
+    grants: Vec<DelegatedGrant>,
+    providers: &HashMap<String, CredentialProvider>,
+    secrets: &Arc<dyn SecretsStore>,
+    exact_allowlist: Option<&str>,
+    actor: Option<&AuditCallerContext>,
+) -> anyhow::Result<()> {
+    let failures = futures::stream::iter(grants)
+        .map(|grant| async move {
+            match providers.get(&grant.credential_provider_id) {
+                Some(provider) => {
+                    revoke_grant(provider, &grant, secrets, exact_allowlist, actor).await;
+                }
+                None => tracing::warn!(
+                    target: "credential_delegation",
+                    grant_id = %grant.id,
+                    "A delegated grant's provider no longer exists, so the grant is removed without revoking it"
+                ),
+            }
+            vault
+                .delete_grant(&grant.id)
+                .await
+                .err()
+        })
+        .buffer_unordered(REVOCATION_CONCURRENCY)
+        .filter_map(std::future::ready)
+        .collect::<Vec<_>>()
+        .await;
+    match failures.into_iter().next() {
+        Some(error) => Err(error.context("Failed to delete a delegated grant")),
+        None => Ok(()),
+    }
 }
 
 async fn revoke(
@@ -83,59 +189,113 @@ async fn revoke(
     grant: &DelegatedGrant,
     secrets: &Arc<dyn SecretsStore>,
     exact_allowlist: Option<&str>,
-) -> RevocationOutcome {
-    let Some(endpoint) = provider
-        .revocation_endpoint
-        .as_deref()
-    else {
-        return RevocationOutcome::NotSupported;
-    };
-    let (Some(client_id), Some(method)) = (provider.client_id.as_deref(), provider.token_endpoint_auth_method) else {
-        return RevocationOutcome::ClientUnavailable;
-    };
-    let secret = if method.uses_secret() {
-        match client_secret(provider, secrets).await {
-            Some(secret) => Some(secret),
-            None => return RevocationOutcome::ClientUnavailable,
-        }
-    } else {
-        None
-    };
-    let (token, hint) = match grant.refresh_token.as_deref() {
-        Some(refresh_token) => (refresh_token, "refresh_token"),
-        None => (grant.access_token.as_str(), "access_token"),
-    };
-    let mut form: Vec<(&str, &str)> = vec![("token", token), ("token_type_hint", hint)];
-    let mut authorization = None;
-    match (method, secret.as_deref()) {
-        (TokenEndpointAuthMethod::None, _) => form.push(("client_id", client_id)),
-        (TokenEndpointAuthMethod::ClientSecretPost, Some(secret)) => {
-            form.push(("client_id", client_id));
-            form.push(("client_secret", secret.as_str()));
-        }
-        (TokenEndpointAuthMethod::ClientSecretBasic, Some(secret)) => {
-            authorization = Some(basic_authorization(client_id, secret));
-        }
-        _ => return RevocationOutcome::ClientUnavailable,
-    }
-    let client = match crate::egress::pinned_vendor_client(endpoint, REVOCATION_TIMEOUT, exact_allowlist).await {
+) -> GrantRevocation {
+    let client = match RevocationClient::new(provider, secrets, exact_allowlist).await {
         Ok(client) => client,
-        Err(error) => {
-            tracing::warn!(target: "credential_delegation", error = %error, "Revocation endpoint refused by egress policy");
-            return RevocationOutcome::Unreachable;
-        }
+        Err(outcome) => return GrantRevocation::failed(outcome),
     };
-    let mut request = client
-        .post(endpoint)
-        .header(reqwest::header::ACCEPT, "application/json")
-        .form(&form);
-    if let Some(authorization) = authorization {
-        request = request.header(reqwest::header::AUTHORIZATION, authorization.as_str());
+    match grant.refresh_token.as_deref() {
+        Some(refresh_token) => GrantRevocation {
+            outcome: client
+                .revoke(refresh_token, "refresh_token")
+                .await,
+            access_token: Some(
+                client
+                    .revoke(&grant.access_token, "access_token")
+                    .await,
+            ),
+        },
+        None => GrantRevocation::failed(
+            client
+                .revoke(&grant.access_token, "access_token")
+                .await,
+        ),
     }
-    match request.send().await {
-        Ok(response) if response.status().is_success() => RevocationOutcome::Revoked,
-        Ok(_) => RevocationOutcome::Refused,
-        Err(_) => RevocationOutcome::Unreachable,
+}
+
+/// A provider's client at its revocation endpoint, reached through one pinned
+/// connection policy for every token of a grant.
+struct RevocationClient<'a> {
+    endpoint: &'a str,
+    client_id: &'a str,
+    method: TokenEndpointAuthMethod,
+    secret: Option<zeroize::Zeroizing<String>>,
+    http: reqwest::Client,
+}
+
+impl<'a> RevocationClient<'a> {
+    async fn new(
+        provider: &'a CredentialProvider,
+        secrets: &Arc<dyn SecretsStore>,
+        exact_allowlist: Option<&str>,
+    ) -> Result<Self, RevocationOutcome> {
+        let endpoint = provider
+            .revocation_endpoint
+            .as_deref()
+            .ok_or(RevocationOutcome::NotSupported)?;
+        let (Some(client_id), Some(method)) = (provider.client_id.as_deref(), provider.token_endpoint_auth_method)
+        else {
+            return Err(RevocationOutcome::ClientUnavailable);
+        };
+        let secret = if method.uses_secret() {
+            Some(
+                client_secret(provider, secrets)
+                    .await
+                    .ok_or(RevocationOutcome::ClientUnavailable)?,
+            )
+        } else {
+            None
+        };
+        let http = crate::egress::pinned_vendor_client(endpoint, REVOCATION_TIMEOUT, exact_allowlist)
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    target: "credential_delegation",
+                    error = ?error.to_string(),
+                    "Revocation endpoint refused by egress policy"
+                );
+                RevocationOutcome::Unreachable
+            })?;
+        Ok(Self {
+            endpoint,
+            client_id,
+            method,
+            secret,
+            http,
+        })
+    }
+
+    async fn revoke(
+        &self,
+        token: &str,
+        hint: &str,
+    ) -> RevocationOutcome {
+        let mut form: Vec<(&str, &str)> = vec![("token", token), ("token_type_hint", hint)];
+        let mut authorization = None;
+        match (self.method, self.secret.as_deref()) {
+            (TokenEndpointAuthMethod::None, _) => form.push(("client_id", self.client_id)),
+            (TokenEndpointAuthMethod::ClientSecretPost, Some(secret)) => {
+                form.push(("client_id", self.client_id));
+                form.push(("client_secret", secret.as_str()));
+            }
+            (TokenEndpointAuthMethod::ClientSecretBasic, Some(secret)) => {
+                authorization = Some(basic_authorization(self.client_id, secret));
+            }
+            _ => return RevocationOutcome::ClientUnavailable,
+        }
+        let mut request = self
+            .http
+            .post(self.endpoint)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .form(&form);
+        if let Some(authorization) = authorization {
+            request = request.header(reqwest::header::AUTHORIZATION, authorization.as_str());
+        }
+        match request.send().await {
+            Ok(response) if response.status().is_success() => RevocationOutcome::Revoked,
+            Ok(_) => RevocationOutcome::Refused,
+            Err(_) => RevocationOutcome::Unreachable,
+        }
     }
 }
 
@@ -175,7 +335,8 @@ pub(crate) mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// An authorization server that records each request's head and body and
-    /// answers every one with `status`.
+    /// answers every one with `status`, after `delay`, serving connections at
+    /// once.
     pub(crate) struct RecordingServer {
         pub(crate) url: String,
         requests: Arc<Mutex<Vec<(String, String)>>>,
@@ -183,6 +344,13 @@ pub(crate) mod tests {
 
     impl RecordingServer {
         pub(crate) async fn start(status: u16) -> Self {
+            Self::start_with_delay(status, Duration::ZERO).await
+        }
+
+        pub(crate) async fn start_with_delay(
+            status: u16,
+            delay: Duration,
+        ) -> Self {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .unwrap();
@@ -194,42 +362,46 @@ pub(crate) mod tests {
                     let Ok((mut stream, _)) = listener.accept().await else {
                         return;
                     };
-                    let mut buffer = Vec::new();
-                    let mut chunk = [0u8; 4096];
-                    let (head, body) = loop {
-                        match stream.read(&mut chunk).await {
-                            Ok(0) | Err(_) => break (String::new(), String::new()),
-                            Ok(read) => buffer.extend_from_slice(&chunk[..read]),
-                        }
-                        let text = String::from_utf8_lossy(&buffer).into_owned();
-                        if let Some((head, body)) = text.split_once("\r\n\r\n") {
-                            let length = head
-                                .lines()
-                                .find_map(|line| {
-                                    line.to_ascii_lowercase()
-                                        .strip_prefix("content-length:")
-                                        .map(|value| {
-                                            value
-                                                .trim()
-                                                .parse::<usize>()
-                                                .unwrap_or(0)
-                                        })
-                                })
-                                .unwrap_or(0);
-                            if body.len() >= length {
-                                break (head.to_string(), body.to_string());
+                    let recorded = recorded.clone();
+                    tokio::spawn(async move {
+                        let mut buffer = Vec::new();
+                        let mut chunk = [0u8; 4096];
+                        let (head, body) = loop {
+                            match stream.read(&mut chunk).await {
+                                Ok(0) | Err(_) => break (String::new(), String::new()),
+                                Ok(read) => buffer.extend_from_slice(&chunk[..read]),
                             }
-                        }
-                    };
-                    recorded
-                        .lock()
-                        .unwrap()
-                        .push((head, body));
-                    let response =
-                        format!("HTTP/1.1 {status} Status\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-                    let _ = stream
-                        .write_all(response.as_bytes())
-                        .await;
+                            let text = String::from_utf8_lossy(&buffer).into_owned();
+                            if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                                let length = head
+                                    .lines()
+                                    .find_map(|line| {
+                                        line.to_ascii_lowercase()
+                                            .strip_prefix("content-length:")
+                                            .map(|value| {
+                                                value
+                                                    .trim()
+                                                    .parse::<usize>()
+                                                    .unwrap_or(0)
+                                            })
+                                    })
+                                    .unwrap_or(0);
+                                if body.len() >= length {
+                                    break (head.to_string(), body.to_string());
+                                }
+                            }
+                        };
+                        recorded
+                            .lock()
+                            .unwrap()
+                            .push((head, body));
+                        tokio::time::sleep(delay).await;
+                        let response =
+                            format!("HTTP/1.1 {status} Status\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                        let _ = stream
+                            .write_all(response.as_bytes())
+                            .await;
+                    });
                 }
             });
             Self {
@@ -249,6 +421,21 @@ pub(crate) mod tests {
                 .lock()
                 .unwrap()
                 .clone()
+        }
+
+        /// The `token` field of every request received.
+        pub(crate) fn revoked_tokens(&self) -> Vec<String> {
+            let mut tokens: Vec<String> = self
+                .requests()
+                .iter()
+                .filter_map(|(_, body)| {
+                    url::form_urlencoded::parse(body.as_bytes())
+                        .find(|(name, _)| name == "token")
+                        .map(|(_, token)| token.into_owned())
+                })
+                .collect();
+            tokens.sort();
+            tokens
         }
     }
 
@@ -310,29 +497,48 @@ pub(crate) mod tests {
             .collect()
     }
 
+    fn actor() -> AuditCallerContext {
+        super::super::audit::management_caller_context(Some("operator"), Some("pat-1")).unwrap()
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_public_client_revokes_the_refresh_token_with_its_client_id() {
+    async fn a_public_client_revokes_the_refresh_token_then_the_access_token_with_its_client_id() {
         let directory = tempfile::tempdir().unwrap();
         let secrets = secrets_with(&directory, Some("tenant-a")).await;
         let server = RecordingServer::start(200).await;
-        let outcome =
+        let revocation =
             revoke(&provider(Some(&server.url), "none", None), &grant(true), &secrets, Some(&server.origin())).await;
-        assert_eq!(outcome, RevocationOutcome::Revoked);
-        let requests = server.requests();
-        assert_eq!(requests.len(), 1);
-        let (head, body) = &requests[0];
-        assert!(head.starts_with("POST /revoke "), "{head}");
-        assert!(
-            !head
-                .to_ascii_lowercase()
-                .contains("authorization:"),
-            "{head}"
-        );
         assert_eq!(
-            form(body),
+            revocation,
+            GrantRevocation {
+                outcome: RevocationOutcome::Revoked,
+                access_token: Some(RevocationOutcome::Revoked),
+            }
+        );
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2);
+        for (head, _) in &requests {
+            assert!(head.starts_with("POST /revoke "), "{head}");
+            assert!(
+                !head
+                    .to_ascii_lowercase()
+                    .contains("authorization:"),
+                "{head}"
+            );
+        }
+        assert_eq!(
+            form(&requests[0].1),
             vec![
                 ("token".to_string(), "access-token-refresh".to_string()),
                 ("token_type_hint".to_string(), "refresh_token".to_string()),
+                ("client_id".to_string(), "client id".to_string()),
+            ]
+        );
+        assert_eq!(
+            form(&requests[1].1),
+            vec![
+                ("token".to_string(), "access-token".to_string()),
+                ("token_type_hint".to_string(), "access_token".to_string()),
                 ("client_id".to_string(), "client id".to_string()),
             ]
         );
@@ -344,9 +550,19 @@ pub(crate) mod tests {
         let secrets = secrets_with(&directory, Some("tenant-a")).await;
         let server = RecordingServer::start(200).await;
         let basic = provider(Some(&server.url), "client_secret_basic", Some("client-secret"));
-        assert_eq!(revoke(&basic, &grant(true), &secrets, Some(&server.origin())).await, RevocationOutcome::Revoked);
+        assert_eq!(
+            revoke(&basic, &grant(false), &secrets, Some(&server.origin()))
+                .await
+                .outcome,
+            RevocationOutcome::Revoked
+        );
         let post = provider(Some(&server.url), "client_secret_post", Some("client-secret"));
-        assert_eq!(revoke(&post, &grant(true), &secrets, Some(&server.origin())).await, RevocationOutcome::Revoked);
+        assert_eq!(
+            revoke(&post, &grant(false), &secrets, Some(&server.origin()))
+                .await
+                .outcome,
+            RevocationOutcome::Revoked
+        );
 
         let requests = server.requests();
         let expected = base64::engine::general_purpose::STANDARD.encode("client+id:s3cret%3A%26%3D");
@@ -385,7 +601,10 @@ pub(crate) mod tests {
         let directory = tempfile::tempdir().unwrap();
         let secrets = secrets_with(&directory, Some("tenant-a")).await;
         let server = RecordingServer::start(200).await;
-        revoke(&provider(Some(&server.url), "none", None), &grant(false), &secrets, Some(&server.origin())).await;
+        let revocation =
+            revoke(&provider(Some(&server.url), "none", None), &grant(false), &secrets, Some(&server.origin())).await;
+        assert_eq!(revocation, GrantRevocation::failed(RevocationOutcome::Revoked));
+        assert_eq!(server.requests().len(), 1);
         let fields = form(&server.requests()[0].1);
         assert!(fields.contains(&("token".to_string(), "access-token".to_string())));
         assert!(fields.contains(&("token_type_hint".to_string(), "access_token".to_string())));
@@ -399,12 +618,16 @@ pub(crate) mod tests {
         assert_eq!(
             revoke(&provider(Some(&refusing.url), "none", None), &grant(true), &secrets, Some(&refusing.origin()))
                 .await,
-            RevocationOutcome::Refused
+            GrantRevocation {
+                outcome: RevocationOutcome::Refused,
+                access_token: Some(RevocationOutcome::Refused),
+            }
         );
         assert_eq!(
             revoke(&provider(None, "none", None), &grant(true), &secrets, None).await,
-            RevocationOutcome::NotSupported
+            GrantRevocation::failed(RevocationOutcome::NotSupported)
         );
+        let before = refusing.requests().len();
         assert_eq!(
             revoke(
                 &provider(Some(&refusing.url), "client_secret_post", Some("client-secret")),
@@ -412,13 +635,15 @@ pub(crate) mod tests {
                 &secrets,
                 Some(&refusing.origin())
             )
-            .await,
+            .await
+            .outcome,
             RevocationOutcome::ClientUnavailable,
             "another tenant's secret is never sent"
         );
-        let before = refusing.requests().len();
         assert_eq!(
-            revoke(&provider(Some(&refusing.url), "none", None), &grant(true), &secrets, None).await,
+            revoke(&provider(Some(&refusing.url), "none", None), &grant(true), &secrets, None)
+                .await
+                .outcome,
             RevocationOutcome::Unreachable,
             "a loopback http endpoint is refused without the test allowlist"
         );
@@ -430,27 +655,150 @@ pub(crate) mod tests {
                 &secrets,
                 Some("http://127.0.0.1:1")
             )
-            .await,
+            .await
+            .outcome,
             RevocationOutcome::Unreachable
         );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_revocation_is_audited_with_its_outcome() {
+    async fn a_revocation_is_audited_with_its_outcome_and_its_actor() {
         let directory = tempfile::tempdir().unwrap();
         let secrets = secrets_with(&directory, Some("tenant-a")).await;
         let server = RecordingServer::start(200).await;
         let provider = provider(Some(&server.url), "none", None);
         let grant = grant(true);
-        let (outcome, events) = crate::audit::producer::capture(async {
-            revoke_grant(&provider, &grant, &secrets, Some(&server.origin())).await
+        let actor = actor();
+        let (revocation, events) = crate::audit::producer::capture(async {
+            revoke_grant(&provider, &grant, &secrets, Some(&server.origin()), Some(&actor)).await
         })
         .await;
-        assert_eq!(outcome, RevocationOutcome::Revoked);
+        assert_eq!(revocation.outcome, RevocationOutcome::Revoked);
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0].event, super::super::audit::DelegationAuditAction::TokenRevoked));
         assert_eq!(events[0].token_id.as_deref(), Some(grant.id.as_str()));
-        assert_eq!(events[0].detail.as_deref(), Some("vendor_revocation:revoked"));
+        assert_eq!(events[0].detail.as_deref(), Some("vendor_revocation:revoked,access_token:revoked"));
+        let caller = events[0]
+            .caller
+            .as_ref()
+            .expect("the audit names the actor");
+        assert_eq!(caller.sub.as_deref(), Some("operator"));
+        assert_eq!(caller.token_id.as_deref(), Some("pat-1"));
         assert!(!format!("{:?}", events[0]).contains("access-token"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_log_says_what_became_of_a_revocation() {
+        use crate::component_tests::helpers::formatted_logs::FormattedLogs;
+        let directory = tempfile::tempdir().unwrap();
+        let secrets = secrets_with(&directory, Some("tenant-a")).await;
+        let refusing = RecordingServer::start(400).await;
+        let accepting = RecordingServer::start(200).await;
+
+        let logs = FormattedLogs::capture();
+        revoke_grant(
+            &provider(Some(&refusing.url), "none", None),
+            &grant(true),
+            &secrets,
+            Some(&refusing.origin()),
+            None,
+        )
+        .await;
+        let refused = logs.text();
+        assert!(refused.contains("WARN"), "{refused}");
+        assert!(refused.contains("could not be revoked"), "{refused}");
+        assert!(!refused.contains("Revoked a delegated grant"), "{refused}");
+
+        let logs = FormattedLogs::capture();
+        revoke_grant(
+            &provider(Some(&accepting.url), "none", None),
+            &grant(true),
+            &secrets,
+            Some(&accepting.origin()),
+            None,
+        )
+        .await;
+        let revoked = logs.text();
+        assert!(revoked.contains("INFO"), "{revoked}");
+        assert!(revoked.contains("Revoked a delegated grant"), "{revoked}");
+    }
+
+    async fn vault_with(
+        directory: &tempfile::TempDir,
+        count: usize,
+    ) -> (Arc<dyn DelegationVaultStorage>, Vec<DelegatedGrant>) {
+        unsafe {
+            std::env::set_var("REVOCATION_TEST_MASTER_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+        }
+        crate::storage::filesystem::init_global_encryption(crate::config::EncryptionConfig {
+            enabled: true,
+            key_env_var: "REVOCATION_TEST_MASTER_KEY".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        crate::identity::credential_identity::configure_pepper_for_tests(true);
+        let vault: Arc<dyn DelegationVaultStorage> = Arc::new(
+            super::super::storage::FileSystemDelegationVaultStore::new(directory.path().join("vault"))
+                .await
+                .unwrap(),
+        );
+        let mut grants = Vec::new();
+        for index in 0..count {
+            let key =
+                GrantKey::caller(Some("tenant-a"), "surface", "hop", "provider", &format!("{index:064x}")).unwrap();
+            grants.push(
+                vault
+                    .store_grant(crate::delegation_vault::grants::tests::grant(&key, &format!("access-{index}")))
+                    .await
+                    .unwrap()
+                    .grant,
+            );
+        }
+        (vault, grants)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn removing_many_grants_revokes_them_at_once_and_deletes_each() {
+        let directory = tempfile::tempdir().unwrap();
+        let secrets = secrets_with(&directory, Some("tenant-a")).await;
+        let delay = Duration::from_millis(300);
+        let server = RecordingServer::start_with_delay(200, delay).await;
+        let (vault, grants) = vault_with(&directory, REVOCATION_CONCURRENCY).await;
+        let providers = HashMap::from([("provider".to_string(), provider(Some(&server.url), "none", None))]);
+
+        let started = std::time::Instant::now();
+        remove_grants(&vault, grants.clone(), &providers, &secrets, Some(&server.origin()), Some(&actor()))
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        let serial = delay * 2 * u32::try_from(REVOCATION_CONCURRENCY).unwrap();
+        assert!(elapsed < serial / 2, "{elapsed:?} is close to revoking one grant after another ({serial:?})");
+        assert_eq!(server.revoked_tokens().len(), 2 * REVOCATION_CONCURRENCY);
+        assert!(
+            vault
+                .all_grants()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grant_whose_provider_is_gone_is_deleted_without_revocation() {
+        let directory = tempfile::tempdir().unwrap();
+        let secrets = secrets_with(&directory, Some("tenant-a")).await;
+        let server = RecordingServer::start(200).await;
+        let (vault, grants) = vault_with(&directory, 2).await;
+        remove_grants(&vault, grants, &HashMap::new(), &secrets, Some(&server.origin()), None)
+            .await
+            .unwrap();
+        assert!(server.requests().is_empty());
+        assert!(
+            vault
+                .all_grants()
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }

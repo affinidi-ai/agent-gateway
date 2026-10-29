@@ -15,7 +15,8 @@ use std::sync::Arc;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::auth_manager::pat::{PatContext, PatResourceScope};
+use crate::auth_manager::middleware::AuthGuardOk;
+use crate::auth_manager::pat::{PatContext, PatDelegationContext, PatResourceScope};
 use crate::secrets::SecretsStore;
 use crate::tenancy::{
     PatTenantContext, ResourceKind, can_access, can_mutate, can_reference, scope_allows_resource, tenant_for_create,
@@ -655,6 +656,8 @@ pub async fn delete_provider(
     Path(id): Path<String>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
+    caller: Option<Extension<AuthGuardOk>>,
+    delegation: Option<Extension<PatDelegationContext>>,
 ) -> impl IntoResponse {
     let existing = match state.store.get(&id).await {
         Ok(Some(provider)) => provider,
@@ -685,10 +688,20 @@ pub async fn delete_provider(
         )
             .into_response();
     }
-    if let Err(response) = refuse_bound_provider(&state, &existing).await {
+    if let Err(response) =
+        refuse_bound_provider(&state, &existing, tenant_context(&context), resource_scope(&scope)).await
+    {
         return response;
     }
-    if let Err(response) = remove_provider_grants(&state, &existing).await {
+    let actor = crate::delegation_vault::audit::management_caller_context(
+        caller
+            .as_ref()
+            .map(|Extension(AuthGuardOk(user_id))| user_id.as_str()),
+        delegation
+            .as_ref()
+            .map(|Extension(delegation)| delegation.token_id.as_str()),
+    );
+    if let Err(response) = remove_provider_grants(&state, &existing, actor.as_ref()).await {
         return response;
     }
     match state.store.delete(&id).await {
@@ -714,12 +727,18 @@ fn unavailable(message: &'static str) -> Response {
     (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "error": message }))).into_response()
 }
 
-/// Refuse to delete a provider any surface binds, in its base or a variant,
+/// Refuse to delete a provider a surface binds, in its base or a variant,
 /// through `outbound_credentials` or a Transit Point's `transit_credentials`.
-/// A surface whose variants cannot be resolved counts as binding it.
+/// Only the surfaces that may reference the provider are read: its own
+/// tenant's, or every surface for an untenanted provider. Bindings are read
+/// from the stored lists, so a surface whose variants cannot be resolved still
+/// counts by what it names. The refusal names the surface only when the caller
+/// may see it.
 async fn refuse_bound_provider(
     state: &CredentialProviderState,
     provider: &CredentialProvider,
+    context: Option<&PatTenantContext>,
+    scope: Option<&PatResourceScope>,
 ) -> Result<(), Response> {
     let Some(surfaces) = state.surfaces.as_ref() else {
         return Err(unavailable("Agent surfaces are unavailable, so the provider's bindings cannot be checked"));
@@ -733,39 +752,36 @@ async fn refuse_bound_provider(
         })?;
     let bound_by = surfaces
         .iter()
+        .filter(|surface| can_reference(surface.tenant_id.as_deref(), provider.tenant_id.as_deref()))
         .find(|surface| {
-            crate::identity::handlers::surface_tenancy::collect_surface_reference_keys(surface).map_or(
-                true,
-                |references| {
-                    references
-                        .iter()
-                        .any(|reference| {
-                            reference.kind == ResourceKind::CredentialProviders && reference.id == provider.id
-                        })
-                },
-            )
+            crate::identity::handlers::surface_tenancy::bound_credential_provider_ids(surface)
+                .contains(provider.id.as_str())
         });
-    match bound_by {
-        Some(surface) => Err((
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": "The credential provider is bound by an agent surface; remove the binding first",
-                "code": "provider_in_use",
-                "surface_id": surface.surface_id,
-            })),
-        )
-            .into_response()),
-        None => Ok(()),
+    let Some(surface) = bound_by else {
+        return Ok(());
+    };
+    let mut body = serde_json::json!({
+        "error": "The credential provider is bound by an agent surface; remove the binding first",
+        "code": "provider_in_use",
+    });
+    if can_access(surface.tenant_id.as_deref(), context)
+        && scope_allows_resource(scope, context, ResourceKind::Surfaces, &surface.surface_id)
+    {
+        body["surface_id"] = serde_json::json!(surface.surface_id);
     }
+    Err((StatusCode::CONFLICT, Json(body)).into_response())
 }
 
 /// Revoke at the authorization server, then delete, every grant by binding made
-/// with an external consent provider being deleted. A revocation that fails is
-/// audited and the grant deleted all the same; a vault that cannot list or
-/// delete the grants keeps the provider.
+/// with an external consent provider being deleted, naming `actor` in the
+/// audit. A revocation that fails is audited and the grant deleted all the
+/// same. A vault that cannot list or delete the grants keeps the provider, as
+/// does one that cannot read them because at-rest encryption is now off while
+/// grants are stored: they would otherwise be left unrevoked on disk.
 async fn remove_provider_grants(
     state: &CredentialProviderState,
     provider: &CredentialProvider,
+    actor: Option<&crate::delegation_vault::audit::AuditCallerContext>,
 ) -> Result<(), Response> {
     if !provider.is_external_consent() {
         return Ok(());
@@ -778,31 +794,44 @@ async fn remove_provider_grants(
         .await
     {
         Ok(grants) => grants,
-        Err(error) if error.is::<crate::delegation_vault::grants::EncryptionRequired>() => Vec::new(),
+        Err(error) if error.is::<crate::delegation_vault::grants::EncryptionRequired>() => {
+            return match vault
+                .has_stored_grants()
+                .await
+            {
+                Ok(false) => Ok(()),
+                Ok(true) => Err(unavailable(
+                    "Delegated grants are stored but cannot be read while at-rest encryption is off, so they \
+                     cannot be revoked or removed; enable [encryption] with the key they were written under, then \
+                     delete the provider",
+                )),
+                Err(error) => {
+                    warn!(target: "credential_delegation", error = %error, "Failed to look for stored grants");
+                    Err(unavailable("The delegation vault is unavailable, so the provider's grants cannot be removed"))
+                }
+            };
+        }
         Err(error) => {
             warn!(target: "credential_delegation", error = %error, "Failed to list a provider's grants");
             return Err(unavailable("The delegation vault is unavailable, so the provider's grants cannot be removed"));
         }
     };
-    for grant in grants {
-        crate::delegation_vault::revocation::revoke_grant(
-            provider,
-            &grant,
-            &state.secrets_store,
-            state
-                .egress_allowlist
-                .as_deref(),
-        )
-        .await;
-        if let Err(error) = vault
-            .delete_grant(&grant.id)
-            .await
-        {
-            warn!(target: "credential_delegation", error = %error, "Failed to delete a provider's grant");
-            return Err(unavailable("The delegation vault is unavailable, so the provider's grants cannot be removed"));
-        }
-    }
-    Ok(())
+    let providers = std::collections::HashMap::from([(provider.id.clone(), provider.clone())]);
+    crate::delegation_vault::revocation::remove_grants(
+        vault,
+        grants,
+        &providers,
+        &state.secrets_store,
+        state
+            .egress_allowlist
+            .as_deref(),
+        actor,
+    )
+    .await
+    .map_err(|error| {
+        warn!(target: "credential_delegation", error = %error, "Failed to delete a provider's grant");
+        unavailable("The delegation vault is unavailable, so the provider's grants cannot be removed")
+    })
 }
 
 /// POST /api/v1/credential-providers/validate
@@ -1107,7 +1136,7 @@ mod consent_strategy_tests {
             .into_response();
         assert_eq!(update.status(), StatusCode::FORBIDDEN);
 
-        let delete = delete_provider(State(state.clone()), Path("provider".into()), tenant_a(), None)
+        let delete = delete_provider(State(state.clone()), Path("provider".into()), tenant_a(), None, None, None)
             .await
             .into_response();
         assert_eq!(delete.status(), StatusCode::FORBIDDEN);
@@ -1132,7 +1161,7 @@ mod consent_strategy_tests {
             .into_response();
         assert_eq!(update.status(), StatusCode::NOT_FOUND);
 
-        let delete = delete_provider(State(state.clone()), Path("provider".into()), tenant_a(), None)
+        let delete = delete_provider(State(state.clone()), Path("provider".into()), tenant_a(), None, None, None)
             .await
             .into_response();
         assert_eq!(delete.status(), StatusCode::NOT_FOUND);
@@ -1165,7 +1194,7 @@ mod consent_strategy_tests {
             Some("Tenant provider".to_string())
         );
 
-        let delete = delete_provider(State(state.clone()), Path("provider".into()), tenant_a(), None)
+        let delete = delete_provider(State(state.clone()), Path("provider".into()), tenant_a(), None, None, None)
             .await
             .into_response();
         assert_eq!(delete.status(), StatusCode::NO_CONTENT);
@@ -1494,7 +1523,7 @@ mod external_provider_tests {
         state: &CredentialProviderState,
         id: &str,
     ) -> (StatusCode, serde_json::Value) {
-        let response = delete_provider(State(state.clone()), Path(id.into()), tenant("tenant-a"), None)
+        let response = delete_provider(State(state.clone()), Path(id.into()), tenant("tenant-a"), None, None, None)
             .await
             .into_response();
         let status = response.status();
@@ -1573,17 +1602,10 @@ mod external_provider_tests {
         let (status, body) = delete(&state, "provider").await;
         assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
 
-        let mut revoked: Vec<String> = server
-            .requests()
-            .iter()
-            .filter_map(|(_, body)| {
-                url::form_urlencoded::parse(body.as_bytes())
-                    .find(|(name, _)| name == "token")
-                    .map(|(_, token)| token.into_owned())
-            })
-            .collect();
-        revoked.sort();
-        assert_eq!(revoked, ["caller-access-refresh", "owner-access-refresh"]);
+        assert_eq!(
+            server.revoked_tokens(),
+            ["caller-access", "caller-access-refresh", "owner-access", "owner-access-refresh"]
+        );
         for key in &keys {
             assert!(
                 vault
@@ -1629,7 +1651,7 @@ mod external_provider_tests {
                 .0,
             StatusCode::NO_CONTENT
         );
-        assert_eq!(server.requests().len(), 1);
+        assert_eq!(server.requests().len(), 2);
         assert!(
             vault
                 .grant(&key)
@@ -1637,5 +1659,224 @@ mod external_provider_tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    async fn delete_as(
+        state: &CredentialProviderState,
+        context: Option<Extension<PatTenantContext>>,
+        scope: Option<Extension<PatResourceScope>>,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = delete_provider(
+            State(state.clone()),
+            Path("provider".into()),
+            context,
+            scope,
+            Some(Extension(AuthGuardOk("operator".into()))),
+            Some(Extension(PatDelegationContext {
+                token_id: "pat-1".into(),
+                delegation_depth: 0,
+                resource_scoped: false,
+            })),
+        )
+        .await
+        .into_response();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+    }
+
+    /// A surface of `tenant` whose two variants share an alias and whose first
+    /// is disabled, so the second cannot be resolved. The second binds
+    /// `provider` through `outbound_credentials` when one is named.
+    fn unresolvable_surface(
+        surface_id: &str,
+        tenant: &str,
+        provider: Option<&str>,
+    ) -> crate::config::agent_surface::AgentSurface {
+        let overrides = match provider {
+            Some(provider) => json!({"outbound_credentials": [{"credential_provider_id": provider}]}),
+            None => json!({}),
+        };
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+            "surface_id": surface_id, "name": surface_id, "tenant_id": tenant,
+            "access_point": {"listen_address": "https://gateway.example", "route": format!("/{surface_id}"),
+                "protocol": "mcp"},
+            "target": {"endpoint": "https://managed.example/agent"},
+            "variants": [
+                {"id": "v-1", "alias": "same", "name": "first", "enabled": false, "overrides": {}},
+                {"id": "v-2", "alias": "same", "name": "second", "enabled": true, "overrides": overrides}
+            ]
+        }))
+        .unwrap();
+        assert!(
+            crate::identity::handlers::surface_tenancy::collect_surface_reference_keys(&surface).is_err(),
+            "the fixture's variants cannot be resolved"
+        );
+        surface
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn another_tenants_surfaces_and_an_unresolvable_surface_that_binds_nothing_never_block_a_delete() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = crate::delegation_vault::revocation::tests::RecordingServer::start(200).await;
+        let state = delete_state(&directory, &server).await;
+        let surfaces = state
+            .surfaces
+            .clone()
+            .unwrap();
+        let mut planted = bound_surface(json!({"where": "surface", "binding": {"credential_provider_id": "provider"}}));
+        planted.surface_id = "tenant-b-surface".into();
+        planted.tenant_id = Some("tenant-b".into());
+        for surface in [
+            planted,
+            unresolvable_surface("tenant-b-broken", "tenant-b", Some("provider")),
+            unresolvable_surface("tenant-a-broken", "tenant-a", None),
+        ] {
+            surfaces
+                .save(&surface)
+                .await
+                .unwrap();
+        }
+        let (status, body) = delete(&state, "provider").await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        assert!(
+            !body
+                .to_string()
+                .contains("tenant-b"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unresolvable_surface_still_binds_the_provider_it_names_and_is_named_only_to_who_may_see_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = crate::delegation_vault::revocation::tests::RecordingServer::start(200).await;
+        let state = delete_state(&directory, &server).await;
+        state
+            .surfaces
+            .as_ref()
+            .unwrap()
+            .save(&unresolvable_surface("tenant-a-broken", "tenant-a", Some("provider")))
+            .await
+            .unwrap();
+        let (status, body) = delete_as(&state, tenant("tenant-a"), None).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "provider_in_use");
+        assert_eq!(body["surface_id"], "tenant-a-broken");
+
+        let provider_only = Some(Extension(PatResourceScope(Arc::new(
+            regex::Regex::new(r"\ATENANT:tenant-a:credential-providers:provider\z").unwrap(),
+        ))));
+        let (status, body) = delete_as(&state, tenant("tenant-a"), provider_only).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "provider_in_use");
+        assert!(
+            body.get("surface_id")
+                .is_none(),
+            "a surface outside the token's scope is not named: {body}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_provider_with_grants_that_cannot_be_read_while_encryption_is_off_is_kept() {
+        use crate::delegation_vault::grants::GrantKey;
+        let directory = tempfile::tempdir().unwrap();
+        let server = crate::delegation_vault::revocation::tests::RecordingServer::start(200).await;
+        let mut state = delete_state(&directory, &server).await;
+        let key = GrantKey::owner(Some("tenant-a"), "surface", "tp-1", "provider");
+        state
+            .vault
+            .as_ref()
+            .unwrap()
+            .store_grant(crate::delegation_vault::grants::tests::grant(&key, "owner-access"))
+            .await
+            .unwrap();
+
+        crate::storage::filesystem::init_global_encryption(crate::config::EncryptionConfig::default()).unwrap();
+        let unencrypted = |path: std::path::PathBuf| async move {
+            let vault: Arc<dyn crate::delegation_vault::storage::DelegationVaultStorage> = Arc::new(
+                crate::delegation_vault::storage::FileSystemDelegationVaultStore::new(path)
+                    .await
+                    .unwrap(),
+            );
+            vault
+        };
+        state.vault = Some(unencrypted(directory.path().join("vault")).await);
+        let (status, body) = delete(&state, "provider").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("at-rest encryption is off")),
+            "{body}"
+        );
+        assert!(
+            state
+                .store
+                .get("provider")
+                .await
+                .unwrap()
+                .is_some(),
+            "the provider is kept"
+        );
+        assert!(
+            directory
+                .path()
+                .join("vault/delegated_grants")
+                .join(format!("{}.json.enc", key.record_id()))
+                .exists(),
+            "the grant is kept to be revoked once it can be read"
+        );
+        assert!(server.requests().is_empty());
+
+        state.vault = Some(
+            unencrypted(
+                directory
+                    .path()
+                    .join("empty-vault"),
+            )
+            .await,
+        );
+        assert_eq!(
+            delete(&state, "provider")
+                .await
+                .0,
+            StatusCode::NO_CONTENT,
+            "with no grant stored there is nothing to orphan"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_providers_revocations_name_the_caller_that_deleted_it() {
+        use crate::delegation_vault::grants::GrantKey;
+        let directory = tempfile::tempdir().unwrap();
+        let server = crate::delegation_vault::revocation::tests::RecordingServer::start(200).await;
+        let state = delete_state(&directory, &server).await;
+        state
+            .vault
+            .as_ref()
+            .unwrap()
+            .store_grant(crate::delegation_vault::grants::tests::grant(
+                &GrantKey::owner(Some("tenant-a"), "surface", "tp-1", "provider"),
+                "owner-access",
+            ))
+            .await
+            .unwrap();
+        let ((status, _), events) =
+            crate::audit::producer::capture(async { delete_as(&state, tenant("tenant-a"), None).await }).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let revoked: Vec<_> = events
+            .iter()
+            .filter(|event| matches!(event.event, crate::delegation_vault::audit::DelegationAuditAction::TokenRevoked))
+            .collect();
+        assert_eq!(revoked.len(), 1);
+        let caller = revoked[0]
+            .caller
+            .as_ref()
+            .expect("the revocation names its actor");
+        assert_eq!(caller.sub.as_deref(), Some("operator"));
+        assert_eq!(caller.token_id.as_deref(), Some("pat-1"));
     }
 }
