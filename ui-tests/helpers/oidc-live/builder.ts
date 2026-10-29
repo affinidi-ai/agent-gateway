@@ -55,6 +55,17 @@ export async function chooseStrategy(page: Page, strategyName: string): Promise<
     await page.getByTestId('caller-auth-close-button').click();
 }
 
+export async function configureCallerAuth(page: Page, options: {strategyName: string; scopes: string[]}): Promise<void> {
+    await openCallerAuth(page);
+    await page.getByTestId('caller-auth-jwt-strategy').selectOption({label: options.strategyName});
+    for (const scope of options.scopes) {
+        await page.getByTestId('caller-auth-scope-input').fill(scope);
+        await page.getByTestId('caller-auth-scope-add').click();
+        await expect(page.getByTestId('caller-auth-scopes')).toContainText(scope);
+    }
+    await page.getByTestId('caller-auth-close-button').click();
+}
+
 export async function nameSurface(page: Page, name: string): Promise<void> {
     const field = page.locator('#surface-name');
     await expect(async () => {
@@ -107,6 +118,7 @@ export async function saveEdit(page: Page, timeout = 15_000): Promise<SavedSurfa
 
 export interface SavedSurface {
     surface_id: string;
+    warnings?: Array<{code: string}>;
     access_point: {
         listen_address: string;
         route: string;
@@ -115,9 +127,14 @@ export interface SavedSurface {
                 type: string;
                 jwt_verification_strategy_id: string;
                 audiences: string[];
+                required_scopes?: string[];
             }>;
         };
         inbound_policy?: {policy_definition_id: string};
     };
-    target: {endpoint: string; auth?: {method: {credential_provider?: {credential_provider_id: string}}}};
+    target: {
+        endpoint: string;
+        auth?: {method: {credential_provider?: {credential_provider_id: string}}};
+        policy?: {policy_definition_id: string};
+    };
 }

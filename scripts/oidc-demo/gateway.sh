@@ -13,7 +13,8 @@
 # the inbound HTTPS listener's external URL https://localhost:<https port> so the Access Point URL is https, and
 # writes the two verification strategies (one per Hydra instance, authorization server
 # metadata pinned) straight into the gateway's storage: the management API's save-time URL checks
-# refuse the loopback JWKS and discovery URLs the local Hydra instances use.
+# refuse the loopback JWKS and discovery URLs the local Hydra instances use. With OIDC_DEMO_IDP=auth0 only
+# the hydra-b strategy is written; seed.sh creates the Auth0 one through the API.
 #
 # OIDC_DEMO_CACHE_REFRESH_SECS=<n> sets cache_refresh_interval_secs, so strategy files written into the gateway's
 # storage while it runs are picked up within n seconds (the live UI tests seed a loopback Hydra this way).
@@ -132,12 +133,14 @@ start_gateway() {
     mkdir -p "${strategies}"
     for which in a b; do
         [[ "${no_strategies}" == false ]] || break
+        [[ "${which}" == "b" ]] || ! auth0_mode || continue
         if [[ "${which}" == "a" ]]; then id="${STRATEGY_A_ID}"; else id="${STRATEGY_B_ID}"; fi
         strategy_record_json "${which}" >"${strategies}/${id}.json"
     done
 
     local allowlist
     allowlist="$(hydra_token_endpoint a),$(hydra_token_endpoint b)"
+    if auth0_mode; then allowlist="$(hydra_token_endpoint b)"; fi
     local egress_allowlist="${AGENT_URL},${HYDRA_A_ISSUER%/},${HYDRA_B_ISSUER%/}"
     (
         cd "${GATEWAY_ENV_DIR}" || exit 1

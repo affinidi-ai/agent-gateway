@@ -38,7 +38,7 @@ caller_token() { fetch_token a demo-caller "${AP_URL}" "${REQUIRED_SCOPE}"; }
 
 gateway_log_is_clean() {
     [[ -f "${GATEWAY_LOG_FILE}" ]] || fail "no gateway log at ${GATEWAY_LOG_FILE}"
-    if grep -qE 'eyJ[A-Za-z0-9_-]{8,}\.|PRIVATE KEY|ory_at_|The provided authorization grant' "${GATEWAY_LOG_FILE}"; then
+    if grep -qE 'eyJ[A-Za-z0-9_-]{8,}\.|-----BEGIN [A-Z ]*PRIVATE KEY-----|ory_at_|The provided authorization grant' "${GATEWAY_LOG_FILE}"; then
         fail "the gateway log ($1) carries a key, an assertion, a token or the token endpoint's error text"
     fi
     pass "the gateway log ($1) carries no key, assertion, token or token endpoint error text"

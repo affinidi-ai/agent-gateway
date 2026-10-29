@@ -6,11 +6,18 @@ agent card and the JSON-RPC endpoint both need a bearer token issued by the agen
 authorization server. The token is checked by asking Hydra's admin API to introspect it,
 which validates the signature, expiry and revocation of a JWT access token.
 
+The card carries its own `securitySchemes` and a dummy `signatures` entry, so a gateway
+that rewrites the card has something to replace and remove.
+
 Endpoints
   GET  /.well-known/agent-card.json, /v1/card   the card (token required unless --open)
   POST /, /v1/message:send                      JSON-RPC message/send (token required unless --open)
   GET  /_demo/log                               requests seen since the last reset (no tokens)
   POST /_demo/reset                             clear that log
+  GET  /_demo/state                             {"refuse": bool}, whether the agent is refusing
+  POST /_demo/refuse                            {"refuse": true} makes the agent answer 401 to every
+                                                card and JSON-RPC request, whatever token it carries;
+                                                {"refuse": false} restores normal checks
 """
 
 import argparse
@@ -37,6 +44,17 @@ def build_card(agent_url: str) -> dict:
         "defaultOutputModes": ["text/plain"],
         "skills": [{"id": "echo", "name": "Echo", "description": "Repeats the message.",
                     "tags": ["demo"]}],
+        "securitySchemes": {
+            "agent_own_oauth": {
+                "type": "oauth2",
+                "flows": {"clientCredentials": {
+                    "tokenUrl": "https://agent-as.internal.example/oauth2/token",
+                    "scopes": {"agent.invoke": "Invoke the agent"}}},
+            }
+        },
+        "security": [{"agent_own_oauth": ["agent.invoke"]}],
+        "signatures": [{"protected": "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpPU1QifQ",
+                        "signature": "ZHVtbXktc2lnbmF0dXJlLWRvZXMtbm90LXZlcmlmeQ"}],
     }
 
 
@@ -45,6 +63,7 @@ class State:
         self.args = args
         self.lock = threading.Lock()
         self.log = []
+        self.refuse = False
 
     def record(self, method, path, authenticated, client_id, status):
         with self.lock:
@@ -94,6 +113,13 @@ def make_handler(state: State):
             self.wfile.write(data)
 
         def guard(self, method, path):
+            with state.lock:
+                refusing = state.refuse
+            if refusing:
+                state.record(method, path, False, "", 401)
+                self.send_json(401, {"error": "invalid_token"},
+                               {"WWW-Authenticate": 'Bearer realm="mock-agent"'})
+                return False, ""
             if state.args.open:
                 return True, ""
             client_id = state.check(self.headers.get("Authorization"))
@@ -109,6 +135,9 @@ def make_handler(state: State):
             if path == "/_demo/log":
                 with state.lock:
                     return self.send_json(200, state.log)
+            if path == "/_demo/state":
+                with state.lock:
+                    return self.send_json(200, {"refuse": state.refuse})
             if path in CARD_PATHS:
                 ok, client_id = self.guard("GET", path)
                 if ok:
@@ -125,6 +154,14 @@ def make_handler(state: State):
                 with state.lock:
                     state.log.clear()
                 return self.send_json(200, {"reset": True})
+            if path == "/_demo/refuse":
+                try:
+                    refuse = json.loads(raw or b"{}").get("refuse") is True
+                except (ValueError, AttributeError):
+                    refuse = False
+                with state.lock:
+                    state.refuse = refuse
+                return self.send_json(200, {"refuse": refuse})
             if path in RPC_PATHS:
                 ok, client_id = self.guard("POST", path)
                 if not ok:

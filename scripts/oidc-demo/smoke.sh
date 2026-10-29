@@ -71,6 +71,20 @@ for which in a b; do
     pass "hydra-${which} refuses an audience the client is not registered for"
 done
 
+step "The refused callers on hydra-a: no scope, another audience"
+token="$(fetch_token a "${NOSCOPE_CLIENT}" "${AP_URL}")"
+jwt_claims "${token}" >"${TMP_DIR}/claims.json"
+assert_json "hydra-a ${NOSCOPE_CLIENT} token names the Access Point and lacks ${REQUIRED_SCOPE}" \
+    "(.aud | index(\"${AP_URL}\") != null) and ((.scp // []) | index(\"${REQUIRED_SCOPE}\") == null)" "${TMP_DIR}/claims.json"
+if fetch_token a "${NOSCOPE_CLIENT}" "${AP_URL}" "${REQUIRED_SCOPE}" >/dev/null 2>&1; then
+    fail "hydra-a issued ${REQUIRED_SCOPE} to ${NOSCOPE_CLIENT}"
+fi
+pass "hydra-a refuses ${REQUIRED_SCOPE} to ${NOSCOPE_CLIENT}"
+token="$(fetch_token a "${OTHERAUD_CLIENT}" "${OTHER_AUDIENCE}" "${REQUIRED_SCOPE}")"
+jwt_claims "${token}" >"${TMP_DIR}/claims.json"
+assert_json "hydra-a ${OTHERAUD_CLIENT} token names ${OTHER_AUDIENCE}, not the Access Point" \
+    ".aud == [\"${OTHER_AUDIENCE}\"]" "${TMP_DIR}/claims.json"
+
 step "Hop 2 on hydra-b: JWT bearer grant with the gateway signing key (what the gateway will send)"
 assertion="$(python3 -I "${OIDC_DEMO_DIR}/jwt_tools.py" assertion "${STATE_DIR}/gateway-hop2.key" gateway-hop2-key \
     "${HOP2_ISSUER}" "${HOP2_SUBJECT}" "$(hydra_token_endpoint b)" "${HOP2_SCOPE}")"
@@ -84,7 +98,7 @@ assert_json "hop 2 token: issuer hydra-b, subject ${HOP2_SUBJECT}, scope [${HOP2
 replayed="$(jwt_bearer_grant "${assertion}" /dev/null)" || fail "the replayed JWT bearer grant request to hydra-b failed"
 assert_eq "a replayed assertion (same jti) is refused" 400 "${replayed}"
 
-step "Mock agent: login-only card and calls"
+step "Mock agent: login-only card, own security scheme, dummy signatures"
 curl -fsS -X POST "${AGENT_URL}/_demo/reset" -o /dev/null
 code="$(curl -sS -o /dev/null -w '%{http_code}' "${AGENT_URL}/.well-known/agent-card.json")"
 if [[ "${HOP2}" == "on" ]]; then
@@ -108,7 +122,11 @@ if [[ "${HOP2}" == "on" ]]; then
         "([.[] | select(.authenticated)] | length == 2 and all(.client_id == \"${HOP2_CLIENT}\")) and ([.[] | select(.authenticated | not)] | length == 3)" "${TMP_DIR}/agent-log.json"
 else
     assert_eq "card without a token (hop 2 off: the agent is open)" 200 "${code}"
+    curl -fsS "${AGENT_URL}/.well-known/agent-card.json" -o "${TMP_DIR}/card.json"
 fi
+assert_json "the card carries the agent's own oauth2 scheme and security requirement" \
+    '.securitySchemes.agent_own_oauth.type == "oauth2" and (.security | length) == 1' "${TMP_DIR}/card.json"
+assert_json "the card carries a dummy signatures entry" '(.signatures | length) == 1' "${TMP_DIR}/card.json"
 
 step "Seeding dry run: payloads are valid and hold no secret values"
 "${OIDC_DEMO_DIR}/seed.sh" --dry-run >"${TMP_DIR}/seed-dry-run.txt"

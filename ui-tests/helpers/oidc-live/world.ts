@@ -17,6 +17,8 @@ import {PREFIX, names} from './names';
 
 export interface World {
     good: OAuthClient;
+    noScope: OAuthClient;
+    otherAudience: OAuthClient;
     goodOnB: OAuthClient;
     hop2: OAuthClient;
     key: SigningKey;
@@ -46,6 +48,20 @@ export async function createWorld(hydra: APIRequestContext): Promise<World> {
         scope: names.scopes.caller,
         audience: [entry],
     });
+    const noScope = await registerClient(hydra, env.hydraA, {
+        id: names.clients.noScope,
+        secret: randomSecret(),
+        grantTypes: callerGrants,
+        scope: '',
+        audience: [entry],
+    });
+    const otherAudience = await registerClient(hydra, env.hydraA, {
+        id: names.clients.otherAudience,
+        secret: randomSecret(),
+        grantTypes: callerGrants,
+        scope: names.scopes.caller,
+        audience: [names.otherAudience],
+    });
     const goodOnB = await registerClient(hydra, env.hydraB, {
         id: names.clients.good,
         secret: randomSecret(),
@@ -67,13 +83,15 @@ export async function createWorld(hydra: APIRequestContext): Promise<World> {
         scope: [names.scopes.hop2],
         jwk: key.publicJwk,
     });
-    const world: World = {good, goodOnB, hop2, key, grantId};
+    const world: World = {good, noScope, otherAudience, goodOnB, hop2, key, grantId};
     saveWorld(world);
     return world;
 }
 
 export async function destroyWorld(hydra: APIRequestContext): Promise<void> {
-    await deleteClient(hydra, env.hydraA, names.clients.good);
+    for (const id of [names.clients.good, names.clients.noScope, names.clients.otherAudience]) {
+        await deleteClient(hydra, env.hydraA, id);
+    }
     for (const id of [names.clients.good, names.clients.hop2]) {
         await deleteClient(hydra, env.hydraB, id);
     }

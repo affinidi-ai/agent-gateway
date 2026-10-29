@@ -9,14 +9,19 @@
 #                      (the save-time URL checks refuse loopback), and this script checks they exist
 #   policy             denies callers whose authentication failed
 #   credential provider  oauth2_jwt_bearer pointing at hydra-b (skipped with hop 2 off)
-#   surface            A2A Access Point at /mock-agent: jwt_bearer from hydra-a,
+#   surface            A2A Access Point at /mock-agent: jwt_bearer from hydra-a, required scope,
 #                      target = the mock agent, Target Authentication through the provider
+#
+# With OIDC_DEMO_IDP=auth0 (see auth0.sh) the caller's authorization server is the Auth0 tenant: the
+# strategy is created through the API with discovery, as the dashboard's Discover from issuer does, and
+# the surface requires the Access Point URL (the tenant's API identifier) as audience and the scope agent:invoke.
 #
 # Usage: scripts/oidc-demo/seed.sh [--dry-run]
 #   --dry-run   print the payloads with secret values redacted; no network and no gateway needed
 #
-# The credential_provider Target Authentication method and the oauth2_jwt_bearer provider type are
-# sent as they are specified; a gateway build without them rejects or ignores them.
+# Fields added by the OIDC work (discover_metadata, required_scopes, the credential_provider
+# Target Authentication method, the oauth2_jwt_bearer provider type) are sent as they are
+# specified; a gateway build without them rejects or ignores them.
 
 set -euo pipefail
 unset CDPATH
@@ -33,6 +38,7 @@ for arg in "$@"; do
 done
 
 require_tools curl jq
+if auth0_mode && [[ "${DRY_RUN}" != true ]]; then auth0_load; fi
 HOP2="$(hop2_mode)"
 PROVIDER_SLUG="oidc-demo-hop2"
 PROVIDER_RECORD_ID=""
@@ -64,13 +70,15 @@ provider_payload() {
                      signing_algorithm: "RS256", key_id: "gateway-hop2-key"}}'
 }
 
+# surface_payload STRATEGY_ID [METHOD_JSON]: the surface, with caller_auth_method_json STRATEGY_ID unless
+# METHOD_JSON is given.
 surface_payload() {
     local strategy_id="$1" target_auth="null"
     if [[ "${HOP2}" == "on" ]]; then
         target_auth="$(jq -n --arg slug "${PROVIDER_RECORD_ID:-<provider record id>}" '{method: {credential_provider: {credential_provider_id: $slug}}, fallback: "reject"}')"
     fi
-    local method
-    method="$(caller_auth_method_json "${strategy_id}")"
+    local method="${2:-}"
+    [[ -n "${method}" ]] || method="$(caller_auth_method_json "${strategy_id}")"
     jq -n --arg id "${SURFACE_ID}" --arg listen "${ACCESS_POINT_ORIGIN}" --arg route "${SURFACE_ROUTE}" --arg agent "${AGENT_URL}" \
         --arg policy "${POLICY_ID}" --argjson method "${method}" --argjson auth "${target_auth}" '{
         surface_id: $id, name: "oidc-demo", description: "OIDC demo surface in front of the mock agent", status: "active",
@@ -148,13 +156,17 @@ if [[ "${HOP2}" == "on" ]]; then
         | api_ok "client secret secret" POST /api/v1/secrets/new --data-binary @-
 fi
 
+STRATEGY_IDS=("${STRATEGY_A_ID}" "${STRATEGY_B_ID}")
+if auth0_mode; then STRATEGY_IDS=("${STRATEGY_B_ID}"); fi
 info "Checking the verification strategies written by gateway.sh start"
-for id in "${STRATEGY_A_ID}" "${STRATEGY_B_ID}"; do
+for id in "${STRATEGY_IDS[@]}"; do
     code="$(api GET "/api/v1/jwt-verification-strategies/${id}")" || fail "strategy ${id}: request failed"
     [[ "${code}" == "200" ]] || fail "strategy ${id} is missing (HTTP ${code}); start the gateway with scripts/oidc-demo/gateway.sh start --fresh"
 done
-api GET "/api/v1/jwt-verification-strategies/${STRATEGY_A_ID}" >/dev/null
-assert_eq "strategy a expected issuer" "${HYDRA_A_ISSUER}" "$(jq -r .expected_issuer "${TMP_DIR}/api-body")"
+if ! auth0_mode; then
+    api GET "/api/v1/jwt-verification-strategies/${STRATEGY_A_ID}" >/dev/null
+    assert_eq "strategy a expected issuer" "${HYDRA_A_ISSUER}" "$(jq -r .expected_issuer "${TMP_DIR}/api-body")"
+fi
 
 info "Creating the deny policy"
 policy_payload | api_ok "policy" POST /api/v1/policy-definitions --data-binary @-
@@ -165,7 +177,25 @@ if [[ "${HOP2}" == "on" ]]; then
     PROVIDER_RECORD_ID="$(jq -er '.id' "${TMP_DIR}/api-body")" || fail "the credential provider response has no id"
 fi
 
+SURFACE_STRATEGY="${STRATEGY_A_ID}"
+SURFACE_METHOD=""
+if auth0_mode; then
+    delete_named /api/v1/jwt-verification-strategies ".name == \"${AUTH0_STRATEGY_NAME}\""
+    info "Discovering the Auth0 tenant's authorization server metadata"
+    jq -n --arg iss "${AUTH0_ISSUER}" '{issuer: $iss}' | api_ok "discover" POST /api/v1/jwt-verification-strategies/discover --data-binary @-
+    assert_eq "discovered issuer equals the tenant issuer, trailing slash included" "${AUTH0_ISSUER}" "$(jq -r .issuer "${TMP_DIR}/api-body")"
+    jwks_uri="$(jq -er .jwks_uri "${TMP_DIR}/api-body")" || fail "discovery returned no jwks_uri"
+    info "Creating the Auth0 verification strategy with discovery"
+    jq -n --arg name "${AUTH0_STRATEGY_NAME}" --arg iss "${AUTH0_ISSUER}" --arg jwks "${jwks_uri}" \
+        '{name: $name, expected_issuer: $iss, jwks_source: {type: "remote", jwks_uri: $jwks}, discover_metadata: true}' \
+        | api_ok "auth0 strategy" POST /api/v1/jwt-verification-strategies --data-binary @-
+    SURFACE_STRATEGY="$(jq -er '.id' "${TMP_DIR}/api-body")" || fail "the strategy response has no id"
+    assert_eq "the strategy pins the tenant issuer" "${AUTH0_ISSUER}" "$(jq -r '.authorization_server.issuer' "${TMP_DIR}/api-body")"
+    (umask 077; printf '%s\n' "${SURFACE_STRATEGY}" >"${STATE_DIR}/auth0-strategy-id")
+    SURFACE_METHOD="$(auth0_auth_method_json "${SURFACE_STRATEGY}")"
+fi
+
 info "Creating the surface"
-surface_payload "${STRATEGY_A_ID}" | api_ok "surface" POST /api/v1/surfaces --data-binary @-
+surface_payload "${SURFACE_STRATEGY}" ${SURFACE_METHOD:+"${SURFACE_METHOD}"} | api_ok "surface" POST /api/v1/surfaces --data-binary @-
 
 pass "gateway seeded: surface ${SURFACE_ID} at ${AP_URL}"

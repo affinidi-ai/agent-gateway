@@ -2,10 +2,12 @@
 #
 # Start the demo's supporting services on the host:
 #   - two Ory Hydra containers (hydra-a, hydra-b), in-memory storage, JWT access tokens,
-#     scopes in a list claim, plain http in Hydra's development mode;
+#     scopes in a list claim, plain http in Hydra's development mode; with OIDC_DEMO_IDP=auth0
+#     (auth0.sh) only hydra-b, because the Auth0 tenant is the caller's authorization server;
 #   - the mock A2A agent, with a login-only card, as a host python3 process.
-# The gateway is not started here; see gateway.sh. Generated keys, secrets and configs live in
-# envs/oidc-demo-run/ (gitignored). Nothing is pulled: the pinned Hydra image must already exist.
+# Callers on hydra-a: demo-caller (the required scope, the Access Point as audience), demo-noscope (no
+# scope) and demo-otheraud (another audience); demo-caller also on hydra-b. The gateway is not started
+# here; see gateway.sh. Generated keys, secrets and configs live in envs/oidc-demo-run/ (gitignored). Nothing is pulled: the pinned Hydra image must already exist.
 #
 # Usage: scripts/oidc-demo/up.sh [--no-hop2]
 #   --no-hop2   the mock agent accepts the card fetch and calls without a token, for a gateway that has
@@ -40,11 +42,18 @@ printf '%s\n' "${HOP2}" >"${STATE_DIR}/hop2"
 
 "${OIDC_DEMO_DIR}/down.sh" --services-only >/dev/null
 
+HYDRA_SET="a b"
+if auth0_mode; then HYDRA_SET="b"; fi
+
 info "Generating local secrets and the hop 2 signing key"
-for which in a b; do
+for which in ${HYDRA_SET}; do
     new_secret "hydra-${which}.system"
     new_secret "${which}-demo-caller.secret"
 done
+if ! auth0_mode; then
+    new_secret "a-${NOSCOPE_CLIENT}.secret"
+    new_secret "a-${OTHERAUD_CLIENT}.secret"
+fi
 new_secret "b-${HOP2_CLIENT}.secret"
 new_secret "test-token"
 if [[ ! -s "${STATE_DIR}/gateway-hop2.key" ]]; then
@@ -94,8 +103,12 @@ start_hydra() {
     wait_http "http://127.0.0.1:${admin}/health/ready" "${name}" 120
 }
 
-info "Starting hydra-a (${HYDRA_A_ISSUER}) and hydra-b (${HYDRA_B_ISSUER})"
-start_hydra a "${HYDRA_A_NAME}" "${HYDRA_A_PUBLIC}" "${HYDRA_A_ADMIN}"
+if auth0_mode; then
+    info "Auth0 mode: starting hydra-b (${HYDRA_B_ISSUER}) only; the caller's authorization server is the Auth0 tenant"
+else
+    info "Starting hydra-a (${HYDRA_A_ISSUER}) and hydra-b (${HYDRA_B_ISSUER})"
+    start_hydra a "${HYDRA_A_NAME}" "${HYDRA_A_PUBLIC}" "${HYDRA_A_ADMIN}"
+fi
 start_hydra b "${HYDRA_B_NAME}" "${HYDRA_B_PUBLIC}" "${HYDRA_B_ADMIN}"
 
 admin_post() {
@@ -119,9 +132,13 @@ register_cc_client() {
 }
 
 info "Registering the demo clients on the Hydra instances"
-for which in a b; do
+for which in ${HYDRA_SET}; do
     register_cc_client "${which}" demo-caller "agent.read agent.write" "${AP_URL}"
 done
+if ! auth0_mode; then
+    register_cc_client a "${NOSCOPE_CLIENT}" "" "${AP_URL}"
+    register_cc_client a "${OTHERAUD_CLIENT}" "${REQUIRED_SCOPE}" "${OTHER_AUDIENCE}"
+fi
 
 info "Registering the hop 2 client and trusting the gateway signing key on hydra-b"
 jq -n --arg id "${HOP2_CLIENT}" --rawfile secret "$(secret_file "b-${HOP2_CLIENT}.secret")" --arg scope "${HOP2_SCOPE}" \
@@ -134,6 +151,9 @@ jq -n --arg iss "${HOP2_ISSUER}" --arg sub "${HOP2_SUBJECT}" --arg scope "${HOP2
     '{issuer: $iss, subject: $sub, scope: [$scope], expires_at: $exp, jwk: $jwk}' \
     | admin_post b /admin/trust/grants/jwt-bearer/issuers
 
+if curl -s -o /dev/null --connect-timeout 2 --max-time 4 "${AGENT_URL}/" 2>/dev/null; then
+    fail "port ${AGENT_PORT} is already in use by another process; stop it or set OIDC_DEMO_AGENT_PORT"
+fi
 info "Starting the mock agent on ${AGENT_URL} (hop 2: ${HOP2})"
 agent_args=(--port "${AGENT_PORT}" --public-url "${AGENT_URL}"
     --introspect-url "${HYDRA_B_ADMIN_URL}/admin/oauth2/introspect"
@@ -146,7 +166,7 @@ wait_http "${AGENT_URL}/_demo/log" "mock agent" 40
 cat <<EOF
 
 Demo services are up.
-  hydra-a   ${HYDRA_A_ISSUER}   (admin ${HYDRA_A_ADMIN_URL})   caller authorization server
+$(auth0_mode || printf '  hydra-a   %s   (admin %s)   caller authorization server\n' "${HYDRA_A_ISSUER}" "${HYDRA_A_ADMIN_URL}")
   hydra-b   ${HYDRA_B_ISSUER}   (admin ${HYDRA_B_ADMIN_URL})   second server; also the agent's own
   agent     ${AGENT_URL}
   gateway   ${GATEWAY_URL} (not started; scripts/oidc-demo/gateway.sh start --fresh starts it)

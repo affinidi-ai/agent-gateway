@@ -4,12 +4,14 @@
  * Covers authorization server discovery in the strategy editor and the list:
  * - Client-side https gate and the fixed failure message from the gateway
  * - Pinned metadata card and the request a discovered save sends
+ * - Scope claims saved, kept and reset to the defaults on the real gateway
  * - Discovered badge and the in-page delete confirmation
  */
 
 import {generateKeyPairSync} from 'crypto';
 import {expect, test} from '../helpers/fixtures';
 import {GatewayApi} from '../helpers/gateway-api';
+import {ticket} from '../helpers/ticket';
 
 const BASE_URL = process.env.AG_BASE_URL || 'http://localhost:8080';
 const EDITOR_PREFIX = 'e2e-strategy-editor-';
@@ -19,6 +21,7 @@ const ISSUER = 'https://idp.example.com';
 interface StoredStrategy {
     id: string;
     name: string;
+    scope_claims?: string[];
     authorization_server?: unknown;
 }
 
@@ -67,6 +70,7 @@ test.describe('Strategy discovery', () => {
     });
 
     test('refuses a non-https issuer without calling the gateway', async ({page}) => {
+        ticket('FTL-30889');
         let discoverCalls = 0;
         await page.route('**/api/v1/jwt-verification-strategies/discover', async route => {
             discoverCalls += 1;
@@ -84,6 +88,7 @@ test.describe('Strategy discovery', () => {
     });
 
     test('shows a fixed message and pins nothing when the gateway cannot discover the issuer', async ({page}) => {
+        ticket('FTL-30889', 'FTL-30890');
         await page.goto(`${BASE_URL}/jwt-verification-strategies/new`);
         await page.getByTestId('strategy-issuer').fill('https://127.0.0.1:1');
         const discover = page.waitForResponse(
@@ -102,6 +107,7 @@ test.describe('Strategy discovery', () => {
     });
 
     test('pins the discovered server and saves it with discover_metadata true', async ({page}) => {
+        ticket('FTL-30889', 'FTL-30890');
         await page.route('**/api/v1/jwt-verification-strategies/discover', async route => {
             await route.fulfill({status: 200, contentType: 'application/json', body: JSON.stringify(PINNED_SERVER)});
         });
@@ -137,15 +143,43 @@ test.describe('Strategy discovery', () => {
             discover_metadata: true,
             jwks_source: {type: 'remote', jwks_uri: PINNED_SERVER.jwks_uri},
         });
+        expect(saved).not.toHaveProperty('scope_claims');
     });
 
     test('warns that static keys cannot be discovered and disables the Discover button', async ({page}) => {
+        ticket('FTL-30889', 'FTL-30890');
         await page.goto(`${BASE_URL}/jwt-verification-strategies/new`);
         await page.getByTestId('strategy-issuer').fill(ISSUER);
         await page.getByTestId('strategy-jwks-source-static').check();
 
         await expect(page.getByTestId('strategy-static-pin-warning')).toBeVisible();
         await expect(page.getByTestId('strategy-discover-button')).toBeDisabled();
+    });
+
+    test('saves scope claims and resets them to the defaults when cleared', async ({page}) => {
+        ticket('FTL-30892');
+        const name = uniqueName(EDITOR_PREFIX);
+        await page.goto(`${BASE_URL}/jwt-verification-strategies/new`);
+        await page.getByTestId('strategy-name').fill(name);
+        await page.getByTestId('strategy-issuer').fill(ISSUER);
+        await page.getByTestId('strategy-jwks-source-static').check();
+        await page.getByTestId('strategy-jwks').fill(staticJwks());
+        await page.getByTestId('strategy-scope-claims').fill('roles, scope');
+        await page.getByTestId('strategy-save-button').click();
+        await expect(page).toHaveURL(/credentials/);
+
+        const created = await findByName(api, name);
+        expect(created?.scope_claims).toEqual(['roles', 'scope']);
+
+        await page.goto(`${BASE_URL}/jwt-verification-strategies/${created!.id}`);
+        const scopeClaims = page.getByTestId('strategy-scope-claims');
+        await expect(scopeClaims).toHaveValue('roles, scope');
+        await scopeClaims.fill('');
+        await page.getByTestId('strategy-save-button').click();
+        await expect(page).toHaveURL(/credentials/);
+
+        const reset = await findByName(api, name);
+        expect(reset?.scope_claims).toBeUndefined();
     });
 });
 
@@ -164,6 +198,7 @@ test.describe('Strategy list', () => {
     });
 
     test('marks a strategy with a pinned authorization server as Discovered', async ({page}) => {
+        ticket('FTL-30890');
         const name = uniqueName(LIST_PREFIX);
         await page.route('**/api/v1/jwt-verification-strategies', async route => {
             if (route.request().method() !== 'GET') {
@@ -193,6 +228,7 @@ test.describe('Strategy list', () => {
     });
 
     test('confirms a delete in the page, then removes the strategy', async ({page}) => {
+        ticket('FTL-30889');
         const name = uniqueName(LIST_PREFIX);
         const created = await api.post<StoredStrategy>('/api/v1/jwt-verification-strategies', {
             name,
@@ -217,6 +253,7 @@ test.describe('Strategy list', () => {
     });
 
     test('keeps the strategy when the delete is cancelled', async ({page}) => {
+        ticket('FTL-30889');
         const name = uniqueName(LIST_PREFIX);
         const created = await api.post<StoredStrategy>('/api/v1/jwt-verification-strategies', {
             name,

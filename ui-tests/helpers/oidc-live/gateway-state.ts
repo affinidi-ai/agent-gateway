@@ -164,7 +164,7 @@ export async function ensureDenyRule(api: GatewayApi): Promise<string> {
     const created = await api.post('/api/v1/policy-definitions', {
         id,
         name: DENY_RULE_NAME,
-        description: 'Denies requests whose caller authentication is missing or invalid.',
+        description: 'Denies requests whose caller authentication is missing, invalid or short of scope.',
         policy_type: 'agent_surface',
         policy: DENY_RULE_REGO,
         enabled: true,
@@ -200,6 +200,7 @@ export async function ensureSurface(api: GatewayApi, world: World): Promise<Enti
                         type: 'jwt_bearer',
                         jwt_verification_strategy_id: names.strategies.hydraA.id,
                         audiences: [env.entryPointUrl],
+                        required_scopes: [names.scopes.caller],
                     },
                 ],
             },

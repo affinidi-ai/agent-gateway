@@ -1,0 +1,22 @@
+{
+  "protocolVersion": "0.3.0",
+  "name": "Fixture Agent",
+  "description": "Static card in the A2A 0.3 shape, secured as the gateway serves it.",
+  "version": "1.0.0",
+  "url": "https://gateway.example.test/a2a/fixture",
+  "preferredTransport": "JSONRPC",
+  "capabilities": {"streaming": true},
+  "defaultInputModes": ["text/plain"],
+  "defaultOutputModes": ["text/plain"],
+  "skills": [
+    {"id": "echo", "name": "Echo", "description": "Echoes text.", "tags": ["echo"]}
+  ],
+  "securitySchemes": {
+    "agent_gateway": {
+      "type": "oauth2",
+      "oauth2MetadataUrl": "https://auth.example.test/.well-known/oauth-authorization-server",
+      "flows": {"clientCredentials": {"tokenUrl": "https://auth.example.test/oauth2/token", "scopes": {"agent.invoke": ""}}}
+    }
+  },
+  "security": [{"agent_gateway": ["agent.invoke"]}]
+}

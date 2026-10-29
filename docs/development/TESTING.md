@@ -175,6 +175,15 @@ make ui-test-report
 
 `make ui-test` boots a gateway in test mode, runs the suite, and tears it down.
 
+A run keeps screenshots and traces only for failed tests. Set `AG_UI_ARTIFACTS=all` to keep a
+full-page screenshot and a trace of every test, passing or not, for example
+`AG_UI_ARTIFACTS=all make ui-test`; videos are still kept only for failed tests. The live OIDC
+suite ignores the setting (see _Live OIDC dashboard tests_).
+
+Specs name the tickets a test proves with `ticket(...ids)` from `ui-tests/helpers/ticket.ts`,
+which adds one `ticket` annotation per id to the report, and attach acceptance screenshots of the
+area under test with `attachCriterion`.
+
 Every interactive element ships with a `data-testid`, and these tests are the consumer.
 The naming convention is in [`ui-tests/README.md`](../../ui-tests/README.md): page roots
 are `page-<area>`, actions are `<area>-<verb>-button`, list items are
@@ -212,7 +221,8 @@ builds. The HTML report is written to `html` under `OIDC_E2E_RESULT_DIR` (defaul
 Secrets are generated at run time. The specs type them into the secret editor with `fillSecret`
 (`helpers/oidc-live/ui.ts`), not `locator.fill`, because Playwright titles a fill step with the typed
 value and the HTML report would hold it. Traces, screenshots and videos are off because a page in
-this suite can show secret material. After Playwright exits, the runner checks every result file,
+this suite can show secret material, whatever `AG_UI_ARTIFACTS` says; `11-agent-card-tab` attaches
+screenshots of the Agent Cards tab alone, after asserting the tab shows no secret. After Playwright exits, the runner checks every result file,
 including the archive embedded in the HTML report, for a PEM private key, a JWT, a Hydra token and
 each of the run's own secrets
 ([`scripts/oidc-demo/report_secret_scan.py`](../../scripts/oidc-demo/report_secret_scan.py)), and fails
@@ -229,12 +239,13 @@ one worker, and each one prepares what it needs through the API when an earlier 
 | `02-secrets` | Client secrets and the signing key in the secret editor; no value is shown again |
 | `03-strategies` | Discover from issuer, the pinned metadata, a trailing-slash issuer, an unreachable issuer, an http issuer |
 | `04-credential-providers` | A client credentials and a JWT bearer provider from the stored secrets |
-| `05-surface-builder` | An A2A surface with Target Authentication |
-| `06-use-it` | The card fetch and calls carry a hydra-b token, 200, hop 2 token reuse |
+| `05-surface-builder` | An A2A surface with caller authentication, required scopes, the entry point audience and Target Authentication; the fail-open warning |
+| `06-use-it` | The card fetch and calls carry a hydra-b token; the card, protected resource metadata, 401 with a challenge, 200, 403, wrong audience, hop 2 token reuse |
 | `07-dashboard-evidence` | Turning on the policy decision and failed authentication audit events in Settings; the audit page lists the allowed call with its caller and the denied call with its decision, the Allow and Deny filters, and the gateway log lines for the same requests |
-| `08-strategy-swap` | Pointing the surface at the second Hydra changes the accepted tokens without a restart |
+| `08-strategy-swap` | Pointing the surface at the second Hydra changes the card and the accepted tokens without a restart |
 | `09-hop2-revocation` | A revoked trust grant makes a cold hop 2 token fail with the generic gateway error; restoring it recovers the same provider once its failure backoff has passed |
 | `10-edit-delete` | Changing a strategy's issuer, and deleting strategies, providers, secrets and surfaces |
+| `11-agent-card-tab` | The Agent Cards tab: the Managed Agent Card and the Gateway-Served Agent Card with their change markers, the fetch status and provider name, Refresh, the raw JSON, the agent refusing the gateway's token, and a surface with no Target Authentication; no secret on the page, in the preview responses or in the attached screenshots |
 
 Two things differ from a production setup, because Hydra and the mock agent are plain http on
 loopback and the suite changes no system trust:
@@ -249,7 +260,10 @@ loopback and the suite changes no system trust:
   pinned metadata, in the strategy list and the Caller Context panel.
 
 The gateway runs with the loopback test seam described in [`OIDC_DEMO.md`](OIDC_DEMO.md#the-test-mode-seam-is-demo-only).
-Counting hydra-b token requests reads the container log after a unique marker request has appeared in
+The gateway allows each dashboard user 10 agent card fetches a minute, and every save of a surface with
+the Managed Agent panel open spends one, so the earlier specs can use up the default test user's
+fetches; `11-agent-card-tab` signs in as a dashboard user of its own to stay within the limit whatever
+ran before it. Counting hydra-b token requests reads the container log after a unique marker request has appeared in
 it, because Docker delivers logs late.
 
 ## Frontend unit tests

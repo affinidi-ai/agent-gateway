@@ -292,7 +292,10 @@ Other available targets include:
 | `make mcp-conformance` | MCP `2026-07-28` conformance harness plus legacy compatibility checks ([`scripts/mcp-conformance/README.md`](../../scripts/mcp-conformance/README.md)) |
 | `make mcp-conformance-legacy` | Only the MCP legacy (`2024-11-05`) compatibility checks on the default build |
 | `make oidc-demo-smoke` | Checks the Ory Hydra demo's authorization servers, mock agent and seed payloads, no gateway ([`OIDC_DEMO.md`](OIDC_DEMO.md)) |
-| `make oidc-demo-run` | The scripted Hydra demo with its hop 2 checks against a native gateway; `oidc-demo-up`, `-seed` and `-down` run the parts |
+| `make oidc-demo-run` | The scripted Hydra demo, its hop one walkthrough and hop 2 checks against a native gateway; `oidc-demo-up`, `-seed` and `-down` run the parts |
+| `make oidc-demo-auth0` | The demo with a live Auth0 tenant as the caller's authorization server; needs the gitignored `envs/oidc-demo/auth0.env` |
+| `make oidc-demo-browser` | Leaves the demo running for a look at the dashboard's Agent card tab ([`OIDC_DEMO.md`](OIDC_DEMO.md#showing-the-agent-card-tab)) |
+| `make oidc-sdk-check` | Parses agent cards with the A2A Python and JavaScript SDKs, no gateway or Docker ([`OIDC_DEMO.md`](OIDC_DEMO.md#a2a-sdk-check)) |
 | `make oidc-ui-e2e` | The live OIDC Playwright dashboard tests against the demo's Hydra containers and mock agent ([`TESTING.md`](TESTING.md#live-oidc-dashboard-tests)) |
 
 ### Frontend Tests

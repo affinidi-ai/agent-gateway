@@ -38,13 +38,18 @@ _gateway_offset() {
 }
 GATEWAY_HTTP_PORT="${OIDC_DEMO_GATEWAY_PORT:-$((8080 + $(_gateway_offset)))}"
 GATEWAY_URL="http://localhost:${GATEWAY_HTTP_PORT}"
-# The Access Point lives on the gateway's HTTPS listener. Clients trust the listener's development
+# The Access Point lives on the gateway's HTTPS listener: an Access Point declares its
+# authorization server only at a canonical https URL. Clients trust the listener's development
 # certificate through --cacert.
 GATEWAY_HTTPS_PORT="${OIDC_DEMO_GATEWAY_HTTPS_PORT:-$((8443 + $(_gateway_offset)))}"
 ACCESS_POINT_ORIGIN="https://localhost:${GATEWAY_HTTPS_PORT}"
 GATEWAY_CA_FILE="${GATEWAY_ENV_DIR}/certs/cert.pem"
 SURFACE_ROUTE="/mock-agent"
 AP_URL="${ACCESS_POINT_ORIGIN}${SURFACE_ROUTE}"
+PRM_URL="${ACCESS_POINT_ORIGIN}/.well-known/oauth-protected-resource${SURFACE_ROUTE}"
+OTHER_AUDIENCE="https://other.example/resource"
+NOSCOPE_CLIENT="demo-noscope"
+OTHERAUD_CLIENT="demo-otheraud"
 
 REQUIRED_SCOPE="agent.read"
 HOP2_SCOPE="agent.invoke"
@@ -122,8 +127,9 @@ bearer_header_file() {
 
 RESP_CODE=""
 RESP_BODY=""
+RESP_HEADERS=""
 
-# req METHOD URL [curl args...]: runs curl, sets RESP_CODE and RESP_BODY (a file).
+# req METHOD URL [curl args...]: runs curl, sets RESP_CODE, RESP_BODY and RESP_HEADERS (files).
 # An Authorization header never reaches a command line: it is written to a mode 600 file under TMP_DIR and
 # curl reads it with -H @file. The printed transcript masks its value.
 req() {
@@ -131,6 +137,7 @@ req() {
     shift 2
     [[ -n "${TMP_DIR}" ]] || make_tmp
     RESP_BODY="${TMP_DIR}/body"
+    RESP_HEADERS="${TMP_DIR}/headers"
     local printed="" arg n=0 header_file
     local -a args=()
     for arg in "$@"; do
@@ -149,9 +156,16 @@ req() {
         esac
     done
     printf '%s$ curl -X %s %s%s%s\n' "${C_DIM}" "${method}" "${url}" "${printed}" "${C_OFF}"
-    RESP_CODE="$(curl -sS --connect-timeout 5 --max-time 30 -X "${method}" -o "${RESP_BODY}" -w '%{http_code}' --cacert "${GATEWAY_CA_FILE}" ${args[@]+"${args[@]}"} "${url}")" \
+    RESP_CODE="$(curl -sS --connect-timeout 5 --max-time 30 -X "${method}" -o "${RESP_BODY}" -D "${RESP_HEADERS}" -w '%{http_code}' --cacert "${GATEWAY_CA_FILE}" ${args[@]+"${args[@]}"} "${url}")" \
         || fail "curl failed for ${method} ${url}"
     printf '%s< HTTP %s%s\n' "${C_DIM}" "${RESP_CODE}" "${C_OFF}"
+}
+
+# header_value NAME: the first value of response header NAME (any case) of the last req call.
+header_value() {
+    local name="$1"
+    tr -d '\r' <"${RESP_HEADERS}" | awk -F': ' -v n="$(printf '%s' "${name}" | tr '[:upper:]' '[:lower:]')" \
+        'tolower($1) == n { sub(/^[^:]*: /, ""); print; exit }'
 }
 
 show_body() {
@@ -201,8 +215,8 @@ jwt_claims() { printf '%s' "$1" | python3 -I "${OIDC_DEMO_DIR}/jwt_tools.py" dec
 
 # caller_auth_method_json STRATEGY_ID: the Access Point's jwt_bearer method for this demo.
 caller_auth_method_json() {
-    jq -n --arg sid "$1" --arg aud "${AP_URL}" \
-        '{type: "jwt_bearer", jwt_verification_strategy_id: $sid, audiences: [$aud]}'
+    jq -n --arg sid "$1" --arg aud "${AP_URL}" --arg scope "${REQUIRED_SCOPE}" \
+        '{type: "jwt_bearer", jwt_verification_strategy_id: $sid, audiences: [$aud], required_scopes: [$scope]}'
 }
 
 # gateway_session: logs in through the test-mode endpoint and sets SESSION_TOKEN and SESSION_HEADER_FILE (a
@@ -237,4 +251,61 @@ strategy_record_json() {
                                token_endpoint: ($iss + "oauth2/token"),
                                jwks_uri: ($iss + ".well-known/jwks.json")},
         created_at: $now, updated_at: $now}'
+}
+
+# Auth0 mode (OIDC_DEMO_IDP=auth0): the caller's authorization server is a live Auth0 tenant.
+# The tenant values come from a gitignored file that only auth0_tool.py and auth0_scan.py read; see OIDC_DEMO.md.
+AUTH0_ENV_FILE="${OIDC_DEMO_AUTH0_ENV:-${REPO_ROOT}/envs/oidc-demo/auth0.env}"
+AUTH0_SCOPE="agent:invoke"
+AUTH0_STRATEGY_NAME="oidc-demo auth0"
+AUTH0_REQUIRED_SCOPE="${AUTH0_SCOPE}"
+
+auth0_mode() { [[ "${OIDC_DEMO_IDP:-}" == "auth0" ]]; }
+
+auth0_tool() { python3 -I "${OIDC_DEMO_DIR}/auth0_tool.py" "$@"; }
+
+# auth0_load: checks the values file and sets AUTH0_DOMAIN, AUTH0_API_IDENTIFIER and AUTH0_ISSUER. The Access
+# Point accepts only tokens whose audience is its own URL, so the tenant's API identifier must equal AP_URL.
+auth0_load() {
+    [[ -f "${AUTH0_ENV_FILE}" ]] || fail "Auth0 mode needs the values file ${AUTH0_ENV_FILE}; see docs/development/OIDC_DEMO.md"
+    auth0_tool check "${AUTH0_ENV_FILE}" >/dev/null 2>&1 || fail "the Auth0 values file is incomplete: $(auth0_tool check "${AUTH0_ENV_FILE}" 2>&1 | tr '\n' ' ')"
+    AUTH0_DOMAIN="$(auth0_tool get "${AUTH0_ENV_FILE}" AUTH0_DOMAIN)"
+    AUTH0_API_IDENTIFIER="$(auth0_tool get "${AUTH0_ENV_FILE}" AUTH0_API_IDENTIFIER)"
+    AUTH0_ISSUER="https://${AUTH0_DOMAIN}/"
+    [[ "${AUTH0_API_IDENTIFIER}" == "${AP_URL}" ]] \
+        || fail "the Auth0 API identifier must equal the Access Point URL ${AP_URL}; see docs/development/OIDC_DEMO.md"
+}
+
+# auth0_redact: masks every value of the Auth0 values file on a stream.
+auth0_redact() { auth0_tool redact "${AUTH0_ENV_FILE}"; }
+
+# auth0_mask_logs: masks every value of the Auth0 values file in the gateway's log files (gateway.log and
+# everything under _storage/logs). The gateway logs the verified issuer and subject of each accepted token,
+# which name the tenant and the app. Run it once the gateway has stopped; down.sh does.
+auth0_mask_logs() {
+    [[ -f "${AUTH0_ENV_FILE}" ]] || return 0
+    local log
+    while IFS= read -r log; do
+        auth0_redact <"${log}" >"${log}.masked" && cat "${log}.masked" >"${log}"
+        rm -f "${log}.masked"
+    done < <(find "${GATEWAY_LOG_FILE}" "${GATEWAY_ENV_DIR}/_storage/logs" -type f -name '*.log*' 2>/dev/null)
+}
+
+# auth0_token CLIENT: client_credentials grant against the tenant (CLIENT is m2m or noscope); prints only the
+# access token. The request body, secret included, reaches curl on standard input, never in a command line.
+auth0_token() {
+    [[ -n "${TMP_DIR}" ]] || { printf 'auth0_token needs make_tmp first\n' >&2; return 1; }
+    local out="${TMP_DIR}/auth0-token-$1.json" code
+    code="$(auth0_tool token-body "${AUTH0_ENV_FILE}" "$1" \
+        | curl -sS --connect-timeout 5 --max-time 20 -X POST -H 'Content-Type: application/json' --data-binary @- \
+            -o "${out}" -w '%{http_code}' "${AUTH0_ISSUER}oauth/token")" || return 1
+    [[ "${code}" == "200" ]] || { printf 'Auth0 token request for %s returned HTTP %s\n' "$1" "${code}" >&2; return 1; }
+    jq -er '.access_token' "${out}"
+}
+
+# auth0_auth_method_json STRATEGY_ID: the Access Point's jwt_bearer method for Auth0. Its one audience is the
+# Access Point URL, which auth0_load checked is the API identifier Auth0 puts in aud.
+auth0_auth_method_json() {
+    jq -n --arg sid "$1" --arg ap "${AP_URL}" --arg scope "${AUTH0_REQUIRED_SCOPE}" \
+        '{type: "jwt_bearer", jwt_verification_strategy_id: $sid, audiences: [$ap], required_scopes: [$scope]}'
 }

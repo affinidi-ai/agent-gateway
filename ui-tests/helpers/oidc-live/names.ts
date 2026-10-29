@@ -19,8 +19,11 @@ export const names = {
     surface: `${PREFIX}-surface`,
     clients: {
         good: 'demo-good',
+        noScope: 'demo-noscope',
+        otherAudience: 'demo-otheraud',
         hop2: `${PREFIX}-hop2`,
     },
     assertion: {issuer: `${PREFIX}-gateway`, subject: `${PREFIX}-gateway-subject`, kid: `${PREFIX}-key-1`},
     scopes: {caller: 'a2a.invoke', hop2: 'agent.invoke'},
+    otherAudience: 'https://other.example/resource',
 };

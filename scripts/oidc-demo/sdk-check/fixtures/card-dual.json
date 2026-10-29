@@ -1,0 +1,26 @@
+{
+  "protocolVersion": "0.3.0",
+  "name": "Fixture Agent",
+  "description": "Static card carrying both eras, secured as the gateway serves it: the flat scheme shape and both requirement arrays.",
+  "version": "1.0.0",
+  "url": "https://gateway.example.test/a2a/fixture",
+  "preferredTransport": "JSONRPC",
+  "supportedInterfaces": [
+    {"url": "https://gateway.example.test/a2a/fixture", "protocolBinding": "JSONRPC", "protocolVersion": "1.0"}
+  ],
+  "capabilities": {"streaming": true},
+  "defaultInputModes": ["text/plain"],
+  "defaultOutputModes": ["text/plain"],
+  "skills": [
+    {"id": "echo", "name": "Echo", "description": "Echoes text.", "tags": ["echo"]}
+  ],
+  "securitySchemes": {
+    "agent_gateway": {
+      "type": "oauth2",
+      "oauth2MetadataUrl": "https://auth.example.test/.well-known/oauth-authorization-server",
+      "flows": {"clientCredentials": {"tokenUrl": "https://auth.example.test/oauth2/token", "scopes": {"agent.invoke": ""}}}
+    }
+  },
+  "security": [{"agent_gateway": ["agent.invoke"]}],
+  "securityRequirements": [{"schemes": {"agent_gateway": {"list": ["agent.invoke"]}}}]
+}

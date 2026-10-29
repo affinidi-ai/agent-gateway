@@ -1,8 +1,14 @@
 /**
  * Surface builder through the dashboard
  *
- * An A2A surface in front of the mock agent: caller authentication with the hydra-a strategy and
- * Target Authentication through the JWT bearer provider.
+ * An A2A surface in front of the mock agent: caller authentication with the hydra-a strategy and a
+ * required scope, and Target Authentication through the JWT bearer provider. Saved without the
+ * entry point as audience, the Access Point does not declare and the gateway warns that failed
+ * callers reach a policy that lets them through; the dashboard only warns and offers the deny rule
+ * to copy. The rule is attached to the Target policy through the API, where it also denies callers
+ * arriving over Fabric, and adding the entry point as audience in the Caller Context editor makes the
+ * Access Point declare hydra-a, after which the gateway refuses failed callers itself and nothing is
+ * left to warn about.
  *
  * The dashboard accepts only an https Target for a credential provider and the mock agent is plain
  * http on loopback, so the save requests go through the scheme bridge.
@@ -12,25 +18,22 @@ import {expect, test} from '../../helpers/fixtures';
 import {GatewayApi} from '../../helpers/gateway-api';
 import {bridgeLoopbackScheme} from '../../helpers/oidc-live/bridge';
 import {
+    configureCallerAuth,
     configureTarget,
     nameSurface,
     openCallerAuth,
     openSurface,
+    retypeTarget,
     routeToTheHttpsListener,
     SavedSurface,
+    saveEdit,
     startA2aSurface,
 } from '../../helpers/oidc-live/builder';
 import {env} from '../../helpers/oidc-live/env';
-import {
-    Entity,
-    ensureDenyRule,
-    ensureProviders,
-    ensureSecrets,
-    ensureStrategy,
-    listEntities,
-} from '../../helpers/oidc-live/gateway-state';
+import {ensureDenyRule, ensureProviders, ensureSecrets, ensureStrategy, listEntities} from '../../helpers/oidc-live/gateway-state';
 import {names} from '../../helpers/oidc-live/names';
 import {loadWorld} from '../../helpers/oidc-live/world';
+import {ticket} from '../../helpers/ticket';
 
 const SURFACES = '**/api/v1/surfaces**';
 
@@ -45,6 +48,7 @@ test.describe('Surface builder', () => {
 
     let api: GatewayApi;
     let jwtBearerProviderId: string;
+    let denyRuleId: string;
 
     test.beforeAll(async () => {
         api = await GatewayApi.connect();
@@ -60,14 +64,13 @@ test.describe('Surface builder', () => {
         await api.dispose();
     });
 
-    test('creates the surface with caller authentication and Target Authentication', async ({page}) => {
+    test('creates the surface with caller authentication, a required scope and Target Authentication, and only warns', async ({page}) => {
+        ticket('FTL-30888', 'FTL-30892', 'FTL-30893');
         await bridgeLoopbackScheme(page, SURFACES);
         await startA2aSurface(page);
         await nameSurface(page, names.surface);
         await routeToTheHttpsListener(page);
-        await openCallerAuth(page);
-        await page.getByTestId('caller-auth-jwt-strategy').selectOption({label: names.strategies.hydraA.name});
-        await page.getByTestId('caller-auth-close-button').click();
+        await configureCallerAuth(page, {strategyName: names.strategies.hydraA.name, scopes: [names.scopes.caller]});
         await configureTarget(page, {
             url: env.agentUrl,
             providerLabel: `${names.providers.jwtBearer} (JWT Bearer)`,
@@ -79,8 +82,16 @@ test.describe('Surface builder', () => {
         const response = await created;
         expect(response.status()).toBe(201);
         const body = (await response.json()) as SavedSurface;
+        const codes = body.warnings?.map(warning => warning.code) ?? [];
+        expect(codes).toContain('declaration_stripped');
+        expect(codes).toContain('fail_open_policy');
 
-        await expect(page).toHaveURL(/\/surfaces$/);
+        await expect(page).toHaveURL(new RegExp(`/surfaces/${body.surface_id}$`));
+        await expect(page.getByTestId('surface-warnings-alert')).toBeVisible();
+        await expect(page.getByTestId('surface-warning-declaration_stripped')).toBeVisible();
+        await expect(page.getByTestId('surface-warning-fail_open_policy')).toBeVisible();
+        await expect(page.getByTestId('surface-warnings-copy-rule')).toBeVisible();
+        await expect(page.getByTestId('surface-node-policy')).toHaveCount(0);
 
         const stored = (await surfaceByName(api)) as SavedSurface;
         expect(stored.surface_id).toBe(body.surface_id);
@@ -90,26 +101,76 @@ test.describe('Surface builder', () => {
         expect(method).toMatchObject({
             type: 'jwt_bearer',
             jwt_verification_strategy_id: names.strategies.hydraA.id,
+            required_scopes: [names.scopes.caller],
         });
+        expect(method.audiences ?? []).not.toContain(env.entryPointUrl);
         expect(stored.target.endpoint).toBe(env.agentUrl);
         expect(stored.target.auth?.method.credential_provider?.credential_provider_id).toBe(jwtBearerProviderId);
+        expect(stored.access_point.inbound_policy).toBeUndefined();
+        expect(stored.target.policy).toBeUndefined();
     });
 
-    test('attaches the policy that denies callers whose token failed verification', async () => {
+    test('attaching the deny rule to the Target policy through the API clears the fail-open warning and the declaration warning stays', async ({page}) => {
+        ticket('FTL-30893');
         const surface = (await surfaceByName(api)) as SavedSurface;
-        const policyId = await ensureDenyRule(api);
+        denyRuleId = await ensureDenyRule(api);
         const patched = await api.patch(`/api/v1/surfaces/${surface.surface_id}`, {
-            access_point: {inbound_policy: {policy_definition_id: policyId, require_agent_context: false}},
+            target: {policy: {policy_definition_id: denyRuleId, require_agent_context: false}},
         });
         expect(patched.status).toBe(200);
+        expect(((await surfaceByName(api)) as SavedSurface).target.policy?.policy_definition_id).toBe(denyRuleId);
 
-        const stored = (await surfaceByName(api)) as SavedSurface;
-        expect(stored.access_point.inbound_policy?.policy_definition_id).toBe(policyId);
+        await openSurface(page, surface.surface_id);
+        await expect(page.getByTestId('surface-warning-declaration_stripped')).toBeVisible();
+        await expect(page.getByTestId('surface-warning-fail_open_policy')).toHaveCount(0);
+        await expect(page.getByTestId('surface-warnings-copy-rule')).toHaveCount(0);
+        await expect(page.getByTestId('surface-node-policy')).toHaveCount(1);
     });
 
-    test('shows the entry point URL for the saved surface', async ({page}) => {
+    test('adding the entry point as audience in the Caller Context editor makes the Access Point declare hydra-a', async ({page}) => {
+        ticket('FTL-30889', 'FTL-30892', 'FTL-30893', 'FTL-30894');
+        await bridgeLoopbackScheme(page, SURFACES);
+        const surface = (await surfaceByName(api)) as SavedSurface;
+        await openSurface(page, surface.surface_id);
+        await openCallerAuth(page);
+        await expect(page.getByTestId('caller-auth-outcome-chip').first()).toContainText('Security removed from card');
+        await expect(page.getByTestId('caller-auth-outcome-detail').first()).toContainText(
+            'The Access Point URL is not in Accepted Audiences.'
+        );
+        await expect(page.getByTestId('caller-auth-discovery-derived-authorization-server')).toHaveText(env.hydraA.issuer);
+        await expect(page.getByTestId('caller-auth-discovery-derived-scopes')).toHaveText(names.scopes.caller);
+        await expect(page.getByTestId('caller-auth-discovery-derived-audience')).toContainText(env.entryPointUrl);
+        await expect(page.getByTestId('caller-auth-discovery-derived-note-audience_missing')).toBeVisible();
+
+        await page.getByTestId('caller-auth-discovery-add-audience-button').click();
+        await expect(page.getByTestId('caller-auth-discovery-audience-listed')).toBeVisible();
+        await expect(page.getByTestId('caller-auth-discovery-add-audience-button')).toHaveCount(0);
+        await page.getByTestId('caller-auth-close-button').click();
+        await retypeTarget(page);
+        const saved = await saveEdit(page);
+
+        expect(saved.warnings ?? []).toEqual([]);
+        await expect(page.getByTestId('surface-warnings-alert')).toHaveCount(0);
+        const stored = (await surfaceByName(api)) as SavedSurface;
+        const [method] = stored.access_point.caller_authentication?.methods ?? [];
+        expect(method).toMatchObject({
+            type: 'jwt_bearer',
+            jwt_verification_strategy_id: names.strategies.hydraA.id,
+            audiences: [env.entryPointUrl],
+            required_scopes: [names.scopes.caller],
+        });
+        expect(stored.target.policy?.policy_definition_id).toBe(denyRuleId);
+    });
+
+    test('shows the entry point URL and the Declares OAuth outcome for the saved surface', async ({page}) => {
+        ticket('FTL-30894', 'FTL-30895');
         const surface = (await surfaceByName(api)) as SavedSurface;
         await openSurface(page, surface.surface_id);
         await expect(page.getByTestId('surface-entry-point-url')).toContainText(env.entryPointUrl);
+        await openCallerAuth(page);
+        await expect(page.getByTestId('caller-auth-outcome-chip').first()).toContainText('Declares OAuth');
+        await expect(page.getByTestId('caller-auth-discovery-audience-listed')).toBeVisible();
+        await expect(page.getByTestId('caller-auth-discovery-derived-notes')).toHaveCount(0);
+        await expect(page.getByTestId('surface-warnings-alert')).toHaveCount(0);
     });
 });

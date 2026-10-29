@@ -64,6 +64,41 @@ changes:
       description: >-
         The strategy page sets the claims read for a caller's granted scopes, for example roles on
         Microsoft Entra app-only tokens, and keeps the default scope and scp when left alone.
+    - timestamp: '2026-10-29T21:15:00Z'
+      title: Add a caller walkthrough to the OIDC demo
+      description: >-
+        make oidc-demo-run now runs a scripted walkthrough of the caller's side before the hop 2
+        checks: the served card names the caller's authorization server and scope, a token for the
+        Access Point is accepted, callers with no token, another audience or a missing scope are
+        refused with the right challenge, and swapping the strategy changes the card without a
+        restart. Each step prints its request with every token masked.
+    - timestamp: '2026-10-29T21:15:00Z'
+      title: Add make oidc-demo-browser to show the Agent Cards tab on a live demo
+      description: >-
+        The target leaves the OIDC demo running in the background, writes a dashboard login to a
+        mode 600 file instead of printing it, and can make the mock agent refuse the gateway's
+        token and accept it again, so a failed card fetch and its recovery after Refresh can be
+        shown in a browser.
+    - timestamp: '2026-10-29T21:15:00Z'
+      title: Add make oidc-sdk-check to parse agent cards with the official A2A SDKs
+      description: >-
+        The check parses fixture cards, or a live card with ARGS="--live <url>", with a2a-python
+        1.2.2 and 0.3.25 and a2a-js 1.3.0 and 0.3.13, and compares the result with the expected
+        card. Known SDK rejections are listed with their reason, and a listed rejection that no
+        longer happens fails the run. The SDKs are installed by hand outside the repository.
+    - timestamp: '2026-10-29T21:15:00Z'
+      title: Run the OIDC demo with a live Auth0 tenant as the caller's server
+      description: >-
+        make oidc-demo-auth0 reads the tenant's values from a gitignored mode 600 file, refuses to
+        start when the file is missing or incomplete, and runs a walkthrough with Auth0 tokens on
+        the caller hop and hydra-b on the hop to the agent. Client secrets reach curl on standard
+        input, and the output and gateway logs are masked and scanned for secrets.
+    - timestamp: '2026-10-29T21:15:00Z'
+      title: Keep screenshots and traces of passing dashboard tests with AG_UI_ARTIFACTS
+      description: >-
+        Setting AG_UI_ARTIFACTS=all keeps a screenshot and a trace for every dashboard UI test,
+        not only failed ones, for reviewing a change visually. Videos are still kept only on
+        failure, and the live OIDC suite keeps all three off.
   changed:
     - timestamp: '2026-10-29T18:00:00Z'
       title: Move focus and announce status in the card tab and the strategy page

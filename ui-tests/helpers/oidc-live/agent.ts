@@ -58,3 +58,13 @@ export async function callAgent(
     });
     return {status: response.status(), headers: response.headers(), text: await response.text()};
 }
+
+/**
+ * Makes the mock agent answer 401 to every card and JSON-RPC request, whatever token it carries,
+ * or restores its normal token checks.
+ */
+export async function setAgentRefusing(api: APIRequestContext, refuse: boolean): Promise<void> {
+    const response = await api.post(`${env.agentUrl}/_demo/refuse`, {data: {refuse}});
+    expect(response.status(), 'the mock agent accepts the refuse switch').toBe(200);
+    expect(await response.json()).toEqual({refuse});
+}

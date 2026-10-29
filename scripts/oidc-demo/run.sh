@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #
 # The whole demo in one command: start Hydra and the mock agent, start a native gateway, seed it
-# and run the hop 2 checks. Everything is stopped afterwards unless OIDC_DEMO_KEEP=1, which leaves
-# the stack running so the steps can be repeated by hand.
+# and run the walkthrough and the hop 2 checks. Everything is stopped afterwards unless
+# OIDC_DEMO_KEEP=1, which leaves the stack running so the steps can be repeated by hand.
 #
 # Usage: scripts/oidc-demo/run.sh [--no-hop2]
-#   --no-hop2   skip the JWT bearer provider: the mock agent needs no token and the hop 2 step is skipped
+#   --no-hop2   skip the JWT bearer provider: the mock agent needs no token and the hop 2 checks are skipped
 
 set -euo pipefail
 unset CDPATH
@@ -24,6 +24,7 @@ trap cleanup EXIT
 "${OIDC_DEMO_DIR}/up.sh" "$@"
 "${OIDC_DEMO_DIR}/gateway.sh" start --fresh
 "${OIDC_DEMO_DIR}/seed.sh"
+"${OIDC_DEMO_DIR}/walkthrough.sh"
 if [[ "$(hop2_mode)" == "on" ]]; then
     "${OIDC_DEMO_DIR}/hop2.sh"
 else

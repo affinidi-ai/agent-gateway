@@ -28,7 +28,7 @@ SHELL := /bin/bash
         ui-test ui-test-headed ui-test-report \
 		itest-a2a itest-a2a-setup itest-a2a-run itest-a2a-teardown itest-a2a-clean itest-a2a-shopping \
 		gw-e2e mcp-conformance mcp-conformance-legacy mcp-discovery \
-		oidc-demo-up oidc-demo-down oidc-demo-seed oidc-demo-run oidc-demo-smoke oidc-ui-e2e \
+		oidc-demo-up oidc-demo-down oidc-demo-seed oidc-demo-run oidc-demo-auth0 oidc-demo-smoke oidc-demo-browser oidc-sdk-check oidc-ui-e2e \
 		mediator mediator-start mediator-up mediator-stop mediator-down
 
 # Default target
@@ -726,11 +726,20 @@ oidc-demo-down: ## Stop the OIDC demo's containers, mock agent and gateway
 oidc-demo-seed: ## Seed a running OIDC demo gateway through the management API (ARGS=--dry-run to preview)
 	@./scripts/oidc-demo/seed.sh $(ARGS)
 
-oidc-demo-run: ## Run the whole OIDC demo: services, native gateway, seed, hop 2 checks (OIDC_DEMO_KEEP=1 keeps it up)
+oidc-demo-run: ## Run the whole OIDC demo: services, native gateway, seed, walkthrough, hop 2 checks (OIDC_DEMO_KEEP=1 keeps it up)
 	@./scripts/oidc-demo/run.sh $(ARGS)
+
+oidc-demo-auth0: ## Run the OIDC demo with a live Auth0 tenant as the caller's authorization server (needs envs/oidc-demo/auth0.env)
+	@./scripts/oidc-demo/auth0.sh
 
 oidc-demo-smoke: ## Check the OIDC demo's Hydra instances, mock agent and seed dry run (no gateway needed)
 	@./scripts/oidc-demo/smoke.sh
+
+oidc-demo-browser: ## Leave the OIDC demo running for the Agent card tab (ARGS=start|stop|status|login|break-card|fix-card)
+	@./scripts/oidc-demo/browser-demo.sh $(or $(ARGS),start)
+
+oidc-sdk-check: ## Parse agent cards with the a2a-python and a2a-js SDKs, 0.3 and 1.x (ARGS="--live <card url>"; OIDC_SDK_DIR names the SDK folder)
+	@./scripts/oidc-demo/sdk-check/run.sh $(ARGS)
 
 oidc-ui-e2e: ## Live OIDC UI tests: headless Chromium, the real dashboard, two Ory Hydra containers and the mock agent (ARGS="<spec or --grep ...>")
 	@./scripts/oidc-demo/run-ui-e2e.sh $(ARGS)

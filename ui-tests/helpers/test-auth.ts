@@ -9,7 +9,7 @@
  * AG_TEST_MODE=true environment variable set.
  */
 
-import {APIRequestContext, BrowserContext, Page} from '@playwright/test';
+import {APIRequestContext, BrowserContext, Page, request} from '@playwright/test';
 
 const TEST_TOKEN = process.env.AG_TEST_TOKEN || 'ui-test-token-32-plus-characters';
 const TEST_AUTH_PATH = '/api/internal/test-support/auth/login';
@@ -151,6 +151,33 @@ export async function loginAsTestUser(
 
     await applyAuthToContext(page.context(), page, baseUrl, result.sessionToken);
     return true;
+}
+
+export type TestUserStorageState = Awaited<ReturnType<APIRequestContext['storageState']>>;
+
+/**
+ * Browser storage state signed in as `username`, a dashboard user of its own, for a spec whose
+ * results depend on per-user state such as a rate limit.
+ *
+ * @param baseUrl - Base URL of the gateway
+ * @param username - The test user to sign in as
+ * @returns Cookies and the `session_token` entry in `localStorage` for that user
+ */
+export async function testUserStorageState(baseUrl: string, username: string): Promise<TestUserStorageState> {
+    const context = await request.newContext({baseURL: baseUrl});
+    try {
+        const auth = await authenticateTestUser(context, baseUrl, username);
+        if (!auth.success || !auth.sessionToken) {
+            throw new Error(`Test login as ${username} failed: ${auth.error}`);
+        }
+        const {cookies} = await context.storageState();
+        return {
+            cookies,
+            origins: [{origin: new URL(baseUrl).origin, localStorage: [{name: 'session_token', value: auth.sessionToken}]}],
+        };
+    } finally {
+        await context.dispose();
+    }
 }
 
 /**

@@ -17,6 +17,7 @@
 import {generateKeyPairSync} from 'crypto';
 import {expect, test} from '../helpers/fixtures';
 import {GatewayApi} from '../helpers/gateway-api';
+import {ticket} from '../helpers/ticket';
 
 const BASE_URL = process.env.AG_BASE_URL || 'http://localhost:8080';
 const TOKEN_ENDPOINT_HOST = '203.0.113.10';
@@ -71,6 +72,8 @@ test.describe('JWT bearer credential provider', () => {
         expect(secret.status).toBe(201);
         secretRecordId = secret.body.id;
     });
+
+    test.beforeEach(() => ticket('FTL-30888'));
 
     test.afterEach(async () => {
         await deleteProviders(api);
