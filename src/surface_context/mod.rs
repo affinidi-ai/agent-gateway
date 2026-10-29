@@ -140,8 +140,10 @@ pub struct TransitCallerContext {
     /// unless `did_verified`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub did: Option<String>,
-    /// `true` only when the DID's presentation was verified
-    /// (`identity_source` `verified-presentation` or `fabric-presentation`).
+    /// `true` only when this gateway verified the DID's presentation
+    /// (`identity_source` `verified-presentation`). Always `false` for a token
+    /// issued for a peer gateway's request: a `fabric-presentation` DID is one
+    /// the peer vouched for, and any peer can vouch for any DID.
     pub did_verified: bool,
     /// The caller's Agent DNA UAI the transit token carries, when resolved.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -177,8 +179,8 @@ impl TransitCallerContext {
     /// caller; the allowlisted fields are copied from that authenticated
     /// identity, so they are dropped when there is no hash. A token issued for
     /// a request that arrived over Fabric is a `fabric_peer` caller, never
-    /// verified: the peer that sent the request is, its caller is not, and the
-    /// caller's DID counts as verified only when a connection issuer's
+    /// verified: the peer that sent the request is, its caller is not, and
+    /// neither is the caller's DID, even when a connection issuer's
     /// presentation carried it (`fabric-presentation`).
     pub fn from_transit_token(claims: &crate::proxy::transit_token::TransitTokenClaims) -> Self {
         if let Some(fabric) = &claims.fabric {
@@ -188,11 +190,7 @@ impl TransitCallerContext {
                 identity_source: claims.identity_source.clone(),
                 user_identity_hash: None,
                 subject: None,
-                did_verified: claims.sub.is_some()
-                    && claims
-                        .identity_source
-                        .as_deref()
-                        == Some("fabric-presentation"),
+                did_verified: false,
                 did: claims.sub.clone(),
                 caller_dna_uai: None,
                 fields: serde_json::Map::new(),

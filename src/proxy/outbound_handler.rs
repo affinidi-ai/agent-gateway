@@ -1189,7 +1189,8 @@ fn outgoing_fabric_hops(ctx: &OutboundPipelineContext) -> Result<u8, OutboundPip
 }
 
 /// Refuses a call to a `fabric://` target that would take the request past
-/// the most Fabric crossings it may make, before anything is resolved for it.
+/// the most Fabric crossings it may make, before anything is resolved for it,
+/// and records it as a `request_rejected` at the `forward` stage.
 fn step_check_fabric_hops(ctx: &OutboundPipelineContext) -> Result<(), OutboundPipelineError> {
     if !ctx
         .virtual_channel
@@ -1200,11 +1201,23 @@ fn step_check_fabric_hops(ctx: &OutboundPipelineContext) -> Result<(), OutboundP
     }
     outgoing_fabric_hops(ctx)
         .map(|_| ())
-        .inspect_err(|_| {
+        .inspect_err(|refusal| {
             warn!(
                 request_id = %ctx.request_id,
                 transit_point = %ctx.virtual_channel.alias,
                 "Refusing a Transit Point call that would pass the Fabric hop limit"
+            );
+            crate::audit::request_events::request_rejected(
+                &crate::audit::request_events::RequestFacts {
+                    surface_id: &ctx.surface.surface_id,
+                    channel_name: &ctx.surface.name,
+                    trace_id: Some(&ctx.request_id),
+                    via_fabric: false,
+                },
+                crate::audit::request_events::RejectionStage::Forward,
+                crate::audit::request_events::RejectionReason::FabricChainTooLong,
+                refusal.status_code().as_u16(),
+                mcp_refusal_id(ctx).map(|_| i64::from(crate::mcp::errors::error_codes::INTERNAL_ERROR)),
             );
         })
 }
@@ -3189,19 +3202,27 @@ fn outbound_actor_did(ctx: &OutboundPipelineContext) -> Option<&str> {
     }
 }
 
-/// The caller of a Transit Point call, for attributing outbound decisions: the
-/// inbound caller a transit token carries, else the caller the Transit Point
-/// verified itself, by its resource token or `source_auth`.
+/// The caller of a Transit Point call, for attributing outbound decisions, in
+/// the order of its policy input: the inbound caller a transit token carries
+/// when the token verifies one, else the caller the Transit Point verified
+/// itself, by its resource token or `source_auth`, else the caller a token only
+/// names.
 fn outbound_caller(ctx: &OutboundPipelineContext) -> Option<crate::delegation_vault::audit::AuditCallerContext> {
-    ctx.transit_token_claims
-        .as_ref()
-        .and_then(crate::delegation_vault::audit::transit_caller_context)
-        .or_else(|| {
-            ctx.authenticated_identity
-                .as_ref()
-                .filter(|_| ctx.authenticated_by.is_some())
-                .map(crate::delegation_vault::audit::build_caller_context)
-        })
+    let token = ctx
+        .transit_token_claims
+        .as_ref();
+    let token_caller = || token.and_then(crate::delegation_vault::audit::transit_caller_context);
+    let transit_point_caller = || {
+        ctx.authenticated_identity
+            .as_ref()
+            .filter(|_| ctx.authenticated_by.is_some())
+            .map(crate::delegation_vault::audit::build_caller_context)
+    };
+    if token.is_some_and(|claims| crate::surface_context::TransitCallerContext::from_transit_token(claims).verified) {
+        token_caller().or_else(transit_point_caller)
+    } else {
+        transit_point_caller().or_else(token_caller)
+    }
 }
 
 /// Shared audit context for an outbound OPA evaluation so each site records a
@@ -4225,13 +4246,16 @@ async fn step_inject_trusted_identity(
         // token's `sub`) as `userIdentity.id` + `delegated`, matching the
         // fabric response-leg shape, alongside the redesign's nested `caller`
         // context object. Only applies when a workloadBinding is already being
-        // produced (WB configured on this Transit Point).
+        // produced (WB configured on this Transit Point), and never for a token
+        // issued for a peer gateway's request, whose `sub` only the peer vouches
+        // for.
         if let Some(obj) = wb
             .as_mut()
             .and_then(|v| v.as_object_mut())
             && let Some(caller_did) = ctx
                 .transit_token_claims
                 .as_ref()
+                .filter(|claims| claims.fabric.is_none())
                 .and_then(|c| c.sub.as_deref())
                 .filter(|d| !d.is_empty())
         {
@@ -11086,6 +11110,111 @@ mod tests {
         );
     }
 
+    /// Every `workloadBinding` object in `value`, reading inside the
+    /// presentations it carries as JSON text.
+    fn signed_workload_bindings(value: &serde_json::Value) -> Vec<serde_json::Value> {
+        let mut found = Vec::new();
+        match value {
+            serde_json::Value::String(text) => {
+                if let Ok(decoded @ serde_json::Value::Object(_)) = serde_json::from_str::<serde_json::Value>(text) {
+                    found.extend(signed_workload_bindings(&decoded));
+                }
+            }
+            serde_json::Value::Array(values) => values
+                .iter()
+                .for_each(|value| found.extend(signed_workload_bindings(value))),
+            serde_json::Value::Object(map) => {
+                for (key, value) in map {
+                    if key == "workloadBinding" {
+                        found.push(value.clone());
+                    }
+                    found.extend(signed_workload_bindings(value));
+                }
+            }
+            _ => {}
+        }
+        found
+    }
+
+    /// The VP a Transit Point signs for its managed agent names the user an
+    /// Access Point's transit token carries, acting for it, and never the caller
+    /// a partner gateway's request named: this gateway verified neither that
+    /// caller nor its DID.
+    #[tokio::test]
+    async fn the_onward_vp_names_the_user_of_an_access_point_token_and_never_a_partners_caller() {
+        let (vc_issuer, _temp_dir) = crate::identity::test_helpers::test_vc_issuer().await;
+        let mut state = test_outbound_state();
+        state.vc_issuer = Some(Arc::new(vc_issuer));
+        for (claims, names_the_user) in [
+            (caller_claims(Some("did:web:victim.example"), Some("gateway-computed"), Some("abc123"), json!({})), true),
+            (fabric_claims(Some("did:web:victim.example"), "fabric-presentation", None, 1), false),
+            (fabric_claims(Some("did:web:victim.example"), "fabric-asserted", None, 1), false),
+        ] {
+            let mut ctx = test_pipeline_context();
+            Arc::make_mut(&mut ctx.surface)
+                .identity_slots
+                .protected = Some(crate::source_auth::ManagedIdentityConfig::PayloadExtraction(
+                crate::source_auth::models::PayloadExtractionConfig {
+                    extension_uri: None,
+                    meta_field: "agentIdentity".to_string(),
+                    fields: Vec::new(),
+                    json_schema: None,
+                    extension_rules: None,
+                    strip_raw_meta: false,
+                },
+            ));
+            allowlist_caller_fields(&mut ctx.virtual_channel, &[]);
+            ctx.protocol = Some(ChannelProtocol::A2a);
+            ctx.body_bytes = Some(Bytes::from(
+                serde_json::to_vec(&json!({
+                    "jsonrpc": "2.0",
+                    "method": "message/send",
+                    "params": { "message": { "metadata": {
+                        "https://fabric.affinidi.io/extensions/agent-identity/v1": { "cloudProvider": "local", "model": "gpt-4" }
+                    }}}
+                }))
+                .unwrap(),
+            ));
+            step_resolve_agent_identity(&state, &mut ctx)
+                .await
+                .unwrap();
+            let fabric = claims.fabric.is_some();
+            ctx.transit_token_claims = Some(claims);
+
+            step_inject_trusted_identity(&state, &mut ctx)
+                .await
+                .unwrap();
+
+            let body: serde_json::Value = serde_json::from_slice(
+                ctx.body_bytes
+                    .as_ref()
+                    .unwrap(),
+            )
+            .unwrap();
+            let bindings = signed_workload_bindings(&body);
+            assert!(!bindings.is_empty(), "the Transit Point signs a workload binding (fabric: {fabric})");
+            for binding in bindings {
+                if names_the_user {
+                    assert_eq!(binding["userIdentity"]["id"], "did:web:victim.example", "{binding}");
+                    assert_eq!(binding["delegated"], true, "{binding}");
+                } else {
+                    assert!(
+                        binding
+                            .get("userIdentity")
+                            .is_none(),
+                        "{binding}"
+                    );
+                    assert!(
+                        !binding
+                            .to_string()
+                            .contains("did:web:victim.example"),
+                        "{binding}"
+                    );
+                }
+            }
+        }
+    }
+
     // ── step_collect_trust_context ─────────────────────────────────────────
 
     #[tokio::test]
@@ -11644,8 +11773,9 @@ mod tests {
     }
 
     /// A Fabric-issued token is a `fabric_peer` caller: never verified, its
-    /// DID verified only when a connection issuer's presentation carried it,
-    /// and always with the peer that sent the request.
+    /// DID never verified either, even when a connection issuer's presentation
+    /// carried it (the peer vouches for it, this gateway checked nothing), and
+    /// always with the peer that sent the request.
     #[test]
     fn outbound_policy_input_names_the_peer_gateway_of_a_fabric_issued_token() {
         let mut ctx = test_pipeline_context();
@@ -11661,7 +11791,7 @@ mod tests {
                 "verification": "fabric_peer",
                 "identity_source": "fabric-presentation",
                 "did": "did:web:agent.example",
-                "did_verified": true,
+                "did_verified": false,
                 "fabric": peer
             })
         );
@@ -11713,6 +11843,42 @@ mod tests {
         );
     }
 
+    /// The caller a Transit Point's audit records name follows the precedence
+    /// of its policy input: a token carrying a verified principal, then a
+    /// caller the Transit Point verified itself, then a token that only names a
+    /// DID, which for a Fabric-issued token is the peer's assertion.
+    #[test]
+    fn the_audit_names_the_caller_its_policy_input_ranks_first() {
+        let mut ctx = test_pipeline_context();
+        ctx.transit_token_claims = Some(fabric_claims(Some("did:web:victim.example"), "fabric-presentation", None, 1));
+        let asserted = outbound_caller(&ctx).unwrap();
+        assert_eq!(asserted.auth_method, "fabric_asserted");
+        assert_eq!(asserted.iss.as_deref(), Some("did:web:partner.example"), "the peer that asserted it");
+        assert_eq!(asserted.sub.as_deref(), Some("did:web:victim.example"));
+
+        ctx.authenticated_identity = Some(crate::source_auth::AuthenticatedIdentity::ApiKey {
+            key_name: "partner-agent".to_string(),
+            provider_agent_id: None,
+        });
+        ctx.authenticated_by = Some(crate::surface_context::TransitCallerVerification::SourceAuth);
+        let caller = outbound_caller(&ctx).unwrap();
+        assert_eq!((caller.auth_method.as_str(), caller.sub.as_deref()), ("api_key", Some("partner-agent")));
+
+        ctx.transit_token_claims = Some(caller_claims(Some("did:example:claimed"), None, None, json!({})));
+        let caller = outbound_caller(&ctx).unwrap();
+        assert_eq!(
+            (caller.auth_method.as_str(), caller.sub.as_deref()),
+            ("api_key", Some("partner-agent")),
+            "a DID an Access Point token only names ranks below the verified caller"
+        );
+
+        ctx.transit_token_claims =
+            Some(caller_claims(Some("did:example:alice"), None, Some("abc123"), json!({ "email": "a@b.example" })));
+        let caller = outbound_caller(&ctx).unwrap();
+        assert_eq!(caller.auth_method, "transit_token", "a verified token ranks first");
+        assert_eq!(caller.email.as_deref(), Some("a@b.example"));
+    }
+
     /// The policy recipes the docs give: admit one partner gateway's requests,
     /// and keep partner requests off a Transit Point.
     #[tokio::test]
@@ -11745,6 +11911,25 @@ mod tests {
                            input.transit.caller.fabric.peer_issuer_did == \"did:web:partner.example\"\n}\n";
         let no_partners = "package surface.policy\n\ndefault allow := true\n\n\
                            allow := false if input.transit.caller.fabric\n";
+        let verified_did = "package surface.policy\n\ndefault allow := false\n\nallow if {\n    \
+                            input.transit.caller.did == \"did:web:q-agent.example\"\n    \
+                            input.transit.caller.did_verified\n}\n";
+
+        let mut vouched = test_pipeline_context();
+        vouched.transit_token_claims =
+            Some(fabric_claims(Some("did:web:q-agent.example"), "fabric-presentation", None, 1));
+        assert!(
+            !decide(&mut vouched, verified_did).await,
+            "a DID any partner vouches for never passes a verified-DID rule"
+        );
+        let mut presented = test_pipeline_context();
+        presented.transit_token_claims = Some(caller_claims(
+            Some("did:web:q-agent.example"),
+            Some("verified-presentation"),
+            Some("abc123"),
+            json!({}),
+        ));
+        assert!(decide(&mut presented, verified_did).await, "the rule admits a DID this gateway verified");
 
         let mut partner = test_pipeline_context();
         partner.transit_token_claims = Some(fabric_claims(None, "fabric-asserted", None, 1));
@@ -13990,6 +14175,58 @@ mod tests {
 
         assert!(call("fabric://peer-gateway/peer-surface", 7, false).is_ok());
         assert!(call("https://partner.example/a2a", 8, false).is_ok(), "only Fabric crossings are counted");
+    }
+
+    /// A Transit Point records the call it refuses at the hop limit as a
+    /// `request_rejected` in the call's trace, with the JSON-RPC code an MCP
+    /// caller gets, and records nothing for a call it forwards.
+    #[tokio::test]
+    async fn a_fabric_transit_point_records_the_call_it_refuses_at_the_hop_limit() {
+        use crate::audit::request_events::{RejectionReason, RejectionStage};
+        let rejections = |hops: u8, mcp: bool| async move {
+            let mut ctx = if mcp {
+                modern_pipeline_context("tools/call")
+            } else {
+                test_pipeline_context()
+            };
+            ctx.virtual_channel
+                .target_endpoint = "fabric://peer-gateway/peer-surface".into();
+            ctx.transit_token_claims = Some(fabric_claims(None, "fabric-asserted", None, hops));
+            let (_, events) = crate::audit::producer::capture(async { step_check_fabric_hops(&ctx) }).await;
+            events
+                .into_iter()
+                .filter_map(|event| match event.event {
+                    crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                        stage,
+                        reason,
+                        http_status,
+                        rpc_error_code,
+                    } => Some((
+                        stage,
+                        reason,
+                        http_status,
+                        rpc_error_code,
+                        event.trace_id == Some(ctx.request_id.clone()),
+                        event.surface_id == Some(ctx.surface.surface_id.clone()),
+                    )),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            rejections(8, false).await,
+            [(RejectionStage::Forward, RejectionReason::FabricChainTooLong, 508, None, true, true)]
+        );
+        assert_eq!(
+            rejections(8, true).await,
+            [(RejectionStage::Forward, RejectionReason::FabricChainTooLong, 508, Some(-32603), true, true)]
+        );
+        assert!(
+            rejections(7, false)
+                .await
+                .is_empty()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

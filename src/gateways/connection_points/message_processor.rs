@@ -3856,7 +3856,8 @@ pub(super) fn fabric_caller_did_and_source(
 /// Fabric peer sent, as the Access Point gives one with a direct request: when
 /// the surface has Transit Points and `target_url`, the Target, is the agent
 /// itself, by HTTP or HTTPS. A Target the gateway runs has no agent to hold
-/// one. `min_lifetime_secs` is the appliance's `transit_token_min_lifetime_secs`.
+/// one, and an agent card fetch is no request of the agent's own.
+/// `min_lifetime_secs` is the appliance's `transit_token_min_lifetime_secs`.
 /// Returns the token and its `jti`; one that cannot be issued is logged and
 /// the request goes on without it.
 pub(super) fn fabric_receive_transit_token(
@@ -3864,6 +3865,7 @@ pub(super) fn fabric_receive_transit_token(
     min_lifetime_secs: Option<u64>,
     surface: &crate::config::agent_surface::AgentSurface,
     target_url: &str,
+    agent_card_request: bool,
     caller: &FabricReceiveCaller<'_>,
     trace_id: Option<&str>,
 ) -> Option<(String, String)> {
@@ -3872,6 +3874,7 @@ pub(super) fn fabric_receive_transit_token(
         .transit_points()
         .is_empty()
         || !agent_target
+        || agent_card_request
     {
         return None;
     }
@@ -5806,6 +5809,7 @@ async fn process_forward_request_in_request_scope(
             .map(|network| network.transit_token_min_lifetime_secs),
         &surface,
         &target_url,
+        is_agent_card_request,
         &FabricReceiveCaller {
             peer_gateway_id: &sender.id,
             peer_issuer_did: sender.issuer_did.as_deref(),

@@ -376,7 +376,9 @@ request received by the destination gateway:
 8. Forward to the local surface Target. When the surface has Transit Points and the Target is an
    HTTP or HTTPS URL, the request carries a transit token this gateway issued for it, naming the
    peer and the hop count, so the agent can call its own Transit Points (see
-   [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)).
+   [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)). A public discovery `GET`, such as an agent
+   card fetch, carries none, nor does a request relayed to an MCP Target over the legacy HTTP+SSE
+   transport.
 9. Apply response processing, including MCP tool-list filtering when configured, before packaging
    the DIDComm response.
 
@@ -496,12 +498,16 @@ request back and forth without end. A hop count bounds them.
   forwarded, to an HTTP target or over Fabric.
 - The receiving gateway reads and removes it before anything else uses the request. Missing,
   as from a sender that predates it, means `1`. It carries the count into the transit token it
-  issues (`fabric.hops`), signed, so the agent cannot lower it.
+  issues (`fabric.hops`), signed, so an agent cannot lower the count in the token it was given.
+  An agent that still holds an older valid token, from an Access Point request or an earlier
+  Fabric request, can present that one instead, which records fewer crossings.
 - The limit is 8 crossings, so a chain reaches at most 9 gateways. A request past it is refused
   with `508` and the message that it passed through too many gateways, recorded as a
   `request_rejected` audit event (stage `routing`, reason `fabric_chain_too_long`; a malformed
   count is `fabric_hops_invalid`, refused with `400`). A Transit Point whose next send would
-  pass the limit refuses the call itself with `508`, before anything is resolved or forwarded.
+  pass the limit refuses the call itself with `508`, before anything is resolved or forwarded,
+  recorded as a `request_rejected` audit event (stage `forward`, reason
+  `fabric_chain_too_long`).
 - The trace continues along the chain: the receiving gateway's onward trace id rides in the
   token, and the Transit Point sends it on the next hop, so caller to A to C to B is one trace
   unless a surface sets `terminate_trace_id`. The hop count crosses a terminated trace too.
@@ -509,8 +515,14 @@ request back and forth without end. A hop count bounds them.
 Hops are counted only across Fabric. A chain through an `http` Transit Point into another
 gateway's Access Point, or an agent calling another surface's Access Point directly, starts
 again at 1, and so does a call through a Transit Point that does not require a transit token,
-which does not read one. A peer that does not follow these rules can reset the count; the
+which does not read one. So does a chain through a gateway that predates the hop count, which
+neither reads nor sends it. A peer that does not follow these rules can reset the count; the
 limit stops honest gateways and runaway agents, it is not an access control.
+
+A Transit Point that was set to `require_transit_token: false`, with
+`allow_unauthenticated_callers: true`, only so that agents serving partner requests could call
+it should require the token again and drop `allow_unauthenticated_callers`: those agents now get
+a token, and until the Transit Point reads it, the hop limit does not hold through it.
 
 `make gw-e2e` verifies a chain across three gateway binaries and the hop limit between two
 (`tests/features/g2g/transit_token_over_fabric.feature`): an agent serving a partner's request
