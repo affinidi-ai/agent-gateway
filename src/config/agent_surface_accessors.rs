@@ -607,11 +607,28 @@ impl AgentSurface {
         {
             errors.push(crate::config::agent_surface::TRANSIT_SOURCE_AUTH_REFUSED.to_string());
         }
-        for tp in &transit.points {
+        let variant_points = self
+            .variants
+            .iter()
+            .flat_map(|variant| {
+                variant
+                    .overrides
+                    .transit
+                    .iter()
+                    .filter_map(|transit| transit.points.as_ref())
+                    .flatten()
+                    .map(|tp| (format!("variant '{}': ", variant.alias), tp))
+            });
+        for (prefix, tp) in transit
+            .points
+            .iter()
+            .map(|tp| (String::new(), tp))
+            .chain(variant_points)
+        {
             if let Some(reason) = tp.unenforceable_caller_authentication() {
-                errors.push(format!("{reason}; every request to it is refused"));
+                errors.push(format!("{prefix}{reason}; every request to it is refused"));
             } else if let Err(error) = tp.validate_caller_authentication() {
-                errors.push(error);
+                errors.push(format!("{prefix}{error}"));
             }
         }
 

@@ -7275,7 +7275,14 @@ mod transit_point_caller_authentication_tests {
                     { "alias": "keyed", "target_endpoint": "https://keyed.example", "require_transit_token": false,
                         "source_auth": api_key() }
                 ]
-            }
+            },
+            "variants": [{ "id": "candidate", "alias": "candidate", "name": "Candidate", "overrides": {
+                "transit": { "points": [
+                    { "alias": "partner", "target_endpoint": "https://partner.example", "require_transit_token": false },
+                    { "alias": "keyed", "target_endpoint": "https://keyed.example", "require_transit_token": false,
+                        "source_auth": api_key() }
+                ] }
+            }}]
         }))
         .unwrap();
 
@@ -7285,6 +7292,7 @@ mod transit_point_caller_authentication_tests {
                 format!("{NO_CALLER}; every request to it is refused"),
                 "Transit Point 'both' sets allow_unauthenticated_callers but authenticates its callers; remove it"
                     .to_string(),
+                format!("variant 'candidate': {NO_CALLER}; every request to it is refused"),
             ]
         );
     }
