@@ -595,6 +595,16 @@ pub async fn resolve_delegation_credentials(
                 }
                 continue;
             }
+            CredentialProviderType::OAuth2JwtBearer | CredentialProviderType::OAuth2ClientCredentialsJwtAuth => {
+                results.push(DelegationResolution::new(
+                    binding,
+                    Some(&provider.name),
+                    DelegationActionOutcome::ProviderUnavailable,
+                    Some("unsupported_provider_type".to_string()),
+                    DelegationLookupResult::Unavailable,
+                ));
+                continue;
+            }
             CredentialProviderType::OAuth2AuthorizationCode => {
                 // Existing 3LO flow — vault lookup → inject or consent
             }
@@ -1770,6 +1780,7 @@ mod tests {
             token_refresh_enabled: true,
             additional_params: HashMap::new(),
             api_key_secret_ref: None,
+            jwt: Default::default(),
             description: None,
             created_at: now,
             updated_at: now,

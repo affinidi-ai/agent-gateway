@@ -11,6 +11,7 @@
 
 pub mod audit;
 pub mod handlers;
+pub mod jwt_assertion;
 pub mod modern_consent;
 pub mod notifier;
 pub mod oauth;
