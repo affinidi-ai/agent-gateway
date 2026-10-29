@@ -12679,7 +12679,7 @@ mod tests {
     fn response_body(result: ProcessingResult) -> (String, serde_json::Value) {
         match result {
             ProcessingResult::RequiresResponse { response_type, response_body } => (response_type, response_body),
-            other => panic!("expected RequiresResponse, got {other:?}"),
+            _ => panic!("expected a RequiresResponse result"),
         }
     }
 
@@ -12688,7 +12688,7 @@ mod tests {
         let message = make_handshake_msg(
             MessageType::X402VerifyRequest.as_str(),
             None,
-            x402_requester_body(&x402_requirement("0x456"), "peer-verify"),
+            x402_requester_body(&x402_requirement("0x456"), &uuid::Uuid::new_v4().to_string()),
         );
 
         let (response_type, body) =
@@ -12730,7 +12730,7 @@ mod tests {
 
         let result = process_message_internal(&message, &MessageType::X402SettleRequest).await;
 
-        assert!(matches!(result, ProcessingResult::ProcessedNoResponse), "got {result:?}");
+        assert!(matches!(result, ProcessingResult::ProcessedNoResponse), "a peer settlement record got a reply");
     }
 
     #[tokio::test]
@@ -12746,7 +12746,7 @@ mod tests {
         let result = process_message_internal(&message, &MessageType::X402SettleResponse).await;
         let response = pending.await.unwrap();
 
-        assert!(matches!(result, ProcessingResult::ProcessedNoResponse), "got {result:?}");
+        assert!(matches!(result, ProcessingResult::ProcessedNoResponse), "a settle response got a reply");
         assert!(response.settled);
         assert_eq!(response.tx_hash, "0xabc");
     }
