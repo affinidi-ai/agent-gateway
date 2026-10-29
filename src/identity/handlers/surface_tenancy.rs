@@ -47,6 +47,11 @@ pub async fn validate_surface_references(
 /// - Such a binding names a `subject`, and no other binding does.
 /// - Its provider has an issuer and the surface's own tenant, exactly; a
 ///   provider with an issuer is bound by no other consent mode.
+/// - Its Transit Point sends the grants only to the provider's `resource`: a
+///   public `https` target with that origin, never a `fabric://` route.
+/// - Its Transit Point id names one Transit Point: it appears once in each list
+///   of points, and every variant that uses it keeps the same `target_endpoint`
+///   and `transit_credentials`.
 /// - At-rest encryption is active, since its grants are kept only then.
 pub async fn validate_external_consent_bindings(
     state: &IdentityApiState,
@@ -67,6 +72,7 @@ async fn check_external_consent_bindings(
     surface: &AgentSurface,
     encryption_active: bool,
 ) -> Result<(), SurfaceApiError> {
+    check_external_transit_point_ids(surface)?;
     let mut views = vec![(String::new(), surface.clone())];
     for (variant, resolved) in surface.variants.iter().zip(
         resolved_views(surface)?
@@ -140,6 +146,77 @@ async fn check_external_consent_bindings(
             }
             if provider.tenant_id != surface.tenant_id {
                 return Err(refuse("consent_mode external needs a credential provider of the surface's own tenant"));
+            }
+            crate::credential_providers::external::check_grant_destination(&provider, &point.target_endpoint, None)
+                .map_err(refuse)?;
+        }
+    }
+    Ok(())
+}
+
+/// The surface's lists of Transit Points as stored: its own, then each
+/// variant's replacement list, with the prefix that names each in a refusal. A
+/// resolved view's points are always one of these lists.
+pub(crate) fn transit_point_lists(
+    surface: &AgentSurface
+) -> Vec<(String, &[crate::config::agent_surface::TransitPoint])> {
+    let mut lists = vec![(String::new(), surface.transit_points())];
+    for variant in &surface.variants {
+        if let Some(points) = variant
+            .overrides
+            .transit
+            .as_ref()
+            .and_then(|transit| transit.points.as_deref())
+        {
+            lists.push((format!("variant '{}' ", variant.alias), points));
+        }
+    }
+    lists
+}
+
+/// A Transit Point id with a `consent_mode: external` binding anywhere in the
+/// surface names one Transit Point: once per list, and with the same
+/// `target_endpoint` and `transit_credentials` in every list that has it. Its
+/// grants are kept under that id, so no second destination or binding may
+/// claim it.
+fn check_external_transit_point_ids(surface: &AgentSurface) -> Result<(), SurfaceApiError> {
+    use std::collections::HashMap;
+    let lists = transit_point_lists(surface);
+    let external: HashSet<&str> = lists
+        .iter()
+        .flat_map(|(_, points)| points.iter())
+        .filter(|point| {
+            point
+                .transit_credentials
+                .as_ref()
+                .is_some_and(|binding| binding.is_external())
+        })
+        .map(|point| point.id.as_str())
+        .collect();
+    let mut first: HashMap<&str, &crate::config::agent_surface::TransitPoint> = HashMap::new();
+    for (prefix, points) in &lists {
+        let mut seen = HashSet::new();
+        for (index, point) in points.iter().enumerate() {
+            if !external.contains(point.id.as_str()) {
+                continue;
+            }
+            if !seen.insert(point.id.as_str()) {
+                return Err(SurfaceApiError::BadRequest(format!(
+                    "{prefix}transit.points[{index}]: the id of a Transit Point with consent_mode external is used \
+                     twice; give each Transit Point an id of its own"
+                )));
+            }
+            let earlier = *first
+                .entry(point.id.as_str())
+                .or_insert(point);
+            let same = earlier.target_endpoint == point.target_endpoint
+                && serde_json::to_value(&earlier.transit_credentials).ok()
+                    == serde_json::to_value(&point.transit_credentials).ok();
+            if !same {
+                return Err(SurfaceApiError::BadRequest(format!(
+                    "{prefix}transit.points[{index}]: a Transit Point with consent_mode external keeps one \
+                     target_endpoint and transit_credentials in the surface and every variant that uses its id"
+                )));
             }
         }
     }
@@ -1026,16 +1103,20 @@ mod tests {
         )
         .await
         .unwrap();
-        for (id, tenant, issuer) in [
-            ("external-a", Some("tenant-a"), Some("https://203.0.113.10")),
-            ("external-b", Some("tenant-b"), Some("https://203.0.113.10")),
-            ("external-global", None, Some("https://203.0.113.10")),
-            ("legacy-a", Some("tenant-a"), None),
+        const VENDOR: Option<&str> = Some("https://203.0.113.30/mcp");
+        for (id, tenant, issuer, resource) in [
+            ("external-a", Some("tenant-a"), Some("https://203.0.113.10"), VENDOR),
+            ("external-b", Some("tenant-b"), Some("https://203.0.113.10"), VENDOR),
+            ("external-global", None, Some("https://203.0.113.10"), VENDOR),
+            ("external-private", Some("tenant-a"), Some("https://203.0.113.10"), Some("https://10.0.0.5/mcp")),
+            ("external-without-resource", Some("tenant-a"), Some("https://203.0.113.10"), None),
+            ("legacy-a", Some("tenant-a"), None, None),
         ] {
             store
                 .create(
                     serde_json::from_value(serde_json::json!({
                         "id": id, "tenant_id": tenant, "name": id, "provider_id": id, "issuer": issuer,
+                        "resource": resource,
                         "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
                     }))
                     .unwrap(),
@@ -1046,19 +1127,20 @@ mod tests {
         std::sync::Arc::new(store)
     }
 
-    fn surface_binding(
-        binding: serde_json::Value,
+    fn vendor_point(binding: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"id": "tp-1", "alias": "vendor", "target_endpoint": "https://203.0.113.30/mcp",
+            "require_transit_token": true, "transit_credentials": binding})
+    }
+
+    fn surface_with_points(
+        points: serde_json::Value,
         outbound_credentials: serde_json::Value,
-        variant_binding: Option<serde_json::Value>,
+        variant_points: Option<serde_json::Value>,
     ) -> AgentSurface {
-        let point = |binding: serde_json::Value| {
-            serde_json::json!({"id": "tp-1", "alias": "vendor", "target_endpoint": "https://203.0.113.30/mcp",
-                "require_transit_token": true, "transit_credentials": binding})
-        };
-        let variants = match variant_binding {
-            Some(binding) => {
+        let variants = match variant_points {
+            Some(points) => {
                 serde_json::json!([{"id": "v-1", "alias": "candidate", "name": "candidate", "enabled": true,
-                "overrides": {"transit": {"points": [point(binding)]}}}])
+                "overrides": {"transit": {"points": points}}}])
             }
             None => serde_json::json!([]),
         };
@@ -1067,10 +1149,22 @@ mod tests {
             "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
             "target": {"endpoint": "https://managed.example/agent"},
             "outbound_credentials": outbound_credentials,
-            "transit": {"points": [point(binding)]},
+            "transit": {"points": points},
             "variants": variants
         }))
         .unwrap()
+    }
+
+    fn surface_binding(
+        binding: serde_json::Value,
+        outbound_credentials: serde_json::Value,
+        variant_binding: Option<serde_json::Value>,
+    ) -> AgentSurface {
+        surface_with_points(
+            serde_json::json!([vendor_point(binding)]),
+            outbound_credentials,
+            variant_binding.map(|binding| serde_json::json!([vendor_point(binding)])),
+        )
     }
 
     fn external(
@@ -1181,10 +1275,12 @@ mod tests {
             ),
             (
                 "a variant without a subject",
-                surface_binding(
-                    external("external-a", Some("owner")),
+                surface_with_points(
+                    serde_json::json!([vendor_point(external("external-a", Some("owner")))]),
                     none.clone(),
-                    Some(external("external-a", None)),
+                    Some(serde_json::json!([{"id": "tp-2", "alias": "vendor",
+                        "target_endpoint": "https://203.0.113.30/mcp", "require_transit_token": true,
+                        "transit_credentials": external("external-a", None)}])),
                 ),
                 true,
                 "variant 'candidate' transit.points[0].transit_credentials: consent_mode external needs a subject",
@@ -1194,6 +1290,112 @@ mod tests {
                 .await
                 .expect_err(case);
             assert!(message.starts_with(expected), "{case}: {message}");
+        }
+    }
+
+    /// A Transit Point's grants go only to its provider's `resource` origin, and
+    /// a Transit Point id that carries them names one destination and one binding
+    /// in the surface and every variant.
+    #[tokio::test]
+    async fn an_external_consent_binding_sends_its_grants_only_to_its_providers_resource() {
+        let directory = tempfile::tempdir().unwrap();
+        let providers = providers_with(&directory).await;
+        let none = serde_json::json!([]);
+        let owner = external("external-a", Some("owner"));
+        let at = |target: &str, binding: &serde_json::Value| {
+            let mut point = vendor_point(binding.clone());
+            point["target_endpoint"] = serde_json::json!(target);
+            point
+        };
+        let mut second = at("https://203.0.113.66/mcp", &owner);
+        second["alias"] = serde_json::json!("vendor-2");
+
+        let same_in_variant = surface_with_points(
+            serde_json::json!([vendor_point(owner.clone())]),
+            none.clone(),
+            Some(serde_json::json!([vendor_point(owner.clone())])),
+        );
+        assert_eq!(checked(&providers, same_in_variant, true).await, Ok(()), "a variant may keep the same point");
+
+        let point = "transit.points[0].transit_credentials: ";
+        for (case, surface, expected) in [
+            (
+                "a target repointed at another host",
+                surface_with_points(serde_json::json!([at("https://203.0.113.66/mcp", &owner)]), none.clone(), None),
+                format!("{point}consent_mode external needs a target_endpoint with the origin of"),
+            ),
+            (
+                "an http target",
+                surface_with_points(serde_json::json!([at("http://203.0.113.30/mcp", &owner)]), none.clone(), None),
+                format!("{point}consent_mode external needs a target_endpoint that is a public https URL"),
+            ),
+            (
+                "a private address",
+                surface_with_points(
+                    serde_json::json!([at("https://10.0.0.5/mcp", &external("external-private", Some("owner")))]),
+                    none.clone(),
+                    None,
+                ),
+                format!("{point}consent_mode external needs a target_endpoint that is a public https URL"),
+            ),
+            (
+                "a Fabric route",
+                surface_with_points(serde_json::json!([at("fabric://gateway-b/channel", &owner)]), none.clone(), None),
+                format!("{point}consent_mode external never forwards over Fabric"),
+            ),
+            (
+                "a provider without a resource",
+                surface_with_points(
+                    serde_json::json!([vendor_point(external("external-without-resource", Some("owner")))]),
+                    none.clone(),
+                    None,
+                ),
+                format!("{point}the credential provider names no resource"),
+            ),
+            (
+                "a second point with the same id",
+                surface_with_points(serde_json::json!([vendor_point(owner.clone()), second]), none.clone(), None),
+                "transit.points[1]: the id of a Transit Point with consent_mode external is used twice".to_string(),
+            ),
+            (
+                "a variant point with the same id and another target",
+                surface_with_points(
+                    serde_json::json!([vendor_point(owner.clone())]),
+                    none.clone(),
+                    Some(serde_json::json!([at("https://203.0.113.30/other", &owner)])),
+                ),
+                "variant 'candidate' transit.points[0]: a Transit Point with consent_mode external keeps one \
+                 target_endpoint and transit_credentials"
+                    .to_string(),
+            ),
+            (
+                "a variant point with the same id and another binding",
+                surface_with_points(
+                    serde_json::json!([vendor_point(owner.clone())]),
+                    none.clone(),
+                    Some(serde_json::json!([vendor_point(external("external-a", Some("caller")))])),
+                ),
+                "variant 'candidate' transit.points[0]: a Transit Point with consent_mode external keeps one \
+                 target_endpoint and transit_credentials"
+                    .to_string(),
+            ),
+            (
+                "a variant point that takes the id of an external point with no binding",
+                surface_with_points(
+                    serde_json::json!([vendor_point(owner.clone())]),
+                    none.clone(),
+                    Some(serde_json::json!([{"id": "tp-1", "alias": "vendor",
+                        "target_endpoint": "https://203.0.113.66/mcp", "require_transit_token": true}])),
+                ),
+                "variant 'candidate' transit.points[0]: a Transit Point with consent_mode external keeps one \
+                 target_endpoint and transit_credentials"
+                    .to_string(),
+            ),
+        ] {
+            let message = checked(&providers, surface, true)
+                .await
+                .expect_err(case);
+            assert!(message.starts_with(&expected), "{case}: {message}");
         }
     }
 

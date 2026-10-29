@@ -164,6 +164,14 @@ pub struct CredentialProvider {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
 
+    /// Admit an issuer whose metadata does not list
+    /// `code_challenge_methods_supported`, which MCP clients refuse. Set only for
+    /// an authorization server known to enforce S256 PKCE without saying so,
+    /// such as Microsoft Entra ID. An external consent provider only, fixed for
+    /// its life.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_unadvertised_pkce: bool,
+
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -229,6 +237,8 @@ pub struct CreateCredentialProviderRequest {
     pub token_endpoint_auth_method: Option<TokenEndpointAuthMethod>,
     #[serde(default)]
     pub client_id: Option<String>,
+    #[serde(default)]
+    pub allow_unadvertised_pkce: bool,
 }
 
 /// Request to update an existing credential provider
@@ -275,6 +285,9 @@ pub struct UpdateCredentialProviderRequest {
     /// Never changes a provider: a value other than the stored one is refused.
     #[serde(default)]
     pub client_id: Option<String>,
+    /// Never changes a provider: a value other than the stored one is refused.
+    #[serde(default)]
+    pub allow_unadvertised_pkce: Option<bool>,
 }
 
 /// List response item (no sensitive data)
@@ -307,6 +320,8 @@ pub struct CredentialProviderListItem {
     pub token_endpoint_auth_method: Option<TokenEndpointAuthMethod>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub allow_unadvertised_pkce: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -335,6 +350,7 @@ impl From<&CredentialProvider> for CredentialProviderListItem {
             revocation_endpoint: p.revocation_endpoint.clone(),
             token_endpoint_auth_method: p.token_endpoint_auth_method,
             client_id: p.client_id.clone(),
+            allow_unadvertised_pkce: p.allow_unadvertised_pkce,
             created_at: p.created_at,
             updated_at: p.updated_at,
         }
@@ -375,6 +391,7 @@ mod tests {
             revocation_endpoint: None,
             token_endpoint_auth_method: None,
             client_id: None,
+            allow_unadvertised_pkce: false,
         }
     }
 
@@ -506,6 +523,7 @@ mod tests {
             revocation_endpoint: None,
             token_endpoint_auth_method: None,
             client_id: None,
+            allow_unadvertised_pkce: false,
         };
         let json = serde_json::to_string(&provider).unwrap();
         assert!(json.contains("api_key"));

@@ -8,18 +8,22 @@
 //! - [`validate`] applies the static rules: an authorization code provider with
 //!   `https` endpoints the Strict egress posture accepts, a plain `client_id`, a
 //!   `token_endpoint_auth_method` with a secret exactly when the method needs one,
-//!   a callback URL, and none of the fields the gateway's own consent flow uses.
+//!   a callback URL, a public `https` `resource`, and none of the fields the
+//!   gateway's own consent flow uses.
 //! - [`check_metadata`] compares it with the issuer's RFC 8414 or OpenID Connect
 //!   metadata, read under the client profile and the Strict posture: the
 //!   authorization, token and revocation endpoints must be the ones the metadata
-//!   names, the server must support the client's authentication method, and S256
-//!   PKCE unless the metadata is silent on it.
+//!   names, the server must support the client's authentication method, and the
+//!   metadata must list S256 PKCE, unless the provider names the
+//!   `allow_unadvertised_pkce` exception for a server that does not list it.
 //! - [`refuse_changes`] keeps the issuer, the endpoints, the client fields and
 //!   `resource` fixed for the provider's life: a different value is a new provider.
+//! - [`check_grant_destination`] binds the provider's grants to where they are
+//!   sent: a Transit Point carries them only to the origin of `resource`.
 //!
-//! So a token that can edit providers cannot point a provider whose grants are
-//! stored at an endpoint of its choosing, which would collect them on the next
-//! refresh or revocation.
+//! So a token that can edit providers or surfaces cannot point a provider whose
+//! grants are stored at an endpoint of its choosing, which would collect them on
+//! the next refresh or revocation, nor send its grants to a host of its choosing.
 
 use std::sync::Arc;
 
@@ -147,8 +151,11 @@ pub fn validate(provider: &CredentialProvider) -> Result<(), ExternalProviderErr
                 .token_endpoint_auth_method
                 .is_some()
             || provider.client_id.is_some()
+            || provider.allow_unadvertised_pkce
         {
-            return Err(Invalid("revocation_endpoint, token_endpoint_auth_method and client_id need an issuer"));
+            return Err(Invalid(
+                "revocation_endpoint, token_endpoint_auth_method, client_id and allow_unadvertised_pkce need an issuer",
+            ));
         }
         return Ok(());
     };
@@ -231,6 +238,16 @@ pub fn validate(provider: &CredentialProvider) -> Result<(), ExternalProviderErr
         return Err(Invalid("callback_url is required with an issuer, as an https URL"));
     }
     if !provider
+        .resource
+        .as_deref()
+        .is_some_and(is_strict_https_url)
+    {
+        return Err(Invalid(
+            "resource is required with an issuer, as a public https URL: its origin is the only one a Transit Point \
+             sends the provider's grants to",
+        ));
+    }
+    if !provider
         .additional_params
         .is_empty()
         || provider
@@ -252,8 +269,9 @@ pub fn validate(provider: &CredentialProvider) -> Result<(), ExternalProviderErr
 /// The authorization and token endpoints must equal the metadata's byte for
 /// byte, and the revocation endpoint too, including its absence. The client's
 /// authentication method must be one the metadata lists, or `client_secret_basic`
-/// when it lists none (RFC 8414). When the metadata lists PKCE methods, S256 must
-/// be one of them.
+/// when it lists none (RFC 8414). The metadata's PKCE methods must include S256.
+/// A metadata document that lists no PKCE methods is refused, as MCP clients
+/// refuse it, unless the provider names the `allow_unadvertised_pkce` exception.
 pub fn check_metadata(
     provider: &CredentialProvider,
     metadata: &ClientAuthzMetadata,
@@ -303,15 +321,16 @@ pub fn check_metadata(
     if !method_supported {
         return Err(MetadataMismatch("token_endpoint_auth_method"));
     }
-    if metadata
+    let pkce_supported = match metadata
         .code_challenge_methods_supported
         .as_deref()
-        .is_some_and(|methods| {
-            !methods
-                .iter()
-                .any(|method| method == "S256")
-        })
     {
+        Some(methods) => methods
+            .iter()
+            .any(|method| method == "S256"),
+        None => provider.allow_unadvertised_pkce,
+    };
+    if !pkce_supported {
         return Err(MetadataMismatch("code_challenge_methods_supported"));
     }
     Ok(())
@@ -341,15 +360,16 @@ pub fn refuse_changes(
                 .token_endpoint_auth_method
                 .is_some()
             || request.client_id.is_some()
+            || request.allow_unadvertised_pkce == Some(true)
         {
             return Err(ExternalProviderError::Invalid(
-                "an existing provider cannot take an issuer, revocation_endpoint, token_endpoint_auth_method or \
-                 client_id; create a new provider instead",
+                "an existing provider cannot take an issuer, revocation_endpoint, token_endpoint_auth_method, \
+                 client_id or allow_unadvertised_pkce; create a new provider instead",
             ));
         }
         return Ok(());
     }
-    let fields: [(&'static str, bool); 14] = [
+    let fields: [(&'static str, bool); 15] = [
         ("issuer", changes(request.issuer.as_ref(), existing.issuer.as_ref())),
         ("provider_type", changes(request.provider_type.as_ref(), Some(&existing.provider_type))),
         (
@@ -452,6 +472,15 @@ pub fn refuse_changes(
                     .as_ref(),
             ),
         ),
+        (
+            "allow_unadvertised_pkce",
+            changes(
+                request
+                    .allow_unadvertised_pkce
+                    .as_ref(),
+                Some(&existing.allow_unadvertised_pkce),
+            ),
+        ),
     ];
     match fields
         .into_iter()
@@ -462,12 +491,97 @@ pub fn refuse_changes(
     }
 }
 
+/// Whether a Transit Point whose target is `target_endpoint` may carry the
+/// grants of the external consent provider `provider`, and if so the origin
+/// they may be sent to: the origin of the provider's `resource`.
+///
+/// The target must be a public `https` URL with that origin, never a `fabric://`
+/// route. `exact_allowlist` is the test allow-list of fixtures
+/// ([`crate::egress::bdd_egress_allowlist`] on the production path, so `None`):
+/// it can admit an `http` or loopback fixture, never another origin or Fabric.
+/// The check runs when the surface is saved and again on every call, so a grant
+/// is bound to where it is sent, not to a Transit Point id.
+pub fn check_grant_destination(
+    provider: &CredentialProvider,
+    target_endpoint: &str,
+    exact_allowlist: Option<&str>,
+) -> Result<url::Origin, &'static str> {
+    if target_endpoint.starts_with("fabric://") {
+        return Err("consent_mode external never forwards over Fabric");
+    }
+    let resource = provider
+        .resource
+        .as_deref()
+        .and_then(|resource| url::Url::parse(resource).ok())
+        .ok_or("the credential provider names no resource")?;
+    let target = url::Url::parse(target_endpoint)
+        .map_err(|_| "consent_mode external needs a target_endpoint that is a public https URL")?;
+    if !is_strict_https_url(target_endpoint) && !crate::egress::exactly_allowlisted(target_endpoint, exact_allowlist) {
+        return Err("consent_mode external needs a target_endpoint that is a public https URL");
+    }
+    if target.origin() != resource.origin() {
+        return Err(
+            "consent_mode external needs a target_endpoint with the origin of the credential provider's resource",
+        );
+    }
+    Ok(resource.origin())
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use serde_json::json;
 
     const ISSUER: &str = "https://203.0.113.10";
+
+    #[test]
+    fn a_grant_goes_only_to_a_public_https_target_with_the_origin_of_the_providers_resource() {
+        let provider = external_provider();
+        let resource = url::Url::parse("https://203.0.113.10/mcp")
+            .unwrap()
+            .origin();
+        for target in ["https://203.0.113.10/mcp", "https://203.0.113.10/other/path?x=1", "https://203.0.113.10:443"] {
+            assert_eq!(check_grant_destination(&provider, target, None), Ok(resource.clone()), "{target}");
+        }
+        for (case, target) in [
+            ("another host", "https://203.0.113.66/mcp"),
+            ("another port", "https://203.0.113.10:8443/mcp"),
+            ("http", "http://203.0.113.10/mcp"),
+            ("Fabric", "fabric://gateway-b/channel"),
+            ("not a URL", "vendor"),
+        ] {
+            assert!(check_grant_destination(&provider, target, None).is_err(), "{case} must be refused");
+        }
+
+        let mut private = external_provider();
+        private.resource = Some("https://10.0.0.5/mcp".into());
+        assert!(
+            check_grant_destination(&private, "https://10.0.0.5/mcp", None).is_err(),
+            "a private address is refused even when a stored provider names it"
+        );
+        let mut loopback = external_provider();
+        loopback.resource = Some("https://127.0.0.1/mcp".into());
+        assert!(check_grant_destination(&loopback, "https://127.0.0.1/mcp", None).is_err());
+        let mut without_resource = external_provider();
+        without_resource.resource = None;
+        assert!(check_grant_destination(&without_resource, "https://203.0.113.10/mcp", None).is_err());
+    }
+
+    #[test]
+    fn only_the_test_allowlist_admits_an_http_fixture_and_never_another_origin_or_fabric() {
+        let mut fixture = external_provider();
+        fixture.resource = Some("http://127.0.0.1:9/mcp".into());
+        let allowlist = Some("http://127.0.0.1:9");
+        assert_eq!(
+            check_grant_destination(&fixture, "http://127.0.0.1:9/mcp", allowlist),
+            Ok(url::Url::parse("http://127.0.0.1:9")
+                .unwrap()
+                .origin())
+        );
+        assert!(check_grant_destination(&fixture, "http://127.0.0.1:9/mcp", None).is_err());
+        assert!(check_grant_destination(&fixture, "http://127.0.0.1:10/mcp", Some("http://127.0.0.1:10")).is_err());
+        assert!(check_grant_destination(&fixture, "fabric://127.0.0.1:9/mcp", allowlist).is_err());
+    }
 
     pub(crate) fn external_provider() -> CredentialProvider {
         serde_json::from_value(json!({
@@ -536,6 +650,7 @@ pub(crate) mod tests {
             |p: &mut CredentialProvider| p.client_id = Some("client".into()),
             |p: &mut CredentialProvider| p.token_endpoint_auth_method = Some(TokenEndpointAuthMethod::None),
             |p: &mut CredentialProvider| p.revocation_endpoint = Some(format!("{ISSUER}/revoke")),
+            |p: &mut CredentialProvider| p.allow_unadvertised_pkce = true,
         ] {
             let mut provider = legacy.clone();
             change(&mut provider);
@@ -581,6 +696,10 @@ pub(crate) mod tests {
             }),
             ("a consent identity strategy", |p| p.consent_identity_strategy_id = Some("strategy".into())),
             ("an api key", |p| p.api_key_secret_ref = Some("key".into())),
+            ("no resource", |p| p.resource = None),
+            ("http resource", |p| p.resource = Some("http://203.0.113.10/mcp".into())),
+            ("private resource", |p| p.resource = Some("https://10.0.0.5/mcp".into())),
+            ("loopback resource", |p| p.resource = Some("https://127.0.0.1/mcp".into())),
         ];
         for (case, change) in cases {
             let mut provider = external_provider();
@@ -649,8 +768,26 @@ pub(crate) mod tests {
             check_metadata(&provider, &metadata),
             Err(ExternalProviderError::MetadataMismatch("code_challenge_methods_supported"))
         );
+        let mut excepted = external_provider();
+        excepted.allow_unadvertised_pkce = true;
+        assert_eq!(
+            check_metadata(&excepted, &metadata),
+            Err(ExternalProviderError::MetadataMismatch("code_challenge_methods_supported")),
+            "the exception never admits a list without S256"
+        );
+    }
+
+    #[test]
+    fn a_server_that_does_not_list_pkce_methods_is_refused_unless_the_provider_names_the_exception() {
+        let mut metadata = metadata();
         metadata.code_challenge_methods_supported = None;
-        assert_eq!(check_metadata(&provider, &metadata), Ok(()));
+        assert_eq!(
+            check_metadata(&external_provider(), &metadata),
+            Err(ExternalProviderError::MetadataMismatch("code_challenge_methods_supported"))
+        );
+        let mut excepted = external_provider();
+        excepted.allow_unadvertised_pkce = true;
+        assert_eq!(check_metadata(&excepted, &metadata), Ok(()));
     }
 
     fn update(value: serde_json::Value) -> UpdateCredentialProviderRequest {
@@ -675,6 +812,7 @@ pub(crate) mod tests {
             ("additional_params", json!({"redirect_uri": "https://attacker.example/"})),
             ("consent_identity_strategy_id", json!("strategy")),
             ("api_key_secret_ref", json!("key")),
+            ("allow_unadvertised_pkce", json!(true)),
         ] {
             assert_eq!(
                 refuse_changes(&existing, &update(json!({ field: value }))),
@@ -714,6 +852,7 @@ pub(crate) mod tests {
             json!({"client_id": "client"}),
             json!({"token_endpoint_auth_method": "none"}),
             json!({"revocation_endpoint": format!("{ISSUER}/token")}),
+            json!({"allow_unadvertised_pkce": true}),
         ] {
             assert!(
                 matches!(refuse_changes(&existing, &update(field.clone())), Err(ExternalProviderError::Invalid(_))),

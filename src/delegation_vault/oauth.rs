@@ -992,6 +992,7 @@ mod tests {
             revocation_endpoint: None,
             token_endpoint_auth_method: None,
             client_id: None,
+            allow_unadvertised_pkce: false,
         };
 
         let consent =
@@ -1038,6 +1039,7 @@ mod tests {
             revocation_endpoint: None,
             token_endpoint_auth_method: None,
             client_id: None,
+            allow_unadvertised_pkce: false,
         };
 
         // Test without signer (unsigned fallback)
@@ -1208,6 +1210,7 @@ mod tests {
             revocation_endpoint: None,
             token_endpoint_auth_method: None,
             client_id: None,
+            allow_unadvertised_pkce: false,
         };
 
         let vc = build_delegation_vc(

@@ -398,6 +398,10 @@ pub struct OutboundPipelineContext {
     /// managed agent's headers and sent after the agent's headers are filtered, in
     /// place of any agent header of the same name.
     pub delegated_credential_headers: HeaderMap,
+    /// The only origin a request carrying a grant by binding may be sent to: its
+    /// provider's `resource`. Set when such a grant is injected; the forward then
+    /// goes through Strict pinned egress to that origin only, never over Fabric.
+    pub grant_destination: Option<url::Origin>,
     /// Request path (used to build target URL).
     pub request_path: String,
     /// Protected agent identity resolved by `step_resolve_agent_identity`.
@@ -658,6 +662,7 @@ impl OutboundPipelineContext {
             original_method,
             original_headers,
             delegated_credential_headers: HeaderMap::new(),
+            grant_destination: None,
             request_path,
             resolved_identity: ProtectedAgentIdentity::Anonymous,
             protocol: None,
@@ -4885,6 +4890,16 @@ async fn step_inject_external_grant(
     if provider.tenant_id != ctx.surface.tenant_id {
         return Err(refuse_external_grant(ctx, DelegationRefusal::Unavailable, "provider_of_another_tenant"));
     }
+    let Ok(destination) = crate::credential_providers::external::check_grant_destination(
+        &provider,
+        &ctx.virtual_channel
+            .target_endpoint,
+        state
+            .egress_allowlist
+            .as_deref(),
+    ) else {
+        return Err(refuse_external_grant(ctx, DelegationRefusal::Unavailable, "destination_not_the_resource"));
+    };
     let surface = ctx.surface.clone();
     let tenant = surface.tenant_id.as_deref();
     let surface_id = surface.surface_id.as_str();
@@ -4924,6 +4939,7 @@ async fn step_inject_external_grant(
             .to_binding_injection(),
         &grant.access_token,
     );
+    ctx.grant_destination = Some(destination);
     apply_credential_injections(ctx, &injections)?;
     if let Err(error) = vault
         .mark_grant_used(&grant.id)
@@ -4985,11 +5001,49 @@ async fn step_forward_request(
         .target_endpoint
         .starts_with("fabric://")
     {
+        if ctx
+            .grant_destination
+            .is_some()
+        {
+            return Err(refuse_external_grant(ctx, DelegationRefusal::Unavailable, "forward_over_fabric"));
+        }
         return step_forward_request_fabric(state, ctx).await;
     }
 
     let response = step_forward_request_http(state, ctx).await?;
     Ok(UpstreamResponse::Http(response))
+}
+
+/// The client a request carrying a grant by binding is sent with: to the
+/// grant's origin only, through Strict, `https`-only egress pinned to the vetted
+/// addresses, with redirects refused.
+async fn grant_forward_client(
+    state: &OutboundProxyState,
+    ctx: &mut OutboundPipelineContext,
+    target_url: &str,
+    destination: &url::Origin,
+    timeout: std::time::Duration,
+) -> Result<reqwest::Client, OutboundPipelineError> {
+    if !url::Url::parse(target_url).is_ok_and(|url| url.origin() == *destination) {
+        return Err(refuse_external_grant(ctx, DelegationRefusal::Unavailable, "forward_outside_the_grants_origin"));
+    }
+    crate::egress::pinned_vendor_client(
+        target_url,
+        timeout,
+        state
+            .egress_allowlist
+            .as_deref(),
+    )
+    .await
+    .map_err(|error| {
+        warn!(
+            target: "credential_delegation",
+            request_id = %ctx.request_id,
+            error = ?error.to_string(),
+            "The target of a request carrying a grant by binding was refused by Strict egress"
+        );
+        refuse_external_grant(ctx, DelegationRefusal::Unavailable, "forward_refused_by_strict_egress")
+    })
 }
 
 /// The headers a Fabric forward carries, built by [`transit_request_headers`]:
@@ -5213,10 +5267,13 @@ async fn step_forward_request_http(
     // window between vetting and connect and returning an upstream 3xx to the
     // caller rather than following it to an unvetted `Location`. Loopback and
     // RFC 1918 stay allowed on purpose — a transit point legitimately targets a
-    // localhost sidecar or same-VPC host.
+    // localhost sidecar or same-VPC host. A request carrying a grant by binding
+    // is held to its grant's origin under the Strict policy instead.
     let candidate = target_url.clone();
     let forward_timeout = resolve_outbound_timeout(ctx);
-    let forward_client =
+    let forward_client = if let Some(destination) = ctx.grant_destination.clone() {
+        grant_forward_client(state, ctx, &target_url, &destination, forward_timeout).await?
+    } else {
         match tokio::task::spawn_blocking(move || crate::egress::pinned_forward_client(&candidate, forward_timeout))
             .await
         {
@@ -5229,7 +5286,8 @@ async fn step_forward_request_http(
                 warn!(request_id = %ctx.request_id, target = %target_url, "SSRF egress validation task failed: {}", e);
                 return Err(OutboundPipelineError::TargetAuthUnavailable);
             }
-        };
+        }
+    };
 
     debug!(
         request_id = %ctx.request_id,
@@ -6403,6 +6461,7 @@ mod tests {
             original_method: Method::POST,
             original_headers: HeaderMap::new(),
             delegated_credential_headers: HeaderMap::new(),
+            grant_destination: None,
             request_path: "/outbound/surfaces/order/partner-a/message/send".to_string(),
             resolved_identity: ProtectedAgentIdentity::Anonymous,
             protocol: None,
@@ -6466,6 +6525,7 @@ mod tests {
             gateway_base_url: None,
             task_monitor: None,
             max_response_bytes: crate::config::A2aConfig::default().max_body_size,
+            egress_allowlist: None,
             vc_alias_override: None,
         }
     }
@@ -14162,15 +14222,17 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        for (id, tenant, issuer) in [
-            ("vendor", None, Some("https://203.0.113.10")),
-            ("vendor-tenant-b", Some("tenant-b"), Some("https://203.0.113.10")),
-            ("agent-keyed", None, None),
+        for (id, tenant, issuer, resource) in [
+            ("vendor", None, Some("https://203.0.113.10"), Some("https://vendor.example/mcp")),
+            ("vendor-tenant-b", Some("tenant-b"), Some("https://203.0.113.10"), Some("https://vendor.example/mcp")),
+            ("vendor-private", None, Some("https://203.0.113.10"), Some("https://10.0.0.5/mcp")),
+            ("agent-keyed", None, None, None),
         ] {
             providers
                 .create(
                     serde_json::from_value(json!({
                         "id": id, "tenant_id": tenant, "name": id, "provider_id": id, "issuer": issuer,
+                        "resource": resource,
                         "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
                     }))
                     .unwrap(),
@@ -14218,9 +14280,18 @@ mod tests {
         hop: &str,
         caller_hash: Option<&str>,
     ) -> OutboundPipelineContext {
+        external_grant_variant_context(surface, None, hop, caller_hash)
+    }
+
+    fn external_grant_variant_context(
+        surface: &crate::config::agent_surface::AgentSurface,
+        variant: Option<&str>,
+        hop: &str,
+        caller_hash: Option<&str>,
+    ) -> OutboundPipelineContext {
         let resolved = Arc::new(
             surface
-                .resolve_variant(None)
+                .resolve_variant(variant)
                 .unwrap(),
         );
         let point = resolved
@@ -14496,15 +14567,41 @@ mod tests {
     async fn the_vendor_receives_only_its_bindings_grant_in_place_of_the_agents_authorization() {
         use crate::delegation_vault::grants::GrantKey;
         let directory = tempfile::tempdir().unwrap();
-        let state = external_grant_state(directory.path(), true).await;
+        let mut state = external_grant_state(directory.path(), true).await;
         let target = crate::component_tests::helpers::RecordingTarget::start(StatusCode::OK, &[]).await;
+        state
+            .credential_provider_store
+            .as_ref()
+            .unwrap()
+            .create(
+                serde_json::from_value(json!({
+                    "id": "vendor-fixture", "name": "vendor-fixture", "provider_id": "vendor-fixture",
+                    "issuer": "https://203.0.113.10", "resource": target.url,
+                    "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        state.egress_allowlist = Some(
+            url::Url::parse(&target.url)
+                .unwrap()
+                .origin()
+                .ascii_serialization(),
+        );
         let point = |id: &str| {
-            let mut point = vendor_transit_point(id, "vendor", "owner");
+            let mut point = vendor_transit_point(id, "vendor-fixture", "owner");
             point["target_endpoint"] = json!(target.url);
             point
         };
         let surface = transit_surface(json!([point(VENDOR_HOP), point("unconnected-hop")]), json!([]));
-        store_grant(&state, GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "vendor"), "vendor-access", 3600).await;
+        store_grant(
+            &state,
+            GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "vendor-fixture"),
+            "vendor-access",
+            3600,
+        )
+        .await;
         let caller = "a".repeat(64);
 
         let mut ctx = with_agent_supplied_credentials(external_grant_context(&surface, VENDOR_HOP, Some(&caller)));
@@ -14527,6 +14624,173 @@ mod tests {
                 .is_err()
         );
         assert_eq!(target.received().len(), 1, "the refused call never reaches the target");
+
+        state.egress_allowlist = None;
+        let mut unlisted = with_agent_supplied_credentials(external_grant_context(&surface, VENDOR_HOP, Some(&caller)));
+        assert!(
+            step_inject_credentials(&state, &mut unlisted)
+                .await
+                .is_err(),
+            "an http loopback target is a vendor only for the test allow-list"
+        );
+        assert_eq!(bearer(&unlisted), None);
+        assert_eq!(target.received().len(), 1);
+    }
+
+    /// A grant by binding goes only to its provider's `resource` origin over
+    /// public `https`: a Transit Point repointed elsewhere, a variant reusing
+    /// its id with another target, an `http` target, a private address and a
+    /// Fabric route never receive it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grant_by_binding_is_sent_only_to_its_providers_resource() {
+        use crate::delegation_vault::grants::GrantKey;
+        let directory = tempfile::tempdir().unwrap();
+        let state = external_grant_state(directory.path(), true).await;
+        let caller = "a".repeat(64);
+        for provider in ["vendor", "vendor-private"] {
+            store_grant(&state, GrantKey::owner(None, "transit-fabric", VENDOR_HOP, provider), "owner-access", 3600)
+                .await;
+        }
+        let at = |target: &str, provider: &str| {
+            let mut point = vendor_transit_point(VENDOR_HOP, provider, "owner");
+            point["target_endpoint"] = json!(target);
+            point
+        };
+        let reaches = transit_surface(json!([at("https://vendor.example/other", "vendor")]), json!([]));
+        let mut ctx = external_grant_context(&reaches, VENDOR_HOP, Some(&caller));
+        step_inject_credentials(&state, &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(bearer(&ctx).as_deref(), Some("Bearer owner-access"), "any path of the resource's origin");
+        assert_eq!(
+            ctx.grant_destination,
+            Some(
+                url::Url::parse("https://vendor.example")
+                    .unwrap()
+                    .origin()
+            )
+        );
+
+        let variant = transit_surface(
+            json!([at("https://vendor.example/mcp", "vendor")]),
+            json!([{"id": "v-1", "alias": "candidate", "name": "candidate", "enabled": true,
+                "overrides": {"transit": {"points": [at("https://attacker.example/mcp", "vendor")]}}}]),
+        );
+        let mut fabric = at("fabric://gateway-b/channel", "vendor");
+        let withheld = transit_surface(json!([fabric.clone()]), json!([]));
+        let mut ctx = external_grant_context(&withheld, VENDOR_HOP, Some(&caller));
+        step_inject_credentials(&state, &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(bearer(&ctx), None, "a Fabric route withholds delegated credentials");
+        fabric["fabric_delegated_credentials"] = json!(true);
+        for (case, surface, variant_alias) in [
+            (
+                "a repointed target",
+                transit_surface(json!([at("https://attacker.example/mcp", "vendor")]), json!([])),
+                None,
+            ),
+            ("a variant reusing the id", variant, Some("candidate")),
+            ("an http target", transit_surface(json!([at("http://vendor.example/mcp", "vendor")]), json!([])), None),
+            (
+                "a private address",
+                transit_surface(json!([at("https://10.0.0.5/mcp", "vendor-private")]), json!([])),
+                None,
+            ),
+            ("a Fabric route that sends delegated credentials", transit_surface(json!([fabric]), json!([])), None),
+        ] {
+            let mut ctx = external_grant_variant_context(&surface, variant_alias, VENDOR_HOP, Some(&caller));
+            let refused = step_inject_credentials(&state, &mut ctx)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{case} must be refused"));
+            assert!(
+                matches!(
+                    refused,
+                    OutboundPipelineError::DelegationRefused {
+                        refusal: DelegationRefusal::Unavailable,
+                        ..
+                    }
+                ),
+                "{case}: {refused:?}"
+            );
+            assert_eq!(bearer(&ctx), None, "{case}");
+            assert_eq!(ctx.grant_destination, None, "{case}");
+        }
+    }
+
+    /// The forward of a request that carries a grant by binding re-checks its
+    /// destination: only the grant's origin, through Strict pinned egress, and
+    /// never over Fabric.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_carrying_a_grant_is_forwarded_only_to_its_origin_through_strict_egress() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = external_grant_state(directory.path(), true).await;
+        let target = crate::component_tests::helpers::RecordingTarget::start(StatusCode::OK, &[]).await;
+        let origin = url::Url::parse(&target.url)
+            .unwrap()
+            .origin();
+        let at = |endpoint: &str| {
+            let mut point = vendor_transit_point(VENDOR_HOP, "vendor", "owner");
+            point["target_endpoint"] = json!(endpoint);
+            transit_surface(json!([point]), json!([]))
+        };
+        let carrying = |surface: &crate::config::agent_surface::AgentSurface, destination: url::Origin| {
+            let mut ctx = external_grant_context(surface, VENDOR_HOP, Some(&"a".repeat(64)));
+            ctx.delegated_credential_headers
+                .insert(
+                    axum::http::header::AUTHORIZATION,
+                    "Bearer owner-access"
+                        .parse()
+                        .unwrap(),
+                );
+            ctx.grant_destination = Some(destination);
+            ctx
+        };
+
+        let mut unlisted = carrying(&at(&target.url), origin.clone());
+        assert!(
+            step_forward_request(&state, &mut unlisted)
+                .await
+                .is_err(),
+            "a loopback http target is refused by Strict egress"
+        );
+        let mut elsewhere = carrying(
+            &at(&target.url),
+            url::Url::parse("https://vendor.example")
+                .unwrap()
+                .origin(),
+        );
+        let mut listed_state = state.clone();
+        listed_state.egress_allowlist = Some(origin.ascii_serialization());
+        assert!(
+            step_forward_request(&listed_state, &mut elsewhere)
+                .await
+                .is_err(),
+            "a target outside the grant's origin is refused"
+        );
+        let mut fabric = carrying(&at("fabric://gateway-b/channel"), origin.clone());
+        let refused = step_forward_request(&listed_state, &mut fabric)
+            .await
+            .err()
+            .expect("a grant never crosses Fabric");
+        assert!(
+            matches!(
+                refused,
+                OutboundPipelineError::DelegationRefused {
+                    refusal: DelegationRefusal::Unavailable,
+                    ..
+                }
+            ),
+            "refused before any Fabric forward: {refused:?}"
+        );
+        assert!(target.received().is_empty(), "no refused forward reaches the target");
+
+        let mut listed = carrying(&at(&target.url), origin);
+        step_forward_request(&listed_state, &mut listed)
+            .await
+            .unwrap();
+        assert_eq!(target.received().len(), 1);
     }
 
     /// A caller the Transit Point's `source_auth` verified reaches only the

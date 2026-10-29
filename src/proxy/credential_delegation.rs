@@ -1797,6 +1797,7 @@ mod tests {
             revocation_endpoint: None,
             token_endpoint_auth_method: None,
             client_id: None,
+            allow_unadvertised_pkce: false,
         }
     }
 
