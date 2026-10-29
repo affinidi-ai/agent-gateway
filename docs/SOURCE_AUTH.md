@@ -93,8 +93,11 @@ invariant is written once in [`AGENTS.md`](../AGENTS.md#architecture); see
 A surface whose JWT verification strategy no longer exists, for example because it was deleted
 while the surface still references it, cannot authenticate any caller. The strategy is looked
 up only after a token is found, so a request with no token is still a missing credential,
-handled as above, while a request that presents one is refused with `500`. Deleting a strategy is not
-refused while a surface uses it; the dashboard asks for confirmation first and lists the
+handled as above, while a request that presents one is refused with `500`. The problem `detail`
+of that `500` is the fixed text `Caller authentication is unavailable` and names no strategy or
+certificate id, so a caller learns nothing about the surface's configuration; only the
+gateway's own log names the id, and the audit event records the reason `config_not_found`.
+Deleting a strategy is not refused while a surface uses it; the dashboard asks for confirmation first and lists the
 surfaces whose Access Point or Surface Variants reference it.
 
 ### JWT bearer signing keys
@@ -269,6 +272,10 @@ resource of the route called, so a token issued for the base route does not open
 an extra value in `audiences` is not accepted. A route that holds `$` or `%24` is refused with
 `400` on save, because it would claim another surface's variant URL.
 
+`GET /v1/surfaces/{id}/declarations` reports the outcome of the base route and of each enabled
+Surface Variant as `{"declarations", "warnings"}`, and every surface save returns the same two
+fields next to the surface; see [Surface save warnings](POLICY.md#surface-save-warnings).
+
 A declaring Access Point never sends the caller's token on, to the Target or over Fabric: it is
 the resource the token was issued for, so a Target would receive a token not meant for it. A strategy store failure while
 resolving a declaration that would otherwise declare answers `503` and never lets the caller
@@ -380,6 +387,97 @@ dropped schemes and whether it became `502`. Over the Fabric, the receiving gate
 or `403` reaches the sending gateway as a relayed challenge, so the caller gets `502` or a
 `403` without it. Every other Access Point passes the Target's challenges and status through
 unchanged, including one whose `jwt_bearer` method forwards the caller's own token.
+
+### Agent card preview
+
+When the card fetch fails, a caller gets no card and only a `502` or the agent's status. The
+Agent card preview shows an operator why, and what the gateway changes in a card it serves. It
+is the Agent Cards tab of the Surface Builder. It runs the base route's card assembly
+([`src/proxy/handler/agent_card.rs`](../src/proxy/handler/agent_card.rs)) as the card route does
+for an anonymous caller, so its `after` is the served card, but as an operator read: it reads
+the Target card with policy-context semantics only. It records no `RequestRejected` or
+`auth_failed` audit event, does not count as a caller request in any metric (including
+`agent_gateway_card_security_total`), writes no Trust Recorder entry and skips the x402 and MPP
+payment gate. An egress refusal is not recorded as a rejected request either. Target
+Authentication delegation events other than a rejected request are still written, because the
+gateway really used its credential.
+
+| Method | Path | Permission |
+| --- | --- | --- |
+| `GET` | `/api/v1/surfaces/{surface_id}/agent-card` | `surfaces.view` |
+| `POST` | `/api/v1/surfaces/{surface_id}/agent-card/refresh` | `surfaces.edit` |
+
+Both routes load the stored surface for the caller's tenant first: `404` when it is unknown or
+belongs to another tenant, so another tenant's card is never returned. A PAT with a resource
+pattern reaches only its own surface ids ([RBAC](RBAC.md#surface-declarations-and-agent-card-preview),
+[Access tokens](ACCESS_TOKENS.md#what-tenancy-does-not-partition)). They then preview the surface
+running on this replica. A failed fetch is data and answers `200`. `POST` takes no body and always
+fetches. `GET` answers from a snapshot under a minute old while the running surface is unchanged
+(a SHA-256 digest of the running surface, so a save or reload is never shown stale), otherwise it
+fetches. Concurrent requests for one surface share one fetch.
+
+Response fields:
+
+| Field | Value |
+| --- | --- |
+| `surface_id` | The surface id |
+| `supported`, `unsupported_reason` | `false` with `not_a2a` for a surface that is not A2A or AP2, or `not_running` when no listener on this replica runs it, or its base route serves no card because the default Surface Variant is missing or disabled; nothing is fetched and the fields below are `null`, `false` or `0`. Otherwise `true` |
+| `generated` | `true` for an `a2a-proxy://` Target; `before` and `source_url` are then `null` |
+| `served_url` | The public card URL of the base route (the Access Point origin and path with `/.well-known/agent-card.json`), `null` when no listener matches |
+| `source_url`, `source_url_query_hidden` | The card URL the gateway fetches, with user info, query and fragment removed; the flag is `true` when a query or user info was removed |
+| `fetched_at`, `cached` | When the snapshot was taken (RFC 3339); `cached` is `true` when no fetch ran for this request |
+| `fetch` | `{status, cause, http_status, duration_ms}`: `status` is `ok`, `failed` (no card obtained) or `not_served` (obtained, but the gateway will not serve it); `cause` is `null` exactly when `ok`; `http_status` is the agent's status for a status-derived cause |
+| `auth` | `{kind, result, provider_name, token_expires_at, failure}`: `kind` is `none`, `static_secret`, `credential_provider`, `credential_lookup` or `remote_gateway` (`fabric://`); `result` is `not_configured`, `sent`, `not_sent` or `failed`; `provider_name` and, for a gateway token, `token_expires_at` only when a provider credential was sent; `failure` is the Target Authentication category when `failed` |
+| `payment_required` | `true` when callers must pay before the card route answers |
+| `outcome` | The [declaration](PROTOCOLS.md#agent-card-security) the rewrite applied, in the shape `GET /declarations` reports; the base route's resolved declaration when the card was not processed |
+| `before`, `after` | The agent's card as parsed, and the card the route serves. A card over `display_limit_bytes` (256 KiB) is `null` |
+| `before_bytes`, `after_bytes` | Serialized sizes, set whenever the card exists |
+| `last_caller_fetch` | `{status, cause, http_status, at}` of the last card request a caller made on this replica since it started, on the URL without `$alias`; `null` when there is none |
+
+| `cause` | `status` | Raised when |
+| --- | --- | --- |
+| `needs_token` | `failed` | The agent answered `401` and no credential was sent |
+| `auth_failed` | `failed` | The `reject` fallback refused the fetch, or the agent answered `401` to the credential |
+| `forbidden` | `failed` | The agent answered `403` |
+| `not_found` | `failed` | The agent answered `404` or `410` |
+| `redirected` | `failed` | The agent answered `3xx` (the fetch never follows redirects) |
+| `upstream_error` | `failed` | Any other non-success status |
+| `unreachable` | `failed` | Connect, TLS or body read error, or a fabric forward error |
+| `timeout` | `failed` | The fetch or body read timed out, or the preview deadline passed |
+| `too_large` | `failed` | The body is over `[a2a] max_body_size` |
+| `invalid_card` | `failed` | The body is not a JSON object |
+| `blocked_by_egress` | `failed` | Egress policy refused the agent's address: its host does not resolve, or resolves to a cloud metadata address |
+| `proxy_unavailable` | `failed` | The A2A proxy is missing or disabled, or its store is unavailable |
+| `identity_failed` | `not_served` | Protected or external identity resolution, or identity credential injection, failed |
+| `rewrite_failed` | `not_served` | The endpoint or security rewrite failed |
+
+When the fetch fails, `after` still holds the last card the gateway served for the same
+running surface: the last card the base route served a caller, or the last successful preview,
+as the card route processed it. A card served before the surface last changed is never shown.
+`after` is `null` when no such card is kept, and `fetch` still reports the failure. The agent's
+own card (`before`) is `null` after a failed fetch.
+
+The preview never returns the upstream body of a failed fetch, any header sent or received, a
+token, an API key, a static secret, a secret id, a client id, a provider id, a resolved address
+or an error string: only the fixed values above and, when it parsed as a JSON object, the
+agent's card. The fetch carries only `Accept: application/json` and, when Target Authentication
+sends one, the Target credential; the management request's cookie and `Authorization` never
+reach the agent. The preview's own log line holds only the surface id, the cause and the
+duration; the fetch itself logs as the card route does, including the target URL at debug level
+and the transport error on a failed send or read.
+
+The fetch is the card route's own: pinned to the address the egress policy vetted, with or
+without a Target credential, never following redirects and bounded by `[a2a] max_body_size`,
+inside an overall deadline of `a2a.timeout_seconds + 5` seconds, at most
+60. It uses the shared gateway token cache like a caller, so a refresh never forces a new
+token ([Target Authentication](CREDENTIAL_DELEGATION.md#target-authentication-through-a-provider)).
+A user may start 10 fetches a minute across all surfaces on a replica (a `GET` counts only when
+it fetches). Past that, `GET` answers from a snapshot of the running surface with `cached: true`
+and otherwise, like `POST`, answers `429` `{"error": "Too many card refreshes; try again in a
+minute", "code": "rate_limited"}` with `Retry-After: 60`. Everything the preview keeps is per
+replica and in memory: snapshots and the last served card for 10 minutes, `last_caller_fetch`
+until the gateway restarts, each for up to 512 surfaces, and the limit. A served card over
+`display_limit_bytes` is kept by its size only.
 
 ### mTLS
 

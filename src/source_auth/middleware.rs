@@ -1750,7 +1750,38 @@ MC4CAQAwBQYDK2VwBCIEIPiOVQaSEcxl/NogGyUAX88ouBy1bWJFMp4gi0pcCgcY
             .authenticate(&config, &headers, "test-channel", "test-surface-id", None)
             .await;
         let err = result.expect_err("should fail");
-        assert!(matches!(err, SourceAuthError::ConfigNotFound { .. }), "expected ConfigNotFound, got: {err:?}");
+        assert!(
+            matches!(&err, SourceAuthError::ConfigNotFound { id } if id == "nonexistent-strategy"),
+            "expected ConfigNotFound, got: {err:?}"
+        );
+        assert!(!err.is_caller_attributable());
+        assert_eq!(err.to_string(), "Auth config not found: nonexistent-strategy");
+        assert_eq!(err.public_detail(), crate::source_auth::errors::CONFIG_NOT_FOUND_DETAIL);
+        assert!(
+            !err.public_detail()
+                .contains("nonexistent-strategy")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_without_a_token_is_a_missing_credential_even_when_the_strategy_is_gone() {
+        let (mw, _strategy_id, _server) = jwt_test_setup().await;
+        let config = SourceAuthConfig::JwtBearer(JwtBearerAuthConfig {
+            jwt_verification_strategy_id: "nonexistent-strategy".to_string(),
+            audiences: vec!["my-audience".to_string()],
+            ..Default::default()
+        });
+
+        let err = mw
+            .authenticate(&config, &HeaderMap::new(), "test-channel", "test-surface-id", None)
+            .await
+            .expect_err("no token");
+
+        assert!(matches!(err, SourceAuthError::MissingCredential { .. }), "expected MissingCredential, got: {err:?}");
+        assert!(
+            !err.public_detail()
+                .contains("nonexistent-strategy")
+        );
     }
 
     #[tokio::test]

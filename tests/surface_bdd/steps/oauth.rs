@@ -98,14 +98,16 @@ fn surface_has_policy_admitting_every_caller(world: &mut SurfaceWorld) {
 }
 
 #[given(expr = "managed agent {string} publishes a v1.0 agent card with its own security")]
-fn managed_agent_publishes_v1_card_with_security(
+async fn managed_agent_publishes_v1_card_with_security(
     world: &mut SurfaceWorld,
     agent_name: String,
 ) {
     world
         .actors
         .expect_target_kind(&agent_name, TargetActorKind::ManagedAgent);
-    world.set_primary_target_response(v1_card_with_security());
+    world
+        .change_primary_target_response(v1_card_with_security())
+        .await;
 }
 
 #[given(expr = "managed agent {string} publishes a v0.3 agent card with its own security")]

@@ -95,8 +95,8 @@ none carries a URL, host, issuer, token or provider name.
 | `agent_gateway_token_fetch_total` | `grant`: `client_credentials`, `jwt_bearer`, `unsupported` (a provider type the gateway never grants for). `result`: `ok`, `unsupported`, `secret_unavailable`, `forbidden`, `unavailable`, `invalid_response`, `assertion_failed` | Each gateway token request that was not answered from cache or held back by the retry backoff. `unavailable` covers an unreachable endpoint, a refused grant and a timeout; `assertion_failed` is a JWT bearer assertion that could not be signed |
 | `agent_gateway_jwks_fetch_total` | `result`: `ok`, `invalid_url`, `blocked`, `unreachable`, `http_error`, `too_large`, `invalid_document` | Each network fetch of a remote strategy's key set, successful or failed. A host that does not resolve counts as `blocked`. A cache hit, a static key set and the validate-jwks-uri probe are not counted |
 | `agent_gateway_discovery_total` | `result`: `ok`, `invalid_url`, `blocked`, `unreachable`, `http_status`, `too_large`, `invalid_document`, `issuer_mismatch` | Each authorization server metadata discovery, whether from a probe, a save or a re-discovery after an issuer change |
-| `agent_gateway_scope_denied_total` | `scheme`: the `auth_failed` scheme, `jwt` for a `jwt_bearer` method's [`required_scopes`](SOURCE_AUTH.md#required-scopes) (an MCP Access Point with `protected_resource` included) and `mcp_resource_token` for `mcp_http.authorization` | Each request whose caller token lacked a required scope, whether the gateway refused it or left the decision to policy. Counted whether or not a sink selects `auth_failed` |
-| `agent_gateway_card_security_total` | `outcome`: `declare`, `strip`, `pass_through`, `unservable`. `reason`: the [strip reason code](SOURCE_AUTH.md#declaring-an-access-point) for `strip` (`transit_point` for a Transit Point card), otherwise `none` | Each agent card an Access Point serves after rewriting it, and each Transit Point card whose security the gateway removes because its Access Point's cards are secured ([Agent card security](PROTOCOLS.md#agent-card-security)) |
+| `agent_gateway_scope_denied_total` | `scheme`: the `auth_failed` scheme, `jwt` for a `jwt_bearer` method's [`required_scopes`](SOURCE_AUTH.md#required-scopes) (an MCP Access Point with `protected_resource` included) and `mcp_resource_token` for `mcp_http.authorization` | Each request whose caller token lacked a required scope, whether the gateway refused it or left the decision to policy. Counted whether or not a sink selects `auth_failed`. An operator's card preview is not a caller request and is not counted |
+| `agent_gateway_card_security_total` | `outcome`: `declare`, `strip`, `pass_through`, `unservable`. `reason`: the [strip reason code](SOURCE_AUTH.md#declaring-an-access-point) for `strip` (`transit_point` for a Transit Point card), otherwise `none` | Each agent card an Access Point serves after rewriting it, and each Transit Point card whose security the gateway removes because its Access Point's cards are secured ([Agent card security](PROTOCOLS.md#agent-card-security)). An operator's [Agent card preview](SOURCE_AUTH.md#agent-card-preview) is not counted |
 
 Alert on `agent_gateway_token_fetch_total{result!="ok"}` and
 `agent_gateway_jwks_fetch_total{result!="ok"}` as a rate against their `ok` series: a gateway
@@ -191,6 +191,14 @@ entry with its `event` name, `label`, `description`, `group` and `group_label`, 
 
 **Request events.** Raised at the Access Point on the direct, MCP-proxy and fabric paths.
 Reasons are fixed codes; no record carries a credential, token or validator message.
+
+An operator's [Agent card preview](SOURCE_AUTH.md#agent-card-preview) records no
+`request_rejected` or `auth_failed` event and counts in no request metric, because it is not a
+caller's request. It still records the Target Authentication delegation events the gateway's own
+credential use produces, other than a rejected request. The last caller card fetch is kept per
+replica, in memory, until the gateway restarts (up to 512 surfaces). The last served card the
+preview falls back to is kept per replica, in memory, for 10 minutes, and only by its size when
+it is over the preview's 256 KiB display limit.
 
 - `auth_failed`: the caller failed authentication. `scheme` is `jwt`, `api_key`, `did_auth`,
   `mtls` or `mcp_resource_token`. `reason` is `missing_credential`, `invalid_credential`,

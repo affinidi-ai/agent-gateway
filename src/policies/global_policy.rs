@@ -409,6 +409,31 @@ impl GlobalPolicyManager {
             .unwrap_or(false)
     }
 
+    /// The verdict of a plane's appliance-wide set for a serialized input, without
+    /// failing closed. Monitor-only members never deny; a broken plane is undetermined.
+    pub fn verdict(
+        &self,
+        plane: &str,
+        input_json: &str,
+    ) -> super::PlaneVerdict {
+        let engines = self
+            .engines
+            .read()
+            .expect("engines lock poisoned");
+        let (Some(set), Some(query)) = (engines.get(plane), plane_query(plane)) else {
+            return super::PlaneVerdict::Allow;
+        };
+        if set.broken {
+            return super::PlaneVerdict::Undetermined;
+        }
+        super::PlaneVerdict::all(
+            set.policies
+                .iter()
+                .filter(|policy| !policy.monitor_only)
+                .map(|policy| super::PlaneVerdict::evaluate(policy.engine.clone(), &query, input_json)),
+        )
+    }
+
     /// Evaluate the appliance-wide set for a plane, deny-overrides. A monitor-only
     /// member that would deny is logged but does not block. A broken plane, or an
     /// enforced member that denies or errors, denies (fail-closed).
@@ -899,5 +924,59 @@ pub(crate) mod tests {
         assert!(manager.has_global(PLANE_GATEWAY));
         let d = manager.evaluate_global(PLANE_GATEWAY, &serde_json::json!({}));
         assert!(d.allow);
+    }
+
+    #[tokio::test]
+    async fn verdict_skips_monitor_only_members_and_marks_a_broken_plane_undetermined() {
+        use crate::policies::PlaneVerdict;
+        let deny = gw_def("deny", "package gateway.policy\ndefault allow = false");
+        let undefined = gw_def("undefined", "package gateway.policy\nallow if input.ok");
+        let store = store_with(vec![deny, undefined]).await;
+        let manager = GlobalPolicyManager::new();
+        manager.set_policy_definition_store(store);
+        let assign = |members: &[(&str, bool)]| {
+            let mut a = GlobalPolicyAssignments::default();
+            a.assignments.insert(
+                PLANE_GATEWAY.to_string(),
+                members
+                    .iter()
+                    .map(|(id, monitor_only)| GlobalAssignment {
+                        policy_id: id.to_string(),
+                        monitor_only: *monitor_only,
+                    })
+                    .collect(),
+            );
+            a
+        };
+
+        assert_eq!(manager.verdict(PLANE_GATEWAY, "{}"), PlaneVerdict::Allow);
+        manager
+            .refresh(&assign(&[("deny", false)]))
+            .await;
+        assert_eq!(manager.verdict(PLANE_GATEWAY, "{}"), PlaneVerdict::Deny);
+        assert_eq!(manager.verdict(PLANE_AGENT_SURFACE, "{}"), PlaneVerdict::Allow);
+        manager
+            .refresh(&assign(&[("deny", true)]))
+            .await;
+        assert_eq!(manager.verdict(PLANE_GATEWAY, "{}"), PlaneVerdict::Allow);
+        manager
+            .refresh(&assign(&[("undefined", false)]))
+            .await;
+        assert_eq!(manager.verdict(PLANE_GATEWAY, "{}"), PlaneVerdict::Undetermined);
+        assert_eq!(manager.verdict(PLANE_GATEWAY, r#"{"ok": true}"#), PlaneVerdict::Allow);
+        manager
+            .refresh(&assign(&[("undefined", false), ("deny", false)]))
+            .await;
+        assert_eq!(manager.verdict(PLANE_GATEWAY, "{}"), PlaneVerdict::Deny);
+        manager
+            .refresh(&assign(&[("gone", false)]))
+            .await;
+        assert_eq!(manager.verdict(PLANE_GATEWAY, "{}"), PlaneVerdict::Undetermined);
+        assert!(
+            !manager
+                .evaluate_global(PLANE_GATEWAY, &serde_json::json!({}))
+                .allow,
+            "the request path still fails closed on a broken plane"
+        );
     }
 }

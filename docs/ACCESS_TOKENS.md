@@ -223,8 +223,10 @@ non-empty subset of its own scopes.
 
 Resource-scoped PAT routing is fail-closed for unknown nested tenant-resource
 paths: only an audited allowlist of handler-enforced actions may proceed. A surface's
-`trust-recorder-status` read (`surfaces.view`) is checked against the surface id in the path, so a
-resource-scoped PAT reaches it only for its own surfaces. Mediator
+`declarations`, `agent-card` and `trust-recorder-status` reads (`surfaces.view`) and its
+`agent-card/refresh` POST (`surfaces.edit`) are checked against the surface id in the path, so a
+resource-scoped PAT reaches them only for its own surfaces, and a surface of another tenant
+answers `404`. Mediator
 trust-ping, Issuer Trust Registry retry, and Trust Registry record-list/reconnect
 enforce owning-record tenancy plus canonical scope; Trust Registry
 list/get/action routes also carry explicit feature guards. Tenant-ownership

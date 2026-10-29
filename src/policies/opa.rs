@@ -167,6 +167,14 @@ impl OpaEngine {
         }
     }
 
+    /// The surface-plane verdict for a serialized input, without failing closed.
+    pub fn verdict(
+        &self,
+        input_json: &str,
+    ) -> super::PlaneVerdict {
+        super::PlaneVerdict::evaluate(self.clone_engine(), &format!("{SURFACE_POLICY_BASE}.allow"), input_json)
+    }
+
     /// Evaluate and filter MCP tools based on policy.
     /// Each tool is evaluated on an independent engine clone — no serialization.
     ///
@@ -289,6 +297,30 @@ allow if {
             .evaluate(input)
             .unwrap();
         assert!(decision.allow);
+    }
+
+    #[test]
+    fn test_opa_verdict_keeps_an_undefined_allow_apart_from_a_deny() {
+        use crate::policies::PlaneVerdict;
+        let engine = OpaEngine::new();
+        engine
+            .load_policy("test", "package surface.policy\nallow if input.ok\nallow := false if input.blocked\n")
+            .unwrap();
+
+        assert_eq!(engine.verdict(r#"{"ok": true}"#), PlaneVerdict::Allow);
+        assert_eq!(engine.verdict(r#"{"blocked": true}"#), PlaneVerdict::Deny);
+        assert_eq!(engine.verdict("{}"), PlaneVerdict::Undetermined);
+        assert!(
+            !engine
+                .evaluate(serde_json::json!({}))
+                .is_ok_and(|decision| decision.allow),
+            "the request path never admits an undefined allow"
+        );
+    }
+
+    #[test]
+    fn test_opa_verdict_without_a_loaded_policy_is_undetermined() {
+        assert_eq!(OpaEngine::new().verdict("{}"), crate::policies::PlaneVerdict::Undetermined);
     }
 
     #[test]

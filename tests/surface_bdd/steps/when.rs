@@ -519,7 +519,7 @@ fn record_caller_response(
     });
 }
 
-fn record_admin_response(
+pub(crate) fn record_admin_response(
     world: &mut SurfaceWorld,
     response: crate::world::RecordedResponse,
 ) {

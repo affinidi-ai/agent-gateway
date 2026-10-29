@@ -146,7 +146,7 @@ The bootstrap file. Startup only; changes need a restart.
 | `[mcp]` | Default MCP revision, validation, timeouts, SSE and stdio transports. Gateway-originated `2026-07-28` consent needs `[mcp.continuations]`; see [`MCP_METADATA.md`](MCP_METADATA.md#protected-continuations). |
 | `[reconnect_policy]` | Backoff for DIDComm connection points |
 | `[oob_connection]` | How long an out-of-band pairing invitation stays pending |
-| `[a2a]` | Default A2A revision, body size, timeouts, fabric timeouts and envelope lifetime, inbound cache sizing |
+| `[a2a]` | Default A2A revision, body size, timeouts, fabric timeouts and envelope lifetime, inbound cache sizing. The body size and `timeout_seconds` also bound the [Agent card preview](SOURCE_AUTH.md#agent-card-preview) fetch. |
 | `[logging]` | Level, JSON output, log directory |
 | `[extension_inspection]` | Whether to parse A2A extensions, and which URIs to watch |
 

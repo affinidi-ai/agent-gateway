@@ -26,7 +26,10 @@ pub enum SourceAuthError {
     #[error("Insufficient scope: missing {}", .missing.join(" "))]
     InsufficientScope { missing: Vec<String> },
 
-    /// The referenced authentication configuration was not found.
+    /// The referenced authentication configuration was not found, for example a
+    /// JWT verification strategy or trust certificate that was deleted while a
+    /// surface still references it. The id is for the gateway log only; callers
+    /// get [`CONFIG_NOT_FOUND_DETAIL`], which names nothing.
     #[error("Auth config not found: {id}")]
     ConfigNotFound { id: String },
 
@@ -66,6 +69,9 @@ impl From<JwtBearerError> for SourceAuthError {
         }
     }
 }
+
+/// The `detail` a caller gets for [`SourceAuthError::ConfigNotFound`].
+pub const CONFIG_NOT_FOUND_DETAIL: &str = "Caller authentication is unavailable";
 
 /// Why a caller's credential failed, published to policy as `input.source_auth.kind`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -115,6 +121,15 @@ impl SourceAuthError {
             _ => "Internal Server Error",
         }
     }
+
+    /// The `detail` a caller sees. A missing configuration gets a fixed text,
+    /// because its message names a strategy or certificate id.
+    pub fn public_detail(&self) -> String {
+        match self {
+            SourceAuthError::ConfigNotFound { .. } => CONFIG_NOT_FOUND_DETAIL.to_string(),
+            _ => self.to_string(),
+        }
+    }
 }
 
 /// Result alias for source authentication operations.
@@ -124,7 +139,8 @@ pub type SourceAuthResult<T> = Result<T, SourceAuthError>;
 /// failure. A missing or invalid credential maps to **401 Unauthorized** and a
 /// scope shortfall to **403 Forbidden**; server-side failures (config not found, internal) map
 /// to **500 Internal Server Error** — a 401 would misrepresent a server-side
-/// problem as the caller's fault. Note: caller-attributable failures are
+/// problem as the caller's fault. The body's `detail` is
+/// [`SourceAuthError::public_detail`], so a missing configuration names no id. Note: caller-attributable failures are
 /// normally handed to the policy layer rather than blocked, so in practice this
 /// builder is reached for server-side (500) failures.
 ///
@@ -143,7 +159,7 @@ pub fn deny_response(
     auth_config: &SourceAuthConfig,
     error: &SourceAuthError,
 ) -> Response {
-    let detail = error.to_string();
+    let detail = error.public_detail();
     let status = error.http_status();
     let title = error.problem_title();
     // Only a genuine 401 warrants a `WWW-Authenticate` challenge; a 403 or 500
@@ -403,18 +419,69 @@ mod tests {
         }
     }
 
+    #[test]
+    fn public_detail_is_exact_for_every_variant_and_names_no_config_id() {
+        for (err, public) in [
+            (SourceAuthError::MissingCredential { reason: "no token".into() }, "Missing credential: no token"),
+            (SourceAuthError::InvalidCredential { reason: "expired".into() }, "Invalid credential: expired"),
+            (
+                SourceAuthError::InsufficientScope {
+                    missing: vec!["a2a:invoke".into()],
+                },
+                "Insufficient scope: missing a2a:invoke",
+            ),
+            (SourceAuthError::ConfigNotFound { id: "strategy-7f3a".into() }, "Caller authentication is unavailable"),
+            (
+                SourceAuthError::Internal {
+                    reason: "jwks fetch failed".into(),
+                },
+                "Internal source auth error: jwks fetch failed",
+            ),
+        ] {
+            assert_eq!(err.public_detail(), public);
+            assert!(
+                !err.public_detail()
+                    .contains("strategy-7f3a")
+            );
+        }
+    }
+
+    #[test]
+    fn config_not_found_keeps_the_id_in_its_log_message_only() {
+        let err = SourceAuthError::ConfigNotFound { id: "cert-91c2".into() };
+        assert_eq!(err.to_string(), "Auth config not found: cert-91c2");
+        assert_eq!(err.public_detail(), CONFIG_NOT_FOUND_DETAIL);
+    }
+
     #[tokio::test]
-    async fn mcp_config_not_found_is_500_without_challenge() {
-        let err = SourceAuthError::ConfigNotFound { id: "missing".into() };
-        let resp = deny_response(&SurfaceProtocol::Mcp, &jwt_config(), &err);
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(
-            resp.headers()
-                .get("www-authenticate")
-                .is_none()
-        );
-        let body = body_json(resp).await;
-        assert_eq!(body["status"], 500);
-        assert_eq!(body["title"], "Internal Server Error");
+    async fn config_not_found_is_500_without_challenge_or_id() {
+        for (protocol, problem_type) in [
+            (SurfaceProtocol::Mcp, "about:blank"),
+            (SurfaceProtocol::A2a, "https://a2a-protocol.org/errors/proxy-error"),
+        ] {
+            let err = SourceAuthError::ConfigNotFound { id: "strategy-7f3a".into() };
+            let resp = deny_response(&protocol, &jwt_config(), &err);
+            assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            assert!(
+                resp.headers()
+                    .get("www-authenticate")
+                    .is_none()
+            );
+            let body = body_json(resp).await;
+            assert_eq!(
+                body,
+                serde_json::json!({
+                    "type": problem_type,
+                    "title": "Internal Server Error",
+                    "status": 500,
+                    "detail": "Caller authentication is unavailable",
+                })
+            );
+            assert!(
+                !body
+                    .to_string()
+                    .contains("strategy-7f3a")
+            );
+        }
     }
 }

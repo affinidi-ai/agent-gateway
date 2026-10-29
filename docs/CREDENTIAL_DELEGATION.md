@@ -263,6 +263,14 @@ The gateway's own agent card reads that attach Target Authentication are the car
 target-leg Trust Check, the managed agent name the dashboard shows, and the caller name read from a
 caller's DID document send no Target credential, so a protected card yields no card or name there.
 
+The [Agent card preview](SOURCE_AUTH.md#agent-card-preview) reads the card through the card
+route's own path, so it presents the same Target credential as the gateway, with the same
+fallback, and writes the same Target Authentication audit events, except that a refused
+credential records no rejected request, because no caller is answered. It reports the credential
+provider's name and, for a gateway token, the token's expiry, never the token, the provider id or
+a secret id. It takes the token from the shared gateway token cache exactly as a caller's card
+request would: a refresh never forces a new token.
+
 ### Gateway token cache
 
 Target Authentication tokens are held per replica in memory

@@ -185,3 +185,25 @@ pub struct SurfaceInfo {
     /// Pre-compiled engines for each virtual channel variant (keyed by variant_id)
     pub variant_engines: HashMap<String, VariantEngines>,
 }
+
+impl SurfaceInfo {
+    /// The channel-level engines the base route runs with.
+    pub fn base_engines(&self) -> VariantEngines {
+        VariantEngines {
+            identity_rules_engine: self
+                .identity_rules_engine
+                .clone(),
+            identity_selector: self.identity_selector.clone(),
+            protected_rules_engine: self
+                .protected_rules_engine
+                .clone(),
+            protected_selector: self
+                .protected_selector
+                .clone(),
+            external_rules_engine: self
+                .external_rules_engine
+                .clone(),
+            external_selector: self.external_selector.clone(),
+        }
+    }
+}

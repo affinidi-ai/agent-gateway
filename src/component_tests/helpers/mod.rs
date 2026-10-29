@@ -4,6 +4,7 @@
 //! lightweight axum mock target server and exposes the channel listen address for
 //! test assertions.
 
+pub(crate) mod admin_api;
 pub(crate) mod audit_events;
 pub(crate) mod card_security;
 pub(crate) mod formatted_logs;

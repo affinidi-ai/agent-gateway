@@ -1908,6 +1908,32 @@ impl SurfaceTaskManager {
     }
 }
 
+impl SurfaceTaskManager {
+    /// The base-route state of a surface running on this replica, as a request on
+    /// its Access Point gets it. `None` when no listener here runs the surface.
+    pub async fn card_preview_state(
+        &self,
+        surface_id: &str,
+    ) -> Option<crate::state::ProxyState> {
+        let listeners: Vec<_> = self
+            .port_listener_states
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect();
+        for listener in listeners {
+            if let Some(state) = listener
+                .base_proxy_state(surface_id)
+                .await
+            {
+                return Some(state);
+            }
+        }
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::config::agent_surface::AgentSurface;

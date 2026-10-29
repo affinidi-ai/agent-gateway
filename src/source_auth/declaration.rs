@@ -439,7 +439,7 @@ fn declare(
     if config.forward_header {
         return Err(StripReason::ForwardsCallerToken);
     }
-    let resource = derived_resource(surface, alias, network).ok_or(StripReason::NoAccessPointUrl)?;
+    let resource = access_point_resource_url(surface, alias, network).ok_or(StripReason::NoAccessPointUrl)?;
     if !config
         .audiences
         .contains(&resource)
@@ -458,7 +458,7 @@ fn declare(
 /// The resource a derived declaration names: the public origin of the Access
 /// Point's listener and its route, as a canonical HTTPS URL, with `$alias` for
 /// a variant.
-fn derived_resource(
+pub fn access_point_resource_url(
     surface: &AgentSurface,
     alias: Option<&str>,
     network: &NetworkConfig,

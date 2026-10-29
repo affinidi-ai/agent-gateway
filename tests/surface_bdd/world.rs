@@ -118,6 +118,8 @@ pub struct SurfaceWorld {
     pub operator_roles: HashMap<String, String>,
     pub operator_clients: HashMap<String, AdminApiClient>,
     pub human_clients: HashMap<String, Vec<AdminApiClient>>,
+    /// Management access tokens the operator issued, by tenant.
+    pub access_tokens: HashMap<String, String>,
     pub terms_enabled: bool,
     pub affinidi_cache_seeded: bool,
     pub affinidi_well_available: bool,
@@ -180,6 +182,7 @@ impl SurfaceWorld {
             operator_roles: HashMap::new(),
             operator_clients: HashMap::new(),
             human_clients: HashMap::new(),
+            access_tokens: HashMap::new(),
             terms_enabled: false,
             affinidi_cache_seeded: false,
             affinidi_well_available: true,
@@ -224,6 +227,22 @@ impl SurfaceWorld {
         self.collaborator_mut(PRIMARY_COLLABORATOR_KEY)
             .target
             .configured_response = response;
+    }
+
+    /// Sets the primary target's response, on its running mock as well once the
+    /// scenario gateway is up.
+    pub(crate) async fn change_primary_target_response(
+        &mut self,
+        response: impl Into<MockResponse>,
+    ) {
+        let response = response.into();
+        if let Some(infra) = self.infra.as_ref() {
+            infra
+                .mock
+                .set_response(response.clone())
+                .await;
+        }
+        self.set_primary_target_response(response);
     }
 
     pub(crate) fn set_secondary_target_response(

@@ -10,10 +10,13 @@ use serde::Serialize;
 use tracing::{debug, error, info, warn};
 
 use crate::audit::config_events::{ManagementActor, TargetAuthEntry, TargetAuthSet, target_auth_changed};
+use crate::auth_manager::middleware::AuthGuardOk;
 use crate::auth_manager::pat::{PatContext, PatDelegationContext, PatResourceScope};
 use crate::config::agent_surface::AgentSurface;
 use crate::identity::state::IdentityApiState;
+use crate::policies::failed_caller_dry_run::PolicyPlanes;
 use crate::surfaces::AgentSurfaceStore;
+use crate::surfaces::save_report::{ReportStores, SurfaceReport, SurfaceWarning, surface_report};
 use crate::tenancy::{
     PatTenantContext, ResourceKind, can_access, can_mutate, scope_allows_resource, tenant_for_create,
 };
@@ -580,7 +583,9 @@ fn convert_old_shape_body(surface: &mut AgentSurface) -> Result<(), SurfaceApiEr
 
 /// A JSON request body as `T`, rejected exactly as [`Json<T>`] would reject
 /// it, together with the JSON the client sent, so a handler can tell an absent
-/// field from an empty one.
+/// field from an empty one. A body that is a save response sent back has its
+/// `warnings` and `declarations` dropped first, from both; any other unknown
+/// field is still refused.
 pub struct JsonWithSent<T>(T, serde_json::Value);
 
 impl<S, T> axum::extract::FromRequest<S> for JsonWithSent<T>
@@ -598,14 +603,59 @@ where
         let bytes = axum::body::Bytes::from_request(request, state)
             .await
             .map_err(IntoResponse::into_response)?;
-        let mut typed = axum::extract::Request::new(axum::body::Body::from(bytes.clone()));
+        let mut sent = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        let bytes = if drop_save_report_fields(&mut sent) {
+            serde_json::to_vec(&sent).map_or(bytes, axum::body::Bytes::from)
+        } else {
+            bytes
+        };
+        let mut typed = axum::extract::Request::new(axum::body::Body::from(bytes));
         *typed.headers_mut() = headers;
         let Json(value) = Json::<T>::from_request(typed, state)
             .await
             .map_err(IntoResponse::into_response)?;
-        let sent = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
         Ok(Self(value, sent))
     }
+}
+
+/// A save response: the saved record plus the surface's `declarations` and
+/// `warnings`. A request that sends it back is accepted; see [`JsonWithSent`].
+#[derive(Debug, Serialize)]
+pub struct WithSaveReport<T> {
+    #[serde(flatten)]
+    body: T,
+    #[serde(flatten)]
+    report: SurfaceReport,
+}
+
+impl<T> WithSaveReport<T> {
+    fn new(
+        body: T,
+        report: SurfaceReport,
+    ) -> Self {
+        Self { body, report }
+    }
+}
+
+/// The fields a save response adds to the record.
+const SAVE_REPORT_FIELDS: [&str; 2] = ["warnings", "declarations"];
+
+/// Drop the fields a save response adds from a JSON object. Returns whether
+/// any was there.
+fn drop_save_report_fields(value: &mut serde_json::Value) -> bool {
+    value
+        .as_object_mut()
+        .is_some_and(|object| {
+            SAVE_REPORT_FIELDS
+                .iter()
+                .filter(|field| {
+                    object
+                        .remove(**field)
+                        .is_some()
+                })
+                .count()
+                > 0
+        })
 }
 
 const PER_TRANSIT_POINT_REQUIRED: &str = "this surface uses the per-Transit-Point Trust Check shape; send \
@@ -1526,8 +1576,8 @@ pub async fn create_surface(
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
     actor: ManagementActor,
-    Json(mut surface): Json<AgentSurface>,
-) -> Result<(StatusCode, Json<AgentSurface>), SurfaceApiError> {
+    JsonWithSent(mut surface, _): JsonWithSent<AgentSurface>,
+) -> Result<(StatusCode, Json<WithSaveReport<AgentSurface>>), SurfaceApiError> {
     let store = state
         .agent_surface_store
         .as_ref()
@@ -1585,7 +1635,8 @@ pub async fn create_surface(
 
     apply_surface_change(&state, SurfaceChange::Upsert(&surface)).await;
 
-    Ok((StatusCode::CREATED, Json(surface)))
+    let report = save_report(&state, &surface).await;
+    Ok((StatusCode::CREATED, Json(WithSaveReport::new(surface, report))))
 }
 
 /// Whether `access_point` in a PUT body removes its discovery setting.
@@ -1635,7 +1686,7 @@ pub async fn update_surface(
     delegation: Option<Extension<PatDelegationContext>>,
     actor: ManagementActor,
     JsonWithSent(mut surface, sent): JsonWithSent<AgentSurface>,
-) -> Result<Json<AgentSurface>, SurfaceApiError> {
+) -> Result<Json<WithSaveReport<AgentSurface>>, SurfaceApiError> {
     let store = state
         .agent_surface_store
         .as_ref()
@@ -1667,10 +1718,11 @@ pub async fn update_surface(
     {
         surface.mcp_legacy_metadata_output = existing.mcp_legacy_metadata_output;
     }
-    retain_mcp_settings(&mut surface, &existing, &state.network_config, &ProtectedResourceRemovals::of(&sent))?;
+    let dropped =
+        retain_mcp_settings(&mut surface, &existing, &state.network_config, &ProtectedResourceRemovals::of(&sent))?;
     retain_a2a_settings(&mut surface, &existing);
 
-    let saved = validate_and_save_surface(
+    let (saved, mut report) = validate_and_save_surface(
         &state,
         store,
         surface,
@@ -1681,7 +1733,10 @@ pub async fn update_surface(
         &actor,
     )
     .await?;
-    Ok(Json(saved))
+    report
+        .warnings
+        .extend(dropped);
+    Ok(Json(WithSaveReport::new(saved, report)))
 }
 
 /// PUT carries the whole record, so an omitted `access_point.a2a` on an A2A or
@@ -1865,7 +1920,7 @@ fn retain_mcp_settings(
     existing: &AgentSurface,
     network: &crate::config::NetworkConfig,
     removals: &ProtectedResourceRemovals,
-) -> Result<(), SurfaceApiError> {
+) -> Result<Vec<SurfaceWarning>, SurfaceApiError> {
     retain_mcp_http(&mut surface.mcp_http, existing.mcp_http.as_ref());
     let base_retained = !removals.base
         && retain_protected_resource(
@@ -2000,18 +2055,19 @@ fn retain_protected_resource(
 /// A restored `protected_resource` the Access Point would no longer serve.
 /// When the setting itself no longer fits, after the dashboard switched the
 /// method, set `forward_header` or audiences, or moved the protocol off MCP, it
-/// is dropped with a warning: the client did not send it, and refusing the save
-/// over it would leave the client no way out. When it no longer fits the
-/// Access Point, for example after a route or listen address change, the save
-/// is refused instead: dropping it would leave the JWT Bearer method checking
-/// no audience, so the client must send a new resource or `null`. A setting
-/// sent in the request is validated and refused as usual.
+/// is dropped and the save report warns of it: the client did not send it, and
+/// refusing the save over it would leave the client no way out. When it no
+/// longer fits the Access Point, for example after a route or listen address
+/// change, the save is refused instead: dropping it would leave the JWT Bearer
+/// method checking no audience, so the client must send a new resource or
+/// `null`. A setting sent in the request is validated and refused as usual.
+/// Returns a warning for each setting dropped.
 fn settle_retained_protected_resources(
     surface: &mut AgentSurface,
     base_retained: bool,
     retained_aliases: &[String],
     network: &crate::config::NetworkConfig,
-) -> Result<(), SurfaceApiError> {
+) -> Result<Vec<SurfaceWarning>, SurfaceApiError> {
     // `true` drops the setting; a setting the Access Point cannot serve
     // refuses the save.
     let settle = |resolved: &AgentSurface, alias: Option<&str>| -> Result<bool, SurfaceApiError> {
@@ -2036,6 +2092,7 @@ fn settle_retained_protected_resources(
             _ => Ok(false),
         }
     };
+    let mut dropped = Vec::new();
     if base_retained
         && settle(surface, None)?
         && let Some(caller) = surface
@@ -2044,6 +2101,7 @@ fn settle_retained_protected_resources(
             .as_mut()
     {
         caller.protected_resource = None;
+        dropped.push(SurfaceWarning::protected_resource_dropped(None));
     }
     for alias in retained_aliases {
         // A disabled variant does not resolve and is not validated on save.
@@ -2068,9 +2126,10 @@ fn settle_retained_protected_resources(
                 })
         {
             caller.protected_resource = None;
+            dropped.push(SurfaceWarning::protected_resource_dropped(Some(alias)));
         }
     }
-    Ok(())
+    Ok(dropped)
 }
 
 /// The authorization servers an Access Point advertises (base and each enabled
@@ -2286,7 +2345,8 @@ fn record_target_auth_change(
 /// PATCH on `/v1/surfaces/{id}`. The caller is responsible for resolving
 /// `surface_id`/`existing` and asserting that the surface already exists
 /// (PUT/PATCH semantics differ from POST on first-write). Takes `surface`
-/// by value so it can be returned to the caller without a defensive clone.
+/// by value so it can be returned to the caller without a defensive clone,
+/// with the save report of the saved record.
 async fn validate_and_save_surface(
     state: &IdentityApiState,
     store: &std::sync::Arc<crate::surfaces::FileSystemAgentSurfaceStore>,
@@ -2296,7 +2356,7 @@ async fn validate_and_save_surface(
     scope: Option<&PatResourceScope>,
     resource_scoped: bool,
     actor: &ManagementActor,
-) -> Result<AgentSurface, SurfaceApiError> {
+) -> Result<(AgentSurface, SurfaceReport), SurfaceApiError> {
     validate_surface_for_save(state, store, &mut surface, existing, context, scope, resource_scoped).await?;
 
     surface.trust_check_split = surface.has_trust_check_lists();
@@ -2322,7 +2382,8 @@ async fn validate_and_save_surface(
 
     apply_surface_change(state, SurfaceChange::Upsert(&surface)).await;
 
-    Ok(surface)
+    let report = save_report(state, &surface).await;
+    Ok((surface, report))
 }
 
 /// Whether an edit added, removed or changed the entries of the surface's Trust Recorder.
@@ -2382,17 +2443,18 @@ pub async fn patch_surface(
     actor: ManagementActor,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
-) -> Result<Json<AgentSurface>, SurfaceApiError> {
+) -> Result<Json<WithSaveReport<AgentSurface>>, SurfaceApiError> {
     require_merge_patch_content_type(&headers)?;
 
     if body.is_empty() {
         return Err(SurfaceApiError::BadRequest("PATCH body must not be empty".to_string()));
     }
-    let patch: serde_json::Value = serde_json::from_slice(&body)
+    let mut patch: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| SurfaceApiError::BadRequest(format!("PATCH body is not valid JSON: {}", e)))?;
     if !patch.is_object() {
         return Err(SurfaceApiError::BadRequest("PATCH body must be a JSON object at the top level".to_string()));
     }
+    drop_save_report_fields(&mut patch);
 
     let (store, existing) = load_surface_or_404(
         &state,
@@ -2421,7 +2483,7 @@ pub async fn patch_surface(
         refuse_a2a_settings_sent_on_other_protocols(&surface)?;
     }
 
-    let saved = validate_and_save_surface(
+    let (saved, report) = validate_and_save_surface(
         &state,
         &store,
         surface,
@@ -2432,7 +2494,7 @@ pub async fn patch_surface(
         &actor,
     )
     .await?;
-    Ok(Json(saved))
+    Ok(Json(WithSaveReport::new(saved, report)))
 }
 
 /// `PATCH /v1/surfaces/{id}/variants/{variant_id}`
@@ -2453,7 +2515,7 @@ pub async fn patch_variant(
     actor: ManagementActor,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
-) -> Result<Json<AgentSurface>, SurfaceApiError> {
+) -> Result<Json<WithSaveReport<AgentSurface>>, SurfaceApiError> {
     require_merge_patch_content_type(&headers)?;
 
     if body.is_empty() {
@@ -2461,6 +2523,7 @@ pub async fn patch_variant(
     }
     let mut patch: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| SurfaceApiError::BadRequest(format!("PATCH body is not valid JSON: {}", e)))?;
+    drop_save_report_fields(&mut patch);
     let Some(patch_obj) = patch.as_object_mut() else {
         return Err(SurfaceApiError::BadRequest("PATCH body must be a JSON object at the top level".to_string()));
     };
@@ -2502,7 +2565,7 @@ pub async fn patch_variant(
     let mut surface = existing.clone();
     surface.variants[variant_index] = new_variant;
 
-    let saved = validate_and_save_surface(
+    let (saved, report) = validate_and_save_surface(
         &state,
         &store,
         surface,
@@ -2513,7 +2576,7 @@ pub async fn patch_variant(
         &actor,
     )
     .await?;
-    Ok(Json(saved))
+    Ok(Json(WithSaveReport::new(saved, report)))
 }
 
 /// Delete an agent surface (hard delete: removes from cache + filesystem).
@@ -2581,6 +2644,164 @@ pub async fn delete_surface(
 pub struct DeleteSurfaceResponse {
     pub success: bool,
     pub message: String,
+}
+
+/// The declarations and warnings of a surface, against the stores as they are now.
+async fn save_report(
+    state: &IdentityApiState,
+    surface: &AgentSurface,
+) -> SurfaceReport {
+    let stores = ReportStores {
+        strategies: state
+            .jwt_verification_strategy_store
+            .as_deref(),
+        network: &state.network_config,
+        planes: PolicyPlanes {
+            global: state
+                .global_policy_manager
+                .clone(),
+            gateway: state
+                .gateway_policy_manager
+                .clone(),
+            definitions: state
+                .policy_definition_store
+                .clone(),
+        },
+    };
+    surface_report(surface, &stores).await
+}
+
+/// `GET /v1/surfaces/{id}/declarations`
+///
+/// The surface's declarations and warnings, recomputed against the current
+/// strategies and policies, so a change to either since the last save shows.
+pub async fn get_surface_declarations(
+    Path(surface_id): Path<String>,
+    State(state): State<IdentityApiState>,
+    context: Option<Extension<PatTenantContext>>,
+    scope: Option<Extension<PatResourceScope>>,
+) -> Result<Json<SurfaceReport>, SurfaceApiError> {
+    let (_store, surface) =
+        load_surface_or_404(&state, &surface_id, tenant_context(&context), resource_scope(&scope), SurfaceAccess::Read)
+            .await?;
+    Ok(Json(save_report(&state, &surface).await))
+}
+
+/// `GET /v1/surfaces/{id}/agent-card`
+///
+/// The base route's agent card beside the agent's own card, with how the gateway's
+/// fetch went. A snapshot under a minute old of the same running surface answers
+/// without a fetch. Every fetch result is a `200`; past the per-user fetch limit
+/// with no snapshot of the running surface left to answer with, `429`.
+pub async fn get_surface_agent_card(
+    Path(surface_id): Path<String>,
+    State(state): State<IdentityApiState>,
+    context: Option<Extension<PatTenantContext>>,
+    scope: Option<Extension<PatResourceScope>>,
+    Extension(AuthGuardOk(user_id)): Extension<AuthGuardOk>,
+) -> Result<Response, SurfaceApiError> {
+    agent_card_preview(
+        &state,
+        &surface_id,
+        &CardPreviewCaller {
+            context: tenant_context(&context),
+            scope: resource_scope(&scope),
+            user_id: &user_id,
+        },
+        crate::proxy::card_preview::PreviewRequest::Read,
+    )
+    .await
+}
+
+/// `POST /v1/surfaces/{id}/agent-card/refresh`
+///
+/// Fetch the base route's agent card again, as [`get_surface_agent_card`] reports
+/// it. The request body is ignored. A concurrent request's fetch is shared; past the
+/// per-user fetch limit, `429`.
+pub async fn refresh_surface_agent_card(
+    Path(surface_id): Path<String>,
+    State(state): State<IdentityApiState>,
+    context: Option<Extension<PatTenantContext>>,
+    scope: Option<Extension<PatResourceScope>>,
+    Extension(AuthGuardOk(user_id)): Extension<AuthGuardOk>,
+) -> Result<Response, SurfaceApiError> {
+    agent_card_preview(
+        &state,
+        &surface_id,
+        &CardPreviewCaller {
+            context: tenant_context(&context),
+            scope: resource_scope(&scope),
+            user_id: &user_id,
+        },
+        crate::proxy::card_preview::PreviewRequest::Refresh,
+    )
+    .await
+}
+
+struct CardPreviewCaller<'a> {
+    context: Option<&'a PatTenantContext>,
+    scope: Option<&'a PatResourceScope>,
+    user_id: &'a str,
+}
+
+const CARD_REFRESH_LIMITED: &str = "Too many card refreshes; try again in a minute";
+
+/// The agent card preview of a surface the caller may read, or for a refresh,
+/// change. A surface of another tenant is `404`, never its card.
+async fn agent_card_preview(
+    state: &IdentityApiState,
+    surface_id: &str,
+    caller: &CardPreviewCaller<'_>,
+    request: crate::proxy::card_preview::PreviewRequest,
+) -> Result<Response, SurfaceApiError> {
+    use crate::proxy::card_preview::{
+        AgentCardPreview, PreviewKey, PreviewRequest, RateLimited, UnsupportedReason, card_preview_service,
+        fetch_preview, surface_digest,
+    };
+
+    let access = match request {
+        PreviewRequest::Read => SurfaceAccess::Read,
+        PreviewRequest::Refresh => SurfaceAccess::Mutate,
+    };
+    let (_store, surface) = load_surface_or_404(state, surface_id, caller.context, caller.scope, access).await?;
+    let unsupported = |reason| Ok(Json(AgentCardPreview::unsupported(&surface.surface_id, reason)).into_response());
+    if !surface.uses_a2a_settings() {
+        return unsupported(UnsupportedReason::NotA2a);
+    }
+    let Some(proxy_state) = state
+        .channel_manager
+        .card_preview_state(&surface.surface_id)
+        .await
+    else {
+        return unsupported(UnsupportedReason::NotRunning);
+    };
+    if !proxy_state
+        .surface
+        .uses_a2a_settings()
+    {
+        return unsupported(UnsupportedReason::NotA2a);
+    }
+
+    let key = PreviewKey {
+        surface_id: &surface.surface_id,
+        digest: surface_digest(&proxy_state.surface),
+        user_id: caller.user_id,
+    };
+    match card_preview_service()
+        .preview(&key, request, || fetch_preview(&proxy_state))
+        .await
+    {
+        Ok(preview) => Ok(Json(preview).into_response()),
+        Err(RateLimited) => {
+            warn!(surface_id = %surface.surface_id, "Agent card preview refused: fetch limit reached");
+            Ok((
+                StatusCode::TOO_MANY_REQUESTS,
+                [(axum::http::header::RETRY_AFTER, "60")],
+                Json(serde_json::json!({"error": CARD_REFRESH_LIMITED, "code": "rate_limited"})),
+            )
+                .into_response())
+        }
+    }
 }
 
 /// Action being applied to the running gateway after a surface mutation.
@@ -2982,7 +3203,7 @@ pub async fn create_variant(
     delegation: Option<Extension<PatDelegationContext>>,
     actor: ManagementActor,
     Json(body): Json<CreateVariantRequest>,
-) -> Result<(StatusCode, Json<SurfaceVariant>), SurfaceApiError> {
+) -> Result<(StatusCode, Json<WithSaveReport<SurfaceVariant>>), SurfaceApiError> {
     let (store, mut surface) = load_surface_or_404(
         &state,
         &surface_id,
@@ -3048,7 +3269,7 @@ pub async fn create_variant(
         .variants
         .push(new_variant.clone());
 
-    let saved = validate_and_save_surface(
+    let (saved, report) = validate_and_save_surface(
         &state,
         &store,
         surface,
@@ -3068,7 +3289,7 @@ pub async fn create_variant(
 
     info!("Created variant '{}' (id={}) on surface '{}'", new_variant.alias, new_variant.id, surface_id);
 
-    Ok((StatusCode::CREATED, Json(new_variant)))
+    Ok((StatusCode::CREATED, Json(WithSaveReport::new(new_variant, report))))
 }
 
 /// `PUT /v1/surfaces/{id}/variants/{variant_id}`
@@ -3085,7 +3306,7 @@ pub async fn update_variant(
     delegation: Option<Extension<PatDelegationContext>>,
     actor: ManagementActor,
     JsonWithSent(body, sent): JsonWithSent<UpdateVariantRequest>,
-) -> Result<Json<SurfaceVariant>, SurfaceApiError> {
+) -> Result<Json<WithSaveReport<SurfaceVariant>>, SurfaceApiError> {
     let (store, mut surface) = load_surface_or_404(
         &state,
         &surface_id,
@@ -3190,9 +3411,9 @@ pub async fn update_variant(
         }
         variant.overrides = overrides;
     }
-    settle_retained_protected_resources(&mut surface, false, &retained, &state.network_config)?;
+    let dropped = settle_retained_protected_resources(&mut surface, false, &retained, &state.network_config)?;
 
-    let saved = validate_and_save_surface(
+    let (saved, mut report) = validate_and_save_surface(
         &state,
         &store,
         surface,
@@ -3218,7 +3439,10 @@ pub async fn update_variant(
 
     info!("Updated variant '{}' (id={}) on surface '{}'", updated.alias, updated.id, surface_id);
 
-    Ok(Json(updated))
+    report
+        .warnings
+        .extend(dropped);
+    Ok(Json(WithSaveReport::new(updated, report)))
 }
 
 /// `DELETE /v1/surfaces/{id}/variants/{variant_id}`
@@ -3233,7 +3457,7 @@ pub async fn delete_variant(
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
     actor: ManagementActor,
-) -> Result<Json<DeleteSurfaceResponse>, SurfaceApiError> {
+) -> Result<Json<WithSaveReport<DeleteSurfaceResponse>>, SurfaceApiError> {
     let (store, mut surface) = load_surface_or_404(
         &state,
         &surface_id,
@@ -3270,7 +3494,7 @@ pub async fn delete_variant(
         .variants
         .remove(position);
 
-    validate_and_save_surface(
+    let (_, report) = validate_and_save_surface(
         &state,
         &store,
         surface,
@@ -3284,10 +3508,13 @@ pub async fn delete_variant(
 
     info!("Deleted variant '{}' (id={}) from surface '{}'", removed.alias, removed.id, surface_id);
 
-    Ok(Json(DeleteSurfaceResponse {
-        success: true,
-        message: format!("Variant '{}' deleted from surface '{}'", variant_id, surface_id),
-    }))
+    Ok(Json(WithSaveReport::new(
+        DeleteSurfaceResponse {
+            success: true,
+            message: format!("Variant '{}' deleted from surface '{}'", variant_id, surface_id),
+        },
+        report,
+    )))
 }
 
 /// `POST /v1/surfaces/{id}/variants/{variant_id}/promote-to-default`
@@ -3305,7 +3532,7 @@ pub async fn promote_variant_to_default(
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
     actor: ManagementActor,
-) -> Result<Json<AgentSurface>, SurfaceApiError> {
+) -> Result<Json<WithSaveReport<AgentSurface>>, SurfaceApiError> {
     let (store, mut surface) = load_surface_or_404(
         &state,
         &surface_id,
@@ -3334,7 +3561,7 @@ pub async fn promote_variant_to_default(
     let variant_alias = variant.alias.clone();
     surface.default_variant_id = Some(variant_id.clone());
 
-    let saved = validate_and_save_surface(
+    let (saved, report) = validate_and_save_surface(
         &state,
         &store,
         surface,
@@ -3348,7 +3575,7 @@ pub async fn promote_variant_to_default(
 
     info!("Promoted variant '{}' (id={}) to default on surface '{}'", variant_alias, variant_id, surface_id);
 
-    Ok(Json(saved))
+    Ok(Json(WithSaveReport::new(saved, report)))
 }
 
 /// `GET /v1/surfaces/{id}/variants/{alias}/resolved`
@@ -3503,9 +3730,11 @@ mod validation_tests {
             .access_point
             .caller_authentication = Some(caller_authentication(false));
         rewritten.variants = vec![variant(false)];
-        retain_mcp_settings(&mut rewritten, &existing, &discovery_network(), &ProtectedResourceRemovals::default())
-            .unwrap();
+        let kept =
+            retain_mcp_settings(&mut rewritten, &existing, &discovery_network(), &ProtectedResourceRemovals::default())
+                .unwrap();
         assert_eq!(stored_resource(&rewritten), (expected.clone(), expected.clone()));
+        assert!(kept.is_empty(), "a kept setting reports no warning: {kept:?}");
 
         // Removing caller authentication does not bring the setting back.
         let mut removed = mcp_surface();
@@ -3557,9 +3786,22 @@ mod validation_tests {
                 .as_mut()
                 .unwrap()
                 .caller_authentication = Some(changed);
-            retain_mcp_settings(&mut switched, &existing, &discovery_network(), &ProtectedResourceRemovals::default())
-                .unwrap();
+            let dropped = retain_mcp_settings(
+                &mut switched,
+                &existing,
+                &discovery_network(),
+                &ProtectedResourceRemovals::default(),
+            )
+            .unwrap();
             assert_eq!(stored_resource(&switched), (None, None), "{change}");
+            assert_eq!(
+                dropped,
+                vec![
+                    SurfaceWarning::protected_resource_dropped(None),
+                    SurfaceWarning::protected_resource_dropped(Some("beta")),
+                ],
+                "{change}"
+            );
         }
         // An edit that moves the Access Point off the resource, to another route
         // or a listener without its public origin, is refused: dropping the
@@ -6386,5 +6628,121 @@ mod tests {
         let mut after = surface_recording(&["tr-1"]);
         after.name = "renamed".into();
         assert!(!trust_recorder_changed(&before, &after));
+    }
+
+    fn stored_surface() -> AgentSurface {
+        serde_json::from_value(serde_json::json!({
+            "surface_id": "s-1", "name": "s-1",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/agent", "protocol": "a2a"},
+            "target": {"endpoint": "https://agent.example"}
+        }))
+        .unwrap()
+    }
+
+    fn sample_report() -> SurfaceReport {
+        SurfaceReport {
+            declarations: vec![crate::surfaces::save_report::DeclarationEntry {
+                variant: None,
+                outcome: "pass_through",
+                reason: None,
+                resource: Some("https://gateway.example/agent".into()),
+            }],
+            warnings: vec![SurfaceWarning::protected_resource_dropped(None)],
+        }
+    }
+
+    async fn read_body<T: serde::de::DeserializeOwned>(
+        body: serde_json::Value,
+        content_type: &str,
+    ) -> Result<JsonWithSent<T>, Response> {
+        use axum::extract::FromRequest;
+        let request = axum::http::Request::builder()
+            .method("PUT")
+            .header(axum::http::header::CONTENT_TYPE, content_type)
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        JsonWithSent::<T>::from_request(request, &()).await
+    }
+
+    #[test]
+    fn a_save_response_carries_the_record_beside_its_report() {
+        let response = serde_json::to_value(WithSaveReport::new(
+            DeleteSurfaceResponse {
+                success: true,
+                message: "deleted".into(),
+            },
+            sample_report(),
+        ))
+        .unwrap();
+        assert_eq!(
+            response,
+            serde_json::json!({
+                "success": true,
+                "message": "deleted",
+                "declarations": [{"variant": null, "outcome": "pass_through", "reason": null,
+                    "resource": "https://gateway.example/agent"}],
+                "warnings": [{"code": "protected_resource_dropped",
+                    "message": SurfaceWarning::protected_resource_dropped(None).message,
+                    "path": "access_point.caller_authentication.protected_resource", "variant": null}],
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_returned_save_response_is_accepted_as_the_next_put_body() {
+        let returned = serde_json::to_value(WithSaveReport::new(stored_surface(), sample_report())).unwrap();
+        assert!(
+            returned
+                .get("warnings")
+                .is_some()
+                && returned
+                    .get("declarations")
+                    .is_some()
+        );
+
+        let Ok(JsonWithSent(surface, sent)) = read_body::<AgentSurface>(returned, "application/json").await else {
+            panic!("a save response sent back must be accepted");
+        };
+        assert_eq!(surface.surface_id, "s-1");
+        assert_eq!(surface.access_point.route, "/agent");
+        assert_eq!(sent.get("warnings"), None);
+        assert_eq!(sent.get("declarations"), None);
+        assert_eq!(sent["name"], "s-1");
+    }
+
+    #[tokio::test]
+    async fn any_other_unknown_field_is_still_refused_as_json_would_refuse_it() {
+        let mut body = serde_json::to_value(WithSaveReport::new(stored_surface(), sample_report())).unwrap();
+        body["colour"] = serde_json::json!("red");
+        let Err(refused) = read_body::<AgentSurface>(body, "application/json").await else {
+            panic!("an unknown field must be refused");
+        };
+        assert_eq!(refused.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let text = String::from_utf8(
+            axum::body::to_bytes(refused.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(text.contains("unknown field `colour`"), "{text}");
+
+        let sent = serde_json::to_value(WithSaveReport::new(stored_surface(), sample_report())).unwrap();
+        let Err(wrong_type) = read_body::<AgentSurface>(sent, "text/plain").await else {
+            panic!("a body that is not JSON by content type must be refused");
+        };
+        assert_eq!(wrong_type.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[test]
+    fn only_the_report_fields_of_an_object_are_dropped() {
+        let mut response = serde_json::json!({"name": "s-1", "warnings": [], "declarations": [], "variants": []});
+        assert!(drop_save_report_fields(&mut response));
+        assert_eq!(response, serde_json::json!({"name": "s-1", "variants": []}));
+        assert!(!drop_save_report_fields(&mut response), "nothing left to drop");
+
+        let mut not_an_object = serde_json::json!(["warnings"]);
+        assert!(!drop_save_report_fields(&mut not_an_object));
+        assert_eq!(not_an_object, serde_json::json!(["warnings"]));
     }
 }

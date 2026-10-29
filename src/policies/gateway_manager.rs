@@ -365,6 +365,33 @@ impl GatewayPolicyManager {
         Ok((crate::policies::PolicyDecision { allow: true, reason: None }, first_evidence))
     }
 
+    /// The verdict of a gateway's policy set for a serialized input, without failing
+    /// closed. An enforced gateway with no compiled policy is undetermined.
+    pub fn verdict(
+        &self,
+        gateway_id: &str,
+        input_json: &str,
+    ) -> crate::policies::PlaneVerdict {
+        if !self.is_enforced(gateway_id) {
+            return crate::policies::PlaneVerdict::Allow;
+        }
+        let engines = self
+            .engines
+            .read()
+            .expect("engines lock poisoned");
+        match engines.get(gateway_id) {
+            Some(set) if !set.is_empty() => {
+                let query = format!("data.{}.allow", super::GATEWAY_POLICY_PACKAGE);
+                crate::policies::PlaneVerdict::all(
+                    set.iter().map(|member| {
+                        crate::policies::PlaneVerdict::evaluate(member.engine.clone(), &query, input_json)
+                    }),
+                )
+            }
+            _ => crate::policies::PlaneVerdict::Undetermined,
+        }
+    }
+
     /// Evaluate the gateway-level policy set, returning just the decision.
     /// Deny-overrides across the set; use [`Self::evaluate_with_evidence`] to
     /// also obtain the deciding revision's attestation evidence.
@@ -1030,5 +1057,66 @@ allow if {{
                 .unwrap(),
             "with the stale engine dropped, evaluation allows by default"
         );
+    }
+
+    async fn manager_with(policy: Option<&str>) -> GatewayPolicyManager {
+        let manager = GatewayPolicyManager::new();
+        let config = policy.map(|policy| GatewayOpaPolicyConfig {
+            enabled: true,
+            policy: policy.to_string(),
+            policy_definition_id: None,
+            ..Default::default()
+        });
+        manager
+            .update_gateway_policy(&create_test_gateway("gw-verdict", GatewayType::SelfGateway, config))
+            .await
+            .expect("policy compiles");
+        manager
+    }
+
+    #[tokio::test]
+    async fn test_verdict_separates_deny_from_an_undefined_decision() {
+        use crate::policies::PlaneVerdict;
+        let failed = r#"{"source_auth": {"method": "failed"}}"#;
+
+        let none = manager_with(None).await;
+        assert_eq!(none.verdict("gw-verdict", failed), PlaneVerdict::Allow);
+
+        let denies = manager_with(Some(
+            "package gateway.policy\ndefault allow := true\nallow := false if input.source_auth.method == \"failed\"\n",
+        ))
+        .await;
+        assert_eq!(denies.verdict("gw-verdict", failed), PlaneVerdict::Deny);
+        assert_eq!(denies.verdict("gw-verdict", "{}"), PlaneVerdict::Allow);
+        assert_eq!(denies.verdict("another-gateway", failed), PlaneVerdict::Allow, "an unenforced gateway allows");
+
+        let undefined =
+            manager_with(Some("package gateway.policy\nallow if input.source_auth.method == \"jwt_bearer\"\n")).await;
+        assert_eq!(undefined.verdict("gw-verdict", failed), PlaneVerdict::Undetermined);
+        assert!(
+            !undefined
+                .evaluate_policy("gw-verdict", serde_json::json!({"source_auth": {"method": "failed"}}))
+                .expect("evaluates"),
+            "the request path still fails closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_verdict_of_an_enforced_gateway_that_did_not_compile_is_undetermined() {
+        use crate::policies::PlaneVerdict;
+        let manager = GatewayPolicyManager::new();
+        let config = GatewayOpaPolicyConfig {
+            enabled: true,
+            policy: "package gateway.policy\nallow if {".to_string(),
+            policy_definition_id: None,
+            ..Default::default()
+        };
+        manager
+            .update_gateway_policy(&create_test_gateway("gw-broken", GatewayType::SelfGateway, Some(config)))
+            .await
+            .expect_err("the policy does not compile");
+
+        assert!(manager.is_enforced("gw-broken"));
+        assert_eq!(manager.verdict("gw-broken", "{}"), PlaneVerdict::Undetermined);
     }
 }

@@ -766,29 +766,10 @@ pub async fn handle_agent_card(
             .surface_id
             .as_str();
         let resource_url = "/.well-known/agent-card.json";
-        let empty_body: &[u8] = b""; // Agent card is a GET request
-
-        // A delegated (Model B) x402 policy has no local price/verify config to
-        // check here and is never routed through the delegation relay on this
-        // endpoint — skip it so an agent-card fetch isn't paywalled against an
-        // empty local challenge.
-        let x402_required = state
-            .surface
-            .x402_config()
-            .is_some_and(|p| p.enabled && p.provider != crate::config::types::X402Provider::AgentPay);
-        let mpp_required = state
-            .surface
-            .mpp_config()
-            .is_some_and(|p| {
-                crate::mpp::should_require_payment(
-                    p,
-                    &state
-                        .surface
-                        .channel_protocol(),
-                    empty_body,
-                    None,
-                )
-            });
+        let agent_card::CardPaymentGates {
+            x402: x402_required,
+            mpp: mpp_required,
+        } = agent_card::card_payment_gates(&state.surface);
 
         if x402_required || mpp_required {
             let payment_signature = crate::x402::extract_payment_signature(
@@ -9325,74 +9306,30 @@ async fn multi_channel_proxy_handler_in_request_scope(
             // per-variant field that `apply_variant_overrides` would
             // write, so `resolve_variant` returns an equivalent
             // surface.
-            let resolved_surface = {
-                let cache_lookup = ch
-                    .surface
-                    .config_id()
-                    .and_then(|sid| {
-                        state
-                            .resolved_surface_cache
-                            .resolve(sid, virtual_channel_alias.as_deref())
-                            .ok()
-                    });
-                if let Some(snap) = cache_lookup {
-                    snap
-                } else {
-                    match ch
-                        .surface
-                        .resolve_variant(virtual_channel_alias.as_deref())
-                    {
-                        Ok(s) => Arc::new(s),
-                        Err(e) => {
-                            error!(
-                                surface = %ch.surface.name,
-                                config_id = ?ch.surface.config_id(),
-                                requested_alias = ?virtual_channel_alias,
-                                error = %e,
-                                "❌ VARIANT RESOLVE FAILED on surface mirror"
-                            );
-                            return create_error_response(
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                "Failed to resolve virtual channel variant",
-                            );
-                        }
-                    }
+            let resolved_surface = match state.resolve_surface(ch, virtual_channel_alias.as_deref()) {
+                Ok(surface) => surface,
+                Err(e) => {
+                    error!(
+                        surface = %ch.surface.name,
+                        config_id = ?ch.surface.config_id(),
+                        requested_alias = ?virtual_channel_alias,
+                        error = %e,
+                        "❌ VARIANT RESOLVE FAILED on surface mirror"
+                    );
+                    return create_error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Failed to resolve virtual channel variant",
+                    );
                 }
             };
 
             // Select the correct engines. In base-mode (variant_id == None) we
             // use channel-level engines and resolve to the base surface.
             // Otherwise we use the pre-compiled per-variant engines.
-            let (
-                identity_rules_engine,
-                identity_selector,
-                protected_rules_engine,
-                protected_selector,
-                external_rules_engine,
-                external_selector,
-            ) = if let Some(ref vid) = variant_id {
+            let engines = if let Some(ref vid) = variant_id {
                 if let Some(variant_engines) = ch.variant_engines.get(vid) {
                     info!("✓ Using pre-compiled engines for variant '{}' on channel '{}'", vid, ch.surface.name);
-                    (
-                        variant_engines
-                            .identity_rules_engine
-                            .clone(),
-                        variant_engines
-                            .identity_selector
-                            .clone(),
-                        variant_engines
-                            .protected_rules_engine
-                            .clone(),
-                        variant_engines
-                            .protected_selector
-                            .clone(),
-                        variant_engines
-                            .external_rules_engine
-                            .clone(),
-                        variant_engines
-                            .external_selector
-                            .clone(),
-                    )
+                    variant_engines.clone()
                 } else {
                     error!(
                         surface = %ch.surface.name,
@@ -9408,17 +9345,7 @@ async fn multi_channel_proxy_handler_in_request_scope(
                 }
             } else {
                 info!("✓ Using channel-level engines (base-mode) for channel '{}'", ch.surface.name);
-                (
-                    ch.identity_rules_engine
-                        .clone(),
-                    ch.identity_selector.clone(),
-                    ch.protected_rules_engine
-                        .clone(),
-                    ch.protected_selector.clone(),
-                    ch.external_rules_engine
-                        .clone(),
-                    ch.external_selector.clone(),
-                )
+                ch.base_engines()
             };
 
             let access_point_declaration = resolve_access_point_declaration(
@@ -9433,75 +9360,17 @@ async fn multi_channel_proxy_handler_in_request_scope(
             let declares =
                 matches!(access_point_declaration, crate::source_auth::declaration::DeclarationOutcome::Declare(_));
 
-            // Create single-channel ProxyState for this request with effective channel and variant engines
-            let proxy_state = ProxyState {
-                config: state.config.clone(),
-                network_config: state.network_config.clone(),
-                client: state.client.clone(),
-                metrics_store: state.metrics_store.clone(),
-                identity_rules_engine,
-                identity_selector,
-                protected_rules_engine,
-                protected_selector,
-                external_rules_engine,
-                external_selector,
-                task_monitor: state.task_monitor.clone(),
-                task_id: Some(ch.task_id.clone()),
-                ws_state: state.ws_state.clone(),
-                listener_manager: state.listener_manager.clone(),
-                secrets_store: state.secrets_store.clone(),
-                certificates_store: state
-                    .certificates_store
-                    .clone(),
-                policy_manager: state.policy_manager.clone(),
-                gateway_policy_manager: state
-                    .gateway_policy_manager
-                    .clone(),
-                didauth_session_store: state
-                    .didauth_session_store
-                    .clone(),
-                transaction_store: state
-                    .transaction_store
-                    .clone(),
-                mpp_transaction_store: state
-                    .mpp_transaction_store
-                    .clone(),
-                trust_registry_listener_manager: state
-                    .trust_registry_listener_manager
-                    .clone(),
-                source_auth_middleware: state
-                    .source_auth_middleware
-                    .clone(),
-
-                #[cfg(feature = "didwebvh")]
-                didwebvh_identity_store: state
-                    .didwebvh_identity_store
-                    .clone(),
-
-                #[cfg(feature = "didwebvh")]
-                didwebvh_log_manager: state
-                    .didwebvh_log_manager
-                    .clone(),
-
-                credential_provider_store: state
-                    .credential_provider_store
-                    .clone(),
-                delegation_vault_store: state
-                    .delegation_vault_store
-                    .clone(),
-                gateway_base_url: state.gateway_base_url.clone(),
-                transit_token_issuer: state
-                    .transit_token_issuer
-                    .clone(),
-                mcp_proxy_store: state.mcp_proxy_store.clone(),
-                a2a_proxy_store: state.a2a_proxy_store.clone(),
-                vc_issuer: state.vc_issuer.clone(),
-                active_variant_alias: virtual_channel_alias.clone(),
-                active_variant_id: variant_id,
-                variant_resolution_error,
-                access_point_declaration: Some(Arc::new(access_point_declaration)),
-                surface: resolved_surface,
-            };
+            let proxy_state = state.proxy_state_for(
+                ch,
+                engines,
+                crate::state::ActiveVariant {
+                    alias: virtual_channel_alias.clone(),
+                    id: variant_id,
+                    resolution_error: variant_resolution_error,
+                },
+                resolved_surface,
+                access_point_declaration,
+            );
 
             // The route + optional `$alias` suffix have already been stripped
             // by `parse_route_with_variant` above; `stripped_tail` is the

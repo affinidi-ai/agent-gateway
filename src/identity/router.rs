@@ -705,6 +705,30 @@ pub fn create_identity_api_router(
                 )),
             )
             .route(
+                "/v1/surfaces/{surface_id}/declarations",
+                get(handlers::surfaces::get_surface_declarations).layer(require_feature(
+                    s.clone(),
+                    r.clone(),
+                    Feature::SurfacesView,
+                )),
+            )
+            .route(
+                "/v1/surfaces/{surface_id}/agent-card",
+                get(handlers::surfaces::get_surface_agent_card).layer(require_feature(
+                    s.clone(),
+                    r.clone(),
+                    Feature::SurfacesView,
+                )),
+            )
+            .route(
+                "/v1/surfaces/{surface_id}/agent-card/refresh",
+                post(handlers::surfaces::refresh_surface_agent_card).layer(require_feature(
+                    s.clone(),
+                    r.clone(),
+                    Feature::SurfacesEdit,
+                )),
+            )
+            .route(
                 "/v1/surfaces/{surface_id}/variants/{alias}/resolved",
                 get(handlers::get_resolved_variant).layer(require_feature(s.clone(), r.clone(), Feature::SurfacesView)),
             )

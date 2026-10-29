@@ -1,8 +1,8 @@
 //! The gateway's own reads of its surface's agent card from the Target: the card
-//! route behind `/.well-known/agent-card.json` and the receiving gateway's policy
-//! context. Both attach the surface's Target Authentication as the gateway itself,
-//! only at one of [`crate::proxy::paths::agent_card_urls`], with the surface's
-//! fallback applied.
+//! route behind `/.well-known/agent-card.json`, the operator's Agent card preview
+//! and the receiving gateway's policy context. Each attaches the surface's Target
+//! Authentication as the gateway itself, only at one of
+//! [`crate::proxy::paths::agent_card_urls`], with the surface's fallback applied.
 
 use std::time::Duration;
 
@@ -34,7 +34,8 @@ impl CardFetchRejected {
 pub(crate) enum CardRead {
     /// The card route, whose refusal answers the caller with a 502.
     AnswersCaller,
-    /// The gateway's policy-context read, whose refusal answers no caller.
+    /// A read whose refusal answers no caller: the gateway's policy context and the
+    /// operator's Agent card preview.
     PolicyContext,
 }
 

@@ -96,6 +96,19 @@ not `.view`, because each makes an outbound request on the caller's behalf; a vi
 a view-scoped token gets 403. See
 [`SOURCE_AUTH.md`](SOURCE_AUTH.md#authorization-server-discovery).
 
+## Surface declarations and Agent card preview
+
+`GET /v1/surfaces/{id}/declarations` and `GET /v1/surfaces/{id}/agent-card` need
+`surfaces.view`; `POST /v1/surfaces/{id}/agent-card/refresh` needs `surfaces.edit`, because it
+makes an outbound request to the agent on the caller's behalf. A viewer-only user or a
+view-scoped token gets `403` on the refresh. All three load the surface for the caller's tenant
+first, so a surface of another tenant answers `404` and its card is never returned, and a
+resource-scoped PAT reaches only its own surface ids
+([`ACCESS_TOKENS.md`](ACCESS_TOKENS.md#what-tenancy-does-not-partition)). The save report that
+surface writes return is covered by the write's own permission. See
+[`SOURCE_AUTH.md`](SOURCE_AUTH.md#agent-card-preview) and
+[`POLICY.md`](POLICY.md#surface-save-warnings).
+
 ## Integrations
 
 Every route under `/v1/integrations` needs one of `integrations.view` (lists, reads and the

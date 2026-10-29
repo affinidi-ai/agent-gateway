@@ -5,6 +5,7 @@ pub mod oauth;
 pub mod policy_changes;
 pub mod strategy_discovery;
 pub mod sts;
+pub mod surface_admin;
 pub mod target_token;
 pub mod terms;
 pub mod then;

@@ -1754,7 +1754,7 @@ fn a2a_surface_targeting_managed_agent(
 }
 
 #[given(expr = "managed agent {string} is failing with status {int}")]
-fn managed_agent_is_failing_with_status(
+async fn managed_agent_is_failing_with_status(
     world: &mut SurfaceWorld,
     agent_name: String,
     status: u16,
@@ -1771,7 +1771,9 @@ fn managed_agent_is_failing_with_status(
         }
     }));
     response.status = status;
-    world.set_primary_target_response(response);
+    world
+        .change_primary_target_response(response)
+        .await;
 }
 
 #[given(expr = "managed agent {string} responds with header {string} set to {string}")]
