@@ -2162,9 +2162,10 @@ fn retain_mcp_settings(
 /// PUT carries the whole record, or a variant PUT its whole overrides, but the
 /// Surface Builder shows neither a Transit Point's `source_auth` nor its
 /// `allow_unauthenticated_callers`, so a save from it omits both. An omitted
-/// `source_auth` means unchanged, as an
-/// omitted `mcp_http.authorization` does; removal is explicit, via a merge
-/// PATCH whose Transit Points leave it out. An omitted
+/// `source_auth` means unchanged, as an omitted `mcp_http.authorization` does;
+/// removal is explicit: a `null` `source_auth` in the PUT, or a merge PATCH
+/// whose Transit Points leave it out. The save rules then refuse a Transit
+/// Point left authenticating no caller. An omitted
 /// `allow_unauthenticated_callers` is kept while the Transit Point still
 /// authenticates no caller, and dropped once it does.
 fn retain_transit_caller_authentication(
@@ -2229,16 +2230,18 @@ fn retain_transit_points_caller_authentication(
         else {
             continue;
         };
-        if point.source_auth.is_none() {
+        let sent_point = sent_points.and_then(|points| points.get(index));
+        let removes_source_auth = sent_point
+            .and_then(|point| point.get("source_auth"))
+            .is_some_and(serde_json::Value::is_null);
+        if point.source_auth.is_none() && !removes_source_auth {
             point.source_auth = previous.source_auth.clone();
         }
-        let sends_open_flag = sent_points
-            .and_then(|points| points.get(index))
-            .is_some_and(|point| {
-                point
-                    .get("allow_unauthenticated_callers")
-                    .is_some()
-            });
+        let sends_open_flag = sent_point.is_some_and(|point| {
+            point
+                .get("allow_unauthenticated_callers")
+                .is_some()
+        });
         if !sends_open_flag && previous.allow_unauthenticated_callers && !point.authenticates_callers() {
             point.allow_unauthenticated_callers = true;
         }
@@ -4105,7 +4108,9 @@ mod validation_tests {
             { "id": "reopened", "alias": "reopened", "target_endpoint": "https://reopened.example",
                 "require_transit_token": false, "allow_unauthenticated_callers": true },
             { "id": "closed", "alias": "closed", "target_endpoint": "https://closed.example",
-                "require_transit_token": false, "allow_unauthenticated_callers": true }
+                "require_transit_token": false, "allow_unauthenticated_callers": true },
+            { "id": "removed", "alias": "removed", "target_endpoint": "https://removed.example",
+                "require_transit_token": true, "source_auth": caller_key() }
         ]);
         let existing = surface_with_transit_points(stored_points.clone(), stored_points);
         let sent_points = serde_json::json!([
@@ -4116,7 +4121,9 @@ mod validation_tests {
             { "id": "reopened", "alias": "reopened", "target_endpoint": "https://reopened.example",
                 "require_transit_token": true },
             { "id": "closed", "alias": "closed", "target_endpoint": "https://closed.example",
-                "require_transit_token": false, "allow_unauthenticated_callers": false }
+                "require_transit_token": false, "allow_unauthenticated_callers": false },
+            { "id": "removed", "alias": "removed", "target_endpoint": "https://removed.example",
+                "require_transit_token": true, "source_auth": null }
         ]);
         let sent = serde_json::json!({
             "transit": { "points": sent_points },
@@ -4144,6 +4151,7 @@ mod validation_tests {
             assert!(points[1].allow_unauthenticated_callers, "kept while it still authenticates no caller");
             assert!(!points[2].allow_unauthenticated_callers, "dropped once it authenticates its callers");
             assert!(!points[3].allow_unauthenticated_callers, "a false the caller sent is honoured");
+            assert_eq!(points[4].source_auth, None, "a null the caller sent removes it");
             for point in points {
                 assert_eq!(
                     point

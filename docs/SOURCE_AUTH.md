@@ -276,18 +276,20 @@ overrides, with `400`. A surface stored with it still loads, with a warning in t
 its Transit Points refuse every request with `503` in the same way.
 
 The Surface Builder shows neither a Transit Point's `source_auth` nor its
-`allow_unauthenticated_callers`. A `PUT` that omits `source_auth`, as a dashboard save does,
-keeps the stored one, and so does a `PUT` of one variant
-(`PUT /v1/surfaces/{id}/variants/{variant_id}`) for the Transit Points its overrides list;
-a merge `PATCH` of the surface or the variant whose `transit.points` leave it out removes it,
-since a merge patch replaces the whole list. A `PUT` that omits
-`allow_unauthenticated_callers` keeps it while the Transit Point still authenticates no
-caller, and drops it once the Transit Point authenticates its callers. A `PUT` matches each Transit Point to the stored one by `id`, and a
-Transit Point sent without an `id` gets a new one, so a `PUT` that omits both the `id` and
-`source_auth` drops the stored `source_auth`: a Transit Point that still requires a transit
-token is saved, authenticated by the token alone, and one that does not is refused with `400`.
-Send each Transit Point's `id` back. In a `PUT`, `"source_auth": null` also keeps the stored
-value; remove it with a merge `PATCH`.
+`allow_unauthenticated_callers`. These rules hold for a `PUT` of the surface and for a `PUT`
+of one variant (`PUT /v1/surfaces/{id}/variants/{variant_id}`), for the Transit Points its
+overrides list. An omitted `source_auth` in a `PUT`, as in a dashboard save, keeps the stored
+one; `"source_auth": null` removes it, and so does a merge `PATCH` of the surface or the
+variant whose `transit.points` leave it out, since a merge patch replaces the whole list. The
+save rules above then apply, so a Transit Point left with no caller authentication is refused
+with `400` unless it requires a transit token or is marked `allow_unauthenticated_callers`. A
+`PUT` that omits `allow_unauthenticated_callers` keeps it while the Transit Point still
+authenticates no caller, and drops it once the Transit Point authenticates its callers. A
+`PUT` matches each Transit Point to the stored one by `id`, and a Transit Point sent without
+an `id` gets a new one, so a `PUT` that omits both the `id` and `source_auth` drops the stored
+`source_auth`: a Transit Point that still requires a transit token is saved, authenticated by
+the token alone, and one that does not is refused with `400`. Send each Transit Point's `id`
+back.
 
 ### Upgrading and rolling back
 

@@ -974,3 +974,116 @@ async fn a_variant_put_that_omits_a_transit_points_caller_authentication_keeps_i
         "{variant}"
     );
 }
+
+/// In a `PUT` of the surface or of one variant, `"source_auth": null` removes a
+/// Transit Point's stored `source_auth` and an omitted one keeps it. The save
+/// rules then apply, so a removal that leaves a Transit Point authenticating no
+/// caller is refused and the stored one is unchanged.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_put_that_sends_a_null_source_auth_removes_it_unless_no_caller_would_be_authenticated() {
+    let mut admin = None;
+    let h = GatewayHarness::start(|temp_dir, _, bootstrap| {
+        write_caller_key(temp_dir);
+        admin = Some(configure_admin_api(bootstrap));
+    })
+    .await;
+    let admin = admin.unwrap();
+    let key = json!({ "type": "api_key", "secret_id": CALLER_KEY_SECRET,
+                      "extraction": { "source": "http_header", "field": "x-api-key" } });
+    let point = |id: &str, require_transit_token: bool, source_auth: Option<serde_json::Value>| {
+        let mut point = json!({ "id": id, "alias": id, "target_endpoint": format!("https://{id}.example/a2a"),
+            "protocol": "a2a", "require_transit_token": require_transit_token });
+        if let Some(source_auth) = source_auth {
+            point["source_auth"] = source_auth;
+        }
+        point
+    };
+    let stored_points = json!([point("kept", false, Some(key.clone())), point("tokened", true, Some(key.clone()))]);
+    let collection = format!("{}/api/v1/surfaces", h.gateway_base);
+    let surface_url = format!("{collection}/tp-null-put");
+    let variant_url = format!("{surface_url}/variants/variant-dev");
+    let surface = |points: &serde_json::Value, variant_points: &serde_json::Value| {
+        json!({
+            "surface_id": "tp-null-put", "name": "tp-null-put", "status": "disabled",
+            "access_point": { "listen_address": h.gateway_base, "route": "/tp-null-put", "protocol": "a2a" },
+            "target": { "endpoint": h.mock.url() },
+            "transit": { "points": points },
+            "variants": [{ "id": "variant-dev", "alias": "dev", "name": "dev", "enabled": true,
+                "overrides": { "transit": { "points": variant_points } } }]
+        })
+    };
+    let created = admin
+        .post(&collection)
+        .json(&surface(&stored_points, &stored_points))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201, "{}", created.text().await.unwrap());
+    let stored = || async {
+        admin
+            .get(&surface_url)
+            .send()
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap()
+    };
+    let base_points = |surface: &serde_json::Value| surface["transit"]["points"].clone();
+    let dev_points = |surface: &serde_json::Value| surface["variants"][0]["overrides"]["transit"]["points"].clone();
+
+    let refused_points = json!([point("kept", false, Some(json!(null))), point("tokened", true, None)]);
+    for (endpoint, url, body) in [
+        ("surface", &surface_url, surface(&refused_points, &stored_points)),
+        ("variant", &variant_url, json!({ "overrides": { "transit": { "points": refused_points } } })),
+    ] {
+        let response = admin
+            .put(url)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let text = response.text().await.unwrap();
+        assert_eq!(status, 400, "{endpoint}: {text}");
+        assert!(text.contains("Transit Point 'kept' authenticates no caller"), "{endpoint}: {text}");
+        let unchanged = stored().await;
+        for points in [base_points(&unchanged), dev_points(&unchanged)] {
+            assert_eq!(points[0]["source_auth"], key, "{endpoint}: {unchanged}");
+        }
+    }
+
+    let removed_points = json!([point("kept", false, None), point("tokened", true, Some(json!(null)))]);
+    let removed = admin
+        .put(&surface_url)
+        .json(&surface(&removed_points, &stored_points))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), 200, "{}", removed.text().await.unwrap());
+    let saved = stored().await;
+    assert_eq!(base_points(&saved)[0]["source_auth"], key, "omitted keeps it: {saved}");
+    assert!(
+        base_points(&saved)[1]
+            .get("source_auth")
+            .is_none(),
+        "null removes it: {saved}"
+    );
+    assert_eq!(dev_points(&saved)[1]["source_auth"], key, "the variant is untouched: {saved}");
+
+    let removed = admin
+        .put(&variant_url)
+        .json(&json!({ "overrides": { "transit": { "points": removed_points } } }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), 200, "{}", removed.text().await.unwrap());
+    let saved = stored().await;
+    assert_eq!(dev_points(&saved)[0]["source_auth"], key, "omitted keeps it: {saved}");
+    assert!(
+        dev_points(&saved)[1]
+            .get("source_auth")
+            .is_none(),
+        "null removes it: {saved}"
+    );
+}
