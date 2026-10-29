@@ -452,6 +452,16 @@ async fn send_mcp_request(
     modern: bool,
     body: String,
 ) -> (axum::http::StatusCode, String, Value, Vec<DelegationAuditEvent>) {
+    send_mcp_body(router(surface), method, path, modern, axum::body::Body::from(body)).await
+}
+
+async fn send_mcp_body(
+    router: crate::state::MultiSurfaceProxyState,
+    method: &str,
+    path: &str,
+    modern: bool,
+    body: axum::body::Body,
+) -> (axum::http::StatusCode, String, Value, Vec<DelegationAuditEvent>) {
     let mut request = axum::http::Request::builder()
         .method(method)
         .uri(path)
@@ -465,14 +475,14 @@ async fn send_mcp_request(
         request.header("mcp-protocol-version", crate::mcp::MCP_LEGACY_VERSION)
     };
     let request = request
-        .body(axum::body::Body::from(body))
+        .body(body)
         .unwrap();
     let (response, events) =
         crate::audit::producer::capture(Box::pin(super::multi_channel_proxy_handler_with_mcp_runtime(
             "127.0.0.1:12345"
                 .parse()
                 .unwrap(),
-            router(surface),
+            router,
             request,
             crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
             None,
@@ -588,6 +598,40 @@ async fn a_modern_mcp_body_over_sixteen_kib_is_refused_for_its_variant_without_a
     let answer = send_mcp_request(mcp_surface(Some("v-prod")), "POST", "/mcp$missing", true, body).await;
 
     assert_json_rpc_refusal("20 KiB under the default limit", answer, RejectionReason::UnknownVariant, 404, None);
+}
+
+/// A body that sends the start of an envelope with an id, then nothing more.
+/// `stalled` is told once the reader waits for the rest.
+fn stalled_body(stalled: tokio::sync::oneshot::Sender<()>) -> axum::body::Body {
+    let mut stalled = Some(stalled);
+    let prefix = futures::stream::iter([Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+        br#"{"jsonrpc":"2.0","id":"variant","#,
+    ))]);
+    let stall = futures::stream::poll_fn(move |_| {
+        if let Some(stalled) = stalled.take() {
+            stalled
+                .send(())
+                .expect("the test waits for the stall");
+        }
+        std::task::Poll::<Option<Result<bytes::Bytes, std::io::Error>>>::Pending
+    });
+    axum::body::Body::from_stream(futures::StreamExt::chain(prefix, stall))
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_modern_mcp_body_that_stalls_is_refused_at_the_id_read_deadline_without_an_id() {
+    let (stalled, _waiting) = tokio::sync::oneshot::channel();
+    let started = tokio::time::Instant::now();
+
+    let answer = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        send_mcp_body(router(mcp_surface(Some("v-prod"))), "POST", "/mcp$missing", true, stalled_body(stalled)),
+    )
+    .await
+    .expect("a stalled body is answered at the id-read deadline");
+
+    assert_eq!(started.elapsed(), std::time::Duration::from_secs(2), "the id-read deadline");
+    assert_json_rpc_refusal("stalled body", answer, RejectionReason::UnknownVariant, 404, None);
 }
 
 #[tokio::test]
