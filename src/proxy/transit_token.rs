@@ -19,9 +19,6 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-/// Default token TTL: 5 minutes (transit should be immediate).
-const DEFAULT_TTL_SECS: u64 = 300;
-
 /// Clock difference tolerated on a token's `iat` and `exp`.
 const CLOCK_LEEWAY_SECS: u64 = 5;
 
@@ -184,8 +181,6 @@ pub struct TransitTokenIssuer {
     key: TransitTokenKey,
     /// Gateway ID used as the `iss` claim.
     gateway_id: String,
-    /// Token TTL in seconds.
-    ttl_secs: u64,
 }
 
 impl TransitTokenIssuer {
@@ -194,24 +189,11 @@ impl TransitTokenIssuer {
         key: TransitTokenKey,
         gateway_id: String,
     ) -> Self {
-        Self {
-            key,
-            gateway_id,
-            ttl_secs: DEFAULT_TTL_SECS,
-        }
+        Self { key, gateway_id }
     }
 
-    /// Create with a custom TTL.
-    #[allow(dead_code)]
-    pub fn with_ttl(
-        mut self,
-        ttl_secs: u64,
-    ) -> Self {
-        self.ttl_secs = ttl_secs;
-        self
-    }
-
-    /// Issue a transit token for the given surface and caller context.
+    /// Issue a transit token for the given surface and caller context, living the
+    /// default transit token lifetime.
     #[cfg(test)]
     pub fn issue(
         &self,
@@ -232,13 +214,15 @@ impl TransitTokenIssuer {
             trace_id,
             allowed_transit_points,
             serde_json::Map::new(),
+            crate::config::agent_surface::DEFAULT_TRANSIT_TOKEN_LIFETIME_SECS,
         )
     }
 
-    /// Issue a transit token that also carries an allowlisted set of caller-
-    /// context fields for Transit Point Workload Binding. The caller is
-    /// responsible for having already filtered `caller_context_fields` down to
-    /// the operator-configured allowlist; the issuer copies them verbatim.
+    /// Issue a transit token that lives `lifetime_secs` and also carries an
+    /// allowlisted set of caller-context fields for Transit Point Workload
+    /// Binding. The caller is responsible for having already filtered
+    /// `caller_context_fields` down to the operator-configured allowlist; the
+    /// issuer copies them verbatim.
     #[allow(clippy::too_many_arguments)]
     pub fn issue_with_caller_context(
         &self,
@@ -250,6 +234,7 @@ impl TransitTokenIssuer {
         trace_id: Option<&str>,
         allowed_transit_points: Vec<String>,
         caller_context_fields: serde_json::Map<String, serde_json::Value>,
+        lifetime_secs: u64,
     ) -> Result<String> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -261,7 +246,7 @@ impl TransitTokenIssuer {
             sub: caller_did.map(|s| s.to_string()),
             surface_id: surface_id.to_string(),
             iat: now,
-            exp: now + self.ttl_secs,
+            exp: now + lifetime_secs,
             jti: uuid::Uuid::new_v4().to_string(),
             identity_source: identity_source.map(|s| s.to_string()),
             caller_dna_uai: caller_dna_uai.map(|s| s.to_string()),
@@ -289,10 +274,15 @@ impl TransitTokenIssuer {
     /// Validate a transit token and return the claims. A token whose `kid` does not name this
     /// issuer's key, or that has none, is refused before its signature is checked. A token is
     /// accepted any number of times until it expires; one issued in the future, living longer
-    /// than this issuer issues, or without a token ID is refused.
+    /// than `allowed_lifetime_secs`, or without a token ID is refused.
+    ///
+    /// `allowed_lifetime_secs` is the lifetime the token's surface sets when the token is
+    /// presented, so shortening it refuses the tokens already issued for longer, and lengthening
+    /// it keeps the shorter ones only until their own expiry.
     pub fn validate(
         &self,
         token: &str,
+        allowed_lifetime_secs: u64,
     ) -> Result<TransitTokenClaims> {
         let header = decode_header(token).context("transit token validation failed")?;
         if header.kid.as_deref() != Some(self.key.kid.as_str()) {
@@ -315,8 +305,11 @@ impl TransitTokenIssuer {
         if claims.iat > now.saturating_add(CLOCK_LEEWAY_SECS) {
             anyhow::bail!("transit token is issued in the future");
         }
-        if claims.exp <= claims.iat || claims.exp - claims.iat > self.ttl_secs {
+        if claims.exp <= claims.iat {
             anyhow::bail!("transit token lifetime is not one this gateway issues");
+        }
+        if claims.exp - claims.iat > allowed_lifetime_secs {
+            anyhow::bail!("transit token lives longer than its surface allows");
         }
         if claims.jti.is_empty() {
             anyhow::bail!("transit token has no token ID");
@@ -325,15 +318,17 @@ impl TransitTokenIssuer {
         Ok(claims)
     }
 
-    /// Validate a transit token and check it was issued for `surface_id` and opens the
-    /// Transit Point named `transit_point_name`.
+    /// Validate a transit token against the lifetime its surface allows, see
+    /// [`Self::validate`], and check it was issued for `surface_id` and opens the Transit Point
+    /// named `transit_point_name`.
     pub fn validate_for_transit_point(
         &self,
         token: &str,
         surface_id: &str,
         transit_point_name: &str,
+        allowed_lifetime_secs: u64,
     ) -> Result<TransitTokenClaims> {
-        let claims = self.validate(token)?;
+        let claims = self.validate(token, allowed_lifetime_secs)?;
 
         if claims.surface_id.is_empty() || claims.surface_id != surface_id {
             anyhow::bail!("transit token was issued for another surface");
@@ -359,6 +354,8 @@ impl TransitTokenIssuer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const LIFETIME: u64 = crate::config::agent_surface::DEFAULT_TRANSIT_TOKEN_LIFETIME_SECS;
 
     fn test_issuer() -> TransitTokenIssuer {
         TransitTokenIssuer::new(TransitTokenKey::from_parts("test-kid", [7; 32]), "gw-test-001".to_string())
@@ -421,7 +418,11 @@ mod tests {
             (without_kid, "transit token is not signed with this gateway's transit token key"),
             (with_our_kid, "transit token validation failed: InvalidSignature"),
         ] {
-            assert_eq!(refusal(issuer.validate(&token)), reason, "a token signed with the domain-derived key");
+            assert_eq!(
+                refusal(issuer.validate(&token, LIFETIME)),
+                reason,
+                "a token signed with the domain-derived key"
+            );
         }
     }
 
@@ -433,10 +434,13 @@ mod tests {
             .issue("surf-001", None, None, None, Some("victim-hash"), None, vec![])
             .unwrap();
 
-        assert_eq!(refusal(ours.validate(&token)), "transit token is not signed with this gateway's transit token key");
+        assert_eq!(
+            refusal(ours.validate(&token, LIFETIME)),
+            "transit token is not signed with this gateway's transit token key"
+        );
         assert_eq!(
             theirs
-                .validate(&token)
+                .validate(&token, LIFETIME)
                 .unwrap()
                 .user_identity_hash
                 .as_deref(),
@@ -453,7 +457,7 @@ mod tests {
         let token = sign_with(header, &[7; 32], &claims_for("surf-001", now, now + 300));
 
         assert_eq!(
-            refusal(issuer.validate(&token)),
+            refusal(issuer.validate(&token, LIFETIME)),
             "transit token is not signed with this gateway's transit token key"
         );
     }
@@ -467,7 +471,7 @@ mod tests {
             .issue("surf-001", None, None, None, None, None, vec![])
             .unwrap();
 
-        assert_eq!(refusal(issuer.validate(&token)), "transit token validation failed: InvalidSignature");
+        assert_eq!(refusal(issuer.validate(&token, LIFETIME)), "transit token validation failed: InvalidSignature");
     }
 
     #[test]
@@ -497,7 +501,7 @@ mod tests {
             .unwrap();
 
         let claims = TransitTokenIssuer::new(restarted, "gw-test-001".to_string())
-            .validate(&token)
+            .validate(&token, LIFETIME)
             .unwrap();
         assert_eq!(claims.surface_id, "surf-001");
         let stored: serde_json::Value =
@@ -566,7 +570,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             standby
-                .validate(&token)
+                .validate(&token, LIFETIME)
                 .unwrap()
                 .surface_id,
             "surf-001"
@@ -645,7 +649,7 @@ mod tests {
             .unwrap();
 
         let claims = issuer
-            .validate(&token)
+            .validate(&token, LIFETIME)
             .unwrap();
         assert_eq!(claims.iss, "gw-test-001");
         assert_eq!(claims.sub, Some("did:example:caller".to_string()));
@@ -684,7 +688,7 @@ mod tests {
 
         let token = issuer.sign(&claims).unwrap();
 
-        let result = issuer.validate(&token);
+        let result = issuer.validate(&token, LIFETIME);
         assert!(result.is_err(), "expired token should be rejected");
     }
 
@@ -698,19 +702,19 @@ mod tests {
 
         // Allowed
         let claims = issuer
-            .validate_for_transit_point(&token, "surf-001", "github-api")
+            .validate_for_transit_point(&token, "surf-001", "github-api", LIFETIME)
             .unwrap();
         assert_eq!(claims.surface_id, "surf-001");
 
         // Also allowed
         assert!(
             issuer
-                .validate_for_transit_point(&token, "surf-001", "partner")
+                .validate_for_transit_point(&token, "surf-001", "partner", LIFETIME)
                 .is_ok()
         );
 
         // Not allowed
-        let result = issuer.validate_for_transit_point(&token, "surf-001", "unauthorized-point");
+        let result = issuer.validate_for_transit_point(&token, "surf-001", "unauthorized-point", LIFETIME);
         assert!(result.is_err());
     }
 
@@ -725,7 +729,7 @@ mod tests {
         // Empty allowed_transit_points means all are permitted
         assert!(
             issuer
-                .validate_for_transit_point(&token, "surf-001", "any-point")
+                .validate_for_transit_point(&token, "surf-001", "any-point", LIFETIME)
                 .is_ok()
         );
     }
@@ -738,7 +742,7 @@ mod tests {
             .unwrap();
 
         let error = issuer
-            .validate_for_transit_point(&token, "surface-b", "partner")
+            .validate_for_transit_point(&token, "surface-b", "partner", LIFETIME)
             .unwrap_err();
 
         assert!(
@@ -749,7 +753,7 @@ mod tests {
         );
         assert!(
             issuer
-                .validate_for_transit_point(&token, "surface-a", "partner")
+                .validate_for_transit_point(&token, "surface-a", "partner", LIFETIME)
                 .is_ok()
         );
     }
@@ -768,18 +772,18 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            refusal(issuer.validate_for_transit_point(&token, "", "partner")),
+            refusal(issuer.validate_for_transit_point(&token, "", "partner", LIFETIME)),
             "transit token was issued for another surface"
         );
     }
 
     #[test]
-    fn refuses_tokens_living_longer_than_the_gateway_issues_or_issued_in_the_future() {
+    fn refuses_tokens_living_longer_than_their_surface_allows_or_issued_in_the_future() {
         let issuer = test_issuer();
         let now = now();
         for (case, iat, exp, reason) in [
-            ("thirty days", now, now + 30 * 24 * 3600, "transit token lifetime is not one this gateway issues"),
-            ("one second too long", now - 10, now + 291, "transit token lifetime is not one this gateway issues"),
+            ("thirty days", now, now + 30 * 24 * 3600, "transit token lives longer than its surface allows"),
+            ("one second too long", now - 10, now + 291, "transit token lives longer than its surface allows"),
             ("issued in the future", now + 60, now + 300, "transit token is issued in the future"),
             ("expires when issued", now, now, "transit token lifetime is not one this gateway issues"),
             ("expires before it is issued", now, now - 1, "transit token lifetime is not one this gateway issues"),
@@ -789,7 +793,7 @@ mod tests {
                 .sign(&claims_for("surf-001", iat, exp))
                 .unwrap();
             assert_eq!(
-                refusal(issuer.validate_for_transit_point(&token, "surf-001", "partner")),
+                refusal(issuer.validate_for_transit_point(&token, "surf-001", "partner", LIFETIME)),
                 reason,
                 "{case} must be refused for its lifetime"
             );
@@ -804,7 +808,7 @@ mod tests {
         claims.jti = String::new();
         let token = issuer.sign(&claims).unwrap();
 
-        assert_eq!(refusal(issuer.validate(&token)), "transit token has no token ID");
+        assert_eq!(refusal(issuer.validate(&token, LIFETIME)), "transit token has no token ID");
     }
 
     #[test]
@@ -822,13 +826,92 @@ mod tests {
             for token in [&token, &near_expiry] {
                 assert_eq!(
                     issuer
-                        .validate_for_transit_point(token, "surf-001", "partner")
+                        .validate_for_transit_point(token, "surf-001", "partner", LIFETIME)
                         .unwrap()
                         .surface_id,
                     "surf-001"
                 );
             }
         }
+    }
+
+    fn issue_living(
+        issuer: &TransitTokenIssuer,
+        lifetime_secs: u64,
+    ) -> String {
+        issuer
+            .issue_with_caller_context(
+                "surf-001",
+                None,
+                None,
+                None,
+                Some("caller-hash"),
+                None,
+                vec![],
+                serde_json::Map::new(),
+                lifetime_secs,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn issues_tokens_living_the_lifetime_asked_for() {
+        let issuer = test_issuer();
+
+        for lifetime in [30, LIFETIME, 600, 900] {
+            let claims = issuer
+                .validate(&issue_living(&issuer, lifetime), lifetime)
+                .unwrap();
+
+            assert_eq!(claims.exp - claims.iat, lifetime);
+        }
+    }
+
+    #[test]
+    fn checks_a_token_against_the_lifetime_its_surface_allows() {
+        let issuer = test_issuer();
+        let now = now();
+        let sign = |iat, exp| {
+            issuer
+                .sign(&claims_for("surf-001", iat, exp))
+                .unwrap()
+        };
+
+        let issued_400_seconds_ago = issuer
+            .validate_for_transit_point(&sign(now - 400, now + 200), "surf-001", "partner", 600)
+            .unwrap();
+        assert_eq!((issued_400_seconds_ago.iat, issued_400_seconds_ago.exp), (now - 400, now + 200));
+        for (case, iat, exp, reason) in [
+            ("past its lifetime", now - 610, now - 10, "transit token validation failed: ExpiredSignature"),
+            ("one second longer", now, now + 601, "transit token lives longer than its surface allows"),
+        ] {
+            assert_eq!(
+                refusal(issuer.validate_for_transit_point(&sign(iat, exp), "surf-001", "partner", 600)),
+                reason,
+                "{case}"
+            );
+        }
+    }
+
+    /// Shortening a surface's lifetime refuses the tokens already issued for longer, and
+    /// lengthening it keeps the shorter ones only until their own expiry.
+    #[test]
+    fn a_changed_lifetime_refuses_longer_tokens_and_never_extends_shorter_ones() {
+        let issuer = test_issuer();
+        let now = now();
+
+        assert_eq!(
+            refusal(issuer.validate(&issue_living(&issuer, 600), 300)),
+            "transit token lives longer than its surface allows"
+        );
+        let kept = issuer
+            .validate(&issue_living(&issuer, 300), 600)
+            .unwrap();
+        assert_eq!(kept.exp - kept.iat, 300);
+        let expired = issuer
+            .sign(&claims_for("surf-001", now - 310, now - 10))
+            .unwrap();
+        assert_eq!(refusal(issuer.validate(&expired, 900)), "transit token validation failed: ExpiredSignature");
     }
 
     #[test]
@@ -840,7 +923,7 @@ mod tests {
             .unwrap();
 
         let claims = issuer
-            .validate(&token)
+            .validate(&token, LIFETIME)
             .unwrap();
         assert_eq!(claims.sub, None);
         assert_eq!(claims.identity_source, None);
@@ -871,11 +954,12 @@ mod tests {
                 None,
                 vec!["delta".to_string()],
                 fields.clone(),
+                LIFETIME,
             )
             .unwrap();
 
         let claims = issuer
-            .validate(&token)
+            .validate(&token, LIFETIME)
             .unwrap();
         assert_eq!(claims.caller_context_fields, fields, "fields must be carried verbatim");
         assert_eq!(claims.user_identity_hash, Some("sha256-user-hash".to_string()));
@@ -896,10 +980,10 @@ mod tests {
         fields.insert("nested".to_string(), serde_json::json!({ "a": { "b": [1, 2, 3] } }));
 
         let token = issuer
-            .issue_with_caller_context("surf-001", None, None, None, None, None, vec![], fields.clone())
+            .issue_with_caller_context("surf-001", None, None, None, None, None, vec![], fields.clone(), LIFETIME)
             .unwrap();
         let claims = issuer
-            .validate(&token)
+            .validate(&token, LIFETIME)
             .unwrap();
         assert_eq!(claims.caller_context_fields["count"], serde_json::json!(42));
         assert_eq!(claims.caller_context_fields["nested"], serde_json::json!({ "a": { "b": [1, 2, 3] } }));
@@ -929,7 +1013,7 @@ mod tests {
         );
         // And it round-trips to an empty map.
         let claims = issuer
-            .validate(&token)
+            .validate(&token, LIFETIME)
             .unwrap();
         assert!(
             claims
@@ -945,18 +1029,28 @@ mod tests {
         fields.insert("sub".to_string(), serde_json::json!("alice-subject"));
 
         let token = issuer
-            .issue_with_caller_context("surf-001", None, None, None, None, None, vec!["delta".to_string()], fields)
+            .issue_with_caller_context(
+                "surf-001",
+                None,
+                None,
+                None,
+                None,
+                None,
+                vec!["delta".to_string()],
+                fields,
+                LIFETIME,
+            )
             .unwrap();
 
         // Carrying caller context does not widen transit-point authorization.
         assert!(
             issuer
-                .validate_for_transit_point(&token, "surf-001", "delta")
+                .validate_for_transit_point(&token, "surf-001", "delta", LIFETIME)
                 .is_ok()
         );
         assert!(
             issuer
-                .validate_for_transit_point(&token, "surf-001", "other")
+                .validate_for_transit_point(&token, "surf-001", "other", LIFETIME)
                 .is_err()
         );
     }

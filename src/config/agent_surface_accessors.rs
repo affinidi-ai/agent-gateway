@@ -607,6 +607,12 @@ impl AgentSurface {
         {
             errors.push(crate::config::agent_surface::TRANSIT_SOURCE_AUTH_REFUSED.to_string());
         }
+        if let Err(error) = transit
+            .shared
+            .validate_transit_token_lifetime()
+        {
+            errors.push(error);
+        }
 
         errors
     }

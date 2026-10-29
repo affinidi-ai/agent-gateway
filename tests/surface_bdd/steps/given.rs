@@ -890,6 +890,33 @@ fn transit_point_requires_a_transit_token(
     transit_point_config_mut(world, &transit_point).require_transit_token = true;
 }
 
+#[given(expr = "the surface's transit tokens live {int} seconds")]
+fn surface_transit_tokens_live(
+    world: &mut SurfaceWorld,
+    lifetime_secs: u64,
+) {
+    world
+        .surface_config
+        .transit_token_lifetime_secs = Some(lifetime_secs);
+}
+
+#[given(expr = "the operator has shortened the surface's transit token lifetime to {int} seconds")]
+async fn operator_has_shortened_the_transit_token_lifetime(
+    world: &mut SurfaceWorld,
+    lifetime_secs: u64,
+) {
+    crate::steps::when::set_transit_token_lifetime(world, lifetime_secs).await;
+    let response = world
+        .admin_response
+        .as_ref()
+        .expect("the admin API must answer");
+    assert_eq!(
+        response.status, 200,
+        "setting the transit token lifetime should succeed, got status {} body {}",
+        response.status, response.body
+    );
+}
+
 #[given("the surface sets source authentication for its Transit Points")]
 fn surface_sets_source_authentication_for_its_transit_points(world: &mut SurfaceWorld) {
     world
@@ -976,6 +1003,58 @@ async fn managed_agent_holds_a_transit_token_for_another_surface(
         world,
         &token,
         serde_json::json!({ "surface_id": surface_id }),
+    ));
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the clock is after the Unix epoch")
+        .as_secs()
+}
+
+#[given(expr = "managed agent {string} holds the transit token the Access Point gave it {int} seconds ago")]
+async fn managed_agent_holds_the_access_points_transit_token_from_seconds_ago(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    age_secs: u64,
+) {
+    managed_agent_holds_the_access_points_transit_token(world, agent_name).await;
+    let token = world
+        .transit_token
+        .clone()
+        .unwrap();
+    let claims = crate::steps::when::transit_token_claims(&token);
+    let lifetime_secs = claims["exp"]
+        .as_u64()
+        .expect("a transit token expires")
+        - claims["iat"]
+            .as_u64()
+            .expect("a transit token has an issue time");
+    let issued_at = unix_now() - age_secs;
+    world.transit_token = Some(crate::steps::when::reissued_transit_token(
+        world,
+        &token,
+        serde_json::json!({ "iat": issued_at, "exp": issued_at + lifetime_secs }),
+    ));
+}
+
+#[given(expr = "managed agent {string} holds a transit token the gateway issued to live {int} seconds")]
+async fn managed_agent_holds_a_transit_token_living(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    lifetime_secs: u64,
+) {
+    managed_agent_holds_the_access_points_transit_token(world, agent_name).await;
+    let token = world
+        .transit_token
+        .clone()
+        .unwrap();
+    let issued_at = unix_now();
+    world.transit_token = Some(crate::steps::when::reissued_transit_token(
+        world,
+        &token,
+        serde_json::json!({ "iat": issued_at, "exp": issued_at + lifetime_secs }),
     ));
 }
 
