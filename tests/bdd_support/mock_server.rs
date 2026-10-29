@@ -432,9 +432,7 @@ pub fn discover_non_loopback_local_ip() -> std::net::IpAddr {
 fn received_headers(headers: &axum::http::HeaderMap) -> HashMap<String, String> {
     let mut received: HashMap<String, String> = HashMap::new();
     for (name, value) in headers {
-        let value = value
-            .to_str()
-            .unwrap_or("");
+        let value = value.to_str().unwrap_or("");
         received
             .entry(name.to_string())
             .and_modify(|existing| {
