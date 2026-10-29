@@ -26,12 +26,11 @@ use crate::config::agent_surface_variants::{VariantResolveError, VariantValidati
 /// when a request selects this surface (default or a named variant).
 #[derive(Debug, Clone)]
 pub struct SurfaceSnapshots {
-    /// Snapshot used when no `$alias` is present in the request URL.
-    /// Equal to the base surface when no variants are configured.
-    pub default: Arc<AgentSurface>,
-    /// The `surface_variant` a request served by `default` records: the
-    /// default variant's alias, or `_base_`.
-    pub default_variant: String,
+    /// What serves a request with no `$alias` in its URL: the default
+    /// variant's snapshot, or the base surface when there is no default
+    /// variant, with the `surface_variant` it records. A disabled default
+    /// variant refuses such requests instead.
+    pub default: Result<CachedVariant, ResolveError>,
     /// Pre-resolved snapshots for each enabled variant alias.
     pub by_alias: HashMap<String, Arc<AgentSurface>>,
     /// Aliases of variants that exist on the surface but are
@@ -57,8 +56,8 @@ pub enum ResolveError {
     UnknownSurface(String),
     /// The surface exists but has no variant with the requested alias.
     UnknownAlias(String),
-    /// The surface has a variant with the requested alias but it is
-    /// `enabled: false`.
+    /// The variant with the requested alias, or the default variant of a
+    /// request with no alias, is `enabled: false`. Holds that variant's alias.
     DisabledAlias(String),
 }
 
@@ -166,10 +165,7 @@ impl ResolvedSurfaceCache {
         let snaps = entry.value().clone();
         drop(entry);
         match alias {
-            None => Ok(CachedVariant {
-                surface: snaps.default.clone(),
-                surface_variant: snaps.default_variant.clone(),
-            }),
+            None => snaps.default.clone(),
             Some(a) => {
                 if let Some(s) = snaps.by_alias.get(a) {
                     Ok(CachedVariant {
@@ -213,9 +209,14 @@ impl ResolvedSurfaceCache {
 }
 
 fn build_snapshots(surface: &AgentSurface) -> Result<SurfaceSnapshots, CacheUpsertError> {
-    let served = surface.serve_variant(None)?;
-    let default = Arc::new(served.surface);
-    let default_variant = served.recorded;
+    let default = match surface.serve_variant(None) {
+        Ok(served) => Ok(CachedVariant {
+            surface: Arc::new(served.surface),
+            surface_variant: served.recorded,
+        }),
+        Err(VariantResolveError::DisabledVariant(alias)) => Err(ResolveError::DisabledAlias(alias)),
+        Err(error) => return Err(error.into()),
+    };
     let mut by_alias = HashMap::with_capacity(surface.variants.len());
     let mut disabled_aliases = HashSet::new();
     for v in &surface.variants {
@@ -228,7 +229,6 @@ fn build_snapshots(surface: &AgentSurface) -> Result<SurfaceSnapshots, CacheUpse
     }
     Ok(SurfaceSnapshots {
         default,
-        default_variant,
         by_alias,
         disabled_aliases,
     })

@@ -40,6 +40,13 @@ changes:
         base surface served its requests. The gateway drops such a stored default at startup,
         with a warning naming the surface and the dropped id, so the base surface keeps serving
         them instead of every path refusing them with 500 as misconfigured_default.
+    - timestamp: '2026-10-29T15:20:00Z'
+      title: Refresh the enabled variants of a surface whose default variant is disabled
+      description: >-
+        Saving a surface whose default variant is disabled now refreshes the Targets and overrides
+        the Access Point serves its enabled variants with. They used to keep the ones from before
+        the save, as the whole cache entry was left as it was; requests with no alias are still
+        refused as the disabled default.
   removed:
     - timestamp: '2026-10-29T13:30:00Z'
       title: Drop variant_alias from request_completed audit records
