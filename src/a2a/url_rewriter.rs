@@ -292,7 +292,7 @@ fn build_proxy_endpoint(
 /// the same precedence used at route registration in `surface_manager`:
 /// TP `listen_address` → channel-wide `transit.outbound_listen_address` →
 /// access point `listen_address`. Path is the TP's `listen_path` when set,
-/// otherwise the derived `/outgoing<route>/<alias>` route.
+/// otherwise the derived `/outbound<route>/<alias>` route.
 pub(crate) fn build_transit_point_proxy_endpoint(
     surface: &crate::config::agent_surface::AgentSurface,
     tp: &crate::config::agent_surface::TransitPoint,
@@ -321,7 +321,8 @@ pub(crate) fn build_transit_point_proxy_endpoint(
         Some(p) => p,
         None => {
             derived_path = format!(
-                "/outgoing{}/{}",
+                "{}{}/{}",
+                crate::proxy::outbound_handler::TP_OUTBOUND_PATH_PREFIX,
                 surface
                     .access_point
                     .route
@@ -608,7 +609,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    const PROXY_URL: &str = "https://gw.internal:9000/outgoing/channels/order/partner-a";
+    const PROXY_URL: &str = "https://gw.internal:9000/outbound/channels/order/partner-a";
 
     // ── rewrite_urls_in_agent_card ───────────────────────────────────────
 
@@ -1247,7 +1248,7 @@ mod tests {
 
     /// No TP override → fall through to channel-wide
     /// `transit.outbound_listen_address`; no `listen_path` →
-    /// `/outgoing<route>/<alias>` is derived.
+    /// `/outbound<route>/<alias>`, the route the Transit Point is mounted on, is derived.
     #[test]
     fn tp_proxy_endpoint_falls_back_to_outbound_listen_and_derived_path() {
         let net = make_network_config(json!([
@@ -1274,7 +1275,7 @@ mod tests {
             .points[0];
         assert_eq!(
             build_transit_point_proxy_endpoint(&surface, tp, &net),
-            "https://localhost:9000/outgoing/agents/a2a/buyer/tp-seller"
+            "https://localhost:9000/outbound/agents/a2a/buyer/tp-seller"
         );
     }
 
@@ -1299,7 +1300,7 @@ mod tests {
             .points[0];
         assert_eq!(
             build_transit_point_proxy_endpoint(&surface, tp, &net),
-            "http://localhost:8080/outgoing/agents/a2a/buyer/tp-seller"
+            "http://localhost:8080/outbound/agents/a2a/buyer/tp-seller"
         );
     }
 

@@ -84,20 +84,28 @@ A full reload is disruptive to the listener tasks, even though it does not resta
 Gateway process:
 
 1. Load the configured source and inject active Agent Surface records.
-2. Abort existing inbound and outbound port-listener tasks and clear their stored runtime states.
+2. Abort existing inbound and outbound port-listener tasks and clear the inbound listeners'
+   stored runtime states.
 3. Clear stale task-monitor entries and wait briefly for listening sockets to be released.
 4. Replace the shared `GatewayConfig` and save the successful snapshot to the configuration cache.
 5. Reload network configuration, group active surfaces by listener, and rebuild derived surface
-   state.
-6. Bind new inbound listeners and outbound listeners that have active outbound surfaces, retaining
-   each inbound listener's `MultiSurfaceProxyState` for later single-surface updates. An outbound
-   port with no active outbound surfaces receives a placeholder task during reload and is not bound;
-   this differs from startup, which binds empty outbound ports so their liveness route remains
+   state. Each surface's outbound state is updated in place rather than replaced: a surface that
+   still has Transit Points on an outbound listener gets its new configuration written into its
+   state, and the state of one that no longer has any, because it was deleted, disabled or
+   emptied, is retired, so its routes refuse each request with `404`.
+6. Bind new inbound and outbound listeners, retaining each inbound listener's
+   `MultiSurfaceProxyState` for later single-surface updates. An outbound port with no active
+   Transit Points is bound with no proxy routes, as at startup, so its liveness route remains
    available.
 
 Requests using a listener while it is stopped and rebound can be interrupted. Process-wide services
 that are not owned by those listener tasks continue running, but their routers are attached to the
 new listeners when those listeners are created.
+
+A plain HTTP listener closes the connections kept alive on it when it stops. A TLS listener's
+connections outlive it, still served by its old routes; because those routes hold the outbound
+state updated in step 5, a removed Transit Point refuses the next request on such a connection
+with `404`, and a changed one is served with its new configuration.
 
 If the requested configuration source cannot be loaded,
 `reload_channels_with_fallback` attempts to load the cached `GatewayConfig`. If neither source is
@@ -130,10 +138,33 @@ A single-surface reload keeps the existing inbound listener bound:
 Concurrent inbound requests retain the listener and observe either the previous or replacement
 surface state around the brief write-lock acquisition. The operation does not promise that every
 outbound listener remains bound: if Transit Point routes were added, removed, renamed, or moved,
-the affected outbound listener is restarted because its Axum routes are static.
+the affected outbound listener is restarted because its Axum routes are static. An update that
+leaves the surface without Transit Points also retires its outbound state, as a delete does.
 
 Single-surface reload assumes the Access Point still maps to a running inbound listener. Changes
 that require a different listener topology belong to a full reload.
+
+## Deleting a surface
+
+A surface delete takes its Transit Points out of service for new requests before the API
+answers, whichever path applies it:
+
+1. Retire the surface's outbound state: every route still holding it, on a new connection or
+   one kept alive, refuses each request with `404`.
+2. Evict the surface's compiled policies, MCP tool gating and rate limiters, its variants' and
+   its Transit Points' included.
+
+A surface without variants is removed in place: its Access Point leaves the running inbound
+listener and no listener is rebound, so the outbound listener its Transit Points shared with
+other surfaces' keeps serving them without interruption, and its retired routes stay on that
+listener, refusing with `404`, until the listener is next rebuilt. Deleting a surface with
+variants takes a full reload, because its variant routes are baked into the inbound listener.
+Disabling a surface, or removing all of its Transit Points, retires its outbound state the same
+way, but does not evict its compiled policies.
+
+A request admitted before the delete has already read the surface, so it can still reach the
+Transit Point's target, with its credentials, until it completes or times out. A `tools/call` to
+a Transit Point configured with MCP tool gating whose gating was evicted meanwhile is refused.
 
 ## Dashboard events
 

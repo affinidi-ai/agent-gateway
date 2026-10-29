@@ -1261,8 +1261,8 @@ impl SurfacePolicyManager {
         }
     }
 
-    /// Remove all policies and rate limiters for a channel
-    #[allow(dead_code)]
+    /// Remove all policies, MCP tool gating and rate limiters for a channel,
+    /// its variants and its Transit Points.
     pub async fn remove_channel(
         &self,
         channel_id: &str,
@@ -1270,34 +1270,17 @@ impl SurfacePolicyManager {
         let _access_change = crate::mcp::subscriptions::AccessChange::begin(
             crate::mcp::subscriptions::AccessScope::Surface(channel_id.to_string()),
         );
+        self.evict_all_opa_engines_for_config(channel_id);
         {
-            let mut engines = self
-                .opa_engines
-                .write()
-                .expect("opa_engines lock poisoned");
-            engines.remove(channel_id);
-            // Also remove the outbound-specific engine key
-            engines.remove(&format!("outbound:{}", channel_id));
-            // Remove the access-point inbound base engine and any per-variant
-            // inbound engines installed for this channel.
-            engines.remove(&format!("inbound:{}", channel_id));
-            let inbound_variant_prefix = format!("inbound:variant:{}:", channel_id);
-            engines.retain(|k, _| !k.starts_with(&inbound_variant_prefix));
-            // Drop any per-variant request engines installed for this channel.
-            // Response-side engines are keyed by `response:{def_id}` and can
-            // be shared across surfaces, so they are not cleared here.
-            let v_prefix = format!("variant:{}:", channel_id);
-            engines.retain(|k, _| !k.starts_with(&v_prefix));
-        }
-        {
-            // Drop base + per-variant MCP tool gating for this channel.
+            // Drop base, per-variant and per-Transit-Point MCP tool gating for this channel.
             let mut gating = self
                 .mcp_tool_gating
                 .write()
                 .expect("mcp_tool_gating lock poisoned");
             gating.remove(channel_id);
             let gating_variant_prefix = format!("variant:{}:", channel_id);
-            gating.retain(|k, _| !k.starts_with(&gating_variant_prefix));
+            let gating_transit_prefix = format!("transit:{}:", channel_id);
+            gating.retain(|k, _| !k.starts_with(&gating_variant_prefix) && !k.starts_with(&gating_transit_prefix));
         }
         let mut limiters = self
             .rate_limiters
@@ -1570,6 +1553,63 @@ allow if {
             "admin_delete",
             &Default::default()
         ));
+    }
+
+    #[tokio::test]
+    async fn removing_a_surface_evicts_its_transit_point_policies_gates_and_limiters() {
+        let manager = SurfacePolicyManager::new();
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(serde_json::json!({
+            "surface_id": "doomed", "name": "doomed", "description": "", "status": "active",
+            "access_point": { "listen_address": "0.0.0.0:8443", "route": "/doomed", "protocol": "mcp" },
+            "target": { "endpoint": "http://localhost:9000" },
+            "transit": { "points": [{
+                "alias": "partner", "target_endpoint": "https://partner.example.com/mcp", "protocol": "mcp",
+                "rate_limit": { "requests": 10, "window_secs": 60 },
+                "mcp_tool_gating": { "gates": [{ "id": "g1", "name": "no admin",
+                    "action": { "effect": "deny", "patterns": ["^admin_"] } }] }
+            }] }
+        }))
+        .unwrap();
+        manager
+            .update_channel_policy(&surface)
+            .await
+            .unwrap();
+        let policy = "package surface.policy\n\ndefault allow := true\n";
+        for key in ["doomed", "outbound:doomed", "transit:doomed:partner", "response:transit:doomed:partner", "kept"] {
+            manager
+                .load_policy_text(key, policy)
+                .unwrap();
+        }
+        assert!(manager.has_transit_mcp_tool_gating("doomed", "partner"));
+        assert!(
+            manager
+                .rate_limiters
+                .read()
+                .await
+                .contains_key("vc:doomed:partner")
+        );
+
+        manager
+            .remove_channel("doomed")
+            .await;
+
+        assert!(!manager.has_transit_mcp_tool_gating("doomed", "partner"));
+        assert!(
+            !manager
+                .rate_limiters
+                .read()
+                .await
+                .contains_key("vc:doomed:partner")
+        );
+        let engines = manager
+            .opa_engines
+            .read()
+            .unwrap();
+        let remaining: Vec<&str> = engines
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(remaining, vec!["kept"]);
     }
 
     #[tokio::test]

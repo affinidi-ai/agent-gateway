@@ -87,6 +87,7 @@ pub fn write_single_surface_config_with_outbound_listener(
 fn transit_point_json(
     transit_point: &SurfaceTransitPointConfig,
     target_endpoint: &str,
+    delegation_binding: Option<&serde_json::Value>,
 ) -> serde_json::Value {
     let mut transit_point_json = serde_json::json!({
         "name": transit_point.alias,
@@ -94,8 +95,13 @@ fn transit_point_json(
         "target_endpoint": target_endpoint,
         "protocol": transit_point.protocol,
         "listen_path": format!("/transit/{}", transit_point.alias),
-        "require_transit_token": false
+        "require_transit_token": transit_point.require_transit_token
     });
+    if let Some(binding) = delegation_binding
+        && transit_point.delegated_credentials
+    {
+        transit_point_json["transit_credentials"] = binding.clone();
+    }
     if !transit_point
         .header_metadata_mapping
         .headers
@@ -271,25 +277,36 @@ fn write_single_surface_config_inner(
             "injection_target": cm.injection_target.clone()
         }));
     }
-    if let Some(delegation) = &surface_config.credential_delegation {
-        let required_for = match &delegation.required_tool {
-            Some(tool) => serde_json::json!({ "tools": [tool] }),
-            None => serde_json::json!("all"),
-        };
-        let inject_as = match &delegation.inject_as {
-            DelegatedCredentialInjection::BearerHeader => serde_json::json!({ "type": "bearer_header" }),
-            DelegatedCredentialInjection::CustomHeader { name, format } => {
-                serde_json::json!({ "type": "custom_header", "name": name, "format": format })
-            }
-            DelegatedCredentialInjection::Meta { field } => serde_json::json!({ "type": "meta", "field": field }),
-        };
-        surface_fixture = surface_fixture.with_outbound_credential(serde_json::json!({
-            "credential_provider_id": delegation.provider_id,
-            "scopes": delegation.scopes,
-            "required_for": required_for,
-            "consent_mode": "on_demand",
-            "inject_as": inject_as,
-        }));
+    let delegation_binding = surface_config
+        .credential_delegation
+        .as_ref()
+        .map(|delegation| {
+            let required_for = match &delegation.required_tool {
+                Some(tool) => serde_json::json!({ "tools": [tool] }),
+                None => serde_json::json!("all"),
+            };
+            let inject_as = match &delegation.inject_as {
+                DelegatedCredentialInjection::BearerHeader => serde_json::json!({ "type": "bearer_header" }),
+                DelegatedCredentialInjection::CustomHeader { name, format } => {
+                    serde_json::json!({ "type": "custom_header", "name": name, "format": format })
+                }
+                DelegatedCredentialInjection::Meta { field } => serde_json::json!({ "type": "meta", "field": field }),
+            };
+            serde_json::json!({
+                "credential_provider_id": delegation.provider_id,
+                "scopes": delegation.scopes,
+                "required_for": required_for,
+                "consent_mode": "on_demand",
+                "inject_as": inject_as,
+            })
+        });
+    if let Some(binding) = &delegation_binding
+        && !surface_config
+            .transit_points
+            .iter()
+            .any(|transit_point| transit_point.delegated_credentials)
+    {
+        surface_fixture = surface_fixture.with_outbound_credential(binding.clone());
     }
     if !surface_config
         .transit_points
@@ -305,7 +322,7 @@ fn write_single_surface_config_inner(
                 let target_endpoint = transit_target_urls
                     .get(&transit_point.alias)
                     .unwrap_or_else(|| panic!("no target URL for Transit Point '{}'", transit_point.alias));
-                transit_point_json(transit_point, target_endpoint)
+                transit_point_json(transit_point, target_endpoint, delegation_binding.as_ref())
             })
             .collect::<Vec<_>>();
         let mut transit_json = serde_json::json!({
@@ -314,6 +331,13 @@ fn write_single_surface_config_inner(
         });
         if let Some(policy) = &surface_config.transit_shared_policy {
             transit_json["opa_policy_definition_id"] = serde_json::json!(policy.id);
+        }
+        if surface_config.transit_source_auth {
+            transit_json["source_auth"] = serde_json::json!({
+                "type": "api_key",
+                "extraction": { "source": "http_header", "field": "X-API-Key" },
+                "secret_id": "bdd-transit-caller-key"
+            });
         }
         surface_fixture = surface_fixture.with_transit(transit_json);
     }
@@ -564,6 +588,7 @@ fn secret_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<SecretFixture> 
             CredentialProviderKind::ApiKey { secret_id, secret_value } => {
                 secrets.push(SecretFixture::new(secret_id, secret_value));
             }
+            CredentialProviderKind::Unknown => {}
         }
     }
     secrets
@@ -590,6 +615,7 @@ fn credential_provider_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<Cr
     let now = chrono::Utc::now();
     let provider_id = delegation.provider_id.clone();
     let provider = match &delegation.provider_kind {
+        CredentialProviderKind::Unknown => return Vec::new(),
         CredentialProviderKind::OAuth2AuthorizationCode => {
             let base_url = surface_config
                 .oauth_provider_base_url
