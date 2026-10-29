@@ -55,6 +55,17 @@ changes:
         check now compares the slug as it is stored, trimmed and in lower case, so `GitHub` and
         `github` conflict, and a create whose duplicate check fails is refused instead of
         proceeding.
+    - timestamp: '2026-10-30T23:00:00Z'
+      title: Refuse to delete a credential provider that a surface still binds
+      description: >-
+        Deleting a credential provider that any surface binds, in its base or a variant, through
+        `outbound_credentials` or a Transit Point's `transit_credentials`, is now refused with
+        409 `provider_in_use` naming a surface, instead of succeeding and leaving every later
+        call through the binding refused. Deleting a provider with an issuer first revokes each
+        of its grants at the authorization server's RFC 7009 revocation endpoint, through
+        pinned Strict `https` egress, with the client authenticating as its
+        `token_endpoint_auth_method` says, then deletes them. Revocation is best effort and
+        audited as `token_revoked` with its outcome; the grant is deleted whatever the outcome.
   fixed:
     - timestamp: '2026-10-30T21:00:00Z'
       title: Stop logging that the delegation vault is encrypted when it is not
