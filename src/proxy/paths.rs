@@ -4,6 +4,17 @@
 //! authentication gates (OIDC, Trust Registry validation, etc.) regardless
 //! of channel configuration.
 
+/// The discovery documents a route serves, relative to its root.
+const DISCOVERY_DOCUMENTS: &[&str] = &[
+    ".well-known/agent-card.json",
+    ".well-known/agent.json",
+    "agent-card.json",
+    "agent.json",
+    ".well-known/ucp",
+    ".well-known/agent-card",
+    "discovery",
+];
+
 /// Returns `true` for paths that are always publicly accessible and must
 /// bypass all authentication gates (OIDC, Trust Registry, etc.) regardless
 /// of how the channel is configured.
@@ -20,12 +31,30 @@ pub fn is_public_path(path: &str) -> bool {
         .strip_suffix('/')
         .unwrap_or(path);
 
-    is_well_known_agent_card_path(path)
-        || path.ends_with("/agent-card.json")
-        || path.ends_with("/agent.json")
-        || path.ends_with("/.well-known/ucp")
-        || path.ends_with("/.well-known/agent-card")
-        || path.ends_with("/discovery")
+    DISCOVERY_DOCUMENTS
+        .iter()
+        .any(|document| {
+            path.strip_suffix(document)
+                .is_some_and(|prefix| prefix.ends_with('/'))
+        })
+}
+
+/// Whether a request through a Transit Point is a public discovery read: a
+/// `GET` or `HEAD` whose path below the Transit Point, which is the path its
+/// target receives below the target endpoint, is exactly a discovery document.
+/// Only that spelling counts, with at most one trailing slash: a document below
+/// another segment, such as `admin/discovery`, or a path with percent-escapes,
+/// `;` parameters, `\` or dot segments is not a discovery read, whatever the
+/// target's router resolves it to.
+pub fn is_transit_discovery_request(
+    method: &str,
+    transit_relative_path: &str,
+) -> bool {
+    let path = transit_relative_path.trim_start_matches('/');
+    let path = path
+        .strip_suffix('/')
+        .unwrap_or(path);
+    (method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD")) && DISCOVERY_DOCUMENTS.contains(&path)
 }
 
 /// Whether `path` requests a well-known agent card (`agent-card.json` or the
@@ -230,6 +259,53 @@ mod tests {
             );
         }
         assert!(!is_public_request("GET", "/surface/tools"));
+    }
+
+    #[test]
+    fn a_transit_discovery_request_is_a_get_or_head_of_a_discovery_document_at_the_transit_point_root() {
+        for path in [
+            ".well-known/agent-card.json",
+            "/.well-known/agent.json",
+            "agent-card.json",
+            "agent.json",
+            ".well-known/ucp",
+            ".well-known/agent-card",
+            "discovery",
+            "discovery/",
+        ] {
+            for method in ["GET", "HEAD", "get"] {
+                assert!(is_transit_discovery_request(method, path), "{method} {path}");
+            }
+            for method in ["POST", "PUT", "DELETE", "OPTIONS"] {
+                assert!(!is_transit_discovery_request(method, path), "{method} {path}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_transit_discovery_request_is_never_a_document_below_the_root_or_a_non_canonical_spelling() {
+        for path in [
+            "",
+            "admin/discovery",
+            "x/admin/discovery",
+            "tools/agent.json",
+            "admin/.well-known/agent-card.json",
+            "discovery/x",
+            "discovery//",
+            "Discovery",
+            "%64iscovery",
+            "admin%2Fdiscovery",
+            "admin%2f..%2fdiscovery",
+            "admin/../discovery",
+            "./discovery",
+            "discovery;x=1",
+            "admin;/discovery",
+            "admin\\discovery",
+            ".well-known/ucp/../../admin",
+            ".well-known%2Fagent-card.json",
+        ] {
+            assert!(!is_transit_discovery_request("GET", path), "{path}");
+        }
     }
 
     const ROOT_TARGET: &str = "http://target.example";
