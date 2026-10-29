@@ -55,7 +55,9 @@ describe('Transit Settings listener authentication', () => {
   });
 
   it('returns null when transit.source_auth is the only shared transit field', () => {
-    expect(transitConfigConfigFromPayload({ transit: { source_auth: storedSourceAuth } })).toBeNull();
+    expect(
+      transitConfigConfigFromPayload({ transit: { source_auth: storedSourceAuth } })
+    ).toBeNull();
   });
 
   it('never writes transit.source_auth, even from stale listener authentication fields', () => {
