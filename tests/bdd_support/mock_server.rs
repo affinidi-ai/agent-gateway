@@ -428,6 +428,24 @@ pub fn discover_non_loopback_local_ip() -> std::net::IpAddr {
     ip
 }
 
+/// Joins a repeated header's values with ", ", so a step comparing one value fails on a duplicate.
+fn received_headers(headers: &axum::http::HeaderMap) -> HashMap<String, String> {
+    let mut received: HashMap<String, String> = HashMap::new();
+    for (name, value) in headers {
+        let value = value
+            .to_str()
+            .unwrap_or("");
+        received
+            .entry(name.to_string())
+            .and_modify(|existing| {
+                existing.push_str(", ");
+                existing.push_str(value);
+            })
+            .or_insert_with(|| value.to_string());
+    }
+    received
+}
+
 async fn handler(
     State(state): State<Arc<Mutex<MockState>>>,
     request: Request<Body>,
@@ -436,18 +454,7 @@ async fn handler(
         .method()
         .as_str()
         .to_string();
-    let headers: HashMap<String, String> = request
-        .headers()
-        .iter()
-        .map(|(k, v)| {
-            (
-                k.to_string(),
-                v.to_str()
-                    .unwrap_or("")
-                    .to_string(),
-            )
-        })
-        .collect();
+    let headers = received_headers(request.headers());
     let content_type = headers
         .get("content-type")
         .cloned();
@@ -800,18 +807,7 @@ async fn default_handler(
 
     let method = request.method().clone();
 
-    let headers: HashMap<String, String> = request
-        .headers()
-        .iter()
-        .map(|(k, v)| {
-            (
-                k.to_string(),
-                v.to_str()
-                    .unwrap_or("")
-                    .to_string(),
-            )
-        })
-        .collect();
+    let headers = received_headers(request.headers());
     let content_type = headers
         .get("content-type")
         .cloned();
