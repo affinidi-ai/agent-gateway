@@ -9717,8 +9717,29 @@ async fn multi_channel_proxy_handler_in_request_scope(
             };
             let variant_id = selected.map(|variant| variant.id.clone());
 
-            let (resolved_surface, recorded_variant) =
-                state.served_surface(ch, virtual_channel_alias.as_deref(), selected);
+            // A surface the cache retired, because it was disabled or deleted,
+            // is refused: the channel may be a stale copy held by a connection
+            // kept alive across a full reload.
+            let Some((resolved_surface, recorded_variant)) =
+                state.served_surface(ch, virtual_channel_alias.as_deref(), selected)
+            else {
+                warn!(
+                    surface = %ch.surface.name,
+                    config_id = %ch.surface.surface_id,
+                    "Refusing a request routed to a disabled or deleted surface"
+                );
+                crate::audit::request_events::request_rejected(
+                    &crate::audit::request_events::RequestFacts::unroutable(),
+                    crate::audit::request_events::RejectionStage::Routing,
+                    crate::audit::request_events::RejectionReason::NoRoute,
+                    404,
+                    None,
+                );
+                return create_error_response(
+                    StatusCode::NOT_FOUND,
+                    &format!("No route configured for path: {}", path),
+                );
+            };
             crate::observability::policy_audit::set_request_variant(&recorded_variant);
 
             // Select the correct engines. In base-mode (variant_id == None) we
@@ -21483,6 +21504,39 @@ allow if {
             .iter()
             .collect();
         assert_eq!(values, ["gateway-key"]);
+    }
+
+    #[tokio::test]
+    async fn a_connection_routed_with_a_disabled_surface_is_refused() {
+        let target = crate::component_tests::helpers::RecordingTarget::start(axum::http::StatusCode::OK, &[]).await;
+        let surface = mcp_surface("retired-surface", &target.url, None);
+        let mut router = direct_router_state(&bare_proxy_state(surface.clone(), None), surface.clone());
+        let cache = std::sync::Arc::new(crate::surfaces::ResolvedSurfaceCache::new());
+        cache
+            .upsert(&surface)
+            .unwrap();
+        router.resolved_surface_cache = cache.clone();
+        let send = || {
+            super::multi_channel_proxy_handler(
+                axum::extract::ConnectInfo(
+                    "127.0.0.1:12345"
+                        .parse()
+                        .unwrap(),
+                ),
+                axum::extract::State(router.clone()),
+                legacy_mcp_request(
+                    "/retired-surface",
+                    &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+                ),
+            )
+        };
+        assert_eq!(send().await.status(), axum::http::StatusCode::OK);
+        assert_eq!(target.received().len(), 1);
+
+        cache.remove(&surface.surface_id);
+
+        assert_eq!(send().await.status(), axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(target.received().len(), 1, "a retired surface must not reach its target");
     }
 
     #[tokio::test]
