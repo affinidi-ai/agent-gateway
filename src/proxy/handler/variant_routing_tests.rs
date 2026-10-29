@@ -680,6 +680,47 @@ async fn a_legacy_mcp_variant_refusal_keeps_its_plain_error() {
     }
 }
 
+#[test]
+fn a_fabric_target_is_sent_only_the_alias_it_pins_never_the_callers() {
+    let route = |endpoint: &str, path: &str| super::fabric_send_route(&surface(endpoint, catalog(), None), path).unwrap();
+    let cases = [
+        ("no alias", "fabric://gw2/orders", "/a2a/rpc", "orders", None, "fabric://gw2/orders"),
+        ("the caller's alias", "fabric://gw2/orders", "/a2a$beta/rpc", "orders", None, "fabric://gw2/orders"),
+        ("a pinned alias", "fabric://gw2/orders$v", "/a2a$beta/rpc", "orders", Some("v"), "fabric://gw2/orders$v"),
+    ];
+    for (case, endpoint, path, channel_id, variant_alias, stream_target) in cases {
+        let sent = route(endpoint, path);
+
+        assert_eq!(sent.gateway_id, "gw2", "{case}");
+        assert_eq!(sent.channel_id, channel_id, "{case}: the ForwardRequest's channel_id");
+        assert_eq!(sent.variant_alias.as_deref(), variant_alias, "{case}: the ForwardRequest's alias");
+        assert_eq!(sent.stream_target, stream_target, "{case}: the stream's target");
+    }
+}
+
+#[test]
+fn a_variant_whose_fabric_target_pins_an_alias_sends_it() {
+    let pinned: AgentSurface = serde_json::from_value(json!({
+        "surface_id": "orders", "name": "Orders",
+        "access_point": {"listen_address": "https://gateway.example", "route": "/a2a", "protocol": "a2a"},
+        "target": {"endpoint": "fabric://gw2/orders"},
+        "variants": [{"id": "v-beta", "alias": "beta", "name": "Beta", "overrides": {
+            "target": {"endpoint": "fabric://gw2/orders$v"}
+        }}]
+    }))
+    .unwrap();
+    let served = pinned
+        .serve_variant(Some("beta"))
+        .unwrap()
+        .surface;
+
+    let sent = super::fabric_send_route(&served, "/a2a$beta/rpc").unwrap();
+
+    assert_eq!(sent.channel_id, "orders");
+    assert_eq!(sent.variant_alias.as_deref(), Some("v"));
+    assert_eq!(sent.stream_target, "fabric://gw2/orders$v");
+}
+
 #[tokio::test]
 async fn a_surface_with_variants_but_no_default_serves_an_alias_less_request_from_the_base() {
     let target =

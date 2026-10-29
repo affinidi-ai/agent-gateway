@@ -679,6 +679,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_forward_request_names_the_peer_surface_and_only_the_alias_its_target_pins() {
+        let method = Method::POST;
+        let request = FabricForwardRequest {
+            fabric_target: "",
+            method: &method,
+            path: "/rpc",
+            headers: HashMap::new(),
+            body: Bytes::new(),
+            timeout: Duration::from_secs(1),
+            trace_id: "trace",
+            log_label: "Orders",
+        };
+        for (channel, surface, alias) in [("orders", "orders", None), ("orders$v", "orders", Some("v"))] {
+            let body = forward_request_body(channel, &request, serde_json::Value::Null, 0);
+
+            assert_eq!(body["channel_id"], surface, "{channel}");
+            assert_eq!(body["virtual_channel_alias"], serde_json::json!(alias), "{channel}: {body}");
+            assert_eq!(body["active_variant_alias"], serde_json::json!(alias), "{channel}: {body}");
+        }
+    }
+
+    #[test]
     fn an_outbound_stream_registered_while_a_revocation_ran_is_refused() {
         use crate::proxy::fabric_stream::registry::{ReceiveRegistry, RegistryLimits, StreamBinding, StreamKind};
 
