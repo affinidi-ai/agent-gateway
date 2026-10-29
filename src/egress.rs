@@ -249,7 +249,9 @@ fn validate_and_pin_inner(
 /// Builds a redirect-disabled client pinned to `target`'s vetted addresses.
 ///
 /// `resolve_to_addrs` is builder-only in reqwest 0.13, so a fresh client is
-/// built per pinned target — acceptable for guarded egress.
+/// built per pinned target — acceptable for guarded egress. The client ignores
+/// any proxy the environment or the system names: a proxy would resolve the
+/// host again and connect to an address nobody vetted.
 fn pinned_client(
     target: &PinnedTarget,
     timeout: Duration,
@@ -257,6 +259,7 @@ fn pinned_client(
     Client::builder()
         .timeout(timeout)
         .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
         .resolve_to_addrs(&target.host, &target.addrs)
         .build()
         .map_err(EgressError::Http)
@@ -659,6 +662,86 @@ mod tests {
             }
         });
         addr
+    }
+
+    /// A pinned client never sends through a proxy the environment names: the
+    /// proxy would resolve the host again and connect to an address nobody
+    /// vetted. Runs in a process of its own, since the proxy variables are
+    /// process-wide.
+    #[test]
+    fn pinned_clients_ignore_proxies_the_environment_names() {
+        if !crate::a2a::version::run_isolated_from_other_tests() {
+            return;
+        }
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let proxy = spawn_server("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await;
+                let proxied = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let listener = TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .unwrap();
+                let recording_proxy = listener.local_addr().unwrap();
+                let seen = proxied.clone();
+                tokio::spawn(async move {
+                    while let Ok((mut sock, _)) = listener.accept().await {
+                        seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                        let mut buf = [0u8; 1024];
+                        let _ = sock.read(&mut buf).await;
+                        let mut upstream = tokio::net::TcpStream::connect(proxy)
+                            .await
+                            .unwrap();
+                        let _ = upstream
+                            .write_all(b"GET / HTTP/1.1\r\nHost: proxy\r\n\r\n")
+                            .await;
+                        let mut answer = [0u8; 1024];
+                        let read = upstream
+                            .read(&mut answer)
+                            .await
+                            .unwrap_or(0);
+                        let _ = sock
+                            .write_all(&answer[..read])
+                            .await;
+                    }
+                });
+                for name in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"] {
+                    unsafe { std::env::set_var(name, format!("http://{recording_proxy}")) };
+                }
+                for name in ["NO_PROXY", "no_proxy"] {
+                    unsafe { std::env::remove_var(name) };
+                }
+
+                let target = spawn_server("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await;
+                let url = format!("http://{target}/direct");
+                let (forward, _) = pinned_forward_client(&url, Duration::from_secs(5)).unwrap();
+                assert_eq!(
+                    forward
+                        .get(&url)
+                        .send()
+                        .await
+                        .unwrap()
+                        .status(),
+                    200
+                );
+                let vendor = pinned_vendor_client(&url, Duration::from_secs(5), Some(&format!("http://{target}")))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    vendor
+                        .get(&url)
+                        .send()
+                        .await
+                        .unwrap()
+                        .status(),
+                    200
+                );
+                assert!(
+                    !proxied.load(std::sync::atomic::Ordering::SeqCst),
+                    "a pinned client sent a request through the proxy"
+                );
+            });
     }
 
     #[tokio::test]

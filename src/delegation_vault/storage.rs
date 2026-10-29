@@ -207,6 +207,15 @@ impl FileSystemDelegationVaultStore {
         let stable_grant_ids = crate::identity::credential_identity::pepper_is_configured();
         // Use uncached storage for security — tokens should not linger in memory
         let storage = uncached_storage(path.clone(), "delegation_token").await?;
+        let grants = uncached_storage(path.join(GRANTS_DIRECTORY), "delegated_grant").await?;
+        // Uncached stores load nothing at boot, so records restored in
+        // plaintext would stay so until read: encrypt them now.
+        storage
+            .migrate_plaintext_at_rest()
+            .await?;
+        grants
+            .migrate_plaintext_at_rest()
+            .await?;
         if encrypted {
             info!(
                 target: "credential_delegation",
@@ -236,9 +245,7 @@ impl FileSystemDelegationVaultStore {
             refreshes: uncached_storage(path.join("refresh_claims"), "delegation_refresh")
                 .await?
                 .into(),
-            grants: uncached_storage(path.join(GRANTS_DIRECTORY), "delegated_grant")
-                .await?
-                .into(),
+            grants: grants.into(),
             grants_directory: path.join(GRANTS_DIRECTORY),
             encrypted,
             stable_grant_ids,
@@ -811,8 +818,8 @@ impl DelegationVaultStorage for FileSystemDelegationVaultStore {
             info!(
                 target: "credential_delegation",
                 grant_id = %grant.id,
-                surface_id = %grant.surface_id,
-                hop = %grant.hop,
+                surface_id = ?grant.surface_id,
+                hop = ?grant.hop,
                 credential_provider_id = %grant.credential_provider_id,
                 replaced = replaced.is_some(),
                 "Delegated grant stored in vault"
@@ -1376,6 +1383,70 @@ mod tests {
         FileSystemDelegationVaultStore::new(directory.into())
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn records_restored_in_plaintext_are_encrypted_when_the_vault_starts() {
+        use crate::delegation_vault::grants::tests::{grant, key};
+        let directory = tempfile::tempdir().unwrap();
+        let grants = directory
+            .path()
+            .join("delegated_grants");
+        std::fs::create_dir_all(&grants).unwrap();
+        let mut restored = grant(&key(), "restored-access");
+        restored.id = key().record_id();
+        let plaintext_grant = grants.join(format!("{}.json", restored.id));
+        std::fs::write(&plaintext_grant, serde_json::to_vec(&restored).unwrap()).unwrap();
+        let plaintext_token = directory
+            .path()
+            .join("restored-token.json");
+        std::fs::write(
+            &plaintext_token,
+            serde_json::to_vec(&serde_json::json!({
+                "id": "restored-token", "agent_did": "did:web:agent.example",
+                "user_identity_hash": "sha256:user", "credential_provider_id": "provider",
+                "provider_id": "provider", "access_token": "restored-token-access", "scopes": ["read"],
+                "consent_granted_at": "2026-09-01T00:00:00Z",
+                "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let vault = encrypted_vault(directory.path()).await;
+
+        for (plaintext, secret) in [(plaintext_grant, "restored-access"), (plaintext_token, "restored-token-access")] {
+            assert!(!plaintext.exists(), "{} is left in plaintext", plaintext.display());
+            let encrypted = plaintext.with_extension("json.enc");
+            assert!(encrypted.exists(), "{}", encrypted.display());
+            assert!(!String::from_utf8_lossy(&std::fs::read(&encrypted).unwrap()).contains(secret));
+        }
+        assert_eq!(
+            vault
+                .grant(&key())
+                .await
+                .unwrap()
+                .unwrap()
+                .access_token,
+            "restored-access"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_grants_transit_point_and_surface_are_logged_escaped() {
+        use crate::component_tests::helpers::formatted_logs::FormattedLogs;
+        use crate::delegation_vault::grants::tests::grant;
+        let directory = tempfile::tempdir().unwrap();
+        let vault = encrypted_vault(directory.path()).await;
+        let key = GrantKey::owner(Some("tenant-a"), "surface\nINFO forged surface", "hop\nINFO forged hop", "provider");
+        let logs = FormattedLogs::capture();
+        vault
+            .store_grant(grant(&key, "access"))
+            .await
+            .unwrap();
+        let text = logs.text();
+        assert!(text.contains("Delegated grant stored in vault"), "{text}");
+        assert!(!text.contains("\nINFO forged"), "a stored name starts a log line of its own: {text}");
     }
 
     #[tokio::test]

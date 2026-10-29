@@ -395,7 +395,7 @@ pub async fn create_provider(
             Err(error) => {
                 warn!(
                     target: "credential_delegation",
-                    provider_id = %provider.provider_id,
+                    provider_id = ?provider.provider_id,
                     code = error.code(),
                     detail = error.detail(),
                     "Refused a credential provider whose issuer's metadata could not be read"
@@ -406,7 +406,7 @@ pub async fn create_provider(
         if let Err(error) = super::external::check_metadata(&provider, &metadata) {
             warn!(
                 target: "credential_delegation",
-                provider_id = %provider.provider_id,
+                provider_id = ?provider.provider_id,
                 error = ?error,
                 "Refused a credential provider that does not match its issuer's metadata"
             );
@@ -1357,6 +1357,28 @@ mod external_provider_tests {
                 .await
                 .is_empty()
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_providers_slug_is_logged_escaped() {
+        use crate::component_tests::helpers::formatted_logs::FormattedLogs;
+        let directory = tempfile::tempdir().unwrap();
+        let mut moved = metadata();
+        moved.token_endpoint = "https://203.0.113.66/token".into();
+        for answer in [Err(DiscoveryFailure::Blocked), Ok(moved)] {
+            let state = state(&directory, answer).await;
+            let logs = FormattedLogs::capture();
+            let (status, _) = create(
+                &state,
+                "tenant-a",
+                create_request(|body| body["provider_id"] = json!("slug\nWARN forged line")),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            let text = logs.text();
+            assert!(text.contains("Refused a credential provider"), "{text}");
+            assert!(!text.contains("\nwarn forged line"), "the slug starts a log line of its own: {text}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
