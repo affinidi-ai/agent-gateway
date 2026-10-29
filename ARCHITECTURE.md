@@ -187,19 +187,20 @@ flowchart TB
         D0[Credential injection] --> D1[Forward] --> D2["Response and<br/>agent-card rewrite"] --> D3[Metrics]
     end
     E --> I --> P --> F
-    I -. discovery GET .-> F
+    I -. discovery read .-> F
 ```
 
 Every Transit Point authenticates its caller in the first stage, with its `source_auth` or
 Resource Server token, or in the second, with the transit token, unless it is marked
 `allow_unauthenticated_callers`; one that cannot be enforced refuses every request there,
 before anything is forwarded or any credential resolved (see
-[`docs/SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#transit-point-callers)). Public discovery GETs,
-such as an agent card, skip transit token validation and the trust and policy group, and are
-forwarded without credentials. They still meet a Transit Point's `source_auth` or Resource
-Server token, but on a Transit Point that authenticates its callers with the transit token
-alone, a discovery GET is forwarded with no caller authentication at all. The outbound path does not
-evaluate the appliance-wide policies.
+[`docs/SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#transit-point-callers)). A discovery read, a `GET`
+or `HEAD` of a discovery document such as an agent card directly below the Transit Point,
+skips transit token validation and the trust and policy group, and is forwarded without
+credentials. It still meets a Transit Point's `source_auth` or Resource Server token, but on a
+Transit Point that authenticates its callers with the transit token alone, a discovery read is
+forwarded with no caller authentication at all. The outbound path does not evaluate the
+appliance-wide policies.
 
 ## Full order
 
@@ -223,13 +224,15 @@ Outbound:
 caller authentication (a Transit Point whose caller authentication cannot be enforced, or
 whose surface sets `transit.source_auth`, is refused here; otherwise its `source_auth`, or on
 a Transit Point with `mcp_http.authorization` the Resource Server token) →
-transit token validation → rate limit → protocol context → Fabric hop check (a `fabric://`
-Transit Point refuses a call past the hop limit with `508`) → Transit Point header mapping
+transit token validation → rate limit → protocol context → variant check (a variant whose
+Transit Point sets other gating or policies than the base surface's is refused with `403`) →
+Fabric hop check (a `fabric://` Transit Point refuses a call past the hop limit with `508`) →
+Transit Point header mapping
 (A2A and AP2) → outbound extension inspection (A2A) → identity resolution → trusted
 identity → custom metadata → trust context → Trust Check (the Transit Point's own list) → gateway OPA →
 surface OPA → Transit Point OPA → MCP tool gating (`tools/call`) → credential injection →
 forward → response and agent-card rewrite → metrics. The stages from trust context to MCP
-tool gating are skipped for public discovery GETs.
+tool gating are skipped for discovery reads.
 
 This page is the authority on pipeline ordering. When it disagrees with a summary
 elsewhere, the source is the arbiter and this page is corrected.
@@ -325,7 +328,7 @@ Breaking one of these is a correctness bug, not a style question.
 | Identity attribution fails closed. A presentation that does not verify never becomes the caller identity. | An unverified DID would reach policy as if it were proven. |
 | Every event of a forwarded A2A event stream gets the response checks a non-streaming reply gets before it is sent, and one that fails them ends the stream. | Streaming would bypass the response policy and the agent identity credential. |
 | A caller whose source authentication failed is never forwarded with the surface's stored target credential, or the A2A proxy's Direct Line secret, on the inbound and Fabric forwarding paths (direct, `proxy://` MCP, `a2a-proxy://`, Fabric send, Fabric receive). | An unauthenticated caller would reach the Target with the operator's credential. |
-| A Transit Point authenticates its caller, with a transit token, a Resource Server token or its `source_auth`, before anything is forwarded or any credential resolved, unless it is marked `allow_unauthenticated_callers`; one whose caller authentication cannot be enforced refuses every request. The one exception: a Transit Point that relies on the transit token alone forwards a public discovery `GET` without it, and without any credential. | Anyone who reaches a Transit Point would call its target as this gateway, with its target credentials. |
+| A Transit Point authenticates its caller, with a transit token, a Resource Server token or its `source_auth`, before anything is forwarded or any credential resolved, unless it is marked `allow_unauthenticated_callers`; one whose caller authentication cannot be enforced refuses every request. The one exception: a Transit Point that relies on the transit token alone forwards a discovery read, a `GET` or `HEAD` of a discovery document directly below the Transit Point, without it, and without any credential. | Anyone who reaches a Transit Point would call its target as this gateway, with its target credentials. |
 | A managed agent receives the caller-info and `did:webvh` identity headers (`CallerHeaders::NAMES`) only as this gateway sets them: the inbound path and Fabric receive drop every copy a caller or a peer gateway sent, and a Transit Point sends its target none of them. | The agent, or a Transit Point's target, could not rely on these headers. |
 | A transit token issued for a request that arrived over Fabric names the peer gateway, never carries a `sub`, and its only principal (`fabric.principal_hash`) is the caller the receiving surface's own source authentication verified, set only when that authentication tells a partner's users apart; nothing the peer says about its caller becomes one. It opens only the Transit Points that allow Fabric callers, keys a delegated credential only on one that sets `delegated_credentials_for_fabric_callers`, and the agent gets only the token this gateway issued. | A partner gateway's word about a user could unlock that user's grants, or a token a peer sent could reach the agent. |
 | Fabric receive never releases its Target's per-user delegated credentials, and never starts consent for a legacy Fabric request. A Transit Point's `delegated_credentials_for_fabric_callers` releases a grant only beside caller authentication that tells a partner's users apart, checked when the token is issued and again on the call, and a Transit Point never starts consent, legacy or `2026-07-28`, for a caller a Fabric-issued token names: it releases only a grant that already exists. | One partner credential would key one grant for all of the partner's users, or an authorization URL relayed through a partner would let it bind its own account. |

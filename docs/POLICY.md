@@ -346,7 +346,7 @@ keep the rule in the Transit Point's own `response_policy`.
 | `input.transit.caller.verification` | `transit_token` | The call carries a valid transit token whose `user_identity_hash` came from source authentication on the Access Point. |
 | | `unverified` | A valid transit token names a caller DID but carries no verified principal: the DID was asserted or derived from request fields on the Access Point. |
 | | `fabric_peer` | The call carries a valid transit token this gateway issued for a request a paired gateway sent over Fabric (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)). The peer gateway is verified, and named in `fabric`. The caller it sent the request for is verified only when the receiving surface's own `source_auth` or resource token verified a credential on that request with caller authentication that tells a partner's users apart (see [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-a-transit-point)): then `verified` is `true` and `user_identity_hash` names that caller. An API key or other shared credential leaves it unverified. Whatever the peer says about its caller never verifies it. A rule on `verification == "transit_token"` never matches it. |
-| | `anonymous` | The call carries no valid transit token: none on a Transit Point that does not require one, one there that does not verify, or a public discovery `GET`. A Transit Point that does not require a token still verifies one the agent sends, so a valid token is reported as above. There it names the caller to policy only: delegated credentials, Workload Binding and stream expiry still treat the call as carrying no token. A client the Transit Point authenticated does not change this. |
+| | `anonymous` | The call carries no valid transit token: none on a Transit Point that does not require one, one there that does not verify, or a discovery read (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)). A Transit Point that does not require a token still verifies one the agent sends, so a valid token is reported as above. There it names the caller to policy only: delegated credentials, Workload Binding and stream expiry still treat the call as carrying no token. A client the Transit Point authenticated does not change this. |
 | `input.transit.caller.identity_source` | `gateway-computed`, `self-presented`, `verified-presentation` | How the Access Point established the caller DID. Absent when the token has none. |
 | | `fabric-presentation`, `fabric-asserted` | For a `fabric_peer` caller: the DID came from a presentation one of the connection's issuers signed, or from anything else the peer sent (or the request names no DID). |
 | `input.transit.caller.user_identity_hash` | lowercase hex SHA-256 | The caller's [identity hash](CREDENTIAL_DELEGATION.md#the-callers-identity-hash) the Access Point computed: the source-auth method, its issuer, the surface's tenant and the principal (the JWT `sub`, API key name, DID or mTLS principal). The same subject verified by another method, issuer or tenant has another hash. For a `fabric_peer` caller it is the caller the receiving surface verified on the Fabric request, the same value for the same credential as on its Access Point. Present only when `verified`, and absent for a JWT that names no `sub`. |
@@ -739,8 +739,15 @@ stored. They do not record which policy a request ends up under:
 - A variant saved with `complete: true` (the surface builder saves every variant this way)
   replaces the base wholesale, so a policy it does not set is cleared for its traffic. Its
   records show only the policies it sets.
-- A variant's transit overrides (shared or per transit point) are recorded as written, but the
-  runtime compiles transit policies from the base surface only, so they are not enforced.
+- A variant's shared transit overrides are recorded as written, but the runtime compiles
+  transit policies from the base surface only, so they are not enforced. A variant's Transit
+  Point cannot change the `policy` or `response_policy` of the surface's Transit Point of the
+  same alias: the admin API refuses such a write with `400`, also when the surface has no
+  Transit Point of that alias, and a stored variant whose Transit Point sets a different
+  one has the requests through that Transit Point refused with `403`. A variant Transit
+  Point that leaves them out is enforced with the surface Transit Point's policies. See
+  [`MCP_TOOL_GATING.md`](MCP_TOOL_GATING.md), which applies the same rule to
+  `mcp_tool_gating`.
 
 A surface change record names the slot it wrote in `surface_variant`: the variant's alias for a
 slot in a variant's overrides, or `_base_` for a slot on the base surface. A base change also
