@@ -164,6 +164,14 @@ the connection point `created`, `updated` and `deleted` events, also carry `OLD_
 respectively. A connection point's state leaves out its invitation (`oob_id`, `oob_url`,
 `oob_message`) and its secret, since whoever holds them can connect.
 
+Audit events carry the `AUDIT_*` variables listed in
+[`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding). Among them,
+`AUDIT_SURFACE_VARIANT` (**Surface Variant**) is the variant the request resolved to: the
+variant's alias, `_base_` when the base surface served it, `_unknown_` on an unknown-variant
+refusal, or the disabled alias on a disabled-variant refusal. It is empty outside surface requests
+and when the surface's default variant is misconfigured. A template can send it as, for example,
+`"audit_surface_variant": "${AUDIT_SURFACE_VARIANT}"`.
+
 A user's `OLD_STATE` and `NEW_STATE` carry only `user_id`, `role`, `status`, `is_primary`,
 `created_at`, and `updated_at`
 ([`user_integration_triggers.rs`](../src/integrations/user_integration_triggers.rs)). Passkeys,

@@ -7,6 +7,7 @@ import {
   planeLabel,
   policyChange,
   policyChangeTitle,
+  requestRejected,
   scopeLabel,
   slotLabel,
   surfaceIdOf,
@@ -15,6 +16,7 @@ import {
   traceTerminated,
 } from './auditHelpers';
 import { actorLabel, trustErrorClause, type UserNameResolver } from './eventNarrative';
+import { surfaceVariantLabel } from '../../utils/surfaceVariant';
 import type {
   AuditEntry,
   PolicyChangeData,
@@ -92,6 +94,7 @@ export function fieldGroups(
       href: surfaceId ? `/surfaces/${encodeURIComponent(surfaceId)}` : undefined,
     });
   }
+  add(routing, 'Variant', surfaceVariantLabel(fieldStr(entry.surface_variant)));
   add(routing, 'Target', fieldStr(entry.target_endpoint), { mono: true });
   add(routing, 'Protocol', fieldStr(entry.protocol));
   add(routing, 'MCP tool', fieldStr(entry.mcp_tool_name), { mono: true });
@@ -119,7 +122,7 @@ export function fieldGroups(
       typeof pd.policy_version === 'number' ? `v${pd.policy_version}` : undefined
     );
     add(policy, 'Policy SHA', fieldStr(pd.policy_content_hash), { mono: true });
-    add(policy, 'Scope', scopeLabel(pd.scope));
+    add(policy, 'Scope', pd.scope === 'gateway' ? 'Gateway (all surfaces)' : scopeLabel(pd.scope));
     if (pd.flow) add(policy, 'Flow', flowLabel(pd.flow));
     add(policy, 'Decision', pd.decision);
     add(policy, 'Deny reason', fieldStr(pd.deny_reason));
@@ -154,12 +157,25 @@ export function fieldGroups(
 
   if (!tt) add(policy, 'Detail', fieldStr(entry.detail));
 
+  // `http_status` is absent on a Fabric refusal, and `rpc_error_code` present only when the
+  // caller was answered with a JSON-RPC error; each row shows only when recorded.
+  const rejected = requestRejected(entry);
+  const refusal: FieldItem[] = [];
+  if (rejected) {
+    add(refusal, 'Stage', fieldStr(rejected.stage));
+    add(refusal, 'Reason', fieldStr(rejected.reason)?.replace(/_/g, ' '));
+    add(refusal, 'HTTP status', fieldStr(rejected.http_status));
+    add(refusal, 'JSON-RPC error', fieldStr(rejected.rpc_error_code));
+    add(refusal, 'Requested variant', fieldStr(rejected.requested_variant), { mono: true });
+  }
+
   return [
     { label: 'Identity', items: identity },
     { label: 'Surface & routing', items: routing },
     { label: 'Credentials', items: credentials },
     { label: 'Trace', items: trace },
     { label: 'Policy', items: policy },
+    { label: 'Refusal', items: refusal },
   ];
 }
 
@@ -222,7 +238,7 @@ function changeGroups(
   add(where, 'Target', target, href ? { href } : {});
   add(where, 'Slot', slotLabel(change));
   add(where, 'Scope', change.scope ? scopeLabel(change.scope) : undefined);
-  add(where, 'Variant', fieldStr(change.variant));
+  add(where, 'Variant', surfaceVariantLabel(fieldStr(change.surface_variant)));
   add(where, 'Transit point', fieldStr(change.transit_point), { mono: true });
   add(where, 'MCP tool', fieldStr(change.mcp_tool_name), { mono: true });
   add(where, 'Gate', fieldStr(change.gate));
