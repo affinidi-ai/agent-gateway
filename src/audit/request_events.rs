@@ -9,7 +9,7 @@ pub use crate::audit::events::{RejectionReason, RejectionStage};
 
 use crate::audit::events::{AuthScheme, RateLimitScope};
 use crate::delegation_vault::audit::{DelegationAuditAction, DelegationAuditEvent, audit_event, emit};
-use crate::mcp::resource_server::ResourceTokenError;
+use crate::protocols::protected_resource::ResourceTokenError;
 use crate::source_auth::errors::SourceAuthError;
 use crate::source_auth::models::SourceAuthConfig;
 
@@ -402,7 +402,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_refused_resource_token_is_a_blocking_auth_failure() {
-        use crate::mcp::resource_server::ResourceTokenError;
+        use crate::protocols::protected_resource::ResourceTokenError;
         let ((), events) = crate::audit::producer::capture(async {
             resource_token_failed(&facts(), ResourceTokenError::InsufficientScope, None);
         })
@@ -458,7 +458,7 @@ mod tests {
 
     #[test]
     fn resource_token_errors_have_fixed_reason_codes() {
-        use crate::mcp::resource_server::ResourceTokenError;
+        use crate::protocols::protected_resource::ResourceTokenError;
         assert_eq!(resource_token_reason(ResourceTokenError::Missing), "missing_credential");
         assert_eq!(resource_token_reason(ResourceTokenError::Invalid), "invalid_credential");
         assert_eq!(resource_token_reason(ResourceTokenError::InsufficientScope), "insufficient_scope");

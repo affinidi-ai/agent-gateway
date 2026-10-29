@@ -85,6 +85,15 @@ impl AgentSurface {
             .and_then(|ca| ca.methods.first())
     }
 
+    /// RFC 9728 settings of the Access Point's caller authentication.
+    #[inline]
+    pub fn protected_resource(&self) -> Option<&crate::protocols::protected_resource::ProtectedResourceConfig> {
+        self.access_point
+            .caller_authentication
+            .as_ref()
+            .and_then(|ca| ca.protected_resource.as_ref())
+    }
+
     /// Lift the surface `target.identity_injection` back to the legacy
     /// `ManagedIdentityConfig` shape used by the proxy/MCP pipelines.
     /// Returns `None` when the injection has no recognized type.

@@ -144,6 +144,33 @@ export interface SurfaceFormShellProps {
    * Set to true by the page on first Create / Save attempt.
    */
   hasAttemptedSave?: boolean;
+  /**
+   * Message of the last failed save. Panels read it from the surface meta
+   * context to show an error next to the field it names, beside `topBanner`.
+   */
+  saveError?: string | null;
+}
+
+/** True when `variantId` is the default variant in the canvas's variant catalog. */
+function isDefaultVariant(nodes: CanvasNode[], variantId: string | null | undefined): boolean {
+  const defaultId: unknown = nodes.find(n => n.type === 'target-variant')?.config
+    ?.default_variant_id;
+  return !!variantId && defaultId === variantId;
+}
+
+/** Alias of the variant `variantId` in the canvas's variant catalog, if it is a named one. */
+function variantAlias(
+  nodes: CanvasNode[],
+  variantId: string | null | undefined
+): string | undefined {
+  if (!variantId) return undefined;
+  const catalog: unknown = nodes.find(n => n.type === 'target-variant')?.config?.variants;
+  if (!Array.isArray(catalog)) return undefined;
+  const entry: unknown = catalog.find(
+    v => !!v && typeof v === 'object' && (v as { id?: unknown }).id === variantId
+  );
+  const alias = entry ? (entry as { alias?: unknown }).alias : undefined;
+  return typeof alias === 'string' && alias ? alias : undefined;
 }
 
 /**
@@ -264,6 +291,7 @@ const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
   topBanner,
   surfacePolicyLoadState,
   hasAttemptedSave,
+  saveError,
 }) => {
   const surfacePolicyIds =
     surfacePolicyLoadState.status === 'loaded' ? surfacePolicyLoadState.ids : null;
@@ -725,6 +753,9 @@ const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
         isCreate: mode === 'create',
         lastActivity,
         surfaceId,
+        activeVariantAlias: variantAlias(builder.state.nodes, activeVariantId),
+        activeVariantIsDefault: isDefaultVariant(builder.state.nodes, activeVariantId),
+        saveError,
         setName: setMeta.setName,
         setDescription: setMeta.setDescription,
         setTagsCsv: setMeta.setTagsCsv,

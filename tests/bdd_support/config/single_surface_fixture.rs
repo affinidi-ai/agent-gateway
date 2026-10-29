@@ -2,6 +2,16 @@ use std::collections::HashMap;
 
 use crate::bdd_support::config::config_tree::PolicyDefinitionFixture;
 
+/// The public https origin a surface's protected resource is published under.
+pub const PROTECTED_RESOURCE_PUBLIC_ORIGIN: &str = "https://gateway.bdd.example";
+
+/// RFC 9728 discovery settings of the surface's caller authentication.
+#[derive(Debug, Clone)]
+pub struct ProtectedResourceFixture {
+    pub authorization_server: String,
+    pub scopes: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SurfaceConfigBuilder {
     pub protocol: String,
@@ -43,6 +53,7 @@ pub struct SurfaceConfigBuilder {
     pub trust_recorder_entries: Vec<serde_json::Value>,
     pub transit_shared_policy: Option<RequestPolicyFixture>,
     pub mcp_http: Option<serde_json::Value>,
+    pub protected_resource: Option<ProtectedResourceFixture>,
     pub a2a_settings: Option<serde_json::Value>,
     /// Requests the Access Point admits per minute.
     pub rate_limit_per_minute: Option<u32>,
@@ -78,6 +89,7 @@ impl Default for SurfaceConfigBuilder {
             override_target_url: None,
             mcp_proxy_target: None,
             a2a_proxy_target: None,
+            protected_resource: None,
             custom_metadata: None,
             credential_delegation: None,
             oauth_provider_base_url: None,

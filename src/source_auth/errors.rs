@@ -102,8 +102,8 @@ pub type SourceAuthResult<T> = Result<T, SourceAuthError>;
 /// - **A2A / AP2**: `application/problem+json` with the A2A `proxy-error` type
 ///   URI. JWT Bearer 401s include a `WWW-Authenticate: Bearer` header.
 /// - **MCP**: JWT Bearer 401s return `application/problem+json` *without*
-///   the A2A error URI, plus a `WWW-Authenticate` header with `realm` and
-///   `resource_metadata`. API key failures use an `about:blank` problem type.
+///   the A2A error URI, plus a `WWW-Authenticate: Bearer` header with `realm`.
+///   API key failures use an `about:blank` problem type.
 /// - **Other protocols**: fall back to the A2A shape (matches the previous
 ///   behaviour).
 ///
@@ -172,10 +172,7 @@ fn mcp_deny(
         .header("content-type", "application/problem+json");
 
     if challenge && matches!(auth_config, SourceAuthConfig::JwtBearer(_)) {
-        builder = builder.header(
-            "www-authenticate",
-            "Bearer realm=\"agent-gateway\", resource_metadata=\"/.well-known/oauth-protected-resource\"",
-        );
+        builder = builder.header("www-authenticate", "Bearer realm=\"agent-gateway\"");
     }
 
     builder
@@ -242,20 +239,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mcp_missing_credential_is_401_with_challenge() {
-        let err = SourceAuthError::MissingCredential { reason: "no token".into() };
-        let resp = deny_response(&SurfaceProtocol::Mcp, &jwt_config(), &err);
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        assert!(
-            resp.headers()
-                .get("www-authenticate")
-                .is_some_and(|v| v
-                    .to_str()
-                    .unwrap()
-                    .contains("realm"))
-        );
-        let body = body_json(resp).await;
-        assert_eq!(body["status"], 401);
+    async fn mcp_caller_credential_failure_is_401_with_a_challenge_naming_no_metadata() {
+        for err in [
+            SourceAuthError::MissingCredential { reason: "no token".into() },
+            SourceAuthError::InvalidCredential { reason: "expired".into() },
+        ] {
+            let resp = deny_response(&SurfaceProtocol::Mcp, &jwt_config(), &err);
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(resp.headers()["www-authenticate"], "Bearer realm=\"agent-gateway\"");
+            let body = body_json(resp).await;
+            assert_eq!(body["status"], 401);
+        }
     }
 
     #[tokio::test]

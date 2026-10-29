@@ -27,11 +27,19 @@ use crate::source_auth::mtls::{ResolvedTrustMaterial, TrustEntry, verify_peer_ce
 
 pub const SURFACE_AGENT_DID_AUDIENCE: &str = "{{ surface.agent_did }}";
 
+/// The audiences a surface's caller authentication accepts on the route
+/// called. The direct path and Fabric receive both resolve them here, so the
+/// protected resource the route publishes, if any, is the only audience either
+/// path accepts.
 pub async fn resolve_surface_audience(
     config: &SourceAuthConfig,
+    protected_resource: Option<&crate::protocols::protected_resource::ProtectedResourceConfig>,
     vc_issuer: Option<&crate::identity::VCIssuer>,
     surface_id: &str,
 ) -> SourceAuthResult<SourceAuthConfig> {
+    if let Some(protected_resource) = protected_resource {
+        return Ok(protected_resource.bind_audience(config.clone()));
+    }
     let SourceAuthConfig::JwtBearer(jwt_config) = config else {
         return Ok(config.clone());
     };
@@ -689,6 +697,25 @@ mod tests {
         let records = vec![identity_record("did:webvh:other", "other-surface", Utc::now(), true)];
 
         assert_eq!(select_surface_agent_did(records, "shop-agent"), None);
+    }
+
+    #[tokio::test]
+    async fn a_published_protected_resource_is_the_only_audience_accepted() {
+        let config = SourceAuthConfig::JwtBearer(JwtBearerAuthConfig {
+            audiences: vec![SURFACE_AGENT_DID_AUDIENCE.to_string(), "https://other.example/mcp".to_string()],
+            ..Default::default()
+        });
+        let protected =
+            crate::protocols::protected_resource::fixtures::protected_resource("https://gateway.example/mcp/alpha");
+
+        let resolved = resolve_surface_audience(&config, Some(&protected), None, "alpha")
+            .await
+            .expect("bind the protected resource");
+
+        let SourceAuthConfig::JwtBearer(resolved) = resolved else {
+            panic!("expected JWT bearer config");
+        };
+        assert_eq!(resolved.audiences, vec!["https://gateway.example/mcp/alpha"]);
     }
 
     // ── In-memory Secrets Store ─────────────────────────────────────────────

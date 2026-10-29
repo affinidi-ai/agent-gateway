@@ -12,7 +12,7 @@ use crate::bdd_support::config::mcp_proxy::WEATHER_OPENAPI_SPEC;
 use crate::bdd_support::config::reserve_free_port;
 use crate::bdd_support::config::single_surface_fixture::{
     A2aProxyTargetFixture, DidWebVhIdentityFixture, McpProxyTargetFixture, McpToolPolicyFixture,
-    McpWildcardToolPolicyFixture, VariantInboundPolicyFixture, VariantTargetPolicyFixture,
+    McpWildcardToolPolicyFixture, ProtectedResourceFixture, VariantInboundPolicyFixture, VariantTargetPolicyFixture,
 };
 use crate::bdd_support::config::source_auth::caller_authentication_method_json;
 use crate::bdd_support::gateway_process::SURFACE_TEST_AUTH_TOKEN as TEST_AUTH_TOKEN;
@@ -2818,6 +2818,22 @@ async fn surface_rate_limit_is_reached(world: &mut SurfaceWorld) {
             response.body
         );
     }
+}
+
+#[given(
+    expr = "the surface publishes protected resource metadata naming authorization server {string} and scope {string}"
+)]
+fn surface_publishes_protected_resource_metadata(
+    world: &mut SurfaceWorld,
+    authorization_server: String,
+    scope: String,
+) {
+    world
+        .surface_config
+        .protected_resource = Some(ProtectedResourceFixture {
+        authorization_server,
+        scopes: vec![scope],
+    });
 }
 
 #[given(expr = "the surface accepts JWT audience {string}")]

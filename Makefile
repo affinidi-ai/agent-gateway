@@ -27,7 +27,7 @@ SHELL := /bin/bash
         ngrok pre-commit pre-commit-rust pre-commit-node dev full-setup release \
         ui-test ui-test-headed ui-test-report \
 		itest-a2a itest-a2a-setup itest-a2a-run itest-a2a-teardown itest-a2a-clean itest-a2a-shopping \
-		gw-e2e mcp-conformance mcp-conformance-legacy \
+		gw-e2e mcp-conformance mcp-conformance-legacy mcp-discovery \
 		mediator mediator-start mediator-up mediator-stop mediator-down
 
 # Default target
@@ -706,6 +706,11 @@ mcp-conformance: ## Run the MCP 2026-07-28 conformance harness (ARGS="--unit-tes
 
 mcp-conformance-legacy: ## Run only the MCP legacy (2024-11-05) compatibility checks
 	@./scripts/mcp-conformance/run.sh --only legacy $(ARGS)
+
+# Needs Docker, Node >= 22 and mkcert with its CA installed (mkcert -install).
+# ARGS="--keep" leaves it running for MCP Inspector. See scripts/mcp-discovery/README.md.
+mcp-discovery: ## Run MCP authorization server discovery end to end against Ory Hydra (ARGS="--keep")
+	@./scripts/mcp-discovery/run.sh $(ARGS)
 
 # ==============================================================================
 # Storage Commands

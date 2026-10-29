@@ -129,12 +129,16 @@ impl JwtBearerVerifier {
         }
 
         validation.set_required_spec_claims(&required_spec_claims);
+        // A token is not valid before its `nbf` (RFC 7519 section 4.1.5);
+        // jsonwebtoken checks it only when asked, with the same leeway as `exp`.
+        validation.validate_nbf = true;
 
-        // 6. Decode and verify signature + exp + iss + aud
+        // 6. Decode and verify signature + exp + nbf + iss + aud
         let token_data = decode::<Value>(token, &decoding_key, &validation).map_err(|e| {
             use jsonwebtoken::errors::ErrorKind;
             match e.kind() {
                 ErrorKind::ExpiredSignature => JwtBearerError::ExpiredToken,
+                ErrorKind::ImmatureSignature => JwtBearerError::InvalidToken("JWT is not valid yet (nbf)".to_string()),
                 ErrorKind::InvalidIssuer => JwtBearerError::InvalidIssuer,
                 ErrorKind::MissingRequiredClaim(claim) if claim == "iss" => JwtBearerError::InvalidAudience,
                 ErrorKind::InvalidAudience => JwtBearerError::InvalidAudience,
@@ -530,6 +534,39 @@ BNGV7kU9kiKxYO6H5k+Yb+kp
             .await;
 
         assert!(matches!(result, Err(JwtBearerError::ExpiredToken)), "expired token should be rejected");
+    }
+
+    #[tokio::test]
+    async fn test_token_used_before_its_nbf_is_rejected() {
+        let kid = "test-key-nbf";
+        let (base, _handle) = start_test_jwks_server(kid).await;
+        let (validator, strategy) = make_validator_with_pem_key(&base);
+        let audiences = ["https://api.example.com".to_string()];
+        let token = |nbf: u64| {
+            make_token(
+                json!({
+                    "iss": "https://issuer.example.com",
+                    "sub": "user-123",
+                    "aud": "https://api.example.com",
+                    "nbf": nbf,
+                    "exp": now_secs() + 7200
+                }),
+                kid,
+            )
+        };
+
+        let early = validator
+            .validate(&token(now_secs() + 3600), &strategy, &audiences)
+            .await;
+        assert!(matches!(early, Err(JwtBearerError::InvalidToken(_))), "a token before its nbf should be rejected");
+        validator
+            .validate(&token(now_secs() + 30), &strategy, &audiences)
+            .await
+            .expect("an nbf within the 60 s leeway is accepted");
+        validator
+            .validate(&token(now_secs() - 60), &strategy, &audiences)
+            .await
+            .expect("a token past its nbf is accepted");
     }
 
     #[test]

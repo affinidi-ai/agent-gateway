@@ -13,6 +13,7 @@ mod header_metadata_mapping_e2e;
 pub(crate) mod helpers;
 mod identity_e2e;
 mod identity_naming_e2e;
+mod mcp_authorization_discovery_e2e;
 mod mcp_outbound_e2e;
 mod mcp_policy_e2e;
 mod mcp_record_compat;

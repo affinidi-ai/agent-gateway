@@ -44,6 +44,12 @@ export interface SurfaceMetaValue {
   lastActivity?: string | null;
   /** Surface UUID; read-only display in edit mode. */
   surfaceId?: string;
+  /** Alias of the named variant the canvas shows; absent while it shows the base. */
+  activeVariantAlias?: string;
+  /** True when that variant is the surface's default, which also answers on its route. */
+  activeVariantIsDefault?: boolean;
+  /** Message of the last failed save, so a panel can show it next to the field it names. */
+  saveError?: string | null;
   setName: (v: string) => void;
   setDescription: (v: string) => void;
   setTagsCsv: (v: string) => void;

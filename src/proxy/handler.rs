@@ -1220,10 +1220,12 @@ fn evaluate_ap2_inbound_decision(
 
 async fn resolve_direct_surface_auth_config(
     auth_config: &crate::source_auth::SourceAuthConfig,
+    protected_resource: Option<&crate::protocols::protected_resource::ProtectedResourceConfig>,
     vc_issuer: Option<&crate::identity::VCIssuer>,
     surface_id: &str,
 ) -> crate::source_auth::errors::SourceAuthResult<crate::source_auth::SourceAuthConfig> {
-    crate::source_auth::middleware::resolve_surface_audience(auth_config, vc_issuer, surface_id).await
+    crate::source_auth::middleware::resolve_surface_audience(auth_config, protected_resource, vc_issuer, surface_id)
+        .await
 }
 
 /// Maps the config-level delegated-rail marker onto the audit `PaymentRail`.
@@ -1810,6 +1812,31 @@ async fn proxy_handler_with_mcp_runtime(
             .get::<crate::source_auth::client_ip::ClientIp>()
             .map_or(addr.ip(), |client| client.0),
     );
+    let protected_resource = match crate::protocols::protected_resource::access_point_protected_resource(
+        &state.surface,
+        state
+            .active_variant_alias
+            .as_deref(),
+        &state.network_config,
+    )
+    .transpose()
+    {
+        Ok(protected_resource) => protected_resource,
+        Err(e) => {
+            channel_warn!(config_id, "Invalid MCP protected resource (reason={}) — blocking", e);
+            crate::audit::request_events::auth_failed(
+                &audit_facts,
+                crate::audit::events::AuthScheme::Jwt,
+                "setup_failed",
+                true,
+                client_ip,
+            );
+            connection_guard
+                .decrement()
+                .await;
+            return Err(create_error_response(StatusCode::SERVICE_UNAVAILABLE, "Invalid MCP protected resource"));
+        }
+    };
     let authenticated_identity: Option<crate::source_auth::AuthenticatedIdentity> = if let Some(authorization) =
         &resource_authorization
     {
@@ -1826,7 +1853,7 @@ async fn proxy_handler_with_mcp_runtime(
             )
             .map(|((profile, issuer), middleware)| (profile, issuer, middleware))
         else {
-            let error = crate::mcp::resource_server::ResourceTokenError::Unavailable;
+            let error = crate::protocols::protected_resource::ResourceTokenError::Unavailable;
             crate::audit::request_events::resource_token_failed(&audit_facts, error, client_ip);
             return Ok(authorization.challenge(error));
         };
@@ -1878,7 +1905,7 @@ async fn proxy_handler_with_mcp_runtime(
                 .validate_network(&state.network_config)
                 .is_err()
         {
-            let error = crate::mcp::resource_server::ResourceTokenError::Unavailable;
+            let error = crate::protocols::protected_resource::ResourceTokenError::Unavailable;
             crate::audit::request_events::resource_token_failed(&audit_facts, error, client_ip);
             return Ok(authorization.challenge(error));
         }
@@ -1914,6 +1941,7 @@ async fn proxy_handler_with_mcp_runtime(
         };
         let resolved_auth_config = match resolve_direct_surface_auth_config(
             auth_config,
+            protected_resource.as_ref(),
             state.vc_issuer.as_deref(),
             &state.surface.surface_id,
         )
@@ -1952,18 +1980,36 @@ async fn proxy_handler_with_mcp_runtime(
             .await
         {
             Ok(identity) => Some(identity),
-            // Caller-attributable failure (missing/invalid credential):
-            // record the outcome for the policy layer and continue with no
-            // asserted caller identity — do not block here.
+            // Caller-attributable failure (missing/invalid credential). An
+            // Access Point that publishes protected resource metadata answers
+            // it with its challenge, so the caller can fetch a token and
+            // retry. Otherwise record the outcome for the policy layer and
+            // continue with no asserted caller identity — do not block here.
             Err(e) if e.is_caller_attributable() => {
-                channel_warn!(config_id, "Source authentication failed (reason={}) — deferring to policy", e);
+                let challenged = protected_resource.is_some();
+                channel_warn!(
+                    config_id,
+                    "Source authentication failed (reason={}) — {}",
+                    e,
+                    if challenged {
+                        "sending the discovery challenge"
+                    } else {
+                        "deferring to policy"
+                    }
+                );
                 crate::audit::request_events::auth_failed(
                     &audit_facts,
                     crate::audit::request_events::source_auth_scheme(&resolved_auth_config),
                     crate::audit::request_events::source_auth_reason(&e),
-                    false,
+                    challenged,
                     client_ip,
                 );
+                if let Some(protected_resource) = &protected_resource {
+                    connection_guard
+                        .decrement()
+                        .await;
+                    return Ok(protected_resource.caller_challenge(&e));
+                }
                 source_auth_failure = Some(crate::surface_context::SourceAuthContext::Failed {
                     attempted_method: resolved_auth_config
                         .method_tag()
@@ -20295,7 +20341,7 @@ allow if {
             ..Default::default()
         });
 
-        let resolved = resolve_direct_surface_auth_config(&config, Some(&vc_issuer), "direct-surface")
+        let resolved = resolve_direct_surface_auth_config(&config, None, Some(&vc_issuer), "direct-surface")
             .await
             .expect("resolve direct surface audience");
 

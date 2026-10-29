@@ -21,6 +21,7 @@ import { dependencyErrorBlocker } from '../components/surface-builder/dependency
 import { useSurfacePolicyDefinitions } from '../components/surface-builder/hooks/useSurfacePolicyDefinitions';
 import { surfacePolicyBlockingReason } from '../components/surface-builder/elements/policy/status';
 import { withA2aValidationSettled } from '../components/surface-builder/elements/access-point/a2aSettings';
+import { withDroppedProtectedResourcesRemoved } from '../components/surface-builder/elements/caller-auth/protectedResource';
 import {
   DEFAULT_DIDWEBVH_CONFIG,
   type DidwebvhConfig,
@@ -1234,6 +1235,9 @@ const SurfaceDetailPage: React.FC = () => {
       payload.status = status;
       payload.issuer_id = issuerId.trim() || undefined;
       payload = withA2aValidationSettled(payload);
+      // A PUT that leaves out a stored discovery setting keeps it, so one the
+      // operator removed is sent as null, removed only if the save succeeds.
+      payload = withDroppedProtectedResourcesRemoved(surface, payload);
       const updated = await apiClient.updateSurface(surfaceId, payload);
       setSurface(updated);
       setJsonOverride(null);
@@ -1645,6 +1649,7 @@ const SurfaceDetailPage: React.FC = () => {
         onApplyJsonPayload={applyJsonPayloadToCanvas}
         surfacePolicyLoadState={surfacePolicyLoadState}
         hasAttemptedSave={hasAttemptedSave}
+        saveError={error}
         surfaceId={surface?.surface_id}
         lastActivity={
           // Backend doesn't carry `last_activity` on the surface payload;
