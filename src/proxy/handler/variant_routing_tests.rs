@@ -411,7 +411,11 @@ async fn the_refusal_warning_names_a_disabled_variant_in_full() {
         .collect();
     assert_eq!(warnings.len(), 1, "{text}");
     assert!(warnings[0].contains("VariantDisabled"), "{}", warnings[0]);
-    assert!(warnings[0].contains("disabled_variant=Some(\"off\")"), "a configured alias, logged in full: {}", warnings[0]);
+    assert!(
+        warnings[0].contains("disabled_variant=Some(\"off\")"),
+        "a configured alias, logged in full: {}",
+        warnings[0]
+    );
 }
 
 #[tokio::test]
@@ -510,9 +514,7 @@ async fn send_mcp_body(
     } else {
         request.header("mcp-protocol-version", crate::mcp::MCP_LEGACY_VERSION)
     };
-    let request = request
-        .body(body)
-        .unwrap();
+    let request = request.body(body).unwrap();
     let (response, events) =
         crate::audit::producer::capture(Box::pin(super::multi_channel_proxy_handler_with_mcp_runtime(
             "127.0.0.1:12345"

@@ -1799,7 +1799,12 @@ mod tests {
         );
         let written = serde_json::to_value(&change).unwrap();
         assert_eq!(written["surface_variant"], "beta");
-        assert!(written.get("variant").is_none(), "{written}");
+        assert!(
+            written
+                .get("variant")
+                .is_none(),
+            "{written}"
+        );
     }
 
     #[test]

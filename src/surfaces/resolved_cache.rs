@@ -168,9 +168,7 @@ impl ResolvedSurfaceCache {
         match alias {
             None => Ok(CachedVariant {
                 surface: snaps.default.clone(),
-                surface_variant: snaps
-                    .default_variant
-                    .clone(),
+                surface_variant: snaps.default_variant.clone(),
             }),
             Some(a) => {
                 if let Some(s) = snaps.by_alias.get(a) {
