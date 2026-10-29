@@ -1441,6 +1441,11 @@ pub(crate) fn retire_outbound_channel_state(retired: &std::sync::RwLock<crate::s
 ///
 /// Returns a map of `config_id → Arc<RwLock<OutboundSurfaceState>>` so the caller
 /// can store them for live updates (e.g. from `reload_single_channel`).
+///
+/// `states_registered` fires once every surface's state is in
+/// `outbound_channel_states`, before the listener binds, so a caller that waits
+/// for it never lets a later surface removal run before the state it must
+/// retire exists.
 pub async fn run_outbound_port_server(
     bind_address: String,
     port: u16,
@@ -1463,6 +1468,7 @@ pub async fn run_outbound_port_server(
     direct_client_auth: Option<Arc<crate::server::DirectClientAuth>>,
     listener_manager: Arc<tokio::sync::RwLock<Option<Arc<crate::gateways::ConnectionPointListenerManager>>>>,
     consent_identity_strategies: Option<Arc<dyn crate::jwt_bearer::JwtVerificationStrategyStorage>>,
+    states_registered: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> anyhow::Result<()> {
     use axum::{Router, routing::any};
 
@@ -1659,6 +1665,9 @@ pub async fn run_outbound_port_server(
                 app = app.route(&route, any(super::outbound_handler::outbound_proxy_handler).with_state(state.clone()));
             }
         }
+    }
+    if let Some(states_registered) = states_registered {
+        let _ = states_registered.send(());
     }
 
     if network_config
@@ -2438,6 +2447,7 @@ mod tests {
             None,
             Arc::new(tokio::sync::RwLock::new(None)),
             None,
+            None,
         ));
         let client = reqwest::Client::builder()
             .no_proxy()
@@ -2463,6 +2473,65 @@ mod tests {
         server.abort();
 
         assert_eq!(alive, Some(reqwest::StatusCode::OK));
+    }
+
+    #[tokio::test]
+    async fn an_outbound_listener_signals_once_its_surface_states_are_registered() {
+        let config: GatewayConfig = serde_json::from_value(serde_json::json!({
+            "tls": {"cert_path": "unused.pem", "key_path": "unused-key.pem"},
+            "integration": {"variable_pattern": "\\$\\{([^}]+)\\}", "custom_variable_prefix": "_", "types": [],
+                "categories": []},
+            "extension_inspection": {"enabled": false}
+        }))
+        .unwrap();
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(serde_json::json!({
+            "surface_id": "fresh", "name": "fresh", "status": "active",
+            "access_point": { "listen_address": "http://localhost:8080", "route": "/fresh", "protocol": "a2a" },
+            "target": { "endpoint": "http://localhost:9001" },
+            "transit": { "outbound_listen_address": "http://localhost:9000",
+                "points": [{ "alias": "partner", "target_endpoint": "http://localhost:9002" }] }
+        }))
+        .unwrap();
+        let points = surface
+            .transit
+            .as_ref()
+            .unwrap()
+            .points
+            .clone();
+        let states = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+        let (registered, states_registered) = tokio::sync::oneshot::channel();
+
+        let server = tokio::spawn(run_outbound_port_server(
+            "127.0.0.1".into(),
+            0,
+            vec![(surface, points)],
+            Arc::new(config),
+            Arc::new(make_network_config_with_listeners(vec![], vec![])),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            states.clone(),
+            None,
+            Arc::new(tokio::sync::RwLock::new(None)),
+            None,
+            Some(registered),
+        ));
+        let signalled = tokio::time::timeout(std::time::Duration::from_secs(5), states_registered).await;
+        let registered: Vec<String> = states
+            .read()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        server.abort();
+
+        assert!(matches!(signalled, Ok(Ok(()))), "{signalled:?}");
+        assert_eq!(registered, ["fresh"]);
     }
 
     #[tokio::test]

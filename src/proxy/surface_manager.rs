@@ -687,6 +687,7 @@ impl SurfaceTaskManager {
                     .as_ref()
                     .map(|middleware| middleware.provider_store());
 
+                let (states_registered, states_registered_rx) = tokio::sync::oneshot::channel();
                 let handle = tokio::spawn(async move {
                     if let Err(e) = super::server::run_outbound_port_server(
                         bind_address,
@@ -706,12 +707,17 @@ impl SurfaceTaskManager {
                         direct_client_auth_clone,
                         listener_mgr_clone,
                         consent_strategies,
+                        Some(states_registered),
                     )
                     .await
                     {
                         error!("Outbound port listener error for port {}: {}", port, e);
                     }
                 });
+                // A surface removal after this reload returns must find the
+                // states the listener registers, or it retires nothing and the
+                // listener later serves the removed surface.
+                let _ = states_registered_rx.await;
 
                 new_port_handles.insert(port, handle.abort_handle());
                 continue;
@@ -1723,6 +1729,7 @@ impl SurfaceTaskManager {
                 .as_ref()
                 .map(|middleware| middleware.provider_store());
 
+            let (states_registered, states_registered_rx) = tokio::sync::oneshot::channel();
             let handle = tokio::spawn(async move {
                 if let Err(e) = super::server::run_outbound_port_server(
                     bind_address,
@@ -1742,12 +1749,14 @@ impl SurfaceTaskManager {
                     direct_client_auth_clone,
                     listener_mgr_clone,
                     consent_strategies,
+                    Some(states_registered),
                 )
                 .await
                 {
                     error!("Outbound port listener error for port {}: {}", outbound_port, e);
                 }
             });
+            let _ = states_registered_rx.await;
 
             {
                 let mut port_handles = self

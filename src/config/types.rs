@@ -768,7 +768,8 @@ pub fn validate_outbound_listen_path(path: &str) -> Result<(), String> {
 ///
 /// VCs whose effective address can't be mapped to a port, or whose port is
 /// not in `configured_ports`, are skipped with a warning. Channels with no
-/// VCs that resolve to any listener are skipped entirely. Both startup
+/// VCs that resolve to any listener, and surfaces that are not active, are
+/// skipped entirely. Both startup
 /// (orchestrator) and hot-reload (channel_manager) call this so the
 /// bucketing logic stays in lockstep.
 pub fn group_outbound_vcs_by_port(
@@ -784,7 +785,7 @@ pub fn group_outbound_vcs_by_port(
         std::collections::HashMap::new();
 
     for surface in surfaces {
-        if surface.status == crate::config::agent_surface::SurfaceStatus::Disabled {
+        if surface.status != crate::config::agent_surface::SurfaceStatus::Active {
             continue;
         }
         let Some(ref transit) = surface.transit else {
@@ -4000,6 +4001,36 @@ mod unresolved_outbound_tests {
         } else {
             None
         }
+    }
+
+    #[test]
+    fn only_active_surfaces_are_bucketed_onto_outbound_ports() {
+        let surface = |name: &str, status: &str| {
+            surface_with_transit(json!({
+                "name": name,
+                "status": status,
+                "access_point": { "listen_address": "https://in.example.com", "route": format!("/{name}"), "protocol": "a2a" },
+                "target": { "endpoint": "http://localhost:1/x" },
+                "transit": {
+                    "outbound_listen_address": "https://out.example.com",
+                    "points": [{ "alias": "tp1", "target_endpoint": "http://localhost:2" }]
+                }
+            }))
+        };
+        let surfaces = [surface("live", "active"), surface("gone", "deleted"), surface("off", "disabled")];
+
+        let by_port = group_outbound_vcs_by_port(&surfaces, &[8081], outbound_resolver);
+
+        let bucketed: Vec<&str> = by_port
+            .get(&8081)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|(surface, _)| surface.name.as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(bucketed, ["live"]);
     }
 
     #[test]
