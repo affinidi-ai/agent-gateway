@@ -11254,8 +11254,9 @@ mod tests {
         }
     }
 
-    /// The caller-info headers a peer gateway sends, in any case, never reach
-    /// the agent behind the receiving surface; the peer's other headers do.
+    /// The caller-info and DID identity headers a peer gateway sends, in any
+    /// case, never reach the agent behind the receiving surface; the peer's
+    /// other headers do.
     #[tokio::test]
     async fn fabric_receive_drops_the_caller_info_headers_a_peer_sends() {
         use crate::surfaces::AgentSurfaceStore;
@@ -11319,6 +11320,8 @@ mod tests {
                 "x-caller-identity-source": "verified-presentation",
                 "X-Caller-Dna-Uai": "uai:peer-sent",
                 "x-gateway-did": "did:web:peer-sent-gateway.example",
+                "X-DID-Identity": "did:web:peer-sent-surface.example",
+                "X-Did-Signed-Identity": "{\"id\":\"did:web:peer-sent-surface.example\"}",
                 "x-peer-context": "kept"
             },
             "body": {"jsonrpc": "2.0", "method": "test", "id": 1}
@@ -11328,7 +11331,14 @@ mod tests {
 
         let received = target.received();
         assert_eq!(received.len(), 1, "{response}");
-        for name in ["x-caller-did", "x-caller-identity-source", "x-caller-dna-uai", "x-gateway-did"] {
+        for name in [
+            "x-caller-did",
+            "x-caller-identity-source",
+            "x-caller-dna-uai",
+            "x-gateway-did",
+            "x-did-identity",
+            "x-did-signed-identity",
+        ] {
             assert!(
                 received[0]
                     .get(name)

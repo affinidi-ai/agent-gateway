@@ -341,9 +341,10 @@ async fn source_auth_credential_header_not_forwarded_upstream() {
     );
 }
 
-/// The managed agent learns who is calling only from the caller-info headers
-/// the gateway sets: a caller's own copies, in any case, are dropped, so the
-/// agent gets the gateway's one value of each it sets and none of the others.
+/// The managed agent learns who is calling only from the caller-info and DID
+/// identity headers the gateway sets: a caller's own copies, in any case, are
+/// dropped, so the agent gets the gateway's one value of each it sets and none
+/// of the others.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_agent_receives_the_caller_info_headers_only_as_the_gateway_sets_them() {
     let target = helpers::RecordingTarget::start(axum::http::StatusCode::OK, &[]).await;
@@ -362,6 +363,8 @@ async fn the_agent_receives_the_caller_info_headers_only_as_the_gateway_sets_the
         .header("X-Caller-Identity-Source", "verified-presentation")
         .header("x-caller-dna-uai", "uai:caller-sent")
         .header("X-Gateway-DID", "did:web:caller-sent-gateway.example")
+        .header("X-DID-Identity", "did:web:caller-sent-surface.example")
+        .header("x-did-signed-identity", r#"{"id":"did:web:caller-sent-surface.example"}"#)
         .header("x-caller-context", "kept")
         .body(r#"{"jsonrpc":"2.0","method":"test","id":1}"#)
         .send()
@@ -385,8 +388,9 @@ async fn the_agent_receives_the_caller_info_headers_only_as_the_gateway_sets_the
     };
     assert_eq!(values("x-caller-did"), ["anonymous"]);
     assert_eq!(values("x-caller-identity-source"), ["gateway-computed"]);
-    assert!(values("x-caller-dna-uai").is_empty(), "{:?}", values("x-caller-dna-uai"));
-    assert!(values("x-gateway-did").is_empty(), "{:?}", values("x-gateway-did"));
+    for unset in ["x-caller-dna-uai", "x-gateway-did", "x-did-identity", "x-did-signed-identity"] {
+        assert!(values(unset).is_empty(), "{unset}: {:?}", values(unset));
+    }
     assert_eq!(values("x-caller-context"), ["kept"], "headers that are not caller-info headers still pass");
 }
 

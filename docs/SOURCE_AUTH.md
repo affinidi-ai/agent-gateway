@@ -530,11 +530,13 @@ to 300 seconds.
 
 ### Headers through a Transit Point
 
-A Transit Point forwards the managed agent's request headers to its target, over HTTP or
-Fabric, except hop-by-hop headers, `Host`, `Content-Length`, `X-Transit-Token`, the agent's
-`Authorization` and its `Cookie`, a header named like the Transit Point's `target_auth`
-header, and any header a Header Metadata Mapping is set to strip. Other headers, such as an
-API key header the agent sends for the target itself, pass. The credentials the gateway adds
+A Transit Point forwards its caller's request headers to its target, over HTTP or Fabric,
+except hop-by-hop headers, `Host`, `Content-Length`, `X-Transit-Token`, the caller's
+`Authorization` and its `Cookie`, the caller-info and `did:webvh` identity headers
+(`x-caller-did`, `x-caller-identity-source`, `x-caller-dna-uai`, `x-gateway-did`,
+`x-did-identity`, `x-did-signed-identity`), the header its `source_auth` reads, a header named
+like the Transit Point's `target_auth` header, and any header a Header Metadata Mapping is set to
+strip. Other headers, such as an API key header the agent sends for the target itself, pass. The credentials the gateway adds
 are described in
 [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#credential-headers-on-a-transit-point).
 

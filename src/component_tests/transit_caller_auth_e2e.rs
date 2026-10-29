@@ -216,6 +216,65 @@ async fn an_api_key_caller_is_admitted_and_a_missing_or_wrong_key_never_reaches_
     assert!(!forwarded.contains_key("x-api-key"), "the caller's key must never reach the target: {forwarded:?}");
 }
 
+/// A Transit Point sends its target none of the caller-info or DID identity
+/// headers, in any case, whoever its caller is; the caller's other headers
+/// pass.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transit_point_sends_its_target_no_caller_info_or_did_identity_header() {
+    let h = GatewayHarness::start_with_outbound(|temp_dir, gw_config, _| {
+        write_caller_key(temp_dir);
+        gw_config.surfaces = vec![surface(json!({
+            "source_auth": {
+                "type": "api_key",
+                "extraction": { "source": "http_header", "field": "X-API-Key" },
+                "secret_id": CALLER_KEY_SECRET
+            }
+        }))];
+    })
+    .await;
+
+    let response = client()
+        .post(format!(
+            "{}/outbound/smoke/target",
+            h.outbound_url
+                .as_ref()
+                .unwrap()
+        ))
+        .header("content-type", "application/json")
+        .header("x-api-key", CALLER_KEY)
+        .header("X-Caller-DID", "did:web:caller-sent.example")
+        .header("x-caller-identity-source", "verified-presentation")
+        .header("x-caller-dna-uai", "uai:caller-sent")
+        .header("X-Gateway-DID", "did:web:caller-sent-gateway.example")
+        .header("x-did-identity", "did:web:caller-sent-surface.example")
+        .header("X-DID-Signed-Identity", r#"{"id":"did:web:caller-sent-surface.example"}"#)
+        .header("x-partner-context", "kept")
+        .body(r#"{"jsonrpc":"2.0","method":"test","id":7}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let forwarded = last_forwarded_headers(&h);
+    for name in [
+        "x-caller-did",
+        "x-caller-identity-source",
+        "x-caller-dna-uai",
+        "x-gateway-did",
+        "x-did-identity",
+        "x-did-signed-identity",
+    ] {
+        assert!(!forwarded.contains_key(name), "{name} reached the target: {forwarded:?}");
+    }
+    assert_eq!(
+        forwarded
+            .get("x-partner-context")
+            .map(String::as_str),
+        Some("kept"),
+        "{forwarded:?}"
+    );
+}
+
 /// A Transit Point that authenticates its callers with a JWT puts the verified
 /// caller in its policy input with `verification: source_auth`, so a policy can
 /// admit Alice and refuse Bob; the target sees only Alice's call and never her
