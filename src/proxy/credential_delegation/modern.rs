@@ -674,120 +674,38 @@ impl ModernDelegationContext<'_> {
         selected: &SelectedProvider<'_>,
         now: u64,
     ) -> Result<String, ContinuationError> {
+        use crate::delegation_vault::service_token::{self, ServiceTokenContext, ServiceTokenError, ServiceTokenKey};
+
         let provider = &selected.provider;
-        let secrets = self
-            .secrets
-            .ok_or(ContinuationError::Unavailable)?;
-        if provider.provider_type == CredentialProviderType::ApiKey {
-            let key = crate::delegation_vault::oauth::resolve_api_key(provider, secrets)
-                .await
-                .map_err(|_| ContinuationError::Unavailable)?;
-            if key.is_empty() {
-                return Err(ContinuationError::Unavailable);
-            }
-            return Ok(key);
-        }
-        let cache_identity = format!("__mcp_client_credentials__:{}", hex::encode(provider_digest(provider)?));
-        if let VaultLookupResult::Found(token) = self
-            .vault
-            .lookup(self.agent_did, &cache_identity, &provider.id)
-            .await
-            .map_err(|_| ContinuationError::Unavailable)?
-            && token.agent_did == self.agent_did
-            && token.user_identity_hash == cache_identity
-            && token.credential_provider_id == provider.id
-            && !token.access_token.is_empty()
-            && token
-                .token_type
-                .eq_ignore_ascii_case("Bearer")
-            && token
-                .expires_at
-                .is_some_and(|expires| u64::try_from(expires.timestamp()).is_ok_and(|expires| expires > now))
-            && selected
-                .binding
-                .scopes
-                .iter()
-                .all(|scope| token.scopes.contains(scope))
-        {
-            return Ok(token.access_token);
-        }
-        let client = match self.provider_http {
-            Some(client) => client.clone(),
-            None => crate::http_client::external().map_err(|_| ContinuationError::Unavailable)?,
-        };
-        let response = crate::delegation_vault::oauth::fetch_scoped_client_credentials_token(
-            provider,
-            &selected.binding.scopes,
-            secrets,
-            &client,
-        )
-        .await
-        .map_err(|_| ContinuationError::Unavailable)?;
-        let scopes = response
-            .scope
-            .as_deref()
-            .map(|scope| {
-                scope
-                    .split_whitespace()
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_else(|| {
-                selected
-                    .binding
-                    .scopes
-                    .clone()
-            });
-        if scopes.iter().any(|scope| {
-            !selected
-                .binding
-                .scopes
-                .contains(scope)
-        }) || selected
-            .binding
-            .scopes
-            .iter()
-            .any(|scope| !scopes.contains(scope))
-        {
-            return Err(ContinuationError::Denied);
-        }
-        let current = self
-            .providers
-            .get(&provider.id)
-            .await
-            .map_err(|_| ContinuationError::Unavailable)?
-            .ok_or(ContinuationError::BindingMismatch)?;
-        if provider_digest(&current)? != provider_digest(provider)? {
-            return Err(ContinuationError::BindingMismatch);
-        }
-        let created = chrono::Utc::now();
-        let expires_at = response
-            .expires_in
-            .and_then(|seconds| created.checked_add_signed(chrono::Duration::seconds(seconds)))
+        let now = i64::try_from(now)
+            .ok()
+            .and_then(|now| chrono::DateTime::from_timestamp(now, 0))
             .ok_or(ContinuationError::InvalidRecord)?;
-        let token = self
-            .vault
-            .store(DelegationToken {
-                id: uuid::Uuid::new_v4().to_string(),
-                agent_did: self.agent_did.into(),
-                user_identity_hash: cache_identity,
-                credential_provider_id: provider.id.clone(),
-                provider_id: provider.provider_id.clone(),
-                access_token: response.access_token,
-                refresh_token: None,
-                token_type: response.token_type,
-                scopes,
-                expires_at: Some(expires_at),
-                delegation_vc: None,
-                consent_identity: None,
-                consent_granted_at: created,
-                last_used_at: None,
-                created_at: created,
-                updated_at: created,
-            })
+        let cache_identity = format!("__mcp_client_credentials__:{}", hex::encode(provider_digest(provider)?));
+        let context = ServiceTokenContext {
+            secrets: self
+                .secrets
+                .ok_or(ContinuationError::Unavailable)?,
+            providers: self.providers,
+            vault: self.vault,
+            http: self.provider_http,
+        };
+        let key = ServiceTokenKey {
+            agent_did: self.agent_did,
+            identity: &cache_identity,
+        };
+        service_token::acquire(provider, &selected.binding.scopes, &context, key, now)
             .await
-            .map_err(|_| ContinuationError::Unavailable)?;
-        Ok(token.access_token)
+            .map(|token| token.value().to_string())
+            .map_err(|error| match error {
+                ServiceTokenError::ScopeMismatch => ContinuationError::Denied,
+                ServiceTokenError::ProviderChanged => ContinuationError::BindingMismatch,
+                ServiceTokenError::MissingExpiry => ContinuationError::InvalidRecord,
+                ServiceTokenError::Unsupported
+                | ServiceTokenError::SecretUnavailable
+                | ServiceTokenError::TokenRequestFailed
+                | ServiceTokenError::StoreUnavailable => ContinuationError::Unavailable,
+            })
     }
 
     async fn refresh_credential(

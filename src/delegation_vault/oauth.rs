@@ -379,11 +379,14 @@ async fn scoped_token_grant(
     client: &reqwest::Client,
 ) -> Result<Option<OAuthTokenResponse>> {
     let endpoint = validated_token_endpoint(provider)?;
-    let resource = provider
-        .resource
-        .as_deref()
-        .ok_or_else(|| anyhow!("Missing refresh resource"))?;
-    crate::sts::mcp_profile::canonical_https_url(resource).map_err(|_| anyhow!("Invalid refresh resource"))?;
+    let resource = match provider.resource.as_deref() {
+        Some(resource) => {
+            crate::sts::mcp_profile::canonical_https_url(resource).map_err(|_| anyhow!("Invalid provider resource"))?;
+            Some(resource)
+        }
+        None if refresh_token.is_some() => return Err(anyhow!("Missing refresh resource")),
+        None => None,
+    };
     let client_id = resolve_secret(
         secrets,
         provider
@@ -414,9 +417,13 @@ async fn scoped_token_grant(
         ),
         ("client_id", client_id.as_str()),
         ("client_secret", client_secret.as_str()),
-        ("resource", resource),
-        ("scope", scope.as_str()),
     ];
+    if let Some(resource) = resource {
+        params.push(("resource", resource));
+    }
+    if !scope.is_empty() {
+        params.push(("scope", scope.as_str()));
+    }
     if let Some(refresh_token) = refresh_token {
         params.push(("refresh_token", refresh_token));
     }
@@ -691,95 +698,6 @@ pub async fn build_delegation_vc(
             Ok(credential)
         }
     }
-}
-
-/// Fetch a token using the OAuth 2.0 Client Credentials flow (M2M, no user consent)
-pub async fn fetch_client_credentials_token(
-    provider: &CredentialProvider,
-    scopes: &[String],
-    secrets_store: &Arc<dyn SecretsStore>,
-) -> Result<OAuthTokenResponse> {
-    let client_id_ref = provider
-        .client_id_secret_ref
-        .as_deref()
-        .ok_or_else(|| anyhow!("Provider '{}' has no client_id_secret_ref", provider.provider_id))?;
-    let client_secret_ref = provider
-        .client_secret_secret_ref
-        .as_deref()
-        .ok_or_else(|| anyhow!("Provider '{}' has no client_secret_secret_ref", provider.provider_id))?;
-    let token_endpoint = provider
-        .token_endpoint
-        .as_deref()
-        .ok_or_else(|| anyhow!("Provider '{}' has no token_endpoint", provider.provider_id))?;
-    let client_id = resolve_secret(secrets_store, client_id_ref)
-        .await
-        .context("Failed to resolve client_id for client_credentials")?;
-    let client_secret = resolve_secret(secrets_store, client_secret_ref)
-        .await
-        .context("Failed to resolve client_secret for client_credentials")?;
-
-    crate::url_validation::validate_oauth_endpoint_url(token_endpoint)
-        .map_err(|e| anyhow!("Blocked token_endpoint for provider '{}': {}", provider.provider_id, e))?;
-
-    let scope_string = scopes.join(" ");
-
-    let http_client = crate::http_client::external()?;
-
-    let mut params = vec![
-        ("grant_type", "client_credentials".to_string()),
-        ("client_id", client_id),
-        ("client_secret", client_secret),
-    ];
-
-    if !scope_string.is_empty() {
-        params.push(("scope", scope_string));
-    }
-
-    info!(
-        target: "credential_delegation",
-        provider_id = %provider.provider_id,
-        token_endpoint = %token_endpoint,
-        scopes = ?scopes,
-        "Fetching client_credentials token (M2M)"
-    );
-
-    let response = http_client
-        .post(token_endpoint)
-        .form(&params)
-        .send()
-        .await
-        .context("Failed to send client_credentials token request")?;
-
-    let status = response.status();
-    let body = response
-        .text()
-        .await
-        .context("Failed to read client_credentials response body")?;
-
-    if !status.is_success() {
-        let reason = token_error_reason(&body);
-        warn!(
-            target: "credential_delegation",
-            provider_id = %provider.provider_id,
-            status = %status,
-            reason = %reason,
-            "Client credentials token fetch failed"
-        );
-        return Err(anyhow!("Client credentials token fetch failed (HTTP {}): {}", status, reason));
-    }
-
-    let token_response: OAuthTokenResponse =
-        serde_json::from_str(&body).context("Failed to parse client_credentials token response")?;
-
-    info!(
-        target: "credential_delegation",
-        provider_id = %provider.provider_id,
-        token_type = %token_response.token_type,
-        expires_in = ?token_response.expires_in,
-        "Client credentials token fetch successful"
-    );
-
-    Ok(token_response)
 }
 
 /// Resolve an API key directly from the secrets store (no OAuth flow)
