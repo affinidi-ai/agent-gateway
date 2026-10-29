@@ -269,6 +269,19 @@ A Transit Point refuses the call with `401` unless the token:
 
 A `2026-07-28` MCP request must also carry exactly one token, and allows no clock difference.
 
+### Headers through a Transit Point
+
+A Transit Point forwards the managed agent's request headers to its target, over HTTP or
+Fabric, except hop-by-hop headers, `Host`, `Content-Length`, `X-Transit-Token`, the agent's
+`Authorization` and its `Cookie`, and any header a Header Metadata Mapping is set to strip.
+Other headers, such as an API key header the agent sends for the target itself, pass. The
+credentials the gateway adds are described in
+[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md).
+
+The target's response headers go back to the agent except hop-by-hop headers, `Set-Cookie`
+and `WWW-Authenticate`, so a target cannot set cookies in the agent or send it to
+authenticate with the target directly. The response status is unchanged.
+
 The signing key is 32 random bytes the gateway creates on its first start, in
 `transit_token_key.json` under `[storage_paths] vc_keys`, readable by the owner only and
 encrypted like the gateway's other keys when encryption at rest is on. A key file that

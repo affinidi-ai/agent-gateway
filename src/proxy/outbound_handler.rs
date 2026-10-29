@@ -2028,6 +2028,9 @@ async fn step_map_transit_point_header_metadata(
     }
 }
 
+/// Whether a managed agent's request header goes on to a Transit Point's target,
+/// over HTTP or Fabric. The agent's `Authorization` and cookies never do; its other
+/// headers, such as its own API key header for the target, do.
 fn should_forward_outbound_request_header(
     name: &str,
     header_metadata_mapping: Option<&crate::config::header_metadata_mapping::HeaderMetadataMappingConfig>,
@@ -2036,7 +2039,7 @@ fn should_forward_outbound_request_header(
         return false;
     }
 
-    if name.eq_ignore_ascii_case("authorization") {
+    if name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("cookie") {
         return false;
     }
 
@@ -2051,6 +2054,15 @@ fn should_forward_outbound_request_header(
     }
 
     true
+}
+
+/// Remove the target response headers a Transit Point never returns to the
+/// managed agent: the target's cookies, and its authentication challenges, which
+/// would have the agent authenticate with the target itself rather than through
+/// the gateway's credentials.
+fn withhold_target_response_headers(headers: &mut HeaderMap) {
+    headers.remove(axum::http::header::SET_COOKIE);
+    headers.remove(axum::http::header::WWW_AUTHENTICATE);
 }
 
 /// Detect the protocol and extract the method/tool from a JSON-RPC body.
@@ -5044,6 +5056,8 @@ async fn process_modern_outbound_response(
     };
     let mut processing_headers = headers.clone();
     processing_headers.insert("content-type", axum::http::HeaderValue::from_static("application/json"));
+    let mut headers = headers;
+    withhold_target_response_headers(&mut headers);
     let prepared = ctx.modern_delegation.take();
     let continuations = state
         .mcp_continuations
@@ -5257,11 +5271,14 @@ fn process_outbound_response_body(
         body_bytes
     };
 
-    // Build the response, forwarding non-hop-by-hop headers.
+    // Build the response, forwarding non-hop-by-hop headers other than the
+    // withheld ones.
     // Skip content-length: the body may have been rewritten (e.g. agent card URL
     // rewriting), so the upstream content-length is stale. Axum/hyper will set
     // the correct value from the actual body bytes.
     let mut builder = axum::response::Response::builder().status(status);
+    let mut upstream_headers = upstream_headers;
+    withhold_target_response_headers(&mut upstream_headers);
 
     for (key, value) in &upstream_headers {
         if !is_hop_by_hop_header(key.as_str()) && key != axum::http::header::CONTENT_LENGTH {
@@ -9110,6 +9127,93 @@ mod tests {
         let mapping = test_header_metadata_mapping(false);
 
         assert!(should_forward_outbound_request_header("x-ms-entra-agent-id", Some(&mapping)));
+    }
+
+    #[test]
+    fn a_managed_agents_cookies_and_authorization_never_reach_a_transit_point_target() {
+        for withheld in ["cookie", "Cookie", "authorization", "x-transit-token"] {
+            assert!(!should_forward_outbound_request_header(withheld, None), "{withheld}");
+        }
+        for forwarded in ["x-api-key", "accept", "content-type", "x-forwarded-for", "mcp-protocol-version"] {
+            assert!(should_forward_outbound_request_header(forwarded, None), "{forwarded}");
+        }
+    }
+
+    #[test]
+    fn a_legacy_transit_point_response_withholds_the_targets_cookies_and_challenges() {
+        let state = test_outbound_state();
+        let mut ctx = test_pipeline_context();
+        let mut upstream_headers = HeaderMap::new();
+        upstream_headers.append("set-cookie", HeaderValue::from_static("vendor_sid=one; HttpOnly"));
+        upstream_headers.append("set-cookie", HeaderValue::from_static("vendor_lb=two"));
+        upstream_headers.insert(
+            "www-authenticate",
+            HeaderValue::from_static(
+                r#"Bearer resource_metadata="https://vendor.example/.well-known/oauth-protected-resource""#,
+            ),
+        );
+        upstream_headers.insert("content-type", HeaderValue::from_static("application/json"));
+        upstream_headers.insert("x-vendor-request-id", HeaderValue::from_static("vendor-7"));
+
+        let response = process_outbound_response_body(
+            &state,
+            &mut ctx,
+            StatusCode::UNAUTHORIZED,
+            upstream_headers,
+            Bytes::from_static(br#"{"error":"invalid_token"}"#),
+            &crate::policies::PolicyAttestation::default(),
+        )
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            !response
+                .headers()
+                .contains_key("set-cookie")
+        );
+        assert!(
+            !response
+                .headers()
+                .contains_key("www-authenticate")
+        );
+        assert_eq!(response.headers()["x-vendor-request-id"], "vendor-7");
+        assert_eq!(response.headers()["content-type"], "application/json");
+    }
+
+    #[tokio::test]
+    async fn a_modern_transit_point_response_withholds_the_targets_cookies_and_challenges() {
+        let upstream = reqwest::Response::from(
+            axum::http::Response::builder()
+                .header("content-type", "application/json")
+                .header("set-cookie", "vendor_sid=one; HttpOnly")
+                .header("www-authenticate", "Bearer error=\"insufficient_scope\"")
+                .header("x-vendor-request-id", "vendor-8")
+                .body(reqwest::Body::from(
+                    json!({"jsonrpc": "2.0", "id": "stream", "result": {"resultType": "complete", "content": []}})
+                        .to_string(),
+                ))
+                .unwrap(),
+        );
+
+        let response = process_modern_outbound_response(
+            test_outbound_state(),
+            modern_pipeline_context("tools/call"),
+            UpstreamResponse::Http(upstream),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !response
+                .headers()
+                .contains_key("set-cookie")
+        );
+        assert!(
+            !response
+                .headers()
+                .contains_key("www-authenticate")
+        );
+        assert_eq!(response.headers()["x-vendor-request-id"], "vendor-8");
     }
 
     // ── step_resolve_agent_identity ──────────────────────────────────────

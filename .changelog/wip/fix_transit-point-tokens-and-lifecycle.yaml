@@ -47,6 +47,13 @@ changes:
         Transit Point callers are authenticated by the transit token and, on an MCP Transit
         Point, by `mcp_http.authorization`.
     - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Stop forwarding cookies and authentication challenges across a Transit Point
+      description: >-
+        A Transit Point no longer forwards the managed agent's `Cookie` to its target, or
+        returns the target's `Set-Cookie` and `WWW-Authenticate` to the agent, on HTTP and
+        Fabric targets and for every MCP revision; other headers, and the response status,
+        are unchanged.
+    - timestamp: '2026-10-28T00:00:00.000Z'
       title: Write the gateway's key files atomically with owner-only permissions
       description: >-
         The gateway's key files (DID keys, VC issuer keys and the transit token key) are now
