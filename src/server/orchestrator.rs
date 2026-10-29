@@ -1835,10 +1835,13 @@ pub async fn run_axum_proxy(
                 .did
                 .domain
                 .clone();
-            Some(crate::trust_registries::TrustRegistryListenerManager::new(
+            Some(crate::trust_registries::TrustRegistryListenerManager::with_retry_policy(
                 domain,
                 trust_registries_storage_path.clone(),
                 Some(secrets_store.clone()),
+                bootstrap_config
+                    .reconnect_policy
+                    .to_policy(),
             ))
         };
 

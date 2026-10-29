@@ -155,7 +155,7 @@ fn default_pending_expiry_hours() -> u64 {
     1
 }
 
-/// Reconnect policy for connection-point DIDComm links (proposal section C).
+/// Reconnect policy for connection-point DIDComm links and trust registry connections.
 ///
 /// A failed connection is retried with exponential backoff up to
 /// `max_backoff_seconds`, after which it retries at that fixed interval
@@ -2863,7 +2863,7 @@ pub struct BootstrapConfig {
     #[serde(default)]
     pub oob_connection: OobConnectionConfig,
 
-    /// Reconnect policy for connection-point DIDComm links
+    /// Reconnect policy for connection-point DIDComm links and trust registry connections
     #[serde(default)]
     pub reconnect_policy: ReconnectPolicyConfig,
 

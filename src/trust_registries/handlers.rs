@@ -385,6 +385,16 @@ pub async fn delete_trust_registry<S: TrustRegistryStore>(
             .await;
     }
 
+    // A record that survives keeps its keys and can be built again
+    if let Err(e) = store.delete(&id).await {
+        if let Some(Extension(listener_mgr)) = &listener_manager {
+            listener_mgr
+                .restore_registry(&id)
+                .await;
+        }
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to delete trust registry: {}", e)));
+    }
+
     // Clean up per-registry DID keys from disk
     let keys_path = std::path::PathBuf::from(
         &config
@@ -397,11 +407,6 @@ pub async fn delete_trust_registry<S: TrustRegistryStore>(
     {
         tracing::warn!("Failed to clean up trust registry keys at {:?}: {}", keys_path, e);
     }
-
-    store
-        .delete(&id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to delete trust registry: {}", e)))?;
 
     if let Some(Extension(listener_mgr)) = &listener_manager {
         listener_mgr.announce_deleted(&trust_registry);
@@ -1073,7 +1078,12 @@ mod tests {
     }
 
     fn standby_manager(dir: &tempfile::TempDir) -> Arc<TrustRegistryListenerManager> {
-        let manager = TrustRegistryListenerManager::new("example.com".into(), dir.path().join("keys"), None);
+        let manager = TrustRegistryListenerManager::with_retry_policy(
+            "example.com".into(),
+            dir.path().join("keys"),
+            None,
+            crate::comm::connection_health::ReconnectPolicy::default(),
+        );
         manager.deactivate();
         manager
     }
@@ -1173,7 +1183,12 @@ mod tests {
                 .await
                 .unwrap()
         );
-        let manager = TrustRegistryListenerManager::new("example.com".into(), dir.path().join("keys"), None);
+        let manager = TrustRegistryListenerManager::with_retry_policy(
+            "example.com".into(),
+            dir.path().join("keys"),
+            None,
+            crate::comm::connection_health::ReconnectPolicy::default(),
+        );
         manager
             .set_store(store.clone())
             .await;
@@ -1263,11 +1278,109 @@ mod tests {
                 .await
                 .unwrap()
         );
-        let manager = TrustRegistryListenerManager::new("example.com".into(), dir.path().join("keys"), None);
+        let manager = TrustRegistryListenerManager::with_retry_policy(
+            "example.com".into(),
+            dir.path().join("keys"),
+            None,
+            crate::comm::connection_health::ReconnectPolicy::default(),
+        );
         manager
             .set_store(store.clone())
             .await;
         (store, registry, manager, dir)
+    }
+
+    /// A store whose deletes fail, so a delete leaves the record in place.
+    struct UndeletableStore(Arc<super::super::FileSystemTrustRegistryStore>);
+
+    #[async_trait::async_trait]
+    impl TrustRegistryStore for UndeletableStore {
+        async fn create(
+            &self,
+            trust_registry: &TrustRegistry,
+        ) -> anyhow::Result<()> {
+            self.0
+                .create(trust_registry)
+                .await
+        }
+
+        async fn get(
+            &self,
+            id: &str,
+        ) -> anyhow::Result<Option<TrustRegistry>> {
+            self.0.get(id).await
+        }
+
+        async fn get_by_did(
+            &self,
+            did: &str,
+        ) -> anyhow::Result<Option<TrustRegistry>> {
+            self.0.get_by_did(did).await
+        }
+
+        async fn list_all(&self) -> anyhow::Result<Vec<TrustRegistry>> {
+            self.0.list_all().await
+        }
+
+        async fn delete(
+            &self,
+            _id: &str,
+        ) -> anyhow::Result<()> {
+            Err(anyhow::anyhow!("the disk is read-only"))
+        }
+
+        async fn update_if_exists(
+            &self,
+            trust_registry: &TrustRegistry,
+        ) -> anyhow::Result<bool> {
+            self.0
+                .update_if_exists(trust_registry)
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_delete_keeps_the_keys_and_the_registry_can_still_connect() {
+        let (store, registry, manager, dir) = never_connected_registry().await;
+        let keys = dir
+            .path()
+            .join("keys")
+            .join(&registry.id);
+        std::fs::create_dir_all(&keys).unwrap();
+
+        let deleted = delete_trust_registry(
+            Extension(Arc::new(UndeletableStore(store.clone()))),
+            Some(Extension(manager.clone())),
+            None,
+            Extension(None),
+            Extension(bootstrap(&dir)),
+            Path(registry.id.clone()),
+            None,
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            deleted
+                .err()
+                .map(|(status, _)| status),
+            Some(StatusCode::INTERNAL_SERVER_ERROR)
+        );
+        assert!(keys.exists(), "the surviving record keeps its keys");
+        crate::trust_registries::test_builds::install(
+            &registry.id,
+            vec![crate::trust_registries::test_builds::Outcome::Connect],
+        );
+        let Json(reconnected) = reconnect_trust_registry(
+            Extension(store.clone()),
+            Some(Extension(manager)),
+            Path(registry.id.clone()),
+            None,
+            None,
+        )
+        .await
+        .expect("the registry is owned again");
+        assert_eq!(reconnected.connection_status, TrustRegistryConnectionStatus::Connecting);
     }
 
     #[tokio::test]
