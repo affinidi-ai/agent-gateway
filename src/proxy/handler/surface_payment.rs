@@ -779,13 +779,17 @@ mod tests {
                 .map(String::as_str),
             Some("payment-proof")
         );
-        surface.mcp_http = None;
         headers.insert(
             "authorization",
             "Payment legacy-credential"
                 .parse()
                 .unwrap(),
         );
+        assert!(
+            !delegation_headers(&surface, &headers).contains_key("AUTHORIZATION"),
+            "a Payment credential does not cross when the Resource Server reads Authorization"
+        );
+        surface.mcp_http = None;
         assert_eq!(
             delegation_headers(&surface, &headers)
                 .get("AUTHORIZATION")
