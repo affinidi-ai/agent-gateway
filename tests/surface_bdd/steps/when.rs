@@ -1418,6 +1418,37 @@ pub(crate) async fn set_transit_token_lifetime(
     record_admin_response(world, response);
 }
 
+#[when(expr = "the operator sets the surface's transit token mode to {string}")]
+async fn operator_sets_the_transit_token_mode(
+    world: &mut SurfaceWorld,
+    mode: String,
+) {
+    ensure_admin_session(world).await;
+    let surface_id = get_tracked_surface_id(world, "setting the transit token mode");
+    let client = world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist");
+    let current = client
+        .get_surface_recorded(&surface_id)
+        .await
+        .unwrap_or_else(|error| panic!("fetch surface before setting the transit token mode: {error}"));
+    assert_eq!(
+        current.status, 200,
+        "fetch surface before setting the transit token mode should succeed, got status {} body {}",
+        current.status, current.body
+    );
+
+    let mut payload = current.body;
+    payload["transit"]["transit_token_mode"] = serde_json::json!(mode);
+    let response = client
+        .update_surface_recorded(&surface_id, &payload)
+        .await
+        .unwrap_or_else(|error| panic!("set the transit token mode through admin API: {error}"));
+
+    record_admin_response(world, response);
+}
+
 pub(crate) async fn delete_surface(world: &mut SurfaceWorld) {
     ensure_admin_session(world).await;
     let surface_id = get_tracked_surface_id(world, "deleting the surface");

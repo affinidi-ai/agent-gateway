@@ -178,3 +178,8 @@ Feature: MCP Transit Point forwarding
     When the operator sets the surface's transit token lifetime to 901 seconds
     Then the admin API response status is 400
     And the admin API error response mentions "transit.transit_token_lifetime_secs must be from 30 to 900 seconds, not 901"
+
+  Scenario: A surface that asks for reference transit tokens is refused
+    When the operator sets the surface's transit token mode to "reference"
+    Then the admin API response status is 400
+    And the admin API error response mentions "transit.transit_token_mode 'reference' is not supported"

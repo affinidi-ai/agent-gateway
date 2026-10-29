@@ -472,7 +472,6 @@ async fn mcp_resource_authorization_requires_scoped_tokens_and_strips_target_cre
         })).unwrap());
         config.surfaces[0].transit = Some(serde_json::from_value(json!({
             "outbound_listen_address": "outbound_port_placeholder",
-            "sign_requests": false,
             "points": [{"alias": "target", "target_endpoint": "outbound_target_placeholder", "protocol": "mcp", "require_transit_token": false,
                 "mcp_http": {"authorization": {"resource": transit_resource, "scopes": ["read"]}}}]
         })).unwrap());
