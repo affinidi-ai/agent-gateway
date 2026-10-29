@@ -2,7 +2,9 @@ import React from 'react';
 import { Form } from 'react-bootstrap';
 import InfoBanner from '../../../shared/InfoBanner';
 import type { ConfigPanelProps } from '../types';
+import { useOptionalSurfaceMeta } from '../../SurfaceMetaContext';
 import { CALLER_AUTH_METHOD_OPTIONS, isSelectableCallerAuthMethod } from './methodOptions';
+import { discoverySaveError, readProtectedResource } from './protectedResource';
 
 /**
  * Compact sidebar panel for the Caller Auth element. Picks the method
@@ -13,10 +15,17 @@ import { CALLER_AUTH_METHOD_OPTIONS, isSelectableCallerAuthMethod } from './meth
  */
 const CallerAuthPanel: React.FC<ConfigPanelProps> = ({
   config,
-  updateField,
+  updateFields,
+  protocol,
   openFullscreenEditor,
 }) => {
   const method = config.method_type || 'jwt_bearer';
+  const meta = useOptionalSurfaceMeta();
+  const discovery = readProtectedResource(config.protected_resource);
+  const showsDiscovery = protocol === 'mcp' && method === 'jwt_bearer';
+  const discoveryError = showsDiscovery
+    ? discoverySaveError(meta?.saveError, discovery?.resource)
+    : null;
 
   return (
     <>
@@ -55,7 +64,10 @@ const CallerAuthPanel: React.FC<ConfigPanelProps> = ({
             const nextMethod = e.target
               .value as (typeof CALLER_AUTH_METHOD_OPTIONS)[number]['value'];
             if (isSelectableCallerAuthMethod(nextMethod)) {
-              updateField('method_type', nextMethod);
+              updateFields({
+                method_type: nextMethod,
+                ...(nextMethod === 'jwt_bearer' ? {} : { protected_resource: null }),
+              });
             }
           }}
         >
@@ -70,6 +82,32 @@ const CallerAuthPanel: React.FC<ConfigPanelProps> = ({
           &quot;Configure…&quot; below for details on each option. Default: JWT Bearer, the standard
           choice unless you specifically need an API key or client certificate.
         </Form.Text>
+        {showsDiscovery && (
+          <Form.Text
+            className="text-muted d-block mt-2"
+            style={{ fontSize: '10px' }}
+            data-testid="caller-auth-panel-discovery-status"
+          >
+            Authorization server discovery:{' '}
+            {discovery ? (
+              <strong>
+                on, {discovery.authorization_servers.length} authorization server
+                {discovery.authorization_servers.length === 1 ? '' : 's'}
+              </strong>
+            ) : (
+              <strong>off</strong>
+            )}
+          </Form.Text>
+        )}
+        {discoveryError && (
+          <div
+            className="invalid-feedback d-block"
+            style={{ fontSize: '10px' }}
+            data-testid="caller-auth-panel-discovery-save-error"
+          >
+            {discoveryError}
+          </div>
+        )}
         <button
           className="btn btn-outline-primary btn-sm w-100 mt-2"
           onClick={() => openFullscreenEditor?.()}

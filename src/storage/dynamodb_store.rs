@@ -254,7 +254,10 @@ impl DynamoDbConfigStore {
                 protocol: surface_protocol,
                 caller_authentication: source_auth
                     .as_ref()
-                    .map(|sa| CallerAuthentication { methods: vec![sa.clone()] }),
+                    .map(|sa| CallerAuthentication {
+                        methods: vec![sa.clone()],
+                        protected_resource: None,
+                    }),
                 ..Default::default()
             },
             target: Target {

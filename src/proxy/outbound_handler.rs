@@ -146,7 +146,7 @@ pub(crate) enum OutboundPipelineError {
     #[error("MCP resource authorization failed")]
     McpResourceAuthorization {
         config: Box<crate::mcp::resource_server::McpResourceServerConfig>,
-        error: crate::mcp::resource_server::ResourceTokenError,
+        error: crate::protocols::protected_resource::ResourceTokenError,
     },
 
     #[error("Upstream request timed out")]
@@ -399,6 +399,7 @@ impl OutboundPipelineContext {
         addr: SocketAddr,
         req: Request,
         state: &OutboundProxyState,
+        versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
     ) -> Result<Self, OutboundPipelineError> {
         // Read the latest channel state (sub-microsecond lock).
         let cs = state
@@ -485,7 +486,7 @@ impl OutboundPipelineContext {
             refusal
         };
         let modern_post = matched_virtual_channel.protocol == crate::config::agent_surface::TransitProtocol::Mcp
-            && crate::mcp::request_validation::has_modern_header(&original_headers)
+            && crate::mcp::request_validation::has_modern_header(&original_headers, versions)
             && original_method == Method::POST;
         let (active_variant_id, surface, pending_variant_refusal) =
             match surface_for_resolve.serve_variant(active_variant_alias.as_deref()) {
@@ -751,7 +752,7 @@ async fn outbound_proxy_handler_in_request_scope(
 ) -> Result<Response, OutboundPipelineError> {
     let mut subscription_access =
         crate::mcp::subscriptions::SubscriptionLifetime::new(std::time::Duration::from_secs(86_400), None);
-    let mut ctx = OutboundPipelineContext::new(addr, req, &state)?;
+    let mut ctx = OutboundPipelineContext::new(addr, req, &state, versions)?;
     if let Some(refusal) = ctx
         .pending_variant_refusal
         .take()
@@ -1074,7 +1075,7 @@ async fn step_source_auth(
         .as_ref()
         .and_then(|http| http.authorization.as_ref())
     {
-        use crate::mcp::resource_server::ResourceTokenError;
+        use crate::protocols::protected_resource::ResourceTokenError;
 
         let fail = |error| OutboundPipelineError::McpResourceAuthorization {
             config: Box::new(authorization.clone()),
@@ -6645,7 +6646,13 @@ mod tests {
                     .insert("x-transit-token", token.parse().unwrap());
                 let mut context_request = subscription_request();
                 *context_request.uri_mut() = variant_uri.parse().unwrap();
-                let context = OutboundPipelineContext::new(address, context_request, &request_state).unwrap();
+                let context = OutboundPipelineContext::new(
+                    address,
+                    context_request,
+                    &request_state,
+                    crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+                )
+                .unwrap();
                 assert_eq!(
                     context
                         .active_variant_id
@@ -8438,6 +8445,7 @@ mod tests {
                 .unwrap(),
             req,
             &state,
+            crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
         )
         .expect("context should resolve variant Transit Point");
 
@@ -8670,7 +8678,7 @@ mod tests {
     async fn test_step_extract_protocol_context_caps_initialize_to_a_served_revision() {
         let state = test_outbound_state();
         let legacy = crate::mcp::MCP_LEGACY_VERSION;
-        for (requested, forwarded) in [("2025-11-25", legacy), (legacy, legacy)] {
+        for (requested, forwarded) in [("2099-01-01", legacy), (legacy, legacy), ("2025-06-18", "2025-06-18")] {
             let mut ctx = test_pipeline_context();
             Arc::make_mut(&mut ctx.surface)
                 .access_point
@@ -8724,8 +8732,8 @@ mod tests {
         for (target, version, admitted) in [
             ("fabric://gateway/channel", crate::mcp::MCP_MODERN_VERSION, true),
             ("https://agent.example/mcp", crate::mcp::MCP_MODERN_VERSION, true),
-            ("fabric://gateway/channel", "2025-11-25", false),
-            ("https://agent.example/mcp", "2025-11-25", false),
+            ("fabric://gateway/channel", "2099-01-01", false),
+            ("https://agent.example/mcp", "2099-01-01", false),
         ] {
             let mut ctx = test_pipeline_context();
             ctx.virtual_channel.protocol = crate::config::agent_surface::TransitProtocol::Mcp;
@@ -8755,10 +8763,7 @@ mod tests {
                 assert_eq!(error.status, StatusCode::BAD_REQUEST);
                 assert_eq!(error.code, crate::mcp::error_codes::UNSUPPORTED_PROTOCOL_VERSION);
                 assert_eq!(error.id, Some(json!("transit-admission")));
-                assert_eq!(
-                    error.data.unwrap()["supported"],
-                    json!([crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION])
-                );
+                assert_eq!(error.data.unwrap()["supported"], json!(versions.supported_versions()));
                 assert!(
                     ctx.mcp_classification
                         .is_none()
@@ -8778,7 +8783,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_step_extract_protocol_context_advertises_versions_learned_from_transit_discovery() {
-        use crate::mcp::{MCP_LEGACY_VERSION, MCP_MODERN_VERSION};
+        use crate::mcp::MCP_MODERN_VERSION;
 
         let versions = crate::mcp::request_validation::MODERN_CAPABLE_POLICY;
         let transit_point = |ctx: &mut OutboundPipelineContext, alias: &str| {
@@ -8837,10 +8842,10 @@ mod tests {
                 .map(|_| ctx.mcp_classification)
         };
         for (alias, supported) in [
-            ("learned-discovery", json!([MCP_LEGACY_VERSION])),
-            ("unlearned-discovery", json!([MCP_LEGACY_VERSION, MCP_MODERN_VERSION])),
+            ("learned-discovery", json!(crate::mcp::request_validation::SESSION_VERSIONS)),
+            ("unlearned-discovery", json!(versions.supported_versions())),
         ] {
-            let Err(OutboundPipelineError::McpValidation(error)) = admit(alias, "2025-11-25").await else {
+            let Err(OutboundPipelineError::McpValidation(error)) = admit(alias, "2099-01-01").await else {
                 panic!("expected MCP version rejection for {alias}");
             };
             assert_eq!(error.code, crate::mcp::error_codes::UNSUPPORTED_PROTOCOL_VERSION);
@@ -11006,6 +11011,7 @@ mod tests {
                     .unwrap(),
                 req,
                 &state,
+                crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
             )
             .expect("context resolves the Transit Point");
             step_collect_trust_context(&state, &mut ctx)

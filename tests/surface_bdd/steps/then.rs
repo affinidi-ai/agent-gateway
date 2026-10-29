@@ -745,6 +745,22 @@ async fn vp_audit_log_records_non_blocking_source_auth_failure(
     .await;
 }
 
+#[then(expr = "the VP Audit Log records a blocking {string} source authentication failure for {string}")]
+async fn vp_audit_log_records_blocking_source_auth_failure(
+    world: &mut SurfaceWorld,
+    auth_type: String,
+    failure: String,
+) {
+    let scheme = audited_auth_scheme(&auth_type);
+    let reason = audited_auth_failure_reason(&failure);
+    let what = format!("a blocking '{auth_type}' source authentication failure for {failure}");
+    expect_vp_audit_record(world, &what, |event| {
+        let recorded = &event["event"]["auth_failed"];
+        recorded["scheme"] == scheme && recorded["reason"] == reason && recorded["blocking"] == true
+    })
+    .await;
+}
+
 /// The audit reason code for a refused request, as the step names the refusal.
 fn audited_refusal_reason(refusal: &str) -> &'static str {
     match refusal {
@@ -2621,6 +2637,61 @@ fn named_external_agent_did_not_receive_header(
     header_name: String,
 ) {
     assert_actor_did_not_receive_header(world, &agent_name, TargetActorKind::ExternalAgent, &header_name);
+}
+
+#[then("the protected resource metadata names the surface as the resource")]
+fn protected_resource_metadata_names_the_surface(world: &mut SurfaceWorld) {
+    let expected = format!(
+        "{}{}",
+        crate::bdd_support::config::single_surface_fixture::PROTECTED_RESOURCE_PUBLIC_ORIGIN,
+        world.surface_config.route
+    );
+    assert_eq!(get_response_body_value(world)["resource"], serde_json::json!(expected));
+    assert_eq!(get_response_body_value(world)["bearer_methods_supported"], serde_json::json!(["header"]));
+}
+
+#[then(expr = "the protected resource metadata names authorization server {string}")]
+fn protected_resource_metadata_names_authorization_server(
+    world: &mut SurfaceWorld,
+    authorization_server: String,
+) {
+    assert_eq!(get_response_body_value(world)["authorization_servers"], serde_json::json!([authorization_server]));
+}
+
+#[then(expr = "the protected resource metadata lists scope {string}")]
+fn protected_resource_metadata_lists_scope(
+    world: &mut SurfaceWorld,
+    scope: String,
+) {
+    assert_eq!(get_response_body_value(world)["scopes_supported"], serde_json::json!([scope]));
+}
+
+fn assert_discovery_challenge(
+    world: &SurfaceWorld,
+    error: &str,
+) {
+    let protected = world
+        .surface_config
+        .protected_resource
+        .as_ref()
+        .expect("the surface must publish protected resource metadata");
+    let expected = format!(
+        "Bearer resource_metadata=\"{}/.well-known/oauth-protected-resource{}\"{error}, scope=\"{}\"",
+        crate::bdd_support::config::single_surface_fixture::PROTECTED_RESOURCE_PUBLIC_ORIGIN,
+        world.surface_config.route,
+        protected.scopes.join(" ")
+    );
+    assert_collaborator_header_value(get_response_headers_value(world), "www-authenticate", &expected, "response");
+}
+
+#[then("the response challenges the caller to fetch a token from the surface's protected resource metadata")]
+fn response_challenges_for_a_token(world: &mut SurfaceWorld) {
+    assert_discovery_challenge(world, "");
+}
+
+#[then("the response challenges the caller for a new token because the token is invalid")]
+fn response_challenges_for_a_new_token(world: &mut SurfaceWorld) {
+    assert_discovery_challenge(world, ", error=\"invalid_token\"");
 }
 
 #[then(expr = "the response includes header {string} with value {string}")]

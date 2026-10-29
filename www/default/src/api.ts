@@ -161,12 +161,12 @@ class APIClient {
 
     try {
       const response = await fetch(url, {
+        ...options,
         headers: {
           'Content-Type': 'application/json',
           ...sessionManager.getAuthHeaders(),
           ...options?.headers,
         },
-        ...options,
         signal: controller.signal,
       });
 
@@ -1235,6 +1235,22 @@ export interface McpHttpConfig {
   };
 }
 
+/**
+ * RFC 9728 discovery an MCP Access Point publishes for its JWT Bearer caller
+ * authentication (`ProtectedResourceConfig` in `src/protocols/protected_resource.rs`).
+ */
+export interface ProtectedResourceConfig {
+  resource: string;
+  authorization_servers: string[];
+  scopes?: string[];
+}
+
+export interface CallerAuthentication {
+  methods: unknown[];
+  /** `null` on a PUT removes the stored setting; leaving it out keeps it. */
+  protected_resource?: ProtectedResourceConfig | null;
+}
+
 export interface AgentSurface {
   surface_id: string;
   name: string;
@@ -1250,6 +1266,7 @@ export interface AgentSurface {
     listen_address: string;
     route: string;
     protocol: 'a2a' | 'ap2' | 'mcp';
+    caller_authentication?: CallerAuthentication;
     caller_context?: { mode: 'required' | 'optional' | 'anonymous' };
     identity_resolution?: any;
     inbound_policy?: { policy_definition_id: string };

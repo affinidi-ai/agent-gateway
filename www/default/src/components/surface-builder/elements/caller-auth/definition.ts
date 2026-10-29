@@ -3,6 +3,15 @@ import type { NodeDefinition, PayloadSlice } from '../types';
 import CallerAuthPanel from './CallerAuthPanel';
 import CallerAuthFullscreen from './CallerAuthFullscreen';
 import { DOCS_URL } from '../../../../config/docs';
+import {
+  discoveryProblems,
+  protectedResourcePayload,
+  readProtectedResource,
+  resourceMissesRoute,
+} from './protectedResource';
+
+const usesDiscovery = (c: Record<string, unknown>): boolean =>
+  c.method_type === 'jwt_bearer' && readProtectedResource(c.protected_resource) !== null;
 
 /**
  * Caller Context Extraction — promotes the AP-side `caller_authentication`
@@ -71,6 +80,10 @@ export const callerAuthDefinition: NodeDefinition = {
       Defaults to <code>Authorization</code> header for JWT bearer.</p>
       <p>JWT bearer authentication can optionally forward the validated token
       header unchanged to the directly managed target.</p>
+      <p>On an MCP surface, JWT bearer authentication can also publish
+      <strong>authorization server discovery</strong>: protected resource
+      metadata naming the authorization servers, so an MCP client finds where
+      to get a token for this resource.</p>
     `,
   },
   incompleteReason: c => {
@@ -83,6 +96,27 @@ export const callerAuthDefinition: NodeDefinition = {
       return 'mTLS certificate must be selected';
     return null;
   },
+  validate: c => discoveryProblems(c ?? {}),
+  featureDependencies: [
+    {
+      description: 'Authorization server discovery requires an MCP Access Point',
+      condition: c => usesDiscovery(c ?? {}),
+      check: (_c, ctx) => ctx.protocol === 'mcp',
+      severity: 'error',
+      message: 'Authorization server discovery requires an MCP Access Point',
+    },
+    {
+      description: 'The discovery resource path is the Access Point route',
+      condition: c => usesDiscovery(c ?? {}),
+      check: (c, ctx) =>
+        !resourceMissesRoute(
+          readProtectedResource(c?.protected_resource)?.resource ?? '',
+          ctx.accessPoint?.route
+        ),
+      severity: 'error',
+      message: "The discovery resource URL's path must be the Access Point route exactly",
+    },
+  ],
   ConfigPanel: CallerAuthPanel,
   FullscreenPanel: CallerAuthFullscreen,
   payloadPath: 'access_point.caller_authentication',
@@ -162,10 +196,15 @@ export const callerAuthDefinition: NodeDefinition = {
         return undefined;
     }
 
+    const discovery =
+      c.method_type === 'jwt_bearer' ? readProtectedResource(c.protected_resource) : null;
     const slices: PayloadSlice[] = [
       {
         path: 'access_point.caller_authentication',
-        value: { methods: [method] },
+        value: {
+          methods: [method],
+          ...(discovery ? { protected_resource: protectedResourcePayload(discovery) } : {}),
+        },
       },
     ];
     return slices;
@@ -173,6 +212,8 @@ export const callerAuthDefinition: NodeDefinition = {
   /**
    * Reverse the wire shape into the flat panel fields. The runtime
    * always reads only the first method, so we only hydrate methods[0].
+   * `protected_resource` is always set, to `null` when the payload has none,
+   * so a stale copy in the canvas blob never brings back a removed setting.
    */
   configFromPayload: slice => {
     const m = slice?.methods?.[0];
@@ -190,6 +231,8 @@ export const callerAuthDefinition: NodeDefinition = {
       out.jwt_token_scheme = m.token_scheme ?? 'Bearer';
       out.jwt_forward_header = m.forward_header === true;
     }
+    out.protected_resource =
+      m.type === 'jwt_bearer' ? readProtectedResource(slice.protected_resource) : null;
     if (m.type === 'api_key' && m.secret_id) out.api_key_secret_id = m.secret_id;
     if (m.type === 'mtls') {
       // New shape: pinned trust carrying certificate_ids[0].

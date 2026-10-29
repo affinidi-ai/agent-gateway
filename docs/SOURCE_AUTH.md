@@ -31,6 +31,20 @@ Configured on the Access Point as `caller_authentication.methods`. Each method i
 ([`AgentSurface::source_auth`](../src/config/agent_surface_accessors.rs)); later entries
 are accepted and ignored.
 
+A JWT bearer token is accepted only when it is signed with an RS256, RS384, RS512, ES256,
+ES384 or EdDSA key from the strategy's key set, its `iss` equals the strategy's expected
+issuer, it has an `exp` that has not passed and, when it has an `nbf`, that time has come,
+each with 60 seconds of leeway. `aud` must name one of the method's `audiences`; an empty
+list skips that check, except on an MCP Access Point that publishes protected resource
+metadata, where `aud` must name the resource of the route called.
+
+An MCP Access Point whose first method is JWT bearer can also publish RFC 9728 protected
+resource metadata naming the authorization server that issues its tokens, with
+`caller_authentication.protected_resource`. See
+[`MCP_METADATA.md`](MCP_METADATA.md#authorization-server-discovery-for-caller-authentication),
+and [Choosing How an MCP Access Point Checks Tokens](MCP_METADATA.md#choosing-how-an-mcp-access-point-checks-tokens)
+for when to use it instead of the gateway STS Resource Server path.
+
 The gateway builds one source authentication middleware at startup. If its JWT
 verification strategy store (`jwt_verification_strategies/`, next to the secrets storage
 directory) cannot be opened, the gateway refuses to start and names that path, rather
@@ -61,6 +75,11 @@ deny if input.source_auth.method == "failed"
 ```
 
 See [`POLICY.md`](POLICY.md#failed-caller-authentication).
+
+A request to an MCP Access Point that publishes protected resource metadata, direct or over
+Fabric, is the exception: a missing or invalid JWT is refused with a `401` (the discovery
+challenge on a direct request), see
+[`MCP_METADATA.md`](MCP_METADATA.md#authorization-server-discovery-for-caller-authentication).
 
 ### mTLS
 
@@ -123,9 +142,10 @@ presentation with `user_hash = SHA256(did)`.
 
 [`src/authz_metadata/`](../src/authz_metadata/) fetches and validates an authorization
 server's metadata document and returns the issuer, the URL the document came from, the
-`token_endpoint` and the `jwks_uri`. An issuer is acceptable only when it has no ASCII
-whitespace or control characters anywhere, leading, trailing or inside; the raw string is
-checked before it is parsed, and a failure is `invalid_url` before any DNS lookup or request.
+`token_endpoint` and the `jwks_uri`. An issuer is acceptable only when it has no whitespace,
+Unicode spaces such as a no-break space or a line separator included, and no control
+character anywhere, leading, trailing or inside; the raw string is checked before it is
+parsed, and a failure is `invalid_url` before any DNS lookup or request.
 Let P be the issuer path with its trailing slashes removed. An origin issuer (empty P, with or
 without a trailing slash) has two attempts, in this order: `{origin}/.well-known/oauth-authorization-server`
 (RFC 8414), then `{origin}/.well-known/openid-configuration`. A path issuer has three: the
@@ -133,7 +153,10 @@ RFC 8414 URL with P inserted after the well-known name
 (`{origin}/.well-known/oauth-authorization-server{P}`), the OpenID Connect URL with P inserted
 (`{origin}/.well-known/openid-configuration{P}`), then the OpenID Connect URL with P appended
 (`{origin}{P}/.well-known/openid-configuration`). The first acceptable document wins. The
-`issuer` in the document must equal the requested issuer byte for byte. `token_endpoint` and `jwks_uri` must be absolute `http` or
+`issuer` in the document must equal the requested issuer byte for byte. `token_endpoint` and
+`jwks_uri` are both required, `jwks_uri` too although RFC 8414 makes it optional, because the
+gateway validates JWT access tokens and needs the issuer's keys; a document without either is
+`invalid_document`. Both must be absolute `http` or
 `https` URLs of at most 2048 characters, with no whitespace, control characters,
 credentials or fragment, not a cloud-metadata address, and not a weaker scheme than the
 issuer: an `https` issuer with an `http` endpoint is an invalid document under every posture.
@@ -160,7 +183,9 @@ applies to the metadata URL at fetch time. It also applies to the discovered
 `localhost` name in a blocked range makes the document invalid. A name that only resolves to
 a private address cannot be known without DNS, so it passes parsing. The caller must therefore
 fetch these URLs with `get_bounded`, or another pinned client, under the same posture, which
-blocks such a name at fetch time.
+blocks such a name at fetch time. The JWT Bearer `JwksFetcher` always uses the
+cloud-metadata-only pinned client, so a `jwks_uri` discovered under `Strict` must not be
+handed to it; fetch it with `get_bounded` under `Strict`.
 
 A failure is a `DiscoveryError`. `failure()` returns the `DiscoveryFailure`, `code()` a
 stable string, `message()` fixed text that is safe in an API response (it never carries a
@@ -189,6 +214,7 @@ all of them, from least to most specific: `http_status`,
 | --- | --- |
 | `discover(issuer, posture, options)` | Fetches and validates, trying the URLs in order |
 | `metadata_urls(issuer)` | Pure: the candidate URLs for an issuer, in order: two for an origin issuer, three for a path issuer |
+| `validate_issuer(issuer, posture)` | Pure: the issuer checks `discover` makes before any request; protected resource metadata uses it for the authorization servers it advertises |
 | `parse_metadata(body, issuer, metadata_url, posture)` | Pure: validates a document already in hand |
 | `get_bounded(url, posture, options)` | The pinned, bounded GET, reusable for a JWKS fetch |
 

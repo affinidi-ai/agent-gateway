@@ -1621,12 +1621,32 @@ fn get_jwt_source_auth_issuer(world: &SurfaceWorld) -> String {
         .expect("jwt source_auth must be configured")
 }
 
-fn create_expired_jwt_for_issuer(issuer: String) -> String {
+/// The audience a caller's token names: the resource of the surface's route
+/// when it publishes protected resource metadata, so a test token fails only
+/// for the flaw it was made with, and none otherwise.
+fn caller_token_audience(world: &SurfaceWorld) -> serde_json::Value {
+    match world
+        .surface_config
+        .protected_resource
+    {
+        Some(_) => serde_json::json!(format!(
+            "{}{}",
+            crate::bdd_support::config::single_surface_fixture::PROTECTED_RESOURCE_PUBLIC_ORIGIN,
+            world.surface_config.route
+        )),
+        None => serde_json::json!([]),
+    }
+}
+
+fn create_expired_jwt_for_issuer(
+    issuer: String,
+    audience: serde_json::Value,
+) -> String {
     let now = jwt::now_secs();
     let claims = serde_json::json!({
         "iss": issuer,
         "sub": "test-user",
-        "aud": [],
+        "aud": audience,
         "iat": now - 7200,
         "exp": now - 3600
     });
@@ -1715,7 +1735,7 @@ async fn send_request_with_bearer_token(
 #[when("the caller sends a request to the surface with an expired token")]
 async fn request_with_expired_token(world: &mut SurfaceWorld) {
     ensure_gateway_running(world).await;
-    let token = create_expired_jwt_for_issuer(get_jwt_source_auth_issuer(world));
+    let token = create_expired_jwt_for_issuer(get_jwt_source_auth_issuer(world), caller_token_audience(world));
     send_request_with_bearer_token(world, token).await;
 }
 
@@ -1805,6 +1825,30 @@ async fn request_to_path_with_alternate_variant_api_key(
         _ => panic!("alternate variant must have an API Key source auth configured"),
     };
     send_request_to_path_and_record(world, &path, vec![(header_name, valid_key)]).await;
+}
+
+#[when("the caller fetches the protected resource metadata of the surface")]
+async fn fetch_protected_resource_metadata(world: &mut SurfaceWorld) {
+    ensure_gateway_running(world).await;
+
+    let infra = world.infra.as_ref().unwrap();
+    let url = format!(
+        "http://127.0.0.1:{}/.well-known/oauth-protected-resource{}",
+        infra.gateway_port, world.surface_config.route
+    );
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .send()
+        .await
+        .expect("protected resource metadata request failed");
+
+    let status = resp.status().as_u16();
+    let headers = collect_headers(resp.headers());
+    let body = resp
+        .json()
+        .await
+        .unwrap_or(serde_json::Value::Null);
+    world.caller_response = Some(RecordedResponse { status, headers, body });
 }
 
 #[when("the caller fetches the agent card")]
@@ -2331,7 +2375,7 @@ async fn caller_asks_mcp_surface_for_available_tools_without_token(world: &mut S
 #[when("the caller asks the MCP surface for available tools with an expired token")]
 async fn caller_asks_mcp_surface_for_available_tools_with_expired_token(world: &mut SurfaceWorld) {
     ensure_gateway_running(world).await;
-    let token = create_expired_jwt_for_issuer(get_jwt_source_auth_issuer(world));
+    let token = create_expired_jwt_for_issuer(get_jwt_source_auth_issuer(world), caller_token_audience(world));
     ask_mcp_surface_for_available_tools_with_headers(
         world,
         vec![("authorization".to_string(), format!("Bearer {}", token))],
@@ -2363,6 +2407,53 @@ async fn caller_asks_mcp_surface_for_available_tools_with_tampered_token(world: 
 async fn caller_asks_mcp_surface_for_available_tools_with_valid_token(world: &mut SurfaceWorld) {
     ensure_gateway_running(world).await;
     let token = create_valid_jwt_for_issuer(get_jwt_source_auth_issuer(world));
+    ask_mcp_surface_for_available_tools_with_headers(
+        world,
+        vec![("authorization".to_string(), format!("Bearer {}", token))],
+    )
+    .await;
+}
+
+#[when("the caller asks the MCP surface for available tools with a token issued for the surface")]
+async fn caller_asks_mcp_surface_for_available_tools_with_token_for_surface(world: &mut SurfaceWorld) {
+    let audience = caller_token_audience(world);
+    ask_mcp_surface_for_available_tools_with_audience(world, audience).await;
+}
+
+#[when(
+    expr = "caller {string} asks the MCP surface for available tools with a token issued for the surface containing group {string}"
+)]
+async fn caller_asks_mcp_surface_for_available_tools_with_token_for_surface_containing_group(
+    world: &mut SurfaceWorld,
+    caller: String,
+    group: String,
+) {
+    ensure_gateway_running(world).await;
+    let token = create_valid_jwt_for_subject(
+        get_jwt_source_auth_issuer(world),
+        &caller,
+        serde_json::json!({ "aud": caller_token_audience(world), "groups": [group] }),
+    );
+    ask_mcp_surface_for_available_tools_with_headers(
+        world,
+        vec![("authorization".to_string(), format!("Bearer {}", token))],
+    )
+    .await;
+}
+
+#[when("the caller asks the MCP surface for available tools with a token issued for another resource")]
+async fn caller_asks_mcp_surface_for_available_tools_with_token_for_another_resource(world: &mut SurfaceWorld) {
+    let resource =
+        format!("{}/elsewhere", crate::bdd_support::config::single_surface_fixture::PROTECTED_RESOURCE_PUBLIC_ORIGIN);
+    ask_mcp_surface_for_available_tools_with_audience(world, serde_json::json!(resource)).await;
+}
+
+async fn ask_mcp_surface_for_available_tools_with_audience(
+    world: &mut SurfaceWorld,
+    audience: serde_json::Value,
+) {
+    ensure_gateway_running(world).await;
+    let token = create_valid_jwt_for_issuer_with_audience(get_jwt_source_auth_issuer(world), audience);
     ask_mcp_surface_for_available_tools_with_headers(
         world,
         vec![("authorization".to_string(), format!("Bearer {}", token))],
@@ -3126,7 +3217,10 @@ async fn caller_asks_mcp_surface_for_available_tools_with_named_valid_token_cont
 #[when(expr = "the caller asks the MCP surface for available tools with a token from an untrusted issuer")]
 async fn caller_asks_mcp_surface_for_available_tools_with_untrusted_issuer(world: &mut SurfaceWorld) {
     ensure_gateway_running(world).await;
-    let token = create_valid_jwt_for_issuer("https://untrusted-issuer.example.test".to_string());
+    let token = create_valid_jwt_for_issuer_with_audience(
+        "https://untrusted-issuer.example.test".to_string(),
+        caller_token_audience(world),
+    );
     ask_mcp_surface_for_available_tools_with_headers(
         world,
         vec![("authorization".to_string(), format!("Bearer {}", token))],

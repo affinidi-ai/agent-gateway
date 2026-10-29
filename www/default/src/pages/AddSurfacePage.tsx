@@ -822,6 +822,7 @@ const AddSurfacePage: React.FC = () => {
         onApplyJsonPayload={applyJsonPayloadToCanvas}
         surfacePolicyLoadState={surfacePolicyLoadState}
         hasAttemptedSave={hasAttemptedSave}
+        saveError={error}
         manageActions={
           <div className="d-flex gap-2">
             <button

@@ -1220,6 +1220,7 @@ async fn start_a2a_proxy_harness_requiring_caller_auth(fake_direct_line: &FakeDi
         surface
             .access_point
             .caller_authentication = Some(crate::config::agent_surface::CallerAuthentication {
+            protected_resource: None,
             methods: vec![crate::source_auth::SourceAuthConfig::ApiKey(crate::source_auth::models::ApiKeyAuthConfig {
                 extraction: crate::source_auth::models::CredentialExtraction::HttpHeader {
                     field: "x-api-key".to_string(),

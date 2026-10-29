@@ -35,7 +35,8 @@ static CHANNEL_SSE_SESSION_MGR: std::sync::LazyLock<crate::mcp::sse_server::SseS
     std::sync::LazyLock::new(|| crate::mcp::sse_server::SseSessionManager::new(None));
 
 async fn resolve_legacy_mcp_session(
-    headers: &HeaderMap
+    surface_id: &str,
+    headers: &HeaderMap,
 ) -> (crate::mcp::request_validation::LegacySessionEvidence, Option<String>) {
     use crate::mcp::request_validation::LegacySessionEvidence;
 
@@ -52,14 +53,43 @@ async fn resolve_legacy_mcp_session(
 
     let (legacy_sse, streamable_sse, capabilities) = tokio::join!(
         CHANNEL_SSE_SESSION_MGR.session_exists(session_id),
-        crate::mcp::streamable_sse::global_streamable_session_registry().has_session(session_id),
-        crate::mcp::elicitation::global_capability_registry().get(session_id),
+        crate::mcp::streamable_sse::global_streamable_session_registry().has_session(surface_id, session_id),
+        crate::mcp::elicitation::global_capability_registry().get(surface_id, session_id),
     );
     if legacy_sse || streamable_sse || capabilities.is_some() {
         (LegacySessionEvidence::Known, Some(session_id.to_string()))
     } else {
         (LegacySessionEvidence::Unknown, None)
     }
+}
+
+/// Longest upstream `Mcp-Session-Id` the gateway records client capabilities under.
+const MAX_UPSTREAM_SESSION_ID_LEN: usize = 1024;
+
+/// The upstream's `Mcp-Session-Id` from an `initialize` response: `Ok(None)`
+/// when it sent none, `Err` when it sent one the gateway can't use as a key
+/// (several values, or not visible ASCII as the MCP spec requires).
+fn upstream_mcp_session_id(headers: &HeaderMap) -> Result<Option<String>, &'static str> {
+    let mut values = headers
+        .get_all("mcp-session-id")
+        .iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err("several values");
+    }
+    let bytes = value.as_bytes();
+    if bytes.is_empty() || bytes.len() > MAX_UPSTREAM_SESSION_ID_LEN {
+        return Err("empty or too long");
+    }
+    if !bytes
+        .iter()
+        .all(|byte| (0x21..=0x7e).contains(byte))
+    {
+        return Err("not visible ASCII");
+    }
+    Ok(Some(String::from_utf8_lossy(bytes).into_owned()))
 }
 
 /// Returns `true` if the header should be forwarded upstream, additionally
@@ -1216,10 +1246,12 @@ fn evaluate_ap2_inbound_decision(
 
 async fn resolve_direct_surface_auth_config(
     auth_config: &crate::source_auth::SourceAuthConfig,
+    protected_resource: Option<&crate::protocols::protected_resource::ProtectedResourceConfig>,
     vc_issuer: Option<&crate::identity::VCIssuer>,
     surface_id: &str,
 ) -> crate::source_auth::errors::SourceAuthResult<crate::source_auth::SourceAuthConfig> {
-    crate::source_auth::middleware::resolve_surface_audience(auth_config, vc_issuer, surface_id).await
+    crate::source_auth::middleware::resolve_surface_audience(auth_config, protected_resource, vc_issuer, surface_id)
+        .await
 }
 
 /// Maps the config-level delegated-rail marker onto the audit `PaymentRail`.
@@ -1802,6 +1834,31 @@ async fn proxy_handler_with_mcp_runtime(
             .get::<crate::source_auth::client_ip::ClientIp>()
             .map_or(addr.ip(), |client| client.0),
     );
+    let protected_resource = match crate::protocols::protected_resource::access_point_protected_resource(
+        &state.surface,
+        state
+            .active_variant_alias
+            .as_deref(),
+        &state.network_config,
+    )
+    .transpose()
+    {
+        Ok(protected_resource) => protected_resource,
+        Err(e) => {
+            channel_warn!(config_id, "Invalid MCP protected resource (reason={}) — blocking", e);
+            crate::audit::request_events::auth_failed(
+                &audit_facts,
+                crate::audit::events::AuthScheme::Jwt,
+                "setup_failed",
+                true,
+                client_ip,
+            );
+            connection_guard
+                .decrement()
+                .await;
+            return Err(create_error_response(StatusCode::SERVICE_UNAVAILABLE, "Invalid MCP protected resource"));
+        }
+    };
     let authenticated_identity: Option<crate::source_auth::AuthenticatedIdentity> = if let Some(authorization) =
         &resource_authorization
     {
@@ -1818,7 +1875,7 @@ async fn proxy_handler_with_mcp_runtime(
             )
             .map(|((profile, issuer), middleware)| (profile, issuer, middleware))
         else {
-            let error = crate::mcp::resource_server::ResourceTokenError::Unavailable;
+            let error = crate::protocols::protected_resource::ResourceTokenError::Unavailable;
             crate::audit::request_events::resource_token_failed(&audit_facts, error, client_ip);
             return Ok(authorization.challenge(error));
         };
@@ -1870,7 +1927,7 @@ async fn proxy_handler_with_mcp_runtime(
                 .validate_network(&state.network_config)
                 .is_err()
         {
-            let error = crate::mcp::resource_server::ResourceTokenError::Unavailable;
+            let error = crate::protocols::protected_resource::ResourceTokenError::Unavailable;
             crate::audit::request_events::resource_token_failed(&audit_facts, error, client_ip);
             return Ok(authorization.challenge(error));
         }
@@ -1906,6 +1963,7 @@ async fn proxy_handler_with_mcp_runtime(
         };
         let resolved_auth_config = match resolve_direct_surface_auth_config(
             auth_config,
+            protected_resource.as_ref(),
             state.vc_issuer.as_deref(),
             &state.surface.surface_id,
         )
@@ -1944,18 +2002,36 @@ async fn proxy_handler_with_mcp_runtime(
             .await
         {
             Ok(identity) => Some(identity),
-            // Caller-attributable failure (missing/invalid credential):
-            // record the outcome for the policy layer and continue with no
-            // asserted caller identity — do not block here.
+            // Caller-attributable failure (missing/invalid credential). An
+            // Access Point that publishes protected resource metadata answers
+            // it with its challenge, so the caller can fetch a token and
+            // retry. Otherwise record the outcome for the policy layer and
+            // continue with no asserted caller identity — do not block here.
             Err(e) if e.is_caller_attributable() => {
-                channel_warn!(config_id, "Source authentication failed (reason={}) — deferring to policy", e);
+                let challenged = protected_resource.is_some();
+                channel_warn!(
+                    config_id,
+                    "Source authentication failed (reason={}) — {}",
+                    e,
+                    if challenged {
+                        "sending the discovery challenge"
+                    } else {
+                        "deferring to policy"
+                    }
+                );
                 crate::audit::request_events::auth_failed(
                     &audit_facts,
                     crate::audit::request_events::source_auth_scheme(&resolved_auth_config),
                     crate::audit::request_events::source_auth_reason(&e),
-                    false,
+                    challenged,
                     client_ip,
                 );
+                if let Some(protected_resource) = &protected_resource {
+                    connection_guard
+                        .decrement()
+                        .await;
+                    return Ok(protected_resource.caller_challenge(&e));
+                }
                 source_auth_failure = Some(crate::surface_context::SourceAuthContext::Failed {
                     attempted_method: resolved_auth_config
                         .method_tag()
@@ -2188,7 +2264,7 @@ async fn proxy_handler_with_mcp_runtime(
         &mcp_http
         && method == Method::POST
     {
-        let (session_evidence, known_session_id) = resolve_legacy_mcp_session(&headers).await;
+        let (session_evidence, known_session_id) = resolve_legacy_mcp_session(config_id, &headers).await;
         let classification = match policy.admit_post(&headers, &body_bytes, session_evidence) {
             Ok(classification) => classification,
             Err(validation_error) => {
@@ -2532,7 +2608,7 @@ async fn proxy_handler_with_mcp_runtime(
             && let Some((elicit_id, result)) = crate::mcp::elicitation::try_parse_elicitation_response(&envelope)
         {
             let resolved = crate::mcp::elicitation::global_pending_elicitation_registry()
-                .resolve(session_id, &elicit_id, result)
+                .resolve(config_id, session_id, &elicit_id, result)
                 .await;
             channel_info!(
                 config_id,
@@ -3984,7 +4060,7 @@ async fn proxy_handler_with_mcp_runtime(
             > = match session_id_opt {
                 Some(sid) => {
                     let rx = match crate::mcp::streamable_sse::global_streamable_session_registry()
-                        .register(&sid)
+                        .register(config_id, &sid)
                         .await
                     {
                         Some(rx) => rx,
@@ -4013,13 +4089,13 @@ async fn proxy_handler_with_mcp_runtime(
             );
             if let Some(sid) = session_id_opt {
                 crate::mcp::streamable_sse::global_streamable_session_registry()
-                    .drop_session(&sid)
+                    .drop_session(config_id, &sid)
                     .await;
                 crate::mcp::elicitation::global_capability_registry()
-                    .drop_session(&sid)
+                    .drop_session(config_id, &sid)
                     .await;
                 crate::mcp::elicitation::global_pending_elicitation_registry()
-                    .drop_session(&sid)
+                    .drop_session(config_id, &sid)
                     .await;
             }
             connection_guard
@@ -8976,60 +9052,100 @@ async fn proxy_handler_with_mcp_runtime(
             .and_then(|v| v.to_str().ok())
             .is_some_and(|ct| ct.contains("application/json"));
 
-        let (response_body, sse_override_content_type, mcp_session_id) =
-            if client_wants_streamable_sse && status.is_success() && upstream_is_json && !response_body.is_empty() {
-                // Detect MCP `initialize` response so we can mint a session id.
-                let parsed = serde_json::from_slice::<serde_json::Value>(&response_body).ok();
+        let (response_body, sse_override_content_type, mcp_session_id) = if client_wants_streamable_sse
+            && status.is_success()
+            && upstream_is_json
+            && !response_body.is_empty()
+        {
+            // Detect MCP `initialize` response so we can mint a session id.
+            let parsed = serde_json::from_slice::<serde_json::Value>(&response_body).ok();
 
-                let compact_body = match &parsed {
-                    Some(v) => serde_json::to_string(v)
-                        .unwrap_or_else(|_| String::from_utf8_lossy(&response_body).into_owned()),
-                    None => String::from_utf8_lossy(&response_body).into_owned(),
-                };
-
-                let is_initialize = parsed
-                    .as_ref()
-                    .and_then(|v| {
-                        v.get("result").map(|r| {
-                            r.get("protocolVersion")
-                                .is_some()
-                                || r.get("serverInfo").is_some()
-                                || r.get("capabilities")
-                                    .is_some()
-                        })
-                    })
-                    .unwrap_or(false);
-
-                let session_id = if is_initialize {
-                    let sid = uuid::Uuid::new_v4()
-                        .to_string()
-                        .replace('-', "");
-                    // Associate the client capabilities captured from the
-                    // inbound `initialize` request with the freshly-minted
-                    // session id, so downstream code (credential delegation,
-                    // Elicit mode) can check `capabilities.elicitation`.
-                    if let Some(caps) = mcp_initialize_caps.clone() {
-                        let registry = crate::mcp::elicitation::global_capability_registry().clone();
-                        registry
-                            .record(&sid, caps)
-                            .await;
-                    }
-                    Some(sid)
-                } else {
-                    None
-                };
-
-                let sse_body = crate::mcp::sse_server::wrap_json_as_sse_event(&compact_body);
-                channel_info!(
-                    config_id,
-                    "📦 MCP Streamable HTTP: wrapping JSON-RPC response as SSE (initialize={}, body_len={})",
-                    is_initialize,
-                    sse_body.len()
-                );
-                (bytes::Bytes::from(sse_body), Some("text/event-stream"), session_id)
-            } else {
-                (response_body, None, None)
+            let compact_body = match &parsed {
+                Some(v) => {
+                    serde_json::to_string(v).unwrap_or_else(|_| String::from_utf8_lossy(&response_body).into_owned())
+                }
+                None => String::from_utf8_lossy(&response_body).into_owned(),
             };
+
+            let is_initialize = parsed
+                .as_ref()
+                .and_then(|v| {
+                    v.get("result").map(|r| {
+                        r.get("protocolVersion")
+                            .is_some()
+                            || r.get("serverInfo").is_some()
+                            || r.get("capabilities")
+                                .is_some()
+                    })
+                })
+                .unwrap_or(false);
+
+            // The id to add as `Mcp-Session-Id`. When the upstream sent its
+            // own id, that header is copied below and the client must get
+            // only that one, or it may send back an id the upstream doesn't know.
+            let session_id = if is_initialize {
+                let (registry_sid, minted) = match upstream_mcp_session_id(&response_headers) {
+                    Ok(Some(sid)) => (Some(sid), None),
+                    Ok(None) => {
+                        let sid = uuid::Uuid::new_v4()
+                            .to_string()
+                            .replace('-', "");
+                        (Some(sid.clone()), Some(sid))
+                    }
+                    // The upstream keys the session by what it sent, so
+                    // dropping or picking one of the values would also break
+                    // the session; the client gets them as sent.
+                    Err(reason) => {
+                        channel_warn!(
+                            config_id,
+                            "Upstream initialize returned an unusable Mcp-Session-Id ({}); passing it through without recording client capabilities",
+                            reason
+                        );
+                        (None, None)
+                    }
+                };
+                // Associate the client capabilities captured from the
+                // inbound `initialize` request with the session id the
+                // client will send, so downstream code (credential
+                // delegation, Elicit mode) can check `capabilities.elicitation`.
+                if let (Some(sid), Some(caps)) = (&registry_sid, mcp_initialize_caps.clone()) {
+                    let registry = crate::mcp::elicitation::global_capability_registry().clone();
+                    // A client re-initializing its own session sends that id;
+                    // any other `initialize` must get an id nobody else holds.
+                    let reinitialized = headers
+                        .get("mcp-session-id")
+                        .and_then(|v| v.to_str().ok())
+                        == Some(sid.as_str());
+                    if reinitialized {
+                        registry
+                            .record(config_id, sid, caps)
+                            .await;
+                    } else if !registry
+                        .record_opened(config_id, sid, caps)
+                        .await
+                    {
+                        channel_warn!(
+                            config_id,
+                            "Upstream initialize returned an Mcp-Session-Id already used by another session; Elicit consent is off for that id"
+                        );
+                    }
+                }
+                minted
+            } else {
+                None
+            };
+
+            let sse_body = crate::mcp::sse_server::wrap_json_as_sse_event(&compact_body);
+            channel_info!(
+                config_id,
+                "📦 MCP Streamable HTTP: wrapping JSON-RPC response as SSE (initialize={}, body_len={})",
+                is_initialize,
+                sse_body.len()
+            );
+            (bytes::Bytes::from(sse_body), Some("text/event-stream"), session_id)
+        } else {
+            (response_body, None, None)
+        };
 
         // Build response
         let mut response = Response::builder().status(status);
@@ -9191,7 +9307,7 @@ async fn refuse_access_point_variant(
     error: &crate::config::agent_surface_variants::VariantResolveError,
 ) -> Response {
     let modern_mcp = surface.access_point.protocol == crate::config::agent_surface::SurfaceProtocol::Mcp
-        && crate::mcp::request_validation::has_modern_header(req.headers());
+        && crate::mcp::request_validation::has_modern_header(req.headers(), versions);
     let refusal = crate::audit::request_events::refuse_routing(
         &routing_facts(surface),
         error,
@@ -16900,7 +17016,7 @@ allow if {
             "target": {"endpoint": target.url()}
         });
         let body = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
-            "protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "client", "version": "1"}
+            "protocolVersion": "2099-01-01", "capabilities": {}, "clientInfo": {"name": "client", "version": "1"}
         }});
         let request = axum::http::Request::builder()
             .method("POST")
@@ -16929,6 +17045,260 @@ allow if {
         assert_eq!(forwarded["method"], "initialize");
         assert_eq!(forwarded["params"]["protocolVersion"], crate::mcp::MCP_LEGACY_VERSION);
         assert_eq!(forwarded["params"]["clientInfo"], body["params"]["clientInfo"]);
+    }
+
+    #[test]
+    fn upstream_session_id_must_be_one_visible_ascii_value_of_bounded_length() {
+        let with = |values: &[HeaderValue]| {
+            let mut headers = axum::http::HeaderMap::new();
+            for value in values {
+                headers.append("mcp-session-id", value.clone());
+            }
+            super::upstream_mcp_session_id(&headers)
+        };
+        let longest = "a".repeat(super::MAX_UPSTREAM_SESSION_ID_LEN);
+        let too_long = "a".repeat(super::MAX_UPSTREAM_SESSION_ID_LEN + 1);
+        assert_eq!(with(&[]), Ok(None));
+        assert_eq!(with(&[HeaderValue::from_static("abc-123")]), Ok(Some("abc-123".to_string())));
+        assert_eq!(with(&[HeaderValue::from_str(&longest).unwrap()]), Ok(Some(longest.clone())));
+        assert_eq!(
+            with(&[HeaderValue::from_static("first"), HeaderValue::from_static("second")]),
+            Err("several values")
+        );
+        assert_eq!(with(&[HeaderValue::from_static("")]), Err("empty or too long"));
+        assert_eq!(with(&[HeaderValue::from_str(&too_long).unwrap()]), Err("empty or too long"));
+        assert_eq!(with(&[HeaderValue::from_static("has space")]), Err("not visible ASCII"));
+        assert_eq!(with(&[HeaderValue::from_bytes("café".as_bytes()).unwrap()]), Err("not visible ASCII"));
+    }
+
+    /// When a JSON `initialize` result is wrapped as SSE, the client gets
+    /// exactly one `Mcp-Session-Id`: the upstream's when it sent one, else a
+    /// gateway id. Client capabilities are recorded under that id, per surface.
+    async fn initialize_wrapped_as_sse_returns_one_session_id(state: &crate::state::ProxyState) {
+        use axum::response::IntoResponse;
+        use serde_json::json;
+
+        async fn upstream(session_ids: &'static [&'static str]) -> std::net::SocketAddr {
+            let app = axum::Router::new().fallback(move || async move {
+                let mut response = axum::Json(json!({"jsonrpc": "2.0", "id": 1, "result": {
+                    "protocolVersion": "2025-11-25", "capabilities": {},
+                    "serverInfo": {"name": "target", "version": "1"}
+                }}))
+                .into_response();
+                for id in session_ids {
+                    response
+                        .headers_mut()
+                        .append("mcp-session-id", HeaderValue::from_static(id));
+                }
+                response
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .await
+                    .ok()
+            });
+            addr
+        }
+
+        let registry = crate::mcp::elicitation::global_capability_registry();
+        for (surface_id, upstream_ids) in [
+            ("session-id-upstream", &["upstream-session-1"][..]),
+            ("session-id-minted", &[][..]),
+            ("session-id-unusable", &["first", "second"][..]),
+        ] {
+            let addr = upstream(upstream_ids).await;
+            let surface = json!({
+                "surface_id": surface_id, "name": surface_id,
+                "access_point": {"listen_address": "https://gateway.example", "route": "/initialize", "protocol": "mcp"},
+                "target": {"endpoint": format!("http://{addr}/mcp")}
+            });
+            let body = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                "protocolVersion": "2025-11-25", "capabilities": {"elicitation": {}},
+                "clientInfo": {"name": "client", "version": "1"}
+            }});
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/initialize")
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .header("mcp-method", "initialize")
+                .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap();
+            let response = super::multi_channel_proxy_handler(
+                axum::extract::ConnectInfo(
+                    "127.0.0.1:12345"
+                        .parse()
+                        .unwrap(),
+                ),
+                axum::extract::State(direct_router_state(state, serde_json::from_value(surface).unwrap())),
+                request,
+            )
+            .await;
+            assert_eq!(response.status(), axum::http::StatusCode::OK, "{surface_id}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get("content-type")
+                    .and_then(|value| value.to_str().ok()),
+                Some("text/event-stream"),
+                "{surface_id}"
+            );
+            let ids: Vec<String> = response
+                .headers()
+                .get_all("mcp-session-id")
+                .iter()
+                .map(|value| {
+                    value
+                        .to_str()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect();
+            match upstream_ids {
+                [one] => {
+                    assert_eq!(ids, vec![one.to_string()], "{surface_id}");
+                    let caps = registry
+                        .get(surface_id, one)
+                        .await
+                        .expect("capabilities recorded under the upstream id");
+                    assert!(caps.elicitation);
+                    assert!(
+                        registry
+                            .get("another-surface", one)
+                            .await
+                            .is_none()
+                    );
+                    registry
+                        .drop_session(surface_id, one)
+                        .await;
+                }
+                [] => {
+                    assert_eq!(ids.len(), 1, "{surface_id}: {ids:?}");
+                    assert!(
+                        registry
+                            .get(surface_id, &ids[0])
+                            .await
+                            .is_some()
+                    );
+                    registry
+                        .drop_session(surface_id, &ids[0])
+                        .await;
+                }
+                several => {
+                    assert_eq!(ids, several.to_vec(), "{surface_id}");
+                    for id in several {
+                        assert!(
+                            registry
+                                .get(surface_id, id)
+                                .await
+                                .is_none()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// An upstream that gives one `Mcp-Session-Id` to two `initialize`s must
+    /// not route one client's consent prompts to the other: the id keeps no
+    /// elicitation capability, so Elicit falls back. A client re-initializing
+    /// the session it holds keeps its capabilities.
+    async fn reused_upstream_session_id_turns_elicitation_off(state: &crate::state::ProxyState) {
+        use axum::response::IntoResponse;
+        use serde_json::json;
+
+        let app = axum::Router::new().fallback(|| async {
+            let mut response = axum::Json(json!({"jsonrpc": "2.0", "id": 1, "result": {
+                "protocolVersion": "2025-11-25", "capabilities": {},
+                "serverInfo": {"name": "target", "version": "1"}
+            }}))
+            .into_response();
+            response
+                .headers_mut()
+                .insert("mcp-session-id", HeaderValue::from_static("fixed-upstream-session"));
+            response
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .ok()
+        });
+
+        let initialize = |surface_id: &'static str, session_id: Option<&'static str>| {
+            let surface = json!({
+                "surface_id": surface_id, "name": surface_id,
+                "access_point": {"listen_address": "https://gateway.example", "route": "/initialize", "protocol": "mcp"},
+                "target": {"endpoint": format!("http://{addr}/mcp")}
+            });
+            let body = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                "protocolVersion": "2025-11-25", "capabilities": {"elicitation": {}},
+                "clientInfo": {"name": "client", "version": "1"}
+            }});
+            let mut request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/initialize")
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream");
+            if let Some(session_id) = session_id {
+                request = request.header("mcp-session-id", session_id);
+            }
+            let request = request
+                .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap();
+            async move {
+                let response = super::multi_channel_proxy_handler(
+                    axum::extract::ConnectInfo(
+                        "127.0.0.1:12345"
+                            .parse()
+                            .unwrap(),
+                    ),
+                    axum::extract::State(direct_router_state(state, serde_json::from_value(surface).unwrap())),
+                    request,
+                )
+                .await;
+                assert_eq!(response.status(), axum::http::StatusCode::OK, "{surface_id}");
+                assert_eq!(
+                    response
+                        .headers()
+                        .get("mcp-session-id")
+                        .and_then(|value| value.to_str().ok()),
+                    Some("fixed-upstream-session"),
+                    "{surface_id}"
+                );
+            }
+        };
+        let registry = crate::mcp::elicitation::global_capability_registry();
+        let elicitation = |surface_id: &'static str| async move {
+            registry
+                .get(surface_id, "fixed-upstream-session")
+                .await
+                .map(|caps| caps.elicitation)
+        };
+
+        initialize("session-id-reused", None).await;
+        assert_eq!(elicitation("session-id-reused").await, Some(true));
+        initialize("session-id-reused", None).await;
+        assert_eq!(elicitation("session-id-reused").await, Some(false));
+        initialize("session-id-reused", Some("fixed-upstream-session")).await;
+        assert_eq!(elicitation("session-id-reused").await, Some(false));
+
+        initialize("session-id-reinitialized", None).await;
+        initialize("session-id-reinitialized", Some("fixed-upstream-session")).await;
+        assert_eq!(elicitation("session-id-reinitialized").await, Some(true));
+
+        for surface_id in ["session-id-reused", "session-id-reinitialized"] {
+            registry
+                .drop_session(surface_id, "fixed-upstream-session")
+                .await;
+        }
     }
 
     /// The direct Access Point is a transparent proxy for the modern routing
@@ -18414,7 +18784,7 @@ allow if {
     }
 
     async fn forwarded_discovery_narrows_unsupported_version_errors(state: &crate::state::ProxyState) {
-        use crate::mcp::{MCP_LEGACY_VERSION, MCP_MODERN_VERSION};
+        use crate::mcp::MCP_MODERN_VERSION;
         use serde_json::json;
         use std::sync::atomic::Ordering;
 
@@ -18450,7 +18820,7 @@ allow if {
         }});
         for (name, discovery, expected) in [
             ("discovered", Some(&discovered), json!([MCP_MODERN_VERSION])),
-            ("legacy-only", Some(&legacy_only), json!([MCP_LEGACY_VERSION])),
+            ("legacy-only", Some(&legacy_only), json!(crate::mcp::request_validation::SESSION_VERSIONS)),
             ("fresh", None, json!(versions.supported_versions())),
         ] {
             let target = crate::component_tests::helpers::MockServer::start_with_response(
@@ -18492,7 +18862,7 @@ allow if {
             let forwarded = target
                 .request_count
                 .load(Ordering::SeqCst);
-            let (status, rejected) = read(send(request(&route, "unmodelled", "tools/list", "2025-11-25")).await).await;
+            let (status, rejected) = read(send(request(&route, "unmodelled", "tools/list", "2099-01-01")).await).await;
             assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{name}: {rejected}");
             assert_eq!(rejected["id"], "unmodelled");
             assert_eq!(rejected["error"]["code"], crate::mcp::error_codes::UNSUPPORTED_PROTOCOL_VERSION);
@@ -18800,6 +19170,8 @@ allow if {
         access_point_router_refuses_a_variant_it_cannot_resolve(&state).await;
         mounted_access_point_uses_the_direct_access_point_policy(&state).await;
         direct_access_point_caps_legacy_initialize(&state).await;
+        initialize_wrapped_as_sse_returns_one_session_id(&state).await;
+        reused_upstream_session_id_turns_elicitation_off(&state).await;
         access_point_admission_rejects_every_negative_case(&state).await;
         access_point_refuses_methods_and_bodies_outside_post(&state).await;
         access_point_rejects_a_spoofed_identity_credential(&state).await;
@@ -20153,7 +20525,7 @@ allow if {
             ..Default::default()
         });
 
-        let resolved = resolve_direct_surface_auth_config(&config, Some(&vc_issuer), "direct-surface")
+        let resolved = resolve_direct_surface_auth_config(&config, None, Some(&vc_issuer), "direct-surface")
             .await
             .expect("resolve direct surface audience");
 
@@ -20169,7 +20541,7 @@ allow if {
 
         let mut headers = HeaderMap::new();
         headers.insert("mcp-session-id", HeaderValue::from_static("unknown-session"));
-        let unknown = resolve_legacy_mcp_session(&headers).await;
+        let unknown = resolve_legacy_mcp_session("surface-a", &headers).await;
         assert_eq!(unknown, (LegacySessionEvidence::Unknown, None));
 
         let (session_id, _receiver) = CHANNEL_SSE_SESSION_MGR
@@ -20177,10 +20549,30 @@ allow if {
             .await
             .unwrap();
         headers.insert("mcp-session-id", HeaderValue::from_str(&session_id).unwrap());
-        let known = resolve_legacy_mcp_session(&headers).await;
+        let known = resolve_legacy_mcp_session("surface-a", &headers).await;
         assert_eq!(known, (LegacySessionEvidence::Known, Some(session_id.clone())));
         CHANNEL_SSE_SESSION_MGR
             .remove_session(&session_id)
+            .await;
+
+        // A session the gateway knows only from the capability registry is
+        // known on the surface that recorded it, not on another surface.
+        let caps = crate::mcp::elicitation::McpClientCapabilities {
+            elicitation: false,
+            sampling: false,
+            roots: false,
+        };
+        crate::mcp::elicitation::global_capability_registry()
+            .record("surface-a", "registry-only-session", caps)
+            .await;
+        headers.insert("mcp-session-id", HeaderValue::from_static("registry-only-session"));
+        assert_eq!(
+            resolve_legacy_mcp_session("surface-a", &headers).await,
+            (LegacySessionEvidence::Known, Some("registry-only-session".to_string()))
+        );
+        assert_eq!(resolve_legacy_mcp_session("surface-b", &headers).await, (LegacySessionEvidence::Unknown, None));
+        crate::mcp::elicitation::global_capability_registry()
+            .drop_session("surface-a", "registry-only-session")
             .await;
     }
 

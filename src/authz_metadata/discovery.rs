@@ -42,10 +42,23 @@ pub fn metadata_urls(issuer: &str) -> Result<Vec<String>, DiscoveryError> {
     ])
 }
 
+/// Check `issuer` as [`discover`] does before any request, under `posture`: an absolute
+/// URL with a host and no credentials, query, fragment, whitespace or control character,
+/// `https` only under [`EgressPosture::Strict`] (`invalid_url` otherwise). Resolves no
+/// host and blocks no address. Performs no I/O.
+pub fn validate_issuer(
+    issuer: &str,
+    posture: EgressPosture,
+) -> Result<(), DiscoveryError> {
+    parse_issuer(issuer, posture).map(|_| ())
+}
+
+/// Unicode whitespace too: the URL parser would percent-encode a no-break space
+/// or a line separator in a path into a URL the operator never meant.
 fn has_whitespace_or_control(value: &str) -> bool {
     value
         .chars()
-        .any(|c| c.is_ascii_whitespace() || c.is_control())
+        .any(|c| c.is_whitespace() || c.is_control())
 }
 
 fn parse_issuer(
@@ -122,7 +135,9 @@ pub async fn discover(
 /// The body must be a JSON object whose `issuer` member equals `issuer` byte for byte,
 /// trailing slash included (`issuer_mismatch` otherwise, whose detail shows at most the
 /// first 200 characters of the escaped discovered issuer). Its `token_endpoint` and
-/// `jwks_uri` members must be strings holding absolute http or https URLs of at most
+/// `jwks_uri` members are required, `jwks_uri` too although RFC 8414 makes it optional,
+/// because the gateway validates JWT access tokens and needs the issuer's keys. They
+/// must be strings holding absolute http or https URLs of at most
 /// 2048 characters, with a host, without whitespace, control characters, credentials or
 /// a fragment, and not naming a cloud-metadata host. They must not use a weaker scheme
 /// than `issuer`: an `https` issuer requires `https` endpoints under every posture, and
@@ -134,7 +149,10 @@ pub async fn discover(
 ///
 /// A host name that only resolves to such an address cannot be detected without DNS, so
 /// the caller must fetch these URLs with [`get_bounded`], or another pinned client, under
-/// the same posture, which blocks such a name at connect time.
+/// the same posture, which blocks such a name at connect time. The JWT Bearer
+/// `JwksFetcher` always uses the cloud-metadata-only pinned client, so a `jwks_uri`
+/// discovered under [`EgressPosture::Strict`] must not be handed to it: fetch it with
+/// [`get_bounded`] under `Strict`.
 pub fn parse_metadata(
     body: &[u8],
     issuer: &str,
@@ -369,6 +387,9 @@ mod tests {
             "https://as.example.com/te\nnant",
             "https://as.example.com/\0",
             "https://as.example.com\r",
+            "https://as.example.com/te\u{a0}nant",
+            "https://as.example.com/tenant\u{2028}",
+            "\u{3000}https://as.example.com",
         ] {
             let error = metadata_urls(issuer).unwrap_err();
             assert_eq!(error.code(), "invalid_url", "{issuer:?}");
@@ -411,6 +432,25 @@ mod tests {
             let error = metadata_urls(issuer).unwrap_err();
             assert_eq!(error.failure(), DiscoveryFailure::InvalidUrl, "{issuer}");
             assert_eq!(error.code(), "invalid_url", "{issuer}");
+        }
+    }
+
+    #[test]
+    fn validate_issuer_applies_the_issuer_rules_of_a_posture_without_any_request() {
+        for issuer in ["https://as.example.com", "https://localhost:4444", "https://as.example.com/tenant/"] {
+            assert!(validate_issuer(issuer, EgressPosture::Strict).is_ok(), "{issuer}");
+        }
+        assert!(validate_issuer("http://127.0.0.1:4444", EgressPosture::CloudMetadataOnly).is_ok());
+        for issuer in [
+            "http://as.example.com",
+            "https://as.example.com/?tenant=a",
+            "https://as.example.com/#x",
+            "https://u:p@as.example.com/",
+            "https://as.example.com/tenant\n",
+            "as.example.com",
+        ] {
+            let error = validate_issuer(issuer, EgressPosture::Strict).unwrap_err();
+            assert_eq!(error.failure(), DiscoveryFailure::InvalidUrl, "{issuer:?}");
         }
     }
 

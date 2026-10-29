@@ -11,8 +11,8 @@ use crate::bdd_support::config::config_tree::{
 use crate::bdd_support::config::gateway_bootstrap::GatewayBootstrapSurface;
 use crate::bdd_support::config::mcp_proxy::McpProxyFixture;
 use crate::bdd_support::config::single_surface_fixture::{
-    CredentialProviderKind, DelegatedCredentialInjection, DidWebVhIdentityFixture, SurfaceConfigBuilder,
-    SurfaceSourceAuthConfig, SurfaceTransitPointConfig,
+    CredentialProviderKind, DelegatedCredentialInjection, DidWebVhIdentityFixture, PROTECTED_RESOURCE_PUBLIC_ORIGIN,
+    SurfaceConfigBuilder, SurfaceSourceAuthConfig, SurfaceTransitPointConfig,
 };
 use crate::bdd_support::config::target_auth::static_secret_target_auth_json;
 
@@ -228,6 +228,13 @@ fn write_single_surface_config_inner(
     if let Some(auth) = &surface_config.source_auth {
         let method = crate::bdd_support::config::source_auth::caller_authentication_method_json(auth);
         surface_fixture = surface_fixture.with_caller_auth_method(method);
+    }
+    if let Some(protected) = &surface_config.protected_resource {
+        surface_fixture = surface_fixture.with_caller_protected_resource(serde_json::json!({
+            "resource": format!("{PROTECTED_RESOURCE_PUBLIC_ORIGIN}{}", surface_config.route),
+            "authorization_servers": [protected.authorization_server],
+            "scopes": protected.scopes,
+        }));
     }
     if let Some(target_auth) = &surface_config.target_auth {
         surface_fixture = surface_fixture.with_target_auth(static_secret_target_auth_json(
@@ -467,6 +474,27 @@ fn write_single_surface_config_inner(
     }
 
     write_gateway_config_tree(base_dir, &config_tree, true);
+    if surface_config
+        .protected_resource
+        .is_some()
+    {
+        add_inbound_public_origin(base_dir, PROTECTED_RESOURCE_PUBLIC_ORIGIN);
+    }
+}
+
+/// Adds a public origin to the inbound listener, the origin a protected
+/// resource must be published under.
+fn add_inbound_public_origin(
+    base_dir: &Path,
+    origin: &str,
+) {
+    let path = base_dir.join("gateway.json");
+    let mut gateway: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    gateway["listeners"][0]["external_urls"]
+        .as_array_mut()
+        .expect("inbound listener external_urls")
+        .push(serde_json::json!(origin));
+    std::fs::write(&path, serde_json::to_string_pretty(&gateway).unwrap()).unwrap();
 }
 
 pub struct JwksFiles {

@@ -497,7 +497,7 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
         if code == -32022 {
             assert_eq!(
                 envelope["error"]["data"],
-                json!({"requested": MCP_MODERN_VERSION, "supported": [MCP_LEGACY_VERSION]})
+                json!({"requested": MCP_MODERN_VERSION, "supported": crate::mcp::request_validation::SESSION_VERSIONS})
             );
         } else {
             assert!(
@@ -551,7 +551,7 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
     // An initialize for a revision this receiver does not serve reaches the
     // Target asking for one it does, so the session it opens stays usable.
     let initialize = json!({"jsonrpc": "2.0", "id": "legacy-initialize", "method": "initialize", "params": {
-        "protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "client", "version": "1"}
+        "protocolVersion": "2099-01-01", "capabilities": {}, "clientInfo": {"name": "client", "version": "1"}
     }});
     let (forward_response, _) = receive(&forward_message(initialize.clone(), json!({}))).await;
     assert_eq!(forward_response["status"], 200);
@@ -563,6 +563,31 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
     let mut expected = initialize;
     expected["params"]["protocolVersion"] = json!(MCP_LEGACY_VERSION);
     assert_eq!(serde_json::from_str::<Value>(&forwarded.body).unwrap(), expected);
+
+    // A session revision the receiver serves reaches the Target unchanged, so
+    // the Target negotiates it.
+    let session_initialize = json!({"jsonrpc": "2.0", "id": "session-initialize", "method": "initialize", "params": {
+        "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "client", "version": "1"}
+    }});
+    let (forward_response, _) = receive(&forward_message(
+        session_initialize.clone(),
+        json!({"MCP-Protocol-Version": "2025-06-18", "Mcp-Method": "initialize"}),
+    ))
+    .await;
+    assert_eq!(forward_response["status"], 200);
+    let forwarded = target
+        .last_request_rx
+        .borrow()
+        .clone()
+        .expect("initialize reached the Target");
+    assert_eq!(serde_json::from_str::<Value>(&forwarded.body).unwrap(), session_initialize);
+    assert_eq!(
+        forwarded
+            .headers
+            .get("mcp-protocol-version")
+            .map(String::as_str),
+        Some("2025-06-18")
+    );
 
     let caller_body = json!({
         "jsonrpc": "2.0", "id": "legacy-control", "method": "tools/list",
@@ -590,7 +615,7 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
             target
                 .request_count
                 .load(Ordering::SeqCst),
-            index + 3
+            index + 4
         );
         let received = target
             .last_request_rx
@@ -1006,14 +1031,14 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
             }
         );
     }
-    // Includes the capped initialize, the one envelope-replay delivery, the
-    // legacy request whose forwarded Origin is not rechecked, and the unmarked
-    // GET and DELETE without a body.
+    // Includes the capped and the session-revision initialize, the one
+    // envelope-replay delivery, the legacy request whose forwarded Origin is
+    // not rechecked, and the unmarked GET and DELETE without a body.
     assert_eq!(
         target
             .request_count
             .load(Ordering::SeqCst),
-        8
+        9
     );
 
     let mut guarded = surface.clone();
@@ -2470,6 +2495,207 @@ allow if {
         "a request the policy rejects is refused: {response_body}"
     );
     assert_ne!(last_body(), Some(denied), "a request the policy rejects never reaches the Target");
+}
+
+#[test]
+fn fabric_receive_binds_tokens_to_the_routes_protected_resource() {
+    if std::env::var_os("ATG_FABRIC_DISCOVERY_CHILD").is_none() {
+        let test_name = std::thread::current()
+            .name()
+            .unwrap()
+            .to_string();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test_name, "--nocapture"])
+            .env("ATG_FABRIC_DISCOVERY_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated Fabric discovery test failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(Box::pin(fabric_discovery_flow()));
+}
+
+/// An MCP Access Point that publishes protected resource metadata binds a
+/// Fabric request's token to the resource of the route called, as on the
+/// direct path. The sending gateway strips the caller's own token, so the
+/// `Authorization` here stands for a credential the sender injects: a missing
+/// one, or one issued for another resource or variant, gets a 401 before
+/// policy without `resource_metadata`, and only one for the route's resource
+/// reaches the Target. A named alias that does not resolve is refused before
+/// any token is read, never served by the default.
+async fn fabric_discovery_flow() {
+    use std::sync::Arc;
+
+    use crate::component_tests::helpers::jwt::{JwksFixture, now_secs, sign_jwt};
+    use crate::jwt_bearer::storage::{FileSystemJwtVerificationStrategyStore, JwtVerificationStrategyStorage};
+
+    let fixture = JwksFixture::start().await;
+    let target =
+        MockServer::start_with_response(json!({"jsonrpc": "2.0", "id": "call", "result": {"tools": []}}).to_string())
+            .await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let _issuer_dir = install_listener_manager_with_sender(temp_dir.path()).await;
+    let storage_path = temp_dir
+        .path()
+        .join("surfaces");
+    let strategies = Arc::new(
+        FileSystemJwtVerificationStrategyStore::new(
+            temp_dir
+                .path()
+                .join("strategies"),
+        )
+        .await
+        .unwrap(),
+    );
+    let strategy = strategies
+        .create(
+            serde_json::from_value(json!({
+                "id": "idp", "name": "IdP", "expected_issuer": fixture.issuer,
+                "jwks_source": {"type": "remote", "jwks_uri": format!("{}/.well-known/jwks.json", fixture.issuer)},
+                "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let surface: AgentSurface = serde_json::from_value(json!({
+        "surface_id": "fabric-discovery", "name": "Fabric discovery",
+        "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp",
+            "caller_authentication": {
+                "methods": [{"type": "jwt_bearer", "jwt_verification_strategy_id": strategy.id, "audiences": []}],
+                "protected_resource": {"resource": "https://gateway.example/mcp",
+                    "authorization_servers": [crate::protocols::protected_resource::fixtures::ISSUER]}
+            }},
+        "target": {"endpoint": format!("http://{}", target.addr)},
+        "variants": [{"id": "beta", "alias": "beta", "name": "Beta", "enabled": true, "overrides": {}}]
+    }))
+    .unwrap();
+    FileSystemAgentSurfaceStore::new(storage_path.clone())
+        .await
+        .unwrap()
+        .save(&surface)
+        .await
+        .unwrap();
+    super::init_mcp_auth_network(Arc::new(crate::protocols::protected_resource::fixtures::discovery_network()));
+    super::init_source_auth_middleware(Arc::new(crate::source_auth::SourceAuthMiddleware::new(
+        Arc::new(crate::didauth::DidAuthSessionStore::new()),
+        strategies,
+        Arc::new(crate::jwt_bearer::JwksClient::new()),
+        None,
+        Arc::new(dashmap::DashMap::new()),
+        None,
+        None,
+    )))
+    .await;
+
+    let token_for = |audience: &str| {
+        sign_jwt(
+            json!({"iss": fixture.issuer, "sub": "user-123", "aud": audience, "exp": now_secs() + 300}),
+            &fixture.kid,
+        )
+    };
+    let now = super::super::envelope_replay::now_secs();
+    let send = |alias: Option<&str>, token: Option<String>| {
+        let mut headers = json!({"MCP-Protocol-Version": MCP_LEGACY_VERSION});
+        if let Some(token) = token {
+            headers["authorization"] = json!(format!("Bearer {token}"));
+        }
+        let mut body = json!({"channel_id": surface.surface_id, "method": "POST", "path": "/mcp", "headers": headers,
+            "body": {"jsonrpc": "2.0", "id": "call", "method": "tools/list"}});
+        if let Some(alias) = alias {
+            body["virtual_channel_alias"] = json!(alias);
+        }
+        let message = ReceivedMessage::new(
+            "receiver-connection".to_string(),
+            "receiver-gateway".to_string(),
+            MessageType::ForwardRequest.to_string(),
+            uuid::Uuid::new_v4().to_string(),
+            None,
+            Some(SENDER_CONNECTION_POINT_DID.to_string()),
+            vec!["did:web:receiver.example".to_string()],
+            None,
+            Some(now + 60),
+            body,
+            MessageMetadata {
+                encrypted: true,
+                authenticated: true,
+                from_key: None,
+                extra: Value::Null,
+            },
+        )
+        .with_context("agent_surface_storage_path", json!(storage_path));
+        async move {
+            let result = tokio::time::timeout(Duration::from_secs(10), Box::pin(process_forward_request(&message)))
+                .await
+                .expect("Fabric receive handler timed out");
+            let ProcessingResult::RequiresResponse { response_body, .. } = result else {
+                panic!("expected a ForwardResponse, got {result:?}");
+            };
+            response_body
+        }
+    };
+    let reached = || {
+        target
+            .request_count
+            .load(Ordering::SeqCst)
+    };
+
+    for (alias, token, invalid_token) in [
+        (None, None, false),
+        (None, Some(token_for("https://gateway.example/other")), true),
+        (None, Some(token_for("https://gateway.example/mcp$beta")), true),
+        (Some("beta"), Some(token_for("https://gateway.example/mcp")), true),
+    ] {
+        let response = send(alias, token).await;
+        assert_eq!(response["status"], 401, "{response}");
+        let challenge = response["headers"]["www-authenticate"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(challenge.starts_with("Bearer realm=\"agent-gateway\""), "{response}");
+        assert!(!challenge.contains("resource_metadata"), "{response}");
+        assert_eq!(challenge.contains("error=\"invalid_token\""), invalid_token, "{response}");
+        assert_eq!(reached(), 0, "a refused token never reaches the Target");
+    }
+
+    for (alias, audience) in [
+        (None, "https://gateway.example/mcp"),
+        (Some("beta"), "https://gateway.example/mcp$beta"),
+    ] {
+        let before = reached();
+        let response = send(alias, Some(token_for(audience))).await;
+        assert_eq!(response["status"], 200, "{response}");
+        assert_eq!(reached(), before + 1, "a token for the route's own resource reaches the Target");
+        let forwarded = target
+            .last_request_rx
+            .borrow()
+            .clone()
+            .unwrap();
+        assert!(
+            !forwarded
+                .headers
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case("authorization")),
+            "the caller's token never reaches the Target"
+        );
+    }
+
+    // A named alias that does not resolve is refused, whatever the token
+    // names, and never reaches the Target.
+    for audience in ["https://gateway.example/mcp", "https://gateway.example/mcp$ghost"] {
+        let before = reached();
+        let response = send(Some("ghost"), Some(token_for(audience))).await;
+        assert_eq!(response["status"], 404, "{response}");
+        assert_eq!(reached(), before, "an unresolved alias never reaches the Target");
+    }
 }
 
 #[derive(Clone, Default)]

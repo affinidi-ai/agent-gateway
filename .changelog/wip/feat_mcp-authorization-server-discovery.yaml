@@ -1,0 +1,78 @@
+branch: feat/mcp-authorization-server-discovery
+changes:
+  added:
+    - timestamp: '2026-10-27T10:54:00Z'
+      title: Publish protected resource metadata for MCP surfaces with JWT callers
+      description: >-
+        An MCP Access Point whose JWT Bearer source authentication accepts tokens from an external
+        authorization server can set caller_authentication.protected_resource with its resource,
+        authorization servers and scopes. The gateway then serves the RFC 9728 document at
+        /.well-known/oauth-protected-resource followed by the route, for the base surface and each
+        enabled variant, so an MCP client finds where to get a token. Each listener publishes only
+        its own surfaces. The authorization servers must be exactly the issuer of the caller
+        authentication's JWT verification strategy. A token is accepted only when its aud claim
+        names the resource advertised for the route called, the base resource or the variant's own,
+        as the MCP authorization specification requires, directly and over Fabric, so the JWT Bearer
+        audiences list must be empty. The caller's token is never forwarded: forward_header is
+        refused on save, and a stored surface with it answers 503. The setting is checked on save
+        like mcp_http.authorization. A PUT of the surface or of a variant that omits it keeps it
+        while the Access Point would still serve it, and is refused when it moves the route or
+        listen address the setting names. A PUT or PATCH that sends null removes it, and surfaces
+        without it behave as before.
+    - timestamp: '2026-10-27T11:14:01Z'
+      title: Challenge MCP callers without a valid token to fetch one
+      description: >-
+        A request to an MCP Access Point that publishes protected resource metadata, whose bearer
+        token is missing or refused, is now answered before policy with 401 and
+        WWW-Authenticate Bearer resource_metadata naming the absolute metadata URL, with
+        error=invalid_token once a token was presented and the scopes when set. MCP clients follow
+        it to the authorization server, get a token and retry. Over Fabric the 401 carries no
+        resource_metadata, since the sending gateway strips the caller's own token. Without this
+        setting a failed credential is still handed to policy.
+    - timestamp: '2026-10-27T19:07:39Z'
+      title: Edit MCP authorization server discovery in the dashboard
+      description: >-
+        The Caller Context editor of an MCP surface whose caller authentication is JWT Bearer can
+        turn on authorization server discovery and set its resource, authorization servers and
+        scopes, for the surface and each variant. It keeps token forwarding off and the accepted
+        audiences empty while discovery is on, shows the resource each variant advertises, and
+        removes a setting the operator switches off in the same request as the rest of the save,
+        so a save that fails changes nothing.
+    - timestamp: '2026-10-27T19:34:56Z'
+      title: Run MCP discovery end to end against Ory Hydra
+      description: >-
+        make mcp-discovery starts Ory Hydra in Docker, a login and consent app, an MCP server and
+        the gateway, then checks discovery, sign-in, the token audience, token stripping and the
+        caller identity in policy with a scripted client and the official MCP client SDK. With
+        ARGS=--keep it stays up for a check with MCP Inspector. The consent app shows how to grant
+        the RFC 8707 resource as the token audience, which Hydra does not do by itself.
+  changed: []
+  fixed:
+    - timestamp: '2026-10-27T10:22:00Z'
+      title: Stop pointing MCP JWT Bearer challenges at a metadata document
+      description: >-
+        A JWT Bearer 401 on an MCP Access Point carried resource_metadata with a relative
+        /.well-known/oauth-protected-resource URL. Nothing served a document there for a surface
+        with caller authentication, so a client that followed it reached a 404, or the document of
+        another endpoint mounted at the root. The challenge is now Bearer realm="agent-gateway"
+        only.
+    - timestamp: '2026-10-27T19:30:01Z'
+      title: Let browser MCP clients read protected resource metadata
+      description: >-
+        The /.well-known/oauth-protected-resource documents answered without CORS headers and
+        refused the preflight, so an MCP client running in a browser on another origin could not
+        find the authorization server. Any origin may now read them with GET or HEAD; other
+        methods keep the cors allowlist. Responses to allowed origins now expose WWW-Authenticate,
+        so a browser client can read the 401 challenge. Without the gateway STS profile, a path no surface
+        publishes still reaches a channel or proxy route at the root or at /.well-known, and is
+        otherwise a plain 404 instead of the static fallback.
+  removed: []
+  security:
+    - timestamp: '2026-10-28T11:02:53Z'
+      title: Reject JWT Bearer tokens used before their nbf
+      description: >-
+        JWT Bearer caller tokens were accepted before the time in their nbf claim, because the JWT
+        library checks nbf only when asked. A token whose nbf is still more than 60 seconds away is
+        now refused like any other invalid token, on every surface with JWT Bearer caller
+        authentication and on the gateway STS Resource Server.
+  breaking: []

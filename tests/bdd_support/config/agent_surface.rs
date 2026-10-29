@@ -24,6 +24,7 @@ pub struct AccessPointFixture {
     pub route: String,
     pub protocol: String,
     pub caller_authentication_methods: Vec<Value>,
+    pub protected_resource: Option<Value>,
     pub inbound_policy_definition_id: Option<String>,
     pub agent_card_path: Option<String>,
     pub didwebvh_identity_id: Option<String>,
@@ -38,6 +39,7 @@ impl Default for AccessPointFixture {
             route: "".to_string(),
             protocol: "".to_string(),
             caller_authentication_methods: Vec::new(),
+            protected_resource: None,
             inbound_policy_definition_id: None,
             agent_card_path: None,
             didwebvh_identity_id: None,
@@ -126,6 +128,7 @@ impl AgentSurfaceFixture {
                 route: route.into(),
                 protocol: protocol.into(),
                 caller_authentication_methods: Vec::new(),
+                protected_resource: None,
                 inbound_policy_definition_id: None,
                 agent_card_path: None,
                 didwebvh_identity_id: None,
@@ -163,6 +166,15 @@ impl AgentSurfaceFixture {
         self.access_point
             .caller_authentication_methods
             .push(method);
+        self
+    }
+
+    pub fn with_caller_protected_resource(
+        mut self,
+        protected_resource: Value,
+    ) -> Self {
+        self.access_point
+            .protected_resource = Some(protected_resource);
         self
     }
 
@@ -353,6 +365,12 @@ impl AgentSurfaceFixture {
             access_point["caller_authentication"] = json!({
                 "methods": self.access_point.caller_authentication_methods,
             });
+            if let Some(protected_resource) = &self
+                .access_point
+                .protected_resource
+            {
+                access_point["caller_authentication"]["protected_resource"] = protected_resource.clone();
+            }
         }
         if let Some(policy_definition_id) = &self
             .access_point
@@ -542,6 +560,7 @@ impl Default for AgentSurfaceFixture {
                 route: "".to_string(),
                 protocol: "".to_string(),
                 caller_authentication_methods: Vec::new(),
+                protected_resource: None,
                 inbound_policy_definition_id: None,
                 agent_card_path: None,
                 didwebvh_identity_id: None,

@@ -117,6 +117,7 @@ fn configure_header_metadata_inbound_identity_surface(
         surface
             .access_point
             .caller_authentication = Some(crate::config::agent_surface::CallerAuthentication {
+            protected_resource: None,
             methods: vec![crate::source_auth::SourceAuthConfig::ApiKey(crate::source_auth::models::ApiKeyAuthConfig {
                 extraction: crate::source_auth::models::CredentialExtraction::HttpHeader {
                     field: "x-api-key".to_string(),

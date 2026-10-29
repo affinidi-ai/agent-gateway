@@ -1,8 +1,9 @@
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 
+use crate::protocols::protected_resource::{self, ResourceTokenError};
 use crate::sts::mcp_profile::{McpIssuerProfile, canonical_https_url};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -11,24 +12,6 @@ pub struct McpResourceServerConfig {
     pub resource: String,
     #[serde(default)]
     pub scopes: Vec<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResourceTokenError {
-    Missing,
-    Invalid,
-    InsufficientScope,
-    Unavailable,
-}
-
-impl ResourceTokenError {
-    pub fn status_code(self) -> StatusCode {
-        match self {
-            Self::Missing | Self::Invalid => StatusCode::UNAUTHORIZED,
-            Self::InsufficientScope => StatusCode::FORBIDDEN,
-            Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -386,7 +369,8 @@ pub struct ResourceDeclaration {
 }
 
 /// Every resource a surface declares — the base Access Point, each enabled
-/// variant, and their Transit Points — checked against the same origins and
+/// variant, and their Transit Points, including the protected resource an
+/// Access Point's caller authentication publishes — checked against the same origins and
 /// paths the Access Point (`src/proxy/handler.rs`) and Transit
 /// (`src/proxy/outbound_handler.rs`) runtime checks use.
 ///
@@ -437,6 +421,17 @@ pub fn surface_resource_declarations(
                 served: derived
                     .validate_endpoint(&origins, &path)
                     .is_ok(),
+                resource: derived.resource,
+            });
+        }
+        if let Some(protected) = resolved.protected_resource()
+            && let Ok(derived) = protected.for_variant(alias)
+        {
+            declarations.push(ResourceDeclaration {
+                served: matches!(
+                    protected_resource::access_point_protected_resource(&resolved, alias, network),
+                    Some(Ok(_))
+                ),
                 resource: derived.resource,
             });
         }
@@ -536,18 +531,8 @@ impl McpResourceServerConfig {
         let Some(alias) = alias else {
             return Ok(self.clone());
         };
-        if alias.is_empty()
-            || alias.len() > 32
-            || !alias
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-        {
-            return Err("Invalid MCP resource variant alias".into());
-        }
-        let mut resource = canonical_https_url(&self.resource).map_err(|error| error.to_string())?;
-        resource.set_path(&format!("{}${alias}", resource.path()));
         Ok(Self {
-            resource: resource.to_string(),
+            resource: protected_resource::variant_resource(&self.resource, alias)?,
             scopes: self.scopes.clone(),
         })
     }
@@ -558,15 +543,7 @@ impl McpResourceServerConfig {
         path: &str,
     ) -> Result<(), String> {
         self.validate()?;
-        let resource = canonical_https_url(&self.resource).map_err(|error| error.to_string())?;
-        if resource.path() != path
-            || !public_origins
-                .iter()
-                .any(|origin| url::Url::parse(origin).is_ok_and(|origin| origin.origin() == resource.origin()))
-        {
-            return Err("MCP resource must match the configured public origin and endpoint path".into());
-        }
-        Ok(())
+        protected_resource::validate_endpoint(&self.resource, public_origins, path)
     }
 
     pub async fn authenticate(
@@ -639,35 +616,12 @@ impl McpResourceServerConfig {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        canonical_https_url(&self.resource).map_err(|error| error.to_string())?;
-        if self.scopes.len() > 128
-            || self
-                .scopes
-                .iter()
-                .any(|scope| {
-                    scope.is_empty()
-                        || scope.len() > 256
-                        || scope
-                            .bytes()
-                            .any(|byte| !matches!(byte, 0x21 | 0x23..=0x5b | 0x5d..=0x7e))
-                })
-        {
-            return Err("MCP authorization scopes must be bounded OAuth scope tokens".into());
-        }
-        Ok(())
+        protected_resource::validate_resource(&self.resource, &self.scopes)
     }
 
     pub fn metadata_url(&self) -> Result<url::Url, String> {
         self.validate()?;
-        let mut resource = canonical_https_url(&self.resource).map_err(|error| error.to_string())?;
-        let suffix = if resource.path() == "/" {
-            ""
-        } else {
-            resource.path()
-        };
-        let path = format!("/.well-known/oauth-protected-resource{suffix}");
-        resource.set_path(&path);
-        Ok(resource)
+        protected_resource::metadata_url(&self.resource)
     }
 
     pub fn metadata(
@@ -678,15 +632,7 @@ impl McpResourceServerConfig {
         profile
             .validate()
             .map_err(|error| error.to_string())?;
-        let mut metadata = json!({
-            "resource": self.resource,
-            "authorization_servers": [profile.issuer],
-            "bearer_methods_supported": ["header"]
-        });
-        if !self.scopes.is_empty() {
-            metadata["scopes_supported"] = json!(self.scopes);
-        }
-        Ok(metadata)
+        Ok(protected_resource::metadata_document(&self.resource, std::slice::from_ref(&profile.issuer), &self.scopes))
     }
 
     pub fn validate_verified_claims(
@@ -764,16 +710,7 @@ impl McpResourceServerConfig {
         if error == ResourceTokenError::Unavailable {
             return response;
         }
-        let mut challenge = format!("Bearer resource_metadata=\"{metadata}\"");
-        match error {
-            ResourceTokenError::Invalid => challenge.push_str(", error=\"invalid_token\""),
-            ResourceTokenError::InsufficientScope => challenge.push_str(", error=\"insufficient_scope\""),
-            _ => {}
-        }
-        if !self.scopes.is_empty() {
-            challenge.push_str(&format!(", scope=\"{}\"", self.scopes.join(" ")));
-        }
-        let Ok(challenge) = HeaderValue::from_str(&challenge) else {
+        let Some(challenge) = protected_resource::challenge_header(&metadata, error, &self.scopes) else {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         };
         response
@@ -785,7 +722,12 @@ impl McpResourceServerConfig {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
+    use crate::protocols::protected_resource::fixtures::{
+        ISSUER, discovery_network, discovery_surface, jwt_bearer_method,
+    };
 
     #[test]
     fn a_declaration_counts_as_served_only_on_its_own_origin_and_path() {
@@ -1086,5 +1028,36 @@ mod tests {
         let mut changed = claims;
         changed["scope"] = json!("write");
         assert_eq!(config.validate_verified_claims(&profile, &changed, 10), Err(ResourceTokenError::InsufficientScope));
+    }
+
+    #[test]
+    fn a_protected_resource_is_declared_like_the_access_point_resource() {
+        let network = discovery_network();
+        let served = discovery_surface(
+            jwt_bearer_method(),
+            Some(json!({"resource": "https://gateway.example/mcp/alpha", "authorization_servers": [ISSUER]})),
+        );
+        assert_eq!(
+            surface_resource_declarations(&served, &network),
+            vec![
+                ResourceDeclaration {
+                    resource: "https://gateway.example/mcp/alpha".into(),
+                    served: true
+                },
+                ResourceDeclaration {
+                    resource: "https://gateway.example/mcp/alpha$beta".into(),
+                    served: true
+                },
+            ]
+        );
+        let elsewhere = discovery_surface(
+            jwt_bearer_method(),
+            Some(json!({"resource": "https://other.example/mcp/alpha", "authorization_servers": [ISSUER]})),
+        );
+        assert!(
+            surface_resource_declarations(&elsewhere, &network)
+                .iter()
+                .all(|declaration| !declaration.served)
+        );
     }
 }

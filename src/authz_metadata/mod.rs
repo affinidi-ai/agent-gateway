@@ -20,7 +20,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 #[allow(unused_imports)]
-pub use discovery::{discover, metadata_urls, parse_metadata};
+pub use discovery::{discover, metadata_urls, parse_metadata, validate_issuer};
 #[allow(unused_imports)]
 pub use fetch::get_bounded;
 
@@ -36,7 +36,8 @@ pub struct AuthzServerMetadata {
     pub metadata_url: String,
     /// The `token_endpoint` of the document: an absolute http(s) URL.
     pub token_endpoint: String,
-    /// The `jwks_uri` of the document: an absolute http(s) URL.
+    /// The `jwks_uri` of the document: an absolute http(s) URL. Required although
+    /// RFC 8414 makes it optional, because the gateway validates JWT access tokens.
     pub jwks_uri: String,
 }
 
