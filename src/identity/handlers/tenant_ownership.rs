@@ -818,6 +818,12 @@ async fn persist_tenant_id(
                 .map_err(|error| {
                     OwnershipApiError::Internal(format!("Surface reference validation failed: {:?}", error))
                 })?;
+            super::surface_tenancy::validate_external_consent_bindings(state, &resource)
+                .await
+                .map_err(|error| match error {
+                    super::surfaces::SurfaceApiError::BadRequest(message) => OwnershipApiError::Refused(message),
+                    other => OwnershipApiError::Internal(format!("External consent validation failed: {other:?}")),
+                })?;
             store
                 .save(&resource)
                 .await

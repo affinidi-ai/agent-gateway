@@ -189,3 +189,9 @@ Feature: MCP Transit Point forwarding
     When the operator asks Transit Point "alpha" for grants of credential provider "calendar" by external consent
     Then the admin API response status is 400
     And the admin API error response mentions "consent_mode external needs at-rest encryption"
+
+  Scenario: A surface cannot be created with a Transit Point asking for external consent while the vault cannot keep grants
+    Given the surface requires delegated credentials from OAuth provider "calendar"
+    When the operator creates a copy of the surface whose Transit Point "alpha" asks credential provider "calendar" for grants by external consent
+    Then the admin API response status is 400
+    And the admin API error response mentions "consent_mode external needs at-rest encryption"

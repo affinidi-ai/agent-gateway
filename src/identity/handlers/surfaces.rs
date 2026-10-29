@@ -1768,6 +1768,7 @@ pub async fn create_surface(
         resource_scope(&scope),
     )
     .await?;
+    super::surface_tenancy::validate_external_consent_bindings(&state, &surface).await?;
 
     // Reject overlapping outbound listener routes before they can reach
     // the Axum router and panic the gateway on rebuild.
