@@ -672,17 +672,16 @@ fn inject_did_headers(
     headers: &mut Vec<(&str, String)>,
 ) {
     use crate::config::DidInjectionMode;
+    use crate::proxy::caller_identity::CallerHeaders;
 
     match context.injection_mode() {
         DidInjectionMode::Header => {
-            // Simple DID in X-DID-Identity header
-            headers.push(("X-DID-Identity", context.did().to_string()));
+            headers.push((CallerHeaders::DID_IDENTITY, context.did().to_string()));
             debug!(did = %context.did(), "Injected DID identity in header");
         }
         DidInjectionMode::SignedHeader => {
-            // DID document in X-DID-Signed-Identity header
             headers.push((
-                "X-DID-Signed-Identity",
+                CallerHeaders::DID_SIGNED_IDENTITY,
                 context
                     .did_document()
                     .to_string(),

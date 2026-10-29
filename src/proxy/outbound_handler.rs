@@ -2267,9 +2267,10 @@ async fn step_map_transit_point_header_metadata(
     }
 }
 
-/// Whether a managed agent's request header goes on to a Transit Point's target,
-/// over HTTP or Fabric. The agent's `Authorization` and cookies never do; its other
-/// headers, such as its own API key header for the target, do.
+/// Whether a Transit Point caller's request header goes on to its target, over
+/// HTTP or Fabric. The caller's `Authorization`, cookies, and caller-info and DID
+/// identity headers ([`crate::proxy::caller_identity::CallerHeaders::NAMES`])
+/// never do; its other headers, such as its own API key header for the target, do.
 fn should_forward_outbound_request_header(
     name: &str,
     header_metadata_mapping: Option<&crate::config::header_metadata_mapping::HeaderMetadataMappingConfig>,
@@ -2278,7 +2279,10 @@ fn should_forward_outbound_request_header(
         return false;
     }
 
-    if name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("cookie") {
+    if name.eq_ignore_ascii_case("authorization")
+        || name.eq_ignore_ascii_case("cookie")
+        || crate::proxy::caller_identity::CallerHeaders::is_caller_info_header(name)
+    {
         return false;
     }
 
@@ -9803,10 +9807,23 @@ mod tests {
 
     #[test]
     fn a_managed_agents_cookies_and_authorization_never_reach_a_transit_point_target() {
-        for withheld in ["cookie", "Cookie", "authorization", "x-transit-token"] {
+        for withheld in [
+            "cookie",
+            "Cookie",
+            "authorization",
+            "x-transit-token",
+            "X-Caller-DID",
+            "x-caller-identity-source",
+            "x-caller-dna-uai",
+            "x-gateway-did",
+            "X-DID-Identity",
+            "x-did-signed-identity",
+        ] {
             assert!(!should_forward_outbound_request_header(withheld, None), "{withheld}");
         }
-        for forwarded in ["x-api-key", "accept", "content-type", "x-forwarded-for", "mcp-protocol-version"] {
+        for forwarded in
+            ["x-api-key", "accept", "content-type", "x-forwarded-for", "mcp-protocol-version", "x-caller-context"]
+        {
             assert!(should_forward_outbound_request_header(forwarded, None), "{forwarded}");
         }
     }

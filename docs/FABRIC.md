@@ -395,9 +395,10 @@ with `Retry-After: 5`; the receiving gateway refuses with `capacity_reached`. Th
 [Framed Fabric limits](MCP_METADATA.md#framed-fabric-limits). A buffered `ForwardRequest` receiver
 does not recheck the caller's browser Origin against its own `mcp_http.allowed_origins`; it trusts
 the paired sending gateway's check, as it trusts that peer for every other forwarded header. The
-exception is the caller-info headers (`x-caller-did`, `x-caller-identity-source`,
-`x-caller-dna-uai`, `x-gateway-did`): the receiving gateway drops every copy the peer sent, so the
-agent behind it never takes a peer's value for one.
+exception is the caller-info and `did:webvh` identity headers (`x-caller-did`,
+`x-caller-identity-source`, `x-caller-dna-uai`, `x-gateway-did`, `x-did-identity`,
+`x-did-signed-identity`): the receiving gateway drops every copy the peer sent, so the agent behind
+it never takes a peer's value for one.
 
 ### Delegated credentials over Fabric
 

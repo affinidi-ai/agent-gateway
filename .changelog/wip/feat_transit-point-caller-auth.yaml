@@ -40,11 +40,13 @@ changes:
   removed: []
   security:
     - timestamp: '2026-10-29T20:30:00.000Z'
-      title: Pass a managed agent only the caller-info headers the gateway sets
+      title: Pass caller-info and DID identity headers only as the gateway sets them
       description: >-
         The Access Point and Fabric receive pass a managed agent `x-caller-did`,
-        `x-caller-identity-source`, `x-caller-dna-uai` and `x-gateway-did` only as the gateway
-        sets them, so the agent can rely on them to know who is calling.
+        `x-caller-identity-source`, `x-caller-dna-uai`, `x-gateway-did`, `X-DID-Identity` and
+        `X-DID-Signed-Identity` only as the gateway sets them, so the agent can rely on them
+        to know who is calling, and a Transit Point sends its target none of them. A request
+        that carries its own copy of one of these headers is forwarded without it.
     - timestamp: '2026-10-29T21:00:00.000Z'
       title: Key delegated credentials by how the caller was identified
       description: >-
