@@ -152,7 +152,7 @@ logic.
 | Appliance-wide surface policy | The global surface-plane set, deny-overrides, ahead of the surface's own policy | [`src/policies/global_policy.rs`](src/policies/global_policy.rs) |
 | Surface OPA | The per-surface policy gate | [`src/policies/surface_manager.rs`](src/policies/surface_manager.rs) |
 | MCP tool gating | The allow/deny firewall over tool names | [`src/policies/mcp_tool_gating.rs`](src/policies/mcp_tool_gating.rs) |
-| Headers | Trace ID, `did:webvh` identity headers, and caller-info headers | [`src/proxy/handler.rs`](src/proxy/handler.rs) |
+| Headers | Trace ID, `did:webvh` identity headers, and caller-info headers (`x-caller-did`, `x-caller-identity-source`, `x-caller-dna-uai`, `x-gateway-did`); the caller's own copies of the caller-info headers are dropped | [`src/proxy/handler.rs`](src/proxy/handler.rs), [`src/proxy/caller_identity.rs`](src/proxy/caller_identity.rs) |
 | Transit token | The token a managed agent echoes back on its Transit Point calls | [`src/proxy/transit_token.rs`](src/proxy/transit_token.rs) |
 | Credential delegation | Injecting delegated OAuth tokens, or signalling consent | [`src/proxy/credential_delegation.rs`](src/proxy/credential_delegation.rs) |
 | VP injection | The deferred identity presentation added to the upstream request | [`src/identity/`](src/identity/) |
@@ -317,6 +317,7 @@ Breaking one of these is a correctness bug, not a style question.
 | Every event of a forwarded A2A event stream gets the response checks a non-streaming reply gets before it is sent, and one that fails them ends the stream. | Streaming would bypass the response policy and the agent identity credential. |
 | A caller whose source authentication failed is never forwarded with the surface's stored target credential, or the A2A proxy's Direct Line secret, on the inbound and Fabric forwarding paths (direct, `proxy://` MCP, `a2a-proxy://`, Fabric send, Fabric receive). | An unauthenticated caller would reach the Target with the operator's credential. |
 | A Transit Point authenticates its caller, with a transit token, a Resource Server token or its `source_auth`, before anything is forwarded or any credential resolved, unless it is marked `allow_unauthenticated_callers`; one whose caller authentication cannot be enforced refuses every request. | Anyone who reaches a Transit Point would call its target as this gateway, with its target credentials. |
+| A managed agent receives the caller-info headers (`CallerHeaders::NAMES`) only as this gateway sets them: the inbound path and Fabric receive drop every copy a caller or a peer gateway sent. | The agent could not rely on the caller-info headers. |
 | The Agent Surface is the only routing unit. | Routing behaviour would drift away from what an operator configured. |
 | x402 verification and settlement use the surface's configured payment requirement, or on a fabric facilitator the requirement the requesting peer sends; a credential's `accepted` must name it exactly. | A caller could name its own recipient and amount and still be granted the resource. |
 

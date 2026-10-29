@@ -108,7 +108,8 @@ fn should_forward_ap_request_header_with_mapping(
     header_metadata_mapping: Option<&crate::config::header_metadata_mapping::HeaderMetadataMappingConfig>,
     forward_source_auth_header: bool,
 ) -> bool {
-    if !should_forward_request_header(name) {
+    if !should_forward_request_header(name) || crate::proxy::caller_identity::CallerHeaders::is_caller_info_header(name)
+    {
         return false;
     }
 
