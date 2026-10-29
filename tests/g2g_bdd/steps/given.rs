@@ -1019,6 +1019,27 @@ async fn caller_holds_mcp_access_token(
         });
 }
 
+#[given(expr = "surface {string} delegates payment to gateway {int} surface {string}")]
+async fn surface_delegates_payment_over_fabric(
+    world: &mut G2gWorld,
+    surface_name: String,
+    payment_gw: usize,
+    payment_surface_name: String,
+) {
+    let (from_gw, from_surface) = world.surface(&surface_name);
+    let (_, to_surface) = world.surface(&payment_surface_name);
+    world
+        .topology
+        .payment_delegation_links
+        .push(FabricLink {
+            from_gw,
+            from_surface,
+            to_gw: payment_gw,
+            to_surface,
+            exposed: true,
+        });
+}
+
 #[given(expr = "surface {string} sends delegated credentials over fabric")]
 async fn surface_sends_delegated_credentials_over_fabric(
     world: &mut G2gWorld,

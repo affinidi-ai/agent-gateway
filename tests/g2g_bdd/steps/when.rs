@@ -113,6 +113,28 @@ pub async fn a2a_request_sent_to_surface(
     send_rpc(world, gw_index, &surface_name, build_a2a_request_body(), &[]).await;
 }
 
+#[when(expr = "the caller sends an A2A request to gateway {int} surface {string} with headers")]
+async fn a2a_request_sent_to_surface_with_headers(
+    world: &mut G2gWorld,
+    gw_index: usize,
+    surface_name: String,
+    step: &cucumber::gherkin::Step,
+) {
+    let headers: Vec<(String, String)> = step
+        .table
+        .as_ref()
+        .expect("step must have a table of headers")
+        .rows
+        .iter()
+        .map(|row| match row.as_slice() {
+            [name, value] => (name.clone(), value.clone()),
+            other => panic!("header row must have a name and a value, got {other:?}"),
+        })
+        .collect();
+    world.start().await;
+    send_rpc(world, gw_index, &surface_name, build_a2a_request_body(), &headers).await;
+}
+
 #[when(expr = "the caller fetches the agent card from gateway {int} surface {string}")]
 pub async fn agent_card_fetched_from_surface(
     world: &mut G2gWorld,
