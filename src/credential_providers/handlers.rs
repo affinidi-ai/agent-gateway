@@ -487,6 +487,7 @@ pub async fn create_provider(
         revocation_endpoint: req.revocation_endpoint,
         token_endpoint_auth_method: req.token_endpoint_auth_method,
         client_id: req.client_id,
+        allow_unadvertised_pkce: req.allow_unadvertised_pkce,
         created_at: now,
         updated_at: now,
     };
@@ -791,6 +792,7 @@ pub async fn update_provider(
         revocation_endpoint: existing.revocation_endpoint,
         token_endpoint_auth_method: existing.token_endpoint_auth_method,
         client_id: existing.client_id,
+        allow_unadvertised_pkce: existing.allow_unadvertised_pkce,
         created_at: existing.created_at,
         updated_at: Utc::now(),
     };

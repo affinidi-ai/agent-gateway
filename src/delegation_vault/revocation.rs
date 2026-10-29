@@ -118,9 +118,7 @@ async fn revoke(
         }
         _ => return RevocationOutcome::ClientUnavailable,
     }
-    let client = match crate::egress::pinned_authorization_server_client(endpoint, REVOCATION_TIMEOUT, exact_allowlist)
-        .await
-    {
+    let client = match crate::egress::pinned_vendor_client(endpoint, REVOCATION_TIMEOUT, exact_allowlist).await {
         Ok(client) => client,
         Err(error) => {
             tracing::warn!(target: "credential_delegation", error = %error, "Revocation endpoint refused by egress policy");

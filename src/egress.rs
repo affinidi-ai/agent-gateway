@@ -317,33 +317,48 @@ pub(crate) fn pinned_strict_client(
     pin_and_build(url, |ip| EgressPolicy::Strict.is_blocked_ip(ip), timeout)
 }
 
-/// Vet an authorization server endpoint for a call that carries a client's
-/// credentials or a user's token (revocation, token exchange, refresh): the
-/// Strict policy, `https` only, pinned to the vetted addresses, redirects
-/// refused.
+/// Vet a vendor endpoint for a call that carries a client's credentials or a
+/// user's token: an authorization server (revocation, token exchange, refresh),
+/// or the resource a grant by binding is sent to. The Strict policy, `https`
+/// only, pinned to the vetted addresses, redirects refused.
 ///
 /// `exact_allowlist` is the BDD allow-list ([`bdd_egress_allowlist`] on the
 /// production path), which alone can admit an `http` or loopback fixture, never
 /// cloud metadata.
-pub(crate) async fn pinned_authorization_server_client(
+pub(crate) async fn pinned_vendor_client(
     raw_url: &str,
     timeout: Duration,
     exact_allowlist: Option<&str>,
 ) -> Result<Client, EgressError> {
     let url = Url::parse(raw_url).map_err(|e| EgressError::Parse(e.to_string()))?;
-    if url.scheme() != "https" {
-        let allowlisted = match exact_allowlist {
-            Some(raw) => parse_egress_allowlist(raw)?
-                .iter()
-                .any(|entry| allowlist_entry_matches(entry, &url)),
-            None => false,
-        };
-        if !allowlisted {
-            return Err(EgressError::Blocked("an authorization server is reached over https only".into()));
-        }
+    if url.scheme() != "https" && !allowlisted(&url, exact_allowlist)? {
+        return Err(EgressError::Blocked("a vendor endpoint is reached over https only".into()));
     }
     let target = resolve_pin_blocking(raw_url.to_string(), EgressPolicy::Strict, exact_allowlist).await?;
     pinned_client(&target, timeout)
+}
+
+fn allowlisted(
+    url: &Url,
+    exact_allowlist: Option<&str>,
+) -> Result<bool, EgressError> {
+    Ok(match exact_allowlist {
+        Some(raw) => parse_egress_allowlist(raw)?
+            .iter()
+            .any(|entry| allowlist_entry_matches(entry, url)),
+        None => false,
+    })
+}
+
+/// Whether the BDD allow-list `exact_allowlist` admits `raw_url`. Never true on
+/// the production path, where the allow-list is `None`, nor for cloud metadata.
+pub(crate) fn exactly_allowlisted(
+    raw_url: &str,
+    exact_allowlist: Option<&str>,
+) -> bool {
+    validate_resolved_cloud_metadata_url(raw_url)
+        .ok()
+        .is_some_and(|url| allowlisted(&url, exact_allowlist).unwrap_or(false))
 }
 
 /// Vet a stored backend with [`EgressPolicy::Configured`] and return a
@@ -812,7 +827,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_authorization_server_is_reached_over_https_on_public_addresses_only() {
+    async fn a_vendor_endpoint_is_reached_over_https_on_public_addresses_only() {
         for raw in [
             "http://203.0.113.10/revoke",
             "https://127.0.0.1/revoke",
@@ -821,34 +836,34 @@ mod tests {
             "not a url",
         ] {
             assert!(
-                pinned_authorization_server_client(raw, Duration::from_secs(1), None)
+                pinned_vendor_client(raw, Duration::from_secs(1), None)
                     .await
                     .is_err(),
                 "{raw}"
             );
         }
         assert!(
-            pinned_authorization_server_client("https://203.0.113.10/revoke", Duration::from_secs(1), None)
+            pinned_vendor_client("https://203.0.113.10/revoke", Duration::from_secs(1), None)
                 .await
                 .is_ok()
         );
     }
 
     #[tokio::test]
-    async fn only_the_allowlist_admits_an_http_or_loopback_authorization_server_fixture() {
+    async fn only_the_allowlist_admits_an_http_or_loopback_vendor_fixture() {
         let fixture = "http://127.0.0.1:9/revoke";
         assert!(
-            pinned_authorization_server_client(fixture, Duration::from_secs(1), Some("http://127.0.0.1:9"))
+            pinned_vendor_client(fixture, Duration::from_secs(1), Some("http://127.0.0.1:9"))
                 .await
                 .is_ok()
         );
         assert!(
-            pinned_authorization_server_client(fixture, Duration::from_secs(1), Some("http://127.0.0.1:10"))
+            pinned_vendor_client(fixture, Duration::from_secs(1), Some("http://127.0.0.1:10"))
                 .await
                 .is_err()
         );
         assert!(
-            pinned_authorization_server_client(
+            pinned_vendor_client(
                 "http://169.254.169.254/latest/",
                 Duration::from_secs(1),
                 Some("http://169.254.169.254")
