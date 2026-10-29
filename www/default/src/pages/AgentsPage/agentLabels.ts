@@ -1,0 +1,157 @@
+import type { AgentRecord, AgentRuntime, AgentTrustRegistry } from '../../api';
+import { timeAgo } from '../../utils/stringUtils';
+
+/**
+ * Display text for the agent record's raw values. The API returns enums; the
+ * pages never show them as-is.
+ */
+
+const RUNTIME_LABELS: Record<AgentRuntime, string> = {
+  url: 'Direct URL',
+  'a2a-proxy': 'A2A proxy',
+  gateway: 'Remote gateway',
+};
+
+const PROTOCOL_LABELS: Record<string, string> = {
+  a2a: 'A2A',
+  ap2: 'AP2',
+  mcp: 'MCP',
+  didcomm: 'DIDComm',
+};
+
+export type BadgeTone = 'primary' | 'secondary' | 'success' | 'warning' | 'info';
+
+const PROTOCOL_TONES: Record<string, BadgeTone> = {
+  a2a: 'primary',
+  ap2: 'warning',
+  mcp: 'info',
+};
+
+export const UNNAMED_AGENT = 'Unnamed agent';
+export const NO_DID = 'No DID';
+export const NO_TRUST_REGISTRY = 'No Trust Registry';
+export const TRUST_NOT_CHECKED =
+  'Configured on the surface, not checked against the Trust Registry';
+
+export function runtimeLabel(runtime: string): string {
+  return RUNTIME_LABELS[runtime as AgentRuntime] ?? 'Unknown runtime';
+}
+
+export function protocolLabel(protocol: string): string {
+  return PROTOCOL_LABELS[protocol] ?? 'Other protocol';
+}
+
+export function protocolTone(protocol: string): BadgeTone {
+  return PROTOCOL_TONES[protocol] ?? 'secondary';
+}
+
+/** The protocol badge, which also says how the agent is reached: `A2A via proxy`. */
+export function protocolBadgeLabel(protocol: string, runtime: string): string {
+  const label = protocolLabel(protocol);
+  if (runtime === 'a2a-proxy') return `${label} via proxy`;
+  if (runtime === 'gateway') return `${label} via gateway`;
+  return label;
+}
+
+export function statusLabel(status: string): string {
+  if (status === 'active') return 'Active';
+  if (status === 'disabled') return 'Disabled';
+  return 'Unknown';
+}
+
+/** `Recognised`, `Authorised`, both, or none (shown as `No Trust Registry`). */
+export function trustRegistryLabels(trust: AgentTrustRegistry): string[] {
+  const labels: string[] = [];
+  if (trust.recognized) labels.push('Recognised');
+  if (trust.authorized) labels.push('Authorised');
+  return labels;
+}
+
+/** What `target.endpoint` points at, safe to display. */
+export type AgentConnectionTarget =
+  | { kind: 'url'; display: string; redacted: boolean }
+  | { kind: 'a2a-proxy'; proxyId: string }
+  | { kind: 'gateway'; gatewayId: string; channelId: string | null }
+  | { kind: 'unknown' };
+
+/**
+ * Splits the endpoint by scheme. A URL drops its credentials, query string and
+ * fragment, which can carry secrets; `redacted` says something was removed.
+ */
+export function connectionTarget(endpoint: string): AgentConnectionTarget {
+  if (endpoint.startsWith('a2a-proxy://')) {
+    const proxyId = endpoint.slice('a2a-proxy://'.length).replace(/\/+$/, '');
+    return proxyId ? { kind: 'a2a-proxy', proxyId } : { kind: 'unknown' };
+  }
+  if (endpoint.startsWith('fabric://')) {
+    const [gatewayId, channelId] = endpoint.slice('fabric://'.length).split('/');
+    return gatewayId
+      ? { kind: 'gateway', gatewayId, channelId: channelId || null }
+      : { kind: 'unknown' };
+  }
+  try {
+    const url = new URL(endpoint);
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return { kind: 'unknown' };
+    return {
+      kind: 'url',
+      display: `${url.origin}${url.pathname === '/' ? '' : url.pathname}`,
+      redacted: Boolean(url.username || url.password || url.search || url.hash),
+    };
+  } catch {
+    return { kind: 'unknown' };
+  }
+}
+
+/** `360` → `6h`, `90` → `90m`, `2880` → `2d`. */
+export function formatWindow(minutes: number): string {
+  if (minutes > 0 && minutes % 1440 === 0) return `${minutes / 1440}d`;
+  if (minutes > 0 && minutes % 60 === 0) return `${minutes / 60}h`;
+  return `${minutes}m`;
+}
+
+/**
+ * Activity is only known inside the metrics retention window, so "never" isn't
+ * claimed: an agent idle for longer shows `None in last 6h`.
+ */
+export function lastActivityLabel(at: string | null, windowMinutes?: number): string {
+  if (at) return timeAgo(at);
+  return windowMinutes ? `None in last ${formatWindow(windowMinutes)}` : 'None retained';
+}
+
+/** Shortened in the middle, so both the method and the unique tail stay visible. */
+export function shortenDid(did: string, head = 20, tail = 8): string {
+  if (did.length <= head + tail + 1) return did;
+  return `${did.slice(0, head)}…${did.slice(-tail)}`;
+}
+
+export function otherSurfacesNote(didSurfaceCount: number): string | null {
+  const others = didSurfaceCount - 1;
+  if (others < 1) return null;
+  return `Also used on ${others} other surface${others === 1 ? '' : 's'}`;
+}
+
+/**
+ * Where the DID comes from. A managed identity always has a creation time; a
+ * DID set on the surface (`agent_did`) has no identity record.
+ */
+export function didSourceLabel(agent: AgentRecord): string | null {
+  if (!agent.agent_did) return null;
+  return agent.identity_created_at
+    ? 'Managed identity, issued by this gateway'
+    : 'Set on the surface';
+}
+
+export function agentMatchesFilter(agent: AgentRecord, term: string): boolean {
+  const needle = term.trim().toLowerCase();
+  if (!needle) return true;
+  return [agent.name ?? '', agent.surface_name].some(value => value.toLowerCase().includes(needle));
+}
+
+/**
+ * The surface behind a list row. Iteration 1 maps one surface to one agent and
+ * the opaque `id` is that surface's id; the details response carries real
+ * `surfaces[]`, so only the list uses this.
+ */
+export function listRowSurfaceId(agent: AgentRecord): string {
+  return agent.id;
+}

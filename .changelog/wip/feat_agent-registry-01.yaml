@@ -1,0 +1,47 @@
+branch: feat/agent-registry-01
+changes:
+  added:
+    - timestamp: '2026-10-29T12:00:00Z'
+      title: Add a read-only Agents API with one agent record per surface
+      description: >-
+        `GET /v1/agents` lists one agent record per non-deleted surface the caller can access, and
+        `GET /v1/agents/{id}` adds the agent's surfaces and its traffic over the metrics retention
+        window, with p95 latency taken from the raw inbound latencies. Each record carries the
+        target's display name, runtime, protocol, status, configured Trust Registry records, the
+        managed DID most recently used on the surface and the last activity time. Both routes need
+        surface view permission, are filtered by tenant and PAT resource scope, return 404 for an
+        agent outside that scope, and are not served when no auth backend is configured.
+    - timestamp: '2026-10-29T15:00:00Z'
+      title: Add GET /v1/agents/{id}/agent-card to show the managed agent's own Agent Card
+      description: >-
+        Returns the card the agent publishes at its target endpoint, marked unverified by the
+        dashboard, or `available: false` with `no_agent_card` (protocol is not A2A or AP2) or
+        `unsupported_runtime` (A2A Proxy or remote gateway target). The card is fetched through the
+        egress policy with the same timeout and size limit as target card names, redirects are not
+        followed. Fetched cards are cached per surface for 5 minutes and failed fetches for 30
+        seconds. A failed fetch returns a generic 502. The surface's public card route is never called, so viewing a card issues no
+        DID, writes no Trust Registry record and records no request. Same permission, tenant and PAT
+        scoping as the other Agents API routes.
+    - timestamp: '2026-10-29T18:00:00Z'
+      title: Add the read-only Agents page and agent details to the dashboard
+      description: >-
+        A new **Agents** sidebar entry, above **Surfaces**, lists one row per surface's managed
+        agent with its DID, runtime and protocol, status, surface, configured Trust Registry records
+        and last activity, with a name filter. The details page has **Overview**, **Agent Card**,
+        **Connection**, **Surfaces** and **Traffic** tabs. **Connection** shows how the gateway
+        reaches the agent, with a URL endpoint's credentials and query string hidden. The Agent Card is shown as plain text and labelled as
+        published by the agent and not verified, Trust Registry badges are labelled as configured
+        and not checked, and traffic is labelled with the metrics retention window. Needs surface
+        view permission.
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-10-29T12:00:00Z'
+      title: Stop exposing every identity's traffic and last payload on GET /v1/agents
+      description: >-
+        The previous `GET /v1/agents` had no feature gate and no tenant or PAT scoping, and returned
+        every DID's per-surface traffic with the last request payload seen for it. It is replaced by
+        the scoped Agents API, and the gateway no longer keeps the per-identity last payload in
+        memory.
+  breaking: []

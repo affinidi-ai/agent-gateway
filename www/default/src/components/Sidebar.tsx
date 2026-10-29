@@ -24,6 +24,13 @@ const Sidebar: React.FC = () => {
       isHeading: true,
     },
     {
+      id: 'agents',
+      label: 'Agents',
+      icon: 'fa-robot',
+      path: '/agents',
+      permission: 'surfaces.view' as const,
+    },
+    {
       id: 'surfaces',
       label: 'Surfaces',
       icon: 'fa-layer-group',

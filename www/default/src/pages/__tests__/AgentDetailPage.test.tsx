@@ -1,0 +1,222 @@
+import React from 'react';
+import { fireEvent, render, screen, within } from '@testing-library/react';
+import '@testing-library/jest-dom';
+import { MemoryRouter, Route, Routes } from 'react-router-dom';
+import AgentDetailPage from '../AgentDetailPage';
+import { AgentDetails, apiClient } from '../../api';
+import { usePermissions } from '../../context/PermissionsContext';
+
+jest.mock('../../api', () => {
+  class ApiError extends Error {
+    readonly status: number;
+    constructor(message: string, httpStatus: number) {
+      super(message);
+      this.status = httpStatus;
+    }
+  }
+  return {
+    ApiError,
+    apiClient: {
+      getAgent: jest.fn(),
+      getAgentCard: jest.fn(),
+    },
+  };
+});
+
+jest.mock('../../context/PermissionsContext', () => ({
+  usePermissions: jest.fn(),
+}));
+
+const mockedUsePermissions = usePermissions as jest.Mock;
+const mockedGetAgent = apiClient.getAgent as jest.Mock;
+const mockedGetAgentCard = apiClient.getAgentCard as jest.Mock;
+
+const details = (overrides: Partial<AgentDetails> = {}): AgentDetails => ({
+  id: 's1',
+  registration: 'unregistered',
+  name: 'TimeAsker',
+  surface_name: 'RICK',
+  status: 'active',
+  protocol: 'a2a',
+  runtime: 'gateway',
+  endpoint: 'fabric://g1/c1',
+  tags: [],
+  trust_registry: { recognized: false, authorized: true },
+  agent_did: 'did:web:agent.example.com',
+  did_surface_count: 1,
+  identity_created_at: '2026-10-22T11:24:02Z',
+  last_activity_at: null,
+  surfaces: [
+    { surface_id: 's1', name: 'RICK', protocol: 'a2a', route: '/agents/rick', status: 'active' },
+  ],
+  traffic: {
+    window_minutes: 360,
+    total_requests: 12,
+    failed: 2,
+    gateway_faults: 1,
+    p95_latency_ms: 140,
+  },
+  ...overrides,
+});
+
+const renderPage = () =>
+  render(
+    <MemoryRouter initialEntries={['/agents/s1']}>
+      <Routes>
+        <Route path="/agents/:agentId" element={<AgentDetailPage />} />
+        <Route path="/agents" element={<div data-testid="list-route" />} />
+      </Routes>
+    </MemoryRouter>
+  );
+
+const openTab = (name: RegExp) => fireEvent.click(screen.getByRole('tab', { name }));
+
+describe('AgentDetailPage', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockedUsePermissions.mockReturnValue({ hasPermission: () => true });
+  });
+
+  it('shows a remote gateway connection with a link', async () => {
+    mockedGetAgent.mockResolvedValue(details());
+    renderPage();
+    await screen.findByTestId('agent-details-name');
+    openTab(/Connection/);
+
+    expect(screen.getByTestId('agent-connection-runtime')).toHaveTextContent('Remote gateway');
+    expect(screen.getByTestId('agent-connection-gateway-link')).toHaveAttribute(
+      'href',
+      '/gateways/g1'
+    );
+    expect(screen.getByTestId('agent-connection-remote-surface')).toHaveTextContent('c1');
+  });
+
+  it('shows an A2A proxy without a link when the viewer cannot open it', async () => {
+    mockedUsePermissions.mockReturnValue({ hasPermission: () => false });
+    mockedGetAgent.mockResolvedValue(details({ runtime: 'a2a-proxy', endpoint: 'a2a-proxy://p1' }));
+    renderPage();
+    await screen.findByTestId('agent-details-name');
+    openTab(/Connection/);
+
+    expect(screen.getByTestId('agent-connection-proxy')).toHaveTextContent('p1');
+    expect(screen.queryByTestId('agent-connection-proxy-link')).not.toBeInTheDocument();
+  });
+
+  it('hides secrets in a URL endpoint', async () => {
+    mockedGetAgent.mockResolvedValue(
+      details({ runtime: 'url', endpoint: 'https://u:pw@agent.example.com/a2a?token=s3cret' })
+    );
+    renderPage();
+    await screen.findByTestId('agent-details-name');
+    openTab(/Connection/);
+
+    expect(screen.getByTestId('agent-connection-endpoint')).toHaveTextContent(
+      'https://agent.example.com/a2a'
+    );
+    expect(screen.getByTestId('agent-connection-redacted')).toBeInTheDocument();
+    expect(screen.queryByText(/s3cret|pw@/)).not.toBeInTheDocument();
+  });
+
+  it('shows the header and Overview values from the agent record', async () => {
+    mockedGetAgent.mockResolvedValue(details());
+    renderPage();
+
+    expect(await screen.findByTestId('agent-details-name')).toHaveTextContent('TimeAsker');
+    expect(screen.getAllByText('A2A via gateway').length).toBeGreaterThan(0);
+    expect(screen.getByTestId('agent-overview-runtime')).toHaveTextContent('Remote gateway');
+    expect(screen.getByTestId('agent-overview-description')).toHaveTextContent('—');
+    expect(screen.getByText('Identity created')).toBeInTheDocument();
+    expect(screen.getByTestId('agent-overview-identity-created')).toHaveTextContent('2026');
+    expect(screen.getByTestId('agent-overview-did-source')).toHaveTextContent(
+      'Managed identity, issued by this gateway'
+    );
+    expect(screen.getByTestId('agents-did')).toHaveTextContent('did:web:agent.example.com');
+    expect(screen.getByText('Authorised')).toBeInTheDocument();
+    expect(screen.getByTestId('agent-overview-trust-note')).toHaveTextContent(
+      'not checked against the Trust Registry'
+    );
+  });
+
+  it('shows not found for a 404', async () => {
+    const { ApiError } = jest.requireMock('../../api');
+    mockedGetAgent.mockRejectedValue(new ApiError('Not Found', 404));
+    renderPage();
+    expect(await screen.findByTestId('agent-not-found')).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('agent-back-button'));
+    expect(screen.getByTestId('list-route')).toBeInTheDocument();
+  });
+
+  it('shows the card as plain text, labelled not verified', async () => {
+    mockedGetAgent.mockResolvedValue(details());
+    mockedGetAgentCard.mockResolvedValue({
+      available: true,
+      card: { name: '<img src=x onerror=alert(1)>', url: 'https://evil.example.com' },
+    });
+    renderPage();
+    await screen.findByTestId('agent-details-name');
+    openTab(/Agent Card/);
+
+    const json = await screen.findByTestId('agent-card-json');
+    expect(json).toHaveTextContent('<img src=x onerror=alert(1)>');
+    expect(within(json).queryByRole('img')).not.toBeInTheDocument();
+    expect(within(json).queryByRole('link')).not.toBeInTheDocument();
+    expect(screen.getByTestId('agent-card-unverified')).toHaveTextContent(
+      'Published by the agent, not verified'
+    );
+    expect(screen.getByTestId('agent-card-copy-button')).toHaveTextContent('Copy JSON');
+  });
+
+  it.each([
+    ['unsupported_runtime', "Agent Card isn't available for this runtime"],
+    ['no_agent_card', "This agent doesn't publish an Agent Card"],
+  ])('shows the %s state', async (reason, text) => {
+    mockedGetAgent.mockResolvedValue(details());
+    mockedGetAgentCard.mockResolvedValue({ available: false, reason });
+    renderPage();
+    await screen.findByTestId('agent-details-name');
+    openTab(/Agent Card/);
+    expect(await screen.findByText(text)).toBeInTheDocument();
+  });
+
+  it('retries a failed card load', async () => {
+    mockedGetAgent.mockResolvedValue(details());
+    mockedGetAgentCard
+      .mockRejectedValueOnce(new Error('Bad Gateway'))
+      .mockResolvedValueOnce({ available: true, card: { name: 'TimeAsker' } });
+    renderPage();
+    await screen.findByTestId('agent-details-name');
+    openTab(/Agent Card/);
+
+    expect(await screen.findByText("Agent Card couldn't be loaded")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('agent-card-retry-button'));
+    expect(await screen.findByTestId('agent-card-json')).toHaveTextContent('TimeAsker');
+  });
+
+  it('lists the one surface', async () => {
+    mockedGetAgent.mockResolvedValue(details());
+    renderPage();
+    await screen.findByTestId('agent-details-name');
+    openTab(/Surfaces \(1\)/);
+
+    expect(screen.getByTestId('agent-surfaces-row-s1')).toBeInTheDocument();
+    expect(screen.getByTestId('agent-surfaces-link')).toHaveTextContent('RICK');
+    expect(screen.getByText('/agents/rick')).toBeInTheDocument();
+  });
+
+  it('labels traffic with the retained window and shows — for 7 days', async () => {
+    mockedGetAgent.mockResolvedValue(details());
+    renderPage();
+    await screen.findByTestId('agent-details-name');
+    openTab(/Traffic/);
+
+    expect(screen.getByTestId('agent-traffic-requests')).toHaveTextContent('Requests (last 6h)');
+    expect(screen.getByTestId('agent-traffic-requests')).toHaveTextContent('12');
+    expect(screen.getByTestId('agent-traffic-requests-7d')).toHaveTextContent('—');
+    expect(screen.getByTestId('agent-traffic-failed')).toHaveTextContent(
+      'Failed requests (last 6h)'
+    );
+    expect(screen.getByTestId('agent-traffic-failed')).toHaveTextContent('3');
+    expect(screen.getByTestId('agent-traffic-p95')).toHaveTextContent('140 ms');
+    expect(screen.getByTestId('agent-traffic-by-surface')).toHaveTextContent('RICK');
+  });
+});

@@ -27,6 +27,7 @@ import {
 } from './types';
 
 // Agent Surface types
+import type { SurfaceProtocol } from './generated/SurfaceProtocol';
 import type { SurfaceStatus } from './generated/SurfaceStatus';
 import { extractErrorCode, formatApiError } from './utils/apiError';
 import { parseWarningHeader } from './utils/warningHeader';
@@ -87,6 +88,60 @@ export interface LimitItem {
   limit: number;
   current: number;
 }
+
+/** How the gateway reaches an agent, from its `target.endpoint` scheme. */
+export type AgentRuntime = 'url' | 'a2a-proxy' | 'gateway';
+
+/** Trust Registry records the surface is configured to write. Not checked against a registry. */
+export interface AgentTrustRegistry {
+  recognized: boolean;
+  authorized: boolean;
+}
+
+/** One row of GET /v1/agents. `id` is opaque: don't parse it. */
+export interface AgentRecord {
+  id: string;
+  registration: 'unregistered';
+  name: string | null;
+  surface_name: string;
+  status: SurfaceStatus;
+  protocol: SurfaceProtocol;
+  runtime: AgentRuntime;
+  endpoint: string;
+  tags: string[];
+  trust_registry: AgentTrustRegistry;
+  agent_did: string | null;
+  did_surface_count: number;
+  identity_created_at: string | null;
+  last_activity_at: string | null;
+}
+
+export interface AgentSurfaceSummary {
+  surface_id: string;
+  name: string;
+  protocol: SurfaceProtocol;
+  route: string;
+  status: SurfaceStatus;
+}
+
+/** Request totals over the metrics retention window (`window_minutes`). */
+export interface AgentTraffic {
+  window_minutes: number;
+  total_requests: number;
+  failed: number;
+  gateway_faults: number;
+  p95_latency_ms: number | null;
+}
+
+export interface AgentDetails extends AgentRecord {
+  surfaces: AgentSurfaceSummary[];
+  traffic: AgentTraffic;
+}
+
+/** The agent's own card, as published by the agent. Untrusted and not verified. */
+export type AgentCardResponse =
+  | { available: true; card: unknown }
+  | { available: false; reason: 'no_agent_card' | 'unsupported_runtime' };
 
 class SessionManager {
   private static readonly YES_VALUE = '1';
@@ -556,6 +611,20 @@ class APIClient {
   // Appliance resource limits
   async getLimits(): Promise<LimitItem[]> {
     return this.request<LimitItem[]>('/limits');
+  }
+
+  // Agents (read-only)
+  async listAgents(): Promise<AgentRecord[]> {
+    const { agents } = await this.request<{ agents: AgentRecord[] }>('/agents');
+    return agents;
+  }
+
+  async getAgent(id: string): Promise<AgentDetails> {
+    return this.request<AgentDetails>(`/agents/${encodeURIComponent(id)}`);
+  }
+
+  async getAgentCard(id: string): Promise<AgentCardResponse> {
+    return this.request<AgentCardResponse>(`/agents/${encodeURIComponent(id)}/agent-card`);
   }
 
   // Agent Surfaces

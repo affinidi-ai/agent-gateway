@@ -1665,6 +1665,41 @@ to it over `fabric://`) shows the gateway's message.
 | Detail surfaces, used by, health         | `payment-gateway-surfaces-refresh-button`, `-surfaces-error`, `-surfaces-empty`, `-surface-<id>`, `payment-gateway-surface-manifest-<id>-*`, `-used-by-<id>`, `-used-by-link-<id>`, `-used-by-empty`, `-used-by-error`, `-ping-button`, `-ping-result` |
 | Use as payment gateway                   | `gateways-use-as-payment-button-<id>` (Gateways tab), `gateway-use-as-payment-button` (edit page)                                                             |
 
+## Agents page
+
+`/agents` (`pages/AgentsPage.tsx`) and `/agents/:agentId` (`pages/AgentDetailPage.tsx`, tabs in
+`pages/AgentDetailPage/`) are read-only and need `surfaces.view`. They call only
+`apiClient.listAgents`, `getAgent` and `getAgentCard` (`/v1/agents`), never `/v1/dashboard/stats`.
+
+- Raw API values are never shown. `pages/AgentsPage/agentLabels.ts` maps them: runtime `url`,
+  `a2a-proxy`, `gateway` to Direct URL, A2A proxy, Remote gateway, and the protocol badge to `A2A`,
+  `A2A via proxy`, `A2A via gateway`. Shared badges are in `pages/AgentsPage/AgentBadges.tsx`.
+- An agent without a name shows **Unnamed agent** in muted text; without a DID, **No DID** and no
+  copy button. The list shortens the DID in the middle, with the full value in the tooltip.
+- Agent `id` is opaque. Only `listRowSurfaceId` reads it as a surface id, for the list's surface
+  link; the details page links from `surfaces[]`.
+- The **Connection** tab is read-only and built from `endpoint` by `connectionTarget`. A URL is
+  shown without credentials, query string or fragment, with a note when any was removed. An
+  `a2a-proxy://` or `fabric://` target links to its A2A proxy or remote gateway page only when
+  the viewer has `a2a_proxies.edit` or `gateways.edit`, which those pages need; otherwise the
+  id is plain text.
+- Trust Registry badges are configuration, labelled "not checked against the Trust Registry".
+- The Agent Card is untrusted: render it as JSON text only (no HTML, Markdown or links), labelled
+  **Published by the agent, not verified**.
+- Activity and traffic exist only inside the metrics retention window, so labels name it
+  (`None in last 6h`, `Requests (last 6h)`) and the 7-day card shows `—`. **Failed requests** is
+  `failed` + `gateway_faults`.
+
+| Element                         | Test id                                                                         |
+| ------------------------------- | ------------------------------------------------------------------------------- |
+| Pages                           | `page-agents`, `page-agent-details`                                             |
+| List row, filter, count, retry  | `agents-row-<id>`, `agents-filter-input`, `agents-count`, `agents-retry-button` |
+| Surface link, DID, copy DID     | `agents-surface-link`, `agents-did`, `agents-copy-did-button`                   |
+| Back, details retry             | `agent-back-button`, `agent-retry-button`                                       |
+| Agent Card states               | `agent-card-json`, `agent-card-unverified`, `agent-card-retry-button`           |
+| Traffic cards                   | `agent-traffic-requests`, `-requests-7d`, `-failed`, `-p95`                     |
+| Connection                      | `agent-connection-tab`, `-endpoint`, `-redacted`, `-proxy-link`, `-gateway-link` |
+
 ## Remote gateway Issuer DIDs
 
 The **Remote** tab of a remote gateway starts with the **Issuer DIDs** card

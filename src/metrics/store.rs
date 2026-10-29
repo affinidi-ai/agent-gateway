@@ -27,8 +27,6 @@ pub struct MetricsStore {
     last_status_by_channel: Arc<RwLock<HashMap<String, ConnectionStatus>>>,
     /// Settings store for configurable windows
     settings_store: Option<Arc<crate::storage::SettingsStore>>,
-    /// Last captured payload by identity hash
-    last_payloads: Arc<RwLock<HashMap<String, serde_json::Value>>>,
     /// Latest payload by channel name (for display in channel list)
     latest_channel_payloads: Arc<RwLock<HashMap<String, serde_json::Value>>>,
     /// Backend for persisting metrics
@@ -96,7 +94,6 @@ impl MetricsStore {
             metrics_retention_minutes: 360, // Default 6 hours in minutes
             last_status_by_channel: last_status,
             settings_store: None,
-            last_payloads: Arc::new(RwLock::new(HashMap::new())),
             latest_channel_payloads: Arc::new(RwLock::new(HashMap::new())),
             backend: None,
             save_task_handle: Arc::new(tokio::sync::Mutex::new(None)),
@@ -117,50 +114,6 @@ impl MetricsStore {
             metrics_tx,
             cache_ttl_ms: 1000, // Default 1 second
         }
-    }
-
-    /// Store the last captured payload for an identity
-    ///
-    /// Capped to 100 entries to bound memory usage. When full, the oldest
-    /// entry (by insertion order) is evicted.
-    pub async fn store_last_payload(
-        &self,
-        identity_hash: String,
-        payload: serde_json::Value,
-    ) {
-        let mut payloads = self
-            .last_payloads
-            .write()
-            .await;
-        payloads.insert(identity_hash, payload);
-
-        // Evict oldest entries if over capacity
-        const MAX_PAYLOAD_ENTRIES: usize = 100;
-        if payloads.len() > MAX_PAYLOAD_ENTRIES {
-            let excess = payloads.len() - MAX_PAYLOAD_ENTRIES;
-            let keys_to_remove: Vec<String> = payloads
-                .keys()
-                .take(excess)
-                .cloned()
-                .collect();
-            for key in keys_to_remove {
-                payloads.remove(&key);
-            }
-        }
-    }
-
-    /// Get the last captured payload for an identity
-    pub async fn get_last_payload(
-        &self,
-        identity_hash: &str,
-    ) -> Option<serde_json::Value> {
-        let payloads = self
-            .last_payloads
-            .read()
-            .await;
-        payloads
-            .get(identity_hash)
-            .cloned()
     }
 
     /// Store the latest payload for a channel (most recent regardless of identity)
@@ -296,7 +249,6 @@ impl MetricsStore {
             metrics_retention_minutes: retention_minutes,
             last_status_by_channel: last_status,
             settings_store: None,
-            last_payloads: Arc::new(RwLock::new(HashMap::new())),
             latest_channel_payloads: Arc::new(RwLock::new(HashMap::new())),
             backend: Some(Arc::new(multi_backend)),
             save_task_handle: Arc::new(tokio::sync::Mutex::new(None)),
@@ -1684,6 +1636,39 @@ impl MetricsStore {
             .collect()
     }
 
+    /// Metrics retention window in minutes.
+    pub fn retention_minutes(&self) -> u64 {
+        self.metrics_retention_minutes
+    }
+
+    /// p95 of the retained Access Point (inbound) latencies across `surface_ids`;
+    /// `None` without samples.
+    pub async fn inbound_p95_latency_ms(
+        &self,
+        surface_ids: &[&str],
+    ) -> Option<u64> {
+        let mut latencies: Vec<u64> = self
+            .connections
+            .read()
+            .await
+            .iter()
+            .filter(|conn| {
+                conn.transit_point.is_none()
+                    && surface_ids.contains(
+                        &conn
+                            .channel_config_id
+                            .as_str(),
+                    )
+            })
+            .filter_map(|conn| conn.latency_ms)
+            .collect();
+        if latencies.is_empty() {
+            return None;
+        }
+        latencies.sort_unstable();
+        Some(percentile(&latencies, 95))
+    }
+
     /// Get latency statistics by channel and source-destination pairs
     pub async fn get_latency_stats(&self) -> Vec<LatencyStats> {
         let connections = self.connections.read().await;
@@ -2849,5 +2834,74 @@ mod tests {
             .get();
 
         assert_eq!(after, before + 1);
+    }
+
+    fn metric(
+        surface_id: &str,
+        latency_ms: Option<u64>,
+        transit_point: Option<&str>,
+    ) -> super::ConnectionMetric {
+        super::ConnectionMetric {
+            timestamp: chrono::Utc::now(),
+            channel_config_id: surface_id.to_string(),
+            source: "caller".to_string(),
+            destination: "agent".to_string(),
+            status: super::ConnectionStatus::Success,
+            latency_ms,
+            identity_hash: None,
+            direction: super::ConnectionDirection::Request,
+            trace_id: uuid::Uuid::new_v4().to_string(),
+            ucp_operation: None,
+            transit_point: transit_point.map(str::to_string),
+            surface_variant: None,
+            metric_type: super::MetricType::Channel,
+            channel_request_latency_ms: None,
+            channel_response_latency_ms: None,
+            total_latency_ms: 0,
+            correlation_id: None,
+            agent_identity: None,
+            request_bytes: None,
+            response_bytes: None,
+            retry_count: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn inbound_p95_latency_uses_only_access_point_samples_of_the_given_surfaces() {
+        let store = MetricsStore::new(1000);
+        {
+            let mut connections = store
+                .connections
+                .write()
+                .await;
+            connections.extend((1..=20).map(|ms| metric("s1", Some(ms * 10), None)));
+            connections.push(metric("s1", Some(9_000), Some("tp-1")));
+            connections.push(metric("s2", Some(8_000), None));
+            connections.push(metric("s1", None, None));
+        }
+
+        assert_eq!(
+            store
+                .inbound_p95_latency_ms(&["s1"])
+                .await,
+            Some(190)
+        );
+        assert_eq!(
+            store
+                .inbound_p95_latency_ms(&["s1", "s2"])
+                .await,
+            Some(200)
+        );
+        assert_eq!(
+            store
+                .inbound_p95_latency_ms(&["s3"])
+                .await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn retention_minutes_defaults_to_six_hours() {
+        assert_eq!(MetricsStore::new(10).retention_minutes(), 360);
     }
 }

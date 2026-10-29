@@ -361,6 +361,10 @@ may discover only with its own tenant's secrets: an appliance-wide secret is ref
 another tenant's, with `400` "Target auth secret is not accessible", whatever
 `tenant_credential_isolation` says, because discovery sends the secret to an endpoint the
 caller chose and stores nothing.
+`GET /v1/agents`, `GET /v1/agents/{id}` and `GET /v1/agents/{id}/agent-card` are
+scoped as Surfaces: an agent's id is
+its surface id, so a PAT's resource pattern is matched against
+`TENANT:{tenant}:surfaces:{id}`, and an agent outside it returns `404`.
 
 Ownership changes are administrator-only: `GET
 /v1/tenant-ownership/{kind}/{id}/impact` reports incoming/outgoing references and

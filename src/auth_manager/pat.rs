@@ -143,6 +143,14 @@ fn is_handler_enforced_nested_action(
     )
 }
 
+/// Agent ids are surface ids, so `/v1/agents` is scoped as Surfaces.
+fn path_family_kind(family: &str) -> Option<ResourceKind> {
+    match family {
+        "agents" => Some(ResourceKind::Surfaces),
+        _ => ResourceKind::from_path_family(family),
+    }
+}
+
 pub fn classify_resource_path(path: &str) -> PathScope {
     let segments: Vec<&str> = path
         .split('/')
@@ -153,7 +161,7 @@ pub fn classify_resource_path(path: &str) -> PathScope {
         if segments[index] == "v1" && index + 1 < segments.len() {
             let candidate = segments[index + 1];
             if HANDLER_ENFORCED_FAMILIES.contains(&candidate)
-                || ResourceKind::from_path_family(candidate).is_some()
+                || path_family_kind(candidate).is_some()
                 || candidate == "sts"
             {
                 family = Some((candidate, index + 2));
@@ -185,7 +193,7 @@ pub fn classify_resource_path(path: &str) -> PathScope {
         };
     }
 
-    let Some(kind) = ResourceKind::from_path_family(name) else {
+    let Some(kind) = path_family_kind(name) else {
         return PathScope::Unscoped;
     };
 
@@ -301,6 +309,27 @@ mod tests {
             assert_eq!(classify_resource_path(path), PathScope::Unscoped, "{path}");
         }
         assert_eq!(ResourceKind::from_path_family("delegation-vault"), Some(ResourceKind::DelegationVault));
+    }
+
+    #[test]
+    fn agent_routes_are_scoped_as_surfaces() {
+        assert_eq!(classify_resource_path("/api/v1/agents"), PathScope::HandlerEnforced);
+        assert_eq!(
+            classify_resource_path("/api/v1/agents/surface%2Fa"),
+            PathScope::EnforceId {
+                kind: ResourceKind::Surfaces,
+                id: "surface/a".into(),
+            }
+        );
+        assert_eq!(
+            classify_resource_path("/api/v1/agents/surface-a/agent-card"),
+            PathScope::EnforceId {
+                kind: ResourceKind::Surfaces,
+                id: "surface-a".into(),
+            }
+        );
+        assert_eq!(classify_resource_path("/v1/agents/id/future-action"), PathScope::DenyScoped);
+        assert_eq!(ResourceKind::from_path_family("agents"), None);
     }
 
     #[test]
