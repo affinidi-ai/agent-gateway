@@ -507,9 +507,9 @@ pub async fn run_axum_proxy(
     let transit_token_min_lifetime_secs = bootstrap_config
         .pin_transit_token_min_lifetime()
         .context("Configuration validation failed")?;
-    config
-        .check_transit_token_lifetimes(transit_token_min_lifetime_secs)
-        .context("Configuration validation failed")?;
+    for adjustment in config.transit_token_lifetime_adjustments(transit_token_min_lifetime_secs) {
+        warn!("{adjustment}");
+    }
     let config = Arc::new(config);
     let bootstrap_config = Arc::new(bootstrap_config);
 

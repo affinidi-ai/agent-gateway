@@ -175,10 +175,8 @@ value startup would refuse by then.
 On every full or single-surface reload, a stored `transit.transit_token_lifetime_secs` below
 that shortest lifetime is raised to it, and one above 900 seconds is lowered to 900, with one
 `WARN` per surface naming the surface and both values, so the surface keeps serving. At
-startup the same `WARN` is logged for a lifetime below the shortest, for every stored surface,
-disabled ones included, and the gateway starts; a lifetime above 900 seconds stops it from
-starting, naming every such surface, so correct one before the next restart even when a reload
-accepted it. See [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token-lifetime).
+startup the same `WARN` is logged for every stored surface, disabled ones included, and the
+gateway starts. See [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token-lifetime).
 
 ## Dashboard events
 

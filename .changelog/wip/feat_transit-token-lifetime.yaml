@@ -12,8 +12,8 @@ changes:
         `transit_token_min_lifetime_secs` in `gateway.json`: 30 seconds unless set, from 1 to
         900. It is read once, when the gateway starts: a value outside 1 to 900 stops it from
         starting, a change takes a restart, and a reload keeps the startup value. A stored
-        lifetime below it is raised to it at startup and on reload, with a warning per
-        surface, and never stops the gateway; one above 900 stops it from starting. A Transit
+        lifetime below it is raised to it, and one above 900 is lowered to 900, at startup and
+        on reload, with a warning per surface; neither stops the gateway. A Transit
         Point checks a token against the lifetime its surface sets when the token is
         presented, so shortening the lifetime refuses the tokens already issued for longer
         while it is in force, and lengthening it never extends a token already issued.
