@@ -6,6 +6,7 @@ import { apiClient } from '../../../../../api';
 import CallerAuthFullscreen from '../CallerAuthFullscreen';
 import CallerAuthPanel from '../CallerAuthPanel';
 import { SurfaceMetaProvider, type SurfaceMetaValue } from '../../../SurfaceMetaContext';
+import { useSaveShortcut } from '../../../hooks/useSaveShortcut';
 import type { CanvasNode, ConfigPanelProps, Protocol } from '../../types';
 
 jest.mock('../../../../../api', () => ({ apiClient: { fetch: jest.fn(), get: jest.fn() } }));
@@ -42,6 +43,7 @@ interface HarnessProps {
   protocol?: Protocol;
   meta?: Partial<SurfaceMetaValue>;
   hasAttemptedSave?: boolean;
+  onSave?: () => void;
 }
 
 /** Renders a caller-auth panel over config it keeps in state, as the builder does. */
@@ -52,8 +54,10 @@ const Harness: React.FC<HarnessProps> = ({
   protocol = 'mcp',
   meta,
   hasAttemptedSave = false,
+  onSave,
 }) => {
   const [config, setConfig] = useState(initial);
+  useSaveShortcut(() => onSave?.());
   latest.config = config;
   const updateFields = (fields: Record<string, unknown>) =>
     setConfig(prev => ({ ...prev, ...fields }));
@@ -143,18 +147,6 @@ describe('Caller Context editor: authorization server discovery', () => {
       jwt_token_scheme: 'Bearer',
     });
     expect(screen.getByTestId('caller-auth-discovery-resource-input')).toHaveValue(RESOURCE);
-  });
-
-  it('commits an audience typed before saving and clears the empty-audience warning', async () => {
-    const latest = await openEditor({ initial: jwtConfig() });
-    const input = screen.getByPlaceholderText('e.g. https://api.example.com');
-
-    fireEvent.change(input, { target: { value: ' https://api.example.com ' } });
-    fireEvent.blur(input);
-
-    expect(latest.config?.audiences).toEqual(['https://api.example.com']);
-    expect(screen.getByText('https://api.example.com')).toBeInTheDocument();
-    expect(screen.queryByText(/No audience configured/)).toBeNull();
   });
 
   it('starts the authorization servers with the issuer the selected strategy trusts', async () => {
@@ -316,6 +308,54 @@ describe('Caller Context editor: authorization server discovery', () => {
   it('offers no discovery outside an MCP surface', async () => {
     await openEditor({ initial: jwtConfig(), protocol: 'a2a' });
     expect(screen.queryByTestId('caller-auth-discovery-switch')).toBeNull();
+  });
+});
+
+describe('Caller Context accepted audiences', () => {
+  it('commits a pending audience before a keyboard save builds the payload', async () => {
+    const save = jest.fn();
+    const latest = await openEditor({ initial: jwtConfig(), onSave: save });
+    const input = screen.getByPlaceholderText('e.g. https://api.example.com');
+
+    fireEvent.change(input, { target: { value: ' https://api.example.com ' } });
+    fireEvent.keyDown(input, { key: 's', metaKey: true });
+
+    expect(save).toHaveBeenCalledTimes(1);
+    expect(latest.config?.audiences).toEqual(['https://api.example.com']);
+    expect(screen.queryByText(/No audience configured/)).toBeNull();
+  });
+
+  it('does not add an empty or whitespace-only audience on blur', async () => {
+    const latest = await openEditor({ initial: jwtConfig() });
+    const input = screen.getByPlaceholderText('e.g. https://api.example.com');
+
+    fireEvent.change(input, { target: { value: '   ' } });
+    fireEvent.blur(input);
+
+    expect(latest.config?.audiences).toEqual([]);
+    expect(screen.getByText(/No audience configured/)).toBeInTheDocument();
+  });
+
+  it('does not add a duplicate audience on blur', async () => {
+    const latest = await openEditor({
+      initial: jwtConfig({ audiences: ['https://api.example.com'] }),
+    });
+    const input = screen.getByPlaceholderText('e.g. https://api.example.com');
+
+    fireEvent.change(input, { target: { value: ' https://api.example.com ' } });
+    fireEvent.blur(input);
+
+    expect(latest.config?.audiences).toEqual(['https://api.example.com']);
+  });
+
+  it('does not add an audience while authorization server discovery is on', async () => {
+    const latest = await openEditor({ initial: jwtConfig({ protected_resource: SETTING }) });
+    const input = screen.getByPlaceholderText('e.g. https://api.example.com');
+
+    fireEvent.change(input, { target: { value: 'https://api.example.com' } });
+    fireEvent.blur(input);
+
+    expect(latest.config?.audiences).toEqual([]);
   });
 });
 

@@ -292,6 +292,11 @@ const CallerAuthFullscreen: React.FC<ConfigPanelProps> = ({
                   onChange={e => setAudienceInput(e.target.value)}
                   onBlur={commitAudienceInput}
                   onKeyDown={e => {
+                    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 's') {
+                      e.preventDefault();
+                      commitAudienceInput();
+                      return;
+                    }
                     if (e.key === 'Enter' || e.key === ',') {
                       e.preventDefault();
                       commitAudienceInput();
