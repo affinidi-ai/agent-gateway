@@ -1,7 +1,7 @@
 use axum::{
     Json,
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
@@ -11,6 +11,9 @@ use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
 use crate::identity::state::IdentityApiState;
+use crate::metrics::MetricsStore;
+use crate::observability::loggable;
+use crate::server::WsState;
 
 /// Active onboarding sessions
 #[derive(Clone)]
@@ -189,9 +192,10 @@ pub async fn create_temp_onboard_surface(
         _ => format!("{}/onboard/{}/.well-known/agent-card.json", base_url, session_uuid),
     };
 
+    let logged_session = loggable::secret(&session_uuid);
     info!(
         "Created temporary onboarding session: {} for {} protocol (expires in {}s)",
-        session_uuid,
+        logged_session,
         req.protocol.to_uppercase(),
         ttl_seconds
     );
@@ -204,21 +208,21 @@ pub async fn create_temp_onboard_surface(
     let ws_state_clone = state.ws_state.clone();
 
     tokio::spawn(async move {
-        info!("Temporary onboarding session '{}' will expire in {} seconds", session_uuid_clone, ttl_seconds);
+        info!("Temporary onboarding session '{}' will expire in {} seconds", logged_session, ttl_seconds);
         tokio::time::sleep(tokio::time::Duration::from_secs(ttl_seconds)).await;
 
         let removed = onboarding_sessions_clone
             .remove_session(&session_uuid_clone)
             .await;
         if removed {
-            info!("Temporary onboarding session '{}' expired and removed", session_uuid_clone);
+            info!("Temporary onboarding session '{}' expired and removed", logged_session);
 
             ws_state_clone.broadcast(crate::server::WsUpdate::ChannelExpired {
                 config_id: session_uuid_clone.clone(),
                 channel_name: format!("onboard-{}", session_uuid_clone),
             });
         } else {
-            info!("Temporary onboarding session '{}' was already removed", session_uuid_clone);
+            info!("Temporary onboarding session '{}' was already removed", logged_session);
         }
     });
 
@@ -240,7 +244,7 @@ pub async fn delete_temp_onboard_channel(
     Path(config_id): Path<String>,
     State(state): State<IdentityApiState>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    info!("Deleting temporary onboarding session: {}", config_id);
+    info!("Deleting temporary onboarding session: {}", loggable::secret(&config_id));
 
     let removed = state
         .onboarding_sessions
@@ -248,10 +252,10 @@ pub async fn delete_temp_onboard_channel(
         .await;
 
     if !removed {
-        return Err(AppError::BadRequest(format!("Temporary onboarding session '{}' not found", config_id)));
+        return Err(AppError::BadRequest("Temporary onboarding session not found".to_string()));
     }
 
-    info!("Temporary onboarding session deleted successfully: {}", config_id);
+    info!("Temporary onboarding session deleted successfully: {}", loggable::secret(&config_id));
 
     Ok(Json(serde_json::json!({
         "message": "Temporary onboarding session deleted successfully",
@@ -263,16 +267,8 @@ pub async fn delete_temp_onboard_channel(
 pub async fn serve_onboarding_agent_card(
     Path(uuid): Path<String>,
     State(state): State<IdentityApiState>,
-    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    info!("=== GET ONBOARDING AGENT CARD REQUEST ===");
-    info!("Session UUID: {}", uuid);
-    info!("Request headers:");
-    for (name, value) in headers.iter() {
-        if let Ok(val_str) = value.to_str() {
-            info!("  {}: {}", name, val_str);
-        }
-    }
+    info!("GET onboarding agent card for session {}", loggable::secret(&uuid));
 
     // Check if session is active
     if !state
@@ -280,17 +276,7 @@ pub async fn serve_onboarding_agent_card(
         .is_session_active(&uuid)
         .await
     {
-        warn!("Onboarding request for invalid or expired session: {}", uuid);
-        warn!(
-            "Available sessions: {:?}",
-            state
-                .onboarding_sessions
-                .sessions
-                .read()
-                .await
-                .keys()
-                .collect::<Vec<_>>()
-        );
+        warn!("Onboarding request for invalid or expired session: {}", loggable::secret(&uuid));
         return Err(AppError::BadRequest("Invalid or expired onboarding session".to_string()));
     }
 
@@ -323,56 +309,39 @@ pub async fn serve_onboarding_agent_card(
         });
     let base_url = base_url.trim_end_matches('/');
 
-    let agent_card = build_onboarding_agent_card(base_url, &uuid);
-
-    info!("Sending agent card response: {}", serde_json::to_string_pretty(&agent_card).unwrap_or_default());
-    info!("=== END GET ONBOARDING AGENT CARD REQUEST ===");
-
-    Ok(Json(agent_card))
+    Ok(Json(build_onboarding_agent_card(base_url, &uuid)))
 }
 
 /// Handle POST requests to onboarding endpoint (A2A message exchange)
 pub async fn handle_onboarding_message(
     Path(uuid): Path<String>,
     State(state): State<IdentityApiState>,
-    headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    info!("=== POST ONBOARDING MESSAGE REQUEST ===");
-    info!("Session UUID: {}", uuid);
-    info!("Request headers:");
-    for (name, value) in headers.iter() {
-        if let Ok(val_str) = value.to_str() {
-            info!("  {}: {}", name, val_str);
-        }
-    }
-    info!("Request body (raw): {} bytes", body.len());
+    respond_to_onboarding_message(&state.onboarding_sessions, &state.metrics_store, &state.ws_state, uuid, &body).await
+}
+
+async fn respond_to_onboarding_message(
+    sessions: &OnboardingSessionManager,
+    metrics_store: &MetricsStore,
+    ws_state: &WsState,
+    uuid: String,
+    body: &[u8],
+) -> Result<Json<serde_json::Value>, AppError> {
+    info!("POST onboarding message for session {} ({} bytes)", loggable::secret(&uuid), body.len());
 
     // Parse JSON manually to provide better error messages
-    let payload: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
-        error!("Failed to parse JSON body: {}", e);
-        AppError::BadRequest(format!("Invalid JSON: {}", e))
+    let payload: serde_json::Value = serde_json::from_slice(body).map_err(|e| {
+        error!("Failed to parse JSON body at line {} column {}", e.line(), e.column());
+        AppError::BadRequest(format!("Invalid JSON at line {} column {}", e.line(), e.column()))
     })?;
 
-    info!("Request body: {}", serde_json::to_string_pretty(&payload).unwrap_or_default());
-
     // Check if session is active
-    if !state
-        .onboarding_sessions
+    if !sessions
         .is_session_active(&uuid)
         .await
     {
-        warn!("Onboarding message for invalid or expired session: {}", uuid);
-        warn!(
-            "Available sessions: {:?}",
-            state
-                .onboarding_sessions
-                .sessions
-                .read()
-                .await
-                .keys()
-                .collect::<Vec<_>>()
-        );
+        warn!("Onboarding message for invalid or expired session: {}", loggable::secret(&uuid));
 
         // Return JSON-RPC error for expired session
         let error_response = serde_json::json!({
@@ -383,7 +352,6 @@ pub async fn handle_onboarding_message(
                 "message": "Invalid or expired onboarding session"
             }
         });
-        info!("Sending JSON-RPC error response: {}", serde_json::to_string_pretty(&error_response).unwrap_or_default());
         return Ok(Json(error_response));
     }
 
@@ -393,14 +361,13 @@ pub async fn handle_onboarding_message(
     // (`initialize`, `tools/list`, `tools/call`, ...) and stores agent
     // identity under `_meta.<field>` rather than the A2A extension-uri
     // metadata block, so it needs its own minimal responder.
-    let session_protocol = state
-        .onboarding_sessions
+    let session_protocol = sessions
         .get_session(&uuid)
         .await
         .map(|s| s.protocol)
         .unwrap_or_default();
     if session_protocol == "mcp" {
-        return handle_mcp_onboarding_message(state, uuid, payload).await;
+        return handle_mcp_onboarding_message(metrics_store, ws_state, uuid, payload).await;
     }
 
     // Extract JSON-RPC request ID (required for proper RPC response)
@@ -490,15 +457,13 @@ pub async fn handle_onboarding_message(
 
         // Derive schema from the agent identity
         derived_schema = crate::a2a::schema::derive_schema_from_metadata(identity);
-        info!("Derived schema: {}", serde_json::to_string_pretty(&derived_schema).unwrap_or_default());
     }
 
     // Define channel name for metrics and broadcasting
     let channel_name = format!("onboard-{}", uuid);
 
     // Store the payload in metrics for later retrieval
-    state
-        .metrics_store
+    metrics_store
         .store_latest_channel_payload(channel_name.clone(), payload.clone())
         .await;
 
@@ -615,19 +580,9 @@ pub async fn handle_onboarding_message(
         surface_variant: None,
     };
 
-    // Log the exact WebSocket message being broadcast
-    if let Ok(ws_json) = serde_json::to_string_pretty(&ws_update) {
-        info!("Broadcasting WebSocket message:\n{}", ws_json);
-    }
-
-    info!("Broadcasting payload capture for channel: {}, config_id: {}", channel_name, uuid);
-    state
-        .ws_state
-        .broadcast(ws_update);
+    info!("Broadcasting payload capture for onboarding session {}", loggable::secret(&uuid));
+    ws_state.broadcast(ws_update);
     info!("Broadcast complete");
-
-    info!("Sending JSON-RPC response: {}", serde_json::to_string_pretty(&rpc_response).unwrap_or_default());
-    info!("=== END ONBOARDING MESSAGE REQUEST ===");
 
     Ok(Json(rpc_response))
 }
@@ -645,7 +600,8 @@ fn is_onboarding_send_method(method: &str) -> bool {
 /// derivation. Notifications without an `id` field receive an empty
 /// response.
 async fn handle_mcp_onboarding_message(
-    state: IdentityApiState,
+    metrics_store: &MetricsStore,
+    ws_state: &WsState,
     uuid: String,
     payload: serde_json::Value,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -744,8 +700,7 @@ async fn handle_mcp_onboarding_message(
     };
 
     let channel_name = format!("onboard-{}", uuid);
-    state
-        .metrics_store
+    metrics_store
         .store_latest_channel_payload(channel_name.clone(), payload.clone())
         .await;
 
@@ -762,11 +717,8 @@ async fn handle_mcp_onboarding_message(
         derived_schema: Box::new(derived_schema),
         surface_variant: None,
     };
-    state
-        .ws_state
-        .broadcast(ws_update);
+    ws_state.broadcast(ws_update);
 
-    info!("MCP onboarding response: {}", serde_json::to_string_pretty(&rpc_response).unwrap_or_default());
     Ok(Json(rpc_response))
 }
 
@@ -959,5 +911,97 @@ mod onboarding_card_tests {
         let card = build_onboarding_agent_card("https://gw.example", "abc");
         assert_eq!(card["url"], card["supportedInterfaces"][0]["url"]);
         assert_eq!(card["url"], "https://gw.example/onboard/abc/");
+    }
+}
+
+#[cfg(test)]
+mod onboarding_logging_tests {
+    use super::*;
+    use crate::component_tests::helpers::formatted_logs::FormattedLogs;
+
+    const CONTENT_MARKER: &str = "onboarding-content-marker-5c1e";
+
+    fn a2a_message_body() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "message/send",
+            "params": {
+                "message": {
+                    "kind": "message",
+                    "role": "user",
+                    "parts": [{ "kind": "text", "text": CONTENT_MARKER }]
+                }
+            }
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn onboarding_message_logs_session_prefix_and_byte_count_but_no_content() {
+        let sessions = OnboardingSessionManager::new();
+        let session = sessions
+            .create_session("a2a".to_string(), 60)
+            .await;
+        let body = a2a_message_body();
+        let logs = FormattedLogs::capture();
+
+        let response =
+            respond_to_onboarding_message(&sessions, &MetricsStore::new(10), &WsState::new(16), session.clone(), &body)
+                .await
+                .unwrap();
+
+        let text = logs.text();
+        assert_eq!(response.0["result"]["kind"], "task");
+        assert!(!text.contains(CONTENT_MARKER), "{text}");
+        assert!(!text.contains(&session), "{text}");
+        assert!(
+            text.contains(&format!(
+                "POST onboarding message for session {} ({} bytes)",
+                loggable::secret(&session),
+                body.len()
+            )),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn onboarding_message_for_unknown_session_names_no_live_session() {
+        let sessions = OnboardingSessionManager::new();
+        let live_sessions = [
+            sessions
+                .create_session("a2a".to_string(), 60)
+                .await,
+            sessions
+                .create_session("mcp".to_string(), 60)
+                .await,
+        ];
+        let unknown_session = uuid::Uuid::new_v4().to_string();
+        let logs = FormattedLogs::capture();
+
+        let response = respond_to_onboarding_message(
+            &sessions,
+            &MetricsStore::new(10),
+            &WsState::new(16),
+            unknown_session.clone(),
+            &a2a_message_body(),
+        )
+        .await
+        .unwrap();
+
+        let text = logs.text();
+        assert_eq!(response.0["error"]["code"], -32001);
+        assert!(
+            text.contains(&format!(
+                "Onboarding message for invalid or expired session: {}",
+                loggable::secret(&unknown_session)
+            )),
+            "{text}"
+        );
+        for live_session in &live_sessions {
+            assert!(!text.contains(&loggable::secret(live_session)), "{text}");
+        }
+        assert!(!text.contains(&unknown_session), "{text}");
+        assert!(!text.contains(CONTENT_MARKER), "{text}");
     }
 }

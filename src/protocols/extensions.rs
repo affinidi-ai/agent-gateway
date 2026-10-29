@@ -160,16 +160,7 @@ pub async fn inspect_message_extensions(
     // Try to parse as JSON
     let body_json: JsonValue = match serde_json::from_slice::<JsonValue>(body_bytes) {
         Ok(json) => {
-            debug!(channel = ctx.channel_name, "Successfully parsed body as JSON");
-            // Log first 500 chars of JSON for debugging
-            let json_str = serde_json::to_string(&json).unwrap_or_default();
-            let preview = if json_str.len() > 500 {
-                format!("{}...", &json_str[..500])
-            } else {
-                json_str.clone()
-            };
-            debug!(channel = ctx.channel_name, body_preview = %preview, "JSON body preview");
-
+            debug!(channel = ctx.channel_name, body_bytes = body_bytes.len(), "Successfully parsed body as JSON");
             json
         }
         Err(e) => {

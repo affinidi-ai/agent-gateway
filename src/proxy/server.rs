@@ -12,6 +12,7 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tracing::{debug, error, info, warn};
 
 use crate::config::GatewayConfig;
+use crate::observability::loggable;
 use crate::state::{MultiSurfaceProxyState, SurfaceInfo};
 
 // ── Credential delegation global stores ──────────────────────────────────────
@@ -1077,7 +1078,11 @@ pub async fn run_port_server(
                                 })
                         }
                         Err(e) => {
-                            tracing::warn!(error = %e, url = %url, "Outgoing proxy forward failed");
+                            tracing::warn!(
+                                error = %e.without_url(),
+                                url = %loggable::url(&url),
+                                "Outgoing proxy forward failed"
+                            );
                             axum::response::Response::builder()
                                 .status(axum::http::StatusCode::BAD_GATEWAY)
                                 .body(axum::body::Body::empty())
@@ -1201,7 +1206,12 @@ pub async fn run_port_server(
 
     info!("Port listener binding to {:?} for {} channels", bind_addrs, surfaces.len());
     for surface in &surfaces {
-        info!("  Channel '{}' route '{}' -> {}", surface.name, surface.route(), surface.target_endpoint());
+        info!(
+            "  Channel '{}' route '{}' -> {}",
+            surface.name,
+            surface.route(),
+            loggable::url(surface.target_endpoint())
+        );
     }
 
     // Update status to running for all channels
@@ -1576,7 +1586,7 @@ pub async fn run_outbound_port_server(
             info!(
                 surface = %outbound_surface.name,
                 alias = %vc.alias,
-                target = %vc.target_endpoint,
+                target = %loggable::url(&vc.target_endpoint),
                 route = %outbound_wildcard,
                 listen_path = ?vc.listen_path,
                 "Registering outbound virtual channel route"

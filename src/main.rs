@@ -80,6 +80,7 @@ mod x402; // x402 protocol (HTTP Native Payments Protocol)
 mod component_tests;
 
 use config::{BootstrapConfig, GatewayConfig};
+use observability::loggable;
 use storage::{ConfigCache, ConfigurationStore, DynamoDbConfigStore};
 
 /// A2A Protocol Intercepting Proxy
@@ -191,26 +192,6 @@ async fn async_main() -> Result<()> {
             bootstrap_config.cache_refresh_interval_secs
         );
     }
-
-    println!("DEBUG: Loaded bootstrap config from {:?}", config_path);
-    println!(
-        "DEBUG:   config_cache_path: {}",
-        bootstrap_config
-            .storage_paths
-            .config_cache
-    );
-    println!(
-        "DEBUG:   settings_storage_path: {}",
-        bootstrap_config
-            .storage_paths
-            .settings
-    );
-    println!(
-        "DEBUG:   metrics_config_path: {}",
-        bootstrap_config
-            .config_files
-            .metrics
-    );
 
     // Export storage with PII redaction (needs config for storage paths)
     if let Some(output_path) = &args.export_storage {
@@ -542,26 +523,7 @@ async fn async_main() -> Result<()> {
     info!("Starting Affinidi Trust Fabric Gateway");
     info!("Configuration: {}", config_path.display());
 
-    log_startup_configs(&bootstrap_config, &config);
-
-    let active_count = config
-        .surfaces
-        .iter()
-        .filter(|s| s.status == crate::config::agent_surface::SurfaceStatus::Active)
-        .count();
-    let disabled_count = config
-        .surfaces
-        .iter()
-        .filter(|s| s.status == crate::config::agent_surface::SurfaceStatus::Disabled)
-        .count();
-    info!("Configured {} channel(s) ({} active, {} disabled)", config.surfaces.len(), active_count, disabled_count);
-    for surface in config
-        .surfaces
-        .iter()
-        .filter(|s| s.status == crate::config::agent_surface::SurfaceStatus::Active)
-    {
-        info!("  Channel '{}': {} -> {}", surface.name, surface.listen_address(), surface.target_endpoint());
-    }
+    log_startup_summary(&bootstrap_config, &config);
 
     // Validate configuration
     config
@@ -678,15 +640,6 @@ async fn ctrl_c() {
 /// Load configuration from the specified source with fallback to last-known-good config
 /// Channels are loaded from DynamoDB, while TLS, A2A, and logging configs come from bootstrap
 async fn load_configuration(bootstrap: &BootstrapConfig) -> Result<GatewayConfig> {
-    eprintln!("🔍 [CONFIG-LOAD] load_configuration called");
-    eprintln!("🔍 [CONFIG-LOAD] channel_config_source = '{}'", bootstrap.channel_config_source);
-    eprintln!(
-        "🔍 [CONFIG-LOAD] agent surface storage path = '{}'",
-        bootstrap
-            .storage_paths
-            .agent_surfaces
-    );
-
     // Initialize config cache
     let config_cache = ConfigCache::new(
         &bootstrap
@@ -703,6 +656,10 @@ async fn load_configuration(bootstrap: &BootstrapConfig) -> Result<GatewayConfig
                 .dynamodb_table
                 .as_ref()
                 .context("DynamoDB table name not specified")?;
+            let network_config = bootstrap
+                .load_network_config()
+                .context("Failed to load network config for logging configuration")?;
+            let logging = effective_logging(bootstrap, &network_config);
 
             info!("Loading channels from DynamoDB table: {}", table_name);
 
@@ -721,14 +678,7 @@ async fn load_configuration(bootstrap: &BootstrapConfig) -> Result<GatewayConfig
                 // Use TLS, A2A, logging, and extension inspection configs from bootstrap
                 config.tls = bootstrap.tls.clone();
                 config.a2a = bootstrap.a2a.clone();
-                // Logging base (level, json, log_directory) comes from config.toml;
-                // redaction rules come from gateway.json and are merged in below.
-                let gw_redaction = config
-                    .logging
-                    .redaction
-                    .clone();
-                config.logging = bootstrap.logging.clone();
-                config.logging.redaction = gw_redaction;
+                config.logging = logging.clone();
                 config.extension_inspection = bootstrap
                     .extension_inspection
                     .clone();
@@ -801,12 +751,7 @@ async fn load_configuration(bootstrap: &BootstrapConfig) -> Result<GatewayConfig
                                 let mut config = cached.config;
                                 config.tls = bootstrap.tls.clone();
                                 config.a2a = bootstrap.a2a.clone();
-                                let gw_redaction = config
-                                    .logging
-                                    .redaction
-                                    .clone();
-                                config.logging = bootstrap.logging.clone();
-                                config.logging.redaction = gw_redaction;
+                                config.logging = logging;
                                 config.extension_inspection = bootstrap
                                     .extension_inspection
                                     .clone();
@@ -863,22 +808,13 @@ async fn load_configuration(bootstrap: &BootstrapConfig) -> Result<GatewayConfig
             }
         }
         "local" => {
-            eprintln!("🔍 [CONFIG-LOAD] Taking LOCAL branch");
-            eprintln!("[V8]");
-            eprintln!("🔍 [CONFIG-LOAD] Deferring channel loading until after logging is initialized");
-
             // Load network config to get integration configuration
             let network_config_path = &bootstrap.config_files.gateway;
             let network_config = config::NetworkConfig::load_from_file(network_config_path)
                 .context("Failed to load network config for integration configuration")?;
 
             // Create configuration with EMPTY channels (will be loaded after logging is initialized)
-            // Logging base (level, json, log_directory) comes from config.toml;
-            // redaction rules come from gateway.json.
-            let mut logging = bootstrap.logging.clone();
-            if let Some(gw_logging) = &network_config.logging {
-                logging.redaction = gw_logging.redaction.clone();
-            }
+            let logging = effective_logging(bootstrap, &network_config);
 
             let mut config = GatewayConfig {
                 surfaces: Vec::new(), // Empty for now
@@ -917,12 +853,78 @@ async fn load_configuration(bootstrap: &BootstrapConfig) -> Result<GatewayConfig
     }
 }
 
-fn log_startup_configs(
+/// Logging settings for every configuration source: level, JSON output and directory
+/// from `config.toml`, redaction from `gateway.json` `logging.redaction`. Without that
+/// block the built-in redaction rules apply.
+fn effective_logging(
+    bootstrap: &BootstrapConfig,
+    network_config: &config::NetworkConfig,
+) -> config::LoggingConfig {
+    config::LoggingConfig {
+        redaction: network_config
+            .logging
+            .as_ref()
+            .map(|gateway_logging| {
+                gateway_logging
+                    .redaction
+                    .clone()
+            })
+            .unwrap_or_default(),
+        ..bootstrap.logging.clone()
+    }
+}
+
+/// Logs the startup settings that hold no secret and the active surfaces. The
+/// configuration structs themselves are never logged: they can carry keys configured inline.
+fn log_startup_summary(
     bootstrap_config: &BootstrapConfig,
     gateway_config: &GatewayConfig,
 ) {
-    info!("Startup bootstrap config:\n{:#?}", bootstrap_config);
-    info!("Startup effective gateway config:\n{:#?}", gateway_config);
+    info!(
+        "Startup configuration: source={}, server_mode={:?}, auth_mode={:?}, secrets_backend={}, log_redaction={}",
+        bootstrap_config.channel_config_source,
+        bootstrap_config.server_mode,
+        bootstrap_config.auth_mode,
+        bootstrap_config.secrets_backend,
+        if gateway_config
+            .logging
+            .redaction
+            .enabled
+        {
+            "on"
+        } else {
+            "off"
+        }
+    );
+    if !bootstrap_config
+        .logging
+        .redaction
+        .is_built_in()
+    {
+        warn!("[logging.redaction] in config.toml is ignored; move its rules to logging.redaction in gateway.json");
+    }
+
+    let surfaces = &gateway_config.surfaces;
+    let active_count = surfaces
+        .iter()
+        .filter(|s| s.status == crate::config::agent_surface::SurfaceStatus::Active)
+        .count();
+    let disabled_count = surfaces
+        .iter()
+        .filter(|s| s.status == crate::config::agent_surface::SurfaceStatus::Disabled)
+        .count();
+    info!("Configured {} channel(s) ({} active, {} disabled)", surfaces.len(), active_count, disabled_count);
+    for surface in surfaces
+        .iter()
+        .filter(|s| s.status == crate::config::agent_surface::SurfaceStatus::Active)
+    {
+        info!(
+            "  Channel '{}': {} -> {}",
+            surface.name,
+            surface.listen_address(),
+            loggable::url(surface.target_endpoint())
+        );
+    }
 }
 
 /// Load surfaces from storage (called AFTER logging is initialized)
@@ -1097,20 +1099,13 @@ fn init_logging(
     // Build the log redactor from gateway.json config (compiled once, shared via Arc)
     let redactor = observability::LogRedactor::from_config(&config.logging.redaction);
     // Capture the redactor for hot-reload up front, even if OpenTelemetry starts
-    // disabled, so a later enable-via-reload applies the configured span
-    // redaction instead of the default (which would leak matched values).
+    // disabled, so a later enable-via-reload applies the configured redaction.
     observability::set_reload_redactor(redactor.clone());
-    if !redactor.is_empty() {
-        eprintln!(
-            "✅ Log redaction enabled with {} rule(s)",
-            config
-                .logging
-                .redaction
-                .rules
-                .len()
-        );
+    if redactor.is_enabled() {
+        eprintln!("✅ Log redaction enabled with {} rule(s)", redactor.rule_count());
+    } else {
+        eprintln!("⚠️  Log redaction is disabled (logging.redaction.enabled = false)");
     }
-
     // Load metrics configuration from metrics.json
     let metrics_config = match config::load_metrics_config(
         &bootstrap_config
@@ -1149,7 +1144,10 @@ fn init_logging(
                         batch_scheduled_delay_ms: None,
                         batch_max_export_size: None,
                     },
-                    logs: config::metrics_config::LogsConfig { enabled: false },
+                    logs: config::metrics_config::LogsConfig {
+                        enabled: false,
+                        ..Default::default()
+                    },
                 },
                 cloudwatch: config::metrics_config::CloudWatchMetricConfig {
                     enabled: false,
@@ -1197,7 +1195,7 @@ fn init_logging(
             .opentelemetry
             .logs
             .enabled
-            && let Err(e) = observability::init_logs(&otel_config)
+            && let Err(e) = observability::init_logs(&otel_config, redactor.clone())
         {
             eprintln!("⚠️  Failed to initialize OpenTelemetry logs: {}", e);
         }
@@ -1440,7 +1438,7 @@ fn render_default_bootstrap_toml(
         auth_mode: crate::auth::AuthMode::default(),
         // The backup key is required at runtime; generated configs reference an env var
         // (nothing secret committed). Local dev supplies it via the Makefile / config-certs.
-        backup_encryption_key: "env://AG_BACKUP_ENCRYPTION_KEY".to_string(),
+        backup_encryption_key: "env://AG_BACKUP_ENCRYPTION_KEY".into(),
         legacy_backup_encryption_keys: None,
         trust_registry: Default::default(),
         tenancy: Default::default(),
@@ -1581,5 +1579,235 @@ mod duplicate_route_surface_tests {
 
         assert_eq!(channels[0].status, SurfaceStatus::Disabled);
         assert_eq!(channels[1].status, SurfaceStatus::Active, "an already-disabled surface must not claim the route");
+    }
+}
+
+#[cfg(test)]
+mod startup_logging_tests {
+    use super::*;
+    use crate::component_tests::helpers::formatted_logs::FormattedLogs;
+    use crate::config::agent_surface::AgentSurface;
+    use serde_json::json;
+
+    const BACKUP_KEY: &str = "4f1e2d3c5b6a79880f1e2d3c5b6a79884f1e2d3c5b6a79880f1e2d3c5b6a7988";
+    const LEGACY_BACKUP_KEY: &str = "9a8b7c6d5e4f30219a8b7c6d5e4f30219a8b7c6d5e4f30219a8b7c6d5e4f3021";
+    const MPP_SECRET_KEY: &str = "bXBwLWlubGluZS1obWFjLXNlY3JldA==";
+    const STRIPE_SECRET_KEY: &str = "inline-stripe-secret-marker";
+    const X402_PRIVATE_KEY: &str = "0x8f2a559490d3e4b4d2c5e1f7a0b3c6d9e2f5a8b1c4d7e0f3a6b9c2d5e8f1a4b7";
+    const UPSTREAM_QUERY_KEY: &str = "sk-upstream-query-key";
+
+    fn bootstrap(extra: &str) -> BootstrapConfig {
+        toml::from_str(&format!(
+            "backup_encryption_key = \"{BACKUP_KEY}\"\nlegacy_backup_encryption_keys = \"{LEGACY_BACKUP_KEY}\"\n{extra}\n[tls]\ncert_path = \"cert.pem\"\nkey_path = \"key.pem\"\n"
+        ))
+        .expect("test bootstrap config should parse")
+    }
+
+    fn network_config(logging: Option<serde_json::Value>) -> config::NetworkConfig {
+        let mut value = json!({
+            "did": { "domain": "test.local" },
+            "webauthn": { "rp_id": "localhost", "external_origin": "https://localhost" },
+            "integration": { "types": [], "categories": [] },
+            "listeners": [],
+            "routes": {},
+        });
+        if let Some(logging) = logging {
+            value["logging"] = logging;
+        }
+        serde_json::from_value(value).expect("test network config should deserialize")
+    }
+
+    fn paid_surface(
+        id: &str,
+        payment_policy: serde_json::Value,
+    ) -> AgentSurface {
+        serde_json::from_value(json!({
+            "surface_id": id,
+            "name": id,
+            "access_point": {"listen_address": "0.0.0.0:8443", "route": format!("/{id}"), "protocol": "a2a"},
+            "target": {
+                "endpoint": format!("https://upstream.example.com/v1?api_key={UPSTREAM_QUERY_KEY}"),
+                "payment_policy": payment_policy
+            }
+        }))
+        .expect("test surface should deserialize")
+    }
+
+    fn gateway_config(bootstrap: &BootstrapConfig) -> GatewayConfig {
+        GatewayConfig {
+            surfaces: vec![
+                paid_surface(
+                    "mpp-surface",
+                    json!({
+                        "type": "mpp",
+                        "realm": "api.example.com",
+                        "secret_key": MPP_SECRET_KEY,
+                        "stripe_secret_key": STRIPE_SECRET_KEY
+                    }),
+                ),
+                paid_surface(
+                    "x402-surface",
+                    json!({
+                        "type": "x402",
+                        "facilitator_private_keys": {
+                            "eip155:8453": {
+                                "private_key": X402_PRIVATE_KEY,
+                                "address": "0x2c7536E3605D9C16a7a3D7b1898e529396a65c23"
+                            }
+                        }
+                    }),
+                ),
+            ],
+            tls: bootstrap.tls.clone(),
+            a2a: Default::default(),
+            mcp: Default::default(),
+            logging: effective_logging(bootstrap, &network_config(None)),
+            extension_inspection: Default::default(),
+            integration: config::IntegrationConfig::default_config(),
+            facilitator_mode: Default::default(),
+            x402_headers: Default::default(),
+        }
+    }
+
+    fn assert_no_configured_secret(text: &str) {
+        for (setting, value) in [
+            ("backup_encryption_key", BACKUP_KEY),
+            ("legacy_backup_encryption_keys", LEGACY_BACKUP_KEY),
+            ("MPP secret_key", MPP_SECRET_KEY),
+            ("stripe_secret_key", STRIPE_SECRET_KEY),
+            ("x402 private_key", X402_PRIVATE_KEY),
+            ("upstream query key", UPSTREAM_QUERY_KEY),
+        ] {
+            assert!(!text.contains(value), "{setting} leaked: {text}");
+        }
+    }
+
+    #[test]
+    fn test_startup_summary_logs_no_inline_secret() {
+        let bootstrap = bootstrap("");
+        let gateway = gateway_config(&bootstrap);
+        let logs = FormattedLogs::capture();
+
+        log_startup_summary(&bootstrap, &gateway);
+
+        let text = logs.text();
+        assert_no_configured_secret(&text);
+        assert!(
+            text.contains(
+                "Startup configuration: source=local, server_mode=Active, auth_mode=Passkey, secrets_backend=filesystem, log_redaction=on"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("Configured 2 channel(s) (2 active, 0 disabled)"), "{text}");
+        assert!(
+            text.contains("Channel 'mpp-surface': 0.0.0.0:8443 -> https://upstream.example.com/v1?api_key=<redacted>"),
+            "{text}"
+        );
+        assert!(!text.contains("[logging.redaction] in config.toml is ignored"), "{text}");
+    }
+
+    #[test]
+    fn test_startup_summary_warns_that_config_toml_redaction_is_ignored() {
+        let bootstrap = bootstrap("[logging.redaction]\nenabled = false\nrules = []\n");
+        let gateway = gateway_config(&bootstrap);
+        let logs = FormattedLogs::capture();
+
+        log_startup_summary(&bootstrap, &gateway);
+
+        let text = logs.text();
+        assert!(text.contains("WARN"), "{text}");
+        assert!(
+            text.contains(
+                "[logging.redaction] in config.toml is ignored; move its rules to logging.redaction in gateway.json"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn test_gateway_config_debug_redacts_payment_secrets() {
+        let bootstrap = bootstrap("");
+        let rendered = format!("{:?}", gateway_config(&bootstrap));
+
+        for (setting, value) in [
+            ("MPP secret_key", MPP_SECRET_KEY),
+            ("stripe_secret_key", STRIPE_SECRET_KEY),
+            ("x402 private_key", X402_PRIVATE_KEY),
+        ] {
+            assert!(!rendered.contains(value), "{setting} leaked: {rendered}");
+        }
+        assert!(rendered.contains("FacilitatorKeyConfig { private_key: \"<redacted>\""), "{rendered}");
+        assert!(rendered.contains("MppConfig {"), "{rendered}");
+    }
+
+    #[test]
+    fn test_bootstrap_config_debug_redacts_backup_keys() {
+        let bootstrap = bootstrap("");
+        let rendered = format!("{bootstrap:?}");
+
+        assert_eq!(&*bootstrap.backup_encryption_key, BACKUP_KEY);
+        for (setting, value) in
+            [("backup_encryption_key", BACKUP_KEY), ("legacy_backup_encryption_keys", LEGACY_BACKUP_KEY)]
+        {
+            assert!(!rendered.contains(value), "{setting} leaked: {rendered}");
+        }
+        assert!(rendered.contains("backup_encryption_key: \"<redacted>\""), "{rendered}");
+        assert!(rendered.contains("legacy_backup_encryption_keys: Some(\"<redacted>\")"), "{rendered}");
+    }
+
+    #[test]
+    fn test_effective_logging_without_gateway_logging_enables_built_in_redaction() {
+        let bootstrap = bootstrap("[logging]\nlevel = \"debug\"\n[logging.redaction]\nenabled = false\nrules = []\n");
+
+        let logging = effective_logging(&bootstrap, &network_config(None));
+
+        assert_eq!(logging.level, "debug");
+        assert!(
+            logging
+                .redaction
+                .is_built_in()
+        );
+    }
+
+    #[test]
+    fn test_effective_logging_honours_gateway_redaction_switch() {
+        let logging =
+            effective_logging(&bootstrap(""), &network_config(Some(json!({"redaction": {"enabled": false}}))));
+
+        assert!(!logging.redaction.enabled);
+    }
+
+    #[test]
+    fn test_effective_logging_uses_gateway_redaction_rules() {
+        let logging = effective_logging(
+            &bootstrap(""),
+            &network_config(Some(json!({
+                "redaction": {"rules": [{"name": "Ticket ids", "pattern": "TCK-\\d+", "replacement": "[TICKET]"}]}
+            }))),
+        );
+
+        assert!(logging.redaction.enabled);
+        assert_eq!(logging.redaction.rules.len(), 1);
+        assert_eq!(logging.redaction.rules[0].name, "Ticket ids");
+    }
+
+    #[test]
+    fn test_effective_logging_gateway_block_without_redaction_enables_built_in_rules() {
+        let logging = effective_logging(&bootstrap(""), &network_config(Some(json!({"level": "warn"}))));
+
+        assert!(
+            logging
+                .redaction
+                .is_built_in()
+        );
+        assert_eq!(logging.level, "info");
+    }
+
+    #[test]
+    fn test_generated_bootstrap_has_no_redaction_table() {
+        let toml = render_default_bootstrap_toml("", "").expect("bootstrap toml should render");
+
+        assert!(!toml.contains("redaction"), "{toml}");
+        assert!(toml.contains("[logging]"), "{toml}");
     }
 }

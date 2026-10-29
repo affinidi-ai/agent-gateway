@@ -102,6 +102,15 @@ Structured call sites attach searchable fields such as surface identifiers, requ
 latency, and trace context. Some older field names still contain `channel`; treat those as legacy
 telemetry schema names rather than current domain terminology.
 
+Log redaction is on by default for every configuration source. Its rules live in `gateway.json`
+under `logging.redaction`, and `"enabled": false` turns it off. It masks stderr and file output,
+exported OTLP spans and exported OTLP log records. In OTLP exports, a span or log attribute whose
+name marks a credential, such as `authorization`, `cookie`, `token`, `session_id`, `password`,
+`secret` or `api_key`, becomes `<redacted>` whatever its value. `opentelemetry.logs.targets` in
+`metrics.json` limits which log targets are exported over OTLP and defaults to `["*"]`, every
+target. [Log redaction](CONFIGURATION_REFERENCE.md#log-redaction) lists the built-in rules and the
+exact credential names.
+
 ## Request correlation
 
 HTTP tracing and policy auditing attach correlation data to request spans and structured events.
@@ -152,6 +161,39 @@ upgrade for one metrics retention window (6 hours by default).
 
 The gateway propagates `X-Gateway-Trace-Id` to a Target where the request path creates that trace
 identifier, allowing gateway and managed-agent logs to be correlated.
+
+## Access log
+
+[`access_log`](../src/observability/http_trace.rs) logs every inbound HTTP request to the
+`agent_gateway::access` target as two plain-text lines:
+
+| Line | Fields |
+| --- | --- |
+| `➡️  HTTP <method> <path>[?<query>]` | `host`, `accept`, `ua` (`User-Agent`), `origin`, `mcp_sid` (`mcp-session-id`), `xff` (`x-forwarded-for`), `xfp` (`x-forwarded-proto`) |
+| `⬅️  HTTP <method> <path> → <status> (<ms>ms)` | `content-type` of the response |
+
+Both lines are `INFO`, or `DEBUG` for static dashboard assets, `/api/` paths, `did.json` documents
+and dashboard page loads (a `GET` that accepts `text/html`). A field is empty when the request did
+not carry that header.
+
+Query strings keep their parameter names only: each value is logged as `<redacted>`, and a
+parameter sent without `=` is replaced by `<redacted>` whole, so an OAuth `code` or a token passed
+as a query parameter never reaches the log. The same redaction applies to `http.uri` on the
+`http.request` trace span and to `http.url` on the `http.client.send` span, which also drops any
+user name and password in the Target URL. Target and mirror endpoint URLs in other log lines are
+redacted the same way, and a failure to reach a Target or mirror is logged without its URL.
+
+MCP session ids appear only as a prefix: their first 8 characters followed by `...`, or
+`<redacted>` when the id is shorter than 16 characters. This covers `mcp_sid` here and the Legacy
+SSE and Streamable HTTP session ids in the proxy and MCP transport logs. Onboarding session ids in
+a path, the UUID after `/onboard/` or `/delete-temp-channel/`, are shortened the same way in both
+lines and in `http.uri` and `http.path`. With the default
+redaction rules, `mcp_sid` is masked entirely in console and file output, because a built-in
+session rule matches `sid=`.
+
+The `xff` field keeps the client address that the reverse proxy reported. It is personal data in
+many jurisdictions, so ship and retain the access log accordingly. [Log
+redaction](CONFIGURATION_REFERENCE.md#log-redaction) applies to these lines as well.
 
 ## Access token rotation events
 

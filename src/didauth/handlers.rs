@@ -16,6 +16,7 @@ use tracing::{debug, info, warn};
 
 use super::sessions::DidAuthSessionStore;
 use super::verify::{DidAuthVerifyError, verify_challenge_response};
+use crate::observability::loggable;
 use crate::source_auth::models::DidAuthAuthConfig;
 
 /// State passed to the DID Auth HTTP handlers. Bundles the shared session
@@ -71,7 +72,7 @@ pub struct AuthenticateRequest {
 }
 
 /// Response from authenticate endpoint
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 pub struct AuthenticateResponse {
     /// The session token to use in subsequent requests
     pub session_id: String,
@@ -81,6 +82,20 @@ pub struct AuthenticateResponse {
 
     /// How long the session is valid for (seconds)
     pub expires_in: u64,
+}
+
+impl std::fmt::Debug for AuthenticateResponse {
+    fn fmt(
+        &self,
+        formatter: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthenticateResponse")
+            .field("session_id", &loggable::secret(&self.session_id))
+            .field("expires_at", &self.expires_at)
+            .field("expires_in", &self.expires_in)
+            .finish()
+    }
 }
 
 /// Error response body
@@ -234,7 +249,7 @@ pub async fn authenticate_handler(
             info!(
                 surface = %state.surface_id,
                 did = %verified.did,
-                session_id = %session.session_id,
+                session_id = %loggable::secret(&session.session_id),
                 expires_at = %session.expires_at,
                 "Minted DID Auth session"
             );
@@ -293,5 +308,111 @@ fn verify_status(err: &DidAuthVerifyError) -> StatusCode {
         DidAuthVerifyError::ResolverError { .. }
         | DidAuthVerifyError::VerificationMethodNotFound { .. }
         | DidAuthVerifyError::UnsupportedVerificationMethod { .. } => StatusCode::BAD_GATEWAY,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::component_tests::helpers::formatted_logs::FormattedLogs;
+    use base64::Engine as _;
+    use ed25519_dalek::{Signer as _, SigningKey};
+
+    fn base64url(bytes: &[u8]) -> String {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    }
+
+    fn did_key(signing_key: &SigningKey) -> String {
+        let mut multicodec_key = vec![0xed, 0x01];
+        multicodec_key.extend_from_slice(
+            &signing_key
+                .verifying_key()
+                .to_bytes(),
+        );
+        format!("did:key:z{}", bs58::encode(multicodec_key).into_string())
+    }
+
+    fn signed_challenge(
+        signing_key: &SigningKey,
+        did: &str,
+        challenge: &str,
+    ) -> String {
+        let key_fragment = did
+            .strip_prefix("did:key:")
+            .unwrap();
+        let header = serde_json::json!({ "alg": "EdDSA", "kid": format!("{did}#{key_fragment}") });
+        let now = chrono::Utc::now().timestamp();
+        let payload = serde_json::json!({ "challenge": challenge, "iat": now, "exp": now + 300 });
+        let signing_input = format!(
+            "{}.{}",
+            base64url(&serde_json::to_vec(&header).unwrap()),
+            base64url(&serde_json::to_vec(&payload).unwrap())
+        );
+        let signature = signing_key.sign(signing_input.as_bytes());
+        format!("{signing_input}.{}", base64url(&signature.to_bytes()))
+    }
+
+    #[test]
+    fn authenticate_response_debug_shows_only_a_session_id_prefix() {
+        let session_id = "7c1e5a90-2d4b-4f6e-9a8c-b1d2e3f4a5b6";
+        let response = AuthenticateResponse {
+            session_id: session_id.to_string(),
+            expires_at: "2026-01-01T00:00:00Z".to_string(),
+            expires_in: 86400,
+        };
+
+        let rendered = format!("{response:?}");
+
+        assert!(rendered.contains(r#"session_id: "7c1e5a90...""#), "{rendered}");
+        assert!(rendered.contains("expires_in: 86400"), "{rendered}");
+        assert!(!rendered.contains(session_id), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn minting_a_session_logs_only_a_session_id_prefix() {
+        crate::gateways::did_cache::init_shared_resolver()
+            .await
+            .unwrap();
+        let signing_key = SigningKey::from_bytes(&[23u8; 32]);
+        let did = did_key(&signing_key);
+        let state = DidAuthHandlerState {
+            session_store: Arc::new(DidAuthSessionStore::new()),
+            config: Arc::new(DidAuthAuthConfig {
+                extraction: crate::source_auth::models::CredentialExtraction::HttpHeader {
+                    field: "X-DID-Auth-Session".to_string(),
+                },
+                allowed_dids: vec![],
+                challenge_ttl_seconds: None,
+                session_ttl_seconds: None,
+                audience: None,
+                allowed_algorithms: vec![],
+            }),
+            surface_id: "surface-1".to_string(),
+        };
+        let challenge = state
+            .session_store
+            .create_challenge(did.clone(), 60)
+            .await;
+        let request = AuthenticateRequest {
+            challenge_response: signed_challenge(&signing_key, &did, &challenge),
+            did,
+            channel: None,
+        };
+        let logs = FormattedLogs::capture();
+
+        let response = authenticate_handler(State(state), Json(request)).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let session_id = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let text = logs.text();
+        assert!(text.contains("Minted DID Auth session"), "{text}");
+        assert!(text.contains(&format!("session_id={}", loggable::secret(&session_id))), "{text}");
+        assert!(!text.contains(&session_id), "{text}");
     }
 }

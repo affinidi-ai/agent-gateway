@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{Instrument, Level, debug, info};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
+use super::loggable;
+
 /// Opt-in toggle for recording the authenticated caller's identity on the
 /// root HTTP span. Off by default; set from `traces.record_caller_identity`
 /// at startup. When off, [`record_caller_identity_on_current_span`] is a
@@ -141,8 +143,9 @@ fn is_spa_html_navigation(
 }
 
 /// Unconditional access log: logs every inbound HTTP request with method, path,
-/// query, peer, and a small set of headers useful for debugging external
-/// integrations (Accept, Host, User-Agent, Origin, MCP session id).
+/// query parameter names (values redacted), peer, and a small set of headers useful
+/// for debugging external integrations (Accept, Host, User-Agent, Origin, and the
+/// MCP session id as a prefix).
 ///
 /// Logged at INFO so it surfaces in normal logs without enabling debug. Useful
 /// for diagnosing situations where a client (e.g. Microsoft Copilot Studio)
@@ -159,10 +162,7 @@ pub async fn access_log(
     let method = request.method().clone();
     let uri = request.uri().clone();
     let path = uri.path().to_string();
-    let query = uri
-        .query()
-        .unwrap_or("")
-        .to_string();
+    let logged_uri = loggable::uri(&uri);
     let headers = request.headers();
     let host = headers
         .get(axum::http::header::HOST)
@@ -187,8 +187,8 @@ pub async fn access_log(
     let mcp_session_id = headers
         .get("mcp-session-id")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+        .map(loggable::secret)
+        .unwrap_or_default();
     let xfwd_for = headers
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
@@ -205,11 +205,9 @@ pub async fn access_log(
     if is_asset {
         debug!(
             target: "agent_gateway::access",
-            "➡️  HTTP {} {}{}{} host=\"{}\" accept=\"{}\" ua=\"{}\" origin=\"{}\" mcp_sid=\"{}\" xff=\"{}\" xfp=\"{}\"",
+            "➡️  HTTP {} {} host=\"{}\" accept=\"{}\" ua=\"{}\" origin=\"{}\" mcp_sid=\"{}\" xff=\"{}\" xfp=\"{}\"",
             method,
-            path,
-            if query.is_empty() { "" } else { "?" },
-            query,
+            logged_uri,
             host,
             accept,
             user_agent,
@@ -221,11 +219,9 @@ pub async fn access_log(
     } else {
         info!(
             target: "agent_gateway::access",
-            "➡️  HTTP {} {}{}{} host=\"{}\" accept=\"{}\" ua=\"{}\" origin=\"{}\" mcp_sid=\"{}\" xff=\"{}\" xfp=\"{}\"",
+            "➡️  HTTP {} {} host=\"{}\" accept=\"{}\" ua=\"{}\" origin=\"{}\" mcp_sid=\"{}\" xff=\"{}\" xfp=\"{}\"",
             method,
-            path,
-            if query.is_empty() { "" } else { "?" },
-            query,
+            logged_uri,
             host,
             accept,
             user_agent,
@@ -250,36 +246,16 @@ pub async fn access_log(
         debug!(
             target: "agent_gateway::access",
             "⬅️  HTTP {} {} → {} ({}ms) content-type=\"{}\"",
-            method, path, status.as_u16(), elapsed_ms, resp_ct
+            method, loggable::path(&path), status.as_u16(), elapsed_ms, resp_ct
         );
     } else {
         info!(
             target: "agent_gateway::access",
             "⬅️  HTTP {} {} → {} ({}ms) content-type=\"{}\"",
-            method, path, status.as_u16(), elapsed_ms, resp_ct
+            method, loggable::path(&path), status.as_u16(), elapsed_ms, resp_ct
         );
     }
     response
-}
-
-/// Check if a request path should be traced
-/// Returns true ONLY for agent-to-agent communication, NOT dashboard/API calls
-///
-/// This dynamically checks against registered channel and MCP proxy prefixes.
-/// Prefixes are registered when channels/MCP proxies are created.
-///
-/// This traces ONLY:
-/// - A2A/MCP protocol traffic (agents using channels) - based on registered channel prefixes
-/// - Background tasks are traced separately via spawn_traced_task
-///
-/// This does NOT trace:
-/// - Identity API endpoints (dashboard/UX)
-/// - Metrics, logs, monitoring endpoints
-/// - Static files
-#[allow(dead_code)]
-fn should_trace_request(path: &str) -> bool {
-    // Use the dynamic trace registry to check if this path should be traced
-    super::should_trace_path(path)
 }
 
 /// Middleware that creates a root span for each HTTP request
@@ -351,8 +327,8 @@ pub async fn trace_http_request(
             "http.request",
             otel.name = %span_name,
             http.method = %method,
-            http.uri = %uri,
-            http.path = %path,
+            http.uri = %loggable::uri(&uri),
+            http.path = %loggable::path(&path),
             http.status_code = tracing::field::Empty,
             caller.auth_method = tracing::field::Empty,
             caller.principal = tracing::field::Empty,
@@ -367,8 +343,8 @@ pub async fn trace_http_request(
             "http.request",
             otel.name = %span_name,
             http.method = %method,
-            http.uri = %uri,
-            http.path = %path,
+            http.uri = %loggable::uri(&uri),
+            http.path = %loggable::path(&path),
             http.status_code = tracing::field::Empty,
             caller.auth_method = tracing::field::Empty,
             caller.principal = tracing::field::Empty,
@@ -536,6 +512,98 @@ mod tests {
         assert_eq!(field(&f, "caller.did"), None);
     }
 
+    #[tokio::test]
+    async fn access_log_keeps_query_parameter_names_and_redacts_values() {
+        use tower::ServiceExt;
+
+        let app = axum::Router::new()
+            .route("/v1/oauth/callback", axum::routing::get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(access_log));
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        for uri in
+            ["/v1/oauth/callback?code=oauth-code-value&state=oauth-state-value", "/v1/oauth/callback?bare-token-value"]
+        {
+            let request = axum::http::Request::builder()
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let response = app
+                .clone()
+                .oneshot(request)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+        }
+
+        let text = logs.text();
+        assert!(text.contains("HTTP GET /v1/oauth/callback?code=<redacted>&state=<redacted> host="), "{text}");
+        assert!(text.contains("HTTP GET /v1/oauth/callback?<redacted> host="), "{text}");
+        assert!(text.contains("HTTP GET /v1/oauth/callback → 200"), "{text}");
+        for (parameter, value) in
+            [("code", "oauth-code-value"), ("state", "oauth-state-value"), ("bare", "bare-token-value")]
+        {
+            assert!(!text.contains(value), "the access log holds the {parameter} value: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn access_log_records_only_a_prefix_of_an_onboarding_session_id() {
+        use tower::ServiceExt;
+
+        let session_id = "0f2c9d7e-1b3a-4c5d-8e9f-a0b1c2d3e4f5";
+        let app = axum::Router::new()
+            .route("/onboard/{uuid}/rpc", axum::routing::post(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(access_log));
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/onboard/{session_id}/rpc"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let text = logs.text();
+        assert!(text.contains("HTTP POST /onboard/0f2c9d7e.../rpc host="), "{text}");
+        assert!(text.contains("HTTP POST /onboard/0f2c9d7e.../rpc → 200"), "{text}");
+        assert!(!text.contains(session_id), "{text}");
+    }
+
+    #[tokio::test]
+    async fn access_log_records_only_a_prefix_of_the_mcp_session_id() {
+        use tower::ServiceExt;
+
+        let session_id = "0f2c9d7e1b3a4c5d8e9fa0b1c2d3e4f5";
+        let app = axum::Router::new()
+            .route("/mcp", axum::routing::post(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(access_log));
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("mcp-session-id", session_id)
+                    .header("x-forwarded-for", "203.0.113.7")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let text = logs.text();
+        assert!(text.contains(r#"mcp_sid="0f2c9d7e...""#), "{text}");
+        assert!(text.contains(r#"xff="203.0.113.7""#), "{text}");
+        assert!(!text.contains(session_id), "the access log holds the full session id: {text}");
+    }
+
     // ── Component test: proxied request produces a span with caller.* ──────────
 
     use super::span_capture::{CapturingExporter, capture_spans, span_attr};
@@ -656,6 +724,67 @@ mod tests {
             Some("[REDACTED-EMAIL]"),
             "principal email must be redacted by the redacting span exporter"
         );
+    }
+
+    #[test]
+    fn http_request_span_redacts_query_values_in_http_uri() {
+        use axum::{Router, body::Body, http::Request, routing::get};
+        use opentelemetry::trace::TracerProvider as _;
+        use tower::ServiceExt;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        super::super::register_channel_prefix("/test-uri-span".to_string(), "Test Uri Span".to_string());
+
+        let captured = Arc::new(Mutex::new(Vec::<SpanData>::new()));
+        let exporter = CapturingExporter { spans: captured.clone() };
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter)
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::OpenTelemetryLayer::new(provider.tracer("test")));
+
+        {
+            let _guard = crate::component_tests::helpers::thread_subscriber::set_thread_default(subscriber);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let app = Router::new()
+                    .route("/test-uri-span/callback", get(|| async { "ok" }))
+                    .layer(axum::middleware::from_fn(trace_http_request));
+                let request = Request::builder()
+                    .uri("/test-uri-span/callback?code=oauth-code-value&bare-token-value")
+                    .body(Body::empty())
+                    .unwrap();
+                let response = app
+                    .oneshot(request)
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), axum::http::StatusCode::OK);
+            });
+        }
+
+        provider
+            .force_flush()
+            .unwrap();
+
+        let spans = captured.lock().unwrap();
+        let http_span = spans
+            .iter()
+            .find(|span| span_attr(span, "http.path").as_deref() == Some("/test-uri-span/callback"))
+            .expect("the request exported an http.request span");
+        assert_eq!(
+            span_attr(http_span, "http.uri").as_deref(),
+            Some("/test-uri-span/callback?code=<redacted>&<redacted>")
+        );
+        for span in spans.iter() {
+            for attribute in &span.attributes {
+                let value = attribute.value.as_str();
+                assert!(!value.contains("oauth-code-value"), "{} holds a query value", attribute.key);
+                assert!(!value.contains("bare-token-value"), "{} holds a query value", attribute.key);
+            }
+        }
     }
 
     #[test]

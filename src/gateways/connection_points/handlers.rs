@@ -1012,10 +1012,7 @@ pub async fn create_connection_point<P: ConnectionPointStore + 'static, G: Gatew
         info!("✓ WebSocket listener started successfully for connection point '{}'", connection_point.name);
     }
 
-    // Trigger connection_point.created integration (async, non-blocking)
-    if let Some(notif) = notif_store.as_ref() {
-        crate::integrations::trigger_connection_point_created_async(Some(notif.clone()), &connection_point);
-    }
+    crate::integrations::trigger_connection_point_created(&connection_point);
 
     Ok(Json(CreateConnectionPointResponse { connection_point }))
 }
@@ -1323,7 +1320,6 @@ pub async fn delete_connection_point<S: ConnectionPointStore>(
     Extension(store): Extension<std::sync::Arc<S>>,
     Extension(gateway_store): Extension<std::sync::Arc<crate::gateways::FileSystemGatewayStore>>,
     Extension(listener_manager): Extension<std::sync::Arc<ConnectionPointListenerManager>>,
-    Extension(notif_store): Extension<Option<std::sync::Arc<crate::integrations::FileSystemNotificationStore>>>,
     Path(id): Path<String>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
@@ -1351,10 +1347,7 @@ pub async fn delete_connection_point<S: ConnectionPointStore>(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to delete connection point: {}", e)))?;
 
-    // Trigger connection_point.deleted integration (async, non-blocking)
-    if let Some(notif) = notif_store.as_ref() {
-        crate::integrations::trigger_connection_point_deleted_async(Some(notif.clone()), &connection_point);
-    }
+    crate::integrations::trigger_connection_point_deleted(&connection_point);
 
     info!("Connection point '{}' deleted successfully", id);
     Ok(StatusCode::NO_CONTENT)
@@ -1395,7 +1388,6 @@ pub async fn update_connection_point<S: ConnectionPointStore>(
     Extension(store): Extension<std::sync::Arc<S>>,
     Extension(gateway_store): Extension<std::sync::Arc<crate::gateways::FileSystemGatewayStore>>,
     Extension(listener_manager): Extension<std::sync::Arc<ConnectionPointListenerManager>>,
-    Extension(notif_store): Extension<Option<std::sync::Arc<crate::integrations::FileSystemNotificationStore>>>,
     Path(id): Path<String>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
@@ -1441,14 +1433,7 @@ pub async fn update_connection_point<S: ConnectionPointStore>(
         // Don't fail the update if listener name update fails
     }
 
-    // Trigger connection_point.updated integration (async, non-blocking)
-    if let Some(notif) = notif_store.as_ref() {
-        crate::integrations::trigger_connection_point_updated_async(
-            Some(notif.clone()),
-            &old_connection_point,
-            &connection_point,
-        );
-    }
+    crate::integrations::trigger_connection_point_updated(&old_connection_point, &connection_point);
 
     info!("✓ Connection point '{}' updated successfully", connection_point.name);
 
@@ -1502,12 +1487,15 @@ pub async fn update_connection_point_exposed_channels<S: ConnectionPointStore>(
         }
     }
 
+    let old_connection_point = connection_point.clone();
     connection_point.exposed_channels = req.exposed_channels.clone();
 
     store
         .update(&connection_point)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update connection point: {}", e)))?;
+
+    crate::integrations::trigger_connection_point_updated(&old_connection_point, &connection_point);
 
     if connection_point
         .exposed_channels

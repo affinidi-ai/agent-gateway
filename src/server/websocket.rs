@@ -19,6 +19,8 @@ use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast};
 use tracing::{debug, error, info, warn};
 
+use crate::observability::loggable;
+
 /// WebSocket update message types
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -178,10 +180,23 @@ impl SessionTokenSource {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct SessionToken {
     token: String,
     source: SessionTokenSource,
+}
+
+impl std::fmt::Debug for SessionToken {
+    fn fmt(
+        &self,
+        formatter: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        formatter
+            .debug_struct("SessionToken")
+            .field("token", &loggable::secret(&self.token))
+            .field("source", &self.source)
+            .finish()
+    }
 }
 
 /// WebSocket handler (unauthenticated - for backward compatibility)
@@ -230,20 +245,14 @@ pub async fn ws_handler_authenticated(
             (StatusCode::UNAUTHORIZED, "Invalid or expired session".to_string()).into_response()
         })?;
     verify_websocket_terms(&session, &terms_manager).await?;
-    let username = session.username;
     let user_id = session.user_id;
 
-    info!(
-        "WebSocket connection authenticated for user: {} ({}) via {}",
-        username,
-        user_id,
-        session_token.source.as_str()
-    );
+    info!("WebSocket connection authenticated for user_id: {} via {}", user_id, session_token.source.as_str());
 
     // Upgrade connection
     let ws_state = state.ws_state.clone();
     Ok(ws
-        .on_upgrade(move |socket| handle_socket(socket, ws_state, Some(username)))
+        .on_upgrade(move |socket| handle_socket(socket, ws_state, Some(user_id)))
         .into_response())
 }
 
@@ -389,7 +398,7 @@ fn normalize_origin(origin: &str) -> Option<String> {
 async fn handle_socket(
     socket: WebSocket,
     state: Arc<WsState>,
-    username: Option<String>,
+    user_id: Option<String>,
 ) {
     let (mut sender, mut receiver) = socket.split();
     let mut rx = state.subscribe();
@@ -413,8 +422,8 @@ async fn handle_socket(
         return;
     }
 
-    if let Some(ref user) = username {
-        debug!("WebSocket client connected (user: {})", user);
+    if let Some(ref user_id) = user_id {
+        debug!("WebSocket client connected (user_id: {})", user_id);
     } else {
         debug!("WebSocket client connected (unauthenticated)");
     }
@@ -476,7 +485,7 @@ async fn handle_socket(
 
     // Handle incoming messages from client (ping/pong, close, and subscribe)
     let recv_sub = Arc::clone(&subscription);
-    let recv_username = username.clone();
+    let recv_user_id = user_id.clone();
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = receiver.next().await {
             match msg {
@@ -504,7 +513,7 @@ async fn handle_socket(
                                 };
                                 debug!(
                                     "WebSocket client {} subscribed to: [{}]",
-                                    recv_username
+                                    recv_user_id
                                         .as_deref()
                                         .unwrap_or("anon"),
                                     label,
@@ -516,16 +525,16 @@ async fn handle_socket(
                             } else {
                                 info!(
                                     "WebSocket client {} sent subscribe but failed to parse sections",
-                                    recv_username
+                                    recv_user_id
                                         .as_deref()
                                         .unwrap_or("anon"),
                                 );
                             }
                         } else {
-                            debug!("Received non-subscribe text message: {}", text);
+                            debug!("Received non-subscribe text message ({} bytes)", text.len());
                         }
                     } else {
-                        debug!("Received unparseable text message: {}", text);
+                        debug!("Received unparseable text message ({} bytes)", text.len());
                     }
                 }
                 Message::Ping(_) => {
@@ -549,8 +558,8 @@ async fn handle_socket(
         _ = (&mut recv_task) => send_task.abort(),
     };
 
-    if let Some(ref user) = username {
-        debug!("WebSocket client disconnected (user: {})", user);
+    if let Some(ref user_id) = user_id {
+        debug!("WebSocket client disconnected (user_id: {})", user_id);
     } else {
         debug!("WebSocket client disconnected");
     }
@@ -704,6 +713,19 @@ mod tests {
 
         assert_eq!(token.token, "cookie-token");
         assert_eq!(token.source, SessionTokenSource::Cookie);
+    }
+
+    #[test]
+    fn session_token_debug_shows_only_a_token_prefix() {
+        let token = "0f2c9d7e-1b3a-4c5d-8e9f-a0b1c2d3e4f5";
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {token}")).unwrap());
+        let session_token = extract_session_token(&headers, &HashMap::new()).expect("token should be extracted");
+
+        let rendered = format!("{session_token:?}");
+
+        assert_eq!(rendered, r#"SessionToken { token: "0f2c9d7e...", source: AuthorizationHeader }"#);
+        assert!(!rendered.contains(token), "{rendered}");
     }
 
     #[test]
