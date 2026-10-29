@@ -108,6 +108,11 @@ The Trust Recorder panel and its entries warn while an entry uses the surface Is
 Authority and the surface has no Issuer or its Issuer no longer exists; see _Trust Recorder_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#trust-recorder).
 
+Delete confirmations shown in the page (JWT verification strategies, secrets referenced by
+credential providers) take focus when they open, close on Escape, and return focus to the Delete
+button; see _JWT verification strategies_ and _Secret editor_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#secret-editor).
+
 The Identities page shows a Trust Recorder status chip and a Recorder filter, and the Trust
 Recorder panel shows a Last outcome row; see _Identities page_ and _Trust Recorder panel_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#trust-recorder-panel).

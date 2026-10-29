@@ -2,6 +2,7 @@ pub mod given;
 pub mod identities;
 pub mod names;
 pub mod policy_changes;
+pub mod strategy_discovery;
 pub mod sts;
 pub mod target_token;
 pub mod terms;

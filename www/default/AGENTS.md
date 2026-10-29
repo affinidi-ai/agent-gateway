@@ -132,7 +132,10 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   sidebar and the fullscreen editor: a `fabric://` target cannot use a provider on the sending
   gateway. Save is blocked (`managedAgentDefinition.validate`) while the type is Credential
   Provider and no provider is picked, the custom header name or `{value}` format is wrong, the
-  URL is not `https://`, or the endpoint is not a direct URL. The sixth type, **Unsupported method
+  URL is not `https://`, or the endpoint is not a direct URL. The fullscreen editor ties that
+  reason (`target-auth-error`, from `credentialProviderAuthProblem`) and the picker's
+  `-unusable` and `-error` messages to the field they concern with `aria-describedby` and
+  `aria-invalid`, and marks the starred fields `aria-required`. The sixth type, **Unsupported method
   (kept as saved)**, is never chosen by hand. Any `target.auth` variant the dashboard cannot
   edit (an unknown method, `credential_lookup`, a `credential_provider` with an `inject_as`
   type other than `bearer_header` or `custom_header`, or with fields the form does not model)
@@ -425,7 +428,12 @@ Keep labels associated, timestamps exact, and clipboard failures visible.
   use the strategy (read from `/api/v1/surfaces`; "Could not check" when that fails), and states
   that a caller presenting a token is refused with `500` and a caller without one is left to the
   surface's policy (see `docs/SOURCE_AUTH.md#source-authentication`). A refused delete shows
-  inline in `strategy-delete-error`.
+  inline in `strategy-delete-error`. Opening the confirmation moves focus into it and scrolls it
+  into view; Escape or Cancel closes it and returns focus to the row's Delete button, and a
+  confirmed delete moves focus to the list heading (`hooks/useInPageConfirm.ts`). Only the
+  surfaces of the strategy asked about last are shown.
+- A Discover that answers after the Expected Issuer was edited is ignored, so the page never
+  shows or saves metadata for an issuer it no longer names.
 - Provider-neutral trust is configured through JWT verification strategies and credential
   providers; the dashboard has no OIDC Providers page.
 
@@ -458,6 +466,10 @@ Keep labels associated, timestamps exact, and clipboard failures visible.
   credential (see `docs/CREDENTIAL_DELEGATION.md#binding-a-provider-to-a-surface`). A provider
   whose `provider_type` the dashboard does not know opens read-only with `provider-unknown-type` (disabled form, no save button, no
   `Cmd+S` save), so it can never be saved with a guessed type.
+- A form error (`provider-error`, role `alert`) is announced. The Provider ID is derived from the
+  Name for every type except Authorization Code, so a Name with no ASCII letter or digit is
+  refused with "Name must contain at least one letter or number."; for Authorization Code the
+  error names the **Callback URL Route** field.
 - The delegation pickers (the surface-level outbound bindings and the Transit Point
   credential binding) list only providers whose type permits `legacy_delegation`, and keep a
   saved provider that is no longer allowed selectable with a `not usable here` label
@@ -472,7 +484,9 @@ Keep labels associated, timestamps exact, and clipboard failures visible.
 - Permissions: the list, add, delete, and the provider picker use `credential_providers.view`,
   `.edit` and `.delete` (administrator by default, matching `src/rbac/mod.rs`), not
   `settings.edit`. `/credential-providers/new` needs `.edit`, `/credential-providers/:id` needs
-  `.view` and shows the form read-only without `.edit`. Without `.view` the list shows a
+  `.view` and shows the form read-only without `.edit`, with a `provider-read-only` notice
+  saying the role can view but not change it. Each list row's name is a link to the provider,
+  so every role that can list providers can open one from the keyboard. Without `.view` the list shows a
   notice and the Target Authentication picker keeps the saved provider id read-only, because a
   role that can edit surfaces cannot list providers.
 
@@ -496,7 +510,9 @@ Keep labels associated, timestamps exact, and clipboard failures visible.
   `secret-delete-warning-cancel-button`. The gateway does not block the delete, so confirming
   deletes. A secret nothing references deletes at once; a failed read shows
   `secret-delete-warning-unknown` and still allows the delete; without `credential_providers.view`
-  there is no check.
+  there is no check. The warning takes focus when it opens; Escape or Cancel returns focus to
+  the Delete button, and a confirmed delete in the Secrets list moves focus to the list heading
+  (`hooks/useInPageConfirm.ts`).
 - **Show the value you entered** (`secret-value-reveal-checkbox`) appears only while the
   value field is editable, and reveals only what was typed or generated on this page. The
   value field is `secret-value-input`.

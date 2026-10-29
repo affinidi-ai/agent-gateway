@@ -137,13 +137,18 @@ cargo test --test surface_bdd
 make gw-e2e
 ```
 
+`surface_bdd` fails a run that skips a step, so a scenario whose steps have no binding compiled
+into the runner fails rather than passing unnoticed. Register every new step module in
+`tests/surface_bdd/steps/mod.rs` and every support module in `tests/bdd_support/mod.rs`.
+Scenarios tagged `@wip` are filtered out before they run.
+
 `make gw-e2e` starts mediator containers, sets `FABRIC_BDD_MANAGED_MEDIATOR`, and runs
 with `G2G_BDD_PARALLELISM` scenarios at once, 8 by default. Set
 `G2G_BDD_PARALLELISM=1` when a failure is hard to attribute.
 
 Target Authentication through a credential provider is covered by the `surface_bdd` feature
-`target_authentication_provider` (the gateway token on the card fetch and on calls, token reuse
-and the `reject` and `passthrough` fallbacks). The local provider in
+`target_authentication_provider` (the gateway token on the card fetch and on calls, token reuse,
+no token on other public reads, and the `reject` and `passthrough` fallbacks). The local provider in
 [`tests/bdd_support/oidc.rs`](../../tests/bdd_support/oidc.rs) counts token requests, which is
 how a scenario asserts that one token served several requests. The `g2g_bdd` provider scenarios
 cover the card fetch across the Fabric.

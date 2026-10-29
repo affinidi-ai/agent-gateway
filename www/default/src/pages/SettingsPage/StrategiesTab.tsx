@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { apiClient } from '../../api';
 import { usePermissions } from '../../context/PermissionsContext';
@@ -8,6 +8,7 @@ import { AppButton } from '../../components/shared/AppButton';
 import { EmptyState } from '../../components/shared/EmptyState';
 import { DOCS_URL } from '../../config/docs';
 import { surfacesUsingStrategy, type SurfaceRef } from '../../utils/strategyUsage';
+import { useInPageConfirm } from '../../hooks/useInPageConfirm';
 
 export interface JwksSource {
   type: 'remote' | 'static';
@@ -47,6 +48,11 @@ const StrategiesTab: React.FC<StrategiesTabProps> = ({
   const [confirming, setConfirming] = useState<JwtVerificationStrategy | null>(null);
   const [usedBy, setUsedBy] = useState<SurfaceRef[] | 'loading' | 'unknown'>('loading');
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const checkingId = useRef<string | null>(null);
+  const headingRef = useRef<HTMLHeadingElement>(null);
+  const { dialogRef, rememberTrigger, returnFocus, cancelOnEscape } = useInPageConfirm(
+    confirming?.id ?? null
+  );
 
   const canEdit = hasPermission('jwt_verification_strategies.edit');
   const canDelete = hasPermission('jwt_verification_strategies.delete');
@@ -73,16 +79,26 @@ const StrategiesTab: React.FC<StrategiesTabProps> = ({
   };
 
   const askDelete = async (strategy: JwtVerificationStrategy) => {
+    rememberTrigger();
+    checkingId.current = strategy.id;
     setConfirming(strategy);
     setDeleteError(null);
     setUsedBy('loading');
+    let result: SurfaceRef[] | 'unknown';
     try {
       const response = await apiClient.fetch('/api/v1/surfaces');
       if (!response.ok) throw new Error(response.statusText);
-      setUsedBy(surfacesUsingStrategy(await response.json(), strategy.id));
+      result = surfacesUsingStrategy(await response.json(), strategy.id);
     } catch {
-      setUsedBy('unknown');
+      result = 'unknown';
     }
+    if (checkingId.current === strategy.id) setUsedBy(result);
+  };
+
+  const cancelDelete = () => {
+    checkingId.current = null;
+    returnFocus();
+    setConfirming(null);
   };
 
   const handleDelete = async (strategy: JwtVerificationStrategy) => {
@@ -97,6 +113,8 @@ const StrategiesTab: React.FC<StrategiesTabProps> = ({
         throw new Error(`Delete failed: ${response.statusText}`);
       }
       setStrategies(prev => prev.filter(s => s.id !== strategy.id));
+      checkingId.current = null;
+      headingRef.current?.focus();
       setConfirming(null);
     } catch (e: any) {
       setDeleteError(e.message ?? 'Delete failed');
@@ -120,7 +138,7 @@ const StrategiesTab: React.FC<StrategiesTabProps> = ({
       {/* Search + Add */}
       <div className="card shadow mb-4">
         <div className="card-header py-3 d-flex justify-content-between align-items-center">
-          <h6 className="m-0 font-weight-bold text-primary">
+          <h6 className="m-0 font-weight-bold text-primary" ref={headingRef} tabIndex={-1}>
             <i className="fas fa-id-badge"></i> JWT Verification Strategies
             <Badge
               value={filtered.length}
@@ -165,10 +183,13 @@ const StrategiesTab: React.FC<StrategiesTabProps> = ({
 
           {confirming && (
             <div
+              ref={dialogRef}
+              tabIndex={-1}
               className="alert alert-warning"
               role="alertdialog"
               aria-labelledby="strategy-delete-title"
               data-testid="strategy-delete-confirm"
+              onKeyDown={cancelOnEscape(cancelDelete, deletingId === confirming.id)}
             >
               <strong id="strategy-delete-title">
                 Delete JWT verification strategy &quot;{confirming.name}&quot;?
@@ -215,7 +236,7 @@ const StrategiesTab: React.FC<StrategiesTabProps> = ({
                 variant="secondary"
                 size="sm"
                 data-testid="strategy-delete-cancel-button"
-                onClick={() => setConfirming(null)}
+                onClick={cancelDelete}
                 disabled={deletingId === confirming.id}
               >
                 Cancel

@@ -28,6 +28,7 @@ STATE_DIR="${OIDC_DEMO_STATE_DIR:-${REPO_ROOT}/envs/oidc-demo-run}"
 SECRETS_DIR="${STATE_DIR}/secrets"
 GATEWAY_ENV_REL="${OIDC_DEMO_GATEWAY_ENV_REL:-tmp/local-oidc-demo}"
 GATEWAY_ENV_DIR="${REPO_ROOT}/${GATEWAY_ENV_REL}"
+GATEWAY_LOG_FILE="${GATEWAY_ENV_DIR}/gateway.log"
 
 # Same formula as scripts/_prepare.sh (assign_ports) for the env named local-oidc-demo.
 _gateway_offset() {

@@ -129,4 +129,67 @@ describe('Strategies list', () => {
     expect(error).toHaveTextContent('Delete failed: Conflict');
     expect(screen.getByText('Strategy b')).toBeInTheDocument();
   });
+
+  it('moves focus into the confirmation and back to the Delete button on Cancel', async () => {
+    renderTab();
+    await screen.findByText('Strategy b');
+    const trigger = screen.getByRole('button', { name: 'Delete strategy Strategy b' });
+    trigger.focus();
+    fireEvent.click(trigger);
+    const panel = await screen.findByTestId('strategy-delete-confirm');
+    await waitFor(() => expect(panel).toHaveFocus());
+    fireEvent.click(screen.getByTestId('strategy-delete-cancel-button'));
+    expect(screen.queryByTestId('strategy-delete-confirm')).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
+  });
+
+  it('closes on Escape without deleting and returns focus to the Delete button', async () => {
+    renderTab();
+    await screen.findByText('Strategy b');
+    const trigger = screen.getByRole('button', { name: 'Delete strategy Strategy b' });
+    trigger.focus();
+    fireEvent.click(trigger);
+    const panel = await screen.findByTestId('strategy-delete-confirm');
+    fireEvent.keyDown(panel, { key: 'Escape' });
+    expect(screen.queryByTestId('strategy-delete-confirm')).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
+    expect(mockFetch.mock.calls.some(([, init]) => init?.method === 'DELETE')).toBe(false);
+  });
+
+  it('moves focus to the list heading after a confirmed delete', async () => {
+    renderTab();
+    await screen.findByText('Strategy b');
+    fireEvent.click(screen.getByRole('button', { name: 'Delete strategy Strategy b' }));
+    await waitFor(() =>
+      expect(screen.getByTestId('strategy-delete-confirm')).toHaveTextContent(/No surface/)
+    );
+    fireEvent.click(screen.getByTestId('strategy-delete-confirm-button'));
+    await waitFor(() => expect(screen.queryByText('Strategy b')).not.toBeInTheDocument());
+    expect(screen.getByRole('heading', { name: /JWT Verification Strategies/ })).toHaveFocus();
+  });
+
+  it('shows the surfaces of the strategy asked about last when an earlier check answers late', async () => {
+    const pending: Array<(body: unknown) => void> = [];
+    mockFetch.mockImplementation(async (url: string) => {
+      if (url === '/api/v1/surfaces') {
+        return new Promise(resolve => pending.push(body => resolve(json(body))));
+      }
+      return json([strategy('a', true), strategy('b', false)]);
+    });
+    renderTab();
+    await screen.findByText('Strategy b');
+    fireEvent.click(screen.getByRole('button', { name: 'Delete strategy Strategy b' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Delete strategy Strategy a' }));
+    await waitFor(() => expect(pending).toHaveLength(2));
+    const panel = screen.getByTestId('strategy-delete-confirm');
+    expect(panel).toHaveTextContent('Delete JWT verification strategy "Strategy a"?');
+
+    pending[1](surfaces);
+    await waitFor(() => expect(panel).toHaveTextContent('Helpdesk'));
+    pending[0]([]);
+    await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(3));
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(panel).toHaveTextContent('Helpdesk');
+    expect(panel).not.toHaveTextContent('No surface uses it.');
+  });
 });

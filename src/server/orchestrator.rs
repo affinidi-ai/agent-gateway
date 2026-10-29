@@ -4345,8 +4345,6 @@ async fn rederive_planes_on_activation(
     )
     .await;
 
-    crate::delegation_vault::gateway_token::target_token_cache().invalidate_all();
-
     // 2. Rebuild channels + surfaces from the refreshed surfaces on disk.
     let reloading = identity_state
         .surface_reload_lock
@@ -4438,8 +4436,9 @@ async fn rederive_planes_on_activation(
 }
 
 /// Reconcile the JWT verification strategy and credential provider stores with
-/// disk, then drop every cached JWKS key set so the next token is checked
-/// against keys fetched for the reconciled strategies.
+/// disk, then drop every cached JWKS key set and every kept gateway token so the
+/// next caller token is checked against keys fetched for the reconciled strategies
+/// and the next Target call is granted by the reconciled providers.
 async fn reconcile_caller_and_target_credentials(
     strategies: Option<&dyn crate::jwt_bearer::JwtVerificationStrategyStorage>,
     providers: Option<&dyn crate::credential_providers::storage::CredentialProviderStorage>,
@@ -4460,6 +4459,7 @@ async fn reconcile_caller_and_target_credentials(
         warn!("Credential provider store refresh on activation failed: {e}");
     }
     jwks_client.clear().await;
+    crate::delegation_vault::gateway_token::target_token_cache().invalidate_all();
 }
 
 /// Initialize passkey authentication state
@@ -4591,7 +4591,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn activation_reconciles_strategies_and_providers_and_drops_cached_jwks() {
+    async fn activation_reconciles_strategies_and_providers_and_drops_cached_jwks_and_gateway_tokens() {
         let storage = tempfile::TempDir::new().unwrap();
         let strategies_dir = storage
             .path()
@@ -4665,8 +4665,78 @@ mod tests {
             .unwrap();
         assert_eq!(stale.expected_issuer, auth_server.issuer());
 
-        reconcile_caller_and_target_credentials(Some(&standby_strategies), Some(&standby_providers), &standby_jwks)
+        let _test_mode = crate::component_tests::helpers::test_mode::TestModeEnv::enabled_for(&auth_server);
+        auth_server.register_client("activation-client", "activation-secret");
+        let secrets: std::sync::Arc<dyn crate::secrets::SecretsStore> = std::sync::Arc::new(
+            crate::secrets::FilesystemSecretsStore::new_async(
+                storage
+                    .path()
+                    .join("secrets")
+                    .to_str()
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+        );
+        for (secret_id, value) in [("CC_ID", "activation-client"), ("CC_SECRET", "activation-secret")] {
+            secrets
+                .create(crate::secrets::CreateSecretRequest {
+                    tenant_id: None,
+                    name: secret_id.into(),
+                    secret_id: secret_id.into(),
+                    description: None,
+                    value: value.into(),
+                    secret_type: "General".into(),
+                    tags: vec![],
+                })
+                .await
+                .unwrap();
+        }
+        let granting: crate::credential_providers::CredentialProvider = serde_json::from_value(serde_json::json!({
+            "id": "provider-granting", "name": "Agent", "provider_id": "agent",
+            "provider_type": "oauth2_client_credentials", "token_endpoint": auth_server.token_endpoint(),
+            "client_id_secret_ref": "CC_ID", "client_secret_secret_ref": "CC_SECRET",
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"
+        }))
+        .unwrap();
+        let key = crate::delegation_vault::gateway_token::GatewayTokenKey::for_target_auth(&granting, &[]).unwrap();
+        let acquire = async || {
+            crate::delegation_vault::gateway_token::acquire_gateway_token(
+                &crate::delegation_vault::gateway_token::target_token_cache(),
+                &key,
+                &granting,
+                &crate::delegation_vault::gateway_token::ProviderSecrets::new(&secrets, &granting),
+            )
+            .await
+            .expect("the authorization server grants a token")
+            .freshness
+        };
+        let (primed, kept, after_activation) =
+            crate::delegation_vault::gateway_token::with_own_target_token_cache(async {
+                let primed = acquire().await;
+                let kept = acquire().await;
+                reconcile_caller_and_target_credentials(
+                    Some(&standby_strategies),
+                    Some(&standby_providers),
+                    &standby_jwks,
+                )
+                .await;
+                (primed, kept, acquire().await)
+            })
             .await;
+        assert_eq!(
+            (primed, kept),
+            (
+                crate::delegation_vault::gateway_token::Freshness::Fresh,
+                crate::delegation_vault::gateway_token::Freshness::Cached
+            )
+        );
+        assert_eq!(
+            after_activation,
+            crate::delegation_vault::gateway_token::Freshness::Fresh,
+            "activation drops every kept gateway token"
+        );
+        assert_eq!(auth_server.token_request_count(), 2);
 
         let reconciled = standby_strategies
             .get(&strategy.id)

@@ -158,6 +158,7 @@ exits non-zero on failure.
 | 3. JWT bearer grant | The gateway obtained its token from hydra-b with the JWT bearer grant. |
 | 4. Token reuse | A second call does not reach hydra-b's token endpoint again. |
 | 5. Revoked grant | After the trust grant is revoked and the gateway restarted (empty token cache), the call fails with a generic 502 whose body has no key, token or authorization server detail. |
+| 6. Gateway log | The gateway log of the granted run and of the refused run holds no private key, JWT, Hydra access token or Hydra error description, and the refused run logs the Target authentication failure. |
 
 It revokes the grant, so run `up.sh`, `gateway.sh start --fresh` and `seed.sh` again before repeating it.
 

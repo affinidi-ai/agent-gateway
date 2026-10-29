@@ -12,7 +12,7 @@ use crate::bdd_support::config::fabric_surface_fixture::{
     TransitPointHeaderMetadataMappingRowSpec, TransitPointSpec,
 };
 use crate::bdd_support::config::modern_consent::ModernConsentFixture;
-use crate::bdd_support::config::target_auth::TargetTokenProviderFixture;
+use crate::bdd_support::config::target_auth::{TargetTokenGrant, TargetTokenProviderFixture};
 use crate::bdd_support::json_rpc::{
     IdentityBindingProof, McpVersion, build_mcp_echo_response_body, build_target_ok_response,
 };
@@ -981,8 +981,7 @@ async fn surface_sends_gateway_token(
     plan.target_token_provider = Some(TargetTokenProviderFixture {
         provider_id: provider_name.clone(),
         token_endpoint,
-        client_id: OIDC_CLIENT_ID.to_string(),
-        client_secret: OIDC_CLIENT_SECRET.to_string(),
+        grant: TargetTokenGrant::client_credentials(OIDC_CLIENT_ID, OIDC_CLIENT_SECRET),
     });
     plan.surfaces
         .iter_mut()

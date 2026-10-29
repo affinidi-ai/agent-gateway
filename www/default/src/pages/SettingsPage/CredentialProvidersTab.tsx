@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { usePermissions } from '../../context/PermissionsContext';
 import { apiClient } from '../../api';
 import { AppButton } from '../../components/shared/AppButton';
@@ -217,10 +217,17 @@ const CredentialProvidersTab: React.FC<CredentialProvidersTabProps> = ({
                   <tr
                     key={provider.id}
                     style={{ cursor: 'pointer' }}
-                    onClick={() => navigate(`/credential-providers/${provider.id}`)}
+                    onClick={() =>
+                      navigate(`/credential-providers/${encodeURIComponent(provider.id)}`)
+                    }
                   >
                     <td>
-                      <strong>{provider.name}</strong>
+                      <Link
+                        to={`/credential-providers/${encodeURIComponent(provider.id)}`}
+                        onClick={e => e.stopPropagation()}
+                      >
+                        <strong>{provider.name}</strong>
+                      </Link>
                       {provider.description && (
                         <div>
                           <small className="text-muted">{provider.description}</small>

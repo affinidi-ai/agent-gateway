@@ -189,6 +189,36 @@ changes:
         them when they are left out, and refuses to clear one the provider type requires. Before,
         null was ignored, so a provider kept sending client references the operator had removed.
   fixed:
+    - timestamp: '2026-10-29T15:35:51Z'
+      title: Ignore a strategy discovery that answers after the issuer was edited
+      description: >-
+        The JWT verification strategy editor applied a Discover result even when the operator had
+        changed the Expected Issuer while it was running, so it showed and saved the old issuer's
+        key set URI without the reachability check. A late result is now ignored.
+    - timestamp: '2026-10-29T15:35:51Z'
+      title: Show the surfaces of the strategy asked about last in the delete confirmation
+      description: >-
+        Asking to delete a second JWT verification strategy before the first surface check
+        answered could list the first strategy's surfaces, or none, under the second one's name.
+    - timestamp: '2026-10-29T15:35:51Z'
+      title: Move focus into in-page delete confirmations and back when they close
+      description: >-
+        The strategy and secret delete confirmations now take focus and scroll into view when they
+        open, close on Escape, return focus to the Delete button on Cancel, and move it to the
+        list heading after a confirmed delete, so keyboard and screen-reader users hear them.
+    - timestamp: '2026-10-29T15:35:51Z'
+      title: Announce credential provider form errors and explain read-only access
+      description: >-
+        A credential provider form error is now an alert, a role that can view but not edit
+        providers is told why the form is read-only, each provider name in the list is a link that
+        opens it from the keyboard, and a Name with no letter or digit is refused with a message
+        about the Name instead of the hidden Provider ID.
+    - timestamp: '2026-10-29T15:35:51Z'
+      title: Tie Target Authentication errors to the provider and header fields
+      description: >-
+        In the Surface Builder, the credential provider picker and the custom header fields now
+        reference the error that concerns them, are marked invalid while it applies, and the
+        starred fields are marked required, so assistive technology reads the reason with the field.
     - timestamp: '2026-10-21T10:49:49Z'
       title: Stop echoing Target Authentication errors in 502 response bodies
       description: >-

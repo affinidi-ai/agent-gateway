@@ -199,4 +199,39 @@ describe('Strategy discovery', () => {
     expect(await screen.findByText(/verify the JWKS URI is reachable/i)).toBeInTheDocument();
     expect(saved()).toBeNull();
   });
+
+  it('ignores a discovery that answers after the issuer was edited', async () => {
+    let answer: (reply: ReturnType<typeof json>) => void = () => undefined;
+    mockFetch.mockImplementation(async (url: string) => {
+      if (url.endsWith('/discover')) return new Promise(resolve => (answer = resolve));
+      if (url.endsWith('/validate-jwks-uri')) return json({ valid: true });
+      return json({});
+    });
+    renderPage('/jwt-verification-strategies/new');
+    fireEvent.change(await screen.findByLabelText(/^Name/), { target: { value: 'Idp' } });
+    fireEvent.change(screen.getByLabelText(/^Expected Issuer/), {
+      target: { value: 'https://idp.example.com' },
+    });
+    fireEvent.change(screen.getByLabelText(/^JWKS URI/), {
+      target: { value: 'https://other.example.com/keys' },
+    });
+    fireEvent.click(screen.getByTestId('strategy-discover-button'));
+    await waitFor(() =>
+      expect(mockFetch.mock.calls.some(([u]) => String(u).endsWith('/discover'))).toBe(true)
+    );
+    fireEvent.change(screen.getByLabelText(/^Expected Issuer/), {
+      target: { value: 'https://other.example.com' },
+    });
+    expect(screen.getByTestId('strategy-discover-button')).toBeEnabled();
+
+    answer(json(SERVER));
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(screen.queryByTestId('strategy-discover-success')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('strategy-pinned-server')).not.toBeInTheDocument();
+    expect(screen.getByLabelText(/^JWKS URI/)).toHaveValue('https://other.example.com/keys');
+    fireEvent.click(screen.getByRole('button', { name: /create strategy/i }));
+    expect(await screen.findByText(/verify the JWKS URI is reachable/i)).toBeInTheDocument();
+    expect(saved()).toBeNull();
+  });
 });

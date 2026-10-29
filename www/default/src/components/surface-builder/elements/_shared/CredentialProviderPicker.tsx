@@ -25,9 +25,21 @@ interface Props {
   onChange: (credentialProviderId: string) => void;
   use: ProviderUse;
   testId: string;
+  required?: boolean;
+  invalid?: boolean;
+  describedBy?: string;
 }
 
-const CredentialProviderPicker: React.FC<Props> = ({ id, value, onChange, use, testId }) => {
+const CredentialProviderPicker: React.FC<Props> = ({
+  id,
+  value,
+  onChange,
+  use,
+  testId,
+  required = false,
+  invalid = false,
+  describedBy,
+}) => {
   const { hasPermission } = usePermissions();
   const canView = hasPermission(CREDENTIAL_PROVIDERS_VIEW_PERMISSION);
   const [providers, setProviders] = useState<ProviderOption[]>([]);
@@ -88,6 +100,10 @@ const CredentialProviderPicker: React.FC<Props> = ({ id, value, onChange, use, t
     !failed &&
     !!value &&
     (!current || !providerPermits(current.provider_type ?? '', use));
+  const description =
+    [failed && `${id}-error`, currentUnusable && `${id}-unusable`, describedBy]
+      .filter(Boolean)
+      .join(' ') || undefined;
 
   return (
     <>
@@ -98,6 +114,9 @@ const CredentialProviderPicker: React.FC<Props> = ({ id, value, onChange, use, t
         value={value}
         onChange={e => onChange(e.target.value)}
         disabled={loading}
+        aria-required={required || undefined}
+        aria-invalid={invalid || currentUnusable || undefined}
+        aria-describedby={description}
       >
         <option value="">
           {loading ? '-- Loading providers... --' : '-- Select a credential provider --'}
@@ -116,12 +135,22 @@ const CredentialProviderPicker: React.FC<Props> = ({ id, value, onChange, use, t
         ))}
       </select>
       {failed && (
-        <div className="form-text text-danger" role="alert" data-testid={`${testId}-error`}>
+        <div
+          id={`${id}-error`}
+          className="form-text text-danger"
+          role="alert"
+          data-testid={`${testId}-error`}
+        >
           Could not load credential providers.
         </div>
       )}
       {currentUnusable && (
-        <div className="form-text text-danger" role="alert" data-testid={`${testId}-unusable`}>
+        <div
+          id={`${id}-unusable`}
+          className="form-text text-danger"
+          role="alert"
+          data-testid={`${testId}-unusable`}
+        >
           {current
             ? `The ${providerTypeLabel(current.provider_type ?? '')} provider cannot be used for Target Authentication.`
             : 'The selected provider no longer exists.'}{' '}

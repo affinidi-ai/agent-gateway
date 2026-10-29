@@ -9,6 +9,7 @@ use crate::bdd_support::config::config_tree::{
     PolicyDefinitionFixture, SecretFixture, write_gateway_config_tree,
 };
 use crate::bdd_support::config::gateway_bootstrap::GatewayBootstrapSurface;
+use crate::bdd_support::config::jwt_verification_strategy::SURFACE_JWT_STRATEGY_ID;
 use crate::bdd_support::config::mcp_proxy::McpProxyFixture;
 use crate::bdd_support::config::single_surface_fixture::{
     CredentialProviderKind, DelegatedCredentialInjection, DidWebVhIdentityFixture, PROTECTED_RESOURCE_PUBLIC_ORIGIN,
@@ -418,12 +419,17 @@ fn write_single_surface_config_inner(
         config_tree
             .jwt_strategies
             .insert(
-                "bdd-jwt-strategy".to_string(),
+                SURFACE_JWT_STRATEGY_ID.to_string(),
                 JwtVerificationStrategyFixture::new(
-                    "bdd-jwt-strategy",
+                    SURFACE_JWT_STRATEGY_ID,
                     "BDD EdDSA Test",
-                    jwks.issuer.clone(),
+                    surface_config.jwt_strategy_issuer(&jwks.issuer),
                     format!("{}/.well-known/jwks.json", jwks.issuer),
+                )
+                .with_authorization_server(
+                    surface_config
+                        .jwt_strategy_authorization_server
+                        .clone(),
                 ),
             );
     }

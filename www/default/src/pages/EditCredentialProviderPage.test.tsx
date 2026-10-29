@@ -141,7 +141,7 @@ describe('Edit credential provider, JWT bearer', () => {
     fireEvent.change(screen.getByLabelText(/^Token Endpoint/), { target: { value: 'https://t' } });
     fireEvent.change(screen.getByLabelText(/^Assertion Issuer/), { target: { value: 'iss' } });
     fireEvent.click(screen.getByRole('button', { name: /Create/ }));
-    expect(await screen.findByText('Signing key secret is required.')).toBeInTheDocument();
+    expect(await screen.findByRole('alert')).toHaveTextContent('Signing key secret is required.');
     expect(savedRequest()).toBeNull();
   });
 
@@ -194,7 +194,39 @@ describe('Edit credential provider, JWT bearer', () => {
     await waitFor(() => expect(screen.getByLabelText(/^Assertion Issuer/)).toHaveValue('iss'));
     expect(screen.getByLabelText(/^Assertion Issuer/)).toBeDisabled();
     expect(screen.queryByRole('button', { name: /Save/ })).not.toBeInTheDocument();
+    expect(screen.getByTestId('provider-read-only')).toHaveTextContent(
+      'Your role can view this provider but not change it.'
+    );
     fireEvent.keyDown(document, { key: 's', ctrlKey: true });
+    expect(savedRequest()).toBeNull();
+  });
+
+  it('says nothing about a read-only role when the role can edit', async () => {
+    route('/api/v1/credential-providers/cp-1', {
+      id: 'cp-1',
+      name: 'Vertex',
+      provider_id: 'vertex',
+      provider_type: 'oauth2_jwt_bearer',
+      token_endpoint: 'https://t',
+      jwt_bearer: { signing_key_secret_ref: 'sa-key', assertion_issuer: 'iss' },
+    });
+    renderPage('/credential-providers/cp-1');
+    await waitFor(() => expect(screen.getByLabelText(/^Assertion Issuer/)).toHaveValue('iss'));
+    expect(screen.queryByTestId('provider-read-only')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Save/ })).toBeInTheDocument();
+  });
+
+  it('asks for a letter or number in the name when the name gives no provider ID', async () => {
+    renderPage('/credential-providers/new');
+    await screen.findByLabelText(/^Provider Type/);
+    fireEvent.change(screen.getByLabelText(/^Name/), { target: { value: '東京' } });
+    fireEvent.change(screen.getByLabelText(/^Provider Type/), {
+      target: { value: 'oauth2_jwt_bearer' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /Create/ }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Name must contain at least one letter or number.'
+    );
     expect(savedRequest()).toBeNull();
   });
 
@@ -234,6 +266,7 @@ describe('Edit credential provider, JWT bearer', () => {
     expect(await screen.findByTestId('provider-unknown-type')).toBeInTheDocument();
     expect(screen.getByLabelText(/^Provider Type/)).toBeDisabled();
     expect(screen.queryByRole('button', { name: /Save/ })).not.toBeInTheDocument();
+    expect(screen.queryByTestId('provider-read-only')).not.toBeInTheDocument();
     fireEvent.keyDown(document, { key: 's', ctrlKey: true });
     expect(savedRequest()).toBeNull();
   });

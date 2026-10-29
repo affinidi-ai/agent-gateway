@@ -3,6 +3,7 @@
 pub mod actors;
 pub mod admin_client;
 pub mod assertions;
+pub mod authz_metadata_server;
 pub mod caller;
 pub mod collaborators;
 pub mod config;

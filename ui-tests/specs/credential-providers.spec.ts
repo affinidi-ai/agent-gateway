@@ -8,15 +8,18 @@
  * - The saved provider nests its assertion settings under jwt_bearer and the
  *   gateway never returns the key itself
  * - A rejected token endpoint is shown inline and nothing is stored
+ * - A role that can view providers but not edit them sees the form read-only
+ *
+ * The token endpoint is a documentation address (TEST-NET-3), so the gateway
+ * checks it without a DNS lookup and saving never calls it.
  */
 
 import {generateKeyPairSync} from 'crypto';
-import {lookup} from 'dns/promises';
 import {expect, test} from '../helpers/fixtures';
 import {GatewayApi} from '../helpers/gateway-api';
 
 const BASE_URL = process.env.AG_BASE_URL || 'http://localhost:8080';
-const TOKEN_ENDPOINT_HOST = 'oauth2.googleapis.com';
+const TOKEN_ENDPOINT_HOST = '203.0.113.10';
 const TOKEN_ENDPOINT = `https://${TOKEN_ENDPOINT_HOST}/token`;
 const RUN_ID = `${Date.now()}`;
 const KEY_SECRET_ID = `e2e-signing-key-${RUN_ID}`;
@@ -56,7 +59,6 @@ test.describe('JWT bearer credential provider', () => {
 
     let api: GatewayApi;
     let secretRecordId: string;
-    let tokenEndpointResolves = false;
 
     test.beforeAll(async () => {
         api = await GatewayApi.connect();
@@ -68,10 +70,6 @@ test.describe('JWT bearer credential provider', () => {
         });
         expect(secret.status).toBe(201);
         secretRecordId = secret.body.id;
-        tokenEndpointResolves = await lookup(TOKEN_ENDPOINT_HOST).then(
-            () => true,
-            () => false
-        );
     });
 
     test.afterEach(async () => {
@@ -114,7 +112,6 @@ test.describe('JWT bearer credential provider', () => {
     });
 
     test('creates the provider with its assertion settings nested under jwt_bearer', async ({page}) => {
-        test.skip(!tokenEndpointResolves, `${TOKEN_ENDPOINT_HOST} does not resolve here; the gateway checks token endpoint hosts`);
         const providerId = `e2e-vertex-${RUN_ID}`;
         let posted: Record<string, unknown> | null = null;
         await page.route('**/api/v1/credential-providers', async route => {
@@ -160,7 +157,6 @@ test.describe('JWT bearer credential provider', () => {
     });
 
     test('reopens a saved provider with its assertion settings filled in', async ({page}) => {
-        test.skip(!tokenEndpointResolves, `${TOKEN_ENDPOINT_HOST} does not resolve here; the gateway checks token endpoint hosts`);
         const providerId = `e2e-reopen-${RUN_ID}`;
         const created = await api.post<StoredProvider>('/api/v1/credential-providers', {
             name: `E2E reopen ${RUN_ID}`,
@@ -189,7 +185,6 @@ test.describe('JWT bearer credential provider', () => {
     });
 
     test('shows the gateway rejection inline and stores nothing when the token endpoint is not https', async ({page}) => {
-        test.skip(!tokenEndpointResolves, `${TOKEN_ENDPOINT_HOST} does not resolve here; the gateway checks token endpoint hosts`);
         const providerId = `e2e-rejected-${RUN_ID}`;
         await page.goto(`${BASE_URL}/credential-providers/new`);
         await page.getByTestId('provider-name').fill(`E2E rejected ${RUN_ID}`);
@@ -202,5 +197,39 @@ test.describe('JWT bearer credential provider', () => {
         await expect(page.getByTestId('provider-error')).toContainText('https');
         await expect(page).toHaveURL(/credential-providers\/new/);
         expect(await findProvider(api, providerId)).toBeUndefined();
+    });
+
+    test('shows a saved provider read-only, with the reason, to a role that cannot edit providers', async ({page}) => {
+        const created = await api.post<StoredProvider>('/api/v1/credential-providers', {
+            name: `E2E read-only ${RUN_ID}`,
+            provider_id: `e2e-read-only-${RUN_ID}`,
+            provider_type: 'oauth2_jwt_bearer',
+            token_endpoint: TOKEN_ENDPOINT,
+            default_scopes: [],
+            token_refresh_enabled: false,
+            jwt_bearer: {
+                signing_key_secret_ref: KEY_SECRET_ID,
+                signing_algorithm: 'ES256',
+                assertion_issuer: 'gateway@example.com',
+            },
+        });
+        expect(created.status).toBe(201);
+        await page.route('**/api/v1/permissions', async route => {
+            const response = await route.fetch();
+            const permissions = await response.json();
+            await route.fulfill({
+                response,
+                json: {...permissions, 'credential_providers.view': true, 'credential_providers.edit': false},
+            });
+        });
+
+        await page.goto(`${BASE_URL}/credential-providers/${created.body.id}`);
+
+        await expect(page.getByTestId('provider-assertion-issuer')).toHaveValue('gateway@example.com');
+        await expect(page.getByTestId('provider-read-only')).toContainText(
+            'Your role can view this provider but not change it.'
+        );
+        await expect(page.getByTestId('provider-name')).toBeDisabled();
+        await expect(page.getByTestId('provider-save-button')).toHaveCount(0);
     });
 });

@@ -17,6 +17,7 @@ import {
   buildProviderBody,
   providerFormFromWire,
   unknownProviderType,
+  deriveProviderId,
   validateProviderForm,
   type CredentialProviderForm,
 } from '../utils/credentialProviders';
@@ -104,7 +105,8 @@ const EditCredentialProviderPage: React.FC = () => {
   const isNew = !id || id === 'new';
   const { hasPermission } = usePermissions();
   const [unknownType, setUnknownType] = useState<string | null>(null);
-  const canEdit = hasPermission('credential_providers.edit') && unknownType === null;
+  const mayEdit = hasPermission('credential_providers.edit');
+  const canEdit = mayEdit && unknownType === null;
   usePageTitle(isNew ? 'New Credential Provider' : 'Edit Credential Provider');
 
   const [form, setForm] = useState<CredentialProviderForm>(EMPTY_PROVIDER_FORM);
@@ -181,12 +183,6 @@ const EditCredentialProviderPage: React.FC = () => {
       setLoading(false);
     }
   };
-
-  const deriveProviderId = (name: string) =>
-    name
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, '-')
-      .replace(/^-|-$/g, '');
 
   const handleChange = (
     e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>
@@ -318,8 +314,14 @@ const EditCredentialProviderPage: React.FC = () => {
               edit. It is shown read-only so saving cannot change its type.
             </div>
           )}
+          {!mayEdit && unknownType === null && (
+            <div className="alert alert-info" role="status" data-testid="provider-read-only">
+              <i className="fas fa-lock me-2" aria-hidden="true"></i>
+              Your role can view this provider but not change it.
+            </div>
+          )}
           {error && (
-            <div className="alert alert-danger" data-testid="provider-error">
+            <div className="alert alert-danger" role="alert" data-testid="provider-error">
               <i className="fas fa-exclamation-triangle me-2"></i>
               {error}
             </div>

@@ -61,6 +61,24 @@ pub struct SurfaceConfigBuilder {
     pub rate_limit_per_minute: Option<u32>,
     /// The gateway starts with the VP Audit Log keeping every audit event.
     pub audit_log_keeps_every_event: bool,
+    /// Authorization server metadata the surface's JWT verification strategy is stored
+    /// pinned to; its issuer becomes the strategy's and the caller tokens' issuer.
+    pub jwt_strategy_authorization_server: Option<serde_json::Value>,
+}
+
+impl SurfaceConfigBuilder {
+    /// The issuer the surface's JWT verification strategy expects: the pinned authorization
+    /// server's when the strategy is pinned, otherwise `key_set_issuer`.
+    pub fn jwt_strategy_issuer(
+        &self,
+        key_set_issuer: &str,
+    ) -> String {
+        self.jwt_strategy_authorization_server
+            .as_ref()
+            .and_then(|server| server["issuer"].as_str())
+            .unwrap_or(key_set_issuer)
+            .to_string()
+    }
 }
 
 impl Default for SurfaceConfigBuilder {
@@ -110,6 +128,7 @@ impl Default for SurfaceConfigBuilder {
             a2a_settings: None,
             rate_limit_per_minute: None,
             audit_log_keeps_every_event: false,
+            jwt_strategy_authorization_server: None,
         }
     }
 }

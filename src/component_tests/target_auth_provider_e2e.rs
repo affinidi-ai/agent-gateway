@@ -3,7 +3,8 @@
 //! authenticated calls, reusing one token, with the Client Credentials grant or a
 //! signed JWT bearer assertion. The admin API refuses cross-tenant
 //! references, unsafe configurations, and deleting or retyping a provider in use, and a
-//! tenant surface never sends an appliance-wide Target secret or gateway token.
+//! tenant surface never sends an appliance-wide Target secret or gateway token. Editing a
+//! provider or its secret, reassigning its tenant and an operator reload drop the kept token.
 
 use serde_json::{Value, json};
 
@@ -345,6 +346,130 @@ async fn admin_api_refuses_unsafe_or_cross_tenant_provider_target_authentication
         )
         .await;
     assert_eq!(status, 409, "a surface bound to an appliance-wide gateway token provider stays appliance-wide: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_changes_drop_the_kept_gateway_token_of_their_provider() {
+    use crate::delegation_vault::gateway_token::{
+        Freshness, GatewayTokenKey, ProviderSecrets, acquire_gateway_token, target_token_cache,
+    };
+
+    let auth_server = MockAuthServer::start().await;
+    auth_server.register_client("drop-client", "drop-secret");
+    let mock = MockServer::start_with_response(String::new()).await;
+    let _test_mode = TestModeEnv::enabled(&auth_server.egress_allowlist(), &auth_server.oauth_endpoint_allowlist());
+    let mut clients = None;
+    let h = GatewayHarness::start_with_mock(mock, |_, _, bootstrap| {
+        clients = Some((
+            helpers::configure_admin_api(bootstrap),
+            helpers::seed_scoped_access_token(
+                bootstrap,
+                Some("TENANT:${x-external-account}:(?:surfaces:.*|secrets:.*|credential-providers:.*)"),
+            ),
+        ));
+    })
+    .await;
+    let (client, tenant) = clients.expect("clients");
+    let admin = Admin {
+        client: client.clone(),
+        base: h.gateway_base.clone(),
+    };
+    wait_until_ready(&admin, &format!("{}/api/v1/health", h.gateway_base)).await;
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let secrets: std::sync::Arc<dyn crate::secrets::SecretsStore> = std::sync::Arc::new(
+        crate::secrets::FilesystemSecretsStore::new_async(
+            directory
+                .path()
+                .join("secrets")
+                .to_str()
+                .expect("utf-8 path"),
+        )
+        .await
+        .expect("secrets store"),
+    );
+    let mut secret_ids = std::collections::HashMap::new();
+    for (secret_id, value) in [("DROP_ID", "drop-client"), ("DROP_SECRET", "drop-secret")] {
+        let (status, body) = admin
+            .post(&client, "/api/v1/secrets/new", secret(secret_id, value))
+            .await;
+        assert_eq!(status, 201, "{body}");
+        secret_ids.insert(
+            secret_id,
+            body["id"]
+                .as_str()
+                .expect("secret id")
+                .to_string(),
+        );
+        secrets
+            .create(crate::secrets::CreateSecretRequest {
+                tenant_id: None,
+                name: secret_id.into(),
+                secret_id: secret_id.into(),
+                description: None,
+                value: value.into(),
+                secret_type: "General".into(),
+                tags: vec![],
+            })
+            .await
+            .expect("secret");
+    }
+    let (status, created) = admin
+        .post(
+            &client,
+            "/api/v1/credential-providers",
+            client_credentials_provider("hop-two-drop", &auth_server.token_endpoint(), "DROP_ID", "DROP_SECRET"),
+        )
+        .await;
+    assert_eq!(status, 201, "{created}");
+    let provider: crate::credential_providers::CredentialProvider =
+        serde_json::from_value(created).expect("the admin API returns the provider");
+    let key = GatewayTokenKey::for_target_auth(&provider, &provider.default_scopes).expect("key");
+    let acquire = async || {
+        acquire_gateway_token(&target_token_cache(), &key, &provider, &ProviderSecrets::new(&secrets, &provider))
+            .await
+            .expect("the authorization server grants a token")
+            .freshness
+    };
+
+    assert_eq!(acquire().await, Freshness::Fresh);
+    assert_eq!(acquire().await, Freshness::Cached, "the token is kept");
+
+    let changes = [
+        (
+            "editing the provider",
+            client
+                .put(format!("{}/api/v1/credential-providers/{}", h.gateway_base, provider.id))
+                .json(&json!({"name": "hop-two-drop-renamed"})),
+        ),
+        (
+            "editing its client secret",
+            client
+                .put(format!("{}/api/v1/secrets/{}", h.gateway_base, secret_ids["DROP_SECRET"]))
+                .json(&json!({"description": "rotated"})),
+        ),
+        (
+            "reassigning the provider's tenant",
+            client
+                .put(format!("{}/api/v1/tenant-ownership/credential-providers/{}", h.gateway_base, provider.id))
+                .json(&json!({"tenant_id": null})),
+        ),
+        ("an operator configuration reload", client.post(format!("{}/api/v1/config/reload", h.gateway_base))),
+    ];
+    for (change, request) in changes {
+        let (status, body) = admin.send(request).await;
+        assert_eq!(status, 200, "{change}: {body}");
+        assert_eq!(acquire().await, Freshness::Fresh, "{change} drops the kept token");
+        assert_eq!(acquire().await, Freshness::Cached, "the token granted after {change} is kept");
+    }
+    assert_eq!(auth_server.token_request_count(), 5, "one grant at first and one after each change");
+
+    let (status, body) = admin
+        .send(tenant.post(format!("{}/api/v1/config/reload", h.gateway_base)))
+        .await;
+    assert_eq!(status, 403, "a tenant cannot reload the configuration: {body}");
+    assert_eq!(acquire().await, Freshness::Cached, "a refused tenant reload keeps the token");
+    assert_eq!(auth_server.token_request_count(), 5);
 }
 
 struct HopTwo {

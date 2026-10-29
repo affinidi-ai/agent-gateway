@@ -431,6 +431,80 @@ async fn fabric_card_fetch_is_a_get_the_receiving_gateway_builds_itself() {
 }
 
 #[tokio::test]
+async fn fabric_card_fetch_with_an_unavailable_provider_is_a_generic_502() {
+    use crate::audit::request_events::{RejectionReason, RejectionStage};
+    use crate::delegation_vault::audit::DelegationAuditAction::RequestRejected;
+    use crate::proxy::target_credentials::TARGET_AUTH_FAILED;
+
+    if rerun_in_isolated_process() {
+        return;
+    }
+    let receiver = Receiver::start(agent_card()).await;
+    receiver
+        .surface(
+            "receiver-card-missing",
+            true,
+            json!({"method": {"credential_provider": {"credential_provider_id": "cp-missing"}}, "fallback": "reject"}),
+        )
+        .await;
+    let before = receiver.forwarded();
+
+    let message = forward_get(&receiver.storage_path, "receiver-card-missing", "/.well-known/agent-card.json");
+    let (result, events) = crate::audit::producer::capture(Box::pin(process_forward_request(&message))).await;
+
+    assert_eq!(forwarded_status(&result), 502);
+    let ProcessingResult::RequiresResponse { response_body, .. } = &result else {
+        panic!("expected a ForwardResponse, got {result:?}");
+    };
+    assert_eq!(response_body["error"], TARGET_AUTH_FAILED);
+    let body: Value = serde_json::from_str(
+        response_body["body"]
+            .as_str()
+            .expect("the ForwardResponse carries a body"),
+    )
+    .expect("the body is JSON");
+    assert_eq!(body["status"], 502);
+    assert_eq!(body["detail"], TARGET_AUTH_FAILED);
+    let serialized = response_body.to_string();
+    for leak in [
+        "cp-missing",
+        "Bearer",
+        &receiver
+            .auth_server
+            .token_endpoint(),
+        receiver.auth_server.origin(),
+    ] {
+        assert!(!serialized.contains(leak), "the 502 reveals {leak:?}: {serialized}");
+    }
+    assert_eq!(receiver.forwarded(), before, "the Target is not called");
+    assert_eq!(
+        receiver
+            .auth_server
+            .token_request_count(),
+        0
+    );
+    let rejected: Vec<_> = events
+        .iter()
+        .filter(|event| matches!(event.event, RequestRejected { .. }))
+        .collect();
+    assert_eq!(rejected.len(), 1, "{events:?}");
+    assert_eq!(
+        rejected[0]
+            .surface_id
+            .as_deref(),
+        Some("receiver-card-missing")
+    );
+    match &rejected[0].event {
+        RequestRejected { stage, reason, http_status, .. } => {
+            assert_eq!(*stage, RejectionStage::Forward);
+            assert_eq!(*reason, RejectionReason::TargetAuthUnavailable);
+            assert_eq!(*http_status, 502);
+        }
+        other => panic!("expected RequestRejected, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn a_receiving_gateway_sends_at_most_one_credential_per_header_name() {
     if rerun_in_isolated_process() {
         return;

@@ -61,6 +61,23 @@ describe('Credential providers list', () => {
     expect(screen.getByText('something_new')).toHaveClass('text-bg-secondary');
   });
 
+  it('links every provider by name so a view-only role can open it from the keyboard', async () => {
+    grant('credential_providers.view');
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: async () => [provider('a', 'api_key'), provider('b c', 'oauth2_jwt_bearer')],
+    });
+    renderTab();
+    expect(await screen.findByRole('link', { name: 'Provider a' })).toHaveAttribute(
+      'href',
+      '/credential-providers/a'
+    );
+    expect(screen.getByRole('link', { name: 'Provider b c' })).toHaveAttribute(
+      'href',
+      '/credential-providers/b%20c'
+    );
+  });
+
   it('hides add and delete without credential_providers.edit and .delete', async () => {
     grant('credential_providers.view');
     renderTab();
@@ -92,6 +109,7 @@ describe('Credential providers list', () => {
     await waitFor(() => expect(mockFetch).not.toHaveBeenCalled());
     expect(screen.queryByText('Add Provider')).not.toBeInTheDocument();
     expect(screen.queryByText('No credential providers yet')).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: /^Provider / })).not.toBeInTheDocument();
   });
 });
 

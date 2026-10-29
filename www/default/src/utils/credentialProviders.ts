@@ -254,10 +254,21 @@ export function providerFormFromWire(
   };
 }
 
+export function deriveProviderId(name: string): string {
+  return name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '');
+}
+
 export function validateProviderForm(form: CredentialProviderForm): string | null {
   if (!form.name.trim()) return 'Name is required.';
-  if (!form.provider_id.trim()) return 'Provider ID is required.';
   const caps = PROVIDER_TYPE_CAPABILITIES[form.provider_type];
+  if (!form.provider_id.trim()) {
+    return caps.callback
+      ? 'Callback URL Route is required.'
+      : 'Name must contain at least one letter or number.';
+  }
   if (caps.tokenEndpoint && !form.token_endpoint.trim()) {
     return 'Token endpoint is required for OAuth providers.';
   }

@@ -148,19 +148,34 @@ export function injectionHeaderName(injectAs: CredentialInjection): string {
   return injectAs.type === 'custom_header' ? injectAs.name.trim() : 'Authorization';
 }
 
-export function credentialProviderAuthError(f: CredentialProviderAuthFields): string | null {
-  if (!f.credentialProviderId.trim()) return 'Select a credential provider.';
+export type CredentialProviderAuthField = 'provider' | 'name' | 'format';
+
+export interface CredentialProviderAuthProblem {
+  field: CredentialProviderAuthField;
+  message: string;
+}
+
+export function credentialProviderAuthProblem(
+  f: CredentialProviderAuthFields
+): CredentialProviderAuthProblem | null {
+  if (!f.credentialProviderId.trim()) {
+    return { field: 'provider', message: 'Select a credential provider.' };
+  }
   if (f.injectAs.type === 'custom_header') {
-    if (!f.injectAs.name.trim()) return 'Enter the header name.';
+    if (!f.injectAs.name.trim()) return { field: 'name', message: 'Enter the header name.' };
     if (!f.injectAs.format.includes('{value}')) {
-      return 'The header format must contain {value}.';
+      return { field: 'format', message: 'The header format must contain {value}.' };
     }
     const name = f.injectAs.name.trim();
     if (FORBIDDEN_HEADER_NAMES.includes(name.toLowerCase())) {
-      return `${name} cannot be used as the header name.`;
+      return { field: 'name', message: `${name} cannot be used as the header name.` };
     }
   }
   return null;
+}
+
+export function credentialProviderAuthError(f: CredentialProviderAuthFields): string | null {
+  return credentialProviderAuthProblem(f)?.message ?? null;
 }
 
 export const PRESERVED_AUTH_PICK = 'preserved';

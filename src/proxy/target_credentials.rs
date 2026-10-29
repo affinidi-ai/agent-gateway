@@ -1443,6 +1443,7 @@ mod tests {
         fixture
             .server
             .set_fault(Endpoint::Token, Fault::NotFound);
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
         for (method, expected) in [
             (provider_method("missing"), TargetCredentialError::ProviderNotFound),
             (provider_method("cp-cc"), TargetCredentialError::TokenUnavailable),
@@ -1468,6 +1469,32 @@ mod tests {
                 assert_eq!(matches!(decision, TargetAuthDecision::Continue), passes, "{fallback}");
             }
         }
+        fixture.server.clear_faults();
+        fixture
+            .client_credentials("cp-ok", None)
+            .await;
+        let (_, granted) = injected(
+            fixture
+                .resolve(
+                    &surface(provider_method("cp-ok"), "reject", None, true),
+                    IN_BASE,
+                    TargetLeg::HttpTarget,
+                    CallerAssertion::Authenticated,
+                )
+                .await,
+        );
+        let token = granted
+            .strip_prefix("Bearer ")
+            .expect("a bearer credential");
+
+        let logged = logs.text();
+        assert!(logged.contains("Target authentication failed"), "{logged}");
+        assert!(logged.contains("surface_id=surface-1"), "{logged}");
+        assert!(logged.contains("category=\"provider_not_found\""), "{logged}");
+        assert!(logged.contains("category=\"token_unavailable\""), "{logged}");
+        assert!(!token.is_empty());
+        assert!(!logged.contains(token), "the log carries the gateway token: {logged}");
+        assert!(!logged.contains("secret-a"), "the log carries the client secret: {logged}");
     }
 
     #[tokio::test]

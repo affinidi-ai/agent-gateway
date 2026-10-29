@@ -1550,6 +1550,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_grant_logs_never_carry_the_key_assertion_token_or_client_secret() {
+        let access_token = "gateway-access-token-5d1c9e";
+        let client_secret = "gateway-client-secret-8b27f4";
+        let refusal = "refusal-detail-2e6a1b";
+        let granted = serde_json::json!({"access_token": access_token, "token_type": "Bearer", "expires_in": 3600});
+        let jwt_endpoint = TokenEndpoint::start(StatusCode::OK, granted.to_string()).await;
+        let cc_endpoint = TokenEndpoint::start(StatusCode::OK, granted.to_string()).await;
+        let refusing_endpoint = TokenEndpoint::start(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error": "invalid_grant", "error_description": refusal}).to_string(),
+        )
+        .await;
+        let directory = tempfile::tempdir().expect("tempdir");
+        let secrets = secrets_with(
+            &directory,
+            &[("SIGNING_KEY", ec_pkcs8_pem(), None), ("CC_ID", "cc-client", None), ("CC_SECRET", client_secret, None)],
+        )
+        .await;
+        let jwt = jwt_provider(&jwt_endpoint.url, JwtBearerAlgorithm::Es256);
+        let mut cc = provider(CredentialProviderType::OAuth2ClientCredentials, &cc_endpoint.url);
+        cc.client_id_secret_ref = Some("CC_ID".into());
+        cc.client_secret_secret_ref = Some("CC_SECRET".into());
+        let refused = jwt_provider(&refusing_endpoint.url, JwtBearerAlgorithm::Es256);
+
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+        let jwt_grant = request_gateway_grant(&jwt, &[], &ProviderSecrets::new(&secrets, &jwt), &jwt_endpoint.egress())
+            .await
+            .expect("the JWT bearer grant succeeds");
+        let cc_grant = request_gateway_grant(&cc, &[], &ProviderSecrets::new(&secrets, &cc), &cc_endpoint.egress())
+            .await
+            .expect("the client credentials grant succeeds");
+        let refusal_error = request_gateway_grant(
+            &refused,
+            &[],
+            &ProviderSecrets::new(&secrets, &refused),
+            &refusing_endpoint.egress(),
+        )
+        .await
+        .expect_err("a 400 is a failure");
+        let logged = logs.text();
+
+        assert_eq!(jwt_grant.access_token, access_token);
+        assert_eq!(cc_grant.access_token, access_token);
+        assert_eq!(refusal_error, GatewayTokenError::Unavailable);
+        assert!(logged.contains("Gateway grant rejected by the token endpoint"), "{logged}");
+        assert!(logged.contains("provider_id=provider"), "{logged}");
+        assert!(logged.contains("status=400"), "{logged}");
+        assert!(logged.contains("error_code=\"invalid_grant\""), "{logged}");
+        let assertion = jwt_endpoint
+            .last_form()
+            .remove("assertion")
+            .expect("the JWT bearer grant posts an assertion");
+        let refused_assertion = refusing_endpoint
+            .last_form()
+            .remove("assertion")
+            .expect("the refused grant posts an assertion");
+        let key_lines = ec_pkcs8_pem()
+            .lines()
+            .filter(|line| !line.starts_with("-----") && !line.is_empty());
+        for forbidden in
+            [access_token, client_secret, refusal, assertion.as_str(), refused_assertion.as_str(), "PRIVATE KEY"]
+                .into_iter()
+                .chain(key_lines)
+        {
+            assert!(!logged.contains(forbidden), "the log carries {forbidden:?}: {logged}");
+        }
+    }
+
+    #[tokio::test]
     async fn test_jwt_bearer_grant_requires_https() {
         let directory = tempfile::tempdir().expect("tempdir");
         let secrets = secrets_with(&directory, &[("SIGNING_KEY", ec_pkcs8_pem(), None)]).await;

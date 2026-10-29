@@ -33,7 +33,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 no_strategies=false
 PID_FILE="${GATEWAY_ENV_DIR}/gateway.pid"
-LOG_FILE="${GATEWAY_ENV_DIR}/gateway.log"
+LOG_FILE="${GATEWAY_LOG_FILE}"
 GATEWAY_BIN="${REPO_ROOT}/target/debug/agent-gateway"
 
 gateway_running() {

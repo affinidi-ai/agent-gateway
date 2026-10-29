@@ -69,6 +69,7 @@ pub struct JwtVerificationStrategyFixture {
     pub name: String,
     pub expected_issuer: String,
     pub jwks_uri: String,
+    pub authorization_server: Option<serde_json::Value>,
 }
 
 impl JwtVerificationStrategyFixture {
@@ -83,7 +84,17 @@ impl JwtVerificationStrategyFixture {
             name: name.into(),
             expected_issuer: expected_issuer.into(),
             jwks_uri: jwks_uri.into(),
+            authorization_server: None,
         }
+    }
+
+    /// Store the strategy pinned to this authorization server metadata.
+    pub fn with_authorization_server(
+        mut self,
+        authorization_server: Option<serde_json::Value>,
+    ) -> Self {
+        self.authorization_server = authorization_server;
+        self
     }
 }
 
@@ -318,6 +329,9 @@ pub fn write_gateway_config_tree(
             &strategy.name,
             &strategy.expected_issuer,
             &strategy.jwks_uri,
+            strategy
+                .authorization_server
+                .as_ref(),
         );
     }
 

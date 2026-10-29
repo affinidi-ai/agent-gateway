@@ -117,6 +117,33 @@ describe('Managed Agent Target Authentication, credential provider', () => {
     );
   });
 
+  it('ties the unusable warning to the provider field and marks it invalid', async () => {
+    renderEditor({ ...credentialProviderConfig, target_auth_credential_provider_id: 'p-ac' });
+    await screen.findByTestId('target-auth-credential-provider-select-unusable');
+    const select = screen.getByTestId('target-auth-credential-provider-select');
+    expect(select).toHaveAttribute('aria-invalid', 'true');
+    expect(select).toHaveAttribute('aria-required', 'true');
+    expect(select).toHaveAccessibleDescription(
+      /cannot be used for Target Authentication.*The gateway signs in with this provider/
+    );
+  });
+
+  it('marks a usable provider field valid and describes it by its help only', async () => {
+    renderEditor(credentialProviderConfig);
+    const select = screen.getByTestId('target-auth-credential-provider-select');
+    await waitFor(() => expect(select).not.toBeDisabled());
+    expect(select).not.toHaveAttribute('aria-invalid');
+    expect(select).toHaveAccessibleDescription(/^The gateway signs in with this provider/);
+  });
+
+  it('ties a missing provider error to the provider field', async () => {
+    renderEditor({ ...credentialProviderConfig, target_auth_credential_provider_id: '' });
+    const select = screen.getByTestId('target-auth-credential-provider-select');
+    await waitFor(() => expect(select).not.toBeDisabled());
+    expect(select).toHaveAttribute('aria-invalid', 'true');
+    expect(select).toHaveAccessibleDescription(/Select a credential provider\.$/);
+  });
+
   it('flags a saved provider that no longer exists', async () => {
     renderEditor({ ...credentialProviderConfig, target_auth_credential_provider_id: 'gone' });
     expect(
@@ -156,6 +183,26 @@ describe('Managed Agent Target Authentication, credential provider', () => {
     expect(screen.getByTestId('target-auth-error')).toHaveTextContent(
       'The header format must contain {value}.'
     );
+    const format = screen.getByTestId('target-auth-inject-format');
+    expect(format).toHaveAttribute('aria-invalid', 'true');
+    expect(format).toHaveAttribute('aria-required', 'true');
+    expect(format).toHaveAccessibleDescription(/The header format must contain \{value\}\.$/);
+    const name = screen.getByTestId('target-auth-inject-name');
+    expect(name).toHaveAttribute('aria-required', 'true');
+    expect(name).not.toHaveAttribute('aria-invalid');
+  });
+
+  it('ties a reserved header name error to the header name field', () => {
+    renderEditor({
+      ...credentialProviderConfig,
+      target_auth_inject_as: 'custom_header',
+      target_auth_inject_name: 'Host',
+      target_auth_inject_format: '{value}',
+    });
+    const name = screen.getByTestId('target-auth-inject-name');
+    expect(name).toHaveAttribute('aria-invalid', 'true');
+    expect(name).toHaveAccessibleDescription('Host cannot be used as the header name.');
+    expect(screen.getByTestId('target-auth-inject-format')).not.toHaveAttribute('aria-invalid');
   });
 
   it('keeps the saved provider and skips the list call without credential_providers.view', () => {

@@ -15,9 +15,13 @@ jest.mock('../../context/PermissionsContext', () => ({
 const remove = jest.fn();
 
 const Harness: React.FC = () => {
-  const { guardDelete, warningNode } = useSecretDeleteGuard();
+  const headingRef = React.useRef<HTMLHeadingElement>(null);
+  const { guardDelete, warningNode } = useSecretDeleteGuard(headingRef);
   return (
     <div>
+      <h2 ref={headingRef} tabIndex={-1}>
+        Secrets
+      </h2>
       <button onClick={() => guardDelete({ secret_id: 'shared', name: 'Shared secret' }, remove)}>
         delete
       </button>
@@ -132,5 +136,43 @@ describe('useSecretDeleteGuard', () => {
     await waitFor(() => expect(remove).toHaveBeenCalledTimes(1));
     expect(mockFetch).not.toHaveBeenCalled();
     expect(screen.queryByTestId('secret-delete-warning')).not.toBeInTheDocument();
+  });
+
+  it('takes focus when it opens and returns it to the Delete button on Cancel', async () => {
+    providers(['Only provider', { api_key_secret_ref: 'shared' }]);
+    render(<Harness />);
+    const trigger = screen.getByText('delete');
+    trigger.focus();
+    fireEvent.click(trigger);
+
+    const warning = await screen.findByTestId('secret-delete-warning');
+    await waitFor(() => expect(warning).toHaveFocus());
+    fireEvent.click(screen.getByTestId('secret-delete-warning-cancel-button'));
+    expect(trigger).toHaveFocus();
+  });
+
+  it('closes on Escape without deleting and returns focus to the Delete button', async () => {
+    providers(['Only provider', { api_key_secret_ref: 'shared' }]);
+    render(<Harness />);
+    const trigger = screen.getByText('delete');
+    trigger.focus();
+    fireEvent.click(trigger);
+
+    fireEvent.keyDown(await screen.findByTestId('secret-delete-warning'), { key: 'Escape' });
+    expect(screen.queryByTestId('secret-delete-warning')).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
+    expect(remove).not.toHaveBeenCalled();
+  });
+
+  it('moves focus to the list heading after a confirmed delete', async () => {
+    providers(['Only provider', { api_key_secret_ref: 'shared' }]);
+    render(<Harness />);
+    const trigger = screen.getByText('delete');
+    trigger.focus();
+    fireEvent.click(trigger);
+
+    fireEvent.click(await screen.findByTestId('secret-delete-warning-confirm-button'));
+    await waitFor(() => expect(remove).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.getByRole('heading', { name: 'Secrets' })).toHaveFocus());
   });
 });

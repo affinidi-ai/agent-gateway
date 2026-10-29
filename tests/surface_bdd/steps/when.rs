@@ -260,6 +260,9 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
     ) {
         let jwks_server = JwksServer::start().await;
         let issuer = jwks_server.base_url.clone();
+        let strategy_issuer = world
+            .surface_config
+            .jwt_strategy_issuer(&issuer);
 
         if let Some(SurfaceSourceAuthConfig::JwtBearer(JwtSourceAuthConfig {
             jwks_url, issuer: auth_issuer, ..
@@ -268,7 +271,7 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
             .source_auth
         {
             *jwks_url = format!("{}/.well-known/jwks.json", issuer);
-            *auth_issuer = issuer.clone();
+            *auth_issuer = strategy_issuer;
         }
 
         (Some(jwks_server), Some(JwksFiles { issuer }))
@@ -1899,15 +1902,30 @@ async fn fetch_agent_card_with_extra_headers(
     fetch_agent_card_with_headers(world, headers).await;
 }
 
+#[when(expr = "the caller reads public path {string} of the surface")]
+async fn caller_reads_public_path(
+    world: &mut SurfaceWorld,
+    path: String,
+) {
+    read_surface_path(world, &path, vec![]).await;
+}
+
 async fn fetch_agent_card_with_headers(
     world: &mut SurfaceWorld,
+    headers: Vec<(String, String)>,
+) {
+    read_surface_path(world, "/.well-known/agent-card.json", headers).await;
+}
+
+async fn read_surface_path(
+    world: &mut SurfaceWorld,
+    path: &str,
     headers: Vec<(String, String)>,
 ) {
     ensure_gateway_running(world).await;
 
     let infra = world.infra.as_ref().unwrap();
-    let url =
-        format!("http://127.0.0.1:{}{}/.well-known/agent-card.json", infra.gateway_port, world.surface_config.route);
+    let url = format!("http://127.0.0.1:{}{}{path}", infra.gateway_port, world.surface_config.route);
 
     let mut req = reqwest::Client::new().get(&url);
     for (name, value) in &headers {
@@ -1916,7 +1934,7 @@ async fn fetch_agent_card_with_headers(
     let resp = req
         .send()
         .await
-        .expect("agent card request failed");
+        .expect("surface read request failed");
 
     let status = resp.status().as_u16();
     let headers = collect_headers(resp.headers());

@@ -55,6 +55,7 @@ const EditJwtVerificationStrategyPage: React.FC = () => {
   const [pinned, setPinned] = useState<AuthorizationServer | null>(null);
   const [discovered, setDiscovered] = useState<AuthorizationServer | null>(null);
   const [clearRequested, setClearRequested] = useState(false);
+  const discoverRequest = useRef(0);
   const [discovering, setDiscovering] = useState(false);
   const [discoverError, setDiscoverError] = useState<string | null>(null);
   const [loadedJwksUri, setLoadedJwksUri] = useState('');
@@ -101,6 +102,8 @@ const EditJwtVerificationStrategyPage: React.FC = () => {
     const { name, value } = e.target;
     setForm(prev => ({ ...prev, [name]: value }));
     if (name === 'expected_issuer') {
+      discoverRequest.current += 1;
+      setDiscovering(false);
       setDiscovered(null);
       setDiscoverError(null);
     }
@@ -126,12 +129,14 @@ const EditJwtVerificationStrategyPage: React.FC = () => {
       setDiscoverError(`Expected Issuer: ${issuerCheck.error}`);
       return;
     }
+    const request = ++discoverRequest.current;
     setDiscovering(true);
     setDiscoverError(null);
     const result = await discoverAuthorizationServer(
       (url, init) => apiClient.fetch(url, init),
       form.expected_issuer.trim()
     );
+    if (request !== discoverRequest.current) return;
     setDiscovering(false);
     if (!result.ok) {
       setDiscoverError(result.message);

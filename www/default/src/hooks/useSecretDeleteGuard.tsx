@@ -1,4 +1,5 @@
 import React, { useCallback, useState } from 'react';
+import { useInPageConfirm } from './useInPageConfirm';
 import { apiClient } from '../api';
 import { AppButton } from '../components/shared/AppButton';
 import { usePermissions } from '../context/PermissionsContext';
@@ -19,16 +20,22 @@ interface PendingDelete {
  * Warns before a secret that credential providers reference is deleted. The delete still goes
  * through after the operator confirms; the gateway does not block it. Call `guardDelete` from the
  * delete action and render `warningNode` once. Without `credential_providers.view` the providers
- * cannot be read, so the delete runs without a warning.
+ * cannot be read, so the delete runs without a warning. The warning takes focus when it opens;
+ * Cancel and Escape return focus to the control that asked for the delete. A confirmed delete
+ * moves focus to `focusAfterDelete` when given, since the deleted row's control goes away.
  */
-export function useSecretDeleteGuard() {
+export function useSecretDeleteGuard(focusAfterDelete?: React.RefObject<HTMLElement | null>) {
   const { hasPermission } = usePermissions();
   const canViewProviders = hasPermission('credential_providers.view');
   const [pending, setPending] = useState<PendingDelete | null>(null);
   const [removing, setRemoving] = useState(false);
+  const { dialogRef, rememberTrigger, returnFocus, cancelOnEscape } = useInPageConfirm(
+    pending?.secret.secret_id ?? null
+  );
 
   const guardDelete = useCallback(
     async (secret: GuardedSecret, remove: () => Promise<void>) => {
+      rememberTrigger();
       if (!canViewProviders) {
         await remove();
         return;
@@ -40,8 +47,13 @@ export function useSecretDeleteGuard() {
       }
       setPending({ secret, providers, remove });
     },
-    [canViewProviders]
+    [canViewProviders, rememberTrigger]
   );
+
+  const cancel = () => {
+    returnFocus();
+    setPending(null);
+  };
 
   const confirm = async () => {
     if (!pending) return;
@@ -50,16 +62,24 @@ export function useSecretDeleteGuard() {
       await pending.remove();
     } finally {
       setRemoving(false);
+      if (focusAfterDelete?.current) {
+        focusAfterDelete.current.focus();
+      } else {
+        returnFocus();
+      }
       setPending(null);
     }
   };
 
   const warningNode = pending ? (
     <div
+      ref={dialogRef}
+      tabIndex={-1}
       className="alert alert-warning"
       role="alertdialog"
       aria-labelledby="secret-delete-warning-title"
       data-testid="secret-delete-warning"
+      onKeyDown={cancelOnEscape(cancel, removing)}
     >
       <strong id="secret-delete-warning-title">
         Delete secret &quot;{pending.secret.name}&quot;?
@@ -100,7 +120,7 @@ export function useSecretDeleteGuard() {
         variant="secondary"
         size="sm"
         data-testid="secret-delete-warning-cancel-button"
-        onClick={() => setPending(null)}
+        onClick={cancel}
         disabled={removing}
       >
         Cancel

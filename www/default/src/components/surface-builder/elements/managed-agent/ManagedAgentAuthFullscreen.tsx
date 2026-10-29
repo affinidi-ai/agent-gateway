@@ -9,7 +9,11 @@ import {
   PRESERVED_AUTH_TYPE,
   credentialProviderFieldsFromConfig,
 } from './targetAuthConfig';
-import { credentialProviderAuthError, injectionHeaderName } from '../../../../utils/targetAuth';
+import {
+  credentialProviderAuthProblem,
+  injectionHeaderName,
+  type CredentialProviderAuthField,
+} from '../../../../utils/targetAuth';
 
 interface SecretOption {
   id: string;
@@ -255,7 +259,10 @@ interface SectionProps {
 const CredentialProviderAuthSection: React.FC<SectionProps> = ({ config, updateField }) => {
   const fields = credentialProviderFieldsFromConfig(config);
   const custom = fields.injectAs.type === 'custom_header';
-  const error = credentialProviderAuthError(fields);
+  const problem = credentialProviderAuthProblem(fields);
+  const errorOn = (field: CredentialProviderAuthField) => problem?.field === field;
+  const errorRef = (field: CredentialProviderAuthField) =>
+    errorOn(field) ? 'target-auth-error' : undefined;
   const headerName = injectionHeaderName(fields.injectAs) || 'Authorization';
 
   return (
@@ -270,8 +277,13 @@ const CredentialProviderAuthSection: React.FC<SectionProps> = ({ config, updateF
           use="target_authentication"
           value={fields.credentialProviderId}
           onChange={v => updateField('target_auth_credential_provider_id', v)}
+          required
+          invalid={errorOn('provider')}
+          describedBy={['target-auth-credential-provider-help', errorRef('provider')]
+            .filter(Boolean)
+            .join(' ')}
         />
-        <small className="form-text text-muted">
+        <small id="target-auth-credential-provider-help" className="form-text text-muted">
           The gateway signs in with this provider and sends its token on every call to the target,
           including the agent card fetch. Authorization Code providers cannot be used here.
         </small>
@@ -322,6 +334,9 @@ const CredentialProviderAuthSection: React.FC<SectionProps> = ({ config, updateF
               className="form-control"
               id="target-auth-inject-name"
               data-testid="target-auth-inject-name"
+              aria-required="true"
+              aria-invalid={errorOn('name') || undefined}
+              aria-describedby={errorRef('name')}
               value={config.target_auth_inject_name || ''}
               onChange={e => updateField('target_auth_inject_name', e.target.value)}
               placeholder="X-Api-Token"
@@ -336,11 +351,16 @@ const CredentialProviderAuthSection: React.FC<SectionProps> = ({ config, updateF
               className="form-control font-monospace"
               id="target-auth-inject-format"
               data-testid="target-auth-inject-format"
+              aria-required="true"
+              aria-invalid={errorOn('format') || undefined}
+              aria-describedby={['target-auth-inject-format-help', errorRef('format')]
+                .filter(Boolean)
+                .join(' ')}
               value={config.target_auth_inject_format || ''}
               onChange={e => updateField('target_auth_inject_format', e.target.value)}
               placeholder="Bearer {value}"
             />
-            <small className="form-text text-muted">
+            <small id="target-auth-inject-format-help" className="form-text text-muted">
               Use <code>{'{value}'}</code> as a placeholder for the token.
             </small>
           </div>
@@ -370,9 +390,14 @@ const CredentialProviderAuthSection: React.FC<SectionProps> = ({ config, updateF
         </small>
       </div>
 
-      {error && (
-        <div className="text-danger small" role="alert" data-testid="target-auth-error">
-          {error}
+      {problem && (
+        <div
+          id="target-auth-error"
+          className="text-danger small"
+          role="alert"
+          data-testid="target-auth-error"
+        >
+          {problem.message}
         </div>
       )}
     </div>

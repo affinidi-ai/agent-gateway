@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useLimitGuard } from '../hooks/useLimitGuard';
 import { useSecretDeleteGuard } from '../hooks/useSecretDeleteGuard';
@@ -48,7 +48,8 @@ const PAGE_SIZE = 10;
 const SecretsPage: React.FC = () => {
   const navigate = useNavigate();
   const { guard, balloonNode } = useLimitGuard();
-  const { guardDelete, warningNode } = useSecretDeleteGuard();
+  const secretsHeadingRef = useRef<HTMLHeadingElement>(null);
+  const { guardDelete, warningNode } = useSecretDeleteGuard(secretsHeadingRef);
   const { hasPermission, loading: permissionsLoading } = usePermissions();
   const [searchParams, setSearchParams] = useSearchParams();
 
@@ -395,7 +396,11 @@ const SecretsPage: React.FC = () => {
         >
           <div className="card shadow mb-4">
             <div className="card-header py-3 d-flex justify-content-between align-items-center">
-              <h6 className="m-0 font-weight-bold text-primary">
+              <h6
+                className="m-0 font-weight-bold text-primary"
+                ref={secretsHeadingRef}
+                tabIndex={-1}
+              >
                 <i className="fas fa-key"></i> Secrets
                 <Badge
                   value={filteredSecrets.length}

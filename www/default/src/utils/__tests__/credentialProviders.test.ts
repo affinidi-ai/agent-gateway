@@ -2,6 +2,7 @@ import {
   EMPTY_PROVIDER_FORM,
   PROVIDER_TYPES,
   buildProviderBody,
+  deriveProviderId,
   filterProvidersForUse,
   keptProviderLabel,
   providerFormFromWire,
@@ -128,6 +129,38 @@ describe('validateProviderForm', () => {
     expect(validateProviderForm({ ...jwtForm, additional_params: '{bad' })).toBe(
       'Additional Parameters must be valid JSON.'
     );
+  });
+
+  it('names the field the operator can change when the provider ID is empty', () => {
+    expect(validateProviderForm({ ...jwtForm, name: '東京', provider_id: '' })).toBe(
+      'Name must contain at least one letter or number.'
+    );
+    expect(
+      validateProviderForm({
+        ...jwtForm,
+        name: '東京',
+        provider_id: '',
+        provider_type: 'api_key',
+      })
+    ).toBe('Name must contain at least one letter or number.');
+    expect(
+      validateProviderForm({
+        ...jwtForm,
+        provider_id: ' ',
+        provider_type: 'oauth2_authorization_code',
+      })
+    ).toBe('Callback URL Route is required.');
+  });
+});
+
+describe('deriveProviderId', () => {
+  it('keeps ASCII letters and digits and joins the rest with dashes', () => {
+    expect(deriveProviderId('Vertex – 東京')).toBe('vertex');
+    expect(deriveProviderId('My  Agent 2')).toBe('my-agent-2');
+  });
+
+  it('derives nothing from a name without ASCII letters or digits', () => {
+    expect(deriveProviderId('東京')).toBe('');
   });
 });
 

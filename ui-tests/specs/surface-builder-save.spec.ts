@@ -6,6 +6,8 @@
  * - The saved surface carries the Managed Agent target
  * - A credential provider chosen as the Target Authentication is saved and
  *   read back by the gateway
+ * - Saving is refused, with the reason next to the field, until a provider is
+ *   chosen and the custom header is not a reserved name such as Host
  */
 
 import type {Page} from '@playwright/test';
@@ -156,6 +158,69 @@ test.describe('Surface builder save', () => {
             const created = await createSurface(page);
             createdSurfaceIds.push(created.surface_id);
 
+            const stored = await api.get<StoredSurface>(`/api/v1/surfaces/${created.surface_id}`);
+            expect(stored.body.target.auth).toMatchObject({
+                method: {credential_provider: {credential_provider_id: provider.body.id}},
+            });
+        } finally {
+            for (const id of createdSurfaceIds.splice(0)) {
+                await api.delete(`/api/v1/surfaces/${id}`);
+            }
+            await api.delete(`/api/v1/credential-providers/${provider.body.id}`);
+            await api.delete(`/api/v1/secrets/${secret.body.id}`);
+        }
+    });
+
+    test('refuses to save credential provider Target Authentication without a provider or with header Host', async ({page}) => {
+        const providerName = `E2E refused ${RUN_ID}`;
+        const secret = await api.post<{id: string}>('/api/v1/secrets/new', {
+            name: `E2E refused key ${RUN_ID}`,
+            secret_id: `e2e-refused-key-${RUN_ID}`,
+            value: 'e2e-api-key-value',
+            secret_type: 'General',
+        });
+        expect(secret.status).toBe(201);
+        const provider = await api.post<{id: string}>('/api/v1/credential-providers', {
+            name: providerName,
+            provider_id: `e2e-refused-${RUN_ID}`,
+            provider_type: 'api_key',
+            api_key_secret_ref: `e2e-refused-key-${RUN_ID}`,
+        });
+        expect(provider.status).toBe(201);
+        const posted: string[] = [];
+        page.on('request', request => {
+            if (request.method() === 'POST' && request.url().endsWith('/api/v1/surfaces')) posted.push(request.url());
+        });
+
+        try {
+            await startFromA2aStarter(page);
+            await addJwtCallerAuth(page, STRATEGY_NAME);
+            await fillTargetUrl(page, TARGET_URL);
+            await page.getByTestId('managed-agent-auth-type').selectOption({label: 'Credential Provider'});
+            await page.getByTestId('managed-agent-auth-configure').click();
+            const save = page.getByTestId('surface-create-button');
+            const error = page.getByTestId('target-auth-error');
+            const providerSelect = page.getByTestId('target-auth-credential-provider-select');
+
+            await expect(error).toHaveText('Select a credential provider.');
+            await expect(providerSelect).toHaveAttribute('aria-invalid', 'true');
+            await expect(save).toBeDisabled();
+            await expect(save).toHaveAttribute('title', 'Fix element validation errors before saving');
+
+            await providerSelect.selectOption({label: `${providerName} (API Key)`});
+            await page.getByTestId('target-auth-inject-as').selectOption('custom_header');
+            await page.getByTestId('target-auth-inject-name').fill('Host');
+            await page.getByTestId('target-auth-inject-format').fill('{value}');
+
+            await expect(error).toHaveText('Host cannot be used as the header name.');
+            await expect(page.getByTestId('target-auth-inject-name')).toHaveAttribute('aria-invalid', 'true');
+            await expect(save).toBeDisabled();
+            expect(posted).toEqual([]);
+
+            await page.getByTestId('target-auth-inject-name').fill('X-Gateway-Token');
+            await expect(error).toHaveCount(0);
+            const created = await createSurface(page);
+            createdSurfaceIds.push(created.surface_id);
             const stored = await api.get<StoredSurface>(`/api/v1/surfaces/${created.surface_id}`);
             expect(stored.body.target.auth).toMatchObject({
                 method: {credential_provider: {credential_provider_id: provider.body.id}},

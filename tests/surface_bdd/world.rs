@@ -8,6 +8,7 @@ pub use crate::bdd_support::admin_client::RecordedResponse;
 use crate::bdd_support::actors::{
     ActorRegistry, PRIMARY_COLLABORATOR_KEY, RuntimeRegistry, SECONDARY_COLLABORATOR_KEY, TargetActorKind,
 };
+use crate::bdd_support::authz_metadata_server::AuthorizationServers;
 use crate::bdd_support::gateway_process::GatewayProcess;
 use crate::bdd_support::jwt::JwksServer;
 use crate::bdd_support::mock_server::{MockResponse, MockServer, ReceivedRequest};
@@ -143,6 +144,7 @@ pub struct SurfaceWorld {
     pub oauth_callback_query: Option<String>,
     /// OAuth providers that grant the gateway its own access token, by name.
     pub oauth_providers: HashMap<String, OidcProvider>,
+    pub authorization_servers: AuthorizationServers,
     pub temp_dir: TempDir,
     pub debug: bool,
     pub runtimes: RuntimeRegistry,
@@ -207,6 +209,7 @@ impl SurfaceWorld {
             a2a_stream_ended: false,
             oauth_callback_query: None,
             oauth_providers: HashMap::new(),
+            authorization_servers: AuthorizationServers::default(),
             temp_dir: get_default_temp_dir(),
             debug: is_debug,
             runtimes: RuntimeRegistry::default(),

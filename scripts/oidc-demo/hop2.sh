@@ -10,6 +10,7 @@
 #   4. A second call does not reach hydra-b's token endpoint again.
 #   5. After the trust grant is revoked and the gateway restarted (empty token cache), the call
 #      fails with the generic gateway error and no key or token detail in the body.
+#   6. The gateway log of each run carries no key, assertion, token or token endpoint error text.
 #
 # The script restarts the gateway first (empty token cache) and revokes the trust grant at the
 # end, so run up.sh, gateway.sh start --fresh and seed.sh again before repeating it.
@@ -34,6 +35,14 @@ AGENT_LOG="${TMP_DIR}/agent-log.json"
 agent_log() { curl -sS "${AGENT_URL}/_demo/log" -o "${AGENT_LOG}" || fail "could not read the mock agent log"; }
 
 caller_token() { fetch_token a demo-caller "${AP_URL}" "${REQUIRED_SCOPE}"; }
+
+gateway_log_is_clean() {
+    [[ -f "${GATEWAY_LOG_FILE}" ]] || fail "no gateway log at ${GATEWAY_LOG_FILE}"
+    if grep -qE 'eyJ[A-Za-z0-9_-]{8,}\.|PRIVATE KEY|ory_at_|The provided authorization grant' "${GATEWAY_LOG_FILE}"; then
+        fail "the gateway log ($1) carries a key, an assertion, a token or the token endpoint's error text"
+    fi
+    pass "the gateway log ($1) carries no key, assertion, token or token endpoint error text"
+}
 
 call_gateway() {
     local token
@@ -77,6 +86,7 @@ step "A second call reuses the cached token"
 call_gateway
 assert_eq "second call status" 200 "${RESP_CODE}"
 assert_eq "hydra-b token requests unchanged" "${AFTER_FIRST}" "$(token_requests)"
+gateway_log_is_clean "granted"
 
 step "Negative: revoke the trust grant, restart the gateway (empty cache), call again"
 grant_id="$(jq -er --arg iss "${HOP2_ISSUER}" '[.[] | select(.issuer == $iss)][0].id' "${grants}")" || fail "no trust grant for ${HOP2_ISSUER}"
@@ -90,6 +100,8 @@ if grep -qiE 'bearer|eyJ|PRIVATE|assertion|invalid_grant|hydra|client_secret|144
     fail "the 502 body carries key, token or authorization server detail"
 fi
 pass "502 body has no key, token or authorization server detail"
+grep -q 'Target authentication failed' "${GATEWAY_LOG_FILE}" || fail "the gateway log does not record the Target authentication failure"
+gateway_log_is_clean "refused"
 agent_log
 assert_json "agent saw no authenticated call after the revoke (the two earlier calls only)" '[.[] | select(.method == "POST" and .authenticated == true)] | length == 2' "${AGENT_LOG}"
 
