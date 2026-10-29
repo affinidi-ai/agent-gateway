@@ -111,6 +111,13 @@ changes:
         otherwise or the stream fails. A streamed response that the managed agent stops reading
         before it ends is still not recorded.
     - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Point a rewritten agent card at the route a Transit Point is served on
+      description: >-
+        When a Transit Point without its own `listen_path` returned an agent card, the gateway
+        rewrote the card's URLs to `/outgoing/<route>/<alias>`, a path no listener serves, so a
+        managed agent following the card was answered `404`. The card now names the
+        `/outbound/<route>/<alias>` route the Transit Point is mounted on.
+    - timestamp: '2026-10-28T00:00:00.000Z'
       title: Keep an outbound listener bound after its last Transit Point is removed
       description: >-
         A reload that left an outbound listener without Transit Points stopped listening on

@@ -95,7 +95,7 @@ async fn inbound_request_forwarded_to_target() {
 }
 
 /// A `POST` through the outbound listener is forwarded to the external mock target.
-/// The route pattern is `/outgoing/<channel-route>/<alias>/<path>`.
+/// The route pattern is `/outbound/<channel-route>/<alias>/<path>`.
 #[tokio::test(flavor = "multi_thread")]
 async fn outbound_request_forwarded_to_target() {
     //

@@ -2021,7 +2021,7 @@ mod tests {
                     managed_identity: None,
                     transit_credentials: None,
                     workload_binding: None,
-                    gateway_url: "https://gw.internal:9000/outgoing/surfaces/order/partner-a".to_string(),
+                    gateway_url: "https://gw.internal:9000/outbound/surfaces/order/partner-a".to_string(),
                     agent_card_path: None,
                     listen_address: None,
                     listen_path: tp_listen_path.map(str::to_string),

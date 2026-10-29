@@ -7,7 +7,7 @@ import FieldHelp from '../../../shared/FieldHelp';
 const TransitConfigPanel: React.FC<ConfigPanelProps> = ({ config, updateField }) => {
   // The outbound listener is a gateway-wide port (separate from the AP
   // listener). Without it set on the channel the backend registers no
-  // `/outgoing/*` routes and every transit point returns 404 — so this
+  // `/outbound/*` routes and every transit point returns 404 - so this
   // is the single most important field on this panel.
   const [outboundAddrs, setOutboundAddrs] = useState<string[]>([]);
   useEffect(() => {
@@ -47,7 +47,7 @@ const TransitConfigPanel: React.FC<ConfigPanelProps> = ({ config, updateField })
           Required for transit points to receive traffic. The gateway routes outbound calls at
           <code>
             {' '}
-            {'<this-address>'}/outgoing/{'<channel-route>'}/{'<alias>'}
+            {'<this-address>'}/outbound/{'<channel-route>'}/{'<alias>'}
           </code>
           .
         </Form.Text>

@@ -486,7 +486,7 @@ impl OutboundPipelineContext {
 
         // Resolve virtual channel. When the route was registered at a
         // custom `listen_path`, the request path no longer follows the
-        // `/outgoing/<route>/<alias>` convention — `state.vc_alias_override`
+        // `/outbound/<route>/<alias>` convention - `state.vc_alias_override`
         // tells us exactly which VC this handler instance serves.
         let path = req.uri().path();
         let surface_for_resolve = cs_surface_for_resolve.clone();
@@ -662,9 +662,9 @@ impl OutboundPipelineContext {
 /// Extract the transit-point name (and optional surface-variant alias) from
 /// the outbound path and look up the matching outbound virtual channel.
 ///
-/// Path layout:  `/outgoing/<aap-path>[$variant-alias]/<tp-name>[/<remainder>]`
+/// Path layout:  `/outbound/<aap-path>[$variant-alias]/<tp-name>[/<remainder>]`
 ///
-/// Axum provides the full request path including `/outgoing/`. The optional
+/// Axum provides the full request path including `/outbound/`. The optional
 /// `$variant-alias` suffix on the route selects a surface variant; the
 /// variant alias is returned to the caller so it can be threaded through
 /// the pipeline.
@@ -672,7 +672,7 @@ fn resolve_virtual_channel(
     path: &str,
     surface: &crate::config::agent_surface::AgentSurface,
 ) -> Result<(TransitPoint, Option<String>), OutboundPipelineError> {
-    // Strip the /outgoing prefix first.
+    // Strip the /outbound prefix first.
     let after_outgoing = path
         .strip_prefix(TP_OUTBOUND_PATH_PREFIX)
         .unwrap_or(path);
@@ -4836,7 +4836,7 @@ fn agent_card_override_url(
 
 /// Compute the path suffix to forward, after stripping the transit point's
 /// listen prefix (its custom `listen_path`, or the derived
-/// `/outgoing/<route>/<alias>` convention).
+/// `/outbound/<route>/<alias>` convention).
 ///
 /// Returns the remainder **without** a leading slash (e.g. `message/send`), or
 /// an empty string when the request targets the transit point root. Both the
@@ -5805,7 +5805,7 @@ mod tests {
         serde_json::from_value(json!({
             "alias": "partner-a",
             "target_endpoint": "https://partner.example.com/a2a",
-            "gateway_url": "https://gw.internal:9000/outgoing/surfaces/order/partner-a",
+            "gateway_url": "https://gw.internal:9000/outbound/surfaces/order/partner-a",
             "identity_injection": { "inject_vp": true }
         }))
         .unwrap()
@@ -5825,8 +5825,8 @@ mod tests {
             },
             "transit": {
                 "points": [
-                    { "alias": "partner-a", "target_endpoint": "https://partner.example.com/a2a", "gateway_url": "https://gw.internal:9000/outgoing/surfaces/order/partner-a" },
-                    { "alias": "partner-b", "target_endpoint": "https://partner-b.example.com", "gateway_url": "https://gw.internal:9000/outgoing/surfaces/order/partner-b" }
+                    { "alias": "partner-a", "target_endpoint": "https://partner.example.com/a2a", "gateway_url": "https://gw.internal:9000/outbound/surfaces/order/partner-a" },
+                    { "alias": "partner-b", "target_endpoint": "https://partner-b.example.com", "gateway_url": "https://gw.internal:9000/outbound/surfaces/order/partner-b" }
                 ]
             }
         }))
@@ -12087,7 +12087,7 @@ mod tests {
             "target": { "endpoint": "http://localhost:9000" },
             "transit": {
                 "points": [
-                    { "alias": "partner-a", "target_endpoint": "https://partner.example.com/mcp", "gateway_url": "https://gw.internal:9000/outgoing/surfaces/order/partner-a" }
+                    { "alias": "partner-a", "target_endpoint": "https://partner.example.com/mcp", "gateway_url": "https://gw.internal:9000/outbound/surfaces/order/partner-a" }
                 ]
             }
         }))

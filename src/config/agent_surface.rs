@@ -1170,7 +1170,7 @@ pub struct TransitPoint {
     /// URL-safe routing identifier for this transit point. Required and
     /// must match `^[a-z][a-z0-9-]*$` (lowercase, digits, dashes; must
     /// start with a letter). Forms the path segment under
-    /// `/outgoing/<route>/<alias>/...` and the transit-point claim in
+    /// `/outbound/<route>/<alias>/...` and the transit-point claim in
     /// transit tokens. Validated server-side on create/update — empty or
     /// malformed values are rejected, not silently coerced.
     #[serde(default)]
@@ -1278,7 +1278,7 @@ pub struct TransitPoint {
     pub agent_card_path: Option<String>,
 
     /// Per-TP outbound listener address override. When set, this TP's
-    /// `/outgoing/...` route is registered on this address (which must
+    /// `/outbound/...` route is registered on this address (which must
     /// be one of the gateway's pre-configured outbound listener
     /// addresses) instead of the channel-wide
     /// [`TransitConfig::outbound_listen_address`]. Lets two TPs in the
@@ -1288,7 +1288,7 @@ pub struct TransitPoint {
 
     /// Per-TP listen path override. When set (e.g. `/partner-a-webhook`),
     /// the TP is registered at exactly `<effective_listen_address>{path}`
-    /// instead of the derived `/outgoing/<channel-route>/<alias>`. Path
+    /// instead of the derived `/outbound/<channel-route>/<alias>`. Path
     /// must start with `/` and must not contain `..`. Per-listener
     /// uniqueness is enforced at validation time.
     #[serde(default, skip_serializing_if = "Option::is_none")]

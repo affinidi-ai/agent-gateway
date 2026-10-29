@@ -3448,7 +3448,7 @@ async fn surface_has_transit_point(
     let transit_point = TransitPointFixture {
         key: transit_point_alias.clone(),
         name: transit_point_alias.clone(),
-        listen_path: Some(format!("/outgoing/{}", target_agent.clone())),
+        listen_path: Some(format!("/transit/{}", target_agent.clone())),
         listen_address: Some(format!("http://localhost:{}", gateway_outbound_port)),
         target_endpoint: Some(format!("http://localhost:{}", target_agent_port)),
         ..Default::default()

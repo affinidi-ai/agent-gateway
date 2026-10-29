@@ -3503,7 +3503,7 @@ mod outbound_config_tests {
                     "alias": *a,
                     "target_endpoint": "https://example.com",
                     "protocol": "a2a",
-                    "gateway_url": format!("https://gw.internal:9000/outgoing/test/{}", a),
+                    "gateway_url": format!("https://gw.internal:9000/outbound/test/{}", a),
                     "require_transit_token": false,
                 })
             })
