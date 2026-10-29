@@ -154,6 +154,28 @@ async fn save_announced<S: TrustRegistryStore + 'static>(
     .map_err(|e| anyhow::anyhow!("the save task failed: {e}"))?
 }
 
+/// Records an accepted OOB invitation on `trust_registry`, which is then
+/// Connecting until the registry approves it, and returns the announcement of
+/// its new DID for the save.
+fn record_oob_connection(
+    trust_registry: &mut TrustRegistry,
+    connection_info: super::communication::OobConnectionInfo,
+) -> crate::event_hook::CreationGuard {
+    trust_registry.our_did = Some(connection_info.our_did);
+    trust_registry.registry_did = Some(
+        connection_info
+            .registry_did
+            .clone(),
+    );
+    trust_registry.did = Some(connection_info.registry_did);
+    trust_registry.main_did = connection_info.main_did;
+    trust_registry.mediator_url = Some(connection_info.mediator_url);
+    trust_registry.mediator_did = Some(connection_info.mediator_did);
+    trust_registry.connection_status = TrustRegistryConnectionStatus::Connecting;
+    trust_registry.updated_at = chrono::Utc::now();
+    connection_info.announcement
+}
+
 /// The status a successful reconnect stores, when it changes one: rebuilding the
 /// transport says nothing about the registry's approval, so only Failed moves.
 fn status_after_reconnect(status: &TrustRegistryConnectionStatus) -> Option<TrustRegistryConnectionStatus> {
@@ -215,19 +237,7 @@ pub async fn create_trust_registry<S: TrustRegistryStore + 'static>(
             .await
         {
             Ok(connection_info) => {
-                let announcement = connection_info.announcement;
-                trust_registry.our_did = Some(connection_info.our_did);
-                trust_registry.registry_did = Some(
-                    connection_info
-                        .registry_did
-                        .clone(),
-                );
-                trust_registry.did = Some(connection_info.registry_did);
-                trust_registry.main_did = connection_info.main_did;
-                trust_registry.mediator_url = Some(connection_info.mediator_url);
-                trust_registry.mediator_did = Some(connection_info.mediator_did);
-                trust_registry.connection_status = TrustRegistryConnectionStatus::Connecting;
-                trust_registry.updated_at = chrono::Utc::now();
+                let announcement = record_oob_connection(&mut trust_registry, connection_info);
 
                 // Update store with connection info
                 if let Err(e) = save_announced(&store, &trust_registry, announcement).await {
@@ -570,10 +580,12 @@ pub async fn serve_trust_registry_did_witness<S: TrustRegistryStore>(
         .into_response()
 }
 
-/// Rebuild a trust registry's connection from its stored keys. Never accepts the
-/// OOB invitation again, so the registry keeps its identity. A failure leaves the
-/// stored status unchanged; a success moves a Failed registry back to Connected
-/// and keeps any other status.
+/// Rebuild a trust registry's connection from its stored keys, so the registry
+/// keeps its identity. A failure leaves the stored status unchanged; a success
+/// moves a Failed registry back to Connected and keeps any other status.
+///
+/// A registry whose setup never connected has no identity to keep, so its OOB
+/// invitation is accepted again instead, as when it was created.
 pub async fn reconnect_trust_registry<S: TrustRegistryStore + 'static>(
     Extension(store): Extension<Arc<S>>,
     listener_manager: Option<Extension<Arc<TrustRegistryListenerManager>>>,
@@ -597,6 +609,9 @@ pub async fn reconnect_trust_registry<S: TrustRegistryStore + 'static>(
         .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "Listener manager not available".to_string()))?;
     if !listener_mgr.is_active() {
         return Err(standby_refusal());
+    }
+    if tr.our_did.is_none() {
+        return complete_setup(&store, &listener_mgr, tr).await;
     }
 
     let connection = listener_mgr
@@ -637,6 +652,30 @@ pub async fn reconnect_trust_registry<S: TrustRegistryStore + 'static>(
     }
 
     Ok(Json(current))
+}
+
+/// Accept the OOB invitation of a registry whose setup never connected and save
+/// its new identity. A failure leaves the record unchanged.
+async fn complete_setup<S: TrustRegistryStore + 'static>(
+    store: &Arc<S>,
+    listener_mgr: &Arc<TrustRegistryListenerManager>,
+    mut trust_registry: TrustRegistry,
+) -> Result<Json<TrustRegistry>, (StatusCode, String)> {
+    let connection_info = listener_mgr
+        .accept_oob_and_connect(&trust_registry.id, &trust_registry.oob_url, &trust_registry.did_method)
+        .await
+        .map_err(|e| {
+            tracing::warn!("OOB setup retry failed for trust registry '{}': {}", trust_registry.id, e);
+            (StatusCode::BAD_GATEWAY, format!("Reconnection failed: OOB connection failed: {}", e))
+        })?;
+    let announcement = record_oob_connection(&mut trust_registry, connection_info);
+    if let Err(e) = save_announced(store, &trust_registry, announcement).await {
+        listener_mgr
+            .remove_connection(&trust_registry.id)
+            .await;
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update trust registry: {}", e)));
+    }
+    Ok(Json(trust_registry))
 }
 
 pub async fn list_trust_registry_records<S: TrustRegistryStore>(
@@ -1208,5 +1247,86 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    async fn never_connected_registry() -> (
+        Arc<super::super::FileSystemTrustRegistryStore>,
+        TrustRegistry,
+        Arc<TrustRegistryListenerManager>,
+        tempfile::TempDir,
+    ) {
+        let (store, mut registry, dir) = stored_registry(None).await;
+        registry.connection_status = TrustRegistryConnectionStatus::Failed;
+        assert!(
+            store
+                .update_if_exists(&registry)
+                .await
+                .unwrap()
+        );
+        let manager = TrustRegistryListenerManager::new("example.com".into(), dir.path().join("keys"), None);
+        manager
+            .set_store(store.clone())
+            .await;
+        (store, registry, manager, dir)
+    }
+
+    #[tokio::test]
+    async fn reconnect_completes_the_setup_of_a_registry_that_never_connected() {
+        let (store, registry, manager, _dir) = never_connected_registry().await;
+        crate::trust_registries::test_builds::install(
+            &registry.id,
+            vec![crate::trust_registries::test_builds::Outcome::Connect],
+        );
+
+        let Json(reconnected) = reconnect_trust_registry(
+            Extension(store.clone()),
+            Some(Extension(manager)),
+            Path(registry.id.clone()),
+            None,
+            None,
+        )
+        .await
+        .expect("the setup completes");
+
+        let expected_did = Some(format!("did:example:gateway-{}", registry.id));
+        assert_eq!(reconnected.connection_status, TrustRegistryConnectionStatus::Connecting);
+        assert_eq!(reconnected.our_did, expected_did);
+        let stored = store
+            .get(&registry.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.connection_status, TrustRegistryConnectionStatus::Connecting);
+        assert_eq!(stored.our_did, expected_did);
+        assert_eq!(stored.mediator_url.as_deref(), Some("https://mediator.example"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_setup_retry_leaves_the_record_unchanged() {
+        let (store, registry, manager, _dir) = never_connected_registry().await;
+        crate::trust_registries::test_builds::install(
+            &registry.id,
+            vec![crate::trust_registries::test_builds::Outcome::Fail("registry unreachable".into())],
+        );
+
+        let (status, message) = reconnect_trust_registry(
+            Extension(store.clone()),
+            Some(Extension(manager)),
+            Path(registry.id.clone()),
+            None,
+            None,
+        )
+        .await
+        .expect_err("the setup fails");
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(message.contains("OOB connection failed"), "the OOB invitation was retried: {message}");
+        let stored = store
+            .get(&registry.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.connection_status, TrustRegistryConnectionStatus::Failed);
+        assert_eq!(stored.our_did, None);
     }
 }

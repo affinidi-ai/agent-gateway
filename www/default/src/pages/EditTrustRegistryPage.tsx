@@ -333,7 +333,7 @@ const EditTrustRegistryPage: React.FC = () => {
                       data-testid="trust-registry-editor-reconnect-button"
                       onClick={handleReconnect}
                       disabled={reconnecting}
-                      title="Restores the connection using this gateway's stored identity for the registry. If that fails, delete and re-add the registry."
+                      title="Restores the connection using this gateway's stored identity for the registry, or completes the setup from the OOB URL if it never connected. If a connected registry still fails, delete and re-add it."
                     >
                       {reconnecting ? (
                         <>
