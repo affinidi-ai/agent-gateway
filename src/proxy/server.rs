@@ -280,7 +280,7 @@ pub async fn run_port_server(
 ) -> anyhow::Result<()> {
     let _task_id = task_id.unwrap_or_else(|| format!("port-{}-{}", port, uuid::Uuid::new_v4()));
 
-    info!("Starting port listener on 0.0.0.0:{} for {} channel(s)", port, surfaces.len());
+    info!("Starting port listener on port {} for {} channel(s)", port, surfaces.len());
 
     // Build channel info for each channel on this port
     let mut channel_infos = Vec::new();
@@ -1005,7 +1005,8 @@ pub async fn run_port_server(
     // this inbound port's external URLs (detected by hostname intersection).
     {
         if let Some(outbound_listener) = find_shared_outbound_listener(&network_config, port) {
-            let outbound_target = format!("http://{}:{}", outbound_listener.bind_address, outbound_listener.port);
+            let outbound_target =
+                format!("http://{}", listener_socket_address(&outbound_listener.bind_address, outbound_listener.port)?);
             let proxy_client = client.clone();
             info!(
                 inbound_port = port,
@@ -1196,12 +1197,9 @@ pub async fn run_port_server(
     // extension. No-op when the upstream extension is absent.
     let app = app.layer(axum::middleware::from_fn(crate::source_auth::peer_cert::promote_direct_peer_cert));
 
-    // Bind to 0.0.0.0:{port} to accept connections on all interfaces for this port
-    let bind_addr: SocketAddr = format!("0.0.0.0:{}", port)
-        .parse()
-        .expect("Valid 0.0.0.0:port format");
+    let bind_addrs = inbound_bind_addresses(&network_config, port)?;
 
-    info!("Port listener binding to {} for {} channels", bind_addr, surfaces.len());
+    info!("Port listener binding to {:?} for {} channels", bind_addrs, surfaces.len());
     for surface in &surfaces {
         info!("  Channel '{}' route '{}' -> {}", surface.name, surface.route(), surface.target_endpoint());
     }
@@ -1216,42 +1214,69 @@ pub async fn run_port_server(
         }
     }
 
-    // Serve with or without TLS based on protocol
-    let result = if use_tls {
-        info!("Port {} using TLS (HTTPS)", port);
-        // Load TLS config (with optional client auth verifier).
-        let tls_config = crate::server::load_server_config(
-            &config.tls.cert_path,
-            &config.tls.key_path,
-            direct_client_auth
-                .as_deref()
-                .cloned(),
-        )?;
+    // Serve with or without TLS based on protocol, on every address of the port.
+    let result: anyhow::Result<()> = async {
+        let listeners = bind_inbound_listeners(&bind_addrs).await?;
+        if use_tls {
+            info!("Port {} using TLS (HTTPS)", port);
+            // Load TLS config (with optional client auth verifier).
+            let tls_config = crate::server::load_server_config(
+                &config.tls.cert_path,
+                &config.tls.key_path,
+                direct_client_auth
+                    .as_deref()
+                    .cloned(),
+            )?;
 
-        // Create TLS listener using axum_server. If direct client auth is
-        // enabled, wrap the acceptor so peer certs are captured into a
-        // per-request extension.
-        let rustls_acceptor = axum_server::tls_rustls::RustlsAcceptor::new(
-            axum_server::tls_rustls::RustlsConfig::from_config(tls_config),
-        );
-        if direct_client_auth.is_some() {
-            let acceptor = crate::source_auth::peer_cert::PeerCertAcceptor::new(rustls_acceptor);
-            axum_server::bind(bind_addr)
-                .acceptor(acceptor)
-                .serve(app.into_make_service_with_connect_info::<SocketAddr>())
-                .await
+            // Create TLS listeners using axum_server. If direct client auth is
+            // enabled, wrap the acceptor so peer certs are captured into a
+            // per-request extension.
+            let rustls_acceptor = axum_server::tls_rustls::RustlsAcceptor::new(
+                axum_server::tls_rustls::RustlsConfig::from_config(tls_config),
+            );
+            let servers = listeners
+                .into_iter()
+                .map(axum_server::Server::<SocketAddr>::from_listener);
+            if direct_client_auth.is_some() {
+                futures::future::try_join_all(servers.map(|server| {
+                    server
+                        .acceptor(crate::source_auth::peer_cert::PeerCertAcceptor::new(rustls_acceptor.clone()))
+                        .serve(
+                            app.clone()
+                                .into_make_service_with_connect_info::<SocketAddr>(),
+                        )
+                }))
+                .await?;
+            } else {
+                futures::future::try_join_all(servers.map(|server| {
+                    server
+                        .acceptor(rustls_acceptor.clone())
+                        .serve(
+                            app.clone()
+                                .into_make_service_with_connect_info::<SocketAddr>(),
+                        )
+                }))
+                .await?;
+            }
         } else {
-            axum_server::bind(bind_addr)
-                .acceptor(rustls_acceptor)
-                .serve(app.into_make_service_with_connect_info::<SocketAddr>())
-                .await
+            info!("Port {} using plain HTTP (no TLS)", port);
+            futures::future::try_join_all(
+                listeners
+                    .into_iter()
+                    .map(|listener| {
+                        axum::serve(
+                            listener,
+                            app.clone()
+                                .into_make_service_with_connect_info::<SocketAddr>(),
+                        )
+                        .into_future()
+                    }),
+            )
+            .await?;
         }
-    } else {
-        info!("Port {} using plain HTTP (no TLS)", port);
-        // Create plain TCP listener
-        let listener = tokio::net::TcpListener::bind(bind_addr).await?;
-        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await
-    };
+        Ok(())
+    }
+    .await;
 
     // Cleanup: Unregister tasks when server stops
     if let Some(ref monitor) = task_monitor {
@@ -1301,6 +1326,71 @@ fn get_or_create_outbound_channel_state(
         states.insert(config_id.to_string(), new_state.clone());
         new_state
     }
+}
+
+/// The socket address a listener binds on `port`, from its `bind_address`, an
+/// IPv4 or IPv6 address.
+fn listener_socket_address(
+    bind_address: &str,
+    port: u16,
+) -> anyhow::Result<SocketAddr> {
+    let ip: std::net::IpAddr = bind_address
+        .parse()
+        .map_err(|error| {
+            anyhow::anyhow!("Invalid bind_address '{bind_address}' for the listener on port {port}: {error}")
+        })?;
+    Ok(SocketAddr::new(ip, port))
+}
+
+/// The addresses the inbound listener on `port` binds: the distinct
+/// `bind_address` of every inbound listener configured for the port, the
+/// unspecified ones first (`::` before `0.0.0.0`), or every IPv4 interface when
+/// no inbound listener is configured for the port.
+fn inbound_bind_addresses(
+    network_config: &crate::config::NetworkConfig,
+    port: u16,
+) -> anyhow::Result<Vec<SocketAddr>> {
+    let mut addresses = Vec::new();
+    for listener in network_config
+        .listeners
+        .iter()
+        .filter(|listener| listener.listener_type == "inbound" && listener.port == port)
+    {
+        let address = listener_socket_address(&listener.bind_address, port)?;
+        if !addresses.contains(&address) {
+            addresses.push(address);
+        }
+    }
+    if addresses.is_empty() {
+        addresses.push(SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port)));
+    }
+    addresses.sort_by_key(|address| (!address.ip().is_unspecified(), address.is_ipv4()));
+    Ok(addresses)
+}
+
+/// Bind every inbound address of a port. An address the operating system
+/// reports in use once an unspecified address of the port is bound is already
+/// served by that one, as when an IPv6 wildcard also accepts IPv4, and is
+/// skipped.
+async fn bind_inbound_listeners(addresses: &[SocketAddr]) -> anyhow::Result<Vec<tokio::net::TcpListener>> {
+    let mut listeners: Vec<tokio::net::TcpListener> = Vec::new();
+    for &address in addresses {
+        match tokio::net::TcpListener::bind(address).await {
+            Ok(listener) => listeners.push(listener),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AddrInUse
+                    && listeners.iter().any(|bound| {
+                        bound
+                            .local_addr()
+                            .is_ok_and(|bound| bound.ip().is_unspecified())
+                    }) =>
+            {
+                info!(%address, "Inbound address is already served by the unspecified address bound on its port");
+            }
+            Err(error) => anyhow::bail!("Failed to bind inbound listener {address}: {error}"),
+        }
+    }
+    Ok(listeners)
 }
 
 /// Take the shared outbound state for `config_id` out of service. Routes still
@@ -1576,9 +1666,7 @@ pub async fn run_outbound_port_server(
     }
 
     // Bind address — use the configured bind_address, not 0.0.0.0.
-    let bind_addr: std::net::SocketAddr = format!("{}:{}", bind_address, port)
-        .parse()
-        .map_err(|e| anyhow::anyhow!("Invalid outbound bind address {}:{}: {}", bind_address, port, e))?;
+    let bind_addr = listener_socket_address(&bind_address, port)?;
 
     info!("Outbound port listener binding to {}", bind_addr);
 
@@ -2214,6 +2302,187 @@ mod tests {
             "routes": {}
         }))
         .expect("make_network_config_with_listeners")
+    }
+
+    #[test]
+    fn an_inbound_listener_binds_its_configured_address() {
+        let config: crate::config::NetworkConfig = serde_json::from_value(serde_json::json!({
+            "did": { "domain": "test.example.com" },
+            "webauthn": { "rp_id": "test", "external_origin": "https://test.example.com" },
+            "integration": { "types": [], "categories": [] },
+            "listeners": [
+                { "id": "loopback", "name": "Loopback", "bind_address": "127.0.0.1", "port": 8080,
+                    "protocol": "http", "external_urls": [] },
+                { "id": "loopback-v6", "name": "Loopback v6", "bind_address": "::1", "port": 8443,
+                    "protocol": "https", "external_urls": [] },
+                { "id": "every-interface", "name": "Every interface", "bind_address": "0.0.0.0", "port": 8081,
+                    "protocol": "http", "external_urls": [] },
+                { "id": "internal", "name": "Internal", "bind_address": "10.0.0.5", "port": 8444,
+                    "protocol": "https", "external_urls": [] },
+                { "id": "sidecar", "name": "Sidecar", "bind_address": "127.0.0.1", "port": 8444,
+                    "protocol": "https", "external_urls": [] },
+                { "id": "narrow", "name": "Narrow", "bind_address": "127.0.0.1", "port": 8445,
+                    "protocol": "http", "external_urls": [] },
+                { "id": "wide-v4", "name": "Wide v4", "bind_address": "0.0.0.0", "port": 8445,
+                    "protocol": "http", "external_urls": [] },
+                { "id": "wide-v6", "name": "Wide v6", "bind_address": "::", "port": 8445,
+                    "protocol": "http", "external_urls": [] },
+                { "id": "outbound", "name": "Outbound", "bind_address": "10.0.0.9", "port": 8446,
+                    "protocol": "http", "external_urls": [], "listener_type": "outbound" },
+                { "id": "inbound-beside-outbound", "name": "Inbound", "bind_address": "127.0.0.1", "port": 8446,
+                    "protocol": "http", "external_urls": [] }
+            ],
+            "routes": {}
+        }))
+        .unwrap();
+
+        for (port, expected) in [
+            (8080, vec!["127.0.0.1:8080"]),
+            (8443, vec!["[::1]:8443"]),
+            (8081, vec!["0.0.0.0:8081"]),
+            (9999, vec!["0.0.0.0:9999"]),
+            (8444, vec!["10.0.0.5:8444", "127.0.0.1:8444"]),
+            (8445, vec!["[::]:8445", "0.0.0.0:8445", "127.0.0.1:8445"]),
+            (8446, vec!["127.0.0.1:8446"]),
+        ] {
+            assert_eq!(
+                inbound_bind_addresses(&config, port).unwrap(),
+                expected
+                    .iter()
+                    .map(|address| {
+                        address
+                            .parse::<SocketAddr>()
+                            .unwrap()
+                    })
+                    .collect::<Vec<_>>(),
+                "{port}"
+            );
+        }
+        assert_eq!(config.get_ports(), vec![8080, 8443, 8081, 8444, 8445, 8446]);
+    }
+
+    #[test]
+    fn a_listener_binds_an_ipv4_or_ipv6_bind_address() {
+        for (bind_address, expected) in
+            [("127.0.0.1", "127.0.0.1:9000"), ("::1", "[::1]:9000"), ("::", "[::]:9000"), ("0.0.0.0", "0.0.0.0:9000")]
+        {
+            assert_eq!(
+                listener_socket_address(bind_address, 9000).unwrap(),
+                expected
+                    .parse::<SocketAddr>()
+                    .unwrap(),
+                "{bind_address}"
+            );
+        }
+        assert!(listener_socket_address("localhost", 9000).is_err());
+        assert_eq!(
+            format!("http://{}", listener_socket_address("::1", 9000).unwrap()),
+            "http://[::1]:9000",
+            "the shared-domain proxy reaches an IPv6 outbound listener at a URL that parses"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_outbound_listener_binds_an_ipv6_bind_address() {
+        let Ok(probe) = std::net::TcpListener::bind("[::1]:0") else {
+            eprintln!("skipped: this host has no IPv6 loopback address");
+            return;
+        };
+        let port = probe
+            .local_addr()
+            .unwrap()
+            .port();
+        drop(probe);
+        let config: GatewayConfig = serde_json::from_value(serde_json::json!({
+            "tls": {"cert_path": "unused.pem", "key_path": "unused-key.pem"},
+            "integration": {"variable_pattern": "\\$\\{([^}]+)\\}", "custom_variable_prefix": "_", "types": [],
+                "categories": []},
+            "extension_inspection": {"enabled": false}
+        }))
+        .unwrap();
+        let server = tokio::spawn(run_outbound_port_server(
+            "::1".into(),
+            port,
+            Vec::new(),
+            Arc::new(config),
+            Arc::new(make_network_config_with_listeners(vec![], vec![])),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            None,
+            Arc::new(tokio::sync::RwLock::new(None)),
+            None,
+        ));
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+
+        let mut alive = None;
+        for _ in 0..50 {
+            if let Ok(response) = client
+                .get(format!("http://[::1]:{port}/alive"))
+                .send()
+                .await
+            {
+                alive = Some(response.status());
+                break;
+            }
+            if server.is_finished() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        server.abort();
+
+        assert_eq!(alive, Some(reqwest::StatusCode::OK));
+    }
+
+    #[tokio::test]
+    async fn a_port_binds_each_inbound_address_and_skips_one_its_wildcard_already_serves() {
+        let held = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let port = held
+            .local_addr()
+            .unwrap()
+            .port();
+        let loopback = SocketAddr::from(([127, 0, 0, 1], port));
+
+        let error = bind_inbound_listeners(&[loopback])
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("Failed to bind inbound listener 127.0.0.1:"),
+            "{error}"
+        );
+        drop(held);
+
+        let listeners = bind_inbound_listeners(&[SocketAddr::from(([0, 0, 0, 0], port)), loopback])
+            .await
+            .unwrap();
+        assert!(
+            listeners
+                .iter()
+                .any(|listener| listener
+                    .local_addr()
+                    .unwrap()
+                    .ip()
+                    .is_unspecified())
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), tokio::net::TcpStream::connect(loopback))
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[test]

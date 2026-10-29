@@ -719,7 +719,7 @@ impl SurfaceTaskManager {
             }
 
             info!(
-                "Reloading port listener on 0.0.0.0:{} for {} channel(s), protocol: {}",
+                "Reloading port listener on port {} for {} channel(s), protocol: {}",
                 port,
                 channels.len(),
                 if use_tls {

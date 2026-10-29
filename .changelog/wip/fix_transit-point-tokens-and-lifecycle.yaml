@@ -72,6 +72,16 @@ changes:
         grants. The Access Point's consent body no longer carries the caller's identity hash
         and agent DID.
     - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Bind inbound listeners to their configured `bind_address`
+      description: >-
+        Inbound listeners now bind their `bind_address`, as outbound listeners already did,
+        on startup and on every reload, where they used to bind every interface. Inbound
+        listeners sharing a port are served by one listener task that binds each of their
+        addresses, instead of a second task that failed to bind the port again. An IPv4
+        caller that an IPv6 address such as `::` accepts matches the IPv4 entries of
+        `client_ip.trusted_proxies` and `tls.client_auth.trusted_proxies`, so a load
+        balancer listed there stays trusted.
+    - timestamp: '2026-10-28T00:00:00.000Z'
       title: Write the gateway's key files atomically with owner-only permissions
       description: >-
         The gateway's key files (DID keys, VC issuer keys and the transit token key) are now
@@ -97,6 +107,14 @@ changes:
         its port, so `/alive` health checks on it failed until the gateway restarted, while
         startup binds such a listener. Reloads now bind it the same way: it answers `/alive`
         and refuses the removed Transit Point paths with `404`.
+    - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Bind an outbound listener whose `bind_address` is an IPv6 address
+      description: >-
+        An outbound listener with an IPv6 `bind_address`, such as `::1`, passed validation but
+        never bound, because its socket address was built as text without brackets, and the
+        inbound listener sharing its host name forwarded `/outbound/*` to an address that did
+        not parse. Both now build the address from the IP address and port, so an IPv6
+        outbound listener binds and is reachable through the shared host name.
   removed: []
   security: []
   breaking:
@@ -167,3 +185,13 @@ changes:
         credential bindings used to carry the delegated credential when its transit token named
         a caller. It is now always forwarded without one, as it is without the `target_auth`
         credential, because the gateway does not check a transit token on such a read.
+    - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Check inbound listener `bind_address` values before upgrading
+      description: >-
+        An inbound listener whose `bind_address` is not `0.0.0.0` now accepts connections on
+        that address only, so a listener set to `127.0.0.1` is no longer reachable from other
+        hosts. Inbound listeners used to ignore their `bind_address`; one that is not an IP
+        address now stops the gateway from loading its network configuration, and one the host
+        does not own, such as an Elastic IP or a NAT address, now stops that port from serving,
+        the management API and dashboard included when they are on it. The example
+        configuration and Docker setup bind `0.0.0.0` and are unaffected.
