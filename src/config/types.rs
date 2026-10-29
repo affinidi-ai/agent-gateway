@@ -2963,6 +2963,12 @@ pub struct BootstrapConfig {
     /// serves fresh state the moment it is promoted.
     #[serde(default)]
     pub cache_refresh_interval_secs: u64,
+
+    /// `gateway.json`'s `transit_token_min_lifetime_secs` as the gateway started
+    /// with it ([`Self::pin_transit_token_min_lifetime`]). Every later load of
+    /// `gateway.json` takes this value instead of the file's.
+    #[serde(skip)]
+    pub pinned_transit_token_min_lifetime_secs: Option<u64>,
 }
 
 /// DID document cache configuration

@@ -7,11 +7,29 @@ use tracing::{info, warn};
 
 #[allow(dead_code)]
 impl BootstrapConfig {
-    /// Load network configuration from the configured path
+    /// Reads `transit_token_min_lifetime_secs` from `gateway.json` when the
+    /// gateway starts, refusing a value outside 1 to 900 seconds, and pins it:
+    /// every later [`Self::load_network_config`], such as a reload's, takes the
+    /// pinned value instead of the file's. A change takes a restart, and an
+    /// edit, valid or not, never reaches a running gateway.
+    pub fn pin_transit_token_min_lifetime(&mut self) -> anyhow::Result<u64> {
+        let network_path = &self.config_files.gateway;
+        let min_secs = NetworkConfig::load_from_file(network_path)?.transit_token_min_lifetime_secs;
+        crate::config::agent_surface::validate_transit_token_min_lifetime(min_secs)
+            .map_err(|error| anyhow::anyhow!("{network_path}: {error}"))?;
+        self.pinned_transit_token_min_lifetime_secs = Some(min_secs);
+        Ok(min_secs)
+    }
+
+    /// Load network configuration from the configured path, with the
+    /// `transit_token_min_lifetime_secs` pinned at startup, once pinned.
     pub fn load_network_config(&self) -> anyhow::Result<NetworkConfig> {
         let network_path = &self.config_files.gateway;
         info!("Loading network configuration from: {}", network_path);
         let mut network_config = NetworkConfig::load_from_file(network_path)?;
+        if let Some(min_secs) = self.pinned_transit_token_min_lifetime_secs {
+            network_config.transit_token_min_lifetime_secs = min_secs;
+        }
 
         if let Some((old_domain, new_domain)) = network_config.normalize_localhost_did_domain() {
             warn!(
@@ -152,24 +170,40 @@ impl GatewayConfig {
         }
     }
 
-    /// Refuses a surface whose transit token lifetime is outside `min_secs`, the
-    /// appliance's `transit_token_min_lifetime_secs`, to 900 seconds.
-    pub fn validate_transit_token_lifetimes(
+    /// Checks every surface's transit token lifetime when the gateway starts,
+    /// disabled ones included. One below `min_secs`, the appliance's
+    /// `transit_token_min_lifetime_secs`, is held to it and logged at `WARN`;
+    /// it never stops the gateway. One above 900 seconds, which no save
+    /// accepts, stops it, naming every such surface.
+    pub fn check_transit_token_lifetimes(
         &self,
         min_secs: u64,
     ) -> anyhow::Result<()> {
+        use crate::config::agent_surface::MAX_TRANSIT_TOKEN_LIFETIME_SECS;
+        let mut too_long = Vec::new();
         for surface in &self.surfaces {
-            if let Some(transit) = &surface.transit
-                && let Err(error) = transit
-                    .shared
-                    .validate_transit_token_lifetime(min_secs)
-            {
-                let channel_id = surface
-                    .config_id()
-                    .map(|id| format!(" ({}.json)", id))
-                    .unwrap_or_default();
-                anyhow::bail!("Channel '{}'{}: {}", surface.name, channel_id, error);
+            match surface
+                .transit
+                .as_ref()
+                .and_then(|transit| {
+                    transit
+                        .shared
+                        .transit_token_lifetime_secs
+                }) {
+                Some(secs) if secs > MAX_TRANSIT_TOKEN_LIFETIME_SECS => too_long.push(format!(
+                    "Surface '{}' ({}): transit.transit_token_lifetime_secs is {secs}, above the longest, \
+                     {MAX_TRANSIT_TOKEN_LIFETIME_SECS} seconds",
+                    surface.name, surface.surface_id
+                )),
+                _ => {
+                    if let Some(adjustment) = surface.transit_token_lifetime_adjustment(min_secs) {
+                        warn!("{adjustment}");
+                    }
+                }
             }
+        }
+        if !too_long.is_empty() {
+            anyhow::bail!("{}", too_long.join("; "));
         }
         Ok(())
     }
@@ -453,19 +487,16 @@ fn validate_allowed_algorithms(
 mod tests {
     use super::*;
 
+    /// At startup a stored lifetime below the appliance's shortest is held to it
+    /// and does not stop the gateway, disabled surfaces included; one above 900
+    /// seconds, which no save accepts, does, and every such surface is named.
     #[test]
-    fn startup_refuses_a_surface_whose_transit_token_lifetime_is_out_of_bounds() {
-        let tls = tempfile::tempdir().unwrap();
-        let mut config = GatewayConfig::default_config();
-        for file in ["cert.pem", "key.pem"] {
-            std::fs::write(tls.path().join(file), "").unwrap();
-        }
-        config.tls.cert_path = tls.path().join("cert.pem");
-        config.tls.key_path = tls.path().join("key.pem");
-        let surface_living = |secs: u64| {
+    fn startup_holds_a_lifetime_below_the_shortest_and_refuses_one_above_the_longest() {
+        let surface_living = |id: &str, secs: u64, status: &str| {
             serde_json::from_value(serde_json::json!({
-                "surface_id": "lifetime-surface",
-                "name": "lifetime",
+                "surface_id": id,
+                "name": id,
+                "status": status,
                 "access_point": { "listen_address": "0.0.0.0:8443", "route": "/lifetime", "protocol": "a2a" },
                 "target": { "endpoint": "https://agent.internal" },
                 "transit": {
@@ -475,37 +506,94 @@ mod tests {
             }))
             .unwrap()
         };
+        let mut config = GatewayConfig::default_config();
 
-        config.surfaces = vec![surface_living(900)];
+        config.surfaces = vec![
+            surface_living("short", 10, "active"),
+            surface_living("short-disabled", 5, "disabled"),
+            surface_living("longest", 900, "active"),
+        ];
         config
-            .validate_transit_token_lifetimes(30)
+            .check_transit_token_lifetimes(120)
             .unwrap();
-        config.surfaces = vec![surface_living(901)];
+
+        config.surfaces = vec![
+            surface_living("too-long", 901, "active"),
+            surface_living("short", 10, "active"),
+            surface_living("too-long-disabled", 1200, "disabled"),
+        ];
         assert_eq!(
             config
-                .validate_transit_token_lifetimes(30)
+                .check_transit_token_lifetimes(30)
                 .unwrap_err()
                 .to_string(),
-            "Channel 'lifetime' (lifetime-surface.json): transit.transit_token_lifetime_secs must be from 30 to 900 \
-             seconds, not 901"
+            "Surface 'too-long' (too-long): transit.transit_token_lifetime_secs is 901, above the longest, 900 \
+             seconds; Surface 'too-long-disabled' (too-long-disabled): transit.transit_token_lifetime_secs is 1200, \
+             above the longest, 900 seconds"
         );
-        config.surfaces = vec![surface_living(10)];
-        assert!(
-            config
-                .validate_transit_token_lifetimes(30)
-                .is_err()
-        );
-        config
-            .validate_transit_token_lifetimes(10)
+    }
+
+    /// The shortest lifetime is read once, when the gateway starts; every later
+    /// load of `gateway.json` keeps that value, whatever the file says, so a
+    /// reload neither changes it nor fails on it.
+    #[test]
+    fn the_shortest_transit_token_lifetime_is_pinned_when_the_gateway_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let gateway_json = dir
+            .path()
+            .join("gateway.json");
+        let write = |min_secs: serde_json::Value| {
+            std::fs::write(
+                &gateway_json,
+                serde_json::json!({
+                    "did": { "domain": "test.local" },
+                    "webauthn": { "rp_id": "localhost", "external_origin": "https://localhost" },
+                    "integration": { "types": [], "categories": [] },
+                    "listeners": [],
+                    "routes": {},
+                    "transit_token_min_lifetime_secs": min_secs
+                })
+                .to_string(),
+            )
             .unwrap();
-        config.surfaces = vec![surface_living(5)];
-        assert_eq!(
-            config
-                .validate_transit_token_lifetimes(10)
+        };
+        let mut bootstrap: BootstrapConfig =
+            toml::from_str(&crate::render_default_bootstrap_toml("", "").unwrap()).unwrap();
+        bootstrap.config_files.gateway = gateway_json
+            .to_string_lossy()
+            .into_owned();
+
+        for refused in [0, 901] {
+            write(serde_json::json!(refused));
+            let error = bootstrap
+                .pin_transit_token_min_lifetime()
                 .unwrap_err()
-                .to_string(),
-            "Channel 'lifetime' (lifetime-surface.json): transit.transit_token_lifetime_secs must be from 10 to 900 \
-             seconds, not 5"
+                .to_string();
+            assert!(
+                error.contains(&format!(
+                    "transit_token_min_lifetime_secs in gateway.json must be from 1 to 900 seconds, not {refused}"
+                )),
+                "{error}"
+            );
+        }
+
+        write(serde_json::json!(10));
+        assert_eq!(
+            bootstrap
+                .pin_transit_token_min_lifetime()
+                .unwrap(),
+            10
         );
+        for on_disk in [30, 0, 901] {
+            write(serde_json::json!(on_disk));
+            assert_eq!(
+                bootstrap
+                    .load_network_config()
+                    .unwrap()
+                    .transit_token_min_lifetime_secs,
+                10,
+                "{on_disk}"
+            );
+        }
     }
 }

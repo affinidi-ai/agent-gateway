@@ -75,7 +75,9 @@ pub struct NetworkConfig {
 
     /// The shortest lifetime, in seconds, a surface may set for its transit
     /// tokens (`transit.transit_token_lifetime_secs`), from 1 to 900; 30 when
-    /// unset. The longest, 900, is fixed. Read at startup.
+    /// unset. The longest, 900, is fixed. Read and checked once, when the
+    /// gateway starts (`BootstrapConfig::pin_transit_token_min_lifetime`); a
+    /// reload keeps that value.
     #[serde(default = "default_transit_token_min_lifetime_secs")]
     pub transit_token_min_lifetime_secs: u64,
 }
@@ -197,8 +199,6 @@ impl NetworkConfig {
         let config: NetworkConfig = serde_json::from_str(&contents)?;
         config.validate_listeners()?;
         config.validate_terms()?;
-        crate::config::agent_surface::validate_transit_token_min_lifetime(config.transit_token_min_lifetime_secs)
-            .map_err(|error| anyhow::anyhow!("{path}: {error}"))?;
         if let Some(profile) = &config.sts.mcp_issuer {
             profile.validate_network(&config)?;
             config
@@ -799,17 +799,17 @@ mod url_mapping_tests {
         }
     }
 
+    /// A load does not judge the shortest lifetime: only the startup pin does
+    /// (`BootstrapConfig::pin_transit_token_min_lifetime`), so a reload never
+    /// fails on it.
     #[test]
-    fn a_shortest_transit_token_lifetime_outside_1_to_900_seconds_stops_startup() {
+    fn a_load_reads_any_shortest_transit_token_lifetime_and_refuses_only_a_non_number() {
         for min_secs in [0, 901] {
-            let error = load_with_min_lifetime(Some(serde_json::json!(min_secs)))
-                .unwrap_err()
-                .to_string();
-            assert!(
-                error.ends_with(&format!(
-                    "transit_token_min_lifetime_secs must be from 1 to 900 seconds, not {min_secs}"
-                )),
-                "{error}"
+            assert_eq!(
+                load_with_min_lifetime(Some(serde_json::json!(min_secs)))
+                    .unwrap()
+                    .transit_token_min_lifetime_secs,
+                min_secs
             );
         }
         assert!(load_with_min_lifetime(Some(serde_json::json!("ten"))).is_err());

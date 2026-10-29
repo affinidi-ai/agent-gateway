@@ -1492,12 +1492,6 @@ pub async fn run_outbound_port_server(
         for e in outbound_surface.validate_outbound() {
             tracing::warn!(channel = %outbound_surface.name, "Outbound validation warning: {}", e);
         }
-        if let Err(e) = transit
-            .shared
-            .validate_transit_token_lifetime(network_config.transit_token_min_lifetime_secs)
-        {
-            tracing::warn!(channel = %outbound_surface.name, "Outbound validation warning: {}", e);
-        }
         let route_prefix = outbound_surface
             .route()
             .trim_end_matches('/');
