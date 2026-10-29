@@ -195,8 +195,10 @@ Resource Server token, or in the second, with the transit token, unless it is ma
 `allow_unauthenticated_callers`; one that cannot be enforced refuses every request there,
 before anything is forwarded or any credential resolved (see
 [`docs/SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#transit-point-callers)). Public discovery GETs,
-such as an agent card, skip transit token validation and the trust and policy group, but not
-caller authentication, and are forwarded without credentials. The outbound path does not
+such as an agent card, skip transit token validation and the trust and policy group, and are
+forwarded without credentials. They still meet a Transit Point's `source_auth` or Resource
+Server token, but on a Transit Point that authenticates its callers with the transit token
+alone, a discovery GET is forwarded with no caller authentication at all. The outbound path does not
 evaluate the appliance-wide policies.
 
 ## Full order
@@ -316,7 +318,7 @@ Breaking one of these is a correctness bug, not a style question.
 | Identity attribution fails closed. A presentation that does not verify never becomes the caller identity. | An unverified DID would reach policy as if it were proven. |
 | Every event of a forwarded A2A event stream gets the response checks a non-streaming reply gets before it is sent, and one that fails them ends the stream. | Streaming would bypass the response policy and the agent identity credential. |
 | A caller whose source authentication failed is never forwarded with the surface's stored target credential, or the A2A proxy's Direct Line secret, on the inbound and Fabric forwarding paths (direct, `proxy://` MCP, `a2a-proxy://`, Fabric send, Fabric receive). | An unauthenticated caller would reach the Target with the operator's credential. |
-| A Transit Point authenticates its caller, with a transit token, a Resource Server token or its `source_auth`, before anything is forwarded or any credential resolved, unless it is marked `allow_unauthenticated_callers`; one whose caller authentication cannot be enforced refuses every request. | Anyone who reaches a Transit Point would call its target as this gateway, with its target credentials. |
+| A Transit Point authenticates its caller, with a transit token, a Resource Server token or its `source_auth`, before anything is forwarded or any credential resolved, unless it is marked `allow_unauthenticated_callers`; one whose caller authentication cannot be enforced refuses every request. The one exception: a Transit Point that relies on the transit token alone forwards a public discovery `GET` without it, and without any credential. | Anyone who reaches a Transit Point would call its target as this gateway, with its target credentials. |
 | A managed agent receives the caller-info headers (`CallerHeaders::NAMES`) only as this gateway sets them: the inbound path and Fabric receive drop every copy a caller or a peer gateway sent. | The agent could not rely on the caller-info headers. |
 | The Agent Surface is the only routing unit. | Routing behaviour would drift away from what an operator configured. |
 | x402 verification and settlement use the surface's configured payment requirement, or on a fabric facilitator the requirement the requesting peer sends; a credential's `accepted` must name it exactly. | A caller could name its own recipient and amount and still be granted the resource. |

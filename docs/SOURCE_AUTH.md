@@ -280,7 +280,12 @@ The Surface Builder shows neither a Transit Point's `source_auth` nor its
 keeps the stored one; a merge `PATCH` whose `transit.points` leave it out removes it, since a
 merge patch replaces the whole list. A `PUT` that omits `allow_unauthenticated_callers` keeps
 it while the Transit Point still authenticates no caller, and drops it once the Transit Point
-authenticates its callers.
+authenticates its callers. A `PUT` matches each Transit Point to the stored one by `id`, and a
+Transit Point sent without an `id` gets a new one, so a `PUT` that omits both the `id` and
+`source_auth` drops the stored `source_auth`: a Transit Point that still requires a transit
+token is saved, authenticated by the token alone, and one that does not is refused with `400`.
+Send each Transit Point's `id` back. In a `PUT`, `"source_auth": null` also keeps the stored
+value; remove it with a merge `PATCH`.
 
 ### Upgrading and rolling back
 
