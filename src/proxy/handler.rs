@@ -170,6 +170,24 @@ fn access_point_fabric_headers(
     (headers_map, stream_headers)
 }
 
+/// Whether a caller header goes on to an Access Point's target: one
+/// [`should_forward_ap_request_header_with_mapping`] forwards, unless it is named
+/// like the `target_auth` header, which only the gateway sets.
+fn forwards_ap_caller_header(
+    name: &str,
+    source_auth_header: Option<&str>,
+    header_metadata_mapping: Option<&crate::config::header_metadata_mapping::HeaderMetadataMappingConfig>,
+    forward_source_auth_header: bool,
+    target_auth_header: Option<&str>,
+) -> bool {
+    should_forward_ap_request_header_with_mapping(
+        name,
+        source_auth_header,
+        header_metadata_mapping,
+        forward_source_auth_header,
+    ) && target_auth_header.is_none_or(|credential| !name.eq_ignore_ascii_case(credential))
+}
+
 /// Extract UCP operation type from request path and method
 /// Supports UCP REST, MCP, and A2A transport bindings per spec
 pub(crate) fn extract_ucp_operation(
@@ -812,6 +830,31 @@ async fn target_provider_token(
     };
     let token = service_token::acquire(&provider, &scopes, &service, key, chrono::Utc::now()).await?;
     Ok(token.value().to_string())
+}
+
+/// The header a Target authentication sets, when it sets one. A caller header of
+/// that name never reaches the target, whether or not the gateway adds its own.
+pub(crate) fn target_auth_header_name(target_auth: Option<&crate::config::TargetAuthConfig>) -> Option<&str> {
+    target_auth.and_then(|target_auth| {
+        target_auth
+            .method
+            .header_name()
+    })
+}
+
+/// Set a gateway credential header on an upstream request, replacing every
+/// value of that header already on it, so the target receives exactly one. An
+/// invalid name or value fails the request when it is sent, as
+/// [`reqwest::RequestBuilder::header`] does.
+pub(crate) fn replace_request_header(
+    request: reqwest::RequestBuilder,
+    name: &str,
+    value: &str,
+) -> reqwest::RequestBuilder {
+    match (axum::http::HeaderName::from_bytes(name.as_bytes()), axum::http::HeaderValue::from_str(value)) {
+        (Ok(name), Ok(value)) => request.headers(HeaderMap::from_iter([(name, value)])),
+        _ => request.header(name, value),
+    }
 }
 
 /// Load and prepare DID:webvh identity context for a channel request
@@ -6178,15 +6221,17 @@ async fn proxy_handler_with_mcp_runtime(
     // what a Transit Point sends its vendor, no caller-info or DID header, and
     // is asked for an answer the gateway can read as it is sent.
     let bound_target = crate::proxy::target_grant::binds_the_target(&state.surface);
+    let target_auth_header = target_auth_header_name(state.surface.target_auth());
     let forwards_header = |name: &str| {
         if bound_target {
             crate::proxy::target_grant::forwards_caller_header(name, source_cred_header, header_metadata_mapping)
         } else {
-            should_forward_ap_request_header_with_mapping(
+            forwards_ap_caller_header(
                 name,
                 source_cred_header,
                 header_metadata_mapping,
                 forward_source_auth_header,
+                target_auth_header,
             )
         }
     };
@@ -6453,7 +6498,7 @@ async fn proxy_handler_with_mcp_runtime(
         .await
         {
             Ok(Some((header_name, header_value))) => {
-                upstream_req = upstream_req.header(&header_name, &header_value);
+                upstream_req = replace_request_header(upstream_req, &header_name, &header_value);
                 debug!(channel = channel_name, header = %header_name, "Injected target authentication header");
             }
             Ok(None) => {
@@ -6866,7 +6911,7 @@ async fn proxy_handler_with_mcp_runtime(
                                 name,
                                 value,
                             } => {
-                                upstream_req = upstream_req.header(name, value);
+                                upstream_req = replace_request_header(upstream_req, name, value);
                                 debug!(
                                     target: "credential_delegation",
                                     surface = %channel_name,
@@ -16740,9 +16785,10 @@ mod tests {
         Ap2InboundDecision, CHANNEL_SSE_SESSION_MGR, a2a_proxy_connection_status, access_point_fabric_headers,
         agent_card_fabric_forward_path, agent_card_response, ap2_experimental_enabled_from_flags,
         decode_bearer_jwt_claims, delegates_credentials_over_fabric, evaluate_ap2_inbound_decision,
-        fabric_mcp_gate_input, is_forwarded_on_credentialed_card_fetch, modern_fabric_failure_response,
-        normalize_route_for_match, resolve_direct_surface_auth_config, resolve_legacy_mcp_session,
-        route_tail_to_uri_path, should_forward_ap_request_header_with_mapping,
+        fabric_mcp_gate_input, forwards_ap_caller_header, is_forwarded_on_credentialed_card_fetch,
+        modern_fabric_failure_response, normalize_route_for_match, replace_request_header,
+        resolve_direct_surface_auth_config, resolve_legacy_mcp_session, route_tail_to_uri_path,
+        should_forward_ap_request_header_with_mapping,
     };
     use axum::http::{HeaderMap, HeaderValue};
     use base64::Engine;
@@ -20982,6 +21028,36 @@ allow if {
     }
 
     #[test]
+    fn a_caller_header_named_like_the_target_auth_header_is_never_forwarded() {
+        assert!(!forwards_ap_caller_header("X-Vendor-Key", None, None, false, Some("x-vendor-key")));
+        assert!(forwards_ap_caller_header("X-Vendor-Key", None, None, false, None));
+        assert!(forwards_ap_caller_header("X-Other", None, None, false, Some("x-vendor-key")));
+        assert!(!forwards_ap_caller_header("authorization", Some("authorization"), None, true, Some("Authorization")));
+        assert!(forwards_ap_caller_header("authorization", Some("authorization"), None, true, None));
+    }
+
+    #[test]
+    fn a_replaced_request_header_carries_only_the_gateway_value() {
+        let request = reqwest::Client::new()
+            .get("http://target.example/")
+            .header("x-vendor-key", "caller-one")
+            .header("X-Vendor-Key", "caller-two")
+            .header("x-other", "kept");
+
+        let request = replace_request_header(request, "X-Vendor-Key", "gateway-key")
+            .build()
+            .unwrap();
+
+        let values: Vec<_> = request
+            .headers()
+            .get_all("x-vendor-key")
+            .iter()
+            .collect();
+        assert_eq!(values, ["gateway-key"]);
+        assert_eq!(request.headers()["x-other"], "kept");
+    }
+
+    #[test]
     fn fabric_agent_card_forward_path_uses_default_well_known_path() {
         let surface = surface_with_agent_card_path(None);
 
@@ -21370,6 +21446,43 @@ allow if {
         assert!(url.ends_with("?code=<redacted>&<redacted>"), "{url}");
         assert!(!url.contains("oauth-code-value"), "{url}");
         assert!(!url.contains("bare-token-value"), "{url}");
+    }
+
+    #[tokio::test]
+    async fn the_target_receives_only_the_gateway_target_auth_header() {
+        let target = crate::component_tests::helpers::RecordingTarget::start(axum::http::StatusCode::OK, &[]).await;
+        let mut surface = mcp_surface("target-auth-header", &target.url, None);
+        surface.target.auth = Some(
+            serde_json::from_value(serde_json::json!({"method": {"static_secret": {
+                "secret_id": "vendor-key", "header_name": "X-Vendor-Key", "header_format": "{value}"
+            }}}))
+            .unwrap(),
+        );
+        let mut state = bare_proxy_state(surface.clone(), None);
+        state.secrets_store =
+            Some(std::sync::Arc::new(crate::integrations::definitions::test_secrets::Secrets(vec![(
+                "vendor-key",
+                None,
+                "gateway-key",
+            )])));
+        let mut request = legacy_mcp_request("/target-auth-header", &tool_call_with_argument("value"));
+        request
+            .headers_mut()
+            .append("x-vendor-key", HeaderValue::from_static("caller-one"));
+        request
+            .headers_mut()
+            .append("X-Vendor-Key", HeaderValue::from_static("caller-two"));
+
+        let response = send_to_surface(&state, surface, request).await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let received = target.received();
+        assert_eq!(received.len(), 1);
+        let values: Vec<_> = received[0]
+            .get_all("x-vendor-key")
+            .iter()
+            .collect();
+        assert_eq!(values, ["gateway-key"]);
     }
 
     #[tokio::test]

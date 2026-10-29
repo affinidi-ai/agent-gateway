@@ -5725,6 +5725,7 @@ async fn process_forward_request_in_request_scope(
 
     // Determine the source-auth credential header to strip (must not leak upstream).
     let source_cred_header = surface.source_auth().and_then(|sa| sa.credential_header_name());
+    let target_auth_header = crate::proxy::handler::target_auth_header_name(surface.target_auth());
     let header_metadata_mapping = surface.access_point.header_metadata_mapping.as_ref();
 
     // Add headers if provided
@@ -5766,6 +5767,9 @@ async fn process_forward_request_in_request_scope(
                 }
             if crate::proxy::caller_identity::CallerHeaders::is_caller_info_header(key) {
                 channel_info!(config_id, "    Skipping caller-info header: {}", key);
+                continue;
+            }
+            if target_auth_header.is_some_and(|credential| key.eq_ignore_ascii_case(credential)) {
                 continue;
             }
             if header_metadata_mapping.is_some_and(|mapping| {
@@ -5832,7 +5836,7 @@ async fn process_forward_request_in_request_scope(
         .await
         {
             Ok(Some((header_name, header_value))) => {
-                req = req.header(&header_name, &header_value);
+                req = crate::proxy::handler::replace_request_header(req, &header_name, &header_value);
                 channel_info!(config_id, "Injected target authentication header: {}", header_name);
             }
             Ok(None) => {
@@ -6064,7 +6068,7 @@ async fn process_forward_request_in_request_scope(
                                 }
                             }
                             crate::proxy::credential_delegation::ResolvedCredentialInjection::Header { name, value } => {
-                                req = req.header(name, value);
+                                req = crate::proxy::handler::replace_request_header(req, name, value);
                                 channel_info!(
                                     config_id,
                                     "GW2: Injected delegated credential header: {}",
