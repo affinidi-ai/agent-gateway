@@ -606,7 +606,11 @@ mod tests {
         assert_eq!(value["jwt_signing_key_secret_ref"], "VERTEX_SA_KEY");
         assert_eq!(value["jwt_signing_algorithm"], "ES256");
         assert!(value.get("jwt").is_none());
-        assert!(value.get("jwt_certificate_secret_ref").is_none());
+        assert!(
+            value
+                .get("jwt_certificate_secret_ref")
+                .is_none()
+        );
         let again: CredentialProvider = serde_json::from_value(value).unwrap();
         assert_eq!(again.jwt, provider.jwt);
     }
@@ -624,13 +628,37 @@ mod tests {
         }"#;
         let request: CreateCredentialProviderRequest = serde_json::from_str(json).unwrap();
         assert_eq!(request.provider_type, CredentialProviderType::OAuth2ClientCredentialsJwtAuth);
-        assert_eq!(request.jwt.jwt_certificate_secret_ref.as_deref(), Some("FOUNDRY_CERT"));
-        assert_eq!(request.jwt.jwt_signing_algorithm, Some(JwtSigningAlgorithm::PS256));
+        assert_eq!(
+            request
+                .jwt
+                .jwt_certificate_secret_ref
+                .as_deref(),
+            Some("FOUNDRY_CERT")
+        );
+        assert_eq!(
+            request
+                .jwt
+                .jwt_signing_algorithm,
+            Some(JwtSigningAlgorithm::PS256)
+        );
         let update: UpdateCredentialProviderRequest =
             serde_json::from_str(r#"{"jwt_key_id": "thumb", "jwt_signing_algorithm": "RS256"}"#).unwrap();
-        assert_eq!(update.jwt.jwt_key_id.as_deref(), Some("thumb"));
-        assert_eq!(update.jwt.jwt_signing_algorithm, Some(JwtSigningAlgorithm::RS256));
-        assert!(serde_json::from_str::<UpdateCredentialProviderRequest>(r#"{"jwt_signing_algorithm": "HS256"}"#).is_err());
+        assert_eq!(
+            update
+                .jwt
+                .jwt_key_id
+                .as_deref(),
+            Some("thumb")
+        );
+        assert_eq!(
+            update
+                .jwt
+                .jwt_signing_algorithm,
+            Some(JwtSigningAlgorithm::RS256)
+        );
+        assert!(
+            serde_json::from_str::<UpdateCredentialProviderRequest>(r#"{"jwt_signing_algorithm": "HS256"}"#).is_err()
+        );
     }
 
     #[test]
@@ -674,7 +702,12 @@ mod tests {
         let merged = update
             .or(existing)
             .normalized();
-        assert_eq!(merged.jwt_signing_key_secret_ref.as_deref(), Some("OLD_KEY"));
+        assert_eq!(
+            merged
+                .jwt_signing_key_secret_ref
+                .as_deref(),
+            Some("OLD_KEY")
+        );
         assert_eq!(merged.jwt_issuer.as_deref(), Some("new@example"));
         assert_eq!(merged.jwt_key_id, None);
     }

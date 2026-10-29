@@ -261,7 +261,9 @@ mod tests {
         let mut validation = Validation::new(algorithm);
         validation.set_audience(&[audience]);
         validation.validate_exp = false;
-        validation.required_spec_claims.clear();
+        validation
+            .required_spec_claims
+            .clear();
         decode::<serde_json::Value>(token, &key, &validation)
             .unwrap()
             .claims
@@ -312,8 +314,8 @@ mod tests {
         let mut provider = provider(CredentialProviderType::OAuth2JwtBearer);
         provider.jwt.jwt_audience = Some("https://audience.example/".into());
         let claims = grant_assertion_claims(&provider, &[], 50).unwrap();
-        let token = sign_assertion(&key.private_pem, JwtSigningAlgorithm::ES256, AssertionHeader::default(), &claims)
-            .unwrap();
+        let token =
+            sign_assertion(&key.private_pem, JwtSigningAlgorithm::ES256, AssertionHeader::default(), &claims).unwrap();
         let header = decode_header(&token).unwrap();
         assert_eq!(header.alg, Algorithm::ES256);
         assert_eq!(header.kid, None);
@@ -379,7 +381,11 @@ mod tests {
         ] {
             let error = check_signing_key(pem, algorithm).unwrap_err();
             assert_eq!(error, AssertionError::InvalidSigningKey);
-            assert!(!error.to_string().contains("key-secret-marker"));
+            assert!(
+                !error
+                    .to_string()
+                    .contains("key-secret-marker")
+            );
             assert!(!format!("{error:?}").contains("PRIVATE"));
         }
         assert_eq!(certificate_thumbprint(&rsa.private_pem), Err(AssertionError::InvalidCertificate));
@@ -387,8 +393,9 @@ mod tests {
             certificate_thumbprint("-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----"),
             Err(AssertionError::InvalidCertificate)
         );
-        let claims = client_auth_assertion_claims(&provider(CredentialProviderType::OAuth2ClientCredentialsJwtAuth), "c", 0)
-            .unwrap();
+        let claims =
+            client_auth_assertion_claims(&provider(CredentialProviderType::OAuth2ClientCredentialsJwtAuth), "c", 0)
+                .unwrap();
         assert_eq!(
             sign_assertion(
                 &rsa.private_pem,

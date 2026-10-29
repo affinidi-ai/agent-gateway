@@ -1,0 +1,17 @@
+branch: oauth-grants
+changes:
+  added:
+    - timestamp: '2026-10-29T22:20:00Z'
+      title: Add JWT Bearer and Client Credentials JWT credential provider types
+      description: >-
+        Credential providers gain oauth2_jwt_bearer, which signs an RS256 or ES256 JWT as
+        the grant (RFC 7523 section 2.1, for example a Google service account for Vertex AI
+        Agent Engine), and oauth2_client_credentials_jwt_auth, which authenticates the
+        client with a signed JWT and certificate thumbprint instead of a client secret
+        (private_key_jwt, for example an Entra certificate credential). The private key and
+        certificate are secret references, checked to be PEM when the provider is saved.
+  changed: []
+  fixed: []
+  removed: []
+  security: []
+  breaking: []

@@ -180,7 +180,12 @@ impl IntoResponse for JwtProviderFieldError {
 fn validate_jwt_provider(provider: &CredentialProvider) -> Result<(), JwtProviderFieldError> {
     let required = match provider.provider_type {
         CredentialProviderType::OAuth2JwtBearer => vec![
-            ("token_endpoint", provider.token_endpoint.as_deref()),
+            (
+                "token_endpoint",
+                provider
+                    .token_endpoint
+                    .as_deref(),
+            ),
             (
                 "jwt_issuer",
                 provider
@@ -197,7 +202,12 @@ fn validate_jwt_provider(provider: &CredentialProvider) -> Result<(), JwtProvide
             ),
         ],
         CredentialProviderType::OAuth2ClientCredentialsJwtAuth => vec![
-            ("token_endpoint", provider.token_endpoint.as_deref()),
+            (
+                "token_endpoint",
+                provider
+                    .token_endpoint
+                    .as_deref(),
+            ),
             (
                 "client_id_secret_ref",
                 provider
@@ -950,9 +960,10 @@ mod jwt_provider_tests {
         state: &CredentialProviderState,
         body: Value,
     ) -> (StatusCode, Value) {
-        let response = create_provider(State(state.clone()), None, None, None, Json(serde_json::from_value(body).unwrap()))
-            .await
-            .into_response();
+        let response =
+            create_provider(State(state.clone()), None, None, None, Json(serde_json::from_value(body).unwrap()))
+                .await
+                .into_response();
         body_of(response).await
     }
 
@@ -961,10 +972,15 @@ mod jwt_provider_tests {
         id: &str,
         body: Value,
     ) -> (StatusCode, Value) {
-        let response =
-            update_provider(State(state.clone()), Path(id.into()), None, None, Json(serde_json::from_value(body).unwrap()))
-                .await
-                .into_response();
+        let response = update_provider(
+            State(state.clone()),
+            Path(id.into()),
+            None,
+            None,
+            Json(serde_json::from_value(body).unwrap()),
+        )
+        .await
+        .into_response();
         body_of(response).await
     }
 
@@ -1132,12 +1148,21 @@ mod jwt_provider_tests {
                 response["error"],
                 "jwt_signing_key_secret_ref must reference a PEM private key matching jwt_signing_algorithm"
             );
-            assert!(!response.to_string().contains("key-secret-marker"));
+            assert!(
+                !response
+                    .to_string()
+                    .contains("key-secret-marker")
+            );
         }
         let mut ec_bearer = jwt_bearer("c");
         ec_bearer["jwt_signing_key_secret_ref"] = json!("EC_KEY");
         ec_bearer["jwt_signing_algorithm"] = json!("ES256");
-        assert_eq!(create(&state, ec_bearer).await.0, StatusCode::CREATED);
+        assert_eq!(
+            create(&state, ec_bearer)
+                .await
+                .0,
+            StatusCode::CREATED
+        );
         let mut bad_certificate = jwt_auth("d");
         bad_certificate["jwt_certificate_secret_ref"] = json!("NOT_A_KEY");
         let (status, response) = create(&state, bad_certificate).await;
@@ -1182,7 +1207,11 @@ mod jwt_provider_tests {
         let (status, response) = update(&state, id, cleared).await;
         assert_eq!(status, StatusCode::OK, "{response}");
         assert_eq!(response["provider_type"], "oauth2_client_credentials_jwt_auth");
-        assert!(response.get("client_secret_secret_ref").is_none());
+        assert!(
+            response
+                .get("client_secret_secret_ref")
+                .is_none()
+        );
         let (status, response) = update(&state, id, json!({"jwt_signing_key_secret_ref": "NOT_A_KEY"})).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(

@@ -435,8 +435,8 @@ pub async fn fetch_jwt_bearer_token(
     client: &reqwest::Client,
 ) -> Result<OAuthTokenResponse> {
     let endpoint = validated_token_endpoint(provider)?;
-    let claims =
-        super::jwt_assertion::grant_assertion_claims(provider, scopes, Utc::now().timestamp()).map_err(|e| anyhow!(e))?;
+    let claims = super::jwt_assertion::grant_assertion_claims(provider, scopes, Utc::now().timestamp())
+        .map_err(|e| anyhow!(e))?;
     let assertion = signed_assertion(provider, &claims, secrets).await?;
     let mut params = vec![("grant_type", JWT_BEARER_GRANT_TYPE), ("assertion", assertion.as_str())];
     if let Some(resource) = provider.resource.as_deref() {
@@ -537,7 +537,8 @@ fn validated_token_endpoint(provider: &CredentialProvider) -> Result<&str> {
         .token_endpoint
         .as_deref()
         .ok_or_else(|| anyhow!("Missing provider token endpoint"))?;
-    crate::url_validation::validate_oauth_endpoint_url(endpoint).map_err(|_| anyhow!("Invalid provider token endpoint"))?;
+    crate::url_validation::validate_oauth_endpoint_url(endpoint)
+        .map_err(|_| anyhow!("Invalid provider token endpoint"))?;
     Ok(endpoint)
 }
 
@@ -1305,7 +1306,12 @@ mod tests {
             assert_eq!(claims["iss"], "agent@project.iam.gserviceaccount.com");
             assert_eq!(claims["scope"], "https://www.googleapis.com/auth/cloud-platform");
             assert_eq!(
-                claims["exp"].as_i64().unwrap() - claims["iat"].as_i64().unwrap(),
+                claims["exp"]
+                    .as_i64()
+                    .unwrap()
+                    - claims["iat"]
+                        .as_i64()
+                        .unwrap(),
                 300
             );
         }
@@ -1339,9 +1345,10 @@ mod tests {
                 "jwt_certificate_secret_ref": "CERTIFICATE"
             }));
             let scopes = vec!["api://foundry/.default".to_string()];
-            let response = fetch_client_credentials_jwt_auth_token(&provider, &scopes, &fixture.secrets, &endpoint.client)
-                .await
-                .unwrap();
+            let response =
+                fetch_client_credentials_jwt_auth_token(&provider, &scopes, &fixture.secrets, &endpoint.client)
+                    .await
+                    .unwrap();
             assert_eq!(response.access_token, "issued-access");
             let form = endpoint
                 .requests
@@ -1367,7 +1374,11 @@ mod tests {
             let claims = claims(&form["client_assertion"], &fixture.key.public_pem, Algorithm::PS256);
             assert_eq!(claims["iss"], "client-123");
             assert_eq!(claims["sub"], "client-123");
-            assert!(claims["jti"].as_str().is_some_and(|jti| !jti.is_empty()));
+            assert!(
+                claims["jti"]
+                    .as_str()
+                    .is_some_and(|jti| !jti.is_empty())
+            );
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1389,7 +1400,9 @@ mod tests {
                 assert!(!text.contains("issued-access"), "{text}");
             }
             let mut unknown_key = provider.clone();
-            unknown_key.jwt.jwt_signing_key_secret_ref = Some("CERTIFICATE".into());
+            unknown_key
+                .jwt
+                .jwt_signing_key_secret_ref = Some("CERTIFICATE".into());
             let endpoint = token_endpoint(200, issued()).await;
             let error = fetch_jwt_bearer_token(&unknown_key, &[], &fixture.secrets, &endpoint.client)
                 .await
