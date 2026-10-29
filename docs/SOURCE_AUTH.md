@@ -267,10 +267,13 @@ that:
 
 A surface stored with such a Transit Point still loads, with a warning in the log naming the
 Transit Point and, for one a variant defines, the variant, but the Transit Point refuses every
-request with `503`, discovery reads included; a Transit Point that sets
-`allow_unauthenticated_callers` but authenticates its callers keeps authenticating them. The
-caller is told only that the Transit Point is unavailable, as a JSON-RPC error on an MCP
-Transit Point and a problem JSON otherwise; the reason is logged.
+request with `503`, discovery reads included. Two kinds serve their callers instead: a Transit
+Point that sets `allow_unauthenticated_callers` but authenticates its callers keeps
+authenticating them, and one that sets `delegated_credentials_for_fabric_callers` without
+requiring a transit token serves its callers as before and releases nothing to Fabric callers,
+since it never reads the token that names them. The caller of a refused request is told only
+that the Transit Point is unavailable, as a JSON-RPC error on an MCP Transit Point and a problem
+JSON otherwise; the reason is logged.
 
 `transit.source_auth`, on the surface's `transit` block rather than a Transit Point, is not
 enforced. The admin API refuses a surface that sets it, on the surface or in a variant's

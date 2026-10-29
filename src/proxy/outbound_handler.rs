@@ -12011,7 +12011,8 @@ mod tests {
     }
 
     /// The policy recipes the docs give: admit one partner gateway's requests,
-    /// and keep partner requests off a Transit Point.
+    /// and keep partner requests off a Transit Point; and that neither
+    /// `verified` nor a partner's vouching ever verifies a DID.
     #[tokio::test]
     async fn a_transit_point_policy_admits_one_partner_gateway_and_can_refuse_every_partner() {
         async fn decide(
@@ -12061,6 +12062,24 @@ mod tests {
             json!({}),
         ));
         assert!(decide(&mut presented, verified_did).await, "the rule admits a DID this gateway verified");
+
+        // A Fabric caller the receiving surface verified is `verified`, but the
+        // DID is still the partner's word: the verified-DID rule refuses it,
+        // and a rule on `verified` with `did` admits any partner naming it.
+        let verified_with_did = "package surface.policy\n\ndefault allow := false\n\nallow if {\n    \
+                                 input.transit.caller.verified\n    \
+                                 input.transit.caller.did == \"did:web:q-agent.example\"\n}\n";
+        let mut verified_partner = test_pipeline_context();
+        verified_partner.transit_token_claims =
+            Some(verified_fabric_claims(Some("did:web:q-agent.example"), "receiver-verified-hash"));
+        assert!(
+            !decide(&mut verified_partner, verified_did).await,
+            "a verified Fabric caller's DID never passes a verified-DID rule"
+        );
+        assert!(
+            decide(&mut verified_partner, verified_with_did).await,
+            "`verified` covers the identity hash, never the DID"
+        );
 
         let mut partner = test_pipeline_context();
         partner.transit_token_claims = Some(fabric_claims(None, "fabric-asserted", None, 1));

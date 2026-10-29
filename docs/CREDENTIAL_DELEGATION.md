@@ -111,9 +111,14 @@ either, so such a call needs the Transit Point's managed identity: its own `mana
 or the surface's when the Transit Point injects a VP, in any mode but `from_jwt_claim`. Without
 one, a binding that applies refuses every Fabric caller with `403`, and a save of a Transit
 Point that sets the switch, on the surface or in an enabled variant, answers with a `Warning`
-header saying so. Because the receiving
-surface normally verifies the credential the peer's `target_auth` presents, a grant keyed this
-way usually belongs to the partner, shared by every request it sends with that credential.
+header saying so.
+
+Set the switch only when the receiving surface verifies a per-user credential on each Fabric
+request: a JWT whose `sub` is the end user, with an audience naming this gateway. The receiving
+surface normally verifies the credential the peer's `target_auth` presents, and when that is the
+partner's own key, every request the partner sends has the same identity hash. One partner
+credential is then one grant: the first of the partner's users to complete consent binds their
+account, and every later request from that partner, for any of its users, is sent with it.
 
 Without the switch, or when the receiving surface verified no caller, a binding that applies
 refuses the call with `403` and the target is not called. The log says delegated credentials
@@ -127,7 +132,8 @@ the switch the call is refused, never served with the grant of the Transit Point
 Static `target_auth` credentials are added as for any caller. A release that predates the
 switch, or `fabric.principal_hash`, keys no grant by a Fabric-issued token; a caller its own
 `source_auth` verified still keys its own grant there, and its policy input and audit records
-name that caller first.
+name that caller first. During a rolling upgrade, a `PUT` of the surface through a node that
+predates the switch saves it without the switch, which turns it off.
 
 On a `fabric://` Transit Point the two switches are independent:
 `delegated_credentials_for_fabric_callers` decides whether a Fabric caller's grant is looked up

@@ -324,7 +324,7 @@ the Transit Point's caller, so a rule about who receives a response reads
 
 | Field | Values | Meaning |
 | --- | --- | --- |
-| `input.transit.caller.verified` | `true` / `false` | `true` when a credential the gateway verified established the caller (`verification` is `transit_token`, `resource_token` or `source_auth`, or `fabric_peer` when the receiving surface verified the caller of the Fabric request itself). |
+| `input.transit.caller.verified` | `true` / `false` | `true` when a credential the gateway verified established the caller (`verification` is `transit_token`, `resource_token` or `source_auth`, or `fabric_peer` when the receiving surface verified the caller of the Fabric request itself). It covers the caller's `user_identity_hash` and `fields` only, never `did`: for a `fabric_peer` caller the DID is whatever the peer named, so `verified` with a `did` rule admits any partner the receiving surface authenticates that names that DID. A rule on `did` needs `did_verified`. |
 | `input.transit.caller.verification` | `transit_token` | The call carries a valid transit token whose `user_identity_hash` came from source authentication on the Access Point. |
 | | `resource_token` | The Transit Point verified the caller's resource-server token (`mcp_http.authorization`) on this request. `input.source_auth` carries the same identity with its claims. |
 | | `source_auth` | The Transit Point's own `source_auth` verified the caller's API key, JWT or client certificate on this request (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-point-source-authentication)). `input.source_auth` carries the same identity, with a JWT's claims. |
@@ -392,6 +392,11 @@ allow if {
 }
 ```
 
+The `verification` line refuses such a request when a caller the Transit Point verified itself
+outranks a Fabric token that names no verified caller, since `verification` then names that
+caller. `fabric` stays whichever caller `verification` names, so matching
+`fabric.peer_issuer_did` alone admits that request too.
+
 To keep every partner's requests off a Transit Point while the rest of the policy decides
 other calls:
 
@@ -402,6 +407,14 @@ default allow := true
 
 allow := false if input.transit.caller.fabric
 ```
+
+`fabric` is present only when the call carries the transit token the gateway issued for the
+partner's request, so this rule, and `not input.transit.caller.fabric` in the hash rule above,
+hold only on a Transit Point that requires the transit token, for an agent that passes the
+token it was given with the request. A Transit Point that does not require the token never
+reads one, and an agent that still holds a live Access Point token from a direct request can
+present that instead (see [`FABRIC.md`](FABRIC.md#chains-across-gateways)). The rule keeps out
+partner requests an agent handles as intended, not those of an agent that sends another token.
 
 ## Egress and SSRF controls
 

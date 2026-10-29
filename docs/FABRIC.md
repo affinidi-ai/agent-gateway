@@ -458,8 +458,9 @@ of the caller the receiving surface's own source authentication verified on the 
 as the token's `fabric.principal_hash`. What the peer says about its caller (a caller DID, a
 presentation, a payload identity) never keys a vault lookup. Otherwise a binding that applies
 refuses the call with `403`, and the Transit Point's target is not called; the log gives the
-reason. A caller the Transit Point's own `source_auth` verified still gets its own grant, and
-static `target_auth` credentials are added as for any caller (see
+reason. A caller the Transit Point's own `source_auth` verified gets its own grant only when the
+token names no caller the receiving surface verified, and static `target_auth` credentials are
+added as for any caller (see
 [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-a-transit-point)).
 
 `make gw-e2e` verifies the Access Point Target case between two gateway binaries

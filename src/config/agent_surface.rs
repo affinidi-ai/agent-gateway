@@ -1400,7 +1400,10 @@ pub struct TransitPoint {
     /// keyed by the caller the receiving surface's own `source_auth` or
     /// resource token verified on that request. Off by default, when such a
     /// call gets none. Only a Transit Point that requires the transit token
-    /// may set it.
+    /// may set it. Set it only when the receiving surface verifies a per-user
+    /// credential, such as a JWT whose `sub` is the end user: when it verifies
+    /// the partner's own key, every request from that partner has the same
+    /// key, so one grant serves all of its users.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub delegated_credentials_for_fabric_callers: bool,
 
