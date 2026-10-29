@@ -357,12 +357,21 @@ pub(crate) fn request_id_from_bytes(body: &[u8]) -> Option<JsonValue> {
 /// without one, as a body that can't be read is.
 pub const ROUTING_REFUSAL_ID_READ_LIMIT: usize = 16 * 1024;
 
+/// How long a refused request's body is read for its JSON-RPC `id`. The read
+/// runs before source auth and rate limiting, so a caller that names a variant
+/// the surface can't serve and then trickles or stalls its body would otherwise
+/// keep the refusal, and its connection, pending for as long as it likes. A
+/// real client sends its envelope at once; a body not read by then is answered
+/// without an `id`, as one that is too large is.
+pub const ROUTING_REFUSAL_ID_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Answers a modern MCP request refused at routing with
 /// [`McpRequestValidationError::for_routing_refusal`]. `body`, when given, is
 /// read only for the request's `id`, within the endpoint's MCP body limit (from
 /// `mcp_http`, `public_endpoints` and `versions`, as the endpoint builds its
-/// [`super::modern_http::EndpointHttpPolicy`]). An endpoint policy that can't be
-/// built, or a body that can't be read, is answered without an `id`.
+/// [`super::modern_http::EndpointHttpPolicy`]) and
+/// [`ROUTING_REFUSAL_ID_READ_TIMEOUT`]. An endpoint policy that can't be built,
+/// or a body that can't be read in time, is answered without an `id`.
 pub(crate) async fn answer_routing_refusal(
     refusal: &crate::audit::request_events::RoutingRefusal,
     mcp_http: Option<&crate::config::McpHttpConfig>,
@@ -379,16 +388,21 @@ pub(crate) async fn answer_routing_refusal(
     (*McpRequestValidationError::for_routing_refusal(refusal, id)).into_response()
 }
 
-/// Reads a refused request's body, within `limit` and
-/// [`ROUTING_REFUSAL_ID_READ_LIMIT`], for its JSON-RPC `id`; `None` when the
-/// body is larger, can't be read or carries no id.
+/// Reads a refused request's body, within `limit`,
+/// [`ROUTING_REFUSAL_ID_READ_LIMIT`] and [`ROUTING_REFUSAL_ID_READ_TIMEOUT`],
+/// for its JSON-RPC `id`; `None` when the body is larger, isn't read in time,
+/// can't be read or carries no id.
 async fn read_request_id(
     body: axum::body::Body,
     limit: usize,
 ) -> Option<JsonValue> {
-    let body = axum::body::to_bytes(body, limit.min(ROUTING_REFUSAL_ID_READ_LIMIT))
-        .await
-        .ok()?;
+    let body = tokio::time::timeout(
+        ROUTING_REFUSAL_ID_READ_TIMEOUT,
+        axum::body::to_bytes(body, limit.min(ROUTING_REFUSAL_ID_READ_LIMIT)),
+    )
+    .await
+    .ok()?
+    .ok()?;
     request_id_from_bytes(&body)
 }
 

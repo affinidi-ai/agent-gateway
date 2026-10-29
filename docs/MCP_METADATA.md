@@ -138,10 +138,12 @@ variant, and `500` when `default_variant_id` names no variant. A modern MCP POST
 Access Point or an MCP Transit Point is answered with a JSON-RPC error with code
 `-32603` carrying the request's `id`. Its body is read only to recover that
 `id`, within the smaller of the endpoint's `mcp_http.max_request_bytes` and
-16 KiB: the read runs before source authentication and rate limiting, so what an
-unauthenticated caller can make the gateway buffer for a refused request is
-bounded. A body that can't be read (larger than that, not JSON, or without an
-`id`) gets the same error without one.
+16 KiB, and within 2 seconds: the read runs before source authentication and
+rate limiting, so what an unauthenticated caller can make the gateway buffer for
+a refused request, and how long it can keep the refusal pending by trickling or
+stalling its body, are bounded. A body that can't be read (larger than that, not
+complete within 2 seconds, not JSON, or without an `id`) gets the same error
+without one.
 On the Access Point, any other request carrying the modern MCP headers gets that
 error without an `id`. Every other request gets a plain error response. Fabric
 Open refuses the same requests.
