@@ -3896,6 +3896,7 @@ pub async fn run_axum_proxy(
                         direct_client_auth_clone,
                         listener_mgr_slot_for_outbound,
                         outbound_source_auth_middleware,
+                        None,
                     )
                     .await
                     {
