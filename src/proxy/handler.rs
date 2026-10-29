@@ -9271,6 +9271,19 @@ async fn multi_channel_proxy_handler_with_mcp_runtime(
     response_in_request(scope, response)
 }
 
+/// The single-channel request future, moved to the heap where it is built.
+/// It is large, so building it in the router would hold a copy in the
+/// router's own frame and in the task-local future that wraps it.
+fn boxed_proxy_handler(
+    addr: SocketAddr,
+    state: ProxyState,
+    req: Request,
+    mcp_versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
+    mcp_continuations: Option<Arc<crate::mcp::continuations::config::ContinuationRuntime>>,
+) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<Response, Response>>>> {
+    Box::pin(proxy_handler_with_mcp_runtime(addr, state, req, mcp_versions, mcp_continuations))
+}
+
 async fn multi_channel_proxy_handler_in_request_scope(
     addr: SocketAddr,
     state: MultiSurfaceProxyState,
@@ -9584,11 +9597,12 @@ async fn multi_channel_proxy_handler_in_request_scope(
             let policy_collector = std::sync::Arc::new(std::sync::Mutex::new(Vec::<
                 crate::observability::policy_audit::PolicyDecisionSummary,
             >::new()));
-            let result = Box::pin(crate::observability::policy_audit::POLICY_DECISION_COLLECTOR.scope(
-                policy_collector,
-                proxy_handler_with_mcp_runtime(addr, proxy_state, new_req, mcp_versions, mcp_continuations),
-            ))
-            .await;
+            let result = crate::observability::policy_audit::POLICY_DECISION_COLLECTOR
+                .scope(
+                    policy_collector,
+                    boxed_proxy_handler(addr, proxy_state, new_req, mcp_versions, mcp_continuations),
+                )
+                .await;
             match result {
                 Ok(response) => {
                     channel_info!(

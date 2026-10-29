@@ -286,20 +286,28 @@ fn one(variant: &str) -> std::collections::BTreeSet<Option<String>> {
     std::collections::BTreeSet::from([Some(variant.to_string())])
 }
 
+/// The future `build` returns, built and kept on the heap. A served request
+/// runs deep, so a test that drives one keeps its surfaces and helper futures
+/// off its own frame, which stays on the stack for the whole request.
+fn on_heap<F: std::future::Future>(build: impl FnOnce() -> F) -> std::pin::Pin<Box<F>> {
+    Box::pin(build())
+}
+
 #[tokio::test]
 async fn every_record_of_a_served_request_names_the_variant_that_served_it() {
     let target =
         MockServer::start_with_response(json!({"jsonrpc": "2.0", "id": 1, "result": {"kind": "message"}}).to_string())
             .await;
     let endpoint = target.url();
-    for (case, surface, path, expected) in [
-        ("named variant", surface(&endpoint, catalog(), Some("v-prod")), "/a2a$beta/rpc", "beta"),
-        ("default variant", surface(&endpoint, catalog(), Some("v-prod")), "/a2a/rpc", "prod"),
-        ("no variants", surface(&endpoint, json!([]), None), "/a2a/rpc", "_base_"),
-        ("variants but no default", surface(&endpoint, catalog(), None), "/a2a/rpc", "_base_"),
+    for (case, catalog_json, default_variant_id, path, expected) in [
+        ("named variant", catalog(), Some("v-prod"), "/a2a$beta/rpc", "beta"),
+        ("default variant", catalog(), Some("v-prod"), "/a2a/rpc", "prod"),
+        ("no variants", json!([]), None, "/a2a/rpc", "_base_"),
+        ("variants but no default", catalog(), None, "/a2a/rpc", "_base_"),
     ] {
-        let (router, _policies) = router_with_decisions(surface).await;
-        let (status, events) = send(router, path).await;
+        let (router, _policies) =
+            on_heap(|| router_with_decisions(surface(&endpoint, catalog_json, default_variant_id))).await;
+        let (status, events) = on_heap(|| send(router, path)).await;
         assert_eq!(status, axum::http::StatusCode::OK, "{case}: {events:?}");
         assert!(decisions(&events) > 0, "{case}: a decision is recorded");
         assert_eq!(variants(&events), one(expected), "{case}");
