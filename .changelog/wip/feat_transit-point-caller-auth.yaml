@@ -20,7 +20,10 @@ changes:
         named callers, and keys per-caller delegated credentials by the same identity hash the
         Access Point uses. The secrets, strategies, API-key parents and certificates it names
         are checked on save as an Access Point's are, so a tenant access token can name only its
-        own or appliance-wide ones. A dashboard save keeps a Transit Point's `source_auth`.
+        own or appliance-wide ones. A `jwt_bearer` must name an audience, and a save answers
+        with a `Warning` header when it accepts the Access Point's own tokens (the same
+        strategy and a shared audience). A dashboard save keeps a Transit Point's
+        `source_auth`.
     - timestamp: '2026-10-29T12:00:00.000Z'
       title: Warn when an open Transit Point is reachable from other hosts
       description: >-
@@ -64,8 +67,8 @@ changes:
         surface or in a variant, with `400`, and also refuses `allow_unauthenticated_callers`
         on a Transit Point that authenticates its callers, `source_auth` beside
         `mcp_http.authorization`, and a `source_auth` a Transit Point does not support
-        (`did_auth`, a `jwt_bearer` that forwards the token, or a key read from anything but a
-        header). A stored surface with such a Transit Point still loads, with a warning in the
+        (`did_auth`, a `jwt_bearer` that forwards the token or names no audience, or a key read
+        from anything but a header). A stored surface with such a Transit Point still loads, with a warning in the
         log, but that Transit Point refuses every request with `503` until it is fixed. Before
         upgrading, set `allow_unauthenticated_callers: true` on every Transit Point that should
         stay open, or give it `source_auth`; the Surface Builder cannot set either, and a

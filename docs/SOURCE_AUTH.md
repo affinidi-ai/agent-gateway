@@ -259,8 +259,9 @@ that:
 - authenticates no caller and does not set `allow_unauthenticated_callers`;
 - sets `allow_unauthenticated_callers` but authenticates its callers;
 - sets both `source_auth` and `mcp_http.authorization`;
-- sets a `source_auth` a Transit Point does not support, or one the Access Point's rules
-  refuse, such as mTLS trust that names no certificate.
+- sets a `source_auth` a Transit Point does not support, such as a `jwt_bearer` that names no
+  audience, or one the Access Point's rules refuse, such as mTLS trust that names no
+  certificate.
 
 A surface stored with such a Transit Point still loads, with a warning in the log, but the
 Transit Point refuses every request with `503`, discovery reads included; a Transit Point
@@ -329,7 +330,7 @@ limit or resolves a credential:
 | Method | On a Transit Point |
 | --- | --- |
 | `api_key`, `api_key_provider` | Read from an HTTP header only |
-| `jwt_bearer` | `forward_header` must be `false`. An audience of `{{ surface.agent_did }}` means the surface's agent DID, as on an Access Point |
+| `jwt_bearer` | `forward_header` must be `false`, and `audiences` must name at least one audience. Give the Transit Point an audience of its own: with the Access Point's strategy and an audience the Access Point also accepts, a token issued for the Access Point is accepted here too, so any caller of the Access Point can call the Transit Point directly, and a save answers with a `Warning` header saying so. An audience of `{{ surface.agent_did }}` means the surface's agent DID, as on an Access Point |
 | `mtls` | The certificate from the outbound listener's own TLS handshake (`[tls.client_auth] direct`, on an `https` outbound listener), or from the forwarded-client-cert header of a proxy in `trusted_proxies` |
 | `did_auth` | Not supported: a Transit Point serves no DID Auth challenge |
 
