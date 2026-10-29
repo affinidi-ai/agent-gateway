@@ -785,7 +785,8 @@ fn a_variant_whose_fabric_target_pins_an_alias_sends_it() {
 #[test]
 fn an_mpp_auto_pay_retry_asks_the_peer_for_the_alias_its_target_pins() {
     let headers = std::collections::HashMap::from([("AUTHORIZATION".to_string(), "Payment proof".to_string())]);
-    let cases = [("/a2a$beta: the Target pins nothing", "beta", None), ("/a2a$pinned: the Target pins v", "pinned", Some("v"))];
+    let cases =
+        [("/a2a$beta: the Target pins nothing", "beta", None), ("/a2a$pinned: the Target pins v", "pinned", Some("v"))];
     for (case, alias, pinned) in cases {
         let served = fabric_surface()
             .serve_variant(Some(alias))

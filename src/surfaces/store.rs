@@ -108,7 +108,9 @@ pub async fn clear_dangling_default_variants<S: AgentSurfaceStore + ?Sized>(
         store
             .save(surface)
             .await
-            .with_context(|| format!("Failed to persist the dropped default variant of surface '{}'", surface.surface_id))?;
+            .with_context(|| {
+                format!("Failed to persist the dropped default variant of surface '{}'", surface.surface_id)
+            })?;
     }
     Ok(())
 }
@@ -783,8 +785,18 @@ mod tests {
             .await
             .expect("cleanup should succeed");
 
-        assert_eq!(channels[0].default_variant_id.as_deref(), Some("v-1"));
-        assert_eq!(channels[1].default_variant_id.as_deref(), Some("removed"));
+        assert_eq!(
+            channels[0]
+                .default_variant_id
+                .as_deref(),
+            Some("v-1")
+        );
+        assert_eq!(
+            channels[1]
+                .default_variant_id
+                .as_deref(),
+            Some("removed")
+        );
         assert!(
             store
                 .get("s-dangling")

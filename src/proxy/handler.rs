@@ -10340,9 +10340,7 @@ fn mpp_retry_forward_request_body(
             "trace_id": trace_id,
             "deadline_ms": deadline_ms,
         }),
-        route
-            .variant_alias
-            .as_deref(),
+        route.variant_alias.as_deref(),
     )
 }
 
