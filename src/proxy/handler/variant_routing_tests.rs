@@ -399,6 +399,22 @@ async fn the_refusal_warning_names_the_requested_variant_cut_never_the_callers_f
 }
 
 #[tokio::test]
+async fn the_refusal_warning_names_a_disabled_variant_in_full() {
+    let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+    send(router(surface("http://127.0.0.1:9", catalog(), Some("v-off"))), "/a2a/rpc").await;
+
+    let text = logs.text();
+    let warnings: Vec<&str> = text
+        .lines()
+        .filter(|line| line.contains("Surface variant cannot be resolved"))
+        .collect();
+    assert_eq!(warnings.len(), 1, "{text}");
+    assert!(warnings[0].contains("VariantDisabled"), "{}", warnings[0]);
+    assert!(warnings[0].contains("disabled_variant=Some(\"off\")"), "a configured alias, logged in full: {}", warnings[0]);
+}
+
+#[tokio::test]
 async fn an_access_point_request_exports_its_span_with_the_variant() {
     use crate::observability::http_trace::span_capture::{capture_spans, span_attr};
     use tower::ServiceExt;
