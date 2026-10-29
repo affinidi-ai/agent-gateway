@@ -3,7 +3,7 @@
 //! caller never reaches the target and an admitted caller's credential is never
 //! sent on; the verified caller reaches the Transit Point's policy input; a
 //! Transit Point that authenticates no caller is refused unless it is marked
-//! open, and an open one reachable on a public address is reported.
+//! open, and an open one other hosts can reach is reported.
 
 use super::helpers::jwt::{JwksFixture, now_secs, sign_jwt};
 use super::helpers::{GatewayHarness, MockServer, configure_admin_api};
@@ -385,7 +385,7 @@ async fn an_mtls_caller_whose_certificate_a_trusted_proxy_forwarded_is_admitted(
 /// A Transit Point that authenticates no caller: the admin API refuses it
 /// unless it is marked open; one stored that way refuses every request without
 /// reaching its target; an open one serves its callers, and the admin API warns
-/// when it is reachable on a public address.
+/// when other hosts can reach it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_transit_point_that_authenticates_no_caller_must_be_marked_open_and_an_open_public_one_is_reported() {
     let mut admin = None;
@@ -459,12 +459,19 @@ async fn a_transit_point_that_authenticates_no_caller_must_be_marked_open_and_an
                 .to_string()
         })
         .collect();
+    let inbound_port = h
+        .gateway_base
+        .rsplit(':')
+        .next()
+        .unwrap();
     assert_eq!(
         warnings,
         vec![format!(
-            "299 - \"Transit Point 'open' serves callers it does not authenticate and is reachable on a public \
-             address: {PUBLIC_OUTBOUND_URL}\""
-        )]
+            "299 - \"Transit Point 'open' serves callers it does not authenticate and is reachable from other \
+             hosts: 0.0.0.0:{inbound_port}, {PUBLIC_OUTBOUND_URL}\""
+        )],
+        "the outbound listener's public URL, and the inbound listener that binds every address and passes \
+         /outbound on because it shares the outbound listener's host"
     );
 
     let before = requests_seen(&h);

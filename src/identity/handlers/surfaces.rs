@@ -834,7 +834,7 @@ fn validate_transit_point_caller_authentication(surface: &AgentSurface) -> Resul
 type SavedSurface = (axum::http::HeaderMap, Json<AgentSurface>);
 
 /// `Warning` headers (code 299) naming each Transit Point of `surface` that
-/// serves callers it does not authenticate on a public address.
+/// serves callers it does not authenticate where other hosts reach it.
 fn open_transit_point_warnings(
     network_config: &crate::config::NetworkConfig,
     surface: &AgentSurface,
@@ -842,7 +842,7 @@ fn open_transit_point_warnings(
     let mut headers = axum::http::HeaderMap::new();
     for exposure in crate::proxy::server::open_transit_points(network_config, surface)
         .iter()
-        .filter_map(crate::proxy::server::OpenTransitPoint::public_exposure)
+        .filter_map(crate::proxy::server::OpenTransitPoint::exposure)
     {
         let quoted = exposure
             .replace('\\', "\\\\")

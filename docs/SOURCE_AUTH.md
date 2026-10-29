@@ -249,9 +249,9 @@ Transit Point:
 A Transit Point that sets none of them must say so with `allow_unauthenticated_callers: true`.
 It then serves anyone who reaches it, through this gateway and with its target credentials,
 such as a `target_auth` key. Set it only on a Transit Point that sends no credential, or one
-only trusted callers can reach: its outbound listener bound to a private address, with no
-public external URL, and no inbound listener sharing a host name with it (see
-[Reachable on a public address](#reachable-on-a-public-address)).
+only trusted callers can reach: its outbound listener bound to loopback, with no external URL
+other hosts reach, and no inbound listener sharing a host name with it (see
+[Reachable from other hosts](#reachable-from-other-hosts)).
 
 The admin API refuses with `400`, on the surface or in a variant's overrides, a Transit Point
 that:
@@ -351,7 +351,7 @@ request, so the target never receives the caller's key or token. A Transit Point
 requires a transit token needs both: `source_auth` first, then the token.
 
 A request that reaches a Transit Point through an inbound listener's `/outbound` route (see
-[Reachable on a public address](#reachable-on-a-public-address)) carries no client
+[Reachable from other hosts](#reachable-from-other-hosts)) carries no client
 certificate: that route never passes on the forwarded-client-cert header, because the
 outbound listener sees the gateway itself as the peer. A Transit Point with `mtls`
 `source_auth` is called on its outbound listener directly, or through a trusted proxy.
@@ -377,22 +377,26 @@ a Transit Point that trusts the Access Point's issuer for the same subjects reac
 those users consented to, while a JWT from another issuer, or an API key secret named like a
 JWT subject, is another caller with grants of its own.
 
-### Reachable on a public address
+### Reachable from other hosts
 
-A Transit Point is reachable on a public address when its outbound listener has an external
-URL whose host is not `localhost` or a loopback, private, link-local or unspecified address
-(any other host name counts as public), or when an inbound listener with such a URL shares a
-host name with the outbound listener, which makes that inbound listener pass `/outbound/...`
-requests on to it. The example configuration's `http://localhost` URLs on both listeners are
-enough for that.
+A Transit Point is reachable from other hosts when its outbound listener binds an address
+other than loopback (`0.0.0.0` included), or has an external URL whose host is not
+`localhost` or a loopback or unspecified address, or when an inbound listener that does either
+shares a host name with the outbound listener, which makes that inbound listener pass
+`/outbound/...` requests on to it. A private or link-local address counts: every workload on
+that network reaches it. Any other host name counts too. The example configuration's
+`http://localhost` URLs on both listeners are enough for an inbound listener to pass
+`/outbound/...` on, and its `0.0.0.0` bind addresses make both reachable from other hosts.
 
 For each Transit Point that sets `allow_unauthenticated_callers` and is reachable that way, on
 the surface or in a variant, a create or update of its surface or of one of its variants is
-answered with a `Warning` header:
+answered with a `Warning` header naming those URLs and bind addresses:
 
 ```
-Warning: 299 - "Transit Point 'crm' serves callers it does not authenticate and is reachable on a public address: https://gateway.example.com"
+Warning: 299 - "Transit Point 'crm' serves callers it does not authenticate and is reachable from other hosts: 0.0.0.0:8080, https://gateway.example.com"
 ```
+
+The dashboard does not show this header; read it from the admin API's answer or the log.
 
 When the outbound listener mounts the surface it logs the same text at `WARN`, and logs
 every other Transit Point that serves callers it does not authenticate at `WARN` too.
