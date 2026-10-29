@@ -792,7 +792,8 @@ impl AgentSurface {
         &self,
         alias: Option<&str>,
     ) -> Result<AgentSurface, VariantResolveError> {
-        Ok(self.apply_variant(self.select_variant(alias)?))
+        self.serve_variant(alias)
+            .map(|served| served.surface)
     }
 
     /// This surface with `variant`'s overrides applied, or the base surface
@@ -883,11 +884,12 @@ impl AgentSurface {
         &self,
         variant: Option<&SurfaceVariant>,
     ) -> ServedVariant {
+        let id = variant.map(|variant| variant.id.clone());
         ServedVariant {
-            id: variant.map(|variant| variant.id.clone()),
-            recorded: variant
-                .map_or(SurfaceVariant::BASE, |variant| variant.alias.as_str())
+            recorded: self
+                .surface_variant(id.as_deref())
                 .to_string(),
+            id,
             surface: self.apply_variant(variant),
         }
     }
