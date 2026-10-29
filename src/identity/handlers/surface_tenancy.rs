@@ -52,7 +52,8 @@ pub async fn validate_surface_references(
 /// - Its Transit Point id names one Transit Point: it appears once in each list
 ///   of points, and every variant that uses it keeps the same `target_endpoint`
 ///   and `transit_credentials`.
-/// - At-rest encryption is active, since its grants are kept only then.
+/// - At-rest encryption is active and the identity hash pepper is configured,
+///   since its grants are kept only then.
 pub async fn validate_external_consent_bindings(
     state: &IdentityApiState,
     surface: &AgentSurface,
@@ -62,15 +63,27 @@ pub async fn validate_external_consent_bindings(
             .credential_provider_store
             .as_ref(),
         surface,
-        crate::storage::filesystem::at_rest_encryption_active(),
+        GrantStorage {
+            encrypted: crate::storage::filesystem::at_rest_encryption_active(),
+            stable_ids: crate::identity::credential_identity::pepper_is_configured(),
+        },
     )
     .await
+}
+
+/// Whether the vault can keep grants by binding: it encrypts at rest, and the
+/// identity hash pepper their ids derive from is configured, not generated
+/// for this process.
+#[derive(Clone, Copy)]
+struct GrantStorage {
+    encrypted: bool,
+    stable_ids: bool,
 }
 
 async fn check_external_consent_bindings(
     providers: Option<&std::sync::Arc<dyn CredentialProviderStorage>>,
     surface: &AgentSurface,
-    encryption_active: bool,
+    storage: GrantStorage,
 ) -> Result<(), SurfaceApiError> {
     check_external_transit_point_ids(surface)?;
     let mut views = vec![(String::new(), surface.clone())];
@@ -129,10 +142,16 @@ async fn check_external_consent_bindings(
                      every Transit Point",
                 ));
             }
-            if !encryption_active {
+            if !storage.encrypted {
                 return Err(refuse(
                     "consent_mode external needs at-rest encryption: enable [encryption] with a key from the \
                      environment, a file or AWS KMS",
+                ));
+            }
+            if !storage.stable_ids {
+                return Err(refuse(
+                    "consent_mode external needs a configured identity hash pepper: set AG_IDENTITY_HASH_PEPPER, the \
+                     same on every node, since grant ids derive from it",
                 ));
             }
             let provider = providers
@@ -1183,7 +1202,23 @@ mod tests {
         surface: AgentSurface,
         encryption_active: bool,
     ) -> Result<(), String> {
-        check_external_consent_bindings(Some(providers), &surface, encryption_active)
+        checked_with(
+            providers,
+            surface,
+            GrantStorage {
+                encrypted: encryption_active,
+                stable_ids: true,
+            },
+        )
+        .await
+    }
+
+    async fn checked_with(
+        providers: &std::sync::Arc<dyn CredentialProviderStorage>,
+        surface: AgentSurface,
+        storage: GrantStorage,
+    ) -> Result<(), String> {
+        check_external_consent_bindings(Some(providers), &surface, storage)
             .await
             .map_err(|error| match error {
                 SurfaceApiError::BadRequest(message) => message,
@@ -1397,6 +1432,30 @@ mod tests {
                 .expect_err(case);
             assert!(message.starts_with(&expected), "{case}: {message}");
         }
+    }
+
+    #[tokio::test]
+    async fn an_external_consent_binding_is_refused_while_the_identity_hash_pepper_is_ephemeral() {
+        let directory = tempfile::tempdir().unwrap();
+        let providers = providers_with(&directory).await;
+        let surface = surface_binding(external("external-a", Some("owner")), serde_json::json!([]), None);
+        let ephemeral = GrantStorage {
+            encrypted: true,
+            stable_ids: false,
+        };
+        let message = checked_with(&providers, surface, ephemeral)
+            .await
+            .expect_err("an ephemeral pepper is refused");
+        assert!(
+            message.starts_with(
+                "transit.points[0].transit_credentials: consent_mode external needs a configured identity hash \
+                 pepper"
+            ),
+            "{message}"
+        );
+        let legacy =
+            surface_binding(serde_json::json!({"credential_provider_id": "legacy-a"}), serde_json::json!([]), None);
+        assert_eq!(checked_with(&providers, legacy, ephemeral).await, Ok(()), "other bindings are unchanged");
     }
 
     #[test]

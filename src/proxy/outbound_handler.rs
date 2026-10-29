@@ -4924,6 +4924,8 @@ async fn step_inject_external_grant(
         Err(error) => {
             let reason = if error.is::<crate::delegation_vault::grants::EncryptionRequired>() {
                 "encryption_required"
+            } else if error.is::<crate::delegation_vault::grants::EphemeralPepper>() {
+                "identity_hash_pepper_ephemeral"
             } else {
                 "vault_unavailable"
             };
@@ -14217,6 +14219,7 @@ mod tests {
             })
             .unwrap();
         }
+        crate::identity::credential_identity::configure_pepper_for_tests(true);
         let providers = Arc::new(
             FileSystemCredentialProviderStore::new(directory.join("providers"))
                 .await

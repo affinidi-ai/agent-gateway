@@ -5,6 +5,9 @@ const PEPPER_HASH_ENV_NAME: &str = "AG_IDENTITY_HASH_PEPPER";
 // export AG_IDENTITY_HASH_PEPPER=<64 hex characters / 32 random bytes>
 pub struct PepperCacheConfig {
     pub pepper_hash: Vec<u8>,
+    /// Whether the pepper was read from `AG_IDENTITY_HASH_PEPPER` rather than
+    /// generated for this process.
+    pub configured: bool,
 }
 
 fn decode_pepper_hex(
@@ -74,7 +77,7 @@ impl PepperCacheConfig {
             target: LOG_TARGET,
             "Using AG_IDENTITY_HASH_PEPPER from env"
         );
-        Ok(Self { pepper_hash })
+        Ok(Self { pepper_hash, configured: true })
     }
 
     fn new_ephemeral() -> Self {
@@ -85,6 +88,9 @@ impl PepperCacheConfig {
           "Ephemeral credential-identity pepper generated. DIDs derived from FromMtls / FromApiKey / Static \
            will NOT persist across gateway restarts. Set AG_IDENTITY_HASH_PEPPER (>=32 bytes hex) for stable DIDs."
         );
-        Self { pepper_hash: out }
+        Self {
+            pepper_hash: out,
+            configured: false,
+        }
     }
 }

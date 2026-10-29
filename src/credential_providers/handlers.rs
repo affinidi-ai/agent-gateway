@@ -1463,6 +1463,7 @@ mod external_provider_tests {
             ..Default::default()
         })
         .unwrap();
+        crate::identity::credential_identity::configure_pepper_for_tests(true);
         let mut state = state(directory, Ok(metadata())).await;
         state.surfaces = Some(Arc::new(
             crate::surfaces::FileSystemAgentSurfaceStore::new(

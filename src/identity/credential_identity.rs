@@ -59,7 +59,19 @@ use crate::source_auth::ManagedIdentityConfig;
 
 // ── Pepper ────────────────────────────────────────────────────────────────
 
-static IDENTITY_HASH_PEPPER: OnceLock<Vec<u8>> = OnceLock::new();
+struct Pepper {
+    bytes: Vec<u8>,
+    /// Read from `AG_IDENTITY_HASH_PEPPER`, so the same on every restart, rather
+    /// than generated for this process.
+    configured: bool,
+}
+
+static IDENTITY_HASH_PEPPER: OnceLock<Pepper> = OnceLock::new();
+
+#[cfg(test)]
+thread_local! {
+    static TEST_PEPPER_CONFIGURED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
 
 pub async fn initialize_pepper() {
     if IDENTITY_HASH_PEPPER
@@ -70,17 +82,20 @@ pub async fn initialize_pepper() {
     }
 
     let resolved = PepperCacheConfig::load().await;
-    let _ = IDENTITY_HASH_PEPPER.set(resolved.pepper_hash);
+    let _ = IDENTITY_HASH_PEPPER.set(Pepper {
+        bytes: resolved.pepper_hash,
+        configured: resolved.configured,
+    });
 }
 
-fn new_ephemeral_pepper() -> Vec<u8> {
+fn new_ephemeral_pepper() -> Pepper {
     let mut out = vec![0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rng(), &mut out);
     tracing::warn!(
         target: "credential_identity",
         "Credential identity pepper was not initialized at startup; using an ephemeral pepper for this process."
     );
-    out
+    Pepper { bytes: out, configured: false }
 }
 
 /// Process-wide HMAC pepper for credential identity hashes.
@@ -92,7 +107,27 @@ fn new_ephemeral_pepper() -> Vec<u8> {
 fn pepper() -> &'static [u8] {
     IDENTITY_HASH_PEPPER
         .get_or_init(new_ephemeral_pepper)
+        .bytes
         .as_slice()
+}
+
+/// Whether the pepper was read from `AG_IDENTITY_HASH_PEPPER`. While it was
+/// generated for this process instead, every value derived from it, such as a
+/// delegated grant's id, changes on the next restart.
+pub fn pepper_is_configured() -> bool {
+    #[cfg(test)]
+    if let Some(configured) = TEST_PEPPER_CONFIGURED.with(std::cell::Cell::get) {
+        return configured;
+    }
+    IDENTITY_HASH_PEPPER
+        .get()
+        .is_some_and(|pepper| pepper.configured)
+}
+
+/// Make [`pepper_is_configured`] answer `configured` on this test thread.
+#[cfg(test)]
+pub(crate) fn configure_pepper_for_tests(configured: bool) {
+    TEST_PEPPER_CONFIGURED.with(|cell| cell.set(Some(configured)));
 }
 
 // ── Error type ────────────────────────────────────────────────────────────
