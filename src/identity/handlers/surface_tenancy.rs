@@ -4,6 +4,7 @@ use crate::a2a_proxies::A2aProxyStore;
 use crate::auth_manager::pat::PatResourceScope;
 use crate::config::agent_surface::{AgentSurface, McpToolGatingConfig};
 use crate::config::{TargetAuthConfig, TargetAuthMethod};
+use crate::credential_providers::storage::CredentialProviderStorage;
 use crate::gateways::GatewayStore;
 use crate::identity::state::IdentityApiState;
 use crate::issuers::IssuerStore;
@@ -35,6 +36,128 @@ pub async fn validate_surface_references(
     }
 
     Ok(())
+}
+
+/// Check the credential bindings of a surface, its base and each variant, for
+/// external consent:
+///
+/// - `consent_mode: external` is a Transit Point's `transit_credentials` only;
+///   surface-level `outbound_credentials` cannot say it, and a surface with
+///   `outbound_credentials` has no Transit Point that does.
+/// - Such a binding names a `subject`, and no other binding does.
+/// - Its provider has an issuer and the surface's own tenant, exactly; a
+///   provider with an issuer is bound by no other consent mode.
+/// - At-rest encryption is active, since its grants are kept only then.
+pub async fn validate_external_consent_bindings(
+    state: &IdentityApiState,
+    surface: &AgentSurface,
+) -> Result<(), SurfaceApiError> {
+    check_external_consent_bindings(
+        state
+            .credential_provider_store
+            .as_ref(),
+        surface,
+        crate::storage::filesystem::at_rest_encryption_active(),
+    )
+    .await
+}
+
+async fn check_external_consent_bindings(
+    providers: Option<&std::sync::Arc<dyn CredentialProviderStorage>>,
+    surface: &AgentSurface,
+    encryption_active: bool,
+) -> Result<(), SurfaceApiError> {
+    let mut views = vec![(String::new(), surface.clone())];
+    for (variant, resolved) in surface.variants.iter().zip(
+        resolved_views(surface)?
+            .into_iter()
+            .skip(1),
+    ) {
+        views.push((format!("variant '{}' ", variant.alias), resolved));
+    }
+    for (prefix, view) in &views {
+        for (index, binding) in view
+            .outbound_credentials
+            .iter()
+            .enumerate()
+        {
+            if credential_provider_has_issuer(providers, &binding.credential_provider_id).await? {
+                return Err(SurfaceApiError::BadRequest(format!(
+                    "{prefix}outbound_credentials[{index}]: a credential provider with an issuer is bound only by a \
+                     Transit Point's transit_credentials with consent_mode external"
+                )));
+            }
+        }
+        for (index, point) in view
+            .transit_points()
+            .iter()
+            .enumerate()
+        {
+            let Some(binding) = point
+                .transit_credentials
+                .as_ref()
+            else {
+                continue;
+            };
+            let refuse = |reason: &str| {
+                SurfaceApiError::BadRequest(format!("{prefix}transit.points[{index}].transit_credentials: {reason}"))
+            };
+            if !binding.is_external() {
+                if binding.subject.is_some() {
+                    return Err(refuse("subject is set only with consent_mode external"));
+                }
+                if credential_provider_has_issuer(providers, &binding.credential_provider_id).await? {
+                    return Err(refuse("a credential provider with an issuer needs consent_mode external"));
+                }
+                continue;
+            }
+            if binding.subject.is_none() {
+                return Err(refuse("consent_mode external needs a subject: owner or caller"));
+            }
+            if !view
+                .outbound_credentials
+                .is_empty()
+            {
+                return Err(refuse(
+                    "consent_mode external cannot be used on a surface with outbound_credentials, which apply on \
+                     every Transit Point",
+                ));
+            }
+            if !encryption_active {
+                return Err(refuse(
+                    "consent_mode external needs at-rest encryption: enable [encryption] with a key from the \
+                     environment, a file or AWS KMS",
+                ));
+            }
+            let provider = providers
+                .ok_or_else(|| unavailable("Credential provider"))?
+                .get(&binding.credential_provider_id)
+                .await
+                .map_err(|error| internal("Credential provider", error))?
+                .ok_or_else(|| inaccessible("Credential provider"))?;
+            if !provider.is_external_consent() {
+                return Err(refuse("consent_mode external needs a credential provider with an issuer"));
+            }
+            if provider.tenant_id != surface.tenant_id {
+                return Err(refuse("consent_mode external needs a credential provider of the surface's own tenant"));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn credential_provider_has_issuer(
+    providers: Option<&std::sync::Arc<dyn CredentialProviderStorage>>,
+    id: &str,
+) -> Result<bool, SurfaceApiError> {
+    let Some(store) = providers else {
+        return Ok(false);
+    };
+    Ok(store
+        .get(id)
+        .await
+        .map_err(|error| internal("Credential provider", error))?
+        .is_some_and(|provider| provider.is_external_consent()))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -893,5 +1016,192 @@ mod tests {
         ] {
             assert!(references.contains(&(kind.as_str(), id.to_string())), "{kind} {id} missing from {references:?}");
         }
+    }
+
+    async fn providers_with(directory: &tempfile::TempDir) -> std::sync::Arc<dyn CredentialProviderStorage> {
+        let store = crate::credential_providers::storage::FileSystemCredentialProviderStore::new(
+            directory
+                .path()
+                .join("providers"),
+        )
+        .await
+        .unwrap();
+        for (id, tenant, issuer) in [
+            ("external-a", Some("tenant-a"), Some("https://203.0.113.10")),
+            ("external-b", Some("tenant-b"), Some("https://203.0.113.10")),
+            ("external-global", None, Some("https://203.0.113.10")),
+            ("legacy-a", Some("tenant-a"), None),
+        ] {
+            store
+                .create(
+                    serde_json::from_value(serde_json::json!({
+                        "id": id, "tenant_id": tenant, "name": id, "provider_id": id, "issuer": issuer,
+                        "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        std::sync::Arc::new(store)
+    }
+
+    fn surface_binding(
+        binding: serde_json::Value,
+        outbound_credentials: serde_json::Value,
+        variant_binding: Option<serde_json::Value>,
+    ) -> AgentSurface {
+        let point = |binding: serde_json::Value| {
+            serde_json::json!({"id": "tp-1", "alias": "vendor", "target_endpoint": "https://203.0.113.30/mcp",
+                "require_transit_token": true, "transit_credentials": binding})
+        };
+        let variants = match variant_binding {
+            Some(binding) => {
+                serde_json::json!([{"id": "v-1", "alias": "candidate", "name": "candidate", "enabled": true,
+                "overrides": {"transit": {"points": [point(binding)]}}}])
+            }
+            None => serde_json::json!([]),
+        };
+        serde_json::from_value(serde_json::json!({
+            "surface_id": "surface", "name": "surface", "tenant_id": "tenant-a",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
+            "target": {"endpoint": "https://managed.example/agent"},
+            "outbound_credentials": outbound_credentials,
+            "transit": {"points": [point(binding)]},
+            "variants": variants
+        }))
+        .unwrap()
+    }
+
+    fn external(
+        provider: &str,
+        subject: Option<&str>,
+    ) -> serde_json::Value {
+        let mut binding = serde_json::json!({"credential_provider_id": provider, "consent_mode": "external"});
+        if let Some(subject) = subject {
+            binding["subject"] = serde_json::json!(subject);
+        }
+        binding
+    }
+
+    async fn checked(
+        providers: &std::sync::Arc<dyn CredentialProviderStorage>,
+        surface: AgentSurface,
+        encryption_active: bool,
+    ) -> Result<(), String> {
+        check_external_consent_bindings(Some(providers), &surface, encryption_active)
+            .await
+            .map_err(|error| match error {
+                SurfaceApiError::BadRequest(message) => message,
+                other => panic!("expected a 400, got {other:?}"),
+            })
+    }
+
+    #[tokio::test]
+    async fn a_transit_point_binds_its_own_tenants_provider_with_an_issuer_by_external_consent() {
+        let directory = tempfile::tempdir().unwrap();
+        let providers = providers_with(&directory).await;
+        for subject in ["owner", "caller"] {
+            let surface = surface_binding(external("external-a", Some(subject)), serde_json::json!([]), None);
+            assert_eq!(checked(&providers, surface, true).await, Ok(()), "{subject}");
+        }
+        let legacy =
+            surface_binding(serde_json::json!({"credential_provider_id": "legacy-a"}), serde_json::json!([]), None);
+        assert_eq!(checked(&providers, legacy, false).await, Ok(()), "other bindings are unchanged");
+    }
+
+    #[tokio::test]
+    async fn external_consent_bindings_that_break_a_rule_are_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let providers = providers_with(&directory).await;
+        let none = serde_json::json!([]);
+        let legacy_outbound = serde_json::json!([{"credential_provider_id": "legacy-a"}]);
+        for (case, surface, encryption_active, expected) in [
+            (
+                "without at-rest encryption",
+                surface_binding(external("external-a", Some("owner")), none.clone(), None),
+                false,
+                "transit.points[0].transit_credentials: consent_mode external needs at-rest encryption",
+            ),
+            (
+                "without a subject",
+                surface_binding(external("external-a", None), none.clone(), None),
+                true,
+                "transit.points[0].transit_credentials: consent_mode external needs a subject",
+            ),
+            (
+                "a provider without an issuer",
+                surface_binding(external("legacy-a", Some("owner")), none.clone(), None),
+                true,
+                "transit.points[0].transit_credentials: consent_mode external needs a credential provider with an issuer",
+            ),
+            (
+                "another tenant's provider",
+                surface_binding(external("external-b", Some("owner")), none.clone(), None),
+                true,
+                "transit.points[0].transit_credentials: consent_mode external needs a credential provider of the surface's own tenant",
+            ),
+            (
+                "an untenanted provider on a tenant's surface",
+                surface_binding(external("external-global", Some("owner")), none.clone(), None),
+                true,
+                "transit.points[0].transit_credentials: consent_mode external needs a credential provider of the surface's own tenant",
+            ),
+            (
+                "a surface with outbound_credentials",
+                surface_binding(external("external-a", Some("owner")), legacy_outbound.clone(), None),
+                true,
+                "transit.points[0].transit_credentials: consent_mode external cannot be used on a surface with outbound_credentials",
+            ),
+            (
+                "a subject on another consent mode",
+                surface_binding(
+                    serde_json::json!({"credential_provider_id": "legacy-a", "subject": "owner"}),
+                    none.clone(),
+                    None,
+                ),
+                true,
+                "transit.points[0].transit_credentials: subject is set only with consent_mode external",
+            ),
+            (
+                "a provider with an issuer on another consent mode",
+                surface_binding(serde_json::json!({"credential_provider_id": "external-a"}), none.clone(), None),
+                true,
+                "transit.points[0].transit_credentials: a credential provider with an issuer needs consent_mode external",
+            ),
+            (
+                "a provider with an issuer in outbound_credentials",
+                surface_binding(
+                    serde_json::json!({"credential_provider_id": "legacy-a"}),
+                    serde_json::json!([{"credential_provider_id": "external-a"}]),
+                    None,
+                ),
+                true,
+                "outbound_credentials[0]: a credential provider with an issuer is bound only by",
+            ),
+            (
+                "a variant without a subject",
+                surface_binding(
+                    external("external-a", Some("owner")),
+                    none.clone(),
+                    Some(external("external-a", None)),
+                ),
+                true,
+                "variant 'candidate' transit.points[0].transit_credentials: consent_mode external needs a subject",
+            ),
+        ] {
+            let message = checked(&providers, surface, encryption_active)
+                .await
+                .expect_err(case);
+            assert!(message.starts_with(expected), "{case}: {message}");
+        }
+    }
+
+    #[test]
+    fn surface_level_outbound_credentials_cannot_ask_for_external_consent() {
+        let parsed = serde_json::from_value::<crate::config::types::OutboundCredentialBinding>(
+            serde_json::json!({"credential_provider_id": "external-a", "consent_mode": "external"}),
+        );
+        assert!(parsed.is_err());
     }
 }

@@ -2587,6 +2587,7 @@ async fn validate_and_save_surface(
         existing,
     )?;
     super::surface_tenancy::validate_surface_references(state, &surface, context, scope).await?;
+    super::surface_tenancy::validate_external_consent_bindings(state, &surface).await?;
     validate_listen_path_collisions(&surface, store, &state.network_config).await?;
     validate_access_point_route_collisions(&surface, store, &state.network_config).await?;
     validate_surface_payment_policies(&mut surface).await?;

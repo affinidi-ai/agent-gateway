@@ -10,6 +10,7 @@
 //! - DelegationCredential VC issuance
 
 pub mod audit;
+pub mod grants;
 pub mod handlers;
 pub mod modern_consent;
 pub mod notifier;

@@ -361,6 +361,22 @@ pub async fn resolve_delegation_credentials(
             }
         };
 
+        if provider.is_external_consent() {
+            warn!(
+                target: "credential_delegation",
+                provider_id = %binding.credential_provider_id,
+                "A provider with an issuer serves only consent_mode external bindings - refusing the request"
+            );
+            results.push(DelegationResolution::new(
+                binding,
+                Some(&provider.name),
+                DelegationActionOutcome::ProviderUnavailable,
+                Some("provider_needs_external_consent".to_string()),
+                DelegationLookupResult::Unavailable,
+            ));
+            continue;
+        }
+
         // Route by provider type
         match &provider.provider_type {
             CredentialProviderType::ApiKey => {
@@ -1071,7 +1087,7 @@ fn refreshed_token_rejected(
     )
 }
 
-fn build_injection_headers(
+pub(crate) fn build_injection_headers(
     inject_as: &CredentialInjection,
     access_token: &str,
 ) -> Vec<ResolvedCredentialInjection> {

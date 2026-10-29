@@ -1666,10 +1666,22 @@ pub struct TransitCredentials {
     /// did not advertise the `elicitation` capability.
     #[serde(default)]
     pub elicit_fallback: ElicitFallback,
+    /// Whose account the grant of a `consent_mode = external` binding is.
+    /// Required with `external`, refused with every other mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<GrantSubject>,
 }
 
 fn default_transit_elicit_timeout_secs() -> u64 {
     300
+}
+
+impl TransitCredentials {
+    /// Whether the binding's grants are made through external consent and
+    /// kept by binding.
+    pub fn is_external(&self) -> bool {
+        self.consent_mode == ConsentMode::External
+    }
 }
 
 /// How to handle missing delegation tokens.
@@ -1683,6 +1695,20 @@ pub enum ConsentMode {
     PreAuthorize,
     /// Spec-compliant MCP `elicitation/create` over the open session.
     Elicit,
+    /// Another system obtains the grant through the browser; the gateway
+    /// keeps it by binding, never builds an authorization URL, and refuses
+    /// the call while it has no grant. Transit Points only.
+    External,
+}
+
+/// Whose account a `consent_mode = external` grant is.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GrantSubject {
+    /// One grant, which every caller of the Transit Point uses.
+    Owner,
+    /// One grant per caller, selected by the caller's identity hash.
+    Caller,
 }
 
 /// Fallback for `consent_mode = elicit` when the MCP client did not advertise

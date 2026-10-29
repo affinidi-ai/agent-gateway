@@ -182,7 +182,8 @@ impl AgentSurface {
     /// is populated. Mirrors the conversion in
     /// `agent_surface_compat::to_channel_mapping`. For display only: inject
     /// with [`Self::target_outbound_credentials`] or
-    /// [`Self::transit_point_outbound_credentials`].
+    /// [`Self::transit_point_outbound_credentials`]. A Transit Point's
+    /// `consent_mode = external` binding is not one of these.
     pub fn outbound_credentials(&self) -> Vec<crate::config::types::OutboundCredentialBinding> {
         if !self
             .outbound_credentials
@@ -201,7 +202,7 @@ impl AgentSurface {
                         point
                             .transit_credentials
                             .as_ref()
-                            .map(transit_credential_binding)
+                            .and_then(transit_credential_binding)
                     })
                     .collect()
             })
@@ -218,7 +219,9 @@ impl AgentSurface {
 
     /// Outbound credential bindings for a request through one Transit Point.
     /// Prefers the surface-level `outbound_credentials` field; otherwise
-    /// only that point's own `transit_credentials`, never another point's.
+    /// only that point's own `transit_credentials`, never another point's,
+    /// unless it is a `consent_mode = external` binding, which
+    /// [`Self::transit_point_external_credentials`] returns instead.
     pub fn transit_point_outbound_credentials(
         &self,
         point: &super::agent_surface::TransitPoint,
@@ -234,9 +237,22 @@ impl AgentSurface {
         point
             .transit_credentials
             .as_ref()
-            .map(transit_credential_binding)
+            .and_then(transit_credential_binding)
             .into_iter()
             .collect()
+    }
+
+    /// A Transit Point's `consent_mode = external` binding, whose grant is
+    /// kept by binding. It applies whatever the surface-level
+    /// `outbound_credentials` say.
+    pub fn transit_point_external_credentials<'a>(
+        &self,
+        point: &'a super::agent_surface::TransitPoint,
+    ) -> Option<&'a super::agent_surface::TransitCredentials> {
+        point
+            .transit_credentials
+            .as_ref()
+            .filter(|credentials| credentials.is_external())
     }
 
     /// Target service-level credentials.
@@ -697,12 +713,14 @@ impl AgentSurface {
     }
 }
 
+/// A Transit Point's binding as an outbound credential binding, or `None`
+/// for a `consent_mode = external` binding, which no agent-keyed path serves.
 fn transit_credential_binding(
     cred: &super::agent_surface::TransitCredentials
-) -> crate::config::types::OutboundCredentialBinding {
+) -> Option<crate::config::types::OutboundCredentialBinding> {
     use crate::config::agent_surface as surface;
-    use crate::config::types::{ConsentMode, CredentialInjection, CredentialRequirement, ElicitFallback};
-    crate::config::types::OutboundCredentialBinding {
+    use crate::config::types::{ConsentMode, CredentialRequirement, ElicitFallback};
+    Some(crate::config::types::OutboundCredentialBinding {
         credential_provider_id: cred
             .credential_provider_id
             .clone(),
@@ -712,20 +730,31 @@ fn transit_credential_binding(
             surface::ConsentMode::OnDemand => ConsentMode::OnDemand,
             surface::ConsentMode::PreAuthorize => ConsentMode::PreAuthorize,
             surface::ConsentMode::Elicit => ConsentMode::Elicit,
+            surface::ConsentMode::External => return None,
         },
-        inject_as: match &cred.inject_as {
-            surface::CredentialInjection::BearerHeader => CredentialInjection::BearerHeader,
-            surface::CredentialInjection::CustomHeader { name, format } => CredentialInjection::CustomHeader {
-                name: name.clone(),
-                format: format.clone(),
-            },
-            surface::CredentialInjection::Meta { field } => CredentialInjection::Meta { field: field.clone() },
-        },
+        inject_as: cred
+            .inject_as
+            .to_binding_injection(),
         elicit_timeout_secs: cred.elicit_timeout_secs,
         elicit_fallback: match cred.elicit_fallback {
             surface::ElicitFallback::OnDemand => ElicitFallback::OnDemand,
             surface::ElicitFallback::Fail => ElicitFallback::Fail,
         },
+    })
+}
+
+impl super::agent_surface::CredentialInjection {
+    /// The same injection as an outbound credential binding names it.
+    pub fn to_binding_injection(&self) -> crate::config::types::CredentialInjection {
+        use crate::config::types::CredentialInjection;
+        match self {
+            Self::BearerHeader => CredentialInjection::BearerHeader,
+            Self::CustomHeader { name, format } => CredentialInjection::CustomHeader {
+                name: name.clone(),
+                format: format.clone(),
+            },
+            Self::Meta { field } => CredentialInjection::Meta { field: field.clone() },
+        }
     }
 }
 

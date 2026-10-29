@@ -17,6 +17,34 @@ changes:
         is refused with `provider_field_immutable`, so a token that can edit providers cannot
         point one whose grants are stored at an endpoint of its choosing. It takes no
         `additional_params`, `client_id_secret_ref`, consent identity strategy or API key.
+    - timestamp: '2026-10-30T21:00:00Z'
+      title: Keep delegated grants by binding in the vault, only while encrypted at rest
+      description: >-
+        The delegation vault keeps the grants of external consent providers apart from its
+        agent-keyed tokens, each keyed by the tenant, the surface, the Transit Point, the
+        provider and the principal (`owner`, or a caller's identity hash), with no agent DID
+        involved, so a grant is never released on another surface, Transit Point or tenant.
+        A record's id is an HMAC of that key under the identity hash pepper, so a lookup is
+        one read and one decrypt instead of a scan of every token, and the id reveals nothing.
+        The vault refuses to store or read such a grant unless at-rest encryption is enabled
+        with a key from the environment, a file or AWS KMS; the development `local` key source
+        does not count. Storage exports leave these grants out. Nothing is migrated: existing
+        agent-keyed tokens stay where they are and are never moved into grants by binding, so
+        people connect their accounts again through external consent.
+    - timestamp: '2026-10-30T22:00:00Z'
+      title: Release a vendor grant on a Transit Point with consent_mode external
+      description: >-
+        A Transit Point's `transit_credentials` can set `consent_mode: external` with a
+        `subject` of `owner` (one grant every caller uses) or `caller` (one per caller's identity
+        hash), for a credential provider with an issuer of the surface's own tenant. The Transit
+        Point then injects the grant the vault keeps for that tenant, surface, Transit Point,
+        provider and principal, needs no managed agent identity, never builds an authorization
+        URL, and refuses the call with 503 before forwarding it when no live grant can be
+        released. A call that names no caller is refused with 403, so an anonymous caller never
+        acts as the owner. Saves are refused when such a binding has no subject, names another
+        tenant's or an agent-keyed provider, sits on a surface with `outbound_credentials`, or
+        at-rest encryption is not active; a provider with an issuer is bound by no other
+        consent mode, and surface-level `outbound_credentials` cannot ask for `external`.
   changed:
     - timestamp: '2026-10-30T20:00:00Z'
       title: Make credential provider slugs unique per tenant
@@ -27,7 +55,13 @@ changes:
         check now compares the slug as it is stored, trimmed and in lower case, so `GitHub` and
         `github` conflict, and a create whose duplicate check fails is refused instead of
         proceeding.
-  fixed: []
+  fixed:
+    - timestamp: '2026-10-30T21:00:00Z'
+      title: Stop logging that the delegation vault is encrypted when it is not
+      description: >-
+        The delegation vault's startup line said it was encrypted whatever the configuration.
+        It now says whether it is encrypted at rest, and warns when it is not that delegated
+        tokens are written in plaintext.
   removed: []
   security: []
   breaking: []

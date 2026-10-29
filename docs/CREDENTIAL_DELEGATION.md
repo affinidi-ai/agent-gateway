@@ -96,7 +96,7 @@ Each entry in `AgentSurface.outbound_credentials`
 | Field | Options | Default |
 | --- | --- | --- |
 | `required_for` | `all` outbound requests, or `tools`: a list of MCP tool names, matched against `params.name` of a `tools/call` on Access Points and Fabric receive, never on Transit Points | `all` |
-| `consent_mode` | `on_demand`, `pre_authorize`, or `elicit` | `on_demand` |
+| `consent_mode` | `on_demand`, `pre_authorize`, or `elicit`; `external` only on a Transit Point's `transit_credentials` ([external consent](#external-consent-on-a-transit-point)) | `on_demand` |
 | `inject_as` | `bearer_header`, `custom_header { name, format }`, or `meta { field }` | `bearer_header` |
 | `scopes` | Scopes to request | The provider's defaults |
 
@@ -193,6 +193,38 @@ On a `fabric://` Transit Point the two switches are independent:
 `delegated_credentials_for_fabric_callers` decides whether a Fabric caller's grant is looked up
 at all, and `fabric_delegated_credentials` whether a resolved credential crosses to the next
 peer (see [Across Fabric](#across-fabric)).
+
+### External consent on a Transit Point
+
+A Transit Point's `transit_credentials` with `consent_mode: external` binds an
+[external consent provider](#external-consent-providers) and releases the
+[grant the vault keeps for that binding](#grants-by-binding). Another system obtains the grant
+through the browser; the gateway never builds an authorization URL for such a binding.
+
+| Field | Rule |
+| --- | --- |
+| `consent_mode` | `external` |
+| `subject` | Required: `owner` for one grant every caller of the Transit Point uses, or `caller` for one grant per caller, selected by the caller's [identity hash](#the-callers-identity-hash). Refused with every other consent mode |
+| `credential_provider_id` | A provider with an `issuer` and the surface's own tenant, exactly: an untenanted provider for an untenanted surface |
+| `scopes`, `inject_as` | As for any binding |
+
+A save of the surface, its base or a variant, is refused with `400` when the binding breaks a
+rule above, when the surface also has `outbound_credentials` (which apply on every Transit
+Point), or while [at-rest encryption](#grants-by-binding) is not active. Surface-level
+`outbound_credentials` cannot ask for `external`, and a provider with an `issuer` is bound by no
+other consent mode, on a Transit Point or in `outbound_credentials`.
+
+A request through such a Transit Point needs a caller it identifies, as every delegated
+credential does: a transit token naming one, or a caller its `source_auth` verified; without
+one it is refused with `403`, so an anonymous caller never acts as the owner. No managed agent identity is needed: the grant is
+keyed by the binding, not by an agent DID. The grant is injected as `inject_as` says, in place
+of any `Authorization` the agent sent. The call is refused with `503` "Delegated credentials
+unavailable", before it is forwarded, when the grant cannot be released: none is stored for the
+key, its access token has expired, the provider is gone, has no issuer or is of another tenant,
+the binding names no subject, the surface also has `outbound_credentials`, or at-rest encryption
+is not active. A `caller` binding is refused for a caller named by anything but an identity hash.
+The log names the reason. A binding that some other path reached with a provider that has an
+`issuer` is refused the same way, so such a provider's grants are reached only by binding.
 
 ## When a token is missing
 
@@ -386,6 +418,37 @@ A lookup has four outcomes.
 For client-credentials providers an expired token is deleted and a fresh one fetched,
 since no user is involved.
 
+### Grants by binding
+
+The grants of [external consent providers](#external-consent-providers) are kept apart from
+the agent-keyed tokens above, in the vault's `delegated_grants` directory. A grant
+([`src/delegation_vault/grants.rs`](../src/delegation_vault/grants.rs)) is keyed by the binding
+it serves and whose account it is:
+
+| Key | Source |
+| --- | --- |
+| `tenant_id` | The surface's tenant, `null` for an untenanted surface |
+| `surface_id` | The surface |
+| `hop` | The Transit Point's `id` |
+| `credential_provider_id` | The provider's record id |
+| `principal` | `owner` for the one grant every caller of the binding uses, or a caller's [identity hash](#the-callers-identity-hash) |
+
+No agent DID is involved, so a grant is never released on another surface, another Transit
+Point or another tenant, even when two Transit Points share a managed identity. A record's id is
+`grant-` and the lowercase hex HMAC-SHA256, under a key derived from `AG_IDENTITY_HASH_PEPPER`,
+of the RFC 8785 JSON array `[tenant, surface, hop, provider, principal]`. It reveals nothing of
+the key, and a lookup is one read and one decrypt, never a scan. A record whose own key is not
+the one its id was derived from is never used. Storing a grant for a key that has one replaces
+it, and the replaced grant is handed back so its tokens can be revoked.
+
+Grants are kept only while at-rest encryption is active: `[encryption] enabled = true` with a
+key from the environment, a file or AWS KMS. The development `local` key source writes
+plaintext, so it does not count. Without it the vault refuses to store or read a grant, and the
+admin API refuses a binding that needs one.
+Storage exports leave the `delegated_grants`
+directory out. Grants stored before this release do not exist: they are made only through
+external consent.
+
 ### Storage
 
 The vault uses **uncached** storage: tokens are read from disk on each lookup and are not
@@ -394,8 +457,9 @@ held in the in-memory cache, so they do not linger in process memory.
 The vault is encrypted at rest **only when at-rest encryption is enabled** in the
 bootstrap configuration (`[encryption] enabled = true`), because it uses the global
 storage configuration like every other store. The default is off. With the default,
-access and refresh tokens are written to `_storage/` as plaintext JSON. Enable encryption
-at rest on any appliance that holds real user tokens. See
+access and refresh tokens are written to `_storage/` as plaintext JSON, and the vault logs a
+warning at startup saying so. Enable encryption at rest on any appliance that holds real user
+tokens; grants by binding need it. See
 [`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md#configtoml).
 
 ## Management API

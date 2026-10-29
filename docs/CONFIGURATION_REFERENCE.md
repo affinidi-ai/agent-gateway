@@ -89,7 +89,7 @@ Each of these behaves differently from the obvious reading of the field.
 | `a2a.message_expires_seconds` | Should be strictly greater than `a2a.fabric_gateway_timeout_ms / 1000`. Nothing validates this. When it is not, a fabric message expires at the mediator while the sending gateway is still waiting, and the failure looks like a timeout with no cause. |
 | `backup_encryption_key` | Required. The service does not start without a resolvable value. |
 | Unknown top-level keys | Ignored, not rejected. A misspelled key takes no effect and produces no error. |
-| `encryption.key_source = "local"` | Does not encrypt. It writes plaintext `ENC[0::…]` envelopes and is for development only. |
+| `encryption.key_source = "local"` | Does not encrypt. It writes plaintext `ENC[0::…]` envelopes and is for development only. It does not count as encryption at rest for delegated grants by binding, so with it, as with `[encryption]` off, a Transit Point binding with `consent_mode: external` is refused. See [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#grants-by-binding). |
 | `encryption.field_encryption_enabled` | Reserved and not wired to any field. Leave it false. |
 
 ## Surface transit settings that do nothing

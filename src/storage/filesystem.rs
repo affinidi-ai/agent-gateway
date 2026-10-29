@@ -113,6 +113,16 @@ fn get_global_storage_config() -> StorageConfig {
         .unwrap_or_default()
 }
 
+/// Whether the stores created from now on encrypt what they write: at-rest
+/// encryption is enabled with a key from the environment, a file or KMS, not
+/// the development `local` key source, which writes plaintext.
+pub fn at_rest_encryption_active() -> bool {
+    get_global_storage_config()
+        .encryption_service
+        .as_ref()
+        .is_some_and(EncryptionService::encrypts_at_rest)
+}
+
 // ============================================================================
 // Core Traits
 // ============================================================================
