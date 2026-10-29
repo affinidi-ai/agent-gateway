@@ -5371,24 +5371,11 @@ async fn process_forward_request_in_request_scope(
     // ── Credential delegation: inject delegated OAuth tokens or signal consent ──
     if !outbound_creds.is_empty() {
         // Derive user identity hash from caller_identity (already a DID or identity hash from VP)
-        // or fall back to authenticated_identity from source_auth
+        // or fall back to the identity hash of the receiving surface's own source_auth
         let delegation_user_hash: Option<String> = caller_identity.clone().or_else(|| {
-            authenticated_identity.as_ref().map(|id| {
-                use sha2::{Digest, Sha256};
-                let raw = match id {
-                    crate::source_auth::AuthenticatedIdentity::JwtBearer { subject, .. } => {
-                        subject.clone()
-                    }
-                    crate::source_auth::AuthenticatedIdentity::ApiKey { key_name } => {
-                        key_name.clone()
-                    }
-                    crate::source_auth::AuthenticatedIdentity::DidAuth { did } => did.clone(),
-                    crate::source_auth::AuthenticatedIdentity::Mtls { principal, .. } => {
-                        principal.clone()
-                    }
-                };
-                format!("{:x}", Sha256::digest(raw.as_bytes()))
-            })
+            authenticated_identity
+                .as_ref()
+                .and_then(|id| id.principal_hash(surface.tenant_id.as_deref()))
         });
 
         if let (

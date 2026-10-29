@@ -115,9 +115,10 @@ pub fn capture_from_bearer_jwt(
 ///
 /// The caller identity is the DID resolved by
 /// [`SourceAuthConfig::DidAuth`](crate::source_auth::models::SourceAuthConfig::DidAuth);
-/// the emitted `user_hash` is `SHA256(did)` (hex) so it lines up with the
-/// delegation-vault key used on every other auth method — see the caller-hash
-/// normalisation in [`crate::proxy::handler`]. When `"did"` appears on the
+/// the emitted `user_hash` is the caller's identity hash on a surface of
+/// `tenant_id`
+/// ([`AuthenticatedIdentity::principal_hash`](crate::source_auth::AuthenticatedIdentity::principal_hash)),
+/// so it lines up with the delegation-vault key. When `"did"` appears on the
 /// operator-configured allowlist the DID is copied into `fields.did`; every
 /// other allowlist entry is silently dropped (DID Auth carries no additional
 /// claims). Rejects nested-path allowlist entries; fails closed when the
@@ -125,6 +126,7 @@ pub fn capture_from_bearer_jwt(
 pub fn capture_from_did(
     identity: &crate::source_auth::AuthenticatedIdentity,
     allowlist: &[String],
+    tenant_id: Option<&str>,
 ) -> Result<CapturedCallerContext, CallerContextCaptureError> {
     use crate::source_auth::AuthenticatedIdentity as I;
     let did = match identity {
@@ -136,8 +138,7 @@ pub fn capture_from_did(
     let mut source_claims = Map::new();
     source_claims.insert("did".to_string(), Value::String(did.clone()));
     let fields = select_allowlisted(&source_claims, allowlist)?;
-    use sha2::{Digest as _, Sha256};
-    let user_hash = Some(format!("{:x}", Sha256::digest(did.as_bytes())));
+    let user_hash = identity.principal_hash(tenant_id);
     Ok(CapturedCallerContext {
         fields,
         user_hash,
@@ -505,16 +506,17 @@ mod tests {
     // ── DID source ───────────────────────────────────────────────────────────
 
     #[test]
-    fn did_source_populates_sha256_user_hash() {
+    fn did_source_populates_the_callers_identity_hash() {
         let identity = crate::source_auth::AuthenticatedIdentity::DidAuth {
             did: "did:example:alice".to_string(),
         };
-        let captured = capture_from_did(&identity, &[]).unwrap();
+        let captured = capture_from_did(&identity, &[], Some("tenant-a")).unwrap();
         assert_eq!(captured.source, CallerContextSource::Did);
         assert!(captured.fields.is_empty());
         use sha2::{Digest as _, Sha256};
-        let expected_hash = format!("{:x}", Sha256::digest(b"did:example:alice"));
+        let expected_hash = hex::encode(Sha256::digest(br#"["did_auth","","tenant-a","did:example:alice"]"#));
         assert_eq!(captured.user_hash, Some(expected_hash));
+        assert_eq!(captured.user_hash, identity.principal_hash(Some("tenant-a")), "the delegation-vault key");
     }
 
     #[test]
@@ -522,7 +524,7 @@ mod tests {
         let identity = crate::source_auth::AuthenticatedIdentity::DidAuth {
             did: "did:example:bob".to_string(),
         };
-        let captured = capture_from_did(&identity, &["did".to_string(), "sub".to_string()]).unwrap();
+        let captured = capture_from_did(&identity, &["did".to_string(), "sub".to_string()], None).unwrap();
         assert_eq!(captured.fields.len(), 1);
         assert_eq!(captured.fields["did"], serde_json::json!("did:example:bob"));
     }
@@ -532,7 +534,7 @@ mod tests {
         let identity = crate::source_auth::AuthenticatedIdentity::DidAuth {
             did: "did:example:carol".to_string(),
         };
-        let err = capture_from_did(&identity, &["a.b".to_string()]).unwrap_err();
+        let err = capture_from_did(&identity, &["a.b".to_string()], None).unwrap_err();
         assert_eq!(err, CallerContextCaptureError::NestedClaim { name: "a.b".into() });
     }
 
@@ -542,12 +544,15 @@ mod tests {
             subject: "alice".to_string(),
             claims: serde_json::json!({}),
         };
-        let err = capture_from_did(&jwt, &[]).unwrap_err();
+        let err = capture_from_did(&jwt, &[], None).unwrap_err();
         assert_eq!(err, CallerContextCaptureError::NotDidAuthenticated { actual: "jwt_bearer" });
 
-        let api = crate::source_auth::AuthenticatedIdentity::ApiKey { key_name: "k".into() };
+        let api = crate::source_auth::AuthenticatedIdentity::ApiKey {
+            key_name: "k".into(),
+            provider_agent_id: None,
+        };
         assert_eq!(
-            capture_from_did(&api, &[]).unwrap_err(),
+            capture_from_did(&api, &[], None).unwrap_err(),
             CallerContextCaptureError::NotDidAuthenticated { actual: "api_key" }
         );
     }

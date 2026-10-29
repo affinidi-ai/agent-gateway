@@ -989,7 +989,7 @@ pub enum CallerContextSource {
     /// Caller context derived from a DID-authenticated session on the current
     /// Access Point hop. The caller must be authenticated via
     /// [`SourceAuthConfig::DidAuth`](crate::source_auth::models::SourceAuthConfig::DidAuth);
-    /// the resolved DID becomes the caller identity and its SHA-256 hash the
+    /// the resolved DID becomes the caller identity and its identity hash the
     /// delegation-vault key.
     Did,
 }

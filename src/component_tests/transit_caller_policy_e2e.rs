@@ -11,8 +11,13 @@ use std::sync::atomic::Ordering;
 const POLICY_ID: &str = "only-alice-at-the-transit-point";
 const STRATEGY_ID: &str = "transit-caller-strategy";
 
-fn sha256_hex(value: &str) -> String {
-    format!("{:x}", Sha256::digest(value.as_bytes()))
+/// The identity hash of a JWT caller on a surface with no tenant, computed as
+/// an operator would: `printf '["jwt_bearer","<iss>",null,"<sub>"]' | shasum -a 256`.
+fn jwt_caller_hash(
+    issuer: &str,
+    subject: &str,
+) -> String {
+    format!("{:x}", Sha256::digest(format!(r#"["jwt_bearer","{issuer}",null,"{subject}"]"#).as_bytes()))
 }
 
 fn write_policy_definition(
@@ -81,10 +86,11 @@ fn surface(require_transit_token: bool) -> crate::config::agent_surface::AgentSu
 }
 
 async fn start_gateway(
-    rego: String,
+    rego: impl FnOnce(&str) -> String,
     require_transit_token: bool,
 ) -> (GatewayHarness, JwksFixture) {
     let fixture = JwksFixture::start().await;
+    let rego = rego(&fixture.issuer);
     let h = GatewayHarness::start_with_outbound_mock(MockServer::start().await, |temp_dir, gw_config, _| {
         write_jwt_strategy(temp_dir, &fixture);
         write_policy_definition(temp_dir, &rego);
@@ -171,8 +177,9 @@ fn requests_seen(h: &GatewayHarness) -> usize {
 /// Alice's call.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_transit_point_policy_can_allow_only_a_named_caller() {
-    let rego = format!(
-        r#"package surface.policy
+    let rego = |issuer: &str| {
+        format!(
+            r#"package surface.policy
 
 default allow := false
 
@@ -182,8 +189,9 @@ allow if {{
     input.transit.caller.user_identity_hash == "{}"
 }}
 "#,
-        sha256_hex("alice")
-    );
+            jwt_caller_hash(issuer, "alice")
+        )
+    };
     let (h, fixture) = start_gateway(rego, true).await;
     let alice = transit_token_for(&h, &fixture, "alice").await;
     let bob = transit_token_for(&h, &fixture, "bob").await;
@@ -221,7 +229,7 @@ allow if {
     input.transit.caller.verified
 }
 "#;
-    let (h, _fixture) = start_gateway(requires_verified.to_string(), false).await;
+    let (h, _fixture) = start_gateway(|_| requires_verified.to_string(), false).await;
     let before = requests_seen(&h);
     assert_eq!(call_transit_point(&h, None).await, 403);
     assert_eq!(requests_seen(&h), before, "an anonymous call must not reach the target of a verified-only policy");
@@ -236,7 +244,7 @@ allow if {
     not input.transit.caller.user_identity_hash
 }
 "#;
-    let (h, _fixture) = start_gateway(admits_anonymous.to_string(), false).await;
+    let (h, _fixture) = start_gateway(|_| admits_anonymous.to_string(), false).await;
     let before = requests_seen(&h);
     assert_eq!(call_transit_point(&h, None).await, 200);
     assert_eq!(requests_seen(&h), before + 1, "the anonymous call is admitted by the policy that names it");

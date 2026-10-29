@@ -98,14 +98,17 @@ pub struct TransitCallerContext {
     /// `source_auth`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identity_source: Option<String>,
-    /// SHA-256 (lowercase hex) of the verified principal: the JWT `sub`, API key
-    /// name, DID or mTLS principal. The same value whichever mechanism verified
-    /// the caller. Present only when `verified`.
+    /// The caller's identity hash
+    /// ([`AuthenticatedIdentity::principal_hash`](crate::source_auth::AuthenticatedIdentity::principal_hash)):
+    /// the same value whichever mechanism carried a caller verified the same
+    /// way. Present only when `verified`, and absent for a credential that
+    /// names no subject.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_identity_hash: Option<String>,
     /// The verified principal itself. Only a caller the Transit Point verified
     /// (`resource_token` or `source_auth`) has one: a transit token carries the
-    /// hash, and the principal only as an allowlisted field.
+    /// hash, and the principal only as an allowlisted field. Absent with the
+    /// hash.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subject: Option<String>,
     /// The caller DID the transit token carries (`sub`). Asserted by the caller
@@ -180,21 +183,27 @@ impl TransitCallerContext {
         }
     }
 
-    /// A caller the Transit Point itself authenticated on this request.
+    /// A caller the Transit Point itself authenticated on this request, on a
+    /// surface of `tenant_id`. A credential that names no subject has neither
+    /// a hash nor a subject.
     pub fn from_authenticated(
         identity: &crate::source_auth::AuthenticatedIdentity,
         verification: TransitCallerVerification,
+        tenant_id: Option<&str>,
     ) -> Self {
+        let user_identity_hash = identity.principal_hash(tenant_id);
         Self {
             verified: true,
             verification,
             identity_source: Some(identity.method().to_string()),
-            user_identity_hash: Some(identity.principal_hash()),
-            subject: Some(
-                identity
-                    .principal()
-                    .to_string(),
-            ),
+            subject: user_identity_hash
+                .as_ref()
+                .map(|_| {
+                    identity
+                        .principal()
+                        .to_string()
+                }),
+            user_identity_hash,
             did: None,
             did_verified: false,
             caller_dna_uai: None,
@@ -524,7 +533,7 @@ impl From<&crate::source_auth::AuthenticatedIdentity> for SourceAuthContext {
                 subject: subject.clone(),
                 claims: claims.clone(),
             },
-            AuthenticatedIdentity::ApiKey { key_name } => SourceAuthContext::ApiKey { key_name: key_name.clone() },
+            AuthenticatedIdentity::ApiKey { key_name, .. } => SourceAuthContext::ApiKey { key_name: key_name.clone() },
             AuthenticatedIdentity::DidAuth { did } => SourceAuthContext::DidAuth { did: did.clone() },
             AuthenticatedIdentity::Mtls {
                 principal,

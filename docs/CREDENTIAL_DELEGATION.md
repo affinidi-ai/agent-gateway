@@ -84,16 +84,15 @@ A Transit Point looks a grant up by the caller's identity hash and the managed a
 The caller is the transit token's when the request carries a valid transit token with a
 `user_identity_hash`. Otherwise, when the Transit Point's own `source_auth` verified the
 caller (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-point-source-authentication)), it is
-that caller, hashed the way the Access Point hashes a caller it authenticated the same way:
-the SHA-256 of the JWT `sub`, of the API key's name (the `secret_id` for `api_key`, the
-key's id for `api_key_provider`), or of the mTLS principal. So:
+that caller's [identity hash](#the-callers-identity-hash), the value the Access Point computes
+for a caller it authenticated the same way. So:
 
-- an agent that calls the Transit Point with a JWT for the same `sub` as a user who consented
-  through the Access Point is given that user's grant;
+- an agent that calls the Transit Point with a JWT from the same issuer, for the same `sub`,
+  as a user who consented through the Access Point is given that user's grant; a JWT from
+  another issuer, or the same name verified another way, is another caller;
 - an API-key caller is one identity: every request with a key from the same `api_key`
   secret, or with the same `api_key_provider` key, shares one set of grants;
-- the hash includes neither the method nor the JWT issuer, so accept only an issuer whose
-  subjects name the people the grants were consented for.
+- a JWT without a `sub` names no caller and is given no grant.
 
 A caller verified by a resource access token (`mcp_http.authorization`) keys a grant only on
 a `2026-07-28` MCP request. The agent half of the key is the Transit Point's
@@ -234,11 +233,39 @@ keyed by three values.
 | Key | Source |
 | --- | --- |
 | `agent_did` | The managed agent the delegation is for |
-| `user_identity_hash` | A SHA-256 hash of the identity source authentication established: the JWT `sub`, the API key name, the DID, or the mTLS principal |
+| `user_identity_hash` | The caller's [identity hash](#the-callers-identity-hash), from the identity source authentication established |
 | `credential_provider_id` | The provider |
 
 With API-key or mTLS source authentication, every caller presenting the same key or
 certificate identity therefore shares one set of delegated tokens.
+
+### The caller's identity hash
+
+`user_identity_hash` is the lowercase hex SHA-256 of the JSON array
+`[method, issuer, tenant, subject]`, written as RFC 8785 canonical JSON (no spaces):
+
+| Source authentication | `method` | `issuer` | `subject` |
+| --- | --- | --- | --- |
+| `jwt_bearer`, and a resource access token | `jwt_bearer` | The token's `iss` | The token's `sub` |
+| `api_key` | `api_key` | `""` | The `secret_id` |
+| `api_key_provider` | `api_key_provider` | The API Key Provider agent id | The key's id |
+| `did_auth` | `did_auth` | `""` | The DID |
+| `mtls` | `mtls` | The client certificate's issuer DN (`""` with pinned trust) | The principal the `identity_binding` derives |
+
+`tenant` is the surface's `tenant_id`, or `null` on a surface with none. The same subject named
+by another method, issuer, API Key Provider agent or tenant is therefore another caller, with
+grants of its own. A JWT without a non-empty `sub`, or without an `iss`, names no caller: it has
+no identity hash, so it is given no delegated credential: an Access Point answers `403`
+`identity-required`, and a Transit Point `403`.
+
+The transit token carries the same value, a policy reads it as
+`input.transit.caller.user_identity_hash`, and a Workload Binding with `caller_source: did`
+puts it in `user_hash`. To compute it for a JWT subject `alice` from
+`https://login.example.com` on a surface with no tenant:
+
+```sh
+printf '%s' '["jwt_bearer","https://login.example.com",null,"alice"]' | shasum -a 256
+```
 
 Client-credentials tokens have no user, so they are cached under the fixed user hash
 `__client_credentials__`.

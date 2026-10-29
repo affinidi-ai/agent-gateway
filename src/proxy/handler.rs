@@ -5032,7 +5032,7 @@ async fn proxy_handler_with_mcp_runtime(
         .as_ref()
         .map(|r| r.did.clone());
     let request_user_id = source_auth_user_id(authenticated_identity.as_ref());
-    let request_user_hash = source_auth_user_hash(authenticated_identity.as_ref());
+    let request_user_hash = source_auth_user_hash(authenticated_identity.as_ref(), &state.surface);
 
     // Stamp the derived agent DID onto the root HTTP span as `caller.did`.
     // For credential-derived managed identity (e.g. `from_jwt_claim`) the DID
@@ -6342,9 +6342,7 @@ async fn proxy_handler_with_mcp_runtime(
 
         // Compute user identity hash from authenticated identity for credential
         // vault lookups on the transit side.
-        let transit_user_hash = authenticated_identity
-            .as_ref()
-            .map(|id| id.principal_hash());
+        let transit_user_hash = source_auth_user_hash(authenticated_identity.as_ref(), &state.surface);
 
         let allowed_points: Vec<String> = state
             .surface
@@ -6512,9 +6510,9 @@ async fn proxy_handler_with_mcp_runtime(
         // Derive the user hash from source authentication only.
         // This identifies the HUMAN user who is delegating — separate from the
         // agent identity (which comes from extension extraction via request_agent_did).
-        let delegation_user_hash = authenticated_identity
-            .as_ref()
-            .map(|id| id.principal_hash());
+        // A credential that names no subject identifies nobody, so it is refused
+        // as anonymous rather than given a grant every such caller would share.
+        let delegation_user_hash = source_auth_user_hash(authenticated_identity.as_ref(), &state.surface);
 
         // Reject anonymous callers: credential delegation requires a verified identity
         if delegation_user_hash.is_none() {
@@ -11802,7 +11800,7 @@ async fn handle_fabric_request(
     let _request_agent_did = identity_result
         .as_ref()
         .map(|r| r.did.clone());
-    let request_user_hash = source_auth_user_hash(authenticated_identity.as_ref());
+    let request_user_hash = source_auth_user_hash(authenticated_identity.as_ref(), &state.surface);
 
     // Mirror the direct path: stamp the derived agent DID onto the root span
     // as `caller.did` so credential-derived identity (e.g. `from_jwt_claim`)
@@ -16397,8 +16395,14 @@ fn build_target_request_workload_binding(
             .and_then(|auth| {
                 crate::proxy::workload_binding::capture_from_bearer_jwt(auth, &cfg.caller_context_fields).ok()
             }),
-        crate::config::types::CallerContextSource::Did => authenticated_identity
-            .and_then(|id| crate::proxy::workload_binding::capture_from_did(id, &cfg.caller_context_fields).ok()),
+        crate::config::types::CallerContextSource::Did => authenticated_identity.and_then(|id| {
+            crate::proxy::workload_binding::capture_from_did(
+                id,
+                &cfg.caller_context_fields,
+                surface.tenant_id.as_deref(),
+            )
+            .ok()
+        }),
     };
     crate::proxy::workload_binding::maybe_build_workload_binding_subject(
         Some(cfg),
@@ -16446,8 +16450,14 @@ fn source_auth_user_id(identity: Option<&crate::source_auth::AuthenticatedIdenti
     identity.map(|id| id.principal().to_string())
 }
 
-fn source_auth_user_hash(identity: Option<&crate::source_auth::AuthenticatedIdentity>) -> Option<String> {
-    identity.map(|id| id.principal_hash())
+/// The caller's identity hash on `surface`: namespaced by how it was
+/// identified and by the surface's tenant, and `None` for a credential that
+/// names no subject.
+fn source_auth_user_hash(
+    identity: Option<&crate::source_auth::AuthenticatedIdentity>,
+    surface: &crate::config::agent_surface::AgentSurface,
+) -> Option<String> {
+    identity.and_then(|id| id.principal_hash(surface.tenant_id.as_deref()))
 }
 
 /// Compute caller context fields for the transit token.
@@ -19616,7 +19626,9 @@ allow if {
             .unwrap();
         let token = serde_json::from_value(json!({
             "id": "verified-token", "agent_did": "did:web:agent.example",
-            "user_identity_hash": hex::encode(Sha256::digest(b"user")), "credential_provider_id": "provider",
+            "user_identity_hash": crate::source_auth::models::caller_identity_hash(
+                "jwt_bearer", "https://gateway.example/api/oauth2/mcp", state.surface.tenant_id.as_deref(), "user"),
+            "credential_provider_id": "provider",
             "provider_id": "provider", "access_token": "verified-credential", "scopes": ["read"],
             "consent_granted_at": "2026-09-01T00:00:00Z", "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z",
             "consent_identity": {

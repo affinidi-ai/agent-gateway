@@ -362,6 +362,7 @@ mod tests {
         let api_key =
             crate::delegation_vault::audit::build_caller_context(&crate::source_auth::AuthenticatedIdentity::ApiKey {
                 key_name: "billing-bot".to_string(),
+                provider_agent_id: None,
             });
         let mut event = policy_decision("allow");
         event.caller = Some(api_key);

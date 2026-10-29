@@ -332,8 +332,8 @@ the Transit Point's caller, so a rule about who receives a response reads
 | | `anonymous` | Nothing identifies the caller: no transit token (a Transit Point that does not require one, or a public discovery `GET`), and the Transit Point verified no resource token or `source_auth` credential. |
 | `input.transit.caller.identity_source` | `gateway-computed`, `self-presented`, `verified-presentation` | For a transit token, how the Access Point established the caller DID. Absent when the token has none. |
 | | `jwt_bearer`, `api_key`, `did_auth`, `mtls` | For a `resource_token` or `source_auth` caller, the source-auth method that verified it (`api_key` also for `api_key_provider`). |
-| `input.transit.caller.user_identity_hash` | lowercase hex SHA-256 | The hash of the verified principal (the JWT `sub`, API key name, DID or mTLS principal). Identical whichever mechanism verified the caller, so one rule covers both. Present only when `verified`. |
-| `input.transit.caller.subject` | string | The verified principal itself. Present only for a `resource_token` or `source_auth` caller; a transit token carries the hash, and the principal only through `fields`. |
+| `input.transit.caller.user_identity_hash` | lowercase hex SHA-256 | The caller's [identity hash](CREDENTIAL_DELEGATION.md#the-callers-identity-hash): the source-auth method, its issuer, the surface's tenant and the principal (the JWT `sub`, API key name, DID or mTLS principal). Identical whether a transit token carried the caller or the Transit Point verified it the same way itself, so one rule covers both. Present only when `verified`, and absent for a JWT that names no `sub`. |
+| `input.transit.caller.subject` | string | The verified principal itself. Present only for a `resource_token` or `source_auth` caller with a `user_identity_hash`; a transit token carries the hash, and the principal only through `fields`. |
 | `input.transit.caller.did` | DID | The caller DID the transit token carries. Asserted by the caller unless `did_verified`. Absent when the token has none, and for a `resource_token` or `source_auth` caller. |
 | `input.transit.caller.did_verified` | `true` / `false` | `true` only when `identity_source` is `verified-presentation`. Always present. No Access Point mints `verified-presentation` yet, so it is always `false` today. |
 | `input.transit.caller.caller_dna_uai` | string | The caller's Agent DNA UAI the token carries, when resolved. Asserted, never verified, whatever `verified` says: it describes the caller, it does not identify it. The Access Point does not fill it yet. |
@@ -352,9 +352,12 @@ An anonymous call looks like this, and a policy that must refuse it denies on
 { "verified": false, "verification": "anonymous", "did_verified": false }
 ```
 
-To allow only one caller, compare the hash (`printf alice | shasum -a 256`). The rule holds
-whichever way the caller was verified; add `input.transit.caller.verification ==
-"source_auth"` to accept only a caller the Transit Point's own credential check admitted:
+To allow only one caller, compare the hash. For the JWT subject `alice` from
+`https://login.example.com` on a surface with no tenant, it is
+`printf '%s' '["jwt_bearer","https://login.example.com",null,"alice"]' | shasum -a 256`. The
+rule holds whether a transit token carried the caller or the Transit Point verified the same
+token itself; add `input.transit.caller.verification == "source_auth"` to accept only a caller
+the Transit Point's own credential check admitted:
 
 ```rego
 package surface.policy
@@ -363,7 +366,7 @@ default allow := false
 
 allow if {
     input.transit.caller.verified
-    input.transit.caller.user_identity_hash == "2bd806c97f0e00af1a1fc3328fa763a9269723c8db8fac4f93af71db186d6e90"
+    input.transit.caller.user_identity_hash == "42628a381c35947c51d560b24315c5590c6f3c217701fcabd95f9fd9697bcd3f"
 }
 ```
 
