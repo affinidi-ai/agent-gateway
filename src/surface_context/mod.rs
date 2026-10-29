@@ -47,6 +47,155 @@ pub struct PolicyInput {
     /// is an empty list, so OPA rules don't need null checks).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trust_check_results: Option<crate::trust_registry_verification::TrustCheckResultsContext>,
+
+    /// The Transit Point call's own context. Present on every outbound
+    /// evaluation, never on an inbound one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transit: Option<TransitContext>,
+}
+
+/// `input.transit`: what the gateway knows about a Transit Point call.
+#[derive(Debug, Clone, Serialize)]
+pub struct TransitContext {
+    pub caller: TransitCallerContext,
+}
+
+/// What established the caller of a Transit Point call. Serialized as
+/// `verification`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransitCallerVerification {
+    /// The gateway-signed transit token carries a principal that source
+    /// authentication verified on the Access Point.
+    TransitToken,
+    /// The Transit Point verified the caller's resource-server token
+    /// (`mcp_http.authorization`) on this request.
+    ResourceToken,
+    /// A valid transit token names a caller DID, but nothing it carries was
+    /// verified by credential: the DID was asserted or derived from request
+    /// fields on the Access Point.
+    Unverified,
+    /// Nothing identifies the caller.
+    Anonymous,
+}
+
+/// `input.transit.caller`: the caller of a Transit Point call and how the
+/// gateway came to know it.
+#[derive(Debug, Clone, Serialize)]
+pub struct TransitCallerContext {
+    /// `true` when a credential the gateway verified established the caller
+    /// (`transit_token` and `resource_token`); `false` for `unverified` and
+    /// `anonymous`.
+    pub verified: bool,
+    pub verification: TransitCallerVerification,
+    /// How the identity was established: the transit token's `identity_source`
+    /// (`gateway-computed`, `self-presented`, `verified-presentation`), or the
+    /// source-auth method for a resource token (`jwt_bearer`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity_source: Option<String>,
+    /// SHA-256 (lowercase hex) of the verified principal: the JWT `sub`, API key
+    /// name, DID or mTLS principal. The same value whichever mechanism verified
+    /// the caller. Present only when `verified`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_identity_hash: Option<String>,
+    /// The verified principal itself. Only a `resource_token` caller has one: a
+    /// transit token carries the hash, and the principal only as an allowlisted
+    /// field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    /// The caller DID the transit token carries (`sub`). Asserted by the caller
+    /// unless `did_verified`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub did: Option<String>,
+    /// `true` only when the DID's presentation was verified
+    /// (`identity_source` `verified-presentation`).
+    pub did_verified: bool,
+    /// The caller's Agent DNA UAI the transit token carries, when resolved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller_dna_uai: Option<String>,
+    /// The operator-allowlisted `caller_context_fields` the transit token
+    /// carries, verbatim. Empty unless the caller is `verified`.
+    #[serde(skip_serializing_if = "serde_json::Map::is_empty")]
+    pub fields: serde_json::Map<String, serde_json::Value>,
+}
+
+impl TransitCallerContext {
+    pub fn anonymous() -> Self {
+        Self {
+            verified: false,
+            verification: TransitCallerVerification::Anonymous,
+            identity_source: None,
+            user_identity_hash: None,
+            subject: None,
+            did: None,
+            did_verified: false,
+            caller_dna_uai: None,
+            fields: serde_json::Map::new(),
+        }
+    }
+
+    /// The caller a validated transit token carries. Only a token whose
+    /// `user_identity_hash` came from source authentication verifies the
+    /// caller; the allowlisted fields are copied from that authenticated
+    /// identity, so they are dropped when there is no hash.
+    pub fn from_transit_token(claims: &crate::proxy::transit_token::TransitTokenClaims) -> Self {
+        let verified = claims
+            .user_identity_hash
+            .is_some();
+        let did = claims.sub.clone();
+        if !verified && did.is_none() {
+            return Self::anonymous();
+        }
+        Self {
+            verified,
+            verification: if verified {
+                TransitCallerVerification::TransitToken
+            } else {
+                TransitCallerVerification::Unverified
+            },
+            identity_source: claims.identity_source.clone(),
+            user_identity_hash: claims
+                .user_identity_hash
+                .clone(),
+            subject: None,
+            did_verified: did.is_some()
+                && claims
+                    .identity_source
+                    .as_deref()
+                    == Some("verified-presentation"),
+            did,
+            caller_dna_uai: claims.caller_dna_uai.clone(),
+            fields: if verified {
+                claims
+                    .caller_context_fields
+                    .clone()
+            } else {
+                serde_json::Map::new()
+            },
+        }
+    }
+
+    /// A caller the Transit Point itself authenticated on this request.
+    pub fn from_authenticated(
+        identity: &crate::source_auth::AuthenticatedIdentity,
+        verification: TransitCallerVerification,
+    ) -> Self {
+        Self {
+            verified: true,
+            verification,
+            identity_source: Some(identity.method().to_string()),
+            user_identity_hash: Some(identity.principal_hash()),
+            subject: Some(
+                identity
+                    .principal()
+                    .to_string(),
+            ),
+            did: None,
+            did_verified: false,
+            caller_dna_uai: None,
+            fields: serde_json::Map::new(),
+        }
+    }
 }
 
 impl PolicyInput {

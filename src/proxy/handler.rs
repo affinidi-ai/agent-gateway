@@ -6343,16 +6343,7 @@ async fn proxy_handler_with_mcp_runtime(
         // vault lookups on the transit side.
         let transit_user_hash = authenticated_identity
             .as_ref()
-            .map(|id| {
-                use sha2::{Digest, Sha256};
-                let raw = match id {
-                    crate::source_auth::AuthenticatedIdentity::JwtBearer { subject, .. } => subject.clone(),
-                    crate::source_auth::AuthenticatedIdentity::ApiKey { key_name } => key_name.clone(),
-                    crate::source_auth::AuthenticatedIdentity::DidAuth { did } => did.clone(),
-                    crate::source_auth::AuthenticatedIdentity::Mtls { principal, .. } => principal.clone(),
-                };
-                format!("{:x}", Sha256::digest(raw.as_bytes()))
-            });
+            .map(|id| id.principal_hash());
 
         let allowed_points: Vec<String> = state
             .surface
@@ -6522,16 +6513,7 @@ async fn proxy_handler_with_mcp_runtime(
         // agent identity (which comes from extension extraction via request_agent_did).
         let delegation_user_hash = authenticated_identity
             .as_ref()
-            .map(|id| {
-                use sha2::{Digest, Sha256};
-                let raw = match id {
-                    crate::source_auth::AuthenticatedIdentity::JwtBearer { subject, .. } => subject.clone(),
-                    crate::source_auth::AuthenticatedIdentity::ApiKey { key_name } => key_name.clone(),
-                    crate::source_auth::AuthenticatedIdentity::DidAuth { did } => did.clone(),
-                    crate::source_auth::AuthenticatedIdentity::Mtls { principal, .. } => principal.clone(),
-                };
-                format!("{:x}", Sha256::digest(raw.as_bytes()))
-            });
+            .map(|id| id.principal_hash());
 
         // Reject anonymous callers: credential delegation requires a verified identity
         if delegation_user_hash.is_none() {
@@ -16456,19 +16438,11 @@ fn build_response_workload_binding(
 }
 
 fn source_auth_user_id(identity: Option<&crate::source_auth::AuthenticatedIdentity>) -> Option<String> {
-    identity.map(|id| match id {
-        crate::source_auth::AuthenticatedIdentity::JwtBearer { subject, .. } => subject.clone(),
-        crate::source_auth::AuthenticatedIdentity::ApiKey { key_name } => key_name.clone(),
-        crate::source_auth::AuthenticatedIdentity::DidAuth { did } => did.clone(),
-        crate::source_auth::AuthenticatedIdentity::Mtls { principal, .. } => principal.clone(),
-    })
+    identity.map(|id| id.principal().to_string())
 }
 
 fn source_auth_user_hash(identity: Option<&crate::source_auth::AuthenticatedIdentity>) -> Option<String> {
-    source_auth_user_id(identity).map(|raw| {
-        use sha2::{Digest, Sha256};
-        format!("{:x}", Sha256::digest(raw.as_bytes()))
-    })
+    identity.map(|id| id.principal_hash())
 }
 
 /// Compute caller context fields for the transit token.

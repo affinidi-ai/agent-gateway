@@ -275,6 +275,10 @@ logged. A `GET` of a public discovery path, such as an agent card, is forwarded 
 transit token check, and so without any credential (see
 [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#when-a-credential-cannot-be-resolved)).
 
+Transit Point policies see the caller the token carries, and a caller verified another way,
+in `input.transit.caller`; see
+[`POLICY.md`](POLICY.md#caller-in-transit-point-policy-input).
+
 The signing key is 32 random bytes the gateway creates on its first start, in
 `transit_token_key.json` under `[storage_paths] vc_keys`, readable by the owner only and
 encrypted like the gateway's other keys when encryption at rest is on. A key file that is

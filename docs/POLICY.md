@@ -303,6 +303,56 @@ The same rule denies every request on the direct A2A path, which never produces
 `vp`; a rule for that path accepts `vp_unanchored` together with a check on
 `input.agent.identity_issuer_did`.
 
+## Caller in Transit Point policy input
+
+Every outbound evaluation (gateway, surface, per-Transit-Point and response policies, and
+MCP tool gating conditions on a Transit Point) gets `input.transit.caller`: who called the
+Transit Point and which mechanism established it. It is never on an inbound evaluation,
+where `input.source_auth` and `input.extension_identity` carry the caller. A policy that
+reads it must test `verified` first: a caller named only by an unverified DID is reported,
+and never as verified.
+
+| Field | Values | Meaning |
+| --- | --- | --- |
+| `input.transit.caller.verified` | `true` / `false` | `true` when a credential the gateway verified established the caller (`verification` is `transit_token` or `resource_token`). |
+| `input.transit.caller.verification` | `transit_token` | The call carries a valid transit token whose `user_identity_hash` came from source authentication on the Access Point. |
+| | `resource_token` | The Transit Point verified the caller's resource-server token (`mcp_http.authorization`) on this request. `input.source_auth` carries the same identity with its claims. |
+| | `unverified` | A valid transit token names a caller DID but carries no verified principal: the DID was asserted or derived from request fields on the Access Point. |
+| | `anonymous` | Nothing identifies the caller: no transit token (a Transit Point that does not require one, or a public discovery `GET`) and no verified resource token. |
+| `input.transit.caller.identity_source` | `gateway-computed`, `self-presented`, `verified-presentation` | For a transit token, how the Access Point established the caller DID. Absent when the token has none. |
+| | `jwt_bearer`, `api_key`, `did_auth`, `mtls` | For a `resource_token` caller, the source-auth method that verified it. |
+| `input.transit.caller.user_identity_hash` | lowercase hex SHA-256 | The hash of the verified principal (the JWT `sub`, API key name, DID or mTLS principal). Identical whichever mechanism verified the caller, so one rule covers both. Present only when `verified`. |
+| `input.transit.caller.subject` | string | The verified principal itself. Present only for a `resource_token` caller; a transit token carries the hash, and the principal only through `fields`. |
+| `input.transit.caller.did` | DID | The caller DID the transit token carries. Asserted by the caller unless `did_verified`. Absent when the token has none, and for a `resource_token` caller. |
+| `input.transit.caller.did_verified` | `true` / `false` | `true` only when `identity_source` is `verified-presentation`. Always present. |
+| `input.transit.caller.caller_dna_uai` | string | The caller's Agent DNA UAI the token carries, when resolved. |
+| `input.transit.caller.fields` | object | The operator-allowlisted `caller_context_fields` the transit token carries, verbatim (a Transit Point's `workload_binding.caller_context_fields`, taken from the caller's verified JWT claims). Absent unless the caller is `verified`. |
+
+When a call has both a verified transit token and a verified resource token, the transit
+token is the caller, because it names the end user the Access Point authenticated; the
+resource token's identity is still on `input.source_auth`. A verified resource token
+outranks a transit token that is only `unverified`.
+
+An anonymous call looks like this, and a policy that must refuse it denies on
+`not input.transit.caller.verified`:
+
+```json
+{ "verified": false, "verification": "anonymous", "did_verified": false }
+```
+
+To allow only one caller, compare the hash (`printf alice | shasum -a 256`):
+
+```rego
+package surface.policy
+
+default allow := false
+
+allow if {
+    input.transit.caller.verified
+    input.transit.caller.user_identity_hash == "2bd806c97f0e00af1a1fc3328fa763a9269723c8db8fac4f93af71db186d6e90"
+}
+```
+
 ## Egress and SSRF controls
 
 ### Forward-leg SSRF guard

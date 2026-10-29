@@ -338,6 +338,35 @@ impl AuthenticatedIdentity {
         }
     }
 
+    /// The caller's name as the credential states it: the JWT `sub`, the API
+    /// key name, the DID, or the mTLS principal.
+    pub fn principal(&self) -> &str {
+        match self {
+            AuthenticatedIdentity::JwtBearer { subject, .. } => subject,
+            AuthenticatedIdentity::ApiKey { key_name } => key_name,
+            AuthenticatedIdentity::DidAuth { did } => did,
+            AuthenticatedIdentity::Mtls { principal, .. } => principal,
+        }
+    }
+
+    /// Lowercase hex SHA-256 of [`Self::principal`]: the `user_identity_hash`
+    /// the transit token and credential vault lookups use.
+    pub fn principal_hash(&self) -> String {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(self.principal().as_bytes()))
+    }
+
+    /// The source-auth method that produced this identity, as policy input
+    /// names it (`input.source_auth.method`).
+    pub fn method(&self) -> &'static str {
+        match self {
+            AuthenticatedIdentity::JwtBearer { .. } => "jwt_bearer",
+            AuthenticatedIdentity::ApiKey { .. } => "api_key",
+            AuthenticatedIdentity::DidAuth { .. } => "did_auth",
+            AuthenticatedIdentity::Mtls { .. } => "mtls",
+        }
+    }
+
     /// A stable key for the authenticated caller, distinct across auth modes,
     /// for per-caller limits.
     pub fn principal_key(&self) -> String {

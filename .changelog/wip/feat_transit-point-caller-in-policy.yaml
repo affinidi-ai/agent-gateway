@@ -1,0 +1,20 @@
+branch: feat/transit-point-caller-in-policy
+changes:
+  added:
+    - timestamp: '2026-10-29T09:30:00.000Z'
+      title: Let a Transit Point policy allow or deny a call by its verified caller
+      description: >-
+        A Transit Point policy could not tell its callers apart, because the caller the transit
+        token carries reached the audit record but not the policy input. Outbound policy input
+        now has `input.transit.caller`: whether the caller is `verified`, the mechanism that
+        verified it (`transit_token`, `resource_token`, `unverified` or `anonymous`), the
+        caller's `user_identity_hash`, the token's DID with `did_verified`, and the allowlisted
+        caller context fields. A caller verified by the Transit Point's own resource-server token
+        fills the same fields, and a call that nothing identifies says it is anonymous. A policy
+        that allows only one caller should test `verified` first, as a token that only names a
+        DID is reported as unverified.
+  changed: []
+  fixed: []
+  removed: []
+  security: []
+  breaking: []

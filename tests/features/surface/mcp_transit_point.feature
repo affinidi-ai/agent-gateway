@@ -67,6 +67,22 @@ Feature: MCP Transit Point forwarding
     Then the response status is 503
     And MCP server "bravo" was not called
 
+  Scenario: A Transit Point policy can allow only a named caller
+    Given Transit Point "alpha" requires a transit token
+    And Transit Point "alpha" has a policy that allows only caller "alice"
+    And managed agent "example-agent" holds a transit token naming caller "alice"
+    When managed agent "example-agent" asks for available tools through Transit Point "alpha" with its transit token
+    Then the response status is 200
+    And MCP server "bravo" received MCP method "tools/list"
+
+  Scenario: A Transit Point policy that allows only a named caller refuses another caller
+    Given Transit Point "alpha" requires a transit token
+    And Transit Point "alpha" has a policy that allows only caller "alice"
+    And managed agent "example-agent" holds a transit token naming caller "bob"
+    When managed agent "example-agent" asks for available tools through Transit Point "alpha" with its transit token
+    Then the response status is 403
+    And MCP server "bravo" was not called
+
   Scenario: A delegated credential reaches the Transit Point's destination and the managed agent cannot replace it
     Given MCP server "bravo" supports tool invocation
     And Transit Point "alpha" requires a transit token

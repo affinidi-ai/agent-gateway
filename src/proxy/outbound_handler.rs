@@ -3768,6 +3768,31 @@ fn step_transit_point_response_policy(
     Ok(())
 }
 
+/// The verified caller of a Transit Point call, for `input.transit.caller`. A
+/// verified transit token wins, then a caller the Transit Point authenticated
+/// itself, then a transit token that only names an unverified DID; with neither
+/// the caller is anonymous.
+fn outbound_transit_caller(ctx: &OutboundPipelineContext) -> crate::surface_context::TransitCallerContext {
+    use crate::surface_context::{TransitCallerContext, TransitCallerVerification};
+    let from_token = ctx
+        .transit_token_claims
+        .as_ref()
+        .map(TransitCallerContext::from_transit_token);
+    if let Some(caller) = from_token
+        .as_ref()
+        .filter(|caller| caller.verified)
+    {
+        return caller.clone();
+    }
+    if let Some(identity) = ctx
+        .authenticated_identity
+        .as_ref()
+    {
+        return TransitCallerContext::from_authenticated(identity, TransitCallerVerification::ResourceToken);
+    }
+    from_token.unwrap_or_else(TransitCallerContext::anonymous)
+}
+
 /// Build the `PolicyInput` for outbound OPA evaluations.
 fn build_outbound_policy_input(ctx: &OutboundPipelineContext) -> crate::surface_context::PolicyInput {
     let modern_mcp_context = ctx
@@ -3854,6 +3879,9 @@ fn build_outbound_policy_input(ctx: &OutboundPipelineContext) -> crate::surface_
         trust_check_results: ctx
             .trust_check_results
             .clone(),
+        transit: Some(crate::surface_context::TransitContext {
+            caller: outbound_transit_caller(ctx),
+        }),
         ..Default::default()
     }
 }
@@ -10817,6 +10845,143 @@ mod tests {
                 .as_deref(),
             Some("test-channel")
         );
+    }
+
+    fn caller_claims(
+        sub: Option<&str>,
+        identity_source: Option<&str>,
+        user_identity_hash: Option<&str>,
+        fields: serde_json::Value,
+    ) -> crate::proxy::transit_token::TransitTokenClaims {
+        crate::proxy::transit_token::TransitTokenClaims {
+            iss: "gw".to_string(),
+            sub: sub.map(str::to_string),
+            surface_id: "s".to_string(),
+            iat: 0,
+            exp: u64::MAX,
+            jti: "jti".to_string(),
+            identity_source: identity_source.map(str::to_string),
+            caller_dna_uai: Some("uai:1".to_string()),
+            user_identity_hash: user_identity_hash.map(str::to_string),
+            caller_context_fields: fields
+                .as_object()
+                .cloned()
+                .unwrap_or_default(),
+            allowed_transit_points: vec![],
+            trace_id: None,
+        }
+    }
+
+    fn transit_caller_json(ctx: &OutboundPipelineContext) -> serde_json::Value {
+        serde_json::to_value(build_outbound_policy_input(ctx)).unwrap()["transit"]["caller"].clone()
+    }
+
+    #[test]
+    fn outbound_policy_input_says_a_call_with_no_caller_is_anonymous() {
+        let ctx = test_pipeline_context();
+        assert_eq!(
+            transit_caller_json(&ctx),
+            json!({ "verified": false, "verification": "anonymous", "did_verified": false })
+        );
+    }
+
+    #[test]
+    fn outbound_policy_input_carries_the_verified_caller_of_a_transit_token() {
+        let mut ctx = test_pipeline_context();
+        ctx.transit_token_claims = Some(caller_claims(
+            Some("did:example:alice-agent"),
+            Some("self-presented"),
+            Some("abc123"),
+            json!({ "email": "alice@example.com" }),
+        ));
+        assert_eq!(
+            transit_caller_json(&ctx),
+            json!({
+                "verified": true,
+                "verification": "transit_token",
+                "identity_source": "self-presented",
+                "user_identity_hash": "abc123",
+                "did": "did:example:alice-agent",
+                "did_verified": false,
+                "caller_dna_uai": "uai:1",
+                "fields": { "email": "alice@example.com" }
+            })
+        );
+    }
+
+    #[test]
+    fn outbound_policy_input_marks_a_verified_presentation_did_as_verified() {
+        let mut ctx = test_pipeline_context();
+        ctx.transit_token_claims = Some(caller_claims(
+            Some("did:example:alice-agent"),
+            Some("verified-presentation"),
+            Some("abc123"),
+            json!({}),
+        ));
+        let caller = transit_caller_json(&ctx);
+        assert_eq!(caller["did"], "did:example:alice-agent");
+        assert_eq!(caller["did_verified"], true);
+    }
+
+    #[test]
+    fn outbound_policy_input_does_not_verify_a_token_that_only_names_a_did() {
+        let mut ctx = test_pipeline_context();
+        ctx.transit_token_claims = Some(caller_claims(
+            Some("did:example:claimed"),
+            Some("self-presented"),
+            None,
+            json!({ "email": "claimed@example.com" }),
+        ));
+        assert_eq!(
+            transit_caller_json(&ctx),
+            json!({
+                "verified": false,
+                "verification": "unverified",
+                "identity_source": "self-presented",
+                "did": "did:example:claimed",
+                "did_verified": false,
+                "caller_dna_uai": "uai:1"
+            })
+        );
+    }
+
+    #[test]
+    fn outbound_policy_input_carries_a_caller_the_transit_point_authenticated() {
+        let mut ctx = test_pipeline_context();
+        ctx.authenticated_identity = Some(crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            subject: "alice".to_string(),
+            claims: json!({ "sub": "alice" }),
+        });
+        let caller = transit_caller_json(&ctx);
+        assert_eq!(
+            caller,
+            json!({
+                "verified": true,
+                "verification": "resource_token",
+                "identity_source": "jwt_bearer",
+                "user_identity_hash": "2bd806c97f0e00af1a1fc3328fa763a9269723c8db8fac4f93af71db186d6e90",
+                "subject": "alice",
+                "did_verified": false
+            })
+        );
+    }
+
+    #[test]
+    fn outbound_policy_input_prefers_a_verified_transit_token_over_a_resource_token() {
+        let mut ctx = test_pipeline_context();
+        ctx.authenticated_identity = Some(crate::source_auth::AuthenticatedIdentity::ApiKey {
+            key_name: "cloud-agent".to_string(),
+        });
+        ctx.transit_token_claims = Some(caller_claims(None, Some("gateway-computed"), Some("abc123"), json!({})));
+        assert_eq!(transit_caller_json(&ctx)["verification"], "transit_token");
+        assert_eq!(transit_caller_json(&ctx)["user_identity_hash"], "abc123");
+
+        ctx.transit_token_claims = Some(caller_claims(Some("did:example:claimed"), None, None, json!({})));
+        let caller = transit_caller_json(&ctx);
+        assert_eq!(caller["verification"], "resource_token");
+        assert_eq!(caller["subject"], "cloud-agent");
+        assert_eq!(caller["identity_source"], "api_key");
+        assert!(caller.get("did").is_none(), "an unverified DID must not ride along with a verified caller: {caller}");
     }
 
     #[test]

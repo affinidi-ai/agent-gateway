@@ -21,6 +21,7 @@ mod mcp_sandbox_e2e;
 mod mcp_subscription_scope;
 mod mtls;
 mod tr_naming_e2e;
+mod transit_caller_policy_e2e;
 mod transit_point_headers_e2e;
 mod transit_point_lifecycle_e2e;
 mod transit_source_auth_e2e;
