@@ -51,11 +51,9 @@ export function parseSurfaceDeclarations(body: unknown): SurfaceDeclarations {
   return { declarations, warnings };
 }
 
-export const FAIL_OPEN_WARNING_CODES = [
-  'fail_open_policy',
-  'fail_open_undetermined',
-  'payment_before_policy',
-];
+export const FAIL_OPEN_WARNING_CODES = ['fail_open_policy', 'fail_open_undetermined'];
+
+export const GATEWAY_DENY_WARNING_CODES = ['payment_before_policy'];
 
 export const STRIP_REASON_TEXT: Record<string, string> = {
   transit_point: 'Transit Point cards never declare authentication.',
@@ -76,6 +74,23 @@ export const STRIP_REASON_TEXT: Record<string, string> = {
     'A variant of an Access Point on the root route has no resource of its own to declare.',
 };
 
+export const UNSERVABLE_REASON_TEXT: Record<string, string> = {
+  not_mcp:
+    'Protected resource metadata is set but this is not an MCP Access Point. Remove protected_resource.',
+  root_variant_resource:
+    'A variant of an Access Point on the root route has no resource of its own. Give the surface a route.',
+  resource_mismatch: 'The resource must be this Access Point URL. Set it to the URL shown.',
+  invalid_protected_resource:
+    'The protected resource metadata settings are not valid. Check the authorization servers, scopes and resource.',
+  incompatible_caller_authentication:
+    'Protected resource metadata needs the first caller authentication method to be JWT Bearer reading the Authorization header with the Bearer scheme, with no audiences and forward_header off. Fix the method or remove protected_resource.',
+  strategy_store_unavailable:
+    'The gateway could not read the JWT verification strategy. Callers get 503 until it can; check the gateway log.',
+};
+
+const UNSERVABLE_FALLBACK =
+  'The discovery setting cannot be served on this route, so callers are refused until it is fixed.';
+
 export function describeDeclaration(
   d: SurfaceDeclaration,
   protocol?: Protocol
@@ -92,8 +107,7 @@ export function describeDeclaration(
   if (d.outcome === 'unservable') {
     return {
       label: 'Cannot be served',
-      detail:
-        'The discovery setting cannot be served on this route, so callers are refused until it is fixed.',
+      detail: (d.reason && UNSERVABLE_REASON_TEXT[d.reason]) || UNSERVABLE_FALLBACK,
     };
   }
   if (d.outcome === 'pass_through') {

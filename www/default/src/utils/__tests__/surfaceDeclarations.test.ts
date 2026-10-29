@@ -4,6 +4,7 @@ import {
   parseSurfaceDeclarations,
   STRIP_REASON_TEXT,
   surfacePathAfterCreate,
+  UNSERVABLE_REASON_TEXT,
 } from '../surfaceDeclarations';
 
 describe('parseSurfaceDeclarations', () => {
@@ -83,6 +84,34 @@ describe('describeDeclaration', () => {
     expect(
       describeDeclaration({ ...base, outcome: 'strip', reason: 'root_variant' }).detail
     ).toMatch(/root route/);
+  });
+
+  it.each([
+    ['not_mcp', 'Remove protected_resource.'],
+    ['root_variant_resource', 'Give the surface a route.'],
+    ['resource_mismatch', 'Set it to the URL shown.'],
+    ['invalid_protected_resource', 'Check the authorization servers, scopes and resource.'],
+    ['incompatible_caller_authentication', 'Fix the method or remove protected_resource.'],
+    ['strategy_store_unavailable', 'Callers get 503 until it can; check the gateway log.'],
+  ])('says what to do when the declaration cannot be served because of %s', (reason, action) => {
+    const d = describeDeclaration({ ...base, outcome: 'unservable', reason }, 'mcp');
+    expect(d.label).toBe('Cannot be served');
+    expect(d.detail).toBe(UNSERVABLE_REASON_TEXT[reason]);
+    expect(d.detail.endsWith(action)).toBe(true);
+  });
+
+  it('keeps the general unservable text for an unknown or missing reason', () => {
+    const general =
+      'The discovery setting cannot be served on this route, so callers are refused until it is fixed.';
+    expect(describeDeclaration({ ...base, outcome: 'unservable', reason: null }).detail).toBe(
+      general
+    );
+    expect(describeDeclaration({ ...base, outcome: 'unservable', reason: 'new_code' }).detail).toBe(
+      general
+    );
+    expect(
+      describeDeclaration({ ...base, outcome: 'unservable', reason: 'audience_missing' }).detail
+    ).toBe(general);
   });
 
   it('falls back for a reason it does not know or a missing reason', () => {

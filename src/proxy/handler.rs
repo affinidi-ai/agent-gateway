@@ -609,7 +609,7 @@ pub(crate) fn forwards_caller_token(
 }
 
 /// The 503 detail for a request to an Access Point that cannot serve its declaration.
-fn unservable_declaration_detail(protocol: &crate::config::agent_surface::SurfaceProtocol) -> &'static str {
+pub(crate) fn unservable_declaration_detail(protocol: &crate::config::agent_surface::SurfaceProtocol) -> &'static str {
     match protocol {
         crate::config::agent_surface::SurfaceProtocol::Mcp => "Invalid MCP protected resource",
         _ => "Caller authentication unavailable",
@@ -636,7 +636,10 @@ pub(crate) async fn resolve_access_point_declaration(
     .unwrap_or_else(|error| {
         warn!(surface = %surface.name, error = %error, "Access Point declaration unavailable: strategy store failed");
         crate::source_auth::declaration::DeclarationOutcome::Unservable(
-            "the JWT verification strategy store is unavailable".into(),
+            crate::source_auth::declaration::UnservableDeclaration::new(
+                crate::source_auth::declaration::UnservableReason::StrategyStoreUnavailable,
+                "the JWT verification strategy store is unavailable",
+            ),
         )
     });
     debug!(
@@ -16531,7 +16534,10 @@ allow if {
                 &network
             )
             .await,
-            DeclarationOutcome::Unservable("the JWT verification strategy store is unavailable".into())
+            DeclarationOutcome::Unservable(crate::source_auth::declaration::UnservableDeclaration::new(
+                crate::source_auth::declaration::UnservableReason::StrategyStoreUnavailable,
+                "the JWT verification strategy store is unavailable"
+            ))
         );
         assert_eq!(
             resolve_access_point_declaration(&surface(serde_json::json!([])), None, Some(&middleware), &network).await,

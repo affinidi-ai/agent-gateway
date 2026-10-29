@@ -84,17 +84,17 @@ function servedPanelOnFailure(
   if (after !== null) {
     const reason =
       preview.fetch.status === 'not_served'
-        ? 'the gateway will not serve the card it fetched'
+        ? 'the gateway refused to serve the card it fetched'
         : 'the latest fetch failed';
     return {
       card: after,
-      note: `The card the gateway serves for this surface, as it last served it. It may be from earlier, because ${reason}.`,
+      note: `The card the gateway last served for this surface, before ${reason}. Callers do not get it until this is fixed.`,
     };
   }
   if (afterBytes !== null && afterBytes > limit) {
     return {
       card: null,
-      missing: `The card the gateway serves is ${kb(afterBytes)} KB, more than the ${kb(limit)} KB the dashboard shows. Open the card URL to read it.`,
+      missing: `The card the gateway last served is ${kb(afterBytes)} KB, more than the ${kb(limit)} KB the dashboard shows. Open the card URL to read it.`,
     };
   }
   if (lastServed) {

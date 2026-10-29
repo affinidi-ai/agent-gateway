@@ -152,8 +152,8 @@ they share one set of rules ([`handlers.rs`](../src/jwt_bearer/handlers.rs)):
 | Permission | `jwt_verification_strategies.edit` |
 | Egress posture | The cloud-metadata-only posture (cloud metadata blocked; http, loopback and RFC 1918 allowed), and the strict posture for a tenant-scoped PAT, which also blocks loopback, RFC 1918, link-local and unique-local addresses. Under the strict posture discovery and `validate-jwks-uri` accept `https` only: an `http` issuer or JWKS URI fails with `invalid_url` before any lookup, and an `http` endpoint in the document makes it invalid. Each request is pinned to the vetted address unless a proxy is configured (see the module's [DNS limit](#authorization-server-metadata-module-developer-reference)), does not follow redirects, and reads at most 64 KiB. A discovery fetch has 10 seconds to resolve the host and 10 more for the request, and discovery makes up to three fetches for an issuer with a path and two for one without, so it takes at most 60 or 40 seconds. |
 | Limit | Up to 10 probes per user at once, replenished at one every 6 seconds; past that, `429` with code `rate_limited`. A save that cannot re-discover because of the limit keeps its pin only when the issuer is unchanged, and clears it otherwise. |
-| Errors | A fixed `code` and message, never the resolved address or the transport error. Discovery uses the [module's codes](#authorization-server-metadata-module-developer-reference): `invalid_url`, `blocked` (also a host name that does not resolve), `unreachable`, `http_status`, `too_large`, `invalid_document`, `issuer_mismatch`. `validate-jwks-uri` uses `invalid_url`, `blocked` (also a host name that does not resolve), `unreachable`, `http_error`, `too_large`, `invalid_document`. `discover` and saves answer `422`; `validate-jwks-uri` answers `400` with `valid: false`. |
-| Audit | Each probe logs an `audit` event `jwt_verification_strategy.probe` with the probe kind (`discover`, `jwks_uri` or `save`), the caller, the tenant, the posture, the host and the result: `ok` or the failure code, which a failed probe also logs in a warning. The `discover` and `save` probes record the discovery codes, so a metadata server that answers outside 2xx is recorded as `http_status`. The `jwks_uri` probe records `http_error` for the same answer, so a rule that matches failed probes by result must match both. |
+| Errors | A fixed `code` and message, never the resolved address or the transport error. Discovery uses the [module's codes](#authorization-server-metadata-module-developer-reference): `invalid_url`, `blocked` (also a host name that does not resolve), `unreachable`, `http_status`, `too_large`, `invalid_document`, `issuer_mismatch`. `validate-jwks-uri` uses `invalid_url`, `blocked` (also a host name that does not resolve), `unreachable`, `http_status`, `too_large`, `invalid_document`. `discover` and saves answer `422`; `validate-jwks-uri` answers `400` with `valid: false`. |
+| Audit | Each probe logs an `audit` event `jwt_verification_strategy.probe` with the probe kind (`discover`, `jwks_uri` or `save`), the caller, the tenant, the posture, the host and the result: `ok` or the failure code, which a failed probe also logs in a warning. Every probe records a server that answers outside 2xx as `http_status`. |
 
 Every discovery is also counted in `agent_gateway_discovery_total`
 ([trust plane metrics](OBSERVABILITY.md#trust-plane-metrics)), and each strategy create, update
@@ -215,6 +215,13 @@ policy those releases can evaluate: one that checks the raw `scope` or `scp` cla
 `input.source_auth.claims`, since they publish neither `input.source_auth.scopes` nor the
 `insufficient_scope` kind. Set `required_scopes` again after upgrading.
 
+Those releases also drop a strategy's pinned `authorization_server` when they save it. A
+strategy an older node saved during a rollback comes back unpinned, so its Access Points stop
+declaring (strip reason `not_pinned`) and lose the built-in refusal of failed callers, and a
+strategy that read scopes from `roles` falls back to `scope` and `scp`. After re-upgrading,
+run discovery on each such strategy (`discover_metadata: true`) and set its `scope_claims`
+again, as well as `required_scopes`.
+
 ### Declaring an Access Point
 
 An Access Point declares when it tells callers which authorization server to use: it publishes
@@ -264,6 +271,23 @@ never the outcome of a request.
 On an explicit MCP declaration `forward_header` is refused with `400` on save and `503` at
 request time instead of stripping, because the setting exists to switch the protection on.
 
+An Access Point is `unservable` when its settings ask for a declaration it cannot serve. Its
+callers get `503` before policy, and the reason code
+([`UnservableReason`](../src/source_auth/declaration.rs)) says why. The code does not change
+the refusal: callers get `503` with `Invalid MCP protected resource` on an MCP Access Point and
+`Caller authentication unavailable` on any other, on the direct path and over Fabric, and the
+gateway warning names the cause's detail.
+
+| Reason code | Unservable when |
+| --- | --- |
+| `not_mcp` | `protected_resource` is set on an Access Point that is not MCP |
+| `invalid_protected_resource` | The `protected_resource` fields fail their checks: the resource, the scopes, or 1 to 8 distinct `authorization_servers` |
+| `incompatible_caller_authentication` | With `protected_resource`, the first method is not `jwt_bearer` reading the `Authorization` header with the `Bearer` scheme, lists `audiences`, or has `forward_header` on |
+| `root_variant_resource` | With `protected_resource`, the route called is a Surface Variant of an Access Point at `/`, which has no resource of its own |
+| `resource_mismatch` | The `protected_resource` resource is not on a public origin of the Access Point's listener with the Access Point's own path |
+| `strategy_store_unavailable` | A derived declaration's strategy could not be read because the strategy store failed |
+| `network_unavailable` | Over Fabric, the receiving gateway has no network configuration to name the resource of an Access Point that would declare |
+
 The resource a derived declaration names is the Access Point URL above, with `$alias` for a
 Surface Variant (`%24` is read as `$`). Each variant is resolved on its own, against its own
 URL. An alias on a surface without variants selects nothing and is ignored: the base route
@@ -274,7 +298,9 @@ an extra value in `audiences` is not accepted. A route that holds `$` or `%24` i
 
 `GET /v1/surfaces/{id}/declarations` reports the outcome of the base route and of each enabled
 Surface Variant as `{"declarations", "warnings"}`, and every surface save returns the same two
-fields next to the surface; see [Surface save warnings](POLICY.md#surface-save-warnings).
+fields next to the surface; see [Surface save warnings](POLICY.md#surface-save-warnings). Each
+declaration's `reason` is the strip reason code for `strip`, the unservable reason code above
+for `unservable`, and `null` otherwise.
 
 A declaring Access Point never sends the caller's token on, to the Target or over Fabric: it is
 the resource the token was issued for, so a Target would receive a token not meant for it. A strategy store failure while

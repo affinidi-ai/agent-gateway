@@ -3755,16 +3755,23 @@ async fn fabric_access_point_declaration(
     network: Option<&crate::config::NetworkConfig>,
 ) -> crate::source_auth::declaration::DeclarationOutcome {
     use crate::source_auth::declaration::{
-        DeclarationOutcome, DeclarationSource, declaration_source, resolve_surface_declaration,
+        DeclarationOutcome, DeclarationSource, UnservableDeclaration, UnservableReason, declaration_source,
+        resolve_surface_declaration,
     };
     match network {
         Some(network) => resolve_surface_declaration(surface, alias, strategies, network)
             .await
             .unwrap_or_else(|error| {
-                DeclarationOutcome::Unservable(format!("the verification strategy store failed: {error}"))
+                DeclarationOutcome::Unservable(UnservableDeclaration::new(
+                    UnservableReason::StrategyStoreUnavailable,
+                    format!("the verification strategy store failed: {error}"),
+                ))
             }),
         None if !matches!(declaration_source(surface, alias), DeclarationSource::None) => {
-            DeclarationOutcome::Unservable("network configuration unavailable".to_string())
+            DeclarationOutcome::Unservable(UnservableDeclaration::new(
+                UnservableReason::NetworkUnavailable,
+                "network configuration unavailable",
+            ))
         }
         None => DeclarationOutcome::PassThrough,
     }
@@ -4202,7 +4209,7 @@ async fn process_forward_request_in_request_scope(
     let declaration = match &access_point_declaration {
         crate::source_auth::declaration::DeclarationOutcome::Declare(declaration) => Some(declaration),
         crate::source_auth::declaration::DeclarationOutcome::Unservable(e) => {
-            channel_warn!(config_id, "GW2: Invalid MCP protected resource (reason={}) — blocking", e);
+            channel_warn!(config_id, "GW2: Access Point cannot serve its declaration (reason={}) — blocking", e);
             crate::audit::request_events::auth_failed(
                 &audit_facts,
                 crate::audit::events::AuthScheme::Jwt,
@@ -4211,7 +4218,7 @@ async fn process_forward_request_in_request_scope(
                 None,
             );
             let error_body = serde_json::json!({
-                "error": "Invalid MCP protected resource",
+                "error": crate::proxy::handler::unservable_declaration_detail(&surface.access_point.protocol),
                 "status": 503,
             });
             return ProcessingResult::RequiresResponse {
@@ -11124,9 +11131,12 @@ mod tests {
     /// by its required scopes, fails closed; any other Access Point passes through.
     #[tokio::test]
     async fn without_the_network_only_a_declaring_access_point_fails_closed() {
-        use crate::source_auth::declaration::DeclarationOutcome;
+        use crate::source_auth::declaration::{DeclarationOutcome, UnservableDeclaration, UnservableReason};
 
-        let unservable = DeclarationOutcome::Unservable("network configuration unavailable".to_string());
+        let unservable = DeclarationOutcome::Unservable(UnservableDeclaration::new(
+            UnservableReason::NetworkUnavailable,
+            "network configuration unavailable",
+        ));
         let derived = a2a_jwt_surface(serde_json::json!(["agent.call"]));
         assert_eq!(fabric_access_point_declaration(&derived, None, Some(&Strategies::Pinned), None).await, unservable);
         assert_eq!(fabric_access_point_declaration(&explicit_mcp_surface(), None, None, None).await, unservable);
@@ -11254,13 +11264,19 @@ mod tests {
     #[tokio::test]
     async fn a_strategy_store_failure_leaves_a_declaring_fabric_access_point_unservable() {
         use crate::protocols::protected_resource::fixtures::discovery_network;
-        use crate::source_auth::declaration::DeclarationOutcome;
+        use crate::source_auth::declaration::{DeclarationOutcome, UnservableReason};
 
         let network = discovery_network();
         let derived = a2a_jwt_surface(serde_json::json!(["agent.call"]));
         match fabric_access_point_declaration(&derived, None, Some(&Strategies::Failing), Some(&network)).await {
-            DeclarationOutcome::Unservable(reason) => {
-                assert!(reason.starts_with("the verification strategy store failed"), "{reason}")
+            DeclarationOutcome::Unservable(unservable) => {
+                assert_eq!(unservable.reason, UnservableReason::StrategyStoreUnavailable);
+                assert!(
+                    unservable
+                        .detail
+                        .starts_with("the verification strategy store failed"),
+                    "{unservable}"
+                )
             }
             other => panic!("expected the Access Point to fail closed, got {other:?}"),
         }

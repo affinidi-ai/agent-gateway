@@ -190,10 +190,10 @@ test.describe('Agent Cards tab', () => {
 
         const managed = page.getByTestId('agent-card-before');
         const served = page.getByTestId('agent-card-after');
-        await expect(managed).toContainText('Managed Agent Card');
-        await expect(managed).toContainText("The agent's own card");
-        await expect(served).toContainText('Gateway-Served Agent Card');
-        await expect(served).toContainText('What callers see');
+        await expect(managed.locator('.agent-card-column-title')).toHaveText('Managed Agent Card');
+        await expect(managed.locator('.agent-card-column-hint')).toHaveText("The agent's own card");
+        await expect(served.locator('.agent-card-column-title')).toHaveText('Gateway-Served Agent Card');
+        await expect(served.locator('.agent-card-column-hint')).toHaveText('What callers see');
         await expect(page.getByTestId('agent-card-era-before')).toHaveText('A2A 0.3');
         await expect(page.getByTestId('agent-card-era-after')).toHaveText('A2A 0.3');
         const managedBox = await managed.boundingBox();

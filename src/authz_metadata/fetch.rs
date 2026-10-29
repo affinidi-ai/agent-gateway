@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use bytes::Bytes;
+use reqwest::header::HeaderMap;
 use url::Url;
 
 use super::{DiscoveryError, DiscoveryFailure, DiscoveryOptions, EgressPosture};
@@ -114,6 +115,17 @@ pub async fn get_bounded(
     posture: EgressPosture,
     options: DiscoveryOptions,
 ) -> Result<Bytes, DiscoveryError> {
+    get_bounded_with_headers(url, posture, options)
+        .await
+        .map(|(body, _headers)| body)
+}
+
+/// [`get_bounded`], also returning the headers of the 2xx response.
+pub async fn get_bounded_with_headers(
+    url: &str,
+    posture: EgressPosture,
+    options: DiscoveryOptions,
+) -> Result<(Bytes, HeaderMap), DiscoveryError> {
     parse_fetch_url(url, posture)?;
     let client = pinned_client(url, posture, options).await?;
     let response = client
@@ -121,20 +133,22 @@ pub async fn get_bounded(
         .header(reqwest::header::ACCEPT, "application/json")
         .send()
         .await
-        .map_err(|e| DiscoveryError::new(DiscoveryFailure::Unreachable, e.to_string()))?;
+        .map_err(|e| DiscoveryError::new(DiscoveryFailure::Unreachable, e.without_url().to_string()))?;
     let status = response.status();
     if !status.is_success() {
         return Err(DiscoveryError::new(DiscoveryFailure::HttpStatus, format!("HTTP {status}")));
     }
+    let headers = response.headers().clone();
     let limits = UpstreamBodyLimits::new(options.max_bytes, None, read_deadline_secs(options));
-    read_bounded(response, limits)
+    let body = read_bounded(response, limits)
         .await
         .map_err(|e| match e {
             UpstreamBodyError::TooLarge(limit) => {
                 DiscoveryError::new(DiscoveryFailure::TooLarge, format!("response exceeds {limit} bytes"))
             }
             other => DiscoveryError::new(DiscoveryFailure::Unreachable, other.to_string()),
-        })
+        })?;
+    Ok((body, headers))
 }
 
 #[cfg(test)]
@@ -550,5 +564,37 @@ mod tests {
         let failure =
             failure_of(get_bounded("http://127.0.0.1:1/jwks.json", OPERATOR, DiscoveryOptions::default()).await);
         assert_eq!(failure, DiscoveryFailure::Unreachable);
+    }
+
+    #[tokio::test]
+    async fn a_failed_send_keeps_the_url_out_of_the_detail() {
+        let error = get_bounded("http://127.0.0.1:1/secret-path/jwks.json", OPERATOR, DiscoveryOptions::default())
+            .await
+            .unwrap_err();
+        assert_eq!(error.failure(), DiscoveryFailure::Unreachable);
+        assert!(
+            !error
+                .detail()
+                .contains("secret-path"),
+            "{}",
+            error.detail()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_headers_variant_returns_the_body_and_the_response_headers() {
+        let server = TestServer::start().await;
+        server.reply("/jwks.json", Reply::json(r#"{"keys":[]}"#));
+        let (body, headers) =
+            get_bounded_with_headers(&server.url("/jwks.json"), OPERATOR, DiscoveryOptions::default())
+                .await
+                .unwrap();
+        assert_eq!(&body[..], br#"{"keys":[]}"#);
+        assert_eq!(
+            headers
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
     }
 }

@@ -317,8 +317,8 @@ top-level fields:
 
 - `declarations`: `[{"variant", "outcome", "reason", "resource"}]`, one entry for the base
   route (`variant` is `null`) and one for each enabled variant. `outcome` is `declare`,
-  `strip`, `pass_through` or `unservable`, `reason` is the strip reason code (otherwise
-  `null`), and `resource` is the Access Point URL, or `null` when the Access Point has none
+  `strip`, `pass_through` or `unservable`, `reason` is the strip or unservable reason code
+  (otherwise `null`), and `resource` is the Access Point URL, or `null` when the Access Point has none
   ([declaring an Access Point](SOURCE_AUTH.md#declaring-an-access-point)).
 - `warnings`: `[{"code", "message", "path", "variant"}]`. `path` names the field of the
   resolved surface the warning is about and `variant` is the alias, `null` for the base route.
@@ -375,7 +375,9 @@ plane denies it on both paths.
 The dry run is a heuristic over this fixed set. A policy that branches on anything else (the
 path, headers, tool name or time) can still admit a failed caller unseen. The controls are the
 deny rule and the Target Authentication caller gate; the dry run only warns. The dashboard
-shows the warnings on Surface Detail with a copyable deny rule.
+shows the warnings on Surface Detail with a copyable deny rule: a surface policy to attach as
+`target.policy` for the fail-open warnings, and the same rule as a gateway policy for
+`payment_before_policy`.
 
 Create, update, merge `PATCH` and the variant routes run one validation. Besides the checks
 that also run when configuration loads at startup, it reads the stores: references and their

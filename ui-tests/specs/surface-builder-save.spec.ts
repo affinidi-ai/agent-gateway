@@ -255,6 +255,8 @@ test.describe('Surface builder save', () => {
         const copied = await page.evaluate(() => navigator.clipboard.readText());
         expect(copied).toContain('package surface.policy');
         expect(copied).toContain('input.source_auth.method == "failed"');
+        await expect(page.getByTestId('surface-warnings-copy-rule-hint')).toContainText('target.policy');
+        await expect(page.getByTestId('surface-warnings-copy-gateway-rule')).toHaveCount(0);
 
         const stored = await api.get<StoredSurface>(`/api/v1/surfaces/${created.surface_id}`);
         expect(stored.body.access_point.inbound_policy).toBeUndefined();

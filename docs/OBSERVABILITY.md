@@ -93,17 +93,25 @@ none carries a URL, host, issuer, token or provider name.
 | Metric | Labels | Counted |
 | --- | --- | --- |
 | `agent_gateway_token_fetch_total` | `grant`: `client_credentials`, `jwt_bearer`, `unsupported` (a provider type the gateway never grants for). `result`: `ok`, `unsupported`, `secret_unavailable`, `forbidden`, `unavailable`, `invalid_response`, `assertion_failed` | Each gateway token request that was not answered from cache or held back by the retry backoff. `unavailable` covers an unreachable endpoint, a refused grant and a timeout; `assertion_failed` is a JWT bearer assertion that could not be signed |
-| `agent_gateway_jwks_fetch_total` | `result`: `ok`, `invalid_url`, `blocked`, `unreachable`, `http_error`, `too_large`, `invalid_document` | Each network fetch of a remote strategy's key set, successful or failed. A host that does not resolve counts as `blocked`. A cache hit, a static key set and the validate-jwks-uri probe are not counted |
+| `agent_gateway_jwks_fetch_total` | `result`: `ok`, `invalid_url`, `blocked`, `unreachable`, `http_status`, `too_large`, `invalid_document` | Each network fetch of a remote strategy's key set, successful or failed. A host that does not resolve counts as `blocked`. A cache hit, a static key set and the validate-jwks-uri probe are not counted |
 | `agent_gateway_discovery_total` | `result`: `ok`, `invalid_url`, `blocked`, `unreachable`, `http_status`, `too_large`, `invalid_document`, `issuer_mismatch` | Each authorization server metadata discovery, whether from a probe, a save or a re-discovery after an issuer change |
 | `agent_gateway_scope_denied_total` | `scheme`: the `auth_failed` scheme, `jwt` for a `jwt_bearer` method's [`required_scopes`](SOURCE_AUTH.md#required-scopes) (an MCP Access Point with `protected_resource` included) and `mcp_resource_token` for `mcp_http.authorization` | Each request whose caller token lacked a required scope, whether the gateway refused it or left the decision to policy. Counted whether or not a sink selects `auth_failed`. An operator's card preview is not a caller request and is not counted |
-| `agent_gateway_card_security_total` | `outcome`: `declare`, `strip`, `pass_through`, `unservable`. `reason`: the [strip reason code](SOURCE_AUTH.md#declaring-an-access-point) for `strip` (`transit_point` for a Transit Point card), otherwise `none` | Each agent card an Access Point serves after rewriting it, and each Transit Point card whose security the gateway removes because its Access Point's cards are secured ([Agent card security](PROTOCOLS.md#agent-card-security)). An operator's [Agent card preview](SOURCE_AUTH.md#agent-card-preview) is not counted |
+| `agent_gateway_card_security_total` | `outcome`: `declare`, `strip`, `pass_through`, `unservable`. `reason`: the [strip reason code](SOURCE_AUTH.md#declaring-an-access-point) for `strip` (`transit_point` for a Transit Point card), the unservable reason code for `unservable`, otherwise `none` | Each agent card an Access Point serves after rewriting it, and each Transit Point card whose security the gateway removes because its Access Point's cards are secured ([Agent card security](PROTOCOLS.md#agent-card-security)). An operator's [Agent card preview](SOURCE_AUTH.md#agent-card-preview) is not counted |
 
 Alert on `agent_gateway_token_fetch_total{result!="ok"}` and
 `agent_gateway_jwks_fetch_total{result!="ok"}` as a rate against their `ok` series: a gateway
-that cannot reach an authorization server refuses callers (JWKS) or, after a failed token fetch,
-either answers 502 (Target Authentication with the default `reject` fallback) or sends the request
-without the credential (an `outbound_credentials` binding, or `fallback: passthrough`), while the
-rest of the appliance looks healthy.
+that cannot reach an authorization server refuses callers (JWKS) or, after a failed token fetch
+that leaves no still-valid token, refuses the request with 503 `Delegated credentials
+unavailable` (an `outbound_credentials` or `transit_credentials` binding), answers 502 `Target
+authentication failed` (Target Authentication with the default `reject` fallback), or sends it
+without the credential (Target Authentication with `fallback: passthrough` only), while the rest
+of the appliance looks healthy.
+
+To find the provider behind a Target Authentication failure, search the `credential_delegation`
+log target for the `Gateway grant failed` warning: one per failed grant, with `provider_id`,
+`grant`, `category` (the `result` code above) and `stale_token_kept`. Requests held back by the
+retry backoff log `Gateway grant held back by the retry backoff` at debug level and are not
+counted.
 
 A record the gateway cannot read at load is skipped and counted in
 `agent_gateway_storage_load_errors_total{entity, reason}`. `reason` is `invalid_json`,

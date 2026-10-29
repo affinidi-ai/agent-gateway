@@ -259,7 +259,7 @@ export const CARD_FETCH_CAUSE_LABEL: Record<CardFetchCause, string> = {
   timeout: 'Timed out',
   too_large: 'Card too large',
   invalid_card: 'Not an agent card',
-  blocked_by_egress: 'Blocked by egress policy',
+  blocked_by_egress: 'Address not resolvable or not allowed',
   proxy_unavailable: 'A2A proxy unavailable',
   identity_failed: 'Identity failed',
   rewrite_failed: 'Rewrite failed',
@@ -280,7 +280,7 @@ export const CARD_FETCH_CAUSE_TEXT: Record<CardFetchCause, string> = {
   too_large: "The agent's card is larger than the gateway accepts. Shrink the agent card.",
   invalid_card: "The agent's answer is not a JSON agent card. Check the agent card location.",
   blocked_by_egress:
-    "The gateway's egress policy blocks the agent's address. Allow the address in the gateway egress policy.",
+    "The gateway could not resolve the agent's host name, or it resolves to a cloud metadata address, which the gateway never calls. Check the endpoint host name and DNS from the gateway host, then Refresh.",
   proxy_unavailable: 'The A2A proxy behind this surface is missing or disabled.',
   identity_failed:
     "The gateway could not attach the agent's identity to the card. Check the gateway logs, then Refresh.",

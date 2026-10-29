@@ -227,7 +227,11 @@ resolves Target Authentication for every method at every call site, in this orde
 
 Every 502 carries the fixed body `Target authentication failed`. The Target Authentication log
 line carries only the category and the surface ID; a failed grant's log line adds the provider
-ID, the HTTP status and the standard OAuth error code.
+ID, the HTTP status and the standard OAuth error code. Each failed Target Authentication grant
+also logs one `Gateway grant failed` warning (target `credential_delegation`) with
+`provider_id`, `grant`, `category` and `stale_token_kept` (whether a still-valid cached token is
+used instead). A request held back by the retry backoff sends nothing and logs `Gateway grant
+held back by the retry backoff` at debug level with `provider_id` and `grant`.
 
 ### Precedence with delegated credentials
 
@@ -591,6 +595,28 @@ storage configuration like every other store. The default is off. With the defau
 access and refresh tokens are written to `_storage/` as plaintext JSON. Enable encryption
 at rest on any appliance that holds real user tokens. See
 [`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md#configtoml).
+
+## Downgrading
+
+Earlier releases cannot read `credential_provider` Target Authentication or a credential
+provider of type `oauth2_jwt_bearer`:
+
+- On filesystem storage, a surface whose Target Authentication, or a variant's, is
+  `credential_provider` is skipped at load, so its route stops answering. On DynamoDB
+  storage its Target Authentication is read as none, and requests are forwarded to the
+  Target without the credential.
+- An `oauth2_jwt_bearer` provider is skipped at load, so every binding to it refuses its
+  requests with `503` as for a deleted provider.
+
+Before downgrading, switch those surfaces to `static_secret` or remove their Target
+Authentication, then remove the bindings to `oauth2_jwt_bearer` providers and delete or
+replace the providers; or restore a backup taken before the upgrade. Find them through the
+management API, which reads either store: in `GET /api/v1/surfaces`, a `credential_provider`
+key under `target.auth.method` on a surface or a variant, and in
+`GET /api/v1/credential-providers`, a `provider_type` of `oauth2_jwt_bearer`. The gateway
+token cache is not persisted, so it leaves nothing behind. The caller side has its own
+rollback steps under [Required scopes](SOURCE_AUTH.md#required-scopes), and the design record
+is ADR 0002's [Migration and change management](adrs/0002-hop-two-target-authentication.md#migration-and-change-management).
 
 ## Management API
 

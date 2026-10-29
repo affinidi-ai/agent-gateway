@@ -772,7 +772,10 @@ mod tests {
         for declaration in [
             DeclarationOutcome::PassThrough,
             DeclarationOutcome::Strip(StripReason::ForwardsCallerToken),
-            DeclarationOutcome::Unservable("no external URL".to_string()),
+            DeclarationOutcome::Unservable(crate::source_auth::declaration::UnservableDeclaration::new(
+                crate::source_auth::declaration::UnservableReason::ResourceMismatch,
+                "no external URL",
+            )),
         ] {
             let label = declaration.label();
             let cases = cases_of(&a2a(None), declaration, &planes).await;

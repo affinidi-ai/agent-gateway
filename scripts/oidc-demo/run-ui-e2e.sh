@@ -9,7 +9,8 @@
 #   2. picks free ports, starts hydra-a, hydra-b and the mock agent with the demo harness, and a
 #      gateway with no stored configuration in tmp/oidc-ui-e2e;
 #   3. runs ui-tests/playwright.oidc-live.config.ts, then fails the run if the results hold a
-#      private key, a token or one of the run's secrets (report_secret_scan.py);
+#      private key, a token or one of the run's secrets (report_secret_scan.py, whose own tests
+#      run before anything starts);
 #   4. stops everything again, also when the run fails or is interrupted, and deletes the
 #      run's keys, secrets and gateway storage, keeping only the results.
 #
@@ -70,6 +71,9 @@ stale() {
 }
 
 cd "${REPO_ROOT}"
+
+python3 -I -B -m unittest discover -s "${OIDC_DEMO_DIR}" -p 'test_report_secret_scan.py' >/dev/null 2>&1 \
+    || fail "report_secret_scan.py tests fail"
 
 if [[ "${OIDC_E2E_SKIP_BUILD:-0}" != "1" ]]; then
     info "Building the debug gateway (incremental)"

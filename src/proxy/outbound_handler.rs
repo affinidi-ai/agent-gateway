@@ -7655,7 +7655,12 @@ mod tests {
             advertised_scopes: vec!["orders".into()],
         };
         assert!(secures_transit_cards(&Ok(DeclarationOutcome::Declare(declaration))));
-        assert!(secures_transit_cards(&Ok(DeclarationOutcome::Unservable("store".into()))));
+        assert!(secures_transit_cards(&Ok(DeclarationOutcome::Unservable(
+            crate::source_auth::declaration::UnservableDeclaration::new(
+                crate::source_auth::declaration::UnservableReason::StrategyStoreUnavailable,
+                "store"
+            )
+        ))));
         assert!(secures_transit_cards(&Err(anyhow::anyhow!("strategy store down"))));
 
         assert!(!secures_transit_cards(&Ok(DeclarationOutcome::PassThrough)));

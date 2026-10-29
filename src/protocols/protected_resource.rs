@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::config::agent_surface::SurfaceProtocol;
+use crate::source_auth::declaration::{UnservableDeclaration, UnservableReason};
 use crate::source_auth::errors::SourceAuthFailureKind;
 use crate::sts::mcp_profile::canonical_https_url;
 
@@ -405,19 +406,27 @@ pub fn access_point_protected_resource(
     surface: &crate::config::agent_surface::AgentSurface,
     alias: Option<&str>,
     network: &crate::config::NetworkConfig,
-) -> Option<Result<ProtectedResourceConfig, String>> {
+) -> Option<Result<ProtectedResourceConfig, UnservableDeclaration>> {
     let configured = surface.protected_resource()?;
     let Some(path) = access_point_path(surface, alias) else {
-        return Some(Err("a variant of an Access Point at / is not reachable at a resource of its own".into()));
+        return Some(Err(UnservableDeclaration::new(
+            UnservableReason::RootVariantResource,
+            "a variant of an Access Point at / is not reachable at a resource of its own",
+        )));
     };
     Some(
         surface
             .validate_protected_resource()
-            .and_then(|()| configured.for_variant(alias))
+            .and_then(|()| {
+                configured
+                    .for_variant(alias)
+                    .map_err(|detail| UnservableDeclaration::new(UnservableReason::InvalidProtectedResource, detail))
+            })
             .and_then(|derived| {
                 derived
                     .validate_endpoint(&access_point_origins(surface, network), &path)
                     .map(|()| derived)
+                    .map_err(|detail| UnservableDeclaration::new(UnservableReason::ResourceMismatch, detail))
             }),
     )
 }

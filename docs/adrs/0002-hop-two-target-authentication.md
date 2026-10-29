@@ -644,20 +644,22 @@ The dashboard's provider type behaviour lives in one
 ### Call sites
 
 Every site resolves through `TargetCredentialResolver::resolve`, or `resolve_unrecorded` for a
-read that answers no caller (the receiving gateway's policy-context card read, row 8), and applies
-`apply_target_auth_fallback`. None echoes error text in the 502 body.
+read that answers no caller (the receiving gateway's policy-context card read, row 8, and the
+operator's agent card preview, row 10), and applies `apply_target_auth_fallback`. None echoes
+error text in the 502 body.
 
 | # | Function | File | Leg | Caller assertion | `credential_provider` there |
 | --- | --- | --- | --- | --- | --- |
 | 1 | `proxy_handler_with_mcp_runtime` | `src/proxy/handler.rs` | `HttpTarget` | `for_forwarded_request`; occupied headers are the delegated credential headers | Resolved |
 | 2 | `handle_fabric_request` | `src/proxy/handler.rs` | `FabricForward` | `for_forwarded_request`; occupied headers are the modern delegated credential headers | Rejected at save; `Unsupported` at use |
-| 3 | `fetch_agent_card_from_surface_target`, through `card_fetch_credential` | `src/proxy/handler.rs`, `src/proxy/target_card.rs` | `HttpTarget` | `GatewayOriginated`, destination the card URL | Resolved |
+| 3 | `AgentCardFetch::fetch_over_http`, through `card_fetch_credential` | `src/proxy/handler/agent_card.rs`, `src/proxy/target_card.rs` | `HttpTarget` | `GatewayOriginated`, destination the card URL | Resolved |
 | 4 | `handle_mcp_proxy_request` | `src/proxy/handler.rs` | `McpProxy` | `for_forwarded_request` | Rejected at save; `Unsupported` at use |
 | 5 | `step_forward_request_fabric`, through `transit_target_credential` | `src/proxy/outbound_handler.rs` | `TransitPoint` | `for_request`; occupied headers are the delegated credential headers (legacy and modern) on the request | Rejected at save; `Unsupported` at use |
 | 6 | `step_forward_request_http`, through `transit_target_credential` | `src/proxy/outbound_handler.rs` | `TransitPoint` | `for_request`; occupied headers are the delegated credential headers (legacy and modern) on the request | Rejected at save; `Unsupported` at use |
 | 7 | `process_forward_request_in_request_scope` | `src/gateways/connection_points/message_processor.rs` | `HttpTarget` (receiving gateway) | `GatewayOriginated` with no occupied headers when `is_gateway_card_fetch` holds for the upstream URL; otherwise `for_forwarded_request`, with the forwarded and delegated headers occupied | Resolved |
 | 8 | `enrich_and_evaluate_surface_policies`, through `fetch_target_card` | `src/gateways/connection_points/message_processor.rs`, `src/proxy/target_card.rs` | `HttpTarget` (receiving gateway) | `GatewayOriginated`, destination each card URL in turn | Resolved |
 | 9 | `handle_mcp_proxy_forward` | `src/gateways/connection_points/message_processor.rs` | `McpProxy` | `for_forwarded_request` | Rejected at save; `Unsupported` at use |
+| 10 | `AgentCardFetch::fetch_over_http` in `CardMode::Preview`, through `card_fetch_credential` with `CardRead::PolicyContext` | `src/proxy/handler/agent_card.rs`, `src/proxy/target_card.rs` | `HttpTarget` | `GatewayOriginated`, destination the card URL | Resolved |
 
 At the `HttpTarget` sites `destination` is the upstream URL as sent, so path confinement holds on
 the receiving gateway too. MCP tool discovery (`build_discovery_headers` in
@@ -914,7 +916,7 @@ No new store and no new persisted record.
 | Resolver and call sites | In `src/proxy/target_credentials.rs`: `test_credential_never_leaves_the_target_base_path` (`%2e%2e` and raw `..` climbs get 502), `test_gateway_token_is_withheld_from_callers_nobody_vouched_for`, `test_gateway_originated_vouches_only_for_the_agent_card_fetch`, `test_cross_tenant_provider_or_secret_is_forbidden_whatever_the_fallback`, `test_static_secret_outside_the_surface_tenant_is_forbidden_whatever_the_fallback`, `test_unsupported_types_legs_and_injections_fail_closed`, `test_missing_provider_and_failed_grant_honour_the_fallback`, `test_provider_header_already_on_the_request_fails_closed_without_a_grant`, `test_static_secret_yields_to_a_header_already_on_the_request` |
 | Gateway grants | In `src/delegation_vault/gateway_token.rs`: `test_jwt_bearer_grant_is_accepted_by_the_authorization_server_for_rs256_and_es256`, `test_grant_to_an_unlisted_loopback_endpoint_is_never_sent`, `test_grant_response_over_the_size_cap_is_invalid`, `test_parse_grant_response_bounds_and_rejects`, `test_rejected_grant_never_leaks_the_error_body`, `test_jwt_bearer_grant_requires_https`, `test_grant_secret_of_another_tenant_is_forbidden_and_missing_is_unavailable` |
 | Gateway token cache | In `src/delegation_vault/gateway_token.rs`: `test_concurrent_requests_share_one_gateway_grant`, `test_failed_refresh_keeps_the_valid_token_and_backs_off`, `test_refresh_runs_once_while_other_requests_keep_the_valid_token`, `test_updating_one_tenants_secret_leaves_another_tenants_tokens`, `test_invalid_token_response_is_never_cached`, `test_grant_in_flight_during_invalidation_never_repopulates_the_cache` |
-| Delegation with JWT bearer | In `src/proxy/credential_delegation.rs`: `test_jwt_bearer_binding_injects_a_cached_token_outside_the_refresh_margin`, `test_jwt_bearer_binding_keeps_a_valid_token_when_its_refresh_fails`, `test_jwt_bearer_binding_failure_reports_a_category_and_backs_off` |
+| Delegation with JWT bearer | In `src/proxy/credential_delegation.rs`: `test_jwt_bearer_binding_injects_a_cached_token_outside_the_refresh_margin`, `test_jwt_bearer_binding_keeps_a_valid_token_when_its_refresh_fails`, `test_jwt_bearer_binding_failure_reports_a_category_each_time` |
 | Save rules and tenancy | `src/component_tests/target_auth_provider_e2e.rs`: `admin_api_refuses_unsafe_or_cross_tenant_provider_target_authentication`, `a_tenant_surface_never_sends_appliance_wide_gateway_credentials`, `a_delegated_credential_and_the_target_credential_never_share_a_header`, `hop_two_sends_one_provider_token_on_the_card_fetch_and_authenticated_calls` |
 | Fabric | `src/gateways/connection_points/message_processor/target_auth_receive_tests.rs`: `fabric_public_reads_carry_the_gateway_token_only_on_the_agent_card_fetch`, `fabric_card_fetch_is_a_get_the_receiving_gateway_builds_itself`, `a_receiving_gateway_sends_at_most_one_credential_per_header_name`, `fabric_card_fetch_follows_the_surface_card_location_override`, `fabric_surface_policy_reads_a_protected_card_with_the_gateway_token` |
 | Dashboard | `www/default/src/utils/__tests__/credentialProviders.test.ts`, `www/default/src/utils/__tests__/targetAuth.test.ts`, `www/default/src/pages/EditCredentialProviderPage.test.tsx` |
@@ -922,11 +924,14 @@ No new store and no new persisted record.
 **Rollback:**
 - **Per surface:** switch Target Authentication back to `static_secret` or remove it through the
   API; the change hot-reloads with no restart.
-- **Release downgrade:** older releases cannot load a surface whose Target Authentication is
-  `credential_provider`, or a provider of type `oauth2_jwt_bearer`. Before downgrading, change or
-  remove those records, or restore a pre-upgrade backup. They can be found by searching the
-  surface and provider JSON under `_storage/` for `"credential_provider"` and
-  `"oauth2_jwt_bearer"`.
+- **Release downgrade:** older releases cannot read `credential_provider` Target Authentication
+  or a provider of type `oauth2_jwt_bearer`. On filesystem storage they skip such a surface, so
+  its route stops answering; on DynamoDB they read its Target Authentication as none and forward
+  to the Target without the credential. They skip such a provider, so its bindings refuse with
+  503. Before downgrading, switch those surfaces to `static_secret` or remove their Target
+  Authentication and replace or delete those providers, or restore a pre-upgrade backup. Find
+  them through the management API, which reads either store; see
+  [Downgrading](../CREDENTIAL_DELEGATION.md#downgrading).
 - **Token cache:** nothing is persisted, so a downgrade leaves nothing behind.
 - **Tenancy rules:** relaxing them is a release rollback; no data changes.
 

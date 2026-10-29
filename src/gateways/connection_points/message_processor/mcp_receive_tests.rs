@@ -2954,3 +2954,119 @@ async fn fabric_tool_call_batch_flow() {
         );
     }
 }
+
+/// A strategy store whose every operation fails.
+struct FailingStrategies;
+
+#[async_trait::async_trait]
+impl crate::jwt_bearer::JwtVerificationStrategyStorage for FailingStrategies {
+    async fn create(
+        &self,
+        _strategy: crate::jwt_bearer::models::JwtVerificationStrategy,
+    ) -> anyhow::Result<crate::jwt_bearer::models::JwtVerificationStrategy> {
+        anyhow::bail!("storage unavailable")
+    }
+    async fn get(
+        &self,
+        _id: &str,
+    ) -> anyhow::Result<Option<crate::jwt_bearer::models::JwtVerificationStrategy>> {
+        anyhow::bail!("storage unavailable")
+    }
+    async fn list(&self) -> anyhow::Result<Vec<crate::jwt_bearer::models::JwtVerificationStrategy>> {
+        anyhow::bail!("storage unavailable")
+    }
+    async fn update(
+        &self,
+        _strategy: crate::jwt_bearer::models::JwtVerificationStrategy,
+    ) -> anyhow::Result<crate::jwt_bearer::models::JwtVerificationStrategy> {
+        anyhow::bail!("storage unavailable")
+    }
+    async fn delete(
+        &self,
+        _id: &str,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("storage unavailable")
+    }
+}
+
+/// An A2A Access Point whose derived declaration cannot be resolved because the
+/// strategy store fails refuses a Fabric request with `503` and the A2A detail,
+/// not the MCP one, and never reaches the Target.
+#[tokio::test]
+async fn fabric_receive_refuses_an_unservable_a2a_declaration_with_the_a2a_detail() {
+    use std::sync::Arc;
+
+    if crate::gateways::test_helpers::rerun_in_isolated_process() {
+        return;
+    }
+
+    let target = MockServer::start_with_response(json!({"jsonrpc": "2.0", "id": 1, "result": {}}).to_string()).await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let _issuer_dir = install_listener_manager_with_sender(temp_dir.path()).await;
+    let storage_path = temp_dir
+        .path()
+        .join("surfaces");
+    let surface: AgentSurface = serde_json::from_value(json!({
+        "surface_id": "fabric-a2a-unservable", "name": "Fabric A2A unservable",
+        "access_point": {"listen_address": "https://gateway.example", "route": "/agent", "protocol": "a2a",
+            "caller_authentication": {"methods": [{"type": "jwt_bearer", "jwt_verification_strategy_id": "idp",
+                "audiences": ["https://gateway.example/agent"], "required_scopes": ["agent.call"]}]}},
+        "target": {"endpoint": format!("http://{}", target.addr)}
+    }))
+    .unwrap();
+    FileSystemAgentSurfaceStore::new(storage_path.clone())
+        .await
+        .unwrap()
+        .save(&surface)
+        .await
+        .unwrap();
+    super::init_mcp_auth_network(Arc::new(crate::protocols::protected_resource::fixtures::discovery_network()));
+    super::init_source_auth_middleware(Arc::new(crate::source_auth::SourceAuthMiddleware::new(
+        Arc::new(crate::didauth::DidAuthSessionStore::new()),
+        Arc::new(FailingStrategies),
+        Arc::new(crate::jwt_bearer::JwksClient::new()),
+        None,
+        Arc::new(dashmap::DashMap::new()),
+        None,
+        None,
+    )))
+    .await;
+
+    let message = ReceivedMessage::new(
+        "receiver-connection".to_string(),
+        "receiver-gateway".to_string(),
+        MessageType::ForwardRequest.to_string(),
+        uuid::Uuid::new_v4().to_string(),
+        None,
+        Some(SENDER_CONNECTION_POINT_DID.to_string()),
+        vec!["did:web:receiver.example".to_string()],
+        None,
+        Some(super::super::envelope_replay::now_secs() + 60),
+        json!({"channel_id": surface.surface_id, "method": "POST", "path": "/agent",
+            "headers": {"content-type": "application/json"},
+            "body": {"jsonrpc": "2.0", "id": 1, "method": "message/send", "params": {"message": {
+                "role": "user", "messageId": "m-1", "parts": [{"kind": "text", "text": "hi"}]}}}}),
+        MessageMetadata {
+            encrypted: true,
+            authenticated: true,
+            from_key: None,
+            extra: Value::Null,
+        },
+    )
+    .with_context("agent_surface_storage_path", json!(storage_path));
+    let result = tokio::time::timeout(Duration::from_secs(10), Box::pin(process_forward_request(&message)))
+        .await
+        .expect("Fabric receive handler timed out");
+    let ProcessingResult::RequiresResponse { response_type, response_body } = result else {
+        panic!("expected a ForwardResponse, got {result:?}");
+    };
+    assert_eq!(response_type, MessageType::ForwardResponse.to_string());
+    assert_eq!(response_body, json!({"error": "Caller authentication unavailable", "status": 503}));
+    assert_eq!(
+        target
+            .request_count
+            .load(Ordering::SeqCst),
+        0,
+        "an unservable declaration never reaches the Target"
+    );
+}

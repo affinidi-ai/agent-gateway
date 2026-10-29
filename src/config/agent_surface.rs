@@ -2675,14 +2675,20 @@ impl AgentSurface {
     /// enforced caller authentication method reads JWT Bearer tokens from the
     /// `Authorization` header, where RFC 9728 clients send them, and keeps
     /// them from the Target: MCP forbids passing a client's token through.
-    pub fn validate_protected_resource(&self) -> Result<(), String> {
+    pub fn validate_protected_resource(&self) -> Result<(), crate::source_auth::declaration::UnservableDeclaration> {
+        use crate::source_auth::declaration::{UnservableDeclaration, UnservableReason};
+
         let Some(protected) = self.protected_resource() else {
             return Ok(());
         };
         if !crate::protocols::protected_resource::supports_protected_resource(&self.access_point.protocol) {
-            return Err("requires an MCP Access Point".into());
+            return Err(UnservableDeclaration::new(UnservableReason::NotMcp, "requires an MCP Access Point"));
         }
-        protected.validate()?;
+        protected
+            .validate()
+            .map_err(|detail| UnservableDeclaration::new(UnservableReason::InvalidProtectedResource, detail))?;
+        let incompatible =
+            |detail: &str| UnservableDeclaration::new(UnservableReason::IncompatibleCallerAuthentication, detail);
         match self.source_auth() {
             Some(SourceAuthConfig::JwtBearer(jwt))
                 if jwt
@@ -2691,20 +2697,22 @@ impl AgentSurface {
                     && jwt.token_scheme == "Bearer" =>
             {
                 if jwt.forward_header {
-                    return Err("cannot be combined with forward_header: the caller's token must not reach the \
-                                Target"
-                        .into());
+                    return Err(incompatible(
+                        "cannot be combined with forward_header: the caller's token must not reach the Target",
+                    ));
                 }
                 if !jwt.audiences.is_empty() {
-                    return Err("requires empty JWT Bearer audiences: tokens must name the protected resource of \
-                                the route they call as their audience"
-                        .into());
+                    return Err(incompatible(
+                        "requires empty JWT Bearer audiences: tokens must name the protected resource of the route \
+                         they call as their audience",
+                    ));
                 }
                 Ok(())
             }
-            _ => Err("requires a first caller authentication method of JWT Bearer reading the Authorization \
-                      header with the Bearer scheme"
-                .into()),
+            _ => Err(incompatible(
+                "requires a first caller authentication method of JWT Bearer reading the Authorization header with \
+                 the Bearer scheme",
+            )),
         }
     }
 

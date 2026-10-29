@@ -72,6 +72,58 @@ impl StripReason {
     }
 }
 
+/// Why an Access Point cannot serve the declaration its settings ask for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnservableReason {
+    NotMcp,
+    InvalidProtectedResource,
+    IncompatibleCallerAuthentication,
+    RootVariantResource,
+    ResourceMismatch,
+    StrategyStoreUnavailable,
+    NetworkUnavailable,
+}
+
+impl UnservableReason {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::NotMcp => "not_mcp",
+            Self::InvalidProtectedResource => "invalid_protected_resource",
+            Self::IncompatibleCallerAuthentication => "incompatible_caller_authentication",
+            Self::RootVariantResource => "root_variant_resource",
+            Self::ResourceMismatch => "resource_mismatch",
+            Self::StrategyStoreUnavailable => "strategy_store_unavailable",
+            Self::NetworkUnavailable => "network_unavailable",
+        }
+    }
+}
+
+/// A declaration the Access Point cannot serve: why, and the detail the
+/// gateway logs and a refused save quotes. It displays as its detail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnservableDeclaration {
+    pub reason: UnservableReason,
+    pub detail: String,
+}
+
+impl UnservableDeclaration {
+    pub fn new(
+        reason: UnservableReason,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self { reason, detail: detail.into() }
+    }
+}
+
+impl std::fmt::Display for UnservableDeclaration {
+    fn fmt(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
 /// The resource server facts a declaring Access Point publishes for the route
 /// called.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,7 +261,7 @@ pub enum DeclarationOutcome {
     PassThrough,
     /// The settings ask for a declaration the Access Point cannot serve, so
     /// callers fail closed.
-    Unservable(String),
+    Unservable(UnservableDeclaration),
 }
 
 impl DeclarationOutcome {
@@ -225,7 +277,8 @@ impl DeclarationOutcome {
     pub fn reason_code(&self) -> Option<&'static str> {
         match self {
             Self::Strip(reason) => Some(reason.code()),
-            Self::Declare(_) | Self::PassThrough | Self::Unservable(_) => None,
+            Self::Unservable(unservable) => Some(unservable.reason.code()),
+            Self::Declare(_) | Self::PassThrough => None,
         }
     }
 }
@@ -602,17 +655,41 @@ mod tests {
         assert!(!refuses_failed_callers_by_default(&resolve(&scoped, None).await));
     }
 
+    fn unservable_reason(outcome: &DeclarationOutcome) -> Option<UnservableReason> {
+        match outcome {
+            DeclarationOutcome::Unservable(unservable) => Some(unservable.reason),
+            _ => None,
+        }
+    }
+
     #[tokio::test]
-    async fn a_protected_resource_the_access_point_cannot_serve_is_unservable() {
-        assert!(matches!(resolve(&root_surface(), Some("beta")).await, DeclarationOutcome::Unservable(_)));
+    async fn a_protected_resource_the_access_point_cannot_serve_is_unservable_with_its_cause() {
+        assert_eq!(
+            unservable_reason(&resolve(&root_surface(), Some("beta")).await),
+            Some(UnservableReason::RootVariantResource)
+        );
 
         let mut a2a = declaring_surface();
         a2a.access_point.protocol = crate::config::agent_surface::SurfaceProtocol::A2a;
-        assert_eq!(resolve(&a2a, None).await, DeclarationOutcome::Unservable("requires an MCP Access Point".into()));
+        assert_eq!(
+            resolve(&a2a, None).await,
+            DeclarationOutcome::Unservable(UnservableDeclaration::new(
+                UnservableReason::NotMcp,
+                "requires an MCP Access Point"
+            ))
+        );
+
+        let no_servers = json!({"resource": RESOURCE, "authorization_servers": []});
+        let surface = discovery_surface(jwt_bearer_method(), Some(no_servers));
+        assert_eq!(unservable_reason(&resolve(&surface, None).await), Some(UnservableReason::InvalidProtectedResource));
 
         for unserved in [explicit("https://other.example/mcp/alpha"), explicit("https://gateway.example/mcp/other")] {
             let surface = discovery_surface(jwt_bearer_method(), Some(unserved.clone()));
-            assert!(matches!(resolve(&surface, None).await, DeclarationOutcome::Unservable(_)), "{unserved}");
+            assert_eq!(
+                unservable_reason(&resolve(&surface, None).await),
+                Some(UnservableReason::ResourceMismatch),
+                "{unserved}"
+            );
         }
         for method in [
             json!({"type": "api_key", "extraction": {"source": "http_header", "field": "x-api-key"}, "secret_id": "key"}),
@@ -622,9 +699,14 @@ mod tests {
         ] {
             let surface = discovery_surface(method.clone(), Some(explicit(RESOURCE)));
             let outcome = resolve(&surface, None).await;
-            assert!(matches!(outcome, DeclarationOutcome::Unservable(_)), "{method}");
+            assert_eq!(
+                unservable_reason(&outcome),
+                Some(UnservableReason::IncompatibleCallerAuthentication),
+                "{method}"
+            );
             assert!(!refuses_failed_callers_by_default(&outcome), "{method}");
         }
+        assert_eq!(unservable_reason(&resolve(&declaring_surface(), None).await), None);
     }
 
     #[tokio::test]
@@ -1235,8 +1317,20 @@ mod tests {
         assert_eq!(stripped(StripReason::TransitPoint).reason_code(), Some("transit_point"));
         assert_eq!(DeclarationOutcome::PassThrough.label(), "pass_through");
         assert_eq!(DeclarationOutcome::PassThrough.reason_code(), None);
-        assert_eq!(DeclarationOutcome::Unservable("x".into()).label(), "unservable");
-        assert_eq!(DeclarationOutcome::Unservable("x".into()).reason_code(), None);
+        for (reason, code) in [
+            (UnservableReason::NotMcp, "not_mcp"),
+            (UnservableReason::InvalidProtectedResource, "invalid_protected_resource"),
+            (UnservableReason::IncompatibleCallerAuthentication, "incompatible_caller_authentication"),
+            (UnservableReason::RootVariantResource, "root_variant_resource"),
+            (UnservableReason::ResourceMismatch, "resource_mismatch"),
+            (UnservableReason::StrategyStoreUnavailable, "strategy_store_unavailable"),
+            (UnservableReason::NetworkUnavailable, "network_unavailable"),
+        ] {
+            let unservable = DeclarationOutcome::Unservable(UnservableDeclaration::new(reason, "detail"));
+            assert_eq!(unservable.label(), "unservable");
+            assert_eq!(unservable.reason_code(), Some(code));
+        }
+        assert_eq!(UnservableDeclaration::new(UnservableReason::NotMcp, "the detail").to_string(), "the detail");
     }
 
     /// A strategy store whose every read fails.

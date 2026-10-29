@@ -1,20 +1,16 @@
 //! Bounded, pinned GETs of JWKS documents, and the egress posture of a caller.
 //!
-//! Every fetch resolves DNS once, pins the connection to the vetted address,
-//! refuses redirects, caps the body and the time, and reports failures as a
-//! [`FetchFailure`] whose code and message are fixed. The detail, which can
-//! name a resolved address, is for logs only.
-
-use std::time::Duration;
+//! Every fetch goes through [`crate::authz_metadata::get_bounded_with_headers`], so a
+//! JWKS fetch and a discovery report the same failure with the same code. A failure is
+//! a [`FetchFailure`] whose code and message are fixed. The detail, which can name a
+//! resolved address, is for logs only.
 
 use axum::body::Bytes;
 use reqwest::header::HeaderMap;
-use url::Url;
 
-use crate::authz_metadata::EgressPosture;
-use crate::egress::{EgressError, pinned_forward_client, pinned_strict_client};
-use crate::http_client::SHORT_TIMEOUT_SECS;
-use crate::proxy::upstream_body::{UpstreamBodyError, UpstreamBodyLimits, read_bounded};
+use crate::authz_metadata::{
+    DiscoveryError, DiscoveryFailure, DiscoveryOptions, EgressPosture, get_bounded_with_headers,
+};
 use crate::tenancy::PatTenantContext;
 
 /// The egress posture of a caller: a tenant-scoped caller must not reach the appliance's own network.
@@ -42,7 +38,7 @@ impl FetchFailure {
             Self::InvalidUrl => "invalid_url",
             Self::Blocked => "blocked",
             Self::Unreachable => "unreachable",
-            Self::HttpStatus => "http_error",
+            Self::HttpStatus => "http_status",
             Self::TooLarge => "too_large",
             Self::InvalidDocument => "invalid_document",
         }
@@ -93,93 +89,34 @@ impl std::fmt::Display for FetchError {
 
 impl std::error::Error for FetchError {}
 
-/// `raw` parsed as an absolute URL with a host and no credentials, whose scheme
-/// `posture` accepts: `https` under [`EgressPosture::Strict`], `http` or `https` otherwise.
-fn parse_fetch_url(
-    raw: &str,
-    posture: EgressPosture,
-) -> Result<Url, FetchError> {
-    let url = Url::parse(raw).map_err(|e| FetchError::new(FetchFailure::InvalidUrl, e.to_string()))?;
-    let scheme_allowed = match posture {
-        EgressPosture::CloudMetadataOnly => matches!(url.scheme(), "http" | "https"),
-        EgressPosture::Strict => url.scheme() == "https",
-    };
-    let acceptable = scheme_allowed
-        && url
-            .host_str()
-            .is_some_and(|host| !host.is_empty())
-        && url.username().is_empty()
-        && url.password().is_none();
-    if acceptable {
-        Ok(url)
-    } else {
-        Err(FetchError::new(
-            FetchFailure::InvalidUrl,
-            format!("not an absolute URL without credentials with a scheme the {posture:?} posture accepts"),
-        ))
+impl From<DiscoveryError> for FetchError {
+    fn from(error: DiscoveryError) -> Self {
+        let failure = match error.failure() {
+            DiscoveryFailure::InvalidUrl => FetchFailure::InvalidUrl,
+            DiscoveryFailure::Blocked => FetchFailure::Blocked,
+            DiscoveryFailure::Unreachable => FetchFailure::Unreachable,
+            DiscoveryFailure::HttpStatus => FetchFailure::HttpStatus,
+            DiscoveryFailure::TooLarge => FetchFailure::TooLarge,
+            DiscoveryFailure::InvalidDocument | DiscoveryFailure::IssuerMismatch => FetchFailure::InvalidDocument,
+        };
+        Self::new(failure, error.detail())
     }
 }
 
-async fn pinned_client(
-    url: &str,
-    posture: EgressPosture,
-) -> Result<reqwest::Client, FetchError> {
-    let raw = url.to_string();
-    let timeout = Duration::from_secs(SHORT_TIMEOUT_SECS);
-    let resolve = tokio::task::spawn_blocking(move || match posture {
-        EgressPosture::CloudMetadataOnly => pinned_forward_client(&raw, timeout),
-        EgressPosture::Strict => pinned_strict_client(&raw, timeout),
-    });
-    tokio::time::timeout(timeout, resolve)
-        .await
-        .map_err(|_| FetchError::new(FetchFailure::Unreachable, "resolving the host timed out"))?
-        .map_err(|e| FetchError::new(FetchFailure::Unreachable, format!("resolve task failed: {e}")))?
-        .map(|(client, _target)| client)
-        .map_err(egress_failure)
-}
-
-fn egress_failure(error: EgressError) -> FetchError {
-    let failure = match error {
-        EgressError::Parse(_) => FetchFailure::InvalidUrl,
-        EgressError::Blocked(_) | EgressError::Dns(_) | EgressError::TooManyRedirects => FetchFailure::Blocked,
-        EgressError::Http(_) => FetchFailure::Unreachable,
-    };
-    FetchError::new(failure, error.to_string())
-}
-
-/// GET `url` under `posture`, accepting only a 2xx response whose body fits in `max_bytes`.
-///
-/// Under [`EgressPosture::Strict`] an `http` URL fails with `invalid_url` before its host
-/// is resolved. A host that does not resolve fails with `blocked`, as in
-/// [`crate::authz_metadata::get_bounded`].
+/// GET `url` under `posture`, accepting only a 2xx response whose body fits in `max_bytes`,
+/// with the egress checks, pinning and timeouts of [`crate::authz_metadata::get_bounded`].
 pub async fn get_bounded(
     url: &str,
     posture: EgressPosture,
     max_bytes: usize,
 ) -> Result<(Bytes, HeaderMap), FetchError> {
-    parse_fetch_url(url, posture)?;
-    let client = pinned_client(url, posture).await?;
-    let response = client
-        .get(url)
-        .header(reqwest::header::ACCEPT, "application/json")
-        .send()
+    let options = DiscoveryOptions {
+        max_bytes,
+        ..DiscoveryOptions::default()
+    };
+    get_bounded_with_headers(url, posture, options)
         .await
-        .map_err(|e| FetchError::new(FetchFailure::Unreachable, e.without_url().to_string()))?;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(FetchError::new(FetchFailure::HttpStatus, format!("HTTP {status}")));
-    }
-    let headers = response.headers().clone();
-    let limits = UpstreamBodyLimits::new(max_bytes, None, SHORT_TIMEOUT_SECS);
-    let body = read_bounded(response, limits)
-        .await
-        .map_err(|e| match e {
-            UpstreamBodyError::TooLarge(limit) => {
-                FetchError::new(FetchFailure::TooLarge, format!("response exceeds {limit} bytes"))
-            }
-            other => FetchError::new(FetchFailure::Unreachable, other.to_string()),
-        })?;
-    Ok((body, headers))
+        .map_err(FetchError::from)
 }
 
 #[cfg(test)]
@@ -202,57 +139,40 @@ mod tests {
         assert_eq!(posture_for_caller(None), EgressPosture::CloudMetadataOnly);
     }
 
-    #[test]
-    fn the_operator_posture_parses_absolute_http_and_https_urls_without_credentials() {
-        let operator = EgressPosture::CloudMetadataOnly;
-        assert!(parse_fetch_url("https://issuer.example.com/path", operator).is_ok());
-        assert!(parse_fetch_url("http://127.0.0.1:4444/", operator).is_ok());
-        for raw in ["not a url", "file:///etc/passwd", "ftp://example.com/", "https://user:pw@example.com/"] {
-            assert_eq!(
-                parse_fetch_url(raw, operator)
-                    .unwrap_err()
-                    .failure(),
-                FetchFailure::InvalidUrl,
-                "{raw}"
-            );
-        }
-    }
-
-    #[test]
-    fn the_strict_posture_parses_https_urls_only() {
-        assert!(parse_fetch_url("https://as.example.com/jwks.json", EgressPosture::Strict).is_ok());
-        for raw in ["http://as.example.com/jwks.json", "HTTP://as.example.com/jwks.json", "ftp://example.com/"] {
-            assert_eq!(
-                parse_fetch_url(raw, EgressPosture::Strict)
-                    .unwrap_err()
-                    .failure(),
-                FetchFailure::InvalidUrl,
-                "{raw}"
-            );
-        }
-    }
-
-    #[test]
-    fn egress_errors_map_to_the_failures_discovery_uses() {
+    #[tokio::test]
+    async fn a_url_the_posture_does_not_accept_is_invalid_before_any_request() {
         let cases = [
-            (EgressError::Parse("bad".into()), FetchFailure::InvalidUrl),
-            (EgressError::Blocked("internal".into()), FetchFailure::Blocked),
-            (EgressError::Dns("no such host".into()), FetchFailure::Blocked),
-            (EgressError::TooManyRedirects, FetchFailure::Blocked),
-            (
-                EgressError::Http(
-                    reqwest::Client::new()
-                        .get("not a url")
-                        .build()
-                        .unwrap_err(),
-                ),
-                FetchFailure::Unreachable,
-            ),
+            ("not a url", EgressPosture::CloudMetadataOnly),
+            ("file:///etc/passwd", EgressPosture::CloudMetadataOnly),
+            ("https://user:pw@example.com/", EgressPosture::CloudMetadataOnly),
+            ("HTTP://as.example.com/jwks.json", EgressPosture::Strict),
+            ("ftp://example.com/", EgressPosture::Strict),
         ];
-        for (error, expected) in cases {
-            let mapped = egress_failure(error);
-            assert_eq!(mapped.failure(), expected, "{mapped}");
+        for (raw, posture) in cases {
+            let error = get_bounded(raw, posture, LIMIT)
+                .await
+                .unwrap_err();
+            assert_eq!(error.failure(), FetchFailure::InvalidUrl, "{raw} under {posture:?}");
         }
+    }
+
+    #[test]
+    fn discovery_failures_keep_their_code_and_detail() {
+        let cases = [
+            (DiscoveryFailure::InvalidUrl, FetchFailure::InvalidUrl),
+            (DiscoveryFailure::Blocked, FetchFailure::Blocked),
+            (DiscoveryFailure::Unreachable, FetchFailure::Unreachable),
+            (DiscoveryFailure::HttpStatus, FetchFailure::HttpStatus),
+            (DiscoveryFailure::TooLarge, FetchFailure::TooLarge),
+            (DiscoveryFailure::InvalidDocument, FetchFailure::InvalidDocument),
+        ];
+        for (discovery, expected) in cases {
+            let mapped = FetchError::from(DiscoveryError::new(discovery, "HTTP 503"));
+            assert_eq!(mapped.failure(), expected);
+            assert_eq!(expected.code(), discovery.code());
+            assert_eq!(mapped.to_string(), format!("{}: HTTP 503", discovery.code()));
+        }
+        assert_eq!(FetchFailure::HttpStatus.code(), "http_status");
     }
 
     #[tokio::test]

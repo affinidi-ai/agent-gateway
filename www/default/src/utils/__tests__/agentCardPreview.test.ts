@@ -2,6 +2,7 @@ import {
   AUTH_FAILURE_TEXT,
   CARD_AUTH_FAILURES,
   CARD_FETCH_CAUSES,
+  CARD_FETCH_CAUSE_LABEL,
   CARD_FETCH_CAUSE_TEXT,
   CARD_REJECTED_CREDENTIAL_TEXT,
   describeCardAuth,
@@ -273,7 +274,10 @@ describe('describeFetchCause', () => {
     ['timeout', 'Check that the agent is running, then Refresh.'],
     ['too_large', 'Shrink the agent card.'],
     ['invalid_card', 'Check the agent card location.'],
-    ['blocked_by_egress', 'Allow the address in the gateway egress policy.'],
+    [
+      'blocked_by_egress',
+      'Check the endpoint host name and DNS from the gateway host, then Refresh.',
+    ],
     ['redirected', 'Set the agent card location to the final URL.'],
     ['identity_failed', 'Check the gateway logs, then Refresh.'],
     ['rewrite_failed', 'Check the gateway logs, then Refresh.'],
@@ -281,6 +285,14 @@ describe('describeFetchCause', () => {
     const text = describeFetchCause(failed(cause), auth());
     expect(text.endsWith(action)).toBe(true);
     expect(text.length).toBeGreaterThan(action.length + 1);
+  });
+
+  it('names DNS and cloud metadata, not an egress allow setting, for a blocked card address', () => {
+    expect(CARD_FETCH_CAUSE_LABEL.blocked_by_egress).toBe('Address not resolvable or not allowed');
+    const text = describeFetchCause(failed('blocked_by_egress'), auth());
+    expect(text).toContain("could not resolve the agent's host name");
+    expect(text).toContain('cloud metadata address');
+    expect(text).not.toContain('Allow the address');
   });
 
   it('returns nothing for a fetch that worked', () => {

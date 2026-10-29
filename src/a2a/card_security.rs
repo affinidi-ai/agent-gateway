@@ -234,7 +234,12 @@ mod tests {
     #[test]
     fn only_a_declaring_or_unservable_access_point_secures_its_cards() {
         assert!(secures_cards(&DeclarationOutcome::Declare(declaration())));
-        assert!(secures_cards(&DeclarationOutcome::Unservable("unservable".into())));
+        assert!(secures_cards(&DeclarationOutcome::Unservable(
+            crate::source_auth::declaration::UnservableDeclaration::new(
+                crate::source_auth::declaration::UnservableReason::StrategyStoreUnavailable,
+                "unservable"
+            )
+        )));
         for outcome in [
             DeclarationOutcome::PassThrough,
             DeclarationOutcome::Strip(StripReason::ForwardsCallerToken),
@@ -259,7 +264,10 @@ mod tests {
         for outcome in [
             DeclarationOutcome::Strip(StripReason::ForwardsCallerToken),
             DeclarationOutcome::Strip(StripReason::NotPinned),
-            DeclarationOutcome::Unservable("unservable".into()),
+            DeclarationOutcome::Unservable(crate::source_auth::declaration::UnservableDeclaration::new(
+                crate::source_auth::declaration::UnservableReason::StrategyStoreUnavailable,
+                "unservable",
+            )),
         ] {
             for mut card in [v1_card(), v0_3_card(), dual_card(), snake_v1_card()] {
                 apply_card_security(&mut card, &outcome);

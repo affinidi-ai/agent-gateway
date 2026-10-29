@@ -231,7 +231,7 @@ Agent Gateway treats OAuth 2.0 and OpenID Connect as a first-class, provider-neu
     | --- | --- |
     | `true` | Discover and pin. If discovery fails, the save is refused with a generic 422 and nothing is stored. |
     | `false` | Clear |
-    | Omitted | Keep the pinned metadata, and re-discover if the issuer or JWKS URI changed. If that re-discovery fails, the existing pin is kept. |
+    | Omitted | Keep the pinned metadata, and re-discover if the issuer or JWKS URI changed. If that re-discovery fails, or is skipped because the caller is past the probe limit, the existing pin is kept only while its issuer still equals the expected issuer; otherwise it is cleared. |
 - `JwtBearerAuthConfig` gains `required_scopes`, and the strategy gains `scope_claims`. Policy input gains `input.source_auth.scopes`, `client_id`, `strategy_id` and `strategy_tenant_id`, and a failed caller's `kind`.
 - **Declaration resolver.** One resolver, `resolve_surface_declaration` (`src/source_auth/declaration.rs`), returns one outcome per Access Point and Surface Variant. The card, the metadata, the audience check and the challenge all read it:
 
@@ -264,9 +264,9 @@ Agent Gateway treats OAuth 2.0 and OpenID Connect as a first-class, provider-neu
 - **Token acquisition (RFC 7523 §2.1).**
   - Build and sign an assertion: `iss`, `sub`, `aud` (the token endpoint), `scope`, `iat`, `exp` no more than `iat` + 3600, a random `jti`, and the `kid` header when a key id is known.
   - POST it with `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer`.
-  - Store and reuse the token in the delegation vault, exactly as Client Credentials does (`src/proxy/credential_delegation.rs`).
+  - For credential delegation, store and reuse the token in the delegation vault, exactly as Client Credentials does (`src/proxy/credential_delegation.rs`). Target Authentication keeps it in the per-replica gateway token cache instead, never in the vault ([ADR 0002](0002-hop-two-target-authentication.md)).
   - Replace a token `min(300 s, lifetime / 2)` before expiry, with the lifetime measured from that token's grant, for both provider types (`DelegationToken::needs_refresh`, `src/delegation_vault/mod.rs`). A token granted before the provider's last edit is not reused.
-- `TargetAuthMethod` gains `CredentialProvider { provider_id }`.
+- `TargetAuthMethod` gains `CredentialProvider { credential_provider_id, scopes, inject_as }`.
   - The gateway injects that provider's current token on calls to the agent and on the agent card fetch, including on the Fabric receive path.
 
 ### Standards adopted, and the order of the increments that follow
@@ -333,7 +333,7 @@ before each increment starts.
 | Fail-open surfaces | A declaring Access Point refuses failed callers before AP2, payment and the Target with no policy attached; a non-declaring one keeps "OPA decides" |
 | Signing key exposure (hop 2) | The key is a secrets-store entry referenced by `secret_id`: a PKCS#8 PEM key or a service account JSON key of at most 16 KiB. It is never returned by the API or logged, and is held in zeroizing memory only while one assertion is signed. Encryption at rest is off by default ([`DEPLOYMENT_REQUIREMENTS.md`](../DEPLOYMENT_REQUIREMENTS.md)), so the docs tell operators to enable it on any appliance that holds a signing key. The AWS Secrets Manager backend is not implemented and cannot hold the key. |
 | Assertion replay (hop 2) | `exp` no more than 3600 s, a random `jti`, and `aud` bound to the token endpoint. Assertions are never cached or logged. |
-| Token leakage (hop 2) | Tokens are stored in the delegation vault, exactly like Client Credentials tokens, so the encryption-at-rest guidance above applies to them too. They are never logged, and only the target receives them. |
+| Token leakage (hop 2) | Tokens a delegation binding obtains are stored in the delegation vault, exactly like Client Credentials tokens, so the encryption-at-rest guidance above applies to them too. Target Authentication tokens are held only in the per-replica gateway token cache in memory ([ADR 0002](0002-hop-two-target-authentication.md)). They are never logged, and only the target receives them. |
 
 - **Least privilege:** strategy and provider management keep their existing RBAC features and PAT resource scoping.
 - **Audit:**
@@ -361,13 +361,13 @@ The change modifies existing records only. It adds no new store.
 | `JwtBearerAuthConfig` (Access Point) | `required_scopes` | String list | Empty | Scope enforcement, the declared scopes and the derived declaration |
 | `JwtVerificationStrategy` | `scope_claims` | String list | Absent, read as `scope` then `scp` | Claims read for granted scopes |
 | `CredentialProvider` | Type `oauth2_jwt_bearer`. New object `jwt_bearer`: `assertion_issuer`, `assertion_subject`, `signing_key_secret_ref`, `signing_algorithm`, `key_id`. Reused fields: `token_endpoint` (also the assertion `aud`), `default_scopes`. | Strings | Subject defaults to the issuer; algorithm to RS256 | Hop 2 token acquisition |
-| `TargetAuthConfig` | `method: credential_provider { provider_id }` | Enum variant | n/a | Hop 2 authentication for calls and the card fetch |
+| `TargetAuthConfig` | `method: credential_provider { credential_provider_id, scopes, inject_as }` | Enum variant | n/a | Hop 2 authentication for calls and the card fetch |
 
 - **Access patterns:** unchanged. Records are read by id from the DashMap caches on each request and written through to filesystem JSON.
 - **Consumers:** a strategy is also read by STS subject and ID-JAG verification (selected by `expected_issuer`, no audience), modern consent ID-token verification (audience is the client id) and credential providers (`consent_identity_strategy_id`). Only the Access Point path reads `authorization_server` and `scope_claims`; the other flows ignore them, and the mandatory audience and ID-token rules apply only when an Access Point declares. Unset fields are not serialized, so a consent record's strategy digest is unchanged for strategies saved before them.
 - **TTL:**
   - Discovered metadata has no TTL. It is pinned and re-discovered on save.
-  - Hop 2 tokens live in the delegation vault until they are within the refresh margin of `expires_in`, then they are replaced.
+  - Hop 2 tokens live until they are within the refresh margin of `expires_in`, then they are replaced: in the delegation vault for a delegation binding, and in the per-replica gateway token cache for Target Authentication.
 - **Delete:** hard delete, as today.
 - **Data minimisation:** only the four metadata fields the projections need are stored. The signing key stays in the secrets store, not in the provider record.
 - **Encryption:**
@@ -396,8 +396,8 @@ The change modifies existing records only. It adds no new store.
 - **Test seam:** with `AG_TEST_MODE=true`, the exact-URL allow-lists let CI and the demo reach a loopback token endpoint; discovery and JWKS need no allow-list. Cloud metadata stays blocked, and a negative test proves the seam is inert without `AG_TEST_MODE`. A run that uses it proves the protocol flow, not production egress; see [Reaching loopback in a test](../development/TESTING.md#reaching-loopback-in-a-test).
 
 **Rollback:**
-- **Optional fields:** older releases ignore the new optional fields. One of them is a security control: `required_scopes` on a `jwt_bearer` Access Point is read by no older release, so after a downgrade the Access Point accepts tokens without the scope, and only a surface policy on the raw `scope` or `scp` claim in `input.source_auth.claims` still enforces it, since older releases do not publish `input.source_auth.scopes`. Treat a downgrade as removing scope enforcement.
-- **New enum values:** an older release cannot read `oauth2_jwt_bearer` providers or `credential_provider` Target Authentication. Its loader skips the whole record it cannot parse, not the field. A surface with such Target Authentication disappears from the older node and its route stops answering; a provider disappears and every binding to it stops resolving. Before downgrading, remove those providers and settings, or restore a pre-upgrade backup.
+- **Optional fields:** older releases ignore the new optional fields. One of them is a security control: `required_scopes` on a `jwt_bearer` Access Point is read by no older release, so after a downgrade the Access Point accepts tokens without the scope, and only a surface policy on the raw `scope` or `scp` claim in `input.source_auth.claims` still enforces it, since older releases do not publish `input.source_auth.scopes`. Treat a downgrade as removing scope enforcement. An older node that re-saves a strategy also drops its pinned `authorization_server` and its `scope_claims`, so after re-upgrading its Access Points strip with `not_pinned` until discovery runs again and `scope_claims` is set again ([`SOURCE_AUTH.md`](../SOURCE_AUTH.md#required-scopes)).
+- **New enum values:** an older release cannot read `oauth2_jwt_bearer` providers or `credential_provider` Target Authentication. Its filesystem loader skips the whole record it cannot parse, not the field. A surface with such Target Authentication disappears from the older node and its route stops answering; a provider disappears and every binding to it refuses with 503. On DynamoDB the older release reads such Target Authentication as none and forwards without the credential (see the DynamoDB bullet below). Before downgrading, remove those providers and settings, or restore a pre-upgrade backup ([Downgrading](../CREDENTIAL_DELEGATION.md#downgrading)).
 - **Detection:** from this release on, a record the loader cannot read is counted in `agent_gateway_storage_load_errors_total{reason="unreadable_record"}` or `invalid_json`. A release that predates this change counts nothing, so check the surface and provider counts in the dashboard after a downgrade. Tests cover the whole-record drop for surfaces and providers.
 - **Shared storage:** do not run mixed releases against one storage directory or one DynamoDB table, including an Active and a Standby node. An older node that loads or re-saves a record can drop it, and a Standby promoted on an older release serves less than the Active node did. Upgrade and downgrade every node together, Standby last on upgrade and first on downgrade.
 - **DynamoDB:** an older release read an unreadable `target_auth` attribute as no Target Authentication, so a channel forwarded without its credential. This release skips the item and counts it in `agent_gateway_storage_load_errors_total{entity="dynamodb_channel"}` while the other channels still load, so it is never served with a credential silently missing. A downgrade of a DynamoDB-backed appliance carries the older behaviour.

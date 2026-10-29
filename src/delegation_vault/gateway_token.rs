@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderValue};
 use serde::Deserialize;
-use tracing::warn;
+use tracing::{debug, warn};
 use zeroize::Zeroizing;
 
 use super::OAuthTokenResponse;
@@ -589,6 +589,7 @@ impl GrantBackoff {
             .retry_allowed(&key, now)
             .await
         {
+            held_back_by_backoff(provider);
             return Err(GatewayTokenError::Unavailable);
         }
         let result = request_gateway_grant(provider, scopes, secrets, egress).await;
@@ -606,6 +607,15 @@ impl GrantBackoff {
         }
         result
     }
+}
+
+fn held_back_by_backoff(provider: &CredentialProvider) {
+    debug!(
+        target: "credential_delegation",
+        provider_id = %provider.provider_id,
+        grant = grant_label(&provider.provider_type),
+        "Gateway grant held back by the retry backoff"
+    );
 }
 
 /// The backoff key of a provider and scope set; a provider edit starts a new key.
@@ -975,7 +985,10 @@ pub(crate) async fn acquire_gateway_token_at(
         SlotView::Fresh(token) => return cached(token),
         SlotView::RefreshDue(token) if slot.backed_off(now) => return cached(token),
         SlotView::RefreshDue(token) => Some(token),
-        SlotView::Empty if slot.backed_off(now) => return Err(GatewayTokenError::Unavailable),
+        SlotView::Empty if slot.backed_off(now) => {
+            held_back_by_backoff(provider);
+            return Err(GatewayTokenError::Unavailable);
+        }
         SlotView::Empty => None,
     };
     match request_gateway_grant(provider, &key.scopes, secrets, &cache.egress()).await {
@@ -983,6 +996,14 @@ pub(crate) async fn acquire_gateway_token_at(
             .store(response, now)
             .grant(Freshness::Fresh)),
         Err(error) => {
+            warn!(
+                target: "credential_delegation",
+                provider_id = %provider.provider_id,
+                grant = grant_label(&provider.provider_type),
+                category = error.category(),
+                stale_token_kept = valid.is_some(),
+                "Gateway grant failed"
+            );
             if error.backs_off() {
                 slot.record_failure(now + entered.elapsed());
             }
@@ -1982,6 +2003,7 @@ mod tests {
         let backoff = GrantBackoff::new(16);
         let scopes = vec!["read".to_string()];
 
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
         for _ in 0..2 {
             let error = backoff
                 .request(&provider, &scopes, &provider_secrets, &endpoint.egress())
@@ -1989,12 +2011,83 @@ mod tests {
                 .expect_err("a rejected grant fails");
             assert_eq!(error, GatewayTokenError::Unavailable);
         }
+        let logged = logs.text();
+
         assert_eq!(
             endpoint
                 .calls
                 .load(Ordering::SeqCst),
             1
         );
+        assert_eq!(
+            logged
+                .matches("Gateway grant held back by the retry backoff")
+                .count(),
+            1,
+            "{logged}"
+        );
+        assert!(logged.contains("grant=\"jwt_bearer\""), "{logged}");
+        assert!(!logged.contains("Gateway grant failed"), "{logged}");
+    }
+
+    #[tokio::test]
+    async fn test_a_target_auth_grant_that_cannot_reach_its_endpoint_logs_the_provider_and_category() {
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener binds");
+        let url = format!(
+            "http://{}/token",
+            closed
+                .local_addr()
+                .expect("address")
+        );
+        drop(closed);
+        let client_secret = "cc-secret-71d3a0";
+        let directory = tempfile::tempdir().expect("tempdir");
+        let secrets =
+            secrets_with(&directory, &[("CC_ID", "cc-client", None), ("CC_SECRET", client_secret, None)]).await;
+        let mut provider = provider(CredentialProviderType::OAuth2ClientCredentials, &url);
+        provider.client_id_secret_ref = Some("CC_ID".into());
+        provider.client_secret_secret_ref = Some("CC_SECRET".into());
+        let cache = GatewayTokenCache::new(GrantEgress {
+            timeout: Duration::from_secs(5),
+            exact_allowlist: Some(url.clone()),
+        });
+        let key = GatewayTokenKey::for_target_auth(&provider, &[]).expect("key");
+        let provider_secrets = ProviderSecrets::new(&secrets, &provider);
+        let start = Instant::now();
+
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+        let failed = acquire_gateway_token_at(&cache, &key, &provider, &provider_secrets, start)
+            .await
+            .map(|_| ());
+        let held_back = acquire_gateway_token_at(&cache, &key, &provider, &provider_secrets, start)
+            .await
+            .map(|_| ());
+        let logged = logs.text();
+
+        assert_eq!(failed, Err(GatewayTokenError::Unavailable));
+        assert_eq!(held_back, Err(GatewayTokenError::Unavailable));
+        assert_eq!(
+            logged
+                .matches("Gateway grant failed")
+                .count(),
+            1,
+            "{logged}"
+        );
+        assert_eq!(
+            logged
+                .matches("Gateway grant held back by the retry backoff")
+                .count(),
+            1,
+            "{logged}"
+        );
+        assert!(logged.contains("provider_id=provider"), "{logged}");
+        assert!(logged.contains("grant=\"client_credentials\""), "{logged}");
+        assert!(logged.contains("category=\"unavailable\""), "{logged}");
+        assert!(logged.contains("stale_token_kept=false"), "{logged}");
+        assert!(!logged.contains(client_secret), "{logged}");
+        assert!(!logged.contains(&url), "{logged}");
     }
 
     #[test]

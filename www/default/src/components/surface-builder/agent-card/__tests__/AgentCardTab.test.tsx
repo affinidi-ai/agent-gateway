@@ -284,7 +284,7 @@ describe('AgentCardTab, the served card on a failed fetch', () => {
     after_bytes: 2950,
   });
   const SERVED_NOTE =
-    'The card the gateway serves for this surface, as it last served it. It may be from earlier, because the latest fetch failed.';
+    'The card the gateway last served for this surface, before the latest fetch failed. Callers do not get it until this is fixed.';
 
   it('shows the card the gateway serves when the first load fails', async () => {
     await showBody(failedWithServed());
@@ -338,7 +338,7 @@ describe('AgentCardTab, the served card on a failed fetch', () => {
     expect(screen.getByTestId('agent-card-raw-after-note')).toHaveTextContent(SERVED_NOTE);
   });
 
-  it('says why a served card may be from earlier when the gateway will not serve the new one', async () => {
+  it('says the served card is from before the gateway refused the new one', async () => {
     await showBody(
       previewBody({
         fetch: { status: 'not_served', cause: 'rewrite_failed', http_status: null, duration_ms: 5 },
@@ -351,8 +351,9 @@ describe('AgentCardTab, the served card on a failed fetch', () => {
       AFTER_CARD
     );
     expect(screen.getByTestId('agent-card-raw-after-note')).toHaveTextContent(
-      'It may be from earlier, because the gateway will not serve the card it fetched.'
+      'The card the gateway last served for this surface, before the gateway refused to serve the card it fetched. Callers do not get it until this is fixed.'
     );
+    expect(screen.getByTestId('agent-card-raw-after-note')).not.toHaveTextContent('gateway serves');
     expect(screen.queryByTestId('agent-card-summary')).not.toBeInTheDocument();
   });
 
@@ -374,7 +375,7 @@ describe('AgentCardTab, the served card on a failed fetch', () => {
   it('points at the card URL when the served card is over the display limit', async () => {
     await showBody({ ...failedBody('needs_token', 401), after_bytes: 300000 });
     expect(screen.getByTestId('agent-card-raw-after-missing')).toHaveTextContent(
-      'The card the gateway serves is 293 KB, more than the 256 KB the dashboard shows. Open the card URL to read it.'
+      'The card the gateway last served is 293 KB, more than the 256 KB the dashboard shows. Open the card URL to read it.'
     );
     expect(screen.queryByTestId('agent-card-raw-after')).not.toBeInTheDocument();
   });
@@ -405,6 +406,12 @@ describe('AgentCardTab, comparison', () => {
     expect(screen.getByTestId('agent-card-before')).toHaveTextContent("The agent's own card");
     expect(screen.getByTestId('agent-card-after')).toHaveTextContent('Gateway-Served Agent Card');
     expect(screen.getByTestId('agent-card-after')).toHaveTextContent('What callers see');
+    const part = (side: string, text: string) =>
+      within(screen.getByTestId(`agent-card-${side}`)).getByText(text, { exact: true });
+    expect(part('before', 'Managed Agent Card')).toHaveClass('agent-card-column-title');
+    expect(part('before', "The agent's own card")).toHaveClass('agent-card-column-hint');
+    expect(part('after', 'Gateway-Served Agent Card')).toHaveClass('agent-card-column-title');
+    expect(part('after', 'What callers see')).toHaveClass('agent-card-column-hint');
     expect(screen.getByTestId('agent-card-era-before')).toHaveTextContent('A2A 0.3');
     expect(screen.getByTestId('agent-card-era-after')).toHaveTextContent('A2A 0.3');
     const endpoint = rowCells('endpoint');

@@ -17,7 +17,8 @@ use crate::policies::failed_caller_dry_run::{
 };
 use crate::source_auth::SourceAuthConfig;
 use crate::source_auth::declaration::{
-    DeclarationOutcome, access_point_resource_url, refuses_failed_callers_by_default, resolve_surface_declaration,
+    DeclarationOutcome, UnservableDeclaration, UnservableReason, access_point_resource_url,
+    refuses_failed_callers_by_default, resolve_surface_declaration,
 };
 use crate::source_auth::errors::SourceAuthFailureKind;
 
@@ -34,7 +35,7 @@ pub struct DeclarationEntry {
     /// The variant alias, or `null` for the base route.
     pub variant: Option<String>,
     pub outcome: &'static str,
-    /// The reason code when the outcome is `strip`.
+    /// The reason code when the outcome is `strip` or `unservable`.
     pub reason: Option<&'static str>,
     /// The Access Point URL, when the Access Point has one.
     pub resource: Option<String>,
@@ -196,7 +197,10 @@ async fn declaration_outcome(
         .await
         .unwrap_or_else(|error| {
             warn!(surface_id = %view.surface_id, error = %error, "Strategy lookup failed while reporting a surface declaration");
-            DeclarationOutcome::Unservable("the JWT verification strategy could not be read".to_string())
+            DeclarationOutcome::Unservable(UnservableDeclaration::new(
+                UnservableReason::StrategyStoreUnavailable,
+                "the JWT verification strategy could not be read",
+            ))
         })
 }
 
@@ -879,9 +883,89 @@ mod tests {
             vec![DeclarationEntry {
                 variant: None,
                 outcome: "unservable",
-                reason: None,
+                reason: Some("strategy_store_unavailable"),
                 resource: Some(format!("{ORIGIN}/agent")),
             }]
+        );
+    }
+
+    /// An MCP Access Point at `route` whose one method is `method` and whose
+    /// `protected_resource` is `protected`.
+    fn explicit(
+        protocol: &str,
+        route: &str,
+        method: Value,
+        protected: Value,
+        variants: Value,
+    ) -> AgentSurface {
+        serde_json::from_value(json!({
+            "surface_id": "surface-1", "name": "agent",
+            "access_point": {"listen_address": ORIGIN, "route": route, "protocol": protocol,
+                "caller_authentication": {"methods": [method], "protected_resource": protected}},
+            "target": {"endpoint": "https://agent.internal"},
+            "variants": variants,
+        }))
+        .expect("surface")
+    }
+
+    #[tokio::test]
+    async fn test_report_names_why_an_explicit_protected_resource_is_unservable() {
+        let resource = json!({"resource": format!("{ORIGIN}/agent"), "authorization_servers": [ISSUER]});
+        for (case, surface, expected) in [
+            ("declares", explicit("mcp", "/agent", jwt_method(&[]), resource.clone(), json!([])), ("declare", None)),
+            (
+                "not MCP",
+                explicit("a2a", "/agent", jwt_method(&[]), resource.clone(), json!([])),
+                ("unservable", Some("not_mcp")),
+            ),
+            (
+                "no authorization server",
+                explicit(
+                    "mcp",
+                    "/agent",
+                    jwt_method(&[]),
+                    json!({"resource": format!("{ORIGIN}/agent"), "authorization_servers": []}),
+                    json!([]),
+                ),
+                ("unservable", Some("invalid_protected_resource")),
+            ),
+            (
+                "audiences listed",
+                explicit("mcp", "/agent", jwt_method(&[&format!("{ORIGIN}/agent")]), resource.clone(), json!([])),
+                ("unservable", Some("incompatible_caller_authentication")),
+            ),
+            (
+                "another origin",
+                explicit(
+                    "mcp",
+                    "/agent",
+                    jwt_method(&[]),
+                    json!({"resource": "https://other.example/agent", "authorization_servers": [ISSUER]}),
+                    json!([]),
+                ),
+                ("unservable", Some("resource_mismatch")),
+            ),
+        ] {
+            let reported = report(&surface, &strategy(true)).await;
+            assert_eq!((reported.declarations[0].outcome, reported.declarations[0].reason), expected, "{case}");
+        }
+
+        let root = explicit(
+            "mcp",
+            "/",
+            jwt_method(&[]),
+            json!({"resource": format!("{ORIGIN}/"), "authorization_servers": [ISSUER]}),
+            json!([variant("beta", true, json!({}))]),
+        );
+        let reported = report(&root, &strategy(true)).await;
+        let outcomes: Vec<_> = reported
+            .declarations
+            .iter()
+            .map(|entry| (entry.variant.as_deref(), entry.outcome, entry.reason))
+            .collect();
+        assert_eq!(
+            outcomes,
+            vec![(None, "declare", None), (Some("beta"), "unservable", Some("root_variant_resource"))]
         );
     }
 

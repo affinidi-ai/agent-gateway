@@ -215,7 +215,9 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   resource metadata:** on MCP. The outcomes are **Declares OAuth**, **Security removed from card**
   (**Not declared** on MCP, with the reason text from `STRIP_REASON_TEXT`, which uses the editor's
   terms **Access Point URL** and **Accepted Audiences**), **Upstream card unchanged** (**No
-  metadata published** on MCP) and **Cannot be served** (`unservable`). The chip is the shared
+  metadata published** on MCP) and **Cannot be served** (`unservable`, with the action for its
+  reason code from `UNSERVABLE_REASON_TEXT`, or a general sentence when the reason is missing or
+  unknown). The chip is the shared
   `Badge` (tinted `app-badge`, tones success, warning, danger and secondary, with the class
   `caller-auth-outcome-chip`; `SurfaceBuilder.css` darkens the light warning text of this chip and
   of the Agent Cards badges to `#92400e` to keep 4.5:1 contrast), never a solid `badge text-bg-*`. Each badge carries an icon and a text label, never
@@ -233,12 +235,18 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   `path`, `variant`). `SurfaceWarningsAlert` keeps an empty polite live container
   (`surface-warnings-live`) always mounted on Surface Detail, so warnings that arrive after a save
   are announced, and shows them inside it as a labelled region (`surface-warnings-alert`,
-  `surface-warning-<code>`). For the fail-open codes (`fail_open_policy`, `fail_open_undetermined`,
-  `payment_before_policy`) it offers **Copy deny rule** (`surface-warnings-copy-rule`), with the
-  hint "Add it to this surface's policy to deny callers whose authentication failed."
-  (`surface-warnings-copy-rule-hint`), which copies `DENY_FAILED_CALLERS_REGO`
-  (`utils/denyRule.ts`), a surface policy denying failed callers; the dashboard never creates or
-  attaches that policy itself. Surface Detail reads `GET /api/v1/surfaces/{id}/declarations` (the
+  `surface-warning-<code>`). For the fail-open codes (`fail_open_policy`, `fail_open_undetermined`)
+  it offers **Copy deny rule** (`surface-warnings-copy-rule`), which copies
+  `DENY_FAILED_CALLERS_REGO` (`utils/denyRule.ts`), a whole surface policy denying failed callers,
+  with a hint (`surface-warnings-copy-rule-hint`) to attach it to the Managed Agent
+  (`target.policy`) when that has no policy, so callers arriving over Fabric are denied too, and
+  otherwise to add `not input.source_auth.method == "failed"` to each existing allow rule rather
+  than paste the whole policy. For `payment_before_policy` it offers **Copy gateway deny rule**
+  (`surface-warnings-copy-gateway-rule`), which copies `GATEWAY_DENY_FAILED_CALLERS_REGO`, the
+  same rule under `package gateway.policy`, with the matching hint
+  (`surface-warnings-copy-gateway-rule-hint`) for the gateway policy; a surface policy cannot fix
+  that warning because payment runs before it. The dashboard never creates or attaches either
+  policy itself. Surface Detail reads `GET /api/v1/surfaces/{id}/declarations` (the
   `useSurfaceDeclarations` hook, refreshed after each save), so it shows the current result, not
   the snapshot from the last save, and falls back to the save response when that read is
   unavailable. After creating a surface whose response carries warnings, the dashboard opens
@@ -340,10 +348,11 @@ surface, never the unsaved form.
   `agent-card-failed-cause`) and opens both raw panels. The managed panel reads "Not available:
   <cause — HTTP n>." (`agent-card-raw-before-missing`), or shows the managed card when the gateway
   fetched it but will not serve it. The served panel shows, in this order: the card the gateway
-  returns in `after` whatever the fetch status, with "The card the gateway serves for this surface,
-  as it last served it. It may be from earlier, because the latest fetch failed." (or "because the
-  gateway will not serve the card it fetched.") as `agent-card-raw-after-note`; when `after` is
-  `null` because the card is over the display limit, "The card the gateway serves is N KB, more
+  returns in `after` whatever the fetch status, with "The card the gateway last served for this
+  surface, before the latest fetch failed. Callers do not get it until this is fixed." (or "before
+  the gateway refused to serve the card it fetched.") as `agent-card-raw-after-note`, never in the
+  present tense, because the card route keeps no stale card for callers; when `after` is
+  `null` because the card is over the display limit, "The card the gateway last served is N KB, more
   than the N KB the dashboard shows. Open the card URL to read it."; on a gateway that returns no
   served card, the last Gateway-Served Agent Card the dashboard saw for this surface
   (`useAgentCardPreview` `lastServed`, never carried to another surface) with "The last card the

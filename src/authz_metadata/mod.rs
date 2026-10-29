@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 #[allow(unused_imports)]
 pub use discovery::{discover, metadata_urls, parse_metadata, validate_issuer};
 #[allow(unused_imports)]
-pub use fetch::get_bounded;
+pub use fetch::{get_bounded, get_bounded_with_headers};
 
 /// Largest metadata document accepted by default, in bytes.
 pub const MAX_METADATA_BYTES: usize = 64 * 1024;
@@ -189,7 +189,7 @@ impl DiscoveryError {
         self.failure.message()
     }
 
-    #[cfg(test)]
+    /// The detail for logs; it can name a resolved address.
     pub fn detail(&self) -> &str {
         &self.detail
     }

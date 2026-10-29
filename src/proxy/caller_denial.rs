@@ -178,7 +178,10 @@ mod tests {
             None,
             Some(DeclarationOutcome::PassThrough),
             Some(DeclarationOutcome::Strip(StripReason::ForwardsCallerToken)),
-            Some(DeclarationOutcome::Unservable("x".into())),
+            Some(DeclarationOutcome::Unservable(crate::source_auth::declaration::UnservableDeclaration::new(
+                crate::source_auth::declaration::UnservableReason::StrategyStoreUnavailable,
+                "x",
+            ))),
         ] {
             assert_eq!(declared(other.as_ref()), None, "{other:?}");
         }
@@ -206,7 +209,10 @@ mod tests {
     #[tokio::test]
     async fn a_refusal_without_a_failed_caller_on_a_declaration_keeps_the_stage_403() {
         let declare = outcome(&declaring_surface()).await;
-        let unservable = DeclarationOutcome::Unservable("requires an MCP Access Point".into());
+        let unservable = DeclarationOutcome::Unservable(crate::source_auth::declaration::UnservableDeclaration::new(
+            crate::source_auth::declaration::UnservableReason::NotMcp,
+            "requires an MCP Access Point",
+        ));
         for protocol in &PROTOCOLS {
             for (outcome, source_auth) in [
                 (Some(&declare), Some(authenticated())),
@@ -251,7 +257,10 @@ mod tests {
     async fn only_a_failed_caller_on_a_declaring_access_point_is_refused_by_default() {
         let declare = outcome(&declaring_surface()).await;
         let stripped = DeclarationOutcome::Strip(StripReason::ForwardsCallerToken);
-        let unservable = DeclarationOutcome::Unservable("strategy store unavailable".into());
+        let unservable = DeclarationOutcome::Unservable(crate::source_auth::declaration::UnservableDeclaration::new(
+            crate::source_auth::declaration::UnservableReason::StrategyStoreUnavailable,
+            "strategy store unavailable",
+        ));
         for protocol in &PROTOCOLS {
             for (outcome, source_auth) in [
                 (Some(&declare), Some(authenticated())),

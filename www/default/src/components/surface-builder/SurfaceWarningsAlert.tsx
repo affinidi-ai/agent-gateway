@@ -1,7 +1,15 @@
 import React from 'react';
 import { CopyButton } from '../shared/CopyButton';
-import { DENY_FAILED_CALLERS_REGO } from '../../utils/denyRule';
-import { FAIL_OPEN_WARNING_CODES, type SurfaceWarning } from '../../utils/surfaceDeclarations';
+import {
+  DENY_FAILED_CALLERS_CONDITION,
+  DENY_FAILED_CALLERS_REGO,
+  GATEWAY_DENY_FAILED_CALLERS_REGO,
+} from '../../utils/denyRule';
+import {
+  FAIL_OPEN_WARNING_CODES,
+  GATEWAY_DENY_WARNING_CODES,
+  type SurfaceWarning,
+} from '../../utils/surfaceDeclarations';
 
 interface SurfaceWarningsAlertProps {
   warnings: SurfaceWarning[];
@@ -9,6 +17,7 @@ interface SurfaceWarningsAlertProps {
 
 const SurfaceWarningsAlert: React.FC<SurfaceWarningsAlertProps> = ({ warnings }) => {
   const failsOpen = warnings.some(w => FAIL_OPEN_WARNING_CODES.includes(w.code));
+  const needsGatewayDeny = warnings.some(w => GATEWAY_DENY_WARNING_CODES.includes(w.code));
 
   return (
     <div aria-live="polite" data-testid="surface-warnings-live">
@@ -43,7 +52,29 @@ const SurfaceWarningsAlert: React.FC<SurfaceWarningsAlertProps> = ({ warnings })
                 data-testid="surface-warnings-copy-rule"
               />
               <small className="text-muted ms-2" data-testid="surface-warnings-copy-rule-hint">
-                Add it to this surface&apos;s policy to deny callers whose authentication failed.
+                If the Managed Agent has no policy, save this as a policy definition and attach it
+                to the Managed Agent (target.policy), so callers arriving over Fabric are denied
+                too. If it already has a policy, do not paste this whole policy: add{' '}
+                <code>{DENY_FAILED_CALLERS_CONDITION}</code> to each of its allow rules.
+              </small>
+            </div>
+          )}
+          {needsGatewayDeny && (
+            <div className="mt-2">
+              <CopyButton
+                text={GATEWAY_DENY_FAILED_CALLERS_REGO}
+                variant="outline-primary"
+                label="Copy gateway deny rule"
+                data-testid="surface-warnings-copy-gateway-rule"
+              />
+              <small
+                className="text-muted ms-2"
+                data-testid="surface-warnings-copy-gateway-rule-hint"
+              >
+                Payment runs before surface policy, so deny failed callers in the gateway policy. If
+                the gateway has no policy, save this as a policy definition and select it as the
+                gateway policy. If it already has one, do not paste this whole policy: add{' '}
+                <code>{DENY_FAILED_CALLERS_CONDITION}</code> to each of its allow rules.
               </small>
             </div>
           )}
