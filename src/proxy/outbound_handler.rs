@@ -709,9 +709,18 @@ fn changes_enforced_transit_policy(
     resolved: &TransitPoint,
 ) -> bool {
     let serialized = |policy: &Option<crate::config::agent_surface::PolicyRef>| serde_json::to_value(policy).ok();
-    base.mcp_tool_gating != resolved.mcp_tool_gating
-        || serialized(&base.policy) != serialized(&resolved.policy)
-        || serialized(&base.response_policy) != serialized(&resolved.response_policy)
+    fn gating(point: &TransitPoint) -> Option<&crate::config::agent_surface::McpToolGatingConfig> {
+        point
+            .mcp_tool_gating
+            .as_ref()
+            .filter(|gating| !gating.is_empty())
+    }
+    (gating(resolved).is_some() && gating(base) != gating(resolved))
+        || (resolved.policy.is_some() && serialized(&base.policy) != serialized(&resolved.policy))
+        || (resolved
+            .response_policy
+            .is_some()
+            && serialized(&base.response_policy) != serialized(&resolved.response_policy))
 }
 
 // ── Virtual channel resolution ──────────────────────────────────────────────
@@ -8676,6 +8685,47 @@ mod tests {
             ctx.virtual_channel
                 .header_metadata_mapping
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn only_a_variant_point_setting_a_different_enforced_policy_changes_it() {
+        let point = |extra: serde_json::Value| -> TransitPoint {
+            let mut point =
+                json!({"id": "tp", "alias": "partner", "target_endpoint": "https://t.example", "protocol": "mcp"});
+            for (key, value) in extra.as_object().unwrap() {
+                point[key] = value.clone();
+            }
+            serde_json::from_value(point).unwrap()
+        };
+        let gating =
+            json!({"gates": [{"id": "g1", "name": "no admin", "action": {"effect": "deny", "patterns": ["^admin_"]}}]});
+        let base = point(json!({
+            "mcp_tool_gating": gating,
+            "policy": {"policy_definition_id": "base-policy"},
+            "response_policy": {"policy_definition_id": "base-response"}
+        }));
+
+        for (case, variant, changes) in [
+            ("omits every field", json!({}), false),
+            ("sets empty gating", json!({"mcp_tool_gating": {}}), false),
+            (
+                "restates the base",
+                json!({"mcp_tool_gating": gating, "policy": {"policy_definition_id": "base-policy"}}),
+                false,
+            ),
+            (
+                "sets other gating",
+                json!({"mcp_tool_gating": {"gates": []}, "policy": {"policy_definition_id": "other"}}),
+                true,
+            ),
+            ("sets another response policy", json!({"response_policy": {"policy_definition_id": "other"}}), true),
+        ] {
+            assert_eq!(changes_enforced_transit_policy(&base, &point(variant)), changes, "{case}");
+        }
+        assert!(
+            changes_enforced_transit_policy(&point(json!({})), &point(json!({"mcp_tool_gating": gating}))),
+            "gating on a variant point whose base has none"
         );
     }
 
