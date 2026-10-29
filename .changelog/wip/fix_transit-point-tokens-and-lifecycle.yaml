@@ -54,6 +54,12 @@ changes:
         Fabric targets and for every MCP revision; other headers, and the response status,
         are unchanged.
     - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Send only the gateway's value for a Transit Point's `target_auth` header
+      description: >-
+        A Transit Point no longer forwards a managed agent header named like its
+        `target_auth` header, such as `X-Api-Key`, whether or not the gateway adds its own
+        value to the request, so the target receives one value for that header.
+    - timestamp: '2026-10-28T00:00:00.000Z'
       title: Write the gateway's key files atomically with owner-only permissions
       description: >-
         The gateway's key files (DID keys, VC issuer keys and the transit token key) are now
@@ -62,6 +68,16 @@ changes:
         reads a partly written file and fails to start; an instance that finds a key file
         migrated by another as it reads it reads the migrated file.
   fixed:
+    - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Send a delegated `bearer_header` credential to a Transit Point's target
+      description: >-
+        A Transit Point resolved a delegated credential for a request that was not
+        `2026-07-28` MCP, then dropped it with the managed agent's own `Authorization`, so a
+        `bearer_header` credential never reached the target. A Transit Point now builds the
+        headers it sends by one rule on HTTP and Fabric targets: the agent's headers, then the
+        `target_auth` header, then the delegated credential headers, each replacing any earlier
+        header of the same name, so the target receives one value of each credential header and
+        a delegated credential under the same name as `target_auth` replaces it.
     - timestamp: '2026-10-28T00:00:00.000Z'
       title: Keep an outbound listener bound after its last Transit Point is removed
       description: >-

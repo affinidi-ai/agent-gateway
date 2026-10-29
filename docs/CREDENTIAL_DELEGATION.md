@@ -65,6 +65,19 @@ each Transit Point's `transit_credentials` as an `all` binding, which therefore 
 every Transit Point, not only the one that declares it. Use `all` only when every Transit
 Point's upstream should hold the credential.
 
+### Credential headers on a Transit Point
+
+A Transit Point sends its target at most one value of each credential header, by the same
+rule over HTTP and Fabric. It starts from the managed agent's headers, without the agent's
+`Authorization` and `Cookie` and without a header named like the Transit Point's
+`target_auth` header, whether or not the gateway adds that header to this request. It then
+adds the `target_auth` header, and then the `bearer_header` and `custom_header` credentials of
+its bindings, each replacing any earlier header of the same name. On a `2026-07-28` MCP
+request, the credentials prepared for `outbound_credentials` are applied last in the same
+way. So the managed agent can neither supply nor replace a credential, and a delegated
+credential under the same name as `target_auth` replaces it; give them different names to
+send both.
+
 ## When a token is missing
 
 Delegation needs a user to key the token by, so a surface with delegation but no

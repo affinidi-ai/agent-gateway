@@ -316,6 +316,10 @@ pub struct OutboundPipelineContext {
     pub original_method: Method,
     /// Original request headers (minus hop-by-hop), preserved before the request is consumed.
     pub original_headers: HeaderMap,
+    /// Delegated credential headers resolved for this request. Kept apart from the
+    /// managed agent's headers and sent after the agent's headers are filtered, in
+    /// place of any agent header of the same name.
+    pub delegated_credential_headers: HeaderMap,
     /// Request path (used to build target URL).
     pub request_path: String,
     /// Protected agent identity resolved by `step_resolve_agent_identity`.
@@ -571,6 +575,7 @@ impl OutboundPipelineContext {
             body_bytes: None,
             original_method,
             original_headers,
+            delegated_credential_headers: HeaderMap::new(),
             request_path,
             resolved_identity: ProtectedAgentIdentity::Anonymous,
             protocol: None,
@@ -2054,6 +2059,87 @@ fn should_forward_outbound_request_header(
     }
 
     true
+}
+
+/// The headers a Transit Point sends to its target, over HTTP or Fabric: the
+/// managed agent's forwardable headers, then the target authentication header,
+/// then the delegated credential headers, each replacing any earlier header of
+/// the same name, so the target receives one value of each credential header. An
+/// agent header named like the `target_auth` header is never forwarded, whether
+/// or not the gateway adds its own value.
+async fn transit_request_headers(
+    state: &OutboundProxyState,
+    ctx: &mut OutboundPipelineContext,
+) -> Result<HeaderMap, OutboundPipelineError> {
+    let target_auth = transit_target_auth_header(state, ctx).await?;
+    let mapping = ctx
+        .virtual_channel
+        .header_metadata_mapping_if_supported();
+    let target_auth_header = ctx
+        .virtual_channel
+        .target_auth
+        .as_ref()
+        .and_then(|target_auth| match &target_auth.method {
+            crate::config::TargetAuthMethod::StaticSecret { header_name, .. } => Some(header_name.as_str()),
+            crate::config::TargetAuthMethod::CredentialLookup => None,
+        });
+    let mut headers = HeaderMap::new();
+    for (name, value) in &ctx.original_headers {
+        if should_forward_outbound_request_header(name.as_str(), mapping)
+            && target_auth_header.is_none_or(|credential| {
+                !name
+                    .as_str()
+                    .eq_ignore_ascii_case(credential)
+            })
+        {
+            headers.append(name.clone(), value.clone());
+        }
+    }
+    if let Some((name, value)) = target_auth {
+        headers.insert(name, value);
+    }
+    for (name, value) in &ctx.delegated_credential_headers {
+        headers.insert(name.clone(), value.clone());
+    }
+    Ok(headers)
+}
+
+/// The Transit Point's target authentication header, when the request may carry
+/// it. A credential that cannot be resolved refuses the request when the
+/// Transit Point's `target_auth.fallback` is `reject`, and is left out otherwise.
+async fn transit_target_auth_header(
+    state: &OutboundProxyState,
+    ctx: &mut OutboundPipelineContext,
+) -> Result<Option<(axum::http::HeaderName, axum::http::HeaderValue)>, OutboundPipelineError> {
+    let Some(target_auth) = ctx
+        .virtual_channel
+        .target_auth
+        .as_ref()
+    else {
+        return Ok(None);
+    };
+    match crate::proxy::handler::inject_target_auth_header(
+        target_auth,
+        &state.secrets_store,
+        &ctx.surface.name,
+        crate::proxy::handler::CallerAssertion::for_request(ctx.original_method.as_str(), &ctx.request_path),
+    )
+    .await
+    {
+        Ok(Some((name, value))) => Ok(Some((
+            axum::http::HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| OutboundPipelineError::TargetAuthUnavailable)?,
+            axum::http::HeaderValue::from_str(&value).map_err(|_| OutboundPipelineError::TargetAuthUnavailable)?,
+        ))),
+        Ok(None) => Ok(None),
+        Err(error) => {
+            warn!(request_id = %ctx.request_id, error = %error, "Failed to resolve target auth credentials");
+            if matches!(target_auth.fallback, crate::config::TargetAuthFallback::Reject) {
+                return Err(OutboundPipelineError::TargetAuthUnavailable);
+            }
+            Ok(None)
+        }
+    }
 }
 
 /// Remove the target response headers a Transit Point never returns to the
@@ -4201,7 +4287,7 @@ async fn step_inject_credentials(
                         if let Ok(header_name) = name.parse::<axum::http::header::HeaderName>()
                             && let Ok(header_value) = value.parse::<axum::http::header::HeaderValue>()
                         {
-                            ctx.original_headers
+                            ctx.delegated_credential_headers
                                 .insert(header_name, header_value);
                         }
                     }
@@ -4250,6 +4336,42 @@ async fn step_forward_request(
     Ok(UpstreamResponse::Http(response))
 }
 
+/// The headers a Fabric forward carries, built by [`transit_request_headers`]:
+/// as a map of upper-cased names, so the remote gateway and its upstream see
+/// case-stable names, as the inbound Fabric forward sends them, and as the header
+/// map a `2026-07-28` MCP stream sends, with that request's prepared delegated
+/// credentials applied last and its session headers removed.
+async fn fabric_forward_headers(
+    state: &OutboundProxyState,
+    ctx: &mut OutboundPipelineContext,
+) -> Result<(std::collections::HashMap<String, String>, HeaderMap), OutboundPipelineError> {
+    let mut headers_map = std::collections::HashMap::new();
+    let mut stream_headers = HeaderMap::new();
+    for (key, value) in &transit_request_headers(state, ctx).await? {
+        if let Ok(v) = value.to_str() {
+            headers_map.insert(key.as_str().to_uppercase(), v.to_string());
+            stream_headers.append(key.clone(), value.clone());
+        }
+    }
+    if matches!(
+        ctx.mcp_classification
+            .as_ref(),
+        Some(crate::mcp::request_validation::McpRequestClassification::Modern(_))
+    ) {
+        if let Some(prepared) = ctx.modern_delegation.as_ref() {
+            for (name, value) in prepared
+                .credential_headers()
+                .map_err(|_| OutboundPipelineError::DelegationUnavailable)?
+                .iter()
+            {
+                stream_headers.insert(name.clone(), value.clone());
+            }
+        }
+        crate::mcp::modern_http::strip_protocol_session_headers(&mut stream_headers);
+    }
+    Ok((headers_map, stream_headers))
+}
+
 /// Forward the prepared request to a remote gateway channel over `fabric://`.
 async fn step_forward_request_fabric(
     state: &OutboundProxyState,
@@ -4278,64 +4400,12 @@ async fn step_forward_request_fabric(
         format!("/{}", remainder)
     };
 
-    // Forward safe, non-hop-by-hop request headers (keys uppercased so the
-    // remote gateway and upstream see case-stable header names, matching the
-    // inbound fabric forward).
-    let mut headers_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let mut stream_headers = axum::http::HeaderMap::new();
     let is_modern = matches!(
         ctx.mcp_classification
             .as_ref(),
         Some(crate::mcp::request_validation::McpRequestClassification::Modern(_))
     );
-    for (key, value) in &ctx.original_headers {
-        if should_forward_outbound_request_header(
-            key.as_str(),
-            ctx.virtual_channel
-                .header_metadata_mapping_if_supported(),
-        ) && let Ok(v) = value.to_str()
-        {
-            headers_map.insert(key.as_str().to_uppercase(), v.to_string());
-            stream_headers.append(key.clone(), value.clone());
-        }
-    }
-
-    // Apply target authentication if configured.
-    if let Some(ref target_auth) = ctx
-        .virtual_channel
-        .target_auth
-    {
-        match crate::proxy::handler::inject_target_auth_header(
-            target_auth,
-            &state.secrets_store,
-            &ctx.surface.name,
-            crate::proxy::handler::CallerAssertion::for_request(ctx.original_method.as_str(), &ctx.request_path),
-        )
-        .await
-        {
-            Ok(Some((header_name, header_value))) => {
-                if is_modern {
-                    let name = axum::http::HeaderName::from_bytes(header_name.as_bytes())
-                        .map_err(|_| OutboundPipelineError::TargetAuthUnavailable)?;
-                    let value = axum::http::HeaderValue::from_str(&header_value)
-                        .map_err(|_| OutboundPipelineError::TargetAuthUnavailable)?;
-                    stream_headers.insert(name, value);
-                }
-                headers_map.insert(header_name.to_uppercase(), header_value);
-            }
-            Ok(None) => {}
-            Err(e) => {
-                warn!(
-                    request_id = %ctx.request_id,
-                    error = %e,
-                    "Failed to resolve target auth credentials for fabric forward"
-                );
-                if matches!(target_auth.fallback, crate::config::TargetAuthFallback::Reject) {
-                    return Err(OutboundPipelineError::TargetAuthUnavailable);
-                }
-            }
-        }
-    }
+    let (headers_map, stream_headers) = fabric_forward_headers(state, ctx).await?;
 
     let timeout = resolve_outbound_timeout(ctx);
 
@@ -4353,16 +4423,6 @@ async fn step_forward_request_fabric(
         .unwrap_or_default();
 
     if is_modern {
-        if let Some(prepared) = ctx.modern_delegation.as_ref() {
-            for (name, value) in prepared
-                .credential_headers()
-                .map_err(|_| OutboundPipelineError::DelegationUnavailable)?
-                .iter()
-            {
-                stream_headers.insert(name.clone(), value.clone());
-            }
-        }
-        crate::mcp::modern_http::strip_protocol_session_headers(&mut stream_headers);
         let response = crate::proxy::fabric_forward::forward_stream_via_fabric(
             &state.listener_manager,
             crate::proxy::fabric_forward::FabricStreamForwardRequest {
@@ -4536,51 +4596,9 @@ async fn step_forward_request_http(
         )
         .body(body);
 
-    // Forward safe, non-hop-by-hop request headers.
-    for (key, value) in &ctx.original_headers {
-        if should_forward_outbound_request_header(
-            key.as_str(),
-            ctx.virtual_channel
-                .header_metadata_mapping_if_supported(),
-        ) && let Ok(v) = value.to_str()
-        {
+    for (key, value) in &transit_request_headers(state, ctx).await? {
+        if let Ok(v) = value.to_str() {
             req_builder = req_builder.header(key.as_str(), v);
-        }
-    }
-
-    // Apply target authentication if configured.
-    if let Some(ref target_auth) = ctx
-        .virtual_channel
-        .target_auth
-    {
-        match crate::proxy::handler::inject_target_auth_header(
-            target_auth,
-            &state.secrets_store,
-            &ctx.surface.name,
-            crate::proxy::handler::CallerAssertion::for_request(ctx.original_method.as_str(), &ctx.request_path),
-        )
-        .await
-        {
-            Ok(Some((header_name, header_value))) => {
-                req_builder = req_builder.header(header_name, header_value);
-            }
-            Ok(None) => {}
-            Err(e) => {
-                warn!(
-                    request_id = %ctx.request_id,
-                    error = %e,
-                    "Failed to resolve target auth credentials"
-                );
-                if matches!(
-                    ctx.virtual_channel
-                        .target_auth
-                        .as_ref()
-                        .map(|ta| &ta.fallback),
-                    Some(crate::config::TargetAuthFallback::Reject)
-                ) {
-                    return Err(OutboundPipelineError::TargetAuthUnavailable);
-                }
-            }
         }
     }
 
@@ -5716,6 +5734,7 @@ mod tests {
             body_bytes: None,
             original_method: Method::POST,
             original_headers: HeaderMap::new(),
+            delegated_credential_headers: HeaderMap::new(),
             request_path: "/outbound/surfaces/order/partner-a/message/send".to_string(),
             resolved_identity: ProtectedAgentIdentity::Anonymous,
             protocol: None,
@@ -7542,7 +7561,7 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{body}: {error:?}"));
 
             assert_eq!(
-                ctx.original_headers
+                ctx.delegated_credential_headers
                     .get("authorization")
                     .and_then(|value| value.to_str().ok()),
                 expected,
@@ -7582,7 +7601,7 @@ mod tests {
             .unwrap();
 
         assert!(
-            ctx.original_headers
+            ctx.delegated_credential_headers
                 .get("authorization")
                 .is_none()
         );
@@ -12236,5 +12255,349 @@ mod tests {
             ctx.variant_resolution_error = error;
             assert_eq!(injected_credential(&state, ctx).await, expected, "variant_resolution_failed={failed}");
         }
+    }
+
+    fn header_values<'a>(
+        headers: &'a HeaderMap,
+        name: &str,
+    ) -> Vec<&'a str> {
+        headers
+            .get_all(name)
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect()
+    }
+
+    /// The managed agent's own credential headers on every request below.
+    fn with_agent_supplied_credentials(mut ctx: OutboundPipelineContext) -> OutboundPipelineContext {
+        for (name, value) in [
+            ("authorization", "Bearer agent-supplied-token"),
+            ("x-vendor-key", "agent-supplied-key"),
+            ("cookie", "agent_session=1"),
+        ] {
+            ctx.original_headers
+                .insert(name, HeaderValue::from_static(value));
+        }
+        ctx
+    }
+
+    /// A Transit Point context over [`delegation_state`] whose agent sends its
+    /// own credential headers and `accept`, with `delegated` resolved for it and
+    /// a `target_auth` static key under `target_auth_header`, for `method` and
+    /// `path`.
+    async fn credential_header_case(
+        state: &OutboundProxyState,
+        target_auth_header: Option<&str>,
+        delegated: &[(&'static str, &'static str)],
+        method: Method,
+        path: &str,
+    ) -> OutboundPipelineContext {
+        if state
+            .secrets_store
+            .as_ref()
+            .unwrap()
+            .get_by_secret_id("target-key")
+            .await
+            .unwrap()
+            .is_none()
+        {
+            state
+                .secrets_store
+                .as_ref()
+                .unwrap()
+                .create(crate::secrets::CreateSecretRequest {
+                    tenant_id: None,
+                    name: "Target key".into(),
+                    secret_id: "target-key".into(),
+                    description: None,
+                    value: "target-static".into(),
+                    secret_type: "ApiKey".into(),
+                    tags: vec![],
+                })
+                .await
+                .unwrap();
+        }
+        let mut ctx = with_agent_supplied_credentials(test_pipeline_context());
+        ctx.original_headers
+            .insert("accept", HeaderValue::from_static("application/json"));
+        ctx.original_method = method;
+        ctx.request_path = path.to_string();
+        ctx.virtual_channel
+            .target_auth = target_auth_header.map(|header| {
+            serde_json::from_value(json!({"method": {"static_secret": {
+                "secret_id": "target-key", "header_name": header, "header_format": "Key {value}"}}}))
+            .unwrap()
+        });
+        for (name, value) in delegated {
+            ctx.delegated_credential_headers
+                .insert(*name, HeaderValue::from_static(value));
+        }
+        ctx
+    }
+
+    fn sorted_headers(headers: impl IntoIterator<Item = (String, String)>) -> Vec<(String, String)> {
+        let mut headers: Vec<(String, String)> = headers.into_iter().collect();
+        headers.sort();
+        headers
+    }
+
+    fn header_pairs(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        sorted_headers(
+            pairs
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string())),
+        )
+    }
+
+    /// A case of the Transit Point header rule: its name, the `target_auth`
+    /// header, the delegated credential headers, the request's method and path,
+    /// and the headers the target receives, by lower-case name.
+    type CredentialHeaderCase = (
+        &'static str,
+        Option<&'static str>,
+        Vec<(&'static str, &'static str)>,
+        Method,
+        &'static str,
+        Vec<(&'static str, &'static str)>,
+    );
+
+    /// Every case the Transit Point header rule decides.
+    fn credential_header_rule_cases() -> Vec<CredentialHeaderCase> {
+        let call = "/outbound/surfaces/order/partner-a/message/send";
+        let discovery = "/outbound/surfaces/order/partner-a/.well-known/agent-card.json";
+        vec![
+            (
+                "a delegated credential in place of the agent's header",
+                None,
+                vec![("authorization", "Bearer delegated-access"), ("x-vendor-key", "Key delegated-access")],
+                Method::POST,
+                call,
+                vec![
+                    ("accept", "application/json"),
+                    ("authorization", "Bearer delegated-access"),
+                    ("x-vendor-key", "Key delegated-access"),
+                ],
+            ),
+            (
+                "target authentication in place of the agent's header",
+                Some("X-Vendor-Key"),
+                vec![],
+                Method::POST,
+                call,
+                vec![("accept", "application/json"), ("x-vendor-key", "Key target-static")],
+            ),
+            (
+                "the agent's header named like target authentication withheld on a discovery read",
+                Some("X-Vendor-Key"),
+                vec![],
+                Method::GET,
+                discovery,
+                vec![("accept", "application/json")],
+            ),
+            (
+                "a delegated credential in place of target authentication of the same name",
+                Some("Authorization"),
+                vec![("authorization", "Bearer delegated-access")],
+                Method::POST,
+                call,
+                vec![
+                    ("accept", "application/json"),
+                    ("authorization", "Bearer delegated-access"),
+                    ("x-vendor-key", "agent-supplied-key"),
+                ],
+            ),
+        ]
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transit_request_headers_send_one_value_of_each_credential_header_and_never_the_agents_own() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = delegation_state(directory.path(), &[]).await;
+        for (case, target_auth_header, delegated, method, path, expected) in credential_header_rule_cases() {
+            let mut ctx = credential_header_case(&state, target_auth_header, &delegated, method, path).await;
+
+            let sent = transit_request_headers(&state, &mut ctx)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                sorted_headers(
+                    sent.iter()
+                        .map(|(name, value)| (
+                            name.to_string(),
+                            value
+                                .to_str()
+                                .unwrap()
+                                .to_string()
+                        ))
+                ),
+                header_pairs(&expected),
+                "{case}"
+            );
+        }
+    }
+
+    /// The Fabric leg hands the transport the headers of the Transit Point rule,
+    /// in its buffered and its streamed form: delegated credentials and target
+    /// authentication, never the agent's own `Authorization`, `Cookie` or a
+    /// header named like the `target_auth` one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fabric_forward_carries_the_transit_point_credential_headers_and_no_agent_credentials() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = delegation_state(directory.path(), &[]).await;
+        for (case, target_auth_header, delegated, method, path, expected) in credential_header_rule_cases() {
+            let mut ctx = credential_header_case(&state, target_auth_header, &delegated, method, path).await;
+            ctx.virtual_channel
+                .target_endpoint = "fabric://peer-gateway/peer-surface".into();
+
+            let (buffered, streamed) = fabric_forward_headers(&state, &mut ctx)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                sorted_headers(buffered),
+                sorted_headers(
+                    header_pairs(&expected)
+                        .into_iter()
+                        .map(|(name, value)| (name.to_uppercase(), value))
+                ),
+                "{case}: buffered"
+            );
+            assert_eq!(
+                sorted_headers(
+                    streamed
+                        .iter()
+                        .map(|(name, value)| (
+                            name.to_string(),
+                            value
+                                .to_str()
+                                .unwrap()
+                                .to_string()
+                        ))
+                ),
+                header_pairs(&expected),
+                "{case}: streamed"
+            );
+        }
+    }
+
+    /// A Fabric peer's response reaches the managed agent without the target's
+    /// cookies and authentication challenges, on a buffered and on a streamed
+    /// `2026-07-28` MCP response.
+    #[tokio::test]
+    async fn a_fabric_transit_point_response_withholds_the_targets_cookies_and_challenges() {
+        let challenge_headers = || {
+            let mut headers = HeaderMap::new();
+            headers.append("set-cookie", HeaderValue::from_static("vendor_sid=one; HttpOnly"));
+            headers.insert("www-authenticate", HeaderValue::from_static("Bearer error=\"invalid_token\""));
+            headers.insert("content-type", HeaderValue::from_static("application/json"));
+            headers.insert("x-vendor-request-id", HeaderValue::from_static("vendor-9"));
+            headers
+        };
+        let state = test_outbound_state();
+        let mut ctx = test_pipeline_context();
+        ctx.virtual_channel
+            .target_endpoint = "fabric://peer-gateway/peer-surface".into();
+        let buffered = step_process_response(
+            &state,
+            &mut ctx,
+            UpstreamResponse::Fabric {
+                status: StatusCode::UNAUTHORIZED,
+                headers: challenge_headers(),
+                body: Bytes::from_static(br#"{"error":"invalid_token"}"#),
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut streamed_upstream = axum::response::Response::new(axum::body::Body::from(
+            json!({"jsonrpc": "2.0", "id": "stream", "result": {"resultType": "complete", "content": []}}).to_string(),
+        ));
+        *streamed_upstream.headers_mut() = challenge_headers();
+        let mut modern = modern_pipeline_context("tools/call");
+        modern
+            .virtual_channel
+            .target_endpoint = "fabric://peer-gateway/peer-surface".into();
+        let streamed = process_modern_outbound_response(
+            test_outbound_state(),
+            modern,
+            UpstreamResponse::FabricStream(streamed_upstream),
+        )
+        .await
+        .unwrap();
+
+        for (case, response) in [("buffered", buffered), ("streamed", streamed)] {
+            assert!(
+                !response
+                    .headers()
+                    .contains_key("set-cookie"),
+                "{case}"
+            );
+            assert!(
+                !response
+                    .headers()
+                    .contains_key("www-authenticate"),
+                "{case}"
+            );
+            assert_eq!(response.headers()["x-vendor-request-id"], "vendor-9", "{case}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delegated_credential_headers_reach_the_target_and_the_agent_cannot_supply_or_replace_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = delegation_state(directory.path(), &[("provider", "vendor-access")]).await;
+        state
+            .secrets_store
+            .as_ref()
+            .unwrap()
+            .create(crate::secrets::CreateSecretRequest {
+                tenant_id: None,
+                name: "Target key".into(),
+                secret_id: "target-key".into(),
+                description: None,
+                value: "target-static".into(),
+                secret_type: "ApiKey".into(),
+                tags: vec![],
+            })
+            .await
+            .unwrap();
+        let target = crate::component_tests::helpers::RecordingTarget::start(StatusCode::OK, &[]).await;
+        let delegated = |alias: &str, inject_as: serde_json::Value| {
+            json!({"alias": alias, "target_endpoint": target.url, "transit_credentials":
+                {"credential_provider_id": "provider", "scopes": ["read"], "inject_as": inject_as}})
+        };
+        let surface = transit_surface(
+            json!([
+                delegated("bearer", json!({"type": "bearer_header"})),
+                delegated("custom", json!({"type": "custom_header", "name": "X-Vendor-Key", "format": "Key {value}"})),
+                {"alias": "fixed", "target_endpoint": target.url, "target_auth": {"method": {"static_secret": {
+                    "secret_id": "target-key", "header_name": "Authorization", "header_format": "Bearer {value}"}}}}
+            ]),
+            json!([]),
+        );
+
+        for (alias, authorization, vendor_key) in [
+            ("bearer", vec!["Bearer vendor-access"], vec!["agent-supplied-key"]),
+            ("custom", vec![], vec!["Key vendor-access"]),
+            ("fixed", vec!["Bearer target-static"], vec!["agent-supplied-key"]),
+        ] {
+            let (resolved, point) = resolved_transit_point(&surface, None, alias);
+            let mut ctx = with_agent_supplied_credentials(legacy_delegation_context(resolved, point));
+
+            step_inject_credentials(&state, &mut ctx)
+                .await
+                .unwrap();
+            step_forward_request(&state, &mut ctx)
+                .await
+                .unwrap();
+
+            let received = target.received();
+            let sent = received.last().unwrap();
+            assert_eq!(header_values(sent, "authorization"), authorization, "{alias}: {sent:?}");
+            assert_eq!(header_values(sent, "x-vendor-key"), vendor_key, "{alias}: {sent:?}");
+            assert!(header_values(sent, "cookie").is_empty(), "{alias}: {sent:?}");
+        }
+        assert_eq!(target.received().len(), 3);
     }
 }
