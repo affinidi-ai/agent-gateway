@@ -474,10 +474,16 @@ Which requests carry one:
 
 | Pipeline | Issues a transit token |
 | --- | --- |
-| Access Point (direct HTTP: MCP, A2A, HTTP) | For every request it forwards to the managed agent of a surface with Transit Points, an anonymous caller's included |
-| Fabric receive, buffered and framed stream | For every request a paired gateway sends that it forwards to an HTTP or HTTPS Target of a surface with Transit Points |
+| Access Point (direct HTTP: MCP, A2A, HTTP) | For every request it forwards to the managed agent of a surface with Transit Points, an anonymous caller's included, but not for an agent card fetch |
+| Fabric receive, buffered and framed stream | For every request a paired gateway sends that it forwards to an HTTP or HTTPS Target of a surface with Transit Points, but not for a public discovery `GET` such as an agent card fetch |
 | `proxy://` and `a2a-proxy://` Targets, on either path | Never: the gateway runs the MCP Proxy and there is no agent, and an A2A Proxy's backend, such as Direct Line, must never see one |
 | Fabric send, the STS, the management API | Never |
+
+On either path, an MCP Target that answers a plain `POST` with `400`, `404` or `405` is reached
+over the legacy HTTP+SSE transport instead, and a request sent that way carries no transit
+token: the transport posts only the request body, on one session per Target URL that later
+requests reuse (over Fabric, without trying the plain `POST` first). An agent that only speaks
+that transport cannot call its Transit Points with a token.
 
 Over Fabric, the receiving gateway issues the token itself, with the same key and the same
 lifetime setting as its Access Point, and removes every `X-Transit-Token` the peer sent first,
@@ -493,11 +499,19 @@ so its agent gets exactly one. It differs from an Access Point token:
 
 A Transit Point accepts such a token as it accepts an Access Point's, and its policy sees the
 peer as the caller (`verification: fabric_peer`, see
-[`POLICY.md`](POLICY.md#caller-in-transit-point-policy-input)). Static `target_auth`
+[`POLICY.md`](POLICY.md#caller-in-transit-point-policy-input)), with the DID unverified
+(`did_verified: false`) even when a presentation carried it. Static `target_auth`
 credentials are added as for any caller; delegated per-user credentials are never released for
 it (see [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-a-transit-point)).
+A Transit Point's audit records name its caller with `auth_method: fabric_asserted`, the peer
+(its issuer DID, else its Remote gateway record id) as `iss` and the DID as `sub`, below a caller
+the Transit Point verified itself. The identity presentation a Transit Point with a
+`workload_binding` signs for its agent never names that DID as the user it acts for
+(`userIdentity`), as it does the DID of an Access Point token.
 A release that predates the `fabric` claim reads such a token as one naming an unverified DID,
-with no principal.
+with no principal. A release that predates the hop count neither reads nor sends
+`X-Gateway-Fabric-Hops`, so a chain through such a gateway starts counting again at 1 after it
+(see [`FABRIC.md`](FABRIC.md#chains-across-gateways)).
 
 A Transit Point refuses the call with `401` unless the token:
 

@@ -13,21 +13,30 @@ changes:
         Remote gateway record and issuer DID) and the Fabric crossings the request made, and the
         caller DID only when the peer's request names a DID. It never carries a principal, so a
         Transit Point releases no delegated per-user credential for it, and a Transit Point
-        policy sees the peer as the caller, with `verification` set to `fabric_peer` and the peer
-        in `input.transit.caller.fabric`. Static `target_auth` credentials are added as for any
-        caller. `proxy://` and `a2a-proxy://` Targets never get a token.
+        policy sees the peer as the caller, with `verification` set to `fabric_peer`, the peer
+        in `input.transit.caller.fabric`, and the DID as the peer's assertion even when a
+        presentation from the peer carried it. Audit records name that DID with
+        `auth_method: fabric_asserted` and the peer as `iss`, and the identity presentation a
+        Transit Point signs for its agent never names it as the user the agent acts for. Static
+        `target_auth` credentials are added as for any caller. `proxy://` and `a2a-proxy://`
+        Targets never get a token, nor does a public discovery `GET` such as an agent card fetch,
+        nor a request relayed to an MCP Target over the legacy HTTP+SSE transport, on this path
+        or the Access Point's.
     - timestamp: '2026-10-30T09:00:00.000Z'
       title: Refuse requests that cross Fabric more than 8 times
       description: >-
         Agents that call each other through their gateways could pass a request back and forth
         without end. Every Fabric send now sets `X-Gateway-Fabric-Hops`, the crossings the
         request has made, and the receiving gateway carries the count in the transit token it
-        issues, so an agent cannot lower it. A request past 8 crossings is refused with `508`,
-        and one whose count is not an integer from 1 to 255 with `400`, before surface lookup,
-        each recorded as a `request_rejected` audit event (`fabric_chain_too_long`,
-        `fabric_hops_invalid`). A Transit Point to a peer gateway refuses a call that would pass
-        the limit with `508` before forwarding it. A request from a gateway that does not send
-        the header counts as its first crossing.
+        issues, so an agent cannot lower the count in the token it was given. A request past 8
+        crossings is refused with `508`, and one whose count is not an integer from 1 to 255
+        with `400`, before surface lookup, each recorded as a `request_rejected` audit event
+        (`fabric_chain_too_long`, `fabric_hops_invalid`). A Transit Point to a peer gateway
+        refuses a call that would pass the limit with `508` before forwarding it, recorded the
+        same way at the `forward` stage. A request from a gateway that does not send the header
+        counts as its first crossing: during a rolling upgrade, a chain through a node that
+        predates the count starts again at 1 after it. Only a Transit Point that requires a
+        transit token reads the count, and an agent holding an older token can present it.
   changed:
     - timestamp: '2026-10-30T09:00:00.000Z'
       title: Serve Transit Point calls from agents handling requests from partner gateways
@@ -38,6 +47,15 @@ changes:
         that token: an `X-Transit-Token` the peer gateway sent is removed on receive. No
         `X-Gateway-Fabric-Hops` a caller, agent or peer sends is forwarded, to an HTTP target or
         over Fabric.
+    - timestamp: '2026-10-30T09:00:00.000Z'
+      title: Turn a Transit Point's transit token back on for agents serving partners
+      description: >-
+        Operators who set `require_transit_token: false` on a Transit Point, with
+        `allow_unauthenticated_callers: true`, only so that agents serving requests from paired
+        gateways could call it, should set it back to `true` and remove
+        `allow_unauthenticated_callers`: those agents now get a transit token. A Transit Point
+        that does not require the token does not read it, so the Fabric hop limit does not hold
+        through it and anyone who reaches it is served.
   fixed: []
   removed: []
   security: []

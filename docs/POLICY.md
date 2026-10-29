@@ -347,7 +347,7 @@ keep the rule in the Transit Point's own `response_policy`.
 | `input.transit.caller.identity_source` | `gateway-computed`, `self-presented`, `verified-presentation` | How the Access Point established the caller DID. Absent when the token has none. |
 | | `fabric-presentation`, `fabric-asserted` | For a `fabric_peer` caller: the DID came from a presentation one of the connection's issuers signed, or from anything else the peer sent (or the request names no DID). |
 | `input.transit.caller.user_identity_hash` | lowercase hex SHA-256 | The caller's [identity hash](CREDENTIAL_DELEGATION.md#the-callers-identity-hash) the Access Point computed: the source-auth method, its issuer, the surface's tenant and the principal (the JWT `sub`, API key name, DID or mTLS principal). The same subject verified by another method, issuer or tenant has another hash. Present only when `verified`, and absent for a JWT that names no `sub`. |
-| `input.transit.caller.did` | DID | The caller DID the transit token carries. Always asserted, even when `verified` is `true`: `verified` is about the principal behind `user_identity_hash`, not this DID. Absent when the token has none. |
+| `input.transit.caller.did` | DID | The caller DID the transit token carries. Always asserted, even when `verified` is `true`: `verified` is about the principal behind `user_identity_hash`, not this DID. For a `fabric_peer` caller the peer gateway asserted it, a `fabric-presentation` DID included, and any paired gateway can vouch for any DID; to admit a DID one partner vouches for, match `identity_source == "fabric-presentation"` together with `fabric.peer_issuer_did`. Absent when the token has none. |
 | `input.transit.caller.fields` | object | The caller claims this Transit Point allowlists, verbatim: its enabled `workload_binding.caller_context_fields` with `caller_source: transit_token`, taken from the caller's verified JWT claims on the Access Point. The token carries the claims every Transit Point of the surface allowlists, but each Transit Point's policy sees only its own. Absent unless the caller is `verified` and the Transit Point allowlists a claim the token carries. |
 | `input.transit.caller.fabric` | object | Present when the transit token was issued for a request that arrived over Fabric: `peer_gateway_id` (the sending gateway's Remote gateway record), `peer_issuer_did` (its issuer DID, once pairing established it) and `hops` (the Fabric crossings the request made). The Fabric handshake verified the peer. |
 | `input.transit.client.verification` | `resource_token` | The Transit Point verified the client's resource-server token (`mcp_http.authorization`) on this request. `input.source_auth` carries the same identity with its claims. |
@@ -389,7 +389,8 @@ allow if {
 ```
 
 A request a partner gateway sent over Fabric reaches the managed agent with a transit token, so
-its agent can call its Transit Points. To admit one partner's requests on a Transit Point:
+its agent can call its Transit Points. A rule on `did` with `did_verified` never matches such a
+request, whichever DID it names. To admit one partner's requests on a Transit Point:
 
 ```rego
 package surface.policy

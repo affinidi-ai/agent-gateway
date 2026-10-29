@@ -389,7 +389,7 @@ async fn a_fabric_request_past_the_hop_limit_or_with_a_malformed_count_is_refuse
                 _ => None,
             })
             .collect();
-        assert_eq!(rejected, [(RejectionStage::Routing, reason, Some(status))], "{hops}");
+        assert_eq!(rejected, [(RejectionStage::Routing, reason, None)], "{hops}");
         assert!(
             events
                 .iter()
@@ -435,6 +435,118 @@ async fn a_surface_without_transit_points_passes_its_agent_no_transit_token() {
         "{:?}",
         received[0]
     );
+}
+
+/// A peer fetching the agent card makes no request of the agent's own, so the
+/// agent gets no transit token with it, as with a card fetched directly.
+#[tokio::test]
+async fn an_agent_card_fetch_over_fabric_passes_the_agent_no_transit_token() {
+    if ran_in_child("ATG_FABRIC_AGENT_CARD_CHILD").await {
+        return;
+    }
+    let target = RecordingTarget::start(axum::http::StatusCode::OK, &[]).await;
+    let root = tempfile::tempdir().unwrap();
+    let _receiver = receiver(root.path(), &surface("a2a", &target.url, &["crm"])).await;
+
+    let mut message = forward_request(
+        root.path(),
+        json!({ "x-api-key": CALLER_KEY, "X-Transit-Token": "token-the-peer-sent" }),
+        Value::Null,
+    );
+    message.message_body["method"] = json!("GET");
+    message.message_body["path"] = json!("/.well-known/agent-card.json");
+    let response = forward_response(&message).await;
+    assert_eq!(response["status"], 200, "{response}");
+    let received = target.received();
+    assert_eq!(received.len(), 1, "the card request reaches the agent");
+    assert!(
+        received[0]
+            .get("x-transit-token")
+            .is_none(),
+        "{:?}",
+        received[0]
+    );
+}
+
+/// A framed stream whose Open carries a hop count past the limit, or one that
+/// is not a count, is refused as a buffered request is, before the agent is
+/// called, and recorded with the stream's trace.
+#[tokio::test]
+async fn a_framed_stream_past_the_hop_limit_or_with_a_malformed_count_is_refused() {
+    if ran_in_child("ATG_FABRIC_STREAM_HOP_LIMIT_CHILD").await {
+        return;
+    }
+    let target = RecordingTarget::start(axum::http::StatusCode::OK, &[]).await;
+    let root = tempfile::tempdir().unwrap();
+    let surface = surface("mcp", &target.url, &["crm"]);
+    let _receiver = receiver(root.path(), &surface).await;
+    let body = json!({ "jsonrpc": "2.0", "id": "stream", "method": "tools/list", "params": { "_meta": {
+        "io.modelcontextprotocol/protocolVersion": crate::mcp::MCP_MODERN_VERSION,
+        "io.modelcontextprotocol/clientCapabilities": {}
+    } } });
+
+    for (hops, status, reason, said) in [
+        ("9", 508, RejectionReason::FabricChainTooLong, "The request passed through too many gateways"),
+        ("many", 400, RejectionReason::FabricHopsInvalid, "Invalid X-Gateway-Fabric-Hops header"),
+    ] {
+        let headers = json!({ "content-type": "application/json", "accept": "application/json, text/event-stream",
+            "mcp-protocol-version": crate::mcp::MCP_MODERN_VERSION, "mcp-method": "tools/list",
+            "x-api-key": CALLER_KEY, "x-gateway-fabric-hops": hops });
+        let stream_headers = crate::proxy::fabric_stream::wire::headers_from_json(Some(&headers)).unwrap();
+        let message = forward_request(root.path(), headers, Value::Null);
+        let (result, events) = crate::audit::producer::capture(tokio::time::timeout(
+            Duration::from_secs(10),
+            crate::observability::policy_audit::REQUEST_TRACE_ID.scope(
+                "trace-from-the-peer".to_string(),
+                Box::pin(super::process_forward_request_with_mcp_runtime(
+                    &message,
+                    Some(super::FabricStreamRequest {
+                        headers: stream_headers,
+                        body: serde_json::to_vec(&body)
+                            .unwrap()
+                            .into(),
+                        surface: surface.clone(),
+                        variant: crate::config::agent_surface_variants::ForwardedVariant {
+                            id: None,
+                            recorded: "_base_".into(),
+                        },
+                        capabilities: crate::proxy::fabric_stream::peer::StreamCapabilities::local(true, true),
+                        scope: crate::observability::policy_audit::RequestScope::fresh(),
+                    }),
+                    crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+                    None,
+                )),
+            ),
+        ))
+        .await;
+        let response = match result.expect("Fabric stream receive timed out") {
+            ProcessingResult::RequiresResponse { response_body, .. } => response_body,
+            other => panic!("{hops}: expected a refusal, got {other:?}"),
+        };
+        assert_eq!(response["status"], status, "{hops}: {response}");
+        let refusal: Value = serde_json::from_str(
+            response["body"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(refusal["message"], said, "{hops}");
+        let rejected: Vec<_> = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                DelegationAuditAction::RequestRejected { stage, reason, http_status, .. } => {
+                    Some((*stage, *reason, *http_status, event.trace_id.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            rejected,
+            [(RejectionStage::Routing, reason, None, Some("trace-from-the-peer".to_string()))],
+            "{hops}"
+        );
+    }
+    assert!(target.received().is_empty(), "a refused stream never reaches the agent");
 }
 
 /// A `2026-07-28` MCP request crossing as a framed stream reaches the agent
@@ -546,19 +658,27 @@ fn a_fabric_token_names_only_a_did_and_says_how_it_was_established() {
 fn a_fabric_token_is_issued_only_for_an_agent_behind_an_http_target() {
     let issuer = test_issuer();
     let with_points = surface("a2a", "https://agent.example", &["crm"]);
-    let issued = |issuer: Option<&TransitTokenIssuer>, surface: &AgentSurface, target_url: &str| {
+    let issue = |issuer: Option<&TransitTokenIssuer>, surface: &AgentSurface, target_url: &str, card: bool| {
         fabric_receive_transit_token(
             issuer,
             Some(30),
             surface,
             target_url,
+            card,
             &caller(None, IdentityVerification::Unverified),
             Some("trace"),
         )
     };
+    let issued = |issuer: Option<&TransitTokenIssuer>, surface: &AgentSurface, target_url: &str| {
+        issue(issuer, surface, target_url, false)
+    };
     for target_url in ["https://agent.example/rpc", "http://agent.example/rpc", "HTTPS://agent.example/rpc"] {
         assert!(issued(Some(&issuer), &with_points, target_url).is_some(), "{target_url}");
     }
+    assert!(
+        issue(Some(&issuer), &with_points, "https://agent.example/.well-known/agent-card.json", true).is_none(),
+        "an agent card fetch is no request of the agent's own"
+    );
     for target_url in ["proxy://tools", "a2a-proxy://direct-line", "fabric://peer/surface"] {
         assert!(issued(Some(&issuer), &with_points, target_url).is_none(), "{target_url}");
     }

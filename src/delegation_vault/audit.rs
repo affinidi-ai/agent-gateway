@@ -1175,7 +1175,32 @@ pub fn build_caller_context(identity: &crate::source_auth::AuthenticatedIdentity
 /// carries onto a Transit Point: the allowlisted `sub`, `email` and `name`
 /// claims captured for Workload Binding, with the inbound caller's DID as the
 /// subject when no `sub` claim was carried. `None` when the token names no caller.
+/// A token issued for a request a peer gateway sent is `fabric_asserted`: the
+/// peer (its issuer DID, else its Remote gateway record id) as `iss`, and as
+/// `sub` the DID the peer's request named, which this gateway did not verify.
 pub fn transit_caller_context(claims: &crate::proxy::transit_token::TransitTokenClaims) -> Option<AuditCallerContext> {
+    if let Some(fabric) = &claims.fabric {
+        return Some(AuditCallerContext {
+            auth_method: "fabric_asserted".to_string(),
+            iss: Some(
+                fabric
+                    .peer_issuer_did
+                    .clone()
+                    .unwrap_or_else(|| fabric.peer_gateway_id.clone()),
+            ),
+            aud: None,
+            sub: claims.sub.clone(),
+            token_id: None,
+            email: None,
+            name: None,
+            email_redacted: None,
+            name_redacted: None,
+            mtls_fingerprint: None,
+            mtls_subject_dn: None,
+            mtls_issuer_dn: None,
+            mtls_source: None,
+        });
+    }
     let field = |name: &str| {
         claims
             .caller_context_fields
@@ -2478,6 +2503,33 @@ mod tests {
             transit_caller_context(&transit_claims(None, serde_json::json!({"email": 7}))).is_none(),
             "non-string claims are ignored"
         );
+    }
+
+    /// A token issued for a request a peer gateway sent names its caller as
+    /// the peer asserted it, with the peer as the issuer, never as a caller the
+    /// transit token verified.
+    #[test]
+    fn a_fabric_issued_token_names_the_caller_its_peer_asserted() {
+        let fabric_claims = |sub: Option<&str>, peer_issuer_did: Option<&str>| {
+            let mut claims = transit_claims(sub, serde_json::json!({}));
+            claims.identity_source = Some("fabric-presentation".to_string());
+            claims.fabric = Some(crate::proxy::transit_token::FabricTransitClaims {
+                peer_gateway_id: "partner-record".to_string(),
+                peer_issuer_did: peer_issuer_did.map(str::to_string),
+                hops: 1,
+            });
+            claims
+        };
+
+        let caller = transit_caller_context(&fabric_claims(Some("did:web:victim"), Some("did:web:partner"))).unwrap();
+        assert_eq!(caller.auth_method, "fabric_asserted");
+        assert_eq!(caller.iss.as_deref(), Some("did:web:partner"));
+        assert_eq!(caller.sub.as_deref(), Some("did:web:victim"));
+
+        let caller = transit_caller_context(&fabric_claims(None, None)).unwrap();
+        assert_eq!(caller.auth_method, "fabric_asserted");
+        assert_eq!(caller.iss.as_deref(), Some("partner-record"), "the peer's record without an issuer DID");
+        assert_eq!(caller.sub, None);
     }
 
     fn binding(
