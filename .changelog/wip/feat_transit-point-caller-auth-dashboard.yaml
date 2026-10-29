@@ -1,0 +1,29 @@
+branch: feat/transit-point-caller-auth-dashboard
+changes:
+  added:
+    - timestamp: '2026-10-30T09:00:00.000Z'
+      title: ⭐ Set who can call a Transit Point from the Surface Builder
+      description: >-
+        The Transit Point panel has a **Who can call this Transit Point** section: the transit
+        token switch, a **Caller authentication** choice (an API key from the secret store or the
+        provider, or a JWT bearer with its strategy, audiences, token header and scheme) that
+        sets the Transit Point's `source_auth`, and an **Open to any caller** switch behind a
+        confirmation. The panel applies the gateway's save rules first: a Transit Point that
+        authenticates no caller and is not open, one that is open beside the token or a method,
+        and a method missing its secret, header, strategy or audience cannot be saved, and the
+        panel says why; a refusal from the gateway shows in the same section in plain words. A
+        `source_auth` set through the API with mTLS is shown and kept.
+    - timestamp: '2026-10-30T09:00:00.000Z'
+      title: Show the gateway's save warnings on the Transit Point they name
+      description: >-
+        A save answered with `Warning` headers, such as an open Transit Point reachable from
+        other hosts, a JWT that accepts the Access Point's own tokens, or a strategy that shares
+        an issuer, now shows each one on its Transit Point and in a toast, and keeps it until
+        that Transit Point's caller authentication, open marking or listener changes. Before
+        saving, the panel warns when an open Transit Point's listener URL is one other hosts
+        reach.
+  changed: []
+  fixed: []
+  removed: []
+  security: []
+  breaking: []

@@ -124,11 +124,36 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
 - **Transit Settings** has no listener authentication control: the gateway does not support
   `transit.source_auth` and refuses a save that sets it. The **Transit Token Mode** option
   says the embedded token is signed and readable by the agent, not encrypted.
-- The Transit Point panel has no control for a Transit Point's `source_auth` or
-  `allow_unauthenticated_callers`, and the factory does not send them; a `PUT` that omits
-  them keeps the stored values (see `docs/SOURCE_AUTH.md`, _Transit Point callers_). Turning
-  **Require transit token** off on a Transit Point with neither is refused by the API on
-  save.
+- The Transit Point panel's **Who can call this Transit Point** section
+  (`TransitCallerSection.tsx`, rules in `callerAuth.ts`) holds the transit token switch
+  (`transit-point-require-transit-token-switch`), the **Caller authentication** select
+  (`transit-point-caller-auth-method`: None, API key from the secret store, API key from the
+  provider, JWT bearer; mTLS only shows, and keeps, one set through the API) with its fields
+  (`transit-point-caller-auth-header`, `-secret`, `-strategy`, `-audience-input`,
+  `-token-header`, `-token-scheme`), and the **Open to any caller** switch
+  (`transit-point-allow-unauthenticated-callers-switch`), shown only while the Transit Point
+  has no transit token, `source_auth` or `mcp_http.authorization`, and set only through a
+  confirmation (`transit-point-open-confirm`). The node config holds `source_auth` in its wire
+  shape, so a stored one round-trips; the factory writes it with `callerAuthToWire`. Turning
+  caller authentication off sends `"source_auth": null`, which a `PUT` honours as removal (an
+  omitted `source_auth` keeps the stored one). The open marking is sent only while nothing
+  else authenticates the Transit Point, and as an explicit `false` after the operator turned
+  it off. The save rules the API enforces apply before the save, through the element's
+  `validate`, which faults the node and blocks Save: no way to authenticate and not open,
+  open beside the token or a method, `source_auth` beside `mcp_http.authorization`, and an API
+  key with no secret or header, a JWT with no strategy or no audience (or one that forwards
+  the token). Each shows as `transit-point-caller-auth-problem`.
+- The exposure warning: when a save answers with `Warning: 299` headers, `apiClient.createSurface`
+  and `updateSurface` pass their messages to an `onWarnings` option, the pages toast them and
+  `SurfaceMetaContext.saveWarnings` hands them to the Transit Point whose alias they name
+  (`transit-point-save-warning`), where each stays until that Transit Point's token, caller
+  authentication, open marking or listener changes. Before the save, the panel predicts the
+  exposure from the Transit Point's listener URL (`transit-point-exposure-warning`) with the
+  gateway's own rule; the gateway also counts bind addresses and shared-domain inbound
+  listeners, which the dashboard does not see, so only the header is complete. A refused save
+  shows the API's reason in plain words on the Transit Point it names
+  (`transit-point-save-error`). A write never carries `transit_point_source_auth`: the gateway
+  derives it from the stored Transit Points.
 - A new surface is named `<protocol>_surface_<n>` (`surfaceNaming.ts`), where `n` is one more
   than the existing surfaces of that protocol, skipping names already taken. The name follows
   the protocol until the user types a different name, from the Name field or the Config tab

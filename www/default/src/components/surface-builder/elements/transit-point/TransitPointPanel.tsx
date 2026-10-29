@@ -17,6 +17,7 @@ import {
   PROVIDER_TARGET_AUTH_DEFAULTS,
   providerTargetAuthFromApi,
 } from '../_shared/providerTargetAuth';
+import TransitCallerSection from './TransitCallerSection';
 import { newTransitPointId, deriveTransitPointAlias } from './factory';
 import { filterSelectableGateways } from '../../../../utils/gateways';
 
@@ -517,25 +518,12 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
           />
         )}
 
-      <div className="config-section">
-        <label>Security</label>
-        <Form.Group className="mb-2">
-          <Form.Check
-            type="switch"
-            id={`tp-require-transit-token-${config.id || 'new'}`}
-            label="Require transit token"
-            checked={config.require_transit_token !== false}
-            onChange={e => updateField('require_transit_token', e.target.checked)}
-          />
-          <Form.Text className="text-muted" style={{ fontSize: '10px' }}>
-            When enabled, every call to this transit point must carry a valid{' '}
-            <code>X-Transit-Token</code> header issued by the surface's Access Point. Disable only
-            when the caller cannot carry the token: the transit point must then authenticate its
-            callers with source_auth, or be marked open to callers it does not authenticate, both
-            set through the API, or saving it is refused.
-          </Form.Text>
-        </Form.Group>
-      </div>
+      <TransitCallerSection
+        config={config}
+        alias={alias}
+        updateField={updateField}
+        updateFields={updateFields}
+      />
     </>
   );
 };

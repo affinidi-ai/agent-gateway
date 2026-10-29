@@ -449,9 +449,17 @@ const AddSurfacePage: React.FC = () => {
     setError(null);
     try {
       const payload: Partial<AgentSurface> = withA2aValidationSettled(buildSurfacePayload());
-      await apiClient.createSurface(payload);
+      let headerWarnings: string[] = [];
+      await apiClient.createSurface(payload, {
+        onWarnings: warnings => {
+          headerWarnings = warnings;
+        },
+      });
       justCreatedRef.current = true;
       showToast('success', `Agent Surface "${name}" created`);
+      for (const warning of headerWarnings.slice(0, 3)) {
+        showToast('error', `Warning: ${warning}`, { autoRemove: true, duration: 8000 });
+      }
       // Surface non-blocking structural warnings AFTER create. See
       // SurfaceDetailPage for full rationale.
       const warnings = validateSurfacePayload(payload).filter(i => i.severity === 'warning');

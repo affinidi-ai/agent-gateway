@@ -108,6 +108,8 @@ const SurfaceDetailPage: React.FC = () => {
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // `Warning` headers of the last save, shown on the Transit Points they name.
+  const [saveWarnings, setSaveWarnings] = useState<readonly string[] | null>(null);
   const [hasAttemptedSave, setHasAttemptedSave] = useState(false);
   const surfacePolicyLoadState = useSurfacePolicyDefinitions();
   const surfacePolicyIds =
@@ -1238,7 +1240,13 @@ const SurfaceDetailPage: React.FC = () => {
       // A PUT that leaves out a stored discovery setting keeps it, so one the
       // operator removed is sent as null, removed only if the save succeeds.
       payload = withDroppedProtectedResourcesRemoved(surface, payload);
-      const updated = await apiClient.updateSurface(surfaceId, payload);
+      let headerWarnings: string[] = [];
+      const updated = await apiClient.updateSurface(surfaceId, payload, {
+        onWarnings: warnings => {
+          headerWarnings = warnings;
+        },
+      });
+      setSaveWarnings(headerWarnings);
       setSurface(updated);
       setJsonOverride(null);
       setJsonError(null);
@@ -1326,6 +1334,9 @@ const SurfaceDetailPage: React.FC = () => {
       bumpExternalRevision();
       if (hydration.didAutoLayout) bumpResetView();
       showToast('success', `Agent Surface "${updated.name}" saved`);
+      for (const warning of headerWarnings.slice(0, 3)) {
+        showToast('error', `Warning: ${warning}`, { autoRemove: true, duration: 8000 });
+      }
       // Surface non-blocking structural warnings AFTER save so the
       // user notices issues like empty target endpoints / unrouted
       // transit points without being prevented from saving. The toast
@@ -1650,6 +1661,7 @@ const SurfaceDetailPage: React.FC = () => {
         surfacePolicyLoadState={surfacePolicyLoadState}
         hasAttemptedSave={hasAttemptedSave}
         saveError={error}
+        saveWarnings={saveWarnings}
         surfaceId={surface?.surface_id}
         lastActivity={
           // Backend doesn't carry `last_activity` on the surface payload;
