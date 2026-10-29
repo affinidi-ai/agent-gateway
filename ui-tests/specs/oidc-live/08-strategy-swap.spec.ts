@@ -48,7 +48,8 @@ test.describe('Strategy swap', () => {
         await chooseStrategy(page, strategyName);
         await retypeTarget(page);
         const saved = await saveEdit(page);
-        expect(saved.access_point.caller_authentication?.methods[0].audiences).toEqual([env.entryPointUrl]);
+        const target = Object.values(names.strategies).find(strategy => strategy.name === strategyName);
+        expect(saved.access_point.caller_authentication?.methods[0].jwt_verification_strategy_id).toBe(target?.id);
     }
 
     test.beforeAll(async () => {

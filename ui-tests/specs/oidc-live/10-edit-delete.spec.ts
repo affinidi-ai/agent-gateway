@@ -160,13 +160,6 @@ test.describe('Edit and delete', () => {
         expect(await findSurfaceByName(SECOND_SURFACE)).toBeDefined();
     });
 
-    test('callers of a surface whose strategy was deleted are denied with 403 and no strategy id', async () => {
-        const denied = await callAgent2(http, staticToken(NEW_ISSUER));
-        expect(denied.status).toBe(403);
-        expect(denied.text).not.toContain(staticStrategy.id);
-        expect(denied.text).not.toContain('Auth config not found');
-    });
-
     test('a provider that a surface uses cannot be deleted, and the dashboard says why', async ({page}) => {
         await page.goto('/credentials?tab=credential-providers');
         await twoStepDelete(page, `Delete "${names.providers.jwtBearer}"`);

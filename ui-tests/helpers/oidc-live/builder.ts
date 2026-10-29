@@ -117,6 +117,7 @@ export interface SavedSurface {
                 audiences: string[];
             }>;
         };
+        inbound_policy?: {policy_definition_id: string};
     };
     target: {endpoint: string; auth?: {method: {credential_provider?: {credential_provider_id: string}}}};
 }

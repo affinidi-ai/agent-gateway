@@ -21,7 +21,14 @@ import {
     startA2aSurface,
 } from '../../helpers/oidc-live/builder';
 import {env} from '../../helpers/oidc-live/env';
-import {Entity, ensureProviders, ensureSecrets, ensureStrategy, listEntities} from '../../helpers/oidc-live/gateway-state';
+import {
+    Entity,
+    ensureDenyRule,
+    ensureProviders,
+    ensureSecrets,
+    ensureStrategy,
+    listEntities,
+} from '../../helpers/oidc-live/gateway-state';
 import {names} from '../../helpers/oidc-live/names';
 import {loadWorld} from '../../helpers/oidc-live/world';
 
@@ -86,6 +93,18 @@ test.describe('Surface builder', () => {
         });
         expect(stored.target.endpoint).toBe(env.agentUrl);
         expect(stored.target.auth?.method.credential_provider?.credential_provider_id).toBe(jwtBearerProviderId);
+    });
+
+    test('attaches the policy that denies callers whose token failed verification', async () => {
+        const surface = (await surfaceByName(api)) as SavedSurface;
+        const policyId = await ensureDenyRule(api);
+        const patched = await api.patch(`/api/v1/surfaces/${surface.surface_id}`, {
+            access_point: {inbound_policy: {policy_definition_id: policyId, require_agent_context: false}},
+        });
+        expect(patched.status).toBe(200);
+
+        const stored = (await surfaceByName(api)) as SavedSurface;
+        expect(stored.access_point.inbound_policy?.policy_definition_id).toBe(policyId);
     });
 
     test('shows the entry point URL for the saved surface', async ({page}) => {

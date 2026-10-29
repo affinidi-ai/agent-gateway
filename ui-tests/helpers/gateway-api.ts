@@ -50,7 +50,9 @@ export class GatewayApi {
     }
 
     async patch<T = unknown>(path: string, data: unknown): Promise<GatewayResponse<T>> {
-        return this.read<T>(await this.context.patch(path, {data}));
+        return this.read<T>(
+            await this.context.patch(path, {data, headers: {'Content-Type': 'application/merge-patch+json'}})
+        );
     }
 
     async delete(path: string): Promise<number> {
