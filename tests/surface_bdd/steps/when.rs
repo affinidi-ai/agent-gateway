@@ -196,6 +196,25 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
     } else {
         None
     };
+    let target_token_endpoint = if let Some(provider) = world
+        .surface_config
+        .target_auth_provider
+        .as_mut()
+    {
+        let mut response = crate::bdd_support::mock_server::MockResponse::json(serde_json::json!({
+            "access_token": crate::bdd_support::config::target_auth::TARGET_AUTH_PROVIDER_TOKEN,
+            "token_type": "Bearer",
+            "expires_in": provider.expires_in,
+        }));
+        response.status = provider.token_status;
+        let mock = MockServer::start(response).await;
+        let token_endpoint = format!("{}/token", mock.url());
+        oauth_endpoint_allowlist.push(token_endpoint.clone());
+        provider.token_endpoint = Some(token_endpoint);
+        Some(mock)
+    } else {
+        None
+    };
 
     let (gateway_port, mut port_reservation) = config::reserve_free_port("gateway inbound port");
     if world
@@ -375,6 +394,7 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
         gateway,
         mock,
         replacement_mock: replacement_mock.or(oauth_mock),
+        target_token_endpoint,
         transit_point_mocks,
         affinidi_well,
         _jwks_server: jwks_server,
@@ -1881,7 +1901,7 @@ async fn fetch_agent_card_with_extra_headers(
     fetch_agent_card_with_headers(world, headers).await;
 }
 
-async fn fetch_agent_card_with_headers(
+pub(crate) async fn fetch_agent_card_with_headers(
     world: &mut SurfaceWorld,
     headers: Vec<(String, String)>,
 ) {

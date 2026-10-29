@@ -12,7 +12,8 @@ use crate::bdd_support::config::mcp_proxy::WEATHER_OPENAPI_SPEC;
 use crate::bdd_support::config::reserve_free_port;
 use crate::bdd_support::config::single_surface_fixture::{
     A2aProxyTargetFixture, DidWebVhIdentityFixture, McpProxyTargetFixture, McpToolPolicyFixture,
-    McpWildcardToolPolicyFixture, ProtectedResourceFixture, VariantInboundPolicyFixture, VariantTargetPolicyFixture,
+    McpWildcardToolPolicyFixture, ProtectedResourceFixture, SurfaceTargetAuthProviderConfig, TargetAuthProviderGrant,
+    VariantInboundPolicyFixture, VariantTargetPolicyFixture,
 };
 use crate::bdd_support::config::source_auth::caller_authentication_method_json;
 use crate::bdd_support::gateway_process::SURFACE_TEST_AUTH_TOKEN as TEST_AUTH_TOKEN;
@@ -2262,6 +2263,66 @@ fn surface_injects_missing_target_auth(
     fallback: String,
 ) {
     configure_missing_target_auth(world, secret_id, header_name, fallback);
+}
+
+fn target_auth_provider(world: &mut SurfaceWorld) -> &mut SurfaceTargetAuthProviderConfig {
+    world
+        .surface_config
+        .target_auth_provider
+        .as_mut()
+        .expect("the surface must authenticate its target with a credential provider first")
+}
+
+#[given(expr = "the surface authenticates its target with a client credentials provider")]
+fn surface_authenticates_target_with_client_credentials(world: &mut SurfaceWorld) {
+    world
+        .surface_config
+        .target_auth_provider = Some(SurfaceTargetAuthProviderConfig::new(TargetAuthProviderGrant::ClientCredentials));
+}
+
+#[given(expr = "the surface authenticates its target with a JWT Bearer provider")]
+fn surface_authenticates_target_with_jwt_bearer(world: &mut SurfaceWorld) {
+    world
+        .surface_config
+        .target_auth_provider = Some(SurfaceTargetAuthProviderConfig::new(TargetAuthProviderGrant::JwtBearer));
+}
+
+#[given(expr = "the target's credential provider refuses token requests and the fallback is {string}")]
+fn target_credential_provider_refuses_tokens(
+    world: &mut SurfaceWorld,
+    fallback: String,
+) {
+    let provider = target_auth_provider(world);
+    provider.token_status = 401;
+    provider.fallback = fallback;
+}
+
+#[given(expr = "the target's credential provider issues tokens that expire in {int} seconds")]
+fn target_credential_provider_token_lifetime(
+    world: &mut SurfaceWorld,
+    expires_in: u64,
+) {
+    target_auth_provider(world).expires_in = expires_in;
+}
+
+#[given("the caller has fetched the agent card")]
+async fn caller_has_fetched_agent_card(world: &mut SurfaceWorld) {
+    crate::steps::when::fetch_agent_card_with_headers(world, vec![]).await;
+    assert_eq!(
+        world
+            .caller_response
+            .as_ref()
+            .map(|response| response.status),
+        Some(200),
+        "the first agent card fetch must succeed"
+    );
+    world
+        .infra
+        .as_ref()
+        .expect("the gateway runs after the first agent card fetch")
+        .mock
+        .clear_requests()
+        .await;
 }
 
 #[given("the surface has managed identity enabled")]

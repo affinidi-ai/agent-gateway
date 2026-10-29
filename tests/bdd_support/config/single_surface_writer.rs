@@ -12,9 +12,14 @@ use crate::bdd_support::config::gateway_bootstrap::GatewayBootstrapSurface;
 use crate::bdd_support::config::mcp_proxy::McpProxyFixture;
 use crate::bdd_support::config::single_surface_fixture::{
     CredentialProviderKind, DelegatedCredentialInjection, DidWebVhIdentityFixture, PROTECTED_RESOURCE_PUBLIC_ORIGIN,
-    SurfaceConfigBuilder, SurfaceSourceAuthConfig, SurfaceTransitPointConfig,
+    SurfaceConfigBuilder, SurfaceSourceAuthConfig, SurfaceTargetAuthProviderConfig, SurfaceTransitPointConfig,
+    TargetAuthProviderGrant,
 };
-use crate::bdd_support::config::target_auth::static_secret_target_auth_json;
+use crate::bdd_support::config::target_auth::{
+    TARGET_AUTH_CLIENT_ID_SECRET, TARGET_AUTH_CLIENT_SECRET_SECRET, TARGET_AUTH_JWT_ISSUER, TARGET_AUTH_PROVIDER_ID,
+    TARGET_AUTH_PROVIDER_SCOPE, TARGET_AUTH_SIGNING_KEY_SECRET, credential_provider_target_auth_json,
+    static_secret_target_auth_json, target_auth_signing_key,
+};
 
 struct SingleSurfaceOptions<'a> {
     outbound: Option<(u16, &'a HashMap<String, String>)>,
@@ -249,6 +254,10 @@ fn write_single_surface_config_inner(
             &target_auth.header_format,
             &target_auth.fallback,
         ));
+    }
+    if let Some(provider) = &surface_config.target_auth_provider {
+        surface_fixture = surface_fixture
+            .with_target_auth(credential_provider_target_auth_json(TARGET_AUTH_PROVIDER_ID, &provider.fallback));
     }
     if let Some(policy) = &surface_config.mcp_tool_policy {
         surface_fixture = surface_fixture.with_mcp_tool_policy(&policy.allowed_tool, &policy.policy_definition_id);
@@ -576,6 +585,20 @@ fn secret_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<SecretFixture> 
     if let Some(proxy) = &surface_config.a2a_proxy_target {
         secrets.push(SecretFixture::new(&proxy.secret_id, &proxy.secret_value));
     }
+    match surface_config
+        .target_auth_provider
+        .as_ref()
+        .map(|provider| provider.grant)
+    {
+        Some(TargetAuthProviderGrant::ClientCredentials) => {
+            secrets.push(SecretFixture::new(TARGET_AUTH_CLIENT_ID_SECRET, "bdd-target-client"));
+            secrets.push(SecretFixture::new(TARGET_AUTH_CLIENT_SECRET_SECRET, "bdd-target-client-secret"));
+        }
+        Some(TargetAuthProviderGrant::JwtBearer) => {
+            secrets.push(SecretFixture::new(TARGET_AUTH_SIGNING_KEY_SECRET, &target_auth_signing_key().private_pem));
+        }
+        None => {}
+    }
     if let Some(delegation) = &surface_config.credential_delegation {
         match &delegation.provider_kind {
             CredentialProviderKind::OAuth2AuthorizationCode => {
@@ -609,6 +632,55 @@ fn api_key_provider_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<ApiKe
 }
 
 fn credential_provider_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<CredentialProviderFixture> {
+    let mut providers: Vec<_> = surface_config
+        .target_auth_provider
+        .iter()
+        .map(target_auth_provider_fixture)
+        .collect();
+    providers.extend(delegation_provider_fixture(surface_config));
+    providers
+}
+
+fn target_auth_provider_fixture(provider: &SurfaceTargetAuthProviderConfig) -> CredentialProviderFixture {
+    let now = chrono::Utc::now();
+    let client_credentials = provider.grant == TargetAuthProviderGrant::ClientCredentials;
+    CredentialProviderFixture {
+        id: TARGET_AUTH_PROVIDER_ID.to_string(),
+        name: TARGET_AUTH_PROVIDER_ID.to_string(),
+        provider_id: TARGET_AUTH_PROVIDER_ID.to_string(),
+        provider_type: if client_credentials {
+            "oauth2_client_credentials"
+        } else {
+            "oauth2_jwt_bearer"
+        }
+        .to_string(),
+        authorization_endpoint: None,
+        token_endpoint: Some(
+            provider
+                .token_endpoint
+                .clone()
+                .expect("the target credential provider's token endpoint must run before its fixture is written"),
+        ),
+        client_id_secret_ref: client_credentials.then(|| TARGET_AUTH_CLIENT_ID_SECRET.to_string()),
+        client_secret_secret_ref: client_credentials.then(|| TARGET_AUTH_CLIENT_SECRET_SECRET.to_string()),
+        default_scopes: vec![TARGET_AUTH_PROVIDER_SCOPE.to_string()],
+        callback_path: String::new(),
+        callback_url: None,
+        token_refresh_enabled: false,
+        api_key_secret_ref: None,
+        jwt_settings: (!client_credentials).then(|| {
+            serde_json::json!({
+                "jwt_issuer": TARGET_AUTH_JWT_ISSUER,
+                "jwt_signing_key_secret_ref": TARGET_AUTH_SIGNING_KEY_SECRET,
+                "jwt_key_id": "bdd-target-key-id",
+            })
+        }),
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+fn delegation_provider_fixture(surface_config: &SurfaceConfigBuilder) -> Vec<CredentialProviderFixture> {
     let Some(delegation) = &surface_config.credential_delegation else {
         return Vec::new();
     };
@@ -638,6 +710,7 @@ fn credential_provider_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<Cr
                     .map(|base| format!("{base}/v1/identity/oauth/callback/{provider_id}")),
                 token_refresh_enabled: true,
                 api_key_secret_ref: None,
+                jwt_settings: None,
                 created_at: now,
                 updated_at: now,
             }
@@ -656,6 +729,7 @@ fn credential_provider_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<Cr
             callback_url: None,
             token_refresh_enabled: false,
             api_key_secret_ref: Some(secret_id.clone()),
+            jwt_settings: None,
             created_at: now,
             updated_at: now,
         },
