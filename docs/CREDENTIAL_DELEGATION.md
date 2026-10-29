@@ -449,6 +449,36 @@ Storage exports leave the `delegated_grants`
 directory out. Grants stored before this release do not exist: they are made only through
 external consent.
 
+### Revoking grants at the vendor
+
+Removing a grant by binding revokes it at its authorization server first (RFC 7009,
+[`src/delegation_vault/revocation.rs`](../src/delegation_vault/revocation.rs)): its refresh
+token with `token_type_hint=refresh_token`, or its access token when it has none, at the
+provider's `revocation_endpoint`. The client authenticates as its `token_endpoint_auth_method`
+says: `client_id` in the form for `none`, the id and secret in the form for
+`client_secret_post`, HTTP Basic for `client_secret_basic`. The secret is resolved from the
+provider's own tenant, or an untenanted secret, and never another tenant's. The call goes
+through the pinned Strict egress client, `https` only, without redirects, with a 10-second
+timeout, and its response body is never read or logged.
+
+Revocation is best effort: whatever its outcome the grant is deleted, and a `token_revoked`
+delegation audit event records the grant's id and `detail` `vendor_revocation:<outcome>`, one
+of `revoked`, `refused` (the server answered another status), `unreachable` (no connection, or
+the egress policy refused the endpoint), `not_supported` (the provider names no revocation
+endpoint) or `client_unavailable` (the client's secret could not be resolved). A vendor that
+does not revoke keeps the token alive until it expires or the person removes the app at the
+vendor.
+
+### Deleting a provider
+
+`DELETE /api/v1/credential-providers/{id}` is refused with `409` and `code`
+`provider_in_use`, naming one `surface_id`, while any surface binds the provider, in its base
+or a variant, through `outbound_credentials` or a Transit Point's `transit_credentials`; a
+surface whose variants cannot be resolved counts as binding it. Remove the bindings first. A
+permitted delete of a provider with an `issuer` revokes and deletes every grant made with it
+first, and answers `503` without deleting the provider when the vault cannot list or delete
+them.
+
 ### Storage
 
 The vault uses **uncached** storage: tokens are read from disk on each lookup and are not
@@ -473,7 +503,8 @@ tokens; grants by binding need it. See
 
 Credential providers have their own management routes in
 [`src/credential_providers/router.rs`](../src/credential_providers/router.rs), gated on
-the `credential_providers.*` permissions.
+the `credential_providers.*` permissions. A provider a surface binds cannot be deleted
+([Deleting a provider](#deleting-a-provider)).
 
 In the dashboard these live on the Credentials page, under the **Credential Providers**,
 **Credential Tokens**, and **Credential Delegation Audit** tabs.

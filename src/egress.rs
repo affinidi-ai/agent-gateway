@@ -317,6 +317,35 @@ pub(crate) fn pinned_strict_client(
     pin_and_build(url, |ip| EgressPolicy::Strict.is_blocked_ip(ip), timeout)
 }
 
+/// Vet an authorization server endpoint for a call that carries a client's
+/// credentials or a user's token (revocation, token exchange, refresh): the
+/// Strict policy, `https` only, pinned to the vetted addresses, redirects
+/// refused.
+///
+/// `exact_allowlist` is the BDD allow-list ([`bdd_egress_allowlist`] on the
+/// production path), which alone can admit an `http` or loopback fixture, never
+/// cloud metadata.
+pub(crate) async fn pinned_authorization_server_client(
+    raw_url: &str,
+    timeout: Duration,
+    exact_allowlist: Option<&str>,
+) -> Result<Client, EgressError> {
+    let url = Url::parse(raw_url).map_err(|e| EgressError::Parse(e.to_string()))?;
+    if url.scheme() != "https" {
+        let allowlisted = match exact_allowlist {
+            Some(raw) => parse_egress_allowlist(raw)?
+                .iter()
+                .any(|entry| allowlist_entry_matches(entry, &url)),
+            None => false,
+        };
+        if !allowlisted {
+            return Err(EgressError::Blocked("an authorization server is reached over https only".into()));
+        }
+    }
+    let target = resolve_pin_blocking(raw_url.to_string(), EgressPolicy::Strict, exact_allowlist).await?;
+    pinned_client(&target, timeout)
+}
+
 /// Vet a stored backend with [`EgressPolicy::Configured`] and return a
 /// redirect-disabled client pinned to the exact address it resolved to.
 ///
@@ -780,6 +809,54 @@ mod tests {
         let lower = received.to_ascii_lowercase();
         assert!(!lower.contains("authorization"), "Authorization must be stripped cross-origin, got:\n{received}");
         assert!(!received.contains("secret-body"), "request body must be dropped cross-origin, got:\n{received}");
+    }
+
+    #[tokio::test]
+    async fn an_authorization_server_is_reached_over_https_on_public_addresses_only() {
+        for raw in [
+            "http://203.0.113.10/revoke",
+            "https://127.0.0.1/revoke",
+            "https://10.0.0.5/revoke",
+            "https://169.254.169.254/latest/meta-data/",
+            "not a url",
+        ] {
+            assert!(
+                pinned_authorization_server_client(raw, Duration::from_secs(1), None)
+                    .await
+                    .is_err(),
+                "{raw}"
+            );
+        }
+        assert!(
+            pinned_authorization_server_client("https://203.0.113.10/revoke", Duration::from_secs(1), None)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn only_the_allowlist_admits_an_http_or_loopback_authorization_server_fixture() {
+        let fixture = "http://127.0.0.1:9/revoke";
+        assert!(
+            pinned_authorization_server_client(fixture, Duration::from_secs(1), Some("http://127.0.0.1:9"))
+                .await
+                .is_ok()
+        );
+        assert!(
+            pinned_authorization_server_client(fixture, Duration::from_secs(1), Some("http://127.0.0.1:10"))
+                .await
+                .is_err()
+        );
+        assert!(
+            pinned_authorization_server_client(
+                "http://169.254.169.254/latest/",
+                Duration::from_secs(1),
+                Some("http://169.254.169.254")
+            )
+            .await
+            .is_err(),
+            "metadata is never allow-listed"
+        );
     }
 
     #[test]

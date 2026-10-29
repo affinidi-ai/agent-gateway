@@ -518,6 +518,12 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   (`egress::pinned_strict_client`): `https` only, internal addresses blocked,
   redirects refused, a 64 KiB body and a 10-second timeout per step. See
   [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#external-consent-providers).
+- A grant's **RFC 7009 revocation** (`src/delegation_vault/revocation.rs`) goes
+  through `egress::pinned_authorization_server_client`: the Strict policy, `https`
+  only, pinned, redirects refused, a 10-second timeout, and the response body is
+  never read. Under `AG_TEST_MODE=true`, `AG_BDD_EGRESS_ALLOWLIST` can admit an
+  exact `http` or loopback fixture, never cloud metadata. See
+  [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#revoking-grants-at-the-vendor).
 
 Both helpers share one `pin_and_build` body.
 

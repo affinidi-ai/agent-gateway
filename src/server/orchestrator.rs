@@ -3365,6 +3365,11 @@ pub async fn run_axum_proxy(
                     .clone(),
                 vault_rbac_guard.clone(),
                 Some(source_auth_middleware.provider_store()),
+                identity_state
+                    .agent_surface_store
+                    .clone()
+                    .map(|store| store as Arc<dyn crate::surfaces::AgentSurfaceStore>),
+                Some(dv_store.clone()),
             );
 
             let dv_state = crate::delegation_vault::handlers::DelegationVaultState {

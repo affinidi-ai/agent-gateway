@@ -143,6 +143,22 @@ pub trait DelegationVaultStorage: Send + Sync {
         anyhow::bail!("This vault does not keep grants by binding")
     }
 
+    /// Every grant made with one credential provider.
+    async fn provider_grants(
+        &self,
+        _credential_provider_id: &str,
+    ) -> Result<Vec<DelegatedGrant>> {
+        anyhow::bail!("This vault does not keep grants by binding")
+    }
+
+    /// Delete the grant with this record id, returning it if it existed.
+    async fn delete_grant(
+        &self,
+        _id: &str,
+    ) -> Result<Option<DelegatedGrant>> {
+        anyhow::bail!("This vault does not keep grants by binding")
+    }
+
     /// Record that a grant was used, when the vault is not busy.
     async fn mark_grant_used(
         &self,
@@ -763,6 +779,43 @@ impl DelegationVaultStorage for FileSystemDelegationVaultStore {
         .await
     }
 
+    async fn provider_grants(
+        &self,
+        credential_provider_id: &str,
+    ) -> Result<Vec<DelegatedGrant>> {
+        self.require_encryption()?;
+        Ok(self
+            .grants
+            .list_all()
+            .await?
+            .into_iter()
+            .filter(|grant| grant.credential_provider_id == credential_provider_id)
+            .filter(|grant| grant.id == grant.key().record_id())
+            .collect())
+    }
+
+    async fn delete_grant(
+        &self,
+        id: &str,
+    ) -> Result<Option<DelegatedGrant>> {
+        let id = id.to_string();
+        self.mutate(move |store| async move {
+            let Some(grant) = store.grants.get(&id).await? else {
+                return Ok(None);
+            };
+            let _access_change = crate::mcp::subscriptions::AccessChange::begin(
+                crate::mcp::subscriptions::AccessScope::owned_by(grant.tenant_id.as_deref()),
+            );
+            store
+                .grants
+                .delete(&id)
+                .await?;
+            info!(target: "credential_delegation", grant_id = %id, "Delegated grant deleted");
+            Ok(Some(grant))
+        })
+        .await
+    }
+
     async fn mark_grant_used(
         &self,
         id: &str,
@@ -1371,6 +1424,13 @@ mod tests {
                 .is::<EncryptionRequired>()
         );
         assert!(
+            vault
+                .provider_grants("provider")
+                .await
+                .unwrap_err()
+                .is::<EncryptionRequired>()
+        );
+        assert!(
             !directory
                 .path()
                 .join("delegated_grants")
@@ -1436,6 +1496,73 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+        assert!(
+            vault
+                .provider_grants("provider")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_providers_grants_are_listed_and_deleted_one_by_one() {
+        use crate::delegation_vault::grants::tests::{grant, key};
+        let directory = tempfile::tempdir().unwrap();
+        let vault = encrypted_vault(directory.path()).await;
+        let other_hop = GrantKey {
+            hop: "other-transit-point".into(),
+            ..key()
+        };
+        let other_provider = GrantKey {
+            credential_provider_id: "other-provider".into(),
+            ..key()
+        };
+        for key in [key(), other_hop.clone(), other_provider.clone()] {
+            vault
+                .store_grant(grant(&key, "access"))
+                .await
+                .unwrap();
+        }
+        let mut ids: Vec<String> = vault
+            .provider_grants("provider")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|grant| grant.id)
+            .collect();
+        ids.sort();
+        let mut expected = vec![key().record_id(), other_hop.record_id()];
+        expected.sort();
+        assert_eq!(ids, expected);
+
+        let deleted = vault
+            .delete_grant(&key().record_id())
+            .await
+            .unwrap()
+            .expect("the grant existed");
+        assert_eq!(deleted.access_token, "access");
+        assert!(
+            vault
+                .delete_grant(&key().record_id())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            vault
+                .grant(&key())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            vault
+                .grant(&other_provider)
+                .await
+                .unwrap()
+                .is_some()
         );
     }
 
