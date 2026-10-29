@@ -874,14 +874,22 @@ impl AgentSurface {
         &self,
         alias: Option<&str>,
     ) -> Result<ServedVariant, VariantResolveError> {
-        let variant = self.select_variant(alias)?;
-        Ok(ServedVariant {
+        Ok(self.serve_selected(self.select_variant(alias)?))
+    }
+
+    /// `variant`, as [`Self::select_variant`] chose it, and the surface it
+    /// resolves to.
+    pub fn serve_selected(
+        &self,
+        variant: Option<&SurfaceVariant>,
+    ) -> ServedVariant {
+        ServedVariant {
             id: variant.map(|variant| variant.id.clone()),
             recorded: variant
                 .map_or(SurfaceVariant::BASE, |variant| variant.alias.as_str())
                 .to_string(),
             surface: self.apply_variant(variant),
-        })
+        }
     }
 
     /// Validate the variant catalog on this surface:

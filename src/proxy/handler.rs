@@ -9480,18 +9480,11 @@ async fn multi_channel_proxy_handler_in_request_scope(
             // The URL's alias, else the default variant, else the base surface
             // (`variant_id` None) serves the request. A variant that can't be
             // resolved is refused, never served by the base or another variant.
-            let variant_id = match ch
+            let selected = match ch
                 .surface
                 .select_variant(virtual_channel_alias.as_deref())
             {
-                Ok(variant) => {
-                    let variant_id = variant.map(|v| v.id.clone());
-                    crate::observability::policy_audit::set_request_variant(
-                        ch.surface
-                            .surface_variant(variant_id.as_deref()),
-                    );
-                    variant_id
-                }
+                Ok(variant) => variant,
                 Err(error) => {
                     // The refusal may wait on the caller's body, so it must not
                     // hold the surface list a surface update writes to.
@@ -9502,47 +9495,33 @@ async fn multi_channel_proxy_handler_in_request_scope(
                         .await;
                 }
             };
+            let variant_id = selected.map(|variant| variant.id.clone());
 
             // Prefer the pre-resolved snapshot from
             // `MultiSurfaceProxyState.resolved_surface_cache`, which is
             // populated by `apply_surface_change` whenever a surface is
-            // saved. Falls back to serving the variant from the channel's
-            // surface when the cache has no entry for it.
-            let resolved_surface = {
-                let cache_lookup = ch
-                    .surface
-                    .config_id()
-                    .and_then(|sid| {
-                        state
-                            .resolved_surface_cache
-                            .resolve(sid, virtual_channel_alias.as_deref())
-                            .ok()
-                    });
-                if let Some(snap) = cache_lookup {
-                    snap
-                } else {
-                    match ch
+            // saved and keeps its last good entry when that fails. Falls back
+            // to serving the selected variant from the channel's surface when
+            // the cache has no entry for it. The variant recorded comes from
+            // the same place as the surface served.
+            let (resolved_surface, recorded_variant) = match ch
+                .surface
+                .config_id()
+                .and_then(|sid| {
+                    state
+                        .resolved_surface_cache
+                        .resolve(sid, virtual_channel_alias.as_deref())
+                        .ok()
+                }) {
+                Some(cached) => (cached.surface, cached.surface_variant),
+                None => {
+                    let served = ch
                         .surface
-                        .serve_variant(virtual_channel_alias.as_deref())
-                    {
-                        Ok(served) => Arc::new(served.surface),
-                        Err(_) => {
-                            error!(
-                                surface = %ch.surface.name,
-                                config_id = ?ch.surface.config_id(),
-                                requested_alias = ?virtual_channel_alias
-                                    .as_deref()
-                                    .map(crate::config::agent_surface_variants::SurfaceVariant::cut_alias),
-                                "❌ VARIANT RESOLVE FAILED on surface mirror"
-                            );
-                            return create_error_response(
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                "Failed to resolve virtual channel variant",
-                            );
-                        }
-                    }
+                        .serve_selected(selected);
+                    (Arc::new(served.surface), served.recorded)
                 }
             };
+            crate::observability::policy_audit::set_request_variant(&recorded_variant);
 
             // Select the correct engines. In base-mode (variant_id == None) we
             // use channel-level engines and resolve to the base surface.

@@ -29,6 +29,9 @@ pub struct SurfaceSnapshots {
     /// Snapshot used when no `$alias` is present in the request URL.
     /// Equal to the base surface when no variants are configured.
     pub default: Arc<AgentSurface>,
+    /// The `surface_variant` a request served by `default` records: the
+    /// default variant's alias, or `_base_`.
+    pub default_variant: String,
     /// Pre-resolved snapshots for each enabled variant alias.
     pub by_alias: HashMap<String, Arc<AgentSurface>>,
     /// Aliases of variants that exist on the surface but are
@@ -36,6 +39,14 @@ pub struct SurfaceSnapshots {
     /// alias — the pipeline must distinguish so it can return HTTP 503
     /// (intentionally switched off) rather than 404 (no such variant).
     pub disabled_aliases: HashSet<String>,
+}
+
+/// A snapshot [`ResolvedSurfaceCache::resolve`] found, with the
+/// `surface_variant` a request it serves records, both from the same entry.
+#[derive(Debug, Clone)]
+pub struct CachedVariant {
+    pub surface: Arc<AgentSurface>,
+    pub surface_variant: String,
 }
 
 /// Why a [`ResolvedSurfaceCache::resolve`] call failed.
@@ -147,7 +158,7 @@ impl ResolvedSurfaceCache {
         &self,
         surface_id: &str,
         alias: Option<&str>,
-    ) -> Result<Arc<AgentSurface>, ResolveError> {
+    ) -> Result<CachedVariant, ResolveError> {
         let entry = self
             .inner
             .get(surface_id)
@@ -155,10 +166,18 @@ impl ResolvedSurfaceCache {
         let snaps = entry.value().clone();
         drop(entry);
         match alias {
-            None => Ok(snaps.default.clone()),
+            None => Ok(CachedVariant {
+                surface: snaps.default.clone(),
+                surface_variant: snaps
+                    .default_variant
+                    .clone(),
+            }),
             Some(a) => {
                 if let Some(s) = snaps.by_alias.get(a) {
-                    Ok(s.clone())
+                    Ok(CachedVariant {
+                        surface: s.clone(),
+                        surface_variant: a.to_string(),
+                    })
                 } else if snaps
                     .disabled_aliases
                     .contains(a)
@@ -196,7 +215,9 @@ impl ResolvedSurfaceCache {
 }
 
 fn build_snapshots(surface: &AgentSurface) -> Result<SurfaceSnapshots, CacheUpsertError> {
-    let default = Arc::new(surface.resolve_variant(None)?);
+    let served = surface.serve_variant(None)?;
+    let default = Arc::new(served.surface);
+    let default_variant = served.recorded;
     let mut by_alias = HashMap::with_capacity(surface.variants.len());
     let mut disabled_aliases = HashSet::new();
     for v in &surface.variants {
@@ -209,6 +230,7 @@ fn build_snapshots(surface: &AgentSurface) -> Result<SurfaceSnapshots, CacheUpse
     }
     Ok(SurfaceSnapshots {
         default,
+        default_variant,
         by_alias,
         disabled_aliases,
     })
@@ -328,8 +350,9 @@ mod tests {
         let snap = cache
             .resolve("s1", None)
             .unwrap();
-        assert_eq!(snap.surface_id, "s1");
-        assert_eq!(snap.target.endpoint, "http://upstream.example/");
+        assert_eq!(snap.surface.surface_id, "s1");
+        assert_eq!(snap.surface.target.endpoint, "http://upstream.example/");
+        assert_eq!(snap.surface_variant, "_base_");
     }
 
     #[test]
@@ -345,7 +368,8 @@ mod tests {
         let snap = cache
             .resolve("s2", None)
             .unwrap();
-        assert_eq!(snap.target.endpoint, "http://beta/");
+        assert_eq!(snap.surface.target.endpoint, "http://beta/");
+        assert_eq!(snap.surface_variant, "beta");
     }
 
     #[test]
@@ -359,7 +383,8 @@ mod tests {
         let snap = cache
             .resolve("s3", Some("alpha"))
             .unwrap();
-        assert_eq!(snap.target.endpoint, "http://alpha/");
+        assert_eq!(snap.surface.target.endpoint, "http://alpha/");
+        assert_eq!(snap.surface_variant, "alpha");
     }
 
     #[test]
@@ -375,8 +400,8 @@ mod tests {
         assert_eq!(
             cache
                 .resolve("s4", Some("alpha"))
-                .unwrap_err(),
-            ResolveError::DisabledAlias("alpha".to_string())
+                .err(),
+            Some(ResolveError::DisabledAlias("alpha".to_string()))
         );
     }
 
@@ -391,8 +416,8 @@ mod tests {
         assert_eq!(
             cache
                 .resolve("s5", Some("gamma"))
-                .unwrap_err(),
-            ResolveError::UnknownAlias("gamma".to_string())
+                .err(),
+            Some(ResolveError::UnknownAlias("gamma".to_string()))
         );
     }
 
@@ -402,8 +427,8 @@ mod tests {
         assert_eq!(
             cache
                 .resolve("missing", None)
-                .unwrap_err(),
-            ResolveError::UnknownSurface("missing".to_string())
+                .err(),
+            Some(ResolveError::UnknownSurface("missing".to_string()))
         );
     }
 
@@ -443,7 +468,7 @@ mod tests {
         let snap = cache
             .resolve("s7", Some("alpha"))
             .unwrap();
-        assert_eq!(snap.target.endpoint, "http://alpha/");
+        assert_eq!(snap.surface.target.endpoint, "http://alpha/");
     }
 
     #[test]
@@ -469,7 +494,7 @@ mod tests {
         let snap = cache
             .resolve("s9", None)
             .unwrap();
-        assert_eq!(snap.target.endpoint, "http://v2/");
+        assert_eq!(snap.surface.target.endpoint, "http://v2/");
         assert_eq!(cache.len(), 1);
     }
 
