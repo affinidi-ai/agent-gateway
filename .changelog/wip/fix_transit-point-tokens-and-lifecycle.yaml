@@ -1,0 +1,38 @@
+branch: fix/transit-point-tokens-and-lifecycle
+changes:
+  added: []
+  changed:
+    - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Sign transit tokens with a random key kept in storage
+      description: >-
+        The gateway now signs transit tokens with a random 256-bit key it creates on its
+        first start and keeps beside its own keys under `[storage_paths] vc_keys`, readable
+        by the owner only, restricted to the owner again when a restore wrote it otherwise,
+        and encrypted when encryption at rest is on, so instances sharing storage agree.
+        Every token names the key in its `kid` header, and a token naming another key, or
+        none, is refused. A key file that cannot be read stops the gateway from starting
+        rather than being replaced, and a key directory on a filesystem without hard links
+        stops the first start with an error saying so.
+    - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Write the gateway's key files atomically with owner-only permissions
+      description: >-
+        The gateway's key files (DID keys, VC issuer keys and the transit token key) are now
+        written readable by their owner only and replaced atomically, including when
+        encryption at rest is turned on, so an instance starting beside another no longer
+        reads a partly written file and fails to start; an instance that finds a key file
+        migrated by another as it reads it reads the migrated file.
+  fixed: []
+  removed: []
+  security: []
+  breaking:
+    - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Refuse transit tokens issued before the upgrade or by an unshared instance
+      description: >-
+        Transit tokens issued before the upgrade are refused once, so a managed agent's
+        Transit Point calls fail until its next inbound request brings a new token, at
+        most five minutes later. Gateway instances that do not share `[storage_paths]
+        vc_keys` no longer accept each other's transit tokens; route a managed agent's
+        Transit Point calls to an instance sharing that directory with the one that served
+        its inbound request. During a rolling upgrade, instances on the old and new versions
+        refuse each other's tokens even when they share storage, so upgrade every instance
+        sharing storage together.

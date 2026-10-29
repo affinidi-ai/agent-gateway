@@ -233,6 +233,34 @@ match discover(issuer, EgressPosture::Strict, DiscoveryOptions::default()).await
 The module has no metrics, audit or storage coupling and no tenancy or strategy types in its
 signatures, so callers record outcomes themselves from `code()`.
 
+## Transit Point callers
+
+A Transit Point listener does not run an Access Point's source authentication. A call to a
+Transit Point is admitted by its transit token, required unless the Transit Point sets
+`require_transit_token: false`, and on an MCP Transit Point also by a resource access token
+when it sets `mcp_http.authorization` (see
+[`MCP_METADATA.md`](MCP_METADATA.md)).
+
+### Transit token
+
+When a surface has Transit Points, its Access Point adds an `X-Transit-Token` header to each
+request it forwards to the managed agent, and the agent sends it back on its Transit Point
+calls ([`transit_token.rs`](../src/proxy/transit_token.rs)). The token is an HS256 JWT:
+signed, not encrypted, so the agent can read every claim. It names the surface, the
+caller, a hash of the caller's authenticated identity, the Transit Points it opens and the
+trace, and expires 300 seconds after it is issued. The agent may send the same token on
+any number of calls to that surface's Transit Points until then. The header is never
+forwarded to a Transit Point's target.
+
+The signing key is 32 random bytes the gateway creates on its first start, in
+`transit_token_key.json` under `[storage_paths] vc_keys`, readable by the owner only and
+encrypted like the gateway's other keys when encryption at rest is on. A key file that
+cannot be read stops the gateway from starting. Every token names the key in its `kid`
+header, and a token that names another key, or none, is refused. Instances that share
+the storage directory share the key, so a Standby that takes over accepts the tokens the
+Active instance issued. To replace the key, stop every instance, delete the file, and start
+them again; every token issued before is refused.
+
 ## Managed identity
 
 A rule that derives the managed agent's DID. `ManagedIdentityConfig`

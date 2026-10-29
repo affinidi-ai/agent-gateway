@@ -6370,7 +6370,7 @@ mod tests {
             );
         }
         let transit_issuer = crate::proxy::transit_token::TransitTokenIssuer::new(
-            b"subscription-transit-fixture-signing-key",
+            crate::proxy::transit_token::TransitTokenKey::generate().unwrap(),
             "gateway".into(),
         );
         state.transit_token_issuer = Some(Arc::new(transit_issuer.clone()));
@@ -10318,15 +10318,15 @@ mod tests {
 
     #[tokio::test]
     async fn modern_transit_tokens_require_live_surface_bound_authority() {
-        use crate::proxy::transit_token::{TransitTokenClaims, TransitTokenIssuer};
+        use crate::proxy::transit_token::{TransitTokenClaims, TransitTokenIssuer, TransitTokenKey};
 
-        let signing_secret = b"modern-transit-fixture-signing-key";
+        let issuer = TransitTokenIssuer::new(TransitTokenKey::generate().unwrap(), "gateway".into());
         let now = crate::proxy::credential_delegation::modern::now_secs().unwrap();
         for case in ["valid", "other-surface", "expired", "future-issued", "other-point", "duplicate", "missing-issuer"]
         {
             let mut state = test_outbound_state();
             if case != "missing-issuer" {
-                state.transit_token_issuer = Some(Arc::new(TransitTokenIssuer::new(signing_secret, "gateway".into())));
+                state.transit_token_issuer = Some(Arc::new(issuer.clone()));
             }
             let mut ctx = modern_pipeline_context("tools/list");
             Arc::make_mut(&mut ctx.surface).surface_id = "current-surface".into();
@@ -10339,12 +10339,7 @@ mod tests {
                 "jti": uuid::Uuid::new_v4().to_string(),
                 "allowed_transit_points": [if case == "other-point" { "partner-b" } else { "partner-a" }]
             })).unwrap();
-            let token = jsonwebtoken::encode(
-                &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
-                &claims,
-                &jsonwebtoken::EncodingKey::from_secret(signing_secret),
-            )
-            .unwrap();
+            let token = issuer.sign(&claims).unwrap();
             ctx.original_headers
                 .insert("x-transit-token", token.parse().unwrap());
             if case == "duplicate" {
@@ -10383,7 +10378,7 @@ mod tests {
     async fn test_transit_token_validation_rejects_missing_header() {
         let mut state = test_outbound_state();
         let issuer = crate::proxy::transit_token::TransitTokenIssuer::new(
-            b"test-secret-key-32-bytes-long!!",
+            crate::proxy::transit_token::TransitTokenKey::generate().unwrap(),
             "gw-test".to_string(),
         );
         state.transit_token_issuer = Some(Arc::new(issuer));
@@ -10404,7 +10399,7 @@ mod tests {
     async fn test_transit_token_validation_rejects_invalid_token() {
         let mut state = test_outbound_state();
         let issuer = crate::proxy::transit_token::TransitTokenIssuer::new(
-            b"test-secret-key-32-bytes-long!!",
+            crate::proxy::transit_token::TransitTokenKey::generate().unwrap(),
             "gw-test".to_string(),
         );
         state.transit_token_issuer = Some(Arc::new(issuer));
@@ -10428,7 +10423,7 @@ mod tests {
     #[tokio::test]
     async fn test_transit_token_validation_accepts_valid_token() {
         let issuer = crate::proxy::transit_token::TransitTokenIssuer::new(
-            b"test-secret-key-32-bytes-long!!",
+            crate::proxy::transit_token::TransitTokenKey::generate().unwrap(),
             "gw-test".to_string(),
         );
 
@@ -10466,7 +10461,7 @@ mod tests {
     #[tokio::test]
     async fn test_transit_token_validation_rejects_wrong_transit_point() {
         let issuer = crate::proxy::transit_token::TransitTokenIssuer::new(
-            b"test-secret-key-32-bytes-long!!",
+            crate::proxy::transit_token::TransitTokenKey::generate().unwrap(),
             "gw-test".to_string(),
         );
 

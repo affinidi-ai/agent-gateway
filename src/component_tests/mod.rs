@@ -21,6 +21,7 @@ mod mcp_sandbox_e2e;
 mod mcp_subscription_scope;
 mod mtls;
 mod tr_naming_e2e;
+mod transit_token_e2e;
 mod trust_check_e2e;
 mod trust_check_store_migration;
 mod trust_recorder_status_e2e;

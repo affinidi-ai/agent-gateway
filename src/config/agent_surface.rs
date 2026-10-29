@@ -1137,7 +1137,8 @@ pub struct SharedTransitConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum TransitTokenMode {
-    /// Context encrypted into the token itself (stateless, larger token).
+    /// Context carried in the signed token itself, readable by the managed
+    /// agent (stateless, larger token).
     #[default]
     Embedded,
     /// Context stored server-side; token is a short reference key.

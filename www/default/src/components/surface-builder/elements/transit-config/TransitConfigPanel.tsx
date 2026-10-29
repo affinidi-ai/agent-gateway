@@ -60,7 +60,7 @@ const TransitConfigPanel: React.FC<ConfigPanelProps> = ({ config, updateField })
           value={config.transit_token_mode || 'embedded'}
           onChange={e => updateField('transit_token_mode', e.target.value)}
         >
-          <option value="embedded">Embedded (encrypted into token)</option>
+          <option value="embedded">Embedded (signed into token, readable by the agent)</option>
           <option value="reference">Reference (server-side store)</option>
         </Form.Select>
         <Form.Text className="text-muted" style={{ fontSize: '10px' }}>

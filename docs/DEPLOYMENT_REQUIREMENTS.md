@@ -82,7 +82,11 @@ inside that folder, except `backup_restore`. Put `backup_restore` on persistent,
 storage next to `_storage`, never inside it: a restore empties `_storage`. A full backup
 covers `_storage` except `logs/` and `system_metrics/`. Back up `config.toml`,
 `gateway.json`, the other configuration files and the TLS certificates separately. See
-[Locating the files](CONFIGURATION_REFERENCE.md#locating-the-files).
+[Locating the files](CONFIGURATION_REFERENCE.md#locating-the-files). The volume must
+support hard links where `[storage_paths] vc_keys` points: the gateway creates its transit
+token key there on its first start by linking a complete copy into place, and stops with an
+error saying so on a filesystem without them, such as an object-store mount. Local disks,
+EFS and NFS support them.
 
 Back up with full `.agbak` archives from the dashboard or the management API; see
 [Storage export and backup](development/DEVELOPMENT.md#storage-export-and-backup). Treat
