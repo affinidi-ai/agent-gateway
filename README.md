@@ -40,8 +40,8 @@ the calls agents make to model providers.
   checks, and delegated credential use, each policy decision tied to the exact policy
   version that made it. On Transit Point calls, policy decisions also travel inside a
   presentation signed by the gateway.
-- **Payment controls for metered services.** x402 and MPP settlement, so an agent can pay
-  for what it calls under limits you set.
+- **Payment controls for metered services.** A surface can charge for selected tools or
+  methods, with the x402 or MPP payment taken by a connected agent-pay gateway.
 
 [`docs/CAPABILITIES.md`](docs/CAPABILITIES.md) describes every capability in detail.
 
@@ -168,7 +168,7 @@ differ, repository documentation describes this source revision exactly.
 | MCP `2026-07-28` | Active on every MCP endpoint |
 | DIDComm v2.1 | Available for Fabric transport |
 | TRQP | Available for Trust Check |
-| x402 and MPP | Available when configured |
+| x402 and MPP | Delegated to a connected agent-pay gateway |
 | AP2 | Experimental and disabled by default |
 
 Use the hosted [protocol documentation](https://docs.affinidi.com/products/affinidi-trust-fabric/agent-gateway/concepts/protocols/)

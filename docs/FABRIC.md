@@ -140,7 +140,16 @@ recovery and its listener read that record by id, never a mediator found by DID.
 `DIDCommMessaging` service endpoint names a mediator other than the sender's own, the send is wrapped
 in a `routing/2.0/forward` addressed to the sender's mediator, which relays it. Otherwise it is sent
 directly. The route does not depend on the feature flag. Fabric stream frames and the x402
-facilitator always send directly.
+verify and settle messages always send directly. Delegated `agent_pay` payment
+requests are ordinary fabric forwards and are routed like any other send.
+
+The gateway is not an x402 facilitator for its peers. An incoming `x402/verify-request` is
+answered `{"valid": false, "error": "facilitator_disabled"}` and an `x402/settle-request`
+`{"settled": false, "error": "facilitator_disabled"}`; a deferred-settlement record
+(`action: "record"`) is dropped without a reply. Nothing is verified, settled or recorded,
+whatever `facilitator_mode.facilitator_via_fabric` says. Verify and settle responses to this
+gateway's own requests are still handled, and the settlement worker still drains x402
+payments already in its transaction store.
 
 ## Peer issuer DIDs
 
@@ -367,9 +376,10 @@ request received by the destination gateway:
 5. Build policy input containing the authenticated sending Gateway and any source-auth result. An
    identity presentation is attributed to the caller only when its issuer is one of the sending
    connection's issuers (see [Peer issuer DIDs](#peer-issuer-dids)).
-6. Run Gateway policy, payment verification, caller identity extraction, MCP per-tool policy, Trust
-   Check, surface policy, and MCP tool gating in that order where configured.
-7. Forward to the local surface Target.
+6. Run Gateway policy, caller identity extraction, MCP per-tool policy, Trust Check, surface
+   policy, and MCP tool gating in that order where configured.
+7. Take the payment of a chargeable request through agent-pay, last, once every refusal that does
+   not depend on payment has been made, then forward to the local surface Target.
 8. Apply response processing, including MCP tool-list filtering when configured, before packaging
    the DIDComm response.
 

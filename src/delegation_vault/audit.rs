@@ -199,19 +199,27 @@ pub enum PaymentStage {
     Verified,
     /// Payment verification failed (invalid or absent credential).
     Failed,
+    /// The delegated payment is held for human review.
+    Held,
+    /// Whether the delegated payment was taken is not known: the payment gateway
+    /// did not answer in time or its answer was unusable, and the caller was
+    /// told to retry the same request with the same credential.
+    Unconfirmed,
+    /// Funds are held until the Target delivers.
+    Authorized,
+    /// Held funds were released without a charge.
+    Voided,
     /// Funds settled on-chain / with the payment processor.
     Settled,
     /// Settlement failed after a successful verification.
     SettlementFailed,
 }
 
-/// Protocol-independent payment lifecycle event. Emitted at every stage of a
-/// payment (challenge → verify → settle) for **every** rail (x402, MPP, and
-/// future protocols), so the whole end-to-end payment interaction is captured in
-/// one audit trail — not only the delegated leg. When the payment was relayed to
-/// a remote gateway over the fabric (Model B delegation) `delegated` is true and
-/// the remote ids / status are populated; correlation with the remote gateway's
-/// own trail is via the shared top-level `trace_id`.
+/// Protocol-independent payment event. Emitted for every outcome of a payment
+/// delegated to agent-pay (challenge, paid, held for review, rejected,
+/// unavailable): `delegated` is true and the remote ids / status are populated;
+/// correlation with the agent-pay gateway's own trail is via the shared
+/// top-level `trace_id`. Legacy x402/MPP settlement records may still appear.
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct PaymentEventDetails {
     /// Which payment protocol produced the event.
@@ -248,6 +256,53 @@ pub struct PaymentEventDetails {
     /// HTTP-style status from the remote gateway's response, delegation only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_status: Option<u16>,
+    /// What agent-pay reported for a delegated payment, delegation only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<Box<DelegatedPaymentFacts>>,
+}
+
+/// The facts of one delegated payment, as recorded by the payment gate. Never
+/// carries the payment credential; the payer is a hash or a verified agent DID.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, serde::Deserialize)]
+pub struct DelegatedPaymentFacts {
+    /// MCP tool, A2A method or HTTP path the payment was for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<String>,
+    /// Variant alias of the caller's surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant: Option<String>,
+    /// DID of the agent-pay gateway that answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_did: Option<String>,
+    /// Oversight case of a held payment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub case_id: Option<String>,
+    /// Fingerprint of agent-pay's receipt credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vc_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    /// MPP receipt `reference`, or the x402 settlement transaction hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt_reference: Option<String>,
+    /// MPP receipt `challengeId`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub challenge_id: Option<String>,
+    /// x402 settlement network.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+    pub latency_ms: u64,
+    /// agent-pay's authorization of funds held until the Target delivers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_id: Option<String>,
+    /// The manifest price, when the receipt names a different amount; the
+    /// event's `amount` and `currency` are then the receipt's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quoted_amount: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quoted_currency: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub price_mismatch: bool,
 }
 
 /// The surface, gateway or appliance-wide set a policy is attached to.
@@ -457,11 +512,9 @@ pub enum DelegationAuditAction {
         /// `transit_point` | `fabric`.
         flow: String,
     },
-    /// Protocol-independent payment lifecycle event (x402, MPP, …). Covers the
-    /// whole challenge → verify → settle flow for both locally-enforced payments
-    /// and payments delegated to a remote gateway over the fabric (in which case
-    /// `delegated` is true and the remote ids / status are populated). Boxed to
-    /// keep the enum small.
+    /// Protocol-independent payment event: an agent-pay delegated payment
+    /// outcome (challenge, paid, held for review, rejected, unavailable), or a
+    /// legacy x402/MPP settlement record. Boxed to keep the enum small.
     PaymentEvent(Box<PaymentEventDetails>),
     /// Source authentication failed. `blocking` is false when the failure was
     /// handed to policy instead of refusing the request.
@@ -1474,6 +1527,29 @@ pub async fn read_audit_log(
     })
 }
 
+/// The `payment` records in VP Audit Log `content`, newest first.
+fn payment_events_in(content: &str) -> Vec<DelegationAuditEvent> {
+    content
+        .lines()
+        .rev()
+        .filter(|line| line.contains("\"payment_event\""))
+        .filter_map(|line| serde_json::from_str::<DelegationAuditEvent>(line.trim()).ok())
+        .filter(|event| matches!(event.event, DelegationAuditAction::PaymentEvent(_)))
+        .collect()
+}
+
+/// The `payment` records the VP Audit Log keeps, newest first. Empty before the
+/// audit pipeline is set up or while the log does not exist.
+pub async fn read_payment_events() -> Vec<DelegationAuditEvent> {
+    let Some(path) = AUDIT_PATH.get() else {
+        return Vec::new();
+    };
+    let content = tokio::fs::read_to_string(path)
+        .await
+        .unwrap_or_default();
+    payment_events_in(&content)
+}
+
 /// Emit a policy-decision audit record (`decision` is `allow`, `deny` or
 /// `error`) when a sink selects `policy_decision`. Called from
 /// [`crate::observability::policy_audit::record_policy_decision`].
@@ -1855,6 +1931,58 @@ mod tests {
     }
 
     #[test]
+    fn only_payment_records_are_read_from_the_log_newest_first() {
+        let payment = |id: &str| {
+            let mut event = audit_event(
+                DelegationAuditAction::PaymentEvent(Box::new(PaymentEventDetails {
+                    rail: PaymentRail::X402,
+                    stage: PaymentStage::Failed,
+                    transaction_id: id.to_string(),
+                    amount: None,
+                    currency: None,
+                    method: None,
+                    payer: None,
+                    error: Some("payment_event mentioned".to_string()),
+                    delegated: true,
+                    payment_gateway_id: None,
+                    payment_surface_id: None,
+                    remote_status: None,
+                    delegation: None,
+                })),
+                None,
+                None,
+                None,
+                Some("s-1"),
+            );
+            event.trace_id = Some(format!("trace-{id}"));
+            serde_json::to_string(&event).unwrap()
+        };
+        let mut other = audit_event(DelegationAuditAction::VpInjected, None, None, None, Some("s-1"));
+        other.detail = Some("\"payment_event\" in a detail".to_string());
+        let content = [
+            payment("old"),
+            serde_json::to_string(&other).unwrap(),
+            "not json \"payment_event\"".to_string(),
+            payment("new"),
+        ]
+        .join("\n");
+
+        let events = payment_events_in(&content);
+
+        let traces: Vec<_> = events
+            .iter()
+            .map(|event| {
+                event
+                    .trace_id
+                    .as_deref()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(traces, vec!["trace-new", "trace-old"]);
+        assert!(payment_events_in("").is_empty());
+    }
+
+    #[test]
     fn test_payment_event_category_and_serialization() {
         // A locally-enforced MPP verification: delegation fields omitted.
         let local = DelegationAuditAction::PaymentEvent(Box::new(PaymentEventDetails {
@@ -1870,6 +1998,7 @@ mod tests {
             payment_gateway_id: None,
             payment_surface_id: None,
             remote_status: None,
+            delegation: None,
         }));
         assert_eq!(action_category(&local), "payment");
         assert!(!local.is_vp_audit());
@@ -1909,6 +2038,7 @@ mod tests {
             payment_gateway_id: Some("gw-pay".to_string()),
             payment_surface_id: Some("surface-1".to_string()),
             remote_status: Some(402),
+            delegation: None,
         }));
         let json = serde_json::to_value(&delegated).unwrap();
         assert_eq!(json["payment_event"]["rail"], "x402");

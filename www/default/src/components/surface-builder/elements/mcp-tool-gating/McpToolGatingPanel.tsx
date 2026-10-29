@@ -9,9 +9,9 @@ interface Gate {
 }
 
 /**
- * Compact sidebar panel for the MCP Tool Gating element. Mirrors the Payment
- * element: it shows a high-level summary of the configured gates and defers
- * the full editor to a fullscreen view via "Configure Tool Gate".
+ * Compact sidebar panel for the MCP Tool Gating element. It shows a summary of
+ * the configured gates and defers the full editor to a fullscreen view via
+ * "Configure Tool Gate".
  */
 const McpToolGatingPanel: React.FC<ConfigPanelProps> = ({
   config,

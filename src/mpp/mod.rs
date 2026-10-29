@@ -17,13 +17,19 @@
 //! 5. Server returns resource with 200 and Payment-Receipt header
 
 pub mod admin_api;
+// Nothing calls MPP auto-pay: a stored `mpp_auto_pay` is ignored.
+#[allow(dead_code)]
 pub mod auto_pay;
 pub mod challenge;
 pub mod errors;
 pub mod middleware;
 pub mod nonce_guard;
 pub mod onchain;
+// Only the payment gate calls `parse_www_authenticate_headers`; the signing helpers serve MPP auto-pay.
+#[allow(dead_code)]
 pub mod payment_challenge;
+// A local MPP policy cannot be saved, so nothing runs the save-time posture check.
+#[allow(dead_code)]
 pub mod posture;
 pub mod secrets;
 pub mod stripe;

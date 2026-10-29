@@ -84,6 +84,8 @@ impl WalletBinding {
     /// Get the private key value
     /// If the private_key starts with $SECRET:, load from secrets store
     /// Otherwise, return the literal value
+    // Only MPP auto-pay reads wallet keys, and nothing calls auto-pay.
+    #[allow(dead_code)]
     pub async fn get_private_key_value(
         &self,
         secrets_store: &dyn crate::secrets::SecretsStore,

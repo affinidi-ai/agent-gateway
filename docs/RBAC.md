@@ -88,6 +88,23 @@ both routers deny every request instead of serving unauthenticated. The built-in
 `payments.view` and `payments.retry` to `poweruser` and `payments.edit` / `payments.delete` to
 `administrator`; the base `user` role holds no payments permission.
 
+The delegated payment ledger routes `GET /api/admin/payments`, `GET /api/admin/payments/{id}`,
+`GET /api/admin/payments/summary`, `GET /api/admin/payments/breakers/{payment_gateway_id}` and
+`GET /api/admin/payments/audit` (the `payment` records of the VP Audit Log, without their signed
+credential) also require `payments.view`, and deny every request when no auth backend is configured. A
+tenant-scoped caller sees only the rows of its own tenant's surfaces: a row recorded for an
+operator's surface or another tenant's is left out of the list, its `{id}` returns `404`, and
+no case status is asked for it, because a row names the resource, the transaction and the case
+of someone else's payer. An operator caller, with no tenant, sees every row. A resource-scoped
+token sees only the rows of the surfaces its scope allows. The summary counts only those rows; a
+tenant caller or scoped token reads a breaker only for a payment gateway one of them names, and
+an audit record only for a surface one of them belongs to (records of other surfaces are for
+operator callers). Each row records one payment gate call and is kept for
+`payment_ledger.retention_days` (seven by default) in `payments_ledger/`, beside the MPP transaction store (`_storage/payments_ledger/` by
+default), as append-only hourly segment files; the list serves the newest 50,000 rows. The detail
+of a held payment adds the live `case_status` agent-pay reports for its case, for a caller who
+may read the row. See [Taking the payment](CONFIGURATION_REFERENCE.md#taking-the-payment).
+
 ## Integrations
 
 Every route under `/v1/integrations` needs one of `integrations.view` (lists, reads and the

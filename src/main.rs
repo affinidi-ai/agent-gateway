@@ -55,6 +55,7 @@ mod messages;
 mod mpp; // MPP (Machine Payments Protocol) — IETF draft-httpauth-payment-00
 mod observability;
 mod payment_credentials; // Payment dispute-evidence Verifiable Credentials
+mod payments_ledger; // Append-only ledger of delegated payment gate calls
 mod policies;
 mod protocols; // Protocol-agnostic utilities (multi-protocol support)
 mod proxy;
@@ -609,6 +610,7 @@ async fn async_main() -> Result<()> {
             Ok(())
         }
     };
+    payments_ledger::flush_global().await;
 
     if let Some(store) = observability::global_system_metrics_store()
         && tokio::time::timeout(SHUTDOWN_STEP_TIMEOUT, store.flush())

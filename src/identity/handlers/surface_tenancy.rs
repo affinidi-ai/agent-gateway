@@ -63,7 +63,7 @@ pub(crate) fn collect_surface_reference_keys(
     Ok(references)
 }
 
-fn resolved_views(surface: &AgentSurface) -> Result<Vec<AgentSurface>, SurfaceApiError> {
+pub(crate) fn resolved_views(surface: &AgentSurface) -> Result<Vec<AgentSurface>, SurfaceApiError> {
     let mut views = vec![surface.clone()];
     for variant in &surface.variants {
         let mut resolvable = surface.clone();
@@ -502,6 +502,9 @@ fn collect_effective_surface_references(
     }
     if let Some(id) = endpoint_id(&surface.target.endpoint, "fabric://") {
         push_reference(references, ResourceKind::Gateways, id);
+    }
+    if let Some(policy) = surface.agent_pay_policy() {
+        push_reference(references, ResourceKind::Gateways, &policy.payment_gateway_id);
     }
 }
 

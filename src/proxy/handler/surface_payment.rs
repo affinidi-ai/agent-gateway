@@ -7,224 +7,32 @@ use bytes::Bytes;
 use crate::state::ProxyState;
 use crate::surface_context::{McpContext, PaymentContext};
 
-pub(super) enum DelegatedPayment {
-    Proceed(std::collections::HashMap<String, Vec<String>>),
-    Challenge(Response),
-    Denied(Response),
-}
-
-fn modern_delegation_decision(
-    decision: crate::x402::PaymentDelegationDecision,
-    request: &crate::mcp::request_validation::ValidatedModernMessage,
-) -> crate::x402::PaymentDelegationDecision {
-    use crate::mcp::errors::application_error_codes;
-    use crate::x402::PaymentDelegationDecision;
-
-    let PaymentDelegationDecision::Challenge { status, mut headers, mut body } = decision else {
-        return decision;
-    };
-    headers.retain(|name, _| !name.eq_ignore_ascii_case("cache-control"));
-    headers.insert("cache-control".into(), vec!["no-store".into()]);
-    if let Ok(envelope) = serde_json::from_slice::<serde_json::Value>(&body)
-        && envelope
-            .get("jsonrpc")
-            .and_then(serde_json::Value::as_str)
-            == Some("2.0")
-        && let Some(code) = envelope
-            .get("error")
-            .and_then(|error| error.get("code"))
-            .and_then(serde_json::Value::as_i64)
-        && matches!(code, -32042 | -32043)
-    {
-        let (code, message) = if code == -32042 {
-            (application_error_codes::PAYMENT_REQUIRED, "Payment required")
-        } else {
-            (application_error_codes::PAYMENT_REJECTED, "Payment rejected")
-        };
-        let error = crate::mcp::errors::create_mcp_error_envelope(
-            request.id.clone(),
-            code,
-            message,
-            envelope
-                .get("error")
-                .and_then(|error| error.get("data"))
-                .cloned(),
-        );
-        let Ok(encoded) = serde_json::to_vec(&error) else {
-            return PaymentDelegationDecision::deny(502, "Invalid delegated payment challenge");
-        };
-        body = encoded;
-        headers.retain(|name, _| !name.eq_ignore_ascii_case("content-type"));
-        headers.insert("content-type".into(), vec!["application/json".into()]);
-    }
-    PaymentDelegationDecision::Challenge { status, headers, body }
-}
-
-fn delegation_headers(
+/// `503 {"error":"payment_unavailable"}` for a surface whose payment policy is
+/// an enabled local x402 or MPP policy, which is no longer supported. Such a
+/// surface refuses every request, over HTTP and over the fabric, until its
+/// policy is pointed at an agent-pay surface.
+pub(crate) fn legacy_payment_unavailable(
     surface: &crate::config::agent_surface::AgentSurface,
-    headers: &HeaderMap,
-) -> std::collections::HashMap<String, String> {
-    let source_credential = surface
-        .source_auth()
-        .and_then(|auth| auth.credential_header_name());
-    let resource_authorization = surface
-        .mcp_http
-        .as_ref()
-        .is_some_and(|http| http.authorization.is_some());
-    headers
-        .iter()
-        .filter_map(|(name, value)| {
-            if source_credential.is_some_and(|credential| {
-                name.as_str()
-                    .eq_ignore_ascii_case(credential)
-            }) || resource_authorization && name == axum::http::header::AUTHORIZATION
-            {
-                return None;
-            }
-            value
-                .to_str()
-                .ok()
-                .map(|value| (name.as_str().to_uppercase(), value.to_string()))
-        })
-        .collect()
-}
+    via_fabric: bool,
+) -> Option<Response> {
+    use axum::response::IntoResponse;
 
-pub(super) async fn delegate(
-    state: &ProxyState,
-    headers: &HeaderMap,
-    body: Bytes,
-    method: &axum::http::Method,
-    uri: &axum::http::Uri,
-    trace_id: &str,
-    channel_name: &str,
-    modern_request: Option<&crate::mcp::request_validation::ValidatedModernMessage>,
-) -> DelegatedPayment {
-    use crate::x402::PaymentDelegationDecision;
-    use axum::http::StatusCode;
-
-    let Some(config) = state
-        .surface
-        .x402_config()
-        .filter(|config| config.enabled && config.provider == crate::config::types::X402Provider::AgentPay)
-    else {
-        return DelegatedPayment::Proceed(std::collections::HashMap::new());
-    };
-    let id = &state.surface.surface_id;
-    let target = match crate::x402::delegation_target(config) {
-        Ok(target) => target,
-        Err(reason) => {
-            super::audit_payment_delegation(
-                id,
-                channel_name,
-                trace_id,
-                super::map_delegated_rail(&config.delegated_rail),
-                config
-                    .payment_gateway_id
-                    .as_deref()
-                    .unwrap_or_default(),
-                config
-                    .payment_surface_id
-                    .as_deref()
-                    .unwrap_or_default(),
-                "misconfigured",
-                502,
-                Some(&reason),
-            )
-            .await;
-            return DelegatedPayment::Denied(crate::a2a::create_error_response(StatusCode::BAD_GATEWAY, &reason));
-        }
-    };
-    let forwarded_headers = delegation_headers(&state.surface, headers);
-    let timeout = state
-        .surface
-        .timeout()
-        .map(|timeout| timeout.request_secs)
-        .unwrap_or(
-            state
-                .config
-                .a2a
-                .message_expires_seconds,
-        );
-    let decision = match crate::proxy::fabric_forward::forward_via_fabric(
-        &state.listener_manager,
-        crate::proxy::fabric_forward::FabricForwardRequest {
-            fabric_target: &target,
-            method,
-            path: uri
-                .path_and_query()
-                .map(|path| path.as_str())
-                .unwrap_or("/"),
-            headers: forwarded_headers,
-            body,
-            timeout: std::time::Duration::from_secs(timeout.max(1)),
-            trace_id,
-            log_label: channel_name,
-        },
-    )
-    .await
-    {
-        Ok(response) => crate::x402::map_delegation_response(response.status, response.headers, response.body),
-        Err(error) => {
-            let status = if matches!(error, crate::proxy::fabric_forward::FabricForwardError::NoResponse(_)) {
-                504
-            } else {
-                502
-            };
-            PaymentDelegationDecision::deny(status, format!("payment delegation to {target} failed: {error}"))
-        }
-    };
-    let decision = match modern_request {
-        Some(request) => modern_delegation_decision(decision, request),
-        None => decision,
-    };
-    let (outcome, status, reason) = match &decision {
-        PaymentDelegationDecision::Proceed { .. } => ("proceed", 200, None),
-        PaymentDelegationDecision::Challenge { status, .. } => ("challenge", *status, None),
-        PaymentDelegationDecision::Deny { status, message } => ("deny", *status, Some(message.as_str())),
-    };
-    super::audit_payment_delegation(
-        id,
-        channel_name,
-        trace_id,
-        super::map_delegated_rail(&config.delegated_rail),
-        config
-            .payment_gateway_id
-            .as_deref()
-            .unwrap_or_default(),
-        config
-            .payment_surface_id
-            .as_deref()
-            .unwrap_or_default(),
-        outcome,
-        status,
-        reason,
-    )
-    .await;
-    match decision {
-        PaymentDelegationDecision::Proceed { receipt_headers } => DelegatedPayment::Proceed(receipt_headers),
-        PaymentDelegationDecision::Challenge { status, headers, body } => {
-            let mut response =
-                Response::builder().status(StatusCode::from_u16(status).unwrap_or(StatusCode::PAYMENT_REQUIRED));
-            for (name, values) in headers {
-                for value in values {
-                    response = response.header(&name, value);
-                }
-            }
-            DelegatedPayment::Challenge(
-                response
-                    .body(axum::body::Body::from(body))
-                    .unwrap_or_else(|_| {
-                        crate::a2a::create_error_response(StatusCode::BAD_GATEWAY, "Failed to relay payment challenge")
-                    }),
-            )
-        }
-        PaymentDelegationDecision::Deny { status, message } => {
-            DelegatedPayment::Denied(crate::a2a::create_error_response(
-                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
-                &message,
-            ))
-        }
+    if !surface.payment_policy_unsupported() {
+        return None;
     }
+    super::agent_pay_gate::record_legacy_refusal(surface, via_fabric);
+    tracing::warn!(
+        surface = %surface.name,
+        surface_id = %surface.surface_id,
+        "Refusing request: the surface uses local x402/MPP payment, which is no longer supported"
+    );
+    Some(
+        (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({ "error": "payment_unavailable" })),
+        )
+            .into_response(),
+    )
 }
 
 pub(crate) struct SurfacePayment {
@@ -239,32 +47,30 @@ impl SurfacePayment {
         &self,
         x402_headers: &crate::config::types::X402Headers,
     ) -> Result<Option<(axum::http::HeaderName, axum::http::HeaderValue)>, axum::http::Error> {
-        let receipt = self
-            .mpp_receipt
-            .as_deref()
-            .map(|receipt| ("payment-receipt", receipt))
-            .or_else(|| {
-                self.context
-                    .as_ref()
-                    .and_then(|context| {
-                        context
-                            .response_header
-                            .as_deref()
-                    })
-                    .map(|receipt| {
-                        (
-                            x402_headers
-                                .payment_response
-                                .as_str(),
-                            receipt,
-                        )
-                    })
-            });
-        receipt
-            .map(|(name, value)| {
-                Ok((axum::http::HeaderName::from_bytes(name.as_bytes())?, axum::http::HeaderValue::from_str(value)?))
+        receipt_header(self.context.as_ref(), self.mpp_receipt.as_deref(), x402_headers)
+    }
+
+    /// Continuation evidence for a payment consumed by this request.
+    pub(crate) fn continuation_evidence(
+        &self
+    ) -> Option<impl FnOnce(u64, u64) -> crate::mcp::continuations::protected::ContinuationPayment + '_> {
+        use crate::mcp::continuations::protected::ContinuationPayment;
+
+        self.consumed
+            .then_some(move |verified_at, expires_at| match &self.context {
+                Some(context) => ContinuationPayment::X402 {
+                    receipt: context
+                        .response_header
+                        .clone(),
+                    verified_at,
+                    expires_at,
+                },
+                None => ContinuationPayment::Mpp {
+                    receipt: self.mpp_receipt.clone(),
+                    verified_at,
+                    expires_at,
+                },
             })
-            .transpose()
     }
 
     pub(crate) fn strip_consumed_mcp_argument(&mut self) -> Result<(), serde_json::Error> {
@@ -301,6 +107,37 @@ impl SurfacePayment {
             headers.remove(axum::http::header::AUTHORIZATION);
         }
     }
+}
+
+/// The receipt header of a locally verified payment: MPP's `Payment-Receipt`,
+/// or the configured x402 response header.
+pub(crate) fn receipt_header(
+    context: Option<&PaymentContext>,
+    mpp_receipt: Option<&str>,
+    x402_headers: &crate::config::types::X402Headers,
+) -> Result<Option<(axum::http::HeaderName, axum::http::HeaderValue)>, axum::http::Error> {
+    mpp_receipt
+        .map(|receipt| ("payment-receipt", receipt))
+        .or_else(|| {
+            context
+                .and_then(|context| {
+                    context
+                        .response_header
+                        .as_deref()
+                })
+                .map(|receipt| {
+                    (
+                        x402_headers
+                            .payment_response
+                            .as_str(),
+                        receipt,
+                    )
+                })
+        })
+        .map(|(name, value)| {
+            Ok((axum::http::HeaderName::from_bytes(name.as_bytes())?, axum::http::HeaderValue::from_str(value)?))
+        })
+        .transpose()
 }
 
 pub(crate) struct LocalPayment<'surface> {
@@ -362,18 +199,14 @@ pub(super) fn is_unpaid(
     state: &ProxyState,
     headers: &HeaderMap,
     body: &[u8],
+    payment: Option<&super::agent_pay_gate::Intake>,
 ) -> bool {
-    LocalPayment::inspect(
-        &state.surface,
-        headers,
-        body,
-        None,
-        &state
-            .config
-            .x402_headers
-            .payment_signature,
-    )
-    .unpaid()
+    let signature_header = &state
+        .config
+        .x402_headers
+        .payment_signature;
+    LocalPayment::inspect(&state.surface, headers, body, None, signature_header).unpaid()
+        || payment.is_some_and(super::agent_pay_gate::Intake::is_unpaid)
 }
 
 pub(crate) fn request_without_local_payment(
@@ -408,10 +241,15 @@ pub(crate) fn request_without_local_payment(
     if let Some(field) = field {
         remove_payment_argument(normalized.params.as_mut(), field);
     }
+    if let Some(policy) = surface.agent_pay_policy()
+        && super::agent_pay_gate::is_chargeable(policy, &protocol, &[], Some(&context))
+    {
+        super::agent_pay_gate::remove_mcp_credentials(normalized.params.as_mut());
+    }
     normalized
 }
 
-fn remove_payment_argument(
+pub(super) fn remove_payment_argument(
     params: Option<&mut serde_json::Value>,
     field: &str,
 ) -> bool {
@@ -425,9 +263,8 @@ fn remove_payment_argument(
     let removed = arguments
         .remove(field)
         .is_some();
-    if arguments.is_empty() {
+    if removed && arguments.is_empty() {
         params.remove("arguments");
-        return true;
     }
     removed
 }
@@ -611,12 +448,20 @@ pub(crate) async fn process_local(
         match evidence {
             ContinuationPayment::X402 { receipt, .. } if x402.is_some() => {
                 payment.context = Some(PaymentContext {
-                    verified: true,
+                    required: true,
                     response_header: receipt.clone(),
+                    ..Default::default()
                 });
             }
             ContinuationPayment::Mpp { receipt, .. } if mpp.is_some() => {
                 payment.mpp_receipt = receipt.clone();
+            }
+            ContinuationPayment::AgentPay { .. }
+                if surface
+                    .agent_pay_policy()
+                    .is_some() =>
+            {
+                return Ok(payment);
             }
             _ => return Err(SurfacePaymentError::ContinuationMismatch),
         }
@@ -649,8 +494,9 @@ pub(crate) async fn process_local(
         payment.body = modified.into();
         payment.consumed = true;
         payment.context = Some(PaymentContext {
-            verified: true,
+            required: true,
             response_header,
+            ..Default::default()
         });
         return Ok(payment);
     }
@@ -685,103 +531,41 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    #[test]
-    fn modern_delegated_challenges_replace_only_retired_payment_codes() {
-        use crate::x402::PaymentDelegationDecision;
+    fn surface_with(policy: serde_json::Value) -> crate::config::agent_surface::AgentSurface {
+        let mut surface = crate::config::agent_surface::AgentSurface::default();
+        surface.target.payment_policy = Some(serde_json::from_value(policy).unwrap());
+        surface
+    }
 
-        let request = crate::mcp::request_validation::ValidatedModernMessage {
-            protocol_version: crate::mcp::MCP_MODERN_VERSION.into(),
-            client_capabilities: None,
-            client_info: None,
-            method: "tools/call".into(),
-            params: Some(json!({"name": "charge"})),
-            id: Some(json!("caller-request")),
-            kind: crate::mcp::request_validation::McpMessageKind::Request,
-        };
-        for (legacy_code, expected_code) in [(-32042, 1001), (-32043, 1002), (7001, 7001)] {
-            let body = serde_json::to_vec(&json!({"jsonrpc": "2.0", "id": "delegate-request", "error": {
-                "code": legacy_code, "message": "Provider message", "data": {"challenges": [], "retry": true}
-            }}))
-            .unwrap();
-            let decision = crate::x402::map_delegation_response(
-                402,
-                std::collections::HashMap::from([
-                    ("WWW-Authenticate".into(), vec!["Payment id=one".into(), "Payment id=two".into()]),
-                    ("Cache-Control".into(), vec!["public".into()]),
-                ]),
-                body.clone(),
+    #[tokio::test]
+    async fn a_local_payment_surface_answers_503_payment_unavailable() {
+        for policy in [json!({"type": "x402"}), json!({"type": "mpp", "realm": "api", "secret_key": "$MPP_SECRET"})] {
+            let response =
+                legacy_payment_unavailable(&surface_with(policy), false).expect("legacy policy must fail closed");
+            assert_eq!(response.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                json!({"error": "payment_unavailable"})
             );
-            let PaymentDelegationDecision::Challenge { status, headers, body: mapped } =
-                modern_delegation_decision(decision, &request)
-            else {
-                panic!("expected challenge")
-            };
-            assert_eq!(status, 402);
-            assert_eq!(headers["WWW-Authenticate"], vec!["Payment id=one", "Payment id=two"]);
-            assert_eq!(headers["cache-control"], vec!["no-store"]);
-            assert!(!headers.contains_key("Cache-Control"));
-            let envelope: serde_json::Value = serde_json::from_slice(&mapped).unwrap();
-            assert_eq!(envelope["error"]["code"], expected_code);
-            assert_eq!(envelope["error"]["data"], json!({"challenges": [], "retry": true}));
-            if legacy_code == 7001 {
-                assert_eq!(mapped, body);
-            } else {
-                assert_eq!(envelope["id"], "caller-request");
-                assert!(
-                    envelope
-                        .get("result")
-                        .is_none()
-                );
-                assert_eq!(headers["content-type"], vec!["application/json"]);
-            }
         }
-        let denied = PaymentDelegationDecision::deny(502, "failed");
-        assert_eq!(modern_delegation_decision(denied.clone(), &request), denied);
     }
 
     #[test]
-    fn delegated_payment_strips_resource_bearers_without_dropping_payment_headers() {
-        let mut surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
-            "surface_id": "paid", "name": "Paid", "access_point": {
-                "listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"
-            }, "target": {"endpoint": "https://target.example/mcp"},
-            "mcp_http": {"authorization": {"resource": "https://gateway.example/mcp", "scopes": ["read"]}}
-        }))
-        .unwrap();
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "authorization",
-            "Bearer ingress-resource-token"
-                .parse()
-                .unwrap(),
+    fn agent_pay_disabled_and_free_surfaces_are_not_refused() {
+        assert!(
+            legacy_payment_unavailable(
+                &surface_with(
+                    json!({"type": "agent_pay", "payment_gateway_id": "gw-1", "payment_surface_id": "pay-1"})
+                ),
+                false,
+            )
+            .is_none()
         );
-        headers.insert(
-            "payment-signature",
-            "payment-proof"
-                .parse()
-                .unwrap(),
-        );
-        let delegated = delegation_headers(&surface, &headers);
-        assert!(!delegated.contains_key("AUTHORIZATION"));
-        assert_eq!(
-            delegated
-                .get("PAYMENT-SIGNATURE")
-                .map(String::as_str),
-            Some("payment-proof")
-        );
-        surface.mcp_http = None;
-        headers.insert(
-            "authorization",
-            "Payment legacy-credential"
-                .parse()
-                .unwrap(),
-        );
-        assert_eq!(
-            delegation_headers(&surface, &headers)
-                .get("AUTHORIZATION")
-                .map(String::as_str),
-            Some("Payment legacy-credential")
-        );
+        assert!(legacy_payment_unavailable(&surface_with(json!({"type": "x402", "enabled": false})), false).is_none());
+        assert!(legacy_payment_unavailable(&crate::config::agent_surface::AgentSurface::default(), false).is_none());
     }
 
     #[tokio::test]
@@ -1018,12 +802,24 @@ mod tests {
         );
         for policy in [
             json!({"type": "x402", "enabled": false, "mcp_payment_triggers": {"mode": "all"}}),
-            json!({"type": "x402", "provider": "agent_pay", "mcp_payment_triggers": {"mode": "all"}}),
             json!({"type": "x402", "mcp_payment_triggers": {"mode": "match", "patterns": ["^other$"]}}),
+            json!({"type": "agent_pay", "mcp_payment_triggers": {"mode": "match", "patterns": ["^other$"]}}),
         ] {
             surface.target.payment_policy = Some(serde_json::from_value(policy).unwrap());
             assert_eq!(request_without_local_payment(&surface, &request).params, request.params);
         }
+        surface.target.payment_policy = Some(
+            serde_json::from_value(json!({"type": "agent_pay", "mcp_payment_triggers": {"mode": "all"}})).unwrap(),
+        );
+        let mut paid = request.clone();
+        paid.params.as_mut().unwrap()["_meta"] = json!({"org.paymentauth/credential": "proof", "progressToken": 1});
+        let normalized = request_without_local_payment(&surface, &paid);
+        let params = normalized
+            .params
+            .as_ref()
+            .unwrap();
+        assert_eq!(params["arguments"], json!({"value": 7, "nested": {"payment_signature": "business-value"}}));
+        assert_eq!(params["_meta"], json!({"progressToken": 1}));
         surface.target.payment_policy = Some(crate::config::agent_surface::PaymentPolicy::Mpp(crate::mpp::MppConfig {
             mcp_payment_triggers: Some(crate::config::types::McpPaymentTriggers::All),
             ..Default::default()
@@ -1060,8 +856,9 @@ mod tests {
                 .is_none()
         );
         payment.context = Some(PaymentContext {
-            verified: true,
+            required: true,
             response_header: Some("x402-receipt".into()),
+            ..Default::default()
         });
         let (name, value) = payment
             .receipt_header(&config)
@@ -1096,8 +893,9 @@ mod tests {
                 .unwrap()
                 .into(),
                 context: x402.then_some(PaymentContext {
-                    verified: true,
+                    required: true,
                     response_header: None,
+                    ..Default::default()
                 }),
                 mpp_receipt: None,
                 consumed: false,

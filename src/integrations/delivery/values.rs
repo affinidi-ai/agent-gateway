@@ -131,6 +131,16 @@ fn summary(
             "MPP payment ${REFERENCE} for ${RESOURCE_URL} on surface ${SURFACE_NAME} was verified"
         }
         "mpp.challenge.issued" => "MPP payment requested for ${RESOURCE_URL} on surface ${SURFACE_NAME}",
+        "payment.challenge_issued" => "Payment requested for ${RESOURCE} on surface ${SURFACE_ID}",
+        "payment.paid" => "Payment for ${RESOURCE} on surface ${SURFACE_ID} was accepted",
+        "payment.held" => "Payment for ${RESOURCE} on surface ${SURFACE_ID} was held for review (case ${CASE_ID})",
+        "payment.rejected" => "Payment for ${RESOURCE} on surface ${SURFACE_ID} was rejected: ${REASON}",
+        "payment.unconfirmed" => "Payment for ${RESOURCE} on surface ${SURFACE_ID} is unconfirmed: ${REASON}",
+        "payment.unavailable" => "Payment gateway unavailable for ${RESOURCE} on surface ${SURFACE_ID}: ${REASON}",
+        "payment.authorized" => "Funds for ${RESOURCE} on surface ${SURFACE_ID} are held until delivery",
+        "payment.voided" => "Held funds for ${RESOURCE} on surface ${SURFACE_ID} were released: ${REASON}",
+        "payment.capture_failed" => "Capturing held funds for ${RESOURCE} on surface ${SURFACE_ID} failed: ${REASON}",
+        "payment.reconcile_failed" => "A payment for ${RESOURCE} on surface ${SURFACE_ID} was not settled: ${REASON}",
         _ => return event.name.clone(),
     };
     render(&serde_json::Value::String(template.to_string()), values, Escaping::None, false)

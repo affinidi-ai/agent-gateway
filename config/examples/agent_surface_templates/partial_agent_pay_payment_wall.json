@@ -1,0 +1,30 @@
+{
+  "$schema": "https://fabric.affinidi.io/schemas/surface-template/v1.json",
+  "id": "0b3817c0-2836-4eae-87a4-b800db8c03e1",
+  "name": "Agent-pay Payment Wall",
+  "description": "Charges callers through a connected agent-pay gateway before requests are forwarded.",
+  "details": "Drops a Payment element on the target that charges every MCP tool call through agent-pay. Select the connected agent-pay gateway and one of its payment surfaces after dropping the template; agent-pay owns the price, the payment methods and settlement. Narrow the triggers to charge only some tools, or set A2A method filters for an A2A surface. Pair with a rate-limit element if you also need per-caller throttling.",
+  "icon": "money-bill-wave",
+  "tags": [
+    "payments",
+    "agent-pay"
+  ],
+  "author": "system",
+  "builtin": true,
+  "sort_priority": 1007,
+  "items": [
+    {
+      "scope": "edge",
+      "kind": "payment",
+      "address": "access-point->target/request",
+      "config": {
+        "type": "agent_pay",
+        "payment_gateway_id": "",
+        "payment_surface_id": "",
+        "mcp_payment_triggers": {
+          "mode": "all"
+        }
+      }
+    }
+  ]
+}

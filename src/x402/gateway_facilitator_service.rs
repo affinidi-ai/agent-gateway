@@ -50,6 +50,16 @@ pub async fn signal_settlement_response(
     }
 }
 
+/// Wait for the settle-response to the settle-request sent as `correlation_id`.
+pub(crate) async fn register_pending_settlement(correlation_id: &str) -> oneshot::Receiver<SettlementResponse> {
+    let (tx, rx) = oneshot::channel();
+    PENDING_SETTLEMENT_RESPONSES
+        .lock()
+        .await
+        .insert(correlation_id.to_string(), tx);
+    rx
+}
+
 /// Body of the `x402/verify-request` a requesting gateway sends its facilitator gateway, carrying
 /// the surface payment requirement the payment was resolved to
 pub(crate) fn verify_request_body(
@@ -397,14 +407,7 @@ pub async fn send_settle_request(
     };
     let timeout_duration = std::time::Duration::from_millis(timeout_ms);
 
-    // Register oneshot channel for response (event-driven, not polling!)
-    let (tx, rx) = oneshot::channel();
-    {
-        let mut pending = PENDING_SETTLEMENT_RESPONSES
-            .lock()
-            .await;
-        pending.insert(message_id.clone(), tx);
-    }
+    let rx = register_pending_settlement(&message_id).await;
 
     info!(
         message_id = %message_id,

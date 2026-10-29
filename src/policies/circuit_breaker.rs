@@ -49,6 +49,26 @@ impl CircuitBreaker {
         }
     }
 
+    /// How much longer an open circuit refuses calls after `last_failure`, or
+    /// `None` once it lets a test request through.
+    fn open_for(
+        &self,
+        last_failure: Instant,
+    ) -> Option<Duration> {
+        let timeout = Duration::from_secs(self.config.timeout_secs);
+        (last_failure.elapsed() <= timeout).then(|| timeout.saturating_sub(last_failure.elapsed()))
+    }
+
+    /// How much longer the circuit refuses calls, without making one: `None`
+    /// when the next call would be let through.
+    pub async fn refusing_for(&self) -> Option<Duration> {
+        let state = self.state.read().await;
+        match (&state.current_state, state.last_failure_time) {
+            (CircuitState::Open, Some(last_failure)) => self.open_for(last_failure),
+            _ => None,
+        }
+    }
+
     /// Check if a request is allowed through the circuit breaker
     /// Returns Ok(()) if allowed, Err if circuit is open
     pub async fn call<F, T, E>(
@@ -73,17 +93,13 @@ impl CircuitBreaker {
                 CircuitState::Open => {
                     // Check if we should transition to half-open
                     if let Some(last_failure) = state.last_failure_time {
-                        if last_failure.elapsed() > Duration::from_secs(self.config.timeout_secs) {
-                            info!("Circuit breaker transitioning from Open to HalfOpen");
-                            state.current_state = CircuitState::HalfOpen;
-                            state.success_count = 0;
-                            state.last_state_change = Instant::now();
-                        } else {
-                            return Err(CircuitBreakerError::Open {
-                                retry_after: Duration::from_secs(self.config.timeout_secs)
-                                    .saturating_sub(last_failure.elapsed()),
-                            });
+                        if let Some(retry_after) = self.open_for(last_failure) {
+                            return Err(CircuitBreakerError::Open { retry_after });
                         }
+                        info!("Circuit breaker transitioning from Open to HalfOpen");
+                        state.current_state = CircuitState::HalfOpen;
+                        state.success_count = 0;
+                        state.last_state_change = Instant::now();
                     }
                 }
                 CircuitState::HalfOpen => {
@@ -238,3 +254,67 @@ impl<E: std::fmt::Display> std::fmt::Display for CircuitBreakerError<E> {
 }
 
 impl<E: std::error::Error> std::error::Error for CircuitBreakerError<E> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn breaker(timeout_secs: u64) -> CircuitBreaker {
+        CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 2,
+            success_threshold: 1,
+            timeout_secs,
+            window_secs: 60,
+        })
+    }
+
+    async fn fail(breaker: &CircuitBreaker) {
+        let _ = breaker
+            .call(async { Err::<(), _>("down") })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_breaker_that_is_not_open_refuses_nothing() {
+        let breaker = breaker(30);
+        assert_eq!(breaker.refusing_for().await, None);
+
+        fail(&breaker).await;
+
+        assert_eq!(breaker.refusing_for().await, None, "one failure is below the threshold");
+    }
+
+    #[tokio::test]
+    async fn an_open_breaker_says_how_long_it_refuses_without_making_a_call() {
+        let breaker = breaker(30);
+        fail(&breaker).await;
+        fail(&breaker).await;
+
+        let remaining = breaker
+            .refusing_for()
+            .await
+            .expect("the breaker is open");
+
+        assert!(remaining > Duration::from_secs(29) && remaining <= Duration::from_secs(30), "{remaining:?}");
+        assert_eq!(breaker.state().await, CircuitState::Open, "asking changes nothing");
+        let refused = breaker
+            .call(async { Ok::<_, &str>(()) })
+            .await;
+        assert!(matches!(refused, Err(CircuitBreakerError::Open { .. })));
+    }
+
+    #[test]
+    fn an_open_circuit_lets_a_test_request_through_once_its_timeout_has_passed() {
+        let breaker = breaker(30);
+        let long_ago = Instant::now()
+            .checked_sub(Duration::from_secs(31))
+            .expect("the clock is far enough from its origin");
+
+        assert_eq!(breaker.open_for(long_ago), None);
+        assert!(
+            breaker
+                .open_for(Instant::now())
+                .is_some()
+        );
+    }
+}

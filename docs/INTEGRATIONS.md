@@ -110,6 +110,7 @@ fields; and `variable_pattern`, the placeholder syntax in use (see _Templates_)
 | Connection point | `connection_point.connected`: someone connected through a connection point with its secret |
 | x402 | `x402.verification.failed`, `x402.settlement.failed`, `x402.transaction.completed`, `x402.cleanup.completed` |
 | MPP | `mpp.verification.failed`, `mpp.payment.verified`, `mpp.challenge.issued` |
+| Payment | `payment.challenge_issued`, `paid`, `held`, `rejected`, `unconfirmed`, `unavailable`, `authorized`, `voided`, `capture_failed`, `reconcile_failed`: the outcomes of payments delegated to a connected agent-pay gateway |
 | Audit | `audit.<event>` for every event of the audit catalog ([`src/audit/catalog.rs`](../src/audit/catalog.rs)) |
 
 A passkey registration raises `user.created`, and an administrator's approval `user.approved`. A
@@ -117,6 +118,42 @@ SAML sign-in that creates the user raises `user.created`; SAML users are approve
 so no `user.approved` follows. A later SAML sign-in that changes the user's role, status, or
 primary flag raises `user.updated`. Every SAML sign-in then raises `user.login`, in that order
 ([`saml/user_provisioning.rs`](../src/auth/saml/user_provisioning.rs)).
+
+### Delegated payment events
+
+The payment gate raises one `payment.*` event per call to a connected agent-pay gateway
+([`payment_gate_integration_triggers.rs`](../src/integrations/payment_gate_integration_triggers.rs)).
+They go to every active integration whose event set holds the event.
+
+| Event | Meaning |
+| --- | --- |
+| `payment.challenge_issued` | The payment gateway answered with a payment challenge |
+| `payment.paid` | The payment gateway accepted the payment |
+| `payment.held` | The payment gateway held the payment for review |
+| `payment.rejected` | The payment gateway rejected the payment, or the credential had already been used for a request this gateway forwarded |
+| `payment.unconfirmed` | The payment gateway did not say whether the payment was taken, or is still working on it; the caller was told to retry the same request with the same credential within 120 seconds |
+| `payment.authorized` | The payment gateway held the funds until the Target delivers |
+| `payment.voided` | Held funds were released because the Target did not deliver |
+| `payment.capture_failed` | The Target delivered but capturing the held funds failed |
+| `payment.reconcile_failed` | A held or unconfirmed payment could not be settled before its deadline |
+| `payment.unavailable` | The payment gateway could not be reached or gave no usable answer, or the surface still carries an unsupported local x402 or MPP policy |
+
+Each carries `SURFACE_ID`, `VARIANT`, `PAYMENT_GATEWAY_ID`, `PAYMENT_SURFACE_ID`, `RESOURCE`,
+`RAIL` (`x402` or `mpp`, empty when the request carried no credential and the payment surface offers both), `AMOUNT`, `CURRENCY`, `CASE_ID` (a held payment's review case),
+`REMOTE_STATUS` (the payment gateway's HTTP status), `TRACE_ID`, `AUTHORIZATION_ID` (agent-pay's
+authorization of funds held until delivery), `RECEIPT_REFERENCE` (the MPP receipt reference or x402
+settlement transaction hash), `QUOTED_AMOUNT` and `QUOTED_CURRENCY` (the manifest price, set only
+when the receipt charged another), `PRICE_MISMATCH` (`true` or `false`), `REASON` (why the payment
+was refused, failed or released, as the ledger row keeps it: clipped to 200 characters with
+credential-shaped words redacted), and `SEVERITY` (`info` for
+`paid`, `challenge_issued`, `held`, `authorized` and `voided`, `warning` for `rejected` and `unconfirmed`, `error` for `unavailable`, `capture_failed` and `reconcile_failed`),
+alongside `EVENT_TYPE` and `TIMESTAMP`. A value that is absent is an empty string. No payer
+identity or credential is included. The governance audit forwarding of a `payment` record carries
+only the fingerprint of its signed credential (`AUDIT_VP_FINGERPRINT`); `AUDIT_VP_JWT` is empty
+for it (see [`OBSERVABILITY.md`](OBSERVABILITY.md#payment-credentials-in-the-audit-trail)).
+
+A surface that still carries a local x402 or MPP policy raises
+`payment.unavailable` at most once a minute, whatever the request rate.
 
 ## Templates
 
@@ -627,6 +664,7 @@ endpoint, an event set and an integration, all three with the old integration's 
 - **Event set:** the events it actually received. That means:
   - the event types of its gateway and user attachments (an empty list meant all of them);
   - every x402 or MPP event for those categories;
+  - every `payment.*` event for an appliance-wide `payment` integration;
   - `connection_point.connected` when a connection point named it;
   - for an appliance-wide `audit` integration, the audit records the previous version
     forwarded, including the three the VP Audit Log settings gated.
@@ -634,7 +672,7 @@ endpoint, an event set and an integration, all three with the old integration's 
   limits of 7 days and 20 attempts, since unset means retried forever.
 - **Endpoint only:** an integration that received nothing keeps only its endpoint, so its
   destination is not lost. This covers `surface`, `identity` and unattached
-  `general`/`connection_point` integrations, and tenant-owned `audit` ones.
+  `general`/`connection_point` integrations, and tenant-owned `audit` and `payment` ones.
 
 **What changes, for each integration the report names:**
 - **Scope:** an integration attached to some gateways or connection points now receives the

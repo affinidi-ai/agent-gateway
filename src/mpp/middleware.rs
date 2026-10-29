@@ -50,7 +50,7 @@ pub fn should_require_payment(
 
             let (json, method) = match crate::x402::middleware::a2a_filter_input(body_bytes) {
                 crate::x402::middleware::A2aFilterInput::Empty => return false,
-                crate::x402::middleware::A2aFilterInput::Unmatchable(_) => return true,
+                crate::x402::middleware::A2aFilterInput::Unmatchable => return true,
                 crate::x402::middleware::A2aFilterInput::Method { json, method } => (json, method),
             };
             let method = method.as_str();

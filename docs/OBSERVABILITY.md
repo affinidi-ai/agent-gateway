@@ -60,6 +60,74 @@ including lag, ends the connection; socket closure does likewise.
 `DashboardDelta` is already serialized before broadcast and held in `Arc<String>`, reducing clone
 cost across subscribers. Other variants are serialized per connection.
 
+## Payment gate metrics
+
+`agent_gateway_payment_gate_requests_total{surface_id,outcome}` counts each call a surface's
+`agent_pay` payment gate makes to agent-pay, by outcome: `paid`, `challenge`, `held`,
+`rejected` (a refused credential or payment, or a credential already used for a request this
+gateway forwarded), `unconfirmed` (whether the payment was taken is not known, or agent-pay is
+still working on it, and the caller was told to retry the same request with the same credential)
+or `unavailable` (agent-pay unreachable, rate limiting, failing before it was given a credential,
+an open circuit breaker, or a misconfigured policy). A surface refused because it still carries a local
+x402 or MPP policy is counted as `unavailable` too, on every request, while its audit event and its
+`payment.unavailable` integration event are raised at most once a minute per surface.
+`agent_gateway_payment_gate_latency_ms{surface_id}` is the histogram of the round trip; a decision
+that made no request to agent-pay (an open breaker, a caller deadline too short, a misconfigured
+policy, a gateway that is not connected, a refused legacy policy) is counted but has no latency
+sample. A free request makes no call and is not counted. A request
+refused by payment is recorded in the connection metrics as failed, or as a gateway fault for a
+`5xx`.
+
+Both are also exported where the other backends have a place for them:
+
+| Backend | Series |
+| --- | --- |
+| Prometheus | The two metrics above |
+| OpenTelemetry | The counter `gateway.payment_gate.requests.total` (attributes `surface.id`, `outcome`) and the histogram `gateway.payment_gate.latency` (attribute `surface.id`), recorded as each call is made |
+| CloudWatch | Totals across surfaces: `PaymentGateRequestCount` with an `Outcome` dimension beside the configured ones, and `PaymentGateAverageLatency` with `PaymentGateLatencySampleCount`. Pushed with the other metrics, and also when only they changed. There is no per-surface series, since each surface and outcome would be a billable CloudWatch metric |
+| File | Totals across surfaces in `payment_gate_metrics.json` beside the metrics file: `requests_by_outcome`, `latency_sum_ms` and `latency_count`, rewritten with each persist (the metrics file keeps the dashboard's format, which has no place for gate calls). Per-surface rows are in the payments ledger |
+
+### Settlement, breaker and ledger metrics
+
+The gate's request counter also counts `authorized` for an answer that holds the funds until
+the Target delivers (`payment-authorization`). Further Prometheus counters:
+
+| Metric | Labels | Counts |
+| --- | --- | --- |
+| `agent_gateway_payment_settlements_total` | `action` (`capture`, `void`, `status`, `reconcile`), `status` (agent-pay's answer: `captured`, `voided`, `failed`, `unconfirmed`, `expired`, `authorized`, `paid`, `unknown`; `unavailable` or `rejected` when there was no usable answer; `failed` for `reconcile` when the reconciler gave up) | Each `payment-settle` and `payment-settlement-status` request |
+| `agent_gateway_payment_gate_breaker_transitions_total` | `payment_gateway_id`, `state` (`open`, `closed`) | Each time a payment gateway's circuit breaker opens or closes; each is also logged (`warn` on open, `info` on close) |
+| `agent_gateway_payment_ledger_unwritten_rows_total` | none | Ledger rows held in memory only, because the write queue was full or a synchronous write failed |
+
+The integration events `payment.authorized`, `payment.voided`, `payment.capture_failed` and
+`payment.reconcile_failed`, and audit `payment` events with the stages `authorized`, `voided`,
+`settled` and `settlement_failed`, record the same transitions. A delegated `payment` audit event
+whose receipt names another price than the manifest snapshot carries `price_mismatch: true` with
+`quoted_amount` and `quoted_currency`, and its `amount`/`currency` are the receipt's.
+
+### Payment outcome in the access log and span
+
+A request on a surface that charges through agent-pay names the gate's decision on the
+`agent_gateway::access` line that closes it, ` payment_outcome="<outcome>" payment_ledger_id="<row id>"`,
+and on its root `http.request` span as `payment.outcome` and `payment.ledger_id`. The outcome is
+the ledger's (`paid`, `challenge`, `held`, `rejected`, `unconfirmed`, `unavailable`,
+`authorized`), so a refused request reads as a payment refusal rather than a failed connection;
+look the row up with `GET /api/admin/payments/{id}`. A request refused for a leftover local
+x402/MPP policy logs `payment_outcome="unavailable"` with an empty ledger id. The fabric path,
+which has no HTTP access log line, is unchanged.
+
+### Payment credentials in the audit trail
+
+When `payment_receipt_vc` is on, a payment audit record carries the gateway-signed credential for
+its outcome (`PaymentReceiptCredential`, `PaymentRejectionCredential`, or for a delegated payment
+`PaymentAccessGrantCredential`) in `vp_jwt` and its `sha256:` fingerprint in `vp_fingerprint`.
+No code path accepts any of these as proof of access: they are dispute evidence only, never
+returned to the caller and never verified by a gateway to admit a request. They are still signed
+statements naming the trace, the payment and, for a rejection, the payer reference, so the full
+JWT stays in the local VP Audit Log (`delegation-audit.jsonl`), where the Audit page shows it as
+evidence, and goes nowhere else: governance audit integrations get `AUDIT_VP_JWT` empty and an
+`AUDIT_RECORD` without `vp_jwt` for a `payment` record, `GET /api/admin/payments/audit` strips it,
+and the ledger and payment integration events carry only fingerprints.
+
 ## A2A protocol version metric
 
 `agent_gateway_a2a_protocol_version_total{channel_id,negotiated_version,method_era}` is a Prometheus
@@ -403,7 +471,10 @@ caller the record holds), `EVENT_DATA` (the same as `AUDIT_RECORD`), `APPLIANCE_
 `AUDIT_PRINCIPAL_EMAIL`, `AUDIT_PRINCIPAL_NAME`, `AUDIT_AUTH_METHOD`, `AUDIT_DECISION`,
 `AUDIT_DENY_REASON`, `AUDIT_POLICY_NAME`, `AUDIT_POLICY_VERSION`, `AUDIT_POLICY_CONTENT_HASH`,
 `AUDIT_VP_JWT` and `AUDIT_VP_FINGERPRINT`. `AUDIT_RECORD` is the full record in the
-`/v1/audit` row shape. The principal variables come from the record's `caller` context:
+`/v1/audit` row shape. A `payment` record never carries its signed credential out of the appliance:
+`AUDIT_VP_JWT` is empty and `AUDIT_RECORD` has no `vp_jwt` for it, so integrations get only
+`AUDIT_VP_FINGERPRINT`; the full credential stays in the local VP Audit Log as dispute evidence
+(see [Payment credentials](#payment-credentials-in-the-audit-trail)). The principal variables come from the record's `caller` context:
 `AUDIT_PRINCIPAL` is the caller's email, else display name, else authenticated subject (JWT
 `sub`, API key name, DID, mTLS principal, or on a Transit Point the caller the transit token
 carries), and all four are empty when the request had no caller context (no source auth, or a

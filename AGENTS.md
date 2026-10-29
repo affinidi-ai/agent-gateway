@@ -123,7 +123,7 @@ Keep `AGENTS.md` and any local `AGENTS.md` in sync in the same change when UI pa
 the inbound, outbound, and fabric paths, the system invariants, and a module map
 covering every entry in `src/`. Read it before changing anything on the request path.
 
-Five things are worth knowing before you open it.
+Six things are worth knowing before you open it.
 
 **The Agent Surface is the routing unit.** `AgentSurface`
 ([`src/config/agent_surface.rs`](src/config/agent_surface.rs)) carries one Access Point,
@@ -166,6 +166,29 @@ A2A request shape). An `a2a-proxy://` surface's versions are fixed (`1.0` only w
 ([`src/config/agent_surface.rs`](src/config/agent_surface.rs)), never a global flag. See
 [`docs/PROTOCOLS.md`](docs/PROTOCOLS.md#a2a-surface-settings).
 
+**Payment is delegated to agent-pay.** A surface charges only through an `agent_pay`
+payment policy that names a payment surface on a connected agent-pay gateway. An enabled local
+x402 or MPP policy still loads but is unsupported: the surface answers `503
+payment_unavailable` and the policy cannot be saved. Read it through
+`AgentSurface::agent_pay_policy` / `payment_policy_unsupported`
+([`src/config/agent_surface_accessors.rs`](src/config/agent_surface_accessors.rs)). This
+gateway decides whether a request is chargeable and agent-pay takes the payment, only after
+policy and just before forwarding, on every path (direct, `fabric://` Target, MCP and A2A
+proxy Targets, Fabric receive); a free request makes no fabric hop. The gate lives in
+[`src/proxy/handler/agent_pay_gate.rs`](src/proxy/handler/agent_pay_gate.rs). This gateway
+captures funds agent-pay only held (`payment-authorization`) once the Target delivered and voids
+them otherwise, recording the decision in the payments ledger first
+([`src/payments_ledger/settlement.rs`](src/payments_ledger/settlement.rs)); a streamed response
+is settled when its stream ends ([`src/proxy/handler/agent_pay_gate/streamed.rs`](src/proxy/handler/agent_pay_gate/streamed.rs)),
+and callers poll held cases through
+[`src/payments_ledger/caller_api.rs`](src/payments_ledger/caller_api.rs). The gateway-signed
+payment credentials (receipt, rejection, access grant) are dispute evidence that nothing accepts
+as proof of access; their JWT stays in the local VP Audit Log and only the fingerprint leaves it
+(integrations, admin API). This gateway
+is not an x402 facilitator: a peer's fabric `x402/verify-request` or `x402/settle-request` is
+refused with `facilitator_disabled`, whatever `facilitator_mode` says. See
+[`docs/CONFIGURATION_REFERENCE.md`](docs/CONFIGURATION_REFERENCE.md#surface-payment-policy).
+
 ### Where the detail lives
 
 Do not summarise these here. Update the owning document in the same change as the code.
@@ -183,6 +206,7 @@ Do not summarise these here. Update the owning document in the same change as th
 | Management tokens and tenant ownership                                         | [`docs/ACCESS_TOKENS.md`](docs/ACCESS_TOKENS.md)                     |
 | Management RBAC                                                                | [`docs/RBAC.md`](docs/RBAC.md)                                       |
 | Configuration files and their effects                                          | [`docs/CONFIGURATION_REFERENCE.md`](docs/CONFIGURATION_REFERENCE.md) |
+| Surface payment policy (agent-pay delegation, manifests, legacy migration)     | [`docs/CONFIGURATION_REFERENCE.md`](docs/CONFIGURATION_REFERENCE.md#surface-payment-policy) |
 | Reload behaviour, server mode                                                  | [`docs/CONFIGURATION_RELOAD.md`](docs/CONFIGURATION_RELOAD.md)       |
 | Self-hosting infrastructure requirements                                       | [`docs/DEPLOYMENT_REQUIREMENTS.md`](docs/DEPLOYMENT_REQUIREMENTS.md) |
 | Observability contracts, governance audit forwarding                           | [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md)                     |

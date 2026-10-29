@@ -224,9 +224,8 @@ function coerceGate(raw: unknown): Gate {
 /**
  * Fullscreen editor for the MCP Tool Gating element. Manages an ordered list
  * of Tool Gates, each with an optional OPA condition (chosen from the
- * surface's policy definitions) and an allow/deny regex action. Mirrors the
- * Payment element's fullscreen: the sidebar shows a summary, this view owns
- * the heavy configuration.
+ * surface's policy definitions) and an allow/deny regex action. The sidebar
+ * shows a summary; this view owns the heavy configuration.
  */
 const McpToolGatingFullscreen: React.FC<ConfigPanelProps> = ({
   config,

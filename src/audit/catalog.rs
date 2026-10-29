@@ -131,7 +131,7 @@ pub const AUDIT_EVENTS: &[AuditEventSpec] = &[
     event(
         "payment",
         "Payment Event",
-        "An x402 or MPP payment lifecycle event (challenge, verification, settlement)",
+        "An agent-pay payment event (challenge, paid, held for review, rejected, unavailable); legacy x402/MPP settlement records may still appear",
         Payments,
     ),
     event(

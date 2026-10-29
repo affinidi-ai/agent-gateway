@@ -16,7 +16,7 @@ static TRACE_REGISTRY: once_cell::sync::Lazy<Arc<RwLock<TraceRegistry>>> =
 #[derive(Debug, Clone)]
 pub struct TraceRegistry {
     /// Channel prefixes mapped to their human-readable names
-    /// e.g., {"/agents": "agents", "/payments": "payments"}
+    /// e.g., {"/agents": "agents", "/billing": "billing"}
     channel_prefixes: HashMap<String, String>,
 
     /// MCP proxy prefixes mapped to their human-readable names

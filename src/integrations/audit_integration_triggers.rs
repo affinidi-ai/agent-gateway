@@ -19,8 +19,23 @@ pub fn audit_event_type(event: &DelegationAuditEvent) -> String {
     format!("audit.{}", action_category(&event.event))
 }
 
+/// The record as it leaves the appliance. A payment record's signed credential
+/// (the gateway's receipt, rejection or access-grant VC) stays in the local
+/// audit file: integrations get its `vp_fingerprint` only.
+fn forwarded_record(event: &DelegationAuditEvent) -> std::borrow::Cow<'_, DelegationAuditEvent> {
+    if matches!(event.event, DelegationAuditAction::PaymentEvent(_)) && event.vp_jwt.is_some() {
+        let mut stripped = event.clone();
+        stripped.vp_jwt = None;
+        std::borrow::Cow::Owned(stripped)
+    } else {
+        std::borrow::Cow::Borrowed(event)
+    }
+}
+
 /// Runtime variables describing one audit record.
 pub fn audit_variables(event: &DelegationAuditEvent) -> HashMap<String, String> {
+    let event = forwarded_record(event);
+    let event = event.as_ref();
     let text = |value: &Option<String>| {
         value
             .clone()
@@ -340,6 +355,48 @@ mod tests {
     }
 
     #[test]
+    fn a_payment_records_signed_credential_never_leaves_the_appliance_only_its_fingerprint() {
+        use crate::delegation_vault::audit::{PaymentEventDetails, PaymentRail, PaymentStage};
+        let mut event = audit_event(
+            DelegationAuditAction::PaymentEvent(Box::new(PaymentEventDetails {
+                rail: PaymentRail::Mpp,
+                stage: PaymentStage::Verified,
+                transaction_id: "row-1".to_string(),
+                amount: None,
+                currency: None,
+                method: None,
+                payer: None,
+                error: None,
+                delegated: true,
+                payment_gateway_id: Some("gw-pay".to_string()),
+                payment_surface_id: Some("ps-1".to_string()),
+                remote_status: Some(200),
+                delegation: None,
+            })),
+            None,
+            None,
+            None,
+            Some("surface-3"),
+        );
+        event.vp_jwt = Some("eyJhbGciOiJFZERTQSJ9.eyJncmFudCI6e319.sig".to_string());
+        event.vp_fingerprint = Some("sha256:grant".to_string());
+
+        let variables = audit_variables(&event);
+
+        assert_eq!(variables["AUDIT_CATEGORY"], "payment");
+        assert_eq!(variables["AUDIT_VP_JWT"], "");
+        assert_eq!(variables["AUDIT_VP_FINGERPRINT"], "sha256:grant");
+        let record: serde_json::Value = serde_json::from_str(&variables["AUDIT_RECORD"]).unwrap();
+        assert!(record.get("vp_jwt").is_none(), "{record}");
+        assert_eq!(record["vp_fingerprint"], "sha256:grant");
+        assert_eq!(
+            event.vp_jwt.as_deref(),
+            Some("eyJhbGciOiJFZERTQSJ9.eyJncmFudCI6e319.sig"),
+            "the local record keeps it"
+        );
+    }
+
+    #[test]
     fn allow_decision_has_no_deny_reason() {
         let variables = audit_variables(&policy_decision("allow"));
         assert_eq!(variables["AUDIT_DECISION"], "allow");
@@ -512,6 +569,7 @@ mod tests {
                 payment_gateway_id: None,
                 payment_surface_id: None,
                 remote_status: None,
+                delegation: None,
             })),
             DelegationAuditAction::AuthFailed {
                 scheme: AuthScheme::Jwt,

@@ -397,26 +397,6 @@ const SystemTab: React.FC<SystemTabProps> = ({
                   updateSettings={updateSettings}
                 />
                 <FeatureFlagRow
-                  flag="agent_pay_delegation"
-                  // Default off when unset — must be explicit `true` to reveal.
-                  checked={featureFlags.agent_pay_delegation === true}
-                  disabled={isSubmitting}
-                  description={
-                    <>
-                      Adds the <code>Agent Pay (delegate payment)</code> provider option to the{' '}
-                      <code>Payment</code> element in the surface builder. UI-only: surfaces already
-                      configured to delegate payment to a connected Agent-Pay gateway continue to
-                      work regardless of this toggle.
-                    </>
-                  }
-                  onChangeMessages={{
-                    on: 'Agent-Pay delegation shown in the Payment element.',
-                    off: 'Agent-Pay delegation hidden from the Payment element.',
-                  }}
-                  featureFlags={featureFlags}
-                  updateSettings={updateSettings}
-                />
-                <FeatureFlagRow
                   flag="mediator_federation"
                   // Default off when unset — must be explicit `true` to reveal.
                   checked={featureFlags.mediator_federation === true}

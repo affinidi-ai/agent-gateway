@@ -33,6 +33,7 @@ import {
   getTemplateProtocolBadge,
 } from '../components/surface-builder/templates/templateSort';
 import { showToast } from '../utils/toaster';
+import { showSaveWarnings } from '../components/surface-builder/elements/payment/saveWarnings';
 import './SurfaceBuilder.css';
 
 const WELCOME_DISMISSED_KEY = 'surface-builder-welcome-dismissed';
@@ -449,9 +450,10 @@ const AddSurfacePage: React.FC = () => {
     setError(null);
     try {
       const payload: Partial<AgentSurface> = withA2aValidationSettled(buildSurfacePayload());
-      await apiClient.createSurface(payload);
+      const created = await apiClient.createSurface(payload);
       justCreatedRef.current = true;
       showToast('success', `Agent Surface "${name}" created`);
+      showSaveWarnings(created?.warnings);
       // Surface non-blocking structural warnings AFTER create. See
       // SurfaceDetailPage for full rationale.
       const warnings = validateSurfacePayload(payload).filter(i => i.severity === 'warning');

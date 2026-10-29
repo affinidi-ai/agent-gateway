@@ -248,12 +248,6 @@ impl AgentSurface {
             .as_ref()
     }
 
-    /// Auto-pay MPP challenges for fabric:// targets.
-    #[inline]
-    pub fn mpp_auto_pay(&self) -> bool {
-        self.target.mpp_auto_pay
-    }
-
     // ── Networking shorthands ───────────────────────────────────────────────
 
     #[inline]
@@ -373,12 +367,27 @@ impl AgentSurface {
         }
     }
 
-    /// Mirrors legacy `channel.mpp_auto_pay_max_amount`.
+    /// The target's agent-pay payment policy, if any.
     #[inline]
-    pub fn mpp_auto_pay_max_amount(&self) -> Option<&str> {
+    pub fn agent_pay_policy(&self) -> Option<&crate::config::agent_surface::AgentPayPolicy> {
+        match self
+            .target
+            .payment_policy
+            .as_ref()?
+        {
+            crate::config::agent_surface::PaymentPolicy::AgentPay(policy) => Some(policy),
+            _ => None,
+        }
+    }
+
+    /// Whether the target carries an enabled local x402 or MPP policy, which
+    /// is no longer supported. Requests to such a surface fail closed.
+    #[inline]
+    pub fn payment_policy_unsupported(&self) -> bool {
         self.target
-            .mpp_auto_pay_max_amount
-            .as_deref()
+            .payment_policy
+            .as_ref()
+            .is_some_and(crate::config::agent_surface::PaymentPolicy::is_unsupported_legacy)
     }
 
     // ── Access-point shorthands ─────────────────────────────────────────────

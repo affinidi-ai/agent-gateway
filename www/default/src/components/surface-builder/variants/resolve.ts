@@ -57,8 +57,6 @@ const TARGET_FIELDS = [
   'a2a_proxy_id',
   'mcp_identity_config',
   'fabric_target_name',
-  'mpp_auto_pay',
-  'mpp_auto_pay_max_amount',
   'fabric_delegated_credentials',
 ] as const;
 

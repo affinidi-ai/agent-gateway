@@ -192,27 +192,20 @@ impl GatewayConfig {
             // Validate authentication configuration
             validate_source_auth_surface(surface)?;
 
-            // Validate MPP configuration if present
-            if let Some(mpp_config) = surface.mpp_config() {
-                for warning in mpp_config.validate(&surface.name) {
-                    warn!("{}", warning);
-                }
-            }
-
-            if let Some(x402) = surface.x402_config()
-                && let Some(ref triggers) = x402.mcp_payment_triggers
-            {
-                for warning in triggers.validate(&surface.name) {
-                    warn!("{}", warning);
-                }
-            }
-
-            // Warn if mpp_auto_pay is enabled but no mpp_policy is set
-            if surface.mpp_auto_pay() && surface.mpp_config().is_none() {
+            if surface.payment_policy_unsupported() {
                 warn!(
-                    "[mpp] Channel '{}'{}: mpp_auto_pay is enabled but no mpp_policy is configured",
+                    "Surface '{}'{}: local x402/MPP payment is no longer supported; requests answer 503 until the \
+                     payment policy points at an agent-pay surface",
                     surface.name, channel_id
                 );
+            }
+            if let Some(policy) = surface.agent_pay_policy() {
+                for error in policy.validate() {
+                    warn!("Surface '{}'{}: agent_pay payment policy: {}", surface.name, channel_id, error);
+                }
+            }
+            if surface.target.mpp_auto_pay {
+                warn!("Surface '{}'{}: mpp_auto_pay is no longer supported and is ignored", surface.name, channel_id);
             }
         }
 

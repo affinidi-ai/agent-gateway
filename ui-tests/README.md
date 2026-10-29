@@ -217,6 +217,8 @@ Reserved patterns:
 | Sidebar nav item | `nav-<route-key>` | `nav-channels` |
 | Wizard root + steps | `wizard-<name>`, `wizard-step-<name>` | `wizard-add-channel`, `wizard-step-configure` |
 | Wizard navigation | `wizard-next`, `wizard-back`, `wizard-submit` | (shared across all wizards) |
+| Surface Builder canvas node | `surface-node-<type>` | `surface-node-payment` |
+| Surface Builder save | `surface-save-button`, `surface-error-alert` | (the save button and the refused-save banner on `/surfaces/<id>`) |
 
 If you need a testid that does not yet exist on the dashboard, add it to the React
 component first (see the `data-testid` rules in [`www/default/AGENTS.md`](../www/default/AGENTS.md)),

@@ -67,6 +67,11 @@ are the consumer; the convention is documented in
 | Action button | `<area>-<verb>-button`                                                               |
 | List item     | `<area>-card-<id>` or `<area>-row-<id>`                                              |
 | Wizard        | `wizard-<name>`, `wizard-step-<name>`, `wizard-next`, `wizard-back`, `wizard-submit` |
+| Canvas node   | `surface-node-<type>`, for example `surface-node-payment`                            |
+
+An indexed or per-row button keeps the `-button` suffix before the index or id, for example
+`payments-details-button-<id>`. On `/surfaces/<id>` the save button is `surface-save-button`
+and the banner for a refused save is `surface-error-alert`.
 
 ## CLI consent page
 
@@ -102,7 +107,67 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   across protocols.
 - Payment setup dependency alerts stay hidden until the first Save attempt. Invalid
   payment configuration remains blocked on Save, while embedded safety warnings stay
-  visible.
+  visible. The one exception is a local x402/MPP policy, which is always flagged.
+- **Payment** (`elements/payment/`) charges through a connected agent-pay gateway only.
+  The sidebar picks the gateway and payment surface (manual entry accepts `id$alias`),
+  previews the agent-pay manifest (the saved `manifest_snapshot` until the selection
+  changes or Refresh is pressed, then the live one with a drift notice; Refresh bypasses
+  the gateway's manifest cache, and the route's error codes map to readable messages), and holds
+  **Charge every request**, **Share the payer's email** (off by default) and the timeout.
+  The timeout is a whole number of milliseconds from 1000 to 120000, the range the gateway
+  accepts; an empty field means the default, and anything else shows
+  `payment-timeout-error` and blocks Save.
+  MCP/A2A triggers live in the `PaymentTriggersEditor` fullscreen. Opening it never changes
+  the config. A policy with no trigger set charges the protocol's default operations, the
+  gateway's rule: every `tools/call` for MCP, `message/send` and `message/stream` for A2A.
+  The editor says so (`payment-triggers-mcp-scope`, `payment-triggers-a2a-defaults-note`), and
+  the A2A **Add default filters** button (`payment-triggers-a2a-add-defaults-button`) writes the
+  two default filters; editing while none are set starts from them, so an edit never un-charges
+  them. Blank patterns count as unset, and the only blocking trigger error is an MCP Match with
+  no non-blank pattern, which the gateway refuses with 400 `invalid_payment_policy`. The
+  browser's check of an MCP regex (`triggerPatternAdvice`) is advisory: the gateway's regex
+  engine differs from the browser's (inline flags such as `(?i)` and `(?P<name>...)` are valid
+  there), so a doubted pattern shows a warning under it and a warning-level dependency, and
+  never blocks Save. The gateway's 400 on save is final, and its `details` reach the page error.
+  A2A message patterns are plain, case-sensitive "message contains" text, never checked as a
+  regex. While a message method has no text, the editor says every message of that method
+  is charged (`payment-triggers-a2a-<method>-scope`). A loaded enabled local x402/MPP policy
+  is kept as-is and shown with a banner whose **Start migration** keeps only its triggers; the
+  policy is never silently dropped. A disabled legacy policy (`enabled: false`) charges
+  nothing, does not block Save, and is saved back unchanged until an agent-pay surface is
+  chosen. `manifest_snapshot` and the save response's `warnings` (objects `{code, message}`,
+  shown as toasts by `showSaveWarnings`, used by the Add and Edit surface pages) are
+  server-written and never sent. Choosing another gateway drops `manifest_snapshot` and the
+  surface id (a surface id only exists on its own gateway) and closes manual entry; choosing
+  another surface drops `manifest_snapshot`. The API client reads and writes through one scrub:
+  `stripServerWrittenFields` removes the snapshot from the policies and from every canvas blob
+  it sends, both a Payment node's config and the Managed Agent node's copy of the policy, and
+  `fromBackendSurface` removes it from the canvas blobs of every surface it reads (get, list,
+  and the create/update responses), so an earlier surface's price never comes back as the new
+  surface's saved price. Test ids:
+  `payment-connect-gateway-button`, `payment-gateway-select`, `payment-surface-select`, `payment-surface-manual-input`,
+  `payment-surface-refresh-button`, `payment-surface-manual-toggle-button`,
+  `payment-only-filter-toggle`, `payment-manifest-preview`, `payment-manifest-refresh-button`,
+  `payment-manifest-drift`, `payment-legacy-unsupported-banner`,
+  `payment-legacy-migrate-button`, `payment-disabled-legacy-note`,
+  `payment-require-all-toggle`, `payment-timeout-input`, `payment-timeout-error`,
+  `payment-share-email-toggle`, `payment-configure-triggers-button`, and
+  `payment-triggers-*` in the fullscreen (`-require-all`, `-mcp-mode`, `-mcp-scope`,
+  `-mcp-error`, `-a2a-defaults-note`, `-a2a-add-defaults-button`,
+  `-a2a-command-toggle-button`, `-a2a-control-toggle-button`, `-a2a-<method>-scope`,
+  `-a2a-method-<method>` for a control method, `-pattern-<n>`, `-pattern-warning-<n>`,
+  `-add-pattern-button`, `-remove-pattern-button-<n>`). Transit Points take no Payment node.
+- On `/surfaces/<id>`, a saved surface whose `target.payment_policy` is `agent_pay` shows
+  `SurfacePaymentActivity` (`elements/payment/SurfacePaymentActivity.tsx`) above the canvas,
+  for a user holding `payments.view` only: its outcome counts over the last 24 hours
+  (`GET /api/admin/payments/summary`), its payment gateway's circuit breaker
+  (`GET /api/admin/payments/breakers/{id}`, left out when it cannot be read), a **Recent**
+  toggle listing the newest five rows, and **View payments** linking to
+  `/payments?surface_id=<id>`. Test ids: `surface-payment-activity`,
+  `surface-payment-activity-error`, `surface-payment-activity-empty`,
+  `surface-payment-count-<outcome>`, `surface-payment-breaker`,
+  `surface-payment-recent-toggle`, `surface-payment-recent`, `surface-payment-recent-<id>`,
+  `surface-payment-activity-link`.
 - **Send delegated credentials over Fabric** is one shared section
   (`_shared/FabricDelegatedCredentialsSection.tsx`) used by the Managed Agent and Transit
   Point panels. It writes `fabric_delegated_credentials` and appears only when that route
@@ -279,6 +344,66 @@ being created, and without an id. States: a quiet **Loading…**, **No attempt y
 the counts summed across entries, and **Status unavailable** when the fetch fails; a failed
 fetch never breaks the panel. Test ids: `trust-recorder-last-outcome` with `-state`,
 `-reason`, `-time`, `-counts`, `-loading`, `-empty`, and `-unavailable`.
+
+## Payments page
+
+`/payments` (`pages/PaymentsPage.tsx`, sections in `pages/PaymentsPage/`) reads the
+append-only ledger from `GET /api/admin/payments` (`surface_id` from the URL query,
+`outcome` from the filter) and shows one row per payment check with an outcome badge; a
+held row shows its case id. `usePaymentLedger` only lets the latest request write rows,
+the error and the Refresh state, so a slow answer to an earlier filter never overwrites a
+later one. When a refresh fails, the rows of the same filter stay under
+`payments-stale-note` ("may be out of date"), and the rows of an earlier filter are dropped.
+An outcome or surface filter with no rows shows "No payments match this filter" rather than
+"No payments yet". The outcomes are `paid`, `challenge`, `held`, `rejected`, `unavailable`, `unconfirmed` (the
+charge outcome is unknown), `authorized` (funds held until the Target delivers), `voided` (held funds released) and
+`capture_failed` (the Target delivered but the capture failed), each with its note in `OUTCOME_META`; an unconfirmed row's details show `payments-detail-outcome-note`
+("Payment taken or unconfirmed - retry the same request with the same credential within 2
+minutes"). The chart stacks counts per outcome per time bucket and keeps the newest 500
+buckets when the rows span more. **Details** opens `GET /api/admin/payments/{id}`; for a
+held row the response may carry `case_status` (`{status, checked_at}` from agent-pay), shown
+as **Case status** in plain words, and **Refresh status** reads the row again while the
+shown row stays. It is absent whenever agent-pay could not be asked, and the modal says "Not available" with the
+possible reasons (not connected or no answer in time, the case no longer known, or no status
+requested for the row).
+The details also show, only when the row has them (`settlementFields` in
+`pages/PaymentsPage/settlementFields.tsx`): **Authorization id**, **Capture deadline**, **Intent**
+(capture or void, with the attempt count), **Settlement status** (awaiting delivery, capture or
+void pending, unconfirmed, settled, superseded, or reconciliation gave up), **Charged vs quoted**
+with a "Price mismatch" badge, **Superseded by** and a "Reconcile failed" badge.
+The details also show **Reason** (why a refused, failed or released payment ended so),
+**Updated at**, **Idempotency key**, **Settle timeout** and **Caller (hashed)** (the peppered hash
+the ledger records, never the caller) when the row has them, and an **Audit events** link beside
+the trace id that closes the modal and opens the **Audit trail** tab filtered by that trace id.
+A row with a reason shows it, truncated with the full text as its tooltip, under the outcome badge.
+The **Audit trail** tab (`pages/PaymentsPage/PaymentAuditTab.tsx`, `usePaymentAudit`) reads
+`GET /api/admin/payments/audit` with the page's surface filter plus stage, trace id and a from/to
+time, 50 events per page; it loads only while the tab is open.
+`capture_failed` reads "Payment capture failed or is unconfirmed - reconcile before asking
+the payer to pay again". `listPayments` and `getPayment` go through the shared request path,
+so a 401 expires the session. The page always has **Ledger** and **Audit trail** tabs; a
+read-only **Legacy x402/MPP** tab appears only while the old
+x402/MPP endpoints still return rows: one row per transaction (the verification and
+settlement summaries merged, the settlement giving the status) with the x402 amount scaled
+by the token's decimals and shown in dollars. `/x402payments` redirects here and keeps its query string and hash. Test ids:
+`page-payments`, `payments-outcome-filter`, `payments-bucket-select`, `payments-filter-input`, `payments-refresh-button`,
+`payments-row-<id>`, `payments-surface-link-<id>`, `payments-held-case-<id>`,
+`payments-details-button-<id>`, `payments-detail-modal`, `payments-detail-dismiss-button`,
+`payments-detail-close-button`, `payments-detail-error`, `payments-detail-case-status`,
+`payments-detail-case-status-text`, `payments-detail-refresh-button`,
+`payments-detail-authorization-id`, `payments-detail-capture-deadline`, `payments-detail-settle-intent`,
+`payments-detail-settlement-status`, `payments-detail-price-mismatch`, `payments-detail-superseded-by`,
+`payments-detail-reconcile-failed`, `payments-detail-reason`, `payments-detail-updated-at`,
+`payments-detail-idempotency-key`, `payments-detail-settle-timeout`,
+`payments-detail-caller-principal`, `payments-detail-audit-link`, `payments-reason-<id>`,
+`payments-audit-tab`, `payments-audit-tab-panel`, `payments-audit-stage-filter`,
+`payments-audit-trace-input`, `payments-audit-since-input`, `payments-audit-until-input`,
+`payments-audit-refresh-button`, `payments-audit-table`, `payments-audit-row-<event id>`,
+`payments-audit-error`, `payments-audit-prev-button`, `payments-audit-next-button`,
+`payments-audit-page`, `payments-ledger-tab`,
+`payments-legacy-tab`, `payments-legacy-panel`, `payments-legacy-row-<key>`,
+`payments-error-alert`, `payments-error-dismiss-button`, `payments-stale-note`,
+`payments-surface-filter`.
 
 ## Access Tokens page
 

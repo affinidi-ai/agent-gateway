@@ -13,6 +13,66 @@ use crate::observability::TaskMonitor;
 use aws_sdk_cloudwatch::types::Dimension;
 
 use super::metric_names::cloudwatch as cw_names;
+use super::prometheus::{PaymentGateTotals, payment_gate_totals};
+
+/// The payment gate metrics as CloudWatch data: the calls so far per outcome
+/// (an `Outcome` dimension beside the configured ones) and the average latency
+/// of the calls that made a round trip. Totals across surfaces, so the number of
+/// CloudWatch metrics does not grow with the number of surfaces.
+fn payment_gate_data(
+    totals: &PaymentGateTotals,
+    dimensions: Option<&Vec<Dimension>>,
+    timestamp: aws_sdk_cloudwatch::primitives::DateTime,
+) -> Vec<aws_sdk_cloudwatch::types::MetricDatum> {
+    use aws_sdk_cloudwatch::types::{MetricDatum, StandardUnit};
+
+    let mut data = Vec::new();
+    for (outcome, count) in totals
+        .requests_by_outcome
+        .iter()
+        .filter(|(_, count)| **count > 0)
+    {
+        let mut by_outcome = dimensions
+            .cloned()
+            .unwrap_or_default();
+        by_outcome.push(
+            Dimension::builder()
+                .name("Outcome")
+                .value(outcome)
+                .build(),
+        );
+        data.push(
+            MetricDatum::builder()
+                .metric_name(cw_names::PAYMENT_GATE_REQUEST_COUNT)
+                .value(*count as f64)
+                .unit(StandardUnit::Count)
+                .timestamp(timestamp)
+                .set_dimensions(Some(by_outcome))
+                .build(),
+        );
+    }
+    if totals.latency_count > 0 {
+        data.push(
+            MetricDatum::builder()
+                .metric_name(cw_names::PAYMENT_GATE_AVG_LATENCY)
+                .value(totals.latency_sum_ms / totals.latency_count as f64)
+                .unit(StandardUnit::Milliseconds)
+                .timestamp(timestamp)
+                .set_dimensions(dimensions.cloned())
+                .build(),
+        );
+        data.push(
+            MetricDatum::builder()
+                .metric_name(cw_names::PAYMENT_GATE_LATENCY_SAMPLE_COUNT)
+                .value(totals.latency_count as f64)
+                .unit(StandardUnit::Count)
+                .timestamp(timestamp)
+                .set_dimensions(dimensions.cloned())
+                .build(),
+        );
+    }
+    data
+}
 
 /// CloudWatch metrics backend (pushes aggregates to AWS CloudWatch)
 pub struct CloudWatchMetricsBackend {
@@ -24,6 +84,7 @@ pub struct CloudWatchMetricsBackend {
     task_monitor: Option<Arc<TaskMonitor>>,
     identity_store: Option<Arc<dyn IdentityStore>>,
     last_sent: Arc<tokio::sync::RwLock<Option<MetricsAggregator>>>,
+    last_payment_gate: Arc<tokio::sync::RwLock<Option<PaymentGateTotals>>>,
     dimensions: Option<Vec<Dimension>>,
 }
 
@@ -54,6 +115,7 @@ impl CloudWatchMetricsBackend {
             task_monitor: None,
             identity_store: None,
             last_sent: Arc::new(tokio::sync::RwLock::new(None)),
+            last_payment_gate: Arc::new(tokio::sync::RwLock::new(None)),
             dimensions: cw_dimensions,
         }
     }
@@ -191,7 +253,15 @@ impl MetricsBackend for CloudWatchMetricsBackend {
             true // If we've never sent metrics before, consider it changed
         };
 
-        if !sent_metrics_changed {
+        let payment_gate = payment_gate_totals();
+        let payment_gate_changed = self
+            .last_payment_gate
+            .read()
+            .await
+            .as_ref()
+            != Some(&payment_gate);
+
+        if !sent_metrics_changed && !payment_gate_changed {
             tracing::debug!("CloudWatch metrics unchanged (counters + latency) - skipping to save costs");
             return Ok(());
         } else {
@@ -472,6 +542,8 @@ impl MetricsBackend for CloudWatchMetricsBackend {
             );
         }
 
+        metric_data.extend(payment_gate_data(&payment_gate, self.dimensions.as_ref(), timestamp));
+
         // Send metrics to CloudWatch (max 1000 per request, we're well under)
         if !metric_data.is_empty() {
             let _metric_count = metric_data.len();
@@ -488,6 +560,10 @@ impl MetricsBackend for CloudWatchMetricsBackend {
                     // Store updated values (with Prometheus counter values) as last sent
                     let mut last_sent = self.last_sent.write().await;
                     *last_sent = Some(updated_aggregator);
+                    *self
+                        .last_payment_gate
+                        .write()
+                        .await = Some(payment_gate);
                 }
                 Err(e) => {
                     tracing::error!("CloudWatch metrics push failed: {}", e);
@@ -502,6 +578,10 @@ impl MetricsBackend for CloudWatchMetricsBackend {
                     // This prevents "first send" messages on every retry
                     let mut last_sent = self.last_sent.write().await;
                     *last_sent = Some(updated_aggregator);
+                    *self
+                        .last_payment_gate
+                        .write()
+                        .await = Some(payment_gate);
                 }
             }
         } else {
@@ -521,5 +601,107 @@ impl MetricsBackend for CloudWatchMetricsBackend {
 
     fn name(&self) -> &str {
         "cloudwatch"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn totals(
+        requests: &[(&str, u64)],
+        latency_sum_ms: f64,
+        latency_count: u64,
+    ) -> PaymentGateTotals {
+        PaymentGateTotals {
+            requests_by_outcome: requests
+                .iter()
+                .map(|(outcome, count)| (outcome.to_string(), *count))
+                .collect(),
+            latency_sum_ms,
+            latency_count,
+        }
+    }
+
+    fn dimension(
+        name: &str,
+        value: &str,
+    ) -> Dimension {
+        Dimension::builder()
+            .name(name)
+            .value(value)
+            .build()
+    }
+
+    fn summary(datum: &aws_sdk_cloudwatch::types::MetricDatum) -> (String, f64, Vec<(String, String)>) {
+        (
+            datum
+                .metric_name()
+                .unwrap()
+                .to_string(),
+            datum.value().unwrap(),
+            datum
+                .dimensions()
+                .iter()
+                .map(|d| {
+                    (
+                        d.name()
+                            .unwrap_or_default()
+                            .to_string(),
+                        d.value()
+                            .unwrap_or_default()
+                            .to_string(),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn the_payment_gate_is_reported_per_outcome_with_an_average_latency() {
+        let timestamp = aws_sdk_cloudwatch::primitives::DateTime::from_secs(1_700_000_000);
+        let configured = vec![dimension("Env", "prod")];
+        let data = payment_gate_data(
+            &totals(&[("challenge", 7), ("paid", 3), ("held", 0)], 600.0, 10),
+            Some(&configured),
+            timestamp,
+        );
+
+        let summaries: Vec<_> = data
+            .iter()
+            .map(summary)
+            .collect();
+        let outcome =
+            |name: &str| vec![("Env".to_string(), "prod".to_string()), ("Outcome".to_string(), name.to_string())];
+        assert_eq!(
+            summaries,
+            vec![
+                ("PaymentGateRequestCount".to_string(), 7.0, outcome("challenge")),
+                ("PaymentGateRequestCount".to_string(), 3.0, outcome("paid")),
+                ("PaymentGateAverageLatency".to_string(), 60.0, vec![("Env".to_string(), "prod".to_string())]),
+                ("PaymentGateLatencySampleCount".to_string(), 10.0, vec![("Env".to_string(), "prod".to_string())]),
+            ]
+        );
+    }
+
+    #[test]
+    fn nothing_is_reported_before_the_payment_gate_has_been_called() {
+        let timestamp = aws_sdk_cloudwatch::primitives::DateTime::from_secs(1_700_000_000);
+        assert!(payment_gate_data(&PaymentGateTotals::default(), None, timestamp).is_empty());
+
+        let only_refusals = payment_gate_data(&totals(&[("unavailable", 2)], 0.0, 0), None, timestamp);
+        let summaries: Vec<_> = only_refusals
+            .iter()
+            .map(summary)
+            .collect();
+        assert_eq!(
+            summaries,
+            vec![(
+                "PaymentGateRequestCount".to_string(),
+                2.0,
+                vec![("Outcome".to_string(), "unavailable".to_string())]
+            )],
+            "a refusal that made no round trip is counted but has no latency"
+        );
     }
 }

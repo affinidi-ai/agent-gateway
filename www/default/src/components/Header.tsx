@@ -158,8 +158,8 @@ const Header: React.FC<HeaderProps> = ({ onLogout }) => {
         return `${TITLE_PREFIX}Authorities`;
       case '/policies':
         return `${TITLE_PREFIX}Policies`;
-      case '/x402payments':
-        return `${TITLE_PREFIX}x402 Payments`;
+      case '/payments':
+        return `${TITLE_PREFIX}Payments`;
       default:
         // Handle dynamic routes with pattern matching
         if (location.pathname.startsWith('/identities/')) {

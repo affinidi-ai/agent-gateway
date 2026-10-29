@@ -43,6 +43,49 @@ fn mcp_attributes(
     attrs
 }
 
+/// The instruments the payment gate records into directly. The gate calls them
+/// from its own code path rather than through `persist`, so they live in a
+/// process-global slot, replaced each time the backend is built.
+struct PaymentGateInstruments {
+    requests: Counter<u64>,
+    latency: Histogram<f64>,
+}
+
+static PAYMENT_GATE: std::sync::RwLock<Option<Arc<PaymentGateInstruments>>> = std::sync::RwLock::new(None);
+
+fn payment_gate_instruments() -> Option<Arc<PaymentGateInstruments>> {
+    PAYMENT_GATE
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// Count one payment gate decision (`outcome` = `paid` | `challenge` | `held` |
+/// `rejected` | `unavailable`). No-op while OpenTelemetry metrics are not set up.
+pub fn record_payment_gate_request(
+    surface_id: &str,
+    outcome: &str,
+) {
+    if let Some(instruments) = payment_gate_instruments() {
+        instruments.requests.add(
+            1,
+            &[KeyValue::new("surface.id", surface_id.to_string()), KeyValue::new("outcome", outcome.to_string())],
+        );
+    }
+}
+
+/// Record the round-trip latency of one payment gate call.
+pub fn record_payment_gate_latency(
+    surface_id: &str,
+    latency_ms: u64,
+) {
+    if let Some(instruments) = payment_gate_instruments() {
+        instruments
+            .latency
+            .record(latency_ms as f64, &[KeyValue::new("surface.id", surface_id.to_string())]);
+    }
+}
+
 /// OpenTelemetry metrics backend for exporting to OTLP collectors
 pub struct OpenTelemetryMetricsBackend {
     #[allow(dead_code)]
@@ -149,6 +192,21 @@ impl OpenTelemetryMetricsBackend {
             .u64_counter(names::USER_LOGINS_TOTAL)
             .with_description("Total number of user logins")
             .build();
+
+        let payment_gate_requests = meter
+            .u64_counter(names::PAYMENT_GATE_REQUESTS_TOTAL)
+            .with_description("Payment gate decisions for agent_pay surfaces, by outcome")
+            .build();
+        let payment_gate_latency = meter
+            .f64_histogram(names::PAYMENT_GATE_LATENCY)
+            .with_description("Payment gate round-trip latency to agent-pay in milliseconds")
+            .build();
+        *PAYMENT_GATE
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(PaymentGateInstruments {
+            requests: payment_gate_requests,
+            latency: payment_gate_latency,
+        }));
 
         Self {
             meter,
@@ -301,6 +359,12 @@ impl MetricsBackend for OpenTelemetryMetricsBackend {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use opentelemetry_sdk::error::OTelSdkResult;
+    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};
+    use opentelemetry_sdk::metrics::exporter::PushMetricExporter;
+    use opentelemetry_sdk::metrics::{PeriodicReader, Temporality};
+
     #[test]
     #[ignore] // FIXME: failing test
     fn test_backend_name() {
@@ -309,5 +373,140 @@ mod tests {
         // This test would require initializing a full meter provider
         // For now, just verify the backend name concept
         assert_eq!("opentelemetry".len(), 14);
+    }
+
+    /// One exported data point: the instrument, its attributes, and its sum
+    /// (a counter's value, or a histogram's sum) with the count of measurements.
+    #[derive(Clone, Debug, PartialEq)]
+    struct Reading {
+        name: String,
+        attributes: Vec<(String, String)>,
+        sum: f64,
+        count: u64,
+    }
+
+    #[derive(Clone, Default)]
+    struct Collected(Arc<std::sync::Mutex<Vec<Reading>>>);
+
+    fn attributes<'a>(attributes: impl Iterator<Item = &'a KeyValue>) -> Vec<(String, String)> {
+        let mut attributes: Vec<_> = attributes
+            .map(|kv| (kv.key.to_string(), kv.value.to_string()))
+            .collect();
+        attributes.sort();
+        attributes
+    }
+
+    impl PushMetricExporter for Collected {
+        fn export(
+            &self,
+            metrics: &ResourceMetrics,
+        ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
+            let mut readings = self.0.lock().unwrap();
+            for metric in metrics
+                .scope_metrics()
+                .flat_map(|scope| scope.metrics())
+            {
+                match metric.data() {
+                    AggregatedMetrics::U64(MetricData::Sum(sum)) => {
+                        for point in sum.data_points() {
+                            readings.push(Reading {
+                                name: metric.name().to_string(),
+                                attributes: attributes(point.attributes()),
+                                sum: point.value() as f64,
+                                count: 0,
+                            });
+                        }
+                    }
+                    AggregatedMetrics::F64(MetricData::Histogram(histogram)) => {
+                        for point in histogram.data_points() {
+                            readings.push(Reading {
+                                name: metric.name().to_string(),
+                                attributes: attributes(point.attributes()),
+                                sum: point.sum(),
+                                count: point.count(),
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            std::future::ready(Ok(()))
+        }
+
+        fn force_flush(&self) -> OTelSdkResult {
+            Ok(())
+        }
+
+        fn shutdown_with_timeout(
+            &self,
+            _timeout: std::time::Duration,
+        ) -> OTelSdkResult {
+            Ok(())
+        }
+
+        fn temporality(&self) -> Temporality {
+            Temporality::Cumulative
+        }
+    }
+
+    #[test]
+    fn the_payment_gate_is_exported_by_surface_and_outcome_with_its_latency() {
+        use crate::metrics::backends::prometheus::{track_payment_gate, track_payment_gate_request};
+
+        let collected = Collected::default();
+        let provider = SdkMeterProvider::builder()
+            .with_reader(PeriodicReader::builder(collected.clone()).build())
+            .build();
+        let _backend = OpenTelemetryMetricsBackend::new(&provider);
+        let surface = format!("surface-{}", uuid::Uuid::new_v4());
+
+        track_payment_gate(&surface, "paid", 40);
+        track_payment_gate(&surface, "paid", 60);
+        track_payment_gate(&surface, "challenge", 10);
+        track_payment_gate_request(&surface, "unavailable");
+        provider
+            .force_flush()
+            .unwrap();
+
+        let ours = |name: &str| -> Vec<Reading> {
+            let mut readings: Vec<Reading> = collected
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|reading| {
+                    reading.name == name
+                        && reading
+                            .attributes
+                            .contains(&("surface.id".to_string(), surface.clone()))
+                })
+                .cloned()
+                .collect();
+            readings.sort_by(|a, b| {
+                a.attributes
+                    .cmp(&b.attributes)
+            });
+            readings
+        };
+        let by_outcome = |outcome: &str, sum: f64| Reading {
+            name: names::PAYMENT_GATE_REQUESTS_TOTAL.to_string(),
+            attributes: vec![("outcome".to_string(), outcome.to_string()), ("surface.id".to_string(), surface.clone())],
+            sum,
+            count: 0,
+        };
+        assert_eq!(
+            ours(names::PAYMENT_GATE_REQUESTS_TOTAL),
+            vec![by_outcome("challenge", 1.0), by_outcome("paid", 2.0), by_outcome("unavailable", 1.0)]
+        );
+        assert_eq!(
+            ours(names::PAYMENT_GATE_LATENCY),
+            vec![Reading {
+                name: names::PAYMENT_GATE_LATENCY.to_string(),
+                attributes: vec![("surface.id".to_string(), surface.clone())],
+                sum: 110.0,
+                count: 3,
+            }],
+            "a decision that made no round trip has no latency"
+        );
     }
 }
