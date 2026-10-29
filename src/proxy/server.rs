@@ -158,8 +158,16 @@ pub fn get_gateway_base_url() -> Option<String> {
         .cloned()
 }
 
+/// Install the process-wide transit token issuer. The first issuer installed
+/// stays in use; a later one is ignored with a warning.
 pub fn init_transit_token_issuer(issuer: Arc<crate::proxy::transit_token::TransitTokenIssuer>) {
-    let _ = GLOBAL_TRANSIT_TOKEN_ISSUER.set(issuer);
+    if GLOBAL_TRANSIT_TOKEN_ISSUER
+        .set(issuer)
+        .is_err()
+    {
+        warn!(target: "transit_token", "Global transit token issuer is already initialized; keeping the first one");
+        return;
+    }
     info!(target: "transit_token", "Global transit token issuer initialized for proxy pipeline");
 }
 
