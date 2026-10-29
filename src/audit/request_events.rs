@@ -124,6 +124,8 @@ pub struct RoutingRefusal {
     reason: RejectionReason,
     status: axum::http::StatusCode,
     requested_variant: Option<String>,
+    /// On `variant_disabled`: the disabled variant's configured alias.
+    disabled_variant: Option<String>,
 }
 
 impl RoutingRefusal {
@@ -136,11 +138,11 @@ impl RoutingRefusal {
     }
 
     /// Logs the refusal of a request to `surface` from what was recorded:
-    /// the reason, the requested alias as cut for the record, and on a
-    /// misconfigured default the configured `default_variant_id`. The
-    /// caller's raw alias is never logged. The message carries the
-    /// `[CHANNEL:<config_id>]` prefix the dashboard's channel log filter
-    /// matches.
+    /// the reason, the requested alias as cut for the record, on a disabled
+    /// variant its configured alias in full, and on a misconfigured default
+    /// the configured `default_variant_id`. The caller's raw alias is never
+    /// logged. The message carries the `[CHANNEL:<config_id>]` prefix the
+    /// dashboard's channel log filter matches.
     pub fn warn(
         &self,
         surface: &crate::config::agent_surface::AgentSurface,
@@ -160,6 +162,7 @@ impl RoutingRefusal {
             surface = %surface.name,
             reason = ?self.reason(),
             requested_variant = ?self.requested_variant(),
+            disabled_variant = ?self.disabled_variant.as_deref(),
             default_variant_id = ?default_variant_id,
             "[CHANNEL:{config_id}] Surface variant cannot be resolved"
         );
@@ -205,16 +208,19 @@ pub fn refuse_routing(
             reason: RejectionReason::UnknownVariant,
             status: StatusCode::NOT_FOUND,
             requested_variant: Some(SurfaceVariant::cut_alias(alias)),
+            disabled_variant: None,
         },
-        VariantResolveError::DisabledVariant(_) => RoutingRefusal {
+        VariantResolveError::DisabledVariant(alias) => RoutingRefusal {
             reason: RejectionReason::VariantDisabled,
             status: StatusCode::NOT_FOUND,
             requested_variant: None,
+            disabled_variant: Some(alias.clone()),
         },
         VariantResolveError::MisconfiguredDefault(_) => RoutingRefusal {
             reason: RejectionReason::MisconfiguredDefault,
             status: StatusCode::INTERNAL_SERVER_ERROR,
             requested_variant: None,
+            disabled_variant: None,
         },
     };
     record_rejection(

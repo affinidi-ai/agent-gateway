@@ -51,8 +51,9 @@ changes:
       title: Log a refused variant alias cut to 32 characters, never as the caller sent it
       description: >-
         The warning written when a request's surface variant can't be resolved names the reason,
-        the requested alias cut to 32 characters as the audit record holds it, and on a
-        misconfigured default the configured default_variant_id. It no longer embeds the alias
+        the requested alias cut to 32 characters as the audit record holds it, on a disabled
+        variant its configured alias in disabled_variant, and on a misconfigured default the
+        configured default_variant_id. It no longer embeds the alias
         from the URL verbatim, so caller-chosen text in the log is bounded on the Access Point,
         the Transit Point and Fabric receive.
   breaking:
