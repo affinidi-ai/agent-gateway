@@ -450,6 +450,43 @@ mod tests {
     }
 
     #[test]
+    fn only_an_insufficient_scope_source_failure_moves_the_scope_denied_counter() {
+        use crate::source_auth::errors::SourceAuthError;
+        let counter = || {
+            crate::metrics::backends::prometheus::SCOPE_DENIED
+                .with_label_values(&["api_key"])
+                .get()
+        };
+        let record = |error: &SourceAuthError| {
+            auth_failed(&facts(), AuthScheme::ApiKey, source_auth_reason(error), true, None);
+        };
+        let missing = SourceAuthError::MissingCredential { reason: "no key".into() };
+        let invalid = SourceAuthError::InvalidCredential { reason: "bad key".into() };
+        let short = SourceAuthError::InsufficientScope {
+            missing: vec!["Task.Run".into()],
+        };
+
+        let before = counter();
+        record(&missing);
+        assert_eq!(counter(), before, "a missing credential is not a scope denial");
+        record(&invalid);
+        assert_eq!(counter(), before, "an invalid credential is not a scope denial");
+        record(&short);
+        assert_eq!(counter(), before + 1);
+        record(&short);
+        assert_eq!(counter(), before + 2);
+
+        let expected = format!("agent_gateway_scope_denied_total{{scheme=\"api_key\"}} {}", before + 2);
+        let exposition = crate::metrics::backends::prometheus::get_metrics();
+        assert!(
+            exposition
+                .lines()
+                .any(|line| line == expected),
+            "missing {expected} in:\n{exposition}"
+        );
+    }
+
+    #[test]
     fn a_refused_resource_token_scope_is_counted_under_its_scheme() {
         let counter = || {
             crate::metrics::backends::prometheus::SCOPE_DENIED

@@ -114,3 +114,6 @@ jobs:
 
       - name: Lint surface BDD support target
         run: cargo clippy --test surface_bdd_support --all-features -- -D warnings
+
+      - name: Lint startup refusal target
+        run: cargo clippy --test startup_refusal --all-features -- -D warnings

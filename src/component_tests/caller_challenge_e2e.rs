@@ -232,13 +232,21 @@ async fn start(
 }
 
 fn token(fixture: &JwksFixture) -> String {
-    sign_jwt(
-        json!({
-            "iss": fixture.issuer, "sub": "client", "aud": SMOKE_RESOURCE,
-            "exp": now_secs() + 300, "iat": now_secs(),
-        }),
-        &fixture.kid,
-    )
+    token_with(fixture, None)
+}
+
+fn token_with(
+    fixture: &JwksFixture,
+    scope: Option<&str>,
+) -> String {
+    let mut claims = json!({
+        "iss": fixture.issuer, "sub": "client", "aud": SMOKE_RESOURCE,
+        "exp": now_secs() + 300, "iat": now_secs(),
+    });
+    if let Some(scope) = scope {
+        claims["scope"] = json!(scope);
+    }
+    sign_jwt(claims, &fixture.kid)
 }
 
 async fn tools_mock() -> MockServer {
@@ -560,4 +568,95 @@ async fn a_target_401_left_without_a_challenge_becomes_a_502_on_a_declaring_acce
     assert_eq!(answer.status, 401, "{body}");
     assert_eq!(answer.challenges, &UPSTREAM_CHALLENGES[..2]);
     assert_eq!(dropped_challenge_lines(&h), Vec::<String>::new());
+}
+
+const SCOPE_DENY_REASON: &str = "scope-order-probe-denied";
+const DENY_ALL_GATEWAY_POLICY: &str =
+    "package gateway.policy\ndefault allow := false\ndeny_reason := \"scope-order-probe-denied\" if true\n";
+const ALLOW_ALL_GATEWAY_POLICY: &str = "package gateway.policy\ndefault allow := true\n";
+
+async fn start_requiring_scope(
+    fixture: &JwksFixture,
+    gateway_policy: &'static str,
+) -> GatewayHarness {
+    let setup = Setup::relaying(CallerAuth::Declaring);
+    GatewayHarness::start_with_mock_and_logs(tools_mock().await, |temp_dir, gw_config, bootstrap| {
+        configure(fixture, &setup, None, temp_dir, gw_config, bootstrap);
+        write_gateway_policy(
+            &bootstrap
+                .storage_paths
+                .gateways,
+            gateway_policy,
+        );
+        let mut surface = serde_json::to_value(&gw_config.surfaces[0]).expect("serialize surface");
+        surface["access_point"]["caller_authentication"]["methods"][0]["required_scopes"] = json!(["tools.call"]);
+        gw_config.surfaces = vec![serde_json::from_value(surface).expect("scoped surface")];
+    })
+    .await
+}
+
+fn policy_decision_lines(h: &GatewayHarness) -> Vec<String> {
+    h.logs()
+        .lines()
+        .filter(|line| line.contains("policy decision"))
+        .map(str::to_string)
+        .collect()
+}
+
+fn insufficient_scope_challenge() -> Vec<String> {
+    vec![format!("Bearer resource_metadata=\"{METADATA_URL}\", error=\"insufficient_scope\", scope=\"tools.call\"")]
+}
+
+fn gateway_policy_evaluations(h: &GatewayHarness) -> usize {
+    h.logs()
+        .lines()
+        .filter(|line| line.contains("[OPA-INPUT] Gateway policy input before eval"))
+        .count()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scope_shortfall_is_refused_before_a_gateway_policy_that_denies_and_a_granted_token_reaches_it() {
+    let fixture = JwksFixture::start().await;
+    let setup = Setup::relaying(CallerAuth::Declaring);
+    let h = start_requiring_scope(&fixture, DENY_ALL_GATEWAY_POLICY).await;
+
+    let (short, body) = send(&h, &setup, Some(&token_with(&fixture, Some("tools")))).await;
+    assert_eq!(short.status, 403, "{body}");
+    assert_eq!(short.challenges, insufficient_scope_challenge(), "{body}");
+    assert_eq!(body["status"], 403, "{body}");
+    assert_eq!(target_calls(&h), 0);
+    assert_eq!(gateway_policy_evaluations(&h), 0, "gateway policy never evaluated for the shortfall");
+    assert!(
+        !h.logs()
+            .contains(SCOPE_DENY_REASON),
+        "policy never ran for the shortfall"
+    );
+
+    let (granted, body) = send(&h, &setup, Some(&token_with(&fixture, Some("tools tools.call")))).await;
+    assert_eq!((granted.status, granted.challenges), (403, vec![]), "{body}");
+    assert_eq!(body["detail"], "Request blocked by gateway policy", "{body}");
+    assert_eq!(target_calls(&h), 0);
+    assert_eq!(gateway_policy_evaluations(&h), 1);
+    let decisions = policy_decision_lines(&h);
+    assert_eq!(decisions.len(), 1, "{decisions:?}");
+    assert!(decisions[0].contains("policy decision: deny"), "{}", decisions[0]);
+    assert!(decisions[0].contains(SCOPE_DENY_REASON), "{}", decisions[0]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scope_shortfall_is_refused_before_a_gateway_policy_that_allows_and_a_granted_token_reaches_the_target() {
+    let fixture = JwksFixture::start().await;
+    let setup = Setup::relaying(CallerAuth::Declaring);
+    let h = start_requiring_scope(&fixture, ALLOW_ALL_GATEWAY_POLICY).await;
+
+    let (short, body) = send(&h, &setup, Some(&token_with(&fixture, Some("tools")))).await;
+    assert_eq!(short.status, 403, "{body}");
+    assert_eq!(short.challenges, insufficient_scope_challenge(), "{body}");
+    assert_eq!(target_calls(&h), 0, "an allowing policy does not admit a scope shortfall");
+    assert_eq!(gateway_policy_evaluations(&h), 0, "gateway policy never evaluated for the shortfall");
+
+    let (granted, body) = send(&h, &setup, Some(&token_with(&fixture, Some("tools.call")))).await;
+    assert_eq!((granted.status, granted.challenges), (200, vec![]), "{body}");
+    assert_eq!(target_calls(&h), 1);
+    assert_eq!(gateway_policy_evaluations(&h), 1);
 }

@@ -781,6 +781,12 @@ async fn a_token_short_of_a_required_scope_is_refused_with_insufficient_scope_be
     supported.sort();
     assert_eq!(supported, vec!["tools", "tools.call"]);
 
+    let scope_denied = || {
+        crate::metrics::backends::prometheus::SCOPE_DENIED
+            .with_label_values(&["jwt"])
+            .get()
+    };
+    let denied_before = scope_denied();
     let short = call("/smoke/rpc", Some(scoped("https://gateway.example/smoke", "tools")))
         .await
         .unwrap();
@@ -795,6 +801,7 @@ async fn a_token_short_of_a_required_scope_is_refused_with_insufficient_scope_be
     let body: serde_json::Value = short.json().await.unwrap();
     assert_eq!(body["status"], 403);
     assert_eq!(body["title"], "Forbidden");
+    assert!(scope_denied() > denied_before, "a scope shortfall through the proxy is counted under jwt");
 
     let variant = call("/smoke$beta/rpc", Some(scoped("https://gateway.example/smoke$beta", "tools")))
         .await

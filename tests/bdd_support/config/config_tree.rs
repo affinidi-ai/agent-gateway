@@ -198,7 +198,7 @@ impl GatewayBootstrapFixture {
         }
     }
 
-    pub async fn start_gateway(&self) -> GatewayProcess {
+    pub fn write_config_files(&self) -> PathBuf {
         let base_dir = self
             .root_dir
             .as_ref()
@@ -207,7 +207,16 @@ impl GatewayBootstrapFixture {
         write_gateway_config_tree(base_dir, self, false);
         write_config_toml_from_fixture(self);
         self.write_self_record();
-        let config_toml_path = base_dir.join("config.toml");
+        base_dir.join("config.toml")
+    }
+
+    pub async fn start_gateway(&self) -> GatewayProcess {
+        let base_dir = self
+            .root_dir
+            .as_ref()
+            .expect("root dir must be set")
+            .as_path();
+        let config_toml_path = self.write_config_files();
         let inbound_port = self.gateway_port;
         let mut gateway = GatewayProcess::start(&config_toml_path, base_dir, TEST_AUTH_TOKEN, OutputMode::Piped);
         gateway = gateway.with_port(inbound_port);

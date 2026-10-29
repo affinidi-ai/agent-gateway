@@ -142,6 +142,10 @@ into the runner fails rather than passing unnoticed. Register every new step mod
 `tests/surface_bdd/steps/mod.rs` and every support module in `tests/bdd_support/mod.rs`.
 Scenarios tagged `@wip` are filtered out before they run.
 
+`tests/startup_refusal.rs` is a separate black-box test that spawns the gateway binary and checks
+startup refusals: exit status 2 and the logged reserved-route collision, for channel, route and MCP
+Proxy prefixes. Run it with `cargo test --test startup_refusal`.
+
 `make gw-e2e` starts mediator containers, sets `FABRIC_BDD_MANAGED_MEDIATOR`, and runs
 with `G2G_BDD_PARALLELISM` scenarios at once, 8 by default. Set
 `G2G_BDD_PARALLELISM=1` when a failure is hard to attribute.
