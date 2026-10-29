@@ -12,6 +12,11 @@ import FabricDelegatedCredentialsSection, {
   hasOutboundCredentialBindings,
 } from '../_shared/FabricDelegatedCredentialsSection';
 import { AgentCardLocationHelp } from '../_shared/AgentCardLocationHelp';
+import TargetAuthProviderSelect from '../_shared/TargetAuthProviderSelect';
+import {
+  PROVIDER_TARGET_AUTH_DEFAULTS,
+  providerTargetAuthFromApi,
+} from '../_shared/providerTargetAuth';
 import { newTransitPointId, deriveTransitPointAlias } from './factory';
 import { filterSelectableGateways } from '../../../../utils/gateways';
 
@@ -78,6 +83,18 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
     }
     const ta = config.target_auth;
     if (!ta || typeof ta !== 'object') return;
+    const provider = providerTargetAuthFromApi(ta);
+    if (provider) {
+      authHydratedRef.current = true;
+      updateFields({
+        auth_type: 'credential_provider',
+        auth_provider_id: provider.providerId,
+        auth_header_name: provider.headerName,
+        auth_header_format: provider.headerFormat,
+        auth_fallback: provider.fallback,
+      });
+      return;
+    }
     const ss =
       (ta.method && typeof ta.method === 'object' && (ta.method as any).static_secret) ||
       (ta.method === 'static_secret' ? ta : null);
@@ -370,6 +387,7 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
         <label>Target Authentication</label>
         <Form.Select
           size="sm"
+          data-testid="transit-point-target-auth-type"
           value={config.auth_type || 'none'}
           onChange={e => updateField('auth_type', e.target.value)}
         >
@@ -377,20 +395,63 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
           <option value="bearer">Bearer Token</option>
           <option value="api_key">API Key Header</option>
           <option value="custom_header">Custom Header</option>
-          <option value="oauth_client_credentials">OAuth Client Credentials</option>
+          <option value="credential_provider">Credential Provider</option>
         </Form.Select>
-        {config.auth_type && config.auth_type !== 'none' && (
-          <Form.Group className="mt-2">
-            <Form.Label className="small text-muted mb-1">Secret Reference</Form.Label>
-            <Form.Control
-              size="sm"
-              type="text"
-              placeholder="secret-name"
-              value={config.auth_secret || ''}
-              onChange={e => updateField('auth_secret', e.target.value)}
-            />
-          </Form.Group>
+        {config.auth_type === 'credential_provider' && (
+          <>
+            <Form.Group className="mt-2">
+              <Form.Label className="small text-muted mb-1" htmlFor="transit-point-auth-provider">
+                Credential Provider
+              </Form.Label>
+              <TargetAuthProviderSelect
+                id="transit-point-auth-provider"
+                testId="transit-point-target-auth-provider"
+                value={config.auth_provider_id || ''}
+                onChange={providerId => updateField('auth_provider_id', providerId)}
+                small
+              />
+            </Form.Group>
+            <Form.Group className="mt-2">
+              <Form.Label className="small text-muted mb-1">Header Name</Form.Label>
+              <Form.Control
+                size="sm"
+                type="text"
+                data-testid="transit-point-target-auth-provider-header-name"
+                placeholder={PROVIDER_TARGET_AUTH_DEFAULTS.headerName}
+                value={config.auth_header_name || ''}
+                onChange={e => updateField('auth_header_name', e.target.value)}
+              />
+            </Form.Group>
+            <Form.Group className="mt-2">
+              <Form.Label className="small text-muted mb-1">Header Format</Form.Label>
+              <Form.Control
+                size="sm"
+                type="text"
+                data-testid="transit-point-target-auth-provider-header-format"
+                placeholder={PROVIDER_TARGET_AUTH_DEFAULTS.headerFormat}
+                value={config.auth_header_format || ''}
+                onChange={e => updateField('auth_header_format', e.target.value)}
+              />
+              <Form.Text className="text-muted" style={{ fontSize: '10px' }}>
+                Use <code>{'{value}'}</code> as the placeholder for the provider's token.
+              </Form.Text>
+            </Form.Group>
+          </>
         )}
+        {config.auth_type &&
+          config.auth_type !== 'none' &&
+          config.auth_type !== 'credential_provider' && (
+            <Form.Group className="mt-2">
+              <Form.Label className="small text-muted mb-1">Secret Reference</Form.Label>
+              <Form.Control
+                size="sm"
+                type="text"
+                placeholder="secret-name"
+                value={config.auth_secret || ''}
+                onChange={e => updateField('auth_secret', e.target.value)}
+              />
+            </Form.Group>
+          )}
         {(config.auth_type === 'api_key' || config.auth_type === 'custom_header') && (
           <Form.Group className="mt-2">
             <Form.Label className="small text-muted mb-1">Header Name</Form.Label>
@@ -420,7 +481,9 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
         )}
         {config.auth_type && config.auth_type !== 'none' && (
           <Form.Group className="mt-2">
-            <Form.Label className="small text-muted mb-1">Fallback when secret missing</Form.Label>
+            <Form.Label className="small text-muted mb-1">
+              Fallback when the credential is missing
+            </Form.Label>
             <Form.Select
               size="sm"
               value={config.auth_fallback || 'reject'}
@@ -430,11 +493,6 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
               <option value="passthrough">Passthrough (no credential injected)</option>
             </Form.Select>
           </Form.Group>
-        )}
-        {config.auth_type === 'oauth_client_credentials' && (
-          <Form.Text className="text-warning" style={{ fontSize: '10px' }}>
-            Not yet wired through the proxy runtime — this selection will not be persisted on save.
-          </Form.Text>
         )}
       </div>
 

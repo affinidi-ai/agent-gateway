@@ -7,6 +7,7 @@ import type { SurfaceNodeType } from '../nodeTypes';
 import { urlError } from '../validators';
 import TransitPointPanel from './TransitPointPanel';
 import { transitCredentialsToApi } from '../_shared/TransitCredentialBindingSection';
+import { providerTargetAuthToApi } from '../_shared/providerTargetAuth';
 import { identityConfigToWire } from '../identity/definition';
 import { workloadBindingFormToApi } from '../workload-binding/config';
 import { getCachedOutboundListenAddresses } from '../access-point/defaults';
@@ -234,12 +235,11 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
           'No outbound listener is configured. Add an outbound listener before using a transit point.',
       },
       {
-        description: 'OAuth Client Credentials auth is not yet wired through the proxy runtime',
-        condition: c => c?.auth_type === 'oauth_client_credentials',
-        check: () => false,
+        description: 'A credential provider target auth needs a provider',
+        condition: c => c?.auth_type === 'credential_provider',
+        check: c => typeof c?.auth_provider_id === 'string' && c.auth_provider_id.trim() !== '',
         severity: 'error',
-        message:
-          'OAuth Client Credentials is not yet supported. The selection will be dropped on save. Pick Bearer, API Key, or Custom Header.',
+        message: 'Pick the credential provider whose token authenticates this Transit Point.',
       },
     ],
     ConfigPanel: TransitPointPanel,
@@ -409,13 +409,25 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
                     // Project the panel's auth_* fields onto the
                     // backend `TargetAuthConfig` shape (externally-tagged
                     // method enum). Empty / "none" auth is omitted so
-                    // the surface JSON stays clean. Today only
-                    // `static_secret` is wired through; the panel maps
-                    // its bearer / api_key / custom_header presets onto
+                    // the surface JSON stays clean. A credential provider
+                    // maps to `credential_provider`; the bearer / api_key /
+                    // custom_header presets map to `static_secret` with
                     // header_name + header_format pairs that the proxy
                     // injects verbatim.
                     const t = c.auth_type;
                     if (!t || t === 'none') return {};
+                    if (t === 'credential_provider') {
+                      const auth = providerTargetAuthToApi({
+                        providerId:
+                          typeof c.auth_provider_id === 'string' ? c.auth_provider_id : '',
+                        headerName:
+                          typeof c.auth_header_name === 'string' ? c.auth_header_name : '',
+                        headerFormat:
+                          typeof c.auth_header_format === 'string' ? c.auth_header_format : '',
+                        fallback: c.auth_fallback,
+                      });
+                      return auth ? { target_auth: auth } : {};
+                    }
                     const secretId = typeof c.auth_secret === 'string' ? c.auth_secret.trim() : '';
                     if (!secretId) return {};
                     let headerName: string;
@@ -447,9 +459,8 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
                           '{value}';
                         break;
                       default:
-                        // Methods the runtime cannot inject yet (e.g.
-                        // oauth_client_credentials) are dropped here
-                        // rather than emitting an invalid wire shape.
+                        // An unknown preset is dropped here rather than
+                        // emitting an invalid wire shape.
                         return {};
                     }
                     return {

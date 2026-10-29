@@ -153,6 +153,19 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   leaves it in place. The default variant's note says it also answers on the surface's route
   with the resource as written.
 
+- **Target authentication** on the Managed Agent (fullscreen editor) and on a Transit Point
+  takes its credential from a static secret or from a credential provider. The Managed Agent
+  editor has a **Credential Source** select (`managed-agent-target-auth-source`: Static secret,
+  Credential provider); the Transit Point's auth type select (`transit-point-target-auth-type`)
+  has a **Credential Provider** option with header name and format inputs defaulting to
+  `Authorization` and `Bearer {value}`. Both use the shared `TargetAuthProviderSelect`
+  (`_shared/TargetAuthProviderSelect.tsx`), which lists only Client Credentials, JWT Bearer,
+  Client Credentials JWT and API Key providers, since the gateway refuses an Authorization Code
+  provider here. `_shared/providerTargetAuth.ts` maps the form to and from the wire
+  `method.credential_provider`, and a Transit Point with the option but no provider blocks Save.
+  Test ids: `managed-agent-target-auth-provider`, `transit-point-target-auth-provider`, each with
+  `-add-link`, and `transit-point-target-auth-provider-header-name` / `-header-format`.
+
 | Element                                                        | Test id                                                                                                                                                                                            |
 | -------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Discovery switch, resource, use listener URL                   | `caller-auth-discovery-switch`, `caller-auth-discovery-resource-input`, `caller-auth-discovery-use-listener-url-button`                                                                            |
@@ -366,6 +379,25 @@ Management personal access tokens live in the Secrets page's **Access Tokens** t
 - Do not add a PAT-only tenant field or tenant picker.
 
 Keep labels associated, timestamps exact, and clipboard failures visible.
+
+## Credential provider editor
+
+`/credential-providers/new` and `/credential-providers/:id` (`EditCredentialProviderPage.tsx`)
+show the inputs of the chosen Provider Type (`credential-provider-type-select`).
+`EditCredentialProviderPage/credentialProviderForm.ts` decides which inputs a type uses
+(`providerTypeFields`), the first missing required field, and the request fields.
+
+- **JWT Bearer** asks for Token Endpoint, Issuer, Signing Key, and optionally Key ID, Audience
+  and Subject, with no client ID or secret. **Client Credentials JWT** asks for Token Endpoint,
+  Client ID, Signing Key and Certificate, with no client secret. Both share the **Signed JWT**
+  section (`JwtAssertionSection.tsx`, `credential-provider-jwt-section`), whose algorithm select
+  lists the type's algorithms, default first.
+- Key material is never typed into this form. Signing key and certificate are secret pickers
+  (`SecretSelect.tsx`, `credential-provider-<field>-select`); the operator creates the secret on
+  the Secrets page and pastes the PEM there. The gateway checks the PEM on save.
+- Save sends a field the type does not use as empty, which the gateway reads as cleared, so
+  switching a provider to Client Credentials JWT drops its client secret.
+- The Credential Providers tab labels the types from `PROVIDER_TYPE_LABELS` in the same module.
 
 ## Secret editor
 

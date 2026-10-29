@@ -588,6 +588,12 @@ export interface DashboardStats {
           header_name: string;
           header_format: string;
         };
+        credential_provider?: {
+          provider_id: string;
+          header_name?: string;
+          header_format?: string;
+          scopes?: string[];
+        };
       };
       target_identifier?: string;
       fallback?: string;
