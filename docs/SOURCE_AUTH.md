@@ -312,6 +312,11 @@ limit or resolves a credential:
 | `mtls` | The certificate from the outbound listener's own TLS handshake (`[tls.client_auth] direct`, on an `https` outbound listener), or from the forwarded-client-cert header of a proxy in `trusted_proxies` |
 | `did_auth` | Not supported: a Transit Point serves no DID Auth challenge |
 
+The secret, JWT verification strategy, API-key parent or certificates a Transit Point's
+`source_auth` names are checked on save as an Access Point's are: a tenant access token can
+name only its own tenant's or appliance-wide ones (see
+[`ACCESS_TOKENS.md`](ACCESS_TOKENS.md)).
+
 Unlike an Access Point, a Transit Point refuses a caller whose credential is missing or
 refused, with `401` and a problem JSON saying only `Caller credential missing or invalid`;
 which check failed is logged. A check the gateway cannot run, such as a secret, strategy,

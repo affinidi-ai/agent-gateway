@@ -16,7 +16,9 @@ changes:
         sent to the target. The verified caller reaches the Transit Point's policy input as
         `input.transit.caller` with `verification: source_auth`, so a policy can allow only
         named callers, and keys per-caller delegated credentials by the same identity hash the
-        Access Point uses. A dashboard save keeps a Transit Point's `source_auth`.
+        Access Point uses. The secrets, strategies, API-key parents and certificates it names
+        are checked on save as an Access Point's are, so a tenant access token can name only its
+        own or appliance-wide ones. A dashboard save keeps a Transit Point's `source_auth`.
     - timestamp: '2026-10-29T12:00:00.000Z'
       title: Warn when an open Transit Point is reachable on a public address
       description: >-
