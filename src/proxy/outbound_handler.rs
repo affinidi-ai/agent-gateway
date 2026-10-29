@@ -964,7 +964,13 @@ async fn outbound_proxy_handler_in_request_scope(
     let processed_response = step_process_response(&state, &mut ctx, upstream_response).await?;
 
     // [13] Metrics & Logging (never fails)
-    step_record_metrics(&state, &ctx);
+    step_record_metrics(
+        &state,
+        &ctx,
+        processed_response
+            .status()
+            .is_success(),
+    );
 
     Ok(processed_response)
 }
@@ -5241,10 +5247,10 @@ async fn process_modern_outbound_response(
         if let Ok(mut snapshot) = shared.lock() {
             let (state, ctx) = &mut *snapshot;
             ctx.response_bytes = Some(outcome.bytes);
-            if outcome.completed {
-                step_record_metrics(state, ctx);
+            if outcome.completed || outcome.failed {
+                step_record_metrics(state, ctx, outcome.completed && status.is_success());
             } else {
-                warn!(request_id = %ctx.request_id, failed = outcome.failed, response_bytes = outcome.bytes, "Modern MCP response ended before completion");
+                warn!(request_id = %ctx.request_id, response_bytes = outcome.bytes, "Modern MCP response ended before completion");
             }
         }
     }))
@@ -5413,10 +5419,13 @@ fn process_outbound_response_body(
         })
 }
 
-/// [13] Metrics & Logging — records latency and status.  Never fails.
+/// [13] Metrics & Logging - records latency and status, `succeeded` when the
+/// target answered with a 2xx and the response reached the agent whole. Never
+/// fails.
 fn step_record_metrics(
     state: &OutboundProxyState,
     ctx: &OutboundPipelineContext,
+    succeeded: bool,
 ) {
     let latency_ms = ctx
         .start_time
@@ -5475,6 +5484,11 @@ fn step_record_metrics(
             .active_variant_alias
             .clone();
         let metrics = Arc::clone(metrics);
+        let status = if succeeded {
+            crate::metrics::ConnectionStatus::Success
+        } else {
+            crate::metrics::ConnectionStatus::Failed
+        };
 
         tokio::spawn(async move {
             metrics
@@ -5482,7 +5496,7 @@ fn step_record_metrics(
                     channel_config_id,
                     source,
                     dest,
-                    crate::metrics::ConnectionStatus::Success,
+                    status,
                     Some(latency_ms),
                     None,
                     crate::metrics::ConnectionDirection::Request,
@@ -10556,7 +10570,118 @@ mod tests {
         let mut state = test_outbound_state();
         state.metrics_store = None;
         let ctx = test_pipeline_context();
-        step_record_metrics(&state, &ctx);
+        step_record_metrics(&state, &ctx, true);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transit_point_records_a_target_error_as_a_failed_call() {
+        for (target_status, recorded) in [
+            (StatusCode::OK, crate::metrics::ConnectionStatus::Success),
+            (StatusCode::UNAUTHORIZED, crate::metrics::ConnectionStatus::Failed),
+            (StatusCode::BAD_GATEWAY, crate::metrics::ConnectionStatus::Failed),
+        ] {
+            let target = crate::component_tests::helpers::RecordingTarget::start(target_status, &[]).await;
+            let metrics = Arc::new(crate::metrics::MetricsStore::new(10));
+            let mut state = test_outbound_state();
+            state.metrics_store = Some(metrics.clone());
+            state
+                .channel_state
+                .write()
+                .unwrap()
+                .surface = Arc::new(transit_surface(
+                json!([{"alias": "partner", "protocol": "http", "require_transit_token": false,
+                    "target_endpoint": target.url}]),
+                json!([]),
+            ));
+            let request = Request::builder()
+                .method("POST")
+                .uri("/outbound/mcp/partner")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(r#"{"ping":true}"#))
+                .unwrap();
+
+            let response = Box::pin(outbound_proxy_handler_with_mcp_versions(
+                "127.0.0.1:12345"
+                    .parse()
+                    .unwrap(),
+                state,
+                request,
+                crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+            ))
+            .await
+            .unwrap();
+            assert_eq!(response.status(), target_status);
+
+            let mut connections = Vec::new();
+            for _ in 0..50 {
+                connections = metrics
+                    .get_recent_connections(10)
+                    .await;
+                if !connections.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert_eq!(connections.len(), 1, "{target_status}");
+            assert_eq!(connections[0].status, recorded, "{target_status}");
+        }
+    }
+
+    /// A `2026-07-28` MCP response stream that fails part way through is
+    /// recorded as a failed call, and one that completes as a successful call.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transit_point_records_a_modern_stream_that_fails_as_a_failed_call() {
+        let event = |message: serde_json::Value| {
+            Ok::<_, std::io::Error>(Bytes::from(format!("event: message\ndata: {message}\n\n")))
+        };
+        let progress = json!({"jsonrpc": "2.0", "method": "notifications/progress",
+            "params": {"progressToken": "work", "progress": 1}});
+        let result = json!({"jsonrpc": "2.0", "id": "stream", "result": {"resultType": "complete", "content": []}});
+        for (case, events, recorded) in [
+            (
+                "fails",
+                vec![event(progress.clone()), Err(std::io::Error::other("the target reset the stream"))],
+                crate::metrics::ConnectionStatus::Failed,
+            ),
+            (
+                "completes",
+                vec![event(progress.clone()), event(result.clone())],
+                crate::metrics::ConnectionStatus::Success,
+            ),
+        ] {
+            let metrics = Arc::new(crate::metrics::MetricsStore::new(10));
+            let mut state = test_outbound_state();
+            state.metrics_store = Some(metrics.clone());
+            let upstream = reqwest::Response::from(
+                axum::http::Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(reqwest::Body::wrap_stream(futures::stream::iter(events)))
+                    .unwrap(),
+            );
+
+            let response = process_modern_outbound_response(
+                state,
+                modern_pipeline_context("tools/call"),
+                UpstreamResponse::Http(upstream),
+            )
+            .await
+            .unwrap();
+            let read = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+            assert_eq!(read.is_ok(), recorded == crate::metrics::ConnectionStatus::Success, "{case}: {read:?}");
+
+            let mut connections = Vec::new();
+            for _ in 0..50 {
+                connections = metrics
+                    .get_recent_connections(10)
+                    .await;
+                if !connections.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert_eq!(connections.len(), 1, "{case}");
+            assert_eq!(connections[0].status, recorded, "{case}");
+        }
     }
 
     // ── build_outbound_policy_input ────────────────────────────────────────

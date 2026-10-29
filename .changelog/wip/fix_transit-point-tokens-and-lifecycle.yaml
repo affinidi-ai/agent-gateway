@@ -101,6 +101,16 @@ changes:
         header of the same name, so the target receives one value of each credential header and
         a delegated credential under the same name as `target_auth` replaces it.
     - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Record a Transit Point call as failed when its target refuses or fails it
+      description: >-
+        Every Transit Point call that returned a response was recorded as a successful
+        connection, so a target answering `401` or `502` looked healthy in the dashboard's
+        traffic, and a streamed MCP response that failed part way was not recorded at all. A
+        call is now recorded as successful only when the target answers with a 2xx and, on a
+        streamed MCP response, the stream completes, and as failed when the target answers
+        otherwise or the stream fails. A streamed response that the managed agent stops reading
+        before it ends is still not recorded.
+    - timestamp: '2026-10-28T00:00:00.000Z'
       title: Keep an outbound listener bound after its last Transit Point is removed
       description: >-
         A reload that left an outbound listener without Transit Points stopped listening on
