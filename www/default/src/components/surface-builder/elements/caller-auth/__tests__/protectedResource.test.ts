@@ -1,6 +1,9 @@
 import type { AgentSurface } from '../../../../../api';
 import {
   authorizationServerProblem,
+  declarationForVariant,
+  declaresOn,
+  derivedDeclarationNotes,
   discoveryProblems,
   discoverySaveError,
   protectedResourcePayload,
@@ -9,6 +12,7 @@ import {
   resourceMissesRoute,
   resourceProblem,
   scopeProblem,
+  strategyPin,
   suggestedResource,
   variantResource,
   withDroppedProtectedResourcesRemoved,
@@ -320,5 +324,94 @@ describe('removing a stored setting', () => {
     expect(withDroppedProtectedResourcesRemoved(stored, withoutCallerAuthentication)).toEqual(
       withoutCallerAuthentication
     );
+  });
+});
+
+describe('derived declaration helpers', () => {
+  const ISSUER = 'https://idp.example/realms/agents';
+  const JWKS = 'https://idp.example/realms/agents/certs';
+  const ACCESS_POINT_URL = 'https://gateway.example/agents/alpha';
+  const strategy = (extra: Record<string, unknown> = {}) => ({
+    id: 'idp',
+    expected_issuer: ISSUER,
+    jwks_source: { type: 'remote', jwks_uri: JWKS },
+    authorization_server: { issuer: ISSUER, metadata_url: 'm', jwks_uri: JWKS },
+    ...extra,
+  });
+
+  it('declares on A2A, AP2 and MCP only', () => {
+    expect(declaresOn('a2a')).toBe(true);
+    expect(declaresOn('ap2')).toBe(true);
+    expect(declaresOn('mcp')).toBe(true);
+    expect(declaresOn('didcomm')).toBe(false);
+    expect(declaresOn(undefined)).toBe(false);
+  });
+
+  it('names the pinned issuer while the pin matches the strategy', () => {
+    expect(strategyPin(strategy())).toEqual({ state: 'pinned', issuer: ISSUER });
+  });
+
+  it('flags an unpinned, moved or static-key strategy', () => {
+    expect(strategyPin(strategy({ authorization_server: undefined }))).toEqual({
+      state: 'not_pinned',
+    });
+    expect(strategyPin(strategy({ authorization_server: { metadata_url: 'm' } }))).toEqual({
+      state: 'not_pinned',
+    });
+    expect(strategyPin(strategy({ expected_issuer: 'https://other.example' }))).toEqual({
+      state: 'mismatch',
+      issuer: ISSUER,
+    });
+    expect(
+      strategyPin(
+        strategy({ jwks_source: { type: 'remote', jwks_uri: 'https://idp.example/new' } })
+      )
+    ).toEqual({ state: 'mismatch', issuer: ISSUER });
+    expect(strategyPin(strategy({ jwks_source: { type: 'static', jwks: [] } }))).toEqual({
+      state: 'static_jwks',
+    });
+  });
+
+  it('has no notes for settings that declare', () => {
+    expect(
+      derivedDeclarationNotes(
+        jwtConfig({ protected_resource: null, audiences: [ACCESS_POINT_URL] }),
+        ACCESS_POINT_URL
+      )
+    ).toEqual([]);
+    expect(
+      derivedDeclarationNotes({ jwt_token_header: 'authorization', jwt_token_scheme: 'bearer' })
+    ).toEqual([]);
+  });
+
+  it('notes a custom header, a forwarded token and a missing audience in order', () => {
+    expect(
+      derivedDeclarationNotes(
+        jwtConfig({
+          jwt_token_header: 'X-Token',
+          jwt_forward_header: true,
+          audiences: ['other'],
+        }),
+        ACCESS_POINT_URL
+      ).map(n => n.code)
+    ).toEqual(['custom_token_header', 'forwards_caller_token', 'audience_missing']);
+    expect(derivedDeclarationNotes(jwtConfig({ jwt_token_scheme: '' })).map(n => n.code)).toEqual([
+      'custom_token_header',
+    ]);
+  });
+
+  it('checks the audience only once the Access Point URL is known', () => {
+    expect(derivedDeclarationNotes(jwtConfig({ audiences: [] }), undefined)).toEqual([]);
+    expect(derivedDeclarationNotes(jwtConfig({ audiences: [] }), null)).toEqual([]);
+  });
+
+  it('picks the entry of the route edited', () => {
+    const entries = [
+      { variant: null, outcome: 'declare' },
+      { variant: 'beta', outcome: 'strip' },
+    ];
+    expect(declarationForVariant(entries, undefined)).toBe(entries[0]);
+    expect(declarationForVariant(entries, 'beta')).toBe(entries[1]);
+    expect(declarationForVariant(entries, 'gamma')).toBeUndefined();
   });
 });

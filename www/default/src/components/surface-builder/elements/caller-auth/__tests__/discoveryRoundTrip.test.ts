@@ -66,6 +66,25 @@ describe('authorization server discovery round-trip', () => {
     );
   });
 
+  it('saves required scopes next to a stored setting, each unchanged', () => {
+    const method = { ...METHOD, required_scopes: ['tools.call'] };
+    const surface = stored({ methods: [method], protected_resource: SETTING });
+    const { nodes, payload } = rebuild(surface);
+
+    expect(callerAuthNode(nodes)?.config.required_scopes).toEqual(['tools.call']);
+    expect(payload.access_point.caller_authentication).toEqual({
+      methods: [method],
+      protected_resource: SETTING,
+    });
+  });
+
+  it('adds no required scopes to a surface stored without them', () => {
+    const { payload } = rebuild(stored({ methods: [METHOD], protected_resource: SETTING }));
+    expect(payload.access_point.caller_authentication.methods[0]).not.toHaveProperty(
+      'required_scopes'
+    );
+  });
+
   it('saves a setting without scopes without inventing any', () => {
     const setting = {
       resource: SETTING.resource,

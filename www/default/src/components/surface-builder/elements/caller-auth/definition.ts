@@ -9,6 +9,7 @@ import {
   readProtectedResource,
   resourceMissesRoute,
 } from './protectedResource';
+import { readRequiredScopes, requiredScopesProblem } from './scopes';
 
 const usesDiscovery = (c: Record<string, unknown>): boolean =>
   c.method_type === 'jwt_bearer' && readProtectedResource(c.protected_resource) !== null;
@@ -55,10 +56,12 @@ export const callerAuthDefinition: NodeDefinition = {
       <p>Extracts caller authentication context from inbound call <em>before</em> any policy or
       payment gate runs. Drops on the caller → access-point arrow.
       Singleton: one auth method per Surface.</p>
-      <p>Without this element every caller is treated as anonymous. The
-      element does not refuse a request on its own: a missing or invalid
-      credential reaches policy as <code>source_auth.method == "failed"</code>.
-      Add a policy that denies unverified callers to require credentials.</p>
+      <p>Without this element every caller is treated as anonymous. An Access
+      Point that declares its authorization server refuses a missing or invalid
+      token itself, with <code>401</code> and a challenge, and a token short of
+      a required scope with <code>403</code>. Otherwise a missing or invalid
+      credential reaches policy as <code>source_auth.method == "failed"</code>:
+      add a policy that denies unverified callers to require credentials.</p>
       <p><strong>Methods:</strong></p>
       <ul>
         <li><strong>JWT bearer</strong>: verify a signed JWT against a
@@ -80,10 +83,15 @@ export const callerAuthDefinition: NodeDefinition = {
       Defaults to <code>Authorization</code> header for JWT bearer.</p>
       <p>JWT bearer authentication can optionally forward the validated token
       header unchanged to the directly managed target.</p>
-      <p>On an MCP surface, JWT bearer authentication can also publish
+      <p>On an A2A, AP2 or MCP surface, JWT bearer authentication with
+      <strong>required scopes</strong> declares the authorization server pinned
+      on its strategy: the agent card or the protected resource metadata names
+      that server and the scopes, and callers' tokens must name the Access
+      Point URL as their audience.</p>
+      <p>On an MCP surface, JWT bearer authentication can instead publish
       <strong>authorization server discovery</strong>: protected resource
-      metadata naming the authorization servers, so an MCP client finds where
-      to get a token for this resource.</p>
+      metadata naming the authorization servers you list, so an MCP client
+      finds where to get a token for this resource.</p>
     `,
   },
   incompleteReason: c => {
@@ -96,7 +104,17 @@ export const callerAuthDefinition: NodeDefinition = {
       return 'mTLS certificate must be selected';
     return null;
   },
-  validate: c => discoveryProblems(c ?? {}),
+  validate: c => {
+    const config = c ?? {};
+    const scopesProblem =
+      config.method_type === 'jwt_bearer'
+        ? requiredScopesProblem(readRequiredScopes(config))
+        : null;
+    return [
+      ...discoveryProblems(config),
+      ...(scopesProblem ? [{ field: 'required_scopes', message: scopesProblem }] : []),
+    ];
+  },
   featureDependencies: [
     {
       description: 'Authorization server discovery requires an MCP Access Point',
@@ -153,6 +171,7 @@ export const callerAuthDefinition: NodeDefinition = {
           token_header: (c.jwt_token_header ?? 'Authorization').trim() || 'Authorization',
           token_scheme: (c.jwt_token_scheme ?? 'Bearer').trim(),
           forward_header: c.jwt_forward_header === true,
+          ...(readRequiredScopes(c).length > 0 ? { required_scopes: readRequiredScopes(c) } : {}),
         };
         break;
       case 'api_key':
@@ -230,6 +249,7 @@ export const callerAuthDefinition: NodeDefinition = {
       out.jwt_token_header = m.token_header ?? 'Authorization';
       out.jwt_token_scheme = m.token_scheme ?? 'Bearer';
       out.jwt_forward_header = m.forward_header === true;
+      if (Array.isArray(m.required_scopes)) out.required_scopes = m.required_scopes;
     }
     out.protected_resource =
       m.type === 'jwt_bearer' ? readProtectedResource(slice.protected_resource) : null;

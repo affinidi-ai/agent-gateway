@@ -194,7 +194,12 @@ const StrategiesTab: React.FC<StrategiesTabProps> = ({
               <strong id="strategy-delete-title">
                 Delete JWT verification strategy &quot;{confirming.name}&quot;?
               </strong>
-              <p className="mb-1 mt-2">A surface that still references it cannot verify tokens.</p>
+              <p className="mb-1 mt-2">
+                A surface that still references it cannot verify tokens. A caller that presents a
+                token is refused with 500, a caller without one is left to the surface&apos;s
+                policy, and the surface stops advertising an authorization server in its agent card
+                or protected resource metadata.
+              </p>
               <div aria-live="polite">
                 {usedBy === 'loading' && <p className="mb-1">Checking which surfaces use it…</p>}
                 {usedBy === 'unknown' && (

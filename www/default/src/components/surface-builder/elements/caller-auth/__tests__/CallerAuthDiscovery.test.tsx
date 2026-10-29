@@ -301,9 +301,50 @@ describe('Caller Context editor: authorization server discovery', () => {
     expect(screen.queryByTestId('caller-auth-discovery-rules-error')).toBeNull();
   });
 
-  it('offers no discovery outside an MCP surface', async () => {
+  it('offers the explicit setting on MCP only, and the required scopes on A2A too', async () => {
     await openEditor({ initial: jwtConfig(), protocol: 'a2a' });
     expect(screen.queryByTestId('caller-auth-discovery-switch')).toBeNull();
+    expect(screen.getByTestId('caller-auth-scopes')).toBeInTheDocument();
+    expect(screen.getByTestId('caller-auth-discovery-derived')).toHaveTextContent(
+      'What the agent card declares'
+    );
+  });
+
+  it('offers nothing to declare on a DIDComm surface', async () => {
+    await openEditor({ initial: jwtConfig(), protocol: 'didcomm' });
+    expect(screen.queryByTestId('caller-auth-discovery')).toBeNull();
+    expect(screen.queryByTestId('caller-auth-scopes')).toBeNull();
+  });
+
+  it('keeps token forwarding and the token header editable on A2A without the explicit setting', async () => {
+    const latest = await openEditor({
+      initial: jwtConfig({ jwt_forward_header: true, required_scopes: ['agent:invoke'] }),
+      protocol: 'a2a',
+    });
+    expect(screen.getByLabelText(/Token Header/)).toBeEnabled();
+    expect(screen.getByLabelText(/Scheme/)).toBeEnabled();
+    expect(screen.getByPlaceholderText('e.g. https://api.example.com')).toBeEnabled();
+    expect(
+      screen.getByTestId('caller-auth-discovery-derived-note-forwards_caller_token')
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('caller-auth-jwt-forward-header-checkbox'));
+    expect(latest.config?.jwt_forward_header).toBe(false);
+    expect(
+      screen.queryByTestId('caller-auth-discovery-derived-note-forwards_caller_token')
+    ).toBeNull();
+  });
+
+  it('keeps required scopes beside the explicit setting on MCP', async () => {
+    const latest = await openEditor({
+      initial: jwtConfig({ protected_resource: SETTING, required_scopes: ['tools.call'] }),
+    });
+    expect(screen.getByRole('button', { name: 'Remove scope tools.call' })).toBeInTheDocument();
+    expect(screen.queryByTestId('caller-auth-discovery-derived')).toBeNull();
+    typeAndAdd('caller-auth-scope-input', 'tools.list');
+    expect(latest.config).toMatchObject({
+      required_scopes: ['tools.call', 'tools.list'],
+      protected_resource: SETTING,
+    });
   });
 });
 
@@ -333,5 +374,39 @@ describe('Caller Context sidebar: authorization server discovery', () => {
     });
     expect(latest.config).toMatchObject({ method_type: 'api_key', protected_resource: null });
     expect(screen.queryByTestId('caller-auth-panel-discovery-status')).toBeNull();
+    expect(screen.queryByTestId('caller-auth-panel-outcome')).toBeNull();
+  });
+
+  it('shows the declaration outcome on A2A, without the MCP discovery status', async () => {
+    await openEditor({ initial: jwtConfig(), Panel: CallerAuthPanel, protocol: 'a2a' });
+    expect(screen.getByTestId('caller-auth-outcome-chip')).toHaveTextContent(
+      'Outcome shown after the first save'
+    );
+    expect(screen.getByText('Agent card:')).toBeInTheDocument();
+    expect(screen.queryByTestId('caller-auth-panel-discovery-status')).toBeNull();
+  });
+
+  it('reads the saved outcome of the surface it edits', async () => {
+    (apiClient.fetch as jest.Mock).mockClear();
+    (apiClient.fetch as jest.Mock).mockResolvedValue({
+      ok: true,
+      json: () =>
+        Promise.resolve({
+          declarations: [
+            { variant: null, outcome: 'declare', reason: null, resource: 'https://gw/a' },
+          ],
+          warnings: [],
+        }),
+    });
+    await openEditor({
+      initial: jwtConfig(),
+      Panel: CallerAuthPanel,
+      protocol: 'a2a',
+      meta: { surfaceId: 's-9' },
+    });
+    expect(await screen.findByText('Declares OAuth')).toBeInTheDocument();
+    expect((apiClient.fetch as jest.Mock).mock.calls[0][0]).toBe(
+      '/api/v1/surfaces/s-9/declarations'
+    );
   });
 });

@@ -8,9 +8,11 @@ import FieldHelp from '../components/shared/FieldHelp';
 import { Link } from '../components/shared/Link';
 import { DOCS_URL } from '../config/docs';
 import {
+  DEFAULT_SCOPE_CLAIMS,
   discoverAuthorizationServer,
   discoverMetadataValue,
   parseAuthorizationServer,
+  parseScopeClaims,
   type AuthorizationServer,
   type DiscoverMode,
 } from '../utils/authorizationServer';
@@ -25,6 +27,7 @@ interface JwtVerificationStrategyForm {
   name: string;
   expected_issuer: string;
   jwks_source: JwksSourceForm;
+  scope_claims: string;
 }
 
 const EMPTY_FORM: JwtVerificationStrategyForm = {
@@ -35,6 +38,7 @@ const EMPTY_FORM: JwtVerificationStrategyForm = {
     jwks_uri: '',
     jwks: '',
   },
+  scope_claims: '',
 };
 
 const EditJwtVerificationStrategyPage: React.FC = () => {
@@ -86,6 +90,7 @@ const EditJwtVerificationStrategyPage: React.FC = () => {
           jwks_uri: src.jwks_uri ?? '',
           jwks: src.jwks ? JSON.stringify(src.jwks, null, 2) : '',
         },
+        scope_claims: Array.isArray(data.scope_claims) ? data.scope_claims.join(', ') : '',
       });
       setPinned(parseAuthorizationServer(data.authorization_server));
       setLoadedJwksUri(src.jwks_uri ?? '');
@@ -264,11 +269,17 @@ const EditJwtVerificationStrategyPage: React.FC = () => {
     setSaving(true);
     setError(null);
 
+    const scopeClaims = parseScopeClaims(form.scope_claims);
     const discoverMetadata = discoverMetadataValue(discoverMode);
     const body = {
       name: form.name.trim(),
       expected_issuer: form.expected_issuer.trim(),
       jwks_source: jwksSourcePayload,
+      ...(scopeClaims.length > 0
+        ? { scope_claims: scopeClaims }
+        : isNew
+          ? {}
+          : { scope_claims: DEFAULT_SCOPE_CLAIMS }),
       ...(discoverMetadata !== undefined ? { discover_metadata: discoverMetadata } : {}),
     };
 
@@ -395,7 +406,8 @@ const EditJwtVerificationStrategyPage: React.FC = () => {
                   testId="field-help-discovery"
                 >
                   Discovery reads the issuer's published metadata and pins its token endpoint and
-                  JWKS URI. It needs Remote URL keys and an https issuer.
+                  JWKS URI. A surface can then advertise this authorization server in its agent card
+                  or protected resource metadata. It needs Remote URL keys and an https issuer.
                 </FieldHelp>
               </div>
               <div className="d-flex align-items-center gap-2 mt-1">
@@ -483,17 +495,38 @@ const EditJwtVerificationStrategyPage: React.FC = () => {
                   className="alert alert-warning py-1 px-2 mt-2 mb-0 small"
                   data-testid="strategy-pinned-stale"
                 >
-                  The issuer or JWKS URI no longer matches the pinned metadata. Saving a changed
-                  issuer or JWKS URI tries to discover it again; if that fails, the save still
-                  succeeds and clears the pin when the issuer changed. Run Discover to pin matching
-                  metadata.
+                  The issuer or JWKS URI no longer matches the pinned metadata, so surfaces using
+                  this strategy stop advertising an authorization server. Saving a changed issuer or
+                  JWKS URI tries to discover it again; if that fails, the save still succeeds and
+                  clears the pin when the issuer changed. Run Discover to pin matching metadata.
                 </div>
               )}
               {!shownServer && !isStatic && (
                 <small className="form-text text-muted d-block" data-testid="strategy-no-pin">
-                  No authorization server is pinned.
+                  No authorization server is pinned, so surfaces using this strategy do not
+                  advertise one in their agent card or protected resource metadata.
                 </small>
               )}
+            </div>
+
+            <div className="mb-3">
+              <label htmlFor="scope_claims">Scope claims</label>
+              <input
+                id="scope_claims"
+                name="scope_claims"
+                type="text"
+                className="form-control"
+                value={form.scope_claims}
+                onChange={handleChange}
+                placeholder="scope, scp"
+                aria-describedby="scope_claims-help"
+                data-testid="strategy-scope-claims"
+              />
+              <small id="scope_claims-help" className="form-text text-muted">
+                Token claims read for granted scopes, separated by commas. The first claim present
+                wins. Leave empty for <code>scope</code> and <code>scp</code>; add{' '}
+                <code>roles</code> for Entra app-only tokens.
+              </small>
             </div>
 
             {/* JWKS Source Type */}

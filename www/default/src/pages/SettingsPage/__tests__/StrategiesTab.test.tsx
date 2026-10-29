@@ -84,7 +84,12 @@ describe('Strategies list', () => {
     expect(confirm).not.toHaveBeenCalled();
     expect(panel).toHaveAttribute('role', 'alertdialog');
     await waitFor(() => expect(panel).toHaveTextContent('Helpdesk'));
-    expect(panel).toHaveTextContent('A surface that still references it cannot verify tokens.');
+    expect(panel).toHaveTextContent('A surface that still references it cannot verify tokens');
+    expect(panel).toHaveTextContent('A caller that presents a token is refused with 500');
+    expect(panel).toHaveTextContent("a caller without one is left to the surface's policy");
+    expect(panel).toHaveTextContent('stops advertising an authorization server');
+    expect(panel).not.toHaveTextContent('403');
+    expect(panel).not.toHaveTextContent('401');
     expect(mockFetch.mock.calls.some(([, init]) => init?.method === 'DELETE')).toBe(false);
   });
 

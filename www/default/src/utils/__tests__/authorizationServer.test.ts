@@ -1,8 +1,10 @@
 import {
+  DEFAULT_SCOPE_CLAIMS,
   DISCOVERY_FAILED_MESSAGE,
   discoverAuthorizationServer,
   discoverMetadataValue,
   parseAuthorizationServer,
+  parseScopeClaims,
 } from '../authorizationServer';
 
 const SERVER = {
@@ -31,6 +33,24 @@ describe('parseAuthorizationServer', () => {
     expect(parseAuthorizationServer(null)).toBeNull();
     expect(parseAuthorizationServer({ issuer: 'x' })).toBeNull();
     expect(parseAuthorizationServer('x')).toBeNull();
+  });
+});
+
+describe('parseScopeClaims', () => {
+  it('splits on commas and spaces and removes duplicates', () => {
+    expect(parseScopeClaims('scope, scp  roles,scope')).toEqual(['scope', 'scp', 'roles']);
+    expect(parseScopeClaims('permissions')).toEqual(['permissions']);
+  });
+  it('returns an empty list for blank text', () => {
+    expect(parseScopeClaims('  ')).toEqual([]);
+    expect(parseScopeClaims(' , ,')).toEqual([]);
+    expect(parseScopeClaims('')).toEqual([]);
+  });
+});
+
+describe('DEFAULT_SCOPE_CLAIMS', () => {
+  it('names the standard scope claims', () => {
+    expect(DEFAULT_SCOPE_CLAIMS).toEqual(['scope', 'scp']);
   });
 });
 

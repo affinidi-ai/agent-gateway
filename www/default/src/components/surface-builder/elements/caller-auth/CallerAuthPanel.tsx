@@ -1,10 +1,12 @@
 import React from 'react';
+import { useParams } from 'react-router-dom';
 import { Form } from 'react-bootstrap';
 import InfoBanner from '../../../shared/InfoBanner';
 import type { ConfigPanelProps } from '../types';
 import { useOptionalSurfaceMeta } from '../../SurfaceMetaContext';
+import DeclarationOutcomeChip from './DeclarationOutcomeChip';
 import { CALLER_AUTH_METHOD_OPTIONS, isSelectableCallerAuthMethod } from './methodOptions';
-import { discoverySaveError, readProtectedResource } from './protectedResource';
+import { declaresOn, discoverySaveError, readProtectedResource } from './protectedResource';
 
 /**
  * Compact sidebar panel for the Caller Auth element. Picks the method
@@ -21,6 +23,8 @@ const CallerAuthPanel: React.FC<ConfigPanelProps> = ({
 }) => {
   const method = config.method_type || 'jwt_bearer';
   const meta = useOptionalSurfaceMeta();
+  const surfaceId = useParams<{ surfaceId: string }>().surfaceId ?? meta?.surfaceId;
+  const declares = method === 'jwt_bearer' && declaresOn(protocol);
   const discovery = readProtectedResource(config.protected_resource);
   const showsDiscovery = protocol === 'mcp' && method === 'jwt_bearer';
   const discoveryError = showsDiscovery
@@ -30,10 +34,11 @@ const CallerAuthPanel: React.FC<ConfigPanelProps> = ({
   return (
     <>
       <Form.Text className="text-muted d-block mb-1" style={{ fontSize: '10px' }}>
-        Extracts and verifies the caller&apos;s identity before any policy or payment gate runs. It
-        does not refuse the request on its own: a missing or invalid credential is reported to the
-        policy layer as <code>source_auth.method == &quot;failed&quot;</code>. Add a policy that
-        denies unverified callers, otherwise the request is forwarded with no asserted identity.
+        Extracts and verifies the caller&apos;s identity before any policy or payment gate runs. An
+        Access Point that declares its authorization server refuses a missing or invalid token
+        itself, with a challenge. Otherwise a failed credential reaches policy as{' '}
+        <code>source_auth.method == &quot;failed&quot;</code>: add a policy that denies unverified
+        callers, or the request is forwarded with no asserted identity.
       </Form.Text>
       <InfoBanner
         title="Why does this matter to the rest of the pipeline?"
@@ -53,6 +58,12 @@ const CallerAuthPanel: React.FC<ConfigPanelProps> = ({
           </>
         }
       />
+
+      {declares && (
+        <div className="config-section" data-testid="caller-auth-panel-outcome">
+          <DeclarationOutcomeChip surfaceId={surfaceId} protocol={protocol} />
+        </div>
+      )}
 
       <div className="config-section">
         <label htmlFor="caller-auth-panel-mode-select">Authentication Method</label>

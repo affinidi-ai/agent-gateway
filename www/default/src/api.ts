@@ -1,3 +1,4 @@
+import type { SurfaceDeclaration, SurfaceWarning } from './utils/surfaceDeclarations';
 import {
   AccessTokenCreated,
   AccessTokenMeta,
@@ -1335,6 +1336,9 @@ export interface AgentSurface {
    */
   default_variant_id?: string;
   last_activity?: string | null;
+  /** Present only on save responses; computed by the gateway and never sent back. */
+  warnings?: SurfaceWarning[];
+  declarations?: SurfaceDeclaration[];
 }
 
 /**
@@ -1399,8 +1403,10 @@ export function templateWithTrustCheckSplit<T>(template: T): T {
   return { ...template, surface: withTrustCheckSplit(surface) };
 }
 
-function toBackendSurface(surface: Partial<AgentSurface>): any {
-  if (!surface || !surface.target) return withTrustCheckSplit(surface);
+function toBackendSurface(input: Partial<AgentSurface>): any {
+  if (!input || typeof input !== 'object') return withTrustCheckSplit(input);
+  const { warnings: _warnings, declarations: _declarations, ...surface } = input;
+  if (!surface.target) return withTrustCheckSplit(surface);
   const target: any = { ...surface.target };
   const ai: any = (target as any).agent_identity;
   // Preserve any operator-set inject_vp toggle (Managed Agent panel); default

@@ -89,6 +89,66 @@ describe('surface API and authorization server discovery', () => {
     });
   });
 
+  it('keeps the setting and required scopes when a save response carries warnings and declarations', async () => {
+    const methods = [
+      {
+        type: 'jwt_bearer',
+        jwt_verification_strategy_id: 'idp',
+        audiences: [],
+        required_scopes: ['tools.call'],
+      },
+    ];
+    const callerAuthentication = { methods, protected_resource: SETTING };
+    const declarations = [
+      { variant: null, outcome: 'declare', reason: null, resource: SETTING.resource },
+    ];
+    const warnings = [
+      {
+        code: 'declaration_stripped',
+        message: 'Declaration stripped.',
+        path: 'access_point',
+        variant: 'beta',
+      },
+    ];
+    fetchMock.mockResolvedValue(
+      ok({
+        ...SURFACE,
+        access_point: { ...SURFACE.access_point, caller_authentication: callerAuthentication },
+        warnings,
+        declarations,
+      })
+    );
+
+    const saved = await apiClient.updateSurface('s-1', {
+      ...SURFACE,
+      access_point: { ...SURFACE.access_point, caller_authentication: callerAuthentication },
+    });
+
+    expect(saved.access_point.caller_authentication).toEqual(callerAuthentication);
+    expect(saved.declarations).toEqual(declarations);
+    expect(saved.warnings).toEqual(warnings);
+
+    fetchMock.mockReset();
+    fetchMock.mockResolvedValue(ok(SURFACE));
+    await apiClient.updateSurface('s-1', saved);
+    const { body } = sent();
+    expect((body.access_point as any).caller_authentication).toEqual(callerAuthentication);
+    expect(body).not.toHaveProperty('warnings');
+    expect(body).not.toHaveProperty('declarations');
+  });
+
+  it('reads a save response without warnings or declarations from an older gateway', async () => {
+    fetchMock.mockResolvedValue(ok(SURFACE));
+
+    const saved = await apiClient.updateSurface('s-1', SURFACE);
+
+    expect(saved.access_point.caller_authentication).toEqual(
+      SURFACE.access_point.caller_authentication
+    );
+    expect(saved.warnings).toBeUndefined();
+    expect(saved.declarations).toBeUndefined();
+  });
+
   it('keeps the JSON content type and session on ordinary requests', async () => {
     fetchMock.mockResolvedValue(ok(SURFACE));
 

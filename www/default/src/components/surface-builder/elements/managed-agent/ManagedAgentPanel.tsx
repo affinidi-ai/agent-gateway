@@ -11,6 +11,7 @@ import FabricDelegatedCredentialsSection, {
   fabricPeerGatewayId,
   hasOutboundCredentialBindings,
 } from '../_shared/FabricDelegatedCredentialsSection';
+import AgentCardFetchLine from '../../agent-card/AgentCardFetchLine';
 import A2aProxyEndpointFields, { type A2aProxyOption } from './A2aProxyEndpointFields';
 import { CREDENTIAL_PROVIDER_AUTH_TYPE, PRESERVED_AUTH_TYPE } from './targetAuthConfig';
 
@@ -536,6 +537,8 @@ const ManagedAgentPanel: React.FC<ConfigPanelProps> = ({
           )}
         </div>
       )}
+
+      <AgentCardFetchLine />
 
       <div className="config-section">
         <label>Identity Binding VP</label>

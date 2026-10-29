@@ -1,4 +1,5 @@
 import type { AgentSurface } from '../../../../api';
+import type { Protocol } from '../types';
 
 /**
  * Authorization server discovery (`caller_authentication.protected_resource`):
@@ -7,6 +8,12 @@ import type { AgentSurface } from '../../../../api';
  * `src/protocols/protected_resource.rs` and `validate_protected_resource` in
  * `src/config/agent_surface.rs`, so the editor flags a setting the gateway
  * refuses before the save is sent.
+ *
+ * Without that setting, an Access Point whose only method is JWT Bearer with
+ * required scopes derives its declaration from the strategy's pinned
+ * authorization server (`src/source_auth/declaration.rs`). The derived helpers
+ * below mirror its strip reasons as advice; the gateway saves such a surface
+ * either way and reports the outcome.
  */
 export interface ProtectedResourceSetting {
   resource: string;
@@ -243,6 +250,98 @@ export function discoverySaveError(
   const named = /^MCP resource '([^']*)'/.exec(error)?.[1];
   if (named && resource && (named === resource || named.startsWith(`${resource}$`))) return error;
   return null;
+}
+
+/** The protocols whose Access Point can declare its authorization server. */
+export const DECLARING_PROTOCOLS: readonly Protocol[] = ['a2a', 'ap2', 'mcp'];
+
+export function declaresOn(protocol: Protocol | undefined): boolean {
+  return !!protocol && DECLARING_PROTOCOLS.includes(protocol);
+}
+
+/** The fields of a JWT verification strategy a derived declaration reads. */
+export interface DeclarationStrategy {
+  id: string;
+  expected_issuer?: string;
+  jwks_source?: unknown;
+  authorization_server?: unknown;
+}
+
+export type StrategyPin =
+  | { state: 'pinned'; issuer: string }
+  | { state: 'not_pinned' }
+  | { state: 'static_jwks' }
+  | { state: 'mismatch'; issuer: string };
+
+/**
+ * The authorization server a derived declaration names: the strategy's pinned
+ * issuer, while the pin still matches its expected issuer and JWKS URI.
+ */
+export function strategyPin(strategy: DeclarationStrategy): StrategyPin {
+  const source = asRecord(strategy.jwks_source);
+  if (source?.type === 'static') return { state: 'static_jwks' };
+  const pin = asRecord(strategy.authorization_server);
+  const issuer = typeof pin?.issuer === 'string' ? pin.issuer : '';
+  if (!issuer) return { state: 'not_pinned' };
+  const jwksUri = typeof source?.jwks_uri === 'string' ? source.jwks_uri : undefined;
+  const issuerMoved =
+    typeof strategy.expected_issuer === 'string' && issuer !== strategy.expected_issuer;
+  const jwksMoved = jwksUri !== undefined && pin?.jwks_uri !== jwksUri;
+  return issuerMoved || jwksMoved ? { state: 'mismatch', issuer } : { state: 'pinned', issuer };
+}
+
+export type DerivedNoteCode = 'custom_token_header' | 'forwards_caller_token' | 'audience_missing';
+
+export interface DerivedNote {
+  code: DerivedNoteCode;
+  message: string;
+}
+
+/**
+ * Why the JWT Bearer settings keep a derived declaration from being made, in
+ * the gateway's order. `accessPointUrl` is the resource the gateway reported
+ * for the route edited; the audience is checked only when it is known.
+ */
+export function derivedDeclarationNotes(
+  config: Record<string, unknown>,
+  accessPointUrl?: string | null
+): DerivedNote[] {
+  const notes: DerivedNote[] = [];
+  const header = typeof config.jwt_token_header === 'string' ? config.jwt_token_header : '';
+  const scheme = typeof config.jwt_token_scheme === 'string' ? config.jwt_token_scheme : 'Bearer';
+  if (
+    (header.trim() || 'Authorization').toLowerCase() !== 'authorization' ||
+    scheme.trim().toLowerCase() !== 'bearer'
+  ) {
+    notes.push({
+      code: 'custom_token_header',
+      message:
+        'The token must arrive in the Authorization header with the Bearer scheme for this Access Point to declare its authorization server.',
+    });
+  }
+  if (config.jwt_forward_header === true) {
+    notes.push({
+      code: 'forwards_caller_token',
+      message:
+        "Forwarding the caller's token to the managed agent keeps this Access Point from declaring its authorization server.",
+    });
+  }
+  if (accessPointUrl && !stringList(config.audiences).includes(accessPointUrl)) {
+    notes.push({
+      code: 'audience_missing',
+      message:
+        'Add the Access Point URL to Accepted Audiences so this Access Point declares its authorization server.',
+    });
+  }
+  return notes;
+}
+
+/** The entry of the route edited: the base for no alias, otherwise that variant. */
+export function declarationForVariant<T extends { variant: string | null }>(
+  declarations: readonly T[],
+  alias: string | undefined
+): T | undefined {
+  return declarations.find(d => d.variant === (alias ?? null));
 }
 
 function storedCallerAuthentication(accessPoint: unknown): Record<string, unknown> | null {

@@ -23,6 +23,7 @@ const STORED = {
   expected_issuer: 'https://idp.example.com',
   jwks_source: { type: 'remote', jwks_uri: 'https://idp.example.com/jwks.json' },
   authorization_server: SERVER,
+  scope_claims: ['scope', 'roles'],
 };
 
 const json = (body: unknown, ok = true) => ({
@@ -84,11 +85,13 @@ describe('Strategy discovery', () => {
     renderPage('/jwt-verification-strategies/s1');
     const card = await screen.findByTestId('strategy-pinned-server');
     expect(card).toHaveTextContent('https://idp.example.com/token');
+    expect(screen.getByTestId('strategy-scope-claims')).toHaveValue('scope, roles');
     save();
     await waitFor(() => expect(saved()).not.toBeNull());
     const request = saved()!;
     expect(request.method).toBe('PUT');
     expect(request.body).not.toHaveProperty('discover_metadata');
+    expect(request.body.scope_claims).toEqual(['scope', 'roles']);
     expect(mockFetch.mock.calls.some(([u]) => String(u).endsWith('/validate-jwks-uri'))).toBe(
       false
     );
@@ -100,7 +103,9 @@ describe('Strategy discovery', () => {
     fireEvent.change(screen.getByLabelText(/^Expected Issuer/), {
       target: { value: 'https://idp.example.com' },
     });
-    expect(screen.getByTestId('strategy-no-pin')).toBeInTheDocument();
+    expect(screen.getByTestId('strategy-no-pin')).toHaveTextContent(
+      /do not advertise one in their agent card/i
+    );
     fireEvent.click(screen.getByTestId('strategy-discover-button'));
     expect(await screen.findByTestId('strategy-discover-success')).toBeInTheDocument();
     expect(screen.getByLabelText(/^JWKS URI/)).toHaveValue(SERVER.jwks_uri);
@@ -149,6 +154,72 @@ describe('Strategy discovery', () => {
     expect(saved()!.body.discover_metadata).toBe(false);
   });
 
+  it('labels the scope claims field and describes it with its help text', async () => {
+    renderPage('/jwt-verification-strategies/s1');
+    await screen.findByTestId('strategy-pinned-server');
+    const field = screen.getByLabelText(/^Scope claims/);
+    expect(field).toBe(screen.getByTestId('strategy-scope-claims'));
+    expect(field).toHaveAttribute('aria-describedby', 'scope_claims-help');
+    expect(field).toHaveAccessibleDescription(/separated by commas/i);
+  });
+
+  it('sends edited scope claims split, trimmed and without duplicates', async () => {
+    renderPage('/jwt-verification-strategies/s1');
+    await screen.findByTestId('strategy-pinned-server');
+    fireEvent.change(screen.getByTestId('strategy-scope-claims'), {
+      target: { value: ' scp, roles  scp ' },
+    });
+    save();
+    await waitFor(() => expect(saved()).not.toBeNull());
+    expect(saved()!.body.scope_claims).toEqual(['scp', 'roles']);
+  });
+
+  it('sends the default scope claims when an existing list is cleared', async () => {
+    renderPage('/jwt-verification-strategies/s1');
+    await screen.findByTestId('strategy-pinned-server');
+    fireEvent.change(screen.getByTestId('strategy-scope-claims'), { target: { value: '' } });
+    save();
+    await waitFor(() => expect(saved()).not.toBeNull());
+    expect(saved()!.body.scope_claims).toEqual(['scope', 'scp']);
+  });
+
+  it('shows an empty scope claims field for a strategy stored without them', async () => {
+    mockFetch.mockImplementation(async (url: string, init?: { method?: string }) => {
+      if (url.endsWith('/s1') && !init?.method) return json({ ...STORED, scope_claims: undefined });
+      return json({});
+    });
+    renderPage('/jwt-verification-strategies/s1');
+    await screen.findByTestId('strategy-pinned-server');
+    expect(screen.getByTestId('strategy-scope-claims')).toHaveValue('');
+  });
+
+  it('omits scope claims on a new strategy that sets none', async () => {
+    renderPage('/jwt-verification-strategies/new');
+    fireEvent.change(await screen.findByLabelText(/^Name/), { target: { value: 'Idp' } });
+    fireEvent.change(screen.getByLabelText(/^Expected Issuer/), {
+      target: { value: 'https://idp.example.com' },
+    });
+    fireEvent.click(screen.getByTestId('strategy-discover-button'));
+    await screen.findByTestId('strategy-pinned-server');
+    save();
+    await waitFor(() => expect(saved()).not.toBeNull());
+    expect(saved()!.body).not.toHaveProperty('scope_claims');
+  });
+
+  it('sends scope claims set on a new strategy', async () => {
+    renderPage('/jwt-verification-strategies/new');
+    fireEvent.change(await screen.findByLabelText(/^Name/), { target: { value: 'Idp' } });
+    fireEvent.change(screen.getByLabelText(/^Expected Issuer/), {
+      target: { value: 'https://idp.example.com' },
+    });
+    fireEvent.change(screen.getByTestId('strategy-scope-claims'), { target: { value: 'roles' } });
+    fireEvent.click(screen.getByTestId('strategy-discover-button'));
+    await screen.findByTestId('strategy-pinned-server');
+    save();
+    await waitFor(() => expect(saved()).not.toBeNull());
+    expect(saved()!.body.scope_claims).toEqual(['roles']);
+  });
+
   it('warns and clears the pin when the keys become static', async () => {
     renderPage('/jwt-verification-strategies/s1');
     await screen.findByTestId('strategy-pinned-server');
@@ -174,6 +245,8 @@ describe('Strategy discovery', () => {
     expect(stale).toHaveTextContent(
       /the save still succeeds and clears the pin when the issuer changed/i
     );
+    expect(stale).toHaveTextContent(/stop advertising an authorization server/i);
+    expect(stale).not.toHaveTextContent(/keeps the old pin/i);
     expect(stale).not.toHaveTextContent(/save fails/i);
     save();
     await waitFor(() => expect(saved()).not.toBeNull());

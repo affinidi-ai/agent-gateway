@@ -117,14 +117,25 @@ The Identities page shows a Trust Recorder status chip and a Recorder filter, an
 Recorder panel shows a Last outcome row; see _Identities page_ and _Trust Recorder panel_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#trust-recorder-panel).
 
-The JWT verification strategy editor discovers and pins an authorization server, and the strategy
-list marks a strategy with a pinned server **Discovered**; see _JWT verification strategies_ in
+The JWT verification strategy editor discovers and pins an authorization server and edits the
+scope claims, and the strategy list marks a strategy with a pinned server **Discovered**; see _JWT verification strategies_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#jwt-verification-strategies).
 
 The Caller Context editor of an MCP surface with JWT Bearer edits authorization server
 discovery (`caller_authentication.protected_resource`), and Save removes a setting the
 operator switched off in the same PUT; see _Authorization server discovery_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
+
+The Surface Detail **Agent Cards** view, for A2A and AP2 surfaces only, sits after Elements and
+before Monitoring. It shows the Managed Agent Card beside the Gateway-Served Agent Card, with each
+difference marked by colour and an icon with a text label, the raw JSON of both, the card fetch
+status with its cause and HTTP status, a Refresh action, the served card discovery URL with a copy
+action and a link back to the Surface view. `CallerAuthDiscoverySection` is the one caller-auth
+declaration section for A2A, AP2 and MCP: it sets the required scopes, shows the authorization
+server, scopes and audience the served card or metadata carries, and keeps the explicit MCP
+discovery setting; the declaration outcome chip shows the result. Surface Detail shows surface save
+warnings, with a copyable deny rule for the fail-open ones. See _Agent Cards tab_ and _Surface
+Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#agent-cards-tab).
 
 Keep `AGENTS.md` and any local `AGENTS.md` in sync in the same change when UI patterns evolve. Instruction drift is a blocker.
 

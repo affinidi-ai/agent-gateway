@@ -26,6 +26,16 @@ export function parseAuthorizationServer(value: unknown): AuthorizationServer | 
   return server.issuer && server.metadata_url ? server : null;
 }
 
+export function parseScopeClaims(text: string): string[] {
+  const seen = new Set<string>();
+  for (const part of text.split(/[\s,]+/)) {
+    if (part) seen.add(part);
+  }
+  return Array.from(seen);
+}
+
+export const DEFAULT_SCOPE_CLAIMS = ['scope', 'scp'];
+
 export const DISCOVERY_FAILED_MESSAGE =
   'Discovery failed. Check the issuer URL and that the authorization server publishes its metadata over https.';
 

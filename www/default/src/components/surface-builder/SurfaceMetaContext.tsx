@@ -61,6 +61,14 @@ export interface SurfaceMetaValue {
   setDidwebvh: (v: DidwebvhConfig) => void;
   /** Optional callback to snapshot the current surface as a reusable template. */
   onSaveAsTemplate?: () => void;
+  /** Opens the Agent Cards view. Set only while that view is offered for the surface's protocol. */
+  onOpenAgentCard?: () => void;
+  /** Opens the Surface view, which holds the Entry point URL and the canvas. */
+  onOpenSurfaceView?: () => void;
+  /** Changes whenever the saved surface changes, so card status shown beside the canvas reads again. */
+  agentCardRevision?: unknown;
+  /** Changes when the saved surface changes or a Refresh in the Agent Cards view succeeds, so the Managed Agent card fetch line reads again. */
+  agentCardFetchRevision?: unknown;
 }
 
 const SurfaceMetaContext = createContext<SurfaceMetaValue | null>(null);
