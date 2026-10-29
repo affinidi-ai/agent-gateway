@@ -22,14 +22,16 @@ changes:
         are checked on save as an Access Point's are, so a tenant access token can name only its
         own or appliance-wide ones. A dashboard save keeps a Transit Point's `source_auth`.
     - timestamp: '2026-10-29T12:00:00.000Z'
-      title: Warn when an open Transit Point is reachable on a public address
+      title: Warn when an open Transit Point is reachable from other hosts
       description: >-
         A Transit Point that serves callers it does not authenticate gives anyone who reaches
-        it its target credentials. When one is reachable on a public address, through its
-        outbound listener's external URLs or an inbound listener that shares a host name and
-        passes `/outbound` requests on, the admin API answers the save of its surface with a
-        `Warning` header naming it and the addresses, and the outbound listener logs it at
-        `WARN`. Every open Transit Point is logged at `WARN` when it is mounted.
+        it its target credentials. When other hosts can reach one, because its outbound
+        listener, or an inbound listener that shares a host name with it and passes `/outbound`
+        requests on, binds an address other than loopback or has an external URL that is not
+        this host's own (private addresses included), the admin API answers the save of its
+        surface with a `Warning` header naming it and those addresses, and the outbound listener
+        logs it at `WARN`. Every open Transit Point is logged at `WARN` when it is mounted. The
+        dashboard does not show the header.
   changed: []
   fixed: []
   removed: []
