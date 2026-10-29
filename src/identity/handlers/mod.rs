@@ -14,6 +14,7 @@ pub mod onboarding;
 pub mod policy_definitions;
 pub mod policy_validation;
 pub mod settings;
+pub(crate) mod surface_grants;
 pub(crate) mod surface_tenancy;
 pub mod surfaces;
 pub mod tenant_ownership;
