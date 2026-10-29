@@ -148,7 +148,8 @@ pub struct SurfaceTemplate {
     /// including any variants stored under the access_point node).
     /// May contain placeholder tokens (`$HOST`, `$ROUTE`, `$NAME`,
     /// `$SLUG`, `$TARGET_ENDPOINT`) that the dashboard substitutes at
-    /// apply time. The gateway never inspects this — it's a passthrough.
+    /// apply time. The gateway only settles its markers (see
+    /// [`SurfaceTemplate::settle_surface_markers`]) and otherwise passes it through.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub surface: Option<serde_json::Value>,
 }
@@ -161,21 +162,31 @@ impl StorableEntity for SurfaceTemplate {
     /// Moves a stored surface snapshot's surface-wide target Trust Checks
     /// onto its Transit Points, as stored surfaces are migrated, so applying
     /// a template saved before per-Transit-Point lists keeps its checks. A
-    /// placeholder or empty target endpoint keeps the target list.
+    /// placeholder or empty target endpoint keeps the target list. The
+    /// snapshot's `transit_point_source_auth` is kept in step with its Transit
+    /// Points, as a stored surface's is.
     fn migrate_raw_json(value: &mut serde_json::Value) -> anyhow::Result<bool> {
         Ok(value
             .get_mut("surface")
-            .is_some_and(crate::config::agent_surface::split_template_target_trust_checks))
+            .is_some_and(|surface| {
+                let split = crate::config::agent_surface::split_template_target_trust_checks(surface);
+                let marked = crate::config::agent_surface::mark_transit_point_source_auth(surface);
+                split || marked
+            }))
     }
 }
 
 impl SurfaceTemplate {
-    /// Settles the Trust Check shape of a surface snapshot written through the
+    /// Settles the markers of a surface snapshot written through the
     /// management API. A snapshot carrying `trust_check_split: true` is
     /// already per-Transit-Point; any other snapshot is migrated like a stored
     /// one. `trust_check_split` is then kept while any Trust Check list
     /// remains, target or Transit Point, and dropped otherwise.
-    pub fn settle_trust_check_shape(&mut self) {
+    /// `transit_point_source_auth` is set while a Transit Point, on the base or
+    /// in a variant, uses `source_auth`, and dropped otherwise, whatever the
+    /// write sent, so a release that predates it refuses a surface made from
+    /// the snapshot as it refuses a stored one.
+    pub fn settle_surface_markers(&mut self) {
         let Some(blob) = self
             .surface
             .as_mut()
@@ -198,6 +209,7 @@ impl SurfaceTemplate {
                 obj.remove("trust_check_split");
             }
         }
+        crate::config::agent_surface::mark_transit_point_source_auth(blob);
     }
 }
 
@@ -450,13 +462,55 @@ mod tests {
         }
     }
 
+    /// A stored template whose surface has a Transit Point with `source_auth`,
+    /// on the base or in a variant, is marked `transit_point_source_auth` in its
+    /// surface when it is loaded, as a stored surface is, and the mark is
+    /// dropped once no Transit Point uses `source_auth`.
+    #[test]
+    fn migrate_raw_json_marks_a_template_whose_transit_point_uses_source_auth() {
+        let template = |points: serde_json::Value, variant_points: serde_json::Value| {
+            serde_json::json!({"id": "user-keyed", "name": "Keyed", "kind": "full", "surface": {
+                "name": "$NAME",
+                "access_point": {"listen_address": "$HOST", "route": "$ROUTE", "protocol": "a2a"},
+                "target": {"endpoint": "$TARGET_ENDPOINT"},
+                "transit": {"points": points},
+                "variants": [{"id": "candidate", "alias": "candidate", "name": "Candidate",
+                    "overrides": {"transit": {"points": variant_points}}}]
+            }})
+        };
+        let keyed = serde_json::json!([{"alias": "partner", "target_endpoint": "https://partner.example/a2a",
+            "require_transit_token": false, "source_auth": {"type": "api_key",
+                "extraction": {"source": "http_header", "field": "X-API-Key"}, "secret_id": "partner-callers"}}]);
+        let open = serde_json::json!([{"alias": "partner", "target_endpoint": "https://partner.example/a2a",
+            "require_transit_token": false, "allow_unauthenticated_callers": true}]);
+
+        for (case, mut value) in [
+            ("base", template(keyed.clone(), serde_json::Value::Null)),
+            ("variant", template(open.clone(), keyed.clone())),
+        ] {
+            assert!(SurfaceTemplate::migrate_raw_json(&mut value).unwrap(), "{case}");
+            assert_eq!(value["surface"]["transit_point_source_auth"], serde_json::json!(true), "{case}");
+            assert!(!SurfaceTemplate::migrate_raw_json(&mut value).unwrap(), "{case}: runs once");
+            let _: SurfaceTemplate = serde_json::from_value(value).expect("marked template deserializes");
+        }
+
+        let mut stale = template(open, serde_json::Value::Null);
+        stale["surface"]["transit_point_source_auth"] = serde_json::json!(true);
+        assert!(SurfaceTemplate::migrate_raw_json(&mut stale).unwrap());
+        assert!(
+            stale["surface"]
+                .get("transit_point_source_auth")
+                .is_none()
+        );
+    }
+
     #[test]
     fn a_template_declaring_the_split_shape_is_not_migrated() {
         let mut value = legacy_surface_template();
         value["surface"]["trust_check_split"] = serde_json::json!(true);
         let mut template: SurfaceTemplate = serde_json::from_value(value.clone()).unwrap();
 
-        template.settle_trust_check_shape();
+        template.settle_surface_markers();
 
         assert_eq!(template.surface.as_ref(), value.get("surface"), "a placeholder target keeps its list and marker");
         assert!(!SurfaceTemplate::migrate_raw_json(&mut value).unwrap());

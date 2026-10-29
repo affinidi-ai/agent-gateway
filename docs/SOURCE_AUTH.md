@@ -304,13 +304,19 @@ whole surface at load (it skips and logs it) instead of serving its Transit Poin
   Transit Point `source_auth`.
 - Do not roll back to such a release while any Transit Point uses `source_auth`. To roll
   back, first remove `source_auth` from each one, base and variant, and turn its transit token
-  back on, or delete the surface. Then check the stored records under
-  `_storage/agent_surfaces/`, not a `GET`: a surface that still carries
-  `transit_point_source_auth` is skipped by the older release.
-- A Surface Template stores its surface unparsed, so an older release still loads it and can
-  create from it a Transit Point without `source_auth`. Back up
-  `_storage/agent_surface_templates/` before upgrading if a rollback may be needed, and
-  restore it on rollback.
+  back on, or delete the surface. Then check that no surface still carries
+  `transit_point_source_auth`, which the older release skips: a `GET` of the surface shows it,
+  and so do the stored records under `_storage/agent_surfaces/` unless storage encryption at
+  rest is on, which stores them encrypted.
+- A Surface Template's surface is marked the same way: the gateway sets
+  `transit_point_source_auth: true` inside it while a Transit Point there, base or variant,
+  uses `source_auth`, on every save and when it loads a stored template, and drops it
+  otherwise. An older release still loads the template, but its admin API refuses a surface
+  created from that surface as it is. The dashboard builds a new surface from a template's
+  elements instead and does not carry the mark, nor a Transit Point's `source_auth`, so before
+  rolling back, also remove `source_auth` from such templates, or back up
+  `_storage/agent_surface_templates/` before upgrading and restore it on rollback. Templates
+  are always stored as plain JSON.
 
 ### Transit Point source authentication
 
