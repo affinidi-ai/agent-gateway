@@ -791,13 +791,17 @@ mod tests {
     fn a_target_auth_credential_provider_is_a_reference_of_the_target_and_each_transit_point() {
         let mut surface = AgentSurface::default();
         surface.target.auth = Some(
-            serde_json::from_value(serde_json::json!({"method": {"credential_provider": {"provider_id": "cp-target"}}}))
-                .unwrap(),
+            serde_json::from_value(
+                serde_json::json!({"method": {"credential_provider": {"provider_id": "cp-target"}}}),
+            )
+            .unwrap(),
         );
         let mut point = transit_point("partner", "tr-partner");
         point.target_auth = Some(
-            serde_json::from_value(serde_json::json!({"method": {"credential_provider": {"provider_id": "cp-partner"}}}))
-                .unwrap(),
+            serde_json::from_value(
+                serde_json::json!({"method": {"credential_provider": {"provider_id": "cp-partner"}}}),
+            )
+            .unwrap(),
         );
         surface.transit = Some(crate::config::agent_surface::TransitConfig {
             points: vec![point],

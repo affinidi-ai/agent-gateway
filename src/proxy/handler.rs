@@ -599,9 +599,7 @@ impl<'a> TargetAuthContext<'a> {
     pub(crate) fn of_proxy(state: &'a ProxyState) -> Self {
         Self::of_surface(
             &state.surface,
-            state
-                .secrets_store
-                .as_ref(),
+            state.secrets_store.as_ref(),
             state
                 .credential_provider_store
                 .as_ref(),
@@ -743,9 +741,7 @@ async fn target_provider_token(
         identity: &identity,
     };
     let token = service_token::acquire(&provider, &scopes, &service, key, chrono::Utc::now()).await?;
-    Ok(token
-        .value()
-        .to_string())
+    Ok(token.value().to_string())
 }
 
 /// Load and prepare DID:webvh identity context for a channel request
@@ -16756,7 +16752,9 @@ mod target_auth_tests {
                     counter.fetch_add(1, Ordering::SeqCst);
                     (
                         axum::http::StatusCode::from_u16(token_status).unwrap(),
-                        axum::Json(json!({"access_token": "provider-token", "token_type": "Bearer", "expires_in": 3600})),
+                        axum::Json(
+                            json!({"access_token": "provider-token", "token_type": "Bearer", "expires_in": 3600}),
+                        ),
                     )
                 }
             }));
@@ -16999,7 +16997,11 @@ mod target_auth_tests {
             .await
             .unwrap_err();
         assert_eq!(error, TargetAuthError::SecretNotFound);
-        assert!(!error.to_string().contains("secret-name-marker"));
+        assert!(
+            !error
+                .to_string()
+                .contains("secret-name-marker")
+        );
     }
 }
 

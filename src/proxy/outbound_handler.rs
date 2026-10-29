@@ -2218,9 +2218,7 @@ async fn transit_target_auth_header(
         target_auth,
         &crate::proxy::handler::TargetAuthContext::of_surface(
             &ctx.surface,
-            state
-                .secrets_store
-                .as_ref(),
+            state.secrets_store.as_ref(),
             state
                 .credential_provider_store
                 .as_ref(),

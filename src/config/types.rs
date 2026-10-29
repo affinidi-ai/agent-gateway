@@ -4595,10 +4595,8 @@ mod target_auth_method_tests {
         let lookup: TargetAuthMethod = serde_json::from_value(json!("credential_lookup")).unwrap();
         assert_eq!(lookup, TargetAuthMethod::CredentialLookup);
         assert_eq!(lookup.header_name(), None);
-        let secret: TargetAuthMethod = serde_json::from_value(
-            json!({"static_secret": {"secret_id": "s", "header_name": "x-key"}}),
-        )
-        .unwrap();
+        let secret: TargetAuthMethod =
+            serde_json::from_value(json!({"static_secret": {"secret_id": "s", "header_name": "x-key"}})).unwrap();
         assert_eq!(secret.header_name(), Some("x-key"));
     }
 }
