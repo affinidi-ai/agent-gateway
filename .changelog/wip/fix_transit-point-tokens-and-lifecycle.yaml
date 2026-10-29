@@ -29,7 +29,14 @@ changes:
         encryption at rest is turned on, so an instance starting beside another no longer
         reads a partly written file and fails to start; an instance that finds a key file
         migrated by another as it reads it reads the migrated file.
-  fixed: []
+  fixed:
+    - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Keep an outbound listener bound after its last Transit Point is removed
+      description: >-
+        A reload that left an outbound listener without Transit Points stopped listening on
+        its port, so `/alive` health checks on it failed until the gateway restarted, while
+        startup binds such a listener. Reloads now bind it the same way: it answers `/alive`
+        and refuses the removed Transit Point paths with `404`.
   removed: []
   security: []
   breaking:

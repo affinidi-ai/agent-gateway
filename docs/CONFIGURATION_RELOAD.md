@@ -89,10 +89,9 @@ Gateway process:
 4. Replace the shared `GatewayConfig` and save the successful snapshot to the configuration cache.
 5. Reload network configuration, group active surfaces by listener, and rebuild derived surface
    state.
-6. Bind new inbound listeners and outbound listeners that have active outbound surfaces, retaining
-   each inbound listener's `MultiSurfaceProxyState` for later single-surface updates. An outbound
-   port with no active outbound surfaces receives a placeholder task during reload and is not bound;
-   this differs from startup, which binds empty outbound ports so their liveness route remains
+6. Bind new inbound and outbound listeners, retaining each inbound listener's
+   `MultiSurfaceProxyState` for later single-surface updates. An outbound port with no active
+   Transit Points is bound with no proxy routes, as at startup, so its liveness route remains
    available.
 
 Requests using a listener while it is stopped and rebound can be interrupted. Process-wide services

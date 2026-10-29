@@ -628,18 +628,12 @@ impl SurfaceTaskManager {
             if listener_type == "outbound" {
                 // ── Outbound listener ────────────────────────────────────────
                 // Use the dedicated outbound_channels_by_port map (built from outbound_listen_address).
+                // A port without Transit Points is bound anyway, as at startup, so it keeps
+                // answering `/alive`.
                 let outbound_channels = outbound_channels_by_port
                     .get(&port)
                     .cloned()
                     .unwrap_or_default();
-
-                if outbound_channels.is_empty() {
-                    info!("Outbound listener on port {} has no enabled outbound channels — skipping", port);
-                    // Still need to insert a dummy handle so the port counts as running.
-                    let handle = tokio::spawn(std::future::pending::<()>());
-                    new_port_handles.insert(port, handle.abort_handle());
-                    continue;
-                }
 
                 let bind_address = listener_info
                     .map(|l| l.bind_address.clone())
@@ -1631,27 +1625,13 @@ impl SurfaceTaskManager {
                 continue;
             }
 
+            // A listener left without Transit Points is rebuilt with no proxy
+            // routes, as at startup: it keeps answering `/alive` and refuses
+            // the removed routes with 404.
             let outbound_channels = outbound_channels_by_port
                 .get(&outbound_port)
                 .cloned()
                 .unwrap_or_default();
-            if outbound_channels.is_empty() {
-                warn!(
-                    surface = %channel.name,
-                    port = outbound_port,
-                    "No outbound channels remain for listener — stopping outbound listener to clear stale routes"
-                );
-                let mut port_handles = self
-                    .port_listener_handles
-                    .write()
-                    .await;
-                if let Some(handle) = port_handles.remove(&outbound_port) {
-                    handle.abort();
-                }
-                let handle = tokio::spawn(std::future::pending::<()>());
-                port_handles.insert(outbound_port, handle.abort_handle());
-                continue;
-            }
 
             let bind_address = listener_info
                 .map(|l| l.bind_address.clone())
