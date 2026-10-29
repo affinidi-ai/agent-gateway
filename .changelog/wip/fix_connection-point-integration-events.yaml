@@ -1,0 +1,14 @@
+branch: fix/connection-point-integration-events
+changes:
+  added: []
+  changed:
+    - timestamp: '2026-10-28T12:00:00.000Z'
+      title: Say when Connection Point Connected is raised in the integration catalog
+      description: The catalog described connection_point.connected as someone connecting through a connection point with its secret. It now says it is raised when another gateway pairs through a connection point's invitation with its secret, which is the only time it is sent; a failed attempt sends nothing. See docs/INTEGRATIONS.md.
+  fixed:
+    - timestamp: '2026-10-28T12:00:00.000Z'
+      title: ⭐ Deliver connection point created, updated and deleted events to integrations
+      description: Creating, editing or deleting a connection point through the management API only logged that its integration trigger was not implemented, and the integration catalog offered no such events, so no email, Slack, webhook or stream integration could be told about them. The catalog now lists connection_point.created, connection_point.updated and connection_point.deleted, and each is delivered to every active integration whose event set holds it, like the gateway events. updated is raised when a save changes the name, description, enabled state or exposed surfaces, and a save that changes none of them raises nothing. They carry the connection point's id, name, description, DID, gateway and mediator, with OLD_STATE and NEW_STATE, never its invitation or secret. Connection points the gateway creates or removes itself, such as those of a pairing or an expired invitation, raise none of them, and these events are separate from the event hook calls of the same names. Add the events to an event set to receive them; upgrading does not add them to existing event sets. See docs/INTEGRATIONS.md.
+  removed: []
+  security: []
+  breaking: []

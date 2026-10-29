@@ -107,7 +107,7 @@ fields; and `variable_pattern`, the placeholder syntax in use (see _Templates_)
 | --- | --- |
 | Gateway | `gateway.created`, `updated`, `deleted`, `status_changed`, `accessed` |
 | User | `user.created`, `approved`, `updated`, `deleted`, `login`, `accessed` |
-| Connection point | `connection_point.connected`: someone connected through a connection point with its secret |
+| Connection point | `connection_point.created`, `updated`, `deleted`, `connected` |
 | x402 | `x402.verification.failed`, `x402.settlement.failed`, `x402.transaction.completed`, `x402.cleanup.completed` |
 | MPP | `mpp.verification.failed`, `mpp.payment.verified`, `mpp.challenge.issued` |
 | Audit | `audit.<event>` for every event of the audit catalog ([`src/audit/catalog.rs`](../src/audit/catalog.rs)) |
@@ -117,6 +117,20 @@ SAML sign-in that creates the user raises `user.created`; SAML users are approve
 so no `user.approved` follows. A later SAML sign-in that changes the user's role, status, or
 primary flag raises `user.updated`. Every SAML sign-in then raises `user.login`, in that order
 ([`saml/user_provisioning.rs`](../src/auth/saml/user_provisioning.rs)).
+
+The connection point management API raises `connection_point.created`, `updated` and `deleted`,
+as the gateway API raises the gateway events. `updated` is raised when a save changes the name,
+description, enabled state or exposed surfaces; a save that changes none of them raises nothing,
+and so does a reconnect. Connection points the gateway creates or removes itself, such as those
+of a pairing or an expired invitation, raise none of them. `connection_point.connected` is
+raised when another gateway pairs through a connection point's invitation with its secret; a
+failed attempt raises nothing ([`connection_point_integration_triggers.rs`](../src/integrations/connection_point_integration_triggers.rs),
+[`webhook.rs`](../src/gateways/connection_points/webhook.rs)).
+
+These integration events are separate from the [event hook](#event-hook) calls of the same
+names. The event hook's `created` and `deleted` also report the connection points the gateway
+creates and removes itself, and its `connected` reports a listener's first mediator connection,
+not a pairing.
 
 ## Templates
 
@@ -144,9 +158,11 @@ Every event fills these variables, plus its own:
 The computed variables (`EVENT_TYPE`, `EVENT_NAME`, `EVENT_SUMMARY`, `EVENT_DATA`,
 `APPLIANCE_ID`) are always set by the gateway, never by the code that raised the event. Each
 event's own variables, such as `GATEWAY_ID`, `GATEWAY_NAME`, `GATEWAY_DID`, and
-`GATEWAY_STATUS` for a gateway event, are listed in the catalog. Gateway and user events also
-carry `OLD_STATE` and `NEW_STATE`: the resource before and after the change as JSON, empty for a
-create or a delete respectively.
+`GATEWAY_STATUS` for a gateway event, are listed in the catalog. Gateway and user events, and
+the connection point `created`, `updated` and `deleted` events, also carry `OLD_STATE` and
+`NEW_STATE`: the resource before and after the change as JSON, empty for a create or a delete
+respectively. A connection point's state leaves out its invitation (`oob_id`, `oob_url`,
+`oob_message`) and its secret, since whoever holds them can connect.
 
 A user's `OLD_STATE` and `NEW_STATE` carry only `user_id`, `role`, `status`, `is_primary`,
 `created_at`, and `updated_at`
