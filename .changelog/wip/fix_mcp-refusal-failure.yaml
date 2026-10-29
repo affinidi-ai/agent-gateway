@@ -16,7 +16,9 @@ changes:
         fails. Those headers are still checked: Mcp-Method must name the request's method, and Mcp-Name
         must match params.name for tools/call and prompts/get or params.uri for resources/read, or the
         request is refused with 400. Unsupported-version errors and
-        server/discover now list the 2025 revisions, and any other revision is still refused with -32022.
+        server/discover now list the 2025 revisions, except that server/discover on a gateway-owned MCP
+        Proxy lists at most 2024-11-05 and 2026-07-28, because it answers initialize with 2024-11-05.
+        Any other revision is still refused with -32022.
     - timestamp: '2026-10-28T00:00:00Z'
       title: Return one Mcp-Session-Id when an MCP initialize response is wrapped as SSE
       description: >-
@@ -46,5 +48,8 @@ changes:
         prompts themselves, are now keyed by surface as well as Mcp-Session-Id. Session ids can now come
         from the upstream, so a client on another surface presenting the same id could otherwise receive
         another user's authorization URL or cancel their pending prompt. Sessions are not bound to the
-        caller, so within one surface this relies on the upstream issuing unguessable session ids.
+        caller, so within one surface protection now rests on the upstream's session id generator
+        rather than an id the gateway minted. When an upstream returns a session id already in use on
+        the surface to a new initialize, consent prompts are turned off for that id, even after DELETE
+        and until the gateway restarts, and the binding's elicit_fallback applies.
   breaking: []

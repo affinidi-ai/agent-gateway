@@ -128,8 +128,9 @@ reject unauthenticated callers needs a policy denying `input.source_auth.method 
 See [`docs/POLICY.md`](docs/POLICY.md#failed-caller-authentication).
 
 **MCP revisions are admitted per transport path.** Every MCP endpoint admits `2026-07-28`
-alongside the session revisions `2024-11-05`, `2025-03-26`, `2025-06-18` and `2025-11-25`
-(`SESSION_VERSIONS`), which are forwarded as legacy traffic. Resolve versions through `runtime_policy_for` /
+alongside the session revisions listed in [`docs/MCP_METADATA.md`](docs/MCP_METADATA.md#modern-mcp-admission).
+Session revisions are forwarded to the upstream, except that gateway-owned MCP Proxies answer
+`initialize` themselves with `2024-11-05`. Resolve versions through `runtime_policy_for` /
 `admission_policy_for_target` ([`src/mcp/request_validation.rs`](src/mcp/request_validation.rs)),
 never an appliance-wide constant. See [`docs/MCP_METADATA.md`](docs/MCP_METADATA.md).
 

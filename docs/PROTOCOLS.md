@@ -12,7 +12,7 @@ revision-specific behavior and limitations of the checked-out source.
 | A2A `0.3` | Accepted | Accepted on each A2A surface that selects it, which is the default except on a new A2A proxy surface. See [A2A Protocol Versions](#a2a-protocol-versions) |
 | MCP `2024-11-05` | Active | Admitted and advertised on every MCP endpoint |
 | MCP `2025-03-26`, `2025-06-18`, `2025-11-25` | Active | Admitted on every MCP endpoint and forwarded as session revisions, like `2024-11-05`. Advertised in discovery on every MCP endpoint except gateway-owned MCP Proxies, which answer `initialize` with `2024-11-05`. Tasks (`tasks/*`) and JSON-RPC batches are not supported (HTTP `422`). See [MCP Validation Boundary](#mcp-validation-boundary) |
-| MCP `2026-07-28` | Active | Admitted and advertised alongside the session revisions on every MCP endpoint |
+| MCP `2026-07-28` | Active | Admitted and advertised on every MCP endpoint, alongside the session revisions that endpoint advertises |
 | AP2 | Experimental | Disabled by default; production proof signing is not implemented |
 
 The hosted documentation is rolling product documentation. Use this matrix and the repository
@@ -758,10 +758,11 @@ Not bounded here: `fabric://` legs.
 
 The session revisions `2024-11-05`, `2025-03-26`, `2025-06-18` and `2025-11-25` are active on
 every MCP endpoint. They all open a session with `initialize` and carry it in `Mcp-Session-Id`, so
-the gateway forwards them as legacy traffic. The Gateway recognizes `2026-07-28` per-request
+the gateway forwards them to the upstream, except that gateway-owned MCP Proxies answer
+`initialize` themselves with `2024-11-05`. The Gateway recognizes `2026-07-28` per-request
 metadata and mirrored HTTP headers on direct Access Points, Transit Points, standalone MCP Proxies
-and Fabric receive, and admits and advertises that revision alongside the session revisions on
-every MCP endpoint. Fabric carries it only as framed streams; the buffered Fabric forward carries
+and Fabric receive, and admits and advertises that revision on every MCP endpoint. A gateway-owned
+MCP Proxy advertises it alongside `2024-11-05` only, or alone when it has no legacy catalog. Fabric carries it only as framed streams; the buffered Fabric forward carries
 the session revisions only. Revisions the gateway does not model are rejected as unsupported.
 
 `2026-07-28` support is measured against the published MCP conformance suite with

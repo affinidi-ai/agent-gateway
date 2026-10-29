@@ -164,7 +164,7 @@ differ, repository documentation describes this source revision exactly.
 | A2A `1.0` | Active |
 | A2A `0.3` | Accepted on each A2A surface that selects it, the default except on a new A2A proxy surface |
 | MCP `2024-11-05` | Active |
-| MCP `2025-03-26`, `2025-06-18`, `2025-11-25` | Active, forwarded as session revisions like `2024-11-05` |
+| MCP `2025-03-26`, `2025-06-18`, `2025-11-25` | Active, forwarded as session revisions like `2024-11-05`; gateway-owned MCP Proxies answer `initialize` with `2024-11-05` |
 | MCP `2026-07-28` | Active on every MCP endpoint |
 | DIDComm v2.1 | Available for Fabric transport |
 | TRQP | Available for Trust Check |
