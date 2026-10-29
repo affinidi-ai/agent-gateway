@@ -8,13 +8,17 @@ changes:
         Reconnect no longer falls back to accepting the registry's OOB invitation again
         once the registry has an identity. That fallback created a new identity over the
         stored keys, which the registry admin rejects, and for `did:peer` and `did:webvh`
-        registries it could not be undone. A failed reconnect now returns 502 with the
-        cause and leaves the stored status and identity unchanged. A registry whose setup
-        never connected has no identity yet, so reconnecting it still accepts its OOB
-        invitation again and completes the setup. A successful reconnect moves a Failed
-        registry to Connected, so reconnecting clears a rejection, and keeps any other
-        status, so an Awaiting approval registry is no longer shown as Connected before the
-        registry approves it.
+        registries it could not be undone. A failed reconnect now returns 502, logs the
+        cause instead of returning it, and leaves the stored status and identity unchanged.
+        A registry whose setup never connected has no identity yet, so reconnecting it
+        still accepts its OOB invitation again and completes the setup, unless a connection
+        for it is already installed. The new identity is saved onto the registry's current
+        record even when the request is dropped during the build, so edits made meanwhile
+        are kept. A successful reconnect moves a Failed registry to Connecting, where it
+        waits for the registry to approve it, and keeps any other status, so a registry is
+        no longer shown as Connected before the registry approves it. A registry marked
+        Failed before this change by a dropped connection stays Connecting after it is
+        reconnected until the registry approves it again.
     - timestamp: '2026-10-28T16:11:17Z'
       title: Refuse to create or reconnect trust registries on a Standby node
       description: >-
@@ -44,8 +48,8 @@ changes:
         30 minutes) until it connects, is deleted or the node goes to Standby; a websocket
         that drops on a working connection is reconnected by the DIDComm client. Reconnect
         starts a build at once and restarts the backoff. Failed is now set only when the
-        registry rejects the gateway before approving it or the first OOB acceptance fails,
-        so a late problem report to a query no longer marks a Connected registry Failed.
+        registry rejects the gateway or the first OOB acceptance fails, and a problem report
+        answering a query that already timed out no longer marks a registry Failed.
         Failed registries are neither retried nor queried automatically, so a registry
         marked Failed before this change by a dropped connection fails its Trust Checks,
         Trust Recorders and issuer registration until it is reconnected from the dashboard.
