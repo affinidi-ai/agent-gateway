@@ -296,6 +296,64 @@ allow if {{
     assert_refused_before_the_target(&h, None, "no token").await;
 }
 
+/// A Transit Point a variant defines authenticates its callers with its own
+/// `source_auth`, here a JWT in a header of its own, on the variant's `$alias`
+/// route; the header never reaches the target, and the surface's own Transit
+/// Point keeps its own check.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_variants_transit_point_checks_a_jwt_in_its_own_header_on_the_variant_route() {
+    let fixture = JwksFixture::start().await;
+    let mock = MockServer::start().await;
+    let target = mock.url();
+    let h = GatewayHarness::start_with_outbound_mock(mock, |temp_dir, gw_config, _| {
+        write_caller_key(temp_dir);
+        write_jwt_strategy(temp_dir, &fixture);
+        let mut surface = surface(json!({
+            "source_auth": { "type": "api_key", "secret_id": CALLER_KEY_SECRET,
+                             "extraction": { "source": "http_header", "field": "x-api-key" } }
+        }));
+        surface.variants = vec![
+            serde_json::from_value(json!({
+                "id": "variant-dev", "alias": "dev", "name": "dev", "enabled": true,
+                "overrides": { "transit": { "points": [{
+                    "alias": "target", "target_endpoint": target, "require_transit_token": false,
+                    "source_auth": { "type": "jwt_bearer", "jwt_verification_strategy_id": STRATEGY_ID,
+                                     "audiences": ["api://transit-point"], "token_header": "x-caller-token" }
+                }] } }
+            }))
+            .unwrap(),
+        ];
+        gw_config.surfaces = vec![surface];
+    })
+    .await;
+    let token = format!(
+        "Bearer {}",
+        sign_jwt(
+            json!({
+                "iss": fixture.issuer, "sub": "alice", "aud": "api://transit-point",
+                "exp": now_secs() + 300, "iat": now_secs(),
+            }),
+            &fixture.kid,
+        )
+    );
+
+    let before = requests_seen(&h);
+    let admitted = call_transit_point(&h, "/outbound/smoke$dev/target", Some(("x-caller-token", &token))).await;
+    assert_eq!(admitted.status(), 200);
+    assert_eq!(requests_seen(&h), before + 1);
+    assert!(!last_forwarded_headers(&h).contains_key("x-caller-token"), "the caller's token never reaches the target");
+
+    let before = requests_seen(&h);
+    for (path, header, case) in [
+        ("/outbound/smoke$dev/target", None, "the variant's Transit Point without a token"),
+        ("/outbound/smoke/target", Some(("x-caller-token", token.as_str())), "the surface's own Transit Point"),
+    ] {
+        let refused = call_transit_point(&h, path, header).await;
+        assert_eq!(refused.status(), 401, "{case}");
+    }
+    assert_eq!(requests_seen(&h), before, "a refused call must not reach the target");
+}
+
 /// A Transit Point that authenticates its callers by client certificate admits
 /// a certificate a trusted proxy forwarded, and refuses a call without one.
 #[tokio::test(flavor = "multi_thread")]
@@ -380,6 +438,20 @@ async fn an_mtls_caller_whose_certificate_a_trusted_proxy_forwarded_is_admitted(
         !last_forwarded_headers(&h).contains_key(&header_name.to_ascii_lowercase()),
         "the forwarded certificate must not reach the target"
     );
+
+    // The inbound listener shares the outbound listener's host, so it passes
+    // `/outbound` requests on from loopback, a trusted proxy; it must not pass
+    // on a forwarded certificate nobody verified.
+    let through_inbound = client()
+        .post(format!("{}/outbound/smoke/target", h.gateway_base))
+        .header("content-type", "application/json")
+        .header(header_name.as_str(), &forwarded_certificate)
+        .body(r#"{"jsonrpc":"2.0","method":"test","id":7}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(through_inbound.status(), 401, "a certificate sent to the inbound listener is never forwarded");
+    assert_eq!(requests_seen(&h), before + 1, "the refused call must not reach the target");
 }
 
 /// A Transit Point that authenticates no caller: the admin API refuses it
