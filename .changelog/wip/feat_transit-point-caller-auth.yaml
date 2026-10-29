@@ -31,7 +31,13 @@ changes:
   changed: []
   fixed: []
   removed: []
-  security: []
+  security:
+    - timestamp: '2026-10-29T20:30:00.000Z'
+      title: Pass a managed agent only the caller-info headers the gateway sets
+      description: >-
+        The Access Point and Fabric receive pass a managed agent `x-caller-did`,
+        `x-caller-identity-source`, `x-caller-dna-uai` and `x-gateway-did` only as the gateway
+        sets them, so the agent can rely on them to know who is calling.
   breaking:
     - timestamp: '2026-10-29T12:00:00.000Z'
       title: ⭐ Refuse a Transit Point that authenticates no caller unless it is marked open
