@@ -2131,6 +2131,11 @@ mod tests {
         for (provider_type, outcome) in [
             (CredentialProviderType::ApiKey, DelegationActionOutcome::ApiKeyResolutionFailed),
             (CredentialProviderType::OAuth2ClientCredentials, DelegationActionOutcome::ClientCredentialsFailed),
+            (CredentialProviderType::OAuth2JwtBearer, DelegationActionOutcome::JwtBearerFailed),
+            (
+                CredentialProviderType::OAuth2ClientCredentialsJwtAuth,
+                DelegationActionOutcome::ClientCredentialsJwtAuthFailed,
+            ),
         ] {
             let vault = MockVaultStore::new(VaultLookupResult::NotFound);
             let providers = MockProviderStore::with_provider("cp-1", provider_type.clone());

@@ -63,8 +63,13 @@ pub enum ServiceTokenError {
     StoreUnavailable,
 }
 
+/// A cached token is not injected within this many seconds of its expiry, so it does not
+/// reach the target just as the issuer stops accepting it.
+pub const EXPIRY_MARGIN_SECS: i64 = 60;
+
 /// The provider's service token for `scopes`: its API key, or a cached token that grants
-/// them, or a new token from the provider's grant, stored under `key`.
+/// them, or a new token from the provider's grant, stored under `key`. Issued scopes must
+/// equal requested ones; when none were requested the issuer's scopes are kept.
 pub async fn acquire(
     provider: &CredentialProvider,
     scopes: &[String],
@@ -119,9 +124,10 @@ pub async fn acquire(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_else(|| scopes.to_vec());
-    if granted
-        .iter()
-        .any(|scope| !scopes.contains(scope))
+    if (!scopes.is_empty()
+        && granted
+            .iter()
+            .any(|scope| !scopes.contains(scope)))
         || scopes
             .iter()
             .any(|scope| !granted.contains(scope))
@@ -195,9 +201,358 @@ async fn cached_token(
             .eq_ignore_ascii_case("Bearer")
         && token
             .expires_at
-            .is_some_and(|expires| expires > now)
+            .is_some_and(|expires| expires - chrono::Duration::seconds(EXPIRY_MARGIN_SECS) > now)
         && scopes
             .iter()
             .all(|scope| token.scopes.contains(scope));
     Ok(usable.then_some(token))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::credential_providers::storage::FileSystemCredentialProviderStore;
+    use crate::delegation_vault::jwt_assertion::test_keys;
+    use crate::delegation_vault::storage::FileSystemDelegationVaultStore;
+    use serde_json::{Value, json};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct Endpoint {
+        response: Mutex<Value>,
+        forms: Mutex<Vec<HashMap<String, String>>>,
+    }
+
+    struct Fixture {
+        secrets: Arc<dyn SecretsStore>,
+        providers: FileSystemCredentialProviderStore,
+        vault: FileSystemDelegationVaultStore,
+        client: reqwest::Client,
+        endpoint: Arc<Endpoint>,
+        _server: tokio::task::JoinSet<()>,
+        _directory: tempfile::TempDir,
+    }
+
+    const KEY: ServiceTokenKey<'static> = ServiceTokenKey {
+        agent_did: "surface:surface-1",
+        identity: "__target_auth__:digest",
+    };
+
+    impl Fixture {
+        async fn new() -> Self {
+            let endpoint = Arc::new(Endpoint {
+                response: Mutex::new(json!({"access_token": "issued", "token_type": "Bearer", "expires_in": 3600})),
+                ..Default::default()
+            });
+            let app = axum::Router::new()
+                .fallback(axum::routing::post(
+                    |axum::extract::State(endpoint): axum::extract::State<Arc<Endpoint>>,
+                     axum::Form(form): axum::Form<HashMap<String, String>>| async move {
+                        endpoint
+                            .forms
+                            .lock()
+                            .unwrap()
+                            .push(form);
+                        axum::Json(
+                            endpoint
+                                .response
+                                .lock()
+                                .unwrap()
+                                .clone(),
+                        )
+                    },
+                ))
+                .with_state(endpoint.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .unwrap();
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .proxy(reqwest::Proxy::http(format!("http://{}", listener.local_addr().unwrap())).unwrap())
+                .build()
+                .unwrap();
+            let mut server = tokio::task::JoinSet::new();
+            server.spawn(async move {
+                axum::serve(listener, app)
+                    .await
+                    .unwrap();
+            });
+            let directory = tempfile::tempdir().unwrap();
+            let secrets: Arc<dyn SecretsStore> = Arc::new(
+                crate::secrets::FilesystemSecretsStore::new(
+                    directory
+                        .path()
+                        .join("secrets")
+                        .to_str()
+                        .unwrap(),
+                )
+                .unwrap(),
+            );
+            for (secret_id, value) in [
+                ("CLIENT_ID", "client-123".to_string()),
+                ("CLIENT_SECRET", "client-secret".to_string()),
+                ("API_KEY", "static-key".to_string()),
+                ("SIGNING_KEY", test_keys::rsa_pkcs8().private_pem),
+                ("CERTIFICATE", test_keys::certificate_pem()),
+            ] {
+                secrets
+                    .create(crate::secrets::CreateSecretRequest {
+                        tenant_id: None,
+                        name: secret_id.into(),
+                        secret_id: secret_id.into(),
+                        description: None,
+                        value,
+                        secret_type: "General".into(),
+                        tags: vec![],
+                    })
+                    .await
+                    .unwrap();
+            }
+            Self {
+                secrets,
+                providers: FileSystemCredentialProviderStore::new(
+                    directory
+                        .path()
+                        .join("providers"),
+                )
+                .await
+                .unwrap(),
+                vault: FileSystemDelegationVaultStore::new(directory.path().join("vault"))
+                    .await
+                    .unwrap(),
+                client,
+                endpoint,
+                _server: server,
+                _directory: directory,
+            }
+        }
+
+        async fn provider(
+            &self,
+            settings: Value,
+        ) -> CredentialProvider {
+            let mut value = json!({
+                "id": "provider", "name": "Provider", "provider_id": "provider",
+                "token_endpoint": "http://192.0.2.1/token",
+                "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+            });
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(
+                    settings
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                );
+            self.providers
+                .create(serde_json::from_value(value).unwrap())
+                .await
+                .unwrap()
+        }
+
+        async fn acquire(
+            &self,
+            provider: &CredentialProvider,
+            scopes: &[&str],
+            now: DateTime<Utc>,
+        ) -> Result<ServiceToken, ServiceTokenError> {
+            let scopes: Vec<String> = scopes
+                .iter()
+                .map(|scope| scope.to_string())
+                .collect();
+            let context = ServiceTokenContext {
+                secrets: &self.secrets,
+                providers: &self.providers,
+                vault: &self.vault,
+                http: Some(&self.client),
+            };
+            acquire(provider, &scopes, &context, KEY, now).await
+        }
+
+        fn requests(&self) -> Vec<HashMap<String, String>> {
+            self.endpoint
+                .forms
+                .lock()
+                .unwrap()
+                .clone()
+        }
+
+        fn respond(
+            &self,
+            response: Value,
+        ) {
+            *self
+                .endpoint
+                .response
+                .lock()
+                .unwrap() = response;
+        }
+    }
+
+    fn issued(token: Result<ServiceToken, ServiceTokenError>) -> (String, bool) {
+        match token {
+            Ok(ServiceToken::Issued { token, cached }) => (token.access_token, cached),
+            Ok(ServiceToken::Static(_)) => panic!("expected an issued token"),
+            Err(error) => panic!("expected an issued token, got {error}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn each_grant_fetches_once_and_then_reuses_the_cached_token() {
+        for (settings, grant_type) in [
+            (
+                json!({"provider_type": "oauth2_client_credentials", "client_id_secret_ref": "CLIENT_ID",
+                       "client_secret_secret_ref": "CLIENT_SECRET"}),
+                "client_credentials",
+            ),
+            (
+                json!({"provider_type": "oauth2_jwt_bearer", "jwt_issuer": "sa@example",
+                       "jwt_signing_key_secret_ref": "SIGNING_KEY"}),
+                "urn:ietf:params:oauth:grant-type:jwt-bearer",
+            ),
+            (
+                json!({"provider_type": "oauth2_client_credentials_jwt_auth", "client_id_secret_ref": "CLIENT_ID",
+                       "jwt_signing_key_secret_ref": "SIGNING_KEY", "jwt_certificate_secret_ref": "CERTIFICATE"}),
+                "client_credentials",
+            ),
+        ] {
+            let fixture = Fixture::new().await;
+            let provider = fixture.provider(settings).await;
+            let now = Utc::now();
+            assert_eq!(issued(fixture.acquire(&provider, &["read"], now).await), ("issued".into(), false));
+            assert_eq!(issued(fixture.acquire(&provider, &["read"], now).await), ("issued".into(), true));
+            let requests = fixture.requests();
+            assert_eq!(requests.len(), 1, "{grant_type}");
+            assert_eq!(requests[0]["grant_type"], grant_type);
+            assert!(!requests[0].contains_key("resource"), "{grant_type}");
+            let VaultLookupResult::Found(stored) = fixture
+                .vault
+                .lookup(KEY.agent_did, KEY.identity, "provider")
+                .await
+                .unwrap()
+            else {
+                panic!("the issued token must be stored under its key");
+            };
+            assert_eq!(stored.scopes, vec!["read"]);
+            assert!(stored.expires_at.is_some());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_api_key_is_read_on_every_use_and_never_cached() {
+        let fixture = Fixture::new().await;
+        let provider = fixture
+            .provider(json!({"provider_type": "api_key", "api_key_secret_ref": "API_KEY"}))
+            .await;
+        for _ in 0..2 {
+            let token = fixture
+                .acquire(&provider, &[], Utc::now())
+                .await
+                .unwrap();
+            assert!(matches!(token, ServiceToken::Static(_)));
+            assert_eq!(token.value(), "static-key");
+        }
+        assert!(fixture.requests().is_empty());
+        assert!(
+            fixture
+                .vault
+                .list_all()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cached_token_counts_as_expired_sixty_seconds_before_it_expires() {
+        let fixture = Fixture::new().await;
+        let provider = fixture
+            .provider(json!({"provider_type": "oauth2_client_credentials", "client_id_secret_ref": "CLIENT_ID",
+                             "client_secret_secret_ref": "CLIENT_SECRET"}))
+            .await;
+        let now = Utc::now();
+        issued(fixture.acquire(&provider, &[], now).await);
+        let later = now + chrono::Duration::seconds(3600 - 90);
+        assert!(issued(fixture.acquire(&provider, &[], later).await).1);
+        fixture.respond(json!({"access_token": "renewed", "token_type": "Bearer", "expires_in": 3600}));
+        let almost = now + chrono::Duration::seconds(3600 - 30);
+        assert_eq!(issued(fixture.acquire(&provider, &[], almost).await), ("renewed".into(), false));
+        assert_eq!(fixture.requests().len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_token_response_without_expires_in_is_refused_and_not_cached() {
+        let fixture = Fixture::new().await;
+        let provider = fixture
+            .provider(json!({"provider_type": "oauth2_jwt_bearer", "jwt_issuer": "sa@example",
+                             "jwt_signing_key_secret_ref": "SIGNING_KEY"}))
+            .await;
+        fixture.respond(json!({"access_token": "forever", "token_type": "Bearer"}));
+        assert_eq!(
+            fixture
+                .acquire(&provider, &[], Utc::now())
+                .await
+                .err(),
+            Some(ServiceTokenError::TokenRequestFailed)
+        );
+        assert!(
+            fixture
+                .vault
+                .list_all()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn issued_scopes_must_match_a_request_and_are_kept_when_none_were_requested() {
+        let fixture = Fixture::new().await;
+        let provider = fixture
+            .provider(json!({"provider_type": "oauth2_client_credentials", "client_id_secret_ref": "CLIENT_ID",
+                             "client_secret_secret_ref": "CLIENT_SECRET"}))
+            .await;
+        fixture.respond(json!({"access_token": "wide", "token_type": "Bearer", "expires_in": 3600, "scope": "read write"}));
+        assert_eq!(
+            fixture
+                .acquire(&provider, &["read"], Utc::now())
+                .await
+                .err(),
+            Some(ServiceTokenError::ScopeMismatch)
+        );
+        assert_eq!(issued(fixture.acquire(&provider, &[], Utc::now()).await), ("wide".into(), false));
+        let VaultLookupResult::Found(stored) = fixture
+            .vault
+            .lookup(KEY.agent_did, KEY.identity, "provider")
+            .await
+            .unwrap()
+        else {
+            panic!("the issued token must be stored");
+        };
+        assert_eq!(stored.scopes, vec!["read", "write"]);
+        assert!(!requests_have_scope(&fixture.requests()[1]));
+    }
+
+    fn requests_have_scope(form: &HashMap<String, String>) -> bool {
+        form.contains_key("scope")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_authorization_code_provider_has_no_service_token() {
+        let fixture = Fixture::new().await;
+        let provider = fixture
+            .provider(json!({"provider_type": "oauth2_authorization_code", "client_id_secret_ref": "CLIENT_ID",
+                             "client_secret_secret_ref": "CLIENT_SECRET"}))
+            .await;
+        assert_eq!(
+            fixture
+                .acquire(&provider, &[], Utc::now())
+                .await
+                .err(),
+            Some(ServiceTokenError::Unsupported)
+        );
+        assert!(fixture.requests().is_empty());
+    }
 }
