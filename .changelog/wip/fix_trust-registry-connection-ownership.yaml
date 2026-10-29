@@ -5,14 +5,15 @@ changes:
     - timestamp: '2026-10-28T16:11:17Z'
       title: Rebuild a trust registry from its stored keys when it is reconnected
       description: >-
-        Reconnect no longer falls back to accepting the registry's OOB invitation again.
-        That fallback created a new identity over the stored keys, which the registry
-        admin rejects, and for `did:peer` and `did:webvh` registries it could not be
-        undone. A failed reconnect now returns 502 with the cause and leaves the stored
-        status and identity unchanged; a registry that never connected has to be deleted
-        and recreated. A successful reconnect moves a Failed registry to Connected and
-        keeps any other status, so an Awaiting approval registry is no longer shown as
-        Connected before the registry approves it.
+        Reconnect no longer falls back to accepting the registry's OOB invitation again
+        once the registry has an identity. That fallback created a new identity over the
+        stored keys, which the registry admin rejects, and for `did:peer` and `did:webvh`
+        registries it could not be undone. A failed reconnect now returns 502 with the
+        cause and leaves the stored status and identity unchanged. A registry whose setup
+        never connected has no identity yet, so reconnecting it still accepts its OOB
+        invitation again and completes the setup. A successful reconnect moves a Failed
+        registry to Connected and keeps any other status, so an Awaiting approval registry
+        is no longer shown as Connected before the registry approves it.
     - timestamp: '2026-10-28T16:11:17Z'
       title: Refuse to create or reconnect trust registries on a Standby node
       description: >-

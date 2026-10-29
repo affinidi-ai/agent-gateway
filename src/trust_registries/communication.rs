@@ -932,6 +932,32 @@ impl TrustRegistryListenerManager {
         oob_url: &str,
         did_method: &DidMethod,
     ) -> Result<(TrustRegistryConnection, OobExtras), TrustRegistryError> {
+        #[cfg(test)]
+        if let Some(built) = super::test_builds::run(trust_registry_id).await {
+            let client = built.map_err(TrustRegistryError::ConnectionError)?;
+            let our_did = format!("did:example:gateway-{}", trust_registry_id);
+            let mediator_did = "did:example:mediator".to_string();
+            let announcement = crate::event_hook::CreationGuard::start(
+                self.event_hook.get().cloned(),
+                trust_registry_payload(trust_registry_id, &mediator_did, &our_did),
+            );
+            let connection = TrustRegistryConnection {
+                trust_registry_id: trust_registry_id.to_string(),
+                our_did,
+                registry_did: format!("did:example:registry-{}", trust_registry_id),
+                main_did: None,
+                mediator_did,
+                is_temporary: false,
+                client,
+                response_waiters: Arc::new(Mutex::new(HashMap::new())),
+            };
+            let extras = OobExtras {
+                mediator_url: "https://mediator.example".to_string(),
+                announcement,
+            };
+            return Ok((connection, extras));
+        }
+
         info!("Accepting OOB invitation for trust registry '{}': {}", trust_registry_id, oob_url);
 
         // Step 1: Fetch and parse OOB invitation
