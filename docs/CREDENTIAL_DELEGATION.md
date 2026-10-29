@@ -269,6 +269,14 @@ puts it in `user_hash`. To compute it for a JWT subject `alice` from
 printf '%s' '["jwt_bearer","https://login.example.com",null,"alice"]' | shasum -a 256
 ```
 
+Delegated credentials stored by a release that keyed them by an earlier form of the identity
+hash are never looked up again, but their access and refresh tokens stay in the vault until
+they are removed. After upgrading, list the vault (`GET /api/v1/delegation-vault`, or the
+Credential Tokens tab on the dashboard's Credentials page) and revoke each entry created before
+the upgrade (`DELETE /api/v1/delegation-vault/{id}`, or its delete button), except those under
+`__client_credentials__`, which are unchanged. Users connect their accounts again the next time
+a credential is needed.
+
 Client-credentials tokens have no user, so they are cached under the fixed user hash
 `__client_credentials__`.
 

@@ -58,7 +58,9 @@ changes:
         no identity hash, so an Access Point or Transit Point that would give its caller a
         delegated credential answers it with `403`. Users who connected an account before
         this release connect it again, and policies that compare `user_identity_hash` need the
-        new value.
+        new value. The delegated credentials stored before the upgrade are no longer used but
+        keep their tokens until removed: revoke them through the delegation vault API or the
+        dashboard's Credential Tokens tab, as `docs/CREDENTIAL_DELEGATION.md` describes.
   breaking:
     - timestamp: '2026-10-29T12:00:00.000Z'
       title: ⭐ Refuse a Transit Point that authenticates no caller unless it is marked open
