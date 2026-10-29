@@ -292,8 +292,9 @@ every instance, delete the file, and start them again; every token issued before
 #### Transit token lifetime
 
 A surface sets how long its transit tokens live in `transit.transit_token_lifetime_secs`,
-from the appliance's shortest lifetime, 30 seconds unless `gateway.json` sets
-`transit_token_min_lifetime_secs`, to 900 seconds; unset means 300. Set a longer one when a managed agent's turn, such
+from the appliance's shortest lifetime (30 seconds unless `gateway.json` sets
+`transit_token_min_lifetime_secs`) to 900 seconds. Unset means 300 seconds, or the shortest
+lifetime when that is above 300. Set a longer one when a managed agent's turn, such
 as a long tool call, needs its Transit Points for longer than 300 seconds. For that whole
 time the managed agent, or anyone who obtains the token, can call the surface's Transit
 Points as that caller, with the credentials they inject, so keep it no longer than a turn
@@ -305,22 +306,35 @@ needs.
 
 The lifetime belongs to the surface: a variant takes its surface's, and cannot set its own.
 A surface whose Transit Points exist only in a variant needs a base `transit` block, with
-empty `points`, to carry the lifetime; without one its tokens live 300 seconds. The admin API
-refuses a lifetime outside the shortest lifetime to 900 seconds with `400`, and one in a
-variant's overrides with `422`. A surface stored with one outside them stops the gateway from
-starting; a reload holds it to the nearer bound (see
+empty `points`, to carry the lifetime; without one its tokens live as an unset lifetime does.
+The admin API refuses a new lifetime outside the shortest lifetime to 900 seconds with `400`,
+naming `transit_token_min_lifetime_secs`, and one in a variant's overrides with `422`. A save
+that keeps the value already stored is accepted even when that value is below the shortest
+lifetime, so a dashboard save, or a `GET` followed by a `PUT`, of such a surface still works.
+
+A stored lifetime below the shortest never stops the gateway. At startup, for every stored
+surface, disabled ones included, and on every reload, it is raised to the shortest, with one
+`WARN` per surface naming the surface, the stored value and the shortest; the surface keeps
+its stored value. Such a value arrives when the shortest is raised, when surfaces are restored
+from a backup taken on an appliance with a lower shortest lifetime, or when they are saved
+through another instance with a lower one; set the same value on every instance that shares
+surfaces. A stored lifetime above 900 seconds, which no save accepts, is lowered to 900 by a
+reload, but stops the gateway from starting, naming every such surface (see
 [`CONFIGURATION_RELOAD.md`](CONFIGURATION_RELOAD.md)). The token issuer itself also refuses a
-lifetime outside them.
+lifetime outside the bounds.
 
 The shortest lifetime is a setting of the appliance, `transit_token_min_lifetime_secs` in
 `gateway.json` (see [`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md)): 30 seconds
-unless set, from 1 to 900. Lower it, for example to 10, when a deployment needs tokens that
-expire sooner than 30 seconds allows, which leaves less time for the 5 second clock leeway
-between gateways; raise it to make every surface's tokens live at least that long. The
-longest, 900 seconds, is fixed. It is read at startup, so a change takes a restart, and a
-value outside 1 to 900 stops the gateway from starting. Raising it above a surface's stored
-lifetime makes that surface stop the next start, and a reload holds it to the new shortest
-lifetime until then; correct the surface first.
+unless set, from 1 to 900. The gateway reads it once, when it starts: a value outside 1 to 900
+stops it from starting, and a change takes a restart. A reload, including the one a surface
+save triggers, keeps the value the gateway started with, whatever `gateway.json` says by then,
+so the admin API, the Access Point and the Transit Point always agree. Raise it to make every
+surface's tokens live at least that long; surfaces stored with a shorter lifetime are raised
+with it, as above. Lower it, for example to 10, when a deployment needs tokens that expire
+sooner. Near the floor, a Transit Point accepts a token on a legacy request until 5 seconds
+past its `exp`, the clock leeway between gateways, so a lifetime of 1 to 5 seconds lasts its
+lifetime plus 5 seconds there, while a `2026-07-28` MCP request checks `exp` with no leeway
+and leaves almost no usable time at that size. The longest, 900 seconds, is fixed.
 
 A Transit Point checks a token against the lifetime its surface sets when the token is
 presented, so a change applies to tokens already issued:

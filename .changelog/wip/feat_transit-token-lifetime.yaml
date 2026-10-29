@@ -7,19 +7,22 @@ changes:
         Transit tokens always lived 300 seconds, so a managed agent's turn that ran longer,
         such as a long tool call, lost its Transit Points part way. A surface's
         `transit.transit_token_lifetime_secs` now sets how long the tokens its Access Point
-        issues live, from the appliance's shortest lifetime to 900 seconds, and 300 when
-        unset. The shortest lifetime is `transit_token_min_lifetime_secs` in `gateway.json`:
-        30 seconds unless set, from 1 to 900, and a value outside that stops the gateway
-        from starting. A Transit Point checks a
-        token against the lifetime its surface sets when the token is presented, so
-        shortening the lifetime refuses the tokens already issued for longer while it is in
-        force, and lengthening it never extends a token already issued. Shortening is not
-        revocation: rotate the transit token key to revoke issued tokens. A `PUT` that omits
-        the lifetime, as a dashboard save does, keeps the stored value, and a merge `PATCH`
-        with `null` resets it to 300. The admin API refuses a lifetime
-        outside the bounds, or one set in a variant, and a surface stored with one outside
-        them stops the gateway from starting. A longer lifetime lets whoever holds a token
-        use the surface's Transit Points as its caller for longer.
+        issues live, from the appliance's shortest lifetime to 900 seconds; unset means 300,
+        or the shortest lifetime when that is above 300. The shortest lifetime is
+        `transit_token_min_lifetime_secs` in `gateway.json`: 30 seconds unless set, from 1 to
+        900. It is read once, when the gateway starts: a value outside 1 to 900 stops it from
+        starting, a change takes a restart, and a reload keeps the startup value. A stored
+        lifetime below it is raised to it at startup and on reload, with a warning per
+        surface, and never stops the gateway; one above 900 stops it from starting. A Transit
+        Point checks a token against the lifetime its surface sets when the token is
+        presented, so shortening the lifetime refuses the tokens already issued for longer
+        while it is in force, and lengthening it never extends a token already issued.
+        Shortening is not revocation: rotate the transit token key to revoke issued tokens. A
+        `PUT` that omits the lifetime, as a dashboard save does, keeps the stored value, and a
+        merge `PATCH` with `null` resets it. The admin API refuses a new lifetime outside the
+        bounds, naming the setting, or one set in a variant, but accepts a save that keeps the
+        stored value. A longer lifetime lets whoever holds a token use the surface's Transit
+        Points as its caller for longer.
   changed: []
   fixed: []
   removed: []

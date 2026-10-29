@@ -168,12 +168,17 @@ a Transit Point configured with MCP tool gating whose gating was evicted meanwhi
 
 ## Transit token lifetime on reload
 
-A stored `transit.transit_token_lifetime_secs` outside the shortest lifetime (30 seconds, or
-`transit_token_min_lifetime_secs` in `gateway.json`) to 900 seconds is held to the nearer
-bound by a reload, with a warning when the outbound listener is built, so the surface keeps
-serving. Startup refuses the same value and the gateway does not start, for every stored
-surface, disabled ones included. Correct an out-of-range value before the next restart, even
-when a reload accepted it. See [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token-lifetime).
+A reload keeps the `transit_token_min_lifetime_secs` the gateway started with. A change to it
+in `gateway.json` takes a restart, and a reload never fails on it, even when the file holds a
+value startup would refuse by then.
+
+On every full or single-surface reload, a stored `transit.transit_token_lifetime_secs` below
+that shortest lifetime is raised to it, and one above 900 seconds is lowered to 900, with one
+`WARN` per surface naming the surface and both values, so the surface keeps serving. At
+startup the same `WARN` is logged for a lifetime below the shortest, for every stored surface,
+disabled ones included, and the gateway starts; a lifetime above 900 seconds stops it from
+starting, naming every such surface, so correct one before the next restart even when a reload
+accepted it. See [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token-lifetime).
 
 ## Dashboard events
 

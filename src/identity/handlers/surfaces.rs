@@ -717,11 +717,21 @@ fn validate_source_auth(surface: &AgentSurface) -> Result<(), SurfaceApiError> {
 /// UUID `id` to any TP that was sent without one so older payloads keep
 /// working without forcing the dashboard to mint IDs client-side. A
 /// `transit.source_auth`, which the gateway does not enforce, is refused, and
-/// so is a transit token lifetime outside its bounds.
+/// so is a transit token lifetime outside its bounds, unless it is the stored
+/// one (`stored`) below the shortest: a save that keeps it, such as a
+/// dashboard round trip, is accepted, and the gateway holds it to the shortest.
 fn validate_transit_points(
     surface: &mut AgentSurface,
     min_lifetime_secs: u64,
+    stored: Option<&AgentSurface>,
 ) -> Result<(), SurfaceApiError> {
+    let stored_lifetime_secs = stored
+        .and_then(|stored| stored.transit.as_ref())
+        .and_then(|transit| {
+            transit
+                .shared
+                .transit_token_lifetime_secs
+        });
     let surface_sets_source_auth = surface
         .transit
         .as_ref()
@@ -748,10 +758,16 @@ fn validate_transit_points(
     let Some(transit) = surface.transit.as_mut() else {
         return Ok(());
     };
-    transit
+    let kept_below_the_shortest = transit
         .shared
-        .validate_transit_token_lifetime(min_lifetime_secs)
-        .map_err(SurfaceApiError::BadRequest)?;
+        .transit_token_lifetime_secs
+        .is_some_and(|secs| Some(secs) == stored_lifetime_secs && secs < min_lifetime_secs);
+    if !kept_below_the_shortest {
+        transit
+            .shared
+            .validate_transit_token_lifetime(min_lifetime_secs)
+            .map_err(SurfaceApiError::BadRequest)?;
+    }
     let mut seen = std::collections::HashSet::with_capacity(transit.points.len());
     for (idx, tp) in transit
         .points
@@ -1409,6 +1425,7 @@ pub async fn create_surface(
         state
             .network_config
             .transit_token_min_lifetime_secs,
+        None,
     )?;
 
     super::surface_tenancy::validate_surface_references(
@@ -2128,6 +2145,7 @@ async fn validate_and_save_surface(
         state
             .network_config
             .transit_token_min_lifetime_secs,
+        existing,
     )?;
     super::surface_tenancy::validate_surface_references(state, &surface, context, scope).await?;
     validate_listen_path_collisions(&surface, store, &state.network_config).await?;

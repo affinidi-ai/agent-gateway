@@ -968,6 +968,7 @@ fn build_bootstrap_config(
         config_dir: None,
         server_mode: crate::server::mode::ServerMode::default(),
         cache_refresh_interval_secs: 0,
+        pinned_transit_token_min_lifetime_secs: None,
     }
 }
 
@@ -1683,15 +1684,23 @@ impl Drop for GatewayHarness {
     }
 }
 
-/// Declare `(id, name, prefix)` route prefixes in the gateway network config,
-/// so a test can serve more than one surface on the shared listener.
 /// Sets a top-level `gateway.json` key, such as `transit_token_min_lifetime_secs`.
 pub fn configure_gateway_setting(
     bootstrap: &crate::config::BootstrapConfig,
     key: &str,
     value: serde_json::Value,
 ) {
-    let gateway_path = std::path::Path::new(&bootstrap.config_files.gateway);
+    set_gateway_json_setting(&bootstrap.config_files.gateway, key, value);
+}
+
+/// Sets a top-level key in the `gateway.json` at `gateway_path`, also while the
+/// gateway that read it runs.
+pub fn set_gateway_json_setting(
+    gateway_path: &str,
+    key: &str,
+    value: serde_json::Value,
+) {
+    let gateway_path = std::path::Path::new(gateway_path);
     let mut gateway_json: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(gateway_path).expect("read gateway network config"))
             .expect("gateway network config JSON");
@@ -1703,6 +1712,8 @@ pub fn configure_gateway_setting(
     .expect("write gateway network config");
 }
 
+/// Declare `(id, name, prefix)` route prefixes in the gateway network config,
+/// so a test can serve more than one surface on the shared listener.
 pub fn configure_gateway_route_prefixes(
     bootstrap: &crate::config::BootstrapConfig,
     prefixes: &[(&str, &str, &str)],
