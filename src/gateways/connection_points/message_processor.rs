@@ -11,6 +11,7 @@ use super::filesystem::ConnectionPointStore;
 use super::messages::ReceivedMessage;
 use crate::gateways::filesystem::GatewayStore;
 use crate::messages::MessageType;
+use crate::observability::loggable;
 use crate::proxy::backend_identity::ProtectedAgentIdentity;
 use crate::proxy::protocol_router::join_endpoint_path;
 use crate::surfaces::AgentSurfaceStore;
@@ -681,7 +682,12 @@ async fn process_forward(message: &ReceivedMessage) -> ProcessingResult {
         .message_body
         .get("next")
     {
-        debug!("Extracted forwarded message: {:?}", forwarded_msg);
+        debug!(
+            "Extracted forwarded message ({} bytes)",
+            forwarded_msg
+                .to_string()
+                .len()
+        );
         // In a real implementation, you would decrypt and process the forwarded message
         ProcessingResult::ProcessedNoResponse
     } else {
@@ -693,7 +699,7 @@ async fn process_forward(message: &ReceivedMessage) -> ProcessingResult {
 
 // Problem Report
 async fn process_problem_report(message: &ReceivedMessage) -> ProcessingResult {
-    warn!("Received problem report from {:?}: {:?}", message.from_did, message.message_body);
+    warn!("Received problem report {} from {:?}", message.didcomm_message_id, message.from_did);
 
     // Extract problem code and description
     let code = message
@@ -708,22 +714,22 @@ async fn process_problem_report(message: &ReceivedMessage) -> ProcessingResult {
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    info!("Problem code: {}, comment: {}", code, comment);
+    info!("Problem code: {}, comment: {} bytes", code, comment.len());
 
     ProcessingResult::ProcessedNoResponse
 }
 
 // Basic Message
 async fn process_basic_message(message: &ReceivedMessage) -> ProcessingResult {
-    info!("Processing basic message from {:?}", message.from_did);
-
-    if let Some(content) = message
+    let content_length = message
         .message_body
         .get("content")
         .and_then(|v| v.as_str())
-    {
-        info!("Basic message content: {}", content);
-    }
+        .map_or(0, str::len);
+    info!(
+        "Processing basic message {} ({}) from {:?}: {} content bytes",
+        message.didcomm_message_id, message.message_type, message.from_did, content_length
+    );
 
     ProcessingResult::ProcessedNoResponse
 }
@@ -2145,8 +2151,8 @@ async fn extract_caller_identity_inbound(
                         if let Some(identity_ext) = metadata.get(crate::config::AFFINIDI_AGENT_IDENTITY_EXTENSION) {
                             channel_info!(
                                 config_id,
-                                "GW2: Found identity extension in metadata: {}",
-                                serde_json::to_string_pretty(identity_ext).unwrap_or_default()
+                                "GW2: Found identity extension in metadata ({} bytes)",
+                                identity_ext.to_string().len()
                             );
 
                             if let Some(did) = identity_ext
@@ -2943,7 +2949,7 @@ async fn enrich_and_evaluate_surface_policies(
                         .trim_end_matches('/')
                 )
             };
-            channel_info!(config_id, "GW2: Fetching agent card from: {}", card_url);
+            channel_info!(config_id, "GW2: Fetching agent card from: {}", loggable::url(&card_url));
             let timeout = GLOBAL_FORWARD_TIMEOUT
                 .get()
                 .copied()
@@ -3096,13 +3102,12 @@ async fn enrich_and_evaluate_surface_policies(
         }
         policy_input.normalize_caller_did();
         let input_value = serde_json::to_value(&policy_input).unwrap_or_default();
-        channel_info!(
+        channel_debug!(
             config_id,
-            "GW2: surface OPA input (identity_binding present={}): {}",
+            "GW2: surface OPA input built (identity_binding present={})",
             input_value
                 .get("identity_binding")
-                .is_some(),
-            serde_json::to_string(&input_value).unwrap_or_default()
+                .is_some()
         );
 
         // Appliance-wide (global) surface policy — enforced deny-overrides ahead
@@ -3684,7 +3689,12 @@ async fn fetch_agent_card(
     let client = match forward_client_for(card_url, timeout).await {
         Ok(client) => client,
         Err(error) => {
-            channel_warn!(config_id, "GW2: Agent card target {} blocked by egress policy: {}", card_url, error);
+            channel_warn!(
+                config_id,
+                "GW2: Agent card target {} blocked by egress policy: {}",
+                loggable::url(card_url),
+                error
+            );
             return None;
         }
     };
@@ -3695,7 +3705,12 @@ async fn fetch_agent_card(
     {
         Ok(response) => response,
         Err(e) => {
-            channel_warn!(config_id, "GW2: Agent card fetch request failed (url={}): {}", card_url, e);
+            channel_warn!(
+                config_id,
+                "GW2: Agent card fetch request failed (url={}): {}",
+                loggable::url(card_url),
+                e.without_url()
+            );
             return None;
         }
     };
@@ -4009,22 +4024,23 @@ async fn process_forward_request_in_request_scope(
         },
     };
 
+    let logged_path = path
+        .parse()
+        .map_or_else(|_| loggable::REDACTED.to_string(), |uri| loggable::uri(&uri));
     info!(
         "📤 Forwarding {} {} to channel {} (headers: {}, body: {} bytes)",
         method,
-        path,
+        logged_path,
         channel_id,
         headers.as_ref().map(|h| h.len()).unwrap_or(0),
         body_bytes.len()
     );
 
-    debug!("  ↳ Received path from gateway 1: '{}'", path);
-
     // Debug: Log all received headers to diagnose payment propagation
     if let Some(ref h) = headers {
         info!("  ↳ Received headers: {:?}", h.keys().collect::<Vec<_>>());
-        if let Some(payment_sig) = h.get("PAYMENT-SIGNATURE") {
-            info!("  ↳ PAYMENT-SIGNATURE present: {:?}", payment_sig);
+        if h.contains_key("PAYMENT-SIGNATURE") {
+            info!("  ↳ PAYMENT-SIGNATURE present");
         } else {
             info!("  ↳ No PAYMENT-SIGNATURE header found");
         }
@@ -5009,7 +5025,7 @@ async fn process_forward_request_in_request_scope(
     channel_info!(
         config_id,
         "🎯 Forwarding to channel target: {}",
-        surface.target_endpoint()
+        loggable::url(surface.target_endpoint())
     );
 
     // Check if this channel uses a2a-proxy:// backend (A2A Proxy)
@@ -5150,7 +5166,9 @@ async fn process_forward_request_in_request_scope(
         channel_info!(
             config_id,
             "Agent card location override applied: {} (origin={}, custom_path={})",
-            url, origin, custom_path
+            loggable::url(&url),
+            loggable::origin(origin),
+            custom_path
         );
         url
     } else {
@@ -5161,7 +5179,7 @@ async fn process_forward_request_in_request_scope(
         config_id,
         "🌐 Making HTTP request: {} {}",
         method.to_uppercase(),
-        target_url
+        loggable::url(&target_url)
     );
 
     // Start timer for latency measurement
@@ -5174,7 +5192,12 @@ async fn process_forward_request_in_request_scope(
     let client = match forward_client_for(&target_url, timeout).await {
         Ok(client) => client,
         Err(error) => {
-            channel_warn!(config_id, "GW2: target {} blocked by egress policy: {}", target_url, error);
+            channel_warn!(
+                config_id,
+                "GW2: target {} blocked by egress policy: {}",
+                loggable::url(&target_url),
+                error
+            );
             if let ForwardClientError::Blocked(_) = error {
                 crate::audit::request_events::request_rejected(
                     &audit_facts,
@@ -5612,7 +5635,7 @@ async fn process_forward_request_in_request_scope(
     }
 
     // Send the request
-    channel_debug!(config_id, "Sending request to {}", target_url);
+    channel_debug!(config_id, "Sending request to {}", loggable::url(&target_url));
 
     let mut header_timeout = std::time::Duration::from_secs(surface.timeout().map(|timeout| timeout.request_secs).unwrap_or(30));
     if modern_request.is_some() {
@@ -5658,7 +5681,7 @@ async fn process_forward_request_in_request_scope(
         };
 
         if has_session {
-            channel_info!(config_id, "GW2: Reusing persistent SSE session for {}", target_url);
+            channel_info!(config_id, "GW2: Reusing persistent SSE session for {}", loggable::url(&target_url));
             let response_start = std::time::Instant::now();
 
             match crate::mcp::sse_transport::send_via_persistent_sse(
@@ -6419,12 +6442,8 @@ async fn process_forward_request_in_request_scope(
                             let identity_ext = &identity_ext;
                             channel_info!(
                                 config_id,
-                                "GW2: Found identity extension in response metadata: {}",
-                                serde_json::to_string_pretty(identity_ext)
-                                    .unwrap_or_default()
-                                    .chars()
-                                    .take(500)
-                                    .collect::<String>()
+                                "GW2: Found identity extension in response metadata ({} bytes)",
+                                identity_ext.to_string().len()
                             );
 
                             // Check if agent already sent a DID
@@ -6954,11 +6973,12 @@ async fn process_forward_request_in_request_scope(
             Box::pin(process_response(response_body, response_headers)).await
         }
         Err(e) => {
+            let e = e.without_url();
             channel_error!(
                 config_id,
                 "❌ Forward failed: {} {} - {}",
                 http_method,
-                target_url,
+                loggable::url(&target_url),
                 e
             );
 
@@ -7002,31 +7022,17 @@ async fn process_forward_request_in_request_scope(
 
             // Provide more specific error messages based on error type
             let (error_msg, status_code) = if e.is_timeout() {
-                ("Request timed out after 30 seconds".to_string(), 504)
+                ("Request timed out after 30 seconds", 504)
             } else if e.is_connect() {
-                (
-                    format!(
-                        "Failed to connect to target endpoint: {}. Service may not be running on port {}",
-                        surface.target_endpoint(),
-                        surface
-                            .target_endpoint()
-                            .split(':')
-                            .next_back()
-                            .unwrap_or("unknown")
-                    ),
-                    502,
-                )
+                ("Failed to connect to the target endpoint", 502)
             } else {
-                (format!("Failed to forward request: {}", e), 502)
+                ("Failed to forward the request to the target endpoint", 502)
             };
 
             let error_body = serde_json::json!({
                 "error": error_msg,
                 "status": status_code,
-                "target": surface.target_endpoint(),
                 "method": http_method.as_str(),
-                "url": target_url,
-                "error_details": error_details,
             });
             ProcessingResult::RequiresResponse {
                 response_type: MessageType::ForwardResponse.to_string(),
@@ -8531,13 +8537,7 @@ async fn verify_x402_request(
     if let Some(ref vid) = verification_id {
         info!("   Verification ID: {}", vid);
     }
-    info!(
-        "   Payment signature: {}...",
-        &payment_signature
-            .chars()
-            .take(20)
-            .collect::<String>()
-    );
+    info!("   Payment signature: {} bytes", payment_signature.len());
     info!("   Network: {}", network);
     info!("   Channel: {}", channel_id);
     info!("   Resource: {}", resource);
@@ -8697,8 +8697,6 @@ async fn process_x402_verify_response(message: &ReceivedMessage) -> ProcessingRe
         info!("   Correlation ID (thid): {}", correlation_id);
 
         if let Some(payment) = body.get("payment") {
-            info!("   Payment details: {}", payment);
-
             // CRITICAL: GW2 must record the verification to its TransactionStore
             // This ensures both GW1 and GW2 have transaction records for traceability
             if let Some(txn_store) = transaction_store
@@ -11444,6 +11442,59 @@ mod tests {
         // process-global surface-store state this test does not own, so assert only that the
         // sender was not refused.
         assert_ne!(response["status"], 403, "an Active registered peer must pass the sender check");
+    }
+
+    #[tokio::test]
+    async fn forward_request_logs_payment_signature_presence_without_its_value() {
+        const PAYMENT_SIGNATURE_MARKER: &str = "payment-signature-marker-9b2d";
+        const QUERY_MARKER: &str = "query-marker-4e7a";
+        let temp = tempfile::tempdir().unwrap();
+        register_gateway(
+            temp.path(),
+            "did:web:peer.example",
+            crate::gateways::types::GatewayStatus::Active,
+            crate::gateways::types::ExposureMode::All,
+            vec![],
+        )
+        .await;
+        let mut msg = make_forward_request_msg(temp.path(), Some("did:web:peer.example"), "surface-1");
+        msg.message_body["path"] = serde_json::json!(format!("/pay?token={QUERY_MARKER}"));
+        msg.message_body["headers"] = serde_json::json!({ "PAYMENT-SIGNATURE": PAYMENT_SIGNATURE_MARKER });
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        let response = forward_response(&msg).await;
+
+        let text = logs.text();
+        assert_ne!(response["status"], 403);
+        assert!(text.contains("PAYMENT-SIGNATURE present"), "{text}");
+        assert!(text.contains("Forwarding GET /pay?token=<redacted> to channel surface-1"), "{text}");
+        assert!(!text.contains(PAYMENT_SIGNATURE_MARKER), "{text}");
+        assert!(!text.contains(QUERY_MARKER), "{text}");
+    }
+
+    #[tokio::test]
+    async fn basic_message_logs_type_id_and_length_without_content() {
+        const CONTENT_MARKER: &str = "basic-message-content-marker-3f8c";
+        let msg = make_handshake_msg(
+            "https://didcomm.org/basicmessage/2.0/message",
+            None,
+            serde_json::json!({ "content": CONTENT_MARKER }),
+        );
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        let result = process_basic_message(&msg).await;
+
+        let text = logs.text();
+        assert!(matches!(result, ProcessingResult::ProcessedNoResponse));
+        assert!(
+            text.contains(&format!(
+                "Processing basic message {} (https://didcomm.org/basicmessage/2.0/message) from Some(\"did:web:peer.example:tmp\"): {} content bytes",
+                msg.didcomm_message_id,
+                CONTENT_MARKER.len()
+            )),
+            "{text}"
+        );
+        assert!(!text.contains(CONTENT_MARKER), "{text}");
     }
 
     const INVITATION_MESSAGE_ID: &str = "invitation-msg-1";

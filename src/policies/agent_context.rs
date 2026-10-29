@@ -188,7 +188,7 @@ async fn build_agent_context_with(
 
     // --- TR extension extraction (registry_did, provider_did/issuer_did, authority_did, agent_did) ---
     let tr_data = extract_trust_registry_extension(msg_metadata, agent_card);
-    debug!("build_agent_context: TR extension found: {:#?} {:#?}", tr_data, msg_metadata);
+    debug!("build_agent_context: TR extension found: {:?}", tr_data);
 
     // Cross-validate: the identity-credential extension DID must equal the TR
     // extension's `agent_did`. Both values are read from the SAME source (card in

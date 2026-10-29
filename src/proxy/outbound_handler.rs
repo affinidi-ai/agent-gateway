@@ -31,6 +31,7 @@ use crate::a2a::create_error_response;
 use crate::config::ChannelProtocol;
 use crate::config::agent_surface::SharedTransitConfig;
 use crate::config::agent_surface::TransitPoint;
+use crate::observability::loggable;
 use crate::proxy::backend_identity::ProtectedAgentIdentity;
 use crate::state::OutboundProxyState;
 
@@ -2569,6 +2570,7 @@ pub(crate) async fn fetch_agent_card(
     };
 
     for card_url in &urls {
+        let logged_url = loggable::url(card_url);
         let candidate = card_url.clone();
         let client = match tokio::task::spawn_blocking(move || {
             crate::egress::pinned_forward_client(&candidate, timeout)
@@ -2577,11 +2579,11 @@ pub(crate) async fn fetch_agent_card(
         {
             Ok(Ok((client, _target))) => client,
             Ok(Err(e)) => {
-                warn!(request_id = %request_id, url = %card_url, "Agent card URL blocked by egress policy: {}", e);
+                warn!(request_id = %request_id, url = %logged_url, "Agent card URL blocked by egress policy: {}", e);
                 continue;
             }
             Err(e) => {
-                warn!(request_id = %request_id, url = %card_url, "Agent card egress validation task failed: {}", e);
+                warn!(request_id = %request_id, url = %logged_url, "Agent card egress validation task failed: {}", e);
                 continue;
             }
         };
@@ -2601,7 +2603,7 @@ pub(crate) async fn fetch_agent_card(
                         debug!(
                             request_id = %request_id,
                             error = %e,
-                            url = %card_url,
+                            url = %logged_url,
                             "Agent card URL response exceeded its bounds, trying next"
                         );
                     }
@@ -2611,15 +2613,15 @@ pub(crate) async fn fetch_agent_card(
                 debug!(
                     request_id = %request_id,
                     status = %resp.status(),
-                    url = %card_url,
+                    url = %logged_url,
                     "Agent card URL returned non-success status, trying next"
                 );
             }
             Err(e) => {
                 debug!(
                     request_id = %request_id,
-                    error = %e,
-                    url = %card_url,
+                    error = %e.without_url(),
+                    url = %logged_url,
                     "Failed to fetch agent card URL, trying next"
                 );
             }
@@ -3076,7 +3078,7 @@ async fn step_gateway_opa_policy(
     ctx: &mut OutboundPipelineContext,
 ) -> Result<(), OutboundPipelineError> {
     let Some(ref gw_pm) = state.gateway_policy_manager else {
-        info!(request_id = %ctx.request_id, "[OPA-INPUT] Outbound gateway OPA skipped: no gateway_policy_manager");
+        info!(request_id = %ctx.request_id, "[OPA] Outbound gateway OPA skipped: no gateway_policy_manager");
         return Ok(());
     };
 
@@ -3090,23 +3092,21 @@ async fn step_gateway_opa_policy(
     // policy is actually found and enforced on egress too. The policy can branch
     // on `input.gateway.direction == "outbound"` to gate egress specifically.
     let Some(gateway_id) = gw_pm.get_self_gateway_id() else {
-        info!(request_id = %ctx.request_id, "[OPA-INPUT] Outbound gateway OPA skipped: no self gateway id");
+        info!(request_id = %ctx.request_id, "[OPA] Outbound gateway OPA skipped: no self gateway id");
         return Ok(());
     };
     if !gw_pm.is_enforced(&gateway_id) {
         info!(
             request_id = %ctx.request_id,
             gateway_id = %gateway_id,
-            "[OPA-INPUT] Outbound gateway OPA skipped: no gateway policy configured, allowing"
+            "[OPA] Outbound gateway OPA skipped: no gateway policy configured, allowing"
         );
         return Ok(());
     }
-    info!(request_id = %ctx.request_id, "[OPA-INPUT] Outbound gateway OPA using gateway_id={}", gateway_id);
+    info!(request_id = %ctx.request_id, "[OPA] Outbound gateway OPA using gateway_id={}", gateway_id);
 
     let policy_input = build_outbound_policy_input(ctx);
     let input_value = serde_json::to_value(&policy_input).unwrap_or_default();
-    // [OPA-INPUT] Outbound gateway policy input before eval
-    info!(request_id = %ctx.request_id, "[OPA-INPUT] Outbound gateway policy input before eval: {}", input_value);
     let (policy_definition_id, policy_name, policy_version, policy_hash) = match gw_pm.policy_evidence(&gateway_id) {
         Some((id, version, hash)) => {
             let name = gw_pm
@@ -3193,14 +3193,14 @@ async fn step_surface_opa_policy(
         .outbound_shared
         .opa_policy_definition_id
     else {
-        info!(request_id = %ctx.request_id, "[OPA-INPUT] Outbound channel OPA skipped: no opa_policy_definition_id on outbound config");
+        info!(request_id = %ctx.request_id, "[OPA] Outbound channel OPA skipped: no opa_policy_definition_id on outbound config");
         return Ok(());
     };
 
     let Some(pm) = &state.policy_manager else {
         warn!(
             request_id = %ctx.request_id,
-            "[OPA-INPUT] Outbound channel OPA skipped: SurfacePolicyManager not available; denying"
+            "[OPA] Outbound channel OPA skipped: SurfacePolicyManager not available; denying"
         );
         return Err(record_surface_policy_unavailable(
             ctx,
@@ -3236,16 +3236,6 @@ async fn step_surface_opa_policy(
 
     let policy_input = build_outbound_policy_input(ctx);
     let input_value = serde_json::to_value(&policy_input).unwrap_or_default();
-    // [OPA-INPUT] Outbound surface policy input before eval
-    info!(request_id = %ctx.request_id, config_id = %config_id,
-        "[OPA-INPUT] Outbound surface policy input before eval: {}", input_value);
-
-    debug!(
-        request_id = %ctx.request_id,
-        config_id = %config_id,
-        input = %serde_json::to_string_pretty(&input_value).unwrap_or_default(),
-        "Outbound channel OPA policy input"
-    );
 
     let def_id = ctx
         .outbound_shared
@@ -3390,9 +3380,6 @@ async fn step_transit_point_opa_policy(
 
     let policy_input = build_outbound_policy_input(ctx);
     let input_value = serde_json::to_value(&policy_input).unwrap_or_default();
-    // [OPA-INPUT] Outbound transit point policy input before eval
-    info!(request_id = %ctx.request_id, alias = %ctx.virtual_channel.alias,
-        "[OPA-INPUT] Outbound transit point policy input before eval: {}", input_value);
 
     let (policy_name, policy_version, policy_hash) = pm
         .resolve_policy_decision_evidence(Some(tp_def_id.as_str()))
@@ -4708,18 +4695,28 @@ async fn step_forward_request_http(
         {
             Ok(Ok((client, _target))) => client,
             Ok(Err(e)) => {
-                warn!(request_id = %ctx.request_id, target = %target_url, "SSRF blocked at forwarding layer: {}", e);
+                warn!(
+                    request_id = %ctx.request_id,
+                    target = %loggable::url(&target_url),
+                    "SSRF blocked at forwarding layer: {}",
+                    e
+                );
                 return Err(OutboundPipelineError::TargetAuthUnavailable);
             }
             Err(e) => {
-                warn!(request_id = %ctx.request_id, target = %target_url, "SSRF egress validation task failed: {}", e);
+                warn!(
+                    request_id = %ctx.request_id,
+                    target = %loggable::url(&target_url),
+                    "SSRF egress validation task failed: {}",
+                    e
+                );
                 return Err(OutboundPipelineError::TargetAuthUnavailable);
             }
         };
 
     debug!(
         request_id = %ctx.request_id,
-        target = %target_url,
+        target = %loggable::url(&target_url),
         method = %ctx.original_method,
         "Outbound: forwarding request"
     );
@@ -4779,7 +4776,11 @@ async fn step_forward_request_http(
                 if error.is_timeout() {
                     OutboundPipelineError::UpstreamTimeout
                 } else {
-                    OutboundPipelineError::UpstreamConnectionFailed(error.to_string())
+                    OutboundPipelineError::UpstreamConnectionFailed(
+                        error
+                            .without_url()
+                            .to_string(),
+                    )
                 }
             });
     }
@@ -4794,6 +4795,7 @@ async fn step_forward_request_http(
         .send()
         .await
         .map_err(|e| {
+            let e = e.without_url();
             if e.is_timeout() {
                 warn!(request_id = %ctx.request_id, error = %e, "Outbound request timed out");
                 OutboundPipelineError::UpstreamTimeout

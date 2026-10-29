@@ -1314,7 +1314,7 @@ async fn try_elicit_flow(
         // deliver. Fall back per binding policy.
         debug!(
             target: "credential_delegation",
-            session_id = %session_id,
+            session_id = %crate::observability::loggable::secret(session_id),
             "Elicit: no open SSE stream for session; honouring fallback"
         );
         match binding.elicit_fallback {
