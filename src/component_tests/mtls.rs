@@ -149,6 +149,7 @@ fn identity_to_json(id: &AuthenticatedIdentity) -> serde_json::Value {
             fingerprint,
             subject_dn,
             issuer_dn,
+            trust_anchor_fingerprint,
             sans,
             source,
         } => json!({
@@ -157,6 +158,7 @@ fn identity_to_json(id: &AuthenticatedIdentity) -> serde_json::Value {
             "fingerprint": fingerprint,
             "subject_dn": subject_dn,
             "issuer_dn": issuer_dn,
+            "trust_anchor_fingerprint": trust_anchor_fingerprint,
             "sans": sans,
             "source": match source {
                 crate::source_auth::models::PeerCertSource::DirectTls => "direct_tls",

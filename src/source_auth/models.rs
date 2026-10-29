@@ -320,7 +320,13 @@ pub enum AuthenticatedIdentity {
         /// Subject DN as an RFC 4514 string.
         subject_dn: String,
         /// Issuer DN. Empty for [`MtlsTrust::Pinned`] (no chain verified).
+        /// For display and audit only: it is a name the certificate states.
         issuer_dn: String,
+        /// Lowercase hex SHA-256 of the certificate the trust check verified
+        /// the leaf against: the configured CA certificate its verified chain
+        /// ends at, or for [`MtlsTrust::Pinned`] the pinned certificate, which
+        /// is the leaf itself.
+        trust_anchor_fingerprint: String,
         /// SANs captured from the leaf, for audit / OPA visibility even
         /// when they are not used as the principal.
         sans: MtlsSans,
@@ -355,8 +361,9 @@ impl AuthenticatedIdentity {
 
     /// This caller's `user_identity_hash` on a surface of `tenant_id`: the
     /// [`caller_identity_hash`] of the method, the issuer (the JWT `iss`, the
-    /// API Key Provider agent, the client certificate's issuer DN) and the
-    /// principal. The transit token, policy input and delegated credentials
+    /// API Key Provider agent, the fingerprint of the certificate an mTLS
+    /// client certificate was verified against) and the principal. The
+    /// transit token, policy input and delegated credentials
     /// key callers by it. `None` when the credential names no subject, such as
     /// a JWT without a `sub`: such a caller has no delegated credentials.
     pub fn principal_hash(
@@ -386,9 +393,11 @@ impl AuthenticatedIdentity {
                 provider_agent_id: Some(agent_id),
             } => ("api_key_provider", agent_id.as_str(), key_name.as_str()),
             AuthenticatedIdentity::DidAuth { did } => ("did_auth", "", did.as_str()),
-            AuthenticatedIdentity::Mtls { principal, issuer_dn, .. } => {
-                ("mtls", issuer_dn.as_str(), principal.as_str())
-            }
+            AuthenticatedIdentity::Mtls {
+                principal,
+                trust_anchor_fingerprint,
+                ..
+            } => ("mtls", trust_anchor_fingerprint.as_str(), principal.as_str()),
         };
         if subject.is_empty() {
             return None;

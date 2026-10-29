@@ -374,10 +374,11 @@ is:
 | `jwt_bearer` | The token's `sub` | One caller per issuer and subject. A token without a `sub` names no caller: it has no identity hash, so no delegated credentials |
 | `api_key` | The `secret_id` | Every key in the secret is the same caller; give each caller a secret of its own to tell them apart |
 | `api_key_provider` | The key's id | One caller per issued key |
-| `mtls` | The principal the `identity_binding` derives | One caller per certificate issuer and bound principal |
+| `mtls` | The principal the `identity_binding` derives | One caller per trusted certificate (the CA certificate its chain ends at, or the pinned certificate) and bound principal |
 
 The identity hash covers the method, the issuer (the JWT `iss`, the API Key Provider agent,
-the certificate's issuer DN), the surface's tenant and the principal (see
+the fingerprint of the certificate an mTLS client certificate was verified against), the
+surface's tenant and the principal (see
 [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-callers-identity-hash)). It is the
 value an Access Point puts in the transit token for a caller it authenticated the same way, so
 a Transit Point that trusts the Access Point's issuer for the same subjects reaches the grants

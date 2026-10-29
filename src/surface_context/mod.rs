@@ -541,7 +541,7 @@ impl From<&crate::source_auth::AuthenticatedIdentity> for SourceAuthContext {
                 subject_dn,
                 issuer_dn,
                 sans,
-                source: _,
+                ..
             } => SourceAuthContext::Mtls {
                 principal: principal.clone(),
                 fingerprint: fingerprint.clone(),

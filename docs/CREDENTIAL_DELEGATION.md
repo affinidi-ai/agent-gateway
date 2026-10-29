@@ -250,11 +250,13 @@ certificate identity therefore shares one set of delegated tokens.
 | `api_key` | `api_key` | `""` | The `secret_id` |
 | `api_key_provider` | `api_key_provider` | The API Key Provider agent id | The key's id |
 | `did_auth` | `did_auth` | `""` | The DID |
-| `mtls` | `mtls` | The client certificate's issuer DN (`""` with pinned trust) | The principal the `identity_binding` derives |
+| `mtls` | `mtls` | The lowercase hex SHA-256 of the certificate the client certificate was verified against: the configured CA certificate its chain ends at, or with pinned trust the pinned certificate | The principal the `identity_binding` derives |
 
 `tenant` is the surface's `tenant_id`, or `null` on a surface with none. The same subject named
 by another method, issuer, API Key Provider agent or tenant is therefore another caller, with
-grants of its own. A JWT without a non-empty `sub`, or without an `iss`, names no caller: it has
+grants of its own. An mTLS caller is keyed by the certificate the gateway trusted, not by the
+issuer name its certificate states, so replacing a trusted CA certificate, or a pinned
+certificate, gives its callers new identity hashes. A JWT without a non-empty `sub`, or without an `iss`, names no caller: it has
 no identity hash, so it is given no delegated credential: an Access Point answers `403`
 `identity-required`, and a Transit Point `403`.
 

@@ -452,6 +452,7 @@ mod tests {
             fingerprint: "abc123".to_string(),
             subject_dn: "CN=client,O=Acme".to_string(),
             issuer_dn: "CN=Acme CA".to_string(),
+            trust_anchor_fingerprint: "def456".to_string(),
             sans: MtlsSans::default(),
             source: PeerCertSource::DirectTls,
         };
