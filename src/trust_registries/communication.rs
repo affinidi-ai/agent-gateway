@@ -221,11 +221,48 @@ pub(crate) struct TrustRegistryConnection {
     /// Shared across clones so the single stream reader can deliver a response
     /// to whichever `send_and_await` call registered that thread.
     pub(crate) response_waiters: ResponseWaiters,
+    /// The threads of this connection's latest queries that timed out.
+    pub(crate) timed_out_queries: TimedOutQueries,
 }
 
 /// Maps an in-flight query's `thid` to the oneshot that its `send_and_await`
 /// caller is awaiting. The stream reader delivers responses here.
 pub(crate) type ResponseWaiters = Arc<Mutex<HashMap<String, oneshot::Sender<PollResult>>>>;
+
+/// How many of a connection's latest timed-out query threads are remembered.
+const TIMED_OUT_QUERIES_KEPT: usize = 256;
+
+/// The latest query threads of a connection that timed out, so the reader can
+/// tell a late reply to one of them from the registry rejecting the gateway.
+#[derive(Clone, Default)]
+pub(crate) struct TimedOutQueries(Arc<std::sync::Mutex<std::collections::VecDeque<String>>>);
+
+impl TimedOutQueries {
+    pub(crate) fn record(
+        &self,
+        thid: &str,
+    ) {
+        let mut threads = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if threads.len() == TIMED_OUT_QUERIES_KEPT {
+            threads.pop_front();
+        }
+        threads.push_back(thid.to_string());
+    }
+
+    pub(crate) fn contains(
+        &self,
+        thid: &str,
+    ) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|query| query == thid)
+    }
+}
 
 /// Register a waiter for `thid`, returning the receiver the caller awaits.
 async fn register_waiter_in(
@@ -1001,6 +1038,7 @@ impl TrustRegistryListenerManager {
                 is_temporary: false,
                 client,
                 response_waiters: Arc::new(Mutex::new(HashMap::new())),
+                timed_out_queries: TimedOutQueries::default(),
             };
             let extras = OobExtras {
                 mediator_url: "https://mediator.example".to_string(),
@@ -1131,6 +1169,7 @@ impl TrustRegistryListenerManager {
             is_temporary: false,
             client,
             response_waiters: Arc::new(Mutex::new(HashMap::new())),
+            timed_out_queries: TimedOutQueries::default(),
         };
 
         info!("🔗 Trust registry '{}' connection established — awaiting registry-side approval", trust_registry_id);
@@ -1196,6 +1235,7 @@ impl TrustRegistryListenerManager {
             is_temporary: false,
             client,
             response_waiters: Arc::new(Mutex::new(HashMap::new())),
+            timed_out_queries: TimedOutQueries::default(),
         };
 
         #[cfg(test)]
@@ -1834,6 +1874,17 @@ impl TrustRegistryListenerManager {
         if let Some(building) = ownership.builds.get(&key) {
             return Ok(Pending::Building(building.clone()));
         }
+        if matches!(plan, BuildPlan::Oob { .. })
+            && self
+                .current_connection(&key)
+                .await
+                .is_some()
+        {
+            return Err(TrustRegistryError::ConnectionError(format!(
+                "trust registry {:?} is already connected, so its OOB invitation is not accepted again",
+                key
+            )));
+        }
         if plan.accepts_current()
             && let Some(current) = self
                 .current_connection(&key)
@@ -2221,6 +2272,7 @@ impl TrustRegistryListenerManager {
                     is_temporary: true,
                     client,
                     response_waiters: Arc::new(Mutex::new(HashMap::new())),
+                    timed_out_queries: TimedOutQueries::default(),
                 })
                 .map_err(TrustRegistryError::ConnectionError);
         }
@@ -2285,6 +2337,7 @@ impl TrustRegistryListenerManager {
             is_temporary: true,
             client,
             response_waiters: Arc::new(Mutex::new(HashMap::new())),
+            timed_out_queries: TimedOutQueries::default(),
         })
     }
 
@@ -2418,6 +2471,9 @@ impl TrustRegistryListenerManager {
                 connection
                     .remove_waiter(&thread_id)
                     .await;
+                connection
+                    .timed_out_queries
+                    .record(&thread_id);
                 Err(TrustRegistryError::Timeout(format!("No response within {:?} for thread {}", remaining, thread_id)))
             }
         }
@@ -3061,6 +3117,7 @@ mod tests {
             is_temporary: false,
             client: super::super::test_builds::offline_client().await,
             response_waiters: empty_waiters(),
+            timed_out_queries: TimedOutQueries::default(),
         }
     }
 
@@ -4157,6 +4214,36 @@ mod tests {
 
     fn empty_waiters() -> ResponseWaiters {
         Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    #[test]
+    fn timed_out_queries_keep_only_the_latest_threads() {
+        let threads = TimedOutQueries::default();
+        for i in 0..=TIMED_OUT_QUERIES_KEPT {
+            threads.record(&format!("thid-{i}"));
+        }
+
+        assert!(!threads.contains("thid-0"), "the oldest thread is forgotten");
+        assert!(threads.contains("thid-1"));
+        assert!(threads.contains(&format!("thid-{TIMED_OUT_QUERIES_KEPT}")));
+        assert!(!threads.contains("thid-unknown"));
+    }
+
+    #[tokio::test]
+    async fn an_oob_invitation_is_not_accepted_again_while_the_registry_is_connected() {
+        let mgr = test_manager();
+        let id = format!("tr-{}", uuid::Uuid::new_v4());
+        mgr.install_connection(test_connection(&id).await)
+            .await
+            .expect("installed");
+        super::super::test_builds::install(&id, vec![super::super::test_builds::Outcome::Connect]);
+
+        let result = mgr
+            .accept_oob_and_connect(&id, "https://registry.example/oob", &DidMethod::Peer)
+            .await;
+
+        assert!(matches!(result, Err(TrustRegistryError::ConnectionError(_))));
+        assert_eq!(super::super::test_builds::calls(&id), 0, "no OOB build runs");
     }
 
     #[tokio::test]
