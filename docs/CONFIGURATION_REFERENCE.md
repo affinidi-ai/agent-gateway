@@ -92,6 +92,18 @@ Each of these behaves differently from the obvious reading of the field.
 | `encryption.key_source = "local"` | Does not encrypt. It writes plaintext `ENC[0::…]` envelopes and is for development only. |
 | `encryption.field_encryption_enabled` | Reserved and not wired to any field. Leave it false. |
 
+## Surface transit settings that do nothing
+
+Two settings in a surface's `transit` block ship in generated configs but the gateway acts
+on neither. The same names set in a variant's `overrides.transit.shared` behave the same.
+
+| Field | Behaviour |
+| --- | --- |
+| `transit.transit_token_mode` | `embedded`, or absent, is the only supported value and the only thing the gateway does: the transit token always carries the caller context itself, readable by the managed agent, so a surface exposes its `caller_context_fields` (an email, for example) to its agent. The admin API refuses `reference` with a 400, on the surface and in a variant. A surface stored with `reference` still loads and serves embedded tokens; the gateway logs a warning naming the surface at load. Set it to `embedded` or remove it. |
+| `transit.sign_requests` | No effect, whatever the value; deprecated and to be removed. Whether a Transit Point sends a signed VP follows its `managed_identity` and `identity_injection.inject_vp`. The admin API accepts either value; a stored `false` logs a warning naming the surface at load, since an operator may expect requests without a VP. Remove it. (`sign_requests` in `saml.json` is a different setting and is read.) |
+
+See [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token) for which requests carry a transit token.
+
 ## Secret references
 
 Any field documented as accepting a loader reference resolves through

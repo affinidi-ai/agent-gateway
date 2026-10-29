@@ -1,0 +1,24 @@
+branch: fix/inert-transit-settings
+changes:
+  added: []
+  changed:
+    - timestamp: '2026-10-30T16:00:00.000Z'
+      title: Refuse transit_token_mode reference, and warn of settings that do nothing
+      description: >-
+        `transit.transit_token_mode` and `transit.sign_requests` ship in generated configs
+        but the gateway never read either. The admin API now refuses
+        `transit_token_mode: reference`, on a surface or in a variant, with a 400 that says it
+        is not supported: the transit token is always embedded, so a surface that chose
+        `reference` was exposing its `caller_context_fields` to its agent while expecting
+        them kept server-side. A surface stored with `reference` still loads and serves
+        embedded tokens, with a warning naming the surface and variant; set it to `embedded`
+        or remove it, since a save that sends `reference` back, such as a dashboard round
+        trip, is refused. `sign_requests` is documented as having no effect and deprecated:
+        a Transit Point's VP follows its `managed_identity` and
+        `identity_injection.inject_vp`. It is never refused, and a stored `false` logs a
+        warning at load, since it may be read as meaning no VP is sent. The built-in
+        surface templates no longer set `sign_requests`.
+  fixed: []
+  removed: []
+  security: []
+  breaking: []
