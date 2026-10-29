@@ -268,28 +268,37 @@ A Transit Point refuses the call with `401` unless the token:
   difference.
 
 A `2026-07-28` MCP request must also carry exactly one token, and allows no clock difference.
+A `GET` of a public discovery path, such as an agent card, is forwarded without a
+transit token check, and so without any credential (see
+[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#when-a-credential-cannot-be-resolved)).
+
+The signing key is 32 random bytes the gateway creates on its first start, in
+`transit_token_key.json` under `[storage_paths] vc_keys`, readable by the owner only and
+encrypted like the gateway's other keys when encryption at rest is on. A key file that is
+not owner-only, such as one a restore wrote, is restricted to its owner when the gateway
+loads it, and the file written when encryption at rest is turned on later is owner-only
+too. The file is created by linking a complete copy into place, so the directory must be on
+a filesystem that supports hard links; one that does not stops the first start with an error
+saying so. A key file that cannot be read stops the gateway from starting. Every token names
+the key in its `kid` header, and a token that names another key, or none, is refused.
+Instances that share the storage directory share the key, so a Standby that takes over
+accepts the tokens the Active instance issued. A portable backup carries the key, so a
+gateway restored from it accepts the tokens the original issued. To replace the key, stop
+every instance, delete the file, and start them again; every token issued before is refused.
 
 ### Headers through a Transit Point
 
 A Transit Point forwards the managed agent's request headers to its target, over HTTP or
 Fabric, except hop-by-hop headers, `Host`, `Content-Length`, `X-Transit-Token`, the agent's
-`Authorization` and its `Cookie`, and any header a Header Metadata Mapping is set to strip.
-Other headers, such as an API key header the agent sends for the target itself, pass. The
-credentials the gateway adds are described in
-[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md).
+`Authorization` and its `Cookie`, a header named like the Transit Point's `target_auth`
+header, and any header a Header Metadata Mapping is set to strip. Other headers, such as an
+API key header the agent sends for the target itself, pass. The credentials the gateway adds
+are described in
+[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#credential-headers-on-a-transit-point).
 
 The target's response headers go back to the agent except hop-by-hop headers, `Set-Cookie`
 and `WWW-Authenticate`, so a target cannot set cookies in the agent or send it to
 authenticate with the target directly. The response status is unchanged.
-
-The signing key is 32 random bytes the gateway creates on its first start, in
-`transit_token_key.json` under `[storage_paths] vc_keys`, readable by the owner only and
-encrypted like the gateway's other keys when encryption at rest is on. A key file that
-cannot be read stops the gateway from starting. Every token names the key in its `kid`
-header, and a token that names another key, or none, is refused. Instances that share
-the storage directory share the key, so a Standby that takes over accepts the tokens the
-Active instance issued. To replace the key, stop every instance, delete the file, and start
-them again; every token issued before is refused.
 
 ## Managed identity
 

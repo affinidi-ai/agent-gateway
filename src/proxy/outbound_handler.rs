@@ -146,6 +146,12 @@ pub(crate) enum OutboundPipelineError {
     #[error("Delegated credentials unavailable")]
     DelegationUnavailable,
 
+    /// The request's delegated credentials cannot be resolved, so it is refused
+    /// rather than forwarded without them. `mcp_request_id` is set, to the id
+    /// the JSON-RPC error answers, when the Transit Point speaks MCP.
+    #[error("{refusal}")]
+    DelegationRefused { refusal: DelegationRefusal, mcp_request_id: Option<serde_json::Value> },
+
     #[error("MCP resource authorization failed")]
     McpResourceAuthorization {
         config: Box<crate::mcp::resource_server::McpResourceServerConfig>,
@@ -181,6 +187,37 @@ pub(crate) enum OutboundPipelineError {
     IdentityInjectionFailed(String),
 }
 
+/// Why a Transit Point refused a request whose delegated credentials it could
+/// not resolve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum DelegationRefusal {
+    #[error("Delegated credentials need the caller's identity, and this request's transit token carries none")]
+    CallerIdentityMissing,
+    #[error(
+        "Delegated credentials need the managed agent's identity, and neither this Transit Point's managed \
+         identity nor the transit token establishes one"
+    )]
+    AgentIdentityMissing,
+    #[error("Delegated credentials unavailable")]
+    Unavailable,
+}
+
+impl DelegationRefusal {
+    fn status_code(self) -> StatusCode {
+        match self {
+            Self::CallerIdentityMissing | Self::AgentIdentityMissing => StatusCode::FORBIDDEN,
+            Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        }
+    }
+
+    fn jsonrpc_code(self) -> i32 {
+        match self {
+            Self::CallerIdentityMissing | Self::AgentIdentityMissing => -32001,
+            Self::Unavailable => crate::mcp::errors::error_codes::INTERNAL_ERROR,
+        }
+    }
+}
+
 impl OutboundPipelineError {
     fn status_code(&self) -> StatusCode {
         match self {
@@ -211,6 +248,7 @@ impl OutboundPipelineError {
             Self::TransitTokenInvalid(_) | Self::ConsentRequired(_) => StatusCode::UNAUTHORIZED,
 
             Self::DelegationUnavailable | Self::TransitSourceAuthUnsupported => StatusCode::SERVICE_UNAVAILABLE,
+            Self::DelegationRefused { refusal, .. } => refusal.status_code(),
             Self::McpResourceAuthorization { error, .. } => error.status_code(),
 
             Self::GatewayPolicyDenied
@@ -262,6 +300,20 @@ impl IntoResponse for OutboundPipelineError {
         }
         if let Self::UpstreamCapacityReached(id) = self {
             return crate::proxy::fabric_forward::capacity_response(id);
+        }
+        if let Self::DelegationRefused {
+            refusal,
+            mcp_request_id: Some(id),
+        } = self
+        {
+            return crate::mcp::request_validation::McpRequestValidationError {
+                status: refusal.status_code(),
+                id: Some(id),
+                code: refusal.jsonrpc_code(),
+                message: refusal.to_string(),
+                data: None,
+            }
+            .into_response();
         }
         if let Self::McpMetadata { error, body, response } = self {
             return error.into_response(
@@ -4049,20 +4101,48 @@ fn log_fabric_delegation_withheld(ctx: &OutboundPipelineContext) {
     );
 }
 
+/// The JSON-RPC id a refusal of this request answers, when the Transit Point
+/// speaks MCP.
+fn mcp_refusal_id(ctx: &OutboundPipelineContext) -> Option<serde_json::Value> {
+    (ctx.virtual_channel.protocol == crate::config::agent_surface::TransitProtocol::Mcp).then(|| {
+        match ctx
+            .mcp_classification
+            .as_ref()
+        {
+            Some(crate::mcp::request_validation::McpRequestClassification::Modern(request)) => request.id.clone(),
+            _ => ctx
+                .body_bytes
+                .as_deref()
+                .and_then(|body| serde_json::from_slice::<serde_json::Value>(body).ok())
+                .and_then(|body| body.get("id").cloned()),
+        }
+        .unwrap_or(serde_json::Value::Null)
+    })
+}
+
 /// [11] Credential Injection — resolve delegated OAuth tokens from the credential
 /// vault and inject them into the outbound request, or return a consent_required
 /// signal if the user has not yet authorized.
 ///
 /// The user identity hash is extracted from the transit token claims (which encodes
 /// the original caller's authenticated identity). The channel's `outbound_credentials`
-/// bindings determine which credential providers to look up.
+/// bindings determine which credential providers to look up. A binding that applies
+/// but cannot be resolved refuses the request; it is never forwarded without the
+/// credential. A public discovery read carries no caller, so, as with target
+/// authentication, no caller's credential is released for it.
 async fn step_inject_credentials(
     state: &OutboundProxyState,
     ctx: &mut OutboundPipelineContext,
 ) -> Result<(), OutboundPipelineError> {
+    let refuse = |ctx: &OutboundPipelineContext, refusal| OutboundPipelineError::DelegationRefused {
+        refusal,
+        mcp_request_id: mcp_refusal_id(ctx),
+    };
     if ctx
         .variant_resolution_error
         .is_some()
+        || !crate::proxy::handler::CallerAssertion::for_request(ctx.original_method.as_str(), &ctx.request_path)
+            .permits_target_credential()
     {
         return Ok(());
     }
@@ -4104,9 +4184,9 @@ async fn step_inject_credentials(
             warn!(
                 target: "credential_delegation",
                 request_id = %ctx.request_id,
-                "Credential delegation configured but stores not available — skipping"
+                "Credential delegation configured but stores not available - refusing the request"
             );
-            return Ok(());
+            return Err(refuse(ctx, DelegationRefusal::Unavailable));
         }
     };
 
@@ -4123,23 +4203,32 @@ async fn step_inject_credentials(
             warn!(
                 target: "credential_delegation",
                 request_id = %ctx.request_id,
-                "Transit token does not carry user_identity_hash — cannot look up credentials"
+                "Transit token does not carry user_identity_hash - refusing the request"
             );
-            return Ok(());
+            return Err(refuse(ctx, DelegationRefusal::CallerIdentityMissing));
         }
     };
 
-    // Use agent DID from identity extraction or fall back to surface_id from token
-    let agent_did = match &ctx.resolved_identity {
-        ProtectedAgentIdentity::Managed { did, .. } => Some(did.as_str()),
+    // The agent half of the vault key: the Transit Point's managed identity, else the
+    // caller DID the transit token carries. Without one no grant is looked up, so a
+    // grant is never shared between agents or surfaces under a placeholder key.
+    let Some(agent_did) = match &ctx.resolved_identity {
+        ProtectedAgentIdentity::Managed { did, .. } => Some(did.clone()),
         ProtectedAgentIdentity::Anonymous => None,
     }
     .or_else(|| {
         ctx.transit_token_claims
             .as_ref()
-            .and_then(|c| c.sub.as_deref())
-    })
-    .unwrap_or("unknown");
+            .and_then(|c| c.sub.clone())
+    }) else {
+        warn!(
+            target: "credential_delegation",
+            request_id = %ctx.request_id,
+            "No managed agent identity for delegated credentials - refusing the request"
+        );
+        return Err(refuse(ctx, DelegationRefusal::AgentIdentityMissing));
+    };
+    let agent_did = agent_did.as_str();
 
     let channel_id = ctx
         .surface
@@ -4196,7 +4285,7 @@ async fn step_inject_credentials(
             matches!(&resolution.result, crate::proxy::credential_delegation::DelegationLookupResult::Unavailable)
         })
     {
-        return Err(OutboundPipelineError::DelegationUnavailable);
+        return Err(refuse(ctx, DelegationRefusal::Unavailable));
     }
 
     // Check for consent_required — if any binding needs consent, return the signal
@@ -4284,12 +4373,20 @@ async fn step_inject_credentials(
                             header = %name,
                             "Injecting delegated credential header into outbound request"
                         );
-                        if let Ok(header_name) = name.parse::<axum::http::header::HeaderName>()
-                            && let Ok(header_value) = value.parse::<axum::http::header::HeaderValue>()
-                        {
-                            ctx.delegated_credential_headers
-                                .insert(header_name, header_value);
-                        }
+                        let (Ok(header_name), Ok(header_value)) = (
+                            name.parse::<axum::http::header::HeaderName>(),
+                            value.parse::<axum::http::header::HeaderValue>(),
+                        ) else {
+                            warn!(
+                                target: "credential_delegation",
+                                request_id = %ctx.request_id,
+                                header = %name,
+                                "Delegated credential is not a valid header - refusing the request"
+                            );
+                            return Err(refuse(ctx, DelegationRefusal::Unavailable));
+                        };
+                        ctx.delegated_credential_headers
+                            .insert(header_name, header_value);
                     }
                 }
             }
@@ -12599,5 +12696,279 @@ mod tests {
             assert!(header_values(sent, "cookie").is_empty(), "{alias}: {sent:?}");
         }
         assert_eq!(target.received().len(), 3);
+    }
+
+    /// The Transit Point pipeline of a surface whose Transit Points, one per
+    /// `(alias, protocol, binding)`, forward to `target_url`, over the vault and
+    /// providers of [`delegation_state`], with the issuer whose tokens open them.
+    async fn delegation_pipeline(
+        directory: &std::path::Path,
+        target_url: &str,
+        points: &[(&str, &str, serde_json::Value)],
+    ) -> (OutboundProxyState, crate::proxy::transit_token::TransitTokenIssuer) {
+        let mut state = delegation_state(directory, &[("provider", "vendor-access")]).await;
+        let providers = state
+            .credential_provider_store
+            .clone()
+            .unwrap();
+        for provider in [
+            json!({"id": "no-endpoint", "name": "No endpoint", "provider_id": "no-endpoint"}),
+            json!({"id": "broken-key", "name": "Broken key", "provider_id": "broken-key",
+                "provider_type": "api_key", "api_key_secret_ref": "missing-secret"}),
+            json!({"id": "consent", "name": "Consent", "provider_id": "consent",
+                "authorization_endpoint": "https://provider.example/authorize", "client_id_secret_ref": "client-id"}),
+        ] {
+            let mut provider = provider;
+            provider["created_at"] = json!("2026-10-01T00:00:00Z");
+            provider["updated_at"] = json!("2026-10-01T00:00:00Z");
+            providers
+                .create(serde_json::from_value(provider).unwrap())
+                .await
+                .unwrap();
+        }
+        state
+            .secrets_store
+            .as_ref()
+            .unwrap()
+            .create(crate::secrets::CreateSecretRequest {
+                tenant_id: None,
+                name: "Client id".into(),
+                secret_id: "client-id".into(),
+                description: None,
+                value: "gateway-client".into(),
+                secret_type: "ApiKey".into(),
+                tags: vec![],
+            })
+            .await
+            .unwrap();
+        state
+            .delegation_vault_store
+            .as_ref()
+            .unwrap()
+            .store(
+                serde_json::from_value(json!({
+                    "id": "consented-elsewhere", "agent_did": "unknown", "user_identity_hash": "sha256:user",
+                    "credential_provider_id": "provider", "provider_id": "provider",
+                    "access_token": "grant-consented-on-another-surface", "scopes": ["read"],
+                    "expires_at": chrono::Utc::now() + chrono::Duration::hours(1),
+                    "consent_granted_at": "2026-10-01T00:00:00Z",
+                    "created_at": "2026-10-01T00:00:00Z", "updated_at": "2026-10-01T00:00:00Z"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let points: Vec<serde_json::Value> = points
+            .iter()
+            .map(|(alias, protocol, binding)| {
+                json!({"alias": alias, "protocol": protocol, "target_endpoint": target_url,
+                    "transit_credentials": binding})
+            })
+            .collect();
+        state
+            .channel_state
+            .write()
+            .unwrap()
+            .surface = Arc::new(transit_surface(json!(points), json!([])));
+        let issuer = crate::proxy::transit_token::TransitTokenIssuer::new(
+            crate::proxy::transit_token::TransitTokenKey::generate().unwrap(),
+            "gateway".into(),
+        );
+        state.transit_token_issuer = Some(Arc::new(issuer.clone()));
+        (state, issuer)
+    }
+
+    async fn through_the_pipeline(
+        state: &OutboundProxyState,
+        alias: &str,
+        token: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/outbound/mcp/{alias}"))
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("x-transit-token", token)
+            .body(axum::body::Body::from(
+                json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "echo"}}).to_string(),
+            ))
+            .unwrap();
+        let response = Box::pin(outbound_proxy_handler_with_mcp_versions(
+            "127.0.0.1:12345"
+                .parse()
+                .unwrap(),
+            state.clone(),
+            request,
+            crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+        ))
+        .await
+        .unwrap_or_else(|error| error.into_response());
+        let status = response.status();
+        let body = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap(),
+        )
+        .unwrap_or(serde_json::Value::Null);
+        (status, body)
+    }
+
+    fn binding(
+        provider: &str,
+        inject_as: serde_json::Value,
+    ) -> serde_json::Value {
+        json!({"credential_provider_id": provider, "scopes": ["read"], "inject_as": inject_as})
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transit_point_refuses_a_request_whose_delegated_credential_cannot_be_resolved() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = crate::component_tests::helpers::RecordingTarget::start(StatusCode::OK, &[]).await;
+        let bearer = json!({"type": "bearer_header"});
+        let (state, issuer) = delegation_pipeline(
+            directory.path(),
+            &target.url,
+            &[
+                ("granted", "mcp", binding("provider", bearer.clone())),
+                ("gone", "mcp", binding("deleted-provider", bearer.clone())),
+                ("no-endpoint", "mcp", binding("no-endpoint", bearer.clone())),
+                ("broken-key", "mcp", binding("broken-key", bearer.clone())),
+                (
+                    "bad-header",
+                    "mcp",
+                    binding("provider", json!({"type": "custom_header", "name": "Bad Header", "format": "{value}"})),
+                ),
+                ("plain", "http", binding("deleted-provider", bearer.clone())),
+                ("untokened", "mcp", binding("provider", bearer.clone())),
+            ],
+        )
+        .await;
+        {
+            let mut channel_state = state
+                .channel_state
+                .write()
+                .unwrap();
+            let mut surface = (*channel_state.surface).clone();
+            for point in &mut surface
+                .transit
+                .as_mut()
+                .unwrap()
+                .points
+            {
+                point.require_transit_token = point.alias != "untokened";
+            }
+            channel_state.surface = Arc::new(surface);
+        }
+        let token = |user: Option<&str>, agent: Option<&str>| {
+            issuer
+                .issue("transit-fabric", agent, None, None, user, None, vec![])
+                .unwrap()
+        };
+        let authenticated = token(Some("sha256:user"), Some("did:web:agent.example"));
+        let mut without_stores = state.clone();
+        without_stores.delegation_vault_store = None;
+
+        for (case, state, alias, token, status, code) in [
+            ("anonymous caller", &state, "granted", token(None, Some("did:web:agent.example")), 403, -32001),
+            ("no transit token where none is required", &state, "untokened", String::new(), 403, -32001),
+            ("no agent identity", &state, "granted", token(Some("sha256:user"), None), 403, -32001),
+            ("provider deleted", &state, "gone", authenticated.clone(), 503, -32603),
+            ("no authorization endpoint", &state, "no-endpoint", authenticated.clone(), 503, -32603),
+            ("api key unresolvable", &state, "broken-key", authenticated.clone(), 503, -32603),
+            ("invalid credential header", &state, "bad-header", authenticated.clone(), 503, -32603),
+            ("stores unavailable", &without_stores, "granted", authenticated.clone(), 503, -32603),
+        ] {
+            let (actual, body) = through_the_pipeline(state, alias, &token).await;
+
+            assert_eq!(actual.as_u16(), status, "{case}: {body}");
+            assert_eq!(body["jsonrpc"], "2.0", "{case}: {body}");
+            assert_eq!(body["id"], 7, "{case}: {body}");
+            assert_eq!(body["error"]["code"], code, "{case}: {body}");
+            assert!(target.received().is_empty(), "{case}: the target must not be called");
+        }
+
+        let (status, body) = through_the_pipeline(&state, "plain", &authenticated).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["detail"], "Delegated credentials unavailable", "{body}");
+        assert!(target.received().is_empty());
+
+        let (status, body) = through_the_pipeline(&state, "granted", &authenticated).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let received = target.received();
+        assert_eq!(received.len(), 1);
+        assert_eq!(header_values(&received[0], "authorization"), ["Bearer vendor-access"]);
+    }
+
+    /// A public discovery read needs no transit token and names no caller, so
+    /// it reaches the target without a delegated credential, as it does without
+    /// a target authentication one, rather than being refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_public_discovery_read_through_a_credentialed_transit_point_carries_no_credential() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = crate::component_tests::helpers::RecordingTarget::start(StatusCode::OK, &[]).await;
+        let (state, _) = delegation_pipeline(
+            directory.path(),
+            &target.url,
+            &[("granted", "mcp", binding("provider", json!({"type": "bearer_header"})))],
+        )
+        .await;
+        let request = Request::builder()
+            .method("GET")
+            .uri("/outbound/mcp/granted/.well-known/agent-card.json")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let response = Box::pin(outbound_proxy_handler_with_mcp_versions(
+            "127.0.0.1:12345"
+                .parse()
+                .unwrap(),
+            state,
+            request,
+            crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+        ))
+        .await
+        .unwrap_or_else(|error| error.into_response());
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let received = target.received();
+        assert_eq!(received.len(), 1);
+        assert!(header_values(&received[0], "authorization").is_empty(), "{:?}", received[0]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transit_point_still_asks_for_consent_when_no_grant_is_stored() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = crate::component_tests::helpers::RecordingTarget::start(StatusCode::OK, &[]).await;
+        let (state, issuer) = delegation_pipeline(
+            directory.path(),
+            &target.url,
+            &[("consent", "mcp", binding("consent", json!({"type": "bearer_header"})))],
+        )
+        .await;
+        let token = issuer
+            .issue("transit-fabric", Some("did:web:agent.example"), None, None, Some("sha256:user"), None, vec![])
+            .unwrap();
+
+        let (status, body) = through_the_pipeline(&state, "consent", &token).await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        assert_eq!(body["type"], "https://affinidi.com/atg/errors/consent-required");
+        assert_eq!(body["consent_required"][0]["provider_name"], "Consent");
+        assert!(
+            body["consent_required"][0]["authorization_url"]
+                .as_str()
+                .unwrap()
+                .starts_with("https://provider.example/authorize?"),
+            "{body}"
+        );
+        assert_eq!(
+            body.as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["consent_required", "detail", "status", "title", "type"].into()
+        );
+        assert!(target.received().is_empty());
     }
 }

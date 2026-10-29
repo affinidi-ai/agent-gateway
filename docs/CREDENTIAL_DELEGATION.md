@@ -102,6 +102,26 @@ response, and `fail` fails the tool call with a JSON-RPC error. Elicit falls bac
   `initialize` with SSE, sent an unusable `Mcp-Session-Id`, or the gateway restarted
   after the session opened.
 
+### When a credential cannot be resolved
+
+A binding that applies but whose credential cannot be resolved refuses the request; the
+gateway never forwards it without the credential. That covers a deleted or unreadable
+provider, an API key whose secret cannot be read, a failed client-credentials token request,
+a vault read error, and consent that is needed but cannot be asked for because no
+authorization URL can be built, for example when the provider has no
+`authorization_endpoint`. An Access Point and Fabric receive answer `503` with `Delegated
+credentials unavailable`. The delegation audit records the binding's outcome, and
+`provider_unavailable` names a provider that cannot be used.
+
+A Transit Point refuses such a request with `503`, and also refuses with `403` one whose
+transit token carries no caller identity, or for which neither its managed identity nor the
+transit token's caller DID gives the agent half of the vault key. An MCP Transit Point answers
+with a JSON-RPC error (`-32603` for `503`, `-32001` for `403`) carrying the request's id, and
+any other Transit Point with an `application/problem+json` body. A missing token still gets
+the consent answer above. A public discovery read, such as an agent card fetch, needs no
+transit token and names no caller, so, as with `target_auth`, it is forwarded without a
+delegated credential rather than refused.
+
 ## Across Fabric
 
 When a surface's Target or Transit Point is `fabric://`, its delegated credential reaches the peer

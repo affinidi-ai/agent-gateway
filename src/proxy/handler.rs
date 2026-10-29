@@ -6785,8 +6785,6 @@ async fn proxy_handler_with_mcp_runtime(
                     "status": 401,
                     "detail": "This channel requires delegated credentials. The user must authorize access via the provided URLs.",
                     "consent_required": consent_entries,
-                    "_debug_user_hash": user_hash,
-                    "_debug_agent_did": agent_did_for_vault,
                 });
                 return Ok(Response::builder()
                     .status(StatusCode::UNAUTHORIZED)

@@ -70,13 +70,11 @@ pub enum DelegationLookupResult {
     /// Token found — inject these credentials into the upstream request
     Inject(Vec<ResolvedCredentialInjection>),
     /// User has not yet consented — return consent_required to caller
-    ConsentRequired {
-        authorization_url: String,
-        provider_name: String,
-        scopes: Vec<String>,
-    },
+    ConsentRequired { authorization_url: String, provider_name: String, scopes: Vec<String> },
     /// Binding doesn't apply to this request (e.g. tool filter)
     NotApplicable,
+    /// The credential the binding requires cannot be resolved; the request must be
+    /// refused rather than forwarded without it.
     Unavailable,
 }
 
@@ -109,9 +107,12 @@ pub enum DelegationActionOutcome {
     /// The MCP client did not advertise the `elicitation` capability and
     /// the binding's fallback is `fail`.
     ElicitationUnsupported,
-    /// Binding skipped because it does not apply (tool filter, missing
-    /// provider, …).
+    /// Binding skipped because it does not apply to this request (tool filter).
     NotApplicable,
+    /// The binding's credential provider cannot be used: it was deleted, its
+    /// record cannot be read, or no authorization URL can be built from it. The
+    /// request is refused rather than forwarded without the credential.
+    ProviderUnavailable,
     /// The stored credential was consented by a different principal than the
     /// one making this request, so it was not released.
     ConsentIdentityMismatch,
@@ -290,14 +291,14 @@ pub async fn resolve_delegation_credentials(
                 warn!(
                     target: "credential_delegation",
                     provider_id = %binding.credential_provider_id,
-                    "Credential provider not found — skipping binding"
+                    "Credential provider not found - refusing the request"
                 );
                 results.push(DelegationResolution::new(
                     binding,
                     None,
-                    DelegationActionOutcome::NotApplicable,
+                    DelegationActionOutcome::ProviderUnavailable,
                     Some("provider_not_found".to_string()),
-                    DelegationLookupResult::NotApplicable,
+                    DelegationLookupResult::Unavailable,
                 ));
                 continue;
             }
@@ -306,14 +307,14 @@ pub async fn resolve_delegation_credentials(
                     target: "credential_delegation",
                     provider_id = %binding.credential_provider_id,
                     error = %e,
-                    "Failed to load credential provider"
+                    "Failed to load credential provider - refusing the request"
                 );
                 results.push(DelegationResolution::new(
                     binding,
                     None,
-                    DelegationActionOutcome::NotApplicable,
+                    DelegationActionOutcome::ProviderUnavailable,
                     Some(format!("provider_load_error: {}", e)),
-                    DelegationLookupResult::NotApplicable,
+                    DelegationLookupResult::Unavailable,
                 ));
                 continue;
             }
@@ -358,14 +359,14 @@ pub async fn resolve_delegation_credentials(
                             target: "credential_delegation",
                             provider_id = %binding.credential_provider_id,
                             error = %e,
-                            "Failed to resolve API key"
+                            "Failed to resolve API key - refusing the request"
                         );
                         results.push(DelegationResolution::new(
                             binding,
                             Some(&provider.name),
                             DelegationActionOutcome::ApiKeyResolutionFailed,
                             Some(e.to_string()),
-                            DelegationLookupResult::NotApplicable,
+                            DelegationLookupResult::Unavailable,
                         ));
                     }
                 }
@@ -547,7 +548,7 @@ pub async fn resolve_delegation_credentials(
                             Some(&provider.name),
                             DelegationActionOutcome::ClientCredentialsFailed,
                             Some(e.to_string()),
-                            DelegationLookupResult::NotApplicable,
+                            DelegationLookupResult::Unavailable,
                         ));
                     }
                 }
@@ -920,7 +921,7 @@ pub async fn resolve_delegation_credentials(
                     .await;
                     let outcome = match cr {
                         DelegationLookupResult::ConsentRequired { .. } => DelegationActionOutcome::ConsentRequired,
-                        _ => DelegationActionOutcome::NotApplicable,
+                        _ => DelegationActionOutcome::ProviderUnavailable,
                     };
                     results.push(DelegationResolution::new(binding, Some(&provider.name), outcome, None, cr));
                 }
@@ -952,7 +953,7 @@ pub async fn resolve_delegation_credentials(
                     Some(&provider.name),
                     DelegationActionOutcome::LookupError,
                     Some(e.to_string()),
-                    DelegationLookupResult::NotApplicable,
+                    DelegationLookupResult::Unavailable,
                 ));
             }
         }
@@ -1134,9 +1135,9 @@ async fn build_consent_required(
                         target: "credential_delegation",
                         provider_id = %binding.credential_provider_id,
                         error = %e,
-                        "Failed to build authorization URL"
+                        "Failed to build authorization URL - refusing the request"
                     );
-                    DelegationLookupResult::NotApplicable
+                    DelegationLookupResult::Unavailable
                 }
             }
         }
@@ -1144,9 +1145,9 @@ async fn build_consent_required(
             warn!(
                 target: "credential_delegation",
                 provider_id = %binding.credential_provider_id,
-                "Credential provider not found for consent_required"
+                "Credential provider not found for consent_required - refusing the request"
             );
-            DelegationLookupResult::NotApplicable
+            DelegationLookupResult::Unavailable
         }
     }
 }
@@ -1552,9 +1553,15 @@ mod tests {
         }
 
         fn with_oauth_provider(id: &str) -> Arc<Self> {
+            Self::with_provider(id, CredentialProviderType::OAuth2AuthorizationCode)
+        }
+
+        fn with_provider(
+            id: &str,
+            provider_type: CredentialProviderType,
+        ) -> Arc<Self> {
             let mut providers = HashMap::new();
-            providers
-                .insert(id.to_string(), make_credential_provider(id, CredentialProviderType::OAuth2AuthorizationCode));
+            providers.insert(id.to_string(), make_credential_provider(id, provider_type));
             Arc::new(Self { providers })
         }
     }
@@ -2027,9 +2034,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_not_found_returns_not_applicable_when_no_provider() {
-        // When vault has no token AND provider store has no provider,
-        // build_consent_required falls back to NotApplicable
+    async fn a_binding_whose_provider_is_gone_is_unavailable() {
         let vault = MockVaultStore::new(VaultLookupResult::NotFound);
         let providers = MockProviderStore::empty();
         let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
@@ -2052,12 +2057,47 @@ mod tests {
         .await;
 
         assert_eq!(results.len(), 1);
-        assert!(
-            matches!(&results[0].result, DelegationLookupResult::NotApplicable),
-            "Expected NotApplicable when provider not found, got {:?}",
-            result_tag(&results[0].result)
+        assert_eq!(result_tag(&results[0].result), "Unavailable");
+        assert_eq!(results[0].action.outcome, DelegationActionOutcome::ProviderUnavailable);
+        assert_eq!(
+            results[0]
+                .action
+                .detail
+                .as_deref(),
+            Some("provider_not_found")
         );
-        assert_eq!(results[0].action.outcome, DelegationActionOutcome::NotApplicable);
+    }
+
+    #[tokio::test]
+    async fn api_key_and_client_credentials_failures_are_unavailable() {
+        for (provider_type, outcome) in [
+            (CredentialProviderType::ApiKey, DelegationActionOutcome::ApiKeyResolutionFailed),
+            (CredentialProviderType::OAuth2ClientCredentials, DelegationActionOutcome::ClientCredentialsFailed),
+        ] {
+            let vault = MockVaultStore::new(VaultLookupResult::NotFound);
+            let providers = MockProviderStore::with_provider("cp-1", provider_type.clone());
+            let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+
+            let results = resolve_delegation_credentials(
+                &[make_binding("cp-1")],
+                "sha256:user1",
+                "did:web:agent.example",
+                "ch-1",
+                None,
+                &(vault as Arc<dyn DelegationVaultStorage>),
+                &(providers as Arc<dyn CredentialProviderStorage>),
+                &secrets,
+                "https://gw.example.com",
+                false,
+                None,
+                None,
+            )
+            .await;
+
+            assert_eq!(results.len(), 1);
+            assert_eq!(result_tag(&results[0].result), "Unavailable", "{provider_type:?}");
+            assert_eq!(results[0].action.outcome, outcome, "{provider_type:?}");
+        }
     }
 
     #[tokio::test]
@@ -2243,7 +2283,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_vault_error_returns_not_applicable() {
+    async fn a_vault_read_error_is_unavailable() {
         struct ErrorVaultStore;
 
         #[async_trait]
@@ -2321,17 +2361,14 @@ mod tests {
         .await;
 
         assert_eq!(results.len(), 1);
-        assert!(
-            matches!(&results[0].result, DelegationLookupResult::NotApplicable),
-            "Vault error should degrade to NotApplicable"
-        );
+        assert_eq!(result_tag(&results[0].result), "Unavailable");
         assert_eq!(results[0].action.outcome, DelegationActionOutcome::LookupError);
     }
 
     #[tokio::test]
     async fn test_expired_no_refresh_triggers_consent_required_path() {
-        // Expired with no refresh token → should attempt consent_required
-        // Since MockProviderStore is empty, falls back to NotApplicable
+        // Expired with no refresh token → should attempt consent_required.
+        // Since MockProviderStore is empty, the binding is unavailable.
         let vault = MockVaultStore::new(VaultLookupResult::ExpiredNoRefresh(make_token(true, false)));
         let providers = MockProviderStore::empty();
         let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
@@ -2354,11 +2391,7 @@ mod tests {
         .await;
 
         assert_eq!(results.len(), 1);
-        // Provider not in mock store — falls through to NotApplicable
-        assert!(
-            matches!(&results[0].result, DelegationLookupResult::NotApplicable),
-            "ExpiredNoRefresh with no provider should degrade to NotApplicable"
-        );
+        assert_eq!(result_tag(&results[0].result), "Unavailable");
     }
 
     #[tokio::test]
@@ -2424,9 +2457,8 @@ mod tests {
     async fn test_elicit_without_session_id_falls_through_to_consent_required() {
         // ConsentMode::Elicit + NO audit_ctx.mcp_session_id → try_elicit_flow
         // returns None and the caller invokes build_consent_required.
-        // MockSecretsStore cannot resolve the OAuth client_id secret, so
-        // build_consent_required itself degrades to NotApplicable. The fact
-        // we did not get a panic or different variant proves the fallthrough.
+        // MockSecretsStore cannot resolve the OAuth client_id secret, so no
+        // authorization URL can be built and the binding is unavailable.
         let vault = MockVaultStore::new(VaultLookupResult::NotFound);
         let providers = MockProviderStore::with_oauth_provider("cp-1");
         let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
@@ -2449,7 +2481,7 @@ mod tests {
         .await;
 
         assert_eq!(results.len(), 1);
-        assert_eq!(result_tag(&results[0].result), "NotApplicable");
+        assert_eq!(result_tag(&results[0].result), "Unavailable");
     }
 
     #[tokio::test]
@@ -2525,9 +2557,9 @@ mod tests {
         .await;
 
         assert_eq!(results.len(), 1);
-        // Same degradation as above: fallthrough → build_consent_required →
-        // secret resolution fails on MockSecretsStore → NotApplicable.
-        assert_eq!(result_tag(&results[0].result), "NotApplicable");
+        // As above: fallthrough → build_consent_required → secret resolution
+        // fails on MockSecretsStore → no authorization URL → Unavailable.
+        assert_eq!(result_tag(&results[0].result), "Unavailable");
     }
 
     #[tokio::test]
@@ -2578,10 +2610,10 @@ mod tests {
         // With MockSecretsStore the authorization-URL build fails before we
         // ever attempt SSE delivery, so try_elicit_flow returns None and the
         // caller falls through to build_consent_required, which also fails
-        // on secrets → NotApplicable. The no-SSE-stream branch itself is
+        // on secrets → Unavailable. The no-SSE-stream branch itself is
         // covered by integration tests where the secret store is real.
-        assert_eq!(result_tag(&results[0].result), "NotApplicable");
-        assert_eq!(results[0].action.outcome, DelegationActionOutcome::NotApplicable);
+        assert_eq!(result_tag(&results[0].result), "Unavailable");
+        assert_eq!(results[0].action.outcome, DelegationActionOutcome::ProviderUnavailable);
     }
 
     // ── DelegationAction serialization ───────────────────────────────
@@ -2598,6 +2630,7 @@ mod tests {
             (DelegationActionOutcome::ElicitationTimedOut, "elicitation_timed_out"),
             (DelegationActionOutcome::ElicitationUnsupported, "elicitation_unsupported"),
             (DelegationActionOutcome::NotApplicable, "not_applicable"),
+            (DelegationActionOutcome::ProviderUnavailable, "provider_unavailable"),
             (DelegationActionOutcome::RefreshFailed, "refresh_failed"),
             (DelegationActionOutcome::LookupError, "lookup_error"),
             (DelegationActionOutcome::ApiKeyResolutionFailed, "api_key_resolution_failed"),

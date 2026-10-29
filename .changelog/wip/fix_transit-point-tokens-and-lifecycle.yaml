@@ -60,6 +60,18 @@ changes:
         `target_auth` header, such as `X-Api-Key`, whether or not the gateway adds its own
         value to the request, so the target receives one value for that header.
     - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Refuse requests whose delegated credential cannot be resolved
+      description: >-
+        A request whose credential binding applies but whose credential cannot be resolved
+        is now refused without calling the target: a deleted or unreadable provider, an
+        unreadable API key secret, a failed client-credentials request, a vault read error,
+        or consent that cannot be asked for. A Transit Point also refuses a request whose
+        transit token names no caller, and no longer looks up a grant under the placeholder
+        agent `unknown` when no agent identity is resolved. Grants are keyed by agent DID,
+        caller and provider, not by surface, so surfaces that share an agent DID share
+        grants. The Access Point's consent body no longer carries the caller's identity hash
+        and agent DID.
+    - timestamp: '2026-10-28T00:00:00.000Z'
       title: Write the gateway's key files atomically with owner-only permissions
       description: >-
         The gateway's key files (DID keys, VC issuer keys and the transit token key) are now
@@ -122,3 +134,36 @@ changes:
         refused, and the admin API refuses to save it with the field. Authenticate Transit
         Point callers with `require_transit_token` and, on MCP Transit Points,
         `mcp_http.authorization`.
+    - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Give Transit Points with credential bindings an agent identity
+      description: >-
+        A Transit Point with `outbound_credentials` or `transit_credentials` now refuses a
+        request with `403` when no agent identity is resolved, because neither the Transit
+        Point's managed identity nor the transit token's caller DID is set, instead of keying
+        the vault on a shared placeholder. Configure a managed identity on such Transit Points,
+        or caller identity on the Access Point; a static key that does not depend on the agent
+        can use `target_auth` instead. Grants consented under the placeholder agent are no
+        longer released.
+    - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Refuse credentialed Transit Point calls whose transit token names no caller
+      description: >-
+        A Transit Point with credential bindings now refuses with `403` a request whose transit
+        token carries no caller identity, instead of forwarding it without the credential.
+        That covers every request to such a Transit Point that sets `require_transit_token:
+        false`, and every request from an anonymous caller of an Access Point whose caller
+        authentication is optional. Authenticate the Access Point's callers, or move a static
+        credential to `target_auth`.
+    - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Refuse Access Point and Fabric calls whose delegated credential is unavailable
+      description: >-
+        An Access Point or Fabric receive with credential delegation now refuses with `503` a
+        request whose provider is deleted or unreadable, whose API key secret cannot be read,
+        whose client-credentials token request fails, whose vault read fails, or whose consent
+        cannot be asked for, instead of forwarding it without the credential.
+    - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Forward Transit Point discovery reads without a delegated credential
+      description: >-
+        A `GET` of a public discovery path, such as an agent card, through a Transit Point with
+        credential bindings used to carry the delegated credential when its transit token named
+        a caller. It is now always forwarded without one, as it is without the `target_auth`
+        credential, because the gateway does not check a transit token on such a read.

@@ -190,8 +190,9 @@ flowchart TB
     I -. discovery GET .-> F
 ```
 
-Public discovery GETs, such as an agent card, skip the trust and policy group. The outbound
-path does not evaluate the appliance-wide policies.
+Public discovery GETs, such as an agent card, skip transit token validation and the trust and
+policy group, and are forwarded without credentials. The outbound path does not evaluate the
+appliance-wide policies.
 
 ## Full order
 
