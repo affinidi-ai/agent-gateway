@@ -1,0 +1,751 @@
+branch: feat/oauth-trust-plane
+changes:
+  added:
+    - timestamp: '2026-10-21T10:49:49Z'
+      title: ⭐ Add the oauth2_jwt_bearer credential provider for RFC 7523 JWT bearer grants
+      description: >-
+        A credential provider can now obtain a gateway token with the RFC 7523 JWT bearer grant, as
+        Google service accounts and Ory Hydra require. The gateway signs a short-lived RS256 or
+        ES256 assertion (iss, sub, aud set to the token endpoint, iat, exp, jti and scope, with the
+        kid in the header) with a PKCS#8 PEM or Google service account key held in the secrets
+        store. The key is checked when the provider is saved and is never stored in the provider,
+        returned by the API or logged. An outbound_credentials or transit_credentials binding to
+        such a provider is refused on save (400), and a retype to this type is refused (409),
+        unless the surface authenticates its callers and every leg the binding reaches is https, so
+        the gateway's own token never goes in cleartext or to callers nobody authenticated. The
+        same rule is checked on every request: a binding that fails it there refuses the request
+        with 503 and the detail jwt_bearer_leg_forbidden, and a modern MCP request that would need
+        it is refused with 403. Earlier releases skip an oauth2_jwt_bearer provider at load, so
+        every binding to it refuses with 503; before rolling back, remove those bindings and delete
+        or replace the providers, or restore a backup taken before the upgrade.
+    - timestamp: '2026-10-21T10:49:49Z'
+      title: Add a JWT Bearer credential provider form
+      description: >-
+        The Credential Provider page can create and edit JWT Bearer providers with a signing key
+        secret, algorithm, key ID, assertion issuer and subject, optional client secret references,
+        and a warning that encryption at rest is off by default. The signing settings are sent and
+        read inside the jwt_bearer object, in the shape the gateway stores.
+    - timestamp: '2026-10-21T12:38:07Z'
+      title: ⭐ Authenticate to Targets with a credential provider's gateway token or API key
+      description: >-
+        Target Authentication gains the credential_provider method. The gateway sends its own Client
+        Credentials or JWT bearer gateway token, or a provider's API key, to an https Target on
+        calls from authenticated callers and on its agent card fetch. The provider must belong to
+        the surface's tenant, and a save is refused on a surface without caller authentication, on
+        a Target that is not https (so Fabric, MCP proxy and A2A proxy Targets), on Transit Points,
+        and when an outbound_credentials binding writes the same header. The same rules are checked
+        on every request, and a header clash in a record loaded from disk, or a same-name header
+        arriving over the Fabric, fails the call with 502 whatever the fallback and is audited with
+        the detail target_auth_header_conflict. A referenced provider cannot be deleted or retyped
+        to authorization code. Target Authentication gateway tokens are cached per replica in
+        memory, keyed by provider record, scopes and audience, shared by every caller, renewed
+        before expiry with one grant in flight per key, kept after a failed renewal, and dropped
+        when the secret or provider they came from changes, on an appliance-wide configuration
+        reload and on Standby to Active activation. They are never stored in the delegation vault or
+        counted towards the credentials licence umbrella. Each failed grant logs one Gateway grant
+        failed warning that names the provider, the grant and the failure category. Earlier
+        releases cannot read this method:
+        on filesystem storage they skip the surface, and on DynamoDB they forward to the Target
+        without the credential. Before rolling back, switch those surfaces to static_secret or
+        remove their Target Authentication, or restore a backup taken before the upgrade.
+    - timestamp: '2026-10-21T12:00:00Z'
+      title: Add credential provider Target Authentication to the Managed Agent editor
+      description: >-
+        The Managed Agent Target Authentication panel can now use a credential provider, with a
+        provider picker that excludes Authorization Code providers, optional scopes, and a choice
+        between an Authorization bearer header and a custom header. The Surface Builder refuses to
+        save it without a provider, with an invalid custom header, a header named Host,
+        Content-Length, Transfer-Encoding or Connection, or a Target that is not a direct https URL,
+        and keeps an injection type or extra fields the editor does not model as saved. The
+        provider picker and the custom header fields reference the error that concerns them and
+        are marked invalid while it applies, and the starred fields are marked required, so
+        assistive technology reads the reason with the field.
+    - timestamp: '2026-10-21T11:54:05Z'
+      title: Discover and pin authorization server metadata on JWT strategies
+      description: >-
+        JWT verification strategies can now pin their authorization server's metadata (issuer,
+        metadata URL, token endpoint and JWKS URI), read from the RFC 8414 document with an OpenID
+        Connect fallback and accepted only when its issuer equals the expected issuer exactly and
+        its endpoints use no weaker scheme than the issuer. An issuer with a path is tried with up
+        to three metadata URLs, and an issuer containing whitespace (Unicode whitespace included)
+        or a control character is refused with invalid_url before any request is made. POST
+        /v1/jwt-verification-strategies/discover returns the metadata without storing it, and
+        discover_metadata on a save pins it (true), clears it (false) or keeps it, re-discovering
+        when the issuer or JWKS URI changes. A discovery that fails on the discover endpoint, or on
+        a save with discover_metadata true, answers 422 with a fixed code and stores nothing. When
+        a re-discovery fails, or is skipped because the caller is past the probe limit, the save
+        still answers 200 and logs a warning. The pin is kept while its issuer still equals the
+        strategy's issuer (only the JWKS URI changed) and cleared when the issuer changed, so a
+        tenant-scoped caller that moves the issuer to an http URL always clears it. Earlier
+        releases drop the pin when they save the strategy; after re-upgrading, run discovery again
+        on a strategy an older node saved.
+    - timestamp: '2026-10-21T15:00:00Z'
+      title: Add a Discover button to the JWT verification strategy editor
+      description: >-
+        The strategy editor has a Discover button that reads the issuer's metadata and shows the
+        pinned issuer, metadata URL, token endpoint and JWKS URI, a way to clear the pin, a note
+        that discovery needs Remote URL keys and that saving with static keys clears the pin, and a
+        warning when the pin no longer matches the issuer or JWKS URI. The warning says that a save
+        whose re-discovery fails clears the pin when the issuer changed. A Discover result that
+        answers after the Expected Issuer was edited is ignored. Saving no longer requires a Check
+        URI run for a JWKS URI that came from discovery or was not changed. The strategy list marks
+        discovered strategies.
+    - timestamp: '2026-10-29T09:00:00Z'
+      title: ⭐ Require scopes on JWT bearer Access Points
+      description: >-
+        A jwt_bearer caller authentication method can list required_scopes. After the token
+        verifies, the Access Point reads the scopes it grants from the strategy's scope claims
+        (scope then scp by default, as a space-separated string or an array) and treats a token
+        that lacks one as a failed caller of kind insufficient_scope, with the audit reason
+        insufficient_scope. An Access Point that does not declare itself a protected resource hands
+        it to policy like a missing or invalid token. A declaring one refuses it with 403 and a
+        WWW-Authenticate challenge carrying error="insufficient_scope" and the required scopes: an
+        MCP Access Point with protected_resource does so before policy, any other after gateway
+        policy and before AP2 and payment. On the receiving gateway of a Fabric route it answers
+        403 with Bearer realm="agent-gateway", error="insufficient_scope". Entries must be RFC 6749
+        scope tokens and are checked on every surface save and at startup. Earlier releases ignore
+        required_scopes and drop it when they save the record, so after a rollback those Access
+        Points accept tokens without the scope, ID tokens included. Before rolling back, disable
+        each Access Point that relies on it or protect it with a surface policy on the raw scope or
+        scp claim in input.source_auth.claims, since earlier releases do not publish
+        input.source_auth.scopes, and set required_scopes again after upgrading. A declaring
+        Access Point also needs the failed-caller rollback step under the caller challenge entry.
+    - timestamp: '2026-10-29T09:00:00Z'
+      title: Let a JWT verification strategy name the claims that carry scopes
+      description: >-
+        A strategy's scope_claims lists the token claims read for granted scopes, in order,
+        defaulting to scope then scp, so Microsoft Entra app-only tokens can be read from roles.
+        The list is validated on save, kept when a save omits it, and stored as absent when it
+        equals the default, so existing strategy records are unchanged. The strategy page sets it
+        and keeps the default when left alone. Earlier releases ignore scope_claims and drop it
+        when they save the strategy, so set it again after re-upgrading.
+    - timestamp: '2026-10-29T09:00:00Z'
+      title: Publish normalised scopes, client id and verifying strategy to policy
+      description: >-
+        Policy input for a verified JWT caller now carries scopes (sorted and de-duplicated),
+        client_id (from client_id, azp or appid), strategy_id and strategy_tenant_id. Gateway
+        policies that trust an issuer should key on the strategy, because a tenant can create a
+        strategy with any issuer.
+    - timestamp: '2026-10-29T09:00:00Z'
+      title: Tell policy why caller authentication failed
+      description: >-
+        A failed caller's policy input now carries kind (missing, invalid or insufficient_scope)
+        next to attempted_method and reason, so a policy can treat a scope shortfall differently
+        from a missing or invalid credential.
+    - timestamp: '2026-10-29T12:00:00Z'
+      title: ⭐ Declare an Access Point from its pinned JWT bearer method and scopes
+      description: >-
+        An Access Point of any protocol without protected_resource now declares itself a protected
+        resource when its only caller authentication method is jwt_bearer with required_scopes, its
+        strategy uses a remote JWKS pinned to an authorization server that matches the expected
+        issuer and JWKS URI, it reads a standard Authorization Bearer token, it does not forward the
+        caller's token, and its audiences contain the Access Point URL (the listener's first
+        external URL plus the route, with $alias for a variant). It then publishes RFC 9728
+        metadata naming the pinned issuer and the required scopes, accepts only tokens whose
+        audience names that URL and challenges failed callers. An Access Point with forward_header
+        does not declare and keeps forwarding the token. A variant of an Access Point at / does not
+        declare. A strategy store failure on such an Access Point answers 503 rather than letting
+        the caller through. An MCP Access Point with protected_resource keeps declaring from that
+        setting. Required scopes and the pinned authorization server are new in this release, so an
+        Access Point that sets neither answers as before.
+    - timestamp: '2026-10-29T12:00:00Z'
+      title: ⭐ Challenge failed callers of a declaring Access Point before payment
+      description: >-
+        A declaring Access Point of any protocol other than MCP, which already refuses at source
+        authentication, refuses a caller whose token is missing or invalid with 401, and one whose
+        token lacks a required scope with 403, carrying the RFC 6750 Bearer challenge that names
+        its protected resource metadata, Cache-Control no-store and the refusing stage's body. The
+        refusal comes after gateway policy and before AP2, payment and any Target or Fabric
+        forwarding, whether or not a policy is attached, so a surface saved through the API is
+        protected like one saved from the dashboard. A gateway policy that refuses such a caller
+        answers with the same challenge. A declaring Access Point never sends the caller's token to
+        the Target or over Fabric, and on the receiving gateway of a Fabric route it refuses a
+        failed caller before policy with a challenge that carries a realm and no
+        resource_metadata. Earlier releases leave failed callers to policy, so before rolling back,
+        attach a gateway or surface policy denying input.source_auth.method == "failed" to every
+        declaring Access Point that has none.
+    - timestamp: '2026-10-29T12:00:00Z'
+      title: ⭐ Name the gateway's authorization server in a declaring A2A agent card
+      description: >-
+        The public and extended agent cards of an A2A Access Point that declares from its pinned
+        jwt_bearer method, including a card an A2A proxy generates, now replace the Target's
+        security and signatures with one agent_gateway OAuth 2.0 scheme naming the pinned
+        authorization server's metadata URL and token endpoint, in the 0.3, 1.0 or dual-era shape
+        the card uses. Its client credentials flow offers every advertised scope and its
+        requirement lists only the required scopes, and a card fetched from the Target names the
+        declared resource as its URL. Its Transit Point cards lose the partner's security and
+        signatures. The public cards of every Access Point whose jwt_bearer method lists
+        required_scopes, including one whose declaration is stripped, carry Cache-Control no-cache
+        and a weak ETag, and such a card the gateway cannot process answers 502 rather than being
+        served as received. Cards of other Access Points keep their security, signatures and cache
+        headers.
+    - timestamp: '2026-10-21T18:00:56Z'
+      title: Record audit events when trust anchors and Target Authentication change
+      description: >-
+        A new Configuration group of audit events, verification_strategy_changed,
+        credential_provider_changed and target_auth_changed, records who created, updated, re-pinned
+        or deleted a JWT verification strategy, a credential provider or a surface's Target
+        Authentication, with the user or access token as the actor; a target_auth_changed event is
+        recorded for the surface and for each variant that sets its own Target Authentication when
+        it changed, naming the variant by id and alias, and none for a variant that only inherits
+        the surface's. A delegation_failed event now records a gateway token request that could not
+        be satisfied, with a typed assertion or token endpoint reason and the gateway as the actor.
+    - timestamp: '2026-10-21T18:00:56Z'
+      title: Add trust plane counters for tokens, key sets, discovery, scopes and cards
+      description: >-
+        Bounded-label Prometheus counters report gateway token requests by grant and result
+        (agent_gateway_token_fetch_total), JWKS key set fetches (agent_gateway_jwks_fetch_total),
+        authorization server discovery (agent_gateway_discovery_total), caller tokens that lacked a
+        required scope (agent_gateway_scope_denied_total, labelled jwt for a jwt_bearer method and
+        mcp_resource_token for mcp_http.authorization, whether the gateway refused the request or
+        left it to policy, and whether or not an audit sink selects auth_failed), and each served
+        agent card's declaration outcome and strip reason (agent_gateway_card_security_total), so
+        an unreachable authorization server or a stripped declaration is visible without reading
+        logs.
+    - timestamp: '2026-10-21T18:00:56Z'
+      title: Record the release in backup manifests and refuse backups from newer releases
+      description: >-
+        Backup and portable archive manifests now carry the Agent Gateway release that took them. A
+        restore refuses a backup from a newer release before it changes anything, reporting the
+        failure category backup_from_newer_release, because a record that release wrote may be
+        skipped on load. A backup whose release cannot be read as major.minor.patch is refused as
+        an invalid manifest. Older backups and backups without a release still restore.
+    - timestamp: '2026-10-22T08:00:00Z'
+      title: Warn before deleting a secret that credential providers reference
+      description: >-
+        Deleting a secret from the Secrets list or the secret editor now shows an in-page warning
+        naming the credential providers that reference it and saying they will lose their
+        credential, with a Delete secret anyway button. The delete itself is unchanged and still
+        answers 204. A secret no provider references deletes without a warning, and a role without
+        credential_providers.view is not warned. If the provider lookup fails, the warning says the
+        references could not be checked and still offers Delete secret anyway. The warning takes
+        focus and scrolls into view when it opens, closes on Escape, returns focus to the Delete
+        button on Cancel and moves it to the list heading after a confirmed delete.
+    - timestamp: '2026-10-29T18:00:00Z'
+      title: ⭐ Add an Agent Cards tab that shows the card a caller gets
+      description: >-
+        The Surface Builder of an A2A or AP2 surface gains an Agent Cards tab. It shows the agent's
+        own card beside the card the gateway serves, a comparison of what the gateway changed,
+        the raw JSON, how the gateway's fetch went (status, cause, HTTP status, duration and how
+        Target Authentication was presented) and when a caller last fetched the card. Refresh
+        fetches the card again, moves focus to the result and announces it to screen readers. When
+        the fetch fails, the tab still shows the card the gateway last served, marked as possibly
+        from earlier.
+    - timestamp: '2026-10-29T18:00:00Z'
+      title: Add management routes to preview and refresh a surface's agent card
+      description: >-
+        GET /v1/surfaces/{id}/agent-card previews the base route's card and POST
+        /v1/surfaces/{id}/agent-card/refresh fetches it again. The preview reads the card as the
+        card route does, with the same egress policy and Target Authentication, and reports a fixed
+        cause for a failed fetch, never an upstream body, header, token or secret. The read needs
+        surfaces view and the refresh surfaces edit permission, and a surface of another tenant
+        answers 404. A read within a minute of an earlier fetch of the same running surface answers
+        from that snapshot without a new fetch. A user may start 10 fetches a minute across all
+        surfaces on a replica; past that, a refresh, or a read with no snapshot to answer with, gets
+        429 with Retry-After 60. When the fetch fails the preview still returns the last card the
+        gateway served for the same running surface, or null when there is none; a served card
+        over the 256 KiB display limit is kept by its size only. A preview records no
+        request_rejected or auth_failed audit event and is not counted as a caller request.
+    - timestamp: '2026-10-29T18:00:00Z'
+      title: Report declarations and warnings when a surface is saved
+      description: >-
+        Surface create, update and merge patch, and variant create, update, patch, delete and
+        promote, return a declarations list (the outcome and strip reason of the base route and
+        each enabled variant) and a warnings list next to the surface. Warnings say when failed
+        callers reach no deny rule (fail_open_policy, fail_open_undetermined,
+        payment_before_policy), including callers arriving over Fabric when only the inbound
+        policy or a gateway policy that reads input.a2a denies them, when a declaration is
+        stripped or lists extra audiences, when the dry run skipped a variant, when a declaring
+        Access Point is reachable only over Fabric (fabric_only_declaration), and when an update
+        dropped a stored protected_resource that no longer fits (protected_resource_dropped). A
+        PUT of a returned save response succeeds because the two fields are dropped before
+        validation; any other unknown field is still refused.
+    - timestamp: '2026-10-29T18:00:00Z'
+      title: Add GET /v1/surfaces/{id}/declarations
+      description: >-
+        The endpoint returns the declarations and warnings of a stored surface recomputed against
+        the current strategies and policies, with the permissions and tenant isolation of reading
+        the surface, so a change to a strategy or policy shows without saving the surface again.
+    - timestamp: '2026-10-29T18:00:00Z'
+      title: Edit caller declarations and required scopes in the Surface Builder
+      description: >-
+        The caller authentication editor sets the scopes a JWT bearer Access Point requires, shows
+        for each route and variant whether it declares its authorization server, strips the
+        declaration with a stated reason, or cannot be served, and explains how to fix a stripped
+        declaration.
+    - timestamp: '2026-10-29T18:00:00Z'
+      title: Show surface warnings with a copyable deny rule for failed callers
+      description: >-
+        Surface Detail and the add-surface page show the save warnings in an alert that names the
+        variant each applies to and offers a Copy deny rule button with the surface policy that
+        denies callers whose authentication failed, to attach as the Managed Agent's target.policy.
+        A payment_before_policy warning offers a gateway policy instead, because payment is checked
+        before surface policy. Saving a surface moves focus to the result, and
+        warnings are announced to screen readers when they change.
+    - timestamp: '2026-10-22T12:30:00Z'
+      title: Add an OIDC demo of both hops with a scripted caller walkthrough
+      description: >-
+        make oidc-demo-run starts two Ory Hydra containers, a mock A2A agent and a native gateway,
+        seeds them through the management API, and walks a caller through the gateway while the
+        gateway gets its own token from Hydra with the JWT bearer grant and sends it to the agent.
+        The caller walkthrough shows that the served card names the caller's authorization server
+        and scope, that a token for the Access Point is accepted, that callers with no token,
+        another audience or a missing scope are refused with the right challenge, and that
+        swapping the strategy changes the card without a restart; each step prints its request
+        with every token masked. oidc-demo-up, oidc-demo-down, oidc-demo-seed and oidc-demo-smoke
+        run the steps on their own, and make oidc-ui-e2e runs the live Playwright dashboard tests
+        against the same services and fails when the results hold a private key, a token or a run
+        secret.
+    - timestamp: '2026-10-29T21:15:00Z'
+      title: Add make oidc-demo-browser to show the Agent Cards tab on a live demo
+      description: >-
+        The target leaves the OIDC demo running in the background, writes a dashboard login to a
+        mode 600 file instead of printing it, and can make the mock agent refuse the gateway's
+        token and accept it again, so a failed card fetch and its recovery after Refresh can be
+        shown in a browser.
+    - timestamp: '2026-10-29T21:15:00Z'
+      title: Add make oidc-sdk-check to parse agent cards with the official A2A SDKs
+      description: >-
+        The check parses fixture cards, or a live card with ARGS="--live <url>", with a2a-python
+        1.2.2 and 0.3.25 and a2a-js 1.3.0 and 0.3.13, and compares the result with the expected
+        card. Known SDK rejections are listed with their reason, and a listed rejection that no
+        longer happens fails the run. The SDKs are installed by hand outside the repository.
+    - timestamp: '2026-10-29T21:15:00Z'
+      title: Run the OIDC demo with a live Auth0 tenant as the caller's server
+      description: >-
+        make oidc-demo-auth0 reads the tenant's values from a gitignored mode 600 file, refuses to
+        start when the file is missing or incomplete, and runs a walkthrough with Auth0 tokens on
+        the caller hop and hydra-b on the hop to the agent. Client secrets reach curl on standard
+        input, and the output and gateway logs are masked and scanned for secrets.
+    - timestamp: '2026-10-29T21:15:00Z'
+      title: Keep screenshots and traces of passing dashboard tests with AG_UI_ARTIFACTS
+      description: >-
+        Setting AG_UI_ARTIFACTS=all keeps a screenshot and a trace for every dashboard UI test,
+        not only failed ones, for reviewing a change visually. Videos are still kept only on
+        failure, and the live OIDC suite keeps all three off.
+  changed:
+    - timestamp: '2026-10-21T10:49:49Z'
+      title: Renew gateway tokens before expiry and keep a valid token when renewal fails
+      description: >-
+        Client Credentials and JWT bearer tokens used by outbound_credentials and
+        transit_credentials bindings are renewed five minutes before expiry, or halfway through a
+        shorter life. A failed renewal keeps injecting the cached token only while its recorded
+        expiry is in the future, and never once the provider has been edited since the token was
+        granted; with no valid token left the request is refused with 503 "Delegated credentials
+        unavailable". Token endpoint failures back off from 1 to 60 seconds, counted from when the
+        failed grant completes. On the legacy and modern delegation paths, grants that fail
+        together in one window count as one failure. A local failure, such as a missing or
+        cross-tenant secret or an unusable signing key, is reported on every request without a
+        backoff. A missing expires_in counts as 300 seconds, and a refresh token returned by a
+        gateway grant is dropped.
+    - timestamp: '2026-10-21T11:20:43Z'
+      title: Serve the last good JWKS for up to an hour when a refresh fails
+      description: >-
+        When the authorization server's JWKS endpoint fails while a cached key set has expired, the
+        gateway keeps validating tokens with the last good key set for up to one hour past its
+        expiry instead of failing every caller. The Cache-Control max-age of a JWKS response is now
+        clamped to between 60 seconds and 24 hours.
+    - timestamp: '2026-10-21T11:54:05Z'
+      title: Refuse issuer templates in a JWT verification strategy's issuer
+      description: >-
+        A strategy whose expected issuer is empty or contains a template such as Entra's {tenantid}
+        is now refused with 400 on create and update, because tokens are matched to the issuer
+        exactly and a template never matches. Use a tenant-specific authority; the common and
+        organizations authorities are not supported. A stored strategy with such an issuer still
+        loads and still matches no token; its next save fails with 400 until the issuer is
+        concrete.
+    - timestamp: '2026-10-21T12:00:00Z'
+      title: Gate credential provider pages on credential_providers permissions
+      description: >-
+        The credential provider list, add, delete and edit pages now follow the
+        credential_providers.view, edit and delete permissions instead of settings.edit. An
+        existing provider opens read-only without edit permission, and the page says why. A refused
+        delete, such as one for a provider still in use, shows the gateway's reason and status
+        inline above the list instead of a browser alert.
+    - timestamp: '2026-10-21T14:25:49Z'
+      title: Send one credential per header when Target Authentication meets delegation
+      description: >-
+        A static_secret Target Authentication header now yields to a delegated credential of the
+        same name, and on the receiving gateway of a Fabric route to a header that arrived in the
+        ForwardRequest. On an HTTP Target the Target credential replaces a same-name caller header
+        instead of being sent next to it, so the Target never receives two values under one header.
+        At a Transit Point, over HTTP and over the Fabric, a static_secret yields to a
+        transit_credentials or modern delegated credential of the same name, and on a sending
+        gateway's direct Fabric leg to a modern delegated credential. Saving a surface whose static
+        secret header collides with an outbound_credentials binding still succeeds and logs the
+        collision. A Target that relied on receiving the static secret under a header a delegated
+        credential also writes now receives only the delegated credential; give them different
+        header names to send both.
+    - timestamp: '2026-10-21T15:00:00Z'
+      title: Confirm strategy deletion in the page with the surfaces that use it
+      description: >-
+        Deleting a JWT verification strategy now asks in the page instead of a browser prompt,
+        says that a surface still referencing it cannot verify tokens and lists the surfaces that
+        use it, always for the strategy asked about last. The confirmation takes focus and scrolls
+        into view when it opens, closes on Escape, returns focus to the Delete button on Cancel,
+        moves it to the list heading after a confirmed delete and announces the result to screen
+        readers. A refused delete shows inline.
+    - timestamp: '2026-10-21T18:00:56Z'
+      title: Audit a request refused because Target Authentication has no credential
+      description: >-
+        When Target Authentication cannot produce a credential and the surface refuses the request,
+        a request_rejected audit event with reason target_auth_unavailable now records the refusal
+        with the 502 the gateway answers with, including on the agent card route. The receiving
+        gateway's card read for its policy context answers no caller and records none.
+    - timestamp: '2026-10-22T14:00:00Z'
+      title: Clear a credential provider's optional references when an update sends null
+      description: >-
+        An update now clears client_id_secret_ref, client_secret_secret_ref, api_key_secret_ref,
+        callback_url, resource and consent_identity_strategy_id when they are sent as null, keeps
+        them when they are left out, and refuses to clear one the provider type requires. Before,
+        null was ignored, so a provider kept sending client references the operator had removed.
+        A client that sends null for a field it means to keep must now leave the field out.
+    - timestamp: '2026-10-29T09:00:00Z'
+      title: Name only required scopes in the MCP discovery challenge
+      description: >-
+        The WWW-Authenticate challenge of an MCP Access Point with protected_resource now carries
+        scope only when its jwt_bearer method lists required_scopes, and names exactly those, since
+        they are what a token must grant. protected_resource.scopes stay advertise-only and no
+        longer appear in the challenge.
+    - timestamp: '2026-10-29T09:00:00Z'
+      title: Advertise required scopes in MCP protected resource metadata
+      description: >-
+        scopes_supported in the protected resource metadata of an MCP Access Point now lists the
+        union of protected_resource.scopes and the method's required_scopes, so a client that
+        reads the metadata asks for every scope the Access Point enforces.
+    - timestamp: '2026-10-29T09:00:00Z'
+      title: Keep MCP Proxy metadata paths apart from Access Point paths
+      description: >-
+        Saving an MCP Proxy with mcp_http.authorization now fails with 400 when its path holds $
+        or %24, or is the route or a Surface Variant path of any stored surface, and saving a
+        surface whose route or variant path such a proxy uses fails the same way. Any MCP Proxy
+        at or under the metadata path is refused too. Otherwise one tenant could make another
+        tenant's Access Point metadata answer 503, or answer for its variant URL. A surface route
+        or proxy path that holds $ or %24 no longer publishes metadata. Stored proxies and surfaces
+        are not checked again at startup or reload, so rename such a path before upgrading to keep
+        its metadata published; its next save otherwise fails with 400.
+    - timestamp: '2026-10-29T12:00:00Z'
+      title: Publish the selected variant alias to policy on direct requests
+      description: >-
+        Gateway, surface and tool-gating policy input for a request that selects an enabled
+        Surface Variant through its $alias URL now carries input.channel.variant_alias, as Fabric
+        requests already did. An alias that selects no enabled variant is not published, on the
+        direct path and over Fabric alike. Policies keyed on variant_alias may now match direct
+        requests they did not match before.
+    - timestamp: '2026-10-29T12:00:00Z'
+      title: Answer an unprocessable public agent card with one generic 502 detail
+      description: >-
+        On every A2A Access Point, a public card the card route cannot rewrite now answers 502 with
+        the detail "Failed to process agent card" instead of "Failed to rewrite agent card URLs" or
+        "Invalid rewritten agent card JSON", so the answer no longer says which step failed.
+        Clients or alerts that match the old detail text need updating.
+  fixed:
+    - timestamp: '2026-10-29T15:35:51Z'
+      title: Announce credential provider form errors and link providers from the list
+      description: >-
+        A credential provider form error is now an alert, each provider name in the list is a link
+        that opens it from the keyboard, and a Name with no letter or digit is refused with a
+        message about the Name instead of the hidden Provider ID.
+    - timestamp: '2026-10-21T10:49:49Z'
+      title: Stop echoing Target Authentication errors in 502 response bodies
+      description: >-
+        A Target Authentication failure on a forwarded request or a request sent over a Fabric route
+        no longer puts the cause in the 502 body. Every Target Authentication 502, including on an
+        MCP proxy Target and the receiving gateway of a Fabric route, which answered "Target
+        authentication configuration error", now carries the fixed detail "Target authentication
+        failed"; the cause is logged only. Clients or alerts that matched the old detail need
+        updating.
+    - timestamp: '2026-10-21T11:20:43Z'
+      title: Use fresh signing keys after a JWT verification strategy changes
+      description: >-
+        Cached JWKS key sets are now tied to the strategy's jwks_uri and update time and are evicted
+        when the strategy is updated or deleted, so a changed strategy is never checked against keys
+        fetched for its previous settings, on any node sharing the storage.
+    - timestamp: '2026-10-21T11:20:43Z'
+      title: Reconcile strategies and credential providers when a standby takes over
+      description: >-
+        A standby node that becomes Active now re-reads JWT verification strategies and credential
+        providers from shared storage and drops its cached JWKS key sets before admitting traffic,
+        so it never authenticates callers or reaches targets with records the previous Active node
+        has since changed.
+    - timestamp: '2026-10-21T11:35:37Z'
+      title: Stop reusing gateway tokens granted before their credential provider changed
+      description: >-
+        A cached Client Credentials token is no longer injected once its credential provider has
+        been edited since the token was granted, so a changed token endpoint, client credentials
+        or scope set takes effect on the next request instead of when the old token expires.
+    - timestamp: '2026-10-21T12:00:00Z'
+      title: Keep unsupported Target Authentication when saving a surface in the dashboard
+      description: >-
+        Saving a surface from the dashboard no longer drops a Target Authentication method the
+        editor does not model, such as credential_lookup. A Transit Point keeps any existing Target
+        Authentication when the surface is saved without opening its panel, and the Transit Point
+        editor no longer offers an OAuth option that was discarded on save.
+    - timestamp: '2026-10-21T14:00:00Z'
+      title: Offer only usable credential providers in the delegation pickers
+      description: >-
+        The outbound credential binding and Transit Point credential binding pickers now list only
+        provider types that allow delegation, keep a saved provider that is no longer allowed with a
+        label, and name the provider field for screen readers.
+    - timestamp: '2026-10-21T14:25:49Z'
+      title: Read the receiving gateway's policy-context card with Target Authentication
+      description: >-
+        The receiving gateway's agent card read for its surface policy context now resolves the
+        credential with the same function as the card route. It tries each of the surface's agent
+        card URLs, attaches the surface's Target Authentication as the gateway itself and honours
+        its fallback, so a card protected by a credential provider or a static secret reaches the
+        policy context.
+    - timestamp: '2026-10-21T18:00:56Z'
+      title: Skip a DynamoDB channel whose Target Authentication cannot be read
+      description: >-
+        An unreadable target_auth attribute was read as no Target Authentication, so the channel
+        forwarded without its credential. The channel is now skipped and counted in
+        agent_gateway_storage_load_errors_total as unreadable_record while the other channels still
+        load. After upgrading, check that counter: a channel it counts is no longer served until
+        its target_auth is corrected. Earlier releases forward such a channel without its
+        credential.
+    - timestamp: '2026-10-21T18:00:56Z'
+      title: Count records the filesystem loader skips in the storage load error metric
+      description: >-
+        A record the filesystem store skips at load is now counted in
+        agent_gateway_storage_load_errors_total with the reason invalid_json, migration_failed or
+        unreadable_record, so a skipped record is visible without reading logs.
+    - timestamp: '2026-10-29T12:00:00Z'
+      title: Answer invalid delegated credential headers with 500 on Access Points and Fabric
+      description: >-
+        A delegated credential that cannot be written as a valid header or into MCP metadata now
+        answers 500 with a fixed detail such as "Invalid delegated credential header" on an Access
+        Point, a sending gateway's Fabric leg and the receiving gateway of a Fabric route, which
+        answered 400 "Invalid MCP continuation". A Transit Point keeps refusing such a request
+        with 503, as it does any delegated credential it cannot resolve. Alerts that matched the
+        old 400 need updating.
+    - timestamp: '2026-10-29T09:00:00Z'
+      title: Run the same surface validation on create as on update
+      description: >-
+        Creating a surface skipped the source authentication, Trust Check and Workload Binding
+        checks that an update ran, so a POST could store a surface a later PUT refused. Create,
+        update, PATCH and the variant routes now share one validation, so a create that an update
+        would refuse now answers 400.
+    - timestamp: '2026-10-29T12:00:00Z'
+      title: Refuse surface routes that contain the $ or %24 variant separator
+      description: >-
+        Creating or updating a surface, or one of its variants, whose access_point.route contains
+        $ or %24 now fails with 400, because those characters separate a Surface Variant alias
+        from the route and such a route could never be reached as written. Change such a route
+        before the surface's next update.
+    - timestamp: '2026-10-29T16:00:00Z'
+      title: Report why an Access Point cannot serve its declaration
+      description: >-
+        The surface save report and GET /api/v1/surfaces/{id}/declarations now give an unservable
+        declaration a reason code (not_mcp, invalid_protected_resource,
+        incompatible_caller_authentication, root_variant_resource, resource_mismatch or
+        strategy_store_unavailable) instead of null, and the dashboard shows the fix for each one.
+        The card security metric carries the same code. Callers are refused with 503 as before.
+    - timestamp: '2026-10-29T16:00:00Z'
+      title: Name caller authentication, not MCP, when a Fabric A2A request is refused
+      description: >-
+        A request received over Fabric for an A2A or other non-MCP Access Point that cannot serve
+        its declaration, for example because the strategy store failed, was refused with 503 and
+        the detail Invalid MCP protected resource. It now gets Caller authentication unavailable,
+        as on the direct path, and the log no longer names MCP.
+  removed:
+    - timestamp: '2026-10-21T15:00:00Z'
+      title: Remove the OIDC Providers dashboard pages
+      description: >-
+        The OIDC Providers list and editor pages, their routes and header titles are removed because
+        the gateway has no matching API. Configure trust through JWT verification strategies and
+        credential providers.
+  security:
+    - timestamp: '2026-10-21T10:49:49Z'
+      title: Pin, bound and redact Client Credentials and JWT bearer token requests
+      description: >-
+        Gateway grants are sent on a client pinned to the token endpoint's vetted addresses with
+        redirects off and a 10 second timeout, read at most 64 KiB, and accept only a Bearer token
+        of at most 8 KiB. Token endpoint response bodies are no longer logged or put in errors,
+        audit details or responses; failures are reported as fixed categories. The consent flow's
+        code exchange and token refresh, and the refresh of a modern delegated credential, use the
+        same pinned client and size limit. A token endpoint that answers over 64 KiB or returns a
+        token over 8 KiB now fails the grant.
+    - timestamp: '2026-10-21T11:20:43Z'
+      title: Limit JWKS refetches and the size of accepted key sets
+      description: >-
+        A token with an unknown kid now triggers at most one JWKS refetch per strategy each minute,
+        concurrent requests share one fetch, and a failed fetch backs off for ten seconds, so
+        unauthenticated callers cannot drive repeated requests to the authorization server. JWKS
+        responses over 64 KiB, with more than 64 keys, with a repeated kid, or with a key missing
+        its kid in a multi-key set are rejected, by the cache and by the validate-jwks-uri probe
+        alike.
+    - timestamp: '2026-10-21T11:54:05Z'
+      title: Restrict and rate-limit outbound JWKS and discovery probes
+      description: >-
+        POST /v1/jwt-verification-strategies/validate-jwks-uri now needs
+        jwt_verification_strategies.edit instead of view, so a view-only role or access token gets
+        403. It, the new discover endpoint and saves that discover are limited to 10 probes per
+        user at once, replenished at one every 6 seconds (429 past that), log an audit event, report
+        failures as fixed codes that never carry a resolved address or transport error, and report
+        a host that does not resolve as blocked. Probes by a tenant-scoped access token, including
+        a save that discovers, accept only https and cannot reach loopback, private, link-local or
+        unique-local addresses, so the endpoints can no longer be used to map the appliance's
+        network. Other callers may still use http and private hosts, with cloud metadata addresses
+        blocked. Every probe reports a server that answers outside 2xx as http_status.
+    - timestamp: '2026-10-21T12:38:07Z'
+      title: Keep Target credentials inside the Target base path
+      description: >-
+        A Target Authentication credential, static secret included, is attached only when the
+        upstream URL stays on the Target origin and under its base path, as both the URL parser and
+        lenient routers resolve dot segments, or is the surface's agent card URL. A request whose
+        path climbs out with .. or %2e%2e is answered 502 instead of carrying the credential.
+    - timestamp: '2026-10-21T12:38:07Z'
+      title: Require same-tenant secrets for every credential provider type
+      description: >-
+        A tenant credential provider of any type, including authorization code and API key, can no
+        longer be saved with an appliance-wide secret, and an appliance-wide provider cannot use a
+        tenant secret. Moving a provider or secret to another tenant is refused when it would break
+        the rule, and the same check runs each time a provider reads a secret, so a provider stored
+        before this release that names such a secret fails at use. Operators copy shared secrets
+        into each tenant.
+    - timestamp: '2026-10-21T13:36:48Z'
+      title: Keep static_secret Target secrets inside the surface's tenant
+      description: >-
+        A tenant surface could name an appliance-wide secret in static_secret Target Authentication,
+        point its Target at a server it controls and read the operator's secret from the request.
+        The secret must now belong to the surface's tenant, on the Target and on Transit Points, and
+        an appliance-wide surface uses an appliance-wide secret. Saving such a surface is refused
+        with 400, moving the secret or surface to another tenant with 409, and a stored one is
+        answered 502 on every request whatever the fallback. MCP tool discovery lets a tenant caller
+        send only its own tenant's secret.
+    - timestamp: '2026-10-21T13:36:48Z'
+      title: Keep bound gateway credentials inside the surface's tenant
+      description: >-
+        An outbound_credentials or transit_credentials binding to an api_key,
+        oauth2_client_credentials or oauth2_jwt_bearer provider sends the gateway's own credential,
+        so a tenant surface could carry an appliance-wide key, or a token granted with the
+        operator's client secret or signing key, to an endpoint it chose. Such a provider must now
+        belong to the surface's tenant. Saving a surface that breaks the rule is refused with 400,
+        moving either record or retyping a provider into breaking it with 409, and a request that
+        meets such a binding is refused with 503 without requesting a token. Bindings to an
+        authorization code provider may still use an appliance-wide provider, because they inject
+        the consenting user's token.
+    - timestamp: '2026-10-21T14:25:49Z'
+      title: Build the receiving gateway's credentialed card fetch as its own GET
+      description: >-
+        On a surface with Target Authentication the receiving gateway answers a Fabric card fetch
+        with a GET it builds itself, with no caller body and only Accept, Accept-Language and
+        User-Agent from the caller, so a method override header, a body or a peer's Authorization
+        never rides on a credentialed request. The card path with a query stays uncredentialed.
+    - timestamp: '2026-10-21T15:10:00Z'
+      title: Send Target credentials without a caller only on the gateway's agent card fetch
+      description: >-
+        A public discovery read, such as a GET for a path ending in /discovery, skips caller
+        authentication. The receiving gateway of a Fabric route treated every such read as its own
+        agent card fetch and attached the Target credential, so an anonymous caller could reach any
+        Target path ending that way with the gateway's credential. Only a GET to exactly one of the
+        surface's agent card URLs now counts as the card fetch, on every path and for every Target
+        Authentication method.
+    - timestamp: '2026-10-29T09:00:00Z'
+      title: Refuse ID tokens on Access Points that require scopes
+      description: >-
+        When required_scopes is set, a token carrying nonce or at_hash, or whose typ header is
+        neither at+jwt, application/at+jwt nor JWT, fails as invalid, and a Google ID token minted
+        for the Access Point URL fails for lacking a scope. Access Points without required_scopes
+        keep their current token acceptance.
+    - timestamp: '2026-10-29T12:00:00Z'
+      title: Stop writing agent card bodies to the debug log
+      description: >-
+        Processing an Access Point's agent card no longer logs the Target's card and the rewritten
+        card in full at debug level, since a card can carry internal hosts and the Target's security
+        settings. The debug line now records the surface, the declaration outcome and strip reason,
+        and the card's size and SHA-256 digest.
+    - timestamp: '2026-10-29T19:43:01.000Z'
+      title: Pin every agent card fetch to an address the egress policy vetted
+      description: >-
+        The card route fetched an agent card without a Target credential through the shared
+        client, which did not check the egress policy, so a Target host resolving to a cloud
+        metadata address was read. Every card fetch from an http(s) Target is now pinned to the
+        vetted address, as the forward path is; a refused or unresolvable host answers 403 Request
+        blocked by egress policy and is recorded as a rejected request, and a 3xx answers 502
+        Upstream redirected. After upgrading, a card route whose Target host the egress policy
+        refuses stops serving the card; allow the host in the egress policy if the gateway is
+        meant to reach it. Earlier releases fetch an uncredentialed card without the egress check.
+    - timestamp: '2026-10-29T18:00:00Z'
+      title: Stop naming a deleted strategy or certificate in caller refusals
+      description: >-
+        A caller of a surface whose JWT verification strategy or mTLS trust certificate no longer
+        exists still gets the generic 500 the gateway answers for a missing configuration, but the
+        problem detail is now the fixed text Caller authentication is unavailable instead of the
+        configuration id. Only the gateway's own log names the id.
+  breaking:
+    - timestamp: '2026-10-21T15:10:00Z'
+      title: Copy appliance-wide secrets into the tenant of each tenant credential provider
+      description: >-
+        A tenant credential provider of any type, including Client Credentials, JWT bearer,
+        authorization code and API key, that references an appliance-wide secret now fails when it
+        obtains or refreshes a credential, so requests that need it are refused, and creating or
+        updating it is refused with 400, so a tenant cannot send appliance-wide secret material to
+        a token endpoint it controls. Before upgrading, create the secrets in the provider's tenant
+        and point the provider at them.
+    - timestamp: '2026-10-21T13:36:48Z'
+      title: Copy shared Target secrets and gateway providers into each surface's tenant
+      description: >-
+        A tenant surface whose static_secret Target Authentication names an appliance-wide secret
+        now answers 502 "Target authentication failed". One whose outbound_credentials or
+        transit_credentials bind an appliance-wide api_key, oauth2_client_credentials or
+        oauth2_jwt_bearer provider refuses every request that binding applies to with 503
+        "Delegated credentials unavailable". Updating such a surface is refused with 400. Before
+        upgrading, create the secret or provider in the surface's tenant and point the surface at
+        it.
+    - timestamp: '2026-10-29T12:00:00Z'
+      title: Grant jwt_verification_strategies.edit to roles that check JWKS URIs
+      description: >-
+        POST /v1/jwt-verification-strategies/validate-jwks-uri, the Check URI action in the strategy
+        editor, now needs jwt_verification_strategies.edit instead of view, and a role or access
+        token with view only gets 403. Before upgrading, grant the edit permission to roles and
+        tokens that rely on the check.
+    - timestamp: '2026-10-29T09:00:00Z'
+      title: Stop at startup on a prefix at the protected resource metadata path
+      description: >-
+        A channel, route of any type (redirect and static included) or MCP proxy prefix in
+        gateway.json at or under /.well-known/oauth-protected-resource now stops the gateway at
+        startup with exit code 2, and POST /v1/config/reload refuses such a configuration and keeps
+        the running one. Previously a prefix equal to that path made the listener log a warning
+        and stop publishing protected resource metadata, while its MCP Access Points kept
+        challenging callers with a metadata URL it did not serve; a prefix below the path started
+        normally and now stops the gateway too. Every listener now mounts the metadata path.
+        Rename the prefix before upgrading.
+    - timestamp: '2026-10-29T09:00:00Z'
+      title: Refuse surface routes on the protected resource metadata path
+      description: >-
+        Saving a surface whose route is /.well-known/oauth-protected-resource or a path below it
+        now fails with 400, because every inbound listener answers that path itself and the
+        Access Point could not be reached there. A stored surface with such a route, which earlier
+        releases served through a catch-all prefix of an empty path or /.well-known, is now logged
+        as an error naming the surface id and no longer mounted, at startup and on reload. Change
+        its route before upgrading.
+    - timestamp: '2026-10-29T09:00:00Z'
+      title: Drop Target challenges other than Payment on declaring and Fabric routes
+      description: >-
+        On any Access Point that declares itself a protected resource (an MCP Access Point with
+        protected_resource, or an Access Point of any protocol whose only caller authentication is
+        a pinned jwt_bearer method with required_scopes), and on any surface whose Target is a
+        fabric:// route, the gateway now removes every WWW-Authenticate challenge from the
+        Target's response except Payment and its own, because those challenges name an
+        authorization the caller cannot use through the gateway. A Target 401 left with no
+        challenge becomes 502, so the receiving gateway's 401 on a Fabric route now reaches the
+        caller as 502. Each dropped challenge is logged with its scheme. Access Points that do not
+        declare still pass the Target's challenges and status through. After upgrading, a client or
+        alert that matched 401 from a fabric:// route or a declaring Access Point must also match
+        502 with the detail "The target refused the gateway's authorization". The caller cannot fix
+        it: correct the credential the gateway injects toward the Target, or, on a Fabric route,
+        the one the sending gateway injects.
+    - timestamp: '2026-10-29T12:00:00Z'
+      title: Remove credential provider Target Authentication before downgrading
+      description: >-
+        Earlier releases cannot read a surface whose Target Authentication is credential_provider,
+        or a credential provider of type oauth2_jwt_bearer. On filesystem storage such a surface is
+        skipped at load and not served; on DynamoDB its Target Authentication is read as none and
+        requests are forwarded to the Target without the credential. A JWT bearer provider is
+        skipped, and bindings to it refuse requests with 503. Before downgrading, switch those
+        surfaces to static_secret or remove their Target Authentication, and delete or replace JWT
+        bearer providers, or restore a backup taken before the upgrade. Find them through the
+        management API, which reads either store: surfaces or variants whose target.auth.method is
+        credential_provider, and providers whose provider_type is oauth2_jwt_bearer.
