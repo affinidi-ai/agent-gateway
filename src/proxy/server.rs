@@ -1347,23 +1347,21 @@ fn get_or_create_outbound_channel_state(
 }
 
 /// The socket address a listener binds on `port`, from its `bind_address`, an
-/// IPv4 or IPv6 address.
+/// IPv4 or IPv6 address, the IPv6 one optionally in brackets.
 fn listener_socket_address(
     bind_address: &str,
     port: u16,
 ) -> anyhow::Result<SocketAddr> {
-    let ip: std::net::IpAddr = bind_address
-        .parse()
-        .map_err(|error| {
-            anyhow::anyhow!("Invalid bind_address '{bind_address}' for the listener on port {port}: {error}")
-        })?;
+    let ip = crate::config::network::parse_bind_address(bind_address).map_err(|error| {
+        anyhow::anyhow!("Invalid bind_address '{bind_address}' for the listener on port {port}: {error}")
+    })?;
     Ok(SocketAddr::new(ip, port))
 }
 
 /// The addresses the inbound listener on `port` binds: the distinct
 /// `bind_address` of every inbound listener configured for the port, the
-/// unspecified ones first (`::` before `0.0.0.0`), or every IPv4 interface when
-/// no inbound listener is configured for the port.
+/// unspecified ones first (`::` before `0.0.0.0`). A port without an inbound
+/// listener is an error rather than a bind on every interface.
 fn inbound_bind_addresses(
     network_config: &crate::config::NetworkConfig,
     port: u16,
@@ -1380,16 +1378,45 @@ fn inbound_bind_addresses(
         }
     }
     if addresses.is_empty() {
-        addresses.push(SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port)));
+        anyhow::bail!("No inbound listener is configured for port {port}");
     }
     addresses.sort_by_key(|address| (!address.ip().is_unspecified(), address.is_ipv4()));
     Ok(addresses)
 }
 
+/// Whether a listener bound on `bound` already accepts connections to
+/// `target`: `bound` is the unspecified address of the target's family, or the
+/// IPv6 unspecified address of a dual-stack socket (`only_v6` false) and the
+/// target is IPv4.
+fn bound_address_covers(
+    bound: SocketAddr,
+    bound_only_v6: bool,
+    target: SocketAddr,
+) -> bool {
+    bound.port() == target.port()
+        && bound.ip().is_unspecified()
+        && (bound.is_ipv4() == target.is_ipv4() || (bound.is_ipv6() && target.is_ipv4() && !bound_only_v6))
+}
+
+/// Whether a bound listener already accepts connections to `target`. A socket
+/// whose IPv6-only setting cannot be read is treated as IPv6-only.
+fn bound_listener_covers(
+    bound: &tokio::net::TcpListener,
+    target: SocketAddr,
+) -> bool {
+    let Ok(address) = bound.local_addr() else {
+        return false;
+    };
+    let only_v6 = address.is_ipv4()
+        || socket2::SockRef::from(bound)
+            .only_v6()
+            .unwrap_or(true);
+    bound_address_covers(address, only_v6, target)
+}
+
 /// Bind every inbound address of a port. An address the operating system
-/// reports in use once an unspecified address of the port is bound is already
-/// served by that one, as when an IPv6 wildcard also accepts IPv4, and is
-/// skipped.
+/// reports in use while a listener already bound on the port accepts its
+/// connections, as an IPv6 dual-stack wildcard does for IPv4, is skipped.
 async fn bind_inbound_listeners(addresses: &[SocketAddr]) -> anyhow::Result<Vec<tokio::net::TcpListener>> {
     let mut listeners: Vec<tokio::net::TcpListener> = Vec::new();
     for &address in addresses {
@@ -1397,11 +1424,9 @@ async fn bind_inbound_listeners(addresses: &[SocketAddr]) -> anyhow::Result<Vec<
             Ok(listener) => listeners.push(listener),
             Err(error)
                 if error.kind() == std::io::ErrorKind::AddrInUse
-                    && listeners.iter().any(|bound| {
-                        bound
-                            .local_addr()
-                            .is_ok_and(|bound| bound.ip().is_unspecified())
-                    }) =>
+                    && listeners
+                        .iter()
+                        .any(|bound| bound_listener_covers(bound, address)) =>
             {
                 info!(%address, "Inbound address is already served by the unspecified address bound on its port");
             }
@@ -2369,7 +2394,6 @@ mod tests {
             (8080, vec!["127.0.0.1:8080"]),
             (8443, vec!["[::1]:8443"]),
             (8081, vec!["0.0.0.0:8081"]),
-            (9999, vec!["0.0.0.0:9999"]),
             (8444, vec!["10.0.0.5:8444", "127.0.0.1:8444"]),
             (8445, vec!["[::]:8445", "0.0.0.0:8445", "127.0.0.1:8445"]),
             (8446, vec!["127.0.0.1:8446"]),
@@ -2388,6 +2412,40 @@ mod tests {
             );
         }
         assert_eq!(config.get_ports(), vec![8080, 8443, 8081, 8444, 8445, 8446]);
+        assert_eq!(
+            inbound_bind_addresses(&config, 9999)
+                .unwrap_err()
+                .to_string(),
+            "No inbound listener is configured for port 9999",
+            "a port without an inbound listener is never bound on every interface"
+        );
+        let outbound_only = make_network_config_with_listeners(vec![], vec![]);
+        assert!(inbound_bind_addresses(&outbound_only, 9000).is_err());
+    }
+
+    #[test]
+    fn a_bound_address_covers_only_what_its_socket_accepts() {
+        let address = |value: &str| {
+            value
+                .parse::<SocketAddr>()
+                .unwrap()
+        };
+        let dual_stack = false;
+        let ipv6_only = true;
+
+        assert!(bound_address_covers(address("0.0.0.0:80"), ipv6_only, address("127.0.0.1:80")));
+        assert!(bound_address_covers(address("0.0.0.0:80"), ipv6_only, address("0.0.0.0:80")));
+        assert!(bound_address_covers(address("[::]:80"), ipv6_only, address("[::1]:80")));
+        assert!(bound_address_covers(address("[::]:80"), dual_stack, address("0.0.0.0:80")));
+        assert!(bound_address_covers(address("[::]:80"), dual_stack, address("10.0.0.5:80")));
+
+        assert!(!bound_address_covers(address("[::]:80"), ipv6_only, address("0.0.0.0:80")));
+        assert!(!bound_address_covers(address("[::]:80"), ipv6_only, address("127.0.0.1:80")));
+        assert!(!bound_address_covers(address("0.0.0.0:80"), ipv6_only, address("[::1]:80")));
+        assert!(!bound_address_covers(address("0.0.0.0:80"), ipv6_only, address("[::]:80")));
+        assert!(!bound_address_covers(address("127.0.0.1:80"), ipv6_only, address("127.0.0.1:80")));
+        assert!(!bound_address_covers(address("[::1]:80"), dual_stack, address("127.0.0.1:80")));
+        assert!(!bound_address_covers(address("0.0.0.0:80"), ipv6_only, address("127.0.0.1:81")));
     }
 
     #[test]
@@ -2404,6 +2462,13 @@ mod tests {
             );
         }
         assert!(listener_socket_address("localhost", 9000).is_err());
+        assert!(listener_socket_address("[1.2.3.4]", 9000).is_err());
+        assert_eq!(
+            listener_socket_address("[::1]", 9000).unwrap(),
+            "[::1]:9000"
+                .parse::<SocketAddr>()
+                .unwrap()
+        );
         assert_eq!(
             format!("http://{}", listener_socket_address("::1", 9000).unwrap()),
             "http://[::1]:9000",

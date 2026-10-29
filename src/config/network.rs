@@ -126,6 +126,22 @@ pub struct Listener {
     pub listener_type: String,
 }
 
+const LISTENER_TYPES: [&str; 2] = ["inbound", "outbound"];
+
+/// The IP address of a listener `bind_address`: an IPv4 or IPv6 address, the
+/// IPv6 one optionally in brackets (`[::1]`). Host names are not accepted.
+pub(crate) fn parse_bind_address(bind_address: &str) -> Result<std::net::IpAddr, std::net::AddrParseError> {
+    match bind_address
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+    {
+        Some(inner) => inner
+            .parse::<std::net::Ipv6Addr>()
+            .map(std::net::IpAddr::V6),
+        None => bind_address.parse(),
+    }
+}
+
 /// A channel prefix configuration for proxy routes
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelPrefix {
@@ -408,21 +424,27 @@ fn validate_listener_set(listeners: &[Listener]) -> anyhow::Result<()> {
         if !ids.insert(l.id.as_str()) {
             anyhow::bail!("Invalid network config: duplicate listener id '{}'", l.id);
         }
-        if l.bind_address
-            .parse::<std::net::IpAddr>()
-            .is_err()
-        {
+        if !LISTENER_TYPES.contains(&l.listener_type.as_str()) {
             anyhow::bail!(
-                "Invalid network config: listener '{}' bind_address '{}' is not an IP address",
+                "Invalid network config: listener '{}' listener_type '{}' is not one of {}",
                 l.id,
-                l.bind_address
+                l.listener_type,
+                LISTENER_TYPES.join(", ")
             );
         }
     }
 
-    let mut sockets: HashSet<(&str, u16)> = HashSet::new();
+    let mut sockets: HashSet<(std::net::IpAddr, u16)> = HashSet::new();
     for l in listeners {
-        if !sockets.insert((l.bind_address.as_str(), l.port)) {
+        let Ok(ip) = parse_bind_address(&l.bind_address) else {
+            anyhow::bail!(
+                "Invalid network config: listener '{}' bind_address '{}' is not an IP address (IPv6 may be \
+                 written in brackets; host names are not accepted)",
+                l.id,
+                l.bind_address
+            );
+        };
+        if !sockets.insert((ip, l.port)) {
             anyhow::bail!(
                 "Invalid network config: duplicate listener bind address {}:{} (listener id '{}')",
                 l.bind_address,
@@ -490,6 +512,50 @@ mod listener_validation_tests {
             assert!(err.contains("is not an IP address"), "{bind}: {err}");
         }
         validate_listener_set(&[listener("a", "::1", 8080), listener("b", "127.0.0.1", 8081)]).unwrap();
+    }
+
+    #[test]
+    fn a_bracketed_ipv6_bind_address_is_accepted() {
+        validate_listener_set(&[listener("a", "[::1]", 8080), listener("b", "[::]", 8081)]).unwrap();
+        assert_eq!(parse_bind_address("[::1]"), Ok(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)));
+        assert_eq!(parse_bind_address("::1"), Ok(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)));
+    }
+
+    #[test]
+    fn a_bracketed_non_ipv6_bind_address_is_rejected() {
+        for bind in ["[1.2.3.4]", "[localhost]", "[[::1]]", "[::1", "::1]", "localhost"] {
+            let err = validate_listener_set(&[listener("a", bind, 8080)])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(&format!("bind_address '{bind}' is not an IP address")), "{bind}: {err}");
+            assert!(err.contains("host names are not accepted"), "{bind}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_bracketed_and_bare_forms_of_one_address_are_one_socket() {
+        let err = validate_listener_set(&[listener("a", "[::1]", 8080), listener("b", "::1", 8080)])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("duplicate listener bind address ::1:8080"), "got: {err}");
+    }
+
+    #[test]
+    fn an_unknown_listener_type_is_rejected() {
+        for listener_type in ["Outbound", "INBOUND", "", "egress"] {
+            let mut unknown = listener("a", "0.0.0.0", 8080);
+            unknown.listener_type = listener_type.to_string();
+            let err = validate_listener_set(&[unknown])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!("listener 'a' listener_type '{listener_type}' is not one of inbound, outbound")),
+                "{listener_type}: {err}"
+            );
+        }
+        let mut outbound = listener("b", "127.0.0.1", 9000);
+        outbound.listener_type = "outbound".to_string();
+        validate_listener_set(&[listener("a", "0.0.0.0", 8080), outbound]).unwrap();
     }
 }
 

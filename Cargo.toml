@@ -72,6 +72,8 @@ tonic = { version = "0.14", default-features = false }
 anyhow = "1.0.100"
 thiserror = "2.0"
 libc = "0.2"
+# Reads a bound socket's IPv6-only setting; already in the dependency tree via tokio
+socket2 = "0.6.4"
 
 # Additional utilities
 bytes = "1.5"

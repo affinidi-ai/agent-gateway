@@ -747,6 +747,7 @@ dependencies = [
  "serde_yaml",
  "sha2 0.10.9",
  "sha256",
+ "socket2 0.6.4",
  "solana-client",
  "solana-sdk",
  "solana-transaction-status",

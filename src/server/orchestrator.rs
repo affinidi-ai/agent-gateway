@@ -3946,7 +3946,7 @@ pub async fn run_axum_proxy(
                     "HTTP (plain)"
                 }
             );
-            info!("Starting port listener on 0.0.0.0:{} for {} channel(s)", port, channels.len());
+            info!("Starting port listener on port {} for {} channel(s)", port, channels.len());
             for surface in &channels {
                 info!(
                     "  -> Channel '{}' route: {} -> {}",
