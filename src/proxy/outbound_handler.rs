@@ -605,11 +605,21 @@ impl OutboundPipelineContext {
             })?;
         let variant_changes_enforced_policy =
             changes_enforced_transit_policy(&matched_virtual_channel, &virtual_channel);
-        let outbound_shared = surface
+        let base_source_auth = outbound_shared
+            .source_auth
+            .clone();
+        let mut outbound_shared = surface
             .transit
             .as_ref()
             .map(|t| t.shared.clone())
             .unwrap_or(outbound_shared);
+        // A complete variant replaces the shared block; the base source_auth refusal still applies.
+        if outbound_shared
+            .source_auth
+            .is_none()
+        {
+            outbound_shared.source_auth = base_source_auth;
+        }
 
         // Per-VC identity override: when this outbound virtual channel
         // declares its own `managed_identity`, build a per-VC selector
@@ -8665,6 +8675,73 @@ mod tests {
         assert!(
             ctx.virtual_channel
                 .header_metadata_mapping
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_complete_variant_does_not_lift_the_base_transit_source_auth() {
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+            "surface_id": "surface-complete-variant",
+            "name": "complete-variant",
+            "description": "",
+            "access_point": {
+                "listen_address": "0.0.0.0:8443",
+                "route": "/surfaces/order",
+                "protocol": "a2a"
+            },
+            "target": { "endpoint": "https://managed.example/a2a" },
+            "transit": {
+                "points": [{
+                    "id": "tp-base",
+                    "alias": "partner-a",
+                    "target_endpoint": "https://base.example/a2a",
+                    "protocol": "a2a"
+                }],
+                "source_auth": {
+                    "type": "api_key",
+                    "extraction": { "source": "http_header", "field": "X-API-Key" },
+                    "secret_id": "transit-caller-key"
+                }
+            },
+            "variants": [{
+                "id": "variant-snapshot",
+                "alias": "snapshot",
+                "name": "Snapshot",
+                "enabled": true,
+                "overrides": { "complete": true, "transit": { "shared": {} } }
+            }]
+        }))
+        .expect("surface should deserialize");
+        let state = test_outbound_state();
+        state
+            .channel_state
+            .write()
+            .unwrap()
+            .surface = Arc::new(surface);
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/outbound/surfaces/order$snapshot/partner-a/message/send")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let ctx = OutboundPipelineContext::new(
+            "127.0.0.1:12345"
+                .parse()
+                .unwrap(),
+            req,
+            &state,
+        )
+        .expect("context should resolve the complete variant");
+
+        assert_eq!(
+            ctx.active_variant_alias
+                .as_deref(),
+            Some("snapshot")
+        );
+        assert!(
+            ctx.outbound_shared
+                .source_auth
                 .is_some()
         );
     }
