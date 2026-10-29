@@ -480,6 +480,25 @@ fn parse_fabric_target(fabric_target: &str) -> Result<(&str, &str), FabricForwar
     Ok((gateway_id, channel_id))
 }
 
+/// The body of the `ForwardRequest` sending `req` to `channel_id`, the part of
+/// the `fabric://` Target after the gateway id.
+fn forward_request_body(
+    channel_id: &str,
+    req: &FabricForwardRequest<'_>,
+    body: serde_json::Value,
+    deadline_ms: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "channel_id": channel_id,
+        "method": req.method.as_str(),
+        "path": req.path,
+        "headers": req.headers,
+        "body": body,
+        "trace_id": req.trace_id,
+        "deadline_ms": deadline_ms,
+    })
+}
+
 /// Forward a prepared request to a remote gateway channel over `fabric://`
 /// and synchronously await its `ForwardResponse`.
 pub(crate) async fn forward_via_fabric(
@@ -544,15 +563,7 @@ pub(crate) async fn forward_via_fabric(
         MessageType::ForwardRequest
             .as_str()
             .to_string(),
-        serde_json::json!({
-            "channel_id": channel_id,
-            "method": req.method.as_str(),
-            "path": req.path,
-            "headers": req.headers,
-            "body": body_value,
-            "trace_id": req.trace_id,
-            "deadline_ms": deadline_ms,
-        }),
+        forward_request_body(channel_id, &req, body_value, deadline_ms),
     )
     .from(
         gateway_listener

@@ -10309,6 +10309,49 @@ fn fabric_mcp_gate_input(
     serde_json::to_value(&policy_input).unwrap_or_default()
 }
 
+/// Where a request to a `fabric://{gateway_id}/{channel_id}` Target goes: the
+/// peer gateway and surface, the variant alias sent with a `ForwardRequest`,
+/// and the target a framed stream opens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FabricSendRoute {
+    gateway_id: String,
+    channel_id: String,
+    variant_alias: Option<String>,
+    stream_target: String,
+}
+
+/// The [`FabricSendRoute`] of a request to `request_path` on `surface`, or
+/// `None` when the Target is not a valid `fabric://` URL.
+fn fabric_send_route(
+    surface: &crate::config::agent_surface::AgentSurface,
+    request_path: &str,
+) -> Option<FabricSendRoute> {
+    let endpoint = &surface.target.endpoint;
+    let mut parts = endpoint
+        .strip_prefix("fabric://")?
+        .split('/');
+    let gateway_id = parts.next()?;
+    let channel_id = parts.next()?;
+    let variant_alias = crate::proxy::route_variant::extract_variant_alias_for_route(
+        request_path,
+        surface
+            .access_point
+            .route
+            .as_str(),
+    )
+    .and_then(|alias| alias);
+    let stream_target = match variant_alias.as_deref() {
+        Some(alias) if !endpoint.contains('$') => format!("{endpoint}${alias}"),
+        _ => endpoint.clone(),
+    };
+    Some(FabricSendRoute {
+        gateway_id: gateway_id.to_string(),
+        channel_id: channel_id.to_string(),
+        variant_alias,
+        stream_target,
+    })
+}
+
 /// Handle requests through the fabric:// protocol by forwarding via gateway
 async fn handle_fabric_request(
     state: ProxyState,
@@ -10386,13 +10429,7 @@ async fn handle_fabric_request(
     channel_debug!(config_id, "  ↳ Query: {:?}", uri.query());
     channel_debug!(config_id, "  ↳ Path and Query: {:?}", uri.path_and_query());
 
-    // Parse fabric://{gateway_id}/{channel_id}
-    let fabric_path = &state.surface.target.endpoint[9..]; // Remove "fabric://"
-    let parts: Vec<&str> = fabric_path
-        .split('/')
-        .collect();
-
-    if parts.len() < 2 {
+    let Some(fabric_route) = fabric_send_route(&state.surface, uri.path()) else {
         channel_error!(config_id, "Invalid fabric URL format: {}", state.surface.target.endpoint);
         connection_guard
             .decrement()
@@ -10401,10 +10438,13 @@ async fn handle_fabric_request(
             StatusCode::BAD_REQUEST,
             "Invalid fabric URL format. Expected: fabric://{gateway_id}/{channel_id}",
         ));
-    }
-
-    let gateway_id = parts[0];
-    let channel_id = parts[1];
+    };
+    let gateway_id = fabric_route
+        .gateway_id
+        .as_str();
+    let channel_id = fabric_route
+        .channel_id
+        .as_str();
 
     channel_info!(config_id, "Fabric - forwarding to gateway {} channel {}", gateway_id, channel_id);
 
@@ -12264,37 +12304,13 @@ async fn handle_fabric_request(
         }
     };
 
-    // Extract variant alias from the request path (for fabric routing).
-    // This allows GW2 to resolve the same surface variant on its side.
-    // URL grammar: `/route$alias/...` (suffix on the route, see plan §2.3).
-    let virtual_channel_alias = crate::proxy::route_variant::extract_variant_alias_for_route(
-        uri.path(),
-        state
-            .surface
-            .access_point
-            .route
-            .as_str(),
-    )
-    .and_then(|a| a);
+    let virtual_channel_alias = fabric_route
+        .variant_alias
+        .clone();
 
     let (modern_upstream, forward_result) = if modern_request.is_some() {
         crate::mcp::modern_http::strip_protocol_session_headers(&mut stream_headers);
-        let stream_target = match virtual_channel_alias.as_deref() {
-            Some(alias)
-                if !state
-                    .surface
-                    .target
-                    .endpoint
-                    .contains('$') =>
-            {
-                format!("{}${alias}", state.surface.target.endpoint)
-            }
-            _ => state
-                .surface
-                .target
-                .endpoint
-                .clone(),
-        };
+        let stream_target = &fabric_route.stream_target;
         let header_timeout = state
             .surface
             .timeout()
@@ -12310,7 +12326,7 @@ async fn handle_fabric_request(
         let response = crate::proxy::fabric_forward::forward_stream_via_fabric(
             &state.listener_manager,
             crate::proxy::fabric_forward::FabricStreamForwardRequest {
-                fabric_target: &stream_target,
+                fabric_target: stream_target,
                 path: path_and_query,
                 headers: stream_headers,
                 body: body_bytes.clone(),
