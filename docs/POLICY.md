@@ -553,8 +553,15 @@ stored. They do not record which policy a request ends up under:
 - A variant saved with `complete: true` (the surface builder saves every variant this way)
   replaces the base wholesale, so a policy it does not set is cleared for its traffic. Its
   records show only the policies it sets.
-- A variant's transit overrides (shared or per transit point) are recorded as written, but the
-  runtime compiles transit policies from the base surface only, so they are not enforced.
+- A variant's shared transit overrides are recorded as written, but the runtime compiles
+  transit policies from the base surface only, so they are not enforced. A variant's Transit
+  Point cannot change the `policy` or `response_policy` of the surface's Transit Point of the
+  same alias: the admin API refuses such a write with `400`, also when the surface has no
+  Transit Point of that alias, and a stored variant whose Transit Point sets a different
+  one has the requests through that Transit Point refused with `403`. A variant Transit
+  Point that leaves them out is enforced with the surface Transit Point's policies. See
+  [`MCP_TOOL_GATING.md`](MCP_TOOL_GATING.md), which applies the same rule to
+  `mcp_tool_gating`.
 
 What actually decided a request is in its `policy_decision` records.
 

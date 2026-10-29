@@ -93,7 +93,8 @@ changes:
     - timestamp: '2026-10-28T00:00:00.000Z'
       title: Write the gateway's key files atomically with owner-only permissions
       description: >-
-        The gateway's key files (DID keys, VC issuer keys and the transit token key) are now
+        The gateway's key files (identity DID keys, issuer DID keys, VC issuer keys,
+        Connection Point DID keys, trust registry DID keys and the transit token key) are now
         written readable by their owner only and replaced atomically, including when
         encryption at rest is turned on, so an instance starting beside another no longer
         reads a partly written file and fails to start; an instance that finds a key file
@@ -147,9 +148,9 @@ changes:
     - timestamp: '2026-10-28T00:00:00.000Z'
       title: Refuse transit tokens issued before the upgrade or by an unshared instance
       description: >-
-        Transit tokens issued before the upgrade are refused once, so a managed agent's
-        Transit Point calls fail until its next inbound request brings a new token, at
-        most five minutes later. Gateway instances that do not share `[storage_paths]
+        Every transit token issued before the upgrade is refused, so a managed agent's
+        Transit Point calls fail until its next inbound request brings a new token; an older
+        token would have expired within five minutes anyway. Gateway instances that do not share `[storage_paths]
         vc_keys` no longer accept each other's transit tokens; route a managed agent's
         Transit Point calls to an instance sharing that directory with the one that served
         its inbound request. During a rolling upgrade, instances on the old and new versions
@@ -167,10 +168,9 @@ changes:
       description: >-
         MCP tool gating is compiled from a surface's own Transit Points only, so a variant's
         Transit Point is gated by the surface's Transit Point of the same alias. A variant
-        Transit Point that sets `mcp_tool_gating` where the surface's Transit Point of that
-        alias sets none, or that the surface does not have, now refuses every `tools/call`
-        and answers `tools/list` with no tools, as a per-Transit-Point policy set only on a
-        variant is already refused. Move such gating to the surface's Transit Point.
+        whose Transit Point's gating differs from it is refused, as described for variant
+        Transit Point gating and policies. Move gating set only on a variant's Transit Point to
+        the surface's Transit Point.
     - timestamp: '2026-10-28T00:00:00.000Z'
       title: Remove `transit.source_auth` from surfaces to serve their Transit Points again
       description: >-
@@ -208,19 +208,49 @@ changes:
         `application/problem+json` body otherwise, where the gateway used to answer `503` in
         plain text.
     - timestamp: '2026-10-28T00:00:00.000Z'
-      title: Forward Transit Point discovery reads without a delegated credential
+      title: Forward a `HEAD` of a Transit Point discovery document without credentials
       description: >-
-        A `GET` of a public discovery path, such as an agent card, through a Transit Point with
-        credential bindings used to carry the delegated credential when its transit token named
-        a caller. It is now always forwarded without one, as it is without the `target_auth`
-        credential, because the gateway does not check a transit token on such a read.
+        A `HEAD` of a discovery document, such as an agent card, through a Transit Point needed a
+        transit token and, on a Transit Point with credential bindings, carried the delegated
+        credential of the caller the token named. It is now handled like a `GET`: no transit
+        token is checked and it is forwarded without the delegated credential, as it already
+        was without the `target_auth` one.
+        A target that answered such a `HEAD` only with the credential now answers it as it
+        answers an anonymous `GET`. Which paths count as discovery documents is described in
+        `docs/SOURCE_AUTH.md`.
     - timestamp: '2026-10-28T00:00:00.000Z'
       title: Check inbound listener `bind_address` values before upgrading
       description: >-
         An inbound listener whose `bind_address` is not `0.0.0.0` now accepts connections on
         that address only, so a listener set to `127.0.0.1` is no longer reachable from other
-        hosts. Inbound listeners used to ignore their `bind_address`; one that is not an IP
-        address now stops the gateway from loading its network configuration, and one the host
-        does not own, such as an Elastic IP or a NAT address, now stops that port from serving,
+        hosts. Inbound listeners used to ignore their `bind_address`; one the host does not own,
+        such as an Elastic IP or a NAT address, now stops that port from serving,
         the management API and dashboard included when they are on it. The example
         configuration and Docker setup bind `0.0.0.0` and are unaffected.
+    - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Use an IP address, not a host name, as every listener's `bind_address`
+      description: >-
+        A listener whose `bind_address` is not an IP address, such as `localhost` or
+        `gateway.internal`, now stops the gateway from loading its network configuration, on
+        inbound and outbound listeners alike. Inbound listeners used to ignore the value, so a
+        host name there went unnoticed. Replace a host name with the address it should bind,
+        such as `127.0.0.1` for `localhost`, or `0.0.0.0` for every interface, before upgrading.
+    - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Stop passing cookies and auth challenges between agent and Transit Point target
+      description: >-
+        A Transit Point no longer passes the managed agent's `Cookie` to its target, or the
+        target's `Set-Cookie` and `WWW-Authenticate` to the agent. A target or load balancer
+        that relies on cookies across a managed agent's calls, such as for session stickiness,
+        no longer receives them, so make it work without cookies or route by another header. An
+        MCP client in the managed agent that authenticates to the target itself no longer sees
+        the target's `WWW-Authenticate` challenge, so it cannot discover the target's OAuth
+        authorization server through the Transit Point; give the Transit Point a `target_auth`
+        or credential binding instead.
+    - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Send a target key through `target_auth`, not a managed agent header of that name
+      description: >-
+        A Transit Point no longer forwards a managed agent header named like its `target_auth`
+        header, so a managed agent that sent its own key under that name, as when
+        `target_auth` uses `fallback: passthrough` or names the header the agent already used,
+        no longer reaches the target with it. Store that key as the `target_auth` secret, or
+        have the agent send it under another header name.

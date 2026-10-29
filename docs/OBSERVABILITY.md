@@ -84,6 +84,15 @@ with `method_era` showing which method names they send. Requests later refused b
 request-shape validation are counted under their negotiated version. Fabric traffic is counted on
 the sending gateway only (see [Fabric coverage gap](PROTOCOLS.md#fabric-coverage-gap)).
 
+## Transit Point call outcomes
+
+A Transit Point call that reaches the forward step is recorded in the dashboard's traffic as
+successful only when the target answers with a 2xx and, on a streamed MCP response, the stream
+completes. It is recorded as failed when the target answers with another status, the stream
+fails, the target cannot be reached or does not answer in time, or the gateway cannot read or
+process its response, as when a `2026-07-28` MCP response is not valid MCP. A streamed response that the managed agent stops reading before
+it ends is not recorded.
+
 ## Logging initialization
 
 Logging is initialized after the encryption service so secret-backed OTLP headers can be resolved.

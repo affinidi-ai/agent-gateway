@@ -1,0 +1,187 @@
+branch: fix/transit-point-review-follow-ups
+changes:
+  added:
+    - timestamp: '2026-10-29T12:00:00Z'
+      title: Accept a bracketed IPv6 listener `bind_address` such as `[::1]`
+      description: >-
+        A listener's `bind_address` may now write an IPv6 address in brackets, such as `[::1]`
+        or `[::]`, as it appears in URLs. The bracketed and bare forms name the same socket, so
+        two listeners using both on one port are refused as duplicates.
+  changed: []
+  fixed:
+    - timestamp: '2026-10-29T12:00:00Z'
+      title: Send non-ASCII credential header values to a Transit Point's HTTP target
+      description: >-
+        A Transit Point dropped a `target_auth` or delegated credential header whose value was
+        not ASCII, so an HTTP target received the request without the credential. Such a value
+        now reaches an HTTP target byte for byte. A Fabric target can carry only text values, so
+        a Transit Point now refuses a Fabric request whose `target_auth` header cannot be carried
+        with `502`, and one whose delegated credential header cannot be carried with `503`,
+        instead of forwarding it without the credential.
+    - timestamp: '2026-10-29T12:00:00Z'
+      title: Answer MCP Transit Point credential failures with a JSON-RPC error
+      description: >-
+        An MCP Transit Point whose `target_auth` credential cannot be resolved or sent, or whose
+        custom metadata cannot be injected, now answers with a JSON-RPC error (`-32603`)
+        carrying the request's id, with the same `502` or `500` status, instead of a problem
+        JSON body that an MCP client cannot match to its request.
+    - timestamp: '2026-10-29T12:00:00Z'
+      title: Record unreachable and timed-out Transit Point calls as failed
+      description: >-
+        A Transit Point call whose target could not be reached, did not answer in time, or
+        answered with a response the gateway could not read or process, such as an invalid
+        `2026-07-28` MCP response, was not recorded in the dashboard's traffic, so a failing
+        target looked idle. These calls are now recorded as failed.
+    - timestamp: '2026-10-29T12:00:00Z'
+      title: Never serve a deleted or disabled surface's Transit Points after a reload
+      description: >-
+        A reload placed every surface that was not disabled on its outbound listener, a deleted
+        one included, and returned before a rebuilt outbound listener had registered its
+        surfaces, so a surface deleted right after the reload was not retired there and its
+        Transit Points stayed in service. Only active surfaces are now served, and a reload
+        returns once each rebuilt outbound listener has registered its surfaces.
+    - timestamp: '2026-10-29T12:00:00Z'
+      title: Refuse requests to a disabled or deleted surface on a kept-alive connection
+      description: >-
+        A connection kept alive on a TLS inbound listener across a reload kept serving the
+        Access Point of a surface that had since been disabled or deleted, from the copy it
+        held. Such a request is now refused with `404`, as on a new connection.
+    - timestamp: '2026-10-29T12:00:00Z'
+      title: Evict a disabled surface's policies, tool gating, limiters and circuit breaker
+      description: >-
+        Disabling a surface left its compiled policies, MCP tool gating and rate limiters in
+        memory, and deleting one left its circuit breaker, so a surface enabled again or created
+        under the same id started from the old state. Disabling or deleting a surface now evicts
+        all of them, its variants' and Transit Points' included.
+    - timestamp: '2026-10-29T12:00:00Z'
+      title: Fail instead of keeping two transit token keys when encryption settings differ
+      description: >-
+        Two instances sharing `[storage_paths] vc_keys` that disagree on encryption at rest
+        could each create a transit token key at the same time, one plaintext and one
+        encrypted, and then refuse each other's tokens. The instance that finds the other form
+        beside the file it created now removes its own and fails to start with an error saying
+        so. The directory is also synced after a secret file is created, so a crash cannot lose
+        the new key after it was used.
+    - timestamp: '2026-10-29T12:00:00Z'
+      title: Report IPv4 callers of a dual-stack listener in IPv4 form
+      description: >-
+        An IPv4 caller of a listener bound to `::` on a dual-stack host, and an IPv4-mapped
+        address in `X-Forwarded-For`, were recorded as `::ffff:a.b.c.d`. The resolved client IP
+        used by the login limits and request records is now `a.b.c.d`.
+    - timestamp: '2026-10-29T12:00:00Z'
+      title: Keep the `transit.source_auth` refusal under every surface variant
+      description: >-
+        A complete variant whose shared transit settings left `source_auth` out served the
+        Transit Points of a surface that sets `transit.source_auth`, which every other route
+        refuses with `503`; it is now refused too. Loading a surface whose variant sets
+        `transit.shared.source_auth` now logs the same warning as one set on the surface.
+    - timestamp: '2026-10-29T12:00:00Z'
+      title: Bind only configured listener addresses, whatever their address family
+      description: >-
+        A port that no inbound listener names is no longer bound on `0.0.0.0` and is reported as
+        an error instead. A bind the operating system reports as in use is skipped only when a
+        listener already bound on the port accepts its connections, where an IPv6 wildcard covers
+        IPv4 only on a dual-stack socket, so an address that is not served is no longer skipped
+        silently.
+  removed: []
+  security:
+    - timestamp: '2026-10-29T12:00:00Z'
+      title: ⭐ Leave configured key and secret paths out of support exports
+      description: >-
+        The redacted `.atgx` storage export left out secret directories only by their default
+        names, so a `vc_keys` directory configured under another name, holding the transit token
+        signing key and issuer keys, was exported unencrypted inside the export. The export now
+        leaves out the paths configured for `identities`, `secrets`, `vc_keys`, `passkeys`,
+        `apikeys`, `certificates`, `sessions`, `avatars`, `delegation_vault` and
+        `identity_hash_pepper`, matched by resolved path, and every `transit_token_key.json`
+        file in either form by name. Treat earlier exports of a gateway with renamed storage
+        paths as holding its keys.
+    - timestamp: '2026-10-29T12:00:00Z'
+      title: Withhold agent headers named like a Transit Point's delegated credentials
+      description: >-
+        A Transit Point forwarded a managed agent header named like a delegated credential
+        binding's `custom_header` whenever the gateway did not add the credential itself, as for
+        a binding scoped to tools, so the agent could send the target a credential of its
+        choosing under that name, or a second value beside the gateway's. Every value of such a
+        header, compared without regard to case, is now withheld on every request.
+    - timestamp: '2026-10-29T12:00:00Z'
+      title: Send the target one value of each Access Point credential header
+      description: >-
+        An Access Point and Fabric receive forwarded a caller header named like the Target's
+        `target_auth` header, and added the gateway's `target_auth` and delegated credential
+        headers beside any caller value, so the target could receive the caller's value first.
+        A caller header named like the `target_auth` header is now never forwarded, including
+        `Authorization` kept by `forward_source_auth_header`, and each credential header the
+        gateway adds replaces every caller value. A caller that sent the target its own key
+        under the `target_auth` header name must now rely on the gateway's.
+    - timestamp: '2026-10-29T12:00:00Z'
+      title: Withhold `Set-Cookie2` and `Authentication-Info` from Transit Point responses
+      description: >-
+        A Transit Point already kept a target's `Set-Cookie` and `WWW-Authenticate` from the
+        managed agent; it now also withholds `Set-Cookie2` and `Authentication-Info`, which
+        carry the same kind of session and authentication state.
+    - timestamp: '2026-10-29T12:00:00Z'
+      title: Stop naming the missing identity or failure detail in credential refusals
+      description: >-
+        A Transit Point's `403` delegated credential refusal said which identity was missing,
+        and an Access Point's `502` under `target_auth` `fallback: reject` included the error
+        detail, on the direct and Fabric send paths. Both now give only a generic message,
+        `Delegated credentials are not available for this request` and `Target authentication
+        failed`; the reason is logged.
+    - timestamp: '2026-10-29T12:00:00Z'
+      title: Refuse every token-requiring Transit Point request without a token issuer
+      description: >-
+        A gateway with no transit token issuer forwarded Transit Point requests other than
+        `2026-07-28` MCP without checking a transit token. Every request that needs a token is
+        now refused with `401`. A gateway that starts normally always has an issuer.
+  breaking:
+    - timestamp: '2026-10-29T12:00:00Z'
+      title: Refuse Transit Point requests naming an unknown or unresolvable variant
+      description: >-
+        A Transit Point request whose route names a variant the surface does not have is now
+        refused with `404`, and one whose variant is disabled or whose default variant reference
+        is broken with `503`, on every protocol, before the target is called. Only `2026-07-28`
+        MCP requests were refused before; others were forwarded through the base surface's
+        Transit Point. An MCP Transit Point answers with a JSON-RPC error (`-32603`) carrying
+        the request's id, any other with a problem JSON body. Point managed agents at a variant
+        alias that exists and is enabled, or at the base route.
+    - timestamp: '2026-10-29T12:00:00Z'
+      title: Refuse variant Transit Points that change the surface's gating or policies
+      description: >-
+        A variant's Transit Point is enforced with the `mcp_tool_gating`, `policy` and
+        `response_policy` of the surface's Transit Point of the same alias. The admin API now
+        refuses with `400` a variant Transit Point that sets any of them to something else, or
+        sets one where the surface has no Transit Point of that alias. A stored variant
+        whose Transit Point sets a different one has every request through it refused with
+        `403`, instead of silently running the surface Transit Point's. A variant Transit Point
+        that leaves them out keeps the surface Transit Point's. Move any variant-only gating or
+        policy to the surface's Transit Point.
+    - timestamp: '2026-10-29T12:00:00Z'
+      title: Refuse a tool call whose `elicit` consent is declined or cannot be asked
+      description: >-
+        A tool call whose `elicit` binding was declined, cancelled or not answered within
+        `elicit_timeout_secs`, and under `elicit_fallback: fail` one from a client without the
+        elicitation capability or without an open SSE stream, was forwarded without the
+        delegated credential. It is now refused as a credential that cannot be resolved: an
+        Access Point answers `503` with a JSON-RPC error (`-32603`). A client must accept the
+        prompt to have the call forwarded; use `elicit_fallback: on_demand` to answer a client
+        that cannot be prompted with the consent link instead.
+    - timestamp: '2026-10-29T12:00:00Z'
+      title: Reject a listener `listener_type` other than `inbound` or `outbound`
+      description: >-
+        A listener whose `listener_type` was anything else, `Outbound` or `egress` included, was
+        accepted and then served as an inbound listener on some paths and ignored on others. It
+        now stops the gateway from loading its network configuration. Write `inbound` or
+        `outbound`, in lower case, before upgrading; leaving the field out still means
+        `inbound`.
+    - timestamp: '2026-10-29T12:00:00Z'
+      title: Require a transit token for discovery documents below a Transit Point's root
+      description: >-
+        A Transit Point skipped the transit token, and withheld the `target_auth` and delegated
+        credentials, for any `GET` whose path ended like a discovery document, such as
+        `admin/discovery` or `tools/agent.json`, and for spellings a target could resolve to
+        another path. Only a `GET` or `HEAD` of `.well-known/agent-card.json`,
+        `.well-known/agent.json`, `.well-known/agent-card`, `.well-known/ucp`,
+        `agent-card.json`, `agent.json` or `discovery` directly below the Transit Point now
+        counts. Any other path needs a transit token and carries the credentials, so a managed
+        agent that fetched such a path without a token must now send one.

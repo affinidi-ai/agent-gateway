@@ -128,12 +128,13 @@ from a surface's Access Point and from each Transit Point, and a Transit Point
 or MCP Proxy that still carries it is served without it. Protect every endpoint
 that relies on it another way, or disable it, before downgrading.
 
-Admitted modern Transit requests do not use the legacy base-surface fallback
-when a requested variant is absent, disabled or has a broken default reference.
-Unknown aliases return a correlated `404`; disabled or misconfigured defaults
-return `503`, before Target work. Fabric Open likewise rejects a named alias
-that is absent even when the variant catalog is empty. Legacy resolution is
-unchanged.
+A Transit Point request, on every protocol and MCP revision, does not fall back
+to the base surface when a requested variant is absent, disabled or has a broken
+default reference. An unknown alias returns `404`; a disabled variant or a
+misconfigured default returns `503`, before Target work. An MCP Transit Point
+answers with a JSON-RPC error (`-32603`) carrying the request's id, any other
+Transit Point with an `application/problem+json` body. Fabric Open likewise
+rejects a named alias that is absent even when the variant catalog is empty.
 
 The Access Point router applies the same rule on an empty variant catalog,
 where generic resolution returns the base surface. Legacy requests keep that

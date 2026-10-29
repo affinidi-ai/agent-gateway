@@ -125,12 +125,18 @@ request is in flight, or never compiled, refuses every `tools/call` and answers
 
 Per-Transit-Point gating is compiled from the surface's own Transit Points only,
 so a variant's Transit Point is gated by the surface's Transit Point of the same
-alias, and gating set on a variant's Transit Point is not supported. A variant
-Transit Point that sets `mcp_tool_gating` where the surface's Transit Point of
-that alias sets none, or that the surface does not have, has gating that is never
-compiled, so it refuses every `tools/call` and lists no tools, as a
-per-Transit-Point policy set only on a variant is refused. Set the gating on the
-surface's Transit Point instead.
+alias, and a variant cannot change it. The admin API refuses with `400` a variant
+Transit Point that sets `mcp_tool_gating` other than that of the surface's Transit
+Point of the same alias, or that sets any where the surface has no Transit Point of
+that alias. Its `policy` and `response_policy` follow the same rule (see
+[`POLICY.md`](POLICY.md#policy-change-audit)). At request time, a stored variant whose
+Transit Point sets a non-empty `mcp_tool_gating`, or a `policy` or `response_policy`,
+other than that of the surface's Transit Point of the same alias has every request
+through that Transit Point refused with `403` before the target is called: a JSON-RPC
+error (`-32603`) carrying the request's id on an MCP Transit Point, an
+`application/problem+json` body otherwise. A variant Transit Point that leaves these
+out, or restates the surface's, is enforced with the surface Transit Point's gating
+and policies. Set new gating on the surface's Transit Point.
 
 - **SSE / Streamable-HTTP note**: when the upstream MCP server answers
   `tools/list` with `text/event-stream` (SSE), `src/proxy/handler.rs` buffers

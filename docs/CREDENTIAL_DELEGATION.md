@@ -69,14 +69,28 @@ with `outbound_credentials` ignores `transit_credentials`.
 
 A Transit Point sends its target at most one value of each credential header, by the same
 rule over HTTP and Fabric. It starts from the managed agent's headers, without the agent's
-`Authorization` and `Cookie` and without a header named like the Transit Point's
-`target_auth` header, whether or not the gateway adds that header to this request. It then
-adds the `target_auth` header, and then the `bearer_header` and `custom_header` credentials of
-its bindings, each replacing any earlier header of the same name. On a `2026-07-28` MCP
-request, the credentials prepared for `outbound_credentials` are applied last in the same
-way. So the managed agent can neither supply nor replace a credential, and a delegated
-credential under the same name as `target_auth` replaces it; give them different names to
-send both.
+`Authorization` and `Cookie`, and without any header, every value of it, compared without
+regard to case, named like the Transit Point's `target_auth` header or like the
+`custom_header` of any credential binding that can apply on it: every binding in the
+surface's `outbound_credentials`, `tools` bindings included, or else its own
+`transit_credentials`. Those headers are withheld whether or not the gateway adds a value to
+this request. It then adds the `target_auth` header, and then the `bearer_header` and
+`custom_header` credentials of its bindings, each replacing any earlier header of the same
+name. On a `2026-07-28` MCP request, the credentials prepared for `outbound_credentials` are
+applied last in the same way. So the managed agent can neither supply nor replace a
+credential, and a delegated credential under the same name as `target_auth` replaces it;
+give them different names to send both.
+
+A credential header value that is not ASCII is sent to an HTTP target byte for byte. A Fabric
+target can carry only text header values, so a Transit Point refuses a Fabric request whose
+`target_auth` header cannot be carried with `502`, and one whose delegated credential header
+cannot be carried with `503`, rather than forwarding it without the credential.
+
+An Access Point and Fabric receive apply the same rule to the caller's headers: a caller
+header named like the Target's `target_auth` header is never forwarded, including
+`Authorization` kept by `forward_source_auth_header`, and the `target_auth` header and each
+delegated credential header the gateway adds replace every value of that header already on
+the request, so the target receives one value of each, the gateway's.
 
 ## When a token is missing
 
@@ -92,27 +106,32 @@ authenticated caller, the consent mode decides what happens the first time.
 
 `elicit` needs an MCP client that advertised the `elicitation` capability during
 `initialize`, and a capability record for its session. `elicit_fallback` decides
-what happens when either is missing: `on_demand`, the default, degrades to the 401
-response, and `fail` records `elicitation_unsupported` and forwards the tool call without
-the credential. Elicit falls back when:
+what happens when either is missing, or when the client has no open stream to send the
+prompt on: `on_demand`, the default, degrades to the 401 response, and `fail` records
+`elicitation_unsupported` and refuses the tool call as a credential that cannot be resolved
+(see below), never forwarding it without the credential. Elicit falls back when:
 
 - the client did not advertise `elicitation`;
 - the upstream returned a session id already in use on the surface (see "MCP session
   ownership" in `docs/MCP_METADATA.md`);
 - the gateway has no capability record for the session, because the upstream answered
   `initialize` with SSE, sent an unusable `Mcp-Session-Id`, or the gateway restarted
-  after the session opened.
+  after the session opened;
+- the session has no open SSE stream to deliver `elicitation/create` on.
 
 A user who declines or cancels the elicitation, or does not answer before
-`elicit_timeout_secs`, also has the call forwarded without it.
+`elicit_timeout_secs`, has the call refused the same way, whatever `elicit_fallback` says;
+the delegation audit records `elicitation_declined`, `elicitation_cancelled` or
+`elicitation_timed_out`.
 
 ### When a credential cannot be resolved
 
 A binding that applies but whose credential cannot be resolved refuses the request rather
 than forwarding it without the credential. That covers a deleted or unreadable provider, an
 API key whose secret cannot be read, a failed client-credentials token request, a vault read
-error, and consent that is needed but cannot be asked for because no authorization URL can be
-built, for example when the provider has no `authorization_endpoint`. An Access Point and
+error, consent that is needed but cannot be asked for because no authorization URL can be
+built, for example when the provider has no `authorization_endpoint`, and an `elicit` prompt
+that fails as described above. An Access Point and
 Fabric receive answer `503`: on an MCP surface a JSON-RPC error (`-32603`, `Delegated
 credentials unavailable`) carrying the request's id, otherwise an `application/problem+json`
 body. The delegation audit records the binding's outcome, and `provider_unavailable` names a
@@ -124,15 +143,19 @@ transit token carries no caller identity, including every request to a Transit P
 token's caller DID gives the agent half of the vault key. It also refuses when its delegation
 stores are not available. An MCP Transit Point answers with a JSON-RPC error (`-32603` for
 `503`, `-32001` for `403`) carrying the request's id, and any other Transit Point with an
-`application/problem+json` body. A missing token still gets the consent answer above. A
-Transit Point forwards a `GET` of a public discovery path, such as an agent card, without
-checking a transit token, so it carries no caller, and it is forwarded without a delegated
-credential, as it is without the `target_auth` one.
+`application/problem+json` body. A `403` says only that delegated credentials are not
+available for the request; which identity is missing is logged. A missing token still gets
+the consent answer above.
+
+A Transit Point discovery read, a `GET` or `HEAD` of a discovery document directly below the
+Transit Point (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)), is forwarded without a
+transit token check, so it carries no caller, and without a delegated credential or the
+`target_auth` one. Any other path, a discovery document below another segment included,
+needs a transit token and carries the credentials.
 
 Outside these checks a request is still forwarded without the credential: on an Access Point
 or Fabric receive whose delegation stores
-are not available, on Fabric receive for a request with no user identity, and on the `elicit`
-outcomes above.
+are not available, and on Fabric receive for a request with no user identity.
 
 A grant is looked up by the managed agent's DID, the caller's identity hash and the provider,
 not by surface or Transit Point. Surfaces that share an agent DID, such as surfaces whose

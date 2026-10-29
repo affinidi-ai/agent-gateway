@@ -187,11 +187,12 @@ flowchart TB
         D0[Credential injection] --> D1[Forward] --> D2["Response and<br/>agent-card rewrite"] --> D3[Metrics]
     end
     E --> I --> P --> F
-    I -. discovery GET .-> F
+    I -. discovery read .-> F
 ```
 
-Public discovery GETs, such as an agent card, skip transit token validation and the trust and
-policy group, and are forwarded without credentials. The outbound path does not evaluate the
+A discovery read, a `GET` or `HEAD` of a discovery document such as an agent card directly
+below the Transit Point, skips transit token validation and the trust and policy group, and is
+forwarded without credentials. The outbound path does not evaluate the
 appliance-wide policies.
 
 ## Full order
@@ -215,12 +216,14 @@ Outbound:
 
 caller authentication (a surface that sets `transit.source_auth`, which is not enforced, is
 refused here; on a Transit Point with `mcp_http.authorization`, the Resource Server token) →
-transit token validation → rate limit → protocol context → Transit Point header mapping
+transit token validation → rate limit → protocol context → variant check (a request naming an
+unknown or unresolvable variant, or a variant that changes the Transit Point's gating or
+policies, is refused) → Transit Point header mapping
 (A2A and AP2) → outbound extension inspection (A2A) → identity resolution → trusted
 identity → custom metadata → trust context → Trust Check (the Transit Point's own list) → gateway OPA →
 surface OPA → Transit Point OPA → MCP tool gating (`tools/call`) → credential injection →
 forward → response and agent-card rewrite → metrics. The stages from trust context to MCP
-tool gating are skipped for public discovery GETs.
+tool gating are skipped for discovery reads.
 
 This page is the authority on pipeline ordering. When it disagrees with a summary
 elsewhere, the source is the arbiter and this page is corrected.
