@@ -1,6 +1,6 @@
 [package]
 name = "agent-gateway"
-version = "1.0.2"
+version = "1.0.3"
 publish = false
 edition = "2024"
 rust-version = "1.95.0"
