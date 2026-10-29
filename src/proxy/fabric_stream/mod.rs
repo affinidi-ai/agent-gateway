@@ -1529,6 +1529,43 @@ mod tests {
                 .await;
             assert_eq!(result.is_ok(), admitted, "peer tenant {peer_tenant:?}");
         }
+        // A peer that may not reach the surface is refused before its alias is
+        // resolved, so it records nothing on the surface's tenant.
+        for (peer_tenant, message, recorded) in [
+            (Some("tenant-b"), "Fabric stream peer or route is unavailable", vec![]),
+            (
+                Some("tenant-a"),
+                "Fabric stream variant is unavailable",
+                vec![crate::audit::request_events::RejectionReason::UnknownVariant],
+            ),
+        ] {
+            let mut tenant_peer = peer.clone();
+            tenant_peer.tenant_id = peer_tenant.map(str::to_string);
+            let mut unknown = fresh_message();
+            unknown.message_body["payload"]["request"]["variant_alias"] = json!("missing");
+            let (result, records) = crate::audit::producer::capture(runtime.prepare_incoming_with_versions(
+                &unknown,
+                &connection,
+                &tenant_peer,
+                versions,
+            ))
+            .await;
+            let refusal = result
+                .err()
+                .unwrap_or_else(|| panic!("peer tenant {peer_tenant:?}: an unknown alias was admitted"));
+            assert_eq!(refusal.code, wire::StreamErrorCode::Unavailable, "peer tenant {peer_tenant:?}");
+            assert_eq!(refusal.to_string(), message, "peer tenant {peer_tenant:?}");
+            let reasons: Vec<_> = records
+                .iter()
+                .filter_map(|record| match &record.event {
+                    crate::delegation_vault::audit::DelegationAuditAction::RequestRejected { reason, .. } => {
+                        Some(*reason)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(reasons, recorded, "peer tenant {peer_tenant:?}: {records:?}");
+        }
         store
             .save(&surface)
             .await
