@@ -144,7 +144,7 @@ The bootstrap file. Startup only; changes need a restart.
 | `[did_cache]` | DID document cache TTL, size, staleness, and path; whether DID resolution may contact private hosts |
 | `[tls]` | Certificate and key paths, upstream verification |
 | `[mcp]` | Default MCP revision, validation, timeouts, SSE and stdio transports. Gateway-originated `2026-07-28` consent needs `[mcp.continuations]`; see [`MCP_METADATA.md`](MCP_METADATA.md#protected-continuations). |
-| `[reconnect_policy]` | Backoff for DIDComm connection points |
+| `[reconnect_policy]` | Backoff for DIDComm connection points and for the background retry of a trust registry connection |
 | `[oob_connection]` | How long an out-of-band pairing invitation stays pending |
 | `[a2a]` | Default A2A revision, body size, timeouts, fabric timeouts and envelope lifetime, inbound cache sizing |
 | `[logging]` | Level, JSON output, log directory. Log redaction is not read here; see [Log redaction](#log-redaction). |
