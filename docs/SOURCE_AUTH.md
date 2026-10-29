@@ -239,7 +239,13 @@ A Transit Point listener does not run an Access Point's source authentication. A
 Transit Point is admitted by its transit token, required unless the Transit Point sets
 `require_transit_token: false`, and on an MCP Transit Point also by a resource access token
 when it sets `mcp_http.authorization` (see
-[`MCP_METADATA.md`](MCP_METADATA.md)).
+[`MCP_METADATA.md`](MCP_METADATA.md)). These are the only ways to authenticate a Transit
+Point caller.
+
+`transit.source_auth` is not enforced. The admin API refuses a surface that sets it, on the
+surface or in a variant's overrides, with `400`. A surface stored with it still loads, with a
+warning in the log, but its Transit Points refuse every request with `503`, discovery reads
+included.
 
 ### Transit token
 

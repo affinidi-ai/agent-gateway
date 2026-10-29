@@ -22,6 +22,7 @@ mod mcp_subscription_scope;
 mod mtls;
 mod tr_naming_e2e;
 mod transit_point_lifecycle_e2e;
+mod transit_source_auth_e2e;
 mod transit_token_e2e;
 mod trust_check_e2e;
 mod trust_check_store_migration;

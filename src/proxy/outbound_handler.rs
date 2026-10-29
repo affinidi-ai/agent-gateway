@@ -134,6 +134,12 @@ pub(crate) enum OutboundPipelineError {
     #[error("Transit token missing or invalid: {0}")]
     TransitTokenInvalid(String),
 
+    #[error(
+        "This Transit Point refuses every request: its surface sets transit.source_auth, which the gateway does \
+         not enforce"
+    )]
+    TransitSourceAuthUnsupported,
+
     #[error("Credential delegation consent required")]
     ConsentRequired(String),
 
@@ -204,7 +210,7 @@ impl OutboundPipelineError {
 
             Self::TransitTokenInvalid(_) | Self::ConsentRequired(_) => StatusCode::UNAUTHORIZED,
 
-            Self::DelegationUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::DelegationUnavailable | Self::TransitSourceAuthUnsupported => StatusCode::SERVICE_UNAVAILABLE,
             Self::McpResourceAuthorization { error, .. } => error.status_code(),
 
             Self::GatewayPolicyDenied
@@ -1040,10 +1046,20 @@ async fn step_validate_transit_token(
     Ok(())
 }
 
+/// Caller authentication. A surface that sets `transit.source_auth`, which the
+/// gateway does not enforce, has every Transit Point request refused. An MCP
+/// Transit Point with `mcp_http.authorization` requires its resource access token.
 async fn step_source_auth(
     state: &OutboundProxyState,
     ctx: &mut OutboundPipelineContext,
 ) -> Result<(), OutboundPipelineError> {
+    if ctx
+        .outbound_shared
+        .source_auth
+        .is_some()
+    {
+        return Err(OutboundPipelineError::TransitSourceAuthUnsupported);
+    }
     if let Some(authorization) = ctx
         .virtual_channel
         .mcp_http
@@ -1102,10 +1118,6 @@ async fn step_source_auth(
             .map(|listener| listener.external_urls.clone())
             .unwrap_or_default();
         if ctx.virtual_channel.protocol != crate::config::agent_surface::TransitProtocol::Mcp
-            || ctx
-                .outbound_shared
-                .source_auth
-                .is_some()
             || authorization
                 .validate_endpoint(&origins, &base_path)
                 .is_err()
@@ -1140,17 +1152,7 @@ async fn step_source_auth(
         }
         ctx.authenticated_identity = Some(identity);
         ctx.mcp_resource_authorization = Some(authorization);
-        return Ok(());
     }
-    if ctx
-        .outbound_shared
-        .source_auth
-        .is_none()
-    {
-        return Ok(());
-    }
-    // Future: delegate to SourceAuthMiddleware.
-    debug!(request_id = %ctx.request_id, "step_source_auth: source_auth present but not yet enforced (MVP)");
     Ok(())
 }
 
@@ -8362,7 +8364,7 @@ mod tests {
         }
     }
 
-    // ── step_source_auth (MVP: no-op) ──────────────────────────────────────
+    // ── step_source_auth ───────────────────────────────────────────────────
 
     #[tokio::test]
     async fn test_step_source_auth_noop_when_none() {
@@ -8372,6 +8374,67 @@ mod tests {
             .source_auth = None;
         let result = step_source_auth(&state, &mut ctx).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn transit_source_auth_refuses_every_request() {
+        let state = test_outbound_state();
+        for (case, method, path, mcp_resource_authorization) in [
+            ("tool call", Method::POST, "/outbound/surfaces/order/partner-a", false),
+            ("discovery read", Method::GET, "/outbound/surfaces/order/partner-a/.well-known/agent-card.json", false),
+            ("resource token", Method::POST, "/outbound/surfaces/order/partner-a", true),
+        ] {
+            let mut ctx = test_pipeline_context();
+            ctx.original_method = method;
+            ctx.request_path = path.to_string();
+            ctx.outbound_shared
+                .source_auth = Some(
+                serde_json::from_value(json!({
+                    "type": "api_key",
+                    "extraction": { "source": "http_header", "field": "X-API-Key" },
+                    "secret_id": "transit-caller-key"
+                }))
+                .unwrap(),
+            );
+            if mcp_resource_authorization {
+                ctx.virtual_channel.protocol = crate::config::agent_surface::TransitProtocol::Mcp;
+                ctx.virtual_channel.mcp_http = Some(
+                    serde_json::from_value(json!({
+                        "authorization": {
+                            "resource": "https://outbound.example/outbound/surfaces/order/partner-a",
+                            "scopes": ["read"]
+                        }
+                    }))
+                    .unwrap(),
+                );
+            }
+
+            let error = step_source_auth(&state, &mut ctx)
+                .await
+                .unwrap_err();
+
+            assert!(matches!(error, OutboundPipelineError::TransitSourceAuthUnsupported), "{case}: {error:?}");
+            assert!(
+                ctx.authenticated_identity
+                    .is_none(),
+                "{case}"
+            );
+            let response = error.into_response();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{case}");
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(
+                body["detail"]
+                    .as_str()
+                    .unwrap()
+                    .contains("transit.source_auth"),
+                "{case}: {body}"
+            );
+        }
     }
 
     // ── step_rate_limit ────────────────────────────────────────────────────

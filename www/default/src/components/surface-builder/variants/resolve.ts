@@ -72,7 +72,6 @@ const SHARED_TRANSIT_FIELDS = [
   'custom_metadata',
   'response_extension_rules',
   'opa_policy_definition_id',
-  'source_auth',
 ] as const;
 
 /**

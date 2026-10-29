@@ -715,8 +715,32 @@ fn validate_source_auth(surface: &AgentSurface) -> Result<(), SurfaceApiError> {
 /// Validate every transit point: alias must match the URL-safe pattern,
 /// be non-empty, and be unique within the surface. Also assigns a fresh
 /// UUID `id` to any TP that was sent without one so older payloads keep
-/// working without forcing the dashboard to mint IDs client-side.
+/// working without forcing the dashboard to mint IDs client-side. A
+/// `transit.source_auth`, which the gateway does not enforce, is refused.
 fn validate_transit_points(surface: &mut AgentSurface) -> Result<(), SurfaceApiError> {
+    let surface_sets_source_auth = surface
+        .transit
+        .as_ref()
+        .is_some_and(|transit| {
+            transit
+                .shared
+                .source_auth
+                .is_some()
+        });
+    let variant_sets_source_auth = surface
+        .variants
+        .iter()
+        .any(|variant| {
+            variant
+                .overrides
+                .transit
+                .as_ref()
+                .and_then(|transit| transit.shared.as_ref())
+                .is_some_and(|shared| shared.source_auth.is_some())
+        });
+    if surface_sets_source_auth || variant_sets_source_auth {
+        return Err(SurfaceApiError::BadRequest(crate::config::agent_surface::TRANSIT_SOURCE_AUTH_REFUSED.to_string()));
+    }
     let Some(transit) = surface.transit.as_mut() else {
         return Ok(());
     };

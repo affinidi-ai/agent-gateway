@@ -3655,6 +3655,28 @@ mod outbound_config_tests {
         );
     }
 
+    #[test]
+    fn validate_outbound_warns_that_transit_source_auth_refuses_every_request() {
+        let mut surface = surface_with_outbound(true, &["partner-a"]);
+        surface
+            .transit
+            .as_mut()
+            .unwrap()
+            .shared
+            .source_auth = Some(
+            serde_json::from_value(json!({
+                "type": "api_key",
+                "extraction": { "source": "http_header", "field": "X-API-Key" },
+                "secret_id": "transit-caller-key"
+            }))
+            .unwrap(),
+        );
+
+        let errors = surface.validate_outbound();
+
+        assert_eq!(errors, vec![crate::config::agent_surface::TRANSIT_SOURCE_AUTH_REFUSED.to_string()]);
+    }
+
     // ── Listener backward-compat ─────────────────────────────────────────────
 
     #[test]

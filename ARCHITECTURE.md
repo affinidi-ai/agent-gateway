@@ -172,7 +172,7 @@ Managed agent → Transit Point listener → external service. Implemented in
 flowchart TB
     subgraph E["Edge"]
         direction LR
-        AR["Resource Server token,<br/>when configured"] --> A0[Transit token validation] --> A2[Rate limit] --> A3[Protocol context] --> A4[Header mapping] --> A5[Extension inspection]
+        AR["Caller authentication:<br/>transit.source_auth refused,<br/>Resource Server token when configured"] --> A0[Transit token validation] --> A2[Rate limit] --> A3[Protocol context] --> A4[Header mapping] --> A5[Extension inspection]
     end
     subgraph I["Identity and context"]
         direction LR
@@ -212,8 +212,9 @@ protected identity → response processing, including the `tools/list` filter �
 
 Outbound:
 
-Resource Server token (on a Transit Point with `mcp_http.authorization`) → transit
-token validation → rate limit → protocol context → Transit Point header mapping
+caller authentication (a surface that sets `transit.source_auth`, which is not enforced, is
+refused here; on a Transit Point with `mcp_http.authorization`, the Resource Server token) →
+transit token validation → rate limit → protocol context → Transit Point header mapping
 (A2A and AP2) → outbound extension inspection (A2A) → identity resolution → trusted
 identity → custom metadata → trust context → Trust Check (the Transit Point's own list) → gateway OPA →
 surface OPA → Transit Point OPA → MCP tool gating (`tools/call`) → credential injection →

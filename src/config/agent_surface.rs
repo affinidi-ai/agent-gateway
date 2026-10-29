@@ -1128,10 +1128,17 @@ pub struct SharedTransitConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opa_policy_definition_id: Option<String>,
 
-    /// Source authentication for the transit listener (protected agent auth).
+    /// Not enforced. The admin API refuses a surface that sets it, and one
+    /// stored with it has every Transit Point request refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_auth: Option<SourceAuthConfig>,
 }
+
+/// Why a surface that sets [`SharedTransitConfig::source_auth`] is refused by the
+/// admin API, and has every Transit Point request refused when it is loaded.
+pub const TRANSIT_SOURCE_AUTH_REFUSED: &str = "transit.source_auth is not enforced, so a surface that sets it has \
+     every Transit Point request refused; remove it, and authenticate Transit Point callers with \
+     require_transit_token and, on an MCP Transit Point, mcp_http.authorization";
 
 /// How the transit token carries caller context.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]

@@ -600,6 +600,14 @@ impl AgentSurface {
             }
         }
 
+        if transit
+            .shared
+            .source_auth
+            .is_some()
+        {
+            errors.push(crate::config::agent_surface::TRANSIT_SOURCE_AUTH_REFUSED.to_string());
+        }
+
         errors
     }
 

@@ -39,6 +39,14 @@ changes:
         when its surface is deleted while a `tools/call` is in flight, now refuses every
         `tools/call` and answers `tools/list` with an empty tool list.
     - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Refuse Transit Point requests when `transit.source_auth` is set
+      description: >-
+        `transit.source_auth` is not supported. The admin API now refuses a surface that
+        sets it, on the surface or in a variant's overrides, and a surface stored with it
+        loads with a warning and has every request to its Transit Points refused with `503`.
+        Transit Point callers are authenticated by the transit token and, on an MCP Transit
+        Point, by `mcp_http.authorization`.
+    - timestamp: '2026-10-28T00:00:00.000Z'
       title: Write the gateway's key files atomically with owner-only permissions
       description: >-
         The gateway's key files (DID keys, VC issuer keys and the transit token key) are now
@@ -84,3 +92,10 @@ changes:
         alias sets none, or that the surface does not have, now refuses every `tools/call`
         and answers `tools/list` with no tools, as a per-Transit-Point policy set only on a
         variant is already refused. Move such gating to the surface's Transit Point.
+    - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Remove `transit.source_auth` from surfaces to serve their Transit Points again
+      description: >-
+        A surface that sets `transit.source_auth` has every request to its Transit Points
+        refused, and the admin API refuses to save it with the field. Authenticate Transit
+        Point callers with `require_transit_token` and, on MCP Transit Points,
+        `mcp_http.authorization`.
