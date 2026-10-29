@@ -132,7 +132,11 @@ with an alias:
 A `variant_disabled` refusal names the disabled alias, and a `misconfigured_default` refusal names
 none. `surface_variant` is a variant of the surface the record's `surface_id` names: across a
 Fabric hop each gateway records its own surface's variant, so the two hops of one request can name
-different ones, joined by `trace_id`. Records outside surface requests carry none: management API
+different ones, joined by `trace_id`. The sending gateway records the variant its URL selected; the
+receiving gateway records the variant the sending route's `fabric://` Target pins
+(`fabric://<gateway>/<surface>$<alias>`), else its own default variant's alias, else `_base_`. The
+caller's URL alias never selects the receiving gateway's variant (see
+[Which variant serves a request over Fabric](FABRIC.md#which-variant-serves-a-request-over-fabric)). Records outside surface requests carry none: management API
 records, `consent_granted` (the OAuth callback), settlement-worker `payment` records, config
 reloads and traffic refused before a surface matched. A `policy_decision` of gateway scope on a
 surface request carries the variant it applied to; the policy itself is the same for every

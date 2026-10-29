@@ -1478,9 +1478,14 @@ The audit records the failure as blocking. A valid token issued for the
 resource is attributed as before, and its identity reaches policy. Over
 Fabric, the receiving gateway binds the token audience to the same resource,
 because both paths resolve the accepted audiences in
-`source_auth::middleware::resolve_surface_audience`; a named variant that does
-not resolve is refused with `404` (`unknown_variant`) before any token is read,
-never served by the default. The sending
+`source_auth::middleware::resolve_surface_audience`. The variant whose
+`<resource>$<alias>` it binds is the one the sending route's `fabric://` Target
+pins (`fabric://<gateway>/<surface>$<alias>`), else the receiving surface's
+default variant or base route; the caller's own URL alias on the sending gateway
+never selects it (see
+[Which variant serves a request over Fabric](FABRIC.md#which-variant-serves-a-request-over-fabric)).
+A pinned variant that does not resolve is refused with `404` (`unknown_variant`)
+before any token is read, never served by the default. The sending
 gateway strips the caller's own `Authorization` header, so only a credential
 it injects (target authentication or a delegated credential) issued for this
 resource can pass, and a missing or refused one gets a `401` before policy

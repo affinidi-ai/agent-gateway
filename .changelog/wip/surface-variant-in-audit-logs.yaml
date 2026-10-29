@@ -83,6 +83,19 @@ changes:
         variants shows _base_, where both were empty, so a per-variant series steps at the upgrade
         for one metrics retention window (6 hours by default). Stored metrics written with
         variant_alias still load.
+    - timestamp: '2026-10-29T13:00:00Z'
+      title: ⭐ Send a peer gateway only the variant alias its fabric:// Target pins
+      description: >-
+        A request over Fabric no longer carries the sending gateway's URL alias: a request to
+        /route$beta on the sending gateway used to ask the peer for its own beta variant, and is now
+        served by the peer's default variant or base surface, as an alias-less request is. Each
+        gateway picks its own variant. To select a peer variant, pin it in the sending route's
+        Target, fabric://<gateway>/<surface>$<alias>, or in a variant's Target override; this works
+        for Access Point Targets and Transit Points, over a buffered ForwardRequest and a framed
+        stream alike (a pinned alias on a ForwardRequest used to reach the peer as part of the
+        surface id, which it couldn't find). The peer refuses a pinned alias it doesn't have, or has
+        disabled, with 404. Setups that relied on matching aliases on both gateways must pin the
+        alias in the Target.
     - timestamp: '2026-10-28T16:15:00Z'
       title: Leave http_status off request_rejected records written on Fabric receive
       description: >-

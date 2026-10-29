@@ -4101,16 +4101,16 @@ async fn process_forward_request_in_request_scope(
     // Extract config_id for channel-specific logging
     let config_id = surface.config_id().unwrap_or("unknown");
 
-    // Apply virtual channel variant override if specified by GW1
+    // The alias the sender's `fabric://` Target pins, if any.
     let variant_alias = message
         .message_body
         .get("virtual_channel_alias")
         .or_else(|| message.message_body.get("active_variant_alias"))
         .and_then(|v| v.as_str());
 
-    // This gateway's own variant serves the request: the alias the sender
-    // named, else this surface's default variant, else its base. A variant
-    // that can't be resolved is refused, never served by another.
+    // This gateway's own variant serves the request: the alias the sender's
+    // Target pins, else this surface's default variant, else its base. A
+    // variant that can't be resolved is refused, never served by another.
     let selected = match stream_request.as_ref() {
         Some(request) => Ok((request.variant.clone(), surface.clone())),
         None => surface

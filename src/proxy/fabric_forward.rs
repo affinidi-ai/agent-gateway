@@ -183,10 +183,8 @@ async fn forward_stream_with_runtime(
         return Err(FabricForwardError::StreamingUnavailable);
     }
     let (gateway_id, target) = parse_fabric_target(request.fabric_target)?;
-    let (channel_id, variant_alias) = match target.split_once('$') {
-        Some((channel, alias)) => (channel, Some(alias.to_string())),
-        None => (target, None),
-    };
+    let (channel_id, variant_alias) = pinned_alias(target);
+    let variant_alias = variant_alias.map(str::to_string);
     if channel_id.contains(['/', '?', '#']) {
         return Err(FabricForwardError::InvalidUrl(
             request
@@ -480,14 +478,27 @@ fn parse_fabric_target(fabric_target: &str) -> Result<(&str, &str), FabricForwar
     Ok((gateway_id, channel_id))
 }
 
-/// The body of the `ForwardRequest` sending `req` to `channel_id`, the part of
-/// the `fabric://` Target after the gateway id.
+/// Splits the part of a `fabric://` Target after the gateway id into the peer
+/// surface it names and the variant alias it pins (`orders$v`: `orders`, `v`).
+/// The pinned alias is the only one a request sends the peer: a caller's own
+/// `$alias` names a variant of the sending surface, and with no alias the peer
+/// serves its own default variant or base surface.
+pub(crate) fn pinned_alias(channel: &str) -> (&str, Option<&str>) {
+    match channel.split_once('$') {
+        Some((surface, alias)) => (surface, Some(alias)),
+        None => (channel, None),
+    }
+}
+
+/// The body of the `ForwardRequest` sending `req` to `channel`, the part of
+/// the `fabric://` Target after the gateway id, with the alias it pins.
 fn forward_request_body(
-    channel_id: &str,
+    channel: &str,
     req: &FabricForwardRequest<'_>,
     body: serde_json::Value,
     deadline_ms: u64,
 ) -> serde_json::Value {
+    let (channel_id, variant_alias) = pinned_alias(channel);
     serde_json::json!({
         "channel_id": channel_id,
         "method": req.method.as_str(),
@@ -496,6 +507,8 @@ fn forward_request_body(
         "body": body,
         "trace_id": req.trace_id,
         "deadline_ms": deadline_ms,
+        "virtual_channel_alias": variant_alias,
+        "active_variant_alias": variant_alias,
     })
 }
 

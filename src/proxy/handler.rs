@@ -10309,46 +10309,35 @@ fn fabric_mcp_gate_input(
     serde_json::to_value(&policy_input).unwrap_or_default()
 }
 
-/// Where a request to a `fabric://{gateway_id}/{channel_id}` Target goes: the
-/// peer gateway and surface, the variant alias sent with a `ForwardRequest`,
-/// and the target a framed stream opens.
+/// Where a request to a `fabric://{gateway_id}/{channel_id}[$alias]` Target
+/// goes: the peer gateway and surface, the variant alias sent with a
+/// `ForwardRequest`, and the target a framed stream opens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FabricSendRoute {
     gateway_id: String,
     channel_id: String,
+    /// The alias the Target pins, never the caller's own `$alias`, which names
+    /// a variant of this surface. With none, the peer serves its own default
+    /// variant or base surface.
     variant_alias: Option<String>,
     stream_target: String,
 }
 
-/// The [`FabricSendRoute`] of a request to `request_path` on `surface`, or
-/// `None` when the Target is not a valid `fabric://` URL.
-fn fabric_send_route(
-    surface: &crate::config::agent_surface::AgentSurface,
-    request_path: &str,
-) -> Option<FabricSendRoute> {
+/// The [`FabricSendRoute`] of the served `surface`, whose Target is the
+/// variant's own when the variant overrides it, or `None` when the Target is
+/// not a valid `fabric://` URL.
+fn fabric_send_route(surface: &crate::config::agent_surface::AgentSurface) -> Option<FabricSendRoute> {
     let endpoint = &surface.target.endpoint;
     let mut parts = endpoint
         .strip_prefix("fabric://")?
         .split('/');
     let gateway_id = parts.next()?;
-    let channel_id = parts.next()?;
-    let variant_alias = crate::proxy::route_variant::extract_variant_alias_for_route(
-        request_path,
-        surface
-            .access_point
-            .route
-            .as_str(),
-    )
-    .and_then(|alias| alias);
-    let stream_target = match variant_alias.as_deref() {
-        Some(alias) if !endpoint.contains('$') => format!("{endpoint}${alias}"),
-        _ => endpoint.clone(),
-    };
+    let (channel_id, variant_alias) = crate::proxy::fabric_forward::pinned_alias(parts.next()?);
     Some(FabricSendRoute {
         gateway_id: gateway_id.to_string(),
         channel_id: channel_id.to_string(),
-        variant_alias,
-        stream_target,
+        variant_alias: variant_alias.map(str::to_string),
+        stream_target: endpoint.clone(),
     })
 }
 
@@ -10429,7 +10418,7 @@ async fn handle_fabric_request(
     channel_debug!(config_id, "  ↳ Query: {:?}", uri.query());
     channel_debug!(config_id, "  ↳ Path and Query: {:?}", uri.path_and_query());
 
-    let Some(fabric_route) = fabric_send_route(&state.surface, uri.path()) else {
+    let Some(fabric_route) = fabric_send_route(&state.surface) else {
         channel_error!(config_id, "Invalid fabric URL format: {}", state.surface.target.endpoint);
         connection_guard
             .decrement()
@@ -12385,9 +12374,8 @@ async fn handle_fabric_request(
                 "trace_id": egress_trace_id.clone(),
                 "otel_context": otel_context,
                 "deadline_ms": deadline_ms,
-                // `virtual_channel_alias` retained for backward compatibility with
-                // older GW2s. `active_variant_alias` is the spec-aligned name
-                // (plan §4.4); GW2 prefers it when present.
+                // The alias the Target pins, under both names the receiving
+                // gateway reads.
                 "virtual_channel_alias": virtual_channel_alias,
                 "active_variant_alias": virtual_channel_alias,
             }),
