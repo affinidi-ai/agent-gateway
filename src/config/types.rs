@@ -696,10 +696,45 @@ pub enum TargetAuthMethod {
         #[serde(default = "default_header_format")]
         header_format: String,
     },
+    /// Use the service token of a credential provider: an issued token (client
+    /// credentials, JWT Bearer, Client Credentials JWT), cached until shortly before it
+    /// expires, or an API key
+    CredentialProvider {
+        /// Credential provider ID (UUID)
+        provider_id: String,
+        #[serde(default = "default_provider_header_name")]
+        header_name: String,
+        /// The placeholder {value} will be replaced with the token
+        #[serde(default = "default_provider_header_format")]
+        header_format: String,
+        /// Scopes to request; the provider's default scopes when empty
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        scopes: Vec<String>,
+    },
+}
+
+impl TargetAuthMethod {
+    /// The header this method injects; `None` for one that injects nothing.
+    pub fn header_name(&self) -> Option<&str> {
+        match self {
+            Self::StaticSecret { header_name, .. } | Self::CredentialProvider { header_name, .. } => {
+                Some(header_name.as_str())
+            }
+            Self::CredentialLookup => None,
+        }
+    }
 }
 
 fn default_header_format() -> String {
     "{value}".to_string()
+}
+
+fn default_provider_header_name() -> String {
+    "Authorization".to_string()
+}
+
+fn default_provider_header_format() -> String {
+    "Bearer {value}".to_string()
 }
 
 /// Fallback behavior when target credentials are not found
@@ -4516,5 +4551,54 @@ mod facilitator_key_config_tests {
         assert!(!rendered.contains("test-private-key-marker"), "{rendered}");
         assert!(rendered.contains("<redacted>"), "{rendered}");
         assert!(rendered.contains("0x2c7536E3605D9C16a7a3D7b1898e529396a65c23"), "{rendered}");
+    }
+}
+
+#[cfg(test)]
+mod target_auth_method_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_credential_provider_method_defaults_to_a_bearer_authorization_header() {
+        let config: TargetAuthConfig =
+            serde_json::from_value(json!({"method": {"credential_provider": {"provider_id": "cp-1"}}})).unwrap();
+        assert_eq!(
+            config.method,
+            TargetAuthMethod::CredentialProvider {
+                provider_id: "cp-1".into(),
+                header_name: "Authorization".into(),
+                header_format: "Bearer {value}".into(),
+                scopes: vec![],
+            }
+        );
+        assert_eq!(config.fallback, TargetAuthFallback::Reject);
+        assert_eq!(config.method.header_name(), Some("Authorization"));
+        assert_eq!(
+            serde_json::to_value(&config.method).unwrap(),
+            json!({"credential_provider": {"provider_id": "cp-1", "header_name": "Authorization",
+                "header_format": "Bearer {value}"}})
+        );
+    }
+
+    #[test]
+    fn a_credential_provider_method_round_trips_its_header_and_scopes() {
+        let method = json!({"credential_provider": {"provider_id": "cp-1", "header_name": "x-api-key",
+            "header_format": "{value}", "scopes": ["https://www.googleapis.com/auth/cloud-platform"]}});
+        let parsed: TargetAuthMethod = serde_json::from_value(method.clone()).unwrap();
+        assert_eq!(parsed.header_name(), Some("x-api-key"));
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), method);
+    }
+
+    #[test]
+    fn stored_methods_still_load_and_name_their_header() {
+        let lookup: TargetAuthMethod = serde_json::from_value(json!("credential_lookup")).unwrap();
+        assert_eq!(lookup, TargetAuthMethod::CredentialLookup);
+        assert_eq!(lookup.header_name(), None);
+        let secret: TargetAuthMethod = serde_json::from_value(
+            json!({"static_secret": {"secret_id": "s", "header_name": "x-key"}}),
+        )
+        .unwrap();
+        assert_eq!(secret.header_name(), Some("x-key"));
     }
 }

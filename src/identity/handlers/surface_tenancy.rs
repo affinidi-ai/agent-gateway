@@ -33,7 +33,55 @@ pub async fn validate_surface_references(
             .validate_reference(&reference)
             .await?;
     }
+    validate_target_auth_methods(state, surface).await
+}
 
+/// The target authentication methods of every Target and Transit Point, in every
+/// variant, must be usable: `credential_lookup` was never implemented, and a provider
+/// that needs a user's consent cannot authenticate the gateway to its target.
+async fn validate_target_auth_methods(
+    state: &IdentityApiState,
+    surface: &AgentSurface,
+) -> Result<(), SurfaceApiError> {
+    use crate::credential_providers::CredentialProviderType;
+
+    for view in resolved_views(surface)? {
+        let transit_points = view
+            .transit
+            .iter()
+            .flat_map(|transit| transit.points.iter());
+        let methods = view
+            .target
+            .auth
+            .iter()
+            .chain(transit_points.filter_map(|point| point.target_auth.as_ref()))
+            .map(|authentication| &authentication.method);
+        for method in methods {
+            match method {
+                TargetAuthMethod::StaticSecret { .. } => {}
+                TargetAuthMethod::CredentialLookup => {
+                    return Err(SurfaceApiError::BadRequest(
+                        "Target authentication method credential_lookup is not supported; use static_secret or credential_provider".into(),
+                    ));
+                }
+                TargetAuthMethod::CredentialProvider { provider_id, .. } => {
+                    let provider = state
+                        .credential_provider_store
+                        .as_ref()
+                        .ok_or_else(|| unavailable("Credential provider"))?
+                        .get(provider_id)
+                        .await
+                        .map_err(|error| internal("Credential provider", error))?
+                        .ok_or_else(|| inaccessible("Credential provider"))?;
+                    if provider.provider_type == CredentialProviderType::OAuth2AuthorizationCode {
+                        return Err(SurfaceApiError::BadRequest(
+                            "Target authentication cannot use an oauth2_authorization_code credential provider: it needs a user's consent".into(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -509,12 +557,14 @@ fn collect_target_auth_reference(
     authentication: Option<&TargetAuthConfig>,
     references: &mut Vec<SurfaceReferenceKey>,
 ) {
-    if let Some(TargetAuthConfig {
-        method: TargetAuthMethod::StaticSecret { secret_id, .. },
-        ..
-    }) = authentication
-    {
-        push_reference(references, ResourceKind::Secrets, secret_id);
+    match authentication.map(|authentication| &authentication.method) {
+        Some(TargetAuthMethod::StaticSecret { secret_id, .. }) => {
+            push_reference(references, ResourceKind::Secrets, secret_id)
+        }
+        Some(TargetAuthMethod::CredentialProvider { provider_id, .. }) => {
+            push_reference(references, ResourceKind::CredentialProviders, provider_id)
+        }
+        Some(TargetAuthMethod::CredentialLookup) | None => {}
     }
 }
 
@@ -735,6 +785,34 @@ mod tests {
         .unwrap();
         point.trust_check_list = vec![trust_check(&format!("{alias}-check"), trust_registry_id)];
         point
+    }
+
+    #[test]
+    fn a_target_auth_credential_provider_is_a_reference_of_the_target_and_each_transit_point() {
+        let mut surface = AgentSurface::default();
+        surface.target.auth = Some(
+            serde_json::from_value(serde_json::json!({"method": {"credential_provider": {"provider_id": "cp-target"}}}))
+                .unwrap(),
+        );
+        let mut point = transit_point("partner", "tr-partner");
+        point.target_auth = Some(
+            serde_json::from_value(serde_json::json!({"method": {"credential_provider": {"provider_id": "cp-partner"}}}))
+                .unwrap(),
+        );
+        surface.transit = Some(crate::config::agent_surface::TransitConfig {
+            points: vec![point],
+            outbound_listen_address: None,
+            shared: Default::default(),
+        });
+
+        let providers: HashSet<_> = collect_surface_reference_keys(&surface)
+            .unwrap()
+            .into_iter()
+            .filter(|reference| reference.kind == ResourceKind::CredentialProviders)
+            .map(|reference| reference.id)
+            .collect();
+
+        assert_eq!(providers, HashSet::from(["cp-target".to_string(), "cp-partner".to_string()]));
     }
 
     #[test]
