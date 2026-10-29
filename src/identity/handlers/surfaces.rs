@@ -2159,9 +2159,10 @@ fn retain_mcp_settings(
     settle_retained_protected_resources(surface, base_retained, &retained_aliases, network)
 }
 
-/// PUT carries the whole record, but the Surface Builder shows neither a
-/// Transit Point's `source_auth` nor its `allow_unauthenticated_callers`, so a
-/// save from it omits both. An omitted `source_auth` means unchanged, as an
+/// PUT carries the whole record, or a variant PUT its whole overrides, but the
+/// Surface Builder shows neither a Transit Point's `source_auth` nor its
+/// `allow_unauthenticated_callers`, so a save from it omits both. An omitted
+/// `source_auth` means unchanged, as an
 /// omitted `mcp_http.authorization` does; removal is explicit, via a merge
 /// PATCH whose Transit Points leave it out. An omitted
 /// `allow_unauthenticated_callers` is kept while the Transit Point still
@@ -2171,39 +2172,15 @@ fn retain_transit_caller_authentication(
     existing: &AgentSurface,
     sent: &serde_json::Value,
 ) {
-    use crate::config::agent_surface::TransitPoint;
-    fn retain(
-        points: &mut [TransitPoint],
-        stored: &[TransitPoint],
-        sent: Option<&serde_json::Value>,
-    ) {
-        for (index, point) in points.iter_mut().enumerate() {
-            let Some(previous) = stored
-                .iter()
-                .find(|previous| previous.id == point.id)
-            else {
-                continue;
-            };
-            if point.source_auth.is_none() {
-                point.source_auth = previous.source_auth.clone();
-            }
-            let sends_open_flag = sent
-                .and_then(|points| points.get(index))
-                .is_some_and(|point| {
-                    point
-                        .get("allow_unauthenticated_callers")
-                        .is_some()
-                });
-            if !sends_open_flag && previous.allow_unauthenticated_callers && !point.authenticates_callers() {
-                point.allow_unauthenticated_callers = true;
-            }
-        }
-    }
     fn sent_points(transit: Option<&serde_json::Value>) -> Option<&serde_json::Value> {
         transit.and_then(|transit| transit.get("points"))
     }
     if let (Some(transit), Some(stored)) = (&mut surface.transit, &existing.transit) {
-        retain(&mut transit.points, &stored.points, sent_points(sent.get("transit")));
+        retain_transit_points_caller_authentication(
+            &mut transit.points,
+            &stored.points,
+            sent_points(sent.get("transit")),
+        );
     }
     for (index, variant) in surface
         .variants
@@ -2232,7 +2209,38 @@ fn retain_transit_caller_authentication(
                 .and_then(|variants| variants.get(index))
                 .and_then(|variant| variant.get("overrides"))
                 .and_then(|overrides| overrides.get("transit"));
-            retain(points, stored_points, sent_points(sent_transit));
+            retain_transit_points_caller_authentication(points, stored_points, sent_points(sent_transit));
+        }
+    }
+}
+
+/// Keeps each Transit Point's stored `source_auth` and
+/// `allow_unauthenticated_callers` that `sent_points`, the JSON the request
+/// sent for `points`, leaves out; see `retain_transit_caller_authentication`.
+fn retain_transit_points_caller_authentication(
+    points: &mut [crate::config::agent_surface::TransitPoint],
+    stored: &[crate::config::agent_surface::TransitPoint],
+    sent_points: Option<&serde_json::Value>,
+) {
+    for (index, point) in points.iter_mut().enumerate() {
+        let Some(previous) = stored
+            .iter()
+            .find(|previous| previous.id == point.id)
+        else {
+            continue;
+        };
+        if point.source_auth.is_none() {
+            point.source_auth = previous.source_auth.clone();
+        }
+        let sends_open_flag = sent_points
+            .and_then(|points| points.get(index))
+            .is_some_and(|point| {
+                point
+                    .get("allow_unauthenticated_callers")
+                    .is_some()
+            });
+        if !sends_open_flag && previous.allow_unauthenticated_callers && !point.authenticates_callers() {
+            point.allow_unauthenticated_callers = true;
         }
     }
 }
@@ -3390,9 +3398,27 @@ pub async fn update_variant(
         reject_undeclared_trust_check_edit(touches_trust_checks, &existing)?;
     }
     // New overrides replace the stored ones, but keep the stored discovery
-    // setting unless they remove it, as a PUT of the whole surface does.
+    // setting unless they remove it, and the Transit Points' caller
+    // authentication they leave out, as a PUT of the whole surface does.
     let mut retained = Vec::new();
     if let Some(mut overrides) = body.overrides {
+        if let (Some(points), Some(stored_points)) = (
+            overrides
+                .transit
+                .as_mut()
+                .and_then(|transit| transit.points.as_mut()),
+            variant
+                .overrides
+                .transit
+                .as_ref()
+                .and_then(|transit| transit.points.as_ref()),
+        ) {
+            retain_transit_points_caller_authentication(
+                points,
+                stored_points,
+                sent.pointer("/overrides/transit/points"),
+            );
+        }
         if !removes_protected_resource(sent.pointer("/overrides/access_point"))
             && retain_protected_resource(
                 overrides
