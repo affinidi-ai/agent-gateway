@@ -134,7 +134,9 @@ pub async fn write_secret_file(
 /// hard-linked into place, which fails rather than replacing a file, so exactly
 /// one creator wins and no reader sees a partly written file. The directory must
 /// therefore support hard links; one that does not fails the creation with an
-/// error saying so.
+/// error saying so. Creators that disagree on encryption at rest can each create
+/// a different form at once; a creator that then finds the other form beside its
+/// own removes its own and fails, so no two keys stay in use.
 pub async fn create_secret_file(
     path: &Path,
     contents: &str,
@@ -143,14 +145,15 @@ pub async fn create_secret_file(
     if path.exists() || enc_path.exists() {
         return Ok(false);
     }
-    let (target, bytes) = match active_encryption() {
+    let (target, other_form, bytes) = match active_encryption() {
         Some(service) => (
             enc_path,
+            path.to_path_buf(),
             service
                 .encrypt_string(contents.to_string())
                 .context("Failed to encrypt secret file")?,
         ),
-        None => (path.to_path_buf(), contents.to_string()),
+        None => (path.to_path_buf(), enc_path, contents.to_string()),
     };
     let mut staged = target
         .as_os_str()
@@ -166,7 +169,7 @@ pub async fn create_secret_file(
         warn!("Failed to remove staged secret file {}: {}", staged.display(), error);
     }
     match linked {
-        Ok(()) => Ok(true),
+        Ok(()) => settle_created_secret_file(&target, &other_form).await,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
         Err(error) => Err(error).with_context(|| {
             format!(
@@ -176,6 +179,35 @@ pub async fn create_secret_file(
             )
         }),
     }
+}
+
+/// Make a just-linked secret file durable, and give it up again when the other
+/// form of the same secret now exists beside it. Every creator checks after
+/// linking, so of two creators of different forms at least one sees the other.
+async fn settle_created_secret_file(
+    target: &Path,
+    other_form: &Path,
+) -> Result<bool> {
+    #[cfg(unix)]
+    if let Some(parent) = target.parent() {
+        crate::storage::filesystem::sync_directory(parent)
+            .await
+            .with_context(|| format!("Failed to sync the directory of secret file {}", target.display()))?;
+    }
+    if !other_form.exists() {
+        return Ok(true);
+    }
+    if let Err(error) = tokio::fs::remove_file(target).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        error!("Failed to remove secret file {} created beside {}: {}", target.display(), other_form.display(), error);
+    }
+    anyhow::bail!(
+        "Secret file {} was created at the same time as {}: processes sharing this directory disagree on encryption \
+         at rest",
+        target.display(),
+        other_form.display()
+    )
 }
 
 /// Restrict a secret file, in whichever form exists, to its owner, when it was
@@ -528,6 +560,42 @@ mod tests {
                 .as_deref(),
             Some(winner)
         );
+    }
+
+    #[tokio::test]
+    async fn a_created_secret_file_is_given_up_when_the_other_form_appeared_beside_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("transit_token_key.json");
+        let enc_path = secret_enc_path(&path);
+        std::fs::write(&path, "plaintext key").unwrap();
+        std::fs::write(&enc_path, "ENC[other key]").unwrap();
+
+        let error = settle_created_secret_file(&enc_path, &path)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("disagree on encryption at rest"), "{error}");
+        assert!(!enc_path.exists(), "the losing form is removed");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "plaintext key", "the other form is left intact");
+    }
+
+    #[tokio::test]
+    async fn a_created_secret_file_without_the_other_form_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("transit_token_key.json");
+        std::fs::write(&path, "plaintext key").unwrap();
+
+        assert!(
+            settle_created_secret_file(&path, &secret_enc_path(&path))
+                .await
+                .unwrap()
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "plaintext key");
     }
 
     #[tokio::test]

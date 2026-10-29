@@ -1381,7 +1381,7 @@ pub(crate) async fn atomic_write_file_with_mode(
 }
 
 #[cfg(unix)]
-async fn sync_directory(directory: &Path) -> Result<()> {
+pub(crate) async fn sync_directory(directory: &Path) -> Result<()> {
     static UNSUPPORTED_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     let handle = fs::File::open(directory)
