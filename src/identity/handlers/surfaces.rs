@@ -9,6 +9,7 @@ use axum::{
 use serde::Serialize;
 use tracing::{debug, error, info, warn};
 
+use crate::auth_manager::middleware::AuthGuardOk;
 use crate::auth_manager::pat::{PatContext, PatDelegationContext, PatResourceScope};
 use crate::config::agent_surface::{AgentSurface, SharedTransitConfig, TransitConfig};
 use crate::identity::state::IdentityApiState;
@@ -33,6 +34,22 @@ fn resource_scope(scope: &Option<Extension<PatResourceScope>>) -> Option<&PatRes
 /// Whether the caller's token carries a resource scope of any kind, including
 /// one made of required headers alone, which yields neither a tenant nor a
 /// [`PatResourceScope`].
+/// The management caller a surface change is audited under: the console user,
+/// and the access token when the request came with one.
+fn management_actor(
+    caller: &Option<Extension<AuthGuardOk>>,
+    delegation: &Option<Extension<PatDelegationContext>>,
+) -> Option<crate::delegation_vault::audit::AuditCallerContext> {
+    crate::delegation_vault::audit::management_caller_context(
+        caller
+            .as_ref()
+            .map(|Extension(AuthGuardOk(user_id))| user_id.as_str()),
+        delegation
+            .as_ref()
+            .map(|Extension(delegation)| delegation.token_id.as_str()),
+    )
+}
+
 fn resource_scoped(delegation: &Option<Extension<PatDelegationContext>>) -> bool {
     delegation
         .as_ref()
@@ -1573,6 +1590,7 @@ pub enum SurfaceApiError {
     NotFound(String),
     UnsupportedMediaType(String),
     InternalError(String),
+    Unavailable(String),
 }
 
 impl IntoResponse for SurfaceApiError {
@@ -1597,6 +1615,10 @@ impl IntoResponse for SurfaceApiError {
             SurfaceApiError::InternalError(msg) => {
                 error!("Surface API Internal Error: {}", msg);
                 (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error", Some(msg.clone()))
+            }
+            SurfaceApiError::Unavailable(msg) => {
+                warn!("Surface API Service Unavailable: {}", msg);
+                (StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable", Some(msg.clone()))
             }
         };
 
@@ -1868,6 +1890,7 @@ pub async fn create_surface(
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
+    caller: Option<Extension<AuthGuardOk>>,
     Json(mut surface): Json<AgentSurface>,
 ) -> Result<(StatusCode, axum::http::HeaderMap, Json<AgentSurface>), SurfaceApiError> {
     let store = state
@@ -2003,6 +2026,14 @@ pub async fn create_surface(
     crate::config::enforce_add("surfaces.agent")
         .await
         .map_err(|e| SurfaceApiError::Forbidden(e.message()))?;
+    let allowlist = crate::egress::bdd_egress_allowlist();
+    let actor = management_actor(&caller, &delegation);
+    super::surface_grants::remove_changed_binding_grants(
+        &super::surface_grants::GrantRemoval::of(&state, allowlist.as_deref(), actor.as_ref()),
+        None,
+        Some(&surface),
+    )
+    .await?;
 
     surface.trust_check_split = surface.has_trust_check_lists();
     surface.transit_point_source_auth = surface.has_transit_point_source_auth();
@@ -2063,6 +2094,7 @@ pub async fn update_surface(
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
+    caller: Option<Extension<AuthGuardOk>>,
     JsonWithSent(mut surface, sent): JsonWithSent<AgentSurface>,
 ) -> Result<SavedSurface, SurfaceApiError> {
     let store = state
@@ -2109,6 +2141,7 @@ pub async fn update_surface(
         tenant_context(&context),
         resource_scope(&scope),
         resource_scoped(&delegation),
+        management_actor(&caller, &delegation).as_ref(),
     )
     .await?;
     Ok((transit_point_warnings(&state, &saved).await, Json(saved)))
@@ -2768,6 +2801,7 @@ async fn validate_and_save_surface(
     context: Option<&PatTenantContext>,
     scope: Option<&PatResourceScope>,
     resource_scoped: bool,
+    actor: Option<&crate::delegation_vault::audit::AuditCallerContext>,
 ) -> Result<AgentSurface, SurfaceApiError> {
     // Ensure route starts with / BEFORE the shape check so the
     // historical "missing slash is auto-fixed" behaviour is preserved.
@@ -2834,6 +2868,13 @@ async fn validate_and_save_surface(
     refuse_validation_off_by_scoped_caller(&surface, stored_a2a, context, scope, resource_scoped)?;
     validate_protected_resource_issuers(state, &surface).await?;
     validate_mcp_resource_declarations(state, &surface).await?;
+    let allowlist = crate::egress::bdd_egress_allowlist();
+    super::surface_grants::remove_changed_binding_grants(
+        &super::surface_grants::GrantRemoval::of(state, allowlist.as_deref(), actor),
+        existing,
+        Some(&surface),
+    )
+    .await?;
 
     surface.trust_check_split = surface.has_trust_check_lists();
     surface.transit_point_source_auth = surface.has_transit_point_source_auth();
@@ -2915,6 +2956,7 @@ pub async fn patch_surface(
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
+    caller: Option<Extension<AuthGuardOk>>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<SavedSurface, SurfaceApiError> {
@@ -2964,6 +3006,7 @@ pub async fn patch_surface(
         tenant_context(&context),
         resource_scope(&scope),
         resource_scoped(&delegation),
+        management_actor(&caller, &delegation).as_ref(),
     )
     .await?;
     Ok((transit_point_warnings(&state, &saved).await, Json(saved)))
@@ -2984,6 +3027,7 @@ pub async fn patch_variant(
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
+    caller: Option<Extension<AuthGuardOk>>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<SavedSurface, SurfaceApiError> {
@@ -3043,6 +3087,7 @@ pub async fn patch_variant(
         tenant_context(&context),
         resource_scope(&scope),
         resource_scoped(&delegation),
+        management_actor(&caller, &delegation).as_ref(),
     )
     .await?;
     Ok((transit_point_warnings(&state, &saved).await, Json(saved)))
@@ -3054,6 +3099,8 @@ pub async fn delete_surface(
     State(state): State<IdentityApiState>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
+    delegation: Option<Extension<PatDelegationContext>>,
+    caller: Option<Extension<AuthGuardOk>>,
 ) -> Result<Json<DeleteSurfaceResponse>, SurfaceApiError> {
     let store = state
         .agent_surface_store
@@ -3074,6 +3121,14 @@ pub async fn delete_surface(
                 resource_scope(&scope),
             ) =>
         {
+            let allowlist = crate::egress::bdd_egress_allowlist();
+            let actor = management_actor(&caller, &delegation);
+            super::surface_grants::remove_changed_binding_grants(
+                &super::surface_grants::GrantRemoval::of(&state, allowlist.as_deref(), actor.as_ref()),
+                Some(&surface),
+                None,
+            )
+            .await?;
             store
                 .delete(&surface_id)
                 .await
@@ -3525,6 +3580,7 @@ pub async fn create_variant(
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
+    caller: Option<Extension<AuthGuardOk>>,
     Json(body): Json<CreateVariantRequest>,
 ) -> Result<(StatusCode, axum::http::HeaderMap, Json<SurfaceVariant>), SurfaceApiError> {
     let (store, mut surface) = load_surface_or_404(
@@ -3600,6 +3656,7 @@ pub async fn create_variant(
         tenant_context(&context),
         resource_scope(&scope),
         resource_scoped(&delegation),
+        management_actor(&caller, &delegation).as_ref(),
     )
     .await?;
     let new_variant = saved
@@ -3626,6 +3683,7 @@ pub async fn update_variant(
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
+    caller: Option<Extension<AuthGuardOk>>,
     JsonWithSent(body, sent): JsonWithSent<UpdateVariantRequest>,
 ) -> Result<(axum::http::HeaderMap, Json<SurfaceVariant>), SurfaceApiError> {
     let (store, mut surface) = load_surface_or_404(
@@ -3756,6 +3814,7 @@ pub async fn update_variant(
         tenant_context(&context),
         resource_scope(&scope),
         resource_scoped(&delegation),
+        management_actor(&caller, &delegation).as_ref(),
     )
     .await?;
 
@@ -3787,6 +3846,7 @@ pub async fn delete_variant(
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
+    caller: Option<Extension<AuthGuardOk>>,
 ) -> Result<Json<DeleteSurfaceResponse>, SurfaceApiError> {
     let (store, mut surface) = load_surface_or_404(
         &state,
@@ -3832,6 +3892,7 @@ pub async fn delete_variant(
         tenant_context(&context),
         resource_scope(&scope),
         resource_scoped(&delegation),
+        management_actor(&caller, &delegation).as_ref(),
     )
     .await?;
 
@@ -3857,6 +3918,7 @@ pub async fn promote_variant_to_default(
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
+    caller: Option<Extension<AuthGuardOk>>,
 ) -> Result<SavedSurface, SurfaceApiError> {
     let (store, mut surface) = load_surface_or_404(
         &state,
@@ -3894,6 +3956,7 @@ pub async fn promote_variant_to_default(
         tenant_context(&context),
         resource_scope(&scope),
         resource_scoped(&delegation),
+        management_actor(&caller, &delegation).as_ref(),
     )
     .await?;
 

@@ -5,7 +5,8 @@ use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 
 use crate::a2a_proxies::A2aProxyStore;
-use crate::auth_manager::pat::PatResourceScope;
+use crate::auth_manager::middleware::AuthGuardOk;
+use crate::auth_manager::pat::{PatDelegationContext, PatResourceScope};
 use crate::authorities::AuthorityStore;
 use crate::gateways::GatewayStore;
 use crate::gateways::connection_points::ConnectionPointStore;
@@ -180,6 +181,8 @@ pub async fn reassign_ownership(
     Path((raw_kind, id)): Path<(String, String)>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
+    caller: Option<Extension<AuthGuardOk>>,
+    delegation: Option<Extension<PatDelegationContext>>,
     Json(request): Json<ReassignOwnershipRequest>,
 ) -> Result<Json<OwnershipReassignmentResponse>, OwnershipApiError> {
     if context.is_some() || scope.is_some() {
@@ -216,7 +219,15 @@ pub async fn reassign_ownership(
     }
 
     let previous_tenant_id = resource.tenant_id;
-    persist_tenant_id(&state, kind, &id, request.tenant_id.clone()).await?;
+    let actor = crate::delegation_vault::audit::management_caller_context(
+        caller
+            .as_ref()
+            .map(|Extension(AuthGuardOk(user_id))| user_id.as_str()),
+        delegation
+            .as_ref()
+            .map(|Extension(delegation)| delegation.token_id.as_str()),
+    );
+    persist_tenant_id(&state, kind, &id, request.tenant_id.clone(), actor.as_ref()).await?;
 
     Ok(Json(OwnershipReassignmentResponse {
         kind: kind.to_string(),
@@ -774,6 +785,7 @@ async fn persist_tenant_id(
     kind: ResourceKind,
     id: &str,
     tenant_id: Option<String>,
+    actor: Option<&crate::delegation_vault::audit::AuditCallerContext>,
 ) -> Result<(), OwnershipApiError> {
     match kind {
         ResourceKind::Gateways => {
@@ -812,6 +824,7 @@ async fn persist_tenant_id(
                 .await
                 .map_err(internal)?
                 .ok_or_else(|| missing(kind, id))?;
+            let stored = resource.clone();
             resource.tenant_id = tenant_id;
             super::surface_tenancy::validate_surface_references(state, &resource, None, None)
                 .await
@@ -824,6 +837,17 @@ async fn persist_tenant_id(
                     super::surfaces::SurfaceApiError::BadRequest(message) => OwnershipApiError::Refused(message),
                     other => OwnershipApiError::Internal(format!("External consent validation failed: {other:?}")),
                 })?;
+            let allowlist = crate::egress::bdd_egress_allowlist();
+            super::surface_grants::remove_changed_binding_grants(
+                &super::surface_grants::GrantRemoval::of(state, allowlist.as_deref(), actor),
+                Some(&stored),
+                Some(&resource),
+            )
+            .await
+            .map_err(|error| match error {
+                super::surfaces::SurfaceApiError::Unavailable(message) => OwnershipApiError::Refused(message),
+                other => OwnershipApiError::Internal(format!("Removing the surface's grants failed: {other:?}")),
+            })?;
             store
                 .save(&resource)
                 .await
