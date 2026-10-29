@@ -245,7 +245,8 @@ Point caller.
 `transit.source_auth` is not enforced. The admin API refuses a surface that sets it, on the
 surface or in a variant's overrides, with `400`. A surface stored with it still loads, with a
 warning in the log, but its Transit Points refuse every request with `503`, discovery reads
-included.
+included. The caller is told only that the Transit Point is unavailable, as a JSON-RPC error
+on an MCP Transit Point and a problem JSON otherwise; the reason is logged.
 
 ### Transit token
 
@@ -268,7 +269,8 @@ A Transit Point refuses the call with `401` unless the token:
   difference.
 
 A `2026-07-28` MCP request must also carry exactly one token, and allows no clock difference.
-A `GET` of a public discovery path, such as an agent card, is forwarded without a
+The refusal says only that the transit token is missing or invalid; which check it failed is
+logged. A `GET` of a public discovery path, such as an agent card, is forwarded without a
 transit token check, and so without any credential (see
 [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#when-a-credential-cannot-be-resolved)).
 

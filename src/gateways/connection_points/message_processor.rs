@@ -5434,12 +5434,16 @@ async fn process_forward_request_in_request_scope(
                 &resolution.result,
                 crate::proxy::credential_delegation::DelegationLookupResult::Unavailable
             )) {
+                let (content_type, body) = crate::proxy::credential_delegation::delegation_unavailable_body(
+                    surface.channel_protocol() == crate::config::ChannelProtocol::Mcp,
+                    &body_bytes,
+                );
                 return ProcessingResult::RequiresResponse {
                     response_type: MessageType::ForwardResponse.to_string(),
                     response_body: serde_json::json!({
                         "status": 503,
-                        "headers": {"content-type": "text/plain", "cache-control": "no-store"},
-                        "body": "Delegated credentials unavailable",
+                        "headers": {"content-type": content_type, "cache-control": "no-store"},
+                        "body": body,
                     }),
                 };
             }

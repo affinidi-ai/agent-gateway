@@ -93,7 +93,8 @@ authenticated caller, the consent mode decides what happens the first time.
 `elicit` needs an MCP client that advertised the `elicitation` capability during
 `initialize`, and a capability record for its session. `elicit_fallback` decides
 what happens when either is missing: `on_demand`, the default, degrades to the 401
-response, and `fail` fails the tool call with a JSON-RPC error. Elicit falls back when:
+response, and `fail` records `elicitation_unsupported` and forwards the tool call without
+the credential. Elicit falls back when:
 
 - the client did not advertise `elicitation`;
 - the upstream returned a session id already in use on the surface (see "MCP session
@@ -102,25 +103,42 @@ response, and `fail` fails the tool call with a JSON-RPC error. Elicit falls bac
   `initialize` with SSE, sent an unusable `Mcp-Session-Id`, or the gateway restarted
   after the session opened.
 
+A user who declines or cancels the elicitation, or does not answer before
+`elicit_timeout_secs`, also has the call forwarded without it.
+
 ### When a credential cannot be resolved
 
-A binding that applies but whose credential cannot be resolved refuses the request; the
-gateway never forwards it without the credential. That covers a deleted or unreadable
-provider, an API key whose secret cannot be read, a failed client-credentials token request,
-a vault read error, and consent that is needed but cannot be asked for because no
-authorization URL can be built, for example when the provider has no
-`authorization_endpoint`. An Access Point and Fabric receive answer `503` with `Delegated
-credentials unavailable`. The delegation audit records the binding's outcome, and
-`provider_unavailable` names a provider that cannot be used.
+A binding that applies but whose credential cannot be resolved refuses the request rather
+than forwarding it without the credential. That covers a deleted or unreadable provider, an
+API key whose secret cannot be read, a failed client-credentials token request, a vault read
+error, and consent that is needed but cannot be asked for because no authorization URL can be
+built, for example when the provider has no `authorization_endpoint`. An Access Point and
+Fabric receive answer `503`: on an MCP surface a JSON-RPC error (`-32603`, `Delegated
+credentials unavailable`) carrying the request's id, otherwise an `application/problem+json`
+body. The delegation audit records the binding's outcome, and `provider_unavailable` names a
+provider that cannot be used.
 
 A Transit Point refuses such a request with `503`, and also refuses with `403` one whose
-transit token carries no caller identity, or for which neither its managed identity nor the
-transit token's caller DID gives the agent half of the vault key. An MCP Transit Point answers
-with a JSON-RPC error (`-32603` for `503`, `-32001` for `403`) carrying the request's id, and
-any other Transit Point with an `application/problem+json` body. A missing token still gets
-the consent answer above. A public discovery read, such as an agent card fetch, needs no
-transit token and names no caller, so, as with `target_auth`, it is forwarded without a
-delegated credential rather than refused.
+transit token carries no caller identity, including every request to a Transit Point that sets
+`require_transit_token: false`, or for which neither its managed identity nor the transit
+token's caller DID gives the agent half of the vault key. It also refuses when its delegation
+stores are not available. An MCP Transit Point answers with a JSON-RPC error (`-32603` for
+`503`, `-32001` for `403`) carrying the request's id, and any other Transit Point with an
+`application/problem+json` body. A missing token still gets the consent answer above. A
+Transit Point forwards a `GET` of a public discovery path, such as an agent card, without
+checking a transit token, so it carries no caller, and it is forwarded without a delegated
+credential, as it is without the `target_auth` one.
+
+Outside these checks a request is still forwarded without the credential: on an Access Point
+or Fabric receive whose delegation stores
+are not available, on Fabric receive for a request with no user identity, and on the `elicit`
+outcomes above.
+
+A grant is looked up by the managed agent's DID, the caller's identity hash and the provider,
+not by surface or Transit Point. Surfaces that share an agent DID, such as surfaces whose
+managed identity is derived from the same JWT claim, therefore release to each other the
+grants a user consented to on either. A Transit Point never looks a grant up under a
+placeholder agent.
 
 ## Across Fabric
 

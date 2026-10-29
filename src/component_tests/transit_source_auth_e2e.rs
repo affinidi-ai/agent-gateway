@@ -55,12 +55,12 @@ async fn transit_source_auth_is_refused_by_the_api_and_closes_a_loaded_surfaces_
             .unwrap();
         assert_eq!(response.status(), 503, "{method} {path}");
         let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["detail"], "This Transit Point is unavailable", "{method} {path}: {body}");
         assert!(
-            body["detail"]
-                .as_str()
-                .unwrap()
-                .contains("transit.source_auth"),
-            "{body}"
+            !body
+                .to_string()
+                .contains("source_auth"),
+            "the caller is not told why: {body}"
         );
     }
     assert_eq!(

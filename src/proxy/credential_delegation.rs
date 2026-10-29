@@ -65,16 +65,57 @@ fn consent_identity_permits(
     }
 }
 
+/// What a caller is told when a delegated credential its request needs cannot be
+/// resolved; why is logged.
+pub(crate) const DELEGATION_UNAVAILABLE: &str = "Delegated credentials unavailable";
+
+/// The `503` body refusing a request whose delegated credential cannot be
+/// resolved, with its content type: on an MCP surface a JSON-RPC error answering
+/// the request's id, otherwise a problem JSON.
+pub(crate) fn delegation_unavailable_body(
+    mcp: bool,
+    request_body: &[u8],
+) -> (&'static str, String) {
+    if mcp {
+        let id = serde_json::from_slice::<serde_json::Value>(request_body)
+            .ok()
+            .and_then(|body| body.get("id").cloned())
+            .unwrap_or(serde_json::Value::Null);
+        return (
+            "application/json",
+            crate::mcp::errors::create_mcp_error_envelope(
+                Some(id),
+                crate::mcp::errors::error_codes::INTERNAL_ERROR,
+                DELEGATION_UNAVAILABLE,
+                None,
+            )
+            .to_string(),
+        );
+    }
+    (
+        "application/problem+json",
+        serde_json::json!({
+            "type": "https://affinidi.com/atg/errors/delegated-credentials-unavailable",
+            "title": "Delegated Credentials Unavailable",
+            "status": 503,
+            "detail": DELEGATION_UNAVAILABLE,
+        })
+        .to_string(),
+    )
+}
+
 /// Result of a delegation credential lookup for a single binding
 pub enum DelegationLookupResult {
     /// Token found — inject these credentials into the upstream request
     Inject(Vec<ResolvedCredentialInjection>),
     /// User has not yet consented — return consent_required to caller
-    ConsentRequired { authorization_url: String, provider_name: String, scopes: Vec<String> },
+    ConsentRequired {
+        authorization_url: String,
+        provider_name: String,
+        scopes: Vec<String>,
+    },
     /// Binding doesn't apply to this request (e.g. tool filter)
     NotApplicable,
-    /// The credential the binding requires cannot be resolved; the request must be
-    /// refused rather than forwarded without it.
     Unavailable,
 }
 
@@ -2031,6 +2072,30 @@ mod tests {
         }
         assert_eq!(results[0].action.outcome, DelegationActionOutcome::TokenInjected);
         assert_eq!(results[0].action.provider_id, "cp-1");
+    }
+
+    #[test]
+    fn an_unresolvable_credential_is_refused_in_the_shape_of_the_surface_protocol() {
+        let (content_type, body) =
+            delegation_unavailable_body(true, br#"{"jsonrpc":"2.0","id":42,"method":"tools/call"}"#);
+        assert_eq!(content_type, "application/json");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({"jsonrpc": "2.0", "id": 42,
+                "error": {"code": -32603, "message": "Delegated credentials unavailable"}})
+        );
+
+        let (_, body) = delegation_unavailable_body(true, b"not json");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"], serde_json::Value::Null);
+
+        let (content_type, body) = delegation_unavailable_body(false, br#"{"jsonrpc":"2.0","id":42}"#);
+        assert_eq!(content_type, "application/problem+json");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({"type": "https://affinidi.com/atg/errors/delegated-credentials-unavailable",
+                "title": "Delegated Credentials Unavailable", "status": 503,
+                "detail": "Delegated credentials unavailable"})
+        );
     }
 
     #[tokio::test]

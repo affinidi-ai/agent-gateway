@@ -131,20 +131,19 @@ pub(crate) enum OutboundPipelineError {
     #[error("Target authentication credentials unavailable")]
     TargetAuthUnavailable,
 
-    #[error("Transit token missing or invalid: {0}")]
+    /// Why the token was refused is logged, never shown to the caller.
+    #[error("Transit token missing or invalid")]
     TransitTokenInvalid(String),
 
-    #[error(
-        "This Transit Point refuses every request: its surface sets transit.source_auth, which the gateway does \
-         not enforce"
-    )]
-    TransitSourceAuthUnsupported,
+    /// The surface sets `transit.source_auth`, which the gateway does not
+    /// enforce, so every request is refused. The reason is logged, never shown
+    /// to the caller. `mcp_request_id` is set, to the id the JSON-RPC error
+    /// answers, when the Transit Point speaks MCP.
+    #[error("This Transit Point is unavailable")]
+    TransitSourceAuthUnsupported { mcp_request_id: Option<serde_json::Value> },
 
     #[error("Credential delegation consent required")]
     ConsentRequired(String),
-
-    #[error("Delegated credentials unavailable")]
-    DelegationUnavailable,
 
     /// The request's delegated credentials cannot be resolved, so it is refused
     /// rather than forwarded without them. `mcp_request_id` is set, to the id
@@ -198,7 +197,7 @@ pub(crate) enum DelegationRefusal {
          identity nor the transit token establishes one"
     )]
     AgentIdentityMissing,
-    #[error("Delegated credentials unavailable")]
+    #[error("{}", crate::proxy::credential_delegation::DELEGATION_UNAVAILABLE)]
     Unavailable,
 }
 
@@ -247,7 +246,7 @@ impl OutboundPipelineError {
 
             Self::TransitTokenInvalid(_) | Self::ConsentRequired(_) => StatusCode::UNAUTHORIZED,
 
-            Self::DelegationUnavailable | Self::TransitSourceAuthUnsupported => StatusCode::SERVICE_UNAVAILABLE,
+            Self::TransitSourceAuthUnsupported { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::DelegationRefused { refusal, .. } => refusal.status_code(),
             Self::McpResourceAuthorization { error, .. } => error.status_code(),
 
@@ -311,6 +310,16 @@ impl IntoResponse for OutboundPipelineError {
                 id: Some(id),
                 code: refusal.jsonrpc_code(),
                 message: refusal.to_string(),
+                data: None,
+            }
+            .into_response();
+        }
+        if let Self::TransitSourceAuthUnsupported { mcp_request_id: Some(id) } = &self {
+            return crate::mcp::request_validation::McpRequestValidationError {
+                status: self.status_code(),
+                id: Some(id.clone()),
+                code: crate::mcp::errors::error_codes::INTERNAL_ERROR,
+                message: self.to_string(),
                 data: None,
             }
             .into_response();
@@ -987,8 +996,25 @@ async fn outbound_proxy_handler_in_request_scope(
 /// carries the caller context (who initiated the inbound request) and is bound
 /// to specific transit points.
 ///
-/// Without a valid transit token, the request is rejected with 401 Unauthorized.
+/// Without a valid transit token, the request is rejected with 401 Unauthorized,
+/// and why is logged.
 async fn step_validate_transit_token(
+    state: &OutboundProxyState,
+    ctx: &mut OutboundPipelineContext,
+) -> Result<(), OutboundPipelineError> {
+    let validated = validate_transit_token(state, ctx).await;
+    if let Err(OutboundPipelineError::TransitTokenInvalid(reason)) = &validated {
+        warn!(
+            request_id = %ctx.request_id,
+            transit_point = %ctx.virtual_channel.alias,
+            reason = %reason,
+            "Transit token refused"
+        );
+    }
+    validated
+}
+
+async fn validate_transit_token(
     state: &OutboundProxyState,
     ctx: &mut OutboundPipelineContext,
 ) -> Result<(), OutboundPipelineError> {
@@ -1121,7 +1147,17 @@ async fn step_source_auth(
         .source_auth
         .is_some()
     {
-        return Err(OutboundPipelineError::TransitSourceAuthUnsupported);
+        warn!(
+            request_id = %ctx.request_id,
+            surface_id = %ctx.surface.surface_id,
+            transit_point = %ctx.virtual_channel.alias,
+            "{}",
+            crate::config::agent_surface::TRANSIT_SOURCE_AUTH_REFUSED
+        );
+        return Err(OutboundPipelineError::TransitSourceAuthUnsupported {
+            mcp_request_id: (ctx.virtual_channel.protocol == crate::config::agent_surface::TransitProtocol::Mcp)
+                .then_some(serde_json::Value::Null),
+        });
     }
     if let Some(authorization) = ctx
         .virtual_channel
@@ -4084,7 +4120,7 @@ async fn step_prepare_modern_credentials(
                 .map_err(|_| OutboundPipelineError::MetadataInjectionFailed)?;
             prepared
                 .credential_headers()
-                .map_err(|_| OutboundPipelineError::DelegationUnavailable)?;
+                .map_err(|_| refuse_delegation(ctx, DelegationRefusal::Unavailable))?;
             ctx.body_bytes = Some(restored);
             ctx.mcp_classification = Some(crate::mcp::request_validation::McpRequestClassification::Modern(Box::new(
                 prepared.request.clone(),
@@ -4126,6 +4162,17 @@ fn mcp_refusal_id(ctx: &OutboundPipelineContext) -> Option<serde_json::Value> {
     })
 }
 
+/// Refuse a request whose delegated credentials cannot be resolved.
+fn refuse_delegation(
+    ctx: &OutboundPipelineContext,
+    refusal: DelegationRefusal,
+) -> OutboundPipelineError {
+    OutboundPipelineError::DelegationRefused {
+        refusal,
+        mcp_request_id: mcp_refusal_id(ctx),
+    }
+}
+
 /// [11] Credential Injection — resolve delegated OAuth tokens from the credential
 /// vault and inject them into the outbound request, or return a consent_required
 /// signal if the user has not yet authorized.
@@ -4140,10 +4187,6 @@ async fn step_inject_credentials(
     state: &OutboundProxyState,
     ctx: &mut OutboundPipelineContext,
 ) -> Result<(), OutboundPipelineError> {
-    let refuse = |ctx: &OutboundPipelineContext, refusal| OutboundPipelineError::DelegationRefused {
-        refusal,
-        mcp_request_id: mcp_refusal_id(ctx),
-    };
     if ctx
         .variant_resolution_error
         .is_some()
@@ -4192,7 +4235,7 @@ async fn step_inject_credentials(
                 request_id = %ctx.request_id,
                 "Credential delegation configured but stores not available - refusing the request"
             );
-            return Err(refuse(ctx, DelegationRefusal::Unavailable));
+            return Err(refuse_delegation(ctx, DelegationRefusal::Unavailable));
         }
     };
 
@@ -4211,7 +4254,7 @@ async fn step_inject_credentials(
                 request_id = %ctx.request_id,
                 "Transit token does not carry user_identity_hash - refusing the request"
             );
-            return Err(refuse(ctx, DelegationRefusal::CallerIdentityMissing));
+            return Err(refuse_delegation(ctx, DelegationRefusal::CallerIdentityMissing));
         }
     };
 
@@ -4232,7 +4275,7 @@ async fn step_inject_credentials(
             request_id = %ctx.request_id,
             "No managed agent identity for delegated credentials - refusing the request"
         );
-        return Err(refuse(ctx, DelegationRefusal::AgentIdentityMissing));
+        return Err(refuse_delegation(ctx, DelegationRefusal::AgentIdentityMissing));
     };
     let agent_did = agent_did.as_str();
 
@@ -4291,7 +4334,7 @@ async fn step_inject_credentials(
             matches!(&resolution.result, crate::proxy::credential_delegation::DelegationLookupResult::Unavailable)
         })
     {
-        return Err(refuse(ctx, DelegationRefusal::Unavailable));
+        return Err(refuse_delegation(ctx, DelegationRefusal::Unavailable));
     }
 
     // Check for consent_required — if any binding needs consent, return the signal
@@ -4389,7 +4432,7 @@ async fn step_inject_credentials(
                                 header = %name,
                                 "Delegated credential is not a valid header - refusing the request"
                             );
-                            return Err(refuse(ctx, DelegationRefusal::Unavailable));
+                            return Err(refuse_delegation(ctx, DelegationRefusal::Unavailable));
                         };
                         ctx.delegated_credential_headers
                             .insert(header_name, header_value);
@@ -4464,7 +4507,7 @@ async fn fabric_forward_headers(
         if let Some(prepared) = ctx.modern_delegation.as_ref() {
             for (name, value) in prepared
                 .credential_headers()
-                .map_err(|_| OutboundPipelineError::DelegationUnavailable)?
+                .map_err(|_| refuse_delegation(ctx, DelegationRefusal::Unavailable))?
                 .iter()
             {
                 stream_headers.insert(name.clone(), value.clone());
@@ -4709,7 +4752,7 @@ async fn step_forward_request_http(
         req_builder = req_builder.headers(
             prepared
                 .credential_headers()
-                .map_err(|_| OutboundPipelineError::DelegationUnavailable)?,
+                .map_err(|_| refuse_delegation(ctx, DelegationRefusal::Unavailable))?,
         );
     }
     if matches!(
@@ -8553,7 +8596,7 @@ mod tests {
                 .await
                 .unwrap_err();
 
-            assert!(matches!(error, OutboundPipelineError::TransitSourceAuthUnsupported), "{case}: {error:?}");
+            assert!(matches!(error, OutboundPipelineError::TransitSourceAuthUnsupported { .. }), "{case}: {error:?}");
             assert!(
                 ctx.authenticated_identity
                     .is_none(),
@@ -8567,12 +8610,23 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
+            if mcp_resource_authorization {
+                assert_eq!(
+                    body,
+                    json!({"jsonrpc": "2.0", "id": null, "error": {
+                        "code": crate::mcp::errors::error_codes::INTERNAL_ERROR,
+                        "message": "This Transit Point is unavailable"
+                    }}),
+                    "{case}"
+                );
+            } else {
+                assert_eq!(body["detail"], "This Transit Point is unavailable", "{case}: {body}");
+            }
             assert!(
-                body["detail"]
-                    .as_str()
-                    .unwrap()
-                    .contains("transit.source_auth"),
-                "{case}: {body}"
+                !body
+                    .to_string()
+                    .contains("source_auth"),
+                "{case}: the caller is not told why: {body}"
             );
         }
     }
@@ -10955,6 +11009,43 @@ mod tests {
             }
             other => panic!("unexpected error: {:?}", other),
         }
+    }
+
+    /// A refused transit token is answered without saying which check it
+    /// failed, such as that it was issued for another surface.
+    #[tokio::test]
+    async fn a_refused_transit_token_is_not_told_why() {
+        let issuer = crate::proxy::transit_token::TransitTokenIssuer::new(
+            crate::proxy::transit_token::TransitTokenKey::generate().unwrap(),
+            "gw-test".to_string(),
+        );
+        let token = issuer
+            .issue("another-surface", None, None, None, None, None, vec![])
+            .unwrap();
+        let mut state = test_outbound_state();
+        state.transit_token_issuer = Some(Arc::new(issuer));
+        let mut ctx = test_pipeline_context();
+        Arc::make_mut(&mut ctx.surface).surface_id = "surf-001".into();
+        ctx.original_headers
+            .insert("X-Transit-Token", token.parse().unwrap());
+
+        let error = step_validate_transit_token(&state, &mut ctx)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, OutboundPipelineError::TransitTokenInvalid(reason) if reason.contains("another surface")),
+            "{error:?}"
+        );
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["detail"], "Transit token missing or invalid", "{body}");
     }
 
     /// A Transit Point configured with MCP tool gating that is not in force, as

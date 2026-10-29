@@ -6638,11 +6638,19 @@ async fn proxy_handler_with_mcp_runtime(
                     )
                 })
             {
+                let (content_type, body) = crate::proxy::credential_delegation::delegation_unavailable_body(
+                    state
+                        .surface
+                        .access_point
+                        .protocol
+                        == crate::config::agent_surface::SurfaceProtocol::Mcp,
+                    &body_bytes,
+                );
                 return Ok(Response::builder()
                     .status(StatusCode::SERVICE_UNAVAILABLE)
-                    .header("content-type", "text/plain")
+                    .header("content-type", content_type)
                     .header("cache-control", "no-store")
-                    .body(Body::from("Delegated credentials unavailable"))
+                    .body(Body::from(body))
                     .unwrap());
             }
 

@@ -20,7 +20,8 @@ changes:
         issuer and expiry, that the token's surface is the Transit Point's surface, that its
         issue time is not in the future, that its lifetime is no longer than the 300 seconds
         the gateway issues, and that it carries a token ID, with 5 seconds of clock
-        allowance. A token can still be used any number of times until it expires.
+        allowance. A token can still be used any number of times until it expires. A refusal
+        says only that the token is missing or invalid; the reason is logged.
     - timestamp: '2026-10-28T00:00:00.000Z'
       title: Take a deleted surface's Transit Points out of service at once
       description: >-
@@ -50,9 +51,10 @@ changes:
       description: >-
         `transit.source_auth` is not supported. The admin API now refuses a surface that
         sets it, on the surface or in a variant's overrides, and a surface stored with it
-        loads with a warning and has every request to its Transit Points refused with `503`.
-        Transit Point callers are authenticated by the transit token and, on an MCP Transit
-        Point, by `mcp_http.authorization`.
+        loads with a warning and has every request to its Transit Points refused with `503`,
+        told only that the Transit Point is unavailable. Transit Point callers are
+        authenticated by the transit token and, on an MCP Transit Point, by
+        `mcp_http.authorization`.
     - timestamp: '2026-10-28T00:00:00.000Z'
       title: Stop forwarding cookies and authentication challenges across a Transit Point
       description: >-
@@ -201,7 +203,10 @@ changes:
         An Access Point or Fabric receive with credential delegation now refuses with `503` a
         request whose provider is deleted or unreadable, whose API key secret cannot be read,
         whose client-credentials token request fails, whose vault read fails, or whose consent
-        cannot be asked for, instead of forwarding it without the credential.
+        cannot be asked for, instead of forwarding it without the credential. The refusal is a
+        JSON-RPC error (`-32603`) carrying the request's id on an MCP surface and an
+        `application/problem+json` body otherwise, where the gateway used to answer `503` in
+        plain text.
     - timestamp: '2026-10-28T00:00:00.000Z'
       title: Forward Transit Point discovery reads without a delegated credential
       description: >-
