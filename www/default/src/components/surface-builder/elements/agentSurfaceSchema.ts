@@ -101,7 +101,6 @@ export const AGENT_SURFACE_PATHS: ReadonlySet<string> = new Set([
   'transit.custom_metadata',
   'transit.response_extension_rules',
   'transit.opa_policy_definition_id',
-  'transit.source_auth',
 
   // ── TransitPoint (each entry in transit.points[]) ────────────────
   'transit.points[*].id',

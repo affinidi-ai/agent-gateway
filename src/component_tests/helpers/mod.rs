@@ -571,6 +571,63 @@ impl MockServer {
     }
 }
 
+/// A target that records the complete headers of every request it receives,
+/// repeated ones included, and answers each with a fixed status and headers and
+/// a JSON-RPC result.
+pub struct RecordingTarget {
+    pub url: String,
+    received: Arc<std::sync::Mutex<Vec<axum::http::HeaderMap>>>,
+    _server: tokio::task::JoinHandle<()>,
+}
+
+impl RecordingTarget {
+    pub async fn start(
+        status: axum::http::StatusCode,
+        headers: &[(&'static str, &'static str)],
+    ) -> Self {
+        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = received.clone();
+        let headers = headers.to_vec();
+        let app = Router::new().fallback(move |request_headers: axum::http::HeaderMap| {
+            let recorded = recorded.clone();
+            let headers = headers.clone();
+            async move {
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push(request_headers);
+                let mut response = Response::builder()
+                    .status(status)
+                    .header("content-type", "application/json");
+                for (name, value) in headers {
+                    response = response.header(name, value);
+                }
+                response
+                    .body(axum::body::Body::from(r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#))
+                    .unwrap()
+            }
+        });
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .ok();
+        });
+        Self { url, received, _server: server }
+    }
+
+    /// The headers of every request received so far, oldest first.
+    pub fn received(&self) -> Vec<axum::http::HeaderMap> {
+        self.received
+            .lock()
+            .unwrap()
+            .clone()
+    }
+}
+
 // ── gateway config builders ──────────────────────────────────────────────────
 
 /// Directory holding the TLS pair component tests boot the gateway with.
@@ -1412,6 +1469,8 @@ async fn wait_for_gateway_http(
     loop {
         match client.get(&url).send().await {
             Ok(_) => break,
+            // The port accepts connections but does not speak plain HTTP: a TLS listener.
+            Err(error) if !error.is_connect() && !error.is_timeout() => break,
             Err(_) if tokio::time::Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }

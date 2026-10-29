@@ -1463,16 +1463,24 @@ pub struct SharedTransitConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opa_policy_definition_id: Option<String>,
 
-    /// Source authentication for the transit listener (protected agent auth).
+    /// Not enforced. The admin API refuses a surface that sets it, and one
+    /// stored with it has every Transit Point request refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_auth: Option<SourceAuthConfig>,
 }
+
+/// Why a surface that sets [`SharedTransitConfig::source_auth`] is refused by the
+/// admin API, and has every Transit Point request refused when it is loaded.
+pub const TRANSIT_SOURCE_AUTH_REFUSED: &str = "transit.source_auth is not enforced, so a surface that sets it has \
+     every Transit Point request refused; remove it, and authenticate Transit Point callers with \
+     require_transit_token and, on an MCP Transit Point, mcp_http.authorization";
 
 /// How the transit token carries caller context.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum TransitTokenMode {
-    /// Context encrypted into the token itself (stateless, larger token).
+    /// Context carried in the signed token itself, readable by the managed
+    /// agent (stateless, larger token).
     #[default]
     Embedded,
     /// Context stored server-side; token is a short reference key.
@@ -1497,7 +1505,7 @@ pub struct TransitPoint {
     /// URL-safe routing identifier for this transit point. Required and
     /// must match `^[a-z][a-z0-9-]*$` (lowercase, digits, dashes; must
     /// start with a letter). Forms the path segment under
-    /// `/outgoing/<route>/<alias>/...` and the transit-point claim in
+    /// `/outbound/<route>/<alias>/...` and the transit-point claim in
     /// transit tokens. Validated server-side on create/update — empty or
     /// malformed values are rejected, not silently coerced.
     #[serde(default)]
@@ -1605,7 +1613,7 @@ pub struct TransitPoint {
     pub agent_card_path: Option<String>,
 
     /// Per-TP outbound listener address override. When set, this TP's
-    /// `/outgoing/...` route is registered on this address (which must
+    /// `/outbound/...` route is registered on this address (which must
     /// be one of the gateway's pre-configured outbound listener
     /// addresses) instead of the channel-wide
     /// [`TransitConfig::outbound_listen_address`]. Lets two TPs in the
@@ -1615,7 +1623,7 @@ pub struct TransitPoint {
 
     /// Per-TP listen path override. When set (e.g. `/partner-a-webhook`),
     /// the TP is registered at exactly `<effective_listen_address>{path}`
-    /// instead of the derived `/outgoing/<channel-route>/<alias>`. Path
+    /// instead of the derived `/outbound/<channel-route>/<alias>`. Path
     /// must start with `/` and must not contain `..`. Per-listener
     /// uniqueness is enforced at validation time.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -111,13 +111,16 @@ pub async fn forwarded_peer_cert(
     next.run(req).await
 }
 
+/// Whether `ip` is inside one of `cidrs`. An IPv4-mapped IPv6 address, which an
+/// IPv6 listener reports for an IPv4 caller, also matches the IPv4 entries.
 pub(crate) fn ip_in_any(
     ip: &IpAddr,
     cidrs: &[IpNet],
 ) -> bool {
+    let canonical = ip.to_canonical();
     cidrs
         .iter()
-        .any(|c| c.contains(ip))
+        .any(|c| c.contains(ip) || c.contains(&canonical))
 }
 
 /// Parse a forwarded-client-cert header value into the leaf certificate's
@@ -408,6 +411,22 @@ mod tests {
         let cidrs: Vec<IpNet> = vec!["fd00::/8".parse().unwrap()];
         assert!(ip_in_any(&"fd12::1".parse().unwrap(), &cidrs));
         assert!(!ip_in_any(&"2001:db8::1".parse().unwrap(), &cidrs));
+    }
+
+    #[test]
+    fn ip_in_any_ipv4_mapped_address_matches_ipv4_cidr() {
+        let ip = |value: &str| -> IpAddr { value.parse().unwrap() };
+        let cidrs: Vec<IpNet> = vec!["10.0.0.0/8".parse().unwrap()];
+        assert!(ip_in_any(&ip("::ffff:10.0.1.7"), &cidrs));
+        assert!(!ip_in_any(&ip("::ffff:8.8.8.8"), &cidrs));
+        assert!(!ip_in_any(&ip("::10.0.1.7"), &cidrs));
+
+        let mapped_cidrs: Vec<IpNet> = vec![
+            "::ffff:10.0.0.0/104"
+                .parse()
+                .unwrap(),
+        ];
+        assert!(ip_in_any(&ip("::ffff:10.0.1.7"), &mapped_cidrs));
     }
 
     // ── Layer behaviour (through real Router) ──────────────────────────────

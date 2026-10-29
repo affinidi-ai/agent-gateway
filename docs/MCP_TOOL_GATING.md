@@ -118,7 +118,19 @@ Every gate fails closed on a `tools/call` whose tool name it cannot read (no
 `fabric://` send leg, the `proxy://` MCP proxy path, Fabric receive and each
 Transit Point deny it and record a deny decision, rather than checking an empty
 name that a deny-pattern gate would pass. A surface or Transit Point without
-gating is unaffected.
+gating is unaffected. A Transit Point whose configuration sets gating that is not
+in force, because it was evicted, as when its surface is deleted while the
+request is in flight, or never compiled, refuses every `tools/call` and answers
+`tools/list` with the fail-closed empty list below.
+
+Per-Transit-Point gating is compiled from the surface's own Transit Points only,
+so a variant's Transit Point is gated by the surface's Transit Point of the same
+alias, and gating set on a variant's Transit Point is not supported. A variant
+Transit Point that sets `mcp_tool_gating` where the surface's Transit Point of
+that alias sets none, or that the surface does not have, has gating that is never
+compiled, so it refuses every `tools/call` and lists no tools, as a
+per-Transit-Point policy set only on a variant is refused. Set the gating on the
+surface's Transit Point instead.
 
 - **SSE / Streamable-HTTP note**: when the upstream MCP server answers
   `tools/list` with `text/event-stream` (SSE), `src/proxy/handler.rs` buffers

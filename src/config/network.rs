@@ -241,12 +241,17 @@ impl NetworkConfig {
         validate_affinidi_terms_url(url, cfg!(debug_assertions))
     }
 
-    /// Get all unique ports that should be bound
+    /// Get all unique ports that should be bound, in listener order. Listeners
+    /// sharing a port are served by one listener task, which binds each of
+    /// their addresses.
     pub fn get_ports(&self) -> Vec<u16> {
-        self.listeners
-            .iter()
-            .map(|l| l.port)
-            .collect()
+        let mut ports = Vec::new();
+        for listener in &self.listeners {
+            if !ports.contains(&listener.port) {
+                ports.push(listener.port);
+            }
+        }
+        ports
     }
 
     /// Get listener by port
@@ -427,6 +432,16 @@ fn validate_listener_set(listeners: &[Listener]) -> anyhow::Result<()> {
         if !ids.insert(l.id.as_str()) {
             anyhow::bail!("Invalid network config: duplicate listener id '{}'", l.id);
         }
+        if l.bind_address
+            .parse::<std::net::IpAddr>()
+            .is_err()
+        {
+            anyhow::bail!(
+                "Invalid network config: listener '{}' bind_address '{}' is not an IP address",
+                l.id,
+                l.bind_address
+            );
+        }
     }
 
     let mut sockets: HashSet<(&str, u16)> = HashSet::new();
@@ -488,6 +503,17 @@ mod listener_validation_tests {
     #[test]
     fn same_port_on_different_bind_addresses_passes() {
         validate_listener_set(&[listener("a", "127.0.0.1", 8080), listener("b", "10.0.0.1", 8080)]).unwrap();
+    }
+
+    #[test]
+    fn a_bind_address_that_is_not_an_ip_address_is_rejected() {
+        for bind in ["localhost", "", "0.0.0.0:8080", "gateway.internal"] {
+            let err = validate_listener_set(&[listener("a", bind, 8080)])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("is not an IP address"), "{bind}: {err}");
+        }
+        validate_listener_set(&[listener("a", "::1", 8080), listener("b", "127.0.0.1", 8081)]).unwrap();
     }
 }
 
