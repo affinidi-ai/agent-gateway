@@ -470,6 +470,56 @@ mod tests {
     }
 
     #[test]
+    fn a_save_with_a_disabled_default_refreshes_the_enabled_variants() {
+        let mut s = base_surface("s11");
+        s.variants
+            .push(variant("v1", "alpha", true, Some("http://alpha/")));
+        s.variants
+            .push(variant("v2", "beta", true, Some("http://beta/")));
+        s.default_variant_id = Some("v2".to_string());
+        let cache = ResolvedSurfaceCache::new();
+        cache.upsert(&s).unwrap();
+
+        s.variants[0] = variant("v1", "alpha", true, Some("http://alpha-2/"));
+        s.variants[1].enabled = false;
+        cache.upsert(&s).unwrap();
+
+        let snap = cache
+            .resolve("s11", Some("alpha"))
+            .unwrap();
+        assert_eq!(snap.surface.target.endpoint, "http://alpha-2/");
+        assert_eq!(snap.surface_variant, "alpha");
+    }
+
+    #[test]
+    fn resolve_default_refuses_a_disabled_default_variant() {
+        let mut s = base_surface("s12");
+        s.variants
+            .push(variant("v1", "alpha", true, Some("http://alpha/")));
+        s.variants
+            .push(variant("v2", "beta", false, Some("http://beta/")));
+        s.default_variant_id = Some("v2".to_string());
+        let cache = ResolvedSurfaceCache::new();
+        cache.upsert(&s).unwrap();
+
+        assert_eq!(
+            cache
+                .resolve("s12", None)
+                .err(),
+            Some(ResolveError::DisabledAlias("beta".to_string()))
+        );
+        assert_eq!(
+            cache
+                .resolve("s12", Some("alpha"))
+                .unwrap()
+                .surface
+                .target
+                .endpoint,
+            "http://alpha/"
+        );
+    }
+
+    #[test]
     fn remove_drops_entry() {
         let cache = ResolvedSurfaceCache::new();
         cache
