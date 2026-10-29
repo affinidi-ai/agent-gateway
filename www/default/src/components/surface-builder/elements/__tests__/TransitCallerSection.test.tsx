@@ -3,7 +3,7 @@ import { fireEvent, render, screen } from '@testing-library/react';
 import TransitCallerSection from '../transit-point/TransitCallerSection';
 import { SurfaceMetaProvider } from '../../SurfaceMetaContext';
 import { apiClient } from '../../../../api';
-import { callerAuthProblems } from '../transit-point/callerAuth';
+import { callerAuthProblems, callerAuthToWire } from '../transit-point/callerAuth';
 
 jest.mock('../../../../api', () => ({
   apiClient: { get: jest.fn(), fetch: jest.fn() },
@@ -188,6 +188,93 @@ describe('Who can call this Transit Point', () => {
   });
 });
 
+describe('a stored method the dashboard cannot show', () => {
+  const didAuth = { type: 'did_auth', allowed_dids: ['did:web:a.example'] };
+
+  it('names it as a disabled option and keeps it until removed', () => {
+    render(<Harness initial={{ id: 'tp', require_transit_token: false, source_auth: didAuth }} />);
+    const select = screen.getByTestId('transit-point-caller-auth-method') as HTMLSelectElement;
+    expect(select.value).toBe('unsupported');
+    const named = screen.getByRole('option', { name: 'did_auth (not supported here)' });
+    expect(named).toBeDisabled();
+    expect(latest.source_auth).toEqual(didAuth);
+  });
+
+  it('removes it with the Remove control, sending an explicit null', () => {
+    render(<Harness initial={{ id: 'tp', require_transit_token: true, source_auth: didAuth }} />);
+    fireEvent.click(screen.getByTestId('transit-point-caller-auth-remove'));
+    expect(latest.source_auth).toBeNull();
+    expect(callerAuthToWire(latest)).toMatchObject({ source_auth: null });
+    expect(screen.queryByTestId('transit-point-caller-auth-unsupported')).toBeNull();
+  });
+
+  it('also lets None replace it', () => {
+    render(<Harness initial={{ id: 'tp', source_auth: didAuth }} />);
+    fireEvent.change(screen.getByTestId('transit-point-caller-auth-method'), {
+      target: { value: 'none' },
+    });
+    expect(latest.source_auth).toBeNull();
+  });
+
+  it('shows one without a readable type as set by the API and kept, not as none', () => {
+    const odd = { extraction: { source: 'http_header', field: 'X' } };
+    render(<Harness initial={{ id: 'tp', require_transit_token: false, source_auth: odd }} />);
+    expect(screen.getByTestId('transit-point-caller-auth-unsupported')).toHaveTextContent(
+      /set through the API.*kept/
+    );
+    expect(screen.getByRole('option', { name: 'Set through the API (kept)' })).toBeInTheDocument();
+    expect(latest.source_auth).toEqual(odd);
+    expect(screen.queryByTestId('transit-point-caller-auth-problem')).toBeNull();
+  });
+});
+
+describe('what the section tells a screen reader', () => {
+  it('marks a blocking problem and a refusal as alerts', () => {
+    render(
+      <Harness
+        initial={{ id: 'tp', require_transit_token: false }}
+        meta={{ saveError: "transit.points[0]: Transit Point 'crm' authenticates no caller (400)" }}
+      />
+    );
+    expect(screen.getByTestId('transit-point-caller-auth-problem')).toHaveAttribute(
+      'role',
+      'alert'
+    );
+    expect(screen.getByTestId('transit-point-save-error')).toHaveAttribute('role', 'alert');
+  });
+
+  it('ties the section title and the help text to the controls', () => {
+    render(<Harness initial={{ id: 'tp' }} />);
+    const group = screen.getByRole('group', { name: 'Who can call this Transit Point' });
+    expect(group).toHaveAccessibleDescription(/must authenticate its callers/);
+    expect(screen.getByTestId('transit-point-caller-auth-method')).toHaveAccessibleDescription(
+      /presents its own credential/
+    );
+  });
+});
+
+describe('header and scheme fields', () => {
+  it('trims the API key header on write', () => {
+    render(
+      <Harness
+        initial={{
+          id: 'tp',
+          require_transit_token: false,
+          source_auth: {
+            type: 'api_key',
+            extraction: { source: 'http_header', field: 'X' },
+            secret_id: 's',
+          },
+        }}
+      />
+    );
+    fireEvent.change(screen.getByTestId('transit-point-caller-auth-header'), {
+      target: { value: ' X-Key ' },
+    });
+    expect(latest.source_auth.extraction.field).toBe('X-Key');
+  });
+});
+
 describe('the exposure warning', () => {
   const exposed = { id: 'tp', ...open, listen_address: 'https://gateway.example.com' };
 
@@ -225,6 +312,43 @@ describe('the exposure warning', () => {
     // Changing who can call it removes it.
     fireEvent.click(screen.getByTestId('transit-point-require-transit-token-switch'));
     expect(screen.queryByTestId('transit-point-save-warning')).toBeNull();
+  });
+});
+
+describe('a save warning for a variant', () => {
+  const base = "Transit Point 'crm' serves callers it does not authenticate and is reachable: a";
+  const inVariant =
+    "Transit Point 'crm' in variant 'candidate' serves callers it does not authenticate and is reachable: b";
+
+  function WithVariant({ variant }: { variant?: string }) {
+    return (
+      <SurfaceMetaProvider
+        value={
+          { surfaceId: 's', activeVariantAlias: variant, saveWarnings: [base, inVariant] } as any
+        }
+      >
+        <TransitCallerSection
+          config={{ id: 'tp', ...open }}
+          alias="crm"
+          updateField={() => {}}
+          updateFields={() => {}}
+        />
+      </SurfaceMetaProvider>
+    );
+  }
+
+  it('shows only the base surface warning on the base', () => {
+    render(<WithVariant />);
+    const shown = screen.getAllByTestId('transit-point-save-warning');
+    expect(shown).toHaveLength(1);
+    expect(shown[0]).toHaveTextContent(/reachable: a$/);
+  });
+
+  it('shows only the variant warning in that variant', () => {
+    render(<WithVariant variant="candidate" />);
+    const shown = screen.getAllByTestId('transit-point-save-warning');
+    expect(shown).toHaveLength(1);
+    expect(shown[0]).toHaveTextContent(/in variant 'candidate'.*reachable: b$/);
   });
 });
 

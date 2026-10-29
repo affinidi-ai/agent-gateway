@@ -15,7 +15,8 @@
 
 /** A Transit Point's `source_auth` as the gateway stores it. */
 export interface TransitSourceAuth {
-  type: string;
+  /** A string for every method the gateway knows; anything else is kept as stored. */
+  type?: unknown;
   [key: string]: unknown;
 }
 
@@ -33,7 +34,7 @@ export const OPEN_WITH_AUTH_PROBLEM =
 export const SOURCE_AUTH_WITH_RESOURCE_TOKEN_PROBLEM =
   'This Transit Point also sets a resource access token (set through the API). Keep one way to authenticate callers: remove the resource access token through the API, or choose no caller authentication here.';
 
-export { parseWarningHeader } from '../../../../utils/warningHeader';
+export { parseWarningHeader, joinWarnings } from '../../../../utils/warningHeader';
 
 type Config = Record<string, unknown> | null | undefined;
 
@@ -47,10 +48,12 @@ function text(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
 }
 
-/** The Transit Point's `source_auth`, or null when it has none. */
+/**
+ * The Transit Point's `source_auth`, or null when it has none. A stored one
+ * whose `type` cannot be read still counts as set, so it is shown and kept.
+ */
 export function readSourceAuth(config: Config): TransitSourceAuth | null {
-  const stored = asRecord(config?.source_auth);
-  return stored && typeof stored.type === 'string' ? (stored as TransitSourceAuth) : null;
+  return asRecord(config?.source_auth) as TransitSourceAuth | null;
 }
 
 /** Whether the Transit Point sets a resource access token (`mcp_http.authorization`). */
@@ -83,7 +86,7 @@ export function callerAuthChoice(config: Config): CallerAuthChoice | 'unsupporte
     case 'api_key_provider':
     case 'jwt_bearer':
     case 'mtls':
-      return sourceAuth.type;
+      return sourceAuth.type as CallerAuthChoice;
     default:
       return 'unsupported';
   }
@@ -131,6 +134,8 @@ export function newSourceAuth(
  */
 export function sourceAuthProblem(sourceAuth: TransitSourceAuth | null): string | null {
   if (!sourceAuth) return null;
+  // A `source_auth` with no readable type was set through the API and is kept.
+  if (typeof sourceAuth.type !== 'string') return null;
   switch (sourceAuth.type) {
     case 'api_key':
       if (!apiKeyHeader(sourceAuth)) {
@@ -151,15 +156,27 @@ export function sourceAuthProblem(sourceAuth: TransitSourceAuth | null): string 
         return 'A Transit Point cannot forward the caller token to its target. Turn off forwarding.';
       }
       if (!text(sourceAuth.jwt_verification_strategy_id)) {
-        return 'Choose the JWT verification strategy that checks the callers tokens.';
+        return "Choose the JWT verification strategy that checks the callers' tokens.";
+      }
+      if (!text(sourceAuth.token_header)) {
+        return 'Name the header callers send their token in, such as Authorization.';
+      }
+      if (!text(sourceAuth.token_scheme)) {
+        return 'Name the scheme callers send their token with, such as Bearer.';
       }
       const audiences = Array.isArray(sourceAuth.audiences) ? sourceAuth.audiences : [];
       return audiences.some(a => text(a))
         ? null
         : 'Name the audience this Transit Point accepts, so a token issued for another service, such as the Access Point, is refused.';
     }
-    case 'mtls':
-      return null;
+    case 'mtls': {
+      const trust = asRecord(sourceAuth.trust);
+      const ids = trust?.type === 'ca' ? trust.ca_certificate_ids : trust?.certificate_ids;
+      const trusted = Array.isArray(ids) && ids.some(id => text(id));
+      return trust && (trust.type === 'ca' || trust.type === 'pinned') && !trusted
+        ? 'The mTLS method trusts no certificate. Set the certificates it trusts through the API, or choose another method.'
+        : null;
+    }
     default:
       return 'DID Auth is not supported on a Transit Point. Choose an API key, a JWT or no caller authentication.';
   }
@@ -256,11 +273,23 @@ export function exposureWarning(config: Config, alias: string): string | null {
   return `Transit Point '${alias}' serves callers it does not authenticate and is reachable from other hosts: ${url}`;
 }
 
-/** The save warnings that name the Transit Point with this alias. */
-export function warningsForTransitPoint(warnings: readonly string[], alias: string): string[] {
+/**
+ * The save warnings that name the Transit Point with this alias, in the base
+ * surface or, with `variant`, in that variant. The gateway words a variant's
+ * as `Transit Point 'x' in variant 'v' ...` and the base's without it.
+ */
+export function warningsForTransitPoint(
+  warnings: readonly string[],
+  alias: string,
+  variant?: string
+): string[] {
   if (!alias) return [];
   const prefix = `Transit Point '${alias}'`;
-  return warnings.filter(w => w.startsWith(prefix));
+  const inVariant = `${prefix} in variant '`;
+  return warnings.filter(w => {
+    if (variant) return w.startsWith(`${inVariant}${variant}'`);
+    return w.startsWith(prefix) && !w.startsWith(inVariant);
+  });
 }
 
 /**

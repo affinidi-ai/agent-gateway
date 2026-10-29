@@ -13,3 +13,12 @@ export function parseWarningHeader(value: string | null | undefined): string[] {
   }
   return out;
 }
+
+/** What the page shows for the save's warnings: the header ones, up to `limit`, then a count. */
+export function joinWarnings(warnings: readonly string[], limit = 3, maxLength = 300): string {
+  const shown = warnings
+    .slice(0, limit)
+    .map(w => (w.length > maxLength ? `${w.slice(0, maxLength - 3)}...` : w));
+  const more = warnings.length - shown.length;
+  return `${shown.join('\n')}${more > 0 ? `\nand ${more} more` : ''}`;
+}

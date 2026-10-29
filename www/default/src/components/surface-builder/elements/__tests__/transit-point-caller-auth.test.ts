@@ -5,6 +5,7 @@ import {
   callerAuthSignature,
   callerAuthToWire,
   exposureWarning,
+  joinWarnings,
   NO_CALLER_AUTH_PROBLEM,
   OPEN_WITH_AUTH_PROBLEM,
   parseWarningHeader,
@@ -306,6 +307,59 @@ describe('what a save answers with', () => {
     const warnings = ["Transit Point 'crm' is open", "Transit Point 'crm-2' is open", 'Other'];
     expect(warningsForTransitPoint(warnings, 'crm')).toEqual(["Transit Point 'crm' is open"]);
     expect(warningsForTransitPoint(warnings, '')).toEqual([]);
+  });
+
+  it('matches a warning by alias and variant', () => {
+    const base = "Transit Point 'crm' serves callers it does not authenticate";
+    const variant = "Transit Point 'crm' in variant 'v1' serves callers it does not authenticate";
+    const other = "Transit Point 'crm' in variant 'v10' serves callers it does not authenticate";
+    const all = [base, variant, other];
+    expect(warningsForTransitPoint(all, 'crm')).toEqual([base]);
+    expect(warningsForTransitPoint(all, 'crm', 'v1')).toEqual([variant]);
+    expect(warningsForTransitPoint(all, 'crm', 'v2')).toEqual([]);
+  });
+
+  it('refuses an mTLS method that trusts no certificate, and a blank token header or scheme', () => {
+    const mtls = (trust: unknown) => ({
+      id: 'x',
+      require_transit_token: false,
+      source_auth: { type: 'mtls', trust },
+    });
+    expect(callerAuthProblems(mtls({ type: 'pinned', certificate_ids: [] }))[0]).toMatch(
+      /trusts no certificate/
+    );
+    expect(callerAuthProblems(mtls({ type: 'ca', ca_certificate_ids: [] }))[0]).toMatch(
+      /trusts no certificate/
+    );
+    expect(callerAuthProblems(mtls({ type: 'ca', ca_certificate_ids: ['c'] }))).toEqual([]);
+    const jwt = (extra: object) => ({
+      id: 'x',
+      require_transit_token: false,
+      source_auth: {
+        type: 'jwt_bearer',
+        jwt_verification_strategy_id: 's',
+        audiences: ['a'],
+        token_header: 'Authorization',
+        token_scheme: 'Bearer',
+        forward_header: false,
+        ...extra,
+      },
+    });
+    expect(callerAuthProblems(jwt({}))).toEqual([]);
+    expect(callerAuthProblems(jwt({ token_header: '  ' }))[0]).toMatch(/header/);
+    expect(callerAuthProblems(jwt({ token_scheme: '' }))[0]).toMatch(/scheme/);
+  });
+
+  it('keeps a source_auth without a readable type as set', () => {
+    const config = { id: 'x', require_transit_token: false, source_auth: { foo: 1 } };
+    expect(callerAuthProblems(config)).toEqual([]);
+    expect(callerAuthToWire(config)).toEqual({ source_auth: { foo: 1 } });
+  });
+
+  it('joins warnings into one message, with a cap and a count', () => {
+    expect(joinWarnings(['a', 'b'])).toBe('a\nb');
+    expect(joinWarnings(['a', 'b', 'c', 'd', 'e'])).toBe('a\nb\nc\nand 2 more');
+    expect(joinWarnings(['x'.repeat(400)], 3, 10)).toBe('xxxxxxx...');
   });
 
   it('puts a refusal in plain words, whichever Transit Point or variant it names', () => {

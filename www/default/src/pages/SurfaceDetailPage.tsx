@@ -1,7 +1,9 @@
 import React, { useEffect, useState, useCallback, useRef, useReducer } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
+import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { AgentSurface, apiClient } from '../api';
 import { showToast } from '../utils/toaster';
+import SaveWarningsBanner from '../components/surface-builder/SaveWarningsBanner';
+import { joinWarnings } from '../utils/warningHeader';
 import { usePermissions } from '../context/PermissionsContext';
 import { usePageTitle } from '../context/PageTitleContext';
 import { useApp } from '../context/AppContext';
@@ -109,7 +111,14 @@ const SurfaceDetailPage: React.FC = () => {
   const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // `Warning` headers of the last save, shown on the Transit Points they name.
-  const [saveWarnings, setSaveWarnings] = useState<readonly string[] | null>(null);
+  // A create that drew warnings sends them here in the route state.
+  const location = useLocation();
+  const [saveWarnings, setSaveWarnings] = useState<readonly string[] | null>(() => {
+    const carried = (location.state as { saveWarnings?: unknown } | null)?.saveWarnings;
+    return Array.isArray(carried) && carried.every(w => typeof w === 'string') && carried.length
+      ? (carried as string[])
+      : null;
+  });
   const [hasAttemptedSave, setHasAttemptedSave] = useState(false);
   const surfacePolicyLoadState = useSurfacePolicyDefinitions();
   const surfacePolicyIds =
@@ -1333,10 +1342,6 @@ const SurfaceDetailPage: React.FC = () => {
       // defaults" until the user re-clicks the node.
       bumpExternalRevision();
       if (hydration.didAutoLayout) bumpResetView();
-      showToast('success', `Agent Surface "${updated.name}" saved`);
-      for (const warning of headerWarnings.slice(0, 3)) {
-        showToast('error', `Warning: ${warning}`, { autoRemove: true, duration: 8000 });
-      }
       // Surface non-blocking structural warnings AFTER save so the
       // user notices issues like empty target endpoints / unrouted
       // transit points without being prevented from saving. The toast
@@ -1344,8 +1349,17 @@ const SurfaceDetailPage: React.FC = () => {
       // error styling — they are real shape problems the user should
       // see, just not severe enough to block the save itself.
       const warnings = validateSurfacePayload(updated).filter(i => i.severity === 'warning');
-      for (const w of warnings.slice(0, 3)) {
-        showToast('error', `Warning: ${w.message}`, { autoRemove: true, duration: 8000 });
+      // One toast: a later one replaces an earlier one, so the saved message
+      // and every warning go into this one.
+      const allWarnings = [...headerWarnings, ...warnings.map(w => w.message)];
+      if (allWarnings.length === 0) {
+        showToast('success', `Agent Surface "${updated.name}" saved`);
+      } else {
+        showToast(
+          'error',
+          `Agent Surface "${updated.name}" saved, with warnings:\n${joinWarnings(allWarnings)}`,
+          { autoRemove: true, duration: 10000 }
+        );
       }
     } catch (err: any) {
       setError(err.message || 'Failed to save surface');
@@ -1618,11 +1632,16 @@ const SurfaceDetailPage: React.FC = () => {
         canEdit={canEdit}
         builder={builder}
         topBanner={
-          error ? (
-            <div className="alert alert-danger surface-page-alert mb-2" role="alert">
-              <i className="fas fa-exclamation-circle me-2" />
-              {error}
-            </div>
+          error || (saveWarnings && saveWarnings.length > 0) ? (
+            <>
+              {error && (
+                <div className="alert alert-danger surface-page-alert mb-2" role="alert">
+                  <i className="fas fa-exclamation-circle me-2" />
+                  {error}
+                </div>
+              )}
+              <SaveWarningsBanner warnings={saveWarnings} />
+            </>
           ) : null
         }
         meta={{

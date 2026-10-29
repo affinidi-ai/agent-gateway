@@ -33,6 +33,7 @@ import {
   getTemplateProtocolBadge,
 } from '../components/surface-builder/templates/templateSort';
 import { showToast } from '../utils/toaster';
+import { joinWarnings } from '../utils/warningHeader';
 import './SurfaceBuilder.css';
 
 const WELCOME_DISMISSED_KEY = 'surface-builder-welcome-dismissed';
@@ -450,23 +451,35 @@ const AddSurfacePage: React.FC = () => {
     try {
       const payload: Partial<AgentSurface> = withA2aValidationSettled(buildSurfacePayload());
       let headerWarnings: string[] = [];
-      await apiClient.createSurface(payload, {
+      const created = await apiClient.createSurface(payload, {
         onWarnings: warnings => {
           headerWarnings = warnings;
         },
       });
       justCreatedRef.current = true;
-      showToast('success', `Agent Surface "${name}" created`);
-      for (const warning of headerWarnings.slice(0, 3)) {
-        showToast('error', `Warning: ${warning}`, { autoRemove: true, duration: 8000 });
-      }
       // Surface non-blocking structural warnings AFTER create. See
       // SurfaceDetailPage for full rationale.
       const warnings = validateSurfacePayload(payload).filter(i => i.severity === 'warning');
-      for (const w of warnings.slice(0, 3)) {
-        showToast('error', `Warning: ${w.message}`, { autoRemove: true, duration: 8000 });
+      // One toast: a later one replaces an earlier one.
+      const allWarnings = [...headerWarnings, ...warnings.map(w => w.message)];
+      if (allWarnings.length === 0) {
+        showToast('success', `Agent Surface "${name}" created`);
+      } else {
+        showToast(
+          'error',
+          `Agent Surface "${name}" created, with warnings:\n${joinWarnings(allWarnings)}`,
+          { autoRemove: true, duration: 10000 }
+        );
       }
-      navigate('/surfaces');
+      // Warnings from the gateway go with the operator to the new surface's
+      // page, which lists them, since the toast goes after a few seconds.
+      if (headerWarnings.length > 0 && created?.surface_id) {
+        navigate(`/surfaces/${encodeURIComponent(created.surface_id)}`, {
+          state: { saveWarnings: headerWarnings },
+        });
+      } else {
+        navigate('/surfaces');
+      }
     } catch (err: any) {
       setError(err.message || 'Failed to create surface');
     } finally {
