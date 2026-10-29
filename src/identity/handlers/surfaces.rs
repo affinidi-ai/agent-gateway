@@ -2589,20 +2589,24 @@ async fn apply_surface_change_while_locked(
 }
 
 /// Compile or refresh the OPA policy of an upserted active surface, or evict
-/// every policy, tool gate and rate limiter of a deleted one.
+/// every policy, tool gate and rate limiter of a deleted or inactive one.
 async fn refresh_surface_policies(
     policy_manager: &crate::policies::SurfacePolicyManager,
     change: SurfaceChange<'_>,
 ) {
     match change {
-        SurfaceChange::Upsert(surface) => {
-            if surface.status == crate::config::agent_surface::SurfaceStatus::Active
-                && let Err(e) = policy_manager
-                    .update_channel_policy(surface)
-                    .await
+        SurfaceChange::Upsert(surface) if surface.status == crate::config::agent_surface::SurfaceStatus::Active => {
+            if let Err(e) = policy_manager
+                .update_channel_policy(surface)
+                .await
             {
                 warn!("Failed to compile OPA policy for surface '{}': {e}", surface.surface_id);
             }
+        }
+        SurfaceChange::Upsert(surface) => {
+            policy_manager
+                .remove_channel(&surface.surface_id)
+                .await;
         }
         SurfaceChange::Delete(id) => {
             policy_manager
@@ -5655,6 +5659,29 @@ mod tests {
         refresh_surface_policies(&manager, SurfaceChange::Delete("doomed")).await;
 
         assert!(!manager.has_transit_mcp_tool_gating("doomed", "partner"));
+    }
+
+    #[tokio::test]
+    async fn disabling_a_surface_evicts_its_transit_point_tool_gating() {
+        let manager = crate::policies::SurfacePolicyManager::new();
+        let mut surface: AgentSurface = serde_json::from_value(serde_json::json!({
+            "surface_id": "paused", "name": "paused", "description": "", "status": "active",
+            "access_point": { "listen_address": "0.0.0.0:8443", "route": "/paused", "protocol": "mcp" },
+            "target": { "endpoint": "http://localhost:9000" },
+            "transit": { "points": [{
+                "alias": "partner", "target_endpoint": "https://partner.example.com/mcp", "protocol": "mcp",
+                "mcp_tool_gating": { "gates": [{ "id": "g1", "name": "no admin",
+                    "action": { "effect": "deny", "patterns": ["^admin_"] } }] }
+            }] }
+        }))
+        .unwrap();
+        refresh_surface_policies(&manager, SurfaceChange::Upsert(&surface)).await;
+        assert!(manager.has_transit_mcp_tool_gating("paused", "partner"));
+
+        surface.status = crate::config::agent_surface::SurfaceStatus::Disabled;
+        refresh_surface_policies(&manager, SurfaceChange::Upsert(&surface)).await;
+
+        assert!(!manager.has_transit_mcp_tool_gating("paused", "partner"));
     }
 
     #[test]
