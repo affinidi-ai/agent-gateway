@@ -292,7 +292,8 @@ every instance, delete the file, and start them again; every token issued before
 #### Transit token lifetime
 
 A surface sets how long its transit tokens live in `transit.transit_token_lifetime_secs`,
-from 30 to 900 seconds; unset means 300. Set a longer one when a managed agent's turn, such
+from the appliance's shortest lifetime, 30 seconds unless `gateway.json` sets
+`transit_token_min_lifetime_secs`, to 900 seconds; unset means 300. Set a longer one when a managed agent's turn, such
 as a long tool call, needs its Transit Points for longer than 300 seconds. For that whole
 time the managed agent, or anyone who obtains the token, can call the surface's Transit
 Points as that caller, with the credentials they inject, so keep it no longer than a turn
@@ -305,10 +306,21 @@ needs.
 The lifetime belongs to the surface: a variant takes its surface's, and cannot set its own.
 A surface whose Transit Points exist only in a variant needs a base `transit` block, with
 empty `points`, to carry the lifetime; without one its tokens live 300 seconds. The admin API
-refuses a lifetime outside 30 to 900 seconds with `400`, and one in a variant's overrides
-with `422`. A surface stored with one outside them stops the gateway from starting; a reload
-holds it to the nearer bound (see [`CONFIGURATION_RELOAD.md`](CONFIGURATION_RELOAD.md)). The
-token issuer itself also refuses a lifetime outside 30 to 900 seconds.
+refuses a lifetime outside the shortest lifetime to 900 seconds with `400`, and one in a
+variant's overrides with `422`. A surface stored with one outside them stops the gateway from
+starting; a reload holds it to the nearer bound (see
+[`CONFIGURATION_RELOAD.md`](CONFIGURATION_RELOAD.md)). The token issuer itself also refuses a
+lifetime outside them.
+
+The shortest lifetime is a setting of the appliance, `transit_token_min_lifetime_secs` in
+`gateway.json` (see [`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md)): 30 seconds
+unless set, from 1 to 900. Lower it, for example to 10, when a deployment needs tokens that
+expire sooner than 30 seconds allows, which leaves less time for the 5 second clock leeway
+between gateways; raise it to make every surface's tokens live at least that long. The
+longest, 900 seconds, is fixed. It is read at startup, so a change takes a restart, and a
+value outside 1 to 900 stops the gateway from starting. Raising it above a surface's stored
+lifetime makes that surface stop the next start, and a reload holds it to the new shortest
+lifetime until then; correct the surface first.
 
 A Transit Point checks a token against the lifetime its surface sets when the token is
 presented, so a change applies to tokens already issued:

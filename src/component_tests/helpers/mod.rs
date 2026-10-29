@@ -1685,6 +1685,24 @@ impl Drop for GatewayHarness {
 
 /// Declare `(id, name, prefix)` route prefixes in the gateway network config,
 /// so a test can serve more than one surface on the shared listener.
+/// Sets a top-level `gateway.json` key, such as `transit_token_min_lifetime_secs`.
+pub fn configure_gateway_setting(
+    bootstrap: &crate::config::BootstrapConfig,
+    key: &str,
+    value: serde_json::Value,
+) {
+    let gateway_path = std::path::Path::new(&bootstrap.config_files.gateway);
+    let mut gateway_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(gateway_path).expect("read gateway network config"))
+            .expect("gateway network config JSON");
+    gateway_json[key] = value;
+    std::fs::write(
+        gateway_path,
+        serde_json::to_string_pretty(&gateway_json).expect("serialize gateway network config"),
+    )
+    .expect("write gateway network config");
+}
+
 pub fn configure_gateway_route_prefixes(
     bootstrap: &crate::config::BootstrapConfig,
     prefixes: &[(&str, &str, &str)],

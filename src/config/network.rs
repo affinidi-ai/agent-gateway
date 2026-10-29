@@ -72,6 +72,16 @@ pub struct NetworkConfig {
     /// Proxies trusted to report the caller's address for per-client-IP limits.
     #[serde(default)]
     pub client_ip: crate::config::types::ClientIpConfig,
+
+    /// The shortest lifetime, in seconds, a surface may set for its transit
+    /// tokens (`transit.transit_token_lifetime_secs`), from 1 to 900; 30 when
+    /// unset. The longest, 900, is fixed. Read at startup.
+    #[serde(default = "default_transit_token_min_lifetime_secs")]
+    pub transit_token_min_lifetime_secs: u64,
+}
+
+fn default_transit_token_min_lifetime_secs() -> u64 {
+    crate::config::agent_surface::DEFAULT_TRANSIT_TOKEN_MIN_LIFETIME_SECS
 }
 
 /// DID configuration
@@ -187,6 +197,8 @@ impl NetworkConfig {
         let config: NetworkConfig = serde_json::from_str(&contents)?;
         config.validate_listeners()?;
         config.validate_terms()?;
+        crate::config::agent_surface::validate_transit_token_min_lifetime(config.transit_token_min_lifetime_secs)
+            .map_err(|error| anyhow::anyhow!("{path}: {error}"))?;
         if let Some(profile) = &config.sts.mcp_issuer {
             profile.validate_network(&config)?;
             config
@@ -748,5 +760,59 @@ mod url_mapping_tests {
         .expect("network config without mcp_proxies should deserialize");
 
         assert!(cfg.mcp_proxies.is_none());
+    }
+
+    fn load_with_min_lifetime(min_secs: Option<serde_json::Value>) -> anyhow::Result<NetworkConfig> {
+        let mut cfg = serde_json::json!({
+            "did": { "domain": "test.local" },
+            "webauthn": { "rp_id": "localhost", "external_origin": "https://localhost" },
+            "integration": { "types": [], "categories": [] },
+            "listeners": [],
+            "routes": {},
+        });
+        if let Some(min_secs) = min_secs {
+            cfg["transit_token_min_lifetime_secs"] = min_secs;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("gateway.json");
+        std::fs::write(&path, cfg.to_string()).unwrap();
+        NetworkConfig::load_from_file(path.to_str().unwrap())
+    }
+
+    #[test]
+    fn the_shortest_transit_token_lifetime_defaults_to_30_seconds_and_gateway_json_may_set_it() {
+        assert_eq!(
+            load_with_min_lifetime(None)
+                .unwrap()
+                .transit_token_min_lifetime_secs,
+            30
+        );
+        for min_secs in [1, 10, 900] {
+            assert_eq!(
+                load_with_min_lifetime(Some(serde_json::json!(min_secs)))
+                    .unwrap()
+                    .transit_token_min_lifetime_secs,
+                min_secs
+            );
+        }
+    }
+
+    #[test]
+    fn a_shortest_transit_token_lifetime_outside_1_to_900_seconds_stops_startup() {
+        for min_secs in [0, 901] {
+            let error = load_with_min_lifetime(Some(serde_json::json!(min_secs)))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.ends_with(&format!(
+                    "transit_token_min_lifetime_secs must be from 1 to 900 seconds, not {min_secs}"
+                )),
+                "{error}"
+            );
+        }
+        assert!(load_with_min_lifetime(Some(serde_json::json!("ten"))).is_err());
+        assert!(load_with_min_lifetime(Some(serde_json::json!(-1))).is_err());
     }
 }

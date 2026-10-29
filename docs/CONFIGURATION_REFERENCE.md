@@ -183,6 +183,7 @@ Network topology and the surfaces served. The largest configuration file; the ex
 | `integration` | Notification and webhook integration settings |
 | `sts` | Security Token Service runtime settings. See [`STS.md`](STS.md). |
 | `cli_login_throttle` | Optional per-client-IP limit on each `fabric` CLI login endpoint: `enabled` (default `false`) and `per_ip` `{requests, window_secs}` (default 20 per 60 seconds). Behind a load balancer, set `client_ip.trusted_proxies` first. |
+| `transit_token_min_lifetime_secs` | The shortest lifetime, in seconds, a surface may set for its transit tokens in `transit.transit_token_lifetime_secs`, from 1 to 900; 30 when unset. A value outside 1 to 900 stops the gateway from starting. The longest lifetime, 900, is fixed. See [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token-lifetime). |
 | `client_ip` | `trusted_proxies`: proxy CIDRs whose `X-Forwarded-For` gives the client IP for the SAML and CLI login limits (default empty, so the TCP peer is the client). Each listed proxy must append the address it saw to `X-Forwarded-For` or overwrite it; `Forwarded` is read only when `X-Forwarded-For` is absent. Separate from `tls.client_auth.trusted_proxies`. |
 | `facilitator_mode` | x402 facilitator behaviour |
 | `cors` | Permitted dashboard origins |

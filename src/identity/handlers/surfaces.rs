@@ -718,7 +718,10 @@ fn validate_source_auth(surface: &AgentSurface) -> Result<(), SurfaceApiError> {
 /// working without forcing the dashboard to mint IDs client-side. A
 /// `transit.source_auth`, which the gateway does not enforce, is refused, and
 /// so is a transit token lifetime outside its bounds.
-fn validate_transit_points(surface: &mut AgentSurface) -> Result<(), SurfaceApiError> {
+fn validate_transit_points(
+    surface: &mut AgentSurface,
+    min_lifetime_secs: u64,
+) -> Result<(), SurfaceApiError> {
     let surface_sets_source_auth = surface
         .transit
         .as_ref()
@@ -747,7 +750,7 @@ fn validate_transit_points(surface: &mut AgentSurface) -> Result<(), SurfaceApiE
     };
     transit
         .shared
-        .validate_transit_token_lifetime()
+        .validate_transit_token_lifetime(min_lifetime_secs)
         .map_err(SurfaceApiError::BadRequest)?;
     let mut seen = std::collections::HashSet::with_capacity(transit.points.len());
     for (idx, tp) in transit
@@ -1401,7 +1404,12 @@ pub async fn create_surface(
 
     // Validate transit point aliases (URL-safe, non-empty, unique) and
     // backfill missing UUIDs.
-    validate_transit_points(&mut surface)?;
+    validate_transit_points(
+        &mut surface,
+        state
+            .network_config
+            .transit_token_min_lifetime_secs,
+    )?;
 
     super::surface_tenancy::validate_surface_references(
         &state,
@@ -2115,7 +2123,12 @@ async fn validate_and_save_surface(
     }
 
     validate_variant_aliases(&surface)?;
-    validate_transit_points(&mut surface)?;
+    validate_transit_points(
+        &mut surface,
+        state
+            .network_config
+            .transit_token_min_lifetime_secs,
+    )?;
     super::surface_tenancy::validate_surface_references(state, &surface, context, scope).await?;
     validate_listen_path_collisions(&surface, store, &state.network_config).await?;
     validate_access_point_route_collisions(&surface, store, &state.network_config).await?;
@@ -3757,7 +3770,7 @@ mod validation_tests {
         json_patch::merge(&mut merged, &serde_json::json!({ "transit": { "transit_token_lifetime_secs": null } }));
         let surface: AgentSurface = serde_json::from_value(merged).unwrap();
         assert_eq!(stored_lifetime(&surface), None);
-        assert_eq!(surface.transit_token_lifetime_secs(), 300);
+        assert_eq!(surface.transit_token_lifetime_secs(30), 300);
     }
 
     fn with_url_variant(surface: AgentSurface) -> AgentSurface {
