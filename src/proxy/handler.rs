@@ -6513,7 +6513,7 @@ async fn proxy_handler_with_mcp_runtime(
                     crate::config::TargetAuthFallback::Reject => {
                         return Ok(create_error_response(
                             StatusCode::BAD_GATEWAY,
-                            &format!("Target authentication failed: {}", e),
+                            "Target authentication failed",
                         ));
                     }
                     crate::config::TargetAuthFallback::Passthrough => {
@@ -12302,7 +12302,7 @@ async fn handle_fabric_request(
                             .await;
                         return Err(create_error_response(
                             StatusCode::BAD_GATEWAY,
-                            &format!("Target authentication failed: {}", e),
+                            "Target authentication failed",
                         ));
                     }
                     crate::config::TargetAuthFallback::Passthrough => {

@@ -885,7 +885,7 @@ pub fn find_unresolved_outbound_transit_points(
     let mut problems = Vec::new();
 
     for surface in surfaces {
-        if surface.status == crate::config::agent_surface::SurfaceStatus::Disabled {
+        if surface.status != crate::config::agent_surface::SurfaceStatus::Active {
             continue;
         }
         let Some(ref transit) = surface.transit else {
