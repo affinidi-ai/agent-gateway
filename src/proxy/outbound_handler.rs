@@ -6646,13 +6646,21 @@ mod tests {
                         "partner-a".into()
                     }],
                     serde_json::Map::new(),
-                    if invalid == "expired" {
-                        0
-                    } else {
-                        300
-                    },
+                    300,
                 )
                 .unwrap();
+            let token = if invalid == "expired" {
+                let mut claims = transit_issuer
+                    .validate(&token, 300)
+                    .unwrap();
+                claims.iat -= 600;
+                claims.exp -= 600;
+                transit_issuer
+                    .sign(&claims)
+                    .unwrap()
+            } else {
+                token
+            };
             if invalid != "missing" {
                 request
                     .headers_mut()
@@ -6778,13 +6786,23 @@ mod tests {
                     None,
                     vec!["partner-a".into()],
                     serde_json::Map::new(),
-                    if termination == "transit-expiry" {
-                        3
-                    } else {
-                        300
-                    },
+                    300,
                 )
                 .unwrap();
+            // The shortest lifetime the issuer allows is 30 seconds, so back-date a
+            // token to leave it three seconds.
+            let token = if termination == "transit-expiry" {
+                let mut claims = transit_issuer
+                    .validate(&token, 300)
+                    .unwrap();
+                claims.iat -= 297;
+                claims.exp -= 297;
+                transit_issuer
+                    .sign(&claims)
+                    .unwrap()
+            } else {
+                token
+            };
             let mut authenticated_request = subscription_request();
             authenticated_request
                 .headers_mut()

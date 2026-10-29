@@ -1561,6 +1561,7 @@ pub async fn update_surface(
     }
     retain_mcp_settings(&mut surface, &existing, &state.network_config, &ProtectedResourceRemovals::of(&sent))?;
     retain_a2a_settings(&mut surface, &existing);
+    retain_transit_token_lifetime(&mut surface, &existing);
 
     let saved = validate_and_save_surface(
         &state,
@@ -1573,6 +1574,31 @@ pub async fn update_surface(
     )
     .await?;
     Ok(Json(saved))
+}
+
+/// PUT carries the whole record, so an omitted
+/// `transit.transit_token_lifetime_secs` means "unchanged", never "back to
+/// 300". The Surface Builder does not show the field, so a save from it omits
+/// it, and resetting it would silently widen a tightened lifetime or cut short
+/// a lengthened one. Removal is explicit, via PATCH with a `null`.
+fn retain_transit_token_lifetime(
+    surface: &mut AgentSurface,
+    existing: &AgentSurface,
+) {
+    let (Some(incoming), Some(stored)) = (&mut surface.transit, &existing.transit) else {
+        return;
+    };
+    if incoming
+        .shared
+        .transit_token_lifetime_secs
+        .is_none()
+    {
+        incoming
+            .shared
+            .transit_token_lifetime_secs = stored
+            .shared
+            .transit_token_lifetime_secs;
+    }
 }
 
 /// PUT carries the whole record, so an omitted `access_point.a2a` on an A2A or
@@ -3675,6 +3701,63 @@ mod validation_tests {
                 "{versions:?}"
             );
         }
+    }
+
+    fn surface_with_transit_lifetime(lifetime: Option<u64>) -> AgentSurface {
+        let mut s = base_surface();
+        s.transit = Some(crate::config::agent_surface::TransitConfig {
+            points: Vec::new(),
+            outbound_listen_address: None,
+            shared: Default::default(),
+        });
+        s.transit
+            .as_mut()
+            .expect("transit")
+            .shared
+            .transit_token_lifetime_secs = lifetime;
+        s
+    }
+
+    fn stored_lifetime(surface: &AgentSurface) -> Option<u64> {
+        surface
+            .transit
+            .as_ref()
+            .and_then(|transit| {
+                transit
+                    .shared
+                    .transit_token_lifetime_secs
+            })
+    }
+
+    /// A PUT that omits the lifetime keeps the stored one, tightened or
+    /// lengthened, and one that sets it wins.
+    #[test]
+    fn a_put_that_omits_the_transit_token_lifetime_keeps_the_stored_one() {
+        for stored in [30, 900] {
+            let existing = surface_with_transit_lifetime(Some(stored));
+            let mut omitted = surface_with_transit_lifetime(None);
+            retain_transit_token_lifetime(&mut omitted, &existing);
+            assert_eq!(stored_lifetime(&omitted), Some(stored));
+        }
+        let existing = surface_with_transit_lifetime(Some(900));
+        let mut changed = surface_with_transit_lifetime(Some(60));
+        retain_transit_token_lifetime(&mut changed, &existing);
+        assert_eq!(stored_lifetime(&changed), Some(60));
+        let mut fresh = surface_with_transit_lifetime(None);
+        retain_transit_token_lifetime(&mut fresh, &surface_with_transit_lifetime(None));
+        assert_eq!(stored_lifetime(&fresh), None);
+    }
+
+    /// A merge PATCH with a `null` is the way to reset the lifetime to its
+    /// default.
+    #[test]
+    fn a_merge_patch_that_nulls_the_transit_token_lifetime_resets_it() {
+        let existing = surface_with_transit_lifetime(Some(900));
+        let mut merged = serde_json::to_value(&existing).unwrap();
+        json_patch::merge(&mut merged, &serde_json::json!({ "transit": { "transit_token_lifetime_secs": null } }));
+        let surface: AgentSurface = serde_json::from_value(merged).unwrap();
+        assert_eq!(stored_lifetime(&surface), None);
+        assert_eq!(surface.transit_token_lifetime_secs(), 300);
     }
 
     fn with_url_variant(surface: AgentSurface) -> AgentSurface {
