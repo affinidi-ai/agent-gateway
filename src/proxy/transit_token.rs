@@ -202,7 +202,7 @@ impl TransitTokenIssuer {
     }
 
     /// Create with a custom TTL.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn with_ttl(
         mut self,
         ttl_secs: u64,
@@ -468,6 +468,91 @@ mod tests {
             .unwrap();
 
         assert_eq!(refusal(issuer.validate(&token)), "transit token validation failed: InvalidSignature");
+    }
+
+    #[test]
+    fn refuses_an_unsigned_token_and_one_signed_with_another_algorithm() {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        let issuer = test_issuer();
+        let now = now();
+        let claims = claims_for("surf-001", now, now + 300);
+        let unsigned = format!(
+            "{}.{}.",
+            URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT","kid":"test-kid"}"#),
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+        );
+        let mut hs384 = Header::new(Algorithm::HS384);
+        hs384.kid = Some("test-kid".to_string());
+        let other_algorithm = sign_with(hs384, &[7; 32], &claims);
+
+        assert!(
+            issuer
+                .validate(&unsigned)
+                .is_err(),
+            "alg:none must be refused"
+        );
+        assert_eq!(refusal(issuer.validate(&other_algorithm)), "transit token validation failed: InvalidAlgorithm");
+    }
+
+    #[test]
+    fn refuses_a_genuine_token_whose_claims_were_altered() {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        let issuer = test_issuer();
+        let token = issuer
+            .issue("surf-001", None, None, None, Some("caller-hash"), None, vec!["partner".to_string()])
+            .unwrap();
+        let [header, payload, signature]: [&str; 3] = token
+            .split('.')
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
+        let mut claims: serde_json::Value = serde_json::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(payload)
+                .unwrap(),
+        )
+        .unwrap();
+        claims["user_identity_hash"] = "victim-hash".into();
+        claims["allowed_transit_points"] = serde_json::json!([]);
+        let altered = format!("{header}.{}.{signature}", URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap()));
+
+        assert!(
+            issuer
+                .validate(&token)
+                .is_ok()
+        );
+        assert_eq!(refusal(issuer.validate(&altered)), "transit token validation failed: InvalidSignature");
+    }
+
+    /// Expiry and issue time allow 5 seconds of clock difference, and no more.
+    /// Each case is retried when the clock ticks between signing and validating,
+    /// which would move the boundary under it.
+    #[test]
+    fn allows_five_seconds_of_clock_difference_on_expiry_and_issue_time() {
+        let issuer = test_issuer();
+        for (case, iat_offset, exp_offset, accepted) in [
+            ("expired within the leeway", -290, -3, true),
+            ("expired beyond the leeway", -290, -7, false),
+            ("issued at the edge of the leeway", 5, 300, true),
+            ("issued just beyond the leeway", 6, 300, false),
+        ] {
+            let validated = loop {
+                let now = now();
+                let at = |offset: i64| now.saturating_add_signed(offset);
+                let token = issuer
+                    .sign(&claims_for("surf-001", at(iat_offset), at(exp_offset)))
+                    .unwrap();
+                let validated = issuer.validate(&token);
+                if self::now() == now {
+                    break validated;
+                }
+            };
+            assert_eq!(validated.is_ok(), accepted, "{case}: {:?}", validated.err());
+        }
     }
 
     #[test]
