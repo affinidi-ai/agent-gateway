@@ -222,6 +222,7 @@ async fn an_api_key_caller_is_admitted_and_a_missing_or_wrong_key_never_reaches_
 /// token.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_jwt_caller_reaches_the_policy_input_so_a_policy_can_admit_one_caller_and_refuse_another() {
+    let fixture = JwksFixture::start().await;
     let rego = format!(
         r#"package surface.policy
 
@@ -235,9 +236,8 @@ allow if {{
     input.source_auth.claims.tid == "contoso"
 }}
 "#,
-        Sha256::digest(b"alice")
+        Sha256::digest(format!(r#"["jwt_bearer","{}",null,"alice"]"#, fixture.issuer).as_bytes())
     );
-    let fixture = JwksFixture::start().await;
     let h = GatewayHarness::start_with_outbound_mock(MockServer::start().await, |temp_dir, gw_config, _| {
         write_jwt_strategy(temp_dir, &fixture);
         write_policy_definition(temp_dir, &rego);

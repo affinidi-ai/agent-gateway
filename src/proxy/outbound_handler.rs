@@ -4430,7 +4430,8 @@ fn mcp_refusal_id(ctx: &OutboundPipelineContext) -> Option<serde_json::Value> {
 /// The caller half of the vault key for a Transit Point's delegated
 /// credentials: the transit token's `user_identity_hash`, else the identity
 /// hash of a caller the Transit Point's `source_auth` verified, which is the
-/// same SHA-256 of the principal the Access Point puts in a transit token.
+/// value the Access Point puts in a transit token for a caller it identified
+/// the same way. A credential that names no subject identifies no caller.
 fn delegation_caller_hash(ctx: &OutboundPipelineContext) -> Option<String> {
     ctx.transit_token_claims
         .as_ref()
@@ -13578,7 +13579,7 @@ mod tests {
         let state = delegation_state(directory.path(), &[("provider", "token-caller-access")]).await;
         let jwt_caller = |subject: &str| crate::source_auth::AuthenticatedIdentity::JwtBearer {
             subject: subject.to_string(),
-            claims: json!({ "sub": subject }),
+            claims: json!({ "iss": "https://idp.example", "sub": subject }),
         };
         state
             .delegation_vault_store
@@ -13587,7 +13588,7 @@ mod tests {
             .store(
                 serde_json::from_value(json!({
                     "id": "alice-token", "agent_did": "did:web:agent.example",
-                    "user_identity_hash": jwt_caller("alice").principal_hash(), "credential_provider_id": "provider",
+                    "user_identity_hash": jwt_caller("alice").principal_hash(None), "credential_provider_id": "provider",
                     "provider_id": "provider", "access_token": "alice-access",
                     "refresh_token": "alice-refresh", "scopes": ["read"],
                     "expires_at": chrono::Utc::now() + chrono::Duration::hours(1),
@@ -13641,6 +13642,121 @@ mod tests {
                 }
             ),
             "{refused:?}"
+        );
+    }
+
+    /// A caller the Transit Point's `source_auth` verified reaches only the
+    /// grant consented under how it was identified: the same subject from
+    /// another issuer, the same name from another method, the same caller on
+    /// another tenant's surface, and a token that names no subject get none.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delegated_grants_are_keyed_by_how_the_caller_was_identified() {
+        use crate::source_auth::AuthenticatedIdentity;
+        use crate::surface_context::TransitClientVerification::SourceAuth;
+
+        let directory = tempfile::tempdir().unwrap();
+        let state = delegation_state(directory.path(), &[("provider", "token-caller-access")]).await;
+        let jwt = |claims: serde_json::Value| AuthenticatedIdentity::JwtBearer {
+            subject: claims["sub"]
+                .as_str()
+                .unwrap_or("<none>")
+                .to_string(),
+            claims,
+        };
+        let alice = jwt(json!({ "iss": "https://idp.example", "sub": "alice" }));
+        let store_grant = |id: &'static str, user_identity_hash: String, access_token: &'static str| {
+            let vault = state
+                .delegation_vault_store
+                .clone()
+                .unwrap();
+            async move {
+                vault
+                    .store(
+                        serde_json::from_value(json!({
+                            "id": id, "agent_did": "did:web:agent.example",
+                            "user_identity_hash": user_identity_hash, "credential_provider_id": "provider",
+                            "provider_id": "provider", "access_token": access_token,
+                            "refresh_token": format!("{id}-refresh"), "scopes": ["read"],
+                            "expires_at": chrono::Utc::now() + chrono::Duration::hours(1),
+                            "consent_granted_at": "2026-09-01T00:00:00Z",
+                            "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+                        }))
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        };
+        store_grant(
+            "alice-token",
+            alice
+                .principal_hash(None)
+                .unwrap(),
+            "alice-access",
+        )
+        .await;
+        // A grant under the hash of the `<none>` subject placeholder, which no
+        // caller's identity hash is.
+        store_grant(
+            "no-subject-token",
+            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(b"<none>")),
+            "no-subject-access",
+        )
+        .await;
+        let surface = transit_surface(
+            json!([meta_transit_point("partner", "https://partner.example/mcp", false, Some("provider"))]),
+            json!([]),
+        );
+        let (resolved, point) = resolved_transit_point(&surface, None, "partner");
+        let context = |identity: AuthenticatedIdentity, tenant: Option<&str>| {
+            let mut ctx = legacy_delegation_context(resolved.clone(), point.clone());
+            ctx.transit_token_claims = None;
+            Arc::make_mut(&mut ctx.surface).tenant_id = tenant.map(str::to_string);
+            ctx.authenticated_identity = Some(identity);
+            ctx.authenticated_by = Some(SourceAuth);
+            ctx
+        };
+
+        assert_eq!(injected_credential(&state, context(alice.clone(), None)).await, "alice-access");
+
+        let refused = async |identity: AuthenticatedIdentity, tenant: Option<&str>| {
+            step_inject_credentials(&state, &mut context(identity, tenant))
+                .await
+                .err()
+        };
+        for (case, identity, tenant) in [
+            (
+                "the same subject from another issuer",
+                jwt(json!({ "iss": "https://partner.example", "sub": "alice" })),
+                None,
+            ),
+            (
+                "an API key secret of the same name",
+                AuthenticatedIdentity::ApiKey {
+                    key_name: "alice".into(),
+                    provider_agent_id: None,
+                },
+                None,
+            ),
+            ("the same caller on another tenant's surface", alice.clone(), Some("tenant-b")),
+        ] {
+            assert!(
+                refused(identity, tenant)
+                    .await
+                    .is_some(),
+                "{case} must not get alice's grant"
+            );
+        }
+        let second_without_subject = jwt(json!({ "iss": "https://idp.example", "client_id": "second" }));
+        assert!(
+            matches!(
+                refused(second_without_subject, None).await,
+                Some(OutboundPipelineError::DelegationRefused {
+                    refusal: DelegationRefusal::CallerIdentityMissing,
+                    ..
+                })
+            ),
+            "a token that names no subject identifies no caller, so it gets no grant"
         );
     }
 

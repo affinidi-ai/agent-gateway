@@ -38,6 +38,17 @@ changes:
         The Access Point and Fabric receive pass a managed agent `x-caller-did`,
         `x-caller-identity-source`, `x-caller-dna-uai` and `x-gateway-did` only as the gateway
         sets them, so the agent can rely on them to know who is calling.
+    - timestamp: '2026-10-29T21:00:00.000Z'
+      title: Key delegated credentials by how the caller was identified
+      description: >-
+        The caller's identity hash, which keys delegated credentials and travels in the
+        transit token as `user_identity_hash`, is now the SHA-256 of the authentication
+        method, its issuer, the surface's tenant and the principal. The Workload Binding
+        `user_hash` for `caller_source: did` follows the same rule. A JWT without a `sub` has
+        no identity hash, so an Access Point or Transit Point that would give its caller a
+        delegated credential answers it with `403`. Users who connected an account before
+        this release connect it again, and policies that compare `user_identity_hash` need the
+        new value.
   breaking:
     - timestamp: '2026-10-29T12:00:00.000Z'
       title: ⭐ Refuse a Transit Point that authenticates no caller unless it is marked open

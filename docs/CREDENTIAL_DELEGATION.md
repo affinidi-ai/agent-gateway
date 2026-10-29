@@ -143,16 +143,15 @@ A Transit Point looks a grant up by the caller's identity hash and the managed a
 The caller is the transit token's when the request carries a valid transit token with a
 `user_identity_hash`. Otherwise, when the Transit Point's own `source_auth` verified the
 caller (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-point-source-authentication)), it is
-that caller, hashed the way the Access Point hashes a caller it authenticated the same way:
-the SHA-256 of the JWT `sub`, of the API key's name (the `secret_id` for `api_key`, the
-key's id for `api_key_provider`), or of the mTLS principal. So:
+that caller's [identity hash](#the-callers-identity-hash), the value the Access Point computes
+for a caller it authenticated the same way. So:
 
-- an agent that calls the Transit Point with a JWT for the same `sub` as a user who consented
-  through the Access Point is given that user's grant;
+- an agent that calls the Transit Point with a JWT from the same issuer, for the same `sub`,
+  as a user who consented through the Access Point is given that user's grant; a JWT from
+  another issuer, or the same name verified another way, is another caller;
 - an API-key caller is one identity: every request with a key from the same `api_key`
   secret, or with the same `api_key_provider` key, shares one set of grants;
-- the hash includes neither the method nor the JWT issuer, so accept only an issuer whose
-  subjects name the people the grants were consented for.
+- a JWT without a `sub` names no caller and is given no grant.
 
 A caller verified by a resource access token (`mcp_http.authorization`) keys a grant only on
 a `2026-07-28` MCP request. The agent half of the key is the Transit Point's

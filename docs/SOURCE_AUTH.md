@@ -339,17 +339,18 @@ is:
 
 | Method | Principal | So |
 | --- | --- | --- |
-| `jwt_bearer` | The token's `sub` | One caller per subject |
+| `jwt_bearer` | The token's `sub` | One caller per issuer and subject. A token without a `sub` names no caller: it has no identity hash, so no delegated credentials |
 | `api_key` | The `secret_id` | Every key in the secret is the same caller; give each caller a secret of its own to tell them apart |
 | `api_key_provider` | The key's id | One caller per issued key |
-| `mtls` | The principal the `identity_binding` derives | One caller per bound principal |
+| `mtls` | The principal the `identity_binding` derives | One caller per certificate issuer and bound principal |
 
-The identity hash is the SHA-256 of the principal, the same value an Access Point puts in the
-transit token for a caller it authenticated the same way. It does not include the method or
-the JWT issuer, so a JWT whose `sub` is `alice` and an API key secret named `alice` hash
-alike. A Transit Point that releases delegated credentials should accept only an issuer whose
-subjects name the same people the grants were consented for; see
-[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-a-transit-point).
+The identity hash covers the method, the issuer (the JWT `iss`, the API Key Provider agent,
+the certificate's issuer DN), the surface's tenant and the principal (see
+[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-callers-identity-hash)). It is the
+value an Access Point puts in the transit token for a caller it authenticated the same way, so
+a Transit Point that trusts the Access Point's issuer for the same subjects reaches the grants
+those users consented to, while a JWT from another issuer, or an API key secret named like a
+JWT subject, is another caller with grants of its own.
 
 ### Reachable on a public address
 
