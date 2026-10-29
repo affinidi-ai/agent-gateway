@@ -21,6 +21,7 @@ mod mcp_sandbox_e2e;
 mod mcp_subscription_scope;
 mod mock_auth_server_tests;
 mod mtls;
+mod provider_activation_e2e;
 mod target_auth_provider_e2e;
 mod tr_naming_e2e;
 mod trust_check_e2e;

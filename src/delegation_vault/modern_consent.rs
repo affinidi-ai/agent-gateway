@@ -1170,10 +1170,9 @@ mod tests {
         tasks.shutdown().await;
     }
 
-    #[test]
-    fn modern_consent_binds_pkce_callback_and_resource_without_parameter_override() {
-        let mut provider: CredentialProvider = serde_json::from_value(json!({
-            "id": "provider", "name": "Provider", "provider_id": "provider", "authorization_endpoint": "https://idp.example/authorize?prompt=consent",
+    fn consent_fixture(authorization_endpoint: &str) -> (CredentialProvider, ConsentTicket) {
+        let provider: CredentialProvider = serde_json::from_value(json!({
+            "id": "provider", "name": "Provider", "provider_id": "provider", "authorization_endpoint": authorization_endpoint,
             "resource": "https://provider.example/api", "consent_identity_strategy_id": "strategy",
             "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
         })).unwrap();
@@ -1185,6 +1184,12 @@ mod tests {
                 "authorization_digest": ([1; 32]), "tenant_id": null, "surface_id": "surface", "variant_id": null, "route": {"kind": "access_point"},
                 "resource": "https://gateway.example/mcp", "provider_id": "provider", "scopes": ["read"], "method": "tools/call", "arguments_digest": ([2; 32])}
         })).unwrap();
+        (provider, ticket)
+    }
+
+    #[test]
+    fn modern_consent_binds_pkce_callback_and_resource_without_parameter_override() {
+        let (mut provider, ticket) = consent_fixture("https://idp.example/authorize?prompt=consent");
         let url = authorization_url(&provider, &ticket, "client", "opaque-callback-state").unwrap();
         let fields = url
             .query_pairs()
@@ -1209,5 +1214,27 @@ mod tests {
             .clear();
         provider.resource = None;
         assert!(authorization_url(&provider, &ticket, "client", "opaque").is_err());
+    }
+
+    #[test]
+    fn modern_consent_is_refused_for_providers_that_need_no_user_consent() {
+        use crate::credential_providers::CredentialProviderType;
+        let (mut provider, ticket) = consent_fixture("https://idp.example/authorize");
+
+        assert!(authorization_url(&provider, &ticket, "client", "opaque").is_ok());
+        for provider_type in [
+            CredentialProviderType::OAuth2ClientCredentials,
+            CredentialProviderType::OAuth2JwtBearer,
+            CredentialProviderType::ApiKey,
+        ] {
+            provider.provider_type = provider_type.clone();
+            assert!(
+                matches!(
+                    authorization_url(&provider, &ticket, "client", "opaque"),
+                    Err(ContinuationError::InvalidRecord)
+                ),
+                "{provider_type:?}"
+            );
+        }
     }
 }

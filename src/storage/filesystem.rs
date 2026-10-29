@@ -4790,6 +4790,71 @@ mod tests {
         assert_eq!(counted("invalid_json"), 1);
     }
 
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    struct RefusingMigrationEntity {
+        id: String,
+    }
+
+    impl StorableEntity for RefusingMigrationEntity {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        fn migrate_raw_json(value: &mut serde_json::Value) -> Result<bool> {
+            if value.get("legacy") == Some(&serde_json::Value::Bool(true)) {
+                anyhow::bail!("legacy record cannot be migrated");
+            }
+            Ok(false)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_record_whose_migration_fails_is_skipped_alone_and_counted() {
+        let entity_name = "metric_probe_entity_migration_failed";
+        let temp_dir = TempDir::new().unwrap();
+        std::fs::write(
+            temp_dir
+                .path()
+                .join("fine.json"),
+            r#"{"id":"fine"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            temp_dir
+                .path()
+                .join("legacy.json"),
+            r#"{"id":"legacy","legacy":true}"#,
+        )
+        .unwrap();
+
+        let storage =
+            CachedFilesystemStorage::<RefusingMigrationEntity>::new(temp_dir.path().to_path_buf(), entity_name)
+                .await
+                .unwrap();
+
+        let loaded: Vec<String> = storage
+            .list_all()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entity| entity.id)
+            .collect();
+        assert_eq!(loaded, vec!["fine".to_string()]);
+        assert_eq!(
+            crate::metrics::backends::prometheus::STORAGE_LOAD_ERRORS
+                .with_label_values(&[entity_name, "migration_failed"])
+                .get(),
+            1
+        );
+        assert!(
+            temp_dir
+                .path()
+                .join("legacy.json")
+                .exists(),
+            "the unmigratable file is left on disk"
+        );
+    }
+
     #[tokio::test]
     async fn test_encrypted_only_record_increments_load_error_metric() {
         // Unique entity label so the absolute counter value is deterministic regardless of

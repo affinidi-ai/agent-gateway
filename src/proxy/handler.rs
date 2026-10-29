@@ -20968,6 +20968,7 @@ mod fabric_extended_card_tests {
     struct FabricPeer {
         state: crate::state::ProxyState,
         peer_did: String,
+        forwarded: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
         _root: tempfile::TempDir,
         _issuer_dir: tempfile::TempDir,
     }
@@ -21013,7 +21014,13 @@ mod fabric_extended_card_tests {
 
         let responder_did = peer_did.clone();
         let reply_body = body.to_string();
+        let forwarded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = forwarded.clone();
         crate::comm::didcomm::client::test_send_hook::install(&peer_did, move |request| {
+            recorded
+                .lock()
+                .unwrap()
+                .push(request.body.clone());
             let reply = crate::gateways::connection_points::messages::ReceivedMessage::new(
                 "cp-1".into(),
                 "peer".into(),
@@ -21100,6 +21107,7 @@ mod fabric_extended_card_tests {
         FabricPeer {
             state,
             peer_did,
+            forwarded,
             _root: root,
             _issuer_dir: issuer_dir,
         }
@@ -21200,6 +21208,124 @@ mod fabric_extended_card_tests {
                 .as_str()
                 .unwrap_or_default();
             assert!(url.starts_with("https://gateway.example"), "{body}");
+        });
+    }
+
+    async fn peer_with_target_secret(secret: Option<&str>) -> FabricPeer {
+        let mut peer = fabric_peer_answering(200, json!({"jsonrpc": "2.0", "id": "m-1", "result": {}})).await;
+        let secrets: Arc<dyn crate::secrets::SecretsStore> = Arc::new(
+            crate::secrets::FilesystemSecretsStore::new_async(
+                peer._root
+                    .path()
+                    .join("secrets")
+                    .to_str()
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+        );
+        if let Some(value) = secret {
+            secrets
+                .create(crate::secrets::CreateSecretRequest {
+                    tenant_id: None,
+                    name: "PEER_KEY".into(),
+                    secret_id: "PEER_KEY".into(),
+                    description: None,
+                    value: value.into(),
+                    secret_type: "General".into(),
+                    tags: vec![],
+                })
+                .await
+                .unwrap();
+        }
+        peer.state.secrets_store = Some(secrets);
+        let mut surface = (*peer.state.surface).clone();
+        surface.target.auth = Some(
+            serde_json::from_value(json!({
+                "method": {"static_secret": {"secret_id": "PEER_KEY", "header_name": "X-Api-Key"}},
+                "fallback": "reject"
+            }))
+            .unwrap(),
+        );
+        peer.state.surface = Arc::new(surface);
+        peer
+    }
+
+    async fn forward_message_send(peer: &FabricPeer) -> (axum::http::StatusCode, String) {
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("https://gateway.example/a2a")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                json!({"jsonrpc": "2.0", "id": "m-1", "method": "message/send", "params": {"message": {
+                    "role": "user", "parts": [{"kind": "text", "text": "hi"}], "messageId": "m-1"}}})
+                .to_string(),
+            ))
+            .unwrap();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            Box::pin(super::proxy_handler_with_mcp_runtime(
+                "127.0.0.1:12345"
+                    .parse()
+                    .unwrap(),
+                peer.state.clone(),
+                request,
+                crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+                None,
+            )),
+        )
+        .await
+        .expect("the Fabric leg answers")
+        .unwrap_or_else(|response| response);
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    #[test]
+    fn fabric_forward_carries_the_target_secret_to_the_peer_in_a_header() {
+        run_on_large_stack(async {
+            let peer = peer_with_target_secret(Some("peer-secret")).await;
+
+            let (status, body) = forward_message_send(&peer).await;
+
+            assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+            let forwarded = peer
+                .forwarded
+                .lock()
+                .unwrap()
+                .clone();
+            assert_eq!(forwarded.len(), 1, "{forwarded:?}");
+            assert_eq!(forwarded[0]["headers"]["X-API-KEY"], "peer-secret", "{forwarded:?}");
+            assert!(!body.contains("peer-secret"), "the secret never reaches the caller: {body}");
+        });
+    }
+
+    #[test]
+    fn fabric_forward_without_its_target_secret_is_refused_before_anything_is_sent() {
+        run_on_large_stack(async {
+            let peer = peer_with_target_secret(None).await;
+
+            let (status, body) = forward_message_send(&peer).await;
+
+            assert_eq!(status, axum::http::StatusCode::BAD_GATEWAY, "{body}");
+            let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(body["detail"], crate::proxy::target_credentials::TARGET_AUTH_FAILED);
+            assert!(
+                !body
+                    .to_string()
+                    .contains("PEER_KEY"),
+                "{body}"
+            );
+            assert!(
+                peer.forwarded
+                    .lock()
+                    .unwrap()
+                    .is_empty(),
+                "the peer gateway never received the request"
+            );
         });
     }
 

@@ -236,4 +236,23 @@ mod tests {
     fn http_target_with_trailing_slash_root_request_stays_without_slash() {
         assert_eq!(routed_url("https://gateway.example/a2a/requester/", "/"), "https://gateway.example/a2a/requester");
     }
+
+    #[test]
+    fn well_known_request_uses_the_card_override_on_the_target_origin() {
+        let routed = route_protocol_request(
+            "https://gateway.example/a2a/requester/",
+            &"/.well-known/agent-card.json"
+                .parse::<Uri>()
+                .unwrap(),
+            &hyper::Method::GET,
+            &hyper::HeaderMap::new(),
+            &[],
+            true,
+            Some("/cards/agent.json"),
+        );
+        match routed {
+            ProtocolResult::HttpForward(url) => assert_eq!(url, "https://gateway.example/cards/agent.json"),
+            _ => panic!("expected HTTP forward"),
+        }
+    }
 }

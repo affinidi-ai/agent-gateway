@@ -349,6 +349,214 @@ async fn admin_api_refuses_unsafe_or_cross_tenant_provider_target_authentication
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn admin_api_checks_variants_transit_credentials_and_provider_types_for_target_authentication() {
+    let auth_server = MockAuthServer::start().await;
+    auth_server.register_client("gateway-client", "gateway-secret");
+    let card = json!({"name": "agent", "description": "hop 2", "url": "http://agent.invalid/", "version": "1.0",
+        "capabilities": {}, "skills": [], "defaultInputModes": ["text"], "defaultOutputModes": ["text"]});
+    let mock = MockServer::start_with_response(card.to_string()).await;
+    let _test_mode = TestModeEnv::enabled(
+        &format!("{},{}", mock.url(), auth_server.egress_allowlist()),
+        &auth_server.oauth_endpoint_allowlist(),
+    );
+    let mut client = None;
+    let h = GatewayHarness::start_with_mock(mock, |_, _, bootstrap| {
+        client = Some(helpers::configure_admin_api(bootstrap));
+    })
+    .await;
+    let client = client.expect("client");
+    let admin = Admin {
+        client: client.clone(),
+        base: h.gateway_base.clone(),
+    };
+    wait_until_ready(&admin, &format!("{}/api/v1/health", h.gateway_base)).await;
+    let mut listener = url::Url::parse(&h.gateway_base).expect("gateway URL");
+    listener
+        .set_host(Some("localhost"))
+        .expect("host");
+    let listener = listener
+        .origin()
+        .ascii_serialization();
+    let target = h.mock.url();
+
+    for (secret_id, value) in [
+        ("GW_ID", "gateway-client"),
+        ("GW_SECRET", "gateway-secret"),
+        ("CALLER_KEYS", "key"),
+        ("SIGNING_KEY", SigningFixture::es256(0).private_pkcs8_pem()),
+    ] {
+        let (status, body) = admin
+            .post(&client, "/api/v1/secrets/new", secret(secret_id, value))
+            .await;
+        assert_eq!(status, 201, "{body}");
+    }
+    let id_of = |body: &Value| {
+        body["id"]
+            .as_str()
+            .expect("provider id")
+            .to_string()
+    };
+    let (status, provider) = admin
+        .post(
+            &client,
+            "/api/v1/credential-providers",
+            client_credentials_provider("variant-hop-two", &auth_server.token_endpoint(), "GW_ID", "GW_SECRET"),
+        )
+        .await;
+    assert_eq!(status, 201, "{provider}");
+    let provider_id = id_of(&provider);
+    let (status, consent) = admin
+        .post(
+            &client,
+            "/api/v1/credential-providers",
+            json!({
+                "name": "consent", "provider_id": "consent", "provider_type": "oauth2_authorization_code",
+                "authorization_endpoint": "https://192.0.2.10/authorize", "token_endpoint": auth_server.token_endpoint(),
+                "client_id_secret_ref": "GW_ID", "client_secret_secret_ref": "GW_SECRET"
+            }),
+        )
+        .await;
+    assert_eq!(status, 201, "{consent}");
+    let consent_id = id_of(&consent);
+    let mut jwt_bearer = jwt_bearer_grant(&auth_server, ASSERTION_ISSUER);
+    jwt_bearer["name"] = json!("variant-jwt");
+    jwt_bearer["provider_id"] = json!("variant-jwt");
+    let (status, jwt_provider) = admin
+        .post(&client, "/api/v1/credential-providers", jwt_bearer)
+        .await;
+    assert_eq!(status, 201, "{jwt_provider}");
+    let jwt_provider_id = id_of(&jwt_provider);
+
+    let (status, body) = admin
+        .post(&client, "/api/v1/surfaces", surface(&listener, "/variants/consent", &target, &consent_id, true))
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body["details"]
+            .as_str()
+            .expect("error message")
+            .contains("cannot be used for Target Authentication"),
+        "a consent provider cannot authenticate to the Target: {body}"
+    );
+
+    let mut lookup = surface(&listener, "/variants/lookup", &target, "", true);
+    lookup["target"]["auth"] = json!({"method": "credential_lookup", "fallback": "reject"});
+    let (status, body) = admin
+        .post(&client, "/api/v1/surfaces", lookup)
+        .await;
+    assert_eq!(status, 201, "a credential lookup references no provider: {body}");
+
+    let transit_surface = |route: &str, endpoint: &str| {
+        let mut surface = surface(&listener, route, &target, "", true);
+        surface["target"]
+            .as_object_mut()
+            .expect("target")
+            .remove("auth");
+        surface["transit"] = json!({"points": [{
+            "alias": "partner", "name": "Partner", "protocol": "a2a", "target_endpoint": endpoint,
+            "transit_credentials": {"credential_provider_id": jwt_provider_id}
+        }]});
+        surface
+    };
+    let (status, body) = admin
+        .post(&client, "/api/v1/surfaces", transit_surface("/variants/transit-clear", "http://partner.invalid"))
+        .await;
+    assert_eq!(status, 400, "a Transit Point binding a JWT bearer provider needs https: {body}");
+    assert!(
+        body["details"]
+            .as_str()
+            .expect("error message")
+            .contains("requires an https endpoint"),
+        "{body}"
+    );
+    let (status, body) = admin
+        .post(&client, "/api/v1/surfaces", transit_surface("/variants/transit-https", "https://partner.invalid"))
+        .await;
+    assert_eq!(status, 201, "an https Transit Point may bind a JWT bearer provider: {body}");
+
+    let (status, created) = admin
+        .post(&client, "/api/v1/surfaces", surface(&listener, "/variants/base", &target, &provider_id, true))
+        .await;
+    assert_eq!(status, 201, "{created}");
+    let surface_id = created["surface_id"]
+        .as_str()
+        .expect("surface id")
+        .to_string();
+    let variants = format!("{}/api/v1/surfaces/{surface_id}/variants", h.gateway_base);
+
+    let (status, variant) = admin
+        .post(&client, &format!("/api/v1/surfaces/{surface_id}/variants"), json!({"alias": "canary", "name": "Canary"}))
+        .await;
+    assert_eq!(status, 201, "{variant}");
+    assert_eq!(variant["alias"], "canary");
+    assert_eq!(variant["enabled"], true);
+    let variant_id = variant["id"]
+        .as_str()
+        .expect("variant id")
+        .to_string();
+    let (status, body) = admin
+        .post(&client, &format!("/api/v1/surfaces/{surface_id}/variants"), json!({"alias": "canary", "name": "Again"}))
+        .await;
+    assert_eq!(status, 400, "a variant alias is unique on its surface: {body}");
+
+    let (status, body) = admin
+        .send(
+            client
+                .put(format!("{variants}/{variant_id}"))
+                .json(&json!({"overrides": {"target": {"auth": {
+                    "method": {"credential_provider": {"credential_provider_id": consent_id}}, "fallback": "reject"
+                }}}})),
+        )
+        .await;
+    assert_eq!(status, 400, "a variant cannot authenticate through a consent provider either: {body}");
+    let (status, body) = admin
+        .send(
+            client
+                .put(format!("{variants}/{variant_id}"))
+                .json(&json!({"overrides": {"target": {"auth": {
+                    "method": {"credential_provider": {"credential_provider_id": provider_id}}, "fallback": "reject"
+                }}}})),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    let (status, promoted) = admin
+        .send(client.post(format!("{variants}/{variant_id}/promote-to-default")))
+        .await;
+    assert_eq!(status, 200, "{promoted}");
+    assert_eq!(promoted["default_variant_id"], variant_id);
+    let (status, stored) = admin
+        .send(client.get(format!("{}/api/v1/surfaces/{surface_id}", h.gateway_base)))
+        .await;
+    assert_eq!(status, 200, "{stored}");
+    assert_eq!(stored["default_variant_id"], variant_id, "the promotion is stored");
+
+    let (status, body) = admin
+        .send(client.post(format!("{variants}/missing/promote-to-default")))
+        .await;
+    assert_eq!(status, 404, "{body}");
+    let (status, disabled) = admin
+        .post(&client, &format!("/api/v1/surfaces/{surface_id}/variants"), json!({"alias": "dark", "name": "Dark"}))
+        .await;
+    assert_eq!(status, 201, "{disabled}");
+    let disabled_id = disabled["id"]
+        .as_str()
+        .expect("variant id");
+    let (status, body) = admin
+        .send(
+            client
+                .put(format!("{variants}/{disabled_id}"))
+                .json(&json!({"enabled": false})),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = admin
+        .send(client.post(format!("{variants}/{disabled_id}/promote-to-default")))
+        .await;
+    assert_eq!(status, 400, "a disabled variant cannot become the default: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn admin_changes_drop_the_kept_gateway_token_of_their_provider() {
     use crate::delegation_vault::gateway_token::{
         Freshness, GatewayTokenKey, ProviderSecrets, acquire_gateway_token, target_token_cache,
@@ -454,6 +662,12 @@ async fn admin_changes_drop_the_kept_gateway_token_of_their_provider() {
                 .put(format!("{}/api/v1/tenant-ownership/credential-providers/{}", h.gateway_base, provider.id))
                 .json(&json!({"tenant_id": null})),
         ),
+        (
+            "reassigning its client secret's tenant",
+            client
+                .put(format!("{}/api/v1/tenant-ownership/secrets/{}", h.gateway_base, secret_ids["DROP_SECRET"]))
+                .json(&json!({"tenant_id": null})),
+        ),
         ("an operator configuration reload", client.post(format!("{}/api/v1/config/reload", h.gateway_base))),
     ];
     for (change, request) in changes {
@@ -462,14 +676,14 @@ async fn admin_changes_drop_the_kept_gateway_token_of_their_provider() {
         assert_eq!(acquire().await, Freshness::Fresh, "{change} drops the kept token");
         assert_eq!(acquire().await, Freshness::Cached, "the token granted after {change} is kept");
     }
-    assert_eq!(auth_server.token_request_count(), 5, "one grant at first and one after each change");
+    assert_eq!(auth_server.token_request_count(), 6, "one grant at first and one after each change");
 
     let (status, body) = admin
         .send(tenant.post(format!("{}/api/v1/config/reload", h.gateway_base)))
         .await;
     assert_eq!(status, 403, "a tenant cannot reload the configuration: {body}");
     assert_eq!(acquire().await, Freshness::Cached, "a refused tenant reload keeps the token");
-    assert_eq!(auth_server.token_request_count(), 5);
+    assert_eq!(auth_server.token_request_count(), 6);
 }
 
 struct HopTwo {
@@ -633,6 +847,10 @@ impl HopTwo {
     }
 
     async fn card(&self) -> u16 {
+        self.card_with_body().await.0
+    }
+
+    async fn card_with_body(&self) -> (u16, String) {
         let response = crate::proxy::handler::handle_agent_card(
             axum::extract::ConnectInfo(
                 "127.0.0.1:12345"
@@ -644,7 +862,11 @@ impl HopTwo {
         )
         .await
         .unwrap_or_else(|response| response);
-        response.status().as_u16()
+        let status = response.status().as_u16();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        (status, String::from_utf8_lossy(&body).into_owned())
     }
 
     async fn call(
@@ -660,6 +882,18 @@ impl HopTwo {
         &self,
         caller_key: Option<&str>,
     ) -> (u16, String) {
+        self.call_with(
+            caller_key,
+            r#"{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"role":"user","messageId":"m-1","parts":[{"kind":"text","text":"hi"}]}}}"#,
+        )
+        .await
+    }
+
+    async fn call_with(
+        &self,
+        caller_key: Option<&str>,
+        body: &'static str,
+    ) -> (u16, String) {
         let mut request = axum::http::Request::builder()
             .method("POST")
             .uri(format!("https://gateway.example{ROUTE}"))
@@ -668,9 +902,7 @@ impl HopTwo {
             request = request.header("x-caller-key", key);
         }
         let request = request
-            .body(axum::body::Body::from(
-                r#"{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"role":"user","messageId":"m-1","parts":[{"kind":"text","text":"hi"}]}}}"#,
-            ))
+            .body(axum::body::Body::from(body))
             .expect("request");
         let response = Box::pin(crate::proxy::handler::proxy_handler_with_mcp_runtime(
             "127.0.0.1:12345"
@@ -1073,4 +1305,248 @@ fn a_delegated_credential_and_the_target_credential_never_share_a_header() {
         .expect("test thread")
         .join()
         .expect("precedence checks pass");
+}
+
+#[test]
+fn a_delegated_credential_header_with_an_unusable_name_is_refused_before_the_target() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let auth_server = runtime.block_on(MockAuthServer::start());
+    auth_server.register_client("gateway-client", "gateway-secret");
+    let mock = runtime.block_on(MockServer::start_with_response(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#.to_string()));
+    let _test_mode = TestModeEnv::enabled(
+        &format!("{},{}", mock.url(), auth_server.egress_allowlist()),
+        &auth_server.oauth_endpoint_allowlist(),
+    );
+    let handle = runtime.handle().clone();
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            handle.block_on(async {
+                let bound = |inject_as: Value| {
+                    let mut bound = surface("https://gateway.example", ROUTE, &mock.url(), "cp-hop-two", true);
+                    bound["outbound_credentials"] =
+                        json!([{"credential_provider_id": "cp-hop-two", "inject_as": inject_as}]);
+                    bound
+                };
+                let forwarded = || {
+                    mock.request_count
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                };
+
+                let hop = HopTwo::start(
+                    &auth_server,
+                    bound(json!({"type": "custom_header", "name": "X-Delegated-Key", "format": "{value}"})),
+                )
+                .await;
+                let before = forwarded();
+                assert_eq!(
+                    hop.call(Some(CALLER_KEY))
+                        .await,
+                    200
+                );
+                assert_eq!(forwarded(), before + 1, "a usable header name is delivered");
+
+                let hop = HopTwo::start(
+                    &auth_server,
+                    bound(json!({"type": "custom_header", "name": "Bad Header Name", "format": "{value}"})),
+                )
+                .await;
+                let before = forwarded();
+                let (status, body) = hop
+                    .call_with_body(Some(CALLER_KEY))
+                    .await;
+                assert_eq!(status, 500, "{body}");
+                assert!(body.contains("Invalid delegated credential header"), "{body}");
+                assert_eq!(forwarded(), before, "the request never reaches the Target");
+            });
+        })
+        .expect("test thread")
+        .join()
+        .expect("unusable header name checks pass");
+}
+
+#[test]
+fn the_card_fetch_follows_the_card_location_override_and_a_refused_grant_never_reaches_the_target() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let card = json!({"name": "agent", "description": "hop 2", "url": "http://agent.invalid/", "version": "1.0",
+        "capabilities": {}, "skills": [], "defaultInputModes": ["text"], "defaultOutputModes": ["text"]});
+    let auth_server = runtime.block_on(MockAuthServer::start());
+    auth_server.register_jwt_client(JwtBearerClient {
+        iss: ASSERTION_ISSUER.into(),
+        sub: ASSERTION_SUBJECT.into(),
+        keys: vec![SigningFixture::es256(0)],
+    });
+    let mock = runtime.block_on(MockServer::start_with_response(card.to_string()));
+    let _test_mode = TestModeEnv::enabled(
+        &format!("{},{}", mock.url(), auth_server.egress_allowlist()),
+        &auth_server.oauth_endpoint_allowlist(),
+    );
+    let handle = runtime.handle().clone();
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            handle.block_on(async {
+                let overridden = |provider_issuer: &str| {
+                    let mut value =
+                        surface("https://gateway.example", ROUTE, &format!("{}/api", mock.url()), "cp-hop-two", true);
+                    value["access_point"]["agent_card_path"] = json!("/cards/agent.json");
+                    (jwt_bearer_grant(&auth_server, provider_issuer), value)
+                };
+
+                let (grant, value) = overridden(ASSERTION_ISSUER);
+                let hop = HopTwo::start_with_grant(grant, value).await;
+                let (status, body) = hop.card_with_body().await;
+                assert_eq!(status, 200, "{body}");
+                let received = mock
+                    .last_request_rx
+                    .borrow()
+                    .clone()
+                    .expect("the Target received the card fetch");
+                assert_eq!(received.path, "/cards/agent.json", "the card is fetched from the override path");
+                assert!(
+                    last_authorization(&mock).is_some_and(|bearer| bearer.starts_with("Bearer ey")),
+                    "the card fetch carries the gateway token"
+                );
+
+                let before = mock
+                    .request_count
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                let (grant, value) = overridden("https://unregistered-agent.example");
+                let refused = HopTwo::start_with_grant(grant, value).await;
+                let (status, body) = refused.card_with_body().await;
+                assert_eq!(status, 502, "{body}");
+                let body: Value = serde_json::from_str(&body).expect("JSON error body");
+                assert_eq!(body["detail"], crate::proxy::target_credentials::TARGET_AUTH_FAILED);
+                assert!(
+                    !body
+                        .to_string()
+                        .contains("unregistered-agent"),
+                    "{body}"
+                );
+                assert_eq!(
+                    mock.request_count
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    before,
+                    "a card fetch without a credential never reaches the Target"
+                );
+            });
+        })
+        .expect("test thread")
+        .join()
+        .expect("card fetch checks pass");
+}
+
+const MCP_TOOL_CALL: &str = r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"echo","arguments":{}}}"#;
+
+async fn mcp_proxy_hop(
+    secret_id: &str,
+    mock_url: &str,
+    directory: &std::path::Path,
+) -> HopTwo {
+    use crate::mcp_proxies::McpProxyStore;
+
+    let proxy = crate::mcp_proxies::types::McpProxy::new(
+        "Hop two tools".into(),
+        String::new(),
+        mock_url.to_string(),
+        json!({
+            "openapi": "3.0.0", "info": {"title": "Tools", "version": "1.0"}, "paths": {
+                "/echo": {"get": {"operationId": "echo", "responses": {"200": {"description": "OK"}}}}
+            }
+        })
+        .to_string(),
+        "/mcp".into(),
+        "/owned".into(),
+    );
+    let mut value = surface("https://gateway.example", ROUTE, &format!("proxy://{}", proxy.id), "cp-hop-two", true);
+    value["access_point"]["protocol"] = json!("mcp");
+    value["target"]["auth"] = json!({
+        "method": {"static_secret": {"secret_id": secret_id, "header_name": "X-Api-Key"}},
+        "fallback": "reject"
+    });
+    let mut hop = HopTwo::start_with_grant(
+        json!({
+            "provider_type": "oauth2_client_credentials", "token_endpoint": "https://auth.example/token",
+            "client_id_secret_ref": "GW_ID", "client_secret_secret_ref": "GW_SECRET"
+        }),
+        value,
+    )
+    .await;
+    let store = crate::mcp_proxies::filesystem::FileSystemMcpProxyStore::new(directory.join("mcp-proxies"))
+        .await
+        .expect("MCP proxy store");
+    store
+        .create(&proxy)
+        .await
+        .expect("MCP proxy");
+    hop.state.mcp_proxy_store = Some(std::sync::Arc::new(store));
+    hop
+}
+
+#[test]
+fn an_mcp_proxy_surface_sends_its_target_secret_to_the_backend_and_refuses_without_one() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let mock = runtime.block_on(MockServer::start_with_response(r#"{"echoed":true}"#.to_string()));
+    let _test_mode = TestModeEnv::enabled(&mock.url(), "");
+    let handle = runtime.handle().clone();
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            handle.block_on(async {
+                let directory = tempfile::tempdir().expect("tempdir");
+                let hop = mcp_proxy_hop("GW_SECRET", &mock.url(), directory.path()).await;
+                let (status, body) = hop
+                    .call_with(Some(CALLER_KEY), MCP_TOOL_CALL)
+                    .await;
+                assert_eq!(status, 200, "{body}");
+                let received = mock
+                    .last_request_rx
+                    .borrow()
+                    .clone()
+                    .expect("the backend received the call");
+                assert_eq!(
+                    received
+                        .headers
+                        .get("x-api-key")
+                        .map(String::as_str),
+                    Some("gateway-secret")
+                );
+
+                let before = mock
+                    .request_count
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                let refused_directory = tempfile::tempdir().expect("tempdir");
+                let refused = mcp_proxy_hop("MISSING_SECRET", &mock.url(), refused_directory.path()).await;
+                let (status, body) = refused
+                    .call_with(Some(CALLER_KEY), MCP_TOOL_CALL)
+                    .await;
+                assert_eq!(status, 502, "{body}");
+                let body: Value = serde_json::from_str(&body).expect("JSON error body");
+                assert_eq!(body["detail"], crate::proxy::target_credentials::TARGET_AUTH_FAILED);
+                assert!(
+                    !body
+                        .to_string()
+                        .contains("MISSING_SECRET"),
+                    "{body}"
+                );
+                assert_eq!(
+                    mock.request_count
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    before,
+                    "the backend never sees a call without its credential"
+                );
+            });
+        })
+        .expect("test thread")
+        .join()
+        .expect("MCP proxy checks pass");
 }

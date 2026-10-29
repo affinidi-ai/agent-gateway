@@ -2261,6 +2261,7 @@ mod tests {
         let fabric_send = ContinuationRoute::FabricSend {
             peer_did: "did:web:peer.example".into(),
         };
+        let standalone = ContinuationRoute::StandaloneProxy;
         let https = "https://agent.example/api";
         let http = "http://agent.example/api";
         let fabric = "fabric://peer-gateway/peer-surface";
@@ -2273,6 +2274,7 @@ mod tests {
             (&partner, https, https, false, false),
             (&unknown_partner, https, https, true, false),
             (&fabric_send, fabric, https, true, false),
+            (&standalone, https, https, true, false),
         ]
         .into_iter()
         .enumerate()
@@ -2306,5 +2308,206 @@ mod tests {
             };
             assert_eq!(outcome, expected, "case {case}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_service_credential_fails_closed_for_an_empty_key_and_a_failed_grant() {
+        use crate::delegation_vault::gateway_token::test_endpoint::TokenEndpoint;
+
+        let directory = tempfile::tempdir().unwrap();
+        let providers = FileSystemCredentialProviderStore::new(
+            directory
+                .path()
+                .join("providers"),
+        )
+        .await
+        .unwrap();
+        let strategies = FileSystemJwtVerificationStrategyStore::new(
+            directory
+                .path()
+                .join("strategies"),
+        )
+        .await
+        .unwrap();
+        let vault = FileSystemDelegationVaultStore::new(directory.path().join("vault"))
+            .await
+            .unwrap();
+        let secrets: Arc<dyn crate::secrets::SecretsStore> = Arc::new(
+            crate::secrets::FilesystemSecretsStore::new_async(
+                directory
+                    .path()
+                    .join("secrets")
+                    .to_str()
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+        );
+        for (secret_id, value) in [("empty-key", ""), ("client-id", "client"), ("client-secret", "secret")] {
+            secrets
+                .create(crate::secrets::CreateSecretRequest {
+                    tenant_id: None,
+                    name: secret_id.into(),
+                    secret_id: secret_id.into(),
+                    description: None,
+                    value: value.into(),
+                    secret_type: "General".into(),
+                    tags: vec![],
+                })
+                .await
+                .unwrap();
+        }
+        let rejecting =
+            TokenEndpoint::start(axum::http::StatusCode::BAD_REQUEST, json!({"error": "invalid_client"}).to_string())
+                .await;
+        let grant_egress = crate::delegation_vault::gateway_token::GrantEgress {
+            timeout: std::time::Duration::from_secs(5),
+            exact_allowlist: Some(rejecting.url.clone()),
+        };
+        let provider = |id: &str, provider_type: &str, extra: serde_json::Value| {
+            let mut provider = json!({
+                "id": id, "name": id, "provider_id": id, "provider_type": provider_type,
+                "resource": "https://provider.example/api",
+                "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+            });
+            provider
+                .as_object_mut()
+                .unwrap()
+                .extend(
+                    extra
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                );
+            serde_json::from_value(provider).unwrap()
+        };
+        let client_credentials = |id: &str, endpoint: &str| {
+            provider(
+                id,
+                "oauth2_client_credentials",
+                json!({"token_endpoint": endpoint, "client_id_secret_ref": "client-id",
+                    "client_secret_secret_ref": "client-secret"}),
+            )
+        };
+        for configured in [
+            provider("empty", "api_key", json!({"api_key_secret_ref": "empty-key"})),
+            client_credentials("rejected", &rejecting.url),
+            client_credentials("blocked", "http://127.0.0.1:9/token"),
+        ] {
+            providers
+                .create(configured)
+                .await
+                .unwrap();
+        }
+        let surface: AgentSurface = serde_json::from_value(json!({
+            "surface_id": "surface", "name": "Surface",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
+            "target": {"endpoint": "https://provider.example/api"},
+            "outbound_credentials": [
+                {"credential_provider_id": "empty", "scopes": ["read"],
+                    "inject_as": {"type": "custom_header", "name": "X-Empty", "format": "{value}"}},
+                {"credential_provider_id": "rejected", "scopes": ["read"],
+                    "inject_as": {"type": "custom_header", "name": "X-Rejected", "format": "{value}"}},
+                {"credential_provider_id": "blocked", "scopes": ["read"],
+                    "inject_as": {"type": "custom_header", "name": "X-Blocked", "format": "{value}"}}
+            ]
+        }))
+        .unwrap();
+        let authorization = McpResourceServerConfig {
+            resource: "https://gateway.example/mcp".into(),
+            scopes: vec!["read".into()],
+        };
+        let profile = McpIssuerProfile {
+            issuer: "https://gateway.example/oauth2/mcp".into(),
+        };
+        let caller = AuthenticatedIdentity::JwtBearer {
+            subject: "user".into(),
+            claims: json!({"iss": profile.issuer, "sub": "user", "scope": "read"}),
+        };
+        let service = ContinuationService::new(
+            ContinuationCipher::new(
+                "deployment".into(),
+                "key".into(),
+                vec![ContinuationKey::new("key".into(), [7; 32], 1, 1000, 1900).unwrap()],
+            )
+            .unwrap(),
+            Arc::new(EmbeddedContinuations::new(32).unwrap()),
+        );
+        let request = ValidatedModernMessage {
+            protocol_version: crate::mcp::MCP_MODERN_VERSION.into(),
+            client_capabilities: None,
+            client_info: None,
+            method: "tools/call".into(),
+            id: Some(json!(1)),
+            kind: McpMessageKind::Request,
+            params: Some(json!({"name": "read", "arguments": {"value": 1}})),
+        };
+        macro_rules! context {
+            ($egress:expr) => {
+                ModernDelegationContext {
+                    service: &service,
+                    deployment: "deployment",
+                    ttl_secs: 100,
+                    surface: &surface,
+                    variant_id: None,
+                    route: ContinuationRoute::AccessPoint,
+                    authorization: &authorization,
+                    identity: &caller,
+                    agent_did: "did:web:agent.example",
+                    profile: &profile,
+                    vault: &vault,
+                    providers: &providers,
+                    strategies: &strategies,
+                    secrets: Some(&secrets),
+                    grant_egress: $egress,
+                }
+            };
+        }
+
+        let with_endpoint = context!(Some(&grant_egress));
+        let selected = with_endpoint
+            .select(&request)
+            .await
+            .unwrap();
+        let by_id = |id: &str| {
+            selected
+                .iter()
+                .find(|selected| selected.provider.id == id)
+                .unwrap()
+        };
+        assert_eq!(
+            with_endpoint
+                .service_credential(by_id("empty"), 100)
+                .await,
+            Err(ContinuationError::Unavailable)
+        );
+        assert_eq!(
+            with_endpoint
+                .service_credential(by_id("rejected"), 100)
+                .await,
+            Err(ContinuationError::Unavailable)
+        );
+        assert_eq!(
+            rejecting
+                .calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        let from_environment = context!(None);
+        let selected = from_environment
+            .select(&request)
+            .await
+            .unwrap();
+        let blocked = selected
+            .iter()
+            .find(|selected| selected.provider.id == "blocked")
+            .unwrap();
+        assert_eq!(
+            from_environment
+                .service_credential(blocked, 100)
+                .await,
+            Err(ContinuationError::BindingMismatch)
+        );
     }
 }

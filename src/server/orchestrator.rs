@@ -4757,6 +4757,90 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn activation_keeps_serving_the_stores_it_could_not_refresh_and_still_drops_cached_jwks() {
+        let storage = tempfile::TempDir::new().unwrap();
+        let strategies_dir = storage
+            .path()
+            .join("strategies");
+        let providers_dir = storage
+            .path()
+            .join("providers");
+        let strategies = FileSystemJwtVerificationStrategyStore::new(strategies_dir.clone())
+            .await
+            .unwrap();
+        let providers = FileSystemCredentialProviderStore::new(providers_dir.clone())
+            .await
+            .unwrap();
+        let auth_server = crate::component_tests::helpers::mock_auth_server::MockAuthServer::start().await;
+        let strategy = strategies
+            .create(JwtVerificationStrategy {
+                name: "Hydra".to_string(),
+                expected_issuer: auth_server
+                    .issuer()
+                    .to_string(),
+                jwks_source: JwksSource::Remote {
+                    jwks_uri: auth_server.jwks_uri(),
+                },
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let provider: crate::credential_providers::CredentialProvider = serde_json::from_value(serde_json::json!({
+            "id": "provider-a", "name": "Calendar", "provider_id": "calendar",
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"
+        }))
+        .unwrap();
+        providers
+            .create(provider)
+            .await
+            .unwrap();
+        let jwks = JwksClient::new();
+        let _test_mode = crate::component_tests::helpers::test_mode::TestModeEnv::enabled_for(&auth_server);
+        jwks.get_key(&strategy, &auth_server.jwks_uri(), "rs256-0")
+            .await
+            .unwrap();
+        assert!(
+            jwks.is_cached(&strategy.id)
+                .await
+        );
+        std::fs::remove_dir_all(strategies_dir).unwrap();
+        std::fs::remove_dir_all(providers_dir).unwrap();
+
+        crate::delegation_vault::gateway_token::with_own_target_token_cache(reconcile_caller_and_target_credentials(
+            Some(&strategies),
+            Some(&providers),
+            &jwks,
+        ))
+        .await;
+
+        assert_eq!(
+            strategies
+                .get(&strategy.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .name,
+            "Hydra",
+            "a store whose refresh failed keeps its last state"
+        );
+        assert_eq!(
+            providers
+                .get("provider-a")
+                .await
+                .unwrap()
+                .unwrap()
+                .name,
+            "Calendar"
+        );
+        assert!(
+            !jwks
+                .is_cached(&strategy.id)
+                .await,
+            "the cached key sets are dropped even when a refresh fails"
+        );
+    }
+
     #[test]
     fn remote_gateway_count_excludes_local_gateway() {
         let gateways = vec![

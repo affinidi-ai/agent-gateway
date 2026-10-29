@@ -1340,4 +1340,38 @@ mod tests {
             result
         );
     }
+
+    #[tokio::test]
+    async fn a_fetch_that_finishes_after_its_strategy_was_evicted_records_nothing() {
+        let client = JwksClient::new();
+        let version = SourceVersion {
+            jwks_uri: "https://issuer.example/jwks.json".to_string(),
+            updated_at: DateTime::<Utc>::default(),
+        };
+
+        let failure = client
+            .record("gone", &version, "k1", Err(JwtBearerError::JwksFetchFailed("upstream down".into())))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&failure, JwtBearerError::JwksFetchFailed(message) if message == "upstream down"),
+            "{failure}"
+        );
+
+        let entry = CacheEntry {
+            keys: HashMap::from([("k1".to_string(), make_jwk(Some("k1")))]),
+            fetched_at: Instant::now(),
+            ttl: DEFAULT_TTL,
+        };
+        let jwk = client
+            .record("gone", &version, "k1", Ok(entry))
+            .await
+            .unwrap();
+        assert_eq!(jwk.kid.as_deref(), Some("k1"));
+        assert!(
+            slot_state(&client, "gone", |_| ())
+                .await
+                .is_none()
+        );
+    }
 }

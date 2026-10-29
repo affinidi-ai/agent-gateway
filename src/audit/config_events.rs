@@ -578,6 +578,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_strategy_with_its_own_keys_is_reported_as_static() {
+        let strategy = JwtVerificationStrategy {
+            id: "strategy-2".into(),
+            name: "Pinned keys".into(),
+            expected_issuer: "https://issuer.example/".into(),
+            jwks_source: JwksSource::Static { jwks: Vec::new() },
+            ..Default::default()
+        };
+        let (_, events) =
+            capture(async { verification_strategy_changed(&actor(), ConfigChange::Created, None, &strategy) }).await;
+        assert!(matches!(
+            &events[0].event,
+            DelegationAuditAction::VerificationStrategyChanged { change: ConfigChange::Created, jwks_source, .. }
+                if jwks_source == "static"
+        ));
+    }
+
+    #[tokio::test]
+    async fn switching_to_credential_lookup_authentication_names_that_method_and_no_provider() {
+        let lookup = TargetAuthConfig {
+            method: TargetAuthMethod::CredentialLookup,
+            auth_type: None,
+            target_identifier: None,
+            fallback: TargetAuthFallback::Reject,
+        };
+        let events = target_events(Some(vec![base(None)]), Some(vec![base(Some(lookup))])).await;
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0].event,
+            DelegationAuditAction::TargetAuthChanged {
+                change: ConfigChange::Created,
+                method: TargetAuthKind::CredentialLookup,
+                credential_provider_id: None,
+                variant_id: None,
+                variant_alias: None,
+            }
+        ));
+    }
+
+    #[tokio::test]
     async fn deleting_a_pinned_strategy_reports_the_pin_as_cleared() {
         let strategy = JwtVerificationStrategy {
             id: "strategy-1".into(),

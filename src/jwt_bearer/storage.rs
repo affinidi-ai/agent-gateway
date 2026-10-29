@@ -408,4 +408,50 @@ mod tests {
                 .any(|s| s.id == strategy.id)
         );
     }
+
+    struct UncachedStore;
+
+    #[async_trait]
+    impl JwtVerificationStrategyStorage for UncachedStore {
+        async fn create(
+            &self,
+            strategy: JwtVerificationStrategy,
+        ) -> Result<JwtVerificationStrategy> {
+            Ok(strategy)
+        }
+
+        async fn get(
+            &self,
+            _id: &str,
+        ) -> Result<Option<JwtVerificationStrategy>> {
+            Ok(None)
+        }
+
+        async fn list(&self) -> Result<Vec<JwtVerificationStrategy>> {
+            Ok(vec![])
+        }
+
+        async fn update(
+            &self,
+            strategy: JwtVerificationStrategy,
+        ) -> Result<JwtVerificationStrategy> {
+            Ok(strategy)
+        }
+
+        async fn delete(
+            &self,
+            _id: &str,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_store_without_a_cache_has_nothing_to_reconcile() {
+        let store = UncachedStore;
+        store
+            .refresh_from_disk()
+            .await
+            .expect("the default reconcile succeeds");
+    }
 }

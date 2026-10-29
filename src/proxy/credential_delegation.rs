@@ -3391,4 +3391,294 @@ mod tests {
             Some("client_credentials_secret_unavailable")
         );
     }
+
+    struct FaultyVault {
+        inner: crate::delegation_vault::storage::FileSystemDelegationVaultStore,
+        lookup: Option<VaultLookupResult>,
+        fail_mark_used: bool,
+        fail_store: bool,
+    }
+
+    #[async_trait]
+    impl DelegationVaultStorage for FaultyVault {
+        async fn store(
+            &self,
+            token: DelegationToken,
+        ) -> Result<DelegationToken> {
+            if self.fail_store {
+                anyhow::bail!("vault rejected the write");
+            }
+            self.inner.store(token).await
+        }
+        async fn get(
+            &self,
+            id: &str,
+        ) -> Result<Option<DelegationToken>> {
+            self.inner.get(id).await
+        }
+        async fn lookup(
+            &self,
+            agent_did: &str,
+            user_identity_hash: &str,
+            provider_id: &str,
+        ) -> Result<VaultLookupResult> {
+            match &self.lookup {
+                Some(result) => Ok(result.clone()),
+                None => {
+                    self.inner
+                        .lookup(agent_did, user_identity_hash, provider_id)
+                        .await
+                }
+            }
+        }
+        async fn list_all(&self) -> Result<Vec<DelegationToken>> {
+            self.inner.list_all().await
+        }
+        async fn delete(
+            &self,
+            id: &str,
+        ) -> Result<bool> {
+            self.inner.delete(id).await
+        }
+        async fn delete_by_user(
+            &self,
+            user_identity_hash: &str,
+        ) -> Result<usize> {
+            self.inner
+                .delete_by_user(user_identity_hash)
+                .await
+        }
+        async fn update(
+            &self,
+            token: DelegationToken,
+        ) -> Result<DelegationToken> {
+            self.inner.update(token).await
+        }
+        async fn mark_used(
+            &self,
+            id: &str,
+        ) -> Result<()> {
+            if self.fail_mark_used {
+                anyhow::bail!("vault could not record the use");
+            }
+            self.inner.mark_used(id).await
+        }
+    }
+
+    async fn faulty_gateway_fixture(
+        provider_id: &str,
+        lookup: Option<VaultLookupResult>,
+        fail_mark_used: bool,
+        fail_store: bool,
+    ) -> GatewayGrantFixture {
+        let mut fixture = GatewayGrantFixture::start(
+            provider_id,
+            axum::http::StatusCode::OK,
+            serde_json::json!({"access_token": "fresh-gateway-token", "token_type": "Bearer", "expires_in": 3600}),
+        )
+        .await;
+        let inner = crate::delegation_vault::storage::FileSystemDelegationVaultStore::new(
+            fixture
+                ._directory
+                .path()
+                .join("faulty-vault"),
+        )
+        .await
+        .unwrap();
+        fixture.vault = Arc::new(FaultyVault {
+            inner,
+            lookup,
+            fail_mark_used,
+            fail_store,
+        });
+        fixture
+    }
+
+    #[tokio::test]
+    async fn test_gateway_binding_replaces_an_expired_token_with_a_new_grant() {
+        for (index, refreshable) in [true, false]
+            .into_iter()
+            .enumerate()
+        {
+            let provider_id = format!("cp-jwt-expired-{index}");
+            let mut token = gateway_token(&provider_id, 7_200, -60);
+            token.refresh_token = refreshable.then(|| "unused-refresh".to_string());
+            let lookup = if refreshable {
+                VaultLookupResult::ExpiredRefreshable(token)
+            } else {
+                VaultLookupResult::ExpiredNoRefresh(token)
+            };
+            let fixture = faulty_gateway_fixture(&provider_id, Some(lookup), false, false).await;
+
+            let resolution = fixture.resolve().await;
+
+            assert_eq!(resolution.action.outcome, DelegationActionOutcome::TokenInjected);
+            assert_eq!(
+                resolution
+                    .action
+                    .detail
+                    .as_deref(),
+                Some("jwt_bearer_fresh")
+            );
+            assert_eq!(injected_bearer(&resolution).as_deref(), Some("Bearer fresh-gateway-token"));
+            assert_eq!(fixture.grants(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_gateway_binding_injects_a_cached_token_when_the_vault_cannot_record_its_use() {
+        let provider_id = "cp-jwt-mark-used";
+        let cached = gateway_token(provider_id, 10, 3_600);
+        let fixture = faulty_gateway_fixture(provider_id, Some(VaultLookupResult::Found(cached)), true, false).await;
+
+        let resolution = fixture.resolve().await;
+
+        assert_eq!(resolution.action.outcome, DelegationActionOutcome::TokenInjected);
+        assert_eq!(
+            resolution
+                .action
+                .detail
+                .as_deref(),
+            Some("jwt_bearer_cached")
+        );
+        assert_eq!(injected_bearer(&resolution).as_deref(), Some("Bearer cached-gateway-token"));
+        assert_eq!(fixture.grants(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_gateway_binding_withholds_a_fresh_token_the_vault_refuses_to_store() {
+        let fixture = faulty_gateway_fixture("cp-jwt-store-refused", None, false, true).await;
+
+        let resolution = fixture.resolve().await;
+
+        assert_eq!(resolution.action.outcome, DelegationActionOutcome::ClientCredentialsFailed);
+        assert_eq!(
+            resolution
+                .action
+                .detail
+                .as_deref(),
+            Some("vault_store_rejected")
+        );
+        assert!(matches!(resolution.result, DelegationLookupResult::Unavailable));
+        assert!(injected_bearer(&resolution).is_none());
+        assert_eq!(fixture.grants(), 1);
+        assert!(
+            fixture
+                .vault
+                .list_all()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_gateway_binding_records_a_token_injected_event_for_the_gateway_grant() {
+        let fixture = GatewayGrantFixture::start(
+            "cp-jwt-injected-audit",
+            axum::http::StatusCode::OK,
+            serde_json::json!({"access_token": "fresh-gateway-token", "token_type": "Bearer", "expires_in": 3600}),
+        )
+        .await;
+
+        let (resolution, events) = crate::audit::producer::capture(fixture.resolve()).await;
+
+        assert_eq!(resolution.action.outcome, DelegationActionOutcome::TokenInjected);
+        let injected: Vec<_> = events
+            .iter()
+            .filter(|event| matches!(event.event, DelegationAuditAction::TokenInjected))
+            .collect();
+        assert_eq!(injected.len(), 1, "{events:?}");
+        let event = injected[0];
+        assert_eq!(event.detail.as_deref(), Some("jwt_bearer_fresh"));
+        assert_eq!(event.provider_id.as_deref(), Some("cp-jwt-injected-audit"));
+        assert_eq!(
+            event
+                .user_identity_hash
+                .as_deref(),
+            Some(GATEWAY_GRANT_USER_HASH)
+        );
+        assert_eq!(event.agent_did.as_deref(), Some("did:web:agent.example"));
+        assert_eq!(event.surface_id.as_deref(), Some("ch-1"));
+        let stored = fixture
+            .vault
+            .list_all()
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(
+            event.token_id.as_deref(),
+            stored
+                .first()
+                .map(|token| token.id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_resolution_reports_a_failed_coordinated_refresh_and_leaves_the_credential_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let vault = Arc::new(
+            crate::delegation_vault::storage::FileSystemDelegationVaultStore::new(directory.path().into())
+                .await
+                .unwrap(),
+        );
+        let mut token = make_token(true, true);
+        token.consent_identity = Some(
+            serde_json::from_value(serde_json::json!({
+                "principal": "verified-user", "provider_digest": ([1; 32]), "strategy_digest": ([2; 32])
+            }))
+            .unwrap(),
+        );
+        let token = vault
+            .store(token)
+            .await
+            .unwrap();
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+        let mut provider = make_credential_provider("cp-1", CredentialProviderType::OAuth2AuthorizationCode);
+        provider.token_endpoint = Some("https://127.0.0.1/token".into());
+        let providers: Arc<dyn CredentialProviderStorage> = MockProviderStore::with_provider(provider);
+        let store: Arc<dyn DelegationVaultStorage> = vault.clone();
+
+        let results = resolve_delegation_credentials(
+            &[make_binding("cp-1")],
+            "sha256:user1",
+            "did:web:agent.example",
+            "ch-1",
+            None,
+            &store,
+            &providers,
+            &secrets,
+            "https://gw.example.com",
+            false,
+            None,
+            Some("verified-user"),
+            None,
+            true,
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        assert!(matches!(
+            vault
+                .claim_refresh(&token, modern::now_secs().unwrap())
+                .await,
+            Err(crate::delegation_vault::storage::RefreshError::InProgress)
+        ));
+        assert_eq!(results[0].action.outcome, DelegationActionOutcome::RefreshFailed);
+        assert!(matches!(results[0].result, DelegationLookupResult::Unavailable));
+        assert_eq!(
+            results[0]
+                .action
+                .detail
+                .as_deref(),
+            Some("coordinated_refresh_unavailable")
+        );
+        let kept = vault
+            .get(&token.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.access_token, token.access_token);
+        assert_eq!(kept.refresh_token, token.refresh_token);
+    }
 }

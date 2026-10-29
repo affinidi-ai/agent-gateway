@@ -353,6 +353,13 @@ mod tests {
     }
 
     #[test]
+    fn a_target_endpoint_without_a_scheme_yields_no_card_url_to_carry_a_credential() {
+        let surface = surface_with_target("agent.example", Some("/card.json"));
+        assert!(agent_card_urls(&surface).is_empty());
+        assert!(!is_within_target_base(&surface, "https://agent.example/card.json"));
+    }
+
+    #[test]
     fn test_only_the_agent_card_urls_are_agent_card_urls() {
         let surface = surface_with_target("https://agent.example/api", None);
         for card in [
@@ -429,6 +436,18 @@ mod tests {
         let surface = surface_with_target("https://agent.example", None);
         assert!(is_within_target_base(&surface, "https://agent.example/anything/here"));
         assert!(!is_within_target_base(&surface, "https://agent.example/%2e%2e/etc"));
+    }
+
+    #[test]
+    fn test_unparseable_target_endpoint_never_carries_the_credential() {
+        let surface = surface_with_target("not a url", None);
+        assert!(!is_within_target_base(&surface, "https://agent.example/api/tasks"));
+    }
+
+    #[test]
+    fn test_target_base_that_climbs_above_the_root_never_carries_the_credential() {
+        let surface = surface_with_target("https://agent.example/a/..%2f..%2fb", None);
+        assert!(!is_within_target_base(&surface, "https://agent.example/b/tasks"));
     }
 
     #[test]

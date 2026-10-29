@@ -672,4 +672,17 @@ mod tests {
             assert_eq!(provider_type.serves_target_authentication(), allowed, "{provider_type:?}");
         }
     }
+
+    #[test]
+    fn provider_type_labels_match_their_stored_form() {
+        for (provider_type, label) in [
+            (CredentialProviderType::OAuth2AuthorizationCode, "oauth2_authorization_code"),
+            (CredentialProviderType::OAuth2ClientCredentials, "oauth2_client_credentials"),
+            (CredentialProviderType::OAuth2JwtBearer, "oauth2_jwt_bearer"),
+            (CredentialProviderType::ApiKey, "api_key"),
+        ] {
+            assert_eq!(provider_type.as_str(), label);
+            assert_eq!(serde_json::to_value(&provider_type).unwrap(), serde_json::json!(label));
+        }
+    }
 }

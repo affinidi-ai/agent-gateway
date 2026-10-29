@@ -1774,6 +1774,8 @@ mod tests {
         assert!(!permits_credential_provider_target("http://agent.example/api"));
         assert!(!permits_credential_provider_target("fabric://gateway/surface"));
         assert!(!permits_credential_provider_target("proxy://mcp-proxy"));
+        assert!(!permits_credential_provider_target("not a url"));
+        assert!(!permits_credential_provider_target(""));
         drop(guard);
         let _production =
             crate::component_tests::helpers::test_mode::TestModeEnv::with(None, Some("http://127.0.0.1:4000"), None);
@@ -1792,5 +1794,81 @@ mod tests {
         assert!(!permits_jwt_bearer_leg(&authenticated, "fabric://peer-gateway/peer-surface", None));
         assert!(!permits_jwt_bearer_leg(&authenticated, TARGET, Some("https://agent.example/other")));
         assert!(!permits_jwt_bearer_leg(&authenticated, TARGET, Some("https://elsewhere.example/api")));
+    }
+
+    #[test]
+    fn test_each_credential_error_has_its_own_category_and_a_gateway_token_error_maps_to_one() {
+        use crate::delegation_vault::gateway_token::GatewayTokenError;
+        for (error, category) in [
+            (TargetCredentialError::SecretUnavailable, "secret_unavailable"),
+            (TargetCredentialError::ProviderNotFound, "provider_not_found"),
+            (TargetCredentialError::TokenUnavailable, "token_unavailable"),
+            (TargetCredentialError::Forbidden, "forbidden"),
+            (TargetCredentialError::Unsupported, "unsupported"),
+            (TargetCredentialError::InvalidHeader, "invalid_header"),
+            (TargetCredentialError::OutsideTargetBase, "outside_target_base"),
+            (TargetCredentialError::HeaderConflict, "header_conflict"),
+        ] {
+            assert_eq!(error.category(), category);
+            assert_eq!(error.to_string(), category);
+        }
+        for (grant_error, expected) in [
+            (GatewayTokenError::Forbidden, TargetCredentialError::Forbidden),
+            (GatewayTokenError::Unsupported, TargetCredentialError::Unsupported),
+            (GatewayTokenError::SecretUnavailable, TargetCredentialError::SecretUnavailable),
+            (GatewayTokenError::Unavailable, TargetCredentialError::TokenUnavailable),
+            (GatewayTokenError::InvalidResponse, TargetCredentialError::TokenUnavailable),
+            (GatewayTokenError::AssertionFailed, TargetCredentialError::TokenUnavailable),
+        ] {
+            assert_eq!(TargetCredentialError::from(grant_error), expected);
+        }
+    }
+
+    #[test]
+    fn test_an_injection_is_labelled_by_its_kind() {
+        let custom = CredentialInjection::CustomHeader {
+            name: "X-Api-Key".into(),
+            format: "{value}".into(),
+        };
+        assert_eq!(injection_label(&CredentialInjection::BearerHeader), "bearer_header");
+        assert_eq!(injection_label(&custom), "custom_header");
+        assert_eq!(injection_label(&CredentialInjection::Meta { field: "token".into() }), "meta");
+    }
+
+    #[test]
+    fn test_an_injected_header_carries_the_value_or_is_refused() {
+        let custom = |name: &str, format: &str| CredentialInjection::CustomHeader {
+            name: name.into(),
+            format: format.into(),
+        };
+        let credential = injected_header(&CredentialInjection::BearerHeader, "tok").expect("bearer");
+        assert!(
+            credential
+                .value
+                .is_sensitive()
+        );
+        let (name, value) = credential.into_pair();
+        assert_eq!((name.as_str(), value.as_str()), ("authorization", "Bearer tok"));
+        let credential = injected_header(&custom("X-Api-Key", "Key {value}"), "tok").expect("custom");
+        assert!(
+            credential
+                .value
+                .is_sensitive()
+        );
+        let (name, value) = credential.into_pair();
+        assert_eq!((name.as_str(), value.as_str()), ("x-api-key", "Key tok"));
+
+        assert_eq!(
+            injected_header(&custom("X-Api-Key", "static"), "tok").err(),
+            Some(TargetCredentialError::InvalidHeader)
+        );
+        assert_eq!(
+            injected_header(&custom("X-Api-Key", "{value}"), "line\nbreak").err(),
+            Some(TargetCredentialError::InvalidHeader)
+        );
+        assert_eq!(
+            injected_header(&CredentialInjection::Meta { field: "token".into() }, "tok").err(),
+            Some(TargetCredentialError::Unsupported)
+        );
     }
 }

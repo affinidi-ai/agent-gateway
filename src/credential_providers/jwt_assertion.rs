@@ -523,7 +523,9 @@ mod tests {
             ("{\"private_key\":\"not a key\"}", SigningKeyError::Format),
             (oversized.as_str(), SigningKeyError::TooLarge),
         ] {
-            assert_eq!(SigningKey::parse(input, JwtBearerAlgorithm::Rs256).map(|_| ()), Err(expected));
+            for algorithm in [JwtBearerAlgorithm::Rs256, JwtBearerAlgorithm::Es256] {
+                assert_eq!(SigningKey::parse(input, algorithm).map(|_| ()), Err(expected), "{input:?} {algorithm:?}");
+            }
         }
     }
 

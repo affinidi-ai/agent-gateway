@@ -239,6 +239,15 @@ mod tests {
             (EgressError::Blocked("internal".into()), FetchFailure::Blocked),
             (EgressError::Dns("no such host".into()), FetchFailure::Blocked),
             (EgressError::TooManyRedirects, FetchFailure::Blocked),
+            (
+                EgressError::Http(
+                    reqwest::Client::new()
+                        .get("not a url")
+                        .build()
+                        .unwrap_err(),
+                ),
+                FetchFailure::Unreachable,
+            ),
         ];
         for (error, expected) in cases {
             let mapped = egress_failure(error);
@@ -347,5 +356,34 @@ mod tests {
                 "{failure:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_body_that_ends_before_its_declared_length_is_unreachable() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let url = format!("http://{}/jwks.json", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener
+                .accept()
+                .await
+                .unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{\"keys\"")
+                .await
+                .unwrap();
+            socket
+                .shutdown()
+                .await
+                .unwrap();
+        });
+
+        let error = get_bounded(&url, EgressPosture::CloudMetadataOnly, LIMIT)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.failure(), FetchFailure::Unreachable);
     }
 }

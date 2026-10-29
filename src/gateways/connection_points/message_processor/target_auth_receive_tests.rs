@@ -26,7 +26,7 @@ const CALLER_KEY: &str = "caller-key-1";
 async fn install_provider_resolver(
     root: &std::path::Path,
     auth_server: &MockAuthServer,
-) {
+) -> (Arc<dyn SecretsStore>, Arc<dyn CredentialProviderStorage>) {
     let secrets: Arc<dyn SecretsStore> = Arc::new(
         FilesystemSecretsStore::new_async(
             root.join("secrets")
@@ -91,7 +91,12 @@ async fn install_provider_resolver(
         None,
     )))
     .await;
-    super::init_target_credential_resolver(TargetCredentialResolver::new(Some(secrets), Some(providers), tokens));
+    super::init_target_credential_resolver(TargetCredentialResolver::new(
+        Some(secrets.clone()),
+        Some(providers.clone()),
+        tokens,
+    ));
+    (secrets, providers)
 }
 
 async fn save_surface(
@@ -248,6 +253,8 @@ struct Receiver {
     storage_path: std::path::PathBuf,
     auth_server: MockAuthServer,
     target: MockServer,
+    secrets: Arc<dyn SecretsStore>,
+    providers: Arc<dyn CredentialProviderStorage>,
 }
 
 impl Receiver {
@@ -261,11 +268,13 @@ impl Receiver {
         );
         let directory = tempfile::tempdir().expect("tempdir");
         let issuer_dir = install_listener_manager_with_peers(directory.path(), &[sender_gateway()]).await;
-        install_provider_resolver(directory.path(), &auth_server).await;
+        let (secrets, providers) = install_provider_resolver(directory.path(), &auth_server).await;
         let storage_path = directory
             .path()
             .join("surfaces");
         Self {
+            secrets,
+            providers,
             _directory: directory,
             _issuer_dir: issuer_dir,
             _test_mode: test_mode,
@@ -713,4 +722,262 @@ async fn fabric_surface_policy_reads_a_protected_card_with_the_gateway_token() {
         "the card was never asked for without the token"
     );
     assert_eq!(auth_server.token_request_count(), 1);
+}
+
+#[tokio::test]
+async fn fabric_delegated_credentials_reach_the_target_and_a_jwt_bearer_binding_stays_off_an_unsafe_leg() {
+    if rerun_in_isolated_process() {
+        return;
+    }
+    let receiver = Receiver::start(json!({"jsonrpc": "2.0", "id": 1, "result": {}})).await;
+    receiver
+        .secrets
+        .create(CreateSecretRequest {
+            tenant_id: None,
+            name: "UPSTREAM_KEY".into(),
+            secret_id: "UPSTREAM_KEY".into(),
+            description: None,
+            value: "upstream-secret".into(),
+            secret_type: "General".into(),
+            tags: vec![],
+        })
+        .await
+        .expect("secret");
+    receiver
+        .secrets
+        .create(CreateSecretRequest {
+            tenant_id: None,
+            name: "JWT_SIGNING_KEY".into(),
+            secret_id: "JWT_SIGNING_KEY".into(),
+            description: None,
+            value: crate::component_tests::helpers::oidc_keys::SigningFixture::es256(0)
+                .private_pkcs8_pem()
+                .into(),
+            secret_type: "General".into(),
+            tags: vec![],
+        })
+        .await
+        .expect("signing key secret");
+    for provider in [
+        json!({"id": "cp-upstream", "name": "upstream", "provider_id": "upstream", "provider_type": "api_key",
+            "api_key_secret_ref": "UPSTREAM_KEY"}),
+        json!({"id": "cp-jwt", "name": "jwt", "provider_id": "jwt", "provider_type": "oauth2_jwt_bearer",
+            "token_endpoint": receiver.auth_server.token_endpoint(),
+            "jwt_bearer": {"assertion_issuer": "https://agent.example", "signing_key_secret_ref": "JWT_SIGNING_KEY",
+                "signing_algorithm": "ES256", "key_id": "key-1"}}),
+    ] {
+        let mut provider = provider;
+        provider["created_at"] = "2026-10-21T00:00:00Z".into();
+        provider["updated_at"] = "2026-10-21T00:00:00Z".into();
+        receiver
+            .providers
+            .create(serde_json::from_value(provider).expect("provider JSON"))
+            .await
+            .expect("provider");
+    }
+    let vault = Arc::new(
+        crate::delegation_vault::storage::FileSystemDelegationVaultStore::new(
+            receiver
+                ._directory
+                .path()
+                .join("vault"),
+        )
+        .await
+        .expect("vault store"),
+    );
+    super::init_delegation_vault_store(vault).await;
+    super::init_secrets_store(receiver.secrets.clone()).await;
+    super::init_credential_provider_store(receiver.providers.clone()).await;
+    super::init_gateway_base_url("https://gateway.example".to_string()).await;
+
+    let bound = |surface_id: &str, binding: Value| {
+        json!({
+            "surface_id": surface_id, "name": surface_id,
+            "access_point": {"listen_address": "127.0.0.1:0", "route": "/route", "protocol": "a2a",
+                "caller_authentication": {"methods": [{
+                    "type": "api_key", "extraction": {"source": "http_header", "field": "X-Caller-Key"},
+                    "secret_id": "CALLER_KEYS"
+                }]}},
+            "target": {"endpoint": format!("{}/api", receiver.target.url())},
+            "outbound_credentials": [binding]
+        })
+    };
+    receiver
+        .save(bound(
+            "delegated-header",
+            json!({"credential_provider_id": "cp-upstream",
+                "inject_as": {"type": "custom_header", "name": "X-Upstream-Key", "format": "{value}"}}),
+        ))
+        .await;
+    receiver
+        .save(bound(
+            "delegated-bad-header",
+            json!({"credential_provider_id": "cp-upstream",
+                "inject_as": {"type": "custom_header", "name": "Bad Header", "format": "{value}"}}),
+        ))
+        .await;
+    receiver
+        .save(bound("delegated-jwt-bearer-authenticated", json!({"credential_provider_id": "cp-jwt"})))
+        .await;
+    let mut anonymous = bound("delegated-jwt-bearer", json!({"credential_provider_id": "cp-jwt"}));
+    anonymous["access_point"]
+        .as_object_mut()
+        .expect("access point")
+        .remove("caller_authentication");
+    receiver.save(anonymous).await;
+    let call = json!({"jsonrpc": "2.0", "id": 1, "method": "message/send"});
+    let caller = json!({"x-caller-key": CALLER_KEY});
+
+    assert_eq!(
+        receiver
+            .send("delegated-header", "POST", "/", caller.clone(), call.clone())
+            .await,
+        200
+    );
+    assert_eq!(
+        receiver
+            .last_request()
+            .headers
+            .get("x-upstream-key")
+            .map(String::as_str),
+        Some("upstream-secret")
+    );
+
+    let before = receiver.forwarded();
+    assert_eq!(
+        receiver
+            .send("delegated-bad-header", "POST", "/", caller.clone(), call.clone())
+            .await,
+        500
+    );
+    assert_eq!(receiver.forwarded(), before, "a header the gateway cannot send never reaches the Target");
+
+    assert_eq!(
+        receiver
+            .send("delegated-jwt-bearer", "POST", "/", caller.clone(), call.clone())
+            .await,
+        200
+    );
+    assert_eq!(
+        receiver
+            .last_request()
+            .headers
+            .get("authorization"),
+        None
+    );
+    assert_eq!(
+        receiver
+            .auth_server
+            .token_request_count(),
+        0,
+        "no token is requested for a forbidden leg"
+    );
+
+    assert_eq!(
+        receiver
+            .send("delegated-jwt-bearer-authenticated", "POST", "/", caller, call)
+            .await,
+        200
+    );
+    assert_eq!(
+        receiver
+            .auth_server
+            .token_request_count(),
+        1,
+        "a permitted leg requests the gateway token"
+    );
+}
+
+#[tokio::test]
+async fn fabric_mcp_proxy_calls_carry_the_target_credential_and_refuse_a_missing_or_disabled_proxy() {
+    use crate::mcp_proxies::filesystem::McpProxyStore;
+    if rerun_in_isolated_process() {
+        return;
+    }
+    let receiver = Receiver::start(json!({"ok": true})).await;
+    let proxies = Arc::new(
+        crate::mcp_proxies::FileSystemMcpProxyStore::new(
+            receiver
+                ._directory
+                .path()
+                .join("mcp_proxies"),
+        )
+        .await
+        .expect("proxy store"),
+    );
+    let spec = json!({"openapi": "3.0.0", "info": {"title": "Tools", "version": "1.0"}, "paths": {
+        "/alpha": {"get": {"operationId": "alpha", "summary": "Alpha tool", "responses": {"200": {"description": "OK"}}}}
+    }});
+    let proxy = |name: &str| {
+        crate::mcp_proxies::types::McpProxy::new(
+            name.into(),
+            String::new(),
+            receiver.target.url(),
+            spec.to_string(),
+            "/mcp".into(),
+            format!("/{name}"),
+        )
+    };
+    let active = proxy("active");
+    let mut disabled = proxy("disabled");
+    disabled.status = crate::mcp_proxies::types::McpProxyStatus::Disabled;
+    for stored in [&active, &disabled] {
+        proxies
+            .create(stored)
+            .await
+            .expect("proxy saved");
+    }
+    super::init_mcp_proxy_store(proxies).await;
+
+    let through = |surface_id: &str, proxy_id: &str| {
+        json!({
+            "surface_id": surface_id, "name": surface_id,
+            "access_point": {"listen_address": "127.0.0.1:0", "route": "/mcp-route", "protocol": "mcp"},
+            "target": {"endpoint": format!("proxy://{proxy_id}"),
+                "auth": {"method": {"static_secret": {"secret_id": "TARGET_KEY", "header_name": "X-Target-Key"}},
+                    "fallback": "reject"}}
+        })
+    };
+    receiver
+        .save(through("proxied", &active.id))
+        .await;
+    receiver
+        .save(through("proxy-missing", "no-such-proxy"))
+        .await;
+    receiver
+        .save(through("proxy-disabled", &disabled.id))
+        .await;
+    let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "alpha", "arguments": {}}});
+
+    assert_eq!(
+        receiver
+            .send("proxied", "POST", "/", json!({}), call.clone())
+            .await,
+        200
+    );
+    let request = receiver.last_request();
+    assert_eq!(request.path, "/alpha");
+    assert_eq!(
+        request
+            .headers
+            .get("x-target-key")
+            .map(String::as_str),
+        Some("target-secret"),
+        "the proxy's backend call carries the Target credential"
+    );
+
+    let before = receiver.forwarded();
+    assert_eq!(
+        receiver
+            .send("proxy-missing", "POST", "/", json!({}), call.clone())
+            .await,
+        404
+    );
+    assert_eq!(
+        receiver
+            .send("proxy-disabled", "POST", "/", json!({}), call)
+            .await,
+        503
+    );
+    assert_eq!(receiver.forwarded(), before, "a missing or disabled proxy never reaches its backend");
 }

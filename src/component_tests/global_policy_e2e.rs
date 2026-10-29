@@ -180,3 +180,42 @@ async fn deleting_unassigned_policy_leaves_global_assignments_unchanged() {
     );
     assert_eq!(f.live_assignments().await, before);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ownership_impact_lists_the_global_assignment_that_references_a_policy() {
+    let f = Fixture::start().await;
+    f.assign_globally(&[DENY_ALL_POLICY_ID])
+        .await;
+
+    let impact_of = async |policy_id: &str| {
+        let resp = f
+            .admin
+            .get(f.api(&format!("tenant-ownership/policy-definitions/{policy_id}/impact")))
+            .send()
+            .await
+            .expect("GET ownership impact");
+        assert_eq!(resp.status(), 200);
+        resp.json::<serde_json::Value>()
+            .await
+            .expect("parse ownership impact")
+    };
+
+    let assigned = impact_of(DENY_ALL_POLICY_ID).await;
+    let incoming = assigned["incoming"]
+        .as_array()
+        .expect("incoming references");
+    assert_eq!(incoming.len(), 1, "{assigned}");
+    assert_eq!(incoming[0]["source"]["kind"], "appliance");
+    assert_eq!(incoming[0]["source"]["id"], "global");
+    assert_eq!(incoming[0]["target"]["id"], DENY_ALL_POLICY_ID);
+    assert!(
+        incoming[0]["context"]
+            .as_str()
+            .expect("context")
+            .starts_with("global "),
+        "{assigned}"
+    );
+
+    let unassigned = impact_of(ALLOW_ALL_POLICY_ID).await;
+    assert_eq!(unassigned["incoming"], json!([]), "{unassigned}");
+}

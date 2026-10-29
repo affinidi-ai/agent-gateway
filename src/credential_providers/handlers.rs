@@ -1552,6 +1552,71 @@ mod consent_strategy_tests {
         assert_eq!(stored.name, "Operator provider");
         assert_eq!(stored.provider_type, CredentialProviderType::ApiKey);
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_update_refuses_a_resource_that_is_not_a_canonical_https_uri() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state_with_provider(&directory, None).await;
+
+        let (status, body) = update_as_operator(&state, json!({ "resource": "http://insecure.example/api" })).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "resource must be a canonical HTTPS URI");
+        let stored = state
+            .store
+            .get("provider")
+            .await
+            .unwrap()
+            .expect("provider is stored");
+        assert_eq!(stored.resource, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_update_refuses_a_secret_reference_that_is_not_accessible() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state_with_provider(&directory, None).await;
+
+        let (status, body) = update_as_operator(&state, json!({ "api_key_secret_ref": "MISSING_KEY" })).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "Secret reference is not accessible");
+        let stored = state
+            .store
+            .get("provider")
+            .await
+            .unwrap()
+            .expect("provider is stored");
+        assert_eq!(stored.api_key_secret_ref, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_delete_fails_closed_when_the_surfaces_cannot_be_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = state_with_provider(&directory, None).await;
+        state.surfaces = Some(Arc::new(Surfaces {
+            readable: false,
+            surfaces: Vec::new(),
+        }));
+
+        let response =
+            delete_provider(State(state.clone()), Path("provider".into()), None, None, ManagementActor::default())
+                .await
+                .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(std::str::from_utf8(&bytes).unwrap(), r#"{"error":"Internal server error"}"#);
+        assert!(
+            state
+                .store
+                .get("provider")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1737,6 +1802,42 @@ mod jwt_bearer_api_tests {
                 .expect("error message");
             assert!(error.contains(message), "{error} should mention {message}");
             assert!(!error.contains("PRIVATE"), "{error}");
+        }
+        assert!(
+            state
+                .store
+                .list()
+                .await
+                .expect("list")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_refuses_a_provider_missing_the_fields_its_type_needs() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let state = state(&directory).await;
+        let mut no_jwt_endpoint = request("no-endpoint", "EC_KEY", "ES256");
+        no_jwt_endpoint
+            .as_object_mut()
+            .expect("object")
+            .remove("token_endpoint");
+        let mut jwt_with_consent = request("consent", "EC_KEY", "ES256");
+        jwt_with_consent["consent_identity_strategy_id"] = "strategy".into();
+        let oauth_without_endpoint = json!({
+            "name": "CC", "provider_id": "cc", "provider_type": "oauth2_client_credentials",
+            "client_id_secret_ref": "JB_ID", "client_secret_secret_ref": "JB_SECRET"
+        });
+        let api_key_without_ref = json!({"name": "Key", "provider_id": "key", "provider_type": "api_key"});
+        for (body, message) in [
+            (no_jwt_endpoint, "token_endpoint is required for JWT bearer providers"),
+            (jwt_with_consent, "consent_identity_strategy_id applies only to authorization code providers"),
+            (oauth_without_endpoint, "token_endpoint is required for OAuth providers"),
+            (api_key_without_ref, "api_key_secret_ref is required for ApiKey providers"),
+        ] {
+            let (status, response) = create(&state, None, body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+            assert_eq!(response["error"], message);
         }
         assert!(
             state

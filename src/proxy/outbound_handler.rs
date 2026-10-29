@@ -11858,25 +11858,35 @@ mod tests {
         point
     }
 
+    fn modern_delegation_with(
+        headers: &[(&str, &str)]
+    ) -> Box<crate::proxy::credential_delegation::modern::PreparedDelegation> {
+        let mut prepared = crate::proxy::credential_delegation::modern::PreparedDelegation::handling(
+            crate::mcp::request_validation::ValidatedModernMessage {
+                protocol_version: crate::mcp::MCP_MODERN_VERSION.into(),
+                client_capabilities: None,
+                client_info: None,
+                method: "tools/call".into(),
+                id: Some(json!(1)),
+                kind: crate::mcp::request_validation::McpMessageKind::Request,
+                params: Some(json!({"name": "echo"})),
+            },
+            vec!["provider".to_string()],
+        );
+        prepared.injections = headers
+            .iter()
+            .map(|(name, value)| crate::proxy::credential_delegation::ResolvedCredentialInjection::Header {
+                name: (*name).into(),
+                value: (*value).into(),
+            })
+            .collect();
+        Box::new(prepared)
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn transit_target_credential_is_the_only_value_of_its_header_and_yields_to_a_delegated_one() {
         let directory = tempfile::tempdir().unwrap();
-        let state = delegation_state(directory.path(), &[("provider", "delegated-key")]).await;
-        state
-            .secrets_store
-            .as_ref()
-            .unwrap()
-            .create(crate::secrets::CreateSecretRequest {
-                tenant_id: None,
-                name: "GATEWAY_KEY".into(),
-                secret_id: "GATEWAY_KEY".into(),
-                description: None,
-                value: "gateway-key".into(),
-                secret_type: "General".into(),
-                tags: vec![],
-            })
-            .await
-            .unwrap();
+        let state = state_with_gateway_key(directory.path(), Some("gateway-key")).await;
         let (endpoint, seen, _server) = spawn_api_key_target().await;
         let gateway_key = Some(("x-api-key".to_string(), "gateway-key".to_string()));
 
@@ -11911,28 +11921,7 @@ mod tests {
             assert_eq!(received, delivered, "{delegated_header:?}");
         }
 
-        let modern = |headers: &[(&str, &str)]| {
-            let mut prepared = crate::proxy::credential_delegation::modern::PreparedDelegation::handling(
-                crate::mcp::request_validation::ValidatedModernMessage {
-                    protocol_version: crate::mcp::MCP_MODERN_VERSION.into(),
-                    client_capabilities: None,
-                    client_info: None,
-                    method: "tools/call".into(),
-                    id: Some(json!(1)),
-                    kind: crate::mcp::request_validation::McpMessageKind::Request,
-                    params: Some(json!({"name": "echo"})),
-                },
-                vec!["provider".to_string()],
-            );
-            prepared.injections = headers
-                .iter()
-                .map(|(name, value)| crate::proxy::credential_delegation::ResolvedCredentialInjection::Header {
-                    name: (*name).into(),
-                    value: (*value).into(),
-                })
-                .collect();
-            Box::new(prepared)
-        };
+        let modern = modern_delegation_with;
         let surface = transit_surface(json!([api_key_transit_point(&endpoint, None)]), json!([]));
         for (headers, resolved_credential) in
             [(vec![("X-Api-Key", "modern-key")], None), (vec![("X-Modern-Key", "modern-key")], gateway_key.clone())]
@@ -11953,6 +11942,186 @@ mod tests {
         let refused = transit_target_credential(&state, &mut ctx, &endpoint).await;
         assert!(matches!(refused, Err(OutboundPipelineError::InvalidDelegatedCredential)), "{refused:?}");
         assert_eq!(OutboundPipelineError::InvalidDelegatedCredential.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    async fn state_with_gateway_key(
+        directory: &std::path::Path,
+        secret: Option<&str>,
+    ) -> OutboundProxyState {
+        let state = delegation_state(directory, &[("provider", "delegated-key")]).await;
+        if let Some(value) = secret {
+            state
+                .secrets_store
+                .as_ref()
+                .unwrap()
+                .create(crate::secrets::CreateSecretRequest {
+                    tenant_id: None,
+                    name: "GATEWAY_KEY".into(),
+                    secret_id: "GATEWAY_KEY".into(),
+                    description: None,
+                    value: value.into(),
+                    secret_type: "General".into(),
+                    tags: vec![],
+                })
+                .await
+                .unwrap();
+        }
+        state
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transit_target_credential_that_cannot_be_resolved_is_refused_before_anything_is_sent() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state_with_gateway_key(directory.path(), None).await;
+        let (endpoint, seen, _server) = spawn_api_key_target().await;
+        let surface = transit_surface(json!([api_key_transit_point(&endpoint, None)]), json!([]));
+        let (resolved, point) = resolved_transit_point(&surface, None, "partner");
+        let mut ctx = legacy_delegation_context(resolved, point);
+
+        let refused = transit_target_credential(&state, &mut ctx, &endpoint).await;
+        assert!(matches!(refused, Err(OutboundPipelineError::TargetAuthUnavailable)), "{refused:?}");
+        assert_eq!(OutboundPipelineError::TargetAuthUnavailable.status_code(), StatusCode::BAD_GATEWAY);
+
+        let forwarded = step_forward_request_http(&state, &mut ctx).await;
+        assert!(matches!(forwarded, Err(OutboundPipelineError::TargetAuthUnavailable)), "{:?}", forwarded.err());
+        assert!(
+            seen.lock()
+                .unwrap()
+                .is_empty(),
+            "the Target never saw the request"
+        );
+    }
+
+    struct RecordingFabricPeer {
+        peer_id: String,
+        peer_did: String,
+        forwarded: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        manager: Arc<crate::gateways::ConnectionPointListenerManager>,
+        _root: tempfile::TempDir,
+        _issuer_dir: tempfile::TempDir,
+    }
+
+    impl Drop for RecordingFabricPeer {
+        fn drop(&mut self) {
+            crate::comm::didcomm::client::test_send_hook::uninstall(&self.peer_did);
+        }
+    }
+
+    async fn recording_fabric_peer() -> RecordingFabricPeer {
+        let root = tempfile::tempdir().unwrap();
+        let peer_did = format!("did:example:peer-{}", uuid::Uuid::new_v4());
+        let peer = crate::gateways::types::Gateway::new(
+            "Peer".into(),
+            String::new(),
+            peer_did.clone(),
+            crate::gateways::types::GatewayType::Remote,
+        );
+        let gateways = Arc::new(
+            crate::gateways::FileSystemGatewayStore::new(
+                root.path().join("gateways"),
+                Some("did:web:gateway.example".into()),
+            )
+            .await
+            .unwrap(),
+        );
+        crate::gateways::GatewayStore::create(gateways.as_ref(), &peer)
+            .await
+            .unwrap();
+        let (manager, issuer_dir) = crate::gateways::test_helpers::test_listener_manager(root.path()).await;
+        let manager = Arc::new(manager.with_gateway_store(gateways));
+        let mut listener = crate::gateways::test_helpers::test_listener("transit-fabric-credential").await;
+        listener.gateway_id = peer.id.clone();
+        manager
+            .register_test_listener(listener)
+            .await;
+
+        let forwarded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = forwarded.clone();
+        crate::comm::didcomm::client::test_send_hook::install(&peer_did, move |request| {
+            recorded
+                .lock()
+                .unwrap()
+                .push(request.body.clone());
+        });
+        RecordingFabricPeer {
+            peer_id: peer.id,
+            peer_did,
+            forwarded,
+            manager,
+            _root: root,
+            _issuer_dir: issuer_dir,
+        }
+    }
+
+    fn fabric_api_key_surface(peer_id: &str) -> crate::config::agent_surface::AgentSurface {
+        transit_surface(
+            json!([{"alias": "partner", "target_endpoint": format!("fabric://{peer_id}/peer-surface"),
+                "target_auth": {"method": {"static_secret": {"secret_id": "GATEWAY_KEY", "header_name": "X-Api-Key"}},
+                    "fallback": "reject"}}]),
+            json!([]),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fabric_transit_point_sends_its_target_credential_and_refuses_when_it_cannot_resolve_it() {
+        let peer = recording_fabric_peer().await;
+        let surface = fabric_api_key_surface(&peer.peer_id);
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut without_secret = state_with_gateway_key(directory.path(), None).await;
+        without_secret.listener_manager = Arc::new(tokio::sync::RwLock::new(Some(peer.manager.clone())));
+        let (resolved, point) = resolved_transit_point(&surface, None, "partner");
+        let mut ctx = legacy_delegation_context(resolved, point);
+        let refused = step_forward_request_fabric(&without_secret, &mut ctx).await;
+        assert!(matches!(refused, Err(OutboundPipelineError::TargetAuthUnavailable)), "{:?}", refused.err());
+        assert!(
+            peer.forwarded
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "nothing was sent to the peer"
+        );
+
+        let other = tempfile::tempdir().unwrap();
+        let mut with_secret = state_with_gateway_key(other.path(), Some("gateway-key")).await;
+        with_secret.listener_manager = Arc::new(tokio::sync::RwLock::new(Some(peer.manager.clone())));
+        let (resolved, point) = resolved_transit_point(&surface, None, "partner");
+        let mut ctx = legacy_delegation_context(resolved, point);
+        let attempted = step_forward_request_fabric(&with_secret, &mut ctx).await;
+        assert!(!matches!(attempted, Err(OutboundPipelineError::TargetAuthUnavailable)), "{:?}", attempted.err());
+        let recorded = peer.forwarded.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0]["headers"]["X-API-KEY"], "gateway-key");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fabric_transit_point_refuses_duplicate_delegated_credential_headers_before_sending() {
+        let state = test_outbound_state();
+        let mut ctx = modern_pipeline_context("tools/call");
+        ctx.virtual_channel
+            .target_endpoint = "fabric://peer-gateway/peer-surface".into();
+        ctx.modern_delegation = Some(modern_delegation_with(&[("X-Api-Key", "first"), ("x-api-key", "second")]));
+
+        let refused = step_forward_request_fabric(&state, &mut ctx).await;
+        assert!(matches!(refused, Err(OutboundPipelineError::InvalidDelegatedCredential)), "{:?}", refused.err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delegated_credential_header_with_an_unusable_name_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state_with_gateway_key(directory.path(), None).await;
+        let surface = transit_surface(
+            json!([api_key_transit_point("http://127.0.0.1:9/api", Some("Bad Header Name"))]),
+            json!([]),
+        );
+        let (resolved, point) = resolved_transit_point(&surface, None, "partner");
+        let mut ctx = legacy_delegation_context(resolved, point);
+        let refused = step_inject_credentials(&state, &mut ctx).await;
+        assert!(matches!(refused, Err(OutboundPipelineError::InvalidDelegatedCredential)), "{refused:?}");
+        assert!(
+            ctx.delegated_headers
+                .is_empty()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

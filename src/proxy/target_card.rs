@@ -200,6 +200,7 @@ pub(crate) mod tests {
                 .route("/api/.well-known/agent-card.json", axum::routing::get(card))
                 .route("/api/.well-known/agent.json", axum::routing::get(|| async { r#"{"name":"legacy card"}"# }))
                 .route("/card", axum::routing::get(|| async { r#"{"name":"card"}"# }))
+                .route("/not-json", axum::routing::get(|| async { "this is not a card" }))
                 .route("/big", axum::routing::get(|| async { format!(r#"{{"name":"{}"}}"#, "x".repeat(4096)) }))
                 .route(
                     "/redirect",
@@ -406,5 +407,63 @@ pub(crate) mod tests {
         assert_eq!(fetch(&resolver, &at("/card")).await, Some(json!({"name": "card"})));
         assert_eq!(fetch(&resolver, &at("/big")).await, None, "an oversized card was read");
         assert_eq!(fetch(&resolver, &at("/redirect")).await, None, "the redirect was followed");
+    }
+
+    #[tokio::test]
+    async fn test_a_card_that_is_not_json_is_not_returned() {
+        let auth_server = MockAuthServer::start().await;
+        let target = ProtectedTarget::start().await;
+        let directory = tempfile::tempdir().expect("tempdir");
+        let resolver = resolver(directory.path(), &auth_server).await;
+        let surface = surface(&format!("{}/api", target.url), Some("/not-json"), None);
+
+        assert_eq!(fetch(&resolver, &surface).await, None);
+    }
+
+    #[tokio::test]
+    async fn test_an_unreachable_target_yields_no_card() {
+        let auth_server = MockAuthServer::start().await;
+        let directory = tempfile::tempdir().expect("tempdir");
+        let resolver = resolver(directory.path(), &auth_server).await;
+        let closed = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener
+                .local_addr()
+                .expect("address")
+        };
+        let surface = surface(&format!("http://{closed}/api"), Some("/card"), None);
+
+        assert_eq!(fetch(&resolver, &surface).await, None);
+    }
+
+    #[tokio::test]
+    async fn test_a_card_url_blocked_by_egress_policy_yields_no_card() {
+        let auth_server = MockAuthServer::start().await;
+        let directory = tempfile::tempdir().expect("tempdir");
+        let resolver = resolver(directory.path(), &auth_server).await;
+        let surface = surface("http://169.254.169.254/api", Some("/card"), None);
+
+        assert_eq!(fetch(&resolver, &surface).await, None);
+    }
+
+    #[tokio::test]
+    async fn test_a_passthrough_fallback_lets_the_card_read_go_without_a_credential() {
+        let auth_server = MockAuthServer::start().await;
+        let target = ProtectedTarget::start().await;
+        let directory = tempfile::tempdir().expect("tempdir");
+        let resolver = resolver(directory.path(), &auth_server).await;
+        let missing_secret = surface(
+            &format!("{}/api", target.url),
+            None,
+            Some(json!({"method": {"static_secret": {"secret_id": "MISSING", "header_name": "Authorization"}},
+                "fallback": "passthrough"})),
+        );
+        let card_url = format!("{}/api/.well-known/agent-card.json", target.url);
+
+        for read in [CardRead::AnswersCaller, CardRead::PolicyContext] {
+            let credential = card_fetch_credential(&resolver, &missing_secret, &card_url, false, read).await;
+            assert_eq!(credential.map(|credential| credential.is_some()), Ok(false));
+        }
+        assert_eq!(fetch(&resolver, &missing_secret).await, Some(json!({"name": "legacy card"})));
     }
 }

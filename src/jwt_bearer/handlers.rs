@@ -1715,6 +1715,17 @@ mod tests {
         put_or_post(router, "POST", uri, body).await
     }
 
+    async fn exhaust_probe_limit(router: &Router) {
+        for _ in 0..PROBES_PER_MINUTE.get() {
+            post_json(
+                router,
+                "/v1/jwt-verification-strategies/validate-jwks-uri",
+                serde_json::json!({ "uri": "not-a-url" }),
+            )
+            .await;
+        }
+    }
+
     async fn put_or_post(
         router: &Router,
         method: &str,
@@ -2285,14 +2296,7 @@ mod tests {
         let store = Arc::new(MemStore::default());
         seed_pinned(&store, &old).await;
         let (router, _dir) = admin_router(store.clone()).await;
-        for _ in 0..PROBES_PER_MINUTE.get() {
-            post_json(
-                &router,
-                "/v1/jwt-verification-strategies/validate-jwks-uri",
-                serde_json::json!({ "uri": "not-a-url" }),
-            )
-            .await;
-        }
+        exhaust_probe_limit(&router).await;
 
         let (status, _, _) = put_or_post(
             &router,
@@ -2435,5 +2439,96 @@ mod tests {
         assert_eq!(saved.expected_issuer, server.issuer());
         assert_eq!(saved.authorization_server, None);
         assert_eq!(server.request_count(Endpoint::Discovery), 0);
+    }
+
+    #[tokio::test]
+    async fn a_create_with_discovery_past_the_probe_limit_is_refused_and_stores_nothing() {
+        let server = MockAuthServer::start().await;
+        let store = Arc::new(MemStore::default());
+        let (router, _dir) = admin_router(store.clone()).await;
+        exhaust_probe_limit(&router).await;
+
+        let (status, body, _) = post_json(
+            &router,
+            "/v1/jwt-verification-strategies",
+            with(strategy_body(server.issuer(), PUBLIC_JWKS), "discover_metadata", true.into()),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body["code"], "rate_limited");
+        assert_eq!(server.request_count(Endpoint::Discovery), 0);
+        assert!(
+            store
+                .list()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_update_with_discovery_past_the_probe_limit_is_refused_and_changes_nothing() {
+        let server = MockAuthServer::start().await;
+        let store = Arc::new(MemStore::default());
+        let seeded = seed_pinned(&store, &server).await;
+        let (router, _dir) = admin_router(store.clone()).await;
+        exhaust_probe_limit(&router).await;
+
+        let body = with(
+            with(strategy_body(server.issuer(), PUBLIC_JWKS), "name", "Changed".into()),
+            "discover_metadata",
+            true.into(),
+        );
+        let (status, response, _) =
+            put_or_post(&router, "PUT", "/v1/jwt-verification-strategies/strategy-a", body).await;
+
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response["code"], "rate_limited");
+        assert_eq!(server.request_count(Endpoint::Discovery), 0);
+        let saved = stored(&store).await;
+        assert_eq!(saved.name, seeded.name);
+        assert_eq!(saved.authorization_server, seeded.authorization_server);
+    }
+
+    #[tokio::test]
+    async fn an_update_with_discovery_true_pins_the_discovered_metadata() {
+        let server = MockAuthServer::start().await;
+        let store = Arc::new(MemStore::default());
+        store
+            .inner
+            .insert("strategy-a".to_string(), seeded_strategy(None));
+        let (router, _dir) = admin_router(store.clone()).await;
+
+        let body = with(strategy_body(server.issuer(), PUBLIC_JWKS), "discover_metadata", true.into());
+        let (status, response, _) =
+            put_or_post(&router, "PUT", "/v1/jwt-verification-strategies/strategy-a", body).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response["authorization_server"], serde_json::to_value(pin_of(&server)).unwrap());
+        let saved = stored(&store).await;
+        assert_eq!(saved.expected_issuer, server.issuer());
+        assert_eq!(saved.authorization_server, Some(pin_of(&server)));
+        assert!(server.request_count(Endpoint::Discovery) > 0);
+    }
+
+    #[tokio::test]
+    async fn a_tenant_probe_is_audited_with_its_tenant_and_the_strict_posture() {
+        let server = MockAuthServer::start().await;
+        let (router, _dir) = tenant_router(Arc::new(MemStore::default())).await;
+        let audit = AuditEvents::capture();
+
+        post_json(
+            &router,
+            "/v1/jwt-verification-strategies/discover",
+            serde_json::json!({ "issuer": server.issuer() }),
+        )
+        .await;
+
+        let events = audit.named("jwt_verification_strategy.probe");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["tenant_id"], "tenant-a");
+        assert_eq!(events[0]["posture"], "strict");
+        assert_eq!(events[0]["result"], "invalid_url");
     }
 }

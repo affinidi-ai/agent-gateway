@@ -1684,6 +1684,8 @@ mod tests {
             serde_json::json!({"access_token": "x".repeat(MAX_GATEWAY_TOKEN_BYTES + 1), "token_type": "bearer"}),
             serde_json::json!({"access_token": "t", "token_type": "bearer", "expires_in": 0}),
             serde_json::json!({"access_token": "t", "token_type": "bearer", "expires_in": "soon"}),
+            serde_json::json!({"access_token": "t", "token_type": "bearer", "expires_in": true}),
+            serde_json::json!({"access_token": "t", "token_type": "bearer", "expires_in": 1.5}),
             serde_json::json!({"token_type": "bearer"}),
         ] {
             assert_eq!(parsed(body.clone()).map(|_| ()), Err(GatewayTokenError::InvalidResponse), "{body}");
@@ -1693,6 +1695,117 @@ mod tests {
             parsed(serde_json::json!({"access_token": "x".repeat(MAX_GATEWAY_TOKEN_BYTES), "token_type": "bearer"}))
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn test_jwt_bearer_endpoint_is_https_or_exactly_allowlisted() {
+        let egress = GrantEgress {
+            timeout: Duration::from_secs(1),
+            exact_allowlist: Some("not a url, http://127.0.0.1:4000/token".into()),
+        };
+        assert!(egress.permits_jwt_bearer_endpoint(" https://auth.example/token "));
+        assert!(egress.permits_jwt_bearer_endpoint("http://127.0.0.1:4000/token"));
+        assert!(!egress.permits_jwt_bearer_endpoint("http://127.0.0.1:4000/other"));
+        assert!(!egress.permits_jwt_bearer_endpoint("http://auth.example/token"));
+        assert!(!egress.permits_jwt_bearer_endpoint("not a url"));
+        assert!(!egress.permits_jwt_bearer_endpoint(""));
+        let production = GrantEgress {
+            timeout: Duration::from_secs(1),
+            exact_allowlist: None,
+        };
+        assert!(!production.permits_jwt_bearer_endpoint("http://127.0.0.1:4000/token"));
+    }
+
+    #[tokio::test]
+    async fn test_client_credentials_grant_without_both_client_references_is_unsupported() {
+        let endpoint = TokenEndpoint::start(StatusCode::OK, token_body(serde_json::json!({}))).await;
+        let directory = tempfile::tempdir().expect("tempdir");
+        let secrets = secrets_with(&directory, &[("CC_ID", "cc-client", None)]).await;
+        let mut provider = provider(CredentialProviderType::OAuth2ClientCredentials, &endpoint.url);
+        let request = |provider: CredentialProvider| {
+            let secrets = secrets.clone();
+            let egress = endpoint.egress();
+            async move {
+                request_gateway_grant(&provider, &[], &ProviderSecrets::new(&secrets, &provider), &egress)
+                    .await
+                    .map(|_| ())
+            }
+        };
+
+        assert_eq!(request(provider.clone()).await, Err(GatewayTokenError::Unsupported));
+        provider.client_id_secret_ref = Some("  ".into());
+        assert_eq!(request(provider.clone()).await, Err(GatewayTokenError::Unsupported));
+        provider.client_id_secret_ref = Some("CC_ID".into());
+        assert_eq!(request(provider.clone()).await, Err(GatewayTokenError::Unsupported));
+        assert_eq!(
+            endpoint
+                .calls
+                .load(Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_jwt_bearer_grant_with_only_a_client_id_sends_it_in_the_form_without_basic_auth() {
+        let endpoint = TokenEndpoint::start(StatusCode::OK, token_body(serde_json::json!({}))).await;
+        let directory = tempfile::tempdir().expect("tempdir");
+        let secrets =
+            secrets_with(&directory, &[("SIGNING_KEY", ec_pkcs8_pem(), None), ("JB_ID", "public-client", None)]).await;
+        let mut provider = jwt_provider(&endpoint.url, JwtBearerAlgorithm::Es256);
+        provider.client_id_secret_ref = Some("JB_ID".into());
+
+        request_gateway_grant(&provider, &[], &ProviderSecrets::new(&secrets, &provider), &endpoint.egress())
+            .await
+            .expect("grant succeeds");
+
+        let form = endpoint.last_form();
+        assert_eq!(form["client_id"], "public-client");
+        assert!(!form.contains_key("client_secret"));
+        assert_eq!(form["grant_type"], JWT_BEARER_GRANT_TYPE);
+        assert_eq!(endpoint.last_authorization(), None);
+
+        let mut missing = provider.clone();
+        missing.client_id_secret_ref = Some("MISSING".into());
+        assert_eq!(
+            request_gateway_grant(&missing, &[], &ProviderSecrets::new(&secrets, &missing), &endpoint.egress())
+                .await
+                .map(|_| ()),
+            Err(GatewayTokenError::SecretUnavailable)
+        );
+        assert_eq!(
+            endpoint
+                .calls
+                .load(Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_token_endpoint_whose_host_does_not_resolve_is_unavailable() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let secrets = secrets_with(&directory, &[("CC_ID", "cc-client", None), ("CC_SECRET", "cc-secret", None)]).await;
+        let egress = GrantEgress {
+            timeout: Duration::from_secs(5),
+            exact_allowlist: None,
+        };
+        let mut provider =
+            provider(CredentialProviderType::OAuth2ClientCredentials, "https://token-endpoint.invalid/token");
+        provider.client_id_secret_ref = Some("CC_ID".into());
+        provider.client_secret_secret_ref = Some("CC_SECRET".into());
+
+        assert_eq!(
+            request_gateway_grant(&provider, &[], &ProviderSecrets::new(&secrets, &provider), &egress)
+                .await
+                .map(|_| ()),
+            Err(GatewayTokenError::Unavailable)
+        );
+    }
+
+    #[test]
+    fn test_freshness_has_a_stable_label_for_each_outcome() {
+        assert_eq!(Freshness::Cached.as_str(), "cached");
+        assert_eq!(Freshness::Fresh.as_str(), "fresh");
+        assert_eq!(Freshness::StaleAfterRefreshFailure.as_str(), "stale");
     }
 
     #[test]

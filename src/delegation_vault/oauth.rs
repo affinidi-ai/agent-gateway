@@ -694,6 +694,8 @@ fn base64_url_decode(encoded: &str) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::component_tests::helpers::formatted_logs::FormattedLogs;
+    use crate::component_tests::helpers::test_mode::TestModeEnv;
     use chrono::Duration;
 
     fn init_test_encryption() {
@@ -1341,5 +1343,234 @@ mod tests {
             .await
             .expect_err("loopback is blocked");
         assert_eq!(error.to_string(), "Invalid refresh endpoint");
+    }
+
+    const CONSENT_TOKENS: &str =
+        r#"{"access_token":"user-token","refresh_token":"next-refresh","token_type":"Bearer","expires_in":60}"#;
+
+    type CapturedForm = Arc<std::sync::Mutex<Option<std::collections::HashMap<String, String>>>>;
+
+    async fn capturing_token_endpoint() -> (String, CapturedForm) {
+        let captured: CapturedForm = Arc::new(std::sync::Mutex::new(None));
+        let sink = captured.clone();
+        let app = axum::Router::new().route(
+            "/token",
+            axum::routing::post(
+                move |axum::extract::Form(form): axum::extract::Form<std::collections::HashMap<String, String>>| {
+                    let sink = sink.clone();
+                    async move {
+                        *sink.lock().expect("lock") = Some(form);
+                        ([("content-type", "application/json")], CONSENT_TOKENS)
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener binds");
+        let address = listener
+            .local_addr()
+            .expect("address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{address}/token"), captured)
+    }
+
+    #[tokio::test]
+    async fn test_authorization_code_exchange_posts_the_client_and_returns_the_tokens() {
+        let (endpoint, captured) = capturing_token_endpoint().await;
+        let _env = TestModeEnv::enabled(&endpoint, &endpoint);
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (mut provider, secrets) = refresh_fixture(&directory, &endpoint).await;
+        provider.callback_url = Some(endpoint.clone());
+        let logs = FormattedLogs::capture();
+
+        let tokens = exchange_code_for_tokens(&provider, "auth-code", "https://gateway.example", &secrets, Some("v"))
+            .await
+            .expect("an allowlisted endpoint is reached");
+
+        assert_eq!(tokens.access_token, "user-token");
+        assert_eq!(
+            tokens
+                .refresh_token
+                .as_deref(),
+            Some("next-refresh")
+        );
+        assert_eq!(tokens.expires_in, Some(60));
+        let form = captured
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("the endpoint received a request");
+        assert_eq!(form["grant_type"], "authorization_code");
+        assert_eq!(form["code"], "auth-code");
+        assert_eq!(form["redirect_uri"], endpoint);
+        assert_eq!(form["client_id"], "client-id-value");
+        assert_eq!(form["client_secret"], "client-secret-value");
+        assert_eq!(form["code_verifier"], "v");
+        let logged = logs.text();
+        assert!(logged.contains("Exchanging authorization code for tokens"), "{logged}");
+        assert!(logged.contains("Token exchange successful"), "{logged}");
+        assert!(!logged.contains("user-token"), "{logged}");
+        assert!(!logged.contains("client-secret-value"), "{logged}");
+    }
+
+    #[tokio::test]
+    async fn test_authorization_code_exchange_to_an_unlisted_endpoint_is_refused() {
+        let endpoint = token_endpoint(200, CONSENT_TOKENS, "application/json").await;
+        let _env = TestModeEnv::with(None, None, None);
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (mut provider, secrets) = refresh_fixture(&directory, &endpoint).await;
+        provider.callback_url = Some("https://gateway.example/callback".into());
+
+        let error = exchange_code_for_tokens(&provider, "auth-code", "https://gateway.example", &secrets, None)
+            .await
+            .expect_err("loopback http is blocked");
+        assert!(
+            error
+                .to_string()
+                .starts_with("Blocked token_endpoint for provider 'provider'"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_refresh_access_token_posts_the_refresh_token_and_returns_the_new_tokens() {
+        let (endpoint, captured) = capturing_token_endpoint().await;
+        let _env = TestModeEnv::enabled(&endpoint, &endpoint);
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (provider, secrets) = refresh_fixture(&directory, &endpoint).await;
+        let logs = FormattedLogs::capture();
+
+        let tokens = refresh_access_token(&provider, "old-refresh", &secrets)
+            .await
+            .expect("an allowlisted endpoint is reached");
+
+        assert_eq!(tokens.access_token, "user-token");
+        assert_eq!(
+            tokens
+                .refresh_token
+                .as_deref(),
+            Some("next-refresh")
+        );
+        let form = captured
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("the endpoint received a request");
+        assert_eq!(form["grant_type"], "refresh_token");
+        assert_eq!(form["refresh_token"], "old-refresh");
+        assert_eq!(form["client_id"], "client-id-value");
+        let logged = logs.text();
+        assert!(logged.contains("Token refresh successful"), "{logged}");
+        assert!(logged.contains("has_new_refresh_token"), "{logged}");
+        assert!(!logged.contains("user-token"), "{logged}");
+        assert!(!logged.contains("next-refresh"), "{logged}");
+    }
+
+    #[tokio::test]
+    async fn test_refresh_access_token_failure_names_only_the_status() {
+        let endpoint = token_endpoint(
+            400,
+            r#"{"error":"invalid_grant","error_description":"provider-detail-5e1a"}"#,
+            "application/json",
+        )
+        .await;
+        let _env = TestModeEnv::enabled(&endpoint, &endpoint);
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (provider, secrets) = refresh_fixture(&directory, &endpoint).await;
+        let logs = FormattedLogs::capture();
+
+        let error = refresh_access_token(&provider, "old-refresh", &secrets)
+            .await
+            .expect_err("a 400 fails");
+
+        assert_eq!(error.to_string(), "Token refresh failed (HTTP 400)");
+        let logged = logs.text();
+        assert!(logged.contains("Token refresh failed"), "{logged}");
+        assert!(logged.contains("status=400"), "{logged}");
+        assert!(logged.contains("error_code=\"invalid_grant\""), "{logged}");
+        assert!(!logged.contains("provider-detail-5e1a"), "{logged}");
+    }
+
+    #[tokio::test]
+    async fn test_consent_exchange_and_refresh_fail_when_a_client_secret_cannot_be_resolved() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (provider, secrets) = refresh_fixture(&directory, "https://provider.example/token").await;
+        let mut missing_id = provider.clone();
+        missing_id.client_id_secret_ref = Some("missing".into());
+        let mut missing_secret = provider.clone();
+        missing_secret.client_secret_secret_ref = Some("missing".into());
+
+        let chain = |error: anyhow::Error| format!("{error:#}");
+        assert_eq!(
+            chain(
+                exchange_code_for_tokens(&missing_id, "code", "https://gateway.example", &secrets, None)
+                    .await
+                    .expect_err("a missing client id fails")
+            ),
+            "Failed to resolve client_id: Secret 'missing' is not available to provider 'provider': secret_unavailable"
+        );
+        assert_eq!(
+            chain(
+                exchange_code_for_tokens(&missing_secret, "code", "https://gateway.example", &secrets, None)
+                    .await
+                    .expect_err("a missing client secret fails")
+            ),
+            "Failed to resolve client_secret: Secret 'missing' is not available to provider 'provider': secret_unavailable"
+        );
+        assert_eq!(
+            chain(
+                refresh_access_token(&missing_id, "refresh", &secrets)
+                    .await
+                    .expect_err("a missing client id fails")
+            ),
+            "Failed to resolve client_id for refresh: Secret 'missing' is not available to provider 'provider': secret_unavailable"
+        );
+        assert_eq!(
+            chain(
+                refresh_access_token(&missing_secret, "refresh", &secrets)
+                    .await
+                    .expect_err("a missing client secret fails")
+            ),
+            "Failed to resolve client_secret for refresh: Secret 'missing' is not available to provider 'provider': secret_unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_streamed_token_response_over_the_size_cap_is_rejected() {
+        let app = axum::Router::new().route(
+            "/token",
+            axum::routing::post(|| async {
+                let chunk = bytes::Bytes::from(vec![b'a'; MAX_TOKEN_RESPONSE_BYTES / 2 + 1]);
+                let chunks = vec![Ok::<_, std::convert::Infallible>(chunk.clone()), Ok(chunk)];
+                axum::body::Body::from_stream(futures::stream::iter(chunks))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener binds");
+        let endpoint = format!(
+            "http://{}/token",
+            listener
+                .local_addr()
+                .expect("address")
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let error = post_consent_token_request(
+            &consent_provider(),
+            &endpoint,
+            &[("grant_type", "refresh_token")],
+            "Token refresh",
+            &egress_for(&endpoint),
+        )
+        .await
+        .expect_err("an oversized body is refused");
+
+        assert_eq!(error.to_string(), "Token refresh response rejected: invalid_response");
     }
 }
