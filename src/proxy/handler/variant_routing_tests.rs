@@ -315,6 +315,26 @@ async fn every_record_of_a_served_request_names_the_variant_that_served_it() {
 }
 
 #[tokio::test]
+async fn a_request_served_from_the_last_good_snapshot_records_that_snapshots_variant() {
+    let target =
+        MockServer::start_with_response(json!({"jsonrpc": "2.0", "id": 1, "result": {"kind": "message"}}).to_string())
+            .await;
+    let endpoint = target.url();
+    // The surface list already holds a default the snapshot cache never took,
+    // as after a save whose snapshots failed to build.
+    let (router, _policies) = on_heap(|| router_with_decisions(surface(&endpoint, catalog(), Some("v-prod")))).await;
+    router
+        .resolved_surface_cache
+        .upsert(&surface(&endpoint, catalog(), Some("v-beta")))
+        .unwrap();
+
+    let (status, events) = on_heap(|| send(router, "/a2a/rpc")).await;
+
+    assert_eq!(status, axum::http::StatusCode::OK, "{events:?}");
+    assert_eq!(variants(&events), one("beta"), "the snapshot that served the request is beta's");
+}
+
+#[tokio::test]
 async fn a_refusal_names_the_variant_it_refused_and_never_the_callers_text() {
     let endpoint = "http://127.0.0.1:9";
     let long = "a".repeat(40);
