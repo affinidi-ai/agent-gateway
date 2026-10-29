@@ -1126,7 +1126,11 @@ async fn validate_transit_token(
             &ctx.surface.surface_id,
             transit_point_name,
             ctx.surface
-                .transit_token_lifetime_secs(),
+                .transit_token_lifetime_secs(
+                    state
+                        .network_config
+                        .transit_token_min_lifetime_secs,
+                ),
         )
         .map_err(|e| OutboundPipelineError::TransitTokenInvalid(e.to_string()))?;
 
@@ -6674,6 +6678,7 @@ mod tests {
                     }],
                     serde_json::Map::new(),
                     300,
+                    30,
                 )
                 .unwrap();
             let token = if invalid == "expired" {
@@ -6814,6 +6819,7 @@ mod tests {
                     vec!["partner-a".into()],
                     serde_json::Map::new(),
                     300,
+                    30,
                 )
                 .unwrap();
             // The shortest lifetime the issuer allows is 30 seconds, so back-date a

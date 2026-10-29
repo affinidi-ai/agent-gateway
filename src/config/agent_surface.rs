@@ -1101,8 +1101,8 @@ pub struct SharedTransitConfig {
     pub transit_token_mode: TransitTokenMode,
 
     /// How long, in seconds, the transit tokens the Access Point issues live,
-    /// from [`MIN_TRANSIT_TOKEN_LIFETIME_SECS`] to
-    /// [`MAX_TRANSIT_TOKEN_LIFETIME_SECS`]; unset means
+    /// from the appliance's `transit_token_min_lifetime_secs` (30 unless
+    /// `gateway.json` sets it) to [`MAX_TRANSIT_TOKEN_LIFETIME_SECS`]; unset means
     /// [`DEFAULT_TRANSIT_TOKEN_LIFETIME_SECS`]. A variant cannot override it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transit_token_lifetime_secs: Option<u64>,
@@ -1144,25 +1144,45 @@ pub struct SharedTransitConfig {
 /// How long a transit token lives when its surface sets no lifetime, in seconds.
 pub const DEFAULT_TRANSIT_TOKEN_LIFETIME_SECS: u64 = 300;
 
-/// The shortest transit token lifetime a surface may set, in seconds.
-pub const MIN_TRANSIT_TOKEN_LIFETIME_SECS: u64 = 30;
+/// The shortest transit token lifetime a surface may set, in seconds, when
+/// `gateway.json` does not set `transit_token_min_lifetime_secs`.
+pub const DEFAULT_TRANSIT_TOKEN_MIN_LIFETIME_SECS: u64 = 30;
+
+/// The lowest value `transit_token_min_lifetime_secs` may take, in seconds.
+pub const LOWEST_TRANSIT_TOKEN_MIN_LIFETIME_SECS: u64 = 1;
 
 /// The longest transit token lifetime a surface may set, in seconds. Whoever
 /// holds a transit token can use it on its surface's Transit Points for its
 /// whole lifetime.
 pub const MAX_TRANSIT_TOKEN_LIFETIME_SECS: u64 = 900;
 
+/// Refuses an appliance-wide `transit_token_min_lifetime_secs` below
+/// [`LOWEST_TRANSIT_TOKEN_MIN_LIFETIME_SECS`] or above
+/// [`MAX_TRANSIT_TOKEN_LIFETIME_SECS`].
+pub fn validate_transit_token_min_lifetime(min_secs: u64) -> Result<(), String> {
+    if (LOWEST_TRANSIT_TOKEN_MIN_LIFETIME_SECS..=MAX_TRANSIT_TOKEN_LIFETIME_SECS).contains(&min_secs) {
+        Ok(())
+    } else {
+        Err(format!(
+            "transit_token_min_lifetime_secs must be from {LOWEST_TRANSIT_TOKEN_MIN_LIFETIME_SECS} to \
+             {MAX_TRANSIT_TOKEN_LIFETIME_SECS} seconds, not {min_secs}"
+        ))
+    }
+}
+
 impl SharedTransitConfig {
-    /// Refuses a [`Self::transit_token_lifetime_secs`] outside
-    /// [`MIN_TRANSIT_TOKEN_LIFETIME_SECS`] to [`MAX_TRANSIT_TOKEN_LIFETIME_SECS`].
-    pub fn validate_transit_token_lifetime(&self) -> Result<(), String> {
+    /// Refuses a [`Self::transit_token_lifetime_secs`] below `min_secs`, the
+    /// appliance's `transit_token_min_lifetime_secs`, or above
+    /// [`MAX_TRANSIT_TOKEN_LIFETIME_SECS`].
+    pub fn validate_transit_token_lifetime(
+        &self,
+        min_secs: u64,
+    ) -> Result<(), String> {
         match self.transit_token_lifetime_secs {
-            Some(secs) if !(MIN_TRANSIT_TOKEN_LIFETIME_SECS..=MAX_TRANSIT_TOKEN_LIFETIME_SECS).contains(&secs) => {
-                Err(format!(
-                    "transit.transit_token_lifetime_secs must be from {MIN_TRANSIT_TOKEN_LIFETIME_SECS} to \
-                     {MAX_TRANSIT_TOKEN_LIFETIME_SECS} seconds, not {secs}"
-                ))
-            }
+            Some(secs) if !(min_secs..=MAX_TRANSIT_TOKEN_LIFETIME_SECS).contains(&secs) => Err(format!(
+                "transit.transit_token_lifetime_secs must be from {min_secs} to \
+                 {MAX_TRANSIT_TOKEN_LIFETIME_SECS} seconds, not {secs}"
+            )),
             _ => Ok(()),
         }
     }
@@ -2683,9 +2703,14 @@ impl AgentSurface {
     /// How long this surface's transit tokens live, in seconds: its
     /// `transit.transit_token_lifetime_secs`, or the default when it sets none.
     /// The Access Point issues tokens for this long, and a Transit Point refuses
-    /// a token that lives longer. A stored value outside the bounds, which
-    /// validation refuses, is held to the nearer bound.
-    pub fn transit_token_lifetime_secs(&self) -> u64 {
+    /// a token that lives longer. `min_secs` is the appliance's
+    /// `transit_token_min_lifetime_secs`. A stored value outside the bounds, which
+    /// validation refuses, is held to the nearer bound, and so is the default when
+    /// `min_secs` is above it.
+    pub fn transit_token_lifetime_secs(
+        &self,
+        min_secs: u64,
+    ) -> u64 {
         self.transit
             .as_ref()
             .and_then(|transit| {
@@ -2693,9 +2718,8 @@ impl AgentSurface {
                     .shared
                     .transit_token_lifetime_secs
             })
-            .map_or(DEFAULT_TRANSIT_TOKEN_LIFETIME_SECS, |secs| {
-                secs.clamp(MIN_TRANSIT_TOKEN_LIFETIME_SECS, MAX_TRANSIT_TOKEN_LIFETIME_SECS)
-            })
+            .unwrap_or(DEFAULT_TRANSIT_TOKEN_LIFETIME_SECS)
+            .clamp(min_secs, MAX_TRANSIT_TOKEN_LIFETIME_SECS)
     }
 
     /// Validate `access_point.a2a`: it belongs to A2A and AP2 Access Points only,
@@ -6603,10 +6627,57 @@ mod transit_token_lifetime_tests {
         let mut without_transit = surface_with_lifetime(None);
         without_transit.transit = None;
 
-        assert_eq!(without_transit.transit_token_lifetime_secs(), 300);
-        assert_eq!(surface_with_lifetime(None).transit_token_lifetime_secs(), 300);
+        assert_eq!(without_transit.transit_token_lifetime_secs(30), 300);
+        assert_eq!(surface_with_lifetime(None).transit_token_lifetime_secs(30), 300);
         for secs in [30, 600, 900] {
-            assert_eq!(surface_with_lifetime(Some(secs)).transit_token_lifetime_secs(), secs);
+            assert_eq!(surface_with_lifetime(Some(secs)).transit_token_lifetime_secs(30), secs);
+        }
+    }
+
+    #[test]
+    fn the_shortest_transit_token_lifetime_is_30_seconds_unless_the_appliance_sets_another() {
+        assert_eq!(DEFAULT_TRANSIT_TOKEN_MIN_LIFETIME_SECS, 30);
+        let surface = surface_with_lifetime(Some(10));
+        let shared = &surface
+            .transit
+            .as_ref()
+            .unwrap()
+            .shared;
+        assert_eq!(
+            shared.validate_transit_token_lifetime(30),
+            Err("transit.transit_token_lifetime_secs must be from 30 to 900 seconds, not 10".to_string())
+        );
+        assert_eq!(shared.validate_transit_token_lifetime(10), Ok(()));
+        assert_eq!(surface.transit_token_lifetime_secs(10), 10);
+        assert_eq!(surface.transit_token_lifetime_secs(30), 30, "a stored 10 is held to the default floor");
+
+        let surface = surface_with_lifetime(Some(5));
+        let shared = &surface
+            .transit
+            .as_ref()
+            .unwrap()
+            .shared;
+        assert_eq!(
+            shared.validate_transit_token_lifetime(10),
+            Err("transit.transit_token_lifetime_secs must be from 10 to 900 seconds, not 5".to_string())
+        );
+        assert_eq!(surface.transit_token_lifetime_secs(10), 10);
+
+        // A minimum above the 300 second default holds an unset lifetime to the minimum.
+        assert_eq!(surface_with_lifetime(None).transit_token_lifetime_secs(600), 600);
+    }
+
+    #[test]
+    fn the_appliance_minimum_must_be_from_1_to_900_seconds() {
+        for min_secs in [1, 10, 30, 900] {
+            assert_eq!(validate_transit_token_min_lifetime(min_secs), Ok(()), "{min_secs}");
+        }
+        for min_secs in [0, 901, u64::MAX] {
+            assert_eq!(
+                validate_transit_token_min_lifetime(min_secs),
+                Err(format!("transit_token_min_lifetime_secs must be from 1 to 900 seconds, not {min_secs}")),
+                "{min_secs}"
+            );
         }
     }
 
@@ -6619,8 +6690,7 @@ mod transit_token_lifetime_tests {
                 .as_ref()
                 .unwrap()
                 .shared;
-            assert_eq!(shared.validate_transit_token_lifetime(), Ok(()), "{lifetime:?}");
-            assert_eq!(surface.validate_outbound(), Vec::<String>::new(), "{lifetime:?}");
+            assert_eq!(shared.validate_transit_token_lifetime(30), Ok(()), "{lifetime:?}");
         }
         for secs in [0, 29, 901, u64::MAX] {
             let surface = surface_with_lifetime(Some(secs));
@@ -6629,15 +6699,14 @@ mod transit_token_lifetime_tests {
                 .as_ref()
                 .unwrap()
                 .shared;
-            assert_eq!(shared.validate_transit_token_lifetime(), Err(refusal(secs)));
-            assert_eq!(surface.validate_outbound(), vec![refusal(secs)]);
+            assert_eq!(shared.validate_transit_token_lifetime(30), Err(refusal(secs)));
         }
     }
 
     #[test]
     fn a_stored_transit_token_lifetime_outside_its_bounds_is_held_to_the_nearer_bound() {
         for (stored, held) in [(0, 30), (29, 30), (901, 900), (u64::MAX, 900)] {
-            assert_eq!(surface_with_lifetime(Some(stored)).transit_token_lifetime_secs(), held, "{stored}");
+            assert_eq!(surface_with_lifetime(Some(stored)).transit_token_lifetime_secs(30), held, "{stored}");
         }
     }
 
@@ -6654,7 +6723,7 @@ mod transit_token_lifetime_tests {
         let set = serde_json::to_value(surface_with_lifetime(Some(600))).unwrap();
         assert_eq!(set["transit"]["transit_token_lifetime_secs"], json!(600));
         let reloaded: AgentSurface = serde_json::from_value(set).unwrap();
-        assert_eq!(reloaded.transit_token_lifetime_secs(), 600);
+        assert_eq!(reloaded.transit_token_lifetime_secs(30), 600);
     }
 
     #[test]
@@ -6680,7 +6749,7 @@ mod transit_token_lifetime_tests {
             surface
                 .resolve_variant(Some("candidate"))
                 .unwrap()
-                .transit_token_lifetime_secs(),
+                .transit_token_lifetime_secs(30),
             600
         );
     }

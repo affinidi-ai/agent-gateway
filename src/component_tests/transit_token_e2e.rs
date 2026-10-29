@@ -70,7 +70,19 @@ async fn start_gateway() -> GatewayHarness {
 /// A gateway whose `/smoke` surface sets `lifetime_secs` as its transit token
 /// lifetime, beside a second surface on `/other`.
 async fn start_gateway_with_transit_token_lifetime(lifetime_secs: Option<u64>) -> GatewayHarness {
+    start_gateway_with_transit_token_limits(lifetime_secs, None).await
+}
+
+/// Like [`start_gateway_with_transit_token_lifetime`], on an appliance whose
+/// `gateway.json` sets `transit_token_min_lifetime_secs` to `min_secs`.
+async fn start_gateway_with_transit_token_limits(
+    lifetime_secs: Option<u64>,
+    min_secs: Option<u64>,
+) -> GatewayHarness {
     GatewayHarness::start_with_outbound_mock(MockServer::start().await, |_, gw_config, bootstrap| {
+        if let Some(min_secs) = min_secs {
+            helpers::configure_gateway_setting(bootstrap, "transit_token_min_lifetime_secs", json!(min_secs));
+        }
         write_target_secret(
             &bootstrap
                 .storage_paths
@@ -462,6 +474,71 @@ async fn a_transit_token_opens_its_transit_point_for_the_lifetime_its_surface_se
         before + 1,
         "a refused call must not reach the target"
     );
+}
+
+/// An appliance whose `gateway.json` lowers `transit_token_min_lifetime_secs` to
+/// 10 admits a surface lifetime of 10 seconds through the admin API and has its
+/// Access Point issue 10 second tokens that its Transit Point accepts, while 5 is
+/// refused naming the new minimum; one that sets nothing still refuses 10.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_appliance_sets_the_shortest_transit_token_lifetime_a_surface_may_have() {
+    let h = start_gateway_with_transit_token_limits(Some(10), Some(10)).await;
+    let token = transit_token_from_access_point(&h, "/smoke").await;
+    assert_eq!(lifetime_of(&token), 10);
+    assert_eq!(call_transit_point(&h, "/smoke", &token).await, 200);
+
+    for (min_secs, secs, accepted) in [(Some(10), 10, true), (Some(10), 5, false), (None, 10, false), (None, 30, true)]
+    {
+        let mut admin = None;
+        let h = GatewayHarness::start_with_outbound(|_, _, bootstrap| {
+            admin = Some(helpers::configure_admin_api(bootstrap));
+            helpers::configure_gateway_route_prefixes(bootstrap, &[("lifetime", "lifetime", "/lifetime")]);
+            if let Some(min_secs) = min_secs {
+                helpers::configure_gateway_setting(bootstrap, "transit_token_min_lifetime_secs", json!(min_secs));
+            }
+        })
+        .await;
+        let local = |url: &str| {
+            format!(
+                "http://localhost:{}",
+                url.rsplit(':')
+                    .next()
+                    .unwrap()
+            )
+        };
+        let response = admin
+            .unwrap()
+            .post(format!("{}/api/v1/surfaces", h.gateway_base))
+            .json(&json!({
+                "name": "lifetime",
+                "access_point": { "listen_address": local(&h.gateway_base), "route": "/lifetime", "protocol": "a2a" },
+                "target": { "endpoint": h.mock.url() },
+                "transit": {
+                    "transit_token_lifetime_secs": secs,
+                    "outbound_listen_address": local(h.outbound_url.as_deref().unwrap()),
+                    "points": [{ "alias": "target", "target_endpoint": h.mock.url() }]
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+        if accepted {
+            assert_eq!(response.status(), 201, "{min_secs:?} {secs}");
+        } else {
+            assert_eq!(response.status(), 400, "{min_secs:?} {secs}");
+            assert!(
+                response
+                    .text()
+                    .await
+                    .unwrap()
+                    .contains(&format!(
+                        "transit.transit_token_lifetime_secs must be from {} to 900 seconds, not {secs}",
+                        min_secs.unwrap_or(30)
+                    )),
+                "{min_secs:?} {secs}"
+            );
+        }
+    }
 }
 
 /// The admin API refuses a transit token lifetime outside 30 to 900 seconds,

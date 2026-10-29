@@ -215,10 +215,13 @@ impl TransitTokenIssuer {
             allowed_transit_points,
             serde_json::Map::new(),
             crate::config::agent_surface::DEFAULT_TRANSIT_TOKEN_LIFETIME_SECS,
+            crate::config::agent_surface::DEFAULT_TRANSIT_TOKEN_MIN_LIFETIME_SECS,
         )
     }
 
-    /// Issue a transit token that lives `lifetime_secs` and also carries an
+    /// Issue a transit token that lives `lifetime_secs`, which must be from
+    /// `min_lifetime_secs` (the appliance's `transit_token_min_lifetime_secs`) to
+    /// 900 seconds, and also carries an
     /// allowlisted set of caller-context fields for Transit Point Workload
     /// Binding. The caller is responsible for having already filtered
     /// `caller_context_fields` down to the operator-configured allowlist; the
@@ -235,11 +238,12 @@ impl TransitTokenIssuer {
         allowed_transit_points: Vec<String>,
         caller_context_fields: serde_json::Map<String, serde_json::Value>,
         lifetime_secs: u64,
+        min_lifetime_secs: u64,
     ) -> Result<String> {
-        use crate::config::agent_surface::{MAX_TRANSIT_TOKEN_LIFETIME_SECS, MIN_TRANSIT_TOKEN_LIFETIME_SECS};
-        if !(MIN_TRANSIT_TOKEN_LIFETIME_SECS..=MAX_TRANSIT_TOKEN_LIFETIME_SECS).contains(&lifetime_secs) {
+        use crate::config::agent_surface::MAX_TRANSIT_TOKEN_LIFETIME_SECS;
+        if !(min_lifetime_secs..=MAX_TRANSIT_TOKEN_LIFETIME_SECS).contains(&lifetime_secs) {
             anyhow::bail!(
-                "transit token lifetime must be from {MIN_TRANSIT_TOKEN_LIFETIME_SECS} to \
+                "transit token lifetime must be from {min_lifetime_secs} to \
                  {MAX_TRANSIT_TOKEN_LIFETIME_SECS} seconds, not {lifetime_secs}"
             );
         }
@@ -857,6 +861,7 @@ mod tests {
                 vec![],
                 serde_json::Map::new(),
                 lifetime_secs,
+                crate::config::agent_surface::DEFAULT_TRANSIT_TOKEN_MIN_LIFETIME_SECS,
             )
             .unwrap()
     }
@@ -962,6 +967,7 @@ mod tests {
                 vec!["delta".to_string()],
                 fields.clone(),
                 LIFETIME,
+                crate::config::agent_surface::DEFAULT_TRANSIT_TOKEN_MIN_LIFETIME_SECS,
             )
             .unwrap();
 
@@ -981,7 +987,9 @@ mod tests {
 
     #[test]
     fn the_issuer_refuses_a_lifetime_outside_the_bounds() {
-        use crate::config::agent_surface::{MAX_TRANSIT_TOKEN_LIFETIME_SECS, MIN_TRANSIT_TOKEN_LIFETIME_SECS};
+        use crate::config::agent_surface::{
+            DEFAULT_TRANSIT_TOKEN_MIN_LIFETIME_SECS as MIN_TRANSIT_TOKEN_LIFETIME_SECS, MAX_TRANSIT_TOKEN_LIFETIME_SECS,
+        };
         let issuer = test_issuer();
         for lifetime in [0, MIN_TRANSIT_TOKEN_LIFETIME_SECS - 1, MAX_TRANSIT_TOKEN_LIFETIME_SECS + 1, u64::MAX] {
             let result = issuer.issue_with_caller_context(
@@ -994,6 +1002,7 @@ mod tests {
                 vec![],
                 serde_json::Map::new(),
                 lifetime,
+                crate::config::agent_surface::DEFAULT_TRANSIT_TOKEN_MIN_LIFETIME_SECS,
             );
             assert!(result.is_err(), "{lifetime}");
         }
@@ -1009,6 +1018,7 @@ mod tests {
                     vec![],
                     serde_json::Map::new(),
                     lifetime,
+                    crate::config::agent_surface::DEFAULT_TRANSIT_TOKEN_MIN_LIFETIME_SECS,
                 )
                 .unwrap();
             assert!(
@@ -1020,6 +1030,34 @@ mod tests {
         }
     }
 
+    /// The shortest lifetime the issuer mints follows the minimum it is given, both ways.
+    #[test]
+    fn the_issuers_shortest_lifetime_follows_the_minimum_it_is_given() {
+        let issuer = test_issuer();
+        let issue = |lifetime: u64, min_lifetime: u64| {
+            issuer.issue_with_caller_context(
+                "surf-001",
+                None,
+                None,
+                None,
+                None,
+                None,
+                vec![],
+                serde_json::Map::new(),
+                lifetime,
+                min_lifetime,
+            )
+        };
+        assert!(issue(10, 10).is_ok());
+        assert!(issue(9, 10).is_err());
+        assert!(issue(120, 120).is_ok());
+        assert!(issue(119, 120).is_err());
+        assert!(
+            issue(10, crate::config::agent_surface::DEFAULT_TRANSIT_TOKEN_MIN_LIFETIME_SECS).is_err(),
+            "the default floor is 30"
+        );
+    }
+
     #[test]
     fn workload_binding_token_preserves_arbitrary_json_values_as_is() {
         let issuer = test_issuer();
@@ -1028,7 +1066,18 @@ mod tests {
         fields.insert("nested".to_string(), serde_json::json!({ "a": { "b": [1, 2, 3] } }));
 
         let token = issuer
-            .issue_with_caller_context("surf-001", None, None, None, None, None, vec![], fields.clone(), LIFETIME)
+            .issue_with_caller_context(
+                "surf-001",
+                None,
+                None,
+                None,
+                None,
+                None,
+                vec![],
+                fields.clone(),
+                LIFETIME,
+                crate::config::agent_surface::DEFAULT_TRANSIT_TOKEN_MIN_LIFETIME_SECS,
+            )
             .unwrap();
         let claims = issuer
             .validate(&token, LIFETIME)
@@ -1087,6 +1136,7 @@ mod tests {
                 vec!["delta".to_string()],
                 fields,
                 LIFETIME,
+                crate::config::agent_surface::DEFAULT_TRANSIT_TOKEN_MIN_LIFETIME_SECS,
             )
             .unwrap();
 

@@ -529,6 +529,14 @@ async fn async_main() -> Result<()> {
     config
         .validate()
         .context("Configuration validation failed")?;
+    config
+        .validate_transit_token_lifetimes(
+            bootstrap_config
+                .load_network_config()
+                .context("Failed to load network config for the transit token lifetime bounds")?
+                .transit_token_min_lifetime_secs,
+        )
+        .context("Configuration validation failed")?;
 
     // ── (Future) one-shot agent-identity `#key-2` migration — trigger point ──
     //

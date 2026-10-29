@@ -152,6 +152,28 @@ impl GatewayConfig {
         }
     }
 
+    /// Refuses a surface whose transit token lifetime is outside `min_secs`, the
+    /// appliance's `transit_token_min_lifetime_secs`, to 900 seconds.
+    pub fn validate_transit_token_lifetimes(
+        &self,
+        min_secs: u64,
+    ) -> anyhow::Result<()> {
+        for surface in &self.surfaces {
+            if let Some(transit) = &surface.transit
+                && let Err(error) = transit
+                    .shared
+                    .validate_transit_token_lifetime(min_secs)
+            {
+                let channel_id = surface
+                    .config_id()
+                    .map(|id| format!(" ({}.json)", id))
+                    .unwrap_or_default();
+                anyhow::bail!("Channel '{}'{}: {}", surface.name, channel_id, error);
+            }
+        }
+        Ok(())
+    }
+
     /// Validate the configuration
     pub fn validate(&self) -> anyhow::Result<()> {
         if let Some(continuations) = &self.mcp.continuations {
@@ -191,14 +213,6 @@ impl GatewayConfig {
 
             // Validate authentication configuration
             validate_source_auth_surface(surface)?;
-
-            if let Some(transit) = &surface.transit
-                && let Err(error) = transit
-                    .shared
-                    .validate_transit_token_lifetime()
-            {
-                anyhow::bail!("Channel '{}'{}: {}", surface.name, channel_id, error);
-            }
 
             // Validate MPP configuration if present
             if let Some(mpp_config) = surface.mpp_config() {
@@ -463,15 +477,35 @@ mod tests {
         };
 
         config.surfaces = vec![surface_living(900)];
-        config.validate().unwrap();
+        config
+            .validate_transit_token_lifetimes(30)
+            .unwrap();
         config.surfaces = vec![surface_living(901)];
         assert_eq!(
             config
-                .validate()
+                .validate_transit_token_lifetimes(30)
                 .unwrap_err()
                 .to_string(),
             "Channel 'lifetime' (lifetime-surface.json): transit.transit_token_lifetime_secs must be from 30 to 900 \
              seconds, not 901"
+        );
+        config.surfaces = vec![surface_living(10)];
+        assert!(
+            config
+                .validate_transit_token_lifetimes(30)
+                .is_err()
+        );
+        config
+            .validate_transit_token_lifetimes(10)
+            .unwrap();
+        config.surfaces = vec![surface_living(5)];
+        assert_eq!(
+            config
+                .validate_transit_token_lifetimes(10)
+                .unwrap_err()
+                .to_string(),
+            "Channel 'lifetime' (lifetime-surface.json): transit.transit_token_lifetime_secs must be from 10 to 900 \
+             seconds, not 5"
         );
     }
 }
