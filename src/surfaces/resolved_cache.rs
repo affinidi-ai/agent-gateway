@@ -17,7 +17,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 
 use crate::config::agent_surface::AgentSurface;
 use crate::config::agent_surface_variants::{VariantResolveError, VariantValidationError};
@@ -111,11 +111,14 @@ impl From<VariantResolveError> for CacheUpsertError {
 #[derive(Debug, Default)]
 pub struct ResolvedSurfaceCache {
     inner: DashMap<String, Arc<SurfaceSnapshots>>,
+    /// Surfaces removed because they were disabled or deleted, until they are
+    /// upserted again.
+    retired: DashSet<String>,
 }
 
 impl ResolvedSurfaceCache {
     pub fn new() -> Self {
-        Self { inner: DashMap::new() }
+        Self::default()
     }
 
     /// Validate `surface.variants`, pre-resolve every snapshot, then
@@ -130,15 +133,32 @@ impl ResolvedSurfaceCache {
         let snapshots = build_snapshots(surface)?;
         self.inner
             .insert(surface.surface_id.clone(), Arc::new(snapshots));
+        self.retired
+            .remove(&surface.surface_id);
         Ok(())
     }
 
-    /// Drop the cache entry for `surface_id`. No-op if absent.
+    /// Drop the cache entry for a surface that was disabled or deleted, and
+    /// remember it as retired until it is upserted again.
     pub fn remove(
         &self,
         surface_id: &str,
     ) {
+        self.retired
+            .insert(surface_id.to_string());
         self.inner.remove(surface_id);
+    }
+
+    /// Whether `surface_id` was disabled or deleted and has not been upserted
+    /// since. A request still routed to such a surface, as over a connection kept
+    /// alive across a full reload, must be refused rather than served from the
+    /// surface it was routed with.
+    pub fn is_retired(
+        &self,
+        surface_id: &str,
+    ) -> bool {
+        self.retired
+            .contains(surface_id)
     }
 
     /// Look up a pre-resolved snapshot by surface and optional alias.
@@ -456,6 +476,29 @@ mod tests {
         cache.remove("s8");
         assert_eq!(cache.len(), 0);
         assert!(matches!(cache.resolve("s8", None), Err(ResolveError::UnknownSurface(_))));
+    }
+
+    #[test]
+    fn a_removed_surface_is_retired_until_it_is_upserted_again() {
+        let cache = ResolvedSurfaceCache::new();
+        assert!(!cache.is_retired("s10"), "a surface never cached is not retired");
+        cache
+            .upsert(&base_surface("s10"))
+            .unwrap();
+        assert!(!cache.is_retired("s10"));
+
+        cache.remove("s10");
+        assert!(cache.is_retired("s10"));
+
+        cache
+            .upsert(&base_surface("s10"))
+            .unwrap();
+        assert!(!cache.is_retired("s10"));
+        assert!(
+            cache
+                .resolve("s10", None)
+                .is_ok()
+        );
     }
 
     #[test]
