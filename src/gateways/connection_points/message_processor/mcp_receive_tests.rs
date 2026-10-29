@@ -2666,10 +2666,8 @@ async fn fabric_discovery_flow() {
         assert_eq!(reached(), 0, "a refused token never reaches the Target");
     }
 
-    for (alias, audience) in [
-        (None, "https://gateway.example/mcp"),
-        (Some("beta"), "https://gateway.example/mcp$beta"),
-    ] {
+    for (alias, audience) in [(None, "https://gateway.example/mcp"), (Some("beta"), "https://gateway.example/mcp$beta")]
+    {
         let before = reached();
         let response = send(alias, Some(token_for(audience))).await;
         assert_eq!(response["status"], 200, "{response}");
