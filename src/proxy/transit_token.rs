@@ -5,16 +5,124 @@
 //! the caller's identity context forward.
 //!
 //! Two modes are supported:
-//! - **Embedded**: All context is encrypted into the token itself (stateless, larger token).
+//! - **Embedded**: All context is carried in the token itself, signed but not encrypted, so the
+//!   managed agent can read every claim (stateless, larger token).
 //! - **Reference**: Context stored server-side; token is a short reference key (not yet implemented).
+//!
+//! Tokens are HS256 JWTs signed with a random key the gateway creates on its first start and keeps
+//! with its own keys, so every instance sharing that storage signs and accepts the same tokens.
 
 use anyhow::{Context, Result};
-use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, decode_header, encode};
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// Default token TTL: 5 minutes (transit should be immediate).
 const DEFAULT_TTL_SECS: u64 = 300;
+
+/// Clock difference tolerated on a token's `iat` and `exp`.
+const CLOCK_LEEWAY_SECS: u64 = 5;
+
+/// File, in the VC key directory, holding the transit token signing key.
+const KEY_FILE_NAME: &str = "transit_token_key.json";
+
+/// The HS256 key transit tokens are signed with, and the `kid` that names it in every token.
+#[derive(Clone)]
+pub struct TransitTokenKey {
+    kid: String,
+    secret: Zeroizing<[u8; 32]>,
+}
+
+#[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+#[serde(deny_unknown_fields)]
+struct StoredTransitTokenKey {
+    kid: String,
+    key: String,
+}
+
+impl TransitTokenKey {
+    /// A new random key and key ID from the operating system's generator.
+    pub fn generate() -> Result<Self> {
+        use rand::TryRngCore;
+
+        let unavailable = "the operating system random number generator is unavailable";
+        let mut secret = Zeroizing::new([0u8; 32]);
+        let mut kid = [0u8; 16];
+        rand::rngs::OsRng
+            .try_fill_bytes(secret.as_mut())
+            .context(unavailable)?;
+        rand::rngs::OsRng
+            .try_fill_bytes(&mut kid)
+            .context(unavailable)?;
+        Ok(Self { kid: hex::encode(kid), secret })
+    }
+
+    /// The key kept in `directory`, created there on first use. Instances starting on one
+    /// storage directory at the same moment create one key between them and all use it. A key
+    /// file that cannot be read or parsed is an error, never replaced. An existing key file,
+    /// such as one a restore wrote, is restricted to its owner.
+    pub async fn load_or_create(directory: &Path) -> Result<Self> {
+        let path = directory.join(KEY_FILE_NAME);
+        let invalid = || format!("Invalid transit token signing key in {}", path.display());
+        if let Some(stored) = crate::encryption::secret_file::read_secret_file(&path).await? {
+            crate::encryption::secret_file::restrict_secret_file_to_owner(&path).await;
+            return Self::parse(&Zeroizing::new(stored)).with_context(invalid);
+        }
+        let generated = Self::generate()?;
+        if crate::encryption::secret_file::create_secret_file(&path, &generated.to_stored()?).await? {
+            return Ok(generated);
+        }
+        let stored = crate::encryption::secret_file::read_secret_file(&path)
+            .await?
+            .with_context(|| {
+                format!("Transit token signing key {} disappeared while it was created", path.display())
+            })?;
+        Self::parse(&Zeroizing::new(stored)).with_context(invalid)
+    }
+
+    fn parse(stored: &str) -> Result<Self> {
+        let stored: StoredTransitTokenKey =
+            serde_json::from_str(stored).map_err(|_| anyhow::anyhow!("the file is not a transit token key record"))?;
+        if stored.kid.is_empty()
+            || stored.kid.len() > 64
+            || !stored
+                .kid
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            anyhow::bail!("the key ID must be 1 to 64 letters, digits, '-' or '_'");
+        }
+        let mut secret = Zeroizing::new([0u8; 32]);
+        if stored.key.len() != 64 || hex::decode_to_slice(&stored.key, secret.as_mut()).is_err() {
+            anyhow::bail!("the key must be 64 hexadecimal characters");
+        }
+        Ok(Self {
+            kid: stored.kid.clone(),
+            secret,
+        })
+    }
+
+    fn to_stored(&self) -> Result<Zeroizing<String>> {
+        let stored = StoredTransitTokenKey {
+            kid: self.kid.clone(),
+            key: hex::encode(self.secret.as_ref()),
+        };
+        Ok(Zeroizing::new(serde_json::to_string_pretty(&stored)?))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_parts(
+        kid: &str,
+        secret: [u8; 32],
+    ) -> Self {
+        Self {
+            kid: kid.to_string(),
+            secret: Zeroizing::new(secret),
+        }
+    }
+}
 
 /// Claims embedded in the transit token.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,8 +180,8 @@ pub struct TransitTokenClaims {
 /// Issues and validates transit tokens.
 #[derive(Clone)]
 pub struct TransitTokenIssuer {
-    /// HMAC secret for signing tokens.
-    signing_key: Vec<u8>,
+    /// The key tokens are signed with.
+    key: TransitTokenKey,
     /// Gateway ID used as the `iss` claim.
     gateway_id: String,
     /// Token TTL in seconds.
@@ -81,13 +189,13 @@ pub struct TransitTokenIssuer {
 }
 
 impl TransitTokenIssuer {
-    /// Create a new issuer with the given HMAC secret and gateway ID.
+    /// Create a new issuer with the given signing key and gateway ID.
     pub fn new(
-        signing_secret: &[u8],
+        key: TransitTokenKey,
         gateway_id: String,
     ) -> Self {
         Self {
-            signing_key: signing_secret.to_vec(),
+            key,
             gateway_id,
             ttl_secs: DEFAULT_TTL_SECS,
         }
@@ -163,35 +271,73 @@ impl TransitTokenIssuer {
             allowed_transit_points,
         };
 
-        let header = Header::new(Algorithm::HS256);
-        let key = EncodingKey::from_secret(&self.signing_key);
-
-        encode(&header, &claims, &key).context("failed to encode transit token")
+        self.sign(&claims)
     }
 
-    /// Validate a transit token and return the claims.
+    /// Sign `claims` with this issuer's key, naming it in the `kid` header.
+    pub(crate) fn sign(
+        &self,
+        claims: &TransitTokenClaims,
+    ) -> Result<String> {
+        let mut header = Header::new(Algorithm::HS256);
+        header.kid = Some(self.key.kid.clone());
+        let key = EncodingKey::from_secret(self.key.secret.as_ref());
+
+        encode(&header, claims, &key).context("failed to encode transit token")
+    }
+
+    /// Validate a transit token and return the claims. A token whose `kid` does not name this
+    /// issuer's key, or that has none, is refused before its signature is checked. A token is
+    /// accepted any number of times until it expires; one issued in the future, living longer
+    /// than this issuer issues, or without a token ID is refused.
     pub fn validate(
         &self,
         token: &str,
     ) -> Result<TransitTokenClaims> {
-        let key = DecodingKey::from_secret(&self.signing_key);
+        let header = decode_header(token).context("transit token validation failed")?;
+        if header.kid.as_deref() != Some(self.key.kid.as_str()) {
+            anyhow::bail!("transit token is not signed with this gateway's transit token key");
+        }
+        let key = DecodingKey::from_secret(self.key.secret.as_ref());
         let mut validation = Validation::new(Algorithm::HS256);
         validation.set_issuer(&[&self.gateway_id]);
         validation.validate_exp = true;
+        validation.leeway = CLOCK_LEEWAY_SECS;
 
-        let token_data =
-            decode::<TransitTokenClaims>(token, &key, &validation).context("transit token validation failed")?;
+        let claims = decode::<TransitTokenClaims>(token, &key, &validation)
+            .context("transit token validation failed")?
+            .claims;
 
-        Ok(token_data.claims)
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock error")?
+            .as_secs();
+        if claims.iat > now.saturating_add(CLOCK_LEEWAY_SECS) {
+            anyhow::bail!("transit token is issued in the future");
+        }
+        if claims.exp <= claims.iat || claims.exp - claims.iat > self.ttl_secs {
+            anyhow::bail!("transit token lifetime is not one this gateway issues");
+        }
+        if claims.jti.is_empty() {
+            anyhow::bail!("transit token has no token ID");
+        }
+
+        Ok(claims)
     }
 
-    /// Validate a transit token and check it's authorized for a specific transit point.
+    /// Validate a transit token and check it was issued for `surface_id` and opens the
+    /// Transit Point named `transit_point_name`.
     pub fn validate_for_transit_point(
         &self,
         token: &str,
+        surface_id: &str,
         transit_point_name: &str,
     ) -> Result<TransitTokenClaims> {
         let claims = self.validate(token)?;
+
+        if claims.surface_id.is_empty() || claims.surface_id != surface_id {
+            anyhow::bail!("transit token was issued for another surface");
+        }
 
         // If allowed_transit_points is empty, all are allowed
         if !claims
@@ -215,7 +361,271 @@ mod tests {
     use super::*;
 
     fn test_issuer() -> TransitTokenIssuer {
-        TransitTokenIssuer::new(b"test-secret-key-32-bytes-long!!", "gw-test-001".to_string())
+        TransitTokenIssuer::new(TransitTokenKey::from_parts("test-kid", [7; 32]), "gw-test-001".to_string())
+    }
+
+    fn claims_for(
+        surface_id: &str,
+        iat: u64,
+        exp: u64,
+    ) -> TransitTokenClaims {
+        TransitTokenClaims {
+            iss: "gw-test-001".to_string(),
+            sub: None,
+            surface_id: surface_id.to_string(),
+            iat,
+            exp,
+            jti: uuid::Uuid::new_v4().to_string(),
+            identity_source: None,
+            caller_dna_uai: None,
+            user_identity_hash: Some("victim-hash".to_string()),
+            caller_context_fields: serde_json::Map::new(),
+            allowed_transit_points: vec![],
+            trace_id: None,
+        }
+    }
+
+    fn now() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    fn sign_with(
+        header: Header,
+        secret: &[u8],
+        claims: &TransitTokenClaims,
+    ) -> String {
+        encode(&header, claims, &EncodingKey::from_secret(secret)).unwrap()
+    }
+
+    #[test]
+    fn refuses_a_token_signed_with_the_key_derived_from_the_gateway_domain() {
+        use sha2::{Digest, Sha256};
+
+        let issuer = test_issuer();
+        let derived = Sha256::new()
+            .chain_update(b"transit-token-signing-key:")
+            .chain_update(b"gw-test-001")
+            .finalize();
+        let now = now();
+        let claims = claims_for("surf-001", now, now + 300);
+
+        let without_kid = sign_with(Header::new(Algorithm::HS256), &derived, &claims);
+        let mut with_kid = Header::new(Algorithm::HS256);
+        with_kid.kid = Some("test-kid".to_string());
+        let with_our_kid = sign_with(with_kid, &derived, &claims);
+
+        for (token, reason) in [
+            (without_kid, "transit token is not signed with this gateway's transit token key"),
+            (with_our_kid, "transit token validation failed: InvalidSignature"),
+        ] {
+            assert_eq!(refusal(issuer.validate(&token)), reason, "a token signed with the domain-derived key");
+        }
+    }
+
+    #[test]
+    fn refuses_a_token_signed_by_another_gateway() {
+        let ours = TransitTokenIssuer::new(TransitTokenKey::generate().unwrap(), "gw-test-001".to_string());
+        let theirs = TransitTokenIssuer::new(TransitTokenKey::generate().unwrap(), "gw-test-001".to_string());
+        let token = theirs
+            .issue("surf-001", None, None, None, Some("victim-hash"), None, vec![])
+            .unwrap();
+
+        assert_eq!(refusal(ours.validate(&token)), "transit token is not signed with this gateway's transit token key");
+        assert_eq!(
+            theirs
+                .validate(&token)
+                .unwrap()
+                .user_identity_hash
+                .as_deref(),
+            Some("victim-hash")
+        );
+    }
+
+    #[test]
+    fn refuses_a_token_whose_kid_names_another_key() {
+        let issuer = test_issuer();
+        let mut header = Header::new(Algorithm::HS256);
+        header.kid = Some("previous-kid".to_string());
+        let now = now();
+        let token = sign_with(header, &[7; 32], &claims_for("surf-001", now, now + 300));
+
+        assert_eq!(
+            refusal(issuer.validate(&token)),
+            "transit token is not signed with this gateway's transit token key"
+        );
+    }
+
+    #[test]
+    fn refuses_a_token_carrying_our_kid_but_another_secret() {
+        let issuer = test_issuer();
+        let forger =
+            TransitTokenIssuer::new(TransitTokenKey::from_parts("test-kid", [8; 32]), "gw-test-001".to_string());
+        let token = forger
+            .issue("surf-001", None, None, None, None, None, vec![])
+            .unwrap();
+
+        assert_eq!(refusal(issuer.validate(&token)), "transit token validation failed: InvalidSignature");
+    }
+
+    #[test]
+    fn issued_tokens_name_the_signing_key() {
+        let issuer = test_issuer();
+        let token = issuer
+            .issue("surf-001", None, None, None, None, None, vec![])
+            .unwrap();
+
+        let header = decode_header(&token).unwrap();
+        assert_eq!(header.kid.as_deref(), Some("test-kid"));
+        assert_eq!(header.alg, Algorithm::HS256);
+    }
+
+    #[tokio::test]
+    async fn a_new_key_is_created_once_and_reloaded_after_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let first = TransitTokenKey::load_or_create(dir.path())
+            .await
+            .unwrap();
+        let token = TransitTokenIssuer::new(first, "gw-test-001".to_string())
+            .issue("surf-001", None, None, None, None, None, vec![])
+            .unwrap();
+        let restarted = TransitTokenKey::load_or_create(dir.path())
+            .await
+            .unwrap();
+
+        let claims = TransitTokenIssuer::new(restarted, "gw-test-001".to_string())
+            .validate(&token)
+            .unwrap();
+        assert_eq!(claims.surface_id, "surf-001");
+        let stored: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join(KEY_FILE_NAME)).unwrap()).unwrap();
+        assert_eq!(
+            stored["kid"]
+                .as_str()
+                .map(str::len),
+            Some(32)
+        );
+        assert_eq!(
+            stored["key"]
+                .as_str()
+                .map(str::len),
+            Some(64)
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.path().join(KEY_FILE_NAME))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_restored_key_file_is_restricted_to_its_owner_when_loaded() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let key_file = dir.path().join(KEY_FILE_NAME);
+        let created = TransitTokenKey::load_or_create(dir.path())
+            .await
+            .unwrap();
+        std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let loaded = TransitTokenKey::load_or_create(dir.path())
+            .await
+            .unwrap();
+
+        assert_eq!(loaded.kid, created.kid);
+        assert_eq!(
+            std::fs::metadata(&key_file)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[tokio::test]
+    async fn instances_starting_together_on_one_storage_directory_share_one_key() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let (active, standby) =
+            tokio::join!(TransitTokenKey::load_or_create(dir.path()), TransitTokenKey::load_or_create(dir.path()));
+        let active = TransitTokenIssuer::new(active.unwrap(), "gw-test-001".to_string());
+        let standby = TransitTokenIssuer::new(standby.unwrap(), "gw-test-001".to_string());
+
+        let token = active
+            .issue("surf-001", None, None, None, None, None, vec![])
+            .unwrap();
+        assert_eq!(
+            standby
+                .validate(&token)
+                .unwrap()
+                .surface_id,
+            "surf-001"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_damaged_key_file_stops_the_load_rather_than_being_replaced() {
+        for damaged in [
+            "not json",
+            r#"{"kid":"k1","key":"abcd"}"#,
+            r#"{"kid":"k1","key":"zz00000000000000000000000000000000000000000000000000000000000000"}"#,
+            r#"{"kid":"","key":"0000000000000000000000000000000000000000000000000000000000000000"}"#,
+            r#"{"kid":"k 1","key":"0000000000000000000000000000000000000000000000000000000000000000"}"#,
+            r#"{"kid":"k1","key":"0000000000000000000000000000000000000000000000000000000000000000","extra":1}"#,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(KEY_FILE_NAME), damaged).unwrap();
+
+            let error = TransitTokenKey::load_or_create(dir.path())
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{damaged} must not load"));
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("Invalid transit token signing key"),
+                "{damaged}: {error}"
+            );
+            assert_eq!(std::fs::read_to_string(dir.path().join(KEY_FILE_NAME)).unwrap(), damaged);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_key_is_stored_encrypted_when_encryption_at_rest_is_enabled() {
+        crate::encryption::global::set_test_encryption(
+            crate::config::EncryptionConfig {
+                enabled: true,
+                key_source: crate::config::KeySourceConfig::Environment,
+                ..crate::config::EncryptionConfig::default()
+            },
+            crate::encryption::EncryptionService::new(crate::encryption::KeySource::Raw { key: [9u8; 32] }).unwrap(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+
+        let created = TransitTokenKey::load_or_create(dir.path())
+            .await
+            .unwrap();
+
+        let path = dir.path().join(KEY_FILE_NAME);
+        assert!(!path.exists(), "the key must not be written in plaintext");
+        let on_disk = std::fs::read_to_string(crate::encryption::secret_file::secret_enc_path(&path)).unwrap();
+        assert!(!on_disk.contains(&hex::encode(created.secret.as_ref())));
+        let reloaded = TransitTokenKey::load_or_create(dir.path())
+            .await
+            .unwrap();
+        assert_eq!(reloaded.kid, created.kid);
+        assert_eq!(reloaded.secret.as_ref(), created.secret.as_ref());
     }
 
     #[test]
@@ -272,24 +682,10 @@ mod tests {
             allowed_transit_points: vec![],
         };
 
-        let header = Header::new(Algorithm::HS256);
-        let key = EncodingKey::from_secret(b"test-secret-key-32-bytes-long!!");
-        let token = encode(&header, &claims, &key).unwrap();
+        let token = issuer.sign(&claims).unwrap();
 
         let result = issuer.validate(&token);
         assert!(result.is_err(), "expired token should be rejected");
-    }
-
-    #[test]
-    fn test_validate_wrong_secret() {
-        let issuer = test_issuer();
-        let token = issuer
-            .issue("surf-001", None, None, None, None, None, vec![])
-            .unwrap();
-
-        let wrong_issuer = TransitTokenIssuer::new(b"wrong-secret-key-32-bytes-long!", "gw-test-001".to_string());
-        let result = wrong_issuer.validate(&token);
-        assert!(result.is_err());
     }
 
     #[test]
@@ -302,19 +698,19 @@ mod tests {
 
         // Allowed
         let claims = issuer
-            .validate_for_transit_point(&token, "github-api")
+            .validate_for_transit_point(&token, "surf-001", "github-api")
             .unwrap();
         assert_eq!(claims.surface_id, "surf-001");
 
         // Also allowed
         assert!(
             issuer
-                .validate_for_transit_point(&token, "partner")
+                .validate_for_transit_point(&token, "surf-001", "partner")
                 .is_ok()
         );
 
         // Not allowed
-        let result = issuer.validate_for_transit_point(&token, "unauthorized-point");
+        let result = issuer.validate_for_transit_point(&token, "surf-001", "unauthorized-point");
         assert!(result.is_err());
     }
 
@@ -329,9 +725,110 @@ mod tests {
         // Empty allowed_transit_points means all are permitted
         assert!(
             issuer
-                .validate_for_transit_point(&token, "any-point")
+                .validate_for_transit_point(&token, "surf-001", "any-point")
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn refuses_a_token_issued_for_another_surface_on_a_transit_point_of_the_same_alias() {
+        let issuer = test_issuer();
+        let token = issuer
+            .issue("surface-a", None, None, None, Some("victim-hash"), None, vec!["partner".to_string()])
+            .unwrap();
+
+        let error = issuer
+            .validate_for_transit_point(&token, "surface-b", "partner")
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("another surface"),
+            "{error}"
+        );
+        assert!(
+            issuer
+                .validate_for_transit_point(&token, "surface-a", "partner")
+                .is_ok()
+        );
+    }
+
+    /// Why `validated` was refused, with every cause.
+    fn refusal(validated: Result<TransitTokenClaims>) -> String {
+        format!("{:#}", validated.unwrap_err())
+    }
+
+    #[test]
+    fn refuses_a_token_without_a_surface() {
+        let issuer = test_issuer();
+        let now = now();
+        let token = issuer
+            .sign(&claims_for("", now, now + 300))
+            .unwrap();
+
+        assert_eq!(
+            refusal(issuer.validate_for_transit_point(&token, "", "partner")),
+            "transit token was issued for another surface"
+        );
+    }
+
+    #[test]
+    fn refuses_tokens_living_longer_than_the_gateway_issues_or_issued_in_the_future() {
+        let issuer = test_issuer();
+        let now = now();
+        for (case, iat, exp, reason) in [
+            ("thirty days", now, now + 30 * 24 * 3600, "transit token lifetime is not one this gateway issues"),
+            ("one second too long", now - 10, now + 291, "transit token lifetime is not one this gateway issues"),
+            ("issued in the future", now + 60, now + 300, "transit token is issued in the future"),
+            ("expires when issued", now, now, "transit token lifetime is not one this gateway issues"),
+            ("expires before it is issued", now, now - 1, "transit token lifetime is not one this gateway issues"),
+            ("expired beyond the leeway", now - 300, now - 30, "transit token validation failed: ExpiredSignature"),
+        ] {
+            let token = issuer
+                .sign(&claims_for("surf-001", iat, exp))
+                .unwrap();
+            assert_eq!(
+                refusal(issuer.validate_for_transit_point(&token, "surf-001", "partner")),
+                reason,
+                "{case} must be refused for its lifetime"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_a_token_without_a_token_id() {
+        let issuer = test_issuer();
+        let now = now();
+        let mut claims = claims_for("surf-001", now, now + 300);
+        claims.jti = String::new();
+        let token = issuer.sign(&claims).unwrap();
+
+        assert_eq!(refusal(issuer.validate(&token)), "transit token has no token ID");
+    }
+
+    #[test]
+    fn accepts_the_same_token_again_and_again_within_its_lifetime() {
+        let issuer = test_issuer();
+        let token = issuer
+            .issue("surf-001", None, None, None, Some("caller-hash"), None, vec![])
+            .unwrap();
+        let now = now();
+        let near_expiry = issuer
+            .sign(&claims_for("surf-001", now - 298, now + 2))
+            .unwrap();
+
+        for _ in 0..5 {
+            for token in [&token, &near_expiry] {
+                assert_eq!(
+                    issuer
+                        .validate_for_transit_point(token, "surf-001", "partner")
+                        .unwrap()
+                        .surface_id,
+                    "surf-001"
+                );
+            }
+        }
     }
 
     #[test]
@@ -454,12 +951,12 @@ mod tests {
         // Carrying caller context does not widen transit-point authorization.
         assert!(
             issuer
-                .validate_for_transit_point(&token, "delta")
+                .validate_for_transit_point(&token, "surf-001", "delta")
                 .is_ok()
         );
         assert!(
             issuer
-                .validate_for_transit_point(&token, "other")
+                .validate_for_transit_point(&token, "surf-001", "other")
                 .is_err()
         );
     }

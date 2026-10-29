@@ -8,13 +8,29 @@
 # The JWKS fixtures depend on each key's fixed public component, so the keys
 # are kept in source rather than generated at runtime.
 src/component_tests/helpers/jwt.rs:private-key:9
-src/jwt_bearer/validator.rs:private-key:256
-src/source_auth/middleware.rs:private-key:1309
+src/jwt_bearer/validator.rs:private-key:259
+src/source_auth/middleware.rs:private-key:1366
 tests/bdd_support/jwt.rs:private-key:7
 
 # --- Redaction test fixtures: inputs must look like secrets ---
 # The log redactor tests feed secret-shaped strings through the JWT and PEM
 # private-key rules to prove they are masked. The PEM finding starts at the
 # RSA fixture and runs through the EC fixture, so one entry covers both.
-src/observability/log_redact.rs:jwt:532
-src/observability/log_redact.rs:private-key:630
+src/observability/log_redact.rs:jwt:685
+src/observability/log_redact.rs:private-key:783
+
+# --- Log-safety test fixtures: values must look like the secrets they stand for ---
+# Tests prove that session tokens, access tokens and payment keys never reach logs
+# or Debug output, so the inputs are shaped like the real values: UUID session
+# tokens, agpat_ access tokens and Stripe and MPP secret keys. None is a real key.
+src/auth/cli_login.rs:generic-api-key:620
+src/auth/handlers.rs:generic-api-key:798
+src/auth/saml/handlers.rs:generic-api-key:1013
+src/auth/session.rs:generic-api-key:514
+src/auth_manager/middleware.rs:generic-api-key:1561
+src/backup_restore/mod.rs:generic-api-key:995
+src/didauth/sessions.rs:generic-api-key:506
+src/encryption/migration.rs:generic-api-key:209
+src/mpp/types.rs:generic-api-key:614
+src/observability/log_redact.rs:generic-api-key:1159
+src/server/websocket.rs:generic-api-key:721

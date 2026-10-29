@@ -9,6 +9,7 @@ use std::time::Duration;
 use tracing::{debug, warn};
 
 use crate::config::agent_surface::AgentSurface;
+use crate::observability::loggable;
 use crate::proxy::handler::CallerAssertion;
 use crate::proxy::target_credentials::{
     TargetAuthContext, TargetAuthDecision, TargetCredential, TargetCredentialError, TargetCredentialResolver,
@@ -124,11 +125,11 @@ pub(crate) async fn fetch_target_card(
         {
             Ok(Ok((client, _target))) => client,
             Ok(Err(error)) => {
-                warn!(surface_id = %surface.surface_id, url = %card_url, %error, "Agent card URL blocked by egress policy");
+                warn!(surface_id = %surface.surface_id, url = %loggable::url(card_url.as_str()), %error, "Agent card URL blocked by egress policy");
                 continue;
             }
             Err(error) => {
-                warn!(surface_id = %surface.surface_id, url = %card_url, %error, "Agent card egress validation task failed");
+                warn!(surface_id = %surface.surface_id, url = %loggable::url(card_url.as_str()), %error, "Agent card egress validation task failed");
                 continue;
             }
         };
@@ -141,11 +142,11 @@ pub(crate) async fn fetch_target_card(
         let response = match request.send().await {
             Ok(response) if response.status().is_success() => response,
             Ok(response) => {
-                debug!(surface_id = %surface.surface_id, url = %card_url, status = %response.status(), "Agent card URL returned non-success status");
+                debug!(surface_id = %surface.surface_id, url = %loggable::url(card_url.as_str()), status = %response.status(), "Agent card URL returned non-success status");
                 continue;
             }
             Err(error) => {
-                debug!(surface_id = %surface.surface_id, url = %card_url, %error, "Agent card fetch failed");
+                debug!(surface_id = %surface.surface_id, url = %loggable::url(card_url.as_str()), error = %error.without_url(), "Agent card fetch failed");
                 continue;
             }
         };
@@ -153,11 +154,11 @@ pub(crate) async fn fetch_target_card(
             Ok(body) => match serde_json::from_slice(&body) {
                 Ok(card) => return Some(card),
                 Err(error) => {
-                    debug!(surface_id = %surface.surface_id, url = %card_url, %error, "Agent card is not JSON");
+                    debug!(surface_id = %surface.surface_id, url = %loggable::url(card_url.as_str()), %error, "Agent card is not JSON");
                 }
             },
             Err(error) => {
-                debug!(surface_id = %surface.surface_id, url = %card_url, %error, "Agent card exceeded its bounds");
+                debug!(surface_id = %surface.surface_id, url = %loggable::url(card_url.as_str()), %error, "Agent card exceeded its bounds");
             }
         }
     }

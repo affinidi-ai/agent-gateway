@@ -5,6 +5,7 @@ use std::path::Path;
 use tracing::{info, warn};
 
 use crate::auth::auth_config::GraphApiConfig;
+use crate::delegation_vault::oauth::token_error_reason;
 
 /// OAuth token response from Azure AD
 #[derive(Debug, Deserialize)]
@@ -58,12 +59,14 @@ impl GraphApiClient {
 
         if !response.status().is_success() {
             let status = response.status();
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_default();
-            warn!("Token request failed - Status: {}, Response: {}", status, error_text);
-            anyhow::bail!("Token request failed with status {}: {}", status, error_text);
+            let reason = token_error_reason(
+                &response
+                    .text()
+                    .await
+                    .unwrap_or_default(),
+            );
+            warn!("Token request failed - Status: {}, Reason: {}", status, reason);
+            anyhow::bail!("Token request failed with status {}: {}", status, reason);
         }
 
         let token_response: TokenResponse = response
@@ -89,7 +92,7 @@ impl GraphApiClient {
         // Fetch user's photo
         let photo_url = format!("https://graph.microsoft.com/v1.0/users/{}/photo/$value", user_email);
 
-        info!("Fetching avatar for user: {}", user_email);
+        info!("Fetching avatar from Microsoft Graph");
 
         let response = self
             .client
@@ -97,6 +100,7 @@ impl GraphApiClient {
             .bearer_auth(&access_token)
             .send()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("Failed to fetch user photo")?;
 
         match response.status().as_u16() {
@@ -105,21 +109,18 @@ impl GraphApiClient {
                 let bytes = response
                     .bytes()
                     .await
+                    .map_err(reqwest::Error::without_url)
                     .context("Failed to read photo bytes")?;
-                info!("Successfully fetched avatar for {}: {} bytes", user_email, bytes.len());
+                info!("Successfully fetched avatar: {} bytes", bytes.len());
                 Ok(Some(bytes.to_vec()))
             }
             404 => {
                 // User doesn't have a photo
-                info!("User {} has no avatar in Azure AD", user_email);
+                info!("User has no avatar in Azure AD");
                 Ok(None)
             }
             status => {
-                let error_text = response
-                    .text()
-                    .await
-                    .unwrap_or_default();
-                warn!("Failed to fetch avatar for {}: {} - {}", user_email, status, error_text);
+                warn!("Failed to fetch avatar: HTTP {}", status);
                 Ok(None)
             }
         }

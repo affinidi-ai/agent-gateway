@@ -528,6 +528,63 @@ impl MockServer {
     }
 }
 
+/// A target that records the complete headers of every request it receives,
+/// repeated ones included, and answers each with a fixed status and headers and
+/// a JSON-RPC result.
+pub struct RecordingTarget {
+    pub url: String,
+    received: Arc<std::sync::Mutex<Vec<axum::http::HeaderMap>>>,
+    _server: tokio::task::JoinHandle<()>,
+}
+
+impl RecordingTarget {
+    pub async fn start(
+        status: axum::http::StatusCode,
+        headers: &[(&'static str, &'static str)],
+    ) -> Self {
+        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = received.clone();
+        let headers = headers.to_vec();
+        let app = Router::new().fallback(move |request_headers: axum::http::HeaderMap| {
+            let recorded = recorded.clone();
+            let headers = headers.clone();
+            async move {
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push(request_headers);
+                let mut response = Response::builder()
+                    .status(status)
+                    .header("content-type", "application/json");
+                for (name, value) in headers {
+                    response = response.header(name, value);
+                }
+                response
+                    .body(axum::body::Body::from(r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#))
+                    .unwrap()
+            }
+        });
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .ok();
+        });
+        Self { url, received, _server: server }
+    }
+
+    /// The headers of every request received so far, oldest first.
+    pub fn received(&self) -> Vec<axum::http::HeaderMap> {
+        self.received
+            .lock()
+            .unwrap()
+            .clone()
+    }
+}
+
 // ── gateway config builders ──────────────────────────────────────────────────
 
 /// Directory holding the TLS pair component tests boot the gateway with.
@@ -904,7 +961,7 @@ fn build_bootstrap_config(
         metrics_cache_ttl_seconds_legacy: 1,
         auth_mode: AuthMode::default(),
         // Deterministic literal test key (64-char hex); the field is required at runtime.
-        backup_encryption_key: "00".repeat(32),
+        backup_encryption_key: "00".repeat(32).into(),
         legacy_backup_encryption_keys: None,
         trust_registry: Default::default(),
         tenancy: Default::default(),
@@ -1378,17 +1435,22 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// A dispatcher writing `info` and higher events to `log` as the gateway's log
-/// file renders them.
+/// A dispatcher writing `info` and higher events, and every `policy_audit`
+/// decision, to `log` as the gateway's log file renders them.
 fn gateway_log_dispatch(log: std::fs::File) -> tracing::Dispatch {
     use tracing_subscriber::Layer;
+    use tracing_subscriber::filter::{LevelFilter, Targets};
     use tracing_subscriber::layer::SubscriberExt;
 
     let layer = tracing_subscriber::fmt::layer()
         .event_format(crate::observability::SimpleFormat)
         .with_writer(Arc::new(log))
         .with_ansi(false)
-        .with_filter(tracing_subscriber::filter::LevelFilter::INFO);
+        .with_filter(
+            Targets::new()
+                .with_default(LevelFilter::INFO)
+                .with_target("policy_audit", LevelFilter::DEBUG),
+        );
     tracing::Dispatch::new(tracing_subscriber::registry().with(layer))
 }
 
@@ -1475,6 +1537,8 @@ async fn wait_for_gateway_http(
     loop {
         match client.get(&url).send().await {
             Ok(_) => break,
+            // The port accepts connections but does not speak plain HTTP: a TLS listener.
+            Err(error) if !error.is_connect() && !error.is_timeout() => break,
             Err(_) if tokio::time::Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
@@ -1572,8 +1636,8 @@ impl GatewayHarness {
         Self::boot_with_mock(mock, setup, true).await
     }
 
-    /// The `info` and higher lines the gateway logged so far, as its log file
-    /// renders them.
+    /// The `info` and higher lines, and the `policy_audit` decisions, the gateway
+    /// logged so far, as its log file renders them.
     pub(crate) fn logs(&self) -> String {
         let log = self
             .log

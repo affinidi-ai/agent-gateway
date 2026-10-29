@@ -50,6 +50,9 @@ pub struct SurfaceConfigBuilder {
     pub constrained_mcp_identity_field: Option<String>,
     pub agent_card_path: Option<String>,
     pub transit_points: Vec<SurfaceTransitPointConfig>,
+    /// The surface sets `transit.source_auth`, as one stored before the admin
+    /// API refused it does.
+    pub transit_source_auth: bool,
     pub didwebvh_identity: Option<DidWebVhIdentityFixture>,
     pub caller_trust_check_list: Vec<serde_json::Value>,
     pub trust_recorder_entries: Vec<serde_json::Value>,
@@ -120,6 +123,7 @@ impl Default for SurfaceConfigBuilder {
             constrained_mcp_identity_field: None,
             agent_card_path: None,
             transit_points: Vec::new(),
+            transit_source_auth: false,
             didwebvh_identity: None,
             caller_trust_check_list: Vec::new(),
             trust_recorder_entries: Vec::new(),
@@ -243,6 +247,10 @@ pub struct SurfaceTransitPointConfig {
     pub managed_identity: Option<TransitPointManagedIdentityConfig>,
     pub trust_check_list: Vec<serde_json::Value>,
     pub policy: Option<RequestPolicyFixture>,
+    pub require_transit_token: bool,
+    /// The surface's delegated credential is this Transit Point's own
+    /// `transit_credentials` rather than the surface's `outbound_credentials`.
+    pub delegated_credentials: bool,
 }
 
 impl SurfaceTransitPointConfig {
@@ -257,6 +265,8 @@ impl SurfaceTransitPointConfig {
             managed_identity: None,
             trust_check_list: Vec::new(),
             policy: None,
+            require_transit_token: false,
+            delegated_credentials: false,
         }
     }
 }
@@ -423,7 +433,12 @@ pub struct SurfaceCredentialDelegationConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CredentialProviderKind {
     OAuth2AuthorizationCode,
-    ApiKey { secret_id: String, secret_value: String },
+    ApiKey {
+        secret_id: String,
+        secret_value: String,
+    },
+    /// A provider the gateway has no record of, as after it was deleted.
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

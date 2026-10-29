@@ -659,7 +659,7 @@ impl TargetCardFetch<'_> {
             .surface
             .name
             .as_str();
-        debug!(channel = channel_name, target = %target_url, "Fetching agent card from upstream");
+        debug!(channel = channel_name, target = %crate::observability::loggable::url(target_url), "Fetching agent card from upstream");
         if self
             .state
             .surface
@@ -841,11 +841,13 @@ impl TargetCardFetch<'_> {
             .send()
             .await
             .map_err(|e| {
-                error!(channel = channel_name, error = %e, "Failed to fetch agent card from upstream - bad gateway");
-                self.fail(
-                    FetchFault::of_send(&e),
-                    create_error_response(StatusCode::BAD_GATEWAY, &format!("Failed to fetch from upstream: {}", e)),
-                )
+                let fault = FetchFault::of_send(&e);
+                error!(
+                    channel = channel_name,
+                    error = %e.without_url(),
+                    "Failed to fetch agent card from upstream - bad gateway"
+                );
+                self.fail(fault, create_error_response(StatusCode::BAD_GATEWAY, "Failed to fetch from upstream"))
             })?;
 
         let status = FetchFault::Status {

@@ -523,6 +523,11 @@ promotes it and `SIGUSR2` steps it down. Two instances sharing storage can keep 
 caches in step with a periodic refresh. See
 [`CONFIGURATION_RELOAD.md`](CONFIGURATION_RELOAD.md#server-mode).
 
+Instances sharing storage also share the key that signs transit tokens, kept beside the
+gateway's own keys, so a managed agent's Transit Point calls are accepted by whichever
+instance serves them. Instances that do not share it refuse each other's transit tokens.
+See [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token).
+
 Set the same `AG_IDENTITY_HASH_PEPPER` on every node of a multi-node gateway. The pepper
 derives the DIDs of agents identified by mTLS, API key or a JWT claim, so nodes with
 different peppers give the same agent different DIDs. With encryption at rest off it also

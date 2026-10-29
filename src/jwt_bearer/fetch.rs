@@ -164,7 +164,7 @@ pub async fn get_bounded(
         .header(reqwest::header::ACCEPT, "application/json")
         .send()
         .await
-        .map_err(|e| FetchError::new(FetchFailure::Unreachable, e.to_string()))?;
+        .map_err(|e| FetchError::new(FetchFailure::Unreachable, e.without_url().to_string()))?;
     let status = response.status();
     if !status.is_success() {
         return Err(FetchError::new(FetchFailure::HttpStatus, format!("HTTP {status}")));

@@ -200,7 +200,7 @@ fn dead_hook_url() -> String {
     format!("http://127.0.0.1:{port}/hooks/events")
 }
 
-struct FakeMediator {
+pub(super) struct FakeMediator {
     port: u16,
     resolvable: bool,
 }
@@ -210,7 +210,7 @@ impl FakeMediator {
         Self::bind(false).await
     }
 
-    async fn start_resolvable() -> Self {
+    pub(super) async fn start_resolvable() -> Self {
         Self::bind(true).await
     }
 
@@ -259,15 +259,15 @@ impl FakeMediator {
     }
 }
 
-struct Api {
-    harness: GatewayHarness,
-    client: reqwest::Client,
+pub(super) struct Api {
+    pub(super) harness: GatewayHarness,
+    pub(super) client: reqwest::Client,
     connection_points_dir: std::path::PathBuf,
     _hook_settings: Option<crate::event_hook::test_settings::Registration>,
 }
 
 impl Api {
-    async fn start(settings: Option<EventHookSettings>) -> Self {
+    pub(super) async fn start(settings: Option<EventHookSettings>) -> Self {
         Self::start_with(settings, |_| {}).await
     }
 
@@ -343,14 +343,14 @@ impl Api {
         .await
     }
 
-    fn url(
+    pub(super) fn url(
         &self,
         path: &str,
     ) -> String {
         format!("{}/api/v1{path}", self.harness.gateway_base)
     }
 
-    async fn get(
+    pub(super) async fn get(
         &self,
         path: &str,
     ) -> (u16, Value) {
@@ -370,7 +370,7 @@ impl Api {
         )
     }
 
-    async fn post(
+    pub(super) async fn post(
         &self,
         path: &str,
         body: &Value,
@@ -387,7 +387,7 @@ impl Api {
         (status, serde_json::from_str(&text).unwrap_or(Value::String(text)))
     }
 
-    async fn create_connection_point(
+    pub(super) async fn create_connection_point(
         &self,
         mediator: &FakeMediator,
     ) -> (u16, Value) {
@@ -419,7 +419,7 @@ impl Api {
         .await
     }
 
-    fn install_fake_mediator(
+    pub(super) fn install_fake_mediator(
         mediator: &FakeMediator,
         outcome: crate::gateways::connection_points::test_mediator::OobOutcome,
     ) {
@@ -449,7 +449,7 @@ async fn eventually<F: std::future::Future<Output = bool>>(
     }
 }
 
-fn fake_invitation() -> crate::gateways::connection_points::test_mediator::OobOutcome {
+pub(super) fn fake_invitation() -> crate::gateways::connection_points::test_mediator::OobOutcome {
     Ok((
         "oobid-1".to_string(),
         "https://mediator.invalid/oob?_oobid=oobid-1".to_string(),

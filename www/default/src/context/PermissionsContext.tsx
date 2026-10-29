@@ -104,16 +104,9 @@ export function PermissionsProvider({ children }: { children: ReactNode }) {
 
   const hasPermission = (feature: string): boolean => {
     if (!permissions) {
-      console.debug(`[PERMISSIONS] hasPermission('${feature}'): false (permissions not loaded)`);
       return false;
     }
-    const result = permissions[feature] === true;
-    if (!result) {
-      console.debug(
-        `[PERMISSIONS] hasPermission('${feature}'): false (value: ${permissions[feature]})`
-      );
-    }
-    return result;
+    return permissions[feature] === true;
   };
 
   const value: PermissionsContextType = {

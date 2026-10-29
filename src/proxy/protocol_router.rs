@@ -2,6 +2,8 @@ use axum::{body::Body, http::Response};
 use hyper::Uri;
 use tracing::{debug, info, warn};
 
+use crate::observability::loggable;
+
 pub(crate) fn join_endpoint_path(
     endpoint: &str,
     path_and_query: &str,
@@ -55,7 +57,10 @@ pub fn route_protocol_request(
         &target_endpoint[..scheme_end]
     } else {
         // Default to HTTPS if no scheme is provided
-        warn!("No scheme found in target endpoint '{}', defaulting to HTTPS", target_endpoint);
+        warn!(
+            "No scheme found in target endpoint, defaulting to HTTPS: {}",
+            loggable::url(&format!("https://{target_endpoint}"))
+        );
         "https"
     };
 
@@ -98,13 +103,13 @@ pub fn route_protocol_request(
             } else {
                 join_endpoint_path(target_endpoint, path_and_query)
             };
-            info!("🌐 HTTP/HTTPS protocol handler forwarding to: {}", target_url);
+            info!("🌐 HTTP/HTTPS protocol handler forwarding to: {}", loggable::url(&target_url));
 
             ProtocolResult::HttpForward(target_url)
         }
         "fabric" => {
             // Fabric protocol - route through gateway
-            info!("🏭 Fabric protocol handler processing request for: {}", target_endpoint);
+            info!("🏭 Fabric protocol handler processing request for: {}", loggable::url(target_endpoint));
             info!("📍 Request path: {}", uri.path());
 
             // Parse fabric://{gateway_id}/{channel_id}
@@ -114,7 +119,7 @@ pub fn route_protocol_request(
                 .collect();
 
             if parts.len() < 2 {
-                warn!("Invalid fabric URL format: {}", target_endpoint);
+                warn!("Invalid fabric URL format: {}", loggable::url(target_endpoint));
                 let response = Response::builder()
                     .status(axum::http::StatusCode::BAD_REQUEST)
                     .header("content-type", "application/json")
@@ -136,7 +141,7 @@ pub fn route_protocol_request(
             }
         }
         "did" => {
-            info!("🔗 DID protocol handler processing request for: {}", target_endpoint);
+            info!("🔗 DID protocol handler processing request for: {}", loggable::url(target_endpoint));
             info!("📍 Request path: {}", uri.path());
 
             // For now, just return a placeholder response
@@ -253,6 +258,31 @@ mod tests {
         match routed {
             ProtocolResult::HttpForward(url) => assert_eq!(url, "https://gateway.example/cards/agent.json"),
             _ => panic!("expected HTTP forward"),
+        }
+    }
+
+    #[test]
+    fn forwarding_log_drops_userinfo_and_query_values() {
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        let url = routed_url(
+            "https://agent:endpoint-password@gateway.example/a2a",
+            "/message/send?code=oauth-code-value&state=oauth-state-value",
+        );
+
+        assert_eq!(
+            url,
+            "https://agent:endpoint-password@gateway.example/a2a/message/send?code=oauth-code-value&state=oauth-state-value"
+        );
+        let text = logs.text();
+        assert!(
+            text.contains("forwarding to: https://gateway.example/a2a/message/send?code=<redacted>&state=<redacted>"),
+            "{text}"
+        );
+        for (part, value) in
+            [("password", "endpoint-password"), ("code", "oauth-code-value"), ("state", "oauth-state-value")]
+        {
+            assert!(!text.contains(value), "the forwarding log holds the {part} value: {text}");
         }
     }
 }

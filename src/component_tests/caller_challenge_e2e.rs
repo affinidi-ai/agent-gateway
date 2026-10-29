@@ -1098,9 +1098,9 @@ fn insufficient_scope_challenge() -> Vec<String> {
 }
 
 fn gateway_policy_evaluations(h: &GatewayHarness) -> usize {
-    h.logs()
-        .lines()
-        .filter(|line| line.contains("[OPA-INPUT] Gateway policy input before eval"))
+    policy_decision_lines(h)
+        .iter()
+        .filter(|line| line.contains("policy_scope=\"gateway\"") || line.contains("policy_scope=gateway "))
         .count()
 }
 

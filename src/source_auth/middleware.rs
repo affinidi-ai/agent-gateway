@@ -295,7 +295,7 @@ impl SourceAuthMiddleware {
 
         info!(
             surface = %channel_name,
-            subject = %subject,
+            strategy_id = %config.jwt_verification_strategy_id,
             "JWT Bearer source authentication succeeded"
         );
 

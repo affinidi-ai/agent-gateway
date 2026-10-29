@@ -533,6 +533,10 @@ sequenceDiagram
 when its `iat` is more than 120 seconds in the future. The backdating allowance is
 wider, at 30 times that value.
 
+Sessions are kept in the `didauth` subdirectory of `[storage_paths] sessions`, apart
+from dashboard sessions. At startup the gateway moves any DID Auth session files it
+finds in `sessions` itself into that subdirectory.
+
 Workload Binding supports `caller_source: did`, which tags the Workload Binding
 presentation with `user_hash = SHA256(did)`.
 
@@ -632,6 +636,75 @@ match discover(issuer, EgressPosture::Strict, DiscoveryOptions::default()).await
 
 The module has no metrics, audit or storage coupling and no tenancy or strategy types in its
 signatures, so callers record outcomes themselves from `code()`.
+
+## Transit Point callers
+
+A Transit Point listener does not run an Access Point's source authentication. A call to a
+Transit Point is admitted by its transit token, required unless the Transit Point sets
+`require_transit_token: false`, and on an MCP Transit Point also by a resource access token
+when it sets `mcp_http.authorization` (see
+[`MCP_METADATA.md`](MCP_METADATA.md)). These are the only ways to authenticate a Transit
+Point caller.
+
+`transit.source_auth` is not enforced. The admin API refuses a surface that sets it, on the
+surface or in a variant's overrides, with `400`. A surface stored with it still loads, with a
+warning in the log, but its Transit Points refuse every request with `503`, discovery reads
+included. The caller is told only that the Transit Point is unavailable, as a JSON-RPC error
+on an MCP Transit Point and a problem JSON otherwise; the reason is logged.
+
+### Transit token
+
+When a surface has Transit Points, its Access Point adds an `X-Transit-Token` header to each
+request it forwards to the managed agent, and the agent sends it back on its Transit Point
+calls ([`transit_token.rs`](../src/proxy/transit_token.rs)). The token is an HS256 JWT:
+signed, not encrypted, so the agent can read every claim. It names the surface, the
+caller, a hash of the caller's authenticated identity, the Transit Points it opens and the
+trace, and expires 300 seconds after it is issued. The agent may send the same token on
+any number of calls to that surface's Transit Points until then. The header is never
+forwarded to a Transit Point's target.
+
+A Transit Point refuses the call with `401` unless the token:
+
+- is signed with this gateway's key and names it in `kid`, with the gateway's domain as
+  `iss`;
+- was issued for this Transit Point's surface, and lists this Transit Point or lists none;
+- has not expired, is not issued in the future, lives no longer than the 300 seconds the
+  gateway issues, and has a token ID. Expiry and issue time allow 5 seconds of clock
+  difference.
+
+A `2026-07-28` MCP request must also carry exactly one token, and allows no clock difference.
+The refusal says only that the transit token is missing or invalid; which check it failed is
+logged. A `GET` of a public discovery path, such as an agent card, is forwarded without a
+transit token check, and so without any credential (see
+[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#when-a-credential-cannot-be-resolved)).
+
+The signing key is 32 random bytes the gateway creates on its first start, in
+`transit_token_key.json` under `[storage_paths] vc_keys`, readable by the owner only and
+encrypted like the gateway's other keys when encryption at rest is on. A key file that is
+not owner-only, such as one a restore wrote, is restricted to its owner when the gateway
+loads it, and the file written when encryption at rest is turned on later is owner-only
+too. The file is created by linking a complete copy into place, so the directory must be on
+a filesystem that supports hard links; one that does not stops the first start with an error
+saying so. A key file that cannot be read stops the gateway from starting. Every token names
+the key in its `kid` header, and a token that names another key, or none, is refused.
+Instances that share the storage directory share the key, so a Standby that takes over
+accepts the tokens the Active instance issued. A portable backup carries the key, so a
+gateway restored from it accepts the tokens the original issued. To replace the key, stop
+every instance, delete the file, and start them again; every token issued before is refused.
+
+### Headers through a Transit Point
+
+A Transit Point forwards the managed agent's request headers to its target, over HTTP or
+Fabric, except hop-by-hop headers, `Host`, `Content-Length`, `X-Transit-Token`, the agent's
+`Authorization` and its `Cookie`, a header named like the Transit Point's `target_auth`
+header, and any header a Header Metadata Mapping is set to strip. Other headers, such as an
+API key header the agent sends for the target itself, pass. The credentials the gateway adds
+are described in
+[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#credential-headers-on-a-transit-point).
+
+The target's response headers go back to the agent except hop-by-hop headers, `Set-Cookie`
+and `WWW-Authenticate`, so a target cannot set cookies in the agent or send it to
+authenticate with the target directly. The response status is unchanged.
 
 ## Managed identity
 

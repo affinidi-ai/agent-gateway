@@ -147,6 +147,8 @@ pub struct SurfaceWorld {
     /// OAuth providers that grant the gateway its own access token, by name.
     pub oauth_providers: HashMap<String, OidcProvider>,
     pub authorization_servers: AuthorizationServers,
+    /// The transit token the managed agent sends on its Transit Point calls.
+    pub transit_token: Option<String>,
     pub temp_dir: TempDir,
     pub debug: bool,
     pub runtimes: RuntimeRegistry,
@@ -213,6 +215,7 @@ impl SurfaceWorld {
             oauth_callback_query: None,
             oauth_providers: HashMap::new(),
             authorization_servers: AuthorizationServers::default(),
+            transit_token: None,
             temp_dir: get_default_temp_dir(),
             debug: is_debug,
             runtimes: RuntimeRegistry::default(),

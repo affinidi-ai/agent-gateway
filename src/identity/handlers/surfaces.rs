@@ -417,7 +417,7 @@ pub(crate) fn check_jwt_bearer_bindings(
     for view in views {
         let mut endpoints = Vec::new();
         if reaches(&view.outbound_credentials) {
-            endpoints.push(view.target.endpoint.as_str());
+            endpoints.push(("the Target endpoint".to_string(), view.target.endpoint.as_str()));
         }
         for point in view
             .transit
@@ -425,7 +425,7 @@ pub(crate) fn check_jwt_bearer_bindings(
             .flat_map(|transit| transit.points.iter())
         {
             if reaches(&view.transit_point_outbound_credentials(point)) {
-                endpoints.push(point.target_endpoint.as_str());
+                endpoints.push((format!("Transit Point '{}' endpoint", point.alias), point.target_endpoint.as_str()));
             }
         }
         if endpoints.is_empty() {
@@ -438,13 +438,13 @@ pub(crate) fn check_jwt_bearer_bindings(
                     .into(),
             ));
         }
-        if let Some(endpoint) = endpoints
+        if let Some((label, _)) = endpoints
             .into_iter()
-            .find(|endpoint| !crate::proxy::target_credentials::permits_credential_provider_target(endpoint))
+            .find(|(_, endpoint)| !crate::proxy::target_credentials::permits_credential_provider_target(endpoint))
         {
             return Err(SurfaceApiError::BadRequest(format!(
-                "A credential binding to an oauth2_jwt_bearer provider requires an https endpoint; '{endpoint}' is \
-                 not one"
+                "A credential binding to an oauth2_jwt_bearer provider requires an https endpoint; {label} is not \
+                 https"
             )));
         }
     }
@@ -980,8 +980,32 @@ fn validate_source_auth(surface: &AgentSurface) -> Result<(), SurfaceApiError> {
 /// Validate every transit point: alias must match the URL-safe pattern,
 /// be non-empty, and be unique within the surface. Also assigns a fresh
 /// UUID `id` to any TP that was sent without one so older payloads keep
-/// working without forcing the dashboard to mint IDs client-side.
+/// working without forcing the dashboard to mint IDs client-side. A
+/// `transit.source_auth`, which the gateway does not enforce, is refused.
 fn validate_transit_points(surface: &mut AgentSurface) -> Result<(), SurfaceApiError> {
+    let surface_sets_source_auth = surface
+        .transit
+        .as_ref()
+        .is_some_and(|transit| {
+            transit
+                .shared
+                .source_auth
+                .is_some()
+        });
+    let variant_sets_source_auth = surface
+        .variants
+        .iter()
+        .any(|variant| {
+            variant
+                .overrides
+                .transit
+                .as_ref()
+                .and_then(|transit| transit.shared.as_ref())
+                .is_some_and(|shared| shared.source_auth.is_some())
+        });
+    if surface_sets_source_auth || variant_sets_source_auth {
+        return Err(SurfaceApiError::BadRequest(crate::config::agent_surface::TRANSIT_SOURCE_AUTH_REFUSED.to_string()));
+    }
     let Some(transit) = surface.transit.as_mut() else {
         return Ok(());
     };
@@ -2996,20 +3020,35 @@ async fn apply_surface_change_while_locked(
         }
     }
 
-    // Compile / refresh the OPA policy for the surface-derived channel.
     // The reload paths above register the ChannelMapping with the runtime
     // but do NOT invoke SurfacePolicyManager — so without this, an active
     // surface with `policy_definition_id` set would have `opa_enabled=true`
     // on the channel but no compiled engine, producing the misleading
     // "OPA policy enforcement is enabled but no policy is loaded" 403.
-    if let SurfaceChange::Upsert(surface) = change
-        && surface.status == crate::config::agent_surface::SurfaceStatus::Active
-        && let Err(e) = state
-            .policy_manager
-            .update_channel_policy(surface)
-            .await
-    {
-        warn!("Failed to compile OPA policy for surface '{surface_id}': {e}");
+    refresh_surface_policies(&state.policy_manager, change).await;
+}
+
+/// Compile or refresh the OPA policy of an upserted active surface, or evict
+/// every policy, tool gate and rate limiter of a deleted one.
+async fn refresh_surface_policies(
+    policy_manager: &crate::policies::SurfacePolicyManager,
+    change: SurfaceChange<'_>,
+) {
+    match change {
+        SurfaceChange::Upsert(surface) => {
+            if surface.status == crate::config::agent_surface::SurfaceStatus::Active
+                && let Err(e) = policy_manager
+                    .update_channel_policy(surface)
+                    .await
+            {
+                warn!("Failed to compile OPA policy for surface '{}': {e}", surface.surface_id);
+            }
+        }
+        SurfaceChange::Delete(id) => {
+            policy_manager
+                .remove_channel(id)
+                .await;
+        }
     }
 }
 
@@ -4827,6 +4866,17 @@ mod validation_tests {
                 "{label}"
             );
         }
+        let refusal = |views: &[AgentSurface]| match check_jwt_bearer_bindings(views, jwt_bearer) {
+            Err(SurfaceApiError::BadRequest(message)) => message,
+            other => panic!("expected a 400, got {other:?}"),
+        };
+        let target_refusal = refusal(&bound("http://agent.example/api?api_key=marker", "cp-jwt", true));
+        assert_eq!(
+            target_refusal,
+            "A credential binding to an oauth2_jwt_bearer provider requires an https endpoint; the Target endpoint is \
+             not https"
+        );
+        assert!(!target_refusal.contains("marker"));
 
         let through_transit = |point_endpoint: &str| {
             let mut surface =
@@ -4847,6 +4897,13 @@ mod validation_tests {
             check_jwt_bearer_bindings(&through_transit("http://partner.example"), jwt_bearer),
             Err(SurfaceApiError::BadRequest(_))
         ));
+        let point_refusal = refusal(&through_transit("http://partner.example/a2a?api_key=marker"));
+        assert_eq!(
+            point_refusal,
+            "A credential binding to an oauth2_jwt_bearer provider requires an https endpoint; Transit Point \
+             'partner' endpoint is not https"
+        );
+        assert!(!point_refusal.contains("marker"));
 
         let mut outbound_reaches_transit = through_transit("http://partner.example");
         outbound_reaches_transit[0].transit = Some(
@@ -6586,6 +6643,28 @@ mod tests {
                 .collect(),
         });
         surface
+    }
+
+    #[tokio::test]
+    async fn deleting_a_surface_evicts_its_transit_point_tool_gating() {
+        let manager = crate::policies::SurfacePolicyManager::new();
+        let surface: AgentSurface = serde_json::from_value(serde_json::json!({
+            "surface_id": "doomed", "name": "doomed", "description": "", "status": "active",
+            "access_point": { "listen_address": "0.0.0.0:8443", "route": "/doomed", "protocol": "mcp" },
+            "target": { "endpoint": "http://localhost:9000" },
+            "transit": { "points": [{
+                "alias": "partner", "target_endpoint": "https://partner.example.com/mcp", "protocol": "mcp",
+                "mcp_tool_gating": { "gates": [{ "id": "g1", "name": "no admin",
+                    "action": { "effect": "deny", "patterns": ["^admin_"] } }] }
+            }] }
+        }))
+        .unwrap();
+        refresh_surface_policies(&manager, SurfaceChange::Upsert(&surface)).await;
+        assert!(manager.has_transit_mcp_tool_gating("doomed", "partner"));
+
+        refresh_surface_policies(&manager, SurfaceChange::Delete("doomed")).await;
+
+        assert!(!manager.has_transit_mcp_tool_gating("doomed", "partner"));
     }
 
     #[test]

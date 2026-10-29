@@ -1207,10 +1207,11 @@ fn a_tenant_surface_never_sends_appliance_wide_gateway_credentials() {
                 assert_eq!(
                     hop.call(Some(CALLER_KEY))
                         .await,
-                    200
+                    503,
+                    "a binding to an appliance-wide provider refuses the request"
                 );
-                assert_eq!(forwarded(), before + 1);
-                assert_eq!(last_authorization(&mock), None, "an appliance-wide provider's token is not bound");
+                assert_eq!(forwarded(), before, "the request never reaches the Target");
+                assert_eq!(last_authorization(&mock), None, "an appliance-wide provider's token is not sent");
                 assert_eq!(auth_server.token_request_count(), 0, "and never requested");
 
                 let hop = HopTwo::start(

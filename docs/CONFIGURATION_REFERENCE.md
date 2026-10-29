@@ -147,7 +147,7 @@ The bootstrap file. Startup only; changes need a restart.
 | `[reconnect_policy]` | Backoff for DIDComm connection points |
 | `[oob_connection]` | How long an out-of-band pairing invitation stays pending |
 | `[a2a]` | Default A2A revision, body size, timeouts, fabric timeouts and envelope lifetime, inbound cache sizing. The body size and `timeout_seconds` also bound the [Agent card preview](SOURCE_AUTH.md#agent-card-preview) fetch. |
-| `[logging]` | Level, JSON output, log directory |
+| `[logging]` | Level, JSON output, log directory. Log redaction is not read here; see [Log redaction](#log-redaction). |
 | `[extension_inspection]` | Whether to parse A2A extensions, and which URIs to watch |
 
 Fields and defaults are defined in [`src/config/bootstrap.rs`](../src/config/bootstrap.rs).
@@ -174,7 +174,7 @@ Network topology and the surfaces served. The largest configuration file; the ex
 
 | Key | Controls |
 | --- | --- |
-| `listeners` | Named bind addresses and ports. Access Points and Transit Points reference these. |
+| `listeners` | Named bind addresses and ports. Access Points and Transit Points reference these. A `bind_address` must be an IPv4 or IPv6 address such as `0.0.0.0`, `127.0.0.1`, `::` or `::1`; any other value stops the gateway from loading its network configuration. Each port is served by one listener task, and the first listener configured on the port decides whether it is inbound or outbound, whether it uses TLS and, for an outbound port, the one address it binds; the other listeners on the port do not change these, so an inbound listener on an outbound port is not served. An inbound port binds the distinct `bind_address` of every inbound listener on it, each on its own address; one of them that an unspecified address on the same port already covers, such as `127.0.0.1` beside `0.0.0.0`, is served through that one. An IPv4 caller accepted on an IPv6 address, such as `::` on a dual-stack host, matches the IPv4 entries of `client_ip.trusted_proxies` and `tls.client_auth.trusted_proxies`. |
 | `channels` | Route prefixes. The legacy wire name for surface routes. The dashboard offers them as an Access Point's **Surface Prefix**, in this order, and preselects the first for a new surface. |
 | `routes` | Route categories and their types, prefixes, and fallbacks |
 | `mcp_proxies` | Route prefixes for MCP proxy endpoints |
@@ -187,7 +187,7 @@ Network topology and the surfaces served. The largest configuration file; the ex
 | `facilitator_mode` | x402 facilitator behaviour |
 | `cors` | Permitted dashboard origins |
 | `terms`, `affinidi_terms_url` | Whether Terms acceptance is enforced, and where metadata is fetched |
-| `logging` | Log redaction rules. Only `redaction` is read here; level, JSON output, and directory come from `config.toml`. |
+| `logging` | Log redaction, for every configuration source. Only `redaction` is read here; level, JSON output, and directory come from `config.toml`. See [Log redaction](#log-redaction). |
 | `oauth_callback_route` | Where OAuth redirects land |
 
 The example file also carries `oob_connection` and `secrets` blocks, which `NetworkConfig`
@@ -202,7 +202,7 @@ Points. A request is matched to its surface by route.
 Some paths are reserved. A `channels` or `proxy` route prefix that shadows a dashboard page, or a
 `channels`, `routes` (of any type, `redirect` and `static` included) or `mcp_proxies` prefix
 at or under `/.well-known/oauth-protected-resource`, stops the gateway at startup with exit
-code `2` and a banner naming each prefix. Every inbound listener serves protected resource
+code `2` and a banner naming each prefix. Every served inbound listener serves protected resource
 metadata on that path itself (see
 [`MCP_METADATA.md`](MCP_METADATA.md#authorization-server-discovery-for-caller-authentication)).
 A configuration reload refuses a `gateway.json` with such a metadata path prefix and keeps the
@@ -219,6 +219,60 @@ records rather than file content; see [`src/config/agent_surface.rs`](../src/con
 registration to succeed. A mismatch is the most common local-setup failure, and
 [`development/GETTING_STARTED.md`](development/GETTING_STARTED.md) treats the generated
 value as the source of truth.
+
+### Log redaction
+
+`logging.redaction` masks values before they leave the gateway: in stderr, in the log
+file, in exported OTLP spans (span names, string attributes and events) and in exported
+OTLP log records (body and string attributes). It is read from `gateway.json` with every
+configuration source, `local` and `dynamodb`. A `[logging.redaction]` table in
+`config.toml` is ignored, and startup logs a warning about it. To keep rules set there, move
+them to `rules` in `gateway.json` `logging.redaction`; they replace the built-in rules, so
+also copy any built-in rules you still want from
+[`config/examples/gateway.example.json`](../config/examples/gateway.example.json).
+
+| Setting | Effect |
+| --- | --- |
+| No `logging.redaction` block, or no `enabled` | Redaction is on. |
+| `"enabled": false` | Redaction is off for every destination. |
+| No `rules` | The built-in rules below apply. |
+| `rules` | Your rules replace the built-in rules and run in order. An empty list applies no pattern. |
+
+A rule whose pattern does not compile is skipped with a warning on stderr. At startup
+stderr reports the number of rules in use, or a warning when redaction is off, and the
+`Startup configuration` log line shows `log_redaction=on` or `off`.
+
+The built-in rules, applied in this order:
+
+| Rule | Masks |
+| --- | --- |
+| JWT tokens | Three-part `eyJ…` tokens |
+| Authorization header values | The credential after `Authorization:` or `Proxy-Authorization:` and a `Bearer`, `Basic`, `Digest`, `Token` or `ApiKey` scheme |
+| Password fields | The value of a `password`, `passwd` or `pwd` assignment |
+| Access and refresh tokens | The value of an `access_token`, `refresh_token` or `token` assignment |
+| Session identifiers | The value of a `session_id`, `sessionid`, `sid`, `jsessionid` or `connect.sid` assignment |
+| API key and secret assignments | The value after `api_key`, `api-key`, `apikey` or `secret` and an `=` or `:` |
+| Quoted credential fields | The JSON-quoted value of a key naming a credential, such as `"authorization": "Bearer …"`, `"x-api-key": "…"` or `"cookie": "…"`, also with escaped quotes |
+| Personal access tokens | `agpat_…` tokens |
+| Private key material (PEM) | PEM private key blocks |
+| Email addresses | Email addresses |
+
+The patterns are `BUILT_IN_RULES` in
+[`src/observability/log_redact.rs`](../src/observability/log_redact.rs).
+`config/examples/gateway.example.json` lists a broader set that adds IP addresses, phone
+numbers, DIDs, wallet addresses, card and national ID numbers. The built-in set leaves
+those out because they also match ordinary log text, such as listen addresses,
+timestamps and module paths, and the access log keeps client IP addresses by design.
+
+In OTLP exports, an attribute whose name is a credential name is replaced with
+`<redacted>` whatever its value, because a rule pattern cannot match a structured
+attribute by its name. The names, ignoring case, are `authorization`, `cookie`, `token`,
+`session_id`, `sessionid`, `jsessionid`, `password`, `passwd`, `secret`, `secret_key`,
+`api_key`, `apikey`, `private_key`, `credential` and `credentials`, alone or after a `.`,
+`_` or `-`: `http.request.header.authorization`, `x-api-key` and `mcp_session_id` match,
+`token_count` and `secret_id` do not. Fields named like a credential lose the
+8-character prefix the gateway logs for correlation, in local logs as well as in OTLP
+exports.
 
 ## `rbac.json`
 
@@ -350,6 +404,12 @@ Telemetry export. Three independent sinks, each with its own `enabled` flag.
 | Remaining keys | Local metric collection and retention |
 
 `opentelemetry.traces.sample_rate` is a fraction, so `0.1` records one span in ten.
+`opentelemetry.logs.targets` lists the log targets exported over OTLP: an exact target,
+such as `policy_audit`, or a module path, such as `agent_gateway`, which also covers
+`agent_gateway::proxy::handler`. `"*"`, the default, exports every target. Exported log
+records carry the level set by `[logging] level` in `config.toml` and the same
+[redaction](#log-redaction) as local logs. The list is applied at startup and again
+whenever the OpenTelemetry settings are saved from the dashboard.
 `opentelemetry.traces.record_caller_identity` adds `caller.auth_method`,
 `caller.principal`, and `caller.did` to the root HTTP span. It is off by default because
 those values identify the caller; turning it on puts caller identity into your tracing

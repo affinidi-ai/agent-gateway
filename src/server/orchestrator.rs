@@ -13,7 +13,7 @@ use crate::gateways::filesystem::GatewayStore;
 use crate::gateways::types::GatewayType;
 use crate::mcp_proxies::filesystem::McpProxyStore;
 use crate::mediators::filesystem::MediatorStore;
-use crate::observability::periodic_metrics_update;
+use crate::observability::{loggable, periodic_metrics_update};
 use crate::surfaces::AgentSurfaceStore;
 use crate::trust_registries::store::TrustRegistryStore;
 
@@ -554,7 +554,10 @@ pub async fn run_axum_proxy(
                         batch_scheduled_delay_ms: None,
                         batch_max_export_size: None,
                     },
-                    logs: crate::config::metrics_config::LogsConfig { enabled: false },
+                    logs: crate::config::metrics_config::LogsConfig {
+                        enabled: false,
+                        ..Default::default()
+                    },
                 },
                 cloudwatch: crate::config::metrics_config::CloudWatchMetricConfig {
                     enabled: false,
@@ -1747,18 +1750,24 @@ pub async fn run_axum_proxy(
             crate::gateways::connection_points::message_processor::init_gateway_base_url(base_url).await;
         }
 
-        // Initialize transit token issuer for the proxy pipeline.
-        // Uses the gateway domain as the issuer ID and derives a signing key
-        // from the domain (in production, this should use a dedicated secret).
+        // Initialize transit token issuer for the proxy pipeline. The gateway domain is the
+        // issuer ID; the signing key is kept beside the gateway's own keys.
         {
-            use sha2::{Digest, Sha256};
-            let gateway_domain = &network_config.did.domain;
-            let mut hasher = Sha256::new();
-            hasher.update(b"transit-token-signing-key:");
-            hasher.update(gateway_domain.as_bytes());
-            let signing_key = hasher.finalize();
-
-            let issuer = crate::proxy::transit_token::TransitTokenIssuer::new(&signing_key, gateway_domain.clone());
+            let vc_keys = PathBuf::from(
+                &bootstrap_config
+                    .storage_paths
+                    .vc_keys,
+            );
+            let key = crate::proxy::transit_token::TransitTokenKey::load_or_create(&vc_keys)
+                .await
+                .context("Failed to load the transit token signing key")?;
+            let issuer = crate::proxy::transit_token::TransitTokenIssuer::new(
+                key,
+                network_config
+                    .did
+                    .domain
+                    .clone(),
+            );
             crate::proxy::server::init_transit_token_issuer(Arc::new(issuer));
         }
 
@@ -3955,7 +3964,9 @@ pub async fn run_axum_proxy(
             for surface in &channels {
                 info!(
                     "  -> Channel '{}' route: {} -> {}",
-                    surface.name, surface.access_point.route, surface.target.endpoint
+                    surface.name,
+                    surface.access_point.route,
+                    loggable::url(&surface.target.endpoint)
                 );
             }
 
@@ -4065,9 +4076,6 @@ pub async fn run_axum_proxy(
                 .await;
             *task_ids = task_ids_map;
         }
-
-        // Log file watcher is no longer needed - logs are broadcast directly via WebSocketLogLayer
-        // when they're written by the tracing system
 
         {
             let mut mode_rx = mode_rx_for_task;

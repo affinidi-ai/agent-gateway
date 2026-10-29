@@ -6,8 +6,9 @@
 use super::PaymentPayload;
 use super::x402rs_adapter;
 use crate::config::types::X402PaymentRequirement;
+use crate::observability::loggable;
 use reqwest::Url;
-use tracing::{debug, error, info};
+use tracing::{error, info};
 use x402_types::proto;
 
 /// Remote facilitator client
@@ -56,15 +57,13 @@ impl RemoteFacilitator {
         // Convert to x402-rs VerifyRequest
         let verify_request = x402rs_adapter::to_verify_request(payload, requirement)?;
 
-        // Serialize request for logging
-        let request_json = serde_json::to_string(&verify_request).unwrap_or_else(|_| "Failed to serialize".to_string());
-
         info!(
             channel = channel_name,
-            facilitator = %self.base_url,
+            facilitator = %loggable::url(self.base_url.as_str()),
+            network = %payload.network(),
+            amount = %payload.amount(),
             "🌐 [X402 VERIFY] Calling external facilitator"
         );
-        debug!("📤 [X402 VERIFY] Request: {}", request_json);
 
         // Call facilitator /verify endpoint
         let response = self
@@ -78,7 +77,7 @@ impl RemoteFacilitator {
             .json(&verify_request)
             .send()
             .await
-            .map_err(|e| format!("Failed to call facilitator: {}", e))?;
+            .map_err(|e| format!("Failed to call facilitator: {}", e.without_url()))?;
 
         let status = response.status();
         info!("📥 [X402 VERIFY] Response status: {}", status);
@@ -87,24 +86,22 @@ impl RemoteFacilitator {
         let body = response
             .text()
             .await
-            .map_err(|e| format!("Failed to read response: {}", e))?;
-
-        debug!("📥 [X402 VERIFY] Response body: {}", body);
+            .map_err(|e| format!("Failed to read response: {}", e.without_url()))?;
 
         if !status.is_success() {
             error!(
                 channel = channel_name,
                 status = %status,
-                body = %body,
-                facilitator = %self.base_url,
+                body_bytes = body.len(),
+                facilitator = %loggable::url(self.base_url.as_str()),
                 "❌ Facilitator verification failed"
             );
-            return Err(format!("Facilitator rejected payment: {} - {}", status, body));
+            return Err(format!("Facilitator rejected payment: {}", status));
         }
 
         // Parse response using x402-rs types
-        let verify_response: proto::VerifyResponse = serde_json::from_str(&body)
-            .map_err(|e| format!("Invalid facilitator response JSON: {} - Body: {}", e, body))?;
+        let verify_response: proto::VerifyResponse =
+            serde_json::from_str(&body).map_err(|e| format!("Invalid facilitator response JSON: {}", e))?;
 
         // Check if verification was valid
         if !x402rs_adapter::is_verification_valid(&verify_response) {
@@ -137,17 +134,13 @@ impl RemoteFacilitator {
         // Convert to x402-rs SettleRequest
         let settle_request = x402rs_adapter::to_settle_request(payload)?;
 
-        // Serialize request for logging
-        let request_json = serde_json::to_string(&settle_request).unwrap_or_else(|_| "Failed to serialize".to_string());
-
         info!(
             channel = channel_name,
-            facilitator = %self.base_url,
+            facilitator = %loggable::url(self.base_url.as_str()),
             network = %payload.network(),
             amount = %payload.amount(),
             "🌐 [X402 SETTLE] Calling external facilitator"
         );
-        debug!("📤 [X402 SETTLE] Request: {}", request_json);
 
         // Call facilitator /settle endpoint
         let response = self
@@ -161,7 +154,7 @@ impl RemoteFacilitator {
             .json(&settle_request)
             .send()
             .await
-            .map_err(|e| format!("Failed to call facilitator /settle: {}", e))?;
+            .map_err(|e| format!("Failed to call facilitator /settle: {}", e.without_url()))?;
 
         let status = response.status();
         info!("📥 [X402 SETTLE] Response status: {}", status);
@@ -170,24 +163,22 @@ impl RemoteFacilitator {
         let body = response
             .text()
             .await
-            .map_err(|e| format!("Failed to read response: {}", e))?;
-
-        debug!("📥 [X402 SETTLE] Response body: {}", body);
+            .map_err(|e| format!("Failed to read response: {}", e.without_url()))?;
 
         if !status.is_success() {
             error!(
                 channel = channel_name,
                 status = %status,
-                body = %body,
-                facilitator = %self.base_url,
+                body_bytes = body.len(),
+                facilitator = %loggable::url(self.base_url.as_str()),
                 "❌ Facilitator settlement failed"
             );
-            return Err(format!("Facilitator settlement failed: {} - {}", status, body));
+            return Err(format!("Facilitator settlement failed: {}", status));
         }
 
         // Parse response using x402-rs types
-        let settle_response: proto::SettleResponse = serde_json::from_str(&body)
-            .map_err(|e| format!("Invalid facilitator settlement response JSON: {} - Body: {}", e, body))?;
+        let settle_response: proto::SettleResponse =
+            serde_json::from_str(&body).map_err(|e| format!("Invalid facilitator settlement response JSON: {}", e))?;
 
         // Check if settlement was successful
         if !x402rs_adapter::is_settlement_successful(&settle_response) {

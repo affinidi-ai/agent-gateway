@@ -287,8 +287,6 @@ impl PaymentSigner {
 
         // Create struct hash (this is simplified - full implementation would use proper EIP-712 encoding)
         info!("Creating EIP-712 signature for EIP-3009 authorization");
-        debug!("Domain: {}", serde_json::to_string_pretty(&domain)?);
-        debug!("Authorization: {}", serde_json::to_string_pretty(&authorization)?);
 
         // For now, create a simple signature (TODO: implement proper EIP-712)
         // In production, you'd use proper EIP-712 typed data signing

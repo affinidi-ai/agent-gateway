@@ -10,6 +10,7 @@ use std::sync::Arc;
 use tracing::error;
 
 use super::{SessionManager, session_cookie};
+use crate::observability::loggable;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AuthenticatedPrincipal {
@@ -26,11 +27,30 @@ impl AuthenticatedPrincipal {
     }
 }
 
-#[derive(Debug)]
 pub(crate) struct FinalizedSession {
     pub(crate) headers: HeaderMap,
     pub(crate) session_token: String,
     pub(crate) consent_required: bool,
+}
+
+impl std::fmt::Debug for FinalizedSession {
+    fn fmt(
+        &self,
+        formatter: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        formatter
+            .debug_struct("FinalizedSession")
+            .field(
+                "headers",
+                &self
+                    .headers
+                    .keys()
+                    .collect::<Vec<_>>(),
+            )
+            .field("session_token", &loggable::secret(&self.session_token))
+            .field("consent_required", &self.consent_required)
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -165,6 +185,28 @@ mod tests {
         assert!(cookie.contains("Max-Age=420"));
         assert_eq!(finalizer.session_timeout_seconds(), 420);
         assert!(!finalized.consent_required);
+    }
+
+    #[tokio::test]
+    async fn finalized_session_debug_hides_the_token_and_the_cookie() {
+        let finalizer = SessionManagerFinalizer::new(
+            Arc::new(SessionManager::with_timeout(7)),
+            std::sync::Arc::new(crate::terms::TermsManager::disabled()),
+        );
+        let finalized = finalizer
+            .finalize_session(AuthenticatedPrincipal::new("alice".to_string(), "user-123".to_string()))
+            .await
+            .unwrap();
+
+        let rendered = format!("{finalized:?}");
+
+        assert!(rendered.contains(r#"headers: ["set-cookie"]"#), "{rendered}");
+        assert!(
+            rendered.contains(&format!("session_token: \"{}\"", loggable::secret(&finalized.session_token))),
+            "{rendered}"
+        );
+        assert!(rendered.contains("consent_required: false"), "{rendered}");
+        assert!(!rendered.contains(&finalized.session_token), "{rendered}");
     }
 
     #[tokio::test]

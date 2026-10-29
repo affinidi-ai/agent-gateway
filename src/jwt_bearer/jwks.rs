@@ -306,7 +306,7 @@ impl JwksClient {
             return outcome;
         }
 
-        info!("Fetching JWKS for strategy {} from {}", strategy.id, jwks_uri);
+        info!("Fetching JWKS for strategy {} from {}", strategy.id, crate::observability::loggable::url(jwks_uri));
         let fetched = fetch_entry(jwks_uri).await;
         self.record(&strategy.id, &version, kid, fetched)
             .await

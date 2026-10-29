@@ -21,11 +21,12 @@ pub mod storage;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::observability::loggable;
 use crate::storage::filesystem::StorableEntity;
 
 /// A delegation token stored in the vault — represents a user's consent
 /// for an agent to access a specific resource provider on their behalf.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct DelegationToken {
     /// Unique identifier (UUID)
     pub id: String,
@@ -81,6 +82,38 @@ pub struct DelegationToken {
 
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+impl std::fmt::Debug for DelegationToken {
+    fn fmt(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        f.debug_struct("DelegationToken")
+            .field("id", &self.id)
+            .field("agent_did", &self.agent_did)
+            .field("user_identity_hash", &self.user_identity_hash)
+            .field("credential_provider_id", &self.credential_provider_id)
+            .field("provider_id", &self.provider_id)
+            .field("access_token", &loggable::REDACTED)
+            .field(
+                "refresh_token",
+                &self
+                    .refresh_token
+                    .as_ref()
+                    .map(|_| loggable::REDACTED),
+            )
+            .field("token_type", &self.token_type)
+            .field("scopes", &self.scopes)
+            .field("expires_at", &self.expires_at)
+            .field("delegation_vc", &self.delegation_vc)
+            .field("consent_identity", &self.consent_identity)
+            .field("consent_granted_at", &self.consent_granted_at)
+            .field("last_used_at", &self.last_used_at)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
 }
 
 fn default_token_type() -> String {
@@ -143,7 +176,7 @@ impl DelegationToken {
 
 /// OAuth state parameter — encrypted and passed through the OAuth flow
 /// to bind the callback to the original request context.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct OAuthState {
     /// Agent DID that needs the delegation
     pub agent_did: String,
@@ -164,8 +197,32 @@ pub struct OAuthState {
     pub code_verifier: Option<String>,
 }
 
+impl std::fmt::Debug for OAuthState {
+    fn fmt(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        f.debug_struct("OAuthState")
+            .field("agent_did", &self.agent_did)
+            .field("user_identity_hash", &self.user_identity_hash)
+            .field("surface_id", &self.surface_id)
+            .field("credential_provider_id", &self.credential_provider_id)
+            .field("provider_id", &self.provider_id)
+            .field("nonce", &loggable::REDACTED)
+            .field("expires_at", &self.expires_at)
+            .field(
+                "code_verifier",
+                &self
+                    .code_verifier
+                    .as_ref()
+                    .map(|_| loggable::REDACTED),
+            )
+            .finish()
+    }
+}
+
 /// Token response from OAuth provider
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct OAuthTokenResponse {
     pub access_token: String,
     #[serde(default)]
@@ -176,6 +233,27 @@ pub struct OAuthTokenResponse {
     pub expires_in: Option<i64>,
     #[serde(default)]
     pub scope: Option<String>,
+}
+
+impl std::fmt::Debug for OAuthTokenResponse {
+    fn fmt(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        f.debug_struct("OAuthTokenResponse")
+            .field("access_token", &loggable::REDACTED)
+            .field(
+                "refresh_token",
+                &self
+                    .refresh_token
+                    .as_ref()
+                    .map(|_| loggable::REDACTED),
+            )
+            .field("token_type", &self.token_type)
+            .field("expires_in", &self.expires_in)
+            .field("scope", &self.scope)
+            .finish()
+    }
 }
 
 /// Consent-required response payload
@@ -276,6 +354,46 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    #[test]
+    fn debug_output_hides_oauth_tokens_and_verifiers() {
+        let rendered = format!("{:?}", make_token(Some(3600), true));
+        assert!(rendered.contains(r#"provider_id: "github""#), "{rendered}");
+        assert!(rendered.contains(r#"refresh_token: Some("<redacted>")"#), "{rendered}");
+        assert!(!rendered.contains("gho_test_access_token"), "{rendered}");
+        assert!(!rendered.contains("gho_test_refresh_token"), "{rendered}");
+
+        let response = format!(
+            "{:?}",
+            OAuthTokenResponse {
+                access_token: "provider-access-token".to_string(),
+                refresh_token: Some("provider-refresh-token".to_string()),
+                token_type: "Bearer".to_string(),
+                expires_in: Some(3600),
+                scope: Some("repo".to_string()),
+            }
+        );
+        assert!(response.contains(r#"scope: Some("repo")"#), "{response}");
+        assert!(!response.contains("provider-access-token"), "{response}");
+        assert!(!response.contains("provider-refresh-token"), "{response}");
+
+        let state = format!(
+            "{:?}",
+            OAuthState {
+                agent_did: "did:web:agent.example.com".to_string(),
+                user_identity_hash: "sha256:abc123".to_string(),
+                surface_id: "surface-1".to_string(),
+                credential_provider_id: "cp-1".to_string(),
+                provider_id: "github".to_string(),
+                nonce: "csrf-nonce-value".to_string(),
+                expires_at: Utc::now(),
+                code_verifier: Some("pkce-code-verifier".to_string()),
+            }
+        );
+        assert!(state.contains(r#"surface_id: "surface-1""#), "{state}");
+        assert!(!state.contains("csrf-nonce-value"), "{state}");
+        assert!(!state.contains("pkce-code-verifier"), "{state}");
     }
 
     #[test]

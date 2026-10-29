@@ -7,6 +7,7 @@ mod access_tokens_pat;
 mod agent_card_preview;
 mod caller_challenge_e2e;
 mod channel_e2e;
+mod connection_point_integration_events_e2e;
 #[cfg(feature = "didwebvh")]
 mod didwebvh_e2e;
 mod event_hook_e2e;
@@ -28,6 +29,10 @@ mod provider_activation_e2e;
 mod surface_save_checks_e2e;
 mod target_auth_provider_e2e;
 mod tr_naming_e2e;
+mod transit_point_headers_e2e;
+mod transit_point_lifecycle_e2e;
+mod transit_source_auth_e2e;
+mod transit_token_e2e;
 mod trust_check_e2e;
 mod trust_check_store_migration;
 mod trust_recorder_status_e2e;

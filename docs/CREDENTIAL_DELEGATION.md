@@ -243,19 +243,20 @@ regard to case (`bearer_header` writes `Authorization`):
 | Card fetch | n/a | Only Target Authentication applies; delegation never runs on it |
 
 The Target credential replaces a caller header of the same name rather than being sent next to it.
-A Transit Point forward, over HTTP or Fabric, follows the same rules: its `static_secret` is
-withheld when a delegated credential header, legacy or modern, already uses the name, and on the
-HTTP leg it replaces an agent-supplied header of the same name. On a sending gateway's direct
-Fabric leg a modern delegated credential takes the place of a same-name `static_secret`, whose
-secret is then not read.
+A Transit Point forward, over HTTP or Fabric, sends a delegated credential, legacy or modern, in
+place of a `static_secret` under the same name, and never forwards a managed agent's header of
+that name; see [Credential headers on a Transit Point](#credential-headers-on-a-transit-point).
+On a sending gateway's direct Fabric leg a modern delegated credential takes the place of a
+same-name `static_secret`, whose secret is then not read.
 On the receiving gateway of a Fabric route a header that arrived in the `ForwardRequest` counts as
 a delegated credential; see [Target authentication over Fabric](FABRIC.md#target-authentication-over-fabric).
 An operator who needs both credentials on one surface uses a `custom_header` for one of them.
 
 A delegated credential that cannot be written as a valid header, or into the MCP `_meta` field,
 is never skipped: the request is answered 500 with a fixed detail such as
-`Invalid delegated credential header`, on Access Points, Transit Points, a sending gateway's
-Fabric leg and the receiving gateway alike.
+`Invalid delegated credential header`, on Access Points, a sending gateway's Fabric leg and the
+receiving gateway alike. A Transit Point refuses it, including duplicate modern delegated headers,
+with `503` as described in [When a credential cannot be resolved](#when-a-credential-cannot-be-resolved).
 
 The gateway's own agent card reads that attach Target Authentication are the card route behind
 `/.well-known/agent-card.json` and the receiving gateway's policy context, both through
@@ -373,14 +374,15 @@ user's token and may be appliance-wide for a tenant surface. The rule is checked
   surface of another tenant to a type that sends the gateway's credential, is refused with 409.
 - Each request checks it again, on Access Points, Transit Points and Fabric receive, so a
   record stored before the rule or edited on disk sends nothing and requests no token. Legacy
-  resolution skips the binding with outcome `not_applicable` and detail `provider_forbidden`;
-  modern preparation refuses the request as a binding mismatch.
+  resolution refuses the request with 503, outcome `provider_unavailable` and detail
+  `provider_forbidden`, as it does for a binding whose provider no longer exists; modern
+  preparation refuses the request as a binding mismatch.
 
-An `all` binding applies on every Transit Point of the surface, so every partner upstream
-behind them receives the delegated credential. A surface with no `outbound_credentials` reads
-a Transit Point's `transit_credentials` as an `all` binding on that Transit Point only. Use an
-`all` binding in `outbound_credentials` only when every Transit Point's upstream should hold the
-credential.
+An `all` binding in `outbound_credentials` applies on every Transit Point of the surface, so
+every partner upstream behind them receives the delegated credential; use it only when every
+Transit Point's upstream should hold the credential. A surface with no `outbound_credentials`
+applies each Transit Point's own `transit_credentials` on that Transit Point only. A surface
+with `outbound_credentials` ignores `transit_credentials`.
 
 A binding to an `oauth2_jwt_bearer` provider also needs what `credential_provider` Target
 Authentication needs: the surface must authenticate its callers, and every leg the binding
@@ -391,10 +393,23 @@ to `oauth2_jwt_bearer` where it would break is refused with 409. Each request ch
 again for the leg it is on, so a record edited on disk never sends the gateway's token on such a
 leg: on the HTTP Target leg the upstream URL must also stay under the Target base, and a
 sending gateway's `fabric://` leg always fails it. Legacy resolution, on Access Points, Transit
-Points and Fabric receive, skips the binding with outcome `not_applicable` and detail
-`jwt_bearer_leg_forbidden` and forwards the request without that credential. Modern MCP
+Points and Fabric receive, refuses the request with 503, outcome `provider_unavailable` and
+detail `jwt_bearer_leg_forbidden`, and never forwards it without that credential. Modern MCP
 delegation refuses the request with 403 `MCP credential authorization denied`. Client
 Credentials and API key bindings are not subject to this rule.
+
+### Credential headers on a Transit Point
+
+A Transit Point sends its target at most one value of each credential header, by the same
+rule over HTTP and Fabric. It starts from the managed agent's headers, without the agent's
+`Authorization` and `Cookie` and without a header named like the Transit Point's
+`target_auth` header, whether or not the gateway adds that header to this request. It then
+adds the `target_auth` header, and then the `bearer_header` and `custom_header` credentials of
+its bindings, each replacing any earlier header of the same name. On a `2026-07-28` MCP
+request, the credentials prepared for `outbound_credentials` are applied last in the same
+way. So the managed agent can neither supply nor replace a credential, and a delegated
+credential under the same name as `target_auth` replaces it; give them different names to
+send both.
 
 ## When a token is missing
 
@@ -411,7 +426,8 @@ authenticated caller, the consent mode decides what happens the first time.
 `elicit` needs an MCP client that advertised the `elicitation` capability during
 `initialize`, and a capability record for its session. `elicit_fallback` decides
 what happens when either is missing: `on_demand`, the default, degrades to the 401
-response, and `fail` fails the tool call with a JSON-RPC error. Elicit falls back when:
+response, and `fail` records `elicitation_unsupported` and forwards the tool call without
+the credential. Elicit falls back when:
 
 - the client did not advertise `elicitation`;
 - the upstream returned a session id already in use on the surface (see "MCP session
@@ -419,6 +435,46 @@ response, and `fail` fails the tool call with a JSON-RPC error. Elicit falls bac
 - the gateway has no capability record for the session, because the upstream answered
   `initialize` with SSE, sent an unusable `Mcp-Session-Id`, or the gateway restarted
   after the session opened.
+
+A user who declines or cancels the elicitation, or does not answer before
+`elicit_timeout_secs`, also has the call forwarded without it.
+
+### When a credential cannot be resolved
+
+A binding that applies but whose credential cannot be resolved refuses the request rather
+than forwarding it without the credential. That covers a deleted or unreadable provider, an
+API key whose secret cannot be read, a failed client-credentials or JWT bearer grant that
+leaves no valid token to send (legacy delegation sends a still-valid cached token instead; see
+[Delegation vault](#delegation-vault)), a vault read error, and consent that is needed but cannot be asked for because no authorization URL can be
+built, for example when the provider has no `authorization_endpoint`. An Access Point and
+Fabric receive answer `503`: on an MCP surface a JSON-RPC error (`-32603`, `Delegated
+credentials unavailable`) carrying the request's id, otherwise an `application/problem+json`
+body. The delegation audit records the binding's outcome, and `provider_unavailable` names a
+provider that cannot be used.
+
+A Transit Point refuses such a request with `503`, and also refuses with `403` one whose
+transit token carries no caller identity, including every request to a Transit Point that sets
+`require_transit_token: false`, or for which neither its managed identity nor the transit
+token's caller DID gives the agent half of the vault key. It also refuses when its delegation
+stores are not available. An MCP Transit Point answers with a JSON-RPC error (`-32603` for
+`503`, `-32001` for `403`) carrying the request's id, and any other Transit Point with an
+`application/problem+json` body. A missing token still gets the consent answer above. A
+Transit Point forwards a `GET` of a public discovery path, such as an agent card, without
+checking a transit token, so it carries no caller, and it is forwarded without a delegated
+credential, as it is without the `target_auth` one.
+
+Outside these checks a request is still forwarded without the credential: on an Access Point
+or Fabric receive whose delegation stores are not available, on Fabric receive for a request
+with no user identity, and on the `elicit` outcomes above. A binding whose provider is outside
+the surface's tenant (`provider_forbidden`), or that would send an `oauth2_jwt_bearer` token on
+a leg that may not carry it (`jwt_bearer_leg_forbidden`), is refused like a deleted provider
+(see [Binding a provider to a surface](#binding-a-provider-to-a-surface)).
+
+A grant is looked up by the managed agent's DID, the caller's identity hash and the provider,
+not by surface or Transit Point. Surfaces that share an agent DID, such as surfaces whose
+managed identity is derived from the same JWT claim, therefore release to each other the
+grants a user consented to on either. A Transit Point never looks a grant up under a
+placeholder agent.
 
 ## Across Fabric
 
@@ -514,7 +570,8 @@ lifetime runs from the time the current token was granted, so a short-lived toke
 renewed halfway through its life rather than on every request. If that grant fails while
 the cached token is still valid, the cached token is injected and the audit detail ends in
 `_stale`. A cached token with no recorded expiry is renewed on its next use and is never
-injected when that grant fails. A cached token granted before the provider was last
+injected when that grant fails. A failed grant that leaves no valid token refuses the request;
+see [When a credential cannot be resolved](#when-a-credential-cannot-be-resolved). A cached token granted before the provider was last
 edited is never used, not even as a `_stale` fallback, so a changed subject, issuer, key,
 token endpoint or scope set takes effect on the next request. Grants are not coalesced:
 requests that reach the refresh point together can each send a grant, and the last token

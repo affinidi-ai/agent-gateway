@@ -13,9 +13,9 @@ changes:
         such a provider is refused on save (400), and a retype to this type is refused (409),
         unless the surface authenticates its callers and every leg the binding reaches is https, so
         the gateway's own token never goes in cleartext or to callers nobody authenticated. The
-        same rule is checked on every request: a binding that fails it there is skipped with the
-        detail jwt_bearer_leg_forbidden, and a modern MCP request that would need it is refused
-        with 403.
+        same rule is checked on every request: a binding that fails it there refuses the request
+        with 503 and the detail jwt_bearer_leg_forbidden, and a modern MCP request that would need
+        it is refused with 403.
     - timestamp: '2026-10-21T11:54:05Z'
       title: ⭐ Discover and pin authorization server metadata on JWT strategies
       description: >-
@@ -281,13 +281,13 @@ changes:
         agent_gateway_storage_load_errors_total with the reason invalid_json, migration_failed or
         unreadable_record, so a skipped record is visible without reading logs.
     - timestamp: '2026-10-29T12:00:00Z'
-      title: Answer invalid delegated credential headers with 500 on every path
+      title: Answer invalid delegated credential headers with 500 on Access Points and Fabric
       description: >-
         A delegated credential that cannot be written as a valid header or into MCP metadata now
-        answers 500 with a fixed detail such as "Invalid delegated credential header" on every
-        path. A Transit Point answered 503 for an invalid modern delegated credential and skipped
-        an invalid legacy one, and the receiving gateway of a Fabric route answered 400 "Invalid
-        MCP continuation".
+        answers 500 with a fixed detail such as "Invalid delegated credential header" on an Access
+        Point, a sending gateway's Fabric leg and the receiving gateway of a Fabric route, which
+        answered 400 "Invalid MCP continuation". A Transit Point keeps refusing such a request
+        with 503, as it does any delegated credential it cannot resolve.
   removed:
     - timestamp: '2026-10-21T15:00:00Z'
       title: Remove the OIDC Providers dashboard pages
@@ -363,8 +363,8 @@ changes:
         so a tenant surface could carry an appliance-wide key, or a token granted with the
         operator's client secret or signing key, to an endpoint it chose. Such a provider must now
         belong to the surface's tenant. Saving a surface that breaks the rule is refused with 400,
-        moving either record or retyping a provider into breaking it with 409, and every request
-        skips such a binding without requesting a token. Bindings to an authorization code provider
+        moving either record or retyping a provider into breaking it with 409, and a request that
+        meets such a binding is refused with 503 without requesting a token. Bindings to an authorization code provider
         may still use an appliance-wide provider, because they inject the consenting user's token.
     - timestamp: '2026-10-21T14:25:49Z'
       title: Build the receiving gateway's credentialed card fetch as its own GET

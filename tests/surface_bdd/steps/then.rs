@@ -2144,6 +2144,19 @@ fn response_is_consent_required_error(
     );
 }
 
+#[then("the consent required error names neither the caller's identity hash nor the managed agent's DID")]
+fn consent_required_error_names_no_caller_or_agent(world: &mut SurfaceWorld) {
+    let body = get_response_body_value(world);
+    let mut fields: Vec<&str> = body
+        .as_object()
+        .unwrap_or_else(|| panic!("expected a consent-required problem body, got {body}"))
+        .keys()
+        .map(String::as_str)
+        .collect();
+    fields.sort_unstable();
+    assert_eq!(fields, ["consent_required", "detail", "status", "title", "type"], "{body}");
+}
+
 #[then(expr = "the response includes an authorization URL for OAuth provider {string}")]
 fn response_includes_authorization_url(
     world: &mut SurfaceWorld,

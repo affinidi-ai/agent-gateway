@@ -181,6 +181,29 @@ pub async fn exchange_code_for_tokens(
     Ok(token_response)
 }
 
+/// The `error` and `error_description` of a token-endpoint error response (RFC 6749
+/// section 5.2), JSON or form-encoded. The rest of the body is never logged or returned:
+/// providers can echo request parameters in it.
+pub(crate) fn token_error_reason(body: &str) -> String {
+    #[derive(serde::Deserialize)]
+    struct TokenErrorBody {
+        error: Option<String>,
+        error_description: Option<String>,
+    }
+
+    let parsed = serde_json::from_str::<TokenErrorBody>(body)
+        .ok()
+        .or_else(|| serde_urlencoded::from_str::<TokenErrorBody>(body).ok());
+    match parsed {
+        Some(TokenErrorBody {
+            error: Some(error),
+            error_description: Some(description),
+        }) => format!("{error}: {description}"),
+        Some(TokenErrorBody { error: Some(error), .. }) => error,
+        _ => "no OAuth error code in response".to_string(),
+    }
+}
+
 /// Refresh an expired access token using a refresh token
 pub async fn refresh_access_token(
     provider: &CredentialProvider,
@@ -853,6 +876,23 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err_msg.contains("not sealed"), "Error should explain plaintext rejection, got: {}", err_msg);
+    }
+
+    #[test]
+    fn token_error_reason_keeps_only_the_oauth_error_fields() {
+        let json_body = r#"{"error":"invalid_grant","error_description":"Code expired","refresh_token":"rt-secret-marker","code":"auth-code-marker"}"#;
+        let form_body = "error=invalid_client&client_secret=cs-secret-marker";
+
+        assert_eq!(token_error_reason(json_body), "invalid_grant: Code expired");
+        assert_eq!(token_error_reason(form_body), "invalid_client");
+        assert_eq!(
+            token_error_reason("<html>upstream echoed token-secret-marker</html>"),
+            "no OAuth error code in response"
+        );
+        assert_eq!(
+            token_error_reason(r#"{"error":{"code":"nested-secret-marker"}}"#),
+            "no OAuth error code in response"
+        );
     }
 
     #[test]

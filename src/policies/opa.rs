@@ -236,7 +236,7 @@ impl OpaEngine {
         let input_json =
             serde_json::to_string(context).map_err(|e| format!("Failed to serialize MCP context: {}", e))?;
 
-        debug!("Evaluating MCP tool policy with context: {}", input_json);
+        debug!("Evaluating MCP tool policy for method {}", context.mcp.method);
 
         engine
             .set_input_json(&input_json)
@@ -429,6 +429,38 @@ deny_reason = "surface tool deny" if {
             .unwrap();
         assert!(!decision.allow);
         assert_eq!(decision.reason.as_deref(), Some("surface tool deny"));
+    }
+
+    #[test]
+    fn mcp_tool_policy_evaluation_logs_neither_tool_arguments_nor_claims() {
+        let engine = OpaEngine::new();
+        engine
+            .load_policy("test", "package surface.policy\n\ndefault allow = false\n")
+            .unwrap();
+        let mut jwt_claims = std::collections::HashMap::new();
+        jwt_claims.insert("email".to_string(), serde_json::json!("claim-value-marker@example.com"));
+        let context = crate::mcp::McpPolicyContext::new(
+            "tools/call".to_string(),
+            Some(serde_json::json!({"name": "send", "arguments": {"text": "tool-argument-marker"}})),
+            Some(jwt_claims),
+            "test-channel".to_string(),
+            None,
+            "mcp".to_string(),
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/".to_string(),
+        );
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        let decision = engine
+            .evaluate_mcp_tool_policy(&context)
+            .unwrap();
+
+        assert!(!decision.allow);
+        let text = logs.text();
+        assert!(text.contains("Evaluating MCP tool policy for method tools/call"), "{text}");
+        assert!(!text.contains("tool-argument-marker"), "a log holds a tool argument: {text}");
+        assert!(!text.contains("claim-value-marker"), "a log holds a JWT claim value: {text}");
     }
 
     #[test]

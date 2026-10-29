@@ -513,7 +513,7 @@ impl Default for McpConfig {
 }
 
 /// A single log redaction rule: a regex pattern and its replacement string.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LogRedactionRule {
     /// Human-readable label for this rule (e.g. "JWT tokens")
     #[serde(default)]
@@ -527,15 +527,32 @@ pub struct LogRedactionRule {
 }
 
 /// Log redaction configuration — loaded from gateway.json `logging.redaction`.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+/// Redaction is on unless `enabled` is `false`; without `rules`, the built-in rules apply.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogRedactionConfig {
     /// Master switch — when false, no redaction is performed
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub enabled: bool,
 
     /// Ordered list of regex→replacement rules applied to every log line
-    #[serde(default)]
+    #[serde(default = "crate::observability::log_redact::built_in_rules")]
     pub rules: Vec<LogRedactionRule>,
+}
+
+impl Default for LogRedactionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            rules: crate::observability::log_redact::built_in_rules(),
+        }
+    }
+}
+
+impl LogRedactionConfig {
+    /// Whether this is the default: enabled with the built-in rules.
+    pub fn is_built_in(&self) -> bool {
+        self.enabled && self.rules == crate::observability::log_redact::built_in_rules()
+    }
 }
 
 /// Logging configuration
@@ -552,8 +569,8 @@ pub struct LoggingConfig {
     /// Directory to write log files (optional, logs to stdout if not set)
     pub log_directory: Option<String>,
 
-    /// PII / secret redaction rules applied to all log output
-    #[serde(default)]
+    /// PII / secret redaction rules applied to all log output. Read from gateway.json only.
+    #[serde(default, skip_serializing_if = "LogRedactionConfig::is_built_in")]
     pub redaction: LogRedactionConfig,
 }
 
@@ -2051,13 +2068,25 @@ pub struct A2AMethodFilter {
 }
 
 /// Facilitator key configuration with private key and derived address
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct FacilitatorKeyConfig {
     /// Private key (hex-encoded, 0x-prefixed) or environment variable reference (e.g., "$FACILITATOR_KEY_BASE")
     pub private_key: String,
 
     /// Ethereum address derived from the private key (public information, doesn't need to be obfuscated)
     pub address: String,
+}
+
+impl std::fmt::Debug for FacilitatorKeyConfig {
+    fn fmt(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        f.debug_struct("FacilitatorKeyConfig")
+            .field("private_key", &crate::observability::loggable::REDACTED)
+            .field("address", &self.address)
+            .finish()
+    }
 }
 
 /// x402 protocol configuration
@@ -2671,7 +2700,8 @@ pub struct StoragePaths {
     #[serde(default = "default_mpp_transactions_storage_path")]
     pub mpp_transactions: String,
 
-    /// Path to store session data (persistent sessions across restarts)
+    /// Path to store session data (persistent sessions across restarts). DID Auth
+    /// sessions are kept in its `didauth` subdirectory.
     #[serde(default = "default_sessions_storage_path")]
     pub sessions: String,
 
@@ -2771,6 +2801,40 @@ impl Default for StoragePaths {
             backup_restore: default_backup_restore_storage_path(),
             identity_hash_pepper: default_identity_hash_pepper_file_path(),
         }
+    }
+}
+
+/// A configured key or key source that `Debug` prints as redacted.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SecretValue(String);
+
+impl std::ops::Deref for SecretValue {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for SecretValue {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for SecretValue {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
+    }
+}
+
+impl std::fmt::Debug for SecretValue {
+    fn fmt(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        std::fmt::Debug::fmt(crate::observability::loggable::REDACTED, f)
     }
 }
 
@@ -2875,11 +2939,11 @@ pub struct BootstrapConfig {
     /// `file://path` reference. `aws_secrets://` / `aws_parameter_store://` are not
     /// supported. Absent from config = a parse error; empty or unresolvable = the
     /// service fails to start.
-    pub backup_encryption_key: String,
+    pub backup_encryption_key: SecretValue,
 
     /// Optional source resolving to up to four ordered, comma-separated previous backup keys.
     #[serde(default)]
-    pub legacy_backup_encryption_keys: Option<String>,
+    pub legacy_backup_encryption_keys: Option<SecretValue>,
 
     /// Trust Registry runtime tunables (Q3 resource name toggle etc.).
     #[serde(default)]
@@ -3514,7 +3578,7 @@ mod outbound_config_tests {
                     "alias": *a,
                     "target_endpoint": "https://example.com",
                     "protocol": "a2a",
-                    "gateway_url": format!("https://gw.internal:9000/outgoing/test/{}", a),
+                    "gateway_url": format!("https://gw.internal:9000/outbound/test/{}", a),
                     "require_transit_token": false,
                 })
             })
@@ -3664,6 +3728,28 @@ mod outbound_config_tests {
                 .iter()
                 .any(|e: &String| e.contains("lowercase"))
         );
+    }
+
+    #[test]
+    fn validate_outbound_warns_that_transit_source_auth_refuses_every_request() {
+        let mut surface = surface_with_outbound(true, &["partner-a"]);
+        surface
+            .transit
+            .as_mut()
+            .unwrap()
+            .shared
+            .source_auth = Some(
+            serde_json::from_value(json!({
+                "type": "api_key",
+                "extraction": { "source": "http_header", "field": "X-API-Key" },
+                "secret_id": "transit-caller-key"
+            }))
+            .unwrap(),
+        );
+
+        let errors = surface.validate_outbound();
+
+        assert_eq!(errors, vec![crate::config::agent_surface::TRANSIT_SOURCE_AUTH_REFUSED.to_string()]);
     }
 
     // ── Listener backward-compat ─────────────────────────────────────────────
@@ -4315,5 +4401,131 @@ mod x402_storage_config_tests {
                 .contains("invalid type"),
             "unexpected error: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod log_redaction_config_tests {
+    use super::*;
+    use crate::observability::log_redact::built_in_rules;
+
+    fn rule_names(config: &LogRedactionConfig) -> Vec<String> {
+        config
+            .rules
+            .iter()
+            .map(|rule| rule.name.clone())
+            .collect()
+    }
+
+    fn built_in_rule_names() -> Vec<String> {
+        built_in_rules()
+            .into_iter()
+            .map(|rule| rule.name)
+            .collect()
+    }
+
+    #[test]
+    fn test_logging_without_redaction_section_enables_built_in_rules() {
+        let logging: LoggingConfig = serde_json::from_str("{}").expect("parses");
+
+        assert!(logging.redaction.enabled);
+        assert_eq!(rule_names(&logging.redaction), built_in_rule_names());
+        assert!(!built_in_rule_names().is_empty());
+    }
+
+    #[test]
+    fn test_redaction_section_without_enabled_or_rules_enables_built_in_rules() {
+        let logging: LoggingConfig = serde_json::from_str(r#"{"redaction": {}}"#).expect("parses");
+
+        assert!(logging.redaction.enabled);
+        assert_eq!(rule_names(&logging.redaction), built_in_rule_names());
+    }
+
+    #[test]
+    fn test_redaction_enabled_false_disables_redaction() {
+        let logging: LoggingConfig = serde_json::from_str(r#"{"redaction": {"enabled": false}}"#).expect("parses");
+
+        assert!(!logging.redaction.enabled);
+    }
+
+    #[test]
+    fn test_redaction_operator_rules_replace_built_in_rules() {
+        let logging: LoggingConfig = serde_json::from_str(
+            r#"{"redaction": {"rules": [{"name": "Ticket ids", "pattern": "TCK-\\d+", "replacement": "[TICKET]"}]}}"#,
+        )
+        .expect("parses");
+
+        assert!(logging.redaction.enabled);
+        assert_eq!(rule_names(&logging.redaction), vec!["Ticket ids".to_string()]);
+        assert_eq!(logging.redaction.rules[0].pattern, r"TCK-\d+");
+    }
+
+    #[test]
+    fn test_bootstrap_logging_table_without_redaction_enables_built_in_rules() {
+        let logging: LoggingConfig = toml::from_str("level = \"info\"\njson = false").expect("parses");
+
+        assert!(logging.redaction.enabled);
+        assert_eq!(rule_names(&logging.redaction), built_in_rule_names());
+    }
+
+    #[test]
+    fn test_default_logging_config_enables_built_in_rules() {
+        let logging = LoggingConfig::default();
+
+        assert!(logging.redaction.enabled);
+        assert!(
+            logging
+                .redaction
+                .is_built_in()
+        );
+        assert_eq!(rule_names(&logging.redaction), built_in_rule_names());
+    }
+
+    #[test]
+    fn test_default_redaction_is_not_serialized_and_reads_back_as_default() {
+        let written = toml::to_string(&LoggingConfig::default()).expect("serializes");
+        assert!(!written.contains("redaction"), "{written}");
+        assert!(written.contains("level = \"info\""), "{written}");
+
+        let read_back: LoggingConfig = toml::from_str(&written).expect("parses");
+        assert!(
+            read_back
+                .redaction
+                .is_built_in()
+        );
+    }
+
+    #[test]
+    fn test_disabled_redaction_is_serialized() {
+        let logging = LoggingConfig {
+            redaction: LogRedactionConfig {
+                enabled: false,
+                ..LogRedactionConfig::default()
+            },
+            ..LoggingConfig::default()
+        };
+
+        let read_back: LoggingConfig =
+            serde_json::from_str(&serde_json::to_string(&logging).expect("serializes")).expect("parses");
+        assert!(!read_back.redaction.enabled);
+    }
+}
+
+#[cfg(test)]
+mod facilitator_key_config_tests {
+    use super::FacilitatorKeyConfig;
+
+    #[test]
+    fn test_facilitator_key_config_debug_redacts_private_key() {
+        let key = FacilitatorKeyConfig {
+            private_key: "test-private-key-marker".to_string(),
+            address: "0x2c7536E3605D9C16a7a3D7b1898e529396a65c23".to_string(),
+        };
+
+        let rendered = format!("{key:?}");
+
+        assert!(!rendered.contains("test-private-key-marker"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(rendered.contains("0x2c7536E3605D9C16a7a3D7b1898e529396a65c23"), "{rendered}");
     }
 }

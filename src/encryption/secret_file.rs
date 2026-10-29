@@ -1,7 +1,7 @@
 //! Encryption-aware whole-file read/write for standalone secret files.
 //!
 //! DID private-key material (connection points, trust registries, departments,
-//! did:webvh identities) and VC issuer keys are persisted as individual JSON
+//! did:webvh identities), VC issuer keys and the transit token signing key are persisted as individual JSON
 //! files *outside* the generic `StorageBackend` layer. These helpers give those
 //! files the same whole-file encryption-at-rest the generic layer provides:
 //!
@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use tracing::{error, warn};
 
 use crate::encryption::EncryptionService;
+use crate::storage::filesystem::{AtomicWriteError, atomic_write_file_with_mode};
 
 /// Path of the whole-file-encrypted sibling for a plaintext secret file.
 pub fn secret_enc_path(path: &Path) -> PathBuf {
@@ -67,7 +68,9 @@ async fn remove_plaintext_sibling(path: &Path) {
         );
         return;
     }
-    if let Err(e) = tokio::fs::remove_file(path).await {
+    if let Err(e) = tokio::fs::remove_file(path).await
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
         crate::metrics::backends::prometheus::track_storage_plaintext_removal_failed("secret_file");
         error!(
             "Failed to delete plaintext secret file {} after encryption; key material may remain on disk: {}",
@@ -77,10 +80,23 @@ async fn remove_plaintext_sibling(path: &Path) {
     }
 }
 
-/// Write a secret file. When encryption at rest is active the content is written
-/// as a whole-file `.enc` blob and any plaintext sibling is removed, so key
-/// material never lingers in plaintext. Otherwise it is written as plaintext and
-/// any stale `.enc` sibling is removed.
+/// Write `bytes` to `path`, readable by its owner only, replacing any previous
+/// file atomically, so a reader sharing the directory sees the previous file or
+/// the new one, never a partly written one.
+async fn write_owner_only(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<()> {
+    atomic_write_file_with_mode(path, bytes, Some(0o600))
+        .await
+        .map_err(|(AtomicWriteError::NotReplaced(error) | AtomicWriteError::ReplacedButUnsynced(error))| error)
+}
+
+/// Write a secret file, readable by its owner only and replaced atomically.
+/// When encryption at rest is active the content is written as a whole-file
+/// `.enc` blob and any plaintext sibling is removed, so key material never
+/// lingers in plaintext. Otherwise it is written as plaintext and any stale
+/// `.enc` sibling is removed.
 pub async fn write_secret_file(
     path: &Path,
     contents: &str,
@@ -91,13 +107,13 @@ pub async fn write_secret_file(
             let ciphertext = service
                 .encrypt_string(contents.to_string())
                 .context("Failed to encrypt secret file")?;
-            tokio::fs::write(&enc_path, ciphertext)
+            write_owner_only(&enc_path, ciphertext.as_bytes())
                 .await
                 .with_context(|| format!("Failed to write encrypted secret file {}", enc_path.display()))?;
             remove_plaintext_sibling(path).await;
         }
         None => {
-            tokio::fs::write(path, contents)
+            write_owner_only(path, contents.as_bytes())
                 .await
                 .with_context(|| format!("Failed to write secret file {}", path.display()))?;
             if enc_path.exists()
@@ -108,6 +124,115 @@ pub async fn write_secret_file(
         }
     }
     Ok(())
+}
+
+/// Create a secret file, in the form [`write_secret_file`] would write, only when
+/// neither form exists yet. The file is readable by its owner only. Returns
+/// `false`, leaving the existing file untouched, when the file already exists,
+/// including when another process sharing the directory creates it at the same
+/// moment: the content is written in full to a temporary file and then
+/// hard-linked into place, which fails rather than replacing a file, so exactly
+/// one creator wins and no reader sees a partly written file. The directory must
+/// therefore support hard links; one that does not fails the creation with an
+/// error saying so.
+pub async fn create_secret_file(
+    path: &Path,
+    contents: &str,
+) -> Result<bool> {
+    let enc_path = secret_enc_path(path);
+    if path.exists() || enc_path.exists() {
+        return Ok(false);
+    }
+    let (target, bytes) = match active_encryption() {
+        Some(service) => (
+            enc_path,
+            service
+                .encrypt_string(contents.to_string())
+                .context("Failed to encrypt secret file")?,
+        ),
+        None => (path.to_path_buf(), contents.to_string()),
+    };
+    let mut staged = target
+        .as_os_str()
+        .to_os_string();
+    staged.push(format!(".{}.new", uuid::Uuid::new_v4()));
+    let staged = PathBuf::from(staged);
+    if let Err(error) = write_owner_only(&staged, bytes.as_bytes()).await {
+        let _ = tokio::fs::remove_file(&staged).await;
+        return Err(error).with_context(|| format!("Failed to write secret file {}", target.display()));
+    }
+    let linked = tokio::fs::hard_link(&staged, &target).await;
+    if let Err(error) = tokio::fs::remove_file(&staged).await {
+        warn!("Failed to remove staged secret file {}: {}", staged.display(), error);
+    }
+    match linked {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "Failed to create secret file {} by hard-linking a complete copy into place; its directory must be on \
+                 a filesystem that supports hard links",
+                target.display()
+            )
+        }),
+    }
+}
+
+/// Restrict a secret file, in whichever form exists, to its owner, when it was
+/// written with the process default mode, as a restore writes every file. A
+/// failure is logged and does not stop the caller.
+pub async fn restrict_secret_file_to_owner(path: &Path) {
+    #[cfg(unix)]
+    for path in [path.to_path_buf(), secret_enc_path(path)] {
+        use std::os::unix::fs::PermissionsExt;
+
+        let Ok(metadata) = tokio::fs::metadata(&path).await else {
+            continue;
+        };
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 == 0 {
+            continue;
+        }
+        match tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await {
+            Ok(()) => tracing::info!(
+                path = %path.display(),
+                previous_mode = format!("{mode:o}"),
+                "Restricted secret file to its owner"
+            ),
+            Err(error) => warn!("Failed to restrict secret file {} to its owner: {}", path.display(), error),
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+/// The content of `path`, or `None` when it does not exist.
+async fn read_if_present(path: &Path) -> std::io::Result<Option<String>> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(content) => Ok(Some(content)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// The decrypted `.enc` sibling of `path`, removing any plaintext beside it, or
+/// `None` when there is no `.enc` sibling.
+async fn read_encrypted_secret_file(
+    service: &EncryptionService,
+    path: &Path,
+) -> Result<Option<String>> {
+    let enc_path = secret_enc_path(path);
+    let Some(ciphertext) = read_if_present(&enc_path)
+        .await
+        .with_context(|| format!("Failed to read encrypted secret file {}", enc_path.display()))?
+    else {
+        return Ok(None);
+    };
+    let plaintext = service
+        .decrypt_string(ciphertext)
+        .with_context(|| format!("Failed to decrypt secret file {}", enc_path.display()))?;
+    remove_plaintext_sibling(path).await;
+    Ok(Some(plaintext))
 }
 
 /// Read a secret file, transparently decrypting the whole-file `.enc` sibling
@@ -129,25 +254,21 @@ pub async fn read_secret_file(path: &Path) -> Result<Option<String>> {
     let enc_path = secret_enc_path(path);
     match active_encryption() {
         Some(service) => {
-            if enc_path.exists() {
-                let ciphertext = tokio::fs::read_to_string(&enc_path)
-                    .await
-                    .with_context(|| format!("Failed to read encrypted secret file {}", enc_path.display()))?;
-                let plaintext = service
-                    .decrypt_string(ciphertext)
-                    .with_context(|| format!("Failed to decrypt secret file {}", enc_path.display()))?;
-                remove_plaintext_sibling(path).await;
-                Ok(Some(plaintext))
-            } else if path.exists() {
-                let content = tokio::fs::read_to_string(path)
-                    .await
-                    .with_context(|| format!("Failed to read secret file {}", path.display()))?;
-                // Migrate plaintext-only to whole-file encryption, then drop the plaintext.
-                write_secret_file(path, &content).await?;
-                Ok(Some(content))
-            } else {
-                Ok(None)
+            if let Some(plaintext) = read_encrypted_secret_file(&service, path).await? {
+                return Ok(Some(plaintext));
             }
+            let Some(content) = read_if_present(path)
+                .await
+                .with_context(|| format!("Failed to read secret file {}", path.display()))?
+            else {
+                // Another instance sharing the directory may have migrated the file
+                // between the two reads, removing the plaintext once its `.enc` was
+                // in place.
+                return read_encrypted_secret_file(&service, path).await;
+            };
+            // Migrate plaintext-only to whole-file encryption, then drop the plaintext.
+            write_secret_file(path, &content).await?;
+            Ok(Some(content))
         }
         None => {
             if path.exists() {
@@ -265,6 +386,57 @@ mod tests {
         assert!(!path.exists(), "plaintext should be gone after migration");
     }
 
+    #[cfg(unix)]
+    fn file_mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn written_and_migrated_secret_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let written = dir
+            .path()
+            .join("written.json");
+        write_secret_file(&written, "{\"secret\":\"written\"}")
+            .await
+            .unwrap();
+        assert_eq!(file_mode(&written), 0o600);
+
+        install_enabled_encryption();
+        let legacy = dir.path().join("legacy.json");
+        std::fs::write(&legacy, "{\"secret\":\"legacy\"}").unwrap();
+        std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        read_secret_file(&legacy)
+            .await
+            .unwrap();
+
+        assert_eq!(file_mode(&secret_enc_path(&legacy)), 0o600, "the migrated ciphertext is owner-only");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_restored_secret_file_is_restricted_to_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key.json");
+        std::fs::write(&path, "{\"secret\":\"restored\"}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        restrict_secret_file_to_owner(&path).await;
+
+        assert_eq!(file_mode(&path), 0o600);
+    }
+
     #[tokio::test]
     async fn read_returns_none_when_absent() {
         let dir = tempfile::tempdir().unwrap();
@@ -294,6 +466,99 @@ mod tests {
         assert!(msg.contains("encryption at rest"), "error must explain the encryption-disabled cause, got: {msg}");
         // The unreadable ciphertext is left intact for recovery.
         assert!(secret_enc_path(&path).exists(), "encrypted sibling must not be deleted");
+    }
+
+    #[tokio::test]
+    async fn create_writes_an_owner_only_file_once_and_never_replaces_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key.json");
+
+        assert!(
+            create_secret_file(&path, "first")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !create_secret_file(&path, "second")
+                .await
+                .unwrap()
+        );
+
+        assert_eq!(
+            read_secret_file(&path)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("first")
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path)
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("key.json")], "no staged file may be left behind");
+    }
+
+    #[tokio::test]
+    async fn create_lets_exactly_one_of_two_concurrent_creators_win() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key.json");
+
+        let (first, second) = tokio::join!(create_secret_file(&path, "first"), create_secret_file(&path, "second"));
+        let (first, second) = (first.unwrap(), second.unwrap());
+
+        assert!(first ^ second, "exactly one creator must win, got {first} and {second}");
+        let winner = if first {
+            "first"
+        } else {
+            "second"
+        };
+        assert_eq!(
+            read_secret_file(&path)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(winner)
+        );
+    }
+
+    #[tokio::test]
+    async fn create_writes_only_ciphertext_when_encryption_is_enabled() {
+        install_enabled_encryption();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key.json");
+
+        assert!(
+            create_secret_file(&path, "{\"secret\":\"material\"}")
+                .await
+                .unwrap()
+        );
+
+        assert!(!path.exists(), "plaintext must never be written");
+        let on_disk = std::fs::read_to_string(secret_enc_path(&path)).unwrap();
+        assert!(on_disk.starts_with("ENC["), "on-disk value must be an envelope, got: {on_disk}");
+        assert!(!on_disk.contains("material"));
+        assert!(
+            !create_secret_file(&path, "other")
+                .await
+                .unwrap(),
+            "an encrypted file counts as existing"
+        );
+        assert_eq!(
+            read_secret_file(&path)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("{\"secret\":\"material\"}")
+        );
     }
 
     #[tokio::test]

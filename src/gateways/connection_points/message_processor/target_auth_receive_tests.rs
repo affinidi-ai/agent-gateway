@@ -758,6 +758,13 @@ async fn fabric_delegated_credentials_reach_the_target_and_a_jwt_bearer_binding_
         })
         .await
         .expect("signing key secret");
+    receiver
+        .auth_server
+        .register_jwt_client(crate::component_tests::helpers::mock_auth_server::JwtBearerClient {
+            iss: "https://agent.example".into(),
+            sub: "https://agent.example".into(),
+            keys: vec![crate::component_tests::helpers::oidc_keys::SigningFixture::es256(0).with_kid("key-1")],
+        });
     for provider in [
         json!({"id": "cp-upstream", "name": "upstream", "provider_id": "upstream", "provider_type": "api_key",
             "api_key_secret_ref": "UPSTREAM_KEY"}),
@@ -885,6 +892,14 @@ async fn fabric_delegated_credentials_reach_the_target_and_a_jwt_bearer_binding_
             .token_request_count(),
         1,
         "a permitted leg requests the gateway token"
+    );
+    assert!(
+        receiver
+            .last_request()
+            .headers
+            .get("authorization")
+            .is_some_and(|value| value.starts_with("Bearer ")),
+        "the granted gateway token reaches the Target"
     );
 }
 

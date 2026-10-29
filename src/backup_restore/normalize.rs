@@ -10,10 +10,13 @@
 //! is a pass-through in that mode, so a key-source-backed service is built instead
 //! (see [`backup_decryption_service`]).
 
+use std::path::Path;
+
 use serde_json::Value;
 use tracing::warn;
 
 use crate::encryption::EncryptionService;
+use crate::observability::loggable;
 
 /// Decrypt every `ENC[...]` string value in a `.json` storage file for a portable
 /// backup, using the provided field-encryption service.
@@ -58,7 +61,7 @@ pub(crate) fn backup_entry_for_file(
                 warn!(
                     "Portable backup: could not decrypt whole-file blob {} — keeping it encrypted \
                      in the archive. Configure the encryption key source to make this backup portable.",
-                    relative_path
+                    loggable::record_path(Path::new(relative_path)).display()
                 );
                 (relative_path.to_string(), bytes.to_vec())
             }
@@ -304,6 +307,18 @@ mod tests {
         let (name, out) = backup_entry_for_file("identity/x.json.enc", input, None);
         assert_eq!(name, "identity/x.json.enc");
         assert_eq!(out, input.to_vec());
+    }
+
+    #[test]
+    fn undecryptable_whole_file_blob_is_logged_by_its_directory_only() {
+        let session_file = "sessions/0f2c9d7e-1b3a-4c5d-8e9f-a0b1c2d3e4f5.json.enc";
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        backup_entry_for_file(session_file, b"ENC[v1:not-decryptable]", None);
+
+        let text = logs.text();
+        assert!(text.contains("could not decrypt whole-file blob sessions/<redacted>"), "{text}");
+        assert!(!text.contains("0f2c9d7e"), "{text}");
     }
 
     #[test]

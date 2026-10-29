@@ -145,10 +145,8 @@ const AppContent: React.FC<AuthenticatedAppProps> = ({ onLogout }) => {
 
   // Connect WebSocket on mount ONCE
   useEffect(() => {
-    //console.log('[AuthenticatedApp] Mounting - connecting WebSocket');
     actions.connectWebSocket();
     return () => {
-      //console.log('[AuthenticatedApp] Unmounting - disconnecting WebSocket');
       actions.disconnectWebSocket();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -206,7 +204,6 @@ const AppContent: React.FC<AuthenticatedAppProps> = ({ onLogout }) => {
               .fetch(`/api/v1/version`)
               .then(response => response.json())
               .then(data => {
-                console.info('version:', JSON.stringify(data));
                 setVersion(data.version);
               })
               .catch(error => {

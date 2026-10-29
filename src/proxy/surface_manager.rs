@@ -397,21 +397,6 @@ impl SurfaceTaskManager {
             port_states.clear();
         }
 
-        // Drop cached outbound channel state so the rebuilt outbound
-        // listeners repopulate it from the new config. `run_outbound_port_server`
-        // reuses any existing `OutboundSurfaceState` by `config_id` (so a
-        // channel spanning multiple ports shares one state); without this
-        // clear, a stale surface — e.g. a transit point whose `target_endpoint`
-        // was switched from `fabric://…` back to a direct URL — would survive
-        // the reload and the gateway would keep routing to the old destination.
-        {
-            let mut outbound_states = self
-                .outbound_channel_states
-                .write()
-                .expect("outbound_channel_states lock poisoned");
-            outbound_states.clear();
-        }
-
         // Step 2: Drop stale TaskInfo entries proactively. Aborting a
         // port listener cancels the `axum_server::serve(...).await`
         // point, so the post-await cleanup in `run_port_server` that
@@ -510,6 +495,43 @@ impl SurfaceTaskManager {
         let outbound_ports = network_config.get_outbound_ports();
         let outbound_channels_by_port =
             crate::config::group_outbound_vcs_by_port(&active_surfaces, &outbound_ports, map_outbound_address_to_port);
+
+        // Routes on a connection kept alive past the rebuild still hold the
+        // outbound state of the surface they were built for, so that state is
+        // kept and updated in place, never replaced: a surface still served
+        // gets its new configuration written into its state before any
+        // listener is rebuilt; the state of a surface no longer served,
+        // because it was deleted, disabled, emptied or no longer maps to an
+        // outbound listener, is retired, and dropped once the surface is gone.
+        {
+            let served: HashMap<&str, &crate::config::agent_surface::AgentSurface> = outbound_channels_by_port
+                .values()
+                .flatten()
+                .filter_map(|(surface, _)| {
+                    surface
+                        .config_id()
+                        .map(|config_id| (config_id, surface))
+                })
+                .collect();
+            let mut outbound_states = self
+                .outbound_channel_states
+                .write()
+                .expect("outbound_channel_states lock poisoned");
+            outbound_states.retain(|config_id, state| {
+                if let Some(surface) = served.get(config_id.as_str()) {
+                    state
+                        .write()
+                        .expect("outbound channel_state lock poisoned")
+                        .surface = Arc::new((*surface).clone());
+                    return true;
+                }
+                crate::proxy::server::retire_outbound_channel_state(state);
+                new_config
+                    .surfaces
+                    .iter()
+                    .any(|surface| surface.config_id() == Some(config_id.as_str()))
+            });
+        }
 
         info!("Grouped {} channels across {} configured ports", channels_count, channels_by_port.len());
 
@@ -628,18 +650,12 @@ impl SurfaceTaskManager {
             if listener_type == "outbound" {
                 // ── Outbound listener ────────────────────────────────────────
                 // Use the dedicated outbound_channels_by_port map (built from outbound_listen_address).
+                // A port without Transit Points is bound anyway, as at startup, so it keeps
+                // answering `/alive`.
                 let outbound_channels = outbound_channels_by_port
                     .get(&port)
                     .cloned()
                     .unwrap_or_default();
-
-                if outbound_channels.is_empty() {
-                    info!("Outbound listener on port {} has no enabled outbound channels — skipping", port);
-                    // Still need to insert a dummy handle so the port counts as running.
-                    let handle = tokio::spawn(std::future::pending::<()>());
-                    new_port_handles.insert(port, handle.abort_handle());
-                    continue;
-                }
 
                 let bind_address = listener_info
                     .map(|l| l.bind_address.clone())
@@ -702,7 +718,7 @@ impl SurfaceTaskManager {
             }
 
             info!(
-                "Reloading port listener on 0.0.0.0:{} for {} channel(s), protocol: {}",
+                "Reloading port listener on port {} for {} channel(s), protocol: {}",
                 port,
                 channels.len(),
                 if use_tls {
@@ -969,10 +985,9 @@ impl SurfaceTaskManager {
                 t.outbound_listen_address
                     .clone()
             });
-        let surface_has_outbound = new_surface
-            .transit
-            .as_ref()
-            .is_some_and(|t| !t.points.is_empty());
+        let surface_has_outbound = !new_surface
+            .transit_points()
+            .is_empty();
 
         // Step 1: Update the channel in the configuration first
         let port: u16;
@@ -1403,11 +1418,18 @@ impl SurfaceTaskManager {
         // virtual channels or changing the route prefix requires a listener restart.
         let previous_surface_has_outbound = previous_surface
             .as_ref()
-            .is_some_and(|s| {
-                s.transit
-                    .as_ref()
-                    .is_some_and(|t| !t.points.is_empty())
-            });
+            .is_some_and(|s| !s.transit_points().is_empty());
+        if previous_surface_has_outbound
+            && !surface_has_outbound
+            && let Some(config_id) = new_surface.config_id()
+            && let Some(state) = self
+                .outbound_channel_states
+                .read()
+                .expect("outbound_channel_states lock poisoned")
+                .get(config_id)
+        {
+            crate::proxy::server::retire_outbound_channel_state(state);
+        }
         if surface_has_outbound || previous_surface_has_outbound {
             self.restart_outbound_listener_for_channel(&new_surface, previous_surface.as_ref(), metrics_store)
                 .await?;
@@ -1419,9 +1441,11 @@ impl SurfaceTaskManager {
     /// Surgically remove a single channel from the running gateway by
     /// `config_id` without restarting any port listener. Used by the
     /// surface-delete fast path so deleting one surface does not tear
-    /// down every other channel's tasks. Returns `Ok(true)` if the
-    /// channel was found and removed, `Ok(false)` if it was not present
-    /// (caller can fall back to a full reload if needed).
+    /// down every other channel's tasks. Its Transit Points stop answering at
+    /// once: the outbound state every route of theirs holds is retired, so
+    /// the outbound listeners other surfaces share stay bound. Returns
+    /// `Ok(true)` if the channel was found and removed, `Ok(false)` if it was
+    /// not present (caller can fall back to a full reload if needed).
     pub async fn remove_single_channel(
         &self,
         config_id: &str,
@@ -1499,13 +1523,15 @@ impl SurfaceTaskManager {
         drop(port_states);
 
         // Step 3: drop the outbound channel state if this channel had
-        // outbound enabled.
+        // outbound enabled, retiring it, so every route still holding it, on
+        // a new or a kept-alive connection, refuses each request.
+        if let Some(state) = self
+            .outbound_channel_states
+            .write()
+            .expect("outbound_channel_states lock poisoned")
+            .remove(config_id)
         {
-            let mut states = self
-                .outbound_channel_states
-                .write()
-                .expect("outbound_channel_states lock poisoned");
-            states.remove(config_id);
+            crate::proxy::server::retire_outbound_channel_state(&state);
         }
 
         // Step 4: clean up every TaskInfo for this channel (AP + TPs).
@@ -1631,27 +1657,13 @@ impl SurfaceTaskManager {
                 continue;
             }
 
+            // A listener left without Transit Points is rebuilt with no proxy
+            // routes, as at startup: it keeps answering `/alive` and refuses
+            // the removed routes with 404.
             let outbound_channels = outbound_channels_by_port
                 .get(&outbound_port)
                 .cloned()
                 .unwrap_or_default();
-            if outbound_channels.is_empty() {
-                warn!(
-                    surface = %channel.name,
-                    port = outbound_port,
-                    "No outbound channels remain for listener — stopping outbound listener to clear stale routes"
-                );
-                let mut port_handles = self
-                    .port_listener_handles
-                    .write()
-                    .await;
-                if let Some(handle) = port_handles.remove(&outbound_port) {
-                    handle.abort();
-                }
-                let handle = tokio::spawn(std::future::pending::<()>());
-                port_handles.insert(outbound_port, handle.abort_handle());
-                continue;
-            }
 
             let bind_address = listener_info
                 .map(|l| l.bind_address.clone())

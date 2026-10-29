@@ -197,8 +197,8 @@ attributed to the authenticated actor and records whether it was orphan cleanup.
   `oauth2_client_credentials` or `oauth2_jwt_bearer` provider. A binding to an
   `oauth2_authorization_code` provider may still use a global provider, because the token it
   injects is the consenting user's. A stored record that breaks the rule is refused at use:
-  Target Authentication fails closed, a legacy binding is skipped with the reason
-  `provider_forbidden`, and a modern delegation binding is refused as a binding mismatch. See
+  Target Authentication fails closed, a legacy binding refuses the request with 503 and the
+  reason `provider_forbidden`, and a modern delegation binding is refused as a binding mismatch. See
   [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#target-authentication-through-a-provider)
   and [Binding a provider to a surface](CREDENTIAL_DELEGATION.md#binding-a-provider-to-a-surface).
 - Moving a record to another tenant is refused with 409 when it would break any of these rules,
