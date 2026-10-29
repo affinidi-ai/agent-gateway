@@ -442,6 +442,8 @@ impl AccessPointEvents {
                 protocol: self.protocol(),
             },
             metadata: None,
+            transit: None,
+            source_auth: None,
         };
         let decision = crate::proxy::response_policy::evaluate_response_policy(
             policy_manager,

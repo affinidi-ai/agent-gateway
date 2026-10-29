@@ -3722,6 +3722,13 @@ fn step_transit_point_response_policy(
             protocol: format!("{:?}", ctx.surface.channel_protocol()).to_lowercase(),
         },
         metadata: None,
+        transit: Some(crate::surface_context::TransitContext {
+            caller: outbound_transit_caller(ctx),
+        }),
+        source_auth: ctx
+            .authenticated_identity
+            .as_ref()
+            .map(crate::surface_context::SourceAuthContext::from),
     };
 
     let decision = evaluate_response_policy(pm.as_ref(), &policy_key, input);
@@ -3771,18 +3778,23 @@ fn step_transit_point_response_policy(
 /// The verified caller of a Transit Point call, for `input.transit.caller`. A
 /// verified transit token wins, then a caller the Transit Point authenticated
 /// itself, then a transit token that only names an unverified DID; with neither
-/// the caller is anonymous.
+/// the caller is anonymous. A token caller's `fields` are only those this
+/// Transit Point allowlists, as the token carries every Transit Point's.
 fn outbound_transit_caller(ctx: &OutboundPipelineContext) -> crate::surface_context::TransitCallerContext {
     use crate::surface_context::{TransitCallerContext, TransitCallerVerification};
     let from_token = ctx
         .transit_token_claims
         .as_ref()
         .map(TransitCallerContext::from_transit_token);
-    if let Some(caller) = from_token
-        .as_ref()
+    if let Some(mut caller) = from_token
+        .clone()
         .filter(|caller| caller.verified)
     {
-        return caller.clone();
+        let allowlist = transit_token_caller_fields(&ctx.virtual_channel);
+        caller
+            .fields
+            .retain(|name, _| allowlist.contains(name));
+        return caller;
     }
     if let Some(identity) = ctx
         .authenticated_identity
@@ -3791,6 +3803,23 @@ fn outbound_transit_caller(ctx: &OutboundPipelineContext) -> crate::surface_cont
         return TransitCallerContext::from_authenticated(identity, TransitCallerVerification::ResourceToken);
     }
     from_token.unwrap_or_else(TransitCallerContext::anonymous)
+}
+
+/// The caller claims a Transit Point copies from the transit token: its enabled
+/// workload binding's `caller_context_fields`, when that binding reads the token.
+fn transit_token_caller_fields(point: &TransitPoint) -> &[String] {
+    point
+        .workload_binding
+        .as_ref()
+        .filter(|binding| {
+            binding.enabled && binding.caller_source == crate::config::types::CallerContextSource::TransitToken
+        })
+        .map(|binding| {
+            binding
+                .caller_context_fields
+                .as_slice()
+        })
+        .unwrap_or_default()
 }
 
 /// Build the `PolicyInput` for outbound OPA evaluations.
@@ -10885,9 +10914,22 @@ mod tests {
         );
     }
 
+    fn allowlist_caller_fields(
+        point: &mut TransitPoint,
+        fields: &[&str],
+    ) {
+        point.workload_binding = Some(
+            serde_json::from_value(json!({
+                "enabled": true, "caller_source": "transit_token", "caller_context_fields": fields
+            }))
+            .unwrap(),
+        );
+    }
+
     #[test]
     fn outbound_policy_input_carries_the_verified_caller_of_a_transit_token() {
         let mut ctx = test_pipeline_context();
+        allowlist_caller_fields(&mut ctx.virtual_channel, &["email"]);
         ctx.transit_token_claims = Some(caller_claims(
             Some("did:example:alice-agent"),
             Some("self-presented"),
@@ -10906,6 +10948,44 @@ mod tests {
                 "caller_dna_uai": "uai:1",
                 "fields": { "email": "alice@example.com" }
             })
+        );
+    }
+
+    /// The transit token carries the fields every Transit Point of the surface
+    /// allowlists; a Transit Point's policy sees only those it allowlists itself.
+    #[test]
+    fn outbound_policy_input_carries_only_the_fields_this_transit_point_allowlists() {
+        let mut ctx = test_pipeline_context();
+        ctx.transit_token_claims = Some(caller_claims(
+            None,
+            Some("gateway-computed"),
+            Some("abc123"),
+            json!({ "email": "alice@example.com", "tid": "tenant-1" }),
+        ));
+        allowlist_caller_fields(&mut ctx.virtual_channel, &["tid"]);
+        assert_eq!(transit_caller_json(&ctx)["fields"], json!({ "tid": "tenant-1" }));
+
+        ctx.virtual_channel
+            .workload_binding = None;
+        assert!(
+            transit_caller_json(&ctx)
+                .get("fields")
+                .is_none(),
+            "{}",
+            transit_caller_json(&ctx)
+        );
+
+        allowlist_caller_fields(&mut ctx.virtual_channel, &["email", "tid"]);
+        ctx.virtual_channel
+            .workload_binding
+            .as_mut()
+            .unwrap()
+            .enabled = false;
+        assert!(
+            transit_caller_json(&ctx)
+                .get("fields")
+                .is_none(),
+            "a disabled binding allowlists nothing"
         );
     }
 
@@ -10982,6 +11062,59 @@ mod tests {
         assert_eq!(caller["subject"], "cloud-agent");
         assert_eq!(caller["identity_source"], "api_key");
         assert!(caller.get("did").is_none(), "an unverified DID must not ride along with a verified caller: {caller}");
+    }
+
+    /// A Transit Point response policy reads the caller as its request policies
+    /// do, so a deny-list rule on an anonymous caller holds the response back
+    /// and one on a claim of the verified caller sees that claim.
+    #[test]
+    fn a_transit_point_response_policy_sees_the_caller_of_the_call() {
+        let decide = |ctx: &mut OutboundPipelineContext, rego: &str| {
+            ctx.virtual_channel
+                .response_policy = Some(serde_json::from_value(json!({"policy_definition_id": "response"})).unwrap());
+            let manager = crate::policies::SurfacePolicyManager::new();
+            let key = format!(
+                "response:transit:{}:{}",
+                ctx.surface
+                    .config_id()
+                    .unwrap_or("unknown"),
+                ctx.virtual_channel.alias
+            );
+            manager
+                .load_policy_text(&key, rego)
+                .unwrap();
+            let mut state = test_outbound_state();
+            state.policy_manager = Some(Arc::new(manager));
+            step_transit_point_response_policy(
+                &state,
+                ctx,
+                StatusCode::OK,
+                &Bytes::from_static(br#"{"jsonrpc":"2.0","id":1,"result":{}}"#),
+                &reqwest::header::HeaderMap::new(),
+                &crate::policies::PolicyAttestation::default(),
+            )
+            .is_ok()
+        };
+        let refuse_anonymous = "package surface.policy\n\ndefault allow := true\n\n\
+                                allow := false if input.transit.caller.verification == \"anonymous\"\n";
+        let only_tenant = "package surface.policy\n\ndefault allow := false\n\n\
+                           allow if {\n    input.transit.caller.verified\n    \
+                           input.source_auth.claims.tid == \"tenant-1\"\n}\n";
+
+        let mut anonymous = test_pipeline_context();
+        assert!(!decide(&mut anonymous, refuse_anonymous), "the response to an anonymous caller is held back");
+
+        let mut verified = test_pipeline_context();
+        verified.transit_token_claims = Some(caller_claims(None, Some("gateway-computed"), Some("abc123"), json!({})));
+        assert!(decide(&mut verified, refuse_anonymous), "the response to a verified caller is released");
+
+        let mut resource_caller = test_pipeline_context();
+        resource_caller.authenticated_identity = Some(crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            subject: "alice".to_string(),
+            claims: json!({ "sub": "alice", "tid": "tenant-1" }),
+        });
+        assert!(decide(&mut resource_caller, only_tenant), "the verified caller's claims reach the response policy");
+        assert!(!decide(&mut anonymous, only_tenant));
     }
 
     #[test]

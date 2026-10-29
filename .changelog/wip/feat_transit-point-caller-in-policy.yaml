@@ -8,11 +8,13 @@ changes:
         token carries reached the audit record but not the policy input. Outbound policy input
         now has `input.transit.caller`: whether the caller is `verified`, the mechanism that
         verified it (`transit_token`, `resource_token`, `unverified` or `anonymous`), the
-        caller's `user_identity_hash`, the token's DID with `did_verified`, and the allowlisted
-        caller context fields. A caller verified by the Transit Point's own resource-server token
-        fills the same fields, and a call that nothing identifies says it is anonymous. A policy
-        that allows only one caller should test `verified` first, as a token that only names a
-        DID is reported as unverified.
+        caller's `user_identity_hash`, the token's DID with `did_verified`, and the caller
+        context fields that Transit Point allowlists. A caller verified by the Transit Point's
+        own resource-server token fills the same fields, and a call that nothing identifies says
+        it is anonymous. A Transit Point's response policy gets the same `input.transit.caller`,
+        and `input.source_auth` for a caller the Transit Point verified, so it can decide who
+        receives a response. A policy that allows only one caller should test `verified` first,
+        as a token that only names a DID is reported as unverified.
   changed: []
   fixed: []
   removed: []

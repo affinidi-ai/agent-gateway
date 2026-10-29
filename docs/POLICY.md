@@ -312,6 +312,12 @@ where `input.source_auth` and `input.extension_identity` carry the caller. A pol
 reads it must test `verified` first: a caller named only by an unverified DID is reported,
 and never as verified.
 
+A Transit Point's response policy gets `input.transit.caller`, and `input.source_auth`
+when the Transit Point verified the caller itself, beside its `input.response`,
+`input.caller` and `input.surface`. Its `input.caller.did` is the managed agent's DID, not
+the Transit Point's caller, so a rule about who receives a response reads
+`input.transit.caller`.
+
 | Field | Values | Meaning |
 | --- | --- | --- |
 | `input.transit.caller.verified` | `true` / `false` | `true` when a credential the gateway verified established the caller (`verification` is `transit_token` or `resource_token`). |
@@ -324,9 +330,9 @@ and never as verified.
 | `input.transit.caller.user_identity_hash` | lowercase hex SHA-256 | The hash of the verified principal (the JWT `sub`, API key name, DID or mTLS principal). Identical whichever mechanism verified the caller, so one rule covers both. Present only when `verified`. |
 | `input.transit.caller.subject` | string | The verified principal itself. Present only for a `resource_token` caller; a transit token carries the hash, and the principal only through `fields`. |
 | `input.transit.caller.did` | DID | The caller DID the transit token carries. Asserted by the caller unless `did_verified`. Absent when the token has none, and for a `resource_token` caller. |
-| `input.transit.caller.did_verified` | `true` / `false` | `true` only when `identity_source` is `verified-presentation`. Always present. |
-| `input.transit.caller.caller_dna_uai` | string | The caller's Agent DNA UAI the token carries, when resolved. |
-| `input.transit.caller.fields` | object | The operator-allowlisted `caller_context_fields` the transit token carries, verbatim (a Transit Point's `workload_binding.caller_context_fields`, taken from the caller's verified JWT claims). Absent unless the caller is `verified`. |
+| `input.transit.caller.did_verified` | `true` / `false` | `true` only when `identity_source` is `verified-presentation`. Always present. No Access Point mints `verified-presentation` yet, so it is always `false` today. |
+| `input.transit.caller.caller_dna_uai` | string | The caller's Agent DNA UAI the token carries, when resolved. Asserted, never verified, whatever `verified` says: it describes the caller, it does not identify it. The Access Point does not fill it yet. |
+| `input.transit.caller.fields` | object | The caller claims this Transit Point allowlists, verbatim: its enabled `workload_binding.caller_context_fields` with `caller_source: transit_token`, taken from the caller's verified JWT claims on the Access Point. The token carries the claims every Transit Point of the surface allowlists, but each Transit Point's policy sees only its own. Absent unless the caller is `verified` and the Transit Point allowlists a claim the token carries. |
 
 When a call has both a verified transit token and a verified resource token, the transit
 token is the caller, because it names the end user the Access Point authenticated; the

@@ -26,6 +26,14 @@ pub struct ResponsePolicyInput {
     /// Optional metadata carried forward from the request pipeline.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<HashMap<String, Value>>,
+    /// The caller of a Transit Point call, as its request policies see it.
+    /// Set only for a Transit Point's response policy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transit: Option<crate::surface_context::TransitContext>,
+    /// The identity the Transit Point itself verified, as its request
+    /// policies see it. Set only for a Transit Point's response policy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_auth: Option<crate::surface_context::SourceAuthContext>,
 }
 
 /// Response body context visible to the policy.
@@ -179,6 +187,8 @@ mod tests {
                 protocol: "mcp".to_string(),
             },
             metadata: None,
+            transit: None,
+            source_auth: None,
         };
 
         let json = serde_json::to_value(&input).unwrap();
@@ -207,6 +217,8 @@ mod tests {
                 protocol: "mcp".to_string(),
             },
             metadata: None,
+            transit: None,
+            source_auth: None,
         }
     }
 

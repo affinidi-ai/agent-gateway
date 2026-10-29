@@ -8703,6 +8703,8 @@ async fn proxy_handler_with_mcp_runtime(
                     .to_lowercase(),
                 },
                 metadata: None,
+                transit: None,
+                source_auth: None,
             };
 
             let response_policy = pm
@@ -15723,6 +15725,8 @@ async fn handle_mcp_proxy_request(
                         .to_lowercase(),
                     },
                     metadata: None,
+                    transit: None,
+                    source_auth: None,
                 };
 
                 let response_policy = pm
