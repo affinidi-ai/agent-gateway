@@ -384,9 +384,9 @@ fn strip_credential_json_headers(
             }
             Value::Array(values) => {
                 values.retain(|value| {
-                    !value
+                    value
                         .as_str()
-                        .is_some_and(|text| payment_token(text.as_bytes()).is_some())
+                        .is_none_or(|text| payment_token(text.as_bytes()).is_none())
                 });
                 if values.is_empty() {
                     headers.remove(&name);
