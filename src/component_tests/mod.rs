@@ -8,6 +8,7 @@ mod channel_e2e;
 mod didwebvh_e2e;
 mod event_hook_e2e;
 mod fabric_stream_revocation;
+mod fabric_transit_token_e2e;
 mod global_policy_e2e;
 mod header_metadata_mapping_e2e;
 pub(crate) mod helpers;

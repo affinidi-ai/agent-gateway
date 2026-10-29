@@ -176,7 +176,11 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
   the refusal was one; legacy MCP refuses a malformed request with HTTP 200 and a JSON-RPC error,
   so read the two together. `stage` and `reason`:
   - `routing`: `no_route` (no surface matches; recorded against surface `unknown`, with no trace
-    id on the direct path), `unknown_variant`, `variant_disabled`.
+    id on the direct path), `unknown_variant`, `variant_disabled`, and on the fabric receive path
+    `fabric_hops_invalid` (an `X-Gateway-Fabric-Hops` that is not one integer from 1 to 255,
+    `400`) and `fabric_chain_too_long` (a request past 8 Fabric crossings, `508`), both recorded
+    against the surface id the peer addressed before it is looked up; see
+    [`FABRIC.md`](FABRIC.md#chains-across-gateways).
   - `admission`: `body_too_large`, `protocol_mismatch` (an MCP body on an A2A Access Point or the
     reverse), `invalid_envelope` (not JSON, or not a JSON-RPC request, on every protocol and MCP
     revision), `invalid_request_shape` (A2A fields), `version_unsupported` (A2A or MCP),

@@ -213,17 +213,8 @@ pub async fn prepare_transit(
         .authenticated_identity
         .as_ref()
         .ok_or(ContinuationError::BindingMismatch)?;
-    let agent_did = match &context.resolved_identity {
-        crate::proxy::backend_identity::ProtectedAgentIdentity::Managed { did, .. } => Some(did.as_str()),
-        crate::proxy::backend_identity::ProtectedAgentIdentity::Anonymous => None,
-    }
-    .or_else(|| {
-        context
-            .transit_token_claims
-            .as_ref()
-            .and_then(|claims| claims.sub.as_deref())
-    })
-    .ok_or(ContinuationError::BindingMismatch)?;
+    let agent_did =
+        crate::proxy::outbound_handler::delegation_agent_did(context).ok_or(ContinuationError::BindingMismatch)?;
     if context
         .variant_resolution_error
         .is_some()

@@ -1598,9 +1598,15 @@ pub fn is_hop_by_hop_header(name: &str) -> bool {
 ///   and the later Transit Point call. It authorizes the outbound hop on the issuing
 ///   gateway only and must never be forwarded to the upstream or to a remote gateway
 ///   (GW2); the cross-gateway trust artifact is the signed workload-binding VP.
+/// - `x-gateway-fabric-hops`: the Fabric crossings a request has made. Every Fabric
+///   send sets its own, so a copy a caller, agent or peer sent never passes.
 pub fn should_forward_request_header(name: &str) -> bool {
     let lower = name.to_lowercase();
-    !is_hop_by_hop_header(&lower) && lower != "content-length" && lower != "host" && lower != "x-transit-token"
+    !is_hop_by_hop_header(&lower)
+        && lower != "content-length"
+        && lower != "host"
+        && lower != "x-transit-token"
+        && lower != crate::proxy::fabric_hops::FABRIC_HOPS_HEADER
 }
 
 #[cfg(test)]
@@ -1800,6 +1806,13 @@ mod tests {
         // Ordinary headers still forward.
         assert!(should_forward_request_header("Content-Type"));
         assert!(should_forward_request_header("X-Custom-Trace"));
+    }
+
+    #[test]
+    fn a_fabric_hop_count_is_never_forwarded_as_its_sender_sent_it() {
+        // Every Fabric send sets its own; a caller's, agent's or peer's never passes.
+        assert!(!should_forward_request_header("X-Gateway-Fabric-Hops"));
+        assert!(!should_forward_request_header("x-gateway-fabric-hops"));
     }
 
     // ── Identity binding issuer trust ────────────────────────────────────────

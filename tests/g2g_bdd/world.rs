@@ -331,6 +331,9 @@ pub struct G2gWorld {
     /// The last consent request a gateway answered a caller with, and the
     /// request it answered.
     pub consent_request: Option<(ConsentRequest, Value)>,
+    /// How many Transit Point calls of a relay between two managed agents
+    /// were answered before one was refused.
+    pub relayed_transit_point_calls: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -372,6 +375,7 @@ impl G2gWorld {
             oauth_providers: HashMap::new(),
             caller_access_tokens: HashMap::new(),
             consent_request: None,
+            relayed_transit_point_calls: None,
         }
     }
 

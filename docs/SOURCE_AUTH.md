@@ -242,7 +242,7 @@ Transit Point:
 
 | Way | Set with | Use it when |
 | --- | --- | --- |
-| [Transit token](#transit-token) | `require_transit_token: true`, the default | The caller is the surface's managed agent, serving a request that came through the Access Point. The token names that request's caller |
+| [Transit token](#transit-token) | `require_transit_token: true`, the default | The caller is the surface's managed agent, serving a request that came through the Access Point or, over Fabric, from a paired gateway. The token names that request's caller |
 | Resource access token | `mcp_http.authorization`, MCP Transit Points only | The caller can obtain an access token for the Transit Point from the gateway's STS (see [`MCP_METADATA.md`](MCP_METADATA.md)) |
 | [Source authentication](#transit-point-source-authentication) | `source_auth` | The caller holds a credential of its own: an API key, a JWT from an identity provider, or a client certificate. Agents that cannot carry a transit token, such as cloud-hosted ones like Copilot Studio, use this |
 
@@ -431,6 +431,35 @@ it is issued, 300 seconds unless the surface sets another. The agent may send th
 token on any number of calls to that surface's Transit Points until then. The header is
 never forwarded to a Transit Point's target.
 
+Which requests carry one:
+
+| Pipeline | Issues a transit token |
+| --- | --- |
+| Access Point (direct HTTP: MCP, A2A, HTTP) | For every request it forwards to the managed agent of a surface with Transit Points, an anonymous caller's included |
+| Fabric receive, buffered and framed stream | For every request a paired gateway sends that it forwards to an HTTP or HTTPS Target of a surface with Transit Points |
+| `proxy://` and `a2a-proxy://` Targets, on either path | Never: the gateway runs the MCP Proxy and there is no agent, and an A2A Proxy's backend, such as Direct Line, must never see one |
+| Fabric send, the STS, the management API | Never |
+
+Over Fabric, the receiving gateway issues the token itself, with the same key and the same
+lifetime setting as its Access Point, and removes every `X-Transit-Token` the peer sent first,
+so its agent gets exactly one. It differs from an Access Point token:
+
+| Claim | Fabric receive |
+| --- | --- |
+| `sub` | The caller DID the peer's request names, only when it is a DID; a payload pseudonym (`sha256:...`) is left out |
+| `identity_source` | `fabric-presentation` when a presentation signed by one of the connection's issuers carried the DID, `fabric-asserted` otherwise |
+| `user_identity_hash`, `caller_context_fields`, `caller_dna_uai` | Never present: the peer gateway is verified, its caller is not. Even when the receiving surface's `source_auth` verified a credential the peer sent, the token carries no principal |
+| `trace_id` | The trace this gateway sends on to its agent, so the agent's Transit Point calls continue it |
+| `fabric` | `peer_gateway_id` (the sender's Remote gateway record), `peer_issuer_did` (its issuer DID, once pairing established it) and `hops`, the Fabric crossings the request made (see [`FABRIC.md`](FABRIC.md#chains-across-gateways)) |
+
+A Transit Point accepts such a token as it accepts an Access Point's, and its policy sees the
+peer as the caller (`verification: fabric_peer`, see
+[`POLICY.md`](POLICY.md#caller-in-transit-point-policy-input)). Static `target_auth`
+credentials are added as for any caller; delegated per-user credentials are never released for
+it (see [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-a-transit-point)).
+A release that predates the `fabric` claim reads such a token as one naming an unverified DID,
+with no principal.
+
 A Transit Point refuses the call with `401` unless the token:
 
 - is signed with this gateway's key and names it in `kid`, with the gateway's domain as
@@ -532,7 +561,8 @@ to 300 seconds.
 ### Headers through a Transit Point
 
 A Transit Point forwards its caller's request headers to its target, over HTTP or Fabric,
-except hop-by-hop headers, `Host`, `Content-Length`, `X-Transit-Token`, the caller's
+except hop-by-hop headers, `Host`, `Content-Length`, `X-Transit-Token`,
+`X-Gateway-Fabric-Hops` (a Fabric send sets its own), the caller's
 `Authorization` and its `Cookie`, the caller-info and `did:webvh` identity headers
 (`x-caller-did`, `x-caller-identity-source`, `x-caller-dna-uai`, `x-gateway-did`,
 `x-did-identity`, `x-did-signed-identity`), the header its `source_auth` reads, a header named

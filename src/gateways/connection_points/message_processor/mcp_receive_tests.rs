@@ -2765,10 +2765,9 @@ async fn fabric_receive_logs_forwarded_header_names_without_values() {
         ("proxy-authorization", "Basic proxy-credential"),
         ("cookie", "session=cookie-credential"),
         ("x-api-key", "api-key-credential"),
-        ("x-transit-token", "transit-credential"),
         ("x-upstream-auth", "custom-header-credential"),
     ];
-    let mut headers = json!({"MCP-Protocol-Version": MCP_LEGACY_VERSION});
+    let mut headers = json!({"MCP-Protocol-Version": MCP_LEGACY_VERSION, "x-transit-token": "transit-credential"});
     for (name, value) in credentials {
         headers[name] = json!(value);
     }
@@ -2820,6 +2819,13 @@ async fn fabric_receive_logs_forwarded_header_names_without_values() {
         assert!(logs.contains(&format!("Header: {name}\n")), "header name {name} was not logged:\n{logs}");
         assert!(!logs.contains(value), "credential value for {name} was logged:\n{logs}");
     }
+    assert!(
+        !forwarded
+            .headers
+            .contains_key("x-transit-token"),
+        "a transit token the peer sent never reaches the Target"
+    );
+    assert!(!logs.contains("transit-credential"), "the peer's transit token was logged:\n{logs}");
 }
 
 #[test]

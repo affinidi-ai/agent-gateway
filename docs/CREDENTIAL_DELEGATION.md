@@ -100,6 +100,14 @@ a `2026-07-28` MCP request. The agent half of the key is the Transit Point's
 carries, so a `source_auth` caller without a transit token needs a managed identity for the
 Transit Point.
 
+A transit token the gateway issued for a request that arrived over Fabric (see
+[`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)) keys no grant: it carries no principal, and
+the caller DID in it is the peer gateway's word, so it is never the agent half of a key either.
+A binding that applies to such a call refuses it with `403` and the target is not called; the
+log says delegated credentials are not released for requests that arrived over Fabric. A caller
+the Transit Point's own `source_auth` verified on the same call still keys its own grant, and
+static `target_auth` credentials are added as for any caller.
+
 ## When a token is missing
 
 Delegation needs a user to key the token by, so a surface with delegation but no

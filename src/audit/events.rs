@@ -44,6 +44,10 @@ pub enum RejectionReason {
     ExtensionRejected,
     SsrfBlocked,
     ConsentIdentityRequired,
+    /// A Fabric request whose `X-Gateway-Fabric-Hops` is not one integer from 1 to 255.
+    FabricHopsInvalid,
+    /// A Fabric request past the limit of Fabric crossings.
+    FabricChainTooLong,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
