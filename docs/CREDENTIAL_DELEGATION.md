@@ -374,6 +374,14 @@ puts it in `user_hash`. To compute it for a JWT subject `alice` from
 printf '%s' '["jwt_bearer","https://login.example.com",null,"alice"]' | shasum -a 256
 ```
 
+Delegated credentials stored by a release that keyed them by an earlier form of the identity
+hash are never looked up again, but their access and refresh tokens stay in the vault until
+they are removed. After upgrading, list the vault (`GET /api/v1/delegation-vault`, or the
+Credential Tokens tab on the dashboard's Credentials page) and revoke each entry created before
+the upgrade (`DELETE /api/v1/delegation-vault/{id}`, or its delete button), except service tokens (those under
+`__client_credentials__`, `__mcp_client_credentials__:` or `__target_auth__:`), which are unchanged. Users connect their accounts again the next time
+a credential is needed.
+
 Service tokens have no user, so a legacy binding caches them under the fixed user hash
 `__client_credentials__`, a `2026-07-28` binding under `__mcp_client_credentials__:<provider
 digest>`, and target authentication under `__target_auth__:<provider digest>:<scope hash>` with
