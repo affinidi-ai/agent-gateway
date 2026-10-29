@@ -113,6 +113,27 @@ impl AgentSurface {
             })
     }
 
+    /// Whether calls through `point` resolve a managed agent identity, as the
+    /// outbound pipeline resolves it: the Transit Point's own
+    /// `managed_identity`, else the surface's when the Transit Point injects a
+    /// VP, in any mode but `from_jwt_claim`, which is inbound only.
+    pub fn transit_point_has_managed_identity(
+        &self,
+        point: &super::agent_surface::TransitPoint,
+    ) -> bool {
+        point
+            .managed_identity
+            .clone()
+            .or_else(|| {
+                point
+                    .identity_injection
+                    .inject_vp
+                    .then(|| self.managed_identity())
+                    .flatten()
+            })
+            .is_some_and(|identity| !matches!(identity, crate::source_auth::ManagedIdentityConfig::FromJwtClaim { .. }))
+    }
+
     /// Slot 1 — caller identity extracted from inbound request (CA → AP).
     #[inline]
     pub fn inbound_identity(&self) -> Option<&crate::source_auth::ManagedIdentityConfig> {

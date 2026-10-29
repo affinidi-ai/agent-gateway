@@ -31,7 +31,9 @@ changes:
         the grant of the caller in the token's `fabric.principal_hash`, and only that caller's;
         the caller DID the peer named never keys a grant. It is off by default, and only a
         Transit Point that requires the transit token may set it: the admin API refuses one
-        that does not with `400`. A `PUT` of the surface or of a variant that omits it keeps the
+        that does not with `400`. The Transit Point also needs a managed identity, and a save of
+        one that sets the switch without one answers with a `Warning` header, since a binding
+        there refuses every Fabric caller. A `PUT` of the surface or of a variant that omits it keeps the
         stored value while the Transit Point requires the transit token, since the Surface
         Builder does not show it. Without it, or when the receiving surface verified no caller,
         the call is refused as before and the log gives the reason. A caller the Transit

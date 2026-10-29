@@ -836,8 +836,10 @@ type SavedSurface = (axum::http::HeaderMap, Json<AgentSurface>);
 /// `Warning` headers (code 299) naming each Transit Point of `surface` that
 /// serves callers it does not authenticate where other hosts reach it, each
 /// that accepts the Access Point's own tokens ([`shared_audience_warnings`]),
-/// and each whose JWT verification strategy names an issuer the surface also
-/// accepts through another ([`shared_issuer_warnings`]).
+/// each whose JWT verification strategy names an issuer the surface also
+/// accepts through another ([`shared_issuer_warnings`]), and each that opts
+/// Fabric callers in to delegated credentials without a managed identity
+/// ([`fabric_delegation_identity_warnings`]).
 async fn transit_point_warnings(
     state: &IdentityApiState,
     surface: &AgentSurface,
@@ -849,6 +851,7 @@ async fn transit_point_warnings(
         .filter_map(crate::proxy::server::OpenTransitPoint::exposure)
         .chain(shared_audience_warnings(surface))
         .chain(shared_issuer_warnings(surface, &issuers))
+        .chain(fabric_delegation_identity_warnings(surface))
     {
         let quoted = warning
             .replace('\\', "\\\\")
@@ -1003,6 +1006,34 @@ fn shared_issuer_warnings(
                 if !warnings.contains(&warning) {
                     warnings.push(warning);
                 }
+            }
+        }
+    }
+    warnings
+}
+
+/// Each Transit Point, on the surface or in an enabled variant, that sets
+/// `delegated_credentials_for_fabric_callers` but resolves no managed identity.
+/// A Fabric caller's DID is never the agent half of a delegated credential's
+/// key, so a binding that applies refuses every Fabric caller there.
+fn fabric_delegation_identity_warnings(surface: &AgentSurface) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for (_, view) in surface_views(surface) {
+        for point in view
+            .transit_points()
+            .iter()
+            .filter(|point| {
+                point.delegated_credentials_for_fabric_callers && !view.transit_point_has_managed_identity(point)
+            })
+        {
+            let warning = format!(
+                "Transit Point '{}' sets delegated_credentials_for_fabric_callers but has no managed identity, so a \
+                 delegated credential binding that applies refuses every Fabric caller with 403; give it a managed \
+                 identity, or inject a VP with the surface's",
+                point.alias
+            );
+            if !warnings.contains(&warning) {
+                warnings.push(warning);
             }
         }
     }
@@ -4110,6 +4141,78 @@ mod validation_tests {
             ),
         ] {
             assert!(shared_audience_warnings(&surface).is_empty(), "{case}");
+        }
+    }
+
+    /// A Transit Point that releases delegated credentials to Fabric callers
+    /// but resolves no managed identity refuses every such call a binding
+    /// applies to, since a Fabric caller's DID is never the agent half of the
+    /// key: a save says so.
+    #[test]
+    fn a_save_warns_of_a_transit_point_that_opts_fabric_callers_in_without_a_managed_identity() {
+        let agent = serde_json::json!({ "type": "static", "did": "did:web:agent.example" });
+        let surface_with = |point: serde_json::Value, surface_identity: bool| -> AgentSurface {
+            let mut surface = serde_json::json!({
+                "name": "tools",
+                "access_point": { "listen_address": "0.0.0.0:8443", "route": "/mcp", "protocol": "mcp" },
+                "target": { "endpoint": "https://tools.internal/mcp" },
+                "transit": { "outbound_listen_address": "http://localhost:9111", "points": [point] },
+                "variants": [{ "id": "beta", "alias": "beta", "name": "Beta", "enabled": true }]
+            });
+            if surface_identity {
+                surface["identity_slots"] = serde_json::json!({ "protected": agent });
+            }
+            serde_json::from_value(surface).unwrap()
+        };
+        let point = |opted_in: bool, identity: serde_json::Value| {
+            let mut point = serde_json::json!({ "alias": "crm", "target_endpoint": "https://crm.example",
+                "protocol": "mcp", "require_transit_token": true,
+                "delegated_credentials_for_fabric_callers": opted_in });
+            if let serde_json::Value::Object(identity) = identity {
+                point
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(identity);
+            }
+            point
+        };
+        let warning = vec![
+            "Transit Point 'crm' sets delegated_credentials_for_fabric_callers but has no managed identity, so a \
+             delegated credential binding that applies refuses every Fabric caller with 403; give it a managed \
+             identity, or inject a VP with the surface's"
+                .to_string(),
+        ];
+
+        for (case, surface) in [
+            ("no identity", surface_with(point(true, serde_json::json!({})), false)),
+            ("the surface's identity without a VP", surface_with(point(true, serde_json::json!({})), true)),
+            (
+                "an inbound-only identity",
+                surface_with(
+                    point(true, serde_json::json!({ "managed_identity": { "type": "from_jwt_claim" } })),
+                    false,
+                ),
+            ),
+        ] {
+            assert_eq!(fabric_delegation_identity_warnings(&surface), warning, "{case}");
+        }
+        let mut variant_only = surface_with(point(false, serde_json::json!({})), false);
+        variant_only.variants[0]
+            .overrides
+            .transit = Some(
+            serde_json::from_value(serde_json::json!({ "points": [point(true, serde_json::json!({}))] })).unwrap(),
+        );
+        assert_eq!(fabric_delegation_identity_warnings(&variant_only), warning, "a Transit Point a variant defines");
+
+        for (case, surface) in [
+            ("its own identity", surface_with(point(true, serde_json::json!({ "managed_identity": agent })), false)),
+            (
+                "the surface's identity with a VP",
+                surface_with(point(true, serde_json::json!({ "identity_injection": { "inject_vp": true } })), true),
+            ),
+            ("the switch off", surface_with(point(false, serde_json::json!({})), false)),
+        ] {
+            assert!(fabric_delegation_identity_warnings(&surface).is_empty(), "{case}");
         }
     }
 

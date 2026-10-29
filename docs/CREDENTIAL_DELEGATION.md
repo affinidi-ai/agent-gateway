@@ -107,7 +107,11 @@ sets `delegated_credentials_for_fabric_callers: true` (off by default), and then
 verified on that request, the same identity hash its Access Point computes for the same
 credential. The caller DID or pseudonym the peer gateway sent, and a top-level
 `user_identity_hash`, never key a grant, and the caller DID is never the agent half of a key
-either, so such a call needs the Transit Point's managed identity. Because the receiving
+either, so such a call needs the Transit Point's managed identity: its own `managed_identity`,
+or the surface's when the Transit Point injects a VP, in any mode but `from_jwt_claim`. Without
+one, a binding that applies refuses every Fabric caller with `403`, and a save of a Transit
+Point that sets the switch, on the surface or in an enabled variant, answers with a `Warning`
+header saying so. Because the receiving
 surface normally verifies the credential the peer's `target_auth` presents, a grant keyed this
 way usually belongs to the partner, shared by every request it sends with that credential.
 
