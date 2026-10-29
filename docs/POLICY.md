@@ -439,6 +439,15 @@ blocked target fails closed (inbound
 and Fabric receive `403` "Request blocked by egress policy"; outbound
 `TargetAuthUnavailable`) with the resolved IP log-only.
 
+A Transit Point request that carries a grant by binding (`consent_mode: external`) is held to
+more: the outbound forward sends it only to the origin of its provider's `resource`, through
+`egress::pinned_vendor_client` (the Strict policy, `https` only), and never over Fabric. See
+[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#external-consent-on-a-transit-point).
+
+Every pinned client ignores proxy settings (`HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and the
+system proxy): a proxy would resolve the host again and connect to an address nobody vetted, so
+pinned egress always connects directly.
+
 ```mermaid
 flowchart LR
     F[Forward step] --> V{"Target passes<br/>egress policy?"}
@@ -519,7 +528,7 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   redirects refused, a 64 KiB body and a 10-second timeout per step. See
   [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#external-consent-providers).
 - A grant's **RFC 7009 revocation** (`src/delegation_vault/revocation.rs`) goes
-  through `egress::pinned_authorization_server_client`: the Strict policy, `https`
+  through `egress::pinned_vendor_client`: the Strict policy, `https`
   only, pinned, redirects refused, a 10-second timeout, and the response body is
   never read. Under `AG_TEST_MODE=true`, `AG_BDD_EGRESS_ALLOWLIST` can admit an
   exact `http` or loopback fixture, never cloud metadata. See

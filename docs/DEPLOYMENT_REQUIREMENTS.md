@@ -166,7 +166,7 @@ The gateway only calls out to what you configure. Allow egress to:
 | --- | --- | --- |
 | `backup_encryption_key` | Yes. The gateway does not start without it. | 64 hex characters, for example `openssl rand -hex 32`. Prefer `file://` with a mounted secret, so the key does not appear in the process environment or `docker inspect`. |
 | Encryption-at-rest key | When the gateway holds real credentials | A 32-byte key. Encryption at rest is off by default, so `_storage/` holds secrets in plain text until you turn it on. Choose the key source before the gateway stores data. See [Secrets and encryption at rest](CAPABILITIES.md#secrets-and-encryption-at-rest). |
-| `AG_IDENTITY_HASH_PEPPER` | Required when you run more than one instance; otherwise recommended | At least 64 hex characters (32 bytes), for example `openssl rand -hex 32`, with the same value on every instance. Without it, DIDs derived from mTLS, API key or JWT-claim credentials change on every restart, and with encryption at rest off, OAuth consent started before a restart or on another instance fails. |
+| `AG_IDENTITY_HASH_PEPPER` | Required when you run more than one instance or keep grants by binding (`consent_mode: external`); otherwise recommended | At least 64 hex characters (32 bytes), for example `openssl rand -hex 32`, with the same value on every instance. Without it, DIDs derived from mTLS, API key or JWT-claim credentials change on every restart, and with encryption at rest off, OAuth consent started before a restart or on another instance fails. |
 
 Store the backup key and the encryption-at-rest key away from the backups. Losing either
 key makes the backups or `_storage/` unreadable. See [Secret references](CONFIGURATION_REFERENCE.md#secret-references)

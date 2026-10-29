@@ -181,7 +181,7 @@ flag a boolean, and a member that is `null` counts as absent. The inbound profil
 | Body size | 64 KiB (`MAX_METADATA_BYTES`), set per call by `DiscoveryOptions::max_bytes` |
 | Timeout | 10 s, set per call by `DiscoveryOptions::timeout`, applied once to resolving the host and again to the HTTP request from connecting to reading the last byte. One fetch can take up to twice the timeout, and `discover` can make three fetches for a path issuer and two for an origin issuer, so up to six or four times the timeout in all |
 | Redirects | Refused |
-| DNS | The egress guard can resolve the host more than once; the connection is pinned to the addresses of the last, vetted resolution. An IPv6 literal host cannot be pinned and fails as `blocked`. Pinning does not hold when a proxy is configured: the HTTP client reads `HTTPS_PROXY`, `HTTP_PROXY` and `ALL_PROXY` (also in lower case) and, on macOS and Windows, the system proxy settings. The request then goes to the proxy, which resolves the host again and connects to an address nobody vetted, so address vetting and pinning no longer apply. This is true of the shared pinned egress clients until they call `.no_proxy()` |
+| DNS | The egress guard can resolve the host more than once; the connection is pinned to the addresses of the last, vetted resolution. An IPv6 literal host cannot be pinned and fails as `blocked`. The pinned client ignores `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and the system proxy settings, since a proxy would resolve the host again and connect to an address nobody vetted, so the fetch always connects directly |
 | Status | Only a 2xx response is read |
 
 The caller chooses an `EgressPosture`. `Strict` accepts `https` only: `get_bounded` and
