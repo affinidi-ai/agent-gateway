@@ -634,6 +634,31 @@ async fn a_modern_mcp_body_that_stalls_is_refused_at_the_id_read_deadline_withou
     assert_json_rpc_refusal("stalled body", answer, RejectionReason::UnknownVariant, 404, None);
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_surface_update_does_not_wait_for_a_refusal_reading_its_body() {
+    let router = router(mcp_surface(Some("v-prod")));
+    let channels = Arc::clone(&router.channels);
+    let (stalled, waiting) = tokio::sync::oneshot::channel();
+    let refusal = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        send_mcp_body(router, "POST", "/mcp$missing", true, stalled_body(stalled)),
+    );
+    let update = async {
+        waiting
+            .await
+            .expect("the refusal reads its body");
+        let surfaces = tokio::time::timeout(std::time::Duration::from_millis(1), channels.write())
+            .await
+            .expect("a surface update waits for a refusal reading its body");
+        drop(surfaces);
+    };
+
+    let (answer, ()) = tokio::join!(refusal, update);
+
+    let answer = answer.expect("a stalled body is answered at the id-read deadline");
+    assert_json_rpc_refusal("stalled body", answer, RejectionReason::UnknownVariant, 404, None);
+}
+
 #[tokio::test]
 async fn a_modern_mcp_get_variant_refusal_answers_without_an_id() {
     for (case, surface, path, reason, status) in mcp_refusal_cases() {
