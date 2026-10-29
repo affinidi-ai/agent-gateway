@@ -466,40 +466,15 @@ impl OutboundPipelineContext {
         };
 
         // The URL's alias, else the default variant, else the base surface
-        // serves the request. A variant that can't be resolved is refused. A
-        // modern MCP POST is answered later, once its body is read for the
-        // `id`, on the unresolved surface; every other request now. So a
-        // request that reaches any later step and names an alias always has
-        // that alias's `active_variant_id`.
-        let refuse = |error: &crate::config::agent_surface_variants::VariantResolveError, rpc_error_code| {
-            let refusal = crate::audit::request_events::refuse_routing(
-                &crate::audit::request_events::RequestFacts {
-                    surface_id: &surface_for_resolve.surface_id,
-                    channel_name: &surface_for_resolve.name,
-                    trace_id: None,
-                    via_fabric: false,
-                },
-                error,
-                rpc_error_code,
-            );
-            refusal.warn(&surface_for_resolve);
-            refusal
-        };
-        let modern_post = matched_virtual_channel.protocol == crate::config::agent_surface::TransitProtocol::Mcp
-            && crate::mcp::request_validation::has_modern_header(&original_headers, versions)
-            && original_method == Method::POST;
-        let (active_variant_id, surface, pending_variant_refusal) =
+        // serves the request. A variant that can't be resolved leaves the
+        // request on the unresolved surface, to be refused below.
+        let (active_variant_id, surface, unresolved) =
             match surface_for_resolve.serve_variant(active_variant_alias.as_deref()) {
                 Ok(served) => {
                     crate::observability::policy_audit::set_request_variant(&served.recorded);
                     (served.id, Arc::new(served.surface), None)
                 }
-                Err(error) if modern_post => (
-                    None,
-                    Arc::clone(&surface_for_resolve),
-                    Some(refuse(&error, Some(i64::from(crate::mcp::error_codes::INTERNAL_ERROR)))),
-                ),
-                Err(error) => return Err(OutboundPipelineError::VariantRefused(refuse(&error, None))),
+                Err(error) => (None, Arc::clone(&surface_for_resolve), Some(error)),
             };
 
         let virtual_channel = surface
@@ -514,6 +489,36 @@ impl OutboundPipelineContext {
                         .clone(),
                 )
             })?;
+
+        // The refusal is recorded only once nothing else can fail, so its record
+        // matches the answer. A modern MCP POST is answered later, once its body
+        // is read for the `id`; every other request now. So a request that
+        // reaches any later step and names an alias always has that alias's
+        // `active_variant_id`.
+        let modern_post = matched_virtual_channel.protocol == crate::config::agent_surface::TransitProtocol::Mcp
+            && crate::mcp::request_validation::has_modern_header(&original_headers, versions)
+            && original_method == Method::POST;
+        let pending_variant_refusal = match unresolved {
+            None => None,
+            Some(error) => {
+                let rpc_error_code = modern_post.then_some(i64::from(crate::mcp::error_codes::INTERNAL_ERROR));
+                let refusal = crate::audit::request_events::refuse_routing(
+                    &crate::audit::request_events::RequestFacts {
+                        surface_id: &surface_for_resolve.surface_id,
+                        channel_name: &surface_for_resolve.name,
+                        trace_id: None,
+                        via_fabric: false,
+                    },
+                    &error,
+                    rpc_error_code,
+                );
+                refusal.warn(&surface_for_resolve);
+                if !modern_post {
+                    return Err(OutboundPipelineError::VariantRefused(refusal));
+                }
+                Some(refusal)
+            }
+        };
         let outbound_shared = surface
             .transit
             .as_ref()
