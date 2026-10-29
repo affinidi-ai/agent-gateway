@@ -109,13 +109,12 @@ pub enum DelegationLookupResult {
     /// Token found — inject these credentials into the upstream request
     Inject(Vec<ResolvedCredentialInjection>),
     /// User has not yet consented — return consent_required to caller
-    ConsentRequired {
-        authorization_url: String,
-        provider_name: String,
-        scopes: Vec<String>,
-    },
+    ConsentRequired { authorization_url: String, provider_name: String, scopes: Vec<String> },
     /// Binding doesn't apply to this request (e.g. tool filter)
     NotApplicable,
+    /// The credential cannot be supplied, including an elicitation the user
+    /// declined, cancelled or left unanswered — refuse the request without
+    /// contacting the target
     Unavailable,
 }
 
@@ -1200,8 +1199,9 @@ async fn build_consent_required(
 ///   - `Some((ElicitationAcceptedPending, _, ConsentRequired))` if the user
 ///     accepted but the OAuth flow hasn't completed yet — caller surfaces
 ///     the URL so the client can resume.
-///   - `Some((ElicitationDeclined|Cancelled|TimedOut|Unsupported, _, NotApplicable))`
-///     when the user rejected or the deadline expired.
+///   - `Some((ElicitationDeclined|Cancelled|TimedOut|Unsupported, _, Unavailable))`
+///     when the user rejected, the deadline expired, or the prompt could not
+///     be delivered under fallback `fail`; the tool call is refused.
 ///   - `None` if we should fall through to the legacy consent_required path
 ///     (no session id, client doesn't advertise elicitation cap and fallback
 ///     is `OnDemand`, provider not found, etc.).
@@ -1241,7 +1241,7 @@ async fn try_elicit_flow(
                 return Some((
                     DelegationActionOutcome::ElicitationUnsupported,
                     Some("client_capability_missing".to_string()),
-                    DelegationLookupResult::NotApplicable,
+                    DelegationLookupResult::Unavailable,
                 ));
             }
         }
@@ -1323,7 +1323,7 @@ async fn try_elicit_flow(
                 return Some((
                     DelegationActionOutcome::ElicitationUnsupported,
                     Some("sse_stream_unavailable".to_string()),
-                    DelegationLookupResult::NotApplicable,
+                    DelegationLookupResult::Unavailable,
                 ));
             }
         }
@@ -1440,7 +1440,7 @@ async fn try_elicit_flow(
             Some((
                 DelegationActionOutcome::ElicitationDeclined,
                 Some(format!("elicit_id={}", elicit_id)),
-                DelegationLookupResult::NotApplicable,
+                DelegationLookupResult::Unavailable,
             ))
         }
         Ok(Ok(crate::mcp::elicitation::ElicitationResult::Cancel)) => {
@@ -1460,7 +1460,7 @@ async fn try_elicit_flow(
             Some((
                 DelegationActionOutcome::ElicitationCancelled,
                 Some(format!("elicit_id={}", elicit_id)),
-                DelegationLookupResult::NotApplicable,
+                DelegationLookupResult::Unavailable,
             ))
         }
         Ok(Err(_canceled)) => {
@@ -1468,7 +1468,7 @@ async fn try_elicit_flow(
             Some((
                 DelegationActionOutcome::ElicitationCancelled,
                 Some("waiter_dropped".to_string()),
-                DelegationLookupResult::NotApplicable,
+                DelegationLookupResult::Unavailable,
             ))
         }
         Err(_elapsed) => {
@@ -1488,7 +1488,7 @@ async fn try_elicit_flow(
             Some((
                 DelegationActionOutcome::ElicitationTimedOut,
                 Some(format!("elicit_id={} timeout_secs={}", elicit_id, binding.elicit_timeout_secs)),
-                DelegationLookupResult::NotApplicable,
+                DelegationLookupResult::Unavailable,
             ))
         }
     };
@@ -2550,9 +2550,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_elicit_no_capability_fail_fallback_returns_not_applicable() {
+    async fn test_elicit_no_capability_fail_fallback_refuses_the_request() {
         // ConsentMode::Elicit + session_id present + client did NOT advertise
-        // elicitation capability + fallback = Fail → NotApplicable + audit.
+        // elicitation capability + fallback = Fail → Unavailable + audit.
         let vault = MockVaultStore::new(VaultLookupResult::NotFound);
         let providers = MockProviderStore::with_oauth_provider("cp-1");
         let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
@@ -2580,8 +2580,15 @@ mod tests {
         .await;
 
         assert_eq!(results.len(), 1);
-        assert_eq!(result_tag(&results[0].result), "NotApplicable");
+        assert_eq!(result_tag(&results[0].result), "Unavailable");
         assert_eq!(results[0].action.outcome, DelegationActionOutcome::ElicitationUnsupported);
+        assert_eq!(
+            results[0]
+                .action
+                .detail
+                .as_deref(),
+            Some("client_capability_missing")
+        );
         // The client was never asked, so nothing was declined.
         assert!(
             !events
@@ -2631,7 +2638,7 @@ mod tests {
     async fn test_elicit_with_capability_no_sse_falls_back_per_policy() {
         // ConsentMode::Elicit + session_id + client DID advertise elicitation
         // capability, but NO SSE stream is registered for the session, so
-        // send() returns false. With fallback = Fail → NotApplicable.
+        // send() returns false. With fallback = Fail → Unavailable.
         let session_id = "session-elicit-no-sse";
         crate::mcp::elicitation::global_capability_registry()
             .record(
@@ -2679,6 +2686,145 @@ mod tests {
         // covered by integration tests where the secret store is real.
         assert_eq!(result_tag(&results[0].result), "Unavailable");
         assert_eq!(results[0].action.outcome, DelegationActionOutcome::ProviderUnavailable);
+    }
+
+    /// Resolves an elicit binding for a client that advertises elicitation and
+    /// holds an open SSE stream, answering the `elicitation/create` request with
+    /// `reply`, or never answering when `reply` is `None`.
+    async fn resolve_with_elicitation_reply(
+        session_id: &str,
+        fallback: crate::config::types::ElicitFallback,
+        reply: Option<crate::mcp::elicitation::ElicitationResult>,
+    ) -> Vec<DelegationResolution> {
+        use axum::response::IntoResponse;
+        use http_body_util::BodyExt;
+
+        crate::mcp::elicitation::global_capability_registry()
+            .record(
+                "ch-1",
+                session_id,
+                crate::mcp::elicitation::McpClientCapabilities {
+                    elicitation: true,
+                    sampling: false,
+                    roots: false,
+                },
+            )
+            .await;
+        let stream = crate::mcp::streamable_sse::global_streamable_session_registry()
+            .register("ch-1", session_id)
+            .await
+            .unwrap();
+        let client_session = session_id.to_string();
+        let client = tokio::spawn(async move {
+            let mut body = axum::response::Sse::new(tokio_stream::wrappers::ReceiverStream::new(stream))
+                .into_response()
+                .into_body();
+            let frame = body
+                .frame()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_data()
+                .unwrap();
+            let event = String::from_utf8(frame.to_vec()).unwrap();
+            let request: serde_json::Value = serde_json::from_str(
+                event
+                    .trim()
+                    .strip_prefix("data: ")
+                    .unwrap(),
+            )
+            .unwrap();
+            match reply {
+                Some(reply) => {
+                    crate::mcp::elicitation::global_pending_elicitation_registry()
+                        .resolve(
+                            "ch-1",
+                            &client_session,
+                            request["id"]
+                                .as_str()
+                                .unwrap(),
+                            reply,
+                        )
+                        .await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let secrets = crate::secrets::FilesystemSecretsStore::new_async(
+            directory
+                .path()
+                .to_str()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        secrets
+            .create(
+                serde_json::from_value(serde_json::json!({
+                    "name": "Client id", "secret_id": "CLIENT_ID", "value": "client-id"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let secrets: Arc<dyn SecretsStore> = Arc::new(secrets);
+        let vault = MockVaultStore::new(VaultLookupResult::NotFound);
+        let providers = MockProviderStore::with_oauth_provider("cp-1");
+        let ctx = DelegationAuditContext {
+            mcp_session_id: Some(session_id.to_string()),
+            ..Default::default()
+        };
+
+        let results = resolve_delegation_credentials(
+            &[elicit_binding("cp-1", fallback)],
+            "sha256:user1",
+            "did:web:agent.example",
+            "ch-1",
+            None,
+            &(vault as Arc<dyn DelegationVaultStorage>),
+            &(providers as Arc<dyn CredentialProviderStorage>),
+            &secrets,
+            "https://gw.example.com",
+            false,
+            Some(&ctx),
+            None,
+        )
+        .await;
+        client.abort();
+        crate::mcp::streamable_sse::global_streamable_session_registry()
+            .drop_session("ch-1", session_id)
+            .await;
+        results
+    }
+
+    #[tokio::test]
+    async fn a_declined_or_cancelled_elicitation_refuses_the_request() {
+        use crate::mcp::elicitation::ElicitationResult;
+
+        for (session_id, reply, outcome) in [
+            ("session-declined", ElicitationResult::Decline, DelegationActionOutcome::ElicitationDeclined),
+            ("session-cancelled", ElicitationResult::Cancel, DelegationActionOutcome::ElicitationCancelled),
+        ] {
+            for fallback in [crate::config::types::ElicitFallback::Fail, crate::config::types::ElicitFallback::OnDemand]
+            {
+                let results = resolve_with_elicitation_reply(session_id, fallback.clone(), Some(reply.clone())).await;
+
+                assert_eq!(results.len(), 1);
+                assert_eq!(result_tag(&results[0].result), "Unavailable", "{session_id} {fallback:?}");
+                assert_eq!(results[0].action.outcome, outcome, "{session_id} {fallback:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_elicitation_refuses_the_request_when_it_times_out() {
+        let results =
+            resolve_with_elicitation_reply("session-timed-out", crate::config::types::ElicitFallback::Fail, None).await;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(result_tag(&results[0].result), "Unavailable");
+        assert_eq!(results[0].action.outcome, DelegationActionOutcome::ElicitationTimedOut);
     }
 
     // ── DelegationAction serialization ───────────────────────────────
