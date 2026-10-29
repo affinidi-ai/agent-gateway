@@ -509,7 +509,10 @@ the Transit Point verified itself. The identity presentation a Transit Point wit
 `workload_binding` signs for its agent never names that DID as the user it acts for
 (`userIdentity`), as it does the DID of an Access Point token.
 A release that predates the `fabric` claim reads such a token as one naming an unverified DID,
-with no principal. A release that predates the hop count neither reads nor sends
+with no principal. So during a rolling upgrade, a Transit Point served by such a node still
+names that DID as the user its agent acts for (`userIdentity`) in the identity presentation it
+signs, and audits it with `auth_method: transit_token`, until every node is upgraded. A release
+that predates the hop count neither reads nor sends
 `X-Gateway-Fabric-Hops`, so a chain through such a gateway starts counting again at 1 after it
 (see [`FABRIC.md`](FABRIC.md#chains-across-gateways)).
 
