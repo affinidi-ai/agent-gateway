@@ -1566,6 +1566,202 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_credentials_are_cached_refetched_when_expired_and_refused_on_a_scope_mismatch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct TokenEndpoint {
+            response: std::sync::Mutex<Value>,
+            calls: AtomicUsize,
+        }
+
+        let endpoint = Arc::new(TokenEndpoint {
+            response: std::sync::Mutex::new(json!({
+                "access_token": "first-access", "token_type": "Bearer", "expires_in": 3600, "scope": "read"
+            })),
+            calls: AtomicUsize::new(0),
+        });
+        let app = axum::Router::new()
+            .fallback(axum::routing::post(
+                |axum::extract::State(endpoint): axum::extract::State<Arc<TokenEndpoint>>| async move {
+                    endpoint
+                        .calls
+                        .fetch_add(1, Ordering::SeqCst);
+                    axum::Json(
+                        endpoint
+                            .response
+                            .lock()
+                            .unwrap()
+                            .clone(),
+                    )
+                },
+            ))
+            .with_state(endpoint.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .proxy(reqwest::Proxy::http(format!("http://{}", listener.local_addr().unwrap())).unwrap())
+            .build()
+            .unwrap();
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .unwrap();
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let providers = FileSystemCredentialProviderStore::new(
+            directory
+                .path()
+                .join("providers"),
+        )
+        .await
+        .unwrap();
+        let strategies = FileSystemJwtVerificationStrategyStore::new(
+            directory
+                .path()
+                .join("strategies"),
+        )
+        .await
+        .unwrap();
+        let vault = FileSystemDelegationVaultStore::new(directory.path().join("vault"))
+            .await
+            .unwrap();
+        let secrets: Arc<dyn crate::secrets::SecretsStore> = Arc::new(
+            crate::secrets::FilesystemSecretsStore::new(
+                directory
+                    .path()
+                    .join("secrets")
+                    .to_str()
+                    .unwrap(),
+            )
+            .unwrap(),
+        );
+        for (secret_id, value) in [("client-id", "service-client"), ("client-secret", "fixture-secret")] {
+            secrets
+                .create(crate::secrets::CreateSecretRequest {
+                    tenant_id: None,
+                    name: secret_id.into(),
+                    secret_id: secret_id.into(),
+                    description: None,
+                    value: value.into(),
+                    secret_type: "General".into(),
+                    tags: vec![],
+                })
+                .await
+                .unwrap();
+        }
+        providers.create(serde_json::from_value(json!({
+            "id": "provider", "name": "Provider", "provider_id": "provider", "provider_type": "oauth2_client_credentials",
+            "resource": "https://provider.example/api", "token_endpoint": "http://192.0.2.1/token",
+            "client_id_secret_ref": "client-id", "client_secret_secret_ref": "client-secret",
+            "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+        })).unwrap()).await.unwrap();
+        let surface: AgentSurface = serde_json::from_value(json!({
+            "surface_id": "surface", "name": "Surface", "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
+            "target": {"endpoint": "https://provider.example/api"}, "outbound_credentials": [{"credential_provider_id": "provider", "scopes": ["read"]}]
+        })).unwrap();
+        let authorization = McpResourceServerConfig {
+            resource: "https://gateway.example/mcp".into(),
+            scopes: vec!["read".into()],
+        };
+        let profile = McpIssuerProfile {
+            issuer: "https://gateway.example/oauth2/mcp".into(),
+        };
+        let caller = AuthenticatedIdentity::JwtBearer {
+            subject: "user".into(),
+            claims: json!({"iss": profile.issuer, "sub": "user", "scope": "read"}),
+        };
+        let service = ContinuationService::new(
+            ContinuationCipher::new(
+                "deployment".into(),
+                "key".into(),
+                vec![ContinuationKey::new("key".into(), [7; 32], 1, 1000, 1900).unwrap()],
+            )
+            .unwrap(),
+            Arc::new(EmbeddedContinuations::new(32).unwrap()),
+        );
+        let context = ModernDelegationContext {
+            service: &service,
+            deployment: "deployment",
+            ttl_secs: 100,
+            surface: &surface,
+            variant_id: None,
+            route: ContinuationRoute::AccessPoint,
+            authorization: &authorization,
+            identity: &caller,
+            agent_did: "did:web:agent.example",
+            profile: &profile,
+            vault: &vault,
+            providers: &providers,
+            strategies: &strategies,
+            secrets: Some(&secrets),
+            provider_http: Some(&client),
+        };
+        let request = ValidatedModernMessage {
+            protocol_version: crate::mcp::MCP_MODERN_VERSION.into(),
+            client_capabilities: None,
+            client_info: None,
+            method: "tools/call".into(),
+            id: Some(json!(1)),
+            kind: McpMessageKind::Request,
+            params: Some(json!({"name": "read", "arguments": {"value": 1}})),
+        };
+        let selected = context
+            .select(&request)
+            .await
+            .unwrap();
+        let now = now_secs().unwrap();
+        let calls = || {
+            endpoint
+                .calls
+                .load(Ordering::SeqCst)
+        };
+
+        assert_eq!(context.service_credential(&selected[0], now).await.ok(), Some("first-access".to_string()));
+        assert_eq!(calls(), 1);
+        assert_eq!(context.service_credential(&selected[0], now).await.ok(), Some("first-access".to_string()));
+        assert_eq!(calls(), 1);
+        let cache_identity = format!("__mcp_client_credentials__:{}", hex::encode(provider_digest(&selected[0].provider).unwrap()));
+        let VaultLookupResult::Found(cached) = vault
+            .lookup("did:web:agent.example", &cache_identity, "provider")
+            .await
+            .unwrap()
+        else {
+            panic!("the service token must be cached under its digest identity");
+        };
+        assert_eq!(cached.scopes, vec!["read"]);
+        assert!(cached.refresh_token.is_none());
+
+        let mut expired = cached.clone();
+        expired.expires_at = Some(chrono::Utc::now() - chrono::Duration::seconds(5));
+        vault
+            .store(expired.clone())
+            .await
+            .unwrap();
+        *endpoint
+            .response
+            .lock()
+            .unwrap() = json!({"access_token": "second-access", "token_type": "Bearer", "expires_in": 3600});
+        assert_eq!(context.service_credential(&selected[0], now).await.ok(), Some("second-access".to_string()));
+        assert_eq!(calls(), 2);
+
+        vault
+            .store(expired)
+            .await
+            .unwrap();
+        *endpoint
+            .response
+            .lock()
+            .unwrap() =
+            json!({"access_token": "wrong-scope", "token_type": "Bearer", "expires_in": 3600, "scope": "read write"});
+        assert!(matches!(context.service_credential(&selected[0], now).await, Err(ContinuationError::Denied)));
+        assert_eq!(calls(), 3);
+        tasks.shutdown().await;
+    }
+
     #[tokio::test]
     async fn preparation_requires_request_capability_and_rejects_unverified_credentials_and_replays() {
         let directory = tempfile::tempdir().unwrap();

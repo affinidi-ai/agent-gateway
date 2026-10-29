@@ -2149,6 +2149,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_cached_client_credentials_token_is_injected_without_a_token_request() {
+        let mut token = make_token(false, false);
+        token.user_identity_hash = "__client_credentials__".to_string();
+        token.access_token = "cached-service-token".to_string();
+        let vault = MockVaultStore::new(VaultLookupResult::Found(token));
+        let providers = MockProviderStore::with_provider("cp-1", CredentialProviderType::OAuth2ClientCredentials);
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+
+        let results = resolve_delegation_credentials(
+            &[make_binding("cp-1")],
+            "sha256:user1",
+            "did:web:agent.example",
+            "ch-1",
+            None,
+            &(vault as Arc<dyn DelegationVaultStorage>),
+            &(providers as Arc<dyn CredentialProviderStorage>),
+            &secrets,
+            "https://gw.example.com",
+            false,
+            None,
+            None,
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        match &results[0].result {
+            DelegationLookupResult::Inject(injections) => assert_eq!(
+                injections,
+                &vec![ResolvedCredentialInjection::Header {
+                    name: "Authorization".to_string(),
+                    value: "Bearer cached-service-token".to_string(),
+                }]
+            ),
+            _ => panic!("Expected Inject, got {:?}", result_tag(&results[0].result)),
+        }
+        assert_eq!(results[0].action.outcome, DelegationActionOutcome::TokenInjected);
+        assert_eq!(
+            results[0]
+                .action
+                .detail
+                .as_deref(),
+            Some("client_credentials_cached")
+        );
+    }
+
+    #[tokio::test]
     async fn api_key_and_client_credentials_failures_are_unavailable() {
         for (provider_type, outcome) in [
             (CredentialProviderType::ApiKey, DelegationActionOutcome::ApiKeyResolutionFailed),
