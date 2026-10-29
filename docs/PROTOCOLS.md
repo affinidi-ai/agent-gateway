@@ -51,7 +51,7 @@ sequenceDiagram
     G->>T: GET the configured card path, presenting target.auth
     Note over G,T: Only Accept, Accept-Language, and User-Agent are forwarded.<br/>Pinned to the vetted address, with redirects disabled.
     T-->>G: Agent card
-    G-->>C: Agent card, served as is
+    G-->>C: Agent card with gateway URLs
 ```
 
 | Aspect | Behaviour |
@@ -64,8 +64,10 @@ sequenceDiagram
 | Without `target.auth` | The fetch forwards caller headers and follows redirects as before. |
 | `fabric://` targets | Unchanged. The remote gateway applies its own target auth. |
 
-The card fetched with `target.auth` is served to unauthenticated callers as is, so a
-target must not return credential-only content on its card path. A2A's authenticated
+The card fetched with `target.auth` is served to unauthenticated callers with its URLs
+rewritten and, on an Access Point that declares, its security replaced (see
+[Agent card security](#agent-card-security)), so a target must not return credential-only
+content on its card path. A2A's authenticated
 extended card lives on a separate endpoint that the gateway does not fetch. This may later
 become a per-surface opt-in.
 
@@ -142,6 +144,10 @@ Access Point of an A2A surface (**A2A Protocol**):
 ```json
 "access_point": { "protocol": "a2a", "a2a": { "accepted_versions": ["1.0"], "validation": "full" } }
 ```
+
+An A2A Access Point that [declares](SOURCE_AUTH.md#declaring-an-access-point) refuses a caller
+that failed source authentication with the [challenge](SOURCE_AUTH.md#caller-challenge) before
+version negotiation and validation, so neither setting applies to that request.
 
 The dashboard shows `validation` as **Message validation**: **Off**, **JSON-RPC envelope** (the
 default) or **Envelope + A2A fields**.
@@ -414,13 +420,24 @@ takes effect on the onboarding card, and on an A2A proxy card whose surface acce
 then list the `0.3` interface first. Remove the line or set `"1.0"` to prefer `1.0`.
 
 A Managed Agent's own card is served at the agent's `protocolVersion` and never translated to
-another version. On agent-card discovery requests the Gateway changes it in two ways: its endpoint
-URLs are rewritten to the gateway, and, when agent identity is configured, its
+another version. On agent-card discovery requests the Gateway changes it in up to three ways: its
+endpoint URLs are rewritten to the gateway, its security is replaced when the Access Point declares
+(see [Agent card security](#agent-card-security)), and, when agent identity is configured, its
 `agent-identity/v1` extension is replaced by a signed `agent-identity-credential/v1` presentation
 (with the `didwebvh` feature, `agentDid` and `agentDNA` are added too). The URL rewrite covers
 `supportedInterfaces`, `supported_interfaces`, `additionalInterfaces` and `additional_interfaces`,
 in their original order, since in `1.0` order
 encodes preference.
+
+The rewritten URL is the Access Point URL: the first `external_urls` entry of the listener the
+Access Point's `listen_address` matches, then the route, so a route of `/` gives
+`https://gw.example` with no trailing slash. Without a listener match the origin falls back to
+`webauthn.external_origin`. The synthesized A2A proxy card uses the same URL, since its Access
+Point accepts JSON-RPC on the route itself. The card of an Access Point that declares names the
+declared resource instead: the Access Point URL with the route kept as configured, so a root
+route gives `https://gw.example/`, and with `$alias` appended when the card was requested
+through a Surface Variant (`<route>$alias`). The card of any other Access Point points at the
+route without an alias.
 
 An extended card gets the same treatment on A2A and AP2 surfaces (on the outbound path, A2A and
 AP2 transit points), whether it is returned as a JSON-RPC result (`GetExtendedAgentCard` /
@@ -462,8 +479,13 @@ a JSON object, both `result` and `error`, and a card with no endpoint field (`ur
 On the JSON-RPC binding the refusal is a JSON-RPC `-32603` error that echoes the request `id`; on
 the HTTP+JSON binding it is a problem response. A non-success response that carries no card
 `result` is forwarded unchanged.
-A public card that cannot be rewritten is answered with `502` on the direct inbound path and
-forwarded as received on fabric and outbound paths.
+A public card that cannot be rewritten is answered with `502` and the generic detail
+"Failed to process agent card" on the card route, whatever the Access Point. On a proxied
+response, a Fabric response and a Transit Point response it is answered the same way when the
+Access Point has a declaration source (an explicit `protected_resource`, or one `jwt_bearer`
+method with `required_scopes`; a Transit Point card is secured when the Access Point declares,
+asks for a declaration it cannot serve, or its declaration cannot be resolved because the
+strategy store failed), and forwarded as received otherwise.
 
 A JSON-RPC batch that contains an extended-card call is rejected with `-32600` before it is
 forwarded, whatever the surface's A2A validation level, `"off"` included, because a card inside a
@@ -493,9 +515,58 @@ the caller's validated JWT claims like any other response; without them the requ
 A surface's agent card (the synthesized A2A-proxy card or a Managed Agent's rewritten card) is
 served as `application/a2a+json` only when the caller's `A2A-Version` resolves to `1.0` and the
 surface accepts `1.0`, or the caller lists that type in `Accept`; every other caller receives `application/json`. The response carries
-`Vary: A2A-Version, Accept`, so a shared cache stores each variant separately. The onboarding
+`Vary: A2A-Version, Accept`, so a shared cache stores each variant separately. The public card the card
+route serves for an Access Point that has a declaration source, and a Transit Point's public card
+when its Access Point declares, also carries `Cache-Control: no-cache` and a weak `ETag` holding the SHA-256 digest of the card
+served, replacing any the Target sent, so a cache revalidates it on every use and a changed
+security declaration is never served stale. A declaration source is enough: the card of a
+derived declaration that strips keeps the upstream security but still carries these headers,
+since an edit to the strategy can make it declare without the card changing. Any other card carries no revalidation headers. The onboarding
 card served by the identity API (`/onboard/{uuid}/.well-known/agent-card.json`) is always served as
 `application/json`.
+
+### Agent card security
+
+The caller reaches the gateway, not the agent, and the gateway never forwards the caller's
+`Authorization` header from an Access Point that declares, so the authorization server an
+upstream card names cannot be used through it. An Access Point that
+[declares](SOURCE_AUTH.md#declaring-an-access-point), or asks for a declaration it cannot
+serve, therefore replaces the security of the cards it serves. One outcome is resolved per card
+from the resolved Surface Variant ([`declaration.rs`](../src/source_auth/declaration.rs)) and
+applied by [`card_security.rs`](../src/a2a/card_security.rs). It covers the public card, the
+extended card and the synthesized A2A proxy card, on A2A and AP2 surfaces, on the direct and
+fabric paths, and the cards of the Access Point's Transit Points.
+
+| Outcome | Card effect |
+| --- | --- |
+| `declare` | Removes `security`, `securitySchemes`, `securityRequirements`, `security_schemes` and `security_requirements` from the card and from every `skills[]` entry and removes `signatures`. A derived declaration, which pins its authorization server, then adds one scheme named `agent_gateway`: an `oauth2` scheme whose `oauth2MetadataUrl` is the pinned `metadata_url`, with a `clientCredentials` flow whose `tokenUrl` is the pinned `token_endpoint` and whose scopes are every advertised scope, and a card-level requirement that lists only `required_scopes`. A declaration from an explicit `protected_resource` has no pinned authorization server to name, so its card gets the removal with no scheme and no requirement, as for an unservable declaration |
+| Unservable (a declaration the Access Point cannot serve) | The same removal, with no scheme, so the card fails closed |
+| `strip` or `pass_through` | The card keeps the upstream security and signatures. A Transit Point card whose security is removed is counted as `strip` with the reason `transit_point` |
+
+The conditions under which an Access Point declares, and the reason codes of a `strip`, are in
+[Declaring an Access Point](SOURCE_AUTH.md#declaring-an-access-point). A Transit Point never
+forwards the managed agent's credentials, so its cards lose the partner's security and
+signatures once the Access Point declares or is unservable, and are otherwise rewritten as
+before.
+
+A declared scheme takes the shape of the card's era. A `1.0` card (with `supportedInterfaces`
+and none of the v0.3 fields `url`, `endpoint`, `endpoints`, `preferredTransport`,
+`additionalInterfaces` or `protocolVersion`) gets the oneof wrapper
+(`{"oauth2SecurityScheme": {...}}`) and `securityRequirements`
+(`[{"schemes": {"agent_gateway": {"list": [...]}}}]`). A `0.3` card gets the flat
+`{"type": "oauth2", ...}` scheme and `security` (`[{"agent_gateway": [...]}]`). A card carrying
+both eras gets the flat scheme and both arrays. A synthesized A2A proxy card carries the v0.3
+fields only while its surface accepts `0.3`, so its declaration follows the surface's accepted
+versions.
+
+A declaring Access Point also publishes RFC 9728 protected resource metadata at its well-known
+URL; see [Protected resource metadata](SOURCE_AUTH.md#protected-resource-metadata). The outcome
+is resolved on every card, and a strategy store failure or any failure to rewrite or secure the
+card answers `502` as above; the extended card keeps its JSON-RPC refusal. Card bodies are never
+logged: a debug line records the surface, the outcome, the reason code, the size and the SHA-256
+digest of the served card, and
+[`agent_gateway_card_security_total`](OBSERVABILITY.md#trust-plane-metrics) counts each served
+card by outcome and reason.
 
 ### Accepting A2A 0.3
 
@@ -693,9 +764,12 @@ Relevant implementation:
   it. A Managed Agent card that declares `capabilities.streaming`
   is forwarded unchanged on these surfaces too. The cards the Gateway generates (A2A proxy and
   onboarding) declare `streaming: false`, and those endpoints do not stream.
-- **Signed cards:** there is no signature handling. URL rewriting and identity-extension
-  replacement invalidate any `signatures[]` on a Managed Agent's card, and the signatures are passed
-  through unchanged, so downstream verification fails.
+- **Signed cards:** the gateway removes `signatures[]` only from a card whose security it
+  replaces (see [Agent card security](#agent-card-security)). On every other card, URL rewriting and
+  identity-extension replacement invalidate any `signatures[]` on a Managed Agent's card, and the
+  signatures are passed through unchanged, so downstream verification fails. The gateway does not sign
+  the card it serves, so a caller cannot verify who published it from a signature and relies on the TLS
+  connection to the gateway.
 - **Bindings:** only the JSON-RPC binding is served. A2A mandates no particular binding, so this is
   conformant; gRPC and REST are not planned.
 - **Per-interface routing:** the rewrite points every interface URL (`supportedInterfaces[]`,

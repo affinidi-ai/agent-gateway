@@ -6,8 +6,6 @@ use axum::{
 };
 use tracing::{debug, info, warn};
 
-use crate::proxy::backend_identity::ProtectedAgentIdentity;
-
 /// Build target URL from endpoint and request URI, or return direct response for special protocols
 #[allow(clippy::result_large_err)]
 pub fn build_target_url(
@@ -235,44 +233,24 @@ pub async fn inject_didwebvh_identity_into_agent_card(
 ) {
 }
 
+/// The card endpoint URL of an Access Point that declares nothing: the first public
+/// origin of its listener, falling back to `webauthn.external_origin`, and its route.
 fn build_proxy_endpoint(
     surface: &crate::config::agent_surface::AgentSurface,
     network_config: &crate::config::NetworkConfig,
 ) -> String {
-    let listen_address = &surface
-        .access_point
-        .listen_address;
-
-    // Resolve the listener's public URL from listen_address → port → listener external_urls.
-    // Falls back to webauthn.external_origin when no matching listener is found.
-    let port = network_config
-        .map_url_to_port(listen_address)
-        .or_else(|| {
-            listen_address
-                .rsplit(':')
-                .next()
-                .and_then(|p| p.parse().ok())
-        });
-
-    let base_url = port
-        .and_then(|p| {
-            network_config
-                .listeners
-                .iter()
-                .find(|l| l.port == p)
-                .and_then(|l| l.external_urls.first())
-        })
-        .map(|u| u.trim_end_matches('/'))
-        .unwrap_or_else(|| {
+    let base_url =
+        crate::protocols::protected_resource::access_point_origin(surface, network_config).unwrap_or_else(|| {
             warn!(
                 surface = %surface.name,
-                listen_address,
+                listen_address = %surface.access_point.listen_address,
                 "No listener found for access point, falling back to webauthn.external_origin"
             );
             network_config
                 .webauthn
                 .external_origin
                 .trim_end_matches('/')
+                .to_string()
         });
 
     if surface.access_point.route == "/"
@@ -281,7 +259,7 @@ fn build_proxy_endpoint(
             .route
             .is_empty()
     {
-        base_url.to_string()
+        base_url
     } else {
         format!("{}{}", base_url, surface.access_point.route)
     }
@@ -393,69 +371,143 @@ fn parse_agent_card(body: &[u8]) -> Result<serde_json::Value, anyhow::Error> {
     Ok(agent_card)
 }
 
-// Process agent card: rewrite URLs to point at the proxy.
+/// What the gateway needs to decide a card's security declaration.
+#[derive(Clone, Copy, Default)]
+pub struct CardSecurityContext<'a> {
+    /// The alias of the Surface Variant the request selected, `None` for the base route.
+    pub variant_alias: Option<&'a str>,
+    pub strategies: Option<&'a dyn crate::jwt_bearer::JwtVerificationStrategyStorage>,
+}
+
+/// Resolve the Access Point's declaration and, when the declaration secures its
+/// cards, apply it to a parsed card. The card's endpoint URLs are left as they are.
+pub(crate) async fn secure_agent_card(
+    agent_card: &mut serde_json::Value,
+    surface: &crate::config::agent_surface::AgentSurface,
+    security: CardSecurityContext<'_>,
+    network_config: &crate::config::NetworkConfig,
+) -> Result<crate::source_auth::declaration::DeclarationOutcome, anyhow::Error> {
+    let outcome = crate::source_auth::declaration::resolve_surface_declaration(
+        surface,
+        security.variant_alias,
+        security.strategies,
+        network_config,
+    )
+    .await?;
+    if super::card_security::secures_cards(&outcome) {
+        super::card_security::apply_card_security(agent_card, &outcome);
+    }
+    Ok(outcome)
+}
+
+/// Count a served card's declaration outcome and log the card by its size and
+/// digest, never its body.
+pub fn record_served_card(
+    surface_name: &str,
+    outcome: &crate::source_auth::declaration::DeclarationOutcome,
+    card: &[u8],
+) {
+    use sha2::Digest;
+
+    crate::metrics::backends::prometheus::track_card_security(outcome.label(), outcome.reason_code());
+    debug!(
+        surface = surface_name,
+        outcome = outcome.label(),
+        reason = outcome.reason_code(),
+        size = card.len(),
+        sha256 = %hex::encode(sha2::Sha256::digest(card)),
+        "Agent card processed"
+    );
+}
+
+/// Apply the Access Point's security declaration to a card and rewrite its
+/// endpoint URLs: a declaring card names the declared resource, `$alias` included
+/// for a variant, and any other card names the Access Point's base URL. The card is
+/// neither counted nor logged. Every error means the card
+/// must not be served.
+pub async fn rewrite_agent_card(
+    body: &[u8],
+    surface: &crate::config::agent_surface::AgentSurface,
+    security: CardSecurityContext<'_>,
+    network_config: &crate::config::NetworkConfig,
+    kind: AgentCardKind,
+) -> Result<(serde_json::Value, crate::source_auth::declaration::DeclarationOutcome), anyhow::Error> {
+    use crate::source_auth::declaration::DeclarationOutcome;
+
+    let mut agent_card = parse_agent_card(body)?;
+    let outcome = secure_agent_card(&mut agent_card, surface, security, network_config).await?;
+    let proxy_endpoint = match &outcome {
+        DeclarationOutcome::Declare(declaration) => declaration.resource.clone(),
+        _ => build_proxy_endpoint(surface, network_config),
+    };
+    rewrite_card_endpoints(&mut agent_card, &proxy_endpoint, &surface.name, kind)?;
+    Ok((agent_card, outcome))
+}
+
+/// Rewrite a card the gateway serves, as [`rewrite_agent_card`] does, and count and
+/// log it. Every error means the card must not be served.
 pub async fn process_agent_card(
     body: &[u8],
     surface: &crate::config::agent_surface::AgentSurface,
-    _config: &crate::config::GatewayConfig,
+    security: CardSecurityContext<'_>,
     network_config: &crate::config::NetworkConfig,
-    _resolved_identity: &ProtectedAgentIdentity,
     kind: AgentCardKind,
 ) -> Result<axum::body::Bytes, anyhow::Error> {
-    let mut agent_card = parse_agent_card(body)?;
-
-    let proxy_endpoint = build_proxy_endpoint(surface, network_config);
-
-    info!(
-        "Agent card processing: surface='{}' route='{}' proxy_endpoint='{}'",
-        surface.name, surface.access_point.route, proxy_endpoint
-    );
-
-    // Log original agent card for debugging
-    if let Ok(original_json) = serde_json::to_string_pretty(&agent_card) {
-        debug!("Original agent card:\n{}", original_json);
-    }
-
-    rewrite_card_endpoints(&mut agent_card, &proxy_endpoint, &surface.name, kind)?;
-
-    // Log processed agent card for debugging
-    if let Ok(processed_json) = serde_json::to_string_pretty(&agent_card) {
-        debug!("Processed agent card:\n{}", processed_json);
-    }
-
-    // Serialize back to JSON
+    info!("Agent card processing: surface='{}' route='{}'", surface.name, surface.access_point.route);
+    let (agent_card, outcome) = rewrite_agent_card(body, surface, security, network_config, kind).await?;
     let processed = serde_json::to_vec(&agent_card)?;
+    record_served_card(&surface.name, &outcome, &processed);
     Ok(axum::body::Bytes::from(processed))
 }
 
-/// Rewrite agent card URLs to point to the proxy instead of the backend server.
-///
-/// DEPRECATED: Use `process_agent_card` instead — this function is kept for backward compatibility.
-pub async fn rewrite_agent_card_urls(
-    body: &[u8],
-    surface: &crate::config::agent_surface::AgentSurface,
-    config: &crate::config::GatewayConfig,
-    network_config: &crate::config::NetworkConfig,
-    resolved_identity: &ProtectedAgentIdentity,
-    kind: AgentCardKind,
-) -> Result<axum::body::Bytes, anyhow::Error> {
-    process_agent_card(body, surface, config, network_config, resolved_identity, kind).await
-}
-
-/// Rewrite agent card URLs for the outbound pipeline.
-/// `proxy_endpoint` is the outbound virtual channel's `gateway_url`.
+/// Rewrite agent card URLs for the outbound pipeline and, when `strip_security` is
+/// set, strip the partner's security and signatures and count and log the card as
+/// served. `proxy_endpoint` is the outbound virtual channel's `gateway_url`.
 pub fn process_outbound_agent_card(
     body: &[u8],
     proxy_endpoint: &str,
     channel_name: &str,
     kind: AgentCardKind,
+    strip_security: bool,
 ) -> Result<axum::body::Bytes, anyhow::Error> {
+    use crate::source_auth::declaration::{DeclarationOutcome, StripReason};
+
     let mut agent_card = parse_agent_card(body)?;
-
     rewrite_card_endpoints(&mut agent_card, proxy_endpoint, channel_name, kind)?;
-
+    let outcome = DeclarationOutcome::Strip(StripReason::TransitPoint);
+    if strip_security {
+        super::card_security::apply_card_security(&mut agent_card, &outcome);
+    }
     let processed = serde_json::to_vec(&agent_card)?;
+    if strip_security {
+        record_served_card(channel_name, &outcome, &processed);
+    }
     Ok(axum::body::Bytes::from(processed))
+}
+
+/// The message for a public card the gateway refuses to serve.
+pub const AGENT_CARD_REFUSAL: &str = "Failed to process agent card";
+
+/// The `502` answering a public card the gateway cannot rewrite or secure.
+pub fn agent_card_refusal() -> axum::response::Response {
+    crate::a2a::errors::create_error_response(axum::http::StatusCode::BAD_GATEWAY, AGENT_CARD_REFUSAL)
+}
+
+/// Make caches revalidate a public card on every use, against a weak validator
+/// derived from the card served, so a changed declaration is never served stale.
+pub fn set_agent_card_revalidation(
+    headers: &mut axum::http::HeaderMap,
+    body: &[u8],
+) {
+    use axum::http::{HeaderValue, header};
+    use sha2::Digest;
+
+    let etag = format!("W/\"{}\"", hex::encode(sha2::Sha256::digest(body)));
+    headers.remove(header::LAST_MODIFIED);
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    if let Ok(etag) = HeaderValue::from_str(&etag) {
+        headers.insert(header::ETAG, etag);
+    }
 }
 
 /// Whether `method` requests the extended agent card, in either A2A era
@@ -586,20 +638,23 @@ pub fn rewrap_extended_agent_card(
 }
 
 /// Rewrite the endpoint URLs of an extended card returned as a JSON-RPC result,
-/// for the outbound pipeline. Returns `None` when there is no card to rewrite
-/// (see [`unwrap_extended_agent_card`]) and an error for a 2xx body that is
+/// for the outbound pipeline, stripping its security when `strip_security` is set
+/// as [`process_outbound_agent_card`] does. Returns `None` when there is no card to
+/// rewrite (see [`unwrap_extended_agent_card`]) and an error for a 2xx body that is
 /// neither a card nor a JSON-RPC error.
 pub fn process_outbound_extended_agent_card(
     body: &[u8],
     proxy_endpoint: &str,
     channel_name: &str,
     status: axum::http::StatusCode,
+    strip_security: bool,
 ) -> Result<Option<axum::body::Bytes>, anyhow::Error> {
     let (card, Some(envelope)) = unwrap_extended_agent_card(axum::body::Bytes::copy_from_slice(body), true, status)?
     else {
         return Ok(None);
     };
-    let card = process_outbound_agent_card(&card, proxy_endpoint, channel_name, AgentCardKind::Extended)?;
+    let card =
+        process_outbound_agent_card(&card, proxy_endpoint, channel_name, AgentCardKind::Extended, strip_security)?;
     rewrap_extended_agent_card(Some(envelope), card).map(Some)
 }
 
@@ -1001,8 +1056,8 @@ mod tests {
     fn process_outbound_leaves_upstream_only_in_non_endpoint_fields() {
         for card in [v0_3_upstream_card(), v1_0_upstream_card()] {
             let body = serde_json::to_vec(&card).expect("serialize fixture");
-            let bytes =
-                process_outbound_agent_card(&body, PROXY_URL, "test-channel", AgentCardKind::Public).expect("rewrite");
+            let bytes = process_outbound_agent_card(&body, PROXY_URL, "test-channel", AgentCardKind::Public, false)
+                .expect("rewrite");
             let rewritten: serde_json::Value = serde_json::from_slice(&bytes).expect("rewritten card is JSON");
 
             let expected_endpoint_fields = endpoint_field_values(&card).len();
@@ -1037,7 +1092,8 @@ mod tests {
         });
         let body = serde_json::to_vec(&card).unwrap();
 
-        let result = process_outbound_agent_card(&body, PROXY_URL, "test-channel", AgentCardKind::Public).unwrap();
+        let result =
+            process_outbound_agent_card(&body, PROXY_URL, "test-channel", AgentCardKind::Public, false).unwrap();
         let rewritten: serde_json::Value = serde_json::from_slice(&result).unwrap();
 
         assert_eq!(rewritten["supported_interfaces"][0]["url"], PROXY_URL);
@@ -1053,7 +1109,8 @@ mod tests {
         });
         let body = serde_json::to_vec(&card).unwrap();
 
-        let result = process_outbound_agent_card(&body, PROXY_URL, "test-channel", AgentCardKind::Public).unwrap();
+        let result =
+            process_outbound_agent_card(&body, PROXY_URL, "test-channel", AgentCardKind::Public, false).unwrap();
         let rewritten: serde_json::Value = serde_json::from_slice(&result).unwrap();
 
         assert_eq!(rewritten["url"], PROXY_URL);
@@ -1061,8 +1118,65 @@ mod tests {
 
     #[test]
     fn process_outbound_returns_error_on_invalid_json() {
-        let result = process_outbound_agent_card(b"not json", PROXY_URL, "test-channel", AgentCardKind::Public);
+        let result = process_outbound_agent_card(b"not json", PROXY_URL, "test-channel", AgentCardKind::Public, false);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn process_outbound_keeps_the_partner_security_and_signatures() {
+        let card = json!({
+            "name": "Partner A",
+            "supported_interfaces": [{ "url": "https://partner-a.example.com/a2a" }],
+            "security_schemes": { "partner": { "type": "http", "scheme": "bearer" } },
+            "security_requirements": [{ "schemes": { "partner": {} } }],
+            "signatures": [{ "protected": "e30", "signature": "c2ln" }],
+            "skills": [{ "id": "s", "security_requirements": [] }]
+        });
+        let body = serde_json::to_vec(&card).unwrap();
+
+        let result =
+            process_outbound_agent_card(&body, PROXY_URL, "test-channel", AgentCardKind::Extended, false).unwrap();
+        let processed: serde_json::Value = serde_json::from_slice(&result).unwrap();
+
+        let mut expected = card;
+        expected["supported_interfaces"][0]["url"] = json!(PROXY_URL);
+        assert_eq!(processed, expected);
+    }
+
+    #[test]
+    fn a_secured_outbound_card_drops_security_and_signatures_in_both_spellings() {
+        let card = json!({
+            "name": "Partner A",
+            "supported_interfaces": [{ "url": "https://partner-a.example.com/a2a" }],
+            "security_schemes": { "partner": { "type": "http", "scheme": "bearer" } },
+            "security_requirements": [{ "schemes": { "partner": {} } }],
+            "securitySchemes": { "partner": { "type": "http", "scheme": "bearer" } },
+            "security": [{ "partner": [] }],
+            "signatures": [{ "protected": "e30", "signature": "c2ln" }],
+            "skills": [{ "id": "s", "security": [{ "partner": [] }], "security_requirements": [] }]
+        });
+        let expected = json!({
+            "name": "Partner A",
+            "supported_interfaces": [{ "url": PROXY_URL }],
+            "skills": [{ "id": "s" }]
+        });
+        let body = serde_json::to_vec(&card).unwrap();
+
+        let result =
+            process_outbound_agent_card(&body, PROXY_URL, "test-channel", AgentCardKind::Extended, true).unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&result).unwrap(), expected);
+
+        let envelope = serde_json::to_vec(&json!({ "jsonrpc": "2.0", "id": 1, "result": card })).unwrap();
+        let result = process_outbound_extended_agent_card(
+            &envelope,
+            PROXY_URL,
+            "test-channel",
+            axum::http::StatusCode::OK,
+            true,
+        )
+        .unwrap()
+        .expect("card result");
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&result).unwrap()["result"], expected);
     }
 
     // ── build_proxy_endpoint ─────────────────────────────────────────────
@@ -1165,6 +1279,375 @@ mod tests {
         );
         let surface = make_surface("0.0.0.0:8080", "/");
         assert_eq!(build_proxy_endpoint(&surface, &net), "https://gw.example.com");
+    }
+
+    // ── process_agent_card ───────────────────────────────────────────────
+
+    const RESOURCE: &str = "https://gw.example.com/agents/buyer";
+    const AS_METADATA_URL: &str = "https://as.example/.well-known/oauth-authorization-server";
+    const TOKEN_URL: &str = "https://as.example/oauth2/token";
+
+    enum Strategies {
+        Pinned,
+        Failing,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::jwt_bearer::JwtVerificationStrategyStorage for Strategies {
+        async fn create(
+            &self,
+            _: crate::jwt_bearer::models::JwtVerificationStrategy,
+        ) -> anyhow::Result<crate::jwt_bearer::models::JwtVerificationStrategy> {
+            anyhow::bail!("read-only")
+        }
+
+        async fn get(
+            &self,
+            id: &str,
+        ) -> anyhow::Result<Option<crate::jwt_bearer::models::JwtVerificationStrategy>> {
+            match self {
+                Self::Pinned => Ok((id == "strategy").then(pinned_strategy)),
+                Self::Failing => anyhow::bail!("unavailable"),
+            }
+        }
+
+        async fn list(&self) -> anyhow::Result<Vec<crate::jwt_bearer::models::JwtVerificationStrategy>> {
+            anyhow::bail!("unavailable")
+        }
+
+        async fn update(
+            &self,
+            _: crate::jwt_bearer::models::JwtVerificationStrategy,
+        ) -> anyhow::Result<crate::jwt_bearer::models::JwtVerificationStrategy> {
+            anyhow::bail!("read-only")
+        }
+
+        async fn delete(
+            &self,
+            _: &str,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("read-only")
+        }
+    }
+
+    fn pinned_strategy() -> crate::jwt_bearer::models::JwtVerificationStrategy {
+        crate::jwt_bearer::models::JwtVerificationStrategy {
+            id: "strategy".into(),
+            name: "as".into(),
+            expected_issuer: "https://as.example/".into(),
+            jwks_source: crate::jwt_bearer::models::JwksSource::Remote {
+                jwks_uri: "https://as.example/jwks".into(),
+            },
+            authorization_server: Some(crate::jwt_bearer::models::AuthorizationServerMetadata {
+                issuer: "https://as.example/".into(),
+                metadata_url: AS_METADATA_URL.into(),
+                token_endpoint: TOKEN_URL.into(),
+                jwks_uri: "https://as.example/jwks".into(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn jwt_bearer_surface(route: &str) -> crate::config::agent_surface::AgentSurface {
+        let mut surface = make_surface("0.0.0.0:8080", route);
+        let resource = format!("https://gw.example.com{route}");
+        surface
+            .access_point
+            .caller_authentication = Some(
+            serde_json::from_value(json!({ "methods": [{
+                "type": "jwt_bearer",
+                "jwt_verification_strategy_id": "strategy",
+                "audiences": [resource, format!("{resource}$dev")],
+                "required_scopes": ["agent.invoke"]
+            }] }))
+            .unwrap(),
+        );
+        surface
+    }
+
+    fn https_network() -> crate::config::NetworkConfig {
+        make_network_config(json!([{
+            "id": "in", "name": "in", "bind_address": "0.0.0.0", "port": 8080,
+            "protocol": "https", "external_urls": ["https://gw.example.com"], "listener_type": "inbound"
+        }]))
+    }
+
+    fn upstream_card(url: &str) -> serde_json::Value {
+        json!({
+            "name": "Agent",
+            "url": url,
+            "securitySchemes": { "upstream": { "type": "http", "scheme": "bearer" } },
+            "security": [{ "upstream": [] }],
+            "signatures": [{ "protected": "e30", "signature": "c2ln" }]
+        })
+    }
+
+    fn secured_card() -> Vec<u8> {
+        serde_json::to_vec(&upstream_card("https://agent.internal/a2a")).unwrap()
+    }
+
+    fn declared_card(url: &str) -> serde_json::Value {
+        json!({
+            "name": "Agent",
+            "url": url,
+            "securitySchemes": { "agent_gateway": {
+                "type": "oauth2",
+                "oauth2MetadataUrl": AS_METADATA_URL,
+                "flows": { "clientCredentials": { "tokenUrl": TOKEN_URL, "scopes": { "agent.invoke": "" } } }
+            } },
+            "security": [{ "agent_gateway": ["agent.invoke"] }]
+        })
+    }
+
+    async fn served_card(
+        surface: &crate::config::agent_surface::AgentSurface,
+        security: CardSecurityContext<'_>,
+    ) -> serde_json::Value {
+        let served = process_agent_card(&secured_card(), surface, security, &https_network(), AgentCardKind::Public)
+            .await
+            .expect("card");
+        serde_json::from_slice(&served).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_declaring_access_point_serves_the_gateway_scheme_at_the_declared_resource() {
+        let strategies = Strategies::Pinned;
+        for (route, alias, url) in [
+            ("/agents/buyer", None, RESOURCE.to_string()),
+            ("/agents/buyer", Some("dev"), format!("{RESOURCE}$dev")),
+            ("/", None, "https://gw.example.com/".to_string()),
+        ] {
+            let card = served_card(
+                &jwt_bearer_surface(route),
+                CardSecurityContext {
+                    variant_alias: alias,
+                    strategies: Some(&strategies),
+                },
+            )
+            .await;
+            assert_eq!(card, declared_card(&url), "route {route} alias {alias:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_access_point_that_cannot_declare_serves_the_card_as_the_target_secured_it() {
+        let strategies = Strategies::Pinned;
+        let variant_of_root = CardSecurityContext {
+            variant_alias: Some("dev"),
+            strategies: Some(&strategies),
+        };
+        assert_eq!(
+            served_card(&jwt_bearer_surface("/"), variant_of_root).await,
+            upstream_card("https://gw.example.com")
+        );
+        let missing_strategy = CardSecurityContext {
+            variant_alias: Some("dev"),
+            strategies: None,
+        };
+        assert_eq!(served_card(&jwt_bearer_surface("/agents/buyer"), missing_strategy).await, upstream_card(RESOURCE));
+    }
+
+    #[tokio::test]
+    async fn process_agent_card_fails_when_the_strategy_store_fails() {
+        let strategies = Strategies::Failing;
+        let result = process_agent_card(
+            &secured_card(),
+            &jwt_bearer_surface("/agents/buyer"),
+            CardSecurityContext {
+                variant_alias: None,
+                strategies: Some(&strategies),
+            },
+            &https_network(),
+            AgentCardKind::Public,
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn process_agent_card_without_caller_authentication_never_reads_the_store() {
+        let strategies = Strategies::Failing;
+        let card = served_card(
+            &make_surface("0.0.0.0:8080", "/agents/buyer"),
+            CardSecurityContext {
+                variant_alias: Some("dev"),
+                strategies: Some(&strategies),
+            },
+        )
+        .await;
+        assert_eq!(card, upstream_card(RESOURCE));
+    }
+
+    #[tokio::test]
+    async fn rewrite_agent_card_yields_exactly_what_process_agent_card_serves() {
+        let strategies = Strategies::Pinned;
+        let security = CardSecurityContext {
+            variant_alias: None,
+            strategies: Some(&strategies),
+        };
+        for (surface, label) in [
+            (jwt_bearer_surface("/agents/buyer"), "declare"),
+            (make_surface("0.0.0.0:8080", "/agents/buyer"), "pass_through"),
+        ] {
+            let (rewritten, outcome) =
+                rewrite_agent_card(&secured_card(), &surface, security, &https_network(), AgentCardKind::Public)
+                    .await
+                    .expect("rewrite");
+            let served =
+                process_agent_card(&secured_card(), &surface, security, &https_network(), AgentCardKind::Public)
+                    .await
+                    .expect("process");
+            assert_eq!(serde_json::to_vec(&rewritten).expect("serialize"), served.to_vec());
+            assert_eq!(outcome.label(), label);
+        }
+        assert!(
+            rewrite_agent_card(
+                b"[]",
+                &jwt_bearer_surface("/agents/buyer"),
+                security,
+                &https_network(),
+                AgentCardKind::Public
+            )
+            .await
+            .is_err(),
+            "a card that is not an object is refused"
+        );
+    }
+
+    fn card_security_count(
+        outcome: &str,
+        reason: &str,
+    ) -> u64 {
+        crate::metrics::backends::prometheus::CARD_SECURITY
+            .with_label_values(&[outcome, reason])
+            .get()
+    }
+
+    #[test]
+    fn each_served_card_outcome_is_counted_with_its_reason() {
+        use crate::source_auth::declaration::{Declaration, DeclarationOutcome, StripReason};
+        let declaration = Declaration {
+            resource: RESOURCE.into(),
+            authorization_servers: vec!["https://as.example/".into()],
+            pin: pinned_strategy().authorization_server,
+            required_scopes: vec!["agent.invoke".into()],
+            advertised_scopes: vec!["agent.invoke".into()],
+        };
+        let strip_before = card_security_count("strip", "root_variant");
+        let declare_before = card_security_count("declare", "none");
+        let pass_before = card_security_count("pass_through", "none");
+        let transit_before = card_security_count("strip", "transit_point");
+
+        record_served_card("surface", &DeclarationOutcome::Strip(StripReason::RootVariant), b"{}");
+        record_served_card("surface", &DeclarationOutcome::Declare(declaration), b"{}");
+        record_served_card("surface", &DeclarationOutcome::PassThrough, b"{}");
+        process_outbound_agent_card(br#"{"name":"agent"}"#, PROXY_URL, "test", AgentCardKind::Public, true)
+            .expect("outbound card");
+
+        assert!(card_security_count("strip", "root_variant") > strip_before);
+        assert!(card_security_count("declare", "none") > declare_before);
+        assert!(card_security_count("pass_through", "none") > pass_before);
+        assert!(card_security_count("strip", "transit_point") > transit_before);
+    }
+
+    /// A served card is logged by its size and digest, never by its body.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_served_card_is_logged_without_its_body() {
+        use sha2::Digest;
+
+        const BODY_MARKER: &str = "card-body-marker";
+        const SCHEME_MARKER: &str = "scheme-marker";
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        let card = json!({
+            "name": "Agent",
+            "description": BODY_MARKER,
+            "url": "https://agent.internal/a2a",
+            "securitySchemes": { "scheme-marker": { "type": "http", "scheme": "bearer" } },
+            "security": [{ "scheme-marker": [] }]
+        });
+        let served = process_agent_card(
+            &serde_json::to_vec(&card).expect("card"),
+            &make_surface("0.0.0.0:8080", "/agents/buyer"),
+            CardSecurityContext::default(),
+            &https_network(),
+            AgentCardKind::Public,
+        )
+        .await
+        .expect("served card");
+
+        let logged = logs.text();
+        assert!(logged.contains("Agent card processed"), "{logged}");
+        assert!(logged.contains(&format!("size={}", served.len())), "{logged}");
+        assert!(logged.contains(&format!("sha256={}", hex::encode(sha2::Sha256::digest(&served)))), "{logged}");
+        assert!(!logged.contains(BODY_MARKER), "the card body was logged: {logged}");
+        assert!(!logged.contains(SCHEME_MARKER), "the card's security was logged: {logged}");
+    }
+
+    #[tokio::test]
+    async fn rewriting_a_card_without_serving_it_is_not_counted() {
+        const REWRITES: u64 = 200;
+        let surface = make_surface("0.0.0.0:8080", "/agents/buyer");
+        let before = card_security_count("pass_through", "none");
+        for _ in 0..REWRITES {
+            rewrite_agent_card(
+                &secured_card(),
+                &surface,
+                CardSecurityContext::default(),
+                &https_network(),
+                AgentCardKind::Public,
+            )
+            .await
+            .expect("rewrite");
+        }
+        let counted = card_security_count("pass_through", "none") - before;
+        assert!(counted < REWRITES, "{counted} of {REWRITES} rewrites were counted as served cards");
+    }
+
+    #[tokio::test]
+    async fn agent_card_refusal_is_a_generic_502_problem() {
+        let response = agent_card_refusal();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_GATEWAY);
+        assert_eq!(response.headers()[axum::http::header::CONTENT_TYPE], "application/problem+json");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["status"], 502);
+        assert_eq!(body["detail"], AGENT_CARD_REFUSAL);
+    }
+
+    #[test]
+    fn a_revalidated_card_has_no_cache_a_weak_etag_of_its_body_and_no_last_modified() {
+        use sha2::Digest;
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::LAST_MODIFIED,
+            "Wed, 21 Oct 2026 07:28:00 GMT"
+                .parse()
+                .unwrap(),
+        );
+        headers.insert(
+            axum::http::header::CACHE_CONTROL,
+            "max-age=3600"
+                .parse()
+                .unwrap(),
+        );
+
+        set_agent_card_revalidation(&mut headers, b"{\"name\":\"Agent\"}");
+
+        let digest = hex::encode(sha2::Sha256::digest(b"{\"name\":\"Agent\"}"));
+        assert_eq!(headers[axum::http::header::CACHE_CONTROL], "no-cache");
+        assert_eq!(headers[axum::http::header::ETAG], format!("W/\"{digest}\"").as_str());
+        assert!(
+            headers
+                .get(axum::http::header::LAST_MODIFIED)
+                .is_none()
+        );
+
+        let mut other = axum::http::HeaderMap::new();
+        set_agent_card_revalidation(&mut other, b"{\"name\":\"Other\"}");
+        assert_ne!(other[axum::http::header::ETAG], headers[axum::http::header::ETAG]);
     }
 
     // ── build_transit_point_proxy_endpoint ───────────────────────────────
@@ -1307,7 +1790,7 @@ mod tests {
 
     fn rewrite_extended_card(envelope: serde_json::Value) -> Option<serde_json::Value> {
         let body = serde_json::to_vec(&envelope).unwrap();
-        process_outbound_extended_agent_card(&body, PROXY_URL, "test", axum::http::StatusCode::OK)
+        process_outbound_extended_agent_card(&body, PROXY_URL, "test", axum::http::StatusCode::OK, false)
             .unwrap()
             .map(|b| serde_json::from_slice(&b).unwrap())
     }
@@ -1420,7 +1903,8 @@ mod tests {
         ] {
             let body = serde_json::to_vec(&envelope).unwrap();
             assert!(
-                process_outbound_extended_agent_card(&body, PROXY_URL, "test", axum::http::StatusCode::OK).is_err(),
+                process_outbound_extended_agent_card(&body, PROXY_URL, "test", axum::http::StatusCode::OK, false)
+                    .is_err(),
                 "{envelope}"
             );
         }
@@ -1429,8 +1913,8 @@ mod tests {
     #[test]
     fn extended_card_without_an_endpoint_field_fails_closed_but_a_public_card_passes() {
         let wrapped = br#"{"agentCard":{"supportedInterfaces":[{"url":"https://backend.internal"}]}}"#;
-        assert!(process_outbound_agent_card(wrapped, PROXY_URL, "test", AgentCardKind::Extended).is_err());
-        let public = process_outbound_agent_card(wrapped, PROXY_URL, "test", AgentCardKind::Public).unwrap();
+        assert!(process_outbound_agent_card(wrapped, PROXY_URL, "test", AgentCardKind::Extended, false).is_err());
+        let public = process_outbound_agent_card(wrapped, PROXY_URL, "test", AgentCardKind::Public, false).unwrap();
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&public).unwrap(),
             serde_json::from_slice::<serde_json::Value>(wrapped).unwrap()
@@ -1440,6 +1924,7 @@ mod tests {
             PROXY_URL,
             "test",
             AgentCardKind::Extended,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -1476,7 +1961,9 @@ mod tests {
     #[test]
     fn extended_card_non_json_body_fails_closed() {
         let sse = b"event: message\ndata: {\"result\":{\"url\":\"https://backend.internal\"}}\n\n";
-        assert!(process_outbound_extended_agent_card(sse, PROXY_URL, "test", axum::http::StatusCode::OK).is_err());
+        assert!(
+            process_outbound_extended_agent_card(sse, PROXY_URL, "test", axum::http::StatusCode::OK, false).is_err()
+        );
         assert!(
             unwrap_extended_agent_card(axum::body::Bytes::from_static(sse), true, axum::http::StatusCode::OK).is_err()
         );
@@ -1495,6 +1982,7 @@ mod tests {
             PROXY_URL,
             "test",
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            false,
         )
         .unwrap()
         .expect("card result is rewritten on any status");
@@ -1514,9 +2002,15 @@ mod tests {
             assert_eq!(out.as_ref(), body);
             assert!(envelope.is_none());
             assert!(
-                process_outbound_extended_agent_card(body, PROXY_URL, "test", axum::http::StatusCode::UNAUTHORIZED)
-                    .unwrap()
-                    .is_none()
+                process_outbound_extended_agent_card(
+                    body,
+                    PROXY_URL,
+                    "test",
+                    axum::http::StatusCode::UNAUTHORIZED,
+                    false
+                )
+                .unwrap()
+                .is_none()
             );
         }
     }
@@ -1524,7 +2018,7 @@ mod tests {
     #[test]
     fn extended_card_empty_body_passes_through() {
         assert!(
-            process_outbound_extended_agent_card(b"", PROXY_URL, "test", axum::http::StatusCode::OK)
+            process_outbound_extended_agent_card(b"", PROXY_URL, "test", axum::http::StatusCode::OK, false)
                 .unwrap()
                 .is_none()
         );
@@ -1537,13 +2031,17 @@ mod tests {
     #[test]
     fn agent_card_that_is_not_an_object_is_rejected() {
         for body in [&b"[]"[..], br#"["https://backend.internal"]"#, br#""https://backend.internal""#, b"42"] {
-            assert!(process_outbound_agent_card(body, PROXY_URL, "test", AgentCardKind::Public).is_err(), "{body:?}");
+            assert!(
+                process_outbound_agent_card(body, PROXY_URL, "test", AgentCardKind::Public, false).is_err(),
+                "{body:?}"
+            );
         }
         let card = process_outbound_agent_card(
             br#"{"url":"https://backend.internal"}"#,
             PROXY_URL,
             "test",
             AgentCardKind::Public,
+            false,
         )
         .unwrap();
         assert_eq!(serde_json::from_slice::<serde_json::Value>(&card).unwrap()["url"], PROXY_URL);

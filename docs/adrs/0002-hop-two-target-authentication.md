@@ -13,6 +13,9 @@
 
 Proposed.
 
+Extends [1. Adopt OpenID Connect and OAuth 2.0 as a provider-neutral trust plane in Agent Gateway](0001-openid-oauth-agent-gateway.md),
+whose Status carries the matching `Extended by` link.
+
 This ADR records the contract for hop 2: how Target Authentication obtains a credential from a
 credential provider, where a gateway token is cached, which provider types may be used where, how
 Target Authentication relates to credential delegation, which gateway owns the token on a Fabric
@@ -143,7 +146,6 @@ described in [`CREDENTIAL_DELEGATION.md`](../CREDENTIAL_DELEGATION.md).
 | Agent Gateway backend | Resolver, cache, call sites, tenancy, save checks | TBD (Open question 1) |
 | Dashboard | Target Authentication panel (provider picker, scopes, header shape); provider type capability map | TBD (Open question 1) |
 | Product | Tenancy tightening for provider secret references | Cosmin Mogos |
-| Temasek POC integration (Ensign) | Vertex and Foundry card fetch and calls | Chaitanya Samprajan |
 
 ### Out of scope
 

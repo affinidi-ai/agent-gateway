@@ -23,6 +23,20 @@ There are exactly two policy planes — **Gateway** (appliance-to-appliance) and
 `surface.policy` at boot. Deny reason: `data.surface.policy.deny_reason` /
 `data.gateway.policy.deny_reason`.
 
+### Surface channel context (`input.channel`)
+
+Every inbound request, on the direct Access Point and on Fabric receive alike, carries
+`input.channel` with the surface `config_id` and `name`, and `variant_alias` only when the
+request names an existing, enabled Surface Variant by its alias (`/route$alias/...`, or the
+alias the sending gateway forwards). The field is absent when the request names no alias,
+including when the surface's default variant serves an unmarked URL, so a rule keyed on the
+default variant's alias does not match its unmarked URL. It is also absent when the alias
+selects no variant: a surface without variants serves such a request (other than a modern
+MCP request, which is refused) from the base surface, and Fabric receive serves an unknown
+or disabled alias from the default or base surface. `input.http.path` is the request path
+after the route and any `$alias` are stripped, so a request to the Access Point URL itself
+has the path `/`.
+
 ### MCP request context (`input.mcp`)
 
 On an MCP surface, gateway and surface policies get `input.mcp` on the direct
@@ -253,30 +267,41 @@ triggered it. On the outbound path the record also names the Transit Point.
 
 ## Failed caller authentication
 
-Source auth does not refuse a request whose credential is missing or invalid, or whose
-JWT lacks a required scope. The request continues with no caller identity,
-`input.source_auth` is
+On an Access Point that does not declare (see
+[Declaring an Access Point](SOURCE_AUTH.md#declaring-an-access-point)), source auth does not
+refuse a request whose credential is missing or invalid, or whose JWT lacks a required scope.
+The request continues with no caller identity, `input.source_auth` is
 `{"method": "failed", "attempted_method": ..., "kind": ..., "reason": ...}`. `kind` is
 `missing`, `invalid` or `insufficient_scope`; `reason` is free text for logs and policy
 authors and is never sent to the caller. On every forwarding
 path (direct inbound, `proxy://` MCP Targets, `a2a-proxy://` Targets, Fabric send and
-Fabric receive, the last for surfaces without protected resource metadata) the surface's
-Target Authentication credential, or the A2A proxy's Direct Line secret, is not attached,
-because it vouches that the gateway vetted the caller. A surface that
-must reject such callers needs a policy that denies `input.source_auth.method == "failed"`.
-Server-side source-auth errors (missing configuration, internal failures) still block
-with `500`. A request to an MCP Access Point that publishes protected resource
-metadata never reaches policy with a failed credential, direct or over Fabric: a direct
-request is refused with a `401` challenge pointing at that metadata, or a `403` with
-`error="insufficient_scope"` for a scope shortfall, and a Fabric request with the same status
-without it, see [caller challenge](SOURCE_AUTH.md#caller-challenge) and
-[`MCP_METADATA.md`](MCP_METADATA.md#authorization-server-discovery-for-caller-authentication).
+Fabric receive) the surface's Target Authentication credential, or the A2A proxy's Direct
+Line secret, is not attached, because it vouches that the gateway vetted the caller. A
+surface that must reject such callers needs a policy that denies
+`input.source_auth.method == "failed"`. Server-side source-auth errors (missing
+configuration, internal failures) still block with `500`.
+
+A declaring Access Point, MCP or A2A, never hands a failed caller to its own policy. It
+refuses the caller itself with `401`, or `403` with `error="insufficient_scope"` for a scope
+shortfall, and a `Bearer` challenge that names its protected resource metadata, whatever the
+surface's policy would allow. MCP does it at the source authentication stage, before any
+policy; every other protocol does it right after the appliance-wide and gateway policy, before
+AP2, payment and any Target or Fabric forwarding, so a gateway policy still sees the caller
+first. A caller that the appliance-wide or gateway policy refuses gets the same challenge in
+place of that stage's `403`. This holds for a surface saved through the API as for one saved
+from the dashboard, and no policy can admit a failed caller on such an Access Point. The
+invariant is written once in [`AGENTS.md`](../AGENTS.md#architecture); the statuses and
+headers are in [caller challenge](SOURCE_AUTH.md#caller-challenge). Over Fabric only the
+sending gateway challenges: a receiving gateway's declaring Access Point refuses a failed
+caller before policy with the same status and `realm="agent-gateway"`, without
+`resource_metadata`.
 
 Over Fabric, the sending Gateway strips the credential header its own surface consumed
-before forwarding. A receiving surface without protected resource metadata that requires
-source authentication on that same header therefore sees every Fabric caller as failed and
-forwards without its target credential; one with the metadata refuses them with `401`. Require caller authentication on one side of the Fabric hop, or use a
-different credential header on each side.
+before forwarding. A receiving surface that does not declare and requires source
+authentication on that same header therefore sees every Fabric caller as failed and forwards
+without its target credential; one that declares refuses them with `401`. Require caller
+authentication on one side of the Fabric hop, or use a different credential header on each
+side.
 
 ## JWT bearer caller input
 
@@ -310,8 +335,9 @@ allow if {
 Tokens the MCP Resource Server verifies for `mcp_http.authorization` have no strategy: their
 input carries `scopes` from `scope` or `scp` and no `strategy_id`. A method's
 [`required_scopes`](SOURCE_AUTH.md#required-scopes) are checked before policy, so a caller
-short of one reaches policy as a failed caller of kind `insufficient_scope`, not as
-`jwt_bearer`.
+short of one reaches the policy of an Access Point that does not declare as a failed caller
+of kind `insufficient_scope`, not as `jwt_bearer`; a declaring Access Point refuses it
+before policy.
 
 ## Caller identity verification in policy input
 

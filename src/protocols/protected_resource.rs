@@ -345,6 +345,36 @@ fn access_point_origins(
         .unwrap_or_default()
 }
 
+/// The public origin a derived declaration names for an Access Point: the
+/// first public origin of its listener, without a trailing slash. The listener
+/// is the one its `listen_address` names, or for a bind address such as
+/// `0.0.0.0:8443`, the one on that port.
+pub fn access_point_origin(
+    surface: &crate::config::agent_surface::AgentSurface,
+    network: &crate::config::NetworkConfig,
+) -> Option<String> {
+    let listen_address = &surface
+        .access_point
+        .listen_address;
+    let port = network
+        .map_url_to_port(listen_address)
+        .or_else(|| {
+            listen_address
+                .rsplit(':')
+                .next()
+                .and_then(|port| port.parse().ok())
+        })?;
+    network
+        .get_listener_by_port(port)?
+        .external_urls
+        .first()
+        .map(|origin| {
+            origin
+                .trim_end_matches('/')
+                .to_string()
+        })
+}
+
 /// The request path of an Access Point variant: its route (`/` for an empty
 /// route), or `route$alias`. `None` for an alias no resource can name, and for
 /// a variant of an Access Point at `/`: a request for `/$alias` reaches the
@@ -867,7 +897,7 @@ mod tests {
     }
 
     /// What the listener of [`discovery_network`] answers at a metadata path.
-    fn served(
+    async fn served(
         surfaces: &[std::sync::Arc<crate::config::agent_surface::AgentSurface>],
         path: &str,
     ) -> Result<Option<Value>, ()> {
@@ -875,7 +905,7 @@ mod tests {
         let Some(requested) = requested_resource_path(path) else {
             return Ok(None);
         };
-        match listener_metadata(surfaces, &[], &requested, None, &discovery_network()) {
+        match listener_metadata(surfaces, &[], &requested, None, None, &discovery_network()).await {
             MetadataMatch::None => Ok(None),
             MetadataMatch::Metadata(metadata) => Ok(Some(metadata)),
             MetadataMatch::Unavailable => Err(()),
@@ -898,6 +928,32 @@ mod tests {
     }
 
     #[test]
+    fn an_access_point_origin_is_the_first_public_origin_of_its_listener() {
+        let mut network = discovery_network();
+        let mut surface = discovery_surface(jwt_bearer_method(), None);
+        assert_eq!(access_point_origin(&surface, &network).as_deref(), Some("https://gateway.example"));
+
+        network.listeners[0].external_urls = vec!["https://first.example/".into(), "https://gateway.example".into()];
+        surface
+            .access_point
+            .listen_address = "0.0.0.0:8443".into();
+        assert_eq!(access_point_origin(&surface, &network).as_deref(), Some("https://first.example"));
+
+        for unmatched in ["0.0.0.0:9999", "https://other.example", "gateway"] {
+            surface
+                .access_point
+                .listen_address = unmatched.into();
+            assert_eq!(access_point_origin(&surface, &network), None, "{unmatched}");
+        }
+
+        surface
+            .access_point
+            .listen_address = "0.0.0.0:8443".into();
+        network.listeners[0].external_urls = Vec::new();
+        assert_eq!(access_point_origin(&surface, &network), None);
+    }
+
+    #[test]
     fn an_access_point_path_names_the_route_called() {
         let mut surface = discovery_surface(jwt_bearer_method(), None);
         assert_eq!(access_point_path(&surface, None).as_deref(), Some("/mcp/alpha"));
@@ -912,12 +968,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn an_access_point_publishes_its_document_at_the_exact_path_of_its_resource() {
+    #[tokio::test]
+    async fn an_access_point_publishes_its_document_at_the_exact_path_of_its_resource() {
         let explicit = json!({"resource": "https://gateway.example/mcp/alpha", "authorization_servers": [ISSUER]});
         let surfaces = vec![std::sync::Arc::new(discovery_surface(jwt_bearer_method(), Some(explicit.clone())))];
         assert_eq!(
-            served(&surfaces, "/.well-known/oauth-protected-resource/mcp/alpha"),
+            served(&surfaces, "/.well-known/oauth-protected-resource/mcp/alpha").await,
             Ok(Some(json!({
                 "resource": "https://gateway.example/mcp/alpha",
                 "authorization_servers": [ISSUER],
@@ -930,6 +986,7 @@ mod tests {
         ] {
             assert_eq!(
                 served(&surfaces, variant_path)
+                    .await
                     .unwrap()
                     .unwrap()["resource"],
                 "https://gateway.example/mcp/alpha$beta",
@@ -943,7 +1000,7 @@ mod tests {
             "/.well-known/oauth-protected-resource/mcp/alpha$off",
             "/.well-known/oauth-protected-resource/mcp/alpha$unknown",
         ] {
-            assert_eq!(served(&surfaces, unclaimed), Ok(None), "{unclaimed}");
+            assert_eq!(served(&surfaces, unclaimed).await, Ok(None), "{unclaimed}");
         }
 
         // A resource naming another path is not published at the route's path.
@@ -951,7 +1008,7 @@ mod tests {
             jwt_bearer_method(),
             Some(json!({"resource": "https://gateway.example/mcp/other", "authorization_servers": [ISSUER]})),
         ))];
-        assert_eq!(served(&elsewhere, "/.well-known/oauth-protected-resource/mcp/alpha"), Ok(None));
+        assert_eq!(served(&elsewhere, "/.well-known/oauth-protected-resource/mcp/alpha").await, Ok(None));
 
         // An Access Point at / publishes the root form only.
         let mut root = discovery_surface(
@@ -962,37 +1019,38 @@ mod tests {
         let root = [std::sync::Arc::new(root)];
         assert_eq!(
             served(&root, "/.well-known/oauth-protected-resource")
+                .await
                 .unwrap()
                 .unwrap()["resource"],
             "https://gateway.example/"
         );
-        assert_eq!(served(&root, "/.well-known/oauth-protected-resource/$beta"), Err(()));
-        assert_eq!(served(&root, "/.well-known/oauth-protected-resource/mcp"), Ok(None));
+        assert_eq!(served(&root, "/.well-known/oauth-protected-resource/$beta").await, Err(()));
+        assert_eq!(served(&root, "/.well-known/oauth-protected-resource/mcp").await, Ok(None));
 
         let mut inactive = discovery_surface(jwt_bearer_method(), Some(explicit.clone()));
         inactive.status = crate::config::agent_surface::SurfaceStatus::Disabled;
         assert_eq!(
-            served(&[std::sync::Arc::new(inactive)], "/.well-known/oauth-protected-resource/mcp/alpha"),
+            served(&[std::sync::Arc::new(inactive)], "/.well-known/oauth-protected-resource/mcp/alpha").await,
             Ok(None)
         );
     }
 
-    #[test]
-    fn settings_the_access_point_cannot_serve_make_its_metadata_path_unavailable() {
+    #[tokio::test]
+    async fn settings_the_access_point_cannot_serve_make_its_metadata_path_unavailable() {
         let explicit = json!({"resource": "https://gateway.example/mcp/alpha", "authorization_servers": [ISSUER]});
         let path = "/.well-known/oauth-protected-resource/mcp/alpha";
 
         let api_key = json!({"type": "api_key", "extraction": {"source": "http_header", "field": "x-api-key"}, "secret_id": "key"});
         let misconfigured = [std::sync::Arc::new(discovery_surface(api_key, Some(explicit.clone())))];
-        assert_eq!(served(&misconfigured, path), Err(()));
+        assert_eq!(served(&misconfigured, path).await, Err(()));
 
         let mut a2a = discovery_surface(jwt_bearer_method(), Some(explicit.clone()));
         a2a.access_point.protocol = crate::config::agent_surface::SurfaceProtocol::A2a;
-        assert_eq!(served(&[std::sync::Arc::new(a2a)], path), Err(()));
+        assert_eq!(served(&[std::sync::Arc::new(a2a)], path).await, Err(()));
     }
 
-    #[test]
-    fn an_explicit_protected_resource_lists_the_required_scopes_as_supported() {
+    #[tokio::test]
+    async fn an_explicit_protected_resource_lists_the_required_scopes_as_supported() {
         let explicit = json!({"resource": "https://gateway.example/mcp/alpha", "authorization_servers": [ISSUER]});
         let unscoped = json!({
             "resource": "https://gateway.example/mcp/alpha",
@@ -1006,15 +1064,15 @@ mod tests {
         for (method, document) in [(jwt_bearer_method(), unscoped), (scoped, scoped_document)] {
             let surfaces = [std::sync::Arc::new(discovery_surface(method.clone(), Some(explicit.clone())))];
             assert_eq!(
-                served(&surfaces, "/.well-known/oauth-protected-resource/mcp/alpha"),
+                served(&surfaces, "/.well-known/oauth-protected-resource/mcp/alpha").await,
                 Ok(Some(document)),
                 "{method}"
             );
         }
     }
 
-    #[test]
-    fn a_published_document_supports_the_required_and_the_advertised_scopes() {
+    #[tokio::test]
+    async fn a_published_document_supports_the_required_and_the_advertised_scopes() {
         let mut scoped = jwt_bearer_method();
         scoped["required_scopes"] = json!(["tools.call", "tools"]);
         let surfaces = [std::sync::Arc::new(discovery_surface(
@@ -1027,19 +1085,20 @@ mod tests {
         ))];
         assert_eq!(
             served(&surfaces, "/.well-known/oauth-protected-resource/mcp/alpha")
+                .await
                 .unwrap()
                 .unwrap()["scopes_supported"],
             json!(["tools.call", "tools", "resources"])
         );
     }
 
-    #[test]
-    fn an_access_point_without_a_protected_resource_publishes_no_document() {
+    #[tokio::test]
+    async fn an_access_point_without_a_protected_resource_publishes_no_document() {
         let surfaces = [std::sync::Arc::new(discovery_surface(jwt_bearer_method(), None))];
         for path in
             ["/.well-known/oauth-protected-resource/mcp/alpha", "/.well-known/oauth-protected-resource/mcp/alpha$beta"]
         {
-            assert_eq!(served(&surfaces, path), Ok(None), "{path}");
+            assert_eq!(served(&surfaces, path).await, Ok(None), "{path}");
         }
     }
 }

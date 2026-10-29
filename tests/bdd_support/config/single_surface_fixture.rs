@@ -300,6 +300,8 @@ pub struct JwtSourceAuthConfig {
     pub issuer: String,
     pub audiences: Vec<String>,
     pub required_scopes: Vec<String>,
+    pub declares_authorization_server: bool,
+    pub forwards_caller_token: bool,
 }
 
 #[derive(Debug, Clone)]

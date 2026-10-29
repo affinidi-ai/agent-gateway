@@ -1196,7 +1196,7 @@ authentication, so it cannot be combined with
 
 | | [Gateway STS](#mcp-resource-authorization) | [External authorization server](#authorization-server-discovery-for-caller-authentication) |
 | --- | --- | --- |
-| Setting | `mcp_http.authorization`, with `sts.mcp_issuer` in the network configuration | `access_point.caller_authentication.protected_resource` on a JWT Bearer caller authentication |
+| Setting | `mcp_http.authorization`, with `sts.mcp_issuer` in the network configuration | `access_point.caller_authentication.protected_resource` on a JWT Bearer caller authentication, or a [derived declaration](#declaring-without-protected_resource) from a method's `required_scopes` |
 | Who issues tokens | The gateway's STS profile | An authorization server you run, for example Ory Hydra, Auth0 or Microsoft Entra ID |
 | Clients | Pre-registered confidential clients that exchange tokens with the gateway STS (token exchange, ID-JAG redemption) | Standard MCP clients that discover the authorization server and sign in there |
 | Token check | EdDSA `at+jwt` from the profile issuer, audience equal to the resource, every configured scope required | The JWT verification strategy, audience equal to the resource, and every scope in the method's `required_scopes`; `protected_resource.scopes` are advertised, not required |
@@ -1363,8 +1363,11 @@ audience-bound credential, never the ingress caller token.
 Protected-resource metadata is read from live endpoint configuration at
 `/.well-known/oauth-protected-resource/<endpoint-path>`, with `no-store`.
 Every inbound listener serves that path. The same path serves the document
-of an MCP Access Point with
-[`caller_authentication.protected_resource`](#authorization-server-discovery-for-caller-authentication),
+of every Access Point that declares its `jwt_bearer` authorization server, an MCP
+Access Point with
+[`caller_authentication.protected_resource`](#authorization-server-discovery-for-caller-authentication)
+or any Access Point with a
+[derived declaration](#declaring-without-protected_resource),
 and a path two endpoints claim answers `503`. A standalone Proxy or surface
 route whose path holds `$` or `%24` publishes no document, so it cannot answer
 for a surface's variant URL.
@@ -1410,6 +1413,9 @@ The setting is valid only on an MCP Access Point whose first caller
 authentication method, the one enforced, is JWT Bearer reading the
 `Authorization` header with the `Bearer` scheme, without `forward_header` and
 with empty `audiences`, and it cannot be combined with `mcp_http.authorization`.
+A save that sets `forward_header` with it is refused with `400`; an Access Point that declares
+through a [derived declaration](#declaring-without-protected_resource) and sets `forward_header`
+is not refused but does not declare.
 The token audience is bound to the resource instead, as the MCP authorization
 specification requires (RFC 8707): a token is accepted only when its `aud`
 names the resource advertised for the route called, `resource` on the base
@@ -1479,7 +1485,7 @@ the running configuration. A surface whose route is there is refused on save
 with `400`, and one already stored is logged as an error and not mounted. A
 standalone MCP Proxy whose path is there is refused with `400`.
 
-A request to such an Access Point whose bearer token is missing,
+A request to such an MCP Access Point whose bearer token is missing,
 malformed, expired or otherwise refused by the JWT verification strategy is
 answered before policy with `401`, `application/problem+json`, `no-store`
 and `WWW-Authenticate: Bearer resource_metadata="<absolute metadata URL>"`,
@@ -1498,7 +1504,8 @@ without `required_scopes` sends no `scope`. The body's detail is fixed and
 never says why a token failed. The audit records the failure as blocking,
 with the reason `insufficient_scope` for a scope shortfall. A valid token issued for the
 resource is attributed as before, and its identity reaches policy. Over
-Fabric, the receiving gateway binds the token audience to the same resource,
+Fabric only the sending gateway challenges with `resource_metadata` and publishes the
+document. The receiving gateway binds the token audience to the same resource,
 because both paths resolve the accepted audiences in
 `source_auth::middleware::resolve_surface_audience`; a named variant that does
 not resolve falls back to the default, whose resource then binds. The sending
@@ -1553,7 +1560,12 @@ onto every surface that sets it, and `{"overrides": {"access_point":
 that sets its own, then protect those Access Points another way: without the
 setting, their JWT Bearer method checks no audience. Those releases also
 check no scope on any Access Point; see
-[Required scopes](SOURCE_AUTH.md#required-scopes).
+[Required scopes](SOURCE_AUTH.md#required-scopes). An Access Point that declares through a
+[derived declaration](#declaring-without-protected_resource) has no setting to remove: those
+releases neither publish its metadata nor challenge its callers, and they pass its failed
+callers to policy. Before rolling back, disable it or attach a gateway or surface policy that
+denies `input.source_auth.method == "failed"` (see
+[Failed caller authentication](POLICY.md#failed-caller-authentication)).
 
 `make mcp-discovery` ([`scripts/mcp-discovery/`](../scripts/mcp-discovery/README.md))
 runs the flow end to end against Ory Hydra with a scripted client and the
@@ -1572,6 +1584,39 @@ Patch and `--unset` sends `null`:
 fabric agent-gateway surfaces update <surface> --set 'access_point.caller_authentication.protected_resource={"resource":"https://gateway.example/mcp/alpha","authorization_servers":["https://idp.example/realms/agents"],"scopes":["tools"]}'
 fabric agent-gateway surfaces update <surface> --unset access_point.caller_authentication.protected_resource
 ```
+
+#### Declaring Without `protected_resource`
+
+An Access Point also declares without the setting. When its caller authentication is exactly one
+JWT Bearer method that sets `required_scopes`, the gateway derives the declaration from that
+method and its JWT verification strategy, for MCP and for every other protocol. The refusal rule
+is the one stated under _Policy planes and identity attribution fail closed_ in
+[`AGENTS.md`](../AGENTS.md#architecture). The derivation applies when all of these hold:
+
+| Condition | Otherwise the Access Point declares nothing, reason |
+| --- | --- |
+| The method is the only caller authentication method | `multiple_methods`, or `method_not_declarable` for another type |
+| `required_scopes` is not empty | `no_required_scopes` |
+| The strategy exists, may be referenced by the surface, verifies with a remote JWKS and is pinned to an authorization server whose issuer and JWKS URI still match it | `strategy_unavailable`, `static_jwks`, `not_pinned`, `pin_mismatch` |
+| The method reads the `Authorization` header with the `Bearer` scheme | `custom_token_header` |
+| `forward_header` is off | `forwards_caller_token` |
+| The Access Point has a public URL, the listener's first external URL followed by the route, and `audiences` lists it | `no_access_point_url`, `audience_missing` |
+| It is not a variant of an Access Point mounted at `/` | `root_variant` |
+
+The resource is that URL, with `$alias` appended for a variant, and the document lists the
+pinned issuer as its only authorization server and the required scopes as `scopes_supported`.
+The audience binding, the metadata route, relayed-challenge filtering and the
+`WWW-Authenticate` challenge are those of an explicit declaration above, and so is the refusal
+on an MCP Access Point, at the source authentication stage. Any other Access Point refuses a
+failed caller after gateway policy and before AP2 and payment, with the same challenge and
+`Cache-Control: no-store` but the refusing stage's body, not `application/problem+json`, and no
+surface policy can admit it (see [Caller challenge](SOURCE_AUTH.md#caller-challenge)). A method
+that falls short passes
+every failed caller to policy as an Access Point without a declaration does, and the reason is
+logged at debug level. An explicit `protected_resource` takes precedence, and a surface with no
+explicit setting and no `required_scopes` never reads the strategy store. A strategy store that
+fails answers `503` with no challenge. There is no setting to switch a derived declaration off:
+remove `required_scopes`.
 
 ### Tool Parameter Headers
 

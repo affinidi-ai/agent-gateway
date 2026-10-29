@@ -2400,6 +2400,7 @@ async fn evaluate_gateway_policy_for_fabric(
     global_policy: Option<&crate::policies::GlobalPolicyManager>,
     surface: &crate::config::agent_surface::AgentSurface,
     config_id: &str,
+    variant_alias: Option<&str>,
     method: &str,
     path: &str,
     headers: Option<&serde_json::Map<String, Value>>,
@@ -2429,6 +2430,7 @@ async fn evaluate_gateway_policy_for_fabric(
                 .map(str::to_string),
             &surface.name,
         );
+        g_input.set_variant_alias(variant_alias);
         g_input.source_auth = source_auth_context.cloned();
         g_input.mcp = mcp_context.cloned();
         let g_input_value = serde_json::to_value(&g_input).unwrap_or_default();
@@ -2490,6 +2492,7 @@ async fn evaluate_gateway_policy_for_fabric(
                 .map(str::to_string),
             &surface.name,
         );
+        gw_input.set_variant_alias(variant_alias);
         gw_input.source_auth = source_auth_context.cloned();
         gw_input.mcp = mcp_context.cloned();
         // Gateway OPA never sees caller-leg trust check results — the
@@ -2729,9 +2732,7 @@ async fn enrich_and_evaluate_surface_policies(
                     .map(str::to_string),
                 &surface.name,
             );
-            if let Some(ref mut ch) = probe_input.channel {
-                ch.variant_alias = variant_alias.map(|s| s.to_string());
-            }
+            probe_input.set_variant_alias(variant_alias);
             probe_input.extension_identity = caller_identity.map(|id| {
                 let did = if id.starts_with("did:") {
                     Some(id.to_string())
@@ -2845,9 +2846,7 @@ async fn enrich_and_evaluate_surface_policies(
                         .map(str::to_string),
                     &surface.name,
                 );
-                if let Some(ref mut ch) = probe_input.channel {
-                    ch.variant_alias = variant_alias.map(|s| s.to_string());
-                }
+                probe_input.set_variant_alias(variant_alias);
                 probe_input.extension_identity = caller_identity.map(|id| {
                     let did = if id.starts_with("did:") {
                         Some(id.to_string())
@@ -3088,9 +3087,7 @@ async fn enrich_and_evaluate_surface_policies(
                 .map(str::to_string),
             &surface.name,
         );
-        if let Some(ref mut ch) = policy_input.channel {
-            ch.variant_alias = variant_alias.map(|s| s.to_string());
-        }
+        policy_input.set_variant_alias(variant_alias);
         policy_input.extension_identity = ext_identity;
         policy_input.source_auth = source_auth_context.cloned();
         policy_input.mcp = mcp_context.cloned();
@@ -3710,6 +3707,64 @@ pub(crate) struct FabricStreamRequest {
     pub capabilities: crate::proxy::fabric_stream::peer::StreamCapabilities,
 }
 
+/// The variant a Fabric forward selects on `surface` by the alias the sending gateway
+/// forwarded (the default variant without one), and the alias policy sees: the forwarded
+/// alias only when it names an enabled variant. An alias that names none, or names a
+/// variant on a surface without variants, is served by the default or base surface.
+fn forwarded_variant<'a>(
+    surface: &crate::config::agent_surface::AgentSurface,
+    alias: Option<&'a str>,
+) -> (Option<String>, Option<&'a str>) {
+    match alias {
+        Some(alias) => surface
+            .variants
+            .iter()
+            .find(|variant| variant.enabled && variant.alias == alias)
+            .map_or((None, None), |variant| (Some(variant.id.clone()), Some(alias))),
+        None => (
+            surface
+                .default_variant_id
+                .clone(),
+            None,
+        ),
+    }
+}
+
+/// The alias a forward's declaration is resolved for. On a surface without variants
+/// an alias selects nothing and the base route answers, so the declaration is the
+/// base route's and a failed caller is refused there.
+fn declared_variant_alias<'a>(
+    surface: &crate::config::agent_surface::AgentSurface,
+    alias: Option<&'a str>,
+) -> Option<&'a str> {
+    alias.filter(|_| !surface.variants.is_empty())
+}
+
+/// The declaration of the Access Point a Fabric forward reached. Without the network
+/// configuration the resource cannot be named, and the strategy store failing leaves
+/// the declaration unknown, so an Access Point that would declare fails closed.
+async fn fabric_access_point_declaration(
+    surface: &crate::config::agent_surface::AgentSurface,
+    alias: Option<&str>,
+    strategies: Option<&dyn crate::jwt_bearer::JwtVerificationStrategyStorage>,
+    network: Option<&crate::config::NetworkConfig>,
+) -> crate::source_auth::declaration::DeclarationOutcome {
+    use crate::source_auth::declaration::{
+        DeclarationOutcome, DeclarationSource, declaration_source, resolve_surface_declaration,
+    };
+    match network {
+        Some(network) => resolve_surface_declaration(surface, alias, strategies, network)
+            .await
+            .unwrap_or_else(|error| {
+                DeclarationOutcome::Unservable(format!("the verification strategy store failed: {error}"))
+            }),
+        None if !matches!(declaration_source(surface, alias), DeclarationSource::None) => {
+            DeclarationOutcome::Unservable("network configuration unavailable".to_string())
+        }
+        None => DeclarationOutcome::PassThrough,
+    }
+}
+
 pub(crate) async fn resolve_stream_surface(
     message: &ReceivedMessage,
     request: &crate::proxy::fabric_stream::wire::OpenRequest,
@@ -4058,19 +4113,17 @@ async fn process_forward_request_in_request_scope(
         .or_else(|| message.message_body.get("active_variant_alias"))
         .and_then(|v| v.as_str());
 
-    let active_variant_id = match stream_request.as_ref() {
-        Some(request) => request.variant_id.clone(),
-        None => match variant_alias {
-            Some(alias) => surface.variants.iter().find(|variant| variant.enabled && variant.alias == alias)
-                .map(|variant| variant.id.clone()),
-            None => surface.default_variant_id.clone(),
-        },
+    let (active_variant_id, policy_variant_alias) = match stream_request.as_ref() {
+        // Opening the stream already refused an alias that selects no enabled variant.
+        Some(request) => (request.variant_id.clone(), variant_alias),
+        None => forwarded_variant(&surface, variant_alias),
     };
 
-    // The alias the surface was resolved for: `None` once a named alias did
-    // not resolve and the default stands in, whose resource is then the one
-    // a caller's token must name.
-    let mut resolved_alias = variant_alias;
+    // The alias the surface was resolved for: `None` on a surface without
+    // variants, where an alias selects nothing, and once a named alias did not
+    // resolve and the default stands in, whose resource is then the one a
+    // caller's token must name.
+    let mut resolved_alias = declared_variant_alias(&surface, variant_alias);
     let surface = if stream_request.is_some() { surface.clone() } else { match surface.resolve_variant(variant_alias) {
         Ok(s) => {
             if let Some(alias) = variant_alias {
@@ -4130,17 +4183,16 @@ async fn process_forward_request_in_request_scope(
     // The resource a declaring route publishes binds the caller's token
     // audience here as on the direct path, and a token that is missing or
     // refused is answered before policy.
-    let access_point_declaration = match GLOBAL_MCP_AUTH_NETWORK.get() {
-        Some(network) => {
-            crate::source_auth::declaration::resolve_surface_declaration(&surface, resolved_alias, network)
-        }
-        None if surface.protected_resource().is_some() => {
-            crate::source_auth::declaration::DeclarationOutcome::Unservable(
-                "network configuration unavailable".to_string(),
-            )
-        }
-        None => crate::source_auth::declaration::DeclarationOutcome::PassThrough,
-    };
+    let strategies = get_source_auth_middleware().map(|middleware| middleware.provider_store());
+    let access_point_declaration = fabric_access_point_declaration(
+        &surface,
+        resolved_alias,
+        strategies.as_deref(),
+        GLOBAL_MCP_AUTH_NETWORK
+            .get()
+            .map(Arc::as_ref),
+    )
+    .await;
     let declaration = match &access_point_declaration {
         crate::source_auth::declaration::DeclarationOutcome::Declare(declaration) => Some(declaration),
         crate::source_auth::declaration::DeclarationOutcome::Unservable(e) => {
@@ -4289,10 +4341,12 @@ async fn process_forward_request_in_request_scope(
                     .await
                 {
                     Ok(identity) => Some(identity),
-                    // Caller-attributable failure. An Access Point that
-                    // publishes protected resource metadata answers it with
-                    // its challenge; otherwise record the outcome for the
-                    // policy layer and continue with no asserted caller identity.
+                    // Caller-attributable failure. A declaring Access Point,
+                    // explicit or derived, refuses it before policy with a
+                    // challenge that names no metadata, since only the sending
+                    // gateway challenges a Fabric caller; otherwise record the
+                    // outcome for the policy layer and continue with no
+                    // asserted caller identity.
                     Err(e) if e.is_caller_attributable() => {
                         let challenged = declaration.is_some();
                         channel_warn!(
@@ -4622,6 +4676,7 @@ async fn process_forward_request_in_request_scope(
             .map(Arc::as_ref),
         &surface,
         config_id,
+        policy_variant_alias,
         method,
         path,
         headers.as_ref(),
@@ -4760,7 +4815,7 @@ async fn process_forward_request_in_request_scope(
         caller_issuer_did.as_ref(),
         authenticated_identity.as_ref(),
         source_auth_context.as_ref(),
-        variant_alias,
+        policy_variant_alias,
         audit_trace_id,
         mcp_verified_binding.as_ref(),
         &peer_issuers,
@@ -4784,7 +4839,7 @@ async fn process_forward_request_in_request_scope(
     if let Some(result) = evaluate_mcp_tool_gating_call_for_fabric(
         &surface,
         config_id,
-        variant_alias,
+        policy_variant_alias,
         &body_bytes,
         headers.as_ref(),
         method,
@@ -4942,7 +4997,7 @@ async fn process_forward_request_in_request_scope(
     if let Some(prepared) = modern_delegation.as_ref() {
         outbound_creds.retain(|binding| !prepared.handled_provider_ids.contains(&binding.credential_provider_id));
     }
-    let active_variant_alias = variant_alias.map(|s| s.to_string());
+    let active_variant_alias = policy_variant_alias.map(str::to_string);
     let resolved_surface = surface.clone();
     let deadline_ms: Option<u64> = message
         .message_body
@@ -7247,9 +7302,7 @@ fn build_fabric_gating_input(
         Some(config_id.to_string()),
         &surface.name,
     );
-    if let Some(ref mut ch) = policy_input.channel {
-        ch.variant_alias = variant_alias.map(|s| s.to_string());
-    }
+    policy_input.set_variant_alias(variant_alias);
     policy_input.source_auth = source_auth_context.cloned();
     policy_input.mcp = Some(
         modern_mcp_context
@@ -10843,6 +10896,7 @@ mod tests {
                 Some(&manager),
                 &surface,
                 "card",
+                None,
                 method,
                 path,
                 None,
@@ -10857,6 +10911,374 @@ mod tests {
                 "{method} {path}: expected the appliance-wide deny, got {result:?}"
             );
         }
+    }
+
+    /// An appliance-wide gateway plane holding `rego` alone.
+    async fn appliance_gateway_plane(rego: &str) -> crate::policies::GlobalPolicyManager {
+        use crate::policies::global_policy::tests::{gw_def, store_with};
+        use crate::policies::global_policy::{GlobalAssignment, GlobalPolicyAssignments, PLANE_GATEWAY};
+        let manager = crate::policies::GlobalPolicyManager::new();
+        manager.set_policy_definition_store(store_with(vec![gw_def("plane", rego)]).await);
+        let mut assignments = GlobalPolicyAssignments::default();
+        assignments
+            .assignments
+            .insert(
+                PLANE_GATEWAY.to_string(),
+                vec![GlobalAssignment {
+                    policy_id: "plane".to_string(),
+                    monitor_only: false,
+                }],
+            );
+        manager
+            .refresh(&assignments)
+            .await;
+        manager
+    }
+
+    fn surface_with_variants(variants: serde_json::Value) -> crate::config::agent_surface::AgentSurface {
+        serde_json::from_value(serde_json::json!({
+            "surface_id": "card", "name": "card",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/card", "protocol": "a2a"},
+            "target": {"endpoint": "https://agent.example"},
+            "variants": variants
+        }))
+        .unwrap()
+    }
+
+    async fn fabric_gateway_status(
+        manager: &crate::policies::GlobalPolicyManager,
+        surface: &crate::config::agent_surface::AgentSurface,
+        alias: Option<&str>,
+        source_auth: Option<&crate::surface_context::SourceAuthContext>,
+    ) -> u16 {
+        match evaluate_gateway_policy_for_fabric(
+            Some(manager),
+            surface,
+            "card",
+            alias,
+            "POST",
+            "/rpc",
+            None,
+            Some("did:web:peer.example".into()),
+            None,
+            source_auth,
+            None,
+        )
+        .await
+        {
+            Ok(()) => 200,
+            Err(refusal) => match refusal
+                .into_forward_response(b"")
+                .await
+            {
+                ProcessingResult::RequiresResponse { response_body, .. } => response_body["status"]
+                    .as_u64()
+                    .and_then(|status| u16::try_from(status).ok())
+                    .expect("a ForwardResponse status"),
+                other => panic!("expected a ForwardResponse, got {other:?}"),
+            },
+        }
+    }
+
+    /// The gateway plane over Fabric sees the Surface Variant the request selected.
+    #[tokio::test]
+    async fn the_fabric_gateway_plane_sees_the_variant_alias() {
+        let manager = appliance_gateway_plane(
+            "package gateway.policy\ndefault allow := true\nallow := false if input.channel.variant_alias == \"strict\"",
+        )
+        .await;
+        let surface = surface_with_variants(serde_json::json!([]));
+        assert_eq!(fabric_gateway_status(&manager, &surface, Some("strict"), None).await, 403);
+        assert_eq!(fabric_gateway_status(&manager, &surface, None, None).await, 200, "the base surface is allowed");
+    }
+
+    #[test]
+    fn forwarded_variant_keeps_only_an_alias_that_selects_an_enabled_variant() {
+        let variants = surface_with_variants(serde_json::json!([
+            {"id": "v-public", "alias": "public", "name": "public", "enabled": true, "overrides": {}},
+            {"id": "v-off", "alias": "off", "name": "off", "enabled": false, "overrides": {}}
+        ]));
+        assert_eq!(forwarded_variant(&variants, Some("public")), (Some("v-public".to_string()), Some("public")));
+        assert_eq!(forwarded_variant(&variants, Some("off")), (None, None), "a disabled variant");
+        assert_eq!(forwarded_variant(&variants, Some("other")), (None, None), "an unknown alias");
+        assert_eq!(forwarded_variant(&variants, None), (None, None));
+
+        let mut with_default = variants.clone();
+        with_default.default_variant_id = Some("v-public".to_string());
+        assert_eq!(
+            forwarded_variant(&with_default, None),
+            (Some("v-public".to_string()), None),
+            "the default variant serves an unmarked request without an alias"
+        );
+
+        let without_variants = surface_with_variants(serde_json::json!([]));
+        assert_eq!(forwarded_variant(&without_variants, Some("public")), (None, None));
+    }
+
+    /// An alias forwarded to a surface without variants selects nothing, so the gateway
+    /// plane sees no alias and a rule admitting failed callers on that alias does not apply.
+    #[tokio::test]
+    async fn an_alias_that_selects_no_variant_reaches_the_fabric_gateway_plane_as_absent() {
+        let manager = appliance_gateway_plane(
+            "package gateway.policy\ndefault allow := false\nallow if input.source_auth.method != \"failed\"\nallow if input.channel.variant_alias == \"public\"",
+        )
+        .await;
+        let failed = crate::surface_context::SourceAuthContext::Failed {
+            attempted_method: "jwt_bearer".to_string(),
+            kind: crate::source_auth::errors::SourceAuthFailureKind::Missing,
+            reason: "missing credential".to_string(),
+        };
+
+        let without_variants = surface_with_variants(serde_json::json!([]));
+        let (_, alias) = forwarded_variant(&without_variants, Some("public"));
+        assert_eq!(fabric_gateway_status(&manager, &without_variants, alias, Some(&failed)).await, 403);
+
+        let with_public = surface_with_variants(serde_json::json!([
+            {"id": "v-public", "alias": "public", "name": "public", "enabled": true, "overrides": {}}
+        ]));
+        let (_, alias) = forwarded_variant(&with_public, Some("public"));
+        assert_eq!(
+            fabric_gateway_status(&manager, &with_public, alias, Some(&failed)).await,
+            200,
+            "the rule applies to the variant it names"
+        );
+    }
+
+    enum Strategies {
+        Pinned,
+        Failing,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::jwt_bearer::JwtVerificationStrategyStorage for Strategies {
+        async fn create(
+            &self,
+            _strategy: crate::jwt_bearer::models::JwtVerificationStrategy,
+        ) -> anyhow::Result<crate::jwt_bearer::models::JwtVerificationStrategy> {
+            anyhow::bail!("read-only")
+        }
+        async fn get(
+            &self,
+            id: &str,
+        ) -> anyhow::Result<Option<crate::jwt_bearer::models::JwtVerificationStrategy>> {
+            use crate::protocols::protected_resource::fixtures::ISSUER;
+            match self {
+                Self::Failing => anyhow::bail!("storage unavailable"),
+                Self::Pinned => Ok((id == "idp").then(|| {
+                    serde_json::from_value(serde_json::json!({
+                        "id": "idp",
+                        "name": "idp",
+                        "expected_issuer": ISSUER,
+                        "jwks_source": {"type": "remote", "jwks_uri": format!("{ISSUER}/certs")},
+                        "authorization_server": {
+                            "issuer": ISSUER,
+                            "metadata_url": format!("{ISSUER}/.well-known/openid-configuration"),
+                            "token_endpoint": format!("{ISSUER}/token"),
+                            "jwks_uri": format!("{ISSUER}/certs")
+                        },
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "updated_at": "2026-01-01T00:00:00Z"
+                    }))
+                    .unwrap()
+                })),
+            }
+        }
+        async fn list(&self) -> anyhow::Result<Vec<crate::jwt_bearer::models::JwtVerificationStrategy>> {
+            Ok(Vec::new())
+        }
+        async fn update(
+            &self,
+            _strategy: crate::jwt_bearer::models::JwtVerificationStrategy,
+        ) -> anyhow::Result<crate::jwt_bearer::models::JwtVerificationStrategy> {
+            anyhow::bail!("read-only")
+        }
+        async fn delete(
+            &self,
+            _id: &str,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("read-only")
+        }
+    }
+
+    /// An A2A Access Point at `/card` whose one JWT Bearer method, verified by the `idp`
+    /// strategy, accepts tokens for the route and requires `required_scopes`.
+    fn a2a_jwt_surface(required_scopes: serde_json::Value) -> crate::config::agent_surface::AgentSurface {
+        serde_json::from_value(serde_json::json!({
+            "surface_id": "card", "name": "card",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/card", "protocol": "a2a",
+                "caller_authentication": {"methods": [{"type": "jwt_bearer", "jwt_verification_strategy_id": "idp",
+                    "audiences": ["https://gateway.example/card"], "required_scopes": required_scopes}]}},
+            "target": {"endpoint": "https://agent.example"}
+        }))
+        .unwrap()
+    }
+
+    /// Whether the Access Point declares or fails closed, as opposed to passing through
+    /// or stripping a declaration it does not qualify for.
+    fn declares_or_fails(outcome: &crate::source_auth::declaration::DeclarationOutcome) -> bool {
+        use crate::source_auth::declaration::DeclarationOutcome;
+        matches!(outcome, DeclarationOutcome::Declare(_) | DeclarationOutcome::Unservable(_))
+    }
+
+    fn explicit_mcp_surface() -> crate::config::agent_surface::AgentSurface {
+        use crate::protocols::protected_resource::fixtures::{ISSUER, discovery_surface, jwt_bearer_method};
+        discovery_surface(
+            jwt_bearer_method(),
+            Some(
+                serde_json::json!({"resource": "https://gateway.example/mcp/alpha", "authorization_servers": [ISSUER]}),
+            ),
+        )
+    }
+
+    /// Without the network configuration an Access Point that would declare, explicitly or
+    /// by its required scopes, fails closed; any other Access Point passes through.
+    #[tokio::test]
+    async fn without_the_network_only_a_declaring_access_point_fails_closed() {
+        use crate::source_auth::declaration::DeclarationOutcome;
+
+        let unservable = DeclarationOutcome::Unservable("network configuration unavailable".to_string());
+        let derived = a2a_jwt_surface(serde_json::json!(["agent.call"]));
+        assert_eq!(fabric_access_point_declaration(&derived, None, Some(&Strategies::Pinned), None).await, unservable);
+        assert_eq!(fabric_access_point_declaration(&explicit_mcp_surface(), None, None, None).await, unservable);
+
+        let unscoped = a2a_jwt_surface(serde_json::json!([]));
+        let outcome = fabric_access_point_declaration(&unscoped, None, Some(&Strategies::Pinned), None).await;
+        assert!(!declares_or_fails(&outcome), "{outcome:?}");
+        let undeclared = surface_with_variants(serde_json::json!([]));
+        assert_eq!(
+            fabric_access_point_declaration(&undeclared, None, None, None).await,
+            DeclarationOutcome::PassThrough
+        );
+    }
+
+    /// The receiving gateway resolves an explicit setting from its configuration alone,
+    /// and declares a derived Access Point from its pinned strategy.
+    #[tokio::test]
+    async fn the_receiving_gateway_resolves_explicit_and_derived_declarations() {
+        use crate::protocols::protected_resource::fixtures::{ISSUER, discovery_network};
+        use crate::source_auth::declaration::DeclarationOutcome;
+
+        let network = discovery_network();
+        match fabric_access_point_declaration(&explicit_mcp_surface(), None, None, Some(&network)).await {
+            DeclarationOutcome::Declare(declaration) => {
+                assert_eq!(declaration.resource, "https://gateway.example/mcp/alpha");
+                assert_eq!(declaration.authorization_servers, vec![ISSUER.to_string()]);
+            }
+            other => panic!("expected an explicit declaration, got {other:?}"),
+        }
+
+        let derived = a2a_jwt_surface(serde_json::json!(["agent.call"]));
+        match fabric_access_point_declaration(&derived, None, Some(&Strategies::Pinned), Some(&network)).await {
+            DeclarationOutcome::Declare(declaration) => {
+                assert_eq!(declaration.resource, "https://gateway.example/card");
+                assert_eq!(declaration.authorization_servers, vec![ISSUER.to_string()]);
+                assert_eq!(declaration.required_scopes, vec!["agent.call".to_string()]);
+            }
+            other => panic!("expected a derived declaration, got {other:?}"),
+        }
+    }
+
+    /// A derived declaration on the receiving gateway refuses a failed caller with the
+    /// Fabric refusal, which names no metadata: only the sending gateway challenges.
+    #[tokio::test]
+    async fn a_derived_declaration_refuses_a_fabric_caller_without_naming_metadata() {
+        use crate::protocols::protected_resource::fixtures::discovery_network;
+        use crate::source_auth::declaration::DeclarationOutcome;
+        use crate::source_auth::errors::SourceAuthError;
+
+        let derived = a2a_jwt_surface(serde_json::json!(["agent.call"]));
+        let network = discovery_network();
+        let DeclarationOutcome::Declare(declaration) =
+            fabric_access_point_declaration(&derived, None, Some(&Strategies::Pinned), Some(&network)).await
+        else {
+            panic!("expected a derived declaration");
+        };
+        for (error, status, challenge) in [
+            (
+                SourceAuthError::MissingCredential {
+                    reason: "Missing bearer token".into(),
+                },
+                axum::http::StatusCode::UNAUTHORIZED,
+                "Bearer realm=\"agent-gateway\"",
+            ),
+            (
+                SourceAuthError::InvalidCredential {
+                    reason: "Token has expired".into(),
+                },
+                axum::http::StatusCode::UNAUTHORIZED,
+                "Bearer realm=\"agent-gateway\", error=\"invalid_token\"",
+            ),
+            (
+                SourceAuthError::InsufficientScope {
+                    missing: vec!["agent.call".into()],
+                },
+                axum::http::StatusCode::FORBIDDEN,
+                "Bearer realm=\"agent-gateway\", error=\"insufficient_scope\"",
+            ),
+        ] {
+            let refusal = declaration.fabric_refusal(&error);
+            assert_eq!(refusal.status(), status, "{error}");
+            assert_eq!(refusal.headers()[axum::http::header::WWW_AUTHENTICATE], challenge, "{error}");
+        }
+    }
+
+    /// An alias forwarded to a surface without variants selects nothing, so the receiving
+    /// gateway declares for the base route and refuses a failed caller there rather than
+    /// stripping the declaration for a resource no audience names.
+    #[tokio::test]
+    async fn an_alias_that_selects_no_variant_keeps_the_base_declaration() {
+        use crate::protocols::protected_resource::fixtures::discovery_network;
+        use crate::source_auth::declaration::{DeclarationOutcome, StripReason};
+
+        let network = discovery_network();
+        let derived = a2a_jwt_surface(serde_json::json!(["agent.call"]));
+        assert_eq!(declared_variant_alias(&derived, Some("x")), None);
+        assert_eq!(declared_variant_alias(&derived, None), None);
+        match fabric_access_point_declaration(
+            &derived,
+            declared_variant_alias(&derived, Some("x")),
+            Some(&Strategies::Pinned),
+            Some(&network),
+        )
+        .await
+        {
+            DeclarationOutcome::Declare(declaration) => {
+                assert_eq!(declaration.resource, "https://gateway.example/card")
+            }
+            other => panic!("expected the base route's declaration, got {other:?}"),
+        }
+        assert_eq!(
+            fabric_access_point_declaration(&derived, Some("x"), Some(&Strategies::Pinned), Some(&network)).await,
+            DeclarationOutcome::Strip(StripReason::AudienceMissing),
+            "the raw alias names a resource no audience lists"
+        );
+
+        let with_variants = surface_with_variants(serde_json::json!([
+            {"id": "v-public", "alias": "public", "name": "public", "enabled": true, "overrides": {}}
+        ]));
+        assert_eq!(declared_variant_alias(&with_variants, Some("public")), Some("public"));
+    }
+
+    /// A strategy store failure on an Access Point that would declare fails closed, and an
+    /// Access Point without required scopes never reads the store.
+    #[tokio::test]
+    async fn a_strategy_store_failure_leaves_a_declaring_fabric_access_point_unservable() {
+        use crate::protocols::protected_resource::fixtures::discovery_network;
+        use crate::source_auth::declaration::DeclarationOutcome;
+
+        let network = discovery_network();
+        let derived = a2a_jwt_surface(serde_json::json!(["agent.call"]));
+        match fabric_access_point_declaration(&derived, None, Some(&Strategies::Failing), Some(&network)).await {
+            DeclarationOutcome::Unservable(reason) => {
+                assert!(reason.starts_with("the verification strategy store failed"), "{reason}")
+            }
+            other => panic!("expected the Access Point to fail closed, got {other:?}"),
+        }
+
+        let unscoped = a2a_jwt_surface(serde_json::json!([]));
+        let outcome =
+            fabric_access_point_declaration(&unscoped, None, Some(&Strategies::Failing), Some(&network)).await;
+        assert!(!declares_or_fails(&outcome), "{outcome:?}");
     }
 
     /// A Fabric receive forward refuses a cloud-metadata Target, and dials an

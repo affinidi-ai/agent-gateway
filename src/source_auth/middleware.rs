@@ -751,6 +751,7 @@ mod tests {
             authorization_servers: vec!["https://as.example".to_string()],
             required_scopes: vec![],
             advertised_scopes: vec![],
+            pin: None,
         }
     }
 

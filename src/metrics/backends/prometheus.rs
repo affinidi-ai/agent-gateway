@@ -277,6 +277,18 @@ lazy_static! {
         counter
     };
 
+    /// Agent cards served (labeled by outcome and reason).
+    /// `outcome` = `declare` | `strip` | `pass_through` | `unservable`; `reason` = a strip reason code or `none`.
+    pub static ref CARD_SECURITY: IntCounterVec = {
+        let opts = Opts::new(
+            names::CARD_SECURITY_TOTAL,
+            "Agent cards served (outcome = declare|strip|pass_through|unservable; reason = strip reason|none)",
+        );
+        let counter = IntCounterVec::new(opts, &["outcome", "reason"]).unwrap();
+        REGISTRY.register(Box::new(counter.clone())).unwrap();
+        counter
+    };
+
     /// AWS KMS per-value envelope operation outcomes (labeled by op, result).
     /// `op` = `generate_data_key` | `decrypt`; `result` = `ok` | `error`.
     pub static ref KMS_OPERATION: IntCounterVec = {
@@ -757,6 +769,16 @@ pub fn track_discovery(result: &'static str) {
 pub fn track_scope_denied(scheme: &'static str) {
     SCOPE_DENIED
         .with_label_values(&[scheme])
+        .inc();
+}
+
+/// Track the declaration outcome of an agent card served.
+pub fn track_card_security(
+    outcome: &'static str,
+    reason: Option<&'static str>,
+) {
+    CARD_SECURITY
+        .with_label_values(&[outcome, reason.unwrap_or("none")])
         .inc();
 }
 

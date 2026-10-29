@@ -66,6 +66,32 @@ pub fn write_gateway_bootstrap_json_with_outbound_listener(
     );
 }
 
+/// The canonical HTTPS URL an Access Point declares as its resource when the
+/// inbound listener publishes `https://localhost:{gateway_port}` first.
+pub fn declared_access_point_url(
+    gateway_port: u16,
+    route: &str,
+) -> String {
+    format!("https://localhost:{gateway_port}{route}")
+}
+
+/// Put `origin` first among the inbound listener's external URLs, where the
+/// derived resource of an Access Point is read from. Other origins are kept in
+/// order and the listener keeps serving plain HTTP.
+pub fn insert_https_origin_first(
+    config_dir: &Path,
+    origin: &str,
+) {
+    let path = config_dir.join("gateway.json");
+    let mut gateway_json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let external_urls = gateway_json["listeners"][0]["external_urls"]
+        .as_array_mut()
+        .expect("inbound listener external_urls");
+    external_urls.retain(|url| url != origin);
+    external_urls.insert(0, json!(origin));
+    std::fs::write(path, serde_json::to_string_pretty(&gateway_json).unwrap()).unwrap();
+}
+
 fn write_gateway_bootstrap_json_inner(
     config_dir: &Path,
     gateway_port: u16,
@@ -126,6 +152,53 @@ fn write_gateway_bootstrap_json_inner(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn https_origin_goes_first_and_the_other_listener_urls_stay() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        super::write_gateway_bootstrap_json_with_outbound_listener(temp_dir.path(), 32001, 32002, &[], "api");
+        let read = || -> serde_json::Value {
+            serde_json::from_str(
+                &std::fs::read_to_string(
+                    temp_dir
+                        .path()
+                        .join("gateway.json"),
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        let original = read()["listeners"][0]["external_urls"].clone();
+
+        super::insert_https_origin_first(temp_dir.path(), "https://gateway.bdd.example");
+        super::insert_https_origin_first(temp_dir.path(), "https://localhost:32001");
+        super::insert_https_origin_first(temp_dir.path(), "https://localhost:32001");
+
+        let gateway_json = read();
+        let urls = gateway_json["listeners"][0]["external_urls"]
+            .as_array()
+            .unwrap();
+        assert_eq!(urls[0], "https://localhost:32001");
+        assert_eq!(urls[1], "https://gateway.bdd.example");
+        assert_eq!(
+            urls.len(),
+            original
+                .as_array()
+                .unwrap()
+                .len()
+                + 2
+        );
+        assert_eq!(
+            &urls[2..],
+            original
+                .as_array()
+                .unwrap()
+                .as_slice()
+        );
+        assert_eq!(gateway_json["listeners"][0]["protocol"], "http");
+        assert_eq!(gateway_json["listeners"][1]["external_urls"][0], "http://localhost:32002");
+        assert_eq!(super::declared_access_point_url(32001, "/bravo"), "https://localhost:32001/bravo");
+    }
+
     #[test]
     fn write_gateway_bootstrap_json_with_surfaces_and_identity_route() {
         let temp_dir = tempfile::TempDir::new().unwrap();

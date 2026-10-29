@@ -128,6 +128,38 @@ impl ProxyState {
             crate::delegation_vault::gateway_token::target_token_cache(),
         )
     }
+
+    /// The policy input for an inbound request on this surface, carrying the alias of
+    /// the Surface Variant the request URL selected. An alias that selects no variant,
+    /// such as one on a surface without variants, is not published.
+    pub fn inbound_policy_input(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &axum::http::HeaderMap,
+    ) -> crate::surface_context::PolicyInput {
+        let mut input = crate::surface_context::PolicyInput::new(
+            method,
+            path,
+            crate::surface_context::filter_sensitive_headers(headers),
+            "inbound",
+            None,
+            None,
+            self.surface
+                .config_id()
+                .map(str::to_string),
+            &self.surface.name,
+        );
+        input.set_variant_alias(
+            self.active_variant_alias
+                .as_deref()
+                .filter(|_| {
+                    self.active_variant_id
+                        .is_some()
+                }),
+        );
+        input
+    }
 }
 
 /// Surface info with routing support (includes rules engines and identity selector)

@@ -96,7 +96,7 @@ flowchart TB
     end
     subgraph G["Gateway plane"]
         direction LR
-        B0[Agent context] --> B1["Appliance-wide<br/>gateway policy"] --> B2[Gateway OPA] --> B3[AP2 gate] --> B4["A2A version and<br/>request validation"] --> B5["Delegated<br/>agent_pay payment"]
+        B0[Agent context] --> B1["Appliance-wide<br/>gateway policy"] --> B2[Gateway OPA] --> B2a["Failed-caller refusal,<br/>declaring Access Point"] --> B3[AP2 gate] --> B4["A2A version and<br/>request validation"] --> B5["Delegated<br/>agent_pay payment"]
     end
     subgraph P["Before forwarding"]
         direction LR
@@ -132,7 +132,7 @@ logic.
 
 | Stage | Owns | Lives in |
 | --- | --- | --- |
-| Source authentication | Establishing the caller's identity. A missing or invalid credential, or a JWT short of a required scope, is passed to policy, not refused, except on an MCP Access Point that publishes protected resource metadata, which answers with a `401` discovery challenge, or `403` with `error="insufficient_scope"` for a scope shortfall | [`src/source_auth/`](src/source_auth/), [`src/source_auth/declaration.rs`](src/source_auth/declaration.rs), [`src/protocols/protected_resource.rs`](src/protocols/protected_resource.rs) |
+| Source authentication | Establishing the caller's identity. A missing or invalid credential, or a JWT short of a required scope, is passed to policy, not refused, except on a declaring Access Point, which refuses such a caller with its challenge: an MCP Access Point here, before policy, and any other after gateway policy (see the [invariant on declaring Access Points](AGENTS.md#architecture)). The sending gateway of a Fabric route challenges; the receiving gateway answers `401`, or `403` with `error="insufficient_scope"`, with a `realm` and no `resource_metadata` | [`src/source_auth/`](src/source_auth/), [`src/source_auth/declaration.rs`](src/source_auth/declaration.rs), [`src/protocols/protected_resource.rs`](src/protocols/protected_resource.rs) |
 | Resource Server token | Replaces source authentication on an MCP surface that sets `mcp_http.authorization`: a bearer token for this resource and its scopes is required, and a missing, invalid or insufficient one is refused at once with a `WWW-Authenticate` challenge, not passed to policy | [`src/mcp/resource_server.rs`](src/mcp/resource_server.rs) |
 | Rate limiting | Per-surface request limits | [`src/policies/rate_limiter.rs`](src/policies/rate_limiter.rs) |
 | Body extraction | Reading the request body once | [`src/proxy/handler.rs`](src/proxy/handler.rs) |
@@ -140,6 +140,7 @@ logic.
 | Agent context | Trust-registry context from the original body, as `input.agent` for every policy and Trust Check template | [`src/surface_context/`](src/surface_context/) |
 | Appliance-wide gateway policy | The global gateway-plane set, deny-overrides, ahead of the gateway's own policy | [`src/policies/global_policy.rs`](src/policies/global_policy.rs) |
 | Gateway OPA | The appliance-level policy gate | [`src/policies/gateway_manager.rs`](src/policies/gateway_manager.rs) |
+| Failed-caller refusal | On a declaring Access Point other than MCP, refusing a caller whose source authentication failed with the declaration's challenge, whatever the surface policy would allow, so no payment settles and the Target is not reached. The decision is `refuses_failed_callers_by_default`; this is its one call site | [`src/proxy/caller_denial.rs`](src/proxy/caller_denial.rs), [`src/source_auth/declaration.rs`](src/source_auth/declaration.rs) |
 | AP2 gate | Refusing AP2 while `ap2_experimental` is off | [`src/proxy/handler.rs`](src/proxy/handler.rs), [`src/ap2/`](src/ap2/) |
 | A2A version and request validation | Resolving `A2A-Version` against the surface's accepted versions, and checking the JSON-RPC envelope and the request shape as the surface's validation level asks; A2A and AP2 only | [`src/a2a/version.rs`](src/a2a/version.rs), [`src/a2a/methods.rs`](src/a2a/methods.rs) |
 | Delegated payment | `agent_pay` settlement through another gateway | [`src/x402/delegate.rs`](src/x402/delegate.rs) |
@@ -154,7 +155,7 @@ logic.
 | Access Point OPA | `access_point.inbound_policy`, its own deny gate, independent of the surface policy | [`src/policies/surface_manager.rs`](src/policies/surface_manager.rs) |
 | Appliance-wide surface policy | The global surface-plane set, deny-overrides, ahead of the surface's own policy | [`src/policies/global_policy.rs`](src/policies/global_policy.rs) |
 | Surface OPA | The per-surface policy gate | [`src/policies/surface_manager.rs`](src/policies/surface_manager.rs) |
-| Caller refusal | The answer to a caller a policy stage refuses: the declaration's `Bearer` challenge for a caller whose source authentication failed on a declaring Access Point, otherwise the stage's `403`. Responses drop relayed challenges other than `Payment` when the Access Point declares or the Target is another gateway | [`src/proxy/caller_denial.rs`](src/proxy/caller_denial.rs), [`src/source_auth/challenge.rs`](src/source_auth/challenge.rs) |
+| Caller refusal | The answer to a caller a policy stage refuses: the declaration's `Bearer` challenge for a caller whose source authentication failed, or whose JWT is short of a required scope, on a declaring Access Point, otherwise the stage's `403`. Responses drop relayed challenges other than `Payment` when the Access Point declares or the Target is `fabric://` | [`src/proxy/caller_denial.rs`](src/proxy/caller_denial.rs), [`src/source_auth/challenge.rs`](src/source_auth/challenge.rs) |
 | MCP tool gating | The allow/deny firewall over tool names | [`src/policies/mcp_tool_gating.rs`](src/policies/mcp_tool_gating.rs) |
 | Headers | Trace ID, `did:webvh` identity headers, and caller-info headers | [`src/proxy/handler.rs`](src/proxy/handler.rs) |
 | Transit token | The token a managed agent echoes back on its Transit Point calls | [`src/proxy/transit_token.rs`](src/proxy/transit_token.rs) |
@@ -205,7 +206,7 @@ Inbound:
 source auth (or, on an MCP surface with `mcp_http.authorization`, the Resource Server
 token, which refuses rather than passing to policy) → rate limit → body extraction → MCP
 wire validation and context → agent
-context → appliance-wide gateway policy → gateway OPA → AP2 gate → A2A version negotiation
+context → appliance-wide gateway policy → gateway OPA → failed-caller refusal (a declaring Access Point other than MCP) → AP2 gate → A2A version negotiation
 and request validation (A2A and AP2) → delegated `agent_pay` payment (a
 `fabric://` Target leaves here: its own paywall, MCP tool policies for MCP, then fabric
 dispatch) → forward-target egress check → body-size limit → local x402/MPP → MCP tool
@@ -313,6 +314,7 @@ Breaking one of these is a correctness bug, not a style question.
 | DashMap is authoritative at runtime; disk is written immediately. | Reads and writes would disagree after a reload. |
 | Identity attribution fails closed. A presentation that does not verify never becomes the caller identity. | An unverified DID would reach policy as if it were proven. |
 | Every event of a forwarded A2A event stream gets the response checks a non-streaming reply gets before it is sent, and one that fails them ends the stream. | Streaming would bypass the response policy and the agent identity credential. |
+| A declaring Access Point never forwards the caller's own token, on the direct path or the Fabric send leg, and refuses a caller whose source authentication failed (stated once under _Policy planes and identity attribution fail closed_ in [`AGENTS.md`](AGENTS.md#architecture)). | The gateway would hand a token issued for it to the Target, and a failed caller would reach payment or the Target on a policy's say-so. |
 | A caller whose source authentication failed is never forwarded with the surface's Target Authentication credential, or the A2A proxy's Direct Line secret, on the inbound and Fabric forwarding paths (direct, `proxy://` MCP, `a2a-proxy://`, Fabric send, Fabric receive). Transit Point listeners do not authenticate callers, so this does not cover them. | An unauthenticated caller would reach the Target with the operator's credential. |
 | Every `Bearer` `WWW-Authenticate` challenge the gateway builds on an Access Point carries the `GatewayChallenge` marker (`mark_gateway_challenge` in `src/protocols/protected_resource.rs`); `Payment` challenges are kept by scheme. | The relayed-challenge filter would drop the gateway's own challenge and turn its `401` into a `502`. |
 | The Agent Surface is the only routing unit. | Routing behaviour would drift away from what an operator configured. |
@@ -341,9 +343,9 @@ from.
 
 | Module | Owns | Document |
 | --- | --- | --- |
-| [`a2a/`](src/a2a/) | A2A-specific schema, auth, errors, agent-card URL rewriting, event-stream forwarding | [`PROTOCOLS.md`](docs/PROTOCOLS.md) |
+| [`a2a/`](src/a2a/) | A2A-specific schema, auth, errors, agent-card URL rewriting, card security (the `agent_gateway` scheme a declaring Access Point's card carries, in place of the Target's security), event-stream forwarding | [`PROTOCOLS.md`](docs/PROTOCOLS.md) |
 | [`a2a_proxies/`](src/a2a_proxies/) | Exposing a non-A2A agent as an A2A endpoint | [`PROTOCOLS.md`](docs/PROTOCOLS.md) |
-| [`mcp/`](src/mcp/) | MCP wire handling, metadata, transports, and matching the protected resource metadata every inbound listener serves to the surface or MCP Proxy that publishes it | [`MCP_TOOL_GATING.md`](docs/MCP_TOOL_GATING.md), [`PROTOCOLS.md`](docs/PROTOCOLS.md) |
+| [`mcp/`](src/mcp/) | MCP wire handling, metadata, transports, and the protected resource metadata every inbound listener serves for each declaring Access Point and MCP Proxy that publishes it (`resource_server.rs`) | [`MCP_TOOL_GATING.md`](docs/MCP_TOOL_GATING.md), [`PROTOCOLS.md`](docs/PROTOCOLS.md) |
 | [`mcp_proxies/`](src/mcp_proxies/) | Exposing REST APIs as MCP tool servers | [`PROTOCOLS.md`](docs/PROTOCOLS.md) |
 | [`ap2/`](src/ap2/) | AP2, experimental and disabled by default | [`PROTOCOLS.md`](docs/PROTOCOLS.md) |
 | [`comm/`](src/comm/) | DIDComm message construction and handling | [`FABRIC.md`](docs/FABRIC.md) |

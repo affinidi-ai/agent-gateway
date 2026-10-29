@@ -1,6 +1,7 @@
-//! The receiving gateway's own read of its surface's agent card from the Target for
-//! its policy context. It attaches the surface's Target Authentication as the gateway
-//! itself, only at one of [`crate::proxy::paths::agent_card_urls`], with the surface's
+//! The gateway's own reads of its surface's agent card from the Target: the card
+//! route behind `/.well-known/agent-card.json` and the receiving gateway's policy
+//! context. Both attach the surface's Target Authentication as the gateway itself,
+//! only at one of [`crate::proxy::paths::agent_card_urls`], with the surface's
 //! fallback applied.
 
 use std::time::Duration;
@@ -10,14 +11,23 @@ use tracing::{debug, warn};
 use crate::config::agent_surface::AgentSurface;
 use crate::proxy::handler::CallerAssertion;
 use crate::proxy::target_credentials::{
-    TargetAuthContext, TargetAuthDecision, TargetCredential, TargetCredentialResolver, TargetLeg,
-    apply_target_auth_fallback,
+    TargetAuthContext, TargetAuthDecision, TargetCredential, TargetCredentialError, TargetCredentialResolver,
+    TargetLeg, apply_target_auth_fallback,
 };
 use crate::proxy::upstream_body::UpstreamBodyLimits;
 
-/// The surface's fallback refused to fetch the card without the Target credential.
+/// The surface's fallback refused to fetch the card without the Target credential,
+/// and the resolution error that made it refuse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct CardFetchRejected;
+pub(crate) struct CardFetchRejected(pub(crate) Option<TargetCredentialError>);
+
+impl CardFetchRejected {
+    /// The category of the resolution error, for logs.
+    pub(crate) fn reason(self) -> &'static str {
+        self.0
+            .map_or("unknown", TargetCredentialError::category)
+    }
+}
 
 /// Who a card read's refusal reaches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,10 +73,14 @@ pub(crate) async fn card_fetch_credential(
                 .await
         }
     };
+    let error = resolution
+        .as_ref()
+        .err()
+        .copied();
     match apply_target_auth_fallback(target_auth, resolution) {
         TargetAuthDecision::Inject(credential) => Ok(Some(credential)),
         TargetAuthDecision::Continue => Ok(None),
-        TargetAuthDecision::Reject => Err(CardFetchRejected),
+        TargetAuthDecision::Reject => Err(CardFetchRejected(error)),
     }
 }
 
@@ -92,8 +106,12 @@ pub(crate) async fn fetch_target_card(
         .await
         {
             Ok(credential) => credential,
-            Err(CardFetchRejected) => {
-                warn!(surface_id = %surface.surface_id, "Agent card not fetched: Target authentication failed");
+            Err(rejected) => {
+                warn!(
+                    surface_id = %surface.surface_id,
+                    reason = rejected.reason(),
+                    "Agent card not fetched: Target authentication failed"
+                );
                 return None;
             }
         };
@@ -386,7 +404,9 @@ pub(crate) mod tests {
             CardRead::AnswersCaller,
         ))
         .await;
-        assert_eq!(credential.map(|_| ()), Err(CardFetchRejected));
+        let rejected = credential.map(|_| ());
+        assert_eq!(rejected, Err(CardFetchRejected(Some(TargetCredentialError::SecretUnavailable))));
+        assert_eq!(rejected.map_err(CardFetchRejected::reason), Err("secret_unavailable"));
         assert_eq!(rejections(&events), 1, "the card route answers 502: {events:?}");
         assert_eq!(
             target
@@ -394,6 +414,13 @@ pub(crate) mod tests {
                 .load(Ordering::SeqCst),
             0
         );
+    }
+
+    #[test]
+    fn test_a_rejection_names_the_resolution_error_it_came_from() {
+        assert_eq!(CardFetchRejected(Some(TargetCredentialError::Forbidden)).reason(), "forbidden");
+        assert_eq!(CardFetchRejected(Some(TargetCredentialError::TokenUnavailable)).reason(), "token_unavailable");
+        assert_eq!(CardFetchRejected(None).reason(), "unknown");
     }
 
     #[tokio::test]

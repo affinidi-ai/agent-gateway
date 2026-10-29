@@ -109,6 +109,9 @@ pub(crate) enum OutboundPipelineError {
     #[error("{}", crate::a2a::url_rewriter::EXTENDED_AGENT_CARD_REFUSAL)]
     UnrewritableExtendedAgentCardResponse { rpc_request_id: Option<serde_json::Value> },
 
+    #[error("{}", crate::a2a::url_rewriter::AGENT_CARD_REFUSAL)]
+    UnrewritableAgentCardResponse,
+
     #[error("{error}")]
     McpMetadata { error: crate::mcp::meta::McpMetadataError, body: Bytes, response: bool },
 
@@ -228,7 +231,8 @@ impl OutboundPipelineError {
             | Self::UpstreamConnectionFailed(_)
             | Self::UpstreamResponseReadFailed
             | Self::ResponseValidationFailed(_)
-            | Self::UnrewritableExtendedAgentCardResponse { .. } => StatusCode::BAD_GATEWAY,
+            | Self::UnrewritableExtendedAgentCardResponse { .. }
+            | Self::UnrewritableAgentCardResponse => StatusCode::BAD_GATEWAY,
 
             Self::UpstreamTimeout => StatusCode::GATEWAY_TIMEOUT,
 
@@ -4789,6 +4793,63 @@ fn is_agent_card_response(
     status.is_success() && crate::proxy::paths::is_well_known_agent_card_path(request_path)
 }
 
+/// Whether the upstream response carries a public or extended agent card.
+fn carries_agent_card(
+    ctx: &OutboundPipelineContext,
+    status: reqwest::StatusCode,
+) -> bool {
+    is_agent_card_response(&ctx.request_path, status)
+        || (status.is_success() && is_rest_extended_card_request(ctx))
+        || is_rpc_extended_card_request(ctx)
+}
+
+/// Whether the Transit Point card a response carries is secured: the partner's
+/// security and signatures are stripped, a public card the gateway cannot
+/// process is refused, and caches must revalidate it. A Transit Point never
+/// forwards the managed agent's credentials, so its cards are secured once the
+/// surface's Access Point declares. Any other card keeps its security, with its
+/// URLs rewritten.
+fn secures_transit_card<'a>(
+    state: &'a OutboundProxyState,
+    ctx: &OutboundPipelineContext,
+    status: reqwest::StatusCode,
+) -> impl std::future::Future<Output = bool> + Send + 'a {
+    let card_request = carries_agent_card(ctx, status).then(|| {
+        (
+            Arc::clone(&ctx.surface),
+            ctx.active_variant_alias
+                .clone(),
+            ctx.request_id.clone(),
+        )
+    });
+    async move {
+        let Some((surface, alias, request_id)) = card_request else {
+            return false;
+        };
+        let resolved = crate::source_auth::declaration::resolve_surface_declaration(
+            &surface,
+            alias.as_deref(),
+            state
+                .consent_identity_strategies
+                .as_deref(),
+            &state.network_config,
+        )
+        .await;
+        if let Err(error) = &resolved {
+            warn!(request_id = %request_id, error = %error, "Access Point declaration unavailable: strategy store failed");
+        }
+        secures_transit_cards(&resolved)
+    }
+}
+
+/// Whether an Access Point's declaration secures its Transit Point cards as it
+/// secures its own, failing closed when the declaration cannot be resolved.
+fn secures_transit_cards(resolved: &anyhow::Result<crate::source_auth::declaration::DeclarationOutcome>) -> bool {
+    resolved
+        .as_ref()
+        .map_or(true, crate::a2a::card_security::secures_cards)
+}
+
 /// [12] Response Processing — strips headers and optionally rewrites agent card URLs.
 /// Per-Transit-Point MCP Tool Gating — `tools/list` leg.
 ///
@@ -4970,7 +5031,8 @@ async fn step_process_response(
     };
 
     let response_policy = transit_response_policy_attestation(state, transit_response_policy_definition_id(ctx)).await;
-    process_outbound_response_body(state, ctx, status, upstream_headers, body_bytes, &response_policy)
+    let secure_card = secures_transit_card(state, ctx, status).await;
+    process_outbound_response_body(state, ctx, status, upstream_headers, body_bytes, &response_policy, secure_card)
 }
 
 async fn process_modern_outbound_response(
@@ -5061,12 +5123,11 @@ async fn process_modern_outbound_response(
                         .lock()
                         .map_err(|_| SseReadError::ResponseRejected)?;
                     let (state, ctx) = &mut *snapshot;
-                    process_outbound_response_body(state, ctx, status, headers, bytes, &response_policy).map_err(
-                        |error| {
+                    process_outbound_response_body(state, ctx, status, headers, bytes, &response_policy, false)
+                        .map_err(|error| {
                             warn!(request_id = %ctx.request_id, error = %error, "Modern MCP response rejected");
                             SseReadError::ResponseRejected
-                        },
-                    )?
+                        })?
                 };
                 let bytes = axum::body::to_bytes(response.into_body(), limits.max_event_bytes.get())
                     .await
@@ -5117,6 +5178,7 @@ fn process_outbound_response_body(
     upstream_headers: reqwest::header::HeaderMap,
     body_bytes: Bytes,
     response_policy: &crate::policies::PolicyAttestation,
+    secure_card: bool,
 ) -> Result<Response, OutboundPipelineError> {
     use crate::a2a::is_hop_by_hop_header;
 
@@ -5191,7 +5253,8 @@ fn process_outbound_response_body(
     let is_rest_extended_card_response = status.is_success() && is_rest_extended_card_request(ctx);
     let is_rpc_extended_card_response = is_rpc_extended_card_request(ctx);
     let is_extended_card_response = is_rest_extended_card_response || is_rpc_extended_card_response;
-    let body_bytes = if is_agent_card_response(&ctx.request_path, status) || is_extended_card_response {
+    let is_public_card_response = is_agent_card_response(&ctx.request_path, status) && !is_extended_card_response;
+    let body_bytes = if carries_agent_card(ctx, status) {
         let proxy_endpoint = crate::a2a::url_rewriter::build_transit_point_proxy_endpoint(
             &ctx.surface,
             &ctx.virtual_channel,
@@ -5203,6 +5266,7 @@ fn process_outbound_response_body(
                 &proxy_endpoint,
                 &ctx.surface.name,
                 status,
+                secure_card,
             )
         } else {
             let kind = if is_extended_card_response {
@@ -5210,8 +5274,14 @@ fn process_outbound_response_body(
             } else {
                 crate::a2a::AgentCardKind::Public
             };
-            crate::a2a::url_rewriter::process_outbound_agent_card(&body_bytes, &proxy_endpoint, &ctx.surface.name, kind)
-                .map(Some)
+            crate::a2a::url_rewriter::process_outbound_agent_card(
+                &body_bytes,
+                &proxy_endpoint,
+                &ctx.surface.name,
+                kind,
+                secure_card,
+            )
+            .map(Some)
         };
         match rewritten {
             Ok(Some(rewritten)) => {
@@ -5232,6 +5302,10 @@ fn process_outbound_response_body(
                             .unwrap_or(serde_json::Value::Null)
                     }),
                 });
+            }
+            Err(e) if secure_card => {
+                warn!(request_id = %ctx.request_id, error = %e, "Failed to process outbound agent card");
+                return Err(OutboundPipelineError::UnrewritableAgentCardResponse);
             }
             Err(e) => {
                 warn!(
@@ -5256,6 +5330,13 @@ fn process_outbound_response_body(
         if !is_hop_by_hop_header(key.as_str()) && key != axum::http::header::CONTENT_LENGTH {
             builder = builder.header(key.as_str(), value.as_bytes());
         }
+    }
+
+    if is_public_card_response
+        && secure_card
+        && let Some(headers) = builder.headers_mut()
+    {
+        crate::a2a::set_agent_card_revalidation(headers, &body_bytes);
     }
 
     builder
@@ -7237,6 +7318,7 @@ mod tests {
             headers,
             bytes,
             &crate::policies::PolicyAttestation::default(),
+            false,
         )
         .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -7262,6 +7344,179 @@ mod tests {
         )
         .unwrap();
         assert_eq!(received, message);
+    }
+
+    const PARTNER_SCHEME: &str = "partner_bearer";
+
+    fn transit_card_context() -> OutboundPipelineContext {
+        let mut ctx = test_pipeline_context();
+        ctx.original_method = Method::GET;
+        ctx.request_path = "/outbound/surfaces/order/partner-a/.well-known/agent-card.json".to_string();
+        ctx
+    }
+
+    fn partner_card() -> serde_json::Value {
+        json!({
+            "name": "partner", "version": "1.0.0",
+            "supportedInterfaces": [
+                { "url": "https://partner.example.com/a2a", "protocolBinding": "JSONRPC", "protocolVersion": "1.0" }
+            ],
+            "securitySchemes": { PARTNER_SCHEME: { "httpAuthSecurityScheme": { "scheme": "Bearer" } } },
+            "securityRequirements": [{ "schemes": { PARTNER_SCHEME: { "list": [] } } }]
+        })
+    }
+
+    fn transit_card_response(
+        body: Bytes,
+        secure_card: bool,
+    ) -> Result<Response, OutboundPipelineError> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "content-type",
+            "application/json"
+                .parse()
+                .unwrap(),
+        );
+        headers.insert(
+            "last-modified",
+            "Wed, 21 Oct 2015 07:28:00 GMT"
+                .parse()
+                .unwrap(),
+        );
+        process_outbound_response_body(
+            &test_outbound_state(),
+            &mut transit_card_context(),
+            StatusCode::OK,
+            headers,
+            body,
+            &crate::policies::PolicyAttestation::default(),
+            secure_card,
+        )
+    }
+
+    async fn body_text(response: Response) -> String {
+        String::from_utf8(
+            axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn transit_cards_are_secured_only_when_the_access_point_declares_or_cannot_resolve() {
+        use crate::source_auth::declaration::{Declaration, DeclarationOutcome, StripReason};
+
+        let declaration = Declaration {
+            resource: "https://gateway.example/surfaces/order".into(),
+            authorization_servers: vec!["https://issuer.example".into()],
+            pin: None,
+            required_scopes: vec!["orders".into()],
+            advertised_scopes: vec!["orders".into()],
+        };
+        assert!(secures_transit_cards(&Ok(DeclarationOutcome::Declare(declaration))));
+        assert!(secures_transit_cards(&Ok(DeclarationOutcome::Unservable("store".into()))));
+        assert!(secures_transit_cards(&Err(anyhow::anyhow!("strategy store down"))));
+
+        assert!(!secures_transit_cards(&Ok(DeclarationOutcome::PassThrough)));
+        assert!(!secures_transit_cards(&Ok(DeclarationOutcome::Strip(StripReason::NoRequiredScopes))));
+        assert!(!secures_transit_cards(&Ok(DeclarationOutcome::Strip(StripReason::StrategyUnavailable))));
+    }
+
+    #[tokio::test]
+    async fn transit_cards_of_an_access_point_that_does_not_declare_are_not_secured() {
+        let state = test_outbound_state();
+
+        let card = transit_card_context();
+        assert!(!secures_transit_card(&state, &card, StatusCode::OK).await);
+
+        let mut scoped = transit_card_context();
+        let mut surface = test_surface();
+        surface
+            .access_point
+            .caller_authentication = Some(
+            serde_json::from_value(json!({ "methods": [{
+                "type": "jwt_bearer", "jwt_verification_strategy_id": "strategy",
+                "audiences": ["https://gateway.example/surfaces/order"], "required_scopes": ["orders"]
+            }]}))
+            .unwrap(),
+        );
+        scoped.surface = Arc::new(surface);
+        assert!(
+            !secures_transit_card(&state, &scoped, StatusCode::OK).await,
+            "a declaration without its strategy strips, so the card is kept as it is"
+        );
+
+        let message = test_pipeline_context();
+        assert!(!secures_transit_card(&state, &message, StatusCode::OK).await);
+    }
+
+    #[tokio::test]
+    async fn a_secured_transit_card_drops_partner_security_and_must_be_revalidated() {
+        let response = transit_card_response(Bytes::from(partner_card().to_string()), true).unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let headers = response.headers().clone();
+        let body = body_text(response).await;
+        let card: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            card.get("securitySchemes")
+                .is_none(),
+            "{card}"
+        );
+        assert!(
+            card.get("securityRequirements")
+                .is_none(),
+            "{card}"
+        );
+        assert_eq!(headers[axum::http::header::CACHE_CONTROL], "no-cache");
+        let digest = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(body.as_bytes()));
+        assert_eq!(headers[axum::http::header::ETAG], format!("W/\"{digest}\"").as_str());
+        assert!(!headers.contains_key(axum::http::header::LAST_MODIFIED));
+    }
+
+    #[tokio::test]
+    async fn an_unsecured_transit_card_keeps_partner_security_and_its_cache_headers() {
+        let response = transit_card_response(Bytes::from(partner_card().to_string()), false).unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let headers = response.headers().clone();
+        let card: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+        assert!(
+            card["securitySchemes"]
+                .get(PARTNER_SCHEME)
+                .is_some(),
+            "{card}"
+        );
+        assert_eq!(card["securityRequirements"], partner_card()["securityRequirements"]);
+        let proxy_endpoint = crate::a2a::url_rewriter::build_transit_point_proxy_endpoint(
+            &test_surface(),
+            &test_virtual_channel(),
+            &test_outbound_state().network_config,
+        );
+        assert_ne!(proxy_endpoint, "https://partner.example.com/a2a");
+        assert_eq!(crate::a2a::url_rewriter::primary_endpoint_url(&card), Some(proxy_endpoint.as_str()));
+        assert!(!headers.contains_key(axum::http::header::CACHE_CONTROL));
+        assert!(!headers.contains_key(axum::http::header::ETAG));
+        assert_eq!(headers[axum::http::header::LAST_MODIFIED], "Wed, 21 Oct 2015 07:28:00 GMT");
+    }
+
+    #[tokio::test]
+    async fn an_unprocessable_transit_card_is_refused_only_when_secured() {
+        let unparseable = format!("not a card {PARTNER_SCHEME}");
+
+        let refused = transit_card_response(Bytes::from(unparseable.clone()), true);
+        assert!(matches!(refused, Err(OutboundPipelineError::UnrewritableAgentCardResponse)));
+        let response = refused
+            .unwrap_err()
+            .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = body_text(response).await;
+        assert!(body.contains(crate::a2a::url_rewriter::AGENT_CARD_REFUSAL), "{body}");
+        assert!(!body.contains(PARTNER_SCHEME), "the upstream body was served: {body}");
+
+        let served = transit_card_response(Bytes::from(unparseable.clone()), false).unwrap();
+        assert_eq!(served.status(), StatusCode::OK);
+        assert_eq!(body_text(served).await, unparseable);
     }
 
     #[tokio::test]

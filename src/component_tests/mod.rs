@@ -1,3 +1,4 @@
+mod a2a_card_security_e2e;
 mod a2a_extended_card_e2e;
 mod a2a_flow_e2e;
 mod a2a_proxy_e2e;

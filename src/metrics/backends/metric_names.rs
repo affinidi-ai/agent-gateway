@@ -47,6 +47,8 @@ pub mod prom {
     pub const DISCOVERY_TOTAL: &str = "agent_gateway_discovery_total";
     // Requests whose caller token lacked a required scope, whether refused or left to surface policy.
     pub const SCOPE_DENIED_TOTAL: &str = "agent_gateway_scope_denied_total";
+    // Agent cards served, by the Access Point's declaration outcome.
+    pub const CARD_SECURITY_TOTAL: &str = "agent_gateway_card_security_total";
 
     // AWS KMS per-value envelope operations (GenerateDataKey / Decrypt)
     pub const KMS_OPERATION_TOTAL: &str = "agent_gateway_kms_operation_total";

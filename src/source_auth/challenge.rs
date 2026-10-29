@@ -3,18 +3,19 @@
 //!
 //! A caller whose source authentication failed, refused on a declaring Access
 //! Point, receives the declaration's RFC 6750 challenge naming its protected
-//! resource metadata. Every other refusal keeps the 403 of the stage that
-//! refused it. On an Access Point where the gateway is the resource server,
-//! Target challenges other than `Payment` are addressed to the gateway, so they
-//! never reach the caller, and a Target `401` left with no challenge becomes a
-//! `502`.
+//! resource metadata: `401` for a missing or invalid token, `403` for a scope
+//! shortfall. Every other refusal keeps the 403 of the stage that refused it.
+//! On an Access Point where the gateway is the resource server, Target
+//! challenges other than `Payment` are addressed to the gateway, so they never
+//! reach the caller, and a Target `401` left with no challenge becomes a `502`.
 
 use axum::body::Body;
-use axum::http::header::{CONTENT_TYPE, WWW_AUTHENTICATE};
+use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, WWW_AUTHENTICATE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 
-use crate::protocols::protected_resource::{ResourceTokenError, is_gateway_challenge};
+use crate::config::agent_surface::SurfaceProtocol;
+use crate::protocols::protected_resource::{ResourceTokenError, is_gateway_challenge, mark_gateway_challenge};
 use crate::source_auth::declaration::Declaration;
 use crate::surface_context::SourceAuthContext;
 
@@ -26,12 +27,15 @@ pub enum CallerDenial {
     SurfacePolicy,
     SurfacePolicyUnloaded,
     IdentityRequired,
+    CallerAuthentication,
 }
 
 impl CallerDenial {
-    /// The stage's `403`.
-    fn response(self) -> Response {
-        let status = StatusCode::FORBIDDEN;
+    /// The stage's refusal body with `status`.
+    fn response(
+        self,
+        status: StatusCode,
+    ) -> Response {
         let title = status
             .canonical_reason()
             .unwrap_or("Error");
@@ -42,6 +46,7 @@ impl CallerDenial {
                 ("application/problem+json", proxy_error("Request blocked by appliance-wide policy"))
             }
             Self::GatewayPolicy => ("application/problem+json", proxy_error("Request blocked by gateway policy")),
+            Self::CallerAuthentication => ("application/problem+json", proxy_error("Caller authentication failed")),
             Self::SurfacePolicy => ("application/json", surface_error("Agent trust policy denied the request")),
             Self::SurfacePolicyUnloaded => (
                 "application/json",
@@ -68,19 +73,31 @@ impl CallerDenial {
 }
 
 /// The response for a refused caller. A caller that failed source
-/// authentication on a declaring Access Point gets the declaration's challenge,
-/// as at the source-auth stage. Every other caller gets the stage's 403.
+/// authentication on a declaring Access Point gets the declaration's challenge
+/// and its status: on an MCP Access Point as at the source-auth stage, on any
+/// other the refusing stage's body. Every other caller gets the stage's 403.
 pub fn caller_deny_response(
     denial: CallerDenial,
+    protocol: &SurfaceProtocol,
     declaration: Option<&Declaration>,
     source_auth: Option<&SourceAuthContext>,
 ) -> Response {
-    match (declaration, source_auth) {
-        (Some(declaration), Some(SourceAuthContext::Failed { kind, .. })) => {
-            declaration.challenge(ResourceTokenError::from(*kind))
-        }
-        _ => denial.response(),
+    let (Some(declaration), Some(SourceAuthContext::Failed { kind, .. })) = (declaration, source_auth) else {
+        return denial.response(StatusCode::FORBIDDEN);
+    };
+    let error = ResourceTokenError::from(*kind);
+    if *protocol == SurfaceProtocol::Mcp {
+        return declaration.challenge(error);
     }
+    let Some(challenge) = declaration.challenge_header(error) else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let mut response = denial.response(error.status_code());
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    mark_gateway_challenge(&mut response, challenge);
+    response
 }
 
 /// What [`strip_relayed_challenges`] removed from a Target response: the
@@ -222,34 +239,39 @@ fn list_elements(value: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use axum::http::header::CACHE_CONTROL;
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::config::agent_surface::AgentSurface;
-    use crate::protocols::protected_resource::fixtures::{
-        ISSUER, discovery_network, discovery_surface, jwt_bearer_method,
-    };
-    use crate::source_auth::declaration::{DeclarationOutcome, resolve_surface_declaration};
+    use crate::protocols::protected_resource::fixtures::ISSUER;
     use crate::source_auth::errors::SourceAuthFailureKind;
 
     const RESOURCE: &str = "https://gateway.example/mcp/alpha";
     const METADATA: &str = "https://gateway.example/.well-known/oauth-protected-resource/mcp/alpha";
+    const A2A_METADATA: &str = "https://gw.example/.well-known/oauth-protected-resource/a2a/buyer";
 
-    fn declaration_of(surface: AgentSurface) -> Declaration {
-        match resolve_surface_declaration(&surface, None, &discovery_network()) {
-            DeclarationOutcome::Declare(declaration) => declaration,
-            other => panic!("expected a declaration, got {other:?}"),
+    fn declaration_for(
+        resource: &str,
+        required_scopes: &[&str],
+    ) -> Declaration {
+        let required_scopes: Vec<String> = required_scopes
+            .iter()
+            .map(|scope| scope.to_string())
+            .collect();
+        Declaration {
+            resource: resource.into(),
+            authorization_servers: vec![ISSUER.into()],
+            pin: None,
+            advertised_scopes: required_scopes.clone(),
+            required_scopes,
         }
     }
 
     fn declaration() -> Declaration {
-        let mut method = jwt_bearer_method();
-        method["required_scopes"] = json!(["tools"]);
-        declaration_of(discovery_surface(
-            method,
-            Some(json!({"resource": RESOURCE, "authorization_servers": [ISSUER], "scopes": ["tools"]})),
-        ))
+        declaration_for(RESOURCE, &["tools"])
+    }
+
+    fn a2a_declaration() -> Declaration {
+        declaration_for("https://gw.example/a2a/buyer", &["agent.invoke", "agent.read"])
     }
 
     fn failed(kind: SourceAuthFailureKind) -> SourceAuthContext {
@@ -282,7 +304,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_a_failed_caller_on_a_declaring_access_point_gets_its_challenge_at_every_stage() {
+    async fn test_a_failed_caller_on_a_declaring_mcp_access_point_gets_its_challenge_at_every_stage() {
         let declaration = declaration();
         for (denial, kind, challenge) in [
             (
@@ -296,7 +318,7 @@ mod tests {
                 format!("Bearer resource_metadata=\"{METADATA}\", error=\"invalid_token\", scope=\"tools\""),
             ),
         ] {
-            let response = caller_deny_response(denial, Some(&declaration), Some(&failed(kind)));
+            let response = caller_deny_response(denial, &SurfaceProtocol::Mcp, Some(&declaration), Some(&failed(kind)));
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{denial:?}");
             assert_eq!(challenge_of(&response), Some(challenge.as_str()));
             assert!(is_gateway_challenge(&response));
@@ -315,37 +337,120 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_a_failed_caller_without_a_declaration_keeps_the_stage_403() {
-        for kind in [SourceAuthFailureKind::Missing, SourceAuthFailureKind::Invalid] {
-            let response = caller_deny_response(CallerDenial::SurfacePolicy, None, Some(&failed(kind)));
-            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{kind:?}");
-            assert_eq!(challenge_of(&response), None, "{kind:?}");
-            assert_eq!(header(&response, CACHE_CONTROL), None, "{kind:?}");
-            assert!(!is_gateway_challenge(&response), "{kind:?}");
+    async fn test_a_failed_caller_on_a_declaring_a2a_access_point_gets_the_challenge_with_the_stage_body() {
+        let declaration = a2a_declaration();
+        let scope = "scope=\"agent.invoke agent.read\"";
+        for (kind, status, title, challenge) in [
+            (
+                SourceAuthFailureKind::Missing,
+                StatusCode::UNAUTHORIZED,
+                "Unauthorized",
+                format!("Bearer resource_metadata=\"{A2A_METADATA}\", {scope}"),
+            ),
+            (
+                SourceAuthFailureKind::Invalid,
+                StatusCode::UNAUTHORIZED,
+                "Unauthorized",
+                format!("Bearer resource_metadata=\"{A2A_METADATA}\", error=\"invalid_token\", {scope}"),
+            ),
+            (
+                SourceAuthFailureKind::InsufficientScope,
+                StatusCode::FORBIDDEN,
+                "Forbidden",
+                format!("Bearer resource_metadata=\"{A2A_METADATA}\", error=\"insufficient_scope\", {scope}"),
+            ),
+        ] {
+            let response = caller_deny_response(
+                CallerDenial::CallerAuthentication,
+                &SurfaceProtocol::A2a,
+                Some(&declaration),
+                Some(&failed(kind)),
+            );
+            assert_eq!(response.status(), status, "{kind:?}");
+            assert_eq!(challenge_of(&response), Some(challenge.as_str()), "{kind:?}");
+            assert!(is_gateway_challenge(&response), "{kind:?}");
+            assert_eq!(header(&response, CONTENT_TYPE), Some("application/problem+json"), "{kind:?}");
+            assert_eq!(header(&response, CACHE_CONTROL), Some("no-store"), "{kind:?}");
             assert_eq!(
                 body_json(response).await,
-                json!({"error": "Forbidden", "message": "Agent trust policy denied the request"})
+                json!({
+                    "type": "https://a2a-protocol.org/errors/proxy-error",
+                    "title": title,
+                    "status": status.as_u16(),
+                    "detail": "Caller authentication failed",
+                })
             );
+        }
+
+        let surface = caller_deny_response(
+            CallerDenial::SurfacePolicy,
+            &SurfaceProtocol::A2a,
+            Some(&declaration),
+            Some(&failed(SourceAuthFailureKind::Missing)),
+        );
+        assert_eq!(surface.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(header(&surface, CONTENT_TYPE), Some("application/json"));
+        assert!(is_gateway_challenge(&surface));
+        assert_eq!(
+            body_json(surface).await,
+            json!({"error": "Unauthorized", "message": "Agent trust policy denied the request"})
+        );
+    }
+
+    #[test]
+    fn test_a_declaration_that_cannot_name_its_metadata_fails_closed_without_a_challenge() {
+        let unnamed = declaration_for("http://gateway.example/mcp/alpha", &[]);
+        for protocol in [SurfaceProtocol::Mcp, SurfaceProtocol::A2a] {
+            let response = caller_deny_response(
+                CallerDenial::GatewayPolicy,
+                &protocol,
+                Some(&unnamed),
+                Some(&failed(SourceAuthFailureKind::Missing)),
+            );
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{protocol:?}");
+            assert_eq!(challenge_of(&response), None, "{protocol:?}");
+            assert!(!is_gateway_challenge(&response), "{protocol:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_failed_caller_without_a_declaration_keeps_the_stage_403() {
+        for protocol in [SurfaceProtocol::Mcp, SurfaceProtocol::A2a] {
+            for kind in [SourceAuthFailureKind::Missing, SourceAuthFailureKind::Invalid] {
+                let response = caller_deny_response(CallerDenial::SurfacePolicy, &protocol, None, Some(&failed(kind)));
+                assert_eq!(response.status(), StatusCode::FORBIDDEN, "{kind:?}");
+                assert_eq!(challenge_of(&response), None, "{kind:?}");
+                assert_eq!(header(&response, CACHE_CONTROL), None, "{kind:?}");
+                assert!(!is_gateway_challenge(&response), "{kind:?}");
+                assert_eq!(
+                    body_json(response).await,
+                    json!({"error": "Forbidden", "message": "Agent trust policy denied the request"})
+                );
+            }
         }
     }
 
     #[tokio::test]
     async fn test_an_authenticated_or_anonymous_caller_keeps_the_stage_403() {
-        let declaration = declaration();
         let authenticated = SourceAuthContext::ApiKey { key_name: "k".into() };
-        for source_auth in [None, Some(&authenticated)] {
-            let response = caller_deny_response(CallerDenial::GatewayPolicy, Some(&declaration), source_auth);
-            assert_eq!(response.status(), StatusCode::FORBIDDEN);
-            assert_eq!(challenge_of(&response), None);
-            assert_eq!(
-                body_json(response).await,
-                json!({
-                    "type": "https://a2a-protocol.org/errors/proxy-error",
-                    "title": "Forbidden",
-                    "status": 403,
-                    "detail": "Request blocked by gateway policy",
-                })
-            );
+        let declarations = [(SurfaceProtocol::Mcp, declaration()), (SurfaceProtocol::A2a, a2a_declaration())];
+        for (protocol, declaration) in declarations {
+            for source_auth in [None, Some(&authenticated)] {
+                let response =
+                    caller_deny_response(CallerDenial::GatewayPolicy, &protocol, Some(&declaration), source_auth);
+                assert_eq!(response.status(), StatusCode::FORBIDDEN);
+                assert_eq!(challenge_of(&response), None);
+                assert_eq!(header(&response, CACHE_CONTROL), None);
+                assert_eq!(
+                    body_json(response).await,
+                    json!({
+                        "type": "https://a2a-protocol.org/errors/proxy-error",
+                        "title": "Forbidden",
+                        "status": 403,
+                        "detail": "Request blocked by gateway policy",
+                    })
+                );
+            }
         }
     }
 
@@ -353,6 +458,7 @@ mod tests {
     async fn test_each_stage_keeps_its_403_body() {
         let cases = [
             (CallerDenial::AppliancePolicy, "detail", "Request blocked by appliance-wide policy"),
+            (CallerDenial::CallerAuthentication, "detail", "Caller authentication failed"),
             (
                 CallerDenial::SurfacePolicyUnloaded,
                 "message",
@@ -360,32 +466,32 @@ mod tests {
             ),
         ];
         for (denial, field, text) in cases {
-            let response = caller_deny_response(denial, None, None);
+            let response = caller_deny_response(denial, &SurfaceProtocol::A2a, None, None);
             assert_eq!(response.status(), StatusCode::FORBIDDEN, "{denial:?}");
             assert_eq!(body_json(response).await[field], text, "{denial:?}");
         }
-        let body = body_json(caller_deny_response(CallerDenial::IdentityRequired, None, None)).await;
+        let body =
+            body_json(caller_deny_response(CallerDenial::IdentityRequired, &SurfaceProtocol::A2a, None, None)).await;
         assert_eq!(body["type"], "https://affinidi.com/atg/errors/identity-required");
         assert_eq!(body["status"], 403);
     }
 
     #[test]
     fn test_a_root_route_resource_names_the_bare_metadata_path() {
-        let mut root = discovery_surface(
-            jwt_bearer_method(),
-            Some(json!({"resource": "https://gateway.example/", "authorization_servers": [ISSUER]})),
-        );
-        root.access_point.route = "/".into();
-        let root = declaration_of(root);
-        let response = caller_deny_response(
-            CallerDenial::SurfacePolicy,
-            Some(&root),
-            Some(&failed(SourceAuthFailureKind::Missing)),
-        );
-        assert_eq!(
-            challenge_of(&response),
-            Some("Bearer resource_metadata=\"https://gateway.example/.well-known/oauth-protected-resource\"")
-        );
+        let root = declaration_for("https://gateway.example/", &[]);
+        for protocol in [SurfaceProtocol::Mcp, SurfaceProtocol::A2a] {
+            let response = caller_deny_response(
+                CallerDenial::SurfacePolicy,
+                &protocol,
+                Some(&root),
+                Some(&failed(SourceAuthFailureKind::Missing)),
+            );
+            assert_eq!(
+                challenge_of(&response),
+                Some("Bearer resource_metadata=\"https://gateway.example/.well-known/oauth-protected-resource\""),
+                "{protocol:?}"
+            );
+        }
     }
 
     fn header_values(headers: &HeaderMap) -> Vec<&str> {
@@ -432,19 +538,22 @@ mod tests {
 
     #[test]
     fn test_the_gateways_own_challenge_survives_the_filter() {
-        let declaration = declaration();
-        let mut own = caller_deny_response(
-            CallerDenial::GatewayPolicy,
-            Some(&declaration),
-            Some(&failed(SourceAuthFailureKind::Missing)),
-        );
-        assert_eq!(strip_relayed_challenges(&mut own), StrippedChallenges::default());
-        assert_eq!(own.status(), StatusCode::UNAUTHORIZED);
-        assert!(
-            challenge_of(&own).is_some_and(|value| value.starts_with("Bearer resource_metadata=")),
-            "{:?}",
-            challenge_of(&own)
-        );
+        let declarations = [(SurfaceProtocol::Mcp, declaration()), (SurfaceProtocol::A2a, a2a_declaration())];
+        for (protocol, declaration) in declarations {
+            let mut own = caller_deny_response(
+                CallerDenial::GatewayPolicy,
+                &protocol,
+                Some(&declaration),
+                Some(&failed(SourceAuthFailureKind::Missing)),
+            );
+            assert_eq!(strip_relayed_challenges(&mut own), StrippedChallenges::default());
+            assert_eq!(own.status(), StatusCode::UNAUTHORIZED);
+            assert!(
+                challenge_of(&own).is_some_and(|value| value.starts_with("Bearer resource_metadata=")),
+                "{:?}",
+                challenge_of(&own)
+            );
+        }
 
         let mut upstream = relayed(StatusCode::OK, &["Bearer realm=\"upstream\""]);
         assert_eq!(

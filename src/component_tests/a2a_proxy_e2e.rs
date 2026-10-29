@@ -210,6 +210,32 @@ async fn start_a2a_proxy_harness_with_a2a_settings(
     .await
 }
 
+/// A harness whose A2A-proxy surface authenticates callers with one pinned
+/// `jwt_bearer` method that declares the gateway's authorization server on its card.
+async fn start_declaring_a2a_proxy_harness(
+    fake_direct_line: &FakeDirectLine,
+    a2a: Value,
+) -> GatewayHarness {
+    use helpers::card_security::{
+        ISSUER, SMOKE_RESOURCE, advertise_public_origin, jwt_bearer_caller_authentication, write_strategy,
+    };
+    let direct_line_base_url = fake_direct_line
+        .base_url
+        .clone();
+    GatewayHarness::start(move |temp_dir, gw_config, bootstrap| {
+        advertise_public_origin(bootstrap);
+        write_strategy(temp_dir, ISSUER, true);
+        let mut surface_json = serde_json::to_value(helpers::build_minimal_channel()).expect("surface JSON");
+        surface_json["target"]["endpoint"] = json!(format!("a2a-proxy://{PROXY_ID}"));
+        surface_json["target"]["a2a_proxy_id"] = json!(PROXY_ID);
+        surface_json["access_point"]["a2a"] = a2a;
+        surface_json["access_point"]["caller_authentication"] = jwt_bearer_caller_authentication(&[SMOKE_RESOURCE]);
+        gw_config.surfaces = vec![serde_json::from_value(surface_json).expect("A2A proxy surface")];
+        write_a2a_proxy_fixtures(temp_dir, &direct_line_base_url, "active", true, 5, 100, 3);
+    })
+    .await
+}
+
 async fn start_a2a_proxy_harness_with_target_trust_check(fake_direct_line: &FakeDirectLine) -> GatewayHarness {
     let direct_line_base_url = fake_direct_line
         .base_url
@@ -626,6 +652,9 @@ async fn a2a_proxy_target_synthesizes_public_agent_card_without_calling_direct_l
     assert_eq!(card["capabilities"]["streaming"], false);
     assert_eq!(card["defaultInputModes"][0], "text/plain");
     assert_eq!(card["skills"][0]["id"], "message-send-text");
+    for key in ["security", "securitySchemes", "securityRequirements"] {
+        assert!(card.get(key).is_none(), "a surface that does not declare adds no {key}: {card}");
+    }
 
     let extensions = card["capabilities"]["extensions"]
         .as_array()
@@ -663,6 +692,56 @@ async fn a2a_proxy_target_synthesizes_public_agent_card_without_calling_direct_l
             .request_count
             .load(Ordering::SeqCst),
         0
+    );
+}
+
+/// A synthesized card gets the surface's declaration in the shape of the versions the
+/// surface accepts: the flat scheme with both requirement arrays while it accepts 0.3,
+/// and the 1.0 shape alone when it accepts only 1.0. Its interfaces keep the A2A
+/// proxy's `/rpc` endpoint on the Access Point's listen address.
+#[tokio::test(flavor = "multi_thread")]
+async fn a2a_proxy_synthesized_card_declares_in_the_shape_of_the_accepted_versions() {
+    use helpers::card_security::{ISSUER, assert_declares};
+    let fake_direct_line = FakeDirectLine::start("should not be called").await;
+    for (versions, v1, v0_3) in [(json!(["0.3", "1.0"]), true, true), (json!(["1.0"]), true, false)] {
+        let h = start_declaring_a2a_proxy_harness(
+            &fake_direct_line,
+            json!({ "accepted_versions": versions, "validation": "envelope" }),
+        )
+        .await;
+        let rpc_url = format!(
+            "{}/smoke/rpc",
+            h.gateway_base
+                .replace("127.0.0.1", "localhost")
+        );
+        let card: Value = reqwest::Client::new()
+            .get(format!("{}/smoke/.well-known/agent-card.json", h.gateway_base))
+            .send()
+            .await
+            .expect("fetch synthesized agent card")
+            .json()
+            .await
+            .expect("agent card JSON");
+        assert_declares(&card, ISSUER, v1, v0_3);
+        let interfaces = card["supportedInterfaces"]
+            .as_array()
+            .expect("supportedInterfaces");
+        assert!(!interfaces.is_empty(), "{card}");
+        for interface in interfaces {
+            assert_eq!(interface["url"], rpc_url.as_str(), "every interface names the A2A proxy endpoint: {card}");
+        }
+        assert_eq!(card.get("url").is_some(), v0_3, "{card}");
+        if v0_3 {
+            assert_eq!(card["url"], rpc_url.as_str(), "{card}");
+        }
+        assert_eq!(card["skills"][0]["id"], "message-send-text");
+    }
+    assert_eq!(
+        fake_direct_line
+            .request_count
+            .load(Ordering::SeqCst),
+        0,
+        "the card is synthesized without calling Direct Line"
     );
 }
 

@@ -189,6 +189,12 @@ fn validate_required_fields(
     {
         return Err(SurfaceApiError::BadRequest(format!("{}access_point.route must start with '/'", prefix)));
     }
+    if crate::proxy::paths::route_holds_variant_separator(&surface.access_point.route) {
+        return Err(SurfaceApiError::BadRequest(format!(
+            "{}access_point.route must not contain '$' or '%24', which separate a Surface Variant alias",
+            prefix
+        )));
+    }
     if surface
         .target
         .endpoint
@@ -4678,6 +4684,24 @@ mod validation_tests {
             SurfaceApiError::BadRequest(msg) => assert!(msg.contains("target.endpoint")),
             other => panic!("expected BadRequest, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn required_fields_rejects_a_route_holding_the_variant_separator() {
+        for route in ["/smoke$dev", "/smoke%24dev", "/$"] {
+            let mut s = base_surface();
+            s.access_point.route = route.to_string();
+            match validate_required_fields(&s, "") {
+                Err(SurfaceApiError::BadRequest(msg)) => assert_eq!(
+                    msg,
+                    "access_point.route must not contain '$' or '%24', which separate a Surface Variant alias"
+                ),
+                other => panic!("expected BadRequest for {route}, got {other:?}"),
+            }
+        }
+        let mut s = base_surface();
+        s.access_point.route = "/smoke-dev/24".to_string();
+        validate_required_fields(&s, "").expect("route without the separator is valid");
     }
 
     #[test]

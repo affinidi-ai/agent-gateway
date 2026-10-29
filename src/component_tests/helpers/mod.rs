@@ -5,6 +5,7 @@
 //! test assertions.
 
 pub(crate) mod audit_events;
+pub(crate) mod card_security;
 pub(crate) mod formatted_logs;
 pub mod jwt;
 pub(crate) mod mock_auth_server;

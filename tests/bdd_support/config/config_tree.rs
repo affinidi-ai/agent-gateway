@@ -96,6 +96,22 @@ impl JwtVerificationStrategyFixture {
         self.authorization_server = authorization_server;
         self
     }
+
+    /// Store the strategy pinned to an authorization server whose issuer and key set are the
+    /// strategy's own.
+    pub fn pinned_to_authorization_server(
+        self,
+        metadata_url: impl Into<String>,
+        token_endpoint: impl Into<String>,
+    ) -> Self {
+        let pin = serde_json::json!({
+            "issuer": self.expected_issuer,
+            "metadata_url": metadata_url.into(),
+            "token_endpoint": token_endpoint.into(),
+            "jwks_uri": self.jwks_uri,
+        });
+        self.with_authorization_server(Some(pin))
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]

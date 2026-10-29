@@ -357,18 +357,16 @@ request received by the destination gateway:
 3. Resolve the destination surface from the legacy wire field `channel_id`.
 4. Run the destination surface's configured source authentication and MCP request-boundary
    validation. DIDComm authentication proves the sending Gateway; source authentication separately
-   evaluates caller evidence presented to the destination surface. On an MCP surface that
-   publishes protected resource metadata, a missing or refused token is answered here with a
-   `401` before policy, and a token short of the method's `required_scopes` with a `403`
-   `error="insufficient_scope"`, both with `realm="agent-gateway"` and without
-   `resource_metadata`: the sending Gateway strips the caller's
-   own `Authorization` header, so only a credential it injects, issued for this surface's
-   resource, can pass. The sending Gateway drops these challenges, like every relayed challenge
-   other than `Payment` on a `fabric://` Target, so its caller gets `502` for the `401` and a
-   `403` without a challenge
-   (see [Relayed challenges](SOURCE_AUTH.md#relayed-challenges)). There is no A2A counterpart:
-   `A2A-Version` is negotiated and A2A requests are validated on the sending gateway, not here
-   (see below).
+   evaluates caller evidence presented to the destination surface. On a declaring Access Point,
+   MCP or A2A, a missing or refused token is answered here with a `401` before policy, and a
+   token short of the method's `required_scopes` with a `403` `error="insufficient_scope"`, both
+   with `realm="agent-gateway"` and without `resource_metadata`: the receiving gateway never
+   points a Fabric caller at protected resource metadata, and the sending gateway strips the caller's own `Authorization`
+   header, so only a credential it injects, issued for this surface's resource, can pass. The
+   sending gateway drops these challenges, like every relayed challenge other than `Payment` on a
+   `fabric://` Target, so its caller gets `502` for the `401` and a `403` without a challenge
+   (see [Relayed challenges](SOURCE_AUTH.md#relayed-challenges)). A2A requests are validated, and
+   `A2A-Version` is negotiated, on the sending gateway, not here (see below).
 5. Build policy input containing the authenticated sending Gateway and any source-auth result. An
    identity presentation is attributed to the caller only when its issuer is one of the sending
    connection's issuers (see [Peer issuer DIDs](#peer-issuer-dids)).
@@ -380,6 +378,26 @@ request received by the destination gateway:
 
 The sending and receiving gateways enforce their own policies independently. For MCP surfaces, tool
 gating on each side composes: a tool hidden or denied by either surface remains unavailable.
+
+### Resource server across the Fabric
+
+The sending gateway is the resource server for its callers. Its Access Point declares,
+publishes protected resource metadata and challenges failed callers
+([declaring an Access Point](SOURCE_AUTH.md#declaring-an-access-point)), including when the
+Target is `fabric://` and the Access Point has a `jwt_bearer` method with `required_scopes`.
+The refusal comes before AP2, payment and the Fabric send, so a failed caller never costs a
+Fabric round trip.
+
+The send leg never forwards the caller's own token, whatever the method's `forward_header`
+says. The receiving gateway trusts the sending one through DIDComm peer authentication. Its own
+source authentication, step 4 above, sees only the headers the sending gateway forwarded, so
+`jwt_bearer` caller authentication on a surface that only Fabric callers reach sees them as
+failed unless the sending gateway injects a credential for it. Only the
+sending gateway declares and sends the challenge that names the metadata: a declaring Access Point on the receiving gateway
+refuses with the realm-only `401` or `403` above, and the sending gateway removes every
+challenge but `Payment` from a relayed response, so the caller never sees the receiving
+gateway's or its agent's authorization server
+([caller challenge](SOURCE_AUTH.md#caller-challenge)).
 
 ### Modern MCP activation
 

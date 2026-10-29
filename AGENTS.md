@@ -158,12 +158,27 @@ are `data.gateway.policy.deny_reason` and `data.surface.policy.deny_reason`.
 **Policy planes and identity attribution fail closed.** Two stages publish results and
 let OPA decide instead: Trust Check, and caller source authentication. A surface that must
 reject unauthenticated callers needs a policy denying `input.source_auth.method == "failed"`.
-An MCP Access Point that publishes protected resource metadata is the exception: a request to
-it, direct or over Fabric, is refused before policy with a `401`, or a `403` for a token short
-of the method's `required_scopes` (direct requests get the discovery challenge). Every challenge
-the gateway builds goes through `mark_gateway_challenge`
+A declaring Access Point, one that publishes protected resource metadata, is the only
+exception, and this paragraph is where the rule is stated; other documents link here. It
+refuses a caller whose source authentication failed (no token, an invalid one, or a JWT short
+of a method's `required_scopes`) with its `WWW-Authenticate` challenge, a `401` or a `403`
+with `error="insufficient_scope"`, and no surface policy can admit that caller. An MCP
+Access Point refuses at the source authentication stage, before policy. Any other declaring
+Access Point refuses after gateway policy and before the AP2 gate and payment, so nothing is
+settled and the Target is never reached. Every other stage that refuses such a caller answers
+with the same challenge, through one mapping. Only the sending gateway's challenge names the
+metadata: the receiving gateway of a Fabric route answers with a `realm` and no
+`resource_metadata`. An
+Access Point declares through an explicit `protected_resource` (MCP only) or, without it,
+through one pinned `jwt_bearer` method that sets `required_scopes`. It never forwards the
+caller's token, and every challenge the gateway builds goes through `mark_gateway_challenge`
 ([`src/protocols/protected_resource.rs`](src/protocols/protected_resource.rs)); relayed Target
-challenges other than `Payment` are dropped on such an Access Point and on a `fabric://` Target.
+challenges other than `Payment` are dropped on such an Access Point and on a `fabric://`
+Target. The choice lives in `refuses_failed_callers_by_default`
+([`src/source_auth/declaration.rs`](src/source_auth/declaration.rs)), read by
+`refuse_failed_caller_by_default` ([`src/proxy/caller_denial.rs`](src/proxy/caller_denial.rs))
+for the refusal and by the source authentication stage in `src/proxy/handler.rs` for its log
+and audit record; the MCP refusal at that stage checks the declaration and protocol directly.
 See [`docs/POLICY.md`](docs/POLICY.md#failed-caller-authentication).
 
 **MCP revisions are admitted per transport path.** Every MCP endpoint admits `2026-07-28`

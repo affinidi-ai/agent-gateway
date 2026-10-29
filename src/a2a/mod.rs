@@ -5,6 +5,7 @@
 //! schema derivation, and error responses.
 
 pub mod auth;
+pub mod card_security;
 pub mod errors;
 pub mod extensions;
 pub mod methods;
@@ -42,8 +43,9 @@ pub use crate::protocols::{
     ExtensionInspectionContext, inspect_message_extensions, is_hop_by_hop_header, should_forward_request_header,
 };
 pub use url_rewriter::{
-    AgentCardKind, EXTENDED_AGENT_CARD_BATCH_REFUSAL, build_target_url, is_extended_agent_card_batch,
-    is_extended_agent_card_method, rewrap_extended_agent_card, rewrite_agent_card_urls, unwrap_extended_agent_card,
+    AgentCardKind, CardSecurityContext, EXTENDED_AGENT_CARD_BATCH_REFUSAL, agent_card_refusal, build_target_url,
+    is_extended_agent_card_batch, is_extended_agent_card_method, process_agent_card, record_served_card,
+    rewrap_extended_agent_card, rewrite_agent_card, set_agent_card_revalidation, unwrap_extended_agent_card,
 };
 
 #[cfg(feature = "didwebvh")]

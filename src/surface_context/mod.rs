@@ -84,6 +84,16 @@ impl PolicyInput {
         }
     }
 
+    /// Publish the Surface Variant the request selected as `input.channel.variant_alias`.
+    pub fn set_variant_alias(
+        &mut self,
+        alias: Option<&str>,
+    ) {
+        if let Some(channel) = self.channel.as_mut() {
+            channel.variant_alias = alias.map(str::to_string);
+        }
+    }
+
     /// Promote the gateway-derived caller DID into `input.agent.did` when
     /// the inbound payload didn't assert one. After the caller is
     /// identified (`extension_identity.did` populated by the managed-
@@ -708,6 +718,27 @@ impl Serialize for IdentityBindingContext {
 mod tests {
     use super::*;
     use axum::http::HeaderMap;
+
+    #[test]
+    fn set_variant_alias_publishes_the_alias_and_clears_it_for_the_base_surface() {
+        let mut input = PolicyInput::new("POST", "/route", HashMap::new(), "inbound", None, None, None, "surface");
+        input.set_variant_alias(Some("strict"));
+        assert_eq!(serde_json::to_value(&input).unwrap()["channel"]["variant_alias"], "strict");
+        input.set_variant_alias(None);
+        assert!(
+            serde_json::to_value(&input).unwrap()["channel"]
+                .get("variant_alias")
+                .is_none()
+        );
+
+        let mut without_channel = PolicyInput::default();
+        without_channel.set_variant_alias(Some("strict"));
+        assert!(
+            without_channel
+                .channel
+                .is_none()
+        );
+    }
 
     #[test]
     fn mcp_context_called_tool_name_is_set_only_for_tools_call() {

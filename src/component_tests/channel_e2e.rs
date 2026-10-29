@@ -401,3 +401,105 @@ async fn inbound_default_variant_unmarked_url_still_forwarded() {
     assert_response(resp).await;
     assert_forwarded_request(&h.mock, body);
 }
+
+/// A gateway serving one surface at `route` under the `/smoke` prefix, with `policy` as
+/// its Target policy and `variants`, whose Access Point refuses no caller without a token.
+async fn start_with_surface_policy(
+    fixture: &JwksFixture,
+    route: &'static str,
+    policy: &'static str,
+    variants: serde_json::Value,
+) -> GatewayHarness {
+    const POLICY_ID: &str = "variant-alias-policy";
+    GatewayHarness::start(move |temp_dir, gw_config, _bootstrap| {
+        setup_jwt_bearer_auth_rejects_missing_then_accepts_valid(fixture, temp_dir, gw_config);
+        let dir = temp_dir.join("policy_definitions");
+        std::fs::create_dir_all(&dir).expect("create policy_definitions dir");
+        let definition = json!({
+            "id": POLICY_ID,
+            "name": POLICY_ID,
+            "policy_type": "agent_surface",
+            "policy": policy,
+            "enabled": true,
+            "created_at": "2026-01-01T00:00:00Z"
+        });
+        std::fs::write(dir.join(format!("{POLICY_ID}.json")), definition.to_string()).expect("write policy definition");
+        let mut surface = serde_json::to_value(&gw_config.surfaces[0]).expect("serialize surface");
+        surface["access_point"]["route"] = json!(route);
+        surface["target"]["policy"] = json!({"policy_definition_id": POLICY_ID});
+        surface["variants"] = variants;
+        gw_config.surfaces = vec![serde_json::from_value(surface).expect("surface with policy")];
+    })
+    .await
+}
+
+async fn post_rpc(
+    h: &GatewayHarness,
+    route: &str,
+    body: &'static str,
+) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("{}{route}/rpc", h.gateway_base))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("request to the gateway failed")
+}
+
+/// A surface policy reads `input.channel.variant_alias` from the request URL, so a
+/// rule that denies failed callers on one variant denies them there and nowhere else.
+#[tokio::test(flavor = "multi_thread")]
+async fn surface_policy_sees_the_variant_alias_of_the_request_url() {
+    let fixture = JwksFixture::start().await;
+    let h = start_with_surface_policy(
+        &fixture,
+        "/smoke",
+        "package surface.policy\ndefault allow := true\nallow := false if {\n  input.source_auth.method == \"failed\"\n  input.channel.variant_alias == \"strict\"\n}\n",
+        json!([{"id": "vc-strict", "alias": "strict", "name": "strict", "enabled": true, "overrides": {}}]),
+    )
+    .await;
+    let body = r#"{"jsonrpc":"2.0","method":"test","id":1}"#;
+
+    let strict = post_rpc(&h, "/smoke$strict", body).await;
+    assert_eq!(strict.status(), 403, "a failed caller on the strict variant must be denied");
+    assert!(
+        h.mock
+            .last_request_rx
+            .borrow()
+            .is_none(),
+        "a denied request must not reach the target"
+    );
+
+    let base = post_rpc(&h, "/smoke", body).await;
+    assert_response(base).await;
+    assert_forwarded_request(&h.mock, body);
+}
+
+/// An alias in the URL of a surface without variants selects nothing, so policy does
+/// not see it and a rule that admits failed callers on that alias does not apply. The
+/// surface sits under a wider route prefix, so such a URL reaches it.
+#[tokio::test(flavor = "multi_thread")]
+async fn policy_does_not_see_an_alias_that_selects_no_variant() {
+    let fixture = JwksFixture::start().await;
+    let h = start_with_surface_policy(
+        &fixture,
+        "/smoke/inner",
+        "package surface.policy\ndefault allow := false\nallow if input.source_auth.method != \"failed\"\nallow if input.channel.variant_alias == \"public\"\n",
+        json!([]),
+    )
+    .await;
+    let body = r#"{"jsonrpc":"2.0","method":"test","id":1}"#;
+
+    let forged = post_rpc(&h, "/smoke/inner$public", body).await;
+    assert_eq!(forged.status(), 403, "an alias that selects no variant must not admit a failed caller");
+    let base = post_rpc(&h, "/smoke/inner", body).await;
+    assert_eq!(base.status(), 403, "a failed caller on the base surface is denied");
+    assert!(
+        h.mock
+            .last_request_rx
+            .borrow()
+            .is_none(),
+        "a denied request must not reach the target"
+    );
+}

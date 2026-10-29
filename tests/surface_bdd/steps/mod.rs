@@ -1,6 +1,7 @@
 pub mod given;
 pub mod identities;
 pub mod names;
+pub mod oauth;
 pub mod policy_changes;
 pub mod strategy_discovery;
 pub mod sts;

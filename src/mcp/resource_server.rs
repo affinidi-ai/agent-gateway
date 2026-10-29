@@ -209,6 +209,10 @@ pub(crate) async fn served_metadata(
         .sts
         .mcp_issuer
         .as_ref();
+    let strategies = state
+        .source_auth_middleware
+        .as_ref()
+        .map(|middleware| middleware.provider_store());
     let surfaces = state
         .channels
         .read()
@@ -226,20 +230,21 @@ pub(crate) async fn served_metadata(
         }
         _ => Vec::new(),
     };
-    listener_metadata(&surfaces, &proxies, requested_path, profile, &state.network_config)
+    listener_metadata(&surfaces, &proxies, requested_path, profile, strategies.as_deref(), &state.network_config).await
 }
 
 /// The one document served at `requested_path` among the surfaces and, when the
 /// gateway STS issuer is set, the standalone MCP Proxies. A path more than one
 /// endpoint claims is unavailable.
-pub(crate) fn listener_metadata(
+pub(crate) async fn listener_metadata(
     surfaces: &[std::sync::Arc<crate::config::agent_surface::AgentSurface>],
     proxies: &[crate::mcp_proxies::types::McpProxy],
     requested_path: &str,
     profile: Option<&McpIssuerProfile>,
+    strategies: Option<&dyn crate::jwt_bearer::JwtVerificationStrategyStorage>,
     network: &crate::config::NetworkConfig,
 ) -> MetadataMatch {
-    let found = surfaces_metadata(surfaces, requested_path, profile, network);
+    let found = surfaces_metadata(surfaces, requested_path, profile, strategies, network).await;
     match profile {
         Some(profile) => found.and(proxies_metadata(proxies, requested_path, profile, network)),
         None => found,
@@ -287,10 +292,11 @@ fn proxies_metadata(
 /// surface claims is unavailable, whatever their protocols. A route holding the
 /// Surface Variant separator is never published, so it cannot answer for
 /// another surface's variant URL.
-fn surfaces_metadata(
+async fn surfaces_metadata(
     surfaces: &[std::sync::Arc<crate::config::agent_surface::AgentSurface>],
     requested_path: &str,
     profile: Option<&McpIssuerProfile>,
+    strategies: Option<&dyn crate::jwt_bearer::JwtVerificationStrategyStorage>,
     network: &crate::config::NetworkConfig,
 ) -> MetadataMatch {
     let mut result = MetadataMatch::None;
@@ -308,7 +314,7 @@ fn surfaces_metadata(
         let found = match (mcp_authorization, profile) {
             (true, Some(profile)) => mcp_surface_metadata(surface, requested_path, profile, network),
             (true, None) => MetadataMatch::None,
-            (false, _) => declared_surface_metadata(surface, requested_path, network),
+            (false, _) => declared_surface_metadata(surface, requested_path, strategies, network).await,
         };
         result = result.and(found);
         if result == MetadataMatch::Unavailable {
@@ -321,10 +327,12 @@ fn surfaces_metadata(
 /// The document an Access Point whose declaration resolves to declare
 /// publishes at its own path, for the base route or an enabled Surface
 /// Variant's `$alias`. An explicit `protected_resource` claims only the path of
-/// the resource it names.
-fn declared_surface_metadata(
+/// the resource it names. A strategy store failure while resolving leaves the
+/// path unavailable.
+async fn declared_surface_metadata(
     surface: &crate::config::agent_surface::AgentSurface,
     requested_path: &str,
+    strategies: Option<&dyn crate::jwt_bearer::JwtVerificationStrategyStorage>,
     network: &crate::config::NetworkConfig,
 ) -> MetadataMatch {
     use crate::source_auth::declaration::{DeclarationOutcome, resolve_surface_declaration};
@@ -368,10 +376,18 @@ fn declared_surface_metadata(
     if !claims_path {
         return MetadataMatch::None;
     }
-    match resolve_surface_declaration(&resolved, alias, network) {
-        DeclarationOutcome::Declare(declaration) => MetadataMatch::Metadata(declaration.metadata()),
-        DeclarationOutcome::Unservable(_) => MetadataMatch::Unavailable,
-        DeclarationOutcome::PassThrough => MetadataMatch::None,
+    match resolve_surface_declaration(&resolved, alias, strategies, network).await {
+        Ok(DeclarationOutcome::Declare(declaration)) => MetadataMatch::Metadata(declaration.metadata()),
+        Ok(DeclarationOutcome::Unservable(_)) => MetadataMatch::Unavailable,
+        Ok(DeclarationOutcome::Strip(_) | DeclarationOutcome::PassThrough) => MetadataMatch::None,
+        Err(error) => {
+            tracing::warn!(
+                surface_id = %surface.surface_id,
+                error = %error,
+                "Strategy lookup failed while serving protected resource metadata"
+            );
+            MetadataMatch::Unavailable
+        }
     }
 }
 
@@ -906,13 +922,114 @@ mod listener_metadata_tests {
         proxy
     }
 
-    fn served(
+    const SCOPE: &str = "agent.invoke";
+
+    enum Strategies {
+        Pinned,
+        Failing,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::jwt_bearer::JwtVerificationStrategyStorage for Strategies {
+        async fn create(
+            &self,
+            _strategy: crate::jwt_bearer::models::JwtVerificationStrategy,
+        ) -> anyhow::Result<crate::jwt_bearer::models::JwtVerificationStrategy> {
+            anyhow::bail!("read-only")
+        }
+        async fn get(
+            &self,
+            id: &str,
+        ) -> anyhow::Result<Option<crate::jwt_bearer::models::JwtVerificationStrategy>> {
+            match self {
+                Self::Failing => anyhow::bail!("storage unavailable"),
+                Self::Pinned => Ok((id == "idp").then(|| {
+                    serde_json::from_value(json!({
+                        "id": "idp",
+                        "name": "idp",
+                        "expected_issuer": ISSUER,
+                        "jwks_source": {"type": "remote", "jwks_uri": format!("{ISSUER}/certs")},
+                        "authorization_server": {
+                            "issuer": ISSUER,
+                            "metadata_url": format!("{ISSUER}/.well-known/openid-configuration"),
+                            "token_endpoint": format!("{ISSUER}/token"),
+                            "jwks_uri": format!("{ISSUER}/certs")
+                        },
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "updated_at": "2026-01-01T00:00:00Z"
+                    }))
+                    .unwrap()
+                })),
+            }
+        }
+        async fn list(&self) -> anyhow::Result<Vec<crate::jwt_bearer::models::JwtVerificationStrategy>> {
+            Ok(Vec::new())
+        }
+        async fn update(
+            &self,
+            _strategy: crate::jwt_bearer::models::JwtVerificationStrategy,
+        ) -> anyhow::Result<crate::jwt_bearer::models::JwtVerificationStrategy> {
+            anyhow::bail!("read-only")
+        }
+        async fn delete(
+            &self,
+            _id: &str,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("read-only")
+        }
+    }
+
+    /// An Access Point at `route` whose one pinned JWT Bearer method requires
+    /// a scope and accepts tokens for the route and its `beta` variant.
+    fn derived(
+        protocol: crate::config::agent_surface::SurfaceProtocol,
+        route: &str,
+        method: impl FnOnce(&mut serde_json::Value),
+    ) -> Arc<AgentSurface> {
+        let base = match route {
+            "/" => "https://gateway.example/".to_string(),
+            route => format!("https://gateway.example{route}"),
+        };
+        let mut jwt_bearer = jwt_bearer_method();
+        jwt_bearer["audiences"] = json!([base, format!("https://gateway.example{route}$beta")]);
+        jwt_bearer["required_scopes"] = json!([SCOPE]);
+        method(&mut jwt_bearer);
+        let mut surface = discovery_surface(jwt_bearer, None);
+        surface.access_point.route = route.into();
+        surface.access_point.protocol = protocol;
+        Arc::new(surface)
+    }
+
+    fn derived_a2a(route: &str) -> Arc<AgentSurface> {
+        derived(crate::config::agent_surface::SurfaceProtocol::A2a, route, |_| ())
+    }
+
+    fn derived_document(resource: &str) -> MetadataMatch {
+        MetadataMatch::Metadata(json!({
+            "resource": resource,
+            "authorization_servers": [ISSUER],
+            "bearer_methods_supported": ["header"],
+            "scopes_supported": [SCOPE]
+        }))
+    }
+
+    async fn served_from(
+        surfaces: &[Arc<AgentSurface>],
+        proxies: &[crate::mcp_proxies::types::McpProxy],
+        path: &str,
+        profile: Option<&McpIssuerProfile>,
+        strategies: &Strategies,
+    ) -> MetadataMatch {
+        listener_metadata(surfaces, proxies, path, profile, Some(strategies), &network()).await
+    }
+
+    async fn served(
         surfaces: &[Arc<AgentSurface>],
         proxies: &[crate::mcp_proxies::types::McpProxy],
         path: &str,
         profile: Option<&McpIssuerProfile>,
     ) -> MetadataMatch {
-        listener_metadata(surfaces, proxies, path, profile, &network())
+        served_from(surfaces, proxies, path, profile, &Strategies::Pinned).await
     }
 
     fn explicit_document(resource: &str) -> MetadataMatch {
@@ -931,86 +1048,175 @@ mod listener_metadata_tests {
         }))
     }
 
-    #[test]
-    fn an_explicit_access_point_publishes_its_own_authorization_servers_with_or_without_the_sts_issuer() {
+    #[tokio::test]
+    async fn an_explicit_access_point_publishes_its_own_authorization_servers_with_or_without_the_sts_issuer() {
         let surfaces = [explicit("/smoke")];
         for profile in [None, Some(&sts())] {
-            assert_eq!(served(&surfaces, &[], "/smoke", profile), explicit_document("https://gateway.example/smoke"));
             assert_eq!(
-                served(&surfaces, &[], "/smoke$beta", profile),
+                served(&surfaces, &[], "/smoke", profile).await,
+                explicit_document("https://gateway.example/smoke")
+            );
+            assert_eq!(
+                served(&surfaces, &[], "/smoke$beta", profile).await,
                 explicit_document("https://gateway.example/smoke$beta")
             );
             for path in ["/", "/smoke/tools", "/smok", "/smoke$off", "/other"] {
-                assert_eq!(served(&surfaces, &[], path, profile), MetadataMatch::None, "{path}");
+                assert_eq!(served(&surfaces, &[], path, profile).await, MetadataMatch::None, "{path}");
             }
         }
     }
 
-    #[test]
-    fn an_mcp_resource_server_keeps_the_sts_issuer_and_needs_it() {
+    #[tokio::test]
+    async fn an_mcp_resource_server_keeps_the_sts_issuer_and_needs_it() {
         let surfaces = [sts_resource("/smoke")];
-        assert_eq!(served(&surfaces, &[], "/smoke", Some(&sts())), sts_document("https://gateway.example/smoke"));
+        assert_eq!(served(&surfaces, &[], "/smoke", Some(&sts())).await, sts_document("https://gateway.example/smoke"));
         assert_eq!(
-            served(&surfaces, &[], "/smoke$beta", Some(&sts())),
+            served(&surfaces, &[], "/smoke$beta", Some(&sts())).await,
             sts_document("https://gateway.example/smoke$beta")
         );
-        assert_eq!(served(&surfaces, &[], "/smoke", None), MetadataMatch::None);
+        assert_eq!(served(&surfaces, &[], "/smoke", None).await, MetadataMatch::None);
     }
 
-    #[test]
-    fn a_route_holding_the_variant_separator_cannot_claim_another_surfaces_variant() {
+    #[tokio::test]
+    async fn a_route_holding_the_variant_separator_cannot_claim_another_surfaces_variant() {
         let claimant = explicit("/smoke$beta");
-        assert_eq!(served(std::slice::from_ref(&claimant), &[], "/smoke$beta", None), MetadataMatch::None);
+        assert_eq!(served(std::slice::from_ref(&claimant), &[], "/smoke$beta", None).await, MetadataMatch::None);
         assert_eq!(
-            served(&[explicit("/smoke"), claimant], &[], "/smoke$beta", None),
+            served(&[explicit("/smoke"), claimant], &[], "/smoke$beta", None).await,
             explicit_document("https://gateway.example/smoke$beta")
         );
     }
 
-    #[test]
-    fn a_path_two_surfaces_claim_is_unavailable_whatever_their_settings() {
+    #[tokio::test]
+    async fn a_path_two_surfaces_claim_is_unavailable_whatever_their_settings() {
         for pair in [[explicit("/smoke"), sts_resource("/smoke")], [explicit("/smoke"), explicit("/smoke")]] {
-            assert_eq!(served(&pair, &[], "/smoke", Some(&sts())), MetadataMatch::Unavailable);
+            assert_eq!(served(&pair, &[], "/smoke", Some(&sts())).await, MetadataMatch::Unavailable);
         }
         assert_eq!(
-            served(&[explicit("/smoke"), explicit("/other")], &[], "/smoke", None),
+            served(&[explicit("/smoke"), explicit("/other")], &[], "/smoke", None).await,
             explicit_document("https://gateway.example/smoke")
         );
     }
 
-    #[test]
-    fn a_declaring_mcp_proxy_names_the_sts_issuer_and_needs_it() {
+    #[tokio::test]
+    async fn a_declaring_mcp_proxy_names_the_sts_issuer_and_needs_it() {
         let proxies = [declaring_proxy("/tools")];
-        assert_eq!(served(&[], &proxies, "/tools", Some(&sts())), sts_document("https://gateway.example/tools"));
-        assert_eq!(served(&[], &proxies, "/tools", None), MetadataMatch::None);
-        assert_eq!(served(&[], &proxies, "/other", Some(&sts())), MetadataMatch::None);
+        assert_eq!(served(&[], &proxies, "/tools", Some(&sts())).await, sts_document("https://gateway.example/tools"));
+        assert_eq!(served(&[], &proxies, "/tools", None).await, MetadataMatch::None);
+        assert_eq!(served(&[], &proxies, "/other", Some(&sts())).await, MetadataMatch::None);
         let mut disabled = declaring_proxy("/tools");
         disabled.status = crate::mcp_proxies::types::McpProxyStatus::Disabled;
-        assert_eq!(served(&[], &[disabled], "/tools", Some(&sts())), MetadataMatch::None);
+        assert_eq!(served(&[], &[disabled], "/tools", Some(&sts())).await, MetadataMatch::None);
         let mut unserved = declaring_proxy("/tools");
         unserved.endpoint_path = "/moved".into();
-        assert_eq!(served(&[], &[unserved], "/moved", Some(&sts())), MetadataMatch::Unavailable);
+        assert_eq!(served(&[], &[unserved], "/moved", Some(&sts())).await, MetadataMatch::Unavailable);
     }
 
-    #[test]
-    fn a_proxy_path_holding_the_variant_separator_cannot_take_over_a_surface_variant() {
+    #[tokio::test]
+    async fn a_proxy_path_holding_the_variant_separator_cannot_take_over_a_surface_variant() {
         let squatter = [declaring_proxy("/smoke$beta")];
-        assert_eq!(served(&[], &squatter, "/smoke$beta", Some(&sts())), MetadataMatch::None);
+        assert_eq!(served(&[], &squatter, "/smoke$beta", Some(&sts())).await, MetadataMatch::None);
         assert_eq!(
-            served(&[explicit("/smoke")], &squatter, "/smoke$beta", Some(&sts())),
+            served(&[explicit("/smoke")], &squatter, "/smoke$beta", Some(&sts())).await,
             explicit_document("https://gateway.example/smoke$beta")
         );
     }
 
-    #[test]
-    fn a_path_an_access_point_shares_with_a_declaring_proxy_is_unavailable() {
+    #[tokio::test]
+    async fn a_path_an_access_point_shares_with_a_declaring_proxy_is_unavailable() {
         let surfaces = [explicit("/smoke")];
         let proxies = [declaring_proxy("/smoke")];
-        assert_eq!(served(&surfaces, &proxies, "/smoke", Some(&sts())), MetadataMatch::Unavailable);
+        assert_eq!(served(&surfaces, &proxies, "/smoke", Some(&sts())).await, MetadataMatch::Unavailable);
         assert_eq!(
-            served(&surfaces, &proxies, "/smoke", None),
+            served(&surfaces, &proxies, "/smoke", None).await,
             explicit_document("https://gateway.example/smoke"),
             "without the STS issuer no MCP Proxy publishes"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_derived_declaration_publishes_its_pinned_authorization_server_at_each_enabled_path() {
+        let mcp = derived(crate::config::agent_surface::SurfaceProtocol::Mcp, "/smoke", |_| ());
+        for surfaces in [[derived_a2a("/smoke")], [mcp]] {
+            for profile in [None, Some(&sts())] {
+                assert_eq!(
+                    served(&surfaces, &[], "/smoke", profile).await,
+                    derived_document("https://gateway.example/smoke")
+                );
+                assert_eq!(
+                    served(&surfaces, &[], "/smoke$beta", profile).await,
+                    derived_document("https://gateway.example/smoke$beta")
+                );
+                for path in ["/", "/smoke/rpc", "/smok", "/smoke$off", "/smoke$unknown", "/other"] {
+                    assert_eq!(served(&surfaces, &[], path, profile).await, MetadataMatch::None, "{path}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_variant_of_a_root_access_point_does_not_declare() {
+        let surfaces = [derived_a2a("/")];
+        assert_eq!(served(&surfaces, &[], "/", None).await, derived_document("https://gateway.example/"));
+        assert_eq!(served(&surfaces, &[], "/$beta", None).await, MetadataMatch::None);
+    }
+
+    #[tokio::test]
+    async fn an_access_point_whose_declaration_strips_or_passes_through_is_not_published() {
+        let forwards = derived(crate::config::agent_surface::SurfaceProtocol::A2a, "/smoke", |method| {
+            method["forward_header"] = json!(true);
+        });
+        let unscoped = derived(crate::config::agent_surface::SurfaceProtocol::A2a, "/smoke", |method| {
+            method["required_scopes"] = json!([]);
+        });
+        let unpinned = derived(crate::config::agent_surface::SurfaceProtocol::A2a, "/smoke", |method| {
+            method["jwt_verification_strategy_id"] = json!("unknown");
+        });
+        for surface in [forwards, unscoped, unpinned] {
+            assert_eq!(served(std::slice::from_ref(&surface), &[], "/smoke", None).await, MetadataMatch::None);
+            assert_eq!(served(&[surface], &[], "/smoke$beta", None).await, MetadataMatch::None);
+        }
+        let mut disabled = (*derived_a2a("/smoke")).clone();
+        disabled.status = crate::config::agent_surface::SurfaceStatus::Disabled;
+        assert_eq!(served(&[Arc::new(disabled)], &[], "/smoke", None).await, MetadataMatch::None);
+    }
+
+    #[tokio::test]
+    async fn a_strategy_store_failure_leaves_a_declaring_candidate_unavailable() {
+        let surfaces = [derived_a2a("/smoke")];
+        for path in ["/smoke", "/smoke$beta"] {
+            assert_eq!(
+                served_from(&surfaces, &[], path, None, &Strategies::Failing).await,
+                MetadataMatch::Unavailable,
+                "{path}"
+            );
+        }
+        assert_eq!(served_from(&surfaces, &[], "/other", None, &Strategies::Failing).await, MetadataMatch::None);
+    }
+
+    #[tokio::test]
+    async fn an_access_point_without_required_scopes_never_reads_the_strategy_store() {
+        let unscoped = derived(crate::config::agent_surface::SurfaceProtocol::A2a, "/smoke", |method| {
+            method["required_scopes"] = json!([]);
+        });
+        assert_eq!(served_from(&[unscoped], &[], "/smoke", None, &Strategies::Failing).await, MetadataMatch::None);
+    }
+
+    #[tokio::test]
+    async fn a_path_a_derived_declaration_shares_with_another_claim_is_unavailable() {
+        for other in [explicit("/smoke"), sts_resource("/smoke"), derived_a2a("/smoke")] {
+            assert_eq!(
+                served(&[derived_a2a("/smoke"), other], &[], "/smoke", Some(&sts())).await,
+                MetadataMatch::Unavailable
+            );
+        }
+        assert_eq!(
+            served(&[derived_a2a("/smoke")], &[declaring_proxy("/smoke")], "/smoke", Some(&sts())).await,
+            MetadataMatch::Unavailable
+        );
+        assert_eq!(
+            served(&[derived_a2a("/smoke"), explicit("/other")], &[], "/smoke", None).await,
+            derived_document("https://gateway.example/smoke")
         );
     }
 }
