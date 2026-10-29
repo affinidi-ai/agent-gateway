@@ -245,7 +245,12 @@ export function policyChange(
   const event = entry.event as Partial<Record<PolicyChangeEvent, PolicyChangeData>>;
   for (const name of POLICY_CHANGE_EVENTS) {
     const change = event[name];
-    if (change) return { name, change };
+    if (change) {
+      return {
+        name,
+        change: { ...change, surface_variant: change.surface_variant ?? change.variant },
+      };
+    }
   }
   return null;
 }

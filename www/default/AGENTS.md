@@ -393,7 +393,7 @@ panels the same way, and do not put `role="button"` on a wrapper around a headin
 The seven policy change events (`policy_created`, `policy_updated`, `policy_deleted`,
 `policy_attached`, `policy_detached`, `policy_attachment_changed`, `policy_change_refused`) are
 read with `policyChange` (`pages/AuditPage/auditHelpers.ts`), never by indexing `entry.event`
-in components.
+in components. It fills `surface_variant` from `variant` on records written before the rename.
 
 - The list row and the panel title use `describeEntry`: one sentence saying which policy changed
   where, and a detail line naming the actor and why (`definition_deleted`, `ownership`). Refused

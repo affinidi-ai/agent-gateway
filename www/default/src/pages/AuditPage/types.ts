@@ -98,6 +98,8 @@ export interface PolicyChangeData {
   slot?: string | null;
   /** The variant whose slot was written, or `_base_` for a base slot. */
   surface_variant?: string | null;
+  /** `surface_variant` on records written before the rename; read through `policyChange`. */
+  variant?: string | null;
   transit_point?: string | null;
   mcp_tool_name?: string | null;
   gate?: string | null;

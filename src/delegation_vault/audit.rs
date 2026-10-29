@@ -299,8 +299,9 @@ pub struct PolicyChangeDetails {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slot: Option<PolicySlot>,
     /// On a surface slot: the variant whose slot was written, or `_base_` for
-    /// a base slot, which also applies to every variant inheriting it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// a base slot, which also applies to every variant inheriting it. Records
+    /// written before the rename stored it as `variant`.
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "variant")]
     pub surface_variant: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transit_point: Option<String>,

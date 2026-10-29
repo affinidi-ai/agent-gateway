@@ -280,7 +280,9 @@ where a policy applies (group Policies). Each record carries its body in the `ev
   `inbound`, `response`, `transit`, `transit_point`, `mcp_tool`, `mcp_tool_gate` or `plane`, with
   `transit_point`, `mcp_tool_name`, `gate` or `plane` naming the place. On a surface target,
   `surface_variant` is the slot written: the variant's alias, or `_base_` for a base slot, which
-  also applies to every variant that inherits it; gateway and appliance targets have none. A replaced
+  also applies to every variant that inherits it; gateway and appliance targets have none. Earlier
+  releases named it `variant`; stored records with that key still read, as `surface_variant`.
+  A replaced
   policy is detached, then its successor attached. A surface target also sets the top-level
   `surface_id` and `channel_name`.
   A gateway's legacy inline Rego has no definition: its records carry `policy_name`

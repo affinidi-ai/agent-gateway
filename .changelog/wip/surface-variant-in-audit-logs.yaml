@@ -30,7 +30,8 @@ changes:
       description: >-
         Policy change records name the variant whose slot was written surface_variant, the name
         every other record uses, and record _base_ for a slot on the base surface, which also
-        applies to the variants that inherit it.
+        applies to the variants that inherit it. Records stored with variant still read, and the
+        Audit Log shows their variant.
   fixed:
     - timestamp: '2026-10-28T18:00:00Z'
       title: Keep the surface variant on metrics of a stream the client aborts
