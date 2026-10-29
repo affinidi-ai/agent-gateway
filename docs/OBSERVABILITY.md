@@ -229,14 +229,13 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
       `default_variant_id` names no variant.
 
     A request whose variant can't be resolved is refused, never served by the base surface or
-    another variant. A modern MCP POST on the Access Point or the Transit Point is answered with a
-    JSON-RPC error with code `-32603` carrying the request's `id` (the body is read only to
-    recover it, within the smaller of `mcp_http.max_request_bytes` and 16 KiB and within 2 seconds,
-    as the read runs before authentication and rate limiting; a body that can't be read within
-    those gets the same error without an `id`), and its record
-    carries `rpc_error_code` `-32603` on both HTTP paths. Other modern MCP requests on the Access
-    Point get that error without an `id`, recorded the same way. The record is written once, at
-    routing, whatever happens to the body.
+    another variant. A modern MCP request of any method on the Access Point or the Transit Point
+    is answered with a JSON-RPC error with code `-32603` carrying the request's `id` (the body is
+    read only to recover it, within the smaller of `mcp_http.max_request_bytes` and 16 KiB and
+    within 2 seconds, as the read runs before authentication and rate limiting; a body that can't
+    be read within those, or carries no `id`, gets the same error without one), and its record
+    carries `rpc_error_code` `-32603` on both HTTP paths. The record is written once, at routing,
+    whatever happens to the body.
 
     On Fabric, the receiving gateway records the refusal (with its reason, and no `http_status`),
     and the reason stays in that record: it does not cross the wire. What the sending gateway's

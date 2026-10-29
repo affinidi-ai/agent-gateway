@@ -371,8 +371,8 @@ pub struct OutboundPipelineContext {
     /// `None` when the request targets the default variant.
     pub active_variant_alias: Option<String>,
     pub active_variant_id: Option<String>,
-    /// A modern MCP POST refused at routing, already recorded. It is answered
-    /// before any other step, once the body has been read for its `id`.
+    /// A modern MCP request refused at routing, already recorded. It is
+    /// answered before any other step, once the body has been read for its `id`.
     pub pending_variant_refusal: Option<crate::audit::request_events::RoutingRefusal>,
     /// Resolved [`AgentSurface`] for this outbound request, symmetric
     /// to inbound `ProxyState::surface`. Built once per request via
@@ -491,17 +491,16 @@ impl OutboundPipelineContext {
             })?;
 
         // The refusal is recorded only once nothing else can fail, so its record
-        // matches the answer. A modern MCP POST is answered later, once its body
-        // is read for the `id`; every other request now. So a request that
-        // reaches any later step and names an alias always has that alias's
-        // `active_variant_id`.
-        let modern_post = matched_virtual_channel.protocol == crate::config::agent_surface::TransitProtocol::Mcp
-            && crate::mcp::request_validation::has_modern_header(&original_headers, versions)
-            && original_method == Method::POST;
+        // matches the answer. A modern MCP request, whatever its method, is
+        // answered later, once its body is read for the `id`; every other
+        // request now. So a request that reaches any later step and names an
+        // alias always has that alias's `active_variant_id`.
+        let modern_mcp = matched_virtual_channel.protocol == crate::config::agent_surface::TransitProtocol::Mcp
+            && crate::mcp::request_validation::has_modern_header(&original_headers, versions);
         let pending_variant_refusal = match unresolved {
             None => None,
             Some(error) => {
-                let rpc_error_code = modern_post.then_some(i64::from(crate::mcp::error_codes::INTERNAL_ERROR));
+                let rpc_error_code = modern_mcp.then_some(i64::from(crate::mcp::error_codes::INTERNAL_ERROR));
                 let refusal = crate::audit::request_events::refuse_routing(
                     &crate::audit::request_events::RequestFacts {
                         surface_id: &surface_for_resolve.surface_id,
@@ -513,7 +512,7 @@ impl OutboundPipelineContext {
                     rpc_error_code,
                 );
                 refusal.warn(&surface_for_resolve);
-                if !modern_post {
+                if !modern_mcp {
                     return Err(OutboundPipelineError::VariantRefused(refusal));
                 }
                 Some(refusal)
@@ -602,7 +601,7 @@ impl OutboundPipelineContext {
         })
     }
 
-    /// Answers a modern MCP POST refused at routing with the JSON-RPC error,
+    /// Answers a modern MCP request refused at routing with the JSON-RPC error,
     /// reading the body within the Transit Point's MCP body limit only to echo
     /// its `id`. A body that can't be read is answered without one.
     async fn answer_variant_refusal(

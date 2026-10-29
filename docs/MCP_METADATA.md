@@ -133,20 +133,19 @@ when the variant it selects can't be resolved. The Access Point, the Transit
 Point and Fabric receive refuse it at routing, before MCP admission and before
 Target work, with one status per reason: `404` for an alias the surface doesn't
 have (including on an empty variant catalog) and for a disabled named or default
-variant, and `500` when `default_variant_id` names no variant. A modern MCP POST
-(`MCP-Protocol-Version` other than `2024-11-05`, or `Mcp-Method`) to an MCP
-Access Point or an MCP Transit Point is answered with a JSON-RPC error with code
-`-32603` carrying the request's `id`. Its body is read only to recover that
-`id`, within the smaller of the endpoint's `mcp_http.max_request_bytes` and
-16 KiB, and within 2 seconds: the read runs before source authentication and
-rate limiting, so what an unauthenticated caller can make the gateway buffer for
-a refused request, and how long it can keep the refusal pending by trickling or
-stalling its body, are bounded. A body that can't be read (larger than that, not
-complete within 2 seconds, not JSON, or without an `id`) gets the same error
-without one.
-On the Access Point, any other request carrying the modern MCP headers gets that
-error without an `id`. Every other request gets a plain error response. Fabric
-Open refuses the same requests.
+variant, and `500` when `default_variant_id` names no variant. A modern MCP
+request (`MCP-Protocol-Version` other than `2024-11-05`, or `Mcp-Method`) to an
+MCP Access Point or an MCP Transit Point, whatever its method, is answered with
+a JSON-RPC error with code `-32603` carrying the request's `id`. Its body is read
+only to recover that `id`, within the smaller of the endpoint's
+`mcp_http.max_request_bytes` and 16 KiB, and within 2 seconds: the read runs
+before source authentication and rate limiting, so what an unauthenticated
+caller can make the gateway buffer for a refused request, and how long it can
+keep the refusal pending by trickling or stalling its body, are bounded. A body
+that can't be read (larger than that, not complete within 2 seconds, not JSON,
+or without an `id`, as a `GET` normally has none) gets the same error without
+one. Every other request gets a plain error response. Fabric Open refuses the
+same requests.
 
 Resolved Access Point, Transit Point and Fabric request snapshots retain the
 selected stable variant ID separately from the materialized surface, whose
