@@ -249,7 +249,7 @@ fn validate_and_pin_inner(
 /// Builds a redirect-disabled client pinned to `target`'s vetted addresses.
 ///
 /// `resolve_to_addrs` is builder-only in reqwest 0.13, so a fresh client is
-/// built per pinned target — acceptable for guarded egress. The client ignores
+/// built per pinned target, which is acceptable for guarded egress. The client ignores
 /// any proxy the environment or the system names: a proxy would resolve the
 /// host again and connect to an address nobody vetted.
 fn pinned_client(
