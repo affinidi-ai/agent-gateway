@@ -1558,6 +1558,7 @@ pub async fn create_surface(
         .map_err(|e| SurfaceApiError::Forbidden(e.message()))?;
 
     surface.trust_check_split = surface.has_trust_check_lists();
+    surface.transit_point_source_auth = surface.has_transit_point_source_auth();
     store
         .save(&surface)
         .await
@@ -2317,6 +2318,7 @@ async fn validate_and_save_surface(
     validate_mcp_resource_declarations(state, &surface).await?;
 
     surface.trust_check_split = surface.has_trust_check_lists();
+    surface.transit_point_source_auth = surface.has_transit_point_source_auth();
     store
         .save(&surface)
         .await
@@ -4451,6 +4453,7 @@ mod validation_tests {
             _retired_protocol_mode: Default::default(),
             mcp_http: None,
             trust_check_split: false,
+            transit_point_source_auth: false,
         }
     }
 

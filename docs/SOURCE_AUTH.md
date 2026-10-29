@@ -280,6 +280,31 @@ merge patch replaces the whole list. A `PUT` that omits `allow_unauthenticated_c
 it while the Transit Point still authenticates no caller, and drops it once the Transit Point
 authenticates its callers.
 
+### Upgrading and rolling back
+
+A release that predates Transit Point `source_auth` ignores a Transit Point's `source_auth`
+and `allow_unauthenticated_callers`. It would serve a Transit Point that relies on
+`source_auth` to anyone who reaches it, with its `target_auth` credential, when the transit
+token is off, and without the `source_auth` check when it is on. So a surface with a Transit
+Point that uses `source_auth`, on the base or in a variant, is stored with
+`transit_point_source_auth: true`. The gateway sets it on every save and when it loads a
+stored surface, including one written outside the API, and drops it once no Transit Point
+uses `source_auth`; a value a write sends is ignored. A release that predates it refuses that
+whole surface at load (it skips and logs it) instead of serving its Transit Points without
+`source_auth`: on such a release the surface is down, not open.
+
+- Upgrade every node that serves the same storage, Active and Standby, before giving any
+  Transit Point `source_auth`.
+- Do not roll back to such a release while any Transit Point uses `source_auth`. To roll
+  back, first remove `source_auth` from each one, base and variant, and turn its transit token
+  back on, or delete the surface. Then check the stored records under
+  `_storage/agent_surfaces/`, not a `GET`: a surface that still carries
+  `transit_point_source_auth` is skipped by the older release.
+- A Surface Template stores its surface unparsed, so an older release still loads it and can
+  create from it a Transit Point without `source_auth`. Back up
+  `_storage/agent_surface_templates/` before upgrading if a rollback may be needed, and
+  restore it on rollback.
+
 ### Transit Point source authentication
 
 A Transit Point's `source_auth` takes the same configuration as an Access Point's

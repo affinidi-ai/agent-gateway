@@ -66,3 +66,18 @@ changes:
         upgrading, set `allow_unauthenticated_callers: true` on every Transit Point that should
         stay open, or give it `source_auth`; the Surface Builder cannot set either, and a
         dashboard save keeps them once set.
+    - timestamp: '2026-10-29T21:30:00.000Z'
+      title: ⭐ Mark surfaces whose Transit Points use source_auth so older releases skip them
+      description: >-
+        A release before this one ignores a Transit Point's `source_auth`. After a rollback, or
+        on an older node sharing storage during a rolling upgrade or in an Active/Standby pair,
+        it would serve such a Transit Point to anyone who reaches it, with its `target_auth`
+        credential, when the transit token is off. A surface with a Transit Point that uses
+        `source_auth`, on the base or in a variant, is now stored with
+        `transit_point_source_auth: true`, which a release before this one refuses, so it skips
+        the whole surface instead of serving it open. Upgrade every node that shares storage
+        before giving a Transit Point `source_auth`, and do not roll back below this release
+        while one uses it: first remove `source_auth` from each such Transit Point and turn its
+        transit token back on, or delete the surface, then check the stored records carry no
+        `transit_point_source_auth`. Surface Templates are stored unparsed, so back them up
+        before upgrading if a rollback may be needed.

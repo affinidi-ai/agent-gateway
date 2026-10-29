@@ -76,6 +76,9 @@ impl AgentSurfaceStore for FileSystemAgentSurfaceStore {
         &self,
         surface: &AgentSurface,
     ) -> Result<()> {
+        let mut marked = surface.clone();
+        marked.transit_point_source_auth = marked.has_transit_point_source_auth();
+        let surface = &marked;
         let write = self.writes.lock().await;
         let before = self
             .before_change(&surface.surface_id)
