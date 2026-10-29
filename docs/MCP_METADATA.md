@@ -897,10 +897,14 @@ to assert one payment record across two rounds, identical receipts, and no
 additional payment or Target call on replay. This is not external payment-rail,
 full two-gateway, or distributed payment-store conformance.
 
-The delegated-payment hop strips an endpoint-bound Resource Server bearer as
-well as any configured source-auth credential; ingress authorization does not
-authorize a separate payment resource. Payment headers remain available to the
-delegate. For admitted modern requests, delegated HTTP 402 responses are
+The delegated-payment hop sends the payment gateway the headers the Access
+Point forwards to its own Target, so neither an endpoint-bound Resource Server
+bearer, a configured source-auth credential, caller-info headers, mapped headers
+the surface strips, `X-Transit-Token` nor hop-by-hop headers reach it; ingress
+authorization does not authorize a separate payment resource. `Authorization`
+crosses only with a `Payment` credential, and never when the surface's
+`source_auth` or Resource Server reads it. Payment headers remain available to
+the delegate. For admitted modern requests, delegated HTTP 402 responses are
 `no-store`; the retired payment codes `-32042` and `-32043` are mapped to the
 gateway application codes `1001` (payment required) and `1002` (payment rejected)
 with the caller's request ID and preserved challenge data and headers. Unknown
@@ -2145,6 +2149,6 @@ Modern credential destinations must be unambiguous before fetching credentials o
 
 Direct and sending Access Points and independent Fabric receive inspect local payment requirements before consuming a ready modern continuation. A no-credential challenge leaves the continuation and staged consent unclaimed; payment verification and Target dispatch still require the atomic claim. Failed or ambiguous payment processing never rearms an operation. Shared local processing uses each endpoint's own configuration and headers, removes consumed header and argument credentials, and preserves x402 versus MPP receipt names. Only the active local paywall's consumed argument is excluded from the continuation digest; business arguments, nested fields and other payment rails remain bound. Successful local payment on consent-enabled paths is retained as bounded, encrypted continuation evidence: later rounds revalidate authority and claim once before reusing the original receipt without another verification or settlement. Neither evidence nor descendant continuations extend the original expiry. Direct and isolated receiver JSON/SSE regressions assert one persisted mock x402 payment across rounds and no further work on replay. Delegated payment, external payment-rail and distributed payment-store conformance are not verified.
 
-Delegated payment never forwards the ingress Resource Server bearer. Modern delegated HTTP 402 challenges force `no-store` and map only retired payment codes `-32042`/`-32043` to application codes `1001`/`1002`, retaining caller correlation and challenge data/headers. Unknown upstream errors and legacy bodies remain unchanged. The remote allow/challenge/deny contract does not prove absence of side effects; never rearm a claimed operation on a challenge or uncertain result.
+Delegated payment never forwards the ingress Resource Server bearer, and forwards `Authorization` only with a `Payment` credential. Modern delegated HTTP 402 challenges force `no-store` and map only retired payment codes `-32042`/`-32043` to application codes `1001`/`1002`, retaining caller correlation and challenge data/headers. Unknown upstream errors and legacy bodies remain unchanged. The remote allow/challenge/deny contract does not prove absence of side effects; never rearm a claimed operation on a challenge or uncertain result.
 
 Vault mutations keep their acquired file lock in an owned task until filesystem work completes, even if the caller is cancelled; lock acquisition remains cancellable and provider network calls stay outside it. A cancelled mutation may have committed and must not be assumed absent. The shared atomic writer uses exclusive UUID temporary files, file flush/sync before rename and Unix directory sync after rename/deletion; a directory sync the filesystem reports as unsupported is logged once and skipped, while other sync failures propagate. Four-process local tests cover refresh claim races, revocation and abrupt owner death; paused-write tests cover cancellation. Real loopback DynamoDB-compatible tests race continuation claims and ID-JAG redemption across four processes. These checks do not prove remote-filesystem, deployed IAM, hardware power-loss or complete multi-host consent conformance.

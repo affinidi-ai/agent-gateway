@@ -659,6 +659,45 @@ impl MultiGatewayHarness {
         }
     }
 
+    /// Make `from_gw`'s `surface_id` delegate its payment to `to_gw`'s
+    /// `peer_surface_id` over Fabric (`agent_pay`), then publish the payment
+    /// surface to `from_gw`.
+    pub async fn delegate_payment_to_peer(
+        &self,
+        from_gw: usize,
+        surface_id: &str,
+        to_gw: usize,
+        peer_surface_id: &str,
+    ) -> Result<()> {
+        let remote_id = self
+            .remote_id(from_gw, to_gw)
+            .map(str::to_string)
+            .with_context(|| {
+                format!("no remote gateway id for gateway {to_gw} from gateway {from_gw}; federate first")
+            })?;
+        let from = self.gw(from_gw);
+        let mut surface = from
+            .admin
+            .get_surface(surface_id)
+            .await
+            .with_context(|| format!("fetch surface {surface_id} on gateway {from_gw}"))?;
+        surface["target"]["payment_policy"] = serde_json::json!({
+            "type": "x402",
+            "enabled": true,
+            "provider": "agent_pay",
+            "payment_gateway_id": remote_id,
+            "payment_surface_id": peer_surface_id,
+        });
+        from.admin
+            .update_surface(surface_id, &surface)
+            .await
+            .with_context(|| format!("delegate payment of surface {surface_id} on gateway {from_gw}"))?;
+        tokio::time::sleep(CHANNEL_RELOAD_SETTLE).await;
+
+        self.expose_surface_to_peer(to_gw, from_gw, peer_surface_id)
+            .await
+    }
+
     /// Point one Transit Point on `from_gw`'s `surface_id` at `to_gw`'s
     /// `peer_surface_id` over Fabric, then publish the destination surface.
     pub async fn point_transit_point_at_peer(

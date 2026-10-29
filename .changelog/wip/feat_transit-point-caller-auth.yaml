@@ -40,7 +40,16 @@ changes:
         surface with a `Warning` header naming it and those addresses, and the outbound listener
         logs it at `WARN`. Every open Transit Point is logged at `WARN` when it is mounted. The
         dashboard does not show the header.
-  changed: []
+  changed:
+    - timestamp: '2026-10-30T06:00:00.000Z'
+      title: Send a delegated payment only the headers an Access Point forwards
+      description: >-
+        A surface that delegates its payment (`agent_pay`) now sends the payment gateway the
+        caller's headers that the Access Point forwards to its own Target, and `Authorization`
+        only when it carries a `Payment` credential that neither the surface's `source_auth`
+        nor its Resource Server reads. Other `Authorization` values, `Proxy-Authorization` and
+        other hop-by-hop headers, caller-info headers, mapped headers the surface strips and
+        `X-Transit-Token` stay on this gateway.
   fixed: []
   removed: []
   security:
