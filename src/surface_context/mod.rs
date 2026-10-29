@@ -71,6 +71,9 @@ pub enum TransitCallerVerification {
     /// The Transit Point verified the caller's resource-server token
     /// (`mcp_http.authorization`) on this request.
     ResourceToken,
+    /// The Transit Point's own `source_auth` verified the caller's credential
+    /// on this request.
+    SourceAuth,
     /// A valid transit token names a caller DID, but nothing it carries was
     /// verified by credential: the DID was asserted or derived from request
     /// fields on the Access Point.
@@ -84,13 +87,15 @@ pub enum TransitCallerVerification {
 #[derive(Debug, Clone, Serialize)]
 pub struct TransitCallerContext {
     /// `true` when a credential the gateway verified established the caller
-    /// (`transit_token` and `resource_token`); `false` for `unverified` and
-    /// `anonymous`.
+    /// (`transit_token`, `resource_token` and `source_auth`); `false` for
+    /// `unverified` and `anonymous`.
     pub verified: bool,
     pub verification: TransitCallerVerification,
     /// How the identity was established: the transit token's `identity_source`
     /// (`gateway-computed`, `self-presented`, `verified-presentation`), or the
-    /// source-auth method for a resource token (`jwt_bearer`).
+    /// source-auth method of a caller the Transit Point verified (`jwt_bearer`
+    /// for a resource token; `api_key`, `jwt_bearer` or `mtls` for
+    /// `source_auth`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identity_source: Option<String>,
     /// SHA-256 (lowercase hex) of the verified principal: the JWT `sub`, API key
@@ -98,9 +103,9 @@ pub struct TransitCallerContext {
     /// the caller. Present only when `verified`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_identity_hash: Option<String>,
-    /// The verified principal itself. Only a `resource_token` caller has one: a
-    /// transit token carries the hash, and the principal only as an allowlisted
-    /// field.
+    /// The verified principal itself. Only a caller the Transit Point verified
+    /// (`resource_token` or `source_auth`) has one: a transit token carries the
+    /// hash, and the principal only as an allowlisted field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subject: Option<String>,
     /// The caller DID the transit token carries (`sub`). Asserted by the caller

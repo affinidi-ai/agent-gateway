@@ -78,6 +78,29 @@ way. So the managed agent can neither supply nor replace a credential, and a del
 credential under the same name as `target_auth` replaces it; give them different names to
 send both.
 
+### The caller on a Transit Point
+
+A Transit Point looks a grant up by the caller's identity hash and the managed agent's DID.
+The caller is the transit token's when the request carries a valid transit token with a
+`user_identity_hash`. Otherwise, when the Transit Point's own `source_auth` verified the
+caller (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-point-source-authentication)), it is
+that caller, hashed the way the Access Point hashes a caller it authenticated the same way:
+the SHA-256 of the JWT `sub`, of the API key's name (the `secret_id` for `api_key`, the
+key's id for `api_key_provider`), or of the mTLS principal. So:
+
+- an agent that calls the Transit Point with a JWT for the same `sub` as a user who consented
+  through the Access Point is given that user's grant;
+- an API-key caller is one identity: every request with a key from the same `api_key`
+  secret, or with the same `api_key_provider` key, shares one set of grants;
+- the hash includes neither the method nor the JWT issuer, so accept only an issuer whose
+  subjects name the people the grants were consented for.
+
+A caller verified by a resource access token (`mcp_http.authorization`) keys a grant only on
+a `2026-07-28` MCP request. The agent half of the key is the Transit Point's
+[managed identity](SOURCE_AUTH.md#managed-identity), else the caller DID the transit token
+carries, so a `source_auth` caller without a transit token needs a managed identity for the
+Transit Point.
+
 ## When a token is missing
 
 Delegation needs a user to key the token by, so a surface with delegation but no
@@ -118,10 +141,11 @@ credentials unavailable`) carrying the request's id, otherwise an `application/p
 body. The delegation audit records the binding's outcome, and `provider_unavailable` names a
 provider that cannot be used.
 
-A Transit Point refuses such a request with `503`, and also refuses with `403` one whose
-transit token carries no caller identity, including every request to a Transit Point that sets
-`require_transit_token: false`, or for which neither its managed identity nor the transit
-token's caller DID gives the agent half of the vault key. It also refuses when its delegation
+A Transit Point refuses such a request with `503`, and also refuses with `403` one that names
+no caller, because neither a transit token with a caller identity nor the Transit Point's
+`source_auth` identifies one, as on every request to a Transit Point that serves callers it
+does not authenticate, or for which neither its managed identity nor the transit token's
+caller DID gives the agent half of the vault key. It also refuses when its delegation
 stores are not available. An MCP Transit Point answers with a JSON-RPC error (`-32603` for
 `503`, `-32001` for `403`) carrying the request's id, and any other Transit Point with an
 `application/problem+json` body. A missing token still gets the consent answer above. A

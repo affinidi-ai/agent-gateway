@@ -164,7 +164,12 @@ async fn create_surface(
 ) -> serde_json::Value {
     let points: Vec<serde_json::Value> = aliases
         .iter()
-        .map(|alias| json!({ "alias": alias, "target_endpoint": h.mock.url(), "require_transit_token": false }))
+        .map(|alias| {
+            json!({
+                "alias": alias, "target_endpoint": h.mock.url(),
+                "require_transit_token": false, "allow_unauthenticated_callers": true
+            })
+        })
         .collect();
     let created = admin
         .post(format!("{}/api/v1/surfaces", h.gateway_base))

@@ -172,7 +172,7 @@ Managed agent → Transit Point listener → external service. Implemented in
 flowchart TB
     subgraph E["Edge"]
         direction LR
-        AR["Caller authentication:<br/>transit.source_auth refused,<br/>Resource Server token when configured"] --> A0[Transit token validation] --> A2[Rate limit] --> A3[Protocol context] --> A4[Header mapping] --> A5[Extension inspection]
+        AR["Caller authentication:<br/>source_auth or Resource Server token,<br/>refused when it cannot be enforced"] --> A0[Transit token validation] --> A2[Rate limit] --> A3[Protocol context] --> A4[Header mapping] --> A5[Extension inspection]
     end
     subgraph I["Identity and context"]
         direction LR
@@ -190,9 +190,14 @@ flowchart TB
     I -. discovery GET .-> F
 ```
 
-Public discovery GETs, such as an agent card, skip transit token validation and the trust and
-policy group, and are forwarded without credentials. The outbound path does not evaluate the
-appliance-wide policies.
+Every Transit Point authenticates its caller in the first stage, with its `source_auth` or
+Resource Server token, or in the second, with the transit token, unless it is marked
+`allow_unauthenticated_callers`; one that cannot be enforced refuses every request there,
+before anything is forwarded or any credential resolved (see
+[`docs/SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#transit-point-callers)). Public discovery GETs,
+such as an agent card, skip transit token validation and the trust and policy group, but not
+caller authentication, and are forwarded without credentials. The outbound path does not
+evaluate the appliance-wide policies.
 
 ## Full order
 
@@ -213,8 +218,9 @@ protected identity → response processing, including the `tools/list` filter �
 
 Outbound:
 
-caller authentication (a surface that sets `transit.source_auth`, which is not enforced, is
-refused here; on a Transit Point with `mcp_http.authorization`, the Resource Server token) →
+caller authentication (a Transit Point whose caller authentication cannot be enforced, or
+whose surface sets `transit.source_auth`, is refused here; otherwise its `source_auth`, or on
+a Transit Point with `mcp_http.authorization` the Resource Server token) →
 transit token validation → rate limit → protocol context → Transit Point header mapping
 (A2A and AP2) → outbound extension inspection (A2A) → identity resolution → trusted
 identity → custom metadata → trust context → Trust Check (the Transit Point's own list) → gateway OPA →
@@ -309,7 +315,8 @@ Breaking one of these is a correctness bug, not a style question.
 | DashMap is authoritative at runtime; disk is written immediately. | Reads and writes would disagree after a reload. |
 | Identity attribution fails closed. A presentation that does not verify never becomes the caller identity. | An unverified DID would reach policy as if it were proven. |
 | Every event of a forwarded A2A event stream gets the response checks a non-streaming reply gets before it is sent, and one that fails them ends the stream. | Streaming would bypass the response policy and the agent identity credential. |
-| A caller whose source authentication failed is never forwarded with the surface's stored target credential, or the A2A proxy's Direct Line secret, on the inbound and Fabric forwarding paths (direct, `proxy://` MCP, `a2a-proxy://`, Fabric send, Fabric receive). Transit Point listeners do not authenticate callers, so this does not cover them. | An unauthenticated caller would reach the Target with the operator's credential. |
+| A caller whose source authentication failed is never forwarded with the surface's stored target credential, or the A2A proxy's Direct Line secret, on the inbound and Fabric forwarding paths (direct, `proxy://` MCP, `a2a-proxy://`, Fabric send, Fabric receive). | An unauthenticated caller would reach the Target with the operator's credential. |
+| A Transit Point authenticates its caller, with a transit token, a Resource Server token or its `source_auth`, before anything is forwarded or any credential resolved, unless it is marked `allow_unauthenticated_callers`; one whose caller authentication cannot be enforced refuses every request. | Anyone who reaches a Transit Point would call its target as this gateway, with its target credentials. |
 | The Agent Surface is the only routing unit. | Routing behaviour would drift away from what an operator configured. |
 | x402 verification and settlement use the surface's configured payment requirement, or on a fabric facilitator the requirement the requesting peer sends; a credential's `accepted` must name it exactly. | A caller could name its own recipient and amount and still be granted the resource. |
 
@@ -349,7 +356,7 @@ from.
 | Module | Owns | Document |
 | --- | --- | --- |
 | [`identity/`](src/identity/) | Agent DIDs, `did:webvh` logs, credential issuance, VP verification, display names (including dashboard-only managed-agent Agent Card names) | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#managed-identity), [`POLICY.md`](docs/POLICY.md) |
-| [`source_auth/`](src/source_auth/) | JWT bearer, API key, DID Auth, mTLS on the inbound edge | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md) |
+| [`source_auth/`](src/source_auth/) | JWT bearer, API key, DID Auth, mTLS on the inbound edge, and a Transit Point's `source_auth` | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md) |
 | [`event_hook/`](src/event_hook/) | Operator-configured notifications of Connection Point lifecycle events to a receiver: signed, sequenced, delivered from background tasks with retries, nothing persisted. `directory.rs` is the cached client of the operator-configured mediator directory, whose entries `mediators/` lists next to stored records | [`INTEGRATIONS.md`](docs/INTEGRATIONS.md#event-hook), [`INTEGRATIONS.md`](docs/INTEGRATIONS.md#mediator-directory) |
 | [`didauth/`](src/didauth/) | The DID Auth challenge and JWS ceremony | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#did-auth) |
 | [`jwt_bearer/`](src/jwt_bearer/) | JWT verification strategies and JWKS fetching | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md) |

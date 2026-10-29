@@ -121,6 +121,7 @@ const surfaces = [
           identity_injection: { inject_vp: false },
           listen_path: '/transit/conformance-mcp',
           require_transit_token: false,
+          allow_unauthenticated_callers: true,
           ...mcpHttp(outbound),
         },
       ],

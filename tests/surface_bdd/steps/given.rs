@@ -890,6 +890,53 @@ fn transit_point_requires_a_transit_token(
     transit_point_config_mut(world, &transit_point).require_transit_token = true;
 }
 
+#[given(expr = "Transit Point {string} authenticates its callers with API key {string}")]
+async fn transit_point_authenticates_its_callers_with_an_api_key(
+    world: &mut SurfaceWorld,
+    transit_point: String,
+    api_key: String,
+) {
+    let secret_id = format!("bdd-transit-{transit_point}-caller-key");
+    transit_point_config_mut(world, &transit_point).source_auth = Some(serde_json::json!({
+        "type": "api_key",
+        "extraction": { "source": "http_header", "field": "X-API-Key" },
+        "secret_id": secret_id,
+    }));
+    crate::steps::when::ensure_admin_session(world).await;
+    let response = world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist")
+        .send_recorded_json(
+            reqwest::Method::POST,
+            "/api/v1/secrets/new",
+            Some(&serde_json::json!({
+                "name": "BDD Transit Point caller API key",
+                "secret_id": secret_id,
+                "description": "BDD Transit Point source authentication key",
+                "value": api_key,
+                "secret_type": "ApiKey",
+                "tags": ["bdd"],
+            })),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("create Transit Point caller key through admin API: {error}"));
+    assert!(
+        response.status == 201 || response.status == 409,
+        "Transit Point caller key setup should create or reuse the secret, got status {} body {}",
+        response.status,
+        response.body
+    );
+}
+
+#[given(expr = "Transit Point {string} is not open to callers it does not authenticate")]
+fn transit_point_is_not_open_to_unauthenticated_callers(
+    world: &mut SurfaceWorld,
+    transit_point: String,
+) {
+    transit_point_config_mut(world, &transit_point).allow_unauthenticated_callers = false;
+}
+
 #[given(expr = "Transit Point {string} has a policy that allows only caller {string}")]
 fn transit_point_has_a_policy_allowing_only_a_caller(
     world: &mut SurfaceWorld,

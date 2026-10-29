@@ -124,6 +124,11 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
 - **Transit Settings** has no listener authentication control: the gateway does not support
   `transit.source_auth` and refuses a save that sets it. The **Transit Token Mode** option
   says the embedded token is signed and readable by the agent, not encrypted.
+- The Transit Point panel has no control for a Transit Point's `source_auth` or
+  `allow_unauthenticated_callers`, and the factory does not send them; a `PUT` that omits
+  them keeps the stored values (see `docs/SOURCE_AUTH.md`, _Transit Point callers_). Turning
+  **Require transit token** off on a Transit Point with neither is refused by the API on
+  save.
 - A new surface is named `<protocol>_surface_<n>` (`surfaceNaming.ts`), where `n` is one more
   than the existing surfaces of that protocol, skipping names already taken. The name follows
   the protocol until the user types a different name, from the Name field or the Config tab

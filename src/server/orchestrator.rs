@@ -3779,7 +3779,7 @@ pub async fn run_axum_proxy(
                     .clone();
                 let direct_client_auth_clone = direct_client_auth.clone();
                 let listener_mgr_slot_for_outbound = listener_manager_slot.clone();
-                let consent_strategies = Some(source_auth_middleware.provider_store());
+                let outbound_source_auth_middleware = Some(source_auth_middleware.clone());
 
                 info!("Starting outbound port listener on port {} for {} channel(s)", port, outbound_channels.len());
 
@@ -3801,7 +3801,7 @@ pub async fn run_axum_proxy(
                         outbound_states,
                         direct_client_auth_clone,
                         listener_mgr_slot_for_outbound,
-                        consent_strategies,
+                        outbound_source_auth_middleware,
                     )
                     .await
                     {

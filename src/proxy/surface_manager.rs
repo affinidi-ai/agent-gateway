@@ -687,12 +687,11 @@ impl SurfaceTaskManager {
                     .read()
                     .await
                     .clone();
-                let consent_strategies = self
+                let source_auth_middleware = self
                     .source_auth_middleware
                     .read()
                     .await
-                    .as_ref()
-                    .map(|middleware| middleware.provider_store());
+                    .clone();
 
                 let handle = tokio::spawn(async move {
                     if let Err(e) = super::server::run_outbound_port_server(
@@ -712,7 +711,7 @@ impl SurfaceTaskManager {
                         outbound_states,
                         direct_client_auth_clone,
                         listener_mgr_clone,
-                        consent_strategies,
+                        source_auth_middleware,
                     )
                     .await
                     {
@@ -1728,12 +1727,11 @@ impl SurfaceTaskManager {
                 .clone();
             let metrics_store = metrics_store.clone();
             let listener_mgr_clone = self.listener_manager.clone();
-            let consent_strategies = self
+            let source_auth_middleware = self
                 .source_auth_middleware
                 .read()
                 .await
-                .as_ref()
-                .map(|middleware| middleware.provider_store());
+                .clone();
 
             let handle = tokio::spawn(async move {
                 if let Err(e) = super::server::run_outbound_port_server(
@@ -1753,7 +1751,7 @@ impl SurfaceTaskManager {
                     outbound_states,
                     direct_client_auth_clone,
                     listener_mgr_clone,
-                    consent_strategies,
+                    source_auth_middleware,
                 )
                 .await
                 {

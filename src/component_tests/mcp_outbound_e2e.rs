@@ -52,7 +52,8 @@ fn build_mcp_outbound_surface(custom_metadata: serde_json::Value) -> AgentSurfac
                 "target_endpoint": "outbound_target_placeholder",
                 "gateway_url": "outbound_gateway_url_placeholder",
                 "protocol": "mcp",
-                "require_transit_token": false
+                "require_transit_token": false,
+                "allow_unauthenticated_callers": true
             }]
         }
     }))

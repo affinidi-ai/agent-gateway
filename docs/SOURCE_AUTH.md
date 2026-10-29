@@ -15,7 +15,8 @@ Implemented in [`src/source_auth/`](../src/source_auth/) and
 
 ## Source authentication
 
-Configured on the Access Point as `caller_authentication.methods`. Each method is a
+Configured on the Access Point as `caller_authentication.methods`, and on a Transit Point as
+`source_auth` (see [Transit Point callers](#transit-point-callers)). Each method is a
 `SourceAuthConfig`
 ([`models.rs`](../src/source_auth/models.rs)), which has five variants.
 
@@ -60,9 +61,9 @@ such as missing configuration or an internal failure, block the request with `50
 ([`errors.rs`](../src/source_auth/errors.rs)). Such a request is forwarded without the
 surface's stored target credential, or the A2A proxy's Direct Line secret, on each inbound
 and Fabric forwarding path: direct inbound, `proxy://` MCP Targets, `a2a-proxy://` Targets,
-Fabric send and Fabric receive. Transit Point listeners do not authenticate callers, so this
-does not cover them. A surface that must reject unauthenticated callers therefore
-needs a policy that denies them:
+Fabric send and Fabric receive. A Transit Point refuses such a caller itself (see
+[Transit Point callers](#transit-point-callers)). A surface that must reject unauthenticated
+callers at its Access Point therefore needs a policy that denies them:
 
 ```rego
 package surface.policy
@@ -235,18 +236,130 @@ signatures, so callers record outcomes themselves from `code()`.
 
 ## Transit Point callers
 
-A Transit Point listener does not run an Access Point's source authentication. A call to a
-Transit Point is admitted by its transit token, required unless the Transit Point sets
-`require_transit_token: false`, and on an MCP Transit Point also by a resource access token
-when it sets `mcp_http.authorization` (see
-[`MCP_METADATA.md`](MCP_METADATA.md)). These are the only ways to authenticate a Transit
-Point caller.
+Every Transit Point authenticates its callers in at least one of these ways, all set on the
+Transit Point:
 
-`transit.source_auth` is not enforced. The admin API refuses a surface that sets it, on the
-surface or in a variant's overrides, with `400`. A surface stored with it still loads, with a
-warning in the log, but its Transit Points refuse every request with `503`, discovery reads
-included. The caller is told only that the Transit Point is unavailable, as a JSON-RPC error
-on an MCP Transit Point and a problem JSON otherwise; the reason is logged.
+| Way | Set with | Use it when |
+| --- | --- | --- |
+| [Transit token](#transit-token) | `require_transit_token: true`, the default | The caller is the surface's managed agent, serving a request that came through the Access Point. The token names that request's caller |
+| Resource access token | `mcp_http.authorization`, MCP Transit Points only | The caller can obtain an access token for the Transit Point from the gateway's STS (see [`MCP_METADATA.md`](MCP_METADATA.md)) |
+| [Source authentication](#transit-point-source-authentication) | `source_auth` | The caller holds a credential of its own: an API key, a JWT from an identity provider, or a client certificate. Agents that cannot carry a transit token, such as cloud-hosted ones like Copilot Studio, use this |
+
+A Transit Point that sets none of them must say so with `allow_unauthenticated_callers: true`.
+It then serves anyone who reaches it, through this gateway and with its target credentials,
+such as a `target_auth` key. Set it only on a Transit Point that sends no credential, or one
+only trusted callers can reach: its outbound listener bound to a private address, with no
+public external URL, and no inbound listener sharing a host name with it (see
+[Reachable on a public address](#reachable-on-a-public-address)).
+
+The admin API refuses with `400`, on the surface or in a variant's overrides, a Transit Point
+that:
+
+- authenticates no caller and does not set `allow_unauthenticated_callers`;
+- sets `allow_unauthenticated_callers` but authenticates its callers;
+- sets both `source_auth` and `mcp_http.authorization`;
+- sets a `source_auth` a Transit Point does not support, or one the Access Point's rules
+  refuse, such as mTLS trust that names no certificate.
+
+A surface stored with such a Transit Point still loads, with a warning in the log, but the
+Transit Point refuses every request with `503`, discovery reads included; a Transit Point
+that sets `allow_unauthenticated_callers` but authenticates its callers keeps authenticating
+them. The caller is told only that the Transit Point is unavailable, as a JSON-RPC error on an
+MCP Transit Point and a problem JSON otherwise; the reason is logged.
+
+`transit.source_auth`, on the surface's `transit` block rather than a Transit Point, is not
+enforced. The admin API refuses a surface that sets it, on the surface or in a variant's
+overrides, with `400`. A surface stored with it still loads, with a warning in the log, but
+its Transit Points refuse every request with `503` in the same way.
+
+The Surface Builder shows neither a Transit Point's `source_auth` nor its
+`allow_unauthenticated_callers`. A `PUT` that omits `source_auth`, as a dashboard save does,
+keeps the stored one; a merge `PATCH` whose `transit.points` leave it out removes it, since a
+merge patch replaces the whole list. A `PUT` that omits `allow_unauthenticated_callers` keeps
+it while the Transit Point still authenticates no caller, and drops it once the Transit Point
+authenticates its callers.
+
+### Transit Point source authentication
+
+A Transit Point's `source_auth` takes the same configuration as an Access Point's
+`caller_authentication` method, and the same source authentication middleware checks it,
+before the gateway reads anything else from the request, checks a transit token, applies a
+limit or resolves a credential:
+
+```json
+{
+  "alias": "crm",
+  "protocol": "mcp",
+  "target_endpoint": "https://crm.example/mcp",
+  "require_transit_token": false,
+  "source_auth": {
+    "type": "api_key",
+    "extraction": { "source": "http_header", "field": "X-API-Key" },
+    "secret_id": "copilot-crm-callers"
+  }
+}
+```
+
+| Method | On a Transit Point |
+| --- | --- |
+| `api_key`, `api_key_provider` | Read from an HTTP header only |
+| `jwt_bearer` | `forward_header` must be `false`. An audience of `{{ surface.agent_did }}` means the surface's agent DID, as on an Access Point |
+| `mtls` | The certificate from the outbound listener's own TLS handshake (`[tls.client_auth] direct`, on an `https` outbound listener), or from the forwarded-client-cert header of a proxy in `trusted_proxies` |
+| `did_auth` | Not supported: a Transit Point serves no DID Auth challenge |
+
+Unlike an Access Point, a Transit Point refuses a caller whose credential is missing or
+refused, with `401` and a problem JSON saying only `Caller credential missing or invalid`;
+which check failed is logged. A check the gateway cannot run, such as a secret, strategy,
+JWKS or certificate it cannot load, is refused with `503` as unavailable. Nothing of a
+refused request reaches the target. The credential's header is removed from an admitted
+request, so the target never receives the caller's key or token. A Transit Point that also
+requires a transit token needs both: `source_auth` first, then the token.
+
+A request that reaches a Transit Point through an inbound listener's `/outbound` route (see
+[Reachable on a public address](#reachable-on-a-public-address)) carries no client
+certificate: that route never passes on the forwarded-client-cert header, because the
+outbound listener sees the gateway itself as the peer. A Transit Point with `mtls`
+`source_auth` is called on its outbound listener directly, or through a trusted proxy.
+
+The verified caller is in the Transit Point's policy input as `input.transit.caller`, with
+`verification: "source_auth"` (see
+[`POLICY.md`](POLICY.md#caller-in-transit-point-policy-input)), and `input.source_auth`
+carries the identity with a JWT's claims. The caller's principal, and so its identity hash,
+is:
+
+| Method | Principal | So |
+| --- | --- | --- |
+| `jwt_bearer` | The token's `sub` | One caller per subject |
+| `api_key` | The `secret_id` | Every key in the secret is the same caller; give each caller a secret of its own to tell them apart |
+| `api_key_provider` | The key's id | One caller per issued key |
+| `mtls` | The principal the `identity_binding` derives | One caller per bound principal |
+
+The identity hash is the SHA-256 of the principal, the same value an Access Point puts in the
+transit token for a caller it authenticated the same way. It does not include the method or
+the JWT issuer, so a JWT whose `sub` is `alice` and an API key secret named `alice` hash
+alike. A Transit Point that releases delegated credentials should accept only an issuer whose
+subjects name the same people the grants were consented for; see
+[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-a-transit-point).
+
+### Reachable on a public address
+
+A Transit Point is reachable on a public address when its outbound listener has an external
+URL whose host is not `localhost` or a loopback, private, link-local or unspecified address
+(any other host name counts as public), or when an inbound listener with such a URL shares a
+host name with the outbound listener, which makes that inbound listener pass `/outbound/...`
+requests on to it. The example configuration's `http://localhost` URLs on both listeners are
+enough for that.
+
+For each Transit Point that sets `allow_unauthenticated_callers` and is reachable that way, on
+the surface or in a variant, a create or update of its surface or of one of its variants is
+answered with a `Warning` header:
+
+```
+Warning: 299 - "Transit Point 'crm' serves callers it does not authenticate and is reachable on a public address: https://gateway.example.com"
+```
+
+When the outbound listener mounts the surface it logs the same text at `WARN`, and logs
+every other Transit Point that serves callers it does not authenticate at `WARN` too.
 
 ### Transit token
 
