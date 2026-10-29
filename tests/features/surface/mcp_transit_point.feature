@@ -183,3 +183,9 @@ Feature: MCP Transit Point forwarding
     When the operator sets the surface's transit token mode to "reference"
     Then the admin API response status is 400
     And the admin API error response mentions "transit.transit_token_mode 'reference' is not supported"
+
+  Scenario: A Transit Point cannot ask for external consent while the vault cannot keep grants
+    Given the surface requires delegated credentials from OAuth provider "calendar"
+    When the operator asks Transit Point "alpha" for grants of credential provider "calendar" by external consent
+    Then the admin API response status is 400
+    And the admin API error response mentions "consent_mode external needs at-rest encryption"

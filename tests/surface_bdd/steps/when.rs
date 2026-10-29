@@ -1449,6 +1449,53 @@ async fn operator_sets_the_transit_token_mode(
     record_admin_response(world, response);
 }
 
+#[when(
+    expr = "the operator asks Transit Point {string} for grants of credential provider {string} by external consent"
+)]
+async fn operator_asks_a_transit_point_for_external_consent(
+    world: &mut SurfaceWorld,
+    alias: String,
+    provider: String,
+) {
+    ensure_admin_session(world).await;
+    let surface_id = get_tracked_surface_id(world, "asking a Transit Point for external consent");
+    let client = world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist");
+    let current = client
+        .get_surface_recorded(&surface_id)
+        .await
+        .unwrap_or_else(|error| panic!("fetch surface before asking for external consent: {error}"));
+    assert_eq!(
+        current.status, 200,
+        "fetch surface before asking for external consent should succeed, got status {} body {}",
+        current.status, current.body
+    );
+
+    let mut payload = current.body;
+    payload["outbound_credentials"] = serde_json::json!([]);
+    let point = payload["transit"]["points"]
+        .as_array_mut()
+        .and_then(|points| {
+            points
+                .iter_mut()
+                .find(|point| point["alias"] == alias.as_str())
+        })
+        .unwrap_or_else(|| panic!("Transit Point {alias} must exist"));
+    point["transit_credentials"] = serde_json::json!({
+        "credential_provider_id": provider,
+        "consent_mode": "external",
+        "subject": "owner"
+    });
+    let response = client
+        .update_surface_recorded(&surface_id, &payload)
+        .await
+        .unwrap_or_else(|error| panic!("ask a Transit Point for external consent through admin API: {error}"));
+
+    record_admin_response(world, response);
+}
+
 pub(crate) async fn delete_surface(world: &mut SurfaceWorld) {
     ensure_admin_session(world).await;
     let surface_id = get_tracked_surface_id(world, "deleting the surface");
