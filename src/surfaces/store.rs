@@ -74,6 +74,45 @@ pub async fn strip_unsupported_header_metadata_mappings<S: AgentSurfaceStore + ?
     Ok(())
 }
 
+/// Drop the `default_variant_id` of a surface with no variants, persisting the
+/// correction to storage.
+///
+/// Save-time validation (`AgentSurface::validate_variants`) refuses one, but a
+/// surface stored before that check, or restored from a backup holding one,
+/// still has it, and every request to it would be refused as a misconfigured
+/// default. Without the default its base surface serves alias-less requests.
+/// A surface with variants keeps its default: the resolver stays strict.
+///
+/// Called from gateway startup (`main.rs::load_surfaces`), before the
+/// resolved-surface cache is seeded and the listeners are built.
+pub async fn clear_dangling_default_variants<S: AgentSurfaceStore + ?Sized>(
+    store: &S,
+    channels: &mut [AgentSurface],
+) -> anyhow::Result<()> {
+    for surface in channels
+        .iter_mut()
+        .filter(|surface| surface.variants.is_empty())
+    {
+        let Some(dropped) = surface
+            .default_variant_id
+            .take()
+        else {
+            continue;
+        };
+        warn!(
+            surface = %surface.name,
+            config_id = %surface.surface_id,
+            default_variant_id = %dropped,
+            "Surface has a default_variant_id but no variants — dropping it so its base surface serves its requests"
+        );
+        store
+            .save(surface)
+            .await
+            .with_context(|| format!("Failed to persist the dropped default variant of surface '{}'", surface.surface_id))?;
+    }
+    Ok(())
+}
+
 /// The retired dashboard feature flag that once turned A2A 0.3 off gateway-wide.
 const RETIRED_A2A_LEGACY_COMPATIBILITY_FLAG: &str = "a2a_legacy_compatibility";
 

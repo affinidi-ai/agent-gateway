@@ -226,7 +226,8 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
     - `variant_disabled` (404): the named variant, or the default variant of an alias-less
       request, is disabled.
     - `misconfigured_default` (500): the request names no variant and the surface's
-      `default_variant_id` names no variant.
+      `default_variant_id` names no variant. On a surface with no variants the gateway drops
+      such a default at startup, with a warning, so its base surface serves those requests.
 
     A request whose variant can't be resolved is refused, never served by the base surface or
     another variant. A modern MCP request of any method on the Access Point or the Transit Point

@@ -36,8 +36,10 @@ changes:
       title: Reject a default_variant_id that names no variant on a surface without variants
       description: >-
         Saving a surface whose default_variant_id names no variant is refused with 400 whether or
-        not the surface has variants. A surface with no variants used to save with a default its
-        requests could never be served by, as every path refuses them with 500.
+        not the surface has variants; a surface with no variants used to save with one, and its
+        base surface served its requests. The gateway drops such a stored default at startup,
+        with a warning naming the surface and the dropped id, so the base surface keeps serving
+        them instead of every path refusing them with 500 as misconfigured_default.
   removed:
     - timestamp: '2026-10-29T13:30:00Z'
       title: Drop variant_alias from request_completed audit records
