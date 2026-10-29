@@ -162,6 +162,12 @@ pub trait DelegationVaultStorage: Send + Sync {
         anyhow::bail!("This vault does not keep grants by binding")
     }
 
+    /// Whether any grant is stored, read without decrypting one, so it can be
+    /// answered while at-rest encryption is off.
+    async fn has_stored_grants(&self) -> Result<bool> {
+        anyhow::bail!("This vault does not keep grants by binding")
+    }
+
     /// Delete the grant with this record id, returning it if it existed.
     async fn delete_grant(
         &self,
@@ -187,6 +193,7 @@ pub struct FileSystemDelegationVaultStore {
     consents: consent::ConsentStorage,
     refreshes: std::sync::Arc<dyn StorageBackend<refresh::RefreshRecord>>,
     grants: std::sync::Arc<dyn StorageBackend<DelegatedGrant>>,
+    grants_directory: PathBuf,
     /// Whether the vault's stores were created with at-rest encryption active.
     encrypted: bool,
     /// Whether the identity hash pepper, which grant ids derive from, was
@@ -232,6 +239,7 @@ impl FileSystemDelegationVaultStore {
             grants: uncached_storage(path.join(GRANTS_DIRECTORY), "delegated_grant")
                 .await?
                 .into(),
+            grants_directory: path.join(GRANTS_DIRECTORY),
             encrypted,
             stable_grant_ids,
         })
@@ -829,6 +837,22 @@ impl DelegationVaultStorage for FileSystemDelegationVaultStore {
     async fn all_grants(&self) -> Result<Vec<DelegatedGrant>> {
         self.require_encryption()?;
         self.grants.list_all().await
+    }
+
+    async fn has_stored_grants(&self) -> Result<bool> {
+        let mut entries = match tokio::fs::read_dir(&self.grants_directory).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error).context("Failed to read the delegated grants directory"),
+        };
+        while let Some(entry) = entries.next_entry().await? {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.ends_with(".json") || name.ends_with(".json.enc") {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     async fn delete_grant(
