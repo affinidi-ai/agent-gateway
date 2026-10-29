@@ -477,15 +477,18 @@ only on a Transit Point that sets `delegated_credentials_for_fabric_callers: tru
 for the caller in `fabric.principal_hash` (see
 [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-a-transit-point)).
 A Transit Point's audit records name a caller in `fabric.principal_hash` with
-`auth_method: fabric_verified`, the peer (its issuer DID, else its Remote gateway record id) as `iss`
-and the allowlisted `sub`, `email` and `name` the receiving surface verified, ahead of a caller
+`auth_method: fabric_verified`, that hash as `user_identity_hash`, which is all that names a
+caller verified by an API key, and the allowlisted `sub`, `email` and `name` the receiving
+surface verified, with no `iss`: the peer issued none of them. They rank it ahead of a caller
 the Transit Point verified itself, as a verified Access Point token is. Without one they name
 the DID with `auth_method: fabric_asserted` and the peer as `iss`, below a caller the Transit
-Point verified itself. Policy sees both as `verification: fabric_peer`; in audit records,
+Point verified itself. Both name the peer (its issuer DID, else its Remote gateway record id) as
+`peer_gateway`. Policy sees both as `verification: fabric_peer`; in audit records,
 `fabric_verified` is a Fabric caller the receiving surface verified and `fabric_asserted` one it
-did not, so a search for every request from paired gateways matches both. The identity presentation a Transit Point with a `workload_binding` signs
-for its agent never names that DID as the user it acts for (`userIdentity`), as it does the DID
-of an Access Point token.
+did not, so a search for every request from paired gateways matches both labels, or
+`peer_gateway`. The identity presentation a Transit Point with a `workload_binding` signs for
+its agent never names that DID as the user it acts for (`userIdentity`), as it does the DID of
+an Access Point token.
 A release that predates the `fabric` claim reads such a token as one naming an unverified DID,
 with no principal, and one that predates `fabric.principal_hash` reads it as a `fabric_peer`
 caller with no principal, so neither releases a delegated credential for it. During a rolling

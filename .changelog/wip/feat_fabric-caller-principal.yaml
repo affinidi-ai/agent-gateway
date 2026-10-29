@@ -15,9 +15,11 @@ changes:
         caller as `fabric_peer` with `verified: true` and that `user_identity_hash`, so a rule
         that admits a verified caller by its hash also admits it when it arrives over Fabric;
         add `not input.transit.caller.fabric` to keep partner requests out. Its audit records
-        name it with `auth_method: fabric_verified`, the peer as `iss` and the claims the receiving
-        surface verified, ahead of a caller the Transit Point verified itself, as a verified
-        Access Point token is. The DID the peer named stays unverified (`did_verified: false`)
+        name it with `auth_method: fabric_verified`, its identity hash as `user_identity_hash`
+        and the claims the receiving surface verified, with the peer as `peer_gateway` and no
+        `iss`, ahead of a caller the Transit Point verified itself, as a verified Access Point
+        token is; a caller the receiving surface did not verify is `fabric_asserted`, with
+        `peer_gateway` too. The DID the peer named stays unverified (`did_verified: false`)
         and never names that caller. The principal is nested under `fabric`, so a release that
         does not read it sees no principal.
     - timestamp: '2026-10-30T15:00:00.000Z'

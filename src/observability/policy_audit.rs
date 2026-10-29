@@ -770,6 +770,8 @@ mod tests {
             mtls_subject_dn: None,
             mtls_issuer_dn: None,
             mtls_source: None,
+            user_identity_hash: None,
+            peer_gateway: None,
         };
 
         let authenticated = decision_caller(&PolicyDecisionEvent {

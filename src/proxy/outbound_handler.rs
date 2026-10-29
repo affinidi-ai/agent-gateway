@@ -11986,7 +11986,19 @@ mod tests {
         );
         let audited = outbound_caller(&ctx).unwrap();
         assert_eq!(audited.auth_method, "fabric_verified");
-        assert_eq!(audited.iss.as_deref(), Some("did:web:partner.example"));
+        assert_eq!(
+            audited
+                .user_identity_hash
+                .as_deref(),
+            Some("receiver-verified-hash")
+        );
+        assert_eq!(
+            audited
+                .peer_gateway
+                .as_deref(),
+            Some("did:web:partner.example")
+        );
+        assert_eq!(audited.iss, None);
         assert_eq!(audited.email.as_deref(), Some("a@b.example"), "the claims the receiving surface verified");
         assert_eq!(audited.sub, None, "never the DID the peer asserted");
 

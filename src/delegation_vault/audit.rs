@@ -59,6 +59,16 @@ pub struct AuditCallerContext {
     /// (e.g. a delegation-vault revoke) to the exact token used.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub token_id: Option<String>,
+    /// The caller's identity hash, for a caller of a request a paired gateway
+    /// sent over Fabric that the receiving surface verified
+    /// (`fabric_verified`): the value its delegated credentials are keyed by.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub user_identity_hash: Option<String>,
+    /// The paired gateway that sent the request over Fabric, for a
+    /// `fabric_verified` or `fabric_asserted` caller: its issuer DID, else its
+    /// Remote gateway record id.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub peer_gateway: Option<String>,
     /// Raw caller email captured for administrator-only audit evidence.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub email: Option<String>,
@@ -1096,6 +1106,8 @@ pub fn build_caller_context(identity: &crate::source_auth::AuthenticatedIdentity
                 mtls_subject_dn: None,
                 mtls_issuer_dn: None,
                 mtls_source: None,
+                user_identity_hash: None,
+                peer_gateway: None,
             }
         }
         crate::source_auth::AuthenticatedIdentity::ApiKey { key_name, .. } => AuditCallerContext {
@@ -1112,6 +1124,8 @@ pub fn build_caller_context(identity: &crate::source_auth::AuthenticatedIdentity
             mtls_subject_dn: None,
             mtls_issuer_dn: None,
             mtls_source: None,
+            user_identity_hash: None,
+            peer_gateway: None,
         },
         crate::source_auth::AuthenticatedIdentity::DidAuth { did } => AuditCallerContext {
             auth_method: "did_auth".to_string(),
@@ -1127,6 +1141,8 @@ pub fn build_caller_context(identity: &crate::source_auth::AuthenticatedIdentity
             mtls_subject_dn: None,
             mtls_issuer_dn: None,
             mtls_source: None,
+            user_identity_hash: None,
+            peer_gateway: None,
         },
         crate::source_auth::AuthenticatedIdentity::Mtls {
             principal,
@@ -1152,6 +1168,8 @@ pub fn build_caller_context(identity: &crate::source_auth::AuthenticatedIdentity
                 crate::source_auth::models::PeerCertSource::DirectTls => "direct".to_string(),
                 crate::source_auth::models::PeerCertSource::Forwarded => "forwarded".to_string(),
             }),
+            user_identity_hash: None,
+            peer_gateway: None,
         },
     }
 }
@@ -1160,13 +1178,15 @@ pub fn build_caller_context(identity: &crate::source_auth::AuthenticatedIdentity
 /// carries onto a Transit Point: the allowlisted `sub`, `email` and `name`
 /// claims captured for Workload Binding, with the inbound caller's DID as the
 /// subject when no `sub` claim was carried. `None` when the token names no caller.
-/// A token issued for a request a peer gateway sent has the peer (its issuer
-/// DID, else its Remote gateway record id) as `iss`. It is `fabric_verified`
-/// when it names the caller the receiving surface verified
-/// (`fabric.principal_hash`), with that caller's allowlisted `sub`, `email` and
-/// `name` only, and `fabric_asserted` otherwise, with the DID the peer's
-/// request named, which this gateway did not verify, as `sub`. Both are a
-/// `fabric_peer` caller in Transit Point policy.
+/// A token issued for a request a peer gateway sent names the peer (its issuer
+/// DID, else its Remote gateway record id) as `peer_gateway`. It is
+/// `fabric_verified` when it names the caller the receiving surface verified
+/// (`fabric.principal_hash`), with that caller's identity hash and allowlisted
+/// `sub`, `email` and `name` only, and no `iss`, since the peer issued none of
+/// them. It is `fabric_asserted` otherwise, with the DID the peer's request
+/// named, which this gateway did not verify, as `sub` and the peer that
+/// asserted it as `iss`. Both are a `fabric_peer` caller in Transit Point
+/// policy.
 pub fn transit_caller_context(claims: &crate::proxy::transit_token::TransitTokenClaims) -> Option<AuditCallerContext> {
     let field = |name: &str| {
         claims
@@ -1180,6 +1200,10 @@ pub fn transit_caller_context(claims: &crate::proxy::transit_token::TransitToken
         let verified = fabric
             .principal_hash
             .is_some();
+        let peer = fabric
+            .peer_issuer_did
+            .clone()
+            .unwrap_or_else(|| fabric.peer_gateway_id.clone());
         return Some(AuditCallerContext {
             auth_method: if verified {
                 "fabric_verified"
@@ -1187,12 +1211,7 @@ pub fn transit_caller_context(claims: &crate::proxy::transit_token::TransitToken
                 "fabric_asserted"
             }
             .to_string(),
-            iss: Some(
-                fabric
-                    .peer_issuer_did
-                    .clone()
-                    .unwrap_or_else(|| fabric.peer_gateway_id.clone()),
-            ),
+            iss: (!verified).then(|| peer.clone()),
             aud: None,
             sub: if verified {
                 field("sub")
@@ -1212,6 +1231,8 @@ pub fn transit_caller_context(claims: &crate::proxy::transit_token::TransitToken
             mtls_subject_dn: None,
             mtls_issuer_dn: None,
             mtls_source: None,
+            user_identity_hash: fabric.principal_hash.clone(),
+            peer_gateway: Some(peer),
         });
     }
     let sub = field("sub").or_else(|| claims.sub.clone());
@@ -1234,6 +1255,8 @@ pub fn transit_caller_context(claims: &crate::proxy::transit_token::TransitToken
         mtls_subject_dn: None,
         mtls_issuer_dn: None,
         mtls_source: None,
+        user_identity_hash: None,
+        peer_gateway: None,
     })
 }
 
@@ -1274,6 +1297,8 @@ pub fn binding_caller_context(binding: &crate::surface_context::IdentityBindingC
         mtls_subject_dn: None,
         mtls_issuer_dn: None,
         mtls_source: None,
+        user_identity_hash: None,
+        peer_gateway: None,
     })
 }
 
@@ -1308,6 +1333,8 @@ pub fn management_caller_context(
         mtls_subject_dn: None,
         mtls_issuer_dn: None,
         mtls_source: None,
+        user_identity_hash: None,
+        peer_gateway: None,
     })
 }
 
@@ -2506,17 +2533,22 @@ mod tests {
         .unwrap();
         assert_eq!(caller.auth_method, "fabric_asserted");
         assert_eq!(caller.iss.as_deref(), Some("did:web:partner"));
+        assert_eq!(caller.peer_gateway.as_deref(), Some("did:web:partner"));
         assert_eq!(caller.sub.as_deref(), Some("did:web:victim"));
+        assert_eq!(caller.user_identity_hash, None);
 
         let caller = transit_caller_context(&fabric_transit_claims(None, None, None, serde_json::json!({}))).unwrap();
         assert_eq!(caller.auth_method, "fabric_asserted");
         assert_eq!(caller.iss.as_deref(), Some("partner-record"), "the peer's record without an issuer DID");
+        assert_eq!(caller.peer_gateway.as_deref(), Some("partner-record"));
         assert_eq!(caller.sub, None);
     }
 
     /// A token naming the caller the receiving surface verified on a peer's
-    /// request names that caller by the claims the surface verified, with the
-    /// peer as the issuer, and never by the DID the peer asserted.
+    /// request names that caller by its identity hash and the claims the
+    /// surface verified, and the peer that sent the request as
+    /// `peer_gateway`, never as the issuer of those claims, and never by the
+    /// DID the peer asserted.
     #[test]
     fn a_fabric_issued_token_names_the_caller_its_receiving_surface_verified() {
         let caller = transit_caller_context(&fabric_transit_claims(
@@ -2527,11 +2559,19 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(caller.auth_method, "fabric_verified");
-        assert_eq!(caller.iss.as_deref(), Some("did:web:partner"));
+        assert_eq!(
+            caller
+                .user_identity_hash
+                .as_deref(),
+            Some("receiver-verified-hash")
+        );
+        assert_eq!(caller.peer_gateway.as_deref(), Some("did:web:partner"));
+        assert_eq!(caller.iss, None, "the peer did not issue the claims the receiving surface verified");
         assert_eq!(caller.sub.as_deref(), Some("alice"));
         assert_eq!(caller.email.as_deref(), Some("ada@example.com"));
         assert_eq!(caller.name.as_deref(), Some("Ada"));
 
+        // A caller verified by an API key has no claims: its hash names it.
         let caller = transit_caller_context(&fabric_transit_claims(
             Some("did:web:victim"),
             Some("did:web:partner"),
@@ -2540,6 +2580,14 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(caller.auth_method, "fabric_verified");
+        assert_eq!(
+            caller
+                .user_identity_hash
+                .as_deref(),
+            Some("receiver-verified-hash")
+        );
+        assert_eq!(caller.peer_gateway.as_deref(), Some("did:web:partner"));
+        assert_eq!(caller.iss, None);
         assert_eq!(caller.sub, None, "the asserted DID never names a verified caller");
     }
 
