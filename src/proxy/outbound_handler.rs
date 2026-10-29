@@ -1430,6 +1430,18 @@ async fn authenticate_transit_caller(
                 error = ?error,
                 "Transit Point caller authentication failed"
             );
+            crate::audit::request_events::auth_failed(
+                &crate::audit::request_events::RequestFacts {
+                    surface_id: &ctx.surface.surface_id,
+                    channel_name: &ctx.surface.name,
+                    trace_id: Some(&ctx.request_id),
+                    via_fabric: false,
+                },
+                crate::audit::request_events::source_auth_scheme(&config),
+                crate::audit::request_events::source_auth_reason(&error),
+                true,
+                Some(ctx.remote_addr.ip()),
+            );
             Err(OutboundPipelineError::TransitCallerUnauthenticated)
         }
         Err(error) => Err(caller_authentication_unavailable(ctx, &error)),
@@ -3210,11 +3222,19 @@ fn outbound_actor_did(ctx: &OutboundPipelineContext) -> Option<&str> {
     }
 }
 
-/// The inbound caller a transit token carries, for attributing outbound decisions.
+/// The caller of a Transit Point call, for attributing outbound decisions: the
+/// inbound caller a transit token carries, else the caller the Transit Point
+/// verified itself, by its resource token or `source_auth`.
 fn outbound_caller(ctx: &OutboundPipelineContext) -> Option<crate::delegation_vault::audit::AuditCallerContext> {
     ctx.transit_token_claims
         .as_ref()
         .and_then(crate::delegation_vault::audit::transit_caller_context)
+        .or_else(|| {
+            ctx.authenticated_identity
+                .as_ref()
+                .filter(|_| ctx.authenticated_by.is_some())
+                .map(crate::delegation_vault::audit::build_caller_context)
+        })
 }
 
 /// Shared audit context for an outbound OPA evaluation so each site records a
@@ -4570,7 +4590,7 @@ async fn step_inject_credentials(
         .and_then(crate::mcp::tool_analyzer::called_tool_name);
 
     let audit_ctx = crate::proxy::credential_delegation::DelegationAuditContext {
-        caller: None,
+        caller: outbound_caller(ctx),
         channel_name: Some(ctx.surface.name.clone()),
         target_endpoint: Some(
             ctx.virtual_channel
@@ -9246,6 +9266,116 @@ mod tests {
             ctx.authenticated_identity
                 .is_none()
         );
+    }
+
+    /// A Transit Point records every caller its `source_auth` refuses as an
+    /// `auth_failed` event, and names the caller it admitted on its policy and
+    /// delegation audit records.
+    #[tokio::test]
+    async fn a_transit_point_audits_the_callers_its_source_auth_refuses_and_names_the_one_it_admits() {
+        use crate::delegation_vault::audit::DelegationAuditAction;
+        use crate::secrets::SecretsStore;
+
+        let directory = tempfile::tempdir().unwrap();
+        let secrets = Arc::new(
+            crate::secrets::FilesystemSecretsStore::new_async(
+                directory
+                    .path()
+                    .join("secrets")
+                    .to_str()
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+        );
+        secrets
+            .create(crate::secrets::CreateSecretRequest {
+                tenant_id: None,
+                name: "Transit Point callers".to_string(),
+                secret_id: "transit-caller-key".to_string(),
+                description: None,
+                value: "right-key".to_string(),
+                secret_type: "ApiKey".to_string(),
+                tags: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let strategies = crate::jwt_bearer::storage::FileSystemJwtVerificationStrategyStore::new(
+            directory
+                .path()
+                .join("strategies"),
+        )
+        .await
+        .unwrap();
+        let mut state = test_outbound_state();
+        state.source_auth_middleware = Some(Arc::new(crate::source_auth::SourceAuthMiddleware::new(
+            Arc::new(crate::didauth::sessions::DidAuthSessionStore::new()),
+            Arc::new(strategies),
+            Arc::new(crate::jwt_bearer::JwksClient::new()),
+            Some(secrets),
+            Arc::new(dashmap::DashMap::new()),
+            None,
+            None,
+        )));
+        let context = |key: Option<&'static str>| {
+            let mut ctx = test_pipeline_context();
+            ctx.virtual_channel
+                .require_transit_token = false;
+            ctx.virtual_channel
+                .source_auth = Some(
+                serde_json::from_value(json!({
+                    "type": "api_key", "extraction": { "source": "http_header", "field": "X-API-Key" },
+                    "secret_id": "transit-caller-key"
+                }))
+                .unwrap(),
+            );
+            if let Some(key) = key {
+                ctx.original_headers
+                    .insert("x-api-key", HeaderValue::from_static(key));
+            }
+            ctx
+        };
+
+        for (key, reason) in [(Some("wrong-key"), "invalid_credential"), (None, "missing_credential")] {
+            let mut ctx = context(key);
+            let (result, events) = crate::audit::producer::capture(step_source_auth(&state, &mut ctx)).await;
+            assert!(matches!(result, Err(OutboundPipelineError::TransitCallerUnauthenticated)), "{result:?}");
+            assert_eq!(events.len(), 1, "{reason}: {events:?}");
+            assert!(
+                matches!(
+                    &events[0].event,
+                    DelegationAuditAction::AuthFailed {
+                        scheme: crate::audit::events::AuthScheme::ApiKey,
+                        reason: recorded,
+                        blocking: true,
+                        client_ip: Some(ip),
+                    } if recorded == reason && ip == "127.0.0.1"
+                ),
+                "{reason}: {events:?}"
+            );
+            assert_eq!(
+                events[0]
+                    .surface_id
+                    .as_deref(),
+                Some(
+                    ctx.surface
+                        .surface_id
+                        .as_str()
+                )
+            );
+            assert_eq!(events[0].trace_id.as_deref(), Some("test-request-id"));
+        }
+
+        let mut admitted = context(Some("right-key"));
+        let (result, events) = crate::audit::producer::capture(step_source_auth(&state, &mut admitted)).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(events.is_empty(), "{events:?}");
+        let caller = outbound_caller(&admitted).expect("the admitted caller is named");
+        assert_eq!(caller.auth_method, "api_key");
+        assert_eq!(caller.sub.as_deref(), Some("transit-caller-key"));
+
+        admitted.authenticated_by = None;
+        assert!(outbound_caller(&admitted).is_none(), "an identity nothing verified names no caller");
     }
 
     // ── step_rate_limit ────────────────────────────────────────────────────

@@ -248,7 +248,10 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
   resource authorization context). `blocking` is false when the failure was handed to policy
   (`input.source_auth.method == "failed"`) instead of refusing the request. `client_ip` is the
   resolved client address (forwarded headers only from `client_ip.trusted_proxies`); absent on
-  the fabric path, where the caller connected to the sending gateway.
+  the fabric path, where the caller connected to the sending gateway. A Transit Point's own
+  `source_auth` records it too, with `blocking: true` (it refuses the caller), the surface and
+  the request's trace id, and the TCP peer as `client_ip`, since the outbound listener does not
+  resolve forwarded headers.
 - `rate_limited`: the request was refused with 429. `scope` is `surface` (the Access Point's
   rate limit), `sse_sessions` (the legacy SSE session cap) or `fabric_capacity` (a full Fabric
   stream cap on the way to a fabric target). `retry_after_ms` is the wait the caller is given,

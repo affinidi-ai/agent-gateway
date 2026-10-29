@@ -344,7 +344,11 @@ name only its own tenant's or appliance-wide ones (see
 
 Unlike an Access Point, a Transit Point refuses a caller whose credential is missing or
 refused, with `401` and a problem JSON saying only `Caller credential missing or invalid`;
-which check failed is logged. A check the gateway cannot run, such as a secret, strategy,
+which check failed is logged, and the refusal is recorded as an `auth_failed` audit event (see
+[`OBSERVABILITY.md`](OBSERVABILITY.md)). Failed attempts are not throttled: protect a Transit
+Point reachable from untrusted networks with a strong key or certificate, and watch those
+events. The admitted caller is named on the Transit Point's policy decision and delegation
+audit records. A check the gateway cannot run, such as a secret, strategy,
 JWKS or certificate it cannot load, is refused with `503` as unavailable. Nothing of a
 refused request reaches the target. The credential's header is removed from an admitted
 request, so the target never receives the caller's key or token. A Transit Point that also
