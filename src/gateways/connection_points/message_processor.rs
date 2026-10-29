@@ -3782,7 +3782,8 @@ pub(crate) async fn resolve_stream_surface(
                 },
                 &error,
                 None,
-            );
+            )
+            .warn(&surface);
             return Err("Fabric stream variant is unavailable".to_string());
         }
     };
