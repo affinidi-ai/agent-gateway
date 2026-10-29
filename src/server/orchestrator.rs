@@ -13,7 +13,7 @@ use crate::gateways::filesystem::GatewayStore;
 use crate::gateways::types::GatewayType;
 use crate::mcp_proxies::filesystem::McpProxyStore;
 use crate::mediators::filesystem::MediatorStore;
-use crate::observability::periodic_metrics_update;
+use crate::observability::{loggable, periodic_metrics_update};
 use crate::surfaces::AgentSurfaceStore;
 use crate::trust_registries::store::TrustRegistryStore;
 
@@ -554,7 +554,10 @@ pub async fn run_axum_proxy(
                         batch_scheduled_delay_ms: None,
                         batch_max_export_size: None,
                     },
-                    logs: crate::config::metrics_config::LogsConfig { enabled: false },
+                    logs: crate::config::metrics_config::LogsConfig {
+                        enabled: false,
+                        ..Default::default()
+                    },
                 },
                 cloudwatch: crate::config::metrics_config::CloudWatchMetricConfig {
                     enabled: false,
@@ -3940,7 +3943,9 @@ pub async fn run_axum_proxy(
             for surface in &channels {
                 info!(
                     "  -> Channel '{}' route: {} -> {}",
-                    surface.name, surface.access_point.route, surface.target.endpoint
+                    surface.name,
+                    surface.access_point.route,
+                    loggable::url(&surface.target.endpoint)
                 );
             }
 
@@ -4050,9 +4055,6 @@ pub async fn run_axum_proxy(
                 .await;
             *task_ids = task_ids_map;
         }
-
-        // Log file watcher is no longer needed - logs are broadcast directly via WebSocketLogLayer
-        // when they're written by the tracing system
 
         {
             let mut mode_rx = mode_rx_for_task;

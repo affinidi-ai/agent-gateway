@@ -12,6 +12,7 @@ use super::McpProxyStore;
 use super::types::{CreateMcpProxyRequest, McpProxy, McpProxyWriteResponse, UpdateMcpProxyRequest};
 use crate::auth_manager::pat::{PatContext, PatResourceScope};
 use crate::mcp::sse_server::SseSessionManager;
+use crate::observability::loggable;
 use crate::tenancy::{
     PatTenantContext, ResourceKind, can_access, can_mutate, scope_allows_resource, tenant_for_create,
 };
@@ -1549,197 +1550,6 @@ pub async fn handle_mcp_info<S: McpProxyStore>(
     })))
 }
 
-/// Handle MCP JSON-RPC requests for a specific proxy
-/// This is the main endpoint that serves MCP requests to clients
-/// NOTE: Superseded by `handle_mcp_post` which also handles SSE and Streamable HTTP.
-#[allow(dead_code)]
-pub async fn handle_mcp_request<S: McpProxyStore>(
-    Extension(store): Extension<Arc<S>>,
-    Extension(manager): Extension<Arc<McpServerManager>>,
-    Path(path): Path<String>,
-    Json(request): Json<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    info!("📨 Received MCP request for path: {}", path);
-    debug!("Request payload: {:?}", request);
-
-    // Find the proxy that matches this path
-    // Note: The path here is just the suffix after the channel prefix was stripped by routing
-    // So we match against endpoint_path (which should start with /)
-    let proxies = store
-        .list_all()
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let normalized_path = if !path.starts_with('/') {
-        format!("/{}", path)
-    } else {
-        path.clone()
-    };
-
-    let proxy = proxies
-        .iter()
-        .find(|p| normalized_path.starts_with(&p.endpoint_path))
-        .ok_or_else(|| {
-            warn!("❌ No MCP proxy configured for path: {} (normalized: {})", path, normalized_path);
-            (StatusCode::NOT_FOUND, format!("No MCP proxy configured for path: {}", path))
-        })?;
-
-    info!("✓ Found matching proxy: '{}' (ID: {})", proxy.name, proxy.id);
-
-    // Check if proxy is active
-    if proxy.status != super::types::McpProxyStatus::Active {
-        warn!("❌ Proxy '{}' is disabled", proxy.name);
-        return Err((StatusCode::SERVICE_UNAVAILABLE, "MCP proxy is disabled".to_string()));
-    }
-
-    // Get the MCP server for this proxy
-    let server_arc = manager
-        .get_server(&proxy.id)
-        .await
-        .ok_or_else(|| {
-            error!("❌ MCP server not initialized for proxy '{}'", proxy.name);
-            (StatusCode::INTERNAL_SERVER_ERROR, "MCP server not initialized".to_string())
-        })?;
-
-    // Handle the MCP request
-    let server = server_arc.read().await;
-
-    let method = request
-        .get("method")
-        .and_then(|m| m.as_str())
-        .unwrap_or("unknown");
-    let request_id = request.get("id").cloned();
-
-    info!("🔧 Handling MCP method: {}", method);
-
-    match method {
-        "initialize" => {
-            // Return server info from the MCP server
-            // Note: In rmcp 0.24.5, we construct the server info manually
-            // as get_info() requires trait bounds that aren't satisfied
-            info!("✓ Returning initialize response for '{}'", proxy.name);
-
-            Ok(Json(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "result": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {
-                        "tools": {}
-                    },
-                    "serverInfo": {
-                        "name": proxy.name.clone(),
-                        "version": "1.0.0"
-                    }
-                }
-            })))
-        }
-        "tools/list" => {
-            // Get tool names from the server
-            let tool_names = server.get_tool_names();
-            info!("✓ Found {} tools for proxy '{}'", tool_names.len(), proxy.name);
-
-            // Get full tool metadata
-            let mut tools = Vec::new();
-            for tool_name in tool_names {
-                if let Some(metadata) = server.get_tool_metadata(&tool_name) {
-                    let input_schema = if proxy.flatten_post_params {
-                        flatten_input_schema(&metadata.parameters)
-                    } else {
-                        metadata.parameters.clone()
-                    };
-                    tools.push(serde_json::json!({
-                        "name": metadata.name,
-                        "description": metadata.description,
-                        "inputSchema": input_schema,
-                    }));
-                    debug!("  - Tool: {}", metadata.name);
-                }
-            }
-
-            Ok(Json(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "result": {
-                    "tools": tools
-                }
-            })))
-        }
-        "tools/call" => {
-            // Extract tool name and arguments from the request
-            let params = request
-                .get("params")
-                .ok_or_else(|| {
-                    error!("❌ Missing 'params' in tools/call request");
-                    (StatusCode::BAD_REQUEST, "Missing 'params' in tools/call request".to_string())
-                })?;
-
-            let tool_name = params
-                .get("name")
-                .and_then(|n| n.as_str())
-                .ok_or_else(|| {
-                    error!("❌ Missing 'name' in tools/call params");
-                    (StatusCode::BAD_REQUEST, "Missing tool 'name' in params".to_string())
-                })?;
-
-            let raw_arguments = params
-                .get("arguments")
-                .cloned()
-                .unwrap_or(serde_json::json!({}));
-
-            // Auto-wrap flat arguments into request_body if the tool expects it (only when flattening is enabled)
-            let arguments = if proxy.flatten_post_params {
-                wrap_request_body_if_needed(&server, tool_name, raw_arguments)
-            } else {
-                raw_arguments
-            };
-
-            info!("🔨 Calling tool: {} with args: {:?}", tool_name, arguments);
-
-            // Get the tool and call it
-            let tool = server
-                .get_tool(tool_name)
-                .ok_or_else(|| {
-                    error!("❌ Tool '{}' not found", tool_name);
-                    (StatusCode::NOT_FOUND, format!("Tool '{}' not found", tool_name))
-                })?;
-
-            // Call the tool (this will make the actual HTTP request to the backend API)
-            // The tool.call method requires: arguments, authorization, and optional response transformer
-            use rmcp_openapi::Authorization;
-            match tool
-                .call(&arguments, Authorization::None, None)
-                .await
-            {
-                Ok(result) => {
-                    info!("✓ Tool '{}' executed successfully", tool_name);
-                    debug!("Result: {:?}", result);
-
-                    // Extract content from CallToolResult
-                    let content = result.content;
-
-                    Ok(Json(serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": request_id,
-                        "result": {
-                            "content": content,
-                            "isError": result.is_error
-                        }
-                    })))
-                }
-                Err(e) => {
-                    error!("❌ Tool '{}' execution failed: {}", tool_name, e);
-                    Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Tool execution failed: {}", e)))
-                }
-            }
-        }
-        _ => {
-            warn!("❌ Unknown MCP method: {}", method);
-            Err((StatusCode::BAD_REQUEST, format!("Unknown MCP method: {}", method)))
-        }
-    }
-}
-
 // ─── SSE transport handlers ─────────────────────────────────────────────────
 
 /// Find the matching proxy for a path and return it along with the path suffix.
@@ -1915,12 +1725,32 @@ async fn process_mcp_request_core(
                     }
                 })),
                 Err(e) => {
-                    error!("❌ Tool '{}' execution failed: {}", tool_name, e);
-                    Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Tool execution failed: {}", e)))
+                    let failure = tool_call_failure(&e);
+                    error!("❌ Tool '{}' execution failed: {}", tool_name, failure);
+                    Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Tool execution failed: {}", failure)))
                 }
             }
         }
         _ => Err((StatusCode::BAD_REQUEST, format!("Unknown MCP method: {}", method))),
+    }
+}
+
+/// What went wrong in a REST tool call, without the request URL, argument values or
+/// upstream response body that the error's own message carries.
+fn tool_call_failure(error: &rmcp_openapi::ToolCallError) -> String {
+    use rmcp_openapi::ToolCallError::{Execution, Validation};
+    use rmcp_openapi::error::{ToolCallExecutionError, ToolCallValidationError};
+    match error {
+        Validation(ToolCallValidationError::ToolNotFound { .. }) => "tool not found".to_string(),
+        Validation(ToolCallValidationError::InvalidParameters { violations }) => {
+            format!("{} invalid parameter(s)", violations.len())
+        }
+        Validation(ToolCallValidationError::RequestConstructionError { .. }) => {
+            "request construction failed".to_string()
+        }
+        Execution(ToolCallExecutionError::HttpError { status, .. }) => format!("REST backend answered HTTP {status}"),
+        Execution(ToolCallExecutionError::NetworkError { category, .. }) => format!("network error ({category:?})"),
+        Execution(ToolCallExecutionError::ResponseParsingError { .. }) => "response parsing failed".to_string(),
     }
 }
 
@@ -2555,7 +2385,7 @@ pub async fn handle_mcp_post<S: McpProxyStore>(
             return Err((StatusCode::NOT_FOUND, format!("SSE session '{}' not found or expired", session_id)));
         }
 
-        info!("📨 SSE session message for proxy '{}' session={}", proxy.name, session_id);
+        info!("📨 SSE session message for proxy '{}' session={}", proxy.name, loggable::secret(&session_id));
 
         // Check if this is a notification (no id → no response expected)
         let is_notification = request.get("id").is_none();
@@ -2682,7 +2512,7 @@ pub async fn handle_mcp_request_with_policies(
     let config_id = surface
         .config_id()
         .unwrap_or("unknown");
-    channel_info!(config_id, "Creating MCP server for proxy '{}' at {}", proxy.name, proxy.base_url);
+    channel_info!(config_id, "Creating MCP server for proxy '{}' at {}", proxy.name, loggable::url(&proxy.base_url));
 
     // Parse the OpenAPI spec from YAML to JSON
     let openapi_json: serde_json::Value =
@@ -2832,7 +2662,6 @@ pub async fn handle_mcp_request_with_policies(
             let tool_call_with_retry = || async {
                 if let Some(retry_config) = surface.retry() {
                     let mut attempt = 0;
-                    let mut _last_error = None;
 
                     loop {
                         attempt += 1;
@@ -2848,7 +2677,12 @@ pub async fn handle_mcp_request_with_policies(
                             }
                             Err(e) => {
                                 if attempt <= retry_config.max_attempts {
-                                    warn!("Tool '{}' failed on attempt {}: {}", tool_name, attempt, e);
+                                    warn!(
+                                        "Tool '{}' failed on attempt {}: {}",
+                                        tool_name,
+                                        attempt,
+                                        tool_call_failure(&e)
+                                    );
 
                                     // Calculate backoff delay
                                     let backoff_ms = std::cmp::min(
@@ -2862,14 +2696,14 @@ pub async fn handle_mcp_request_with_policies(
 
                                     info!("Retrying after {} ms", backoff_ms);
                                     tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                                    _last_error = Some(format!("{}", e));
                                     continue;
                                 } else {
+                                    let failure = tool_call_failure(&e);
                                     error!(
                                         "❌ Tool '{}' execution failed after {} attempts: {}",
-                                        tool_name, attempt, e
+                                        tool_name, attempt, failure
                                     );
-                                    return Err(format!("Tool execution failed: {}", e));
+                                    return Err(format!("Tool execution failed: {}", failure));
                                 }
                             }
                         }
@@ -2878,7 +2712,7 @@ pub async fn handle_mcp_request_with_policies(
                     // No retry configured, call once
                     tool.call(&arguments, Authorization::None, None)
                         .await
-                        .map_err(|e| format!("Tool execution failed: {}", e))
+                        .map_err(|e| format!("Tool execution failed: {}", tool_call_failure(&e)))
                 }
             };
 
@@ -2909,7 +2743,7 @@ pub async fn handle_mcp_request_with_policies(
                         return Err(format!("Circuit breaker open, retry after {:?}", retry_after));
                     }
                     Err(crate::policies::CircuitBreakerError::Inner(e)) => {
-                        return Err(format!("Tool execution failed: {}", e));
+                        return Err(e);
                     }
                 }
             } else {
@@ -2949,7 +2783,7 @@ pub async fn handle_mcp_request_with_policies(
                             Ok(resp) => {
                                 info!(
                                     channel = channel_name_clone,
-                                    mirror_endpoint = mirror_endpoint,
+                                    mirror_endpoint = %loggable::url(&mirror_endpoint),
                                     status = resp.status().as_u16(),
                                     "MCP mirror request completed"
                                 );
@@ -2957,8 +2791,8 @@ pub async fn handle_mcp_request_with_policies(
                             Err(e) => {
                                 warn!(
                                     channel = channel_name_clone,
-                                    mirror_endpoint = mirror_endpoint,
-                                    error = %e,
+                                    mirror_endpoint = %loggable::url(&mirror_endpoint),
+                                    error = %e.without_url(),
                                     "MCP mirror request failed"
                                 );
                             }
@@ -2989,157 +2823,11 @@ pub async fn handle_mcp_request_with_policies(
     }
 }
 
-/// Handle MCP request directly with a proxy object (for channel integration)
-/// This is a simplified version that doesn't require Extension dependencies
-/// NOTE: This version does NOT apply surface policies - use handle_mcp_request_with_policies for full policy support
-#[allow(dead_code)]
-pub async fn handle_mcp_request_direct(
-    proxy: &super::types::McpProxy,
-    request: serde_json::Value,
-) -> Result<serde_json::Value, String> {
-    use rmcp_openapi::Authorization;
-
-    // Check if proxy is active
-    if proxy.status != super::types::McpProxyStatus::Active {
-        warn!("❌ Proxy '{}' is disabled", proxy.name);
-        return Err("MCP proxy is disabled".to_string());
-    }
-
-    // Create MCP server from proxy config
-    info!("Creating MCP server for proxy '{}' at {}", proxy.name, proxy.base_url);
-
-    // Parse the OpenAPI spec from YAML to JSON
-    let openapi_json: serde_json::Value =
-        serde_yaml::from_str(&proxy.openapi_spec).map_err(|e| format!("Failed to parse OpenAPI spec: {}", e))?;
-
-    let base_url = Url::parse(&proxy.base_url).map_err(|e| format!("Invalid base_url: {}", e))?;
-
-    let mut server = McpServer::builder()
-        .openapi_spec(openapi_json)
-        .base_url(base_url)
-        .build();
-
-    server
-        .load_openapi_spec()
-        .map_err(|e| format!("Failed to load OpenAPI spec: {}", e))?;
-
-    let method = request
-        .get("method")
-        .and_then(|m| m.as_str())
-        .unwrap_or("unknown");
-    let request_id = request.get("id").cloned();
-
-    info!("🔧 Handling MCP method: {}", method);
-
-    match method {
-        "initialize" => {
-            info!("✓ Returning initialize response for '{}'", proxy.name);
-
-            Ok(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "result": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {
-                        "tools": {}
-                    },
-                    "serverInfo": {
-                        "name": proxy.name.clone(),
-                        "version": "1.0.0"
-                    }
-                }
-            }))
-        }
-        "tools/list" => {
-            let tool_names = server.get_tool_names();
-            info!("✓ Found {} tools for proxy '{}'", tool_names.len(), proxy.name);
-
-            let mut tools = Vec::new();
-            for tool_name in tool_names {
-                if let Some(metadata) = server.get_tool_metadata(&tool_name) {
-                    let input_schema = if proxy.flatten_post_params {
-                        flatten_input_schema(&metadata.parameters)
-                    } else {
-                        metadata.parameters.clone()
-                    };
-                    tools.push(serde_json::json!({
-                        "name": metadata.name,
-                        "description": metadata.description,
-                        "inputSchema": input_schema,
-                    }));
-                }
-            }
-
-            Ok(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "result": {
-                    "tools": tools
-                }
-            }))
-        }
-        "tools/call" => {
-            let params = request
-                .get("params")
-                .ok_or_else(|| "Missing 'params' in tools/call request".to_string())?;
-
-            let tool_name = params
-                .get("name")
-                .and_then(|n| n.as_str())
-                .ok_or_else(|| "Missing tool 'name' in params".to_string())?;
-
-            let raw_arguments = params
-                .get("arguments")
-                .cloned()
-                .unwrap_or(serde_json::json!({}));
-
-            // Auto-wrap flat arguments into request_body if the tool expects it (only when flattening is enabled)
-            let arguments = if proxy.flatten_post_params {
-                wrap_request_body_if_needed(&server, tool_name, raw_arguments)
-            } else {
-                raw_arguments
-            };
-
-            info!("🔨 Calling tool: {}", tool_name);
-
-            let tool = server
-                .get_tool(tool_name)
-                .ok_or_else(|| format!("Tool '{}' not found", tool_name))?;
-
-            match tool
-                .call(&arguments, Authorization::None, None)
-                .await
-            {
-                Ok(result) => {
-                    info!("✓ Tool '{}' executed successfully", tool_name);
-
-                    Ok(serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": request_id,
-                        "result": {
-                            "content": result.content,
-                            "isError": result.is_error
-                        }
-                    }))
-                }
-                Err(e) => {
-                    error!("❌ Tool '{}' execution failed: {}", tool_name, e);
-                    Err(format!("Tool execution failed: {}", e))
-                }
-            }
-        }
-        _ => {
-            warn!("❌ Unknown MCP method: {}", method);
-            Err(format!("Unknown MCP method: {}", method))
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         DiscoverMcpToolsRequest, discovery_secret_allowed, ensure_jsonrpc_success, mcp_proxy_allowed,
-        pin_discovery_client, resolve_proxy_id,
+        pin_discovery_client, resolve_proxy_id, tool_call_failure,
     };
     use crate::mcp_proxies::McpProxyStore;
     use axum::http::StatusCode;
@@ -3150,6 +2838,140 @@ mod tests {
     use crate::auth_manager::pat::PatResourceScope;
     use crate::mcp_proxies::types::McpProxy;
     use crate::tenancy::PatTenantContext;
+
+    #[test]
+    fn tool_call_failure_names_the_kind_without_url_arguments_or_body() {
+        use rmcp_openapi::ToolCallError;
+        use rmcp_openapi::error::{NetworkErrorCategory, ToolCallExecutionError};
+
+        let http_error = ToolCallError::Execution(ToolCallExecutionError::HttpError {
+            status: 404,
+            message: "no record for customer-marker-42".to_string(),
+            details: None,
+        });
+        let network_error = ToolCallError::Execution(ToolCallExecutionError::NetworkError {
+            message: "error sending request for url (https://api.example.com/v1/customers/customer-marker-42?key=sk-1)"
+                .to_string(),
+            category: NetworkErrorCategory::Connect,
+        });
+
+        assert_eq!(tool_call_failure(&http_error), "REST backend answered HTTP 404");
+        assert_eq!(tool_call_failure(&network_error), "network error (Connect)");
+        assert!(
+            http_error
+                .to_string()
+                .contains("customer-marker-42")
+        );
+    }
+
+    #[test]
+    fn tool_call_failure_covers_validation_and_parsing_failures() {
+        use rmcp_openapi::ToolCallError;
+        use rmcp_openapi::error::{ToolCallExecutionError, ToolCallValidationError};
+
+        let cases = [
+            (
+                ToolCallError::Validation(ToolCallValidationError::ToolNotFound {
+                    tool_name: "lookup-customer-marker-42".to_string(),
+                    suggestions: vec![],
+                }),
+                "tool not found",
+            ),
+            (
+                ToolCallError::Validation(ToolCallValidationError::InvalidParameters { violations: vec![] }),
+                "0 invalid parameter(s)",
+            ),
+            (
+                ToolCallError::Validation(ToolCallValidationError::RequestConstructionError {
+                    reason: "body holds customer-marker-42".to_string(),
+                }),
+                "request construction failed",
+            ),
+            (
+                ToolCallError::Execution(ToolCallExecutionError::ResponseParsingError {
+                    reason: "unexpected customer-marker-42".to_string(),
+                    raw_response: Some("customer-marker-42".to_string()),
+                }),
+                "response parsing failed",
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(tool_call_failure(&error), expected);
+        }
+    }
+
+    /// The error a failed tool call returns is logged, shown on the dashboard and sent to
+    /// the MCP client, so on every policy path it names the failure kind without the
+    /// request URL or the argument values it carried.
+    #[tokio::test]
+    async fn policy_tool_call_errors_name_the_kind_without_url_or_arguments() {
+        use serde_json::json;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let proxy = McpProxy::new(
+            "Closed backend".into(),
+            String::new(),
+            base_url,
+            json!({
+                "openapi": "3.0.0", "info": {"title": "Closed", "version": "1.0"},
+                "paths": {"/items": {"get": {
+                    "operationId": "listItems",
+                    "parameters": [{"name": "key", "in": "query", "required": true, "schema": {"type": "string"}}],
+                    "responses": {"200": {"description": "OK"}}
+                }}}
+            })
+            .to_string(),
+            "/mcp".into(),
+            "/items".into(),
+        );
+        let request = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "listItems", "arguments": {"key": "argument-marker-42"}}
+        });
+        let client = reqwest::Client::new();
+        let policy_manager = Arc::new(crate::policies::SurfacePolicyManager::new());
+
+        for (path, networking) in [
+            ("no retry", json!(null)),
+            ("retry", json!({"retry": {"max_attempts": 1, "initial_backoff_ms": 1, "max_backoff_ms": 1}})),
+            ("circuit breaker", json!({"circuit_breaker": {"failure_threshold": 5}})),
+        ] {
+            let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+                "surface_id": format!("tool-errors-{}", path.replace(' ', "-")), "name": "Tool errors",
+                "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
+                "target": {"endpoint": "http://127.0.0.1:9", "networking": networking}
+            }))
+            .unwrap();
+            policy_manager
+                .update_channel_policy(&surface)
+                .await
+                .unwrap();
+            assert_eq!(
+                policy_manager
+                    .get_circuit_breaker(&surface.surface_id)
+                    .await
+                    .is_some(),
+                path == "circuit breaker",
+                "{path}"
+            );
+
+            let error = super::handle_mcp_request_with_policies(
+                &proxy,
+                request.clone(),
+                &surface,
+                Some(&policy_manager),
+                &client,
+                "tool-errors",
+                None,
+            )
+            .await
+            .expect_err("a closed backend fails the tool call");
+
+            assert_eq!(error, "Tool execution failed: network error (Connect)", "{path}");
+        }
+    }
 
     #[test]
     fn owned_modern_flattening_preserves_mirrors_and_rejects_ambiguous_schemas() {

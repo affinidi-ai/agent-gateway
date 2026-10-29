@@ -904,7 +904,7 @@ fn build_bootstrap_config(
         metrics_cache_ttl_seconds_legacy: 1,
         auth_mode: AuthMode::default(),
         // Deterministic literal test key (64-char hex); the field is required at runtime.
-        backup_encryption_key: "00".repeat(32),
+        backup_encryption_key: "00".repeat(32).into(),
         legacy_backup_encryption_keys: None,
         trust_registry: Default::default(),
         tenancy: Default::default(),

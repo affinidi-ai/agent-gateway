@@ -21,6 +21,7 @@ use crate::a2a::{
     validate_jsonrpc_envelope,
 };
 use crate::observability::broadcast_payload_capture_async;
+use crate::observability::loggable;
 use crate::proxy::backend_identity::ProtectedAgentIdentity;
 use crate::server::ConnectionGuard;
 use crate::state::{MultiSurfaceProxyState, ProxyState};
@@ -2622,7 +2623,7 @@ async fn proxy_handler_with_mcp_runtime(
             channel_info!(
                 config_id,
                 "📩 MCP elicitation response routed session={} elicit_id={} resolved={}",
-                session_id,
+                loggable::secret(session_id),
                 elicit_id,
                 resolved
             );
@@ -2827,18 +2828,11 @@ async fn proxy_handler_with_mcp_runtime(
             &state.surface.name,
         );
         gw_input.source_auth = source_auth_context.clone();
-        // [OPA-INPUT] Gateway policy input BEFORE agent/TR data
-        info!(
-            channel = state.surface.name,
-            "[OPA-INPUT] Gateway policy input before TR: {}",
-            serde_json::to_string(&gw_input).unwrap_or_default()
-        );
         gw_input.agent = agent_context.clone();
         gw_input.mcp = mcp_context.clone();
         gw_input.a2a = a2a_context.clone();
         gw_input.trust_check_results = trust_check_results.clone();
         let gw_input_value = serde_json::to_value(&gw_input).unwrap_or_default();
-        info!(channel = state.surface.name, "[OPA-INPUT] Gateway policy input before eval: {}", gw_input_value);
         let (gw_policy_def_id, gw_policy_version, gw_policy_hash) =
             match gw_policy_manager.policy_evidence(&self_gateway_id) {
                 Some((id, v, h)) => (id, v, Some(h)),
@@ -3520,7 +3514,11 @@ async fn proxy_handler_with_mcp_runtime(
                 return Err(create_error_response(StatusCode::NOT_FOUND, "SSE session not found or expired"));
             }
 
-            channel_info!(config_id, "📨 SSE session POST for fabric:// MCP channel session={}", session_id);
+            channel_info!(
+                config_id,
+                "📨 SSE session POST for fabric:// MCP channel session={}",
+                loggable::secret(&session_id)
+            );
 
             // Parse the JSON-RPC request
             let json_request: serde_json::Value = serde_json::from_slice(&body_bytes).map_err(|e| {
@@ -3542,7 +3540,7 @@ async fn proxy_handler_with_mcp_runtime(
                 "📨 Fabric SSE: forwarding through Fabric — rewritten_uri={}, body_len={}, method=POST, target={}",
                 rewritten_uri,
                 body_bytes.len(),
-                state.surface.target.endpoint
+                loggable::url(&state.surface.target.endpoint)
             );
 
             // Forward through Fabric
@@ -3597,10 +3595,9 @@ async fn proxy_handler_with_mcp_runtime(
 
                     channel_info!(
                         config_id,
-                        "📨 Fabric SSE: response status={}, body_len={}, body_preview={}",
+                        "📨 Fabric SSE: response status={}, body_len={}",
                         parts.status,
-                        json_str.len(),
-                        &json_str[..json_str.len().min(500)]
+                        json_str.len()
                     );
 
                     if parts.status.is_success() && !json_str.is_empty() {
@@ -3624,7 +3621,6 @@ async fn proxy_handler_with_mcp_runtime(
                     }
                 }
                 Err(err_resp) => {
-                    // Extract error details for debugging
                     let err_status = err_resp.status();
                     let (err_parts, err_body) = err_resp.into_parts();
                     let err_body_bytes = axum::body::to_bytes(err_body, 1024 * 1024)
@@ -3633,10 +3629,12 @@ async fn proxy_handler_with_mcp_runtime(
                     let err_body_str = String::from_utf8_lossy(&err_body_bytes);
                     channel_error!(
                         config_id,
-                        "📨 Fabric SSE: forwarding FAILED — status={}, headers={:?}, body={}",
+                        "📨 Fabric SSE: forwarding FAILED — status={}, content_type={:?}, body_len={}",
                         err_status,
-                        err_parts.headers,
-                        &err_body_str[..err_body_str.len().min(1000)]
+                        err_parts
+                            .headers
+                            .get(axum::http::header::CONTENT_TYPE),
+                        err_body_bytes.len()
                     );
 
                     let error_json = serde_json::json!({
@@ -3934,7 +3932,7 @@ async fn proxy_handler_with_mcp_runtime(
     }
 
     if !is_a2a_proxy_target {
-        debug!(channel = channel_name, target = %target_url, "Forwarding to upstream");
+        debug!(channel = channel_name, target = %loggable::url(&target_url), "Forwarding to upstream");
     }
 
     let _prep_span = tracing::info_span!(
@@ -4066,6 +4064,8 @@ async fn proxy_handler_with_mcp_runtime(
                 config_id,
                 "🔌 MCP Streamable HTTP GET: opening notification stream session_id={:?}",
                 session_id_opt
+                    .as_deref()
+                    .map(loggable::secret)
             );
 
             let stream: std::pin::Pin<
@@ -4099,6 +4099,8 @@ async fn proxy_handler_with_mcp_runtime(
                 config_id,
                 "🔌 MCP Streamable HTTP DELETE: terminating session session_id={:?}",
                 session_id_opt
+                    .as_deref()
+                    .map(loggable::secret)
             );
             if let Some(sid) = session_id_opt {
                 crate::mcp::streamable_sse::global_streamable_session_registry()
@@ -4224,7 +4226,7 @@ async fn proxy_handler_with_mcp_runtime(
                 config_id,
                 "📨 SSE session POST for proxy:// channel proxy_id={} session={}",
                 proxy_id,
-                session_id
+                loggable::secret(&session_id)
             );
 
             // Parse JSON-RPC request
@@ -5670,12 +5672,6 @@ async fn proxy_handler_with_mcp_runtime(
             &state.surface.name,
         );
         policy_input.source_auth = source_auth_context.clone();
-        // [OPA-INPUT] Surface policy input BEFORE agent/TR data
-        info!(
-            channel = config_id_str,
-            "[OPA-INPUT] Surface policy input before TR: {}",
-            serde_json::to_string(&policy_input).unwrap_or_default()
-        );
         policy_input.agent = agent_context.clone();
         policy_input.mcp = mcp_context.clone();
         policy_input.a2a = a2a_context.clone();
@@ -5685,8 +5681,6 @@ async fn proxy_handler_with_mcp_runtime(
         policy_input.trust_check_results = trust_check_results.clone();
         policy_input.normalize_caller_did();
         let input_value = serde_json::to_value(&policy_input).unwrap_or_default();
-        // [OPA-INPUT] Surface policy input fully populated
-        info!(channel = config_id_str, "[OPA-INPUT] Surface policy input before eval: {}", input_value);
 
         let Some(policy_manager) = state
             .policy_manager
@@ -7029,7 +7023,7 @@ async fn proxy_handler_with_mcp_runtime(
         deferred_audit.flush();
     }
 
-    debug!("🟢 OUTBOUND REQUEST: trace_id={} target={}", trace_id, target_url);
+    debug!("🟢 OUTBOUND REQUEST: trace_id={} target={}", trace_id, loggable::url(&target_url));
 
     // Traffic mirroring - send duplicate request to mirror endpoint (if configured)
     if let Some(mirror_config) = state.surface.mirror() {
@@ -7046,7 +7040,7 @@ async fn proxy_handler_with_mcp_runtime(
 
         if should_mirror {
             let mirror_endpoint = mirror_config.endpoint.clone();
-            let mirror_endpoint_for_log = mirror_endpoint.clone(); // Clone for later use
+            let mirror_endpoint_for_log = loggable::url(&mirror_endpoint);
             let mirror_timeout = std::time::Duration::from_secs(mirror_config.timeout_secs);
             let wait_for_response = mirror_config.wait_for_response;
             let channel_name_clone = channel_name.to_string();
@@ -7087,7 +7081,7 @@ async fn proxy_handler_with_mcp_runtime(
                         Ok(resp) => {
                             info!(
                                 channel = channel_name_clone,
-                                mirror_endpoint = mirror_endpoint,
+                                mirror_endpoint = mirror_endpoint_for_log,
                                 status = resp.status().as_u16(),
                                 trace_id = trace_id_clone,
                                 "Mirror request completed"
@@ -7096,8 +7090,8 @@ async fn proxy_handler_with_mcp_runtime(
                         Err(e) => {
                             warn!(
                                 channel = channel_name_clone,
-                                mirror_endpoint = mirror_endpoint,
-                                error = %e,
+                                mirror_endpoint = mirror_endpoint_for_log,
+                                error = %e.without_url(),
                                 trace_id = trace_id_clone,
                                 "Mirror request failed"
                             );
@@ -7106,6 +7100,7 @@ async fn proxy_handler_with_mcp_runtime(
                 } else {
                     // Fire-and-forget mirror request
                     let config_id_clone = config_id.to_string();
+                    let mirror_endpoint_for_task = mirror_endpoint_for_log.clone();
                     tokio::spawn(async move {
                         match mirror_req_with_headers
                             .send()
@@ -7115,7 +7110,7 @@ async fn proxy_handler_with_mcp_runtime(
                                 channel_info!(
                                     config_id_clone,
                                     "Mirror request completed (async): endpoint={}, status={}",
-                                    mirror_endpoint,
+                                    mirror_endpoint_for_task,
                                     resp.status().as_u16()
                                 );
                             }
@@ -7123,8 +7118,8 @@ async fn proxy_handler_with_mcp_runtime(
                                 channel_warn!(
                                     config_id_clone,
                                     "Mirror request failed (async): endpoint={}, error={}",
-                                    mirror_endpoint,
-                                    e
+                                    mirror_endpoint_for_task,
+                                    e.without_url()
                                 );
                             }
                         }
@@ -7236,7 +7231,7 @@ async fn proxy_handler_with_mcp_runtime(
         "http.client.send",
         otel.name = "Send Request & Await Response",
         http.method = %method,
-        http.url = %target_url,
+        http.url = %loggable::url(&target_url),
         surface = %channel_name
     );
 
@@ -7374,6 +7369,7 @@ async fn proxy_handler_with_mcp_runtime(
                     }
                     Err(e) => {
                         if attempt <= retry_config.max_attempts {
+                            let e = e.without_url();
                             warn!(channel = channel_name, attempt = attempt, error = %e, "Request failed, will retry");
 
                             // Calculate backoff delay
@@ -7516,7 +7512,7 @@ async fn proxy_handler_with_mcp_runtime(
         info!(
             surface = %channel_name,
             status = %sse_status,
-            body = %String::from_utf8_lossy(&body_bytes),
+            body_bytes = body_bytes.len(),
             "Upstream rejected direct POST ({}), falling back to Legacy SSE transport",
             sse_status
         );
@@ -7531,7 +7527,11 @@ async fn proxy_handler_with_mcp_runtime(
         .await
         {
             Ok(json_response) => {
-                info!(channel = %channel_name, response = %json_response, "SSE fallback succeeded, returning JSON response");
+                info!(
+                    channel = %channel_name,
+                    response_bytes = json_response.len(),
+                    "SSE fallback succeeded, returning JSON response"
+                );
                 connection_guard
                     .decrement()
                     .await;
@@ -9729,14 +9729,6 @@ async fn multi_channel_proxy_handler_in_request_scope(
                 stripped_path.clone()
             };
 
-            debug!(
-                "Rewriting URI: original='{}' new='{}' (stripped route '{}' alias={:?})",
-                path,
-                new_uri,
-                ch.surface.route(),
-                virtual_channel_alias
-            );
-
             let parsed_uri = match new_uri.parse() {
                 Ok(uri) => uri,
                 Err(e) => {
@@ -9744,6 +9736,13 @@ async fn multi_channel_proxy_handler_in_request_scope(
                     return create_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Failed to process request path");
                 }
             };
+            debug!(
+                "Rewriting URI: original='{}' new='{}' (stripped route '{}' alias={:?})",
+                path,
+                loggable::uri(&parsed_uri),
+                ch.surface.route(),
+                virtual_channel_alias
+            );
             parts.uri = parsed_uri;
 
             let new_req = Request::from_parts(parts, body);
@@ -9932,44 +9931,14 @@ fn handle_upstream_error(
             .endpoint
             .contains("your-domain.com");
 
-    // Provide more specific error messages based on the error type
-    let error_message = if e.is_connect() {
-        if e.to_string().contains("dns")
-            || e.to_string()
-                .contains("resolve")
-        {
-            if is_example_domain {
-                format!(
-                    "Target endpoint '{}' uses a placeholder domain that doesn't resolve. Please configure a valid endpoint in your channel settings.",
-                    state.surface.target.endpoint
-                )
-            } else {
-                format!(
-                    "DNS resolution failed for target endpoint '{}'. Please check that the hostname is valid and resolvable.",
-                    state.surface.target.endpoint
-                )
-            }
-        } else if e
-            .to_string()
-            .contains("timeout")
-        {
-            format!(
-                "Connection timeout to target endpoint '{}'. The server may be unavailable or slow to respond.",
-                state.surface.target.endpoint
-            )
-        } else {
-            format!("Connection failed to target endpoint '{}': {}", state.surface.target.endpoint, e)
-        }
-    } else if e.is_timeout() {
-        format!(
-            "Request timeout to target endpoint '{}'. The server did not respond within the configured timeout period.",
-            state.surface.target.endpoint
-        )
-    } else {
-        format!("Failed to forward request to target endpoint '{}': {}", state.surface.target.endpoint, e)
-    };
-
-    error!(channel = channel_name, error = %e, target = %state.surface.target.endpoint, "Failed to forward request to upstream - bad gateway");
+    let error_message = upstream_error_message(&e, is_example_domain);
+    let e = e.without_url();
+    error!(
+        channel = channel_name,
+        error = %e,
+        target = %loggable::url(&state.surface.target.endpoint),
+        "Failed to forward request to upstream - bad gateway"
+    );
 
     // Record gateway fault in metrics
     if let Some(ref metrics) = state.metrics_store {
@@ -10036,7 +10005,36 @@ fn handle_upstream_error(
     } else {
         StatusCode::BAD_GATEWAY
     };
-    create_error_response(status_code, &error_message)
+    create_error_response(status_code, error_message)
+}
+
+/// Message returned to the caller when forwarding to the target fails. It names the
+/// kind of failure only: the target URL and the transport error stay in the server log.
+fn upstream_error_message(
+    error: &reqwest::Error,
+    is_example_domain: bool,
+) -> &'static str {
+    let causes = std::iter::successors(std::error::Error::source(error), |cause| cause.source())
+        .map(|cause| cause.to_string())
+        .collect::<Vec<_>>()
+        .join(": ");
+    if error.is_connect() {
+        if causes.contains("dns") || causes.contains("resolve") {
+            if is_example_domain {
+                "Target endpoint uses a placeholder domain that doesn't resolve. Please configure a valid endpoint in your channel settings."
+            } else {
+                "DNS resolution failed for target endpoint. Please check that the hostname is valid and resolvable."
+            }
+        } else if causes.contains("timeout") {
+            "Connection timeout to target endpoint. The server may be unavailable or slow to respond."
+        } else {
+            "Connection failed to target endpoint"
+        }
+    } else if error.is_timeout() {
+        "Request timeout to target endpoint. The server did not respond within the configured timeout period."
+    } else {
+        "Failed to forward request to target endpoint"
+    }
 }
 
 async fn handle_onboarding_request(
@@ -10086,7 +10084,8 @@ async fn fetch_agent_card(
     let urls = [format!("{}/.well-known/agent-card.json", base), format!("{}/.well-known/agent.json", base)];
 
     for url in &urls {
-        info!(channel = channel_id, "GW1 fabric: [Target mode] Fetching agent card from: {}", url);
+        let logged_url = loggable::url(url);
+        info!(channel = channel_id, "GW1 fabric: [Target mode] Fetching agent card from: {}", logged_url);
         match client.get(url).send().await {
             Ok(resp) => {
                 info!(channel = channel_id, "GW1 fabric: Agent card fetch HTTP status: {}", resp.status());
@@ -10096,7 +10095,7 @@ async fn fetch_agent_card(
                         Err(e) => {
                             warn!(
                                 channel = channel_id,
-                                "GW1 fabric: Agent card exceeded its bounds (url={}): {}", url, e
+                                "GW1 fabric: Agent card exceeded its bounds (url={}): {}", logged_url, e
                             );
                             return None;
                         }
@@ -10106,7 +10105,7 @@ async fn fetch_agent_card(
                             info!(
                                 channel = channel_id,
                                 "GW1 fabric: Agent card fetched successfully (url={}): name={:?} endpoint={:?}",
-                                url,
+                                logged_url,
                                 card.get("name"),
                                 // Reads either era: a pure-1.0 card has no top-level
                                 // `url`, only `supportedInterfaces[]`.
@@ -10118,7 +10117,7 @@ async fn fetch_agent_card(
                             // JSON parse failure — no value in retrying with http
                             warn!(
                                 channel = channel_id,
-                                "GW1 fabric: Failed to parse agent card JSON (url={}): {}", url, e
+                                "GW1 fabric: Failed to parse agent card JSON (url={}): {}", logged_url, e
                             );
                             return None;
                         }
@@ -10128,14 +10127,19 @@ async fn fetch_agent_card(
                     warn!(
                         channel = channel_id,
                         "GW1 fabric: Agent card fetch non-success status (url={}): {}",
-                        url,
+                        logged_url,
                         resp.status()
                     );
                     return None;
                 }
             }
             Err(e) => {
-                warn!(channel = channel_id, "GW1 fabric: Agent card fetch request failed (url={}): {}", url, e);
+                warn!(
+                    channel = channel_id,
+                    "GW1 fabric: Agent card fetch request failed (url={}): {}",
+                    logged_url,
+                    e.without_url()
+                );
                 // Transport-level failure — try the next well-known path
             }
         }
@@ -10424,12 +10428,6 @@ async fn handle_fabric_request(
         );
     }
 
-    // Log the incoming URI details
-    channel_debug!(config_id, "📍 Incoming URI: {}", uri);
-    channel_debug!(config_id, "  ↳ Path: {:?}", uri.path());
-    channel_debug!(config_id, "  ↳ Query: {:?}", uri.query());
-    channel_debug!(config_id, "  ↳ Path and Query: {:?}", uri.path_and_query());
-
     // Parse fabric://{gateway_id}/{channel_id}
     let fabric_path = &state.surface.target.endpoint[9..]; // Remove "fabric://"
     let parts: Vec<&str> = fabric_path
@@ -10437,7 +10435,7 @@ async fn handle_fabric_request(
         .collect();
 
     if parts.len() < 2 {
-        channel_error!(config_id, "Invalid fabric URL format: {}", state.surface.target.endpoint);
+        channel_error!(config_id, "Invalid fabric URL format: {}", loggable::url(&state.surface.target.endpoint));
         connection_guard
             .decrement()
             .await;
@@ -11066,8 +11064,8 @@ async fn handle_fabric_request(
             );
             info!(
                 channel = config_id_str,
-                fabric_target = %state.surface.target.endpoint,
-                resolved_url = %card_url,
+                fabric_target = %loggable::url(&state.surface.target.endpoint),
+                resolved_url = %loggable::url(&card_url),
                 "GW1 fabric: resolving agent card via access point listen address"
             );
             fetch_agent_card(
@@ -11116,12 +11114,6 @@ async fn handle_fabric_request(
         );
         policy_input.source_auth = source_auth_context.clone();
         policy_input.mcp = modern_mcp_context.clone();
-        // [OPA-INPUT] Fabric surface policy input BEFORE agent/TR data
-        info!(
-            channel = config_id_str,
-            "[OPA-INPUT] Fabric surface policy input before TR: {}",
-            serde_json::to_string(&policy_input).unwrap_or_default()
-        );
         policy_input.agent = agent_ctx;
         if matches!(
             state
@@ -11173,8 +11165,6 @@ async fn handle_fabric_request(
             }
         }
         let input_value = serde_json::to_value(&policy_input).unwrap_or_default();
-        // [OPA-INPUT] Fabric surface policy input fully populated
-        info!(channel = config_id_str, "[OPA-INPUT] Fabric surface policy input before eval: {}", input_value);
 
         if let Some(ref policy_manager) = state.policy_manager {
             let channel_opa_def_id = state
@@ -11411,7 +11401,7 @@ async fn handle_fabric_request(
             debug!(
                 target: "credential_delegation",
                 surface_id = %state.surface.surface_id,
-                route = %state.surface.target.endpoint,
+                route = %loggable::url(&state.surface.target.endpoint),
                 reason = "fabric_delegated_credentials=false",
                 "Delegated credentials withheld from Fabric peer"
             );
@@ -11608,6 +11598,7 @@ async fn handle_fabric_request(
 
         if should_mirror {
             let mirror_endpoint = mirror_config.endpoint.clone();
+            let mirror_endpoint_for_log = loggable::url(&mirror_endpoint);
             let mirror_timeout = std::time::Duration::from_secs(mirror_config.timeout_secs);
             let wait_for_response = mirror_config.wait_for_response;
             let client = crate::http_client::with_timeout(mirror_timeout).unwrap_or_else(|_| reqwest::Client::new());
@@ -11655,7 +11646,7 @@ async fn handle_fabric_request(
                         channel_info!(
                             config_id,
                             "Fabric mirror request completed: endpoint={}, status={}",
-                            mirror_endpoint,
+                            mirror_endpoint_for_log,
                             resp.status().as_u16()
                         );
                     }
@@ -11674,8 +11665,8 @@ async fn handle_fabric_request(
                             config_id,
                             "Fabric mirror request failed ({}): endpoint={}, error={}",
                             error_type,
-                            mirror_endpoint,
-                            e
+                            mirror_endpoint_for_log,
+                            e.without_url()
                         );
 
                         // For synchronous mirroring, return error if mirror fails
@@ -11684,16 +11675,13 @@ async fn handle_fabric_request(
                             .await;
                         return Err(create_error_response(
                             StatusCode::SERVICE_UNAVAILABLE,
-                            &format!(
-                                "Traffic mirroring failed ({}): Mirror endpoint '{}' is unreachable. Error: {}",
-                                error_type, mirror_endpoint, e
-                            ),
+                            &format!("Traffic mirroring failed ({error_type}): the mirror endpoint is unreachable"),
                         ));
                     }
                 }
             } else {
                 // Fire-and-forget mirror request
-                let mirror_endpoint_clone = mirror_endpoint.clone();
+                let mirror_endpoint_clone = mirror_endpoint_for_log.clone();
                 let config_id_clone = config_id.to_string();
                 tokio::spawn(async move {
                     match mirror_req_with_headers
@@ -11713,7 +11701,7 @@ async fn handle_fabric_request(
                                 config_id_clone,
                                 "Fabric mirror request failed (async): endpoint={}, error={}",
                                 mirror_endpoint_clone,
-                                e
+                                e.without_url()
                             );
                         }
                     }
@@ -12202,17 +12190,8 @@ async fn handle_fabric_request(
         }
     }
 
-    // Debug: Log payment-related headers to diagnose propagation
     if let Some(payment_sig) = headers_map.get("PAYMENT-SIGNATURE") {
-        channel_info!(
-            config_id,
-            "Forwarding PAYMENT-SIGNATURE header (first 50 chars): {}",
-            if payment_sig.len() > 50 {
-                &payment_sig[..50]
-            } else {
-                payment_sig
-            }
-        );
+        channel_info!(config_id, "Forwarding PAYMENT-SIGNATURE header ({} bytes)", payment_sig.len());
     } else {
         channel_info!(config_id, "No PAYMENT-SIGNATURE header to forward");
     }
@@ -12247,15 +12226,16 @@ async fn handle_fabric_request(
         serde_json::Value::Null
     };
 
+    let logged_path = loggable::uri(&uri);
     info!(
         "📦 Building ForwardRequest: {} {} ({} headers, {} bytes body)",
         method.as_str(),
-        path_and_query,
+        logged_path,
         headers_map.len(),
         body_bytes.len()
     );
 
-    debug!("  ↳ Full path being sent: '{}'", path_and_query);
+    debug!("  ↳ Full path being sent: '{}'", logged_path);
     debug!("  ↳ Body bytes length: {}", body_bytes.len());
 
     // Calculate message expiration time (use channel timeout if configured, otherwise global)
@@ -13519,7 +13499,7 @@ async fn handle_fabric_request(
                                                                 if let Some(extension_obj) = extension_data.as_object_mut() {
                                                                     if let Some(payload_obj) = payload.as_object() {
                                                                         for (key, value) in payload_obj {
-                                                                            channel_info!(config_id, "Injecting A2A response metadata key '{}' = {:?} under {}", key, value, extension_uri);
+                                                                            channel_info!(config_id, "Injecting A2A response metadata key '{}' under {}", key, extension_uri);
                                                                             extension_obj.insert(key.clone(), value.clone());
                                                                         }
                                                                         modified = true;
@@ -14624,7 +14604,7 @@ async fn fetch_agent_card_from_surface_target(
     channel_name: &str,
     target_url: &str,
 ) -> Result<JsonValue, Response> {
-    debug!(channel = channel_name, target = %target_url, "Fetching agent card from upstream");
+    debug!(channel = channel_name, target = %loggable::url(target_url), "Fetching agent card from upstream");
 
     let source_cred_header = state
         .surface
@@ -14718,9 +14698,13 @@ async fn fetch_agent_card_from_surface_target(
             .send()
             .await
             .map_err(|e| {
-                error!(channel = channel_name, error = %e, "Failed to fetch agent card from upstream - bad gateway");
+                error!(
+                    channel = channel_name,
+                    error = %e.without_url(),
+                    "Failed to fetch agent card from upstream - bad gateway"
+                );
                 record_agent_card_gateway_fault(state, source_addr);
-                create_error_response(StatusCode::BAD_GATEWAY, &format!("Failed to fetch from upstream: {}", e))
+                create_error_response(StatusCode::BAD_GATEWAY, "Failed to fetch from upstream")
             })?;
 
         if response
@@ -14816,7 +14800,7 @@ async fn pinned_target_client(
     match tokio::task::spawn_blocking(move || crate::egress::pinned_forward_client(&candidate, timeout)).await {
         Ok(Ok((client, _target))) => Ok(client),
         Ok(Err(e)) => {
-            warn!(channel = channel_name, target = %target_url, "SSRF blocked by egress policy: {}", e);
+            warn!(channel = channel_name, target = %loggable::url(target_url), "SSRF blocked by egress policy: {}", e);
             crate::audit::request_events::request_rejected(
                 facts,
                 crate::audit::request_events::RejectionStage::Forward,
@@ -14827,7 +14811,12 @@ async fn pinned_target_client(
             Err(create_error_response(StatusCode::FORBIDDEN, "Request blocked by egress policy"))
         }
         Err(e) => {
-            warn!(channel = channel_name, target = %target_url, "SSRF egress validation task failed: {}", e);
+            warn!(
+                channel = channel_name,
+                target = %loggable::url(target_url),
+                "SSRF egress validation task failed: {}",
+                e
+            );
             Err(create_error_response(StatusCode::FORBIDDEN, "Request blocked by egress policy"))
         }
     }
@@ -20630,6 +20619,297 @@ allow if {
                     .is_none()
             );
         }
+    }
+
+    // ── Log and span redaction ─────────────────────────────────────────────────
+
+    /// A `ProxyState` for `surface` with no stores and no source authentication.
+    fn bare_proxy_state(
+        surface: crate::config::agent_surface::AgentSurface,
+        policy_manager: Option<std::sync::Arc<crate::policies::SurfacePolicyManager>>,
+    ) -> crate::state::ProxyState {
+        let network = serde_json::from_value(serde_json::json!({
+            "did": {"domain": "gateway.example"},
+            "webauthn": {"rp_id": "gateway.example", "external_origin": "https://gateway.example"},
+            "integration": {"types": [], "categories": []},
+            "listeners": [], "routes": {}
+        }))
+        .unwrap();
+        let config = serde_json::from_value(serde_json::json!({
+            "tls": {"cert_path": "unused.pem", "key_path": "unused-key.pem"},
+            "integration": {"variable_pattern": "\\$\\{([^}]+)\\}", "custom_variable_prefix": "_", "types": [], "categories": []},
+            "extension_inspection": {"enabled": false}
+        }))
+        .unwrap();
+        crate::state::ProxyState {
+            config: std::sync::Arc::new(config),
+            network_config: std::sync::Arc::new(network),
+            client: reqwest::Client::new(),
+            metrics_store: None,
+            identity_rules_engine: None,
+            identity_selector: None,
+            protected_rules_engine: None,
+            protected_selector: None,
+            external_rules_engine: None,
+            external_selector: None,
+            task_monitor: None,
+            task_id: None,
+            ws_state: None,
+            listener_manager: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
+            secrets_store: None,
+            certificates_store: None,
+            vc_issuer: None,
+            policy_manager,
+            gateway_policy_manager: None,
+            didauth_session_store: std::sync::Arc::new(crate::didauth::DidAuthSessionStore::new()),
+            transaction_store: None,
+            mpp_transaction_store: None,
+            trust_registry_listener_manager: None,
+            source_auth_middleware: None,
+            #[cfg(feature = "didwebvh")]
+            didwebvh_identity_store: None,
+            #[cfg(feature = "didwebvh")]
+            didwebvh_log_manager: None,
+            credential_provider_store: None,
+            delegation_vault_store: None,
+            gateway_base_url: None,
+            transit_token_issuer: None,
+            mcp_proxy_store: None,
+            a2a_proxy_store: None,
+            active_variant_alias: None,
+            active_variant_id: None,
+            variant_resolution_error: None,
+            surface: std::sync::Arc::new(surface),
+        }
+    }
+
+    fn mcp_surface(
+        surface_id: &str,
+        endpoint: &str,
+        policy_definition_id: Option<&str>,
+    ) -> crate::config::agent_surface::AgentSurface {
+        let mut target = serde_json::json!({"endpoint": endpoint});
+        if let Some(policy_definition_id) = policy_definition_id {
+            target["policy"] = serde_json::json!({"policy_definition_id": policy_definition_id});
+        }
+        serde_json::from_value(serde_json::json!({
+            "surface_id": surface_id, "name": surface_id,
+            "access_point": {"listen_address": "https://gateway.example", "route": format!("/{surface_id}"), "protocol": "mcp"},
+            "target": target
+        }))
+        .unwrap()
+    }
+
+    fn legacy_mcp_request(
+        uri: &str,
+        body: &serde_json::Value,
+    ) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-protocol-version", crate::mcp::MCP_LEGACY_VERSION)
+            .body(axum::body::Body::from(serde_json::to_vec(body).unwrap()))
+            .unwrap()
+    }
+
+    async fn send_to_surface(
+        state: &crate::state::ProxyState,
+        surface: crate::config::agent_surface::AgentSurface,
+        request: axum::http::Request<axum::body::Body>,
+    ) -> axum::response::Response {
+        super::multi_channel_proxy_handler(
+            axum::extract::ConnectInfo(
+                "127.0.0.1:12345"
+                    .parse()
+                    .unwrap(),
+            ),
+            axum::extract::State(direct_router_state(state, surface)),
+            request,
+        )
+        .await
+    }
+
+    fn tool_call_with_argument(argument: &str) -> serde_json::Value {
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+            "name": "send", "arguments": {"text": argument}
+        }})
+    }
+
+    /// Fields of every `http.client.send` span opened on the current thread.
+    #[derive(Clone, Default)]
+    struct ClientSendSpans(std::sync::Arc<std::sync::Mutex<Vec<HashMap<String, String>>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ClientSendSpans {
+        fn on_new_span(
+            &self,
+            attributes: &tracing::span::Attributes<'_>,
+            _id: &tracing::span::Id,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if attributes.metadata().name() != "http.client.send" {
+                return;
+            }
+            let mut fields = SpanFields::default();
+            attributes.record(&mut fields);
+            self.0
+                .lock()
+                .unwrap()
+                .push(fields.0);
+        }
+    }
+
+    #[derive(Default)]
+    struct SpanFields(HashMap<String, String>);
+
+    impl tracing::field::Visit for SpanFields {
+        fn record_debug(
+            &mut self,
+            field: &tracing::field::Field,
+            value: &dyn std::fmt::Debug,
+        ) {
+            self.0
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn the_client_send_span_records_the_target_url_without_query_values() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let target = crate::component_tests::helpers::MockServer::start_with_response(
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"tools": []}}).to_string(),
+        )
+        .await;
+        let surface = mcp_surface("client-span-url", &target.url(), None);
+        let state = bare_proxy_state(surface.clone(), None);
+        let spans = ClientSendSpans::default();
+        let _guard = crate::component_tests::helpers::thread_subscriber::set_thread_default(
+            tracing_subscriber::registry().with(spans.clone()),
+        );
+
+        let response = send_to_surface(
+            &state,
+            surface,
+            legacy_mcp_request(
+                "/client-span-url?code=oauth-code-value&bare-token-value",
+                &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+            ),
+        )
+        .await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let spans = spans.0.lock().unwrap();
+        let url = spans
+            .iter()
+            .find_map(|fields| fields.get("http.url"))
+            .expect("the request opened an http.client.send span");
+        assert!(url.starts_with(&target.url()), "{url}");
+        assert!(url.ends_with("?code=<redacted>&<redacted>"), "{url}");
+        assert!(!url.contains("oauth-code-value"), "{url}");
+        assert!(!url.contains("bare-token-value"), "{url}");
+    }
+
+    #[tokio::test]
+    async fn an_opa_enforced_request_logs_neither_tool_arguments_nor_header_values() {
+        use std::sync::atomic::Ordering;
+
+        let target = crate::component_tests::helpers::MockServer::start().await;
+        let surface = mcp_surface("opa-input-logs", &target.url(), Some("deny-all"));
+        let policies = crate::policies::SurfacePolicyManager::new();
+        policies
+            .load_policy_text("opa-input-logs", "package surface.policy\n\ndefault allow := false\n")
+            .unwrap();
+        let state = bare_proxy_state(surface.clone(), Some(std::sync::Arc::new(policies)));
+        let mut request = legacy_mcp_request("/opa-input-logs", &tool_call_with_argument("tool-argument-marker"));
+        request
+            .headers_mut()
+            .insert("x-request-note", HeaderValue::from_static("header-value-marker"));
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        send_to_surface(&state, surface, request).await;
+
+        let text = logs.text();
+        assert!(text.contains("policy decision: deny"), "{text}");
+        assert_eq!(
+            target
+                .request_count
+                .load(Ordering::SeqCst),
+            0
+        );
+        assert!(!text.contains("tool-argument-marker"), "a log holds a tool argument: {text}");
+        assert!(!text.contains("header-value-marker"), "a log holds a header value: {text}");
+    }
+
+    /// An upstream that answers every request with `404`, as a Legacy SSE server
+    /// does for a direct POST to its root.
+    async fn upstream_answering_not_found() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().fallback(|| async { axum::http::StatusCode::NOT_FOUND });
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        url
+    }
+
+    #[tokio::test]
+    async fn the_legacy_sse_fallback_logs_the_status_and_size_but_not_the_body() {
+        let target = upstream_answering_not_found().await;
+        let surface = mcp_surface("sse-fallback-logs", &target, None);
+        let state = bare_proxy_state(surface.clone(), None);
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        send_to_surface(
+            &state,
+            surface,
+            legacy_mcp_request("/sse-fallback-logs", &tool_call_with_argument("tool-argument-marker")),
+        )
+        .await;
+
+        let text = logs.text();
+        let fallback = text
+            .lines()
+            .find(|line| line.contains("falling back to Legacy SSE transport"))
+            .unwrap_or_else(|| panic!("no fallback log line: {text}"));
+        assert!(fallback.contains("status=404 Not Found"), "{fallback}");
+        assert!(fallback.contains("body_bytes="), "{fallback}");
+        assert!(text.contains("SSE fallback also failed"), "{text}");
+        assert!(!text.contains("tool-argument-marker"), "a log holds the request body: {text}");
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_target_answers_a_generic_error_and_logs_no_target_url() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let endpoint = format!("http://127.0.0.1:{port}/agent?api_key=endpoint-key-value");
+        let state = bare_proxy_state(mcp_surface("unreachable-target", &endpoint, None), None);
+        let error = reqwest::Client::new()
+            .get(&endpoint)
+            .send()
+            .await
+            .expect_err("nothing listens on the port");
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        let response =
+            super::handle_upstream_error(error, &state, "127.0.0.1:12345", &None, "unreachable-target", &None);
+
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_GATEWAY);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(problem["detail"], "Connection failed to target endpoint");
+        let text = logs.text();
+        assert!(text.contains("Failed to forward request to upstream - bad gateway"), "{text}");
+        assert!(text.contains(&format!("target=http://127.0.0.1:{port}/agent?api_key=<redacted>")), "{text}");
+        assert!(text.contains("error=error sending request "), "{text}");
+        assert!(!text.contains("endpoint-key-value"), "a log holds the target's query value: {text}");
+        assert!(!text.contains("for url"), "a log holds the reqwest error URL: {text}");
     }
 }
 

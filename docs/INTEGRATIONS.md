@@ -393,8 +393,9 @@ most one). The settings are read from the environment the first time a Connectio
 The request is not answered until the sequence ends, and the gateway sets no request timeout of its own. Keep the idle timeout of any proxy or load balancer in front of the management API above the cap plus the rest of the handler (the 60 second default of an AWS ALB is enough), or a client sees a gateway timeout while the Connection Point is still created and a retry creates a second one.
 
 **Log lines.** All logs are plain text at the target `agent_gateway::event_hook`; the
-`did` field is logged like any DID and masked by the global log redactor. The URL, the secret and
-the signature are never logged.
+`did` field is logged in full, like any DID, and is masked only when an operator configures a
+[`logging.redaction`](CONFIGURATION_REFERENCE.md#log-redaction) rule that matches DIDs. The URL, the
+secret and the signature are never logged.
 
 | Level | Line |
 | --- | --- |
