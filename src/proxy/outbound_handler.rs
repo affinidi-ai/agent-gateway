@@ -4458,28 +4458,36 @@ fn mcp_refusal_id(ctx: &OutboundPipelineContext) -> Option<serde_json::Value> {
 }
 
 /// The caller half of the vault key for a Transit Point's delegated
-/// credentials: the transit token's `user_identity_hash`, else the identity
-/// hash of a caller the Transit Point's `source_auth` verified, which is the
-/// value the Access Point puts in a transit token for a caller it identified
-/// the same way. A credential that names no subject identifies no caller. A
-/// token issued for a request that arrived over Fabric keys only the caller the
-/// receiving surface verified (`fabric.principal_hash`), and only on a Transit
-/// Point with `delegated_credentials_for_fabric_callers`; never its top-level
-/// hash or `sub`.
+/// credentials: the caller its policy input ranks first. That is the caller a
+/// transit token verifies, its `user_identity_hash`, else the identity hash of
+/// a caller the Transit Point's `source_auth` verified, which is the value the
+/// Access Point puts in a transit token for a caller it identified the same
+/// way. A credential that names no subject identifies no caller. A token
+/// issued for a request that arrived over Fabric verifies only the caller the
+/// receiving surface verified (`fabric.principal_hash`), never one its
+/// top-level hash or `sub` names, and that caller keys a grant only on a Transit
+/// Point with `delegated_credentials_for_fabric_callers`. Without the switch
+/// there is no key, so the grant of a Transit Point caller it outranks is
+/// never released under it.
 fn delegation_caller_hash(ctx: &OutboundPipelineContext) -> Option<String> {
-    ctx.transit_token_claims
-        .as_ref()
-        .and_then(|claims| match &claims.fabric {
-            None => claims
+    let token = ctx
+        .transit_token_claims
+        .as_ref();
+    if let Some(principal) = token
+        .and_then(|claims| claims.fabric.as_ref())
+        .and_then(|fabric| fabric.principal_hash.as_ref())
+    {
+        return ctx
+            .virtual_channel
+            .delegated_credentials_for_fabric_callers
+            .then(|| principal.clone());
+    }
+    token
+        .filter(|claims| claims.fabric.is_none())
+        .and_then(|claims| {
+            claims
                 .user_identity_hash
-                .clone(),
-            Some(fabric) => fabric
-                .principal_hash
                 .clone()
-                .filter(|_| {
-                    ctx.virtual_channel
-                        .delegated_credentials_for_fabric_callers
-                }),
         })
         .or_else(|| {
             ctx.authenticated_identity
@@ -14182,8 +14190,9 @@ mod tests {
     /// request, and only that caller's. Without the switch, or without a
     /// caller the receiving surface verified, a binding that applies refuses
     /// the call with 403 before any grant is looked up, however the peer named
-    /// its caller; the Transit Point's own `source_auth` caller still keys its
-    /// own grant then.
+    /// its caller. The Transit Point's own `source_auth` caller keys its own
+    /// grant only when the token names no verified caller, the order its
+    /// policy input and audit records follow.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn delegated_credentials_reach_a_fabric_caller_only_as_the_receiving_surface_verified_it_on_opt_in() {
         use crate::source_auth::AuthenticatedIdentity;
@@ -14276,20 +14285,66 @@ mod tests {
             refused(call(true, fabric_claims(Some(peer_did), "fabric-presentation", Some(top_level_hash), 2))).await;
         }
 
-        // The Transit Point's own `source_auth` caller keys its own grant when
-        // the Fabric token does not.
-        let mut verified_here = call(false, verified_fabric_claims(Some(peer_did), &alice_hash));
-        verified_here.authenticated_identity = Some(api_key("bob"));
-        verified_here.authenticated_by = Some(SourceAuth);
-        assert_eq!(injected_credential(&state, verified_here).await, "bob-access");
-        let mut both = call(true, verified_fabric_claims(None, &alice_hash));
-        both.authenticated_identity = Some(api_key("bob"));
-        both.authenticated_by = Some(SourceAuth);
+        // The grant is keyed by the caller the Transit Point's policy ranks
+        // first, and the delegation audit names that caller. A caller the
+        // receiving surface verified outranks the Transit Point's own
+        // `source_auth` caller, so without the switch the call is refused
+        // before any grant is looked up, never served with the Transit Point
+        // caller's grant. A Fabric token that names no verified caller ranks
+        // below the Transit Point's caller, which keys its own grant.
+        let bob_hash = api_key("bob")
+            .principal_hash(None)
+            .unwrap();
+        let with_transit_point_caller = |opted_in: bool, claims| {
+            let mut ctx = call(opted_in, claims);
+            ctx.authenticated_identity = Some(api_key("bob"));
+            ctx.authenticated_by = Some(SourceAuth);
+            ctx
+        };
+        let audited = async |ctx: OutboundPipelineContext| {
+            let (credential, events) = crate::audit::producer::capture(injected_credential(&state, ctx)).await;
+            let named: std::collections::BTreeSet<_> = events
+                .iter()
+                .map(|event| {
+                    (
+                        event
+                            .user_identity_hash
+                            .clone(),
+                        event
+                            .caller
+                            .as_ref()
+                            .map(|caller| caller.auth_method.clone()),
+                    )
+                })
+                .collect();
+            (credential, named)
+        };
+        let named = |hash: &str, auth_method: &str| {
+            std::collections::BTreeSet::from([(Some(hash.to_string()), Some(auth_method.to_string()))])
+        };
+
         assert_eq!(
-            injected_credential(&state, both).await,
-            "alice-access",
+            audited(with_transit_point_caller(true, verified_fabric_claims(None, &alice_hash))).await,
+            (json!("alice-access"), named(&alice_hash, "fabric_verified")),
             "a verified token's caller keys the grant, as an Access Point's does"
         );
+        let ((), events) = crate::audit::producer::capture(refused(with_transit_point_caller(
+            false,
+            verified_fabric_claims(Some(peer_did), &alice_hash),
+        )))
+        .await;
+        assert!(events.is_empty(), "refused before any grant is looked up: {events:?}");
+        for opted_in in [false, true] {
+            assert_eq!(
+                audited(with_transit_point_caller(
+                    opted_in,
+                    fabric_claims(Some(peer_did), "fabric-presentation", None, 2)
+                ))
+                .await,
+                (json!("bob-access"), named(&bob_hash, "api_key")),
+                "opted_in={opted_in}: a Fabric token with no verified caller ranks below the Transit Point's caller"
+            );
+        }
     }
 
     /// Without a managed identity, the agent half of a delegated credential's

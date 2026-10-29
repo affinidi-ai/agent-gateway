@@ -32,7 +32,11 @@ changes:
         that does not with `400`. A `PUT` of the surface or of a variant that omits it keeps the
         stored value while the Transit Point requires the transit token, since the Surface
         Builder does not show it. Without it, or when the receiving surface verified no caller,
-        the call is refused as before and the log gives the reason.
+        the call is refused as before and the log gives the reason. A caller the Transit
+        Point's own `source_auth` verified keys its own grant only when the token names no
+        caller the receiving surface verified, the order its policy input and audit records
+        follow, so without the switch such a call is refused rather than served with the
+        Transit Point caller's grant.
   changed: []
   fixed: []
   removed: []

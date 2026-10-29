@@ -115,10 +115,15 @@ Without the switch, or when the receiving surface verified no caller, a binding 
 refuses the call with `403` and the target is not called. The log says delegated credentials
 are not released for requests that arrived over Fabric
 (`reason=delegated_credentials_for_fabric_callers=false`), or that the receiving surface
-verified no caller of the request (`reason=no_fabric_caller_verified`). A caller the Transit
-Point's own `source_auth` verified on the same call keys its own grant when the token does not,
-and static `target_auth` credentials are added as for any caller. A release that predates the
-switch, or `fabric.principal_hash`, releases nothing for a Fabric-issued token.
+verified no caller of the request (`reason=no_fabric_caller_verified`). The grant follows the
+caller the Transit Point's policy input ranks first: a caller the Transit Point's own
+`source_auth` verified on the same call keys its own grant only when the token names no caller
+the receiving surface verified. When the token names one, that caller outranks it, so without
+the switch the call is refused, never served with the grant of the Transit Point's caller.
+Static `target_auth` credentials are added as for any caller. A release that predates the
+switch, or `fabric.principal_hash`, keys no grant by a Fabric-issued token; a caller its own
+`source_auth` verified still keys its own grant there, and its policy input and audit records
+name that caller first.
 
 On a `fabric://` Transit Point the two switches are independent:
 `delegated_credentials_for_fabric_callers` decides whether a Fabric caller's grant is looked up
