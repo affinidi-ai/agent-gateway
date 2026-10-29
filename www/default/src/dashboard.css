@@ -58,6 +58,13 @@
   --radius-lg: 0.75rem;
   --radius-xl: 1rem;
 
+  /* Layout chrome. .topbar, #content and .sticky-footer take their sizes from
+     these (the topbar height and footer padding match sb-admin-2), and pages
+     that fill the viewport, like the Audit Log, subtract them. */
+  --topbar-height: 4.375rem;
+  --content-padding-top: calc(5rem + 15px);
+  --footer-height: calc(4rem + 0.8rem);
+
   /* Form Controls */
   --control-height: calc(1.5em + 1.25rem + 2px);
   --control-height-sm: calc(1.5em + 0.5rem + 2px);
@@ -1564,6 +1571,7 @@ select.dropdown-styling option {
   right: 0;
   left: 220px;
   /* overridden via inline style in Header.tsx */
+  height: var(--topbar-height);
   z-index: 1030;
   background: rgba(255, 255, 255, 0.3);
   -webkit-backdrop-filter: blur(12px);
@@ -1596,7 +1604,7 @@ html.dark-theme-fs:fullscreen::backdrop {
  * top/left/right gives full pages a bit more breathing room around the
  * .container-fluid that wraps each page body. */
 #content {
-  padding-top: calc(5rem + 15px);
+  padding-top: var(--content-padding-top);
   padding-left: 15px;
   padding-right: 15px;
   min-height: calc(100vh - 5rem);
@@ -1979,6 +1987,7 @@ body.dark-theme #log-content {
 /* Enhanced Footer with Glassmorphism */
 .sticky-footer {
   flex-shrink: 0;
+  height: var(--footer-height);
   background: transparent;
   border-top: none;
   box-shadow: none;
@@ -2908,7 +2917,7 @@ body.dark-theme .audit-policy-evidence-chip {
 
 /* --- Viewport-filling master/detail ---
    Side by side, the page fills the viewport between the fixed topbar and its
-   gap (95px above the page) and the sticky footer (77px below it), so the
+   gap (--content-padding-top) and the sticky footer (--footer-height), so the
    document does not scroll and the list and evidence scroll inside their
    panels. The card body is a two-column grid: the "About the Audit Log"
    banner and the list share the left column, and the detail panel takes the
@@ -2918,7 +2927,7 @@ body.dark-theme .audit-policy-evidence-chip {
 .audit-page {
   display: flex;
   flex-direction: column;
-  height: calc(100vh - 95px - 77px);
+  height: calc(100vh - var(--content-padding-top) - var(--footer-height));
   min-height: 0;
 }
 
@@ -3680,7 +3689,7 @@ body.dark-theme .audit-skeleton-line {
    scrolls as one, with no scroll box inside it. Selecting an entry scrolls
    the page to the detail panel (AuditPage reads the computed flex-direction
    of .audit-shell). The filters and the card header (title, Forward records,
-   Refresh) stay pinned under the fixed 70px topbar while the page scrolls,
+   Refresh) stay pinned under the fixed topbar (--topbar-height) while the page scrolls,
    and the scroll margin keeps the panel and the entry below them. AuditPage
    publishes the two heights as --audit-filters-height and
    --audit-header-height. */
@@ -3698,7 +3707,7 @@ body.dark-theme .audit-skeleton-line {
 
   .audit-filters {
     position: sticky;
-    top: 70px;
+    top: var(--topbar-height);
     z-index: 20;
     padding: 0.75rem 1rem 0.25rem;
     border-radius: var(--radius-md);
@@ -3714,7 +3723,7 @@ body.dark-theme .audit-skeleton-line {
 
   .audit-card-header {
     position: sticky;
-    top: calc(70px + var(--audit-filters-height, 0px));
+    top: calc(var(--topbar-height) + var(--audit-filters-height, 0px));
     z-index: 19;
     background: rgba(255, 255, 255, 0.92);
     box-shadow: 0 6px 12px -8px rgba(0, 0, 0, 0.25);
@@ -3748,7 +3757,8 @@ body.dark-theme .audit-skeleton-line {
     max-height: none;
     align-self: stretch;
     scroll-margin-top: calc(
-      70px + var(--audit-filters-height, 0px) + var(--audit-header-height, 0px) + 0.75rem
+      var(--topbar-height) + var(--audit-filters-height, 0px) + var(--audit-header-height, 0px) +
+        0.75rem
     );
   }
 
@@ -3758,7 +3768,8 @@ body.dark-theme .audit-skeleton-line {
 
   .audit-item {
     scroll-margin-top: calc(
-      70px + var(--audit-filters-height, 0px) + var(--audit-header-height, 0px) + 0.75rem
+      var(--topbar-height) + var(--audit-filters-height, 0px) + var(--audit-header-height, 0px) +
+        0.75rem
     );
   }
 }

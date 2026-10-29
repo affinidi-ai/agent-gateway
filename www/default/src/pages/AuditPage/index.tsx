@@ -65,13 +65,16 @@ const AuditPage: React.FC = () => {
   };
 
   // When the layout stacks the list above the detail (the shell is a column),
-  // bring the detail panel into view; side by side it is already on screen.
+  // bring the detail panel into view and move focus to it, so the next Tab and
+  // a screen reader continue from the panel instead of the list far above.
+  // Side by side the panel is already on screen.
   const selectEntry = (idx: number) => {
     audit.setExpandedIdx(idx);
     const shell = shellRef.current;
     if (shell && window.getComputedStyle(shell).flexDirection === 'column') {
-      const panel = shell.querySelector('[data-testid="audit-detail-panel"]');
+      const panel = shell.querySelector<HTMLElement>('[data-testid="audit-detail-panel"]');
       panel?.scrollIntoView?.({ block: 'start', behavior: 'smooth' });
+      panel?.focus({ preventScroll: true });
     }
   };
 

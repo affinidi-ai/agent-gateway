@@ -255,6 +255,7 @@ describe('AuditPage stacked layout', () => {
       block: 'start',
       behavior: 'smooth',
     });
+    expect(screen.getByTestId('audit-detail-panel')).toHaveFocus();
   });
 
   it('does not scroll on the default selection or a filter change', async () => {
@@ -276,6 +277,7 @@ describe('AuditPage stacked layout', () => {
     fireEvent.click(await screen.findByTestId('audit-item-1'));
     expect(screen.getByTestId('audit-item-1')).toHaveAttribute('aria-current', 'true');
     expect(scrolled).toEqual([]);
+    expect(screen.getByTestId('audit-detail-panel')).not.toHaveFocus();
   });
 });
 
