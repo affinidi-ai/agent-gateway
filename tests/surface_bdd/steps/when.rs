@@ -1028,6 +1028,7 @@ async fn operator_attempts_create_mcp_transit_point_with_header_metadata_mapping
             "protocol": "mcp",
             "listen_path": "/transit/tr1",
             "require_transit_token": false,
+            "allow_unauthenticated_callers": true,
             "header_metadata_mapping": {
                 "extension_uri": "https://fabric.affinidi.io/extensions/header-metadata/v1",
                 "headers": [{
@@ -1353,6 +1354,46 @@ pub async fn update_transit_point_listen_path(
         "updating Transit Point listen_path should succeed, got status {} body {}",
         response.status, response.body
     );
+
+    record_admin_response(world, response);
+}
+
+#[when(expr = "the operator saves Transit Point {string} with no way to authenticate its callers")]
+async fn operator_saves_a_transit_point_that_authenticates_no_caller(
+    world: &mut SurfaceWorld,
+    transit_point: String,
+) {
+    ensure_admin_session(world).await;
+    let surface_id = get_tracked_surface_id(world, "saving a Transit Point that authenticates no caller");
+    let client = world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist");
+    let current = client
+        .get_surface_recorded(&surface_id)
+        .await
+        .unwrap_or_else(|error| panic!("fetch surface before saving the Transit Point: {error}"));
+    assert_eq!(
+        current.status, 200,
+        "fetch surface before saving the Transit Point should succeed, got status {} body {}",
+        current.status, current.body
+    );
+
+    let mut payload = current.body;
+    let point = payload["transit"]["points"]
+        .as_array_mut()
+        .and_then(|points| {
+            points
+                .iter_mut()
+                .find(|point| point["alias"] == transit_point.as_str())
+        })
+        .unwrap_or_else(|| panic!("surface '{surface_id}' has no Transit Point '{transit_point}'"));
+    point["require_transit_token"] = serde_json::json!(false);
+    point["allow_unauthenticated_callers"] = serde_json::json!(false);
+    let response = client
+        .update_surface_recorded(&surface_id, &payload)
+        .await
+        .unwrap_or_else(|error| panic!("save the Transit Point through admin API: {error}"));
 
     record_admin_response(world, response);
 }

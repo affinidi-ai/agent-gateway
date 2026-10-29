@@ -77,6 +77,7 @@ fn surface(require_transit_token: bool) -> crate::config::agent_surface::AgentSu
                 "target_endpoint": "outbound_target_placeholder",
                 "gateway_url": "outbound_gateway_url_placeholder",
                 "require_transit_token": require_transit_token,
+                "allow_unauthenticated_callers": !require_transit_token,
                 "policy": { "policy_definition_id": POLICY_ID }
             }]
         }

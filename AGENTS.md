@@ -83,8 +83,11 @@ a surface with credential bindings; see _Surface Builder_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
 The Surface Builder's **Transit Settings** offer no listener authentication, which the gateway
-does not support, and a dashboard save does not keep a stored `transit.source_auth`. See
-_Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
+does not support, and a dashboard save does not keep a stored `transit.source_auth`. The
+Transit Point element shows neither a Transit Point's own `source_auth` nor its
+`allow_unauthenticated_callers`; a dashboard save omits them and the admin API keeps the
+stored values. See _Surface Builder_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
 The Surface Builder labels an Access Point's URL **Entry point URL**, with a copy button in the
 Access Point panel and on the canvas, and names a new surface `<protocol>_surface_<n>`; see

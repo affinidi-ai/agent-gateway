@@ -511,6 +511,7 @@ impl AgentSurfaceFixture {
                         "listen_address": tp.listen_address.clone().unwrap_or_default(),
                         "listen_path": tp.listen_path.clone().unwrap_or_default(),
                         "require_transit_token": false,
+                        "allow_unauthenticated_callers": true,
                     });
                     if let Some(policy) = &tp.policy {
                         tp_json["policy"] = serde_json::json!({

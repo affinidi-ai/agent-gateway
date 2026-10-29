@@ -1343,7 +1343,11 @@ that same canonical audience. Authentication and protected-resource metadata
 share this derivation; a token for the base resource cannot authorize a named
 variant. Access Point
 authorization is an alternative to legacy `source_auth`; combining them is
-rejected. Transit-token requirements remain independent. Protection applies
+rejected. On a Transit Point it is an alternative to the Transit Point's own
+`source_auth`: the admin API refuses one that sets both, and a stored one
+refuses every request with `503` (see
+[`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-point-callers)). Transit-token
+requirements remain independent. Protection applies
 to all requests on the opted-in endpoint, not only modern-shaped requests,
 so removing modern metadata cannot bypass it. Unconfigured endpoints retain
 existing authentication behavior.

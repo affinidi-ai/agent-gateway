@@ -205,6 +205,7 @@ fn build_surface_fixture(
                     "protocol": tp.protocol,
                     "listen_path": format!("/transit/{}", tp.alias),
                     "require_transit_token": false,
+                    "allow_unauthenticated_callers": true,
                 });
                 // A Transit Point only mints the surface's managed identity
                 // into its outbound request when its own inject_vp is on.

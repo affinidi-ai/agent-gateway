@@ -268,6 +268,10 @@ request is refused with a `401` challenge pointing at that metadata, and a Fabri
 with a `401` without it, see
 [`MCP_METADATA.md`](MCP_METADATA.md#authorization-server-discovery-for-caller-authentication).
 
+A Transit Point's own `source_auth` is different: it refuses a missing or invalid credential
+itself, with `401`, before any policy runs, so an outbound policy never sees
+`"method": "failed"` (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-point-callers)).
+
 Over Fabric, the sending Gateway strips the credential header its own surface consumed
 before forwarding. A receiving surface without protected resource metadata that requires
 source authentication on that same header therefore sees every Fabric caller as failed and
@@ -344,13 +348,15 @@ keep the rule in the Transit Point's own `response_policy`.
 | `input.transit.caller.did` | DID | The caller DID the transit token carries. Always asserted, even when `verified` is `true`: `verified` is about the principal behind `user_identity_hash`, not this DID. Absent when the token has none. |
 | `input.transit.caller.fields` | object | The caller claims this Transit Point allowlists, verbatim: its enabled `workload_binding.caller_context_fields` with `caller_source: transit_token`, taken from the caller's verified JWT claims on the Access Point. The token carries the claims every Transit Point of the surface allowlists, but each Transit Point's policy sees only its own. Absent unless the caller is `verified` and the Transit Point allowlists a claim the token carries. |
 | `input.transit.client.verification` | `resource_token` | The Transit Point verified the client's resource-server token (`mcp_http.authorization`) on this request. `input.source_auth` carries the same identity with its claims. |
+| | `source_auth` | The Transit Point's own `source_auth` verified the client's API key, JWT or client certificate on this request (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-point-source-authentication)). `input.source_auth` carries the same identity, with a JWT's claims. |
 | `input.transit.client.method` | `jwt_bearer`, `api_key`, `did_auth`, `mtls` | The source-auth method that verified the client (`api_key` also for `api_key_provider`). |
 | `input.transit.client.user_identity_hash` | lowercase hex SHA-256 | The client's identity hash, computed as for the caller. It equals a caller's hash only when both were verified the same way. Absent for a JWT that names no `sub`. |
 | `input.transit.client.subject` | string | The verified principal itself. Absent with the hash. |
 
 On an MCP Transit Point that requires a resource token and also receives a transit token,
 `caller` is the end user, and `client` is the client the resource token names. A rule that
-admits one end user checks `caller`; one that admits only some clients checks `client` as well.
+admits one end user checks `caller`; one that admits only some clients checks `client` as well. `client` is set when the Transit Point
+verified a resource token or its own `source_auth`, whichever it requires.
 
 An anonymous call looks like this, and a policy that must refuse it denies on
 `not input.transit.caller.verified`:

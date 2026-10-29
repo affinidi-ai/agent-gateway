@@ -1,0 +1,49 @@
+branch: feat/transit-point-caller-auth
+changes:
+  added:
+    - timestamp: '2026-10-29T12:00:00.000Z'
+      title: ⭐ Let a Transit Point authenticate its callers with an API key, JWT or mTLS
+      description: >-
+        A caller that cannot carry a transit token, such as a cloud-hosted agent, had no way to
+        prove who it was to a Transit Point, so operators turned the token off and served
+        anyone who reached it. A Transit Point now takes its own `source_auth`, checked by the
+        same source authentication as an Access Point before anything is forwarded: `api_key`
+        or `api_key_provider` read from a header, `jwt_bearer`, or `mtls` from the outbound
+        listener's TLS handshake or a trusted proxy; an inbound listener that passes `/outbound`
+        requests on now drops the forwarded-client-cert header, so no certificate reaches a Transit
+        Point that way unverified. A missing or refused credential is refused
+        with `401` that says only that it is missing or invalid, and the credential is never
+        sent to the target. The verified caller reaches the Transit Point's policy input as
+        `input.transit.caller` with `verification: source_auth`, so a policy can allow only
+        named callers, and keys per-caller delegated credentials by the same identity hash the
+        Access Point uses. A dashboard save keeps a Transit Point's `source_auth`.
+    - timestamp: '2026-10-29T12:00:00.000Z'
+      title: Warn when an open Transit Point is reachable on a public address
+      description: >-
+        A Transit Point that serves callers it does not authenticate gives anyone who reaches
+        it its target credentials. When one is reachable on a public address, through its
+        outbound listener's external URLs or an inbound listener that shares a host name and
+        passes `/outbound` requests on, the admin API answers the save of its surface with a
+        `Warning` header naming it and the addresses, and the outbound listener logs it at
+        `WARN`. Every open Transit Point is logged at `WARN` when it is mounted.
+  changed: []
+  fixed: []
+  removed: []
+  security: []
+  breaking:
+    - timestamp: '2026-10-29T12:00:00.000Z'
+      title: ⭐ Refuse a Transit Point that authenticates no caller unless it is marked open
+      description: >-
+        A Transit Point with `require_transit_token: false` and neither `mcp_http.authorization`
+        nor `source_auth` served anyone who reached it, through this gateway and with its
+        `target_auth` credential. Such a Transit Point must now be marked
+        `allow_unauthenticated_callers: true`. The admin API refuses one that is not, on the
+        surface or in a variant, with `400`, and also refuses `allow_unauthenticated_callers`
+        on a Transit Point that authenticates its callers, `source_auth` beside
+        `mcp_http.authorization`, and a `source_auth` a Transit Point does not support
+        (`did_auth`, a `jwt_bearer` that forwards the token, or a key read from anything but a
+        header). A stored surface with such a Transit Point still loads, with a warning in the
+        log, but that Transit Point refuses every request with `503` until it is fixed. Before
+        upgrading, set `allow_unauthenticated_callers: true` on every Transit Point that should
+        stay open, or give it `source_auth`; the Surface Builder cannot set either, and a
+        dashboard save keeps them once set.

@@ -227,6 +227,11 @@ pub struct SurfaceTransitPointConfig {
     pub trust_check_list: Vec<serde_json::Value>,
     pub policy: Option<RequestPolicyFixture>,
     pub require_transit_token: bool,
+    /// The Transit Point's own `source_auth`.
+    pub source_auth: Option<serde_json::Value>,
+    /// Serves callers it does not authenticate when it requires no transit
+    /// token and has no `source_auth`.
+    pub allow_unauthenticated_callers: bool,
     /// The surface's delegated credential is this Transit Point's own
     /// `transit_credentials` rather than the surface's `outbound_credentials`.
     pub delegated_credentials: bool,
@@ -245,6 +250,8 @@ impl SurfaceTransitPointConfig {
             trust_check_list: Vec::new(),
             policy: None,
             require_transit_token: false,
+            source_auth: None,
+            allow_unauthenticated_callers: true,
             delegated_credentials: false,
         }
     }

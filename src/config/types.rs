@@ -3610,6 +3610,7 @@ mod outbound_config_tests {
                     "protocol": "a2a",
                     "gateway_url": format!("https://gw.internal:9000/outbound/test/{}", a),
                     "require_transit_token": false,
+                    "allow_unauthenticated_callers": true,
                 })
             })
             .collect();

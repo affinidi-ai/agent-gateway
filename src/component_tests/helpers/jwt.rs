@@ -172,7 +172,8 @@ pub fn setup_jwt_claim_managed_identity(
                 "alias": "target",
                 "target_endpoint": "outbound_target_placeholder",
                 "gateway_url": "outbound_gateway_url_placeholder",
-                "require_transit_token": false
+                "require_transit_token": false,
+                "allow_unauthenticated_callers": true
             }]
         },
         "identity_slots": {
@@ -243,7 +244,8 @@ pub fn setup_jwt_claim_inbound_identity(
                 "alias": "target",
                 "target_endpoint": "outbound_target_placeholder",
                 "gateway_url": "outbound_gateway_url_placeholder",
-                "require_transit_token": false
+                "require_transit_token": false,
+                "allow_unauthenticated_callers": true
             }]
         },
         "identity_slots": {
