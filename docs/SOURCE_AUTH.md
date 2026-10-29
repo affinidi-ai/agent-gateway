@@ -307,20 +307,30 @@ needs.
 ```
 
 The lifetime belongs to the surface: a variant takes its surface's, and cannot set its own.
-The admin API refuses a lifetime outside 30 to 900 seconds with `400`, and one in a
-variant's overrides with `422`. A surface stored with one outside them stops the gateway
-from starting; a reload holds it to the nearer bound.
+A surface whose Transit Points exist only in a variant needs a base `transit` block, with
+empty `points`, to carry the lifetime; without one its tokens live 300 seconds. The admin API
+refuses a lifetime outside 30 to 900 seconds with `400`, and one in a variant's overrides
+with `422`. A surface stored with one outside them stops the gateway from starting; a reload
+holds it to the nearer bound (see [`CONFIGURATION_RELOAD.md`](CONFIGURATION_RELOAD.md)). The
+token issuer itself also refuses a lifetime outside 30 to 900 seconds.
 
 A Transit Point checks a token against the lifetime its surface sets when the token is
 presented, so a change applies to tokens already issued:
 
-- shortening the lifetime refuses at once every token issued to live longer, until the
-  caller's next request through the Access Point brings the managed agent a new one;
-- lengthening it keeps the tokens already issued, each until its own expiry; only tokens
-  issued after the change live longer.
+- shortening the lifetime refuses every token issued to live longer, only while the shorter
+  lifetime is in force, until the caller's next request through the Access Point brings the
+  managed agent a new one;
+- lengthening it keeps the tokens already issued, each until its own expiry, and accepts
+  again a longer token a shorter lifetime refused if it has not expired; only tokens issued
+  after the change live longer.
 
-The Surface Builder does not show the lifetime, and a dashboard save of the surface leaves
-it out, which sets it back to 300 seconds.
+Shortening the lifetime is therefore not revocation. To revoke the tokens already issued,
+rotate the transit token key as described above.
+
+The Surface Builder does not show the lifetime. A `PUT` that omits
+`transit.transit_token_lifetime_secs`, as a dashboard save does, keeps the stored value;
+a merge `PATCH` with `"transit_token_lifetime_secs": null` removes it, which sets it back
+to 300 seconds.
 
 ### Headers through a Transit Point
 

@@ -236,6 +236,13 @@ impl TransitTokenIssuer {
         caller_context_fields: serde_json::Map<String, serde_json::Value>,
         lifetime_secs: u64,
     ) -> Result<String> {
+        use crate::config::agent_surface::{MAX_TRANSIT_TOKEN_LIFETIME_SECS, MIN_TRANSIT_TOKEN_LIFETIME_SECS};
+        if !(MIN_TRANSIT_TOKEN_LIFETIME_SECS..=MAX_TRANSIT_TOKEN_LIFETIME_SECS).contains(&lifetime_secs) {
+            anyhow::bail!(
+                "transit token lifetime must be from {MIN_TRANSIT_TOKEN_LIFETIME_SECS} to \
+                 {MAX_TRANSIT_TOKEN_LIFETIME_SECS} seconds, not {lifetime_secs}"
+            );
+        }
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .context("system clock error")?
@@ -970,6 +977,47 @@ mod tests {
                 .len(),
             4
         );
+    }
+
+    #[test]
+    fn the_issuer_refuses_a_lifetime_outside_the_bounds() {
+        use crate::config::agent_surface::{MAX_TRANSIT_TOKEN_LIFETIME_SECS, MIN_TRANSIT_TOKEN_LIFETIME_SECS};
+        let issuer = test_issuer();
+        for lifetime in [0, MIN_TRANSIT_TOKEN_LIFETIME_SECS - 1, MAX_TRANSIT_TOKEN_LIFETIME_SECS + 1, u64::MAX] {
+            let result = issuer.issue_with_caller_context(
+                "surf-001",
+                None,
+                None,
+                None,
+                None,
+                None,
+                vec![],
+                serde_json::Map::new(),
+                lifetime,
+            );
+            assert!(result.is_err(), "{lifetime}");
+        }
+        for lifetime in [MIN_TRANSIT_TOKEN_LIFETIME_SECS, MAX_TRANSIT_TOKEN_LIFETIME_SECS] {
+            let token = issuer
+                .issue_with_caller_context(
+                    "surf-001",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    vec![],
+                    serde_json::Map::new(),
+                    lifetime,
+                )
+                .unwrap();
+            assert!(
+                issuer
+                    .validate(&token, lifetime)
+                    .is_ok(),
+                "{lifetime}"
+            );
+        }
     }
 
     #[test]
