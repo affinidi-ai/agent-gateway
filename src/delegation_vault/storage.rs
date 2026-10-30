@@ -174,7 +174,9 @@ pub trait DelegationVaultStorage: Send + Sync {
     }
 
     /// The record ids of every grant stored for `binding`, read from the file
-    /// names alone, so it can be answered whatever the grants hold.
+    /// names alone, so it can be answered whatever the grants hold. Fails with
+    /// [`PepperMismatch`] when none is found and the grants stored were
+    /// written under another pepper, whose ids this gateway cannot derive.
     async fn binding_grant_ids(
         &self,
         _binding: &GrantBinding,
@@ -1052,8 +1054,13 @@ impl DelegationVaultStorage for FileSystemDelegationVaultStore {
         &self,
         binding: &GrantBinding,
     ) -> Result<Vec<String>> {
-        self.grant_ids_with_prefix(&binding.record_id_prefix())
-            .await
+        let ids = self
+            .grant_ids_with_prefix(&binding.record_id_prefix())
+            .await?;
+        if ids.is_empty() && self.pepper_mismatch().await? {
+            return Err(PepperMismatch.into());
+        }
+        Ok(ids)
     }
 
     async fn purge_grant(
