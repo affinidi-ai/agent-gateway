@@ -55,8 +55,11 @@ record that misses a required one.
 
 Create and update resolve the referenced key and certificate after checking the caller may
 use them, and refuse with 400 a key that cannot sign with the algorithm or a certificate that
-is not PEM, so a wrong format fails the save rather than the first token request. JWK keys are
-not accepted. The provider API never returns the key or certificate; the list leaves out
+is not PEM, so a wrong format fails the save rather than the first token request.
+`POST /api/v1/credential-providers/validate` runs the same check before a save: it needs the
+credential provider edit permission, applies the caller's tenant to the secrets it names, and
+answers `"key_material": "ok"` beside the token endpoint's reachability. JWK keys are not
+accepted. The provider API never returns the key or certificate; the list leaves out
 their references too.
 
 Every token request signs a fresh assertion that lives 5 minutes (`iat`, `exp`, and for a
@@ -64,7 +67,8 @@ client assertion `nbf` and a random `jti`); only the issued access token is cach
 Bearer grant sends the scopes in the `scope` claim, a client assertion in the `scope` form
 field (Entra: `<audience>/.default`). Entra needs the tenant-specific v2.0 token endpoint, not
 `common`. An update that sends a reference or JWT field as an empty string clears it, which
-is how a client-credentials provider switches to `oauth2_client_credentials_jwt_auth`.
+is how a client-credentials provider switches to `oauth2_client_credentials_jwt_auth`; a create
+reads an empty reference as none.
 
 ### Service tokens
 
