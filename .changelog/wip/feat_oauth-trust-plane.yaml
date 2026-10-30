@@ -687,7 +687,7 @@ changes:
         configuration id. Only the gateway's own log names the id.
   breaking:
     - timestamp: '2026-10-21T15:10:00Z'
-      title: Copy appliance-wide secrets into the tenant of each tenant credential provider
+      title: Refuse appliance-wide secrets in tenant credential providers
       description: >-
         A tenant credential provider of any type, including Client Credentials, JWT bearer,
         authorization code and API key, that references an appliance-wide secret now fails when it
@@ -696,7 +696,7 @@ changes:
         a token endpoint it controls. Before upgrading, create the secrets in the provider's tenant
         and point the provider at them.
     - timestamp: '2026-10-21T13:36:48Z'
-      title: Copy shared Target secrets and gateway providers into each surface's tenant
+      title: Refuse appliance-wide secrets and providers on tenant surfaces
       description: >-
         A tenant surface whose static_secret Target Authentication names an appliance-wide secret
         now answers 502 "Target authentication failed". One whose outbound_credentials or
