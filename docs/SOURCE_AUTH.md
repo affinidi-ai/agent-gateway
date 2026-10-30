@@ -408,7 +408,9 @@ Access Point that declares a protected resource, only a `GET` or `HEAD` of exact
 caller authentication. Any other path, including one that only ends like a discovery document,
 such as `{route}/tasks/discovery` or `{route}/agent.json`, is challenged like any other request;
 once authenticated it runs Trust Check, gateway and surface policy and tool gating, and carries
-the Target credential. The same rule applies on a Fabric receive. A policy
+the Target credential. The same rule applies on a Fabric receive and, through a Transit Point, to
+the transit token, identity and policy steps: a path that only ends like a discovery document
+needs a transit token like any other request. A policy
 stage refuses with its own `403` and never a challenge. On every protocol the body is a problem
 (`application/problem+json`, `Cache-Control: no-store`) whose detail is fixed and never says why
 a token failed. Every challenge the gateway builds carries the `GatewayChallenge` marker

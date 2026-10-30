@@ -949,7 +949,7 @@ async fn outbound_proxy_handler_in_request_scope(
 
     // Public/discovery paths (agent card, UCP well-known) are metadata-
     // only GETs — skip trust context, trust check, and OPA evaluation.
-    let is_discovery = ctx.original_method == Method::GET && crate::proxy::paths::is_public_path(&ctx.request_path);
+    let is_discovery = ctx.original_method == Method::GET && is_public_transit_request(&ctx);
 
     if !is_discovery {
         // [8] Trust Context Collection
@@ -1054,7 +1054,7 @@ async fn validate_transit_token(
     // `X-Transit-Token` before it can reach those bypasses. The trace id stays the
     // one `OutboundContext::new` derived (no token to adopt one from), which is
     // fine for a standalone metadata GET.
-    if ctx.original_method == Method::GET && crate::proxy::paths::is_public_path(&ctx.request_path) {
+    if ctx.original_method == Method::GET && is_public_transit_request(ctx) {
         debug!(
             request_id = %ctx.request_id,
             "Transit token validation skipped for public discovery path"
@@ -1353,7 +1353,7 @@ async fn step_resolve_agent_identity(
     // so body-based identity extraction would always fail with 422. Skip
     // identity resolution entirely — the response-path agent card rewrite
     // still runs.
-    if ctx.original_method == Method::GET && crate::proxy::paths::is_public_path(&ctx.request_path) {
+    if ctx.original_method == Method::GET && is_public_transit_request(ctx) {
         debug!(
             request_id = %ctx.request_id,
             "Outbound: public discovery path — skipping identity resolution"
@@ -5001,6 +5001,23 @@ fn compute_outbound_remainder_path(
                 .unwrap_or("")
         })
         .to_string()
+}
+
+/// Whether the request is a public discovery read through the routed Transit Point.
+/// On a declaring surface only the well-known agent card and UCP URLs qualify.
+fn is_public_transit_request(ctx: &OutboundPipelineContext) -> bool {
+    let tail = format!(
+        "/{}",
+        compute_outbound_remainder_path(
+            &ctx.request_path,
+            &ctx.surface.access_point.route,
+            &ctx.virtual_channel.alias,
+            ctx.virtual_channel
+                .listen_path
+                .as_deref(),
+        )
+    );
+    crate::proxy::paths::is_public_surface_request(&ctx.surface, ctx.original_method.as_str(), &tail)
 }
 
 /// Whether the request fetches the extended agent card over the HTTP+JSON binding
@@ -14052,6 +14069,107 @@ mod tests {
         .unwrap_or_else(|error| error.into_response());
 
         assert_eq!(response.status(), StatusCode::OK);
+        let received = target.received();
+        assert_eq!(received.len(), 1);
+        assert!(header_values(&received[0], "authorization").is_empty(), "{:?}", received[0]);
+    }
+
+    fn declare_protected_resource(state: &OutboundProxyState) {
+        let mut channel_state = state
+            .channel_state
+            .write()
+            .unwrap();
+        let mut surface = (*channel_state.surface).clone();
+        surface.access_point.caller_authentication = Some(
+            serde_json::from_value(json!({
+                "methods": [{"type": "jwt_bearer", "jwt_verification_strategy_id": "discovery-strategy", "audiences": []}],
+                "protected_resource": {"resource": "https://gateway.example/mcp"}
+            }))
+            .unwrap(),
+        );
+        channel_state.surface = Arc::new(surface);
+    }
+
+    async fn get_through_the_pipeline(
+        state: &OutboundProxyState,
+        path: &str,
+    ) -> StatusCode {
+        let request = Request::builder()
+            .method("GET")
+            .uri(path)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        Box::pin(outbound_proxy_handler_with_mcp_versions(
+            "127.0.0.1:12345"
+                .parse()
+                .unwrap(),
+            state.clone(),
+            request,
+            crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+        ))
+        .await
+        .unwrap_or_else(|error| error.into_response())
+        .status()
+    }
+
+    /// On a declaring surface the agent card stays a public read, so it reaches
+    /// the target without the transit point's credential.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_declared_agent_card_read_through_a_credentialed_transit_point_stays_public() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = crate::component_tests::helpers::RecordingTarget::start(StatusCode::OK, &[]).await;
+        let (state, _) = delegation_pipeline(
+            directory.path(),
+            &target.url,
+            &[("granted", "mcp", binding("provider", json!({"type": "bearer_header"})))],
+        )
+        .await;
+        declare_protected_resource(&state);
+
+        assert_eq!(
+            get_through_the_pipeline(&state, "/outbound/mcp/granted/.well-known/agent-card.json").await,
+            StatusCode::OK
+        );
+        let received = target.received();
+        assert_eq!(received.len(), 1);
+        assert!(header_values(&received[0], "authorization").is_empty(), "{:?}", received[0]);
+    }
+
+    /// On a declaring surface a discovery-suffixed path that is not the agent card
+    /// is no longer public, so the transit token check applies and the read is
+    /// refused before it reaches the target.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_declared_surface_refuses_a_discovery_suffixed_read_without_a_transit_token() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = crate::component_tests::helpers::RecordingTarget::start(StatusCode::OK, &[]).await;
+        let (state, _) = delegation_pipeline(
+            directory.path(),
+            &target.url,
+            &[("granted", "mcp", binding("provider", json!({"type": "bearer_header"})))],
+        )
+        .await;
+        declare_protected_resource(&state);
+
+        assert_eq!(
+            get_through_the_pipeline(&state, "/outbound/mcp/granted/tasks/discovery").await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert!(target.received().is_empty(), "{:?}", target.received());
+    }
+
+    /// A non-declaring surface keeps treating a discovery-suffixed read as public.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_non_declaring_discovery_suffixed_read_through_a_transit_point_stays_public() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = crate::component_tests::helpers::RecordingTarget::start(StatusCode::OK, &[]).await;
+        let (state, _) = delegation_pipeline(
+            directory.path(),
+            &target.url,
+            &[("granted", "mcp", binding("provider", json!({"type": "bearer_header"})))],
+        )
+        .await;
+
+        assert_eq!(get_through_the_pipeline(&state, "/outbound/mcp/granted/tasks/discovery").await, StatusCode::OK);
         let received = target.received();
         assert_eq!(received.len(), 1);
         assert!(header_values(&received[0], "authorization").is_empty(), "{:?}", received[0]);

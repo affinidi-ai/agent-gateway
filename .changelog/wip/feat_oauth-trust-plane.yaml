@@ -843,6 +843,14 @@ changes:
         log, so a forged token chose part of a string that policy may match on. The reason is now
         fixed text such as Signing key not found, and a header that cannot be decoded gives Failed
         to decode JWT header.
+    - timestamp: '2026-10-30T14:30:00Z'
+      title: Stop public discovery reads on Transit Points of declaring surfaces
+      description: >-
+        On a surface whose Access Point declares a protected resource, only a GET of exactly the
+        agent card or UCP well-known URL through a Transit Point skips the transit token, identity
+        and policy steps. Any other path that only ends like a discovery document, such as
+        /tasks/discovery, now needs a transit token and runs the full pipeline. A surface that does
+        not declare keeps the current behaviour.
   breaking:
     - timestamp: '2026-10-30T13:30:00Z'
       title: Refuse client credentials tokens on plain http legs
