@@ -377,8 +377,9 @@ certificate: that route never passes on the forwarded-client-cert header, becaus
 outbound listener sees the gateway itself as the peer. A Transit Point with `mtls`
 `source_auth` is called on its outbound listener directly, or through a trusted proxy.
 
-The verified caller is in the Transit Point's policy input as `input.transit.caller`, with
-`verification: "source_auth"` (see
+The verified caller is in the Transit Point's policy input as `input.transit.client`, with
+`verification: "source_auth"`, apart from `input.transit.caller`, the end user a transit token
+names (see
 [`POLICY.md`](POLICY.md#caller-in-transit-point-policy-input)), and `input.source_auth`
 carries the identity with a JWT's claims. The caller's principal, and so its identity hash,
 is:
@@ -388,10 +389,16 @@ is:
 | `jwt_bearer` | The token's `sub` | One caller per issuer and subject. A token without a `sub` names no caller: it has no identity hash, so no delegated credentials |
 | `api_key` | The `secret_id` | Every key in the secret is the same caller; give each caller a secret of its own to tell them apart |
 | `api_key_provider` | The key's id | One caller per issued key |
-| `mtls` | The principal the `identity_binding` derives | One caller per trusted certificate (the CA certificate its chain ends at, or the pinned certificate) and bound principal |
+| `mtls` | The principal the `identity_binding` derives | One caller per trusted CA (its subject and key, or the pinned certificate) and bound principal |
+
+A Workload Binding on the Transit Point with `caller_source: authorization_bearer_jwt` binds the
+claims of the JWT the Transit Point verified (its `source_auth` or `mcp_http.authorization`),
+whichever header carried it. A caller verified another way (API key, mTLS) binds no claims. A
+Transit Point that authenticated no caller reads the `Authorization` header as sent, which the
+gateway has not verified, so give such a Transit Point `source_auth` before binding its claims.
 
 The identity hash covers the method, the issuer (the JWT `iss`, the API Key Provider agent,
-the fingerprint of the certificate an mTLS client certificate was verified against), the
+a hash of the subject and public key of the CA an mTLS client certificate was verified against), the
 surface's tenant and the principal (see
 [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-callers-identity-hash)). It is the
 value an Access Point puts in the transit token for a caller it authenticated the same way, so

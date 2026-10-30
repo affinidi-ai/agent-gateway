@@ -1134,14 +1134,7 @@ async fn validate_transit_token(
         ctx.transit_token_claims = None;
     }
     let Some(ref issuer) = state.transit_token_issuer else {
-        if modern {
-            return Err(OutboundPipelineError::TransitTokenInvalid("Transit token validation is unavailable".into()));
-        }
-        // Transit token issuer not configured — skip validation.
-        // This allows the outbound pipeline to degrade gracefully when the
-        // gateway is not configured for transit token enforcement.
-        debug!(request_id = %ctx.request_id, "Transit token issuer not configured, skipping validation");
-        return Ok(());
+        return Err(OutboundPipelineError::TransitTokenInvalid("Transit token validation is unavailable".into()));
     };
 
     if modern
@@ -4135,6 +4128,48 @@ fn build_outbound_policy_input(ctx: &OutboundPipelineContext) -> crate::surface_
     }
 }
 
+/// The caller context a Transit Point's Workload Binding binds into the signed
+/// presentation. A JWT caller is read from the claims the Transit Point's own
+/// authentication verified, never from an `Authorization` header it did not
+/// verify; the raw header is read only when the Transit Point authenticated no
+/// caller itself.
+fn capture_workload_binding_caller(
+    ctx: &OutboundPipelineContext,
+    cfg: &crate::config::types::WorkloadBindingConfig,
+) -> Option<crate::proxy::workload_binding::CapturedCallerContext> {
+    match cfg.caller_source {
+        crate::config::types::CallerContextSource::TransitToken => ctx
+            .transit_token_claims
+            .as_ref()
+            .and_then(|claims| {
+                crate::proxy::workload_binding::capture_from_transit_token(claims, &cfg.caller_context_fields).ok()
+            }),
+        crate::config::types::CallerContextSource::AuthorizationBearerJwt => match ctx
+            .authenticated_identity
+            .as_ref()
+        {
+            Some(crate::source_auth::AuthenticatedIdentity::JwtBearer { claims, .. }) => {
+                crate::proxy::workload_binding::capture_from_verified_claims(claims, &cfg.caller_context_fields).ok()
+            }
+            Some(_) => None,
+            None => ctx
+                .original_headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|auth| {
+                    crate::proxy::workload_binding::capture_from_bearer_jwt(auth, &cfg.caller_context_fields).ok()
+                }),
+        },
+        // Transit Point calls are made by the managed agent, not the original
+        // DID-authenticated caller — the raw DID is not available on this hop.
+        // Use `TransitToken` here so the AP-hop's `SHA256(did)` user_hash flows
+        // through the transit token, then set `caller_source: did` on the
+        // target-leg workload binding where the AP-inbound authenticated
+        // identity is still in scope.
+        crate::config::types::CallerContextSource::Did => None,
+    }
+}
+
 /// [5] Trusted Identity Injection — removes the raw `agent-identity/v1` extension
 /// from the request body and inserts a signed `agent-identity-credential/v1`
 /// containing a VP (Verifiable Presentation) JWT issued by the gateway's
@@ -4201,30 +4236,7 @@ async fn step_inject_trusted_identity(
             .as_ref();
         let captured = wb_config
             .filter(|c| c.enabled)
-            .and_then(|cfg| match cfg.caller_source {
-                crate::config::types::CallerContextSource::TransitToken => ctx
-                    .transit_token_claims
-                    .as_ref()
-                    .and_then(|claims| {
-                        crate::proxy::workload_binding::capture_from_transit_token(claims, &cfg.caller_context_fields)
-                            .ok()
-                    }),
-                crate::config::types::CallerContextSource::AuthorizationBearerJwt => ctx
-                    .original_headers
-                    .get(axum::http::header::AUTHORIZATION)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|auth| {
-                        crate::proxy::workload_binding::capture_from_bearer_jwt(auth, &cfg.caller_context_fields).ok()
-                    }),
-                // Transit Point calls are made by the managed agent, not the
-                // original DID-authenticated caller — the raw DID is not
-                // available on this hop. Use `TransitToken` here so the
-                // AP-hop's `SHA256(did)` user_hash flows through the transit
-                // token, then set `caller_source: did` on the target-leg
-                // workload binding where the AP-inbound authenticated
-                // identity is still in scope.
-                crate::config::types::CallerContextSource::Did => None,
-            });
+            .and_then(|cfg| capture_workload_binding_caller(ctx, cfg));
         let mut wb = crate::proxy::workload_binding::maybe_build_workload_binding_subject(
             wb_config,
             crate::proxy::workload_binding::WorkloadBindingInputs {
@@ -4457,24 +4469,23 @@ fn mcp_refusal_id(ctx: &OutboundPipelineContext) -> Option<serde_json::Value> {
 /// value the Access Point puts in a transit token for a caller it identified
 /// the same way. A credential that names no subject identifies no caller.
 fn delegation_caller_hash(ctx: &OutboundPipelineContext) -> Option<String> {
-    ctx.transit_token_claims
+    if let Some(claims) = ctx
+        .transit_token_claims
         .as_ref()
-        .and_then(|claims| {
-            claims
-                .user_identity_hash
-                .clone()
-        })
-        .or_else(|| {
-            ctx.authenticated_identity
-                .as_ref()
-                .filter(|_| ctx.authenticated_by == Some(crate::surface_context::TransitClientVerification::SourceAuth))
-                .and_then(|identity| {
-                    identity.principal_hash(
-                        ctx.surface
-                            .tenant_id
-                            .as_deref(),
-                    )
-                })
+    {
+        return claims
+            .user_identity_hash
+            .clone();
+    }
+    ctx.authenticated_identity
+        .as_ref()
+        .filter(|_| ctx.authenticated_by == Some(crate::surface_context::TransitClientVerification::SourceAuth))
+        .and_then(|identity| {
+            identity.principal_hash(
+                ctx.surface
+                    .tenant_id
+                    .as_deref(),
+            )
         })
 }
 
@@ -4557,6 +4568,7 @@ async fn step_inject_credentials(
         warn!(
             target: "credential_delegation",
             request_id = %ctx.request_id,
+            surface_variant = surface_variant.as_deref(),
             "Neither the transit token nor the Transit Point's source_auth identifies the caller - refusing the request"
         );
         return Err(refuse_delegation(ctx, DelegationRefusal::CallerIdentityMissing));
@@ -8908,7 +8920,8 @@ mod tests {
                 "transit": {
                     "shared": {"opa_policy_definition_id": "unavailable"},
                     "points": [{"alias": "partner-a", "protocol": "mcp",
-                        "require_transit_token": false, "target_endpoint": "http://127.0.0.1:1"}]
+                        "require_transit_token": false, "allow_unauthenticated_callers": true,
+                        "target_endpoint": "http://127.0.0.1:1"}]
                 },
                 "variants": variants
             }))
@@ -11813,6 +11826,125 @@ mod tests {
         ctx.authenticated_by = Some(crate::surface_context::TransitClientVerification::ResourceToken);
     }
 
+    /// A transit token that names no verified end user is not replaced by the
+    /// client the Transit Point authenticated: that client's grant belongs to
+    /// the client, not to an end user the Access Point could not identify.
+    #[test]
+    fn delegation_keys_on_the_transit_point_client_only_when_no_token_names_the_caller() {
+        let mut ctx = test_pipeline_context();
+        ctx.authenticated_identity = Some(crate::source_auth::AuthenticatedIdentity::ApiKey {
+            key_name: "copilot-studio".to_string(),
+            provider_agent_id: None,
+        });
+        ctx.authenticated_by = Some(crate::surface_context::TransitClientVerification::SourceAuth);
+        let client_hash = delegation_caller_hash(&ctx).expect("a client the Transit Point verified keys its grant");
+
+        ctx.transit_token_claims = Some(caller_claims(None, Some("gateway-computed"), None, json!({})));
+        assert_eq!(delegation_caller_hash(&ctx), None, "a token with no verified end user refuses, not falls back");
+
+        ctx.transit_token_claims = Some(caller_claims(None, Some("gateway-computed"), Some("abc123"), json!({})));
+        assert_eq!(delegation_caller_hash(&ctx).as_deref(), Some("abc123"));
+        assert_ne!(Some("abc123"), Some(client_hash.as_str()));
+    }
+
+    fn bearer_workload_binding() -> crate::config::types::WorkloadBindingConfig {
+        serde_json::from_value(json!({
+            "enabled": true,
+            "caller_source": "authorization_bearer_jwt",
+            "caller_context_fields": ["tid"]
+        }))
+        .unwrap()
+    }
+
+    fn unverified_bearer(claims: serde_json::Value) -> axum::http::HeaderValue {
+        use base64::Engine as _;
+        let b64 = |value: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value);
+        axum::http::HeaderValue::from_str(&format!(
+            "Bearer {}.{}.sig",
+            b64(br#"{"alg":"none"}"#),
+            b64(claims.to_string().as_bytes())
+        ))
+        .unwrap()
+    }
+
+    /// A Workload Binding that reads the caller's bearer JWT binds the claims the
+    /// Transit Point's own authentication verified, whichever header or method
+    /// carried them, and never those of an `Authorization` header nothing verified.
+    #[test]
+    fn a_bearer_workload_binding_reads_the_claims_the_transit_point_verified() {
+        let config = bearer_workload_binding();
+        let mut ctx = test_pipeline_context();
+        ctx.original_headers
+            .insert(axum::http::header::AUTHORIZATION, unverified_bearer(json!({ "tid": "forged" })));
+
+        ctx.authenticated_identity = Some(crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            subject: "alice".to_string(),
+            claims: json!({ "iss": "https://idp.example", "sub": "alice", "tid": "contoso" }),
+        });
+        ctx.authenticated_by = Some(crate::surface_context::TransitClientVerification::SourceAuth);
+        let captured = capture_workload_binding_caller(&ctx, &config).expect("a verified JWT caller is captured");
+        assert_eq!(captured.fields.get("tid"), Some(&json!("contoso")), "the verified claims win over the header");
+        assert_eq!(captured.fields.len(), 1, "only the allowlisted claim is bound");
+
+        ctx.authenticated_identity = Some(crate::source_auth::AuthenticatedIdentity::ApiKey {
+            key_name: "copilot-studio".to_string(),
+            provider_agent_id: None,
+        });
+        assert!(
+            capture_workload_binding_caller(&ctx, &config).is_none(),
+            "a caller verified another way binds nothing from a header the gateway did not verify"
+        );
+    }
+
+    #[test]
+    fn a_bearer_workload_binding_reads_the_header_when_the_transit_point_authenticates_no_caller() {
+        let config = bearer_workload_binding();
+        let mut ctx = test_pipeline_context();
+        assert!(capture_workload_binding_caller(&ctx, &config).is_none(), "no credential, nothing to bind");
+        ctx.original_headers
+            .insert(axum::http::header::AUTHORIZATION, unverified_bearer(json!({ "tid": "contoso" })));
+        let captured = capture_workload_binding_caller(&ctx, &config).expect("the header is read");
+        assert_eq!(captured.fields.get("tid"), Some(&json!("contoso")));
+    }
+
+    #[test]
+    fn outbound_policy_input_carries_a_client_the_transit_points_source_auth_verified() {
+        let mut ctx = test_pipeline_context();
+        ctx.authenticated_identity = Some(crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            subject: "alice".to_string(),
+            claims: json!({ "iss": "https://idp.example", "sub": "alice", "tid": "tenant-1" }),
+        });
+        ctx.authenticated_by = Some(crate::surface_context::TransitClientVerification::SourceAuth);
+        Arc::make_mut(&mut ctx.surface).tenant_id = Some("tenant-a".to_string());
+        assert_eq!(
+            transit_client_json(&ctx),
+            json!({
+                "verification": "source_auth",
+                "method": "jwt_bearer",
+                "user_identity_hash": hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+                    br#"["jwt_bearer","https://idp.example","tenant-a","alice"]"#
+                )),
+                "subject": "alice"
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(build_outbound_policy_input(&ctx).source_auth).unwrap()["claims"]["tid"],
+            "tenant-1",
+            "the verified token's claims stay in input.source_auth"
+        );
+        assert_eq!(transit_caller_json(&ctx)["verification"], "anonymous", "the client is not the caller");
+
+        ctx.authenticated_identity = Some(crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            subject: "<none>".to_string(),
+            claims: json!({ "iss": "https://idp.example", "client_id": "no-subject" }),
+        });
+        assert_eq!(
+            transit_client_json(&ctx),
+            json!({ "verification": "source_auth", "method": "jwt_bearer" }),
+            "a token that names no subject has neither a hash nor a subject"
+        );
+    }
+
     #[test]
     fn outbound_policy_input_carries_the_client_the_transit_point_authenticated() {
         let mut ctx = test_pipeline_context();
@@ -12097,14 +12229,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_transit_token_validation_skipped_when_no_issuer() {
+    async fn test_transit_token_validation_refuses_when_no_issuer() {
         let state = test_outbound_state(); // transit_token_issuer = None
         let mut ctx = test_pipeline_context();
         let result = step_validate_transit_token(&state, &mut ctx).await;
-        assert!(result.is_ok());
+        assert!(
+            matches!(result, Err(OutboundPipelineError::TransitTokenInvalid(ref reason)) if reason.contains("unavailable")),
+            "a Transit Point that requires the token refuses when it cannot check it: {result:?}"
+        );
         assert!(
             ctx.transit_token_claims
                 .is_none()
+        );
+
+        ctx.virtual_channel
+            .require_transit_token = false;
+        assert!(
+            step_validate_transit_token(&state, &mut ctx)
+                .await
+                .is_ok(),
+            "a Transit Point that does not require the token is unaffected"
         );
     }
 
@@ -13794,7 +13938,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_caller_the_transit_points_source_auth_verified_keys_delegated_credentials_by_its_identity_hash() {
-        use crate::surface_context::TransitCallerVerification::{ResourceToken, SourceAuth};
+        use crate::surface_context::TransitClientVerification::{ResourceToken, SourceAuth};
 
         let directory = tempfile::tempdir().unwrap();
         let state = delegation_state(directory.path(), &[("provider", "token-caller-access")]).await;
@@ -13988,7 +14132,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_delegation_refusal_line_names_the_request_variant() {
         use crate::observability::policy_audit::{RequestScope, in_request, set_request_variant};
-        use crate::surface_context::TransitCallerVerification::SourceAuth;
+        use crate::surface_context::TransitClientVerification::SourceAuth;
 
         let directory = tempfile::tempdir().unwrap();
         let state = delegation_state(directory.path(), &[("provider", "transit-access")]).await;

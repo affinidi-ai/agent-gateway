@@ -16,8 +16,8 @@ changes:
         `auth_failed` audit event, and the credential is never sent to the target. The admitted
         caller is named on the Transit Point's policy and delegation audit records. The verified
         caller reaches the Transit Point's policy input as
-        `input.transit.caller` with `verification: source_auth`, so a policy can allow only
-        named callers, and keys per-caller delegated credentials by the same identity hash the
+        `input.transit.client` with `verification: source_auth`, apart from the end user a
+        transit token names in `input.transit.caller`, so a policy can allow only named callers, and keys per-caller delegated credentials by the same identity hash the
         Access Point uses. The secrets, strategies, API-key parents and certificates it names
         are checked on save as an Access Point's are, so a tenant access token can name only its
         own or appliance-wide ones. A `jwt_bearer` must name an audience, and a save answers

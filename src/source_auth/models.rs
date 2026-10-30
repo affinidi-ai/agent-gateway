@@ -322,10 +322,9 @@ pub enum AuthenticatedIdentity {
         /// Issuer DN. Empty for [`MtlsTrust::Pinned`] (no chain verified).
         /// For display and audit only: it is a name the certificate states.
         issuer_dn: String,
-        /// Lowercase hex SHA-256 of the certificate the trust check verified
-        /// the leaf against: the configured CA certificate its verified chain
-        /// ends at, or for [`MtlsTrust::Pinned`] the pinned certificate, which
-        /// is the leaf itself.
+        /// Lowercase hex SHA-256 of the subject and public key of the CA its
+        /// verified chain ends at, so renewing a CA with the same subject and
+        /// key keeps it; for [`MtlsTrust::Pinned`] the pinned certificate's SHA-256.
         trust_anchor_fingerprint: String,
         /// SANs captured from the leaf, for audit / OPA visibility even
         /// when they are not used as the principal.
@@ -361,7 +360,7 @@ impl AuthenticatedIdentity {
 
     /// This caller's `user_identity_hash` on a surface of `tenant_id`: the
     /// [`caller_identity_hash`] of the method, the issuer (the JWT `iss`, the
-    /// API Key Provider agent, the fingerprint of the certificate an mTLS
+    /// API Key Provider agent, a hash of the subject and key of the CA an mTLS
     /// client certificate was verified against) and the principal. The
     /// transit token, policy input and delegated credentials
     /// key callers by it. `None` when the credential names no subject, such as
