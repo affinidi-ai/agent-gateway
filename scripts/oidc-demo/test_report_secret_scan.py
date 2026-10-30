@@ -11,14 +11,15 @@ import unittest
 import zipfile
 
 SCRIPT = pathlib.Path(__file__).resolve().with_name("report_secret_scan.py")
-CLIENT_SECRET = "world-client-secret-4f19c2"
-HARNESS_SECRET = "harness-test-token-8e03d7"
-SHORT_SECRET = "tiny-value"
+PLANTED_CLIENT_VALUE = "world-client-secret-4f19c2"
+PLANTED_HARNESS_VALUE = "harness-test-token-8e03d7"
+PLANTED_SHORT_VALUE = "tiny-value"
 KEY_LINE = "MIGHAgEAMBMG" + "ByqGSM49AgEGCCqGSM49"
 PEM_BEGIN = "-----BEGIN " + "PRIVATE KEY-----"
 PEM_END = "-----END " + "PRIVATE KEY-----"
 JWT = "eyJ" + "a" * 10 + ".eyJ" + "b" * 10 + "." + "c" * 10
 HYDRA_TOKEN = "ory_" + "at_" + "x" * 20
+WORLD_TEMPLATE = '{"clientA": {"id": "client-a", "secret": %s}, "key": {"privatePem": %s}}'
 
 
 class ScanTests(unittest.TestCase):
@@ -30,17 +31,12 @@ class ScanTests(unittest.TestCase):
         self.results.mkdir()
         self.world = root / "world.json"
         self.world.write_text(
-            json.dumps(
-                {
-                    "clientA": {"id": "client-a", "secret": CLIENT_SECRET},
-                    "key": {"privatePem": f"{PEM_BEGIN}\n{KEY_LINE}\n{PEM_END}\n"},
-                }
-            )
+            WORLD_TEMPLATE % (json.dumps(PLANTED_CLIENT_VALUE), json.dumps(f"{PEM_BEGIN}\n{KEY_LINE}\n{PEM_END}\n"))
         )
-        self.secrets = root / "secrets"
-        self.secrets.mkdir()
-        (self.secrets / "test-token").write_text(HARNESS_SECRET + "\n")
-        (self.secrets / "short").write_text(SHORT_SECRET)
+        self.harness_dir = root / "secrets"
+        self.harness_dir.mkdir()
+        (self.harness_dir / "test-token").write_text(PLANTED_HARNESS_VALUE + "\n")
+        (self.harness_dir / "short").write_text(PLANTED_SHORT_VALUE)
 
     def plant(self, name, data):
         path = self.results / name
@@ -48,7 +44,7 @@ class ScanTests(unittest.TestCase):
         path.write_bytes(data)
 
     def scan(self, *args):
-        argv = args or (self.results, self.world, self.secrets)
+        argv = args or (self.results, self.world, self.harness_dir)
         return subprocess.run(
             [sys.executable, "-I", "-B", str(SCRIPT), *map(str, argv)],
             capture_output=True,
@@ -82,27 +78,27 @@ class ScanTests(unittest.TestCase):
         self.assert_found(HYDRA_TOKEN, "log.txt: Hydra access token")
 
     def test_a_world_client_secret_fails_the_scan(self):
-        self.plant("stdout.txt", CLIENT_SECRET.encode())
-        self.assert_found(CLIENT_SECRET, "stdout.txt: client secret of clientA")
+        self.plant("stdout.txt", PLANTED_CLIENT_VALUE.encode())
+        self.assert_found(PLANTED_CLIENT_VALUE, "stdout.txt: client secret of clientA")
 
     def test_a_signing_key_line_fails_the_scan(self):
         self.plant("stdout.txt", KEY_LINE.encode())
         self.assert_found(KEY_LINE, "stdout.txt: signing key line 1")
 
     def test_a_harness_secret_fails_the_scan(self):
-        self.plant("stdout.txt", HARNESS_SECRET.encode())
-        self.assert_found(HARNESS_SECRET, "stdout.txt: harness secret test-token")
+        self.plant("stdout.txt", PLANTED_HARNESS_VALUE.encode())
+        self.assert_found(PLANTED_HARNESS_VALUE, "stdout.txt: harness secret test-token")
 
     def test_a_secret_inside_a_zip_embedded_in_an_html_page_fails_the_scan(self):
         archive = io.BytesIO()
         with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as zipped:
-            zipped.writestr("attachment.txt", f"client_secret={CLIENT_SECRET}")
+            zipped.writestr("attachment.txt", f"client_secret={PLANTED_CLIENT_VALUE}")
         encoded = base64.b64encode(archive.getvalue())
         self.plant("html/index.html", b'<script>window.r="data:application/zip;base64,' + encoded + b'"</script>')
-        self.assert_found(CLIENT_SECRET, "html/index.html!attachment.txt: client secret of clientA")
+        self.assert_found(PLANTED_CLIENT_VALUE, "html/index.html!attachment.txt: client secret of clientA")
 
     def test_a_secret_shorter_than_the_minimum_is_ignored(self):
-        self.plant("stdout.txt", SHORT_SECRET.encode())
+        self.plant("stdout.txt", PLANTED_SHORT_VALUE.encode())
         completed = self.scan()
         self.assertEqual(completed.returncode, 0, completed.stderr)
 

@@ -45,12 +45,12 @@ def main(argv: list[str]) -> int:
         except OSError:
             print(f"{target}: cannot be read", file=sys.stderr)
             return 2
-        secrets = sum(data.count(v.encode()) for k, v in values.items() if k not in IDENTIFIERS)
-        ids = sum(data.count(values[k].encode()) for k in IDENTIFIERS if k in values)
+        value_hits = sum(data.count(v.encode()) for k, v in values.items() if k not in IDENTIFIERS)
+        identifier_hits = sum(data.count(values[k].encode()) for k in IDENTIFIERS if k in values)
         kinds = {kind: len(pattern.findall(data)) for kind, pattern in PATTERNS.items()}
         counts = " ".join(f"{kind.lower().replace(' ', '-')}={count}" for kind, count in kinds.items())
-        print(f"{target}: secret-and-client-id values={secrets} identifiers={ids} {counts}")
-        failed = failed or bool(secrets or any(kinds.values()))
+        print(f"{target}: secret-and-client-id values={value_hits} identifiers={identifier_hits} {counts}")
+        failed = failed or bool(value_hits or any(kinds.values()))
     return 1 if failed else 0
 
 
