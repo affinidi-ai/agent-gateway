@@ -12,7 +12,7 @@ use crate::credential_providers::CredentialProviderType;
 use crate::credential_providers::storage::CredentialProviderStorage;
 use crate::delegation_vault::audit::{self, AuditCallerContext, DelegationAuditAction};
 use crate::delegation_vault::service_token::{
-    self, IssuedToken, ServiceTokenContext, ServiceTokenError, ServiceTokenKey,
+    self, Freshness, IssuedToken, ServiceTokenContext, ServiceTokenError, ServiceTokenKey,
 };
 use crate::delegation_vault::{DelegationToken, VaultLookupResult, oauth, storage::DelegationVaultStorage};
 use crate::secrets::SecretsStore;
@@ -509,21 +509,19 @@ pub async fn resolve_delegation_credentials(
                 let acquired = service_token::acquire(&provider, effective_scopes, &context, key, Utc::now())
                     .await
                     .and_then(|mut token| match token.issued.take() {
-                        Some(IssuedToken { id, cached, insecure_endpoint }) => {
-                            Ok((id, cached, insecure_endpoint, token))
-                        }
+                        Some(IssuedToken {
+                            id,
+                            freshness,
+                            insecure_endpoint,
+                        }) => Ok((id, freshness, insecure_endpoint, token)),
                         // Unreachable: acquire issues a vault token for each of these OAuth types.
                         None => Err(ServiceTokenError::Unsupported),
                     });
                 match acquired {
-                    Ok((token_id, cached, insecure_endpoint, token)) => {
+                    Ok((token_id, freshness, insecure_endpoint, token)) => {
                         let detail = with_note(format!(
                             "{grant}_{}{}",
-                            if cached {
-                                "cached"
-                            } else {
-                                "fresh"
-                            },
+                            freshness.as_str(),
                             if insecure_endpoint {
                                 INSECURE_TOKEN_ENDPOINT_DETAIL
                             } else {
@@ -538,7 +536,7 @@ pub async fn resolve_delegation_credentials(
                             detail = %detail,
                             "Service token resolved — injecting into upstream request"
                         );
-                        if cached
+                        if freshness != Freshness::Fresh
                             && let Err(e) = vault_store
                                 .mark_used(&token_id)
                                 .await
@@ -2276,6 +2274,59 @@ mod tests {
                 .detail
                 .as_deref(),
             Some("client_credentials_cached")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_renewal_injects_the_cached_client_credentials_token_as_stale() {
+        let now = Utc::now();
+        let mut token = make_token(false, false);
+        token.user_identity_hash = "__client_credentials__".to_string();
+        token.access_token = "cached-service-token".to_string();
+        token.created_at = now - Duration::seconds(3400);
+        token.expires_at = Some(now + Duration::seconds(200));
+        let vault = MockVaultStore::new(VaultLookupResult::Found(token));
+        let mut provider = make_credential_provider("cp-1", CredentialProviderType::OAuth2ClientCredentials);
+        // Without a token endpoint the renewal fails without contacting a provider.
+        provider.token_endpoint = None;
+        let providers = MockProviderStore::with_stored(provider);
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
+
+        let results = resolve_delegation_credentials(
+            &[make_binding("cp-1")],
+            "sha256:user1",
+            "did:web:agent.example",
+            "ch-1",
+            crate::tenancy::SurfaceTenancy::configured(None),
+            None,
+            &(vault as Arc<dyn DelegationVaultStorage>),
+            &(providers as Arc<dyn CredentialProviderStorage>),
+            &secrets,
+            "https://gw.example.com",
+            false,
+            None,
+            None,
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        match &results[0].result {
+            DelegationLookupResult::Inject(injections) => assert_eq!(
+                injections,
+                &vec![ResolvedCredentialInjection::Header {
+                    name: "Authorization".to_string(),
+                    value: "Bearer cached-service-token".to_string(),
+                }]
+            ),
+            _ => panic!("Expected Inject, got {:?}", result_tag(&results[0].result)),
+        }
+        assert_eq!(results[0].action.outcome, DelegationActionOutcome::TokenInjected);
+        assert_eq!(
+            results[0]
+                .action
+                .detail
+                .as_deref(),
+            Some("client_credentials_stale")
         );
     }
 

@@ -90,6 +90,17 @@ changes:
         clears the wait. Missing secrets, store errors and refused token endpoints never start
         one, and a secret that cannot be read is now reported as unavailable rather than as a
         failed token request.
+    - timestamp: '2026-10-31T01:30:00Z'
+      title: Keep using a valid service token when its renewal fails
+      description: >-
+        A cached service token is now renewed half its lifetime before it expires, at most
+        5 minutes and at least 60 seconds early, while other requests keep using it. When
+        the renewal fails at the token endpoint or is held back by the retry backoff, the
+        cached token is still injected, marked stale, until 60 seconds before it expires,
+        so a short outage of the credential provider no longer fails proxied requests. A
+        changed provider, a missing secret, a secrets store error or a refused token
+        endpoint never serves the stale token. Legacy delegation audit details gain the
+        value <grant>_stale, for example client_credentials_stale.
   removed: []
   security:
     - timestamp: '2026-10-30T20:30:00Z'

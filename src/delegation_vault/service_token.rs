@@ -41,11 +41,32 @@ pub struct ServiceToken {
 
 pub struct IssuedToken {
     pub id: String,
-    /// Whether it came from the vault cache rather than a token request just now.
-    pub cached: bool,
+    pub freshness: Freshness,
     /// Whether the provider's token endpoint breaks the https rule and is let through only
     /// because the rule is in warn mode.
     pub insecure_endpoint: bool,
+}
+
+/// How an issued token was obtained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Freshness {
+    /// From the vault cache.
+    Cached,
+    /// From a token request just now.
+    Fresh,
+    /// From the vault cache, due for renewal, after its renewal failed at the token endpoint
+    /// or was held back by the retry backoff.
+    Stale,
+}
+
+impl Freshness {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cached => "cached",
+            Self::Fresh => "fresh",
+            Self::Stale => "stale",
+        }
+    }
 }
 
 impl ServiceToken {
@@ -55,14 +76,14 @@ impl ServiceToken {
 
     fn issued(
         token: DelegationToken,
-        cached: bool,
+        freshness: Freshness,
         insecure_endpoint: bool,
     ) -> Self {
         Self {
             value: zeroize::Zeroizing::new(token.access_token),
             issued: Some(IssuedToken {
                 id: token.id,
-                cached,
+                freshness,
                 insecure_endpoint,
             }),
         }
@@ -91,7 +112,8 @@ pub enum ServiceTokenError {
 
 impl ServiceTokenError {
     /// Whether the token endpoint's answer caused it, so the next request for the same key
-    /// waits for the retry backoff. Local failures never do.
+    /// waits for the retry backoff and a cached token due for renewal is served stale. Local
+    /// failures never do either.
     fn backs_off(self) -> bool {
         matches!(self, Self::TokenRequestFailed | Self::ScopeMismatch)
     }
@@ -101,13 +123,19 @@ impl ServiceTokenError {
 /// reach the target just as the issuer stops accepting it.
 pub const EXPIRY_MARGIN_SECS: i64 = 60;
 
+/// A cached token is renewed half its lifetime before it expires, but at most this many
+/// seconds and at least [`EXPIRY_MARGIN_SECS`] before.
+const RENEWAL_MARGIN_MAX_SECS: i64 = 300;
+
 /// The provider's service token for `scopes`: its API key, or a cached token that grants
 /// them, or a new token from the provider's grant, stored under `key`. On this replica one
 /// token request per key is in flight at a time; a caller that missed the cache waits for it
 /// and reads the vault again before requesting. After a failed request the next one for the
 /// key waits for the retry backoff, and a caller arriving before then fails without a request.
-/// Issued scopes must equal requested ones; when none were requested the issuer's scopes are
-/// kept.
+/// A cached token due for renewal is renewed by one caller while the others keep using it;
+/// when the renewal fails at the token endpoint or is held back by the backoff, the cached
+/// token is served as stale until [`EXPIRY_MARGIN_SECS`] before it expires. Issued scopes must
+/// equal requested ones; when none were requested the issuer's scopes are kept.
 pub async fn acquire(
     provider: &CredentialProvider,
     scopes: &[String],
@@ -155,25 +183,55 @@ pub async fn acquire(
             .tenant_credential_isolation,
     )
     .await?;
-    let cached = |token| {
+    let served = |token, freshness| {
         if insecure_endpoint {
             warn!(target: "credential_delegation", provider_id = %provider.provider_id, "Using a service token from a credential provider token endpoint that is not https");
         }
-        ServiceToken::issued(token, true, insecure_endpoint)
+        ServiceToken::issued(token, freshness, insecure_endpoint)
     };
-    if let Some(token) = cached_token(provider, scopes, context, key.agent_did, &identity, now).await? {
-        return Ok(cached(token));
-    }
-    let slot = grant_slot(key.agent_did, &identity, &provider.id).await;
-    let mut backoff = slot.lock().await;
-    if let Some(token) = cached_token(provider, scopes, context, key.agent_did, &identity, now).await? {
-        return Ok(cached(token));
-    }
-    if backoff.holds_back(now) {
-        debug!(target: "credential_delegation", provider_id = %provider.provider_id, "Service token request held back by the retry backoff");
-        return Err(ServiceTokenError::TokenRequestFailed);
-    }
-    let (response, granted) = backoff.record(token_grant(provider, scopes, context.secrets, &egress).await, now)?;
+    let mut backoff = match cached_token(provider, scopes, context, key.agent_did, &identity, now).await? {
+        CachedToken::Fresh(token) => return Ok(served(token, Freshness::Cached)),
+        CachedToken::RenewalDue(token) => match grant_slot(key.agent_did, &identity, &provider.id)
+            .await
+            .try_lock_owned()
+        {
+            Ok(backoff) => backoff,
+            Err(_) => return Ok(served(token, Freshness::Cached)),
+        },
+        CachedToken::None => {
+            grant_slot(key.agent_did, &identity, &provider.id)
+                .await
+                .lock_owned()
+                .await
+        }
+    };
+    let renewing = match cached_token(provider, scopes, context, key.agent_did, &identity, now).await? {
+        CachedToken::Fresh(token) => return Ok(served(token, Freshness::Cached)),
+        CachedToken::RenewalDue(token) if backoff.holds_back(now) => {
+            warn!(target: "credential_delegation", provider_id = %provider.provider_id, token_id = %token.id, "Service token renewal held back by the retry backoff, serving the cached token as stale");
+            return Ok(served(token, Freshness::Stale));
+        }
+        CachedToken::RenewalDue(token) => Some(token),
+        CachedToken::None if backoff.holds_back(now) => {
+            debug!(target: "credential_delegation", provider_id = %provider.provider_id, "Service token request held back by the retry backoff");
+            return Err(ServiceTokenError::TokenRequestFailed);
+        }
+        CachedToken::None => None,
+    };
+    let requested_at = Utc::now();
+    let (response, granted) = match backoff.record(token_grant(provider, scopes, context.secrets, &egress).await, now) {
+        Ok(granted) => granted,
+        Err(error) => {
+            let failed_at = now + (Utc::now() - requested_at);
+            return match renewing {
+                Some(token) if error.backs_off() && usable_at(&token, failed_at) => {
+                    warn!(target: "credential_delegation", provider_id = %provider.provider_id, token_id = %token.id, %error, "Service token renewal failed, serving the cached token as stale");
+                    Ok(served(token, Freshness::Stale))
+                }
+                _ => Err(error),
+            };
+        }
+    };
     let current = context
         .providers
         .get(&provider.id)
@@ -223,7 +281,7 @@ pub async fn acquire(
     {
         warn!(target: "credential_delegation", provider_id = %provider.provider_id, %error, "Could not remove expired service tokens");
     }
-    Ok(ServiceToken::issued(token, false, insecure_endpoint))
+    Ok(ServiceToken::issued(token, Freshness::Fresh, insecure_endpoint))
 }
 
 /// Requests a token with the provider's grant, checking the issued scopes against `scopes`.
@@ -412,6 +470,14 @@ async fn cache_identity(
     Ok(format!("{purpose}:{}", hex::encode(hash)))
 }
 
+/// The cached token for a key, by where `now` falls in its lifetime.
+enum CachedToken {
+    Fresh(DelegationToken),
+    /// Past its renewal time and more than [`EXPIRY_MARGIN_SECS`] before it expires.
+    RenewalDue(DelegationToken),
+    None,
+}
+
 async fn cached_token(
     provider: &CredentialProvider,
     scopes: &[String],
@@ -419,7 +485,7 @@ async fn cached_token(
     agent_did: &str,
     identity: &str,
     now: DateTime<Utc>,
-) -> Result<Option<DelegationToken>, ServiceTokenError> {
+) -> Result<CachedToken, ServiceTokenError> {
     let token = match context
         .vault
         .lookup(agent_did, identity, &provider.id)
@@ -429,24 +495,47 @@ async fn cached_token(
         VaultLookupResult::Found(token) => token,
         VaultLookupResult::ExpiredRefreshable(token) | VaultLookupResult::ExpiredNoRefresh(token) => {
             debug!(target: "credential_delegation", token_id = %token.id, "Cached service token expired, requesting a new one");
-            return Ok(None);
+            return Ok(CachedToken::None);
         }
-        VaultLookupResult::NotFound => return Ok(None),
+        VaultLookupResult::NotFound => return Ok(CachedToken::None),
     };
-    let usable = token.agent_did == agent_did
+    let matches = token.agent_did == agent_did
         && token.user_identity_hash == identity
         && token.credential_provider_id == provider.id
         && !token.access_token.is_empty()
         && token
             .token_type
             .eq_ignore_ascii_case("Bearer")
-        && token
-            .expires_at
-            .is_some_and(|expires| expires - chrono::Duration::seconds(EXPIRY_MARGIN_SECS) > now)
         && scopes
             .iter()
             .all(|scope| token.scopes.contains(scope));
-    Ok(usable.then_some(token))
+    Ok(match token.expires_at {
+        Some(expires) if matches && usable_at(&token, now) => {
+            if now < expires - renewal_margin(expires - token.created_at) {
+                CachedToken::Fresh(token)
+            } else {
+                CachedToken::RenewalDue(token)
+            }
+        }
+        _ => CachedToken::None,
+    })
+}
+
+/// Whether `token` may still be injected at `now`: more than [`EXPIRY_MARGIN_SECS`] before
+/// it expires.
+fn usable_at(
+    token: &DelegationToken,
+    now: DateTime<Utc>,
+) -> bool {
+    token
+        .expires_at
+        .is_some_and(|expires| expires - chrono::Duration::seconds(EXPIRY_MARGIN_SECS) > now)
+}
+
+/// How long before expiry a token of `lifetime` is renewed: half its lifetime, from
+/// [`EXPIRY_MARGIN_SECS`] up to [`RENEWAL_MARGIN_MAX_SECS`].
+fn renewal_margin(lifetime: chrono::Duration) -> chrono::Duration {
+    chrono::Duration::seconds((lifetime.num_seconds() / 2).clamp(EXPIRY_MARGIN_SECS, RENEWAL_MARGIN_MAX_SECS))
 }
 
 #[cfg(test)]
@@ -792,14 +881,14 @@ mod tests {
         }
     }
 
-    fn issued(token: Result<ServiceToken, ServiceTokenError>) -> (String, bool) {
+    fn issued(token: Result<ServiceToken, ServiceTokenError>) -> (String, Freshness) {
         let token = token.unwrap_or_else(|error| panic!("expected an issued token, got {error}"));
-        let cached = token
+        let freshness = token
             .issued
             .as_ref()
             .expect("expected an issued token")
-            .cached;
-        (token.value().to_string(), cached)
+            .freshness;
+        (token.value().to_string(), freshness)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -832,7 +921,7 @@ mod tests {
                         .acquire(&provider, &["read"], now)
                         .await
                 ),
-                ("issued".into(), false)
+                ("issued".into(), Freshness::Fresh)
             );
             assert_eq!(
                 issued(
@@ -840,7 +929,7 @@ mod tests {
                         .acquire(&provider, &["read"], now)
                         .await
                 ),
-                ("issued".into(), true)
+                ("issued".into(), Freshness::Cached)
             );
             let requests = fixture.requests();
             assert_eq!(requests.len(), 1, "{grant_type}");
@@ -886,39 +975,238 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_cached_token_counts_as_expired_sixty_seconds_before_it_expires() {
-        let fixture = Fixture::new().await;
-        let provider = fixture
-            .provider(json!({"provider_type": "oauth2_client_credentials", "client_id_secret_ref": "CLIENT_ID",
-                             "client_secret_secret_ref": "CLIENT_SECRET"}))
-            .await;
-        let now = Utc::now();
+    /// Acquires a token for `client_credentials()` with no scopes and returns the time the
+    /// token's lifetime is counted from.
+    async fn cache_a_token(
+        fixture: &Fixture,
+        provider: &CredentialProvider,
+    ) -> DateTime<Utc> {
         issued(
             fixture
-                .acquire(&provider, &[], now)
+                .acquire(provider, &[], Utc::now())
                 .await,
         );
-        let later = now + chrono::Duration::seconds(3600 - 90);
-        assert!(
-            issued(
-                fixture
-                    .acquire(&provider, &[], later)
-                    .await
-            )
-            .1
-        );
-        fixture.respond(json!({"access_token": "renewed", "token_type": "Bearer", "expires_in": 3600}));
-        let almost = now + chrono::Duration::seconds(3600 - 30);
+        fixture
+            .only_stored()
+            .await
+            .created_at
+    }
+
+    fn seconds(
+        from: DateTime<Utc>,
+        seconds: i64,
+    ) -> DateTime<Utc> {
+        from + chrono::Duration::seconds(seconds)
+    }
+
+    #[test]
+    fn a_token_is_renewed_half_its_lifetime_early_between_one_and_five_minutes() {
+        for (lifetime, margin) in [(3600, 300), (600, 300), (400, 200), (120, 60), (100, 60), (10, 60)] {
+            assert_eq!(
+                renewal_margin(chrono::Duration::seconds(lifetime)),
+                chrono::Duration::seconds(margin),
+                "{lifetime}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cached_token_is_renewed_five_minutes_before_it_expires() {
+        let fixture = Fixture::new().await;
+        let provider = fixture
+            .provider(client_credentials())
+            .await;
+        let created = cache_a_token(&fixture, &provider).await;
         assert_eq!(
             issued(
                 fixture
-                    .acquire(&provider, &[], almost)
+                    .acquire(&provider, &[], seconds(created, 3299))
                     .await
             ),
-            ("renewed".into(), false)
+            ("issued".into(), Freshness::Cached)
+        );
+        fixture.respond(json!({"access_token": "renewed", "token_type": "Bearer", "expires_in": 3600}));
+        assert_eq!(
+            issued(
+                fixture
+                    .acquire(&provider, &[], seconds(created, 3300))
+                    .await
+            ),
+            ("renewed".into(), Freshness::Fresh)
         );
         assert_eq!(fixture.requests().len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_renewal_serves_the_cached_token_as_stale() {
+        let fixture = Fixture::new().await;
+        let provider = fixture
+            .provider(client_credentials())
+            .await;
+        let created = cache_a_token(&fixture, &provider).await;
+        let cached = fixture.only_stored().await;
+        fixture.fail(true);
+        let renew_at = seconds(created, 3300);
+        assert_eq!(
+            issued(
+                fixture
+                    .acquire(&provider, &[], renew_at)
+                    .await
+            ),
+            ("issued".into(), Freshness::Stale)
+        );
+        assert_eq!(fixture.requests().len(), 2);
+        let stored = fixture.only_stored().await;
+        assert_eq!(
+            (stored.id, stored.expires_at, stored.updated_at),
+            (cached.id.clone(), cached.expires_at, cached.updated_at)
+        );
+
+        assert_eq!(
+            issued(
+                fixture
+                    .acquire(&provider, &[], after(renew_at, 500))
+                    .await
+            ),
+            ("issued".into(), Freshness::Stale),
+            "a renewal held back by the backoff serves the token as stale"
+        );
+        assert_eq!(fixture.requests().len(), 2);
+
+        fixture.fail(false);
+        fixture.respond(json!({"access_token": "renewed", "token_type": "Bearer", "expires_in": 3600}));
+        assert_eq!(
+            issued(
+                fixture
+                    .acquire(&provider, &[], after(renew_at, 1_100))
+                    .await
+            ),
+            ("renewed".into(), Freshness::Fresh)
+        );
+        assert_eq!(fixture.requests().len(), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_renewal_in_flight_serves_the_cached_token_to_other_callers() {
+        let fixture = Fixture::new().await;
+        let provider = fixture
+            .provider(client_credentials())
+            .await;
+        let created = cache_a_token(&fixture, &provider).await;
+        let (_, slot) = fixture
+            .grant_slot(&provider, &[])
+            .await;
+        let renewing = slot.lock().await;
+        assert_eq!(
+            issued(
+                fixture
+                    .acquire(&provider, &[], seconds(created, 3300))
+                    .await
+            ),
+            ("issued".into(), Freshness::Cached)
+        );
+        drop(renewing);
+        assert_eq!(fixture.requests().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn never_stale_within_sixty_seconds_of_expiry() {
+        let fixture = Fixture::new().await;
+        let provider = fixture
+            .provider(client_credentials())
+            .await;
+        let created = cache_a_token(&fixture, &provider).await;
+        fixture.fail(true);
+        assert_eq!(
+            fixture
+                .acquire(&provider, &[], seconds(created, 3540))
+                .await
+                .err(),
+            Some(ServiceTokenError::TokenRequestFailed)
+        );
+        assert_eq!(
+            fixture
+                .acquire(&provider, &[], seconds(created, 3545))
+                .await
+                .err(),
+            Some(ServiceTokenError::TokenRequestFailed)
+        );
+        assert_eq!(fixture.requests().len(), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_token_living_two_minutes_or_less_is_never_stale() {
+        let fixture = Fixture::new().await;
+        let provider = fixture
+            .provider(client_credentials())
+            .await;
+        fixture.respond(json!({"access_token": "short", "token_type": "Bearer", "expires_in": 100}));
+        let created = cache_a_token(&fixture, &provider).await;
+        assert_eq!(
+            issued(
+                fixture
+                    .acquire(&provider, &[], seconds(created, 39))
+                    .await
+            ),
+            ("short".into(), Freshness::Cached)
+        );
+        fixture.fail(true);
+        assert_eq!(
+            fixture
+                .acquire(&provider, &[], seconds(created, 40))
+                .await
+                .err(),
+            Some(ServiceTokenError::TokenRequestFailed)
+        );
+        assert_eq!(fixture.requests().len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_provider_change_secret_or_policy_error_never_serves_a_stale_token() {
+        for expected in [
+            ServiceTokenError::ProviderChanged,
+            ServiceTokenError::SecretUnavailable,
+            ServiceTokenError::TokenEndpointRefused,
+        ] {
+            let mut fixture = Fixture::new().await;
+            let provider = fixture
+                .provider(client_credentials())
+                .await;
+            let created = cache_a_token(&fixture, &provider).await;
+            let mut requests = 1;
+            match expected {
+                ServiceTokenError::ProviderChanged => {
+                    let mut edited = provider.clone();
+                    edited.default_scopes = vec!["other".into()];
+                    fixture
+                        .providers
+                        .update(edited)
+                        .await
+                        .unwrap();
+                    requests = 2;
+                }
+                ServiceTokenError::SecretUnavailable => fixture
+                    .observed
+                    .values_missing
+                    .store(true, Ordering::SeqCst),
+                _ => fixture.egress.exact_allowlist = None,
+            }
+            assert_eq!(
+                fixture
+                    .acquire(&provider, &[], seconds(created, 3300))
+                    .await
+                    .err(),
+                Some(expected)
+            );
+            assert_eq!(fixture.requests().len(), requests, "{expected}");
+            assert_eq!(
+                fixture
+                    .only_stored()
+                    .await
+                    .access_token,
+                "issued"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -969,7 +1257,7 @@ mod tests {
                     .acquire(&provider, &[], Utc::now())
                     .await
             ),
-            ("wide".into(), false)
+            ("wide".into(), Freshness::Fresh)
         );
         let stored = fixture.only_stored().await;
         assert_eq!(stored.scopes, vec!["read", "write"]);
@@ -1110,14 +1398,14 @@ mod tests {
             let issued = token
                 .issued
                 .expect("expected an issued token");
-            (issued.cached, issued.insecure_endpoint)
+            (issued.freshness, issued.insecure_endpoint)
         };
         let now = Utc::now();
         let listed = fixture
             .acquire(&provider, &[], now)
             .await
             .unwrap();
-        assert_eq!(flags(listed), (false, false), "an exactly listed http endpoint meets the rule");
+        assert_eq!(flags(listed), (Freshness::Fresh, false), "an exactly listed http endpoint meets the rule");
 
         fixture.egress.exact_allowlist = None;
         fixture
@@ -1129,7 +1417,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(grandfathered.value(), "issued");
-        assert_eq!(flags(grandfathered), (true, true));
+        assert_eq!(flags(grandfathered), (Freshness::Cached, true));
 
         fixture
             .egress
@@ -1282,7 +1570,7 @@ mod tests {
                     .acquire(&provider, &["read"], now)
                     .await
             ),
-            ("issued".into(), true)
+            ("issued".into(), Freshness::Cached)
         );
         assert_eq!(
             fixture
@@ -1330,7 +1618,7 @@ mod tests {
                     .acquire(&provider, &["read"], now)
                     .await
             ),
-            ("after-rotation".into(), false)
+            ("after-rotation".into(), Freshness::Fresh)
         );
         let requests = fixture.requests();
         assert_eq!(requests.len(), 2);
@@ -1341,7 +1629,7 @@ mod tests {
                     .acquire(&provider, &["read"], now)
                     .await
             ),
-            ("after-rotation".into(), true)
+            ("after-rotation".into(), Freshness::Cached)
         );
     }
 
@@ -1372,7 +1660,7 @@ mod tests {
                     .acquire(&provider, &["read"], now)
                     .await
             ),
-            ("after-move".into(), false),
+            ("after-move".into(), Freshness::Fresh),
             "a moved secret is used in warn mode, under a new key"
         );
         fixture
@@ -1387,7 +1675,7 @@ mod tests {
                     .acquire(&provider, &["read"], now)
                     .await
             ),
-            ("after-move-back".into(), false)
+            ("after-move-back".into(), Freshness::Fresh)
         );
 
         let mut edited = provider.clone();
@@ -1404,7 +1692,7 @@ mod tests {
                     .acquire(&edited, &["read"], now)
                     .await
             ),
-            ("after-edit".into(), false)
+            ("after-edit".into(), Freshness::Fresh)
         );
         assert_eq!(fixture.requests().len(), 4);
         let mut identities: Vec<String> = fixture
@@ -1437,7 +1725,7 @@ mod tests {
                     .acquire(&provider, &["write", "read", "write"], now)
                     .await
             ),
-            ("both".into(), true)
+            ("both".into(), Freshness::Cached)
         );
         fixture.respond(json!({"access_token": "admin", "token_type": "Bearer", "expires_in": 3600}));
         assert_eq!(
@@ -1446,7 +1734,7 @@ mod tests {
                     .acquire(&provider, &["admin"], now)
                     .await
             ),
-            ("admin".into(), false)
+            ("admin".into(), Freshness::Fresh)
         );
         assert_eq!(fixture.requests().len(), 2);
     }
@@ -1527,7 +1815,7 @@ mod tests {
                     .acquire(&provider, &["read"], now)
                     .await
             ),
-            ("issued".into(), true),
+            ("issued".into(), Freshness::Cached),
             "warn mode keeps serving the cached token"
         );
         fixture
@@ -1637,7 +1925,7 @@ mod tests {
                 drop(held);
             }
         );
-        let results: Vec<(String, bool)> = results
+        let results: Vec<(String, Freshness)> = results
             .into_iter()
             .map(issued)
             .collect();
@@ -1649,7 +1937,7 @@ mod tests {
         assert_eq!(
             results
                 .iter()
-                .filter(|(_, cached)| *cached)
+                .filter(|(_, freshness)| *freshness == Freshness::Cached)
                 .count(),
             15
         );
@@ -1695,7 +1983,7 @@ mod tests {
                 .unwrap();
             drop(held);
         });
-        assert_eq!(issued(token), ("from-other-replica".into(), true));
+        assert_eq!(issued(token), ("from-other-replica".into(), Freshness::Cached));
         assert!(fixture.requests().is_empty());
     }
 
@@ -1715,7 +2003,7 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_secs(5), fixture.acquire(&provider, &["write"], now))
                 .await
                 .expect("a request for other scopes waited for another key's request");
-        assert_eq!(issued(other), ("write".into(), false));
+        assert_eq!(issued(other), ("write".into(), Freshness::Fresh));
         drop(held);
         fixture.respond(json!({"access_token": "read", "token_type": "Bearer", "expires_in": 3600}));
         assert_eq!(
@@ -1724,7 +2012,7 @@ mod tests {
                     .acquire(&provider, &["read"], now)
                     .await
             ),
-            ("read".into(), false)
+            ("read".into(), Freshness::Fresh)
         );
         assert_eq!(fixture.requests().len(), 2);
     }
@@ -1797,7 +2085,7 @@ mod tests {
             assert_eq!(fixture.requests().len(), requests, "{millis}");
         }
         fixture.fail(false);
-        assert_eq!(issued(attempt(15_000).await), ("issued".into(), false));
+        assert_eq!(issued(attempt(15_000).await), ("issued".into(), Freshness::Fresh));
 
         fixture.fail(true);
         let expired = 15_000 + 3_600_000;
@@ -1894,7 +2182,7 @@ mod tests {
                     .acquire(&provider, &["read"], now)
                     .await
             ),
-            ("issued".into(), false)
+            ("issued".into(), Freshness::Fresh)
         );
         assert_eq!(fixture.requests().len(), 1);
     }
@@ -1931,7 +2219,7 @@ mod tests {
                     .acquire(&edited, &["read"], now)
                     .await
             ),
-            ("issued".into(), false)
+            ("issued".into(), Freshness::Fresh)
         );
         assert_eq!(fixture.requests().len(), 2);
     }

@@ -16618,7 +16618,7 @@ mod target_auth_tests {
     use crate::secrets::SecretsStore;
     use serde_json::{Value, json};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 
     struct Fixture {
         surface: crate::config::agent_surface::AgentSurface,
@@ -16627,6 +16627,7 @@ mod target_auth_tests {
         vault: FileSystemDelegationVaultStore,
         egress: crate::delegation_vault::oauth::TokenEgress,
         token_requests: Arc<AtomicUsize>,
+        token_status: Arc<AtomicU16>,
         _server: tokio::task::JoinSet<()>,
         _directory: tempfile::TempDir,
     }
@@ -16635,12 +16636,15 @@ mod target_auth_tests {
         async fn new(token_status: u16) -> Self {
             let token_requests = Arc::new(AtomicUsize::new(0));
             let counter = token_requests.clone();
+            let token_status = Arc::new(AtomicU16::new(token_status));
+            let status = token_status.clone();
             let app = axum::Router::new().fallback(axum::routing::post(move || {
                 let counter = counter.clone();
+                let status = status.clone();
                 async move {
                     counter.fetch_add(1, Ordering::SeqCst);
                     (
-                        axum::http::StatusCode::from_u16(token_status).unwrap(),
+                        axum::http::StatusCode::from_u16(status.load(Ordering::SeqCst)).unwrap(),
                         axum::Json(
                             json!({"access_token": "provider-token", "token_type": "Bearer", "expires_in": 3600}),
                         ),
@@ -16732,6 +16736,7 @@ mod target_auth_tests {
                     policy: Default::default(),
                 },
                 token_requests,
+                token_status,
                 _server: server,
                 _directory: directory,
             }
@@ -16787,6 +16792,40 @@ mod target_auth_tests {
         );
         assert_eq!(stored[0].credential_provider_id, "machine");
         assert_eq!(stored[0].scopes, vec!["read"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cached_provider_token_is_still_injected_when_its_renewal_fails() {
+        let fixture = Fixture::new(200).await;
+        let auth = provider_auth("machine");
+        let context = fixture.context();
+        let inject = || inject_target_auth_header(&auth, &context, "surface", CallerAssertion::GatewayOriginated);
+        inject().await.unwrap();
+        let mut stored = fixture
+            .vault
+            .list_all()
+            .await
+            .unwrap()
+            .remove(0);
+        let now = chrono::Utc::now();
+        stored.created_at = now - chrono::Duration::seconds(3400);
+        stored.expires_at = Some(now + chrono::Duration::seconds(200));
+        fixture
+            .vault
+            .delete(&stored.id)
+            .await
+            .unwrap();
+        fixture
+            .vault
+            .store(stored)
+            .await
+            .unwrap();
+        fixture
+            .token_status
+            .store(500, Ordering::SeqCst);
+        let header = inject().await.unwrap();
+        assert_eq!(header, Some(("Authorization".to_string(), "Bearer provider-token".to_string())));
+        assert_eq!(fixture.requests(), 2, "the renewal was attempted");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

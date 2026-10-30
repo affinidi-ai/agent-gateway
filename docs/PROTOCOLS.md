@@ -62,7 +62,7 @@ sequenceDiagram
 | --- | --- |
 | `target.auth.fallback: reject` | 502 with the generic detail "Target authentication failed" when the secret cannot be read or the provider's token request fails. The cause is logged only. |
 | `target.auth.fallback: passthrough` | Fetches without the credential. |
-| Provider token | Requested once, then reused from the vault until 60 seconds before it expires. |
+| Provider token | Requested once, then reused from the vault and renewed up to 5 minutes before it expires. While a renewal fails, the cached token is still used until 60 seconds before it expires. |
 | Caller headers | Only `Accept`, `Accept-Language`, and `User-Agent` are forwarded while the credential is attached, so an anonymous caller can neither override the credential nor add identity or forwarding headers. |
 | Redirects | The client is pinned to the vetted target address with redirects disabled, so the credential cannot follow a 3xx to another host. A 3xx answers 502 "Upstream redirected". |
 | Blocked by egress policy | 403 |

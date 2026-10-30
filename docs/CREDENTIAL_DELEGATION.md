@@ -131,8 +131,17 @@ that needs one: legacy and `2026-07-28` delegation bindings, and target authenti
   endpoint refused by egress policy"); RFC 1918 addresses stay allowed. Under
   `AG_TEST_MODE=true`, `AG_BDD_OAUTH_ENDPOINT_ALLOWLIST` admits listed loopback test endpoints
   (never cloud metadata).
-- An issued token is cached in the delegation vault until 60 seconds before its `expires_at`,
-  then a new one is requested. Its key is `<purpose>:<hash>`, where the hash is the hex SHA-256
+- An issued token is cached in the delegation vault and renewed half its lifetime before its
+  `expires_at`, but at most 5 minutes and at least 60 seconds before (a one-hour token is
+  renewed 5 minutes early, a 100-second one 60 seconds early). One request renews it while the
+  others keep using the cached token. When the renewal fails at the token endpoint
+  (`TokenRequestFailed`, `ScopeMismatch`) or is held back by the retry backoff, the cached token
+  is still used, marked stale, until 60 seconds before it expires; after that the request fails.
+  A legacy binding's audit detail then reads `<grant>_stale` (for example
+  `client_credentials_stale`) in place of `<grant>_cached` or `<grant>_fresh`, and each use
+  logs a warning.
+  A changed provider, a missing secret, a secrets store or vault error, or a token endpoint the
+  egress or https rule refuses never serves the stale token. Its key is `<purpose>:<hash>`, where the hash is the hex SHA-256
   of the provider's digest, the sorted, deduplicated scopes, and the id, tenant and `updated_at`
   of every secret the provider references (client ID, client secret, signing key,
   certificate). Editing the provider, rotating one of its secrets or moving a secret to another
@@ -525,7 +534,8 @@ A lookup has four outcomes.
 | Not found | Applies the consent mode |
 
 For a service token, one within 60 seconds of expiry counts as expired and is replaced by a
-fresh one, since no user is involved.
+fresh one, since no user is involved. It is renewed up to 5 minutes before that and, while the
+renewal fails, served stale until then (see [Service tokens](#service-tokens)).
 
 ### Storage
 
