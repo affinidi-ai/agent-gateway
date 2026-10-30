@@ -148,6 +148,19 @@ already `"off"`; it may choose any other level. See
 | Integrations, their endpoints and event sets (`/v1/integrations`) | No, `403` | No, `403`; integrations describe the whole appliance, so a tenant or resource-scoped PAT can neither read nor change them, and none can be given a tenant owner |
 | Connection Points of an appliance-wide Gateway | List, read, metrics and messages | No, `403` on create, update, delete, exposed surfaces, use, reconnect, and marking or deleting messages. Connection Points are created only on the appliance's own Gateway, which is appliance-wide, so a tenant PAT cannot create Connection Points |
 
+A tenant surface may reference an appliance-wide record in general, with one exception: it
+may not send the appliance's own credential upstream. An appliance-wide secret used as
+`static_secret` Target authentication, and an appliance-wide `api_key`, client-credentials
+or JWT bearer credential provider used for Target authentication or in
+`outbound_credentials` or `transit_credentials`, are refused with `400` when a save adds
+them, and a tenant credential provider may not reference an appliance-wide secret. A
+reference the stored surface already held is kept in the default `warn` mode and refused
+once `credential_policy.tenant_credential_isolation` is `enforce` (see
+[`CONFIGURATION_RELOAD.md`](CONFIGURATION_RELOAD.md#credential-policy)). Appliance-wide
+secrets stay usable for caller authentication, and an appliance-wide
+`oauth2_authorization_code` provider stays usable. See
+[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#tenant-isolation-on-a-surfaces-upstream-legs).
+
 Peers that arrive through the inbound Fabric handshake are always appliance-wide, so a tenant
 PAT cannot approve, rename or reconfigure them. Approving one needs an appliance-wide
 credential, because an active appliance-wide peer reaches every tenant's Fabric surfaces.
@@ -221,7 +234,9 @@ to discover through a stored MCP Proxy rather than a caller-supplied endpoint.
 Ownership changes are administrator-only: `GET
 /v1/tenant-ownership/{kind}/{id}/impact` reports incoming/outgoing references and
 `PUT /v1/tenant-ownership/{kind}/{id}` changes `tenant_id`, returning `409` if any
-reference would become incompatible. The self Gateway and built-in Surface
+reference would become incompatible, including a tenant surface or credential provider that
+would end up sending an appliance-wide secret or credential provider upstream (an existing
+one is only refused when `tenant_credential_isolation` is `enforce`). The self Gateway and built-in Surface
 Templates are immovable, and so is a mediator provided by the mediator directory (`409`);
 child API keys and Connection Points move with their parent.
 

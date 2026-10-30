@@ -3,29 +3,50 @@ use std::collections::HashSet;
 use crate::a2a_proxies::A2aProxyStore;
 use crate::auth_manager::pat::PatResourceScope;
 use crate::config::agent_surface::{AgentSurface, McpToolGatingConfig};
+use crate::config::credential_policy::RuleMode;
 use crate::config::{TargetAuthConfig, TargetAuthMethod};
 use crate::gateways::GatewayStore;
 use crate::identity::state::IdentityApiState;
 use crate::issuers::IssuerStore;
 use crate::mcp_proxies::McpProxyStore;
 use crate::surfaces::AgentSurfaceStore;
-use crate::tenancy::{PatTenantContext, ResourceKind, can_reference, scope_allows_resource};
+use crate::tenancy::{
+    PatTenantContext, ResourceKind, SurfaceTenancy, can_reference, can_reference_with_rule, scope_allows_resource,
+};
 use crate::trust_registries::TrustRegistryStore;
 
 use super::surfaces::SurfaceApiError;
 
+/// Validates the resources a surface references. A tenant surface may not send an
+/// appliance-wide secret or credential provider upstream: a reference that breaks that
+/// rule is refused when it is new, and when `tenant_credential_isolation` is `enforce` even
+/// when `stored` (the surface as stored, if any) already held it.
 pub async fn validate_surface_references(
     state: &IdentityApiState,
     surface: &AgentSurface,
+    stored: Option<&AgentSurface>,
     context: Option<&PatTenantContext>,
     scope: Option<&PatResourceScope>,
 ) -> Result<(), SurfaceApiError> {
+    let isolation = crate::config::credential_policy::credential_policy().tenant_credential_isolation;
+    let grandfathered = match stored {
+        Some(stored) if stored.tenant_id == surface.tenant_id => collect_surface_reference_keys(stored)
+            .map(|keys| {
+                keys.into_iter()
+                    .map(|key| (key.kind, key.id))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
     let authorizer = ReferenceAuthorizer {
         state,
         owner_tenant_id: surface.tenant_id.as_deref(),
         context,
         scope,
         current_surface_id: &surface.surface_id,
+        isolation,
+        grandfathered,
     };
 
     for reference in collect_surface_reference_keys(surface)? {
@@ -89,6 +110,8 @@ async fn validate_target_auth_methods(
 pub(crate) struct SurfaceReferenceKey {
     pub kind: ResourceKind,
     pub id: String,
+    /// A secret a tenant surface sends upstream, which must not be appliance-wide.
+    pub same_tenant: bool,
 }
 
 pub(crate) fn collect_surface_reference_keys(
@@ -107,7 +130,13 @@ pub(crate) fn collect_surface_reference_keys(
             .cmp(right.kind.as_str())
             .then_with(|| left.id.cmp(&right.id))
     });
-    references.dedup_by(|left, right| left.kind == right.kind && left.id == right.id);
+    references.dedup_by(|later, kept| {
+        let duplicate = later.kind == kept.kind && later.id == kept.id;
+        if duplicate {
+            kept.same_tenant |= later.same_tenant;
+        }
+        duplicate
+    });
     Ok(references)
 }
 
@@ -141,9 +170,19 @@ struct ReferenceAuthorizer<'a> {
     context: Option<&'a PatTenantContext>,
     scope: Option<&'a PatResourceScope>,
     current_surface_id: &'a str,
+    isolation: RuleMode,
+    grandfathered: Vec<(ResourceKind, String)>,
 }
 
 impl ReferenceAuthorizer<'_> {
+    fn rule_for(
+        &self,
+        kind: ResourceKind,
+        id: &str,
+    ) -> RuleMode {
+        reference_rule(&self.grandfathered, self.isolation, kind, id)
+    }
+
     async fn validate_reference(
         &self,
         reference: &SurfaceReferenceKey,
@@ -158,7 +197,7 @@ impl ReferenceAuthorizer<'_> {
                     .await
             }
             ResourceKind::Secrets => {
-                self.secret(&reference.id)
+                self.secret(&reference.id, reference.same_tenant)
                     .await
             }
             ResourceKind::Certificates => {
@@ -248,6 +287,7 @@ impl ReferenceAuthorizer<'_> {
     async fn secret(
         &self,
         id: &str,
+        same_tenant: bool,
     ) -> Result<(), SurfaceApiError> {
         let store = self
             .state
@@ -259,7 +299,17 @@ impl ReferenceAuthorizer<'_> {
             .await
             .map_err(|error| internal("Secret", error))?
             .ok_or_else(|| inaccessible("Secret"))?;
-        self.ensure(resource.tenant_id.as_deref(), ResourceKind::Secrets, &resource.secret_id, "Secret")
+        self.ensure(resource.tenant_id.as_deref(), ResourceKind::Secrets, &resource.secret_id, "Secret")?;
+        if same_tenant
+            && !can_reference_with_rule(
+                self.owner_tenant_id,
+                resource.tenant_id.as_deref(),
+                self.rule_for(ResourceKind::Secrets, id),
+            )
+        {
+            return Err(inaccessible("Secret"));
+        }
+        Ok(())
     }
 
     async fn certificate(
@@ -315,6 +365,13 @@ impl ReferenceAuthorizer<'_> {
             .await
             .map_err(|error| internal("Credential provider", error))?
             .ok_or_else(|| inaccessible("Credential provider"))?;
+        let tenancy = SurfaceTenancy {
+            tenant_id: self.owner_tenant_id,
+            mode: self.rule_for(ResourceKind::CredentialProviders, id),
+        };
+        if !resource.usable_by(tenancy) {
+            return Err(inaccessible("Credential provider"));
+        }
         self.ensure(
             resource.tenant_id.as_deref(),
             ResourceKind::CredentialProviders,
@@ -414,6 +471,24 @@ impl ReferenceAuthorizer<'_> {
             &resource.surface_id,
             "API-key parent Surface",
         )
+    }
+}
+
+/// How strictly a reference is held to tenant isolation: one the stored surface already
+/// held (`grandfathered`) is held only to `isolation`, any other is held to `enforce`.
+fn reference_rule(
+    grandfathered: &[(ResourceKind, String)],
+    isolation: RuleMode,
+    kind: ResourceKind,
+    id: &str,
+) -> RuleMode {
+    if grandfathered
+        .iter()
+        .any(|(stored_kind, stored_id)| *stored_kind == kind && stored_id == id)
+    {
+        isolation
+    } else {
+        RuleMode::Enforce
     }
 }
 
@@ -562,7 +637,7 @@ fn collect_target_auth_reference(
 ) {
     match authentication.map(|authentication| &authentication.method) {
         Some(TargetAuthMethod::StaticSecret { secret_id, .. }) => {
-            push_reference(references, ResourceKind::Secrets, secret_id)
+            push_reference_with_rule(references, ResourceKind::Secrets, secret_id, true)
         }
         Some(TargetAuthMethod::CredentialProvider { provider_id, .. }) => {
             push_reference(references, ResourceKind::CredentialProviders, provider_id)
@@ -636,8 +711,21 @@ fn push_reference(
     kind: ResourceKind,
     id: &str,
 ) {
+    push_reference_with_rule(references, kind, id, false);
+}
+
+fn push_reference_with_rule(
+    references: &mut Vec<SurfaceReferenceKey>,
+    kind: ResourceKind,
+    id: &str,
+    same_tenant: bool,
+) {
     if !id.trim().is_empty() {
-        references.push(SurfaceReferenceKey { kind, id: id.to_string() });
+        references.push(SurfaceReferenceKey {
+            kind,
+            id: id.to_string(),
+            same_tenant,
+        });
     }
 }
 
@@ -820,6 +908,103 @@ mod tests {
             .collect();
 
         assert_eq!(providers, HashSet::from(["cp-target".to_string(), "cp-partner".to_string()]));
+    }
+
+    fn static_secret_auth(secret_id: &str) -> crate::config::TargetAuthConfig {
+        serde_json::from_value(
+            serde_json::json!({"method": {"static_secret": {"secret_id": secret_id, "header_name": "x-key"}}}),
+        )
+        .unwrap()
+    }
+
+    fn key<'a>(
+        keys: &'a [SurfaceReferenceKey],
+        kind: ResourceKind,
+        id: &str,
+    ) -> &'a SurfaceReferenceKey {
+        keys.iter()
+            .find(|key| key.kind == kind && key.id == id)
+            .unwrap()
+    }
+
+    #[test]
+    fn the_target_auth_secret_of_the_target_and_each_transit_point_must_be_same_tenant_and_a_caller_secret_need_not() {
+        let mut surface = AgentSurface::default();
+        surface.target.auth = Some(static_secret_auth("target-secret"));
+        surface.access_point.caller_authentication = Some(
+            serde_json::from_value(serde_json::json!({"methods": [
+                {"type": "api_key", "extraction": {"source": "http_header", "field": "x-api-key"}, "secret_id": "caller-secret"}
+            ]}))
+            .unwrap(),
+        );
+        let mut point = transit_point("partner", "tr-partner");
+        point.target_auth = Some(static_secret_auth("point-secret"));
+        surface.transit = Some(crate::config::agent_surface::TransitConfig {
+            points: vec![point],
+            outbound_listen_address: None,
+            shared: Default::default(),
+        });
+
+        let keys = collect_surface_reference_keys(&surface).unwrap();
+
+        assert!(key(&keys, ResourceKind::Secrets, "target-secret").same_tenant);
+        assert!(key(&keys, ResourceKind::Secrets, "point-secret").same_tenant);
+        assert!(!key(&keys, ResourceKind::Secrets, "caller-secret").same_tenant);
+    }
+
+    #[test]
+    fn a_secret_used_as_target_auth_and_elsewhere_stays_same_tenant_after_deduplication() {
+        let mut surface = AgentSurface::default();
+        surface.target.auth = Some(static_secret_auth("shared-secret"));
+        surface.access_point.caller_authentication = Some(
+            serde_json::from_value(serde_json::json!({"methods": [
+                {"type": "api_key", "extraction": {"source": "http_header", "field": "x-api-key"}, "secret_id": "shared-secret"}
+            ]}))
+            .unwrap(),
+        );
+
+        let keys = collect_surface_reference_keys(&surface).unwrap();
+
+        let shared: Vec<_> = keys
+            .iter()
+            .filter(|key| key.kind == ResourceKind::Secrets)
+            .collect();
+        assert_eq!(shared.len(), 1);
+        assert!(shared[0].same_tenant);
+    }
+
+    #[test]
+    fn a_stored_reference_is_held_to_the_mode_and_a_new_one_always_to_enforce() {
+        let stored = vec![(ResourceKind::Secrets, "old".to_string())];
+
+        assert_eq!(reference_rule(&stored, RuleMode::Warn, ResourceKind::Secrets, "old"), RuleMode::Warn);
+        assert_eq!(reference_rule(&stored, RuleMode::Enforce, ResourceKind::Secrets, "old"), RuleMode::Enforce);
+        assert_eq!(reference_rule(&stored, RuleMode::Warn, ResourceKind::Secrets, "new"), RuleMode::Enforce);
+        assert_eq!(
+            reference_rule(&stored, RuleMode::Warn, ResourceKind::CredentialProviders, "old"),
+            RuleMode::Enforce
+        );
+        assert_eq!(reference_rule(&[], RuleMode::Warn, ResourceKind::Secrets, "old"), RuleMode::Enforce);
+    }
+
+    #[test]
+    fn an_appliance_wide_secret_is_refused_on_a_tenant_surface_when_new_and_when_enforced_but_not_when_stored_in_warn_mode()
+     {
+        let stored = vec![(ResourceKind::Secrets, "old".to_string())];
+        let allowed = |isolation: RuleMode, id: &str, secret_tenant: Option<&str>| {
+            can_reference_with_rule(
+                Some("tenant-a"),
+                secret_tenant,
+                reference_rule(&stored, isolation, ResourceKind::Secrets, id),
+            )
+        };
+
+        assert!(!allowed(RuleMode::Warn, "new", None));
+        assert!(allowed(RuleMode::Warn, "old", None));
+        assert!(!allowed(RuleMode::Enforce, "old", None));
+        assert!(allowed(RuleMode::Warn, "new", Some("tenant-a")));
+        assert!(allowed(RuleMode::Enforce, "new", Some("tenant-a")));
+        assert!(!allowed(RuleMode::Warn, "old", Some("tenant-b")));
     }
 
     #[test]

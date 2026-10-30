@@ -1786,6 +1786,7 @@ pub async fn create_surface(
     super::surface_tenancy::validate_surface_references(
         &state,
         &surface,
+        None,
         tenant_context(&context),
         resource_scope(&scope),
     )
@@ -2627,7 +2628,7 @@ async fn validate_and_save_surface(
             .transit_token_max_lifetime_secs,
         existing,
     )?;
-    super::surface_tenancy::validate_surface_references(state, &surface, context, scope).await?;
+    super::surface_tenancy::validate_surface_references(state, &surface, existing, context, scope).await?;
     validate_listen_path_collisions(&surface, store, &state.network_config).await?;
     validate_access_point_route_collisions(&surface, store, &state.network_config).await?;
     validate_surface_payment_policies(&mut surface).await?;

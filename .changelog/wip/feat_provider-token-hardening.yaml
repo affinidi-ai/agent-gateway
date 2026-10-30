@@ -26,6 +26,14 @@ changes:
         tenant; an appliance-wide secret no longer counts for a tenant provider. Validate
         applies the same rule to a signing key or certificate. Stored references keep working
         while credential_policy tenant_credential_isolation is warn.
+    - timestamp: '2026-10-30T22:30:00Z'
+      title: Refuse new appliance-wide credentials on tenant surfaces when saving
+      description: >-
+        Saving a tenant surface that newly names an appliance-wide secret for static secret
+        Target authentication, or an appliance-wide API key, client credentials or JWT
+        bearer provider, is refused with 400, and a tenant reassignment that would create
+        such a reference answers 409. References already stored are kept until
+        credential_policy tenant_credential_isolation is enforce.
   fixed: []
   removed: []
   security:
