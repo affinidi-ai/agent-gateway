@@ -279,10 +279,28 @@ enforced. The admin API refuses a surface that sets it, on the surface or in a v
 overrides, with `400`. A surface stored with it still loads, with a warning in the log, but
 its Transit Points refuse every request with `503` in the same way.
 
-The Surface Builder shows neither a Transit Point's `source_auth` nor its
-`allow_unauthenticated_callers`. These rules hold for a `PUT` of the surface and for a `PUT`
+The Surface Builder's Transit Point panel has a **Who can call this Transit Point** section
+with the transit token switch, a **Caller authentication** choice (an API key from the secret
+store or from the provider, or a JWT bearer with its strategy, audiences, token header and
+scheme), and an **Open to any caller** switch that asks for confirmation. The switch shows
+while the Transit Point has no transit token, `source_auth` or `mcp_http.authorization`, and
+while it is already marked open; choosing the token or a method turns the marking off. An
+empty token scheme is allowed: the gateway then reads the token as the raw header value. The
+API key provider validates the surface's own keys, the same keys an Access Point using the
+provider accepts, so the panel warns that the Access Point's callers can call the Transit Point
+too; an API key from the secret store keeps a separate set of callers. A dashboard save writes
+the provider's `agent_id` from the surface being saved, so a Transit Point copied from a
+template accepts the new surface's keys, not the original's. A `source_auth` set through the API with
+mTLS shows as such and is kept; the panel does not edit it, nor DID Auth, which a Transit
+Point does not support. The panel applies the rules above before the save: a Transit Point that
+authenticates no caller and is not open, one that is open beside the token or a method, and a
+method that is missing its secret, header, strategy or audience cannot be saved, and the panel
+says why. A refusal from the admin API shows in the same section in plain words. Turning
+caller authentication off sends `"source_auth": null`.
+
+These rules hold for a `PUT` of the surface and for a `PUT`
 of one variant (`PUT /v1/surfaces/{id}/variants/{variant_id}`), for the Transit Points its
-overrides list. An omitted `source_auth` in a `PUT`, as in a dashboard save, keeps the stored
+overrides list. An omitted `source_auth` in a `PUT` keeps the stored
 one; `"source_auth": null` removes it, and so does a merge `PATCH` of the surface or the
 variant whose `transit.points` leave it out, since a merge patch replaces the whole list. The
 save rules above then apply, so a Transit Point left with no caller authentication is refused
@@ -293,7 +311,7 @@ authenticates no caller, and drops it once the Transit Point authenticates its c
 an `id` gets a new one, so a `PUT` that omits both the `id` and `source_auth` drops the stored
 `source_auth`: a Transit Point that still requires a transit token is saved, authenticated by
 the token alone, and one that does not is refused with `400`. Send each Transit Point's `id`
-back.
+back. A write's `transit_point_source_auth` is ignored (see below), so the dashboard never sends it.
 
 ### Upgrading and rolling back
 
@@ -425,7 +443,17 @@ answered with a `Warning` header naming those URLs and bind addresses:
 Warning: 299 - "Transit Point 'crm' serves callers it does not authenticate and is reachable from other hosts: 0.0.0.0:8080, https://gateway.example.com"
 ```
 
-The dashboard does not show this header; read it from the admin API's answer or the log.
+This warning, and the shared-audience and shared-issuer warnings above, name a Transit Point
+that a variant's overrides define as `Transit Point 'crm' in variant 'beta'`. A Transit Point a
+variant inherits from the surface is named as the surface's own, once.
+
+The dashboard shows each such header on the Transit Point it names, in its **Who can call
+this Transit Point** section and in a toast, and keeps it there until that Transit Point's
+token, caller authentication, open marking or listener changes. Before the save it shows the
+same text when an open Transit Point's listener URL is one other hosts reach; that check sees
+only external URLs, so the header, which also counts bind addresses and shared-domain inbound
+listeners, is the complete answer. The same headers carry the shared audience and shared
+issuer warnings, shown the same way.
 
 When the outbound listener mounts the surface it logs the same text at `WARN`, and logs
 every other Transit Point that serves callers it does not authenticate at `WARN` too.

@@ -19,6 +19,26 @@ describe('showToast', () => {
     jest.useRealTimers();
   });
 
+  describe('a save with warnings', () => {
+    it('shows the saved message and every warning in the one toast, one per line', () => {
+      showToast('error', 'Saved, with warnings:\nfirst warning\nsecond warning');
+      expect(document.querySelectorAll('#app-toast')).toHaveLength(1);
+      const toast = getToast();
+      expect(toast.textContent).toContain('Saved, with warnings:');
+      expect(toast.textContent).toContain('first warning');
+      expect(toast.textContent).toContain('second warning');
+      expect((toast.querySelector('span[style*="pre-line"]') as HTMLElement).style.whiteSpace).toBe(
+        'pre-line'
+      );
+    });
+
+    it('is replaced by a later toast, which is why a save sends one', () => {
+      showToast('success', 'saved');
+      showToast('error', 'a warning');
+      expect(getToast().textContent).not.toContain('saved');
+    });
+  });
+
   describe('text rendering', () => {
     it('renders markup in the message literally and adds no element for it', () => {
       showToast('error', PAYLOAD);

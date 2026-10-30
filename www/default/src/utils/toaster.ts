@@ -104,6 +104,7 @@ export const showToast = (
   if (body) {
     const message = document.createElement('span');
     message.style.fontSize = '0.9em';
+    message.style.whiteSpace = 'pre-line';
     message.textContent = text;
     body.appendChild(message);
 

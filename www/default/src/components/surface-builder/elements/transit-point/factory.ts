@@ -19,6 +19,7 @@ import {
   transitPointTrustCheckListToWire,
 } from '../trust-check/definition';
 import { DOCS_URL } from '../../../../config/docs';
+import { callerAuthProblems, callerAuthToWire } from './callerAuth';
 
 /**
  * Pattern that a transit point alias MUST match. Mirrors the backend
@@ -160,9 +161,10 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
         presented to the destination.</li>
         <li><strong>Transit credentials</strong>: user-consented
         credential injection (OAuth-style) per provider.</li>
-        <li><strong>Require transit token</strong>: demand a signed
-        transit token from the caller before routing through this
-        route.</li>
+        <li><strong>Who can call this Transit Point</strong>: demand a
+        signed transit token from the caller, check a credential the
+        caller holds (API key or JWT), or mark the route open to any
+        caller. It must do one of them.</li>
         <li><strong>Listen address / path</strong>: choose the outbound
         listener for this route.</li>
       </ul>
@@ -196,6 +198,11 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
       const errs: Array<{ field?: string; message: string }> = [];
       const e = urlError('target_endpoint', c.target_endpoint, 'Target endpoint');
       if (e) errs.push(e);
+      // The gateway refuses a Transit Point that authenticates no caller and is
+      // not open to any, so the save is blocked here with its reason.
+      for (const message of callerAuthProblems(c)) {
+        errs.push({ field: 'caller_authentication', message });
+      }
       return errs;
     },
     // A transit point's listen address must be an actual outbound listener
@@ -400,6 +407,7 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
                     ? { header_metadata_mapping: headerMetadataMapping }
                     : {}),
                   require_transit_token: c.require_transit_token !== false,
+                  ...callerAuthToWire(c, ctx.surfaceMeta.surface_id),
                   ...(typeof c.target_endpoint === 'string' &&
                   c.target_endpoint.startsWith('fabric://') &&
                   c.fabric_delegated_credentials === true
