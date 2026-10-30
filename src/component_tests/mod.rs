@@ -26,6 +26,7 @@ mod mcp_record_compat;
 mod mcp_sandbox_e2e;
 mod mcp_subscription_scope;
 mod mtls;
+mod multi_method_source_auth_e2e;
 mod stored_reference_transit_token_e2e;
 mod target_auth_provider_e2e;
 mod tenant_credential_save_e2e;

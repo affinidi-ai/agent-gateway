@@ -399,12 +399,61 @@ impl GatewayConfig {
 
 /// Validate a loaded surface's `source_auth` at boot: every rule of a save but
 /// the DID Auth session TTL bound, which a stored value is held to at runtime
-/// (see [`GatewayConfig::did_auth_session_ttl_adjustments`]).
+/// (see [`GatewayConfig::did_auth_session_ttl_adjustments`]). A
+/// `from_jwt_claim` identity beside a method other than `jwt_bearer`, and an
+/// inbound `from_api_key` identity beside a method other than an API key, are
+/// only warned about here: stored surfaces predating the rule booted with
+/// them, and saving them enforces it.
 fn validate_source_auth_surface(surface: &crate::config::agent_surface::AgentSurface) -> anyhow::Result<()> {
-    match surface.source_auth() {
-        Some(src) => validate_stored_source_auth_method(src, &surface.name),
-        None => Ok(()),
+    use crate::source_auth::SourceAuthConfig;
+
+    validate_stored_source_auth_methods(surface)?;
+    if let Err(error) = validate_jwt_claim_identity(surface) {
+        warn!("{error}; callers that authenticate with another method are refused until the surface is fixed");
     }
+    if surface.inbound_identity_from_api_key()
+        && surface
+            .source_auth_methods()
+            .iter()
+            .any(|method| !matches!(method, SourceAuthConfig::ApiKey(_) | SourceAuthConfig::ApiKeyProvider(_)))
+    {
+        warn!(
+            "Channel '{}': inbound identity from_api_key requires every source authentication method to be api_key \
+             or api_key_provider; callers that authenticate with another method are refused until the surface is fixed",
+            surface.name
+        );
+    }
+    Ok(())
+}
+
+/// Serve a stored surface whose source authentication methods break the
+/// rules for several methods with its first method alone, the only one the
+/// gateway enforced before those rules, when that method is valid on its own.
+/// Returns the rule broken; the caller logs it and persists the surface.
+pub fn fall_back_to_first_source_auth_method(
+    surface: &mut crate::config::agent_surface::AgentSurface
+) -> Option<String> {
+    let error = validate_stored_source_auth_methods(surface).err()?;
+    let mut first_only = surface.clone();
+    first_only
+        .access_point
+        .caller_authentication
+        .as_mut()?
+        .methods
+        .truncate(1);
+    validate_stored_source_auth_methods(&first_only).ok()?;
+    *surface = first_only;
+    Some(error.to_string())
+}
+
+/// The rules a stored surface's source authentication methods must meet to
+/// load: each method's own, and those that let a request select one method.
+fn validate_stored_source_auth_methods(surface: &crate::config::agent_surface::AgentSurface) -> anyhow::Result<()> {
+    let methods = surface.source_auth_methods();
+    for method in methods {
+        validate_stored_source_auth_method(method, &surface.name)?;
+    }
+    validate_method_selection(methods, &surface.name)
 }
 
 /// Validate a surface's `source_auth` configuration on the HTTP save path
@@ -413,16 +462,20 @@ fn validate_source_auth_surface(surface: &crate::config::agent_surface::AgentSur
 ///
 /// Enforces the mTLS trust rules the runtime relies on, every
 /// `DidAuthAuthConfig` invariant boot also checks (see
-/// [`validate_did_auth_config`]), and the DID Auth session TTL bound on every
+/// [`validate_did_auth_config`]), the DID Auth session TTL bound on every
 /// method that mints sessions, the surface's and each variant's
 /// ([`AgentSurface::session_did_auth_configs`](crate::config::agent_surface::AgentSurface::session_did_auth_configs)),
-/// unless `stored`, the surface as stored, has the same TTL in the same place.
+/// unless `stored`, the surface as stored, has the same TTL in the same place,
+/// the rules that let a request select one method (each method reads its own
+/// credential location, at most one is DID Auth), and the `from_jwt_claim`
+/// rule boot only warns about.
 pub fn validate_source_auth_config(
     surface: &crate::config::agent_surface::AgentSurface,
     stored: Option<&crate::config::agent_surface::AgentSurface>,
 ) -> anyhow::Result<()> {
-    if let Some(src) = surface.source_auth() {
-        validate_stored_source_auth_method(src, &surface.name)?;
+    let methods = surface.source_auth_methods();
+    for method in methods {
+        validate_stored_source_auth_method(method, &surface.name)?;
     }
     let stored_configs = stored.map_or_else(Vec::new, |stored| stored.session_did_auth_configs());
     for (variant, cfg) in surface.session_did_auth_configs() {
@@ -437,7 +490,8 @@ pub fn validate_source_auth_config(
             validate_session_ttl_bound(cfg.session_ttl_seconds, &surface.name, &place)?;
         }
     }
-    Ok(())
+    validate_method_selection(methods, &surface.name)?;
+    validate_jwt_claim_identity(surface)
 }
 
 /// Validate one source authentication method being saved, set on the Access
@@ -524,6 +578,100 @@ fn validate_stored_source_auth_method(
         },
         SourceAuthConfig::JwtBearer(_) | SourceAuthConfig::ApiKey(_) | SourceAuthConfig::ApiKeyProvider(_) => {}
         SourceAuthConfig::DidAuth(cfg) => validate_did_auth_config(cfg, surface_name)?,
+    }
+    Ok(())
+}
+
+/// A request selects its method by the credential it carries, so two methods
+/// reading the same location would be indistinguishable, and a method reading
+/// the request body, where no credential is looked for, could only ever be the
+/// fallback.
+fn validate_method_selection(
+    methods: &[crate::source_auth::SourceAuthConfig],
+    surface_name: &str,
+) -> anyhow::Result<()> {
+    use crate::source_auth::models::{CredentialSource, SourceAuthConfig};
+
+    let describe = |source: CredentialSource<'_>| match source {
+        CredentialSource::Header(name) => format!("the '{name}' header"),
+        CredentialSource::McpMeta => "MCP _meta".to_string(),
+        CredentialSource::A2aExtension => "the A2A message extension".to_string(),
+        CredentialSource::ClientCertificate => "the client certificate".to_string(),
+    };
+    for (position, method) in methods.iter().enumerate() {
+        let source = method.credential_source();
+        if methods.len() > 1 && matches!(source, CredentialSource::McpMeta | CredentialSource::A2aExtension) {
+            anyhow::bail!(
+                "Channel '{}': source authentication method {} ({}) reads {}; with more than one method, each must read a header or the client certificate",
+                surface_name,
+                position + 1,
+                method.method_tag(),
+                describe(source)
+            );
+        }
+        if let Some(earlier_position) = methods[..position]
+            .iter()
+            .position(|earlier| {
+                earlier
+                    .credential_source()
+                    .same_as(&source)
+            })
+        {
+            anyhow::bail!(
+                "Channel '{}': source authentication methods {} ({}) and {} ({}) both read {}; each method needs its own credential location",
+                surface_name,
+                earlier_position + 1,
+                methods[earlier_position].method_tag(),
+                position + 1,
+                method.method_tag(),
+                describe(source)
+            );
+        }
+    }
+    if methods
+        .iter()
+        .filter(|method| matches!(method, SourceAuthConfig::DidAuth(_)))
+        .count()
+        > 1
+    {
+        anyhow::bail!("Channel '{}': source authentication allows at most one did_auth method", surface_name);
+    }
+    Ok(())
+}
+
+/// `from_jwt_claim` derives a DID from the caller's verified JWT, so every
+/// caller must authenticate with a JWT.
+fn validate_jwt_claim_identity(surface: &crate::config::agent_surface::AgentSurface) -> anyhow::Result<()> {
+    use crate::source_auth::{ManagedIdentityConfig, SourceAuthConfig};
+
+    let transit_identities = surface
+        .transit
+        .iter()
+        .flat_map(|transit| transit.points.iter())
+        .filter_map(|point| point.managed_identity.clone());
+    let uses_jwt_claim = [
+        surface
+            .inbound_identity()
+            .cloned(),
+        surface
+            .external_identity()
+            .cloned(),
+        surface.managed_identity(),
+    ]
+    .into_iter()
+    .flatten()
+    .chain(transit_identities)
+    .any(|identity| matches!(identity, ManagedIdentityConfig::FromJwtClaim { .. }));
+    if uses_jwt_claim
+        && surface
+            .source_auth_methods()
+            .iter()
+            .any(|method| !matches!(method, SourceAuthConfig::JwtBearer(_)))
+    {
+        anyhow::bail!(
+            "Channel '{}': from_jwt_claim identity requires every source authentication method to be jwt_bearer",
+            surface.name
+        );
     }
     Ok(())
 }
@@ -634,6 +782,207 @@ fn ignored_transit_token_max_lifetime(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn surface_with_caller_auth(
+        methods: serde_json::Value,
+        extra: serde_json::Value,
+    ) -> crate::config::agent_surface::AgentSurface {
+        let mut surface = serde_json::json!({
+            "surface_id": "s1",
+            "name": "multi",
+            "access_point": {
+                "listen_address": "0.0.0.0:8443",
+                "route": "/multi",
+                "protocol": "a2a",
+                "caller_authentication": { "methods": methods }
+            },
+            "target": { "endpoint": "https://agent.internal" }
+        });
+        if let (Some(surface), Some(extra)) = (surface.as_object_mut(), extra.as_object()) {
+            surface.extend(extra.clone());
+        }
+        serde_json::from_value(surface).unwrap()
+    }
+
+    fn jwt_method() -> serde_json::Value {
+        serde_json::json!({"type": "jwt_bearer", "jwt_verification_strategy_id": "strat-1", "audiences": []})
+    }
+
+    fn api_key_method(header: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "api_key",
+            "extraction": {"source": "http_header", "field": header},
+            "secret_id": "keys"
+        })
+    }
+
+    fn did_auth_method(header: &str) -> serde_json::Value {
+        serde_json::json!({"type": "did_auth", "extraction": {"source": "http_header", "field": header}})
+    }
+
+    #[test]
+    fn methods_on_distinct_credential_locations_are_accepted() {
+        let surface = surface_with_caller_auth(
+            serde_json::json!([jwt_method(), api_key_method("X-API-Key")]),
+            serde_json::json!({}),
+        );
+        validate_source_auth_config(&surface, None).unwrap();
+    }
+
+    #[test]
+    fn methods_sharing_a_header_are_rejected_case_insensitively() {
+        let surface = surface_with_caller_auth(
+            serde_json::json!([jwt_method(), api_key_method("authorization")]),
+            serde_json::json!({}),
+        );
+        let error = validate_source_auth_config(&surface, None)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "Channel 'multi': source authentication methods 1 (jwt_bearer) and 2 (api_key) both read the \
+             'authorization' header; each method needs its own credential location"
+        );
+    }
+
+    #[test]
+    fn a_second_did_auth_method_is_rejected() {
+        let surface = surface_with_caller_auth(
+            serde_json::json!([did_auth_method("X-Session-A"), did_auth_method("X-Session-B")]),
+            serde_json::json!({}),
+        );
+        let error = validate_source_auth_config(&surface, None)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "Channel 'multi': source authentication allows at most one did_auth method");
+    }
+
+    #[test]
+    fn a_body_extracted_method_is_rejected_beside_another_method() {
+        let body_method = serde_json::json!({
+            "type": "api_key",
+            "extraction": {"source": "mcp_meta"},
+            "secret_id": "keys"
+        });
+        let surface =
+            surface_with_caller_auth(serde_json::json!([jwt_method(), body_method.clone()]), serde_json::json!({}));
+        let error = validate_source_auth_config(&surface, None)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "Channel 'multi': source authentication method 2 (api_key) reads MCP _meta; with more than one method, \
+             each must read a header or the client certificate"
+        );
+
+        let alone = surface_with_caller_auth(serde_json::json!([body_method]), serde_json::json!({}));
+        validate_source_auth_config(&alone, None).unwrap();
+    }
+
+    #[test]
+    fn every_method_is_validated_not_only_the_first() {
+        let surface = surface_with_caller_auth(
+            serde_json::json!([
+                jwt_method(),
+                {"type": "did_auth", "extraction": {"source": "http_header", "field": "X-Session"}, "challenge_ttl_seconds": 0}
+            ]),
+            serde_json::json!({}),
+        );
+        let error = validate_source_auth_config(&surface, None)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "Channel 'multi': did_auth.challenge_ttl_seconds must be > 0");
+    }
+
+    #[test]
+    fn from_jwt_claim_identity_requires_every_method_to_be_jwt_bearer() {
+        let inbound = serde_json::json!({"identity_slots": {"inbound": {"type": "from_jwt_claim"}}});
+        let mixed =
+            surface_with_caller_auth(serde_json::json!([jwt_method(), api_key_method("X-API-Key")]), inbound.clone());
+        let error = validate_source_auth_config(&mixed, None)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "Channel 'multi': from_jwt_claim identity requires every source authentication method to be jwt_bearer"
+        );
+
+        let jwt_only = surface_with_caller_auth(serde_json::json!([jwt_method()]), inbound);
+        validate_source_auth_config(&jwt_only, None).unwrap();
+    }
+
+    #[test]
+    fn from_jwt_claim_on_the_protected_slot_or_a_transit_point_also_requires_jwt_bearer() {
+        let methods = serde_json::json!([jwt_method(), api_key_method("X-API-Key")]);
+        for extra in [
+            serde_json::json!({"identity_slots": {"protected": {"type": "from_jwt_claim"}}}),
+            serde_json::json!({"transit": {"points": [{
+                "alias": "partner",
+                "target_endpoint": "https://partner.example",
+                "managed_identity": {"type": "from_jwt_claim"}
+            }]}}),
+        ] {
+            let surface = surface_with_caller_auth(methods.clone(), extra);
+            let error = validate_source_auth_config(&surface, None)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("from_jwt_claim identity requires"), "{error}");
+        }
+    }
+
+    #[test]
+    fn boot_validation_only_warns_about_from_jwt_claim_beside_other_methods() {
+        let surface = surface_with_caller_auth(
+            serde_json::json!([api_key_method("X-API-Key")]),
+            serde_json::json!({"identity_slots": {"inbound": {"type": "from_jwt_claim"}}}),
+        );
+        validate_source_auth_surface(&surface).unwrap();
+        assert!(validate_source_auth_config(&surface, None).is_err(), "saving still refuses it");
+
+        let shared = surface_with_caller_auth(
+            serde_json::json!([jwt_method(), api_key_method("authorization")]),
+            serde_json::json!({}),
+        );
+        assert!(validate_source_auth_surface(&shared).is_err(), "only a fallback can make it boot");
+    }
+
+    #[test]
+    fn a_surface_breaking_the_method_rules_falls_back_to_its_first_method() {
+        let mut surface = surface_with_caller_auth(
+            serde_json::json!([jwt_method(), api_key_method("authorization")]),
+            serde_json::json!({}),
+        );
+        let reason = fall_back_to_first_source_auth_method(&mut surface).unwrap();
+        assert!(reason.contains("both read the 'authorization' header"), "{reason}");
+        assert_eq!(
+            surface
+                .source_auth_methods()
+                .len(),
+            1
+        );
+        validate_source_auth_surface(&surface).unwrap();
+
+        let mut valid = surface_with_caller_auth(
+            serde_json::json!([jwt_method(), api_key_method("X-API-Key")]),
+            serde_json::json!({}),
+        );
+        assert!(fall_back_to_first_source_auth_method(&mut valid).is_none());
+        assert_eq!(
+            valid
+                .source_auth_methods()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn other_identity_modes_allow_mixed_methods() {
+        let surface = surface_with_caller_auth(
+            serde_json::json!([jwt_method(), api_key_method("X-API-Key")]),
+            serde_json::json!({"identity_slots": {"protected": {"type": "static", "did": "did:web:agent.example"}}}),
+        );
+        validate_source_auth_config(&surface, None).unwrap();
+    }
 
     #[test]
     fn a_reload_names_a_longest_transit_token_lifetime_it_does_not_apply() {
@@ -792,7 +1141,7 @@ mod tests {
                 "session_ttl_seconds": ttl
             })
         };
-        let surface = |variant_ttl: u64| -> crate::config::agent_surface::AgentSurface {
+        let surface = |base_ttl: u64, variant_ttl: u64| -> crate::config::agent_surface::AgentSurface {
             serde_json::from_value(serde_json::json!({
                 "surface_id": "varied",
                 "name": "varied",
@@ -801,7 +1150,7 @@ mod tests {
                     "caller_authentication": { "methods": [
                         { "type": "api_key", "extraction": { "source": "http_header", "field": "X-API-Key" },
                             "secret_id": "caller-key" },
-                        did_auth(604_800)
+                        did_auth(base_ttl)
                     ] }
                 },
                 "target": { "endpoint": "https://agent.internal" },
@@ -811,7 +1160,7 @@ mod tests {
             .unwrap()
         };
         let mut config = GatewayConfig::default_config();
-        config.surfaces = vec![surface(172_800)];
+        config.surfaces = vec![surface(3_600, 172_800)];
         assert_eq!(
             config.did_auth_session_ttl_adjustments(),
             ["Surface 'varied' (varied): variant 'candidate' did_auth.session_ttl_seconds is 172800, above the \
@@ -825,14 +1174,24 @@ mod tests {
         );
         validate_source_auth_config(&config.surfaces[0], Some(&config.surfaces[0]))
             .expect("a save that keeps the variant's stored TTL passes");
-        validate_source_auth_config(&surface(86_400), None)
-            .expect("the method that is not the first mints no session, so its TTL is not bounded");
-        config.surfaces = vec![surface(86_400)];
+        config.surfaces = vec![surface(3_600, 86_400)];
         assert!(
             config
                 .did_auth_session_ttl_adjustments()
                 .is_empty()
         );
+
+        // A DID Auth method after the first mints sessions too, so its TTL is
+        // bounded like the first method's.
+        config.surfaces = vec![surface(604_800, 86_400)];
+        assert_eq!(
+            config.did_auth_session_ttl_adjustments(),
+            ["Surface 'varied' (varied): did_auth.session_ttl_seconds is 604800, above the longest, 86400 seconds; \
+              its sessions last 86400 seconds"]
+        );
+        let error = validate_source_auth_config(&config.surfaces[0], None)
+            .expect_err("a later DID Auth method's TTL above the longest is refused");
+        assert_eq!(error.to_string(), "Channel 'varied': did_auth.session_ttl_seconds 604800 exceeds max 86400");
     }
 
     /// The longest lifetime is read once, when the gateway starts; every later

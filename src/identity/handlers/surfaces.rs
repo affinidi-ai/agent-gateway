@@ -130,7 +130,7 @@ fn validate_identity_extraction(
 }
 
 pub(crate) const INBOUND_API_KEY_NEEDS_API_KEY_CALLER: &str =
-    "Identity 'From API Key' needs an API Key or API Key Provider as the first Caller Context method";
+    "Identity 'From API Key' needs every Caller Context method to be API Key or API Key Provider";
 pub(crate) const INBOUND_API_KEY_WITH_RESOURCE_TOKENS: &str = "Identity 'From API Key' cannot be used with \
      mcp_http.authorization, which identifies callers by their resource token; remove one of them";
 pub(crate) const INBOUND_API_KEY_ON_MCP_PROXY: &str =
@@ -172,8 +172,8 @@ fn configured_api_key_id<'a>(
 }
 
 /// Refuse `from_api_key` identities the request path cannot resolve: an
-/// inbound slot whose callers do not authenticate with an API key, and a
-/// stored slot without a key.
+/// inbound slot on a surface with a caller method other than an API key, whose
+/// callers it could not identify, and a stored slot without a key.
 fn validate_api_key_identities(
     surface: &AgentSurface,
     label: &str,
@@ -190,7 +190,12 @@ fn validate_api_key_identities(
     };
     let inbound_from_api_key = surface.inbound_identity_from_api_key();
     if inbound_from_api_key {
-        if !matches!(surface.source_auth(), Some(SourceAuthConfig::ApiKey(_) | SourceAuthConfig::ApiKeyProvider(_))) {
+        let methods = surface.source_auth_methods();
+        if methods.is_empty()
+            || !methods
+                .iter()
+                .all(|method| matches!(method, SourceAuthConfig::ApiKey(_) | SourceAuthConfig::ApiKeyProvider(_)))
+        {
             return Err(refuse(INBOUND_API_KEY_NEEDS_API_KEY_CALLER));
         }
         if surface
@@ -844,11 +849,29 @@ fn validate_workload_binding_config(surface: &AgentSurface) -> Result<(), Surfac
 /// Without this hook a dashboard save could persist values that would then
 /// be rejected on the next process restart (`challenge_ttl_seconds: 0`,
 /// unsupported `allowed_algorithms`, etc.).
+///
+/// Each enabled variant is validated as resolved, against the stored variant
+/// of the same alias, since it can override the caller authentication methods
+/// and the identity slots.
 fn validate_source_auth(
     surface: &AgentSurface,
     stored: Option<&AgentSurface>,
 ) -> Result<(), SurfaceApiError> {
-    crate::config::validate_source_auth_config(surface, stored).map_err(|e| SurfaceApiError::BadRequest(e.to_string()))
+    crate::config::validate_source_auth_config(surface, stored)
+        .map_err(|e| SurfaceApiError::BadRequest(e.to_string()))?;
+    for variant in &surface.variants {
+        let Ok(resolved) = surface.resolve_variant(Some(&variant.alias)) else {
+            continue;
+        };
+        let stored_resolved = stored.and_then(|stored| {
+            stored
+                .resolve_variant(Some(&variant.alias))
+                .ok()
+        });
+        crate::config::validate_source_auth_config(&resolved, stored_resolved.as_ref())
+            .map_err(|e| SurfaceApiError::BadRequest(format!("variant '{}': {e}", variant.alias)))?;
+    }
+    Ok(())
 }
 
 /// Validate every transit point: alias must match the URL-safe pattern,
@@ -2190,11 +2213,13 @@ fn validate_delegation_source_auth(surface: &AgentSurface) -> Result<(), Surface
     if !is_delegated_mpp {
         return Ok(());
     }
-    if let Some(crate::source_auth::SourceAuthConfig::JwtBearer(_)) = surface.source_auth()
-        && surface
-            .source_auth()
-            .and_then(|sa| sa.credential_header_name())
-            .is_some_and(|h| h.eq_ignore_ascii_case("authorization"))
+    if surface
+        .source_auth_methods()
+        .iter()
+        .any(|method| {
+            matches!(method, crate::source_auth::SourceAuthConfig::JwtBearer(jwt)
+                if jwt.token_header.eq_ignore_ascii_case("authorization"))
+        })
     {
         return Err(SurfaceApiError::BadRequest(format!(
             "Surface '{}': an A2A surface delegating payment to a remote MPP rail cannot use jwt_bearer source \
@@ -3281,9 +3306,12 @@ async fn validate_protected_resource_issuers(
                 .map(|resolved| (format!("variant '{}': ", variant.alias), resolved))
         });
     for (label, resolved) in std::iter::once((String::new(), surface.clone())).chain(variants) {
-        let (Some(protected), Some(crate::source_auth::SourceAuthConfig::JwtBearer(jwt))) =
-            (resolved.protected_resource(), resolved.source_auth())
-        else {
+        let (Some(protected), Some(crate::source_auth::SourceAuthConfig::JwtBearer(jwt))) = (
+            resolved.protected_resource(),
+            resolved
+                .source_auth_methods()
+                .first(),
+        ) else {
             continue;
         };
         let strategy = state
@@ -7089,9 +7117,13 @@ mod validation_tests {
     }
 
     #[test]
-    fn inbound_from_api_key_is_accepted_behind_an_api_key_or_provider_caller_method() {
-        for (case, caller) in [("api key", api_key_caller("caller-keys")), ("api key provider", provider_caller())] {
-            let s = inbound_api_key_surface(&[caller, jwt_caller()]);
+    fn inbound_from_api_key_is_accepted_behind_api_key_or_provider_caller_methods() {
+        for (case, callers) in [
+            ("api key", vec![api_key_caller("caller-keys")]),
+            ("api key provider", vec![provider_caller()]),
+            ("both", vec![api_key_caller("caller-keys"), provider_caller()]),
+        ] {
+            let s = inbound_api_key_surface(&callers);
             assert!(validate_api_key_identities(&s, "").is_ok(), "{case}");
         }
     }
@@ -7100,16 +7132,17 @@ mod validation_tests {
     fn inbound_from_api_key_refusal_matches_the_dashboard_text() {
         assert_eq!(
             INBOUND_API_KEY_NEEDS_API_KEY_CALLER,
-            "Identity 'From API Key' needs an API Key or API Key Provider as the first Caller Context method"
+            "Identity 'From API Key' needs every Caller Context method to be API Key or API Key Provider"
         );
     }
 
     #[test]
-    fn inbound_from_api_key_is_refused_unless_the_first_caller_method_is_an_api_key() {
+    fn inbound_from_api_key_is_refused_unless_every_caller_method_is_an_api_key() {
         for (case, caller) in [
             ("no caller authentication", vec![]),
             ("jwt only", vec![jwt_caller()]),
             ("api key second", vec![jwt_caller(), provider_caller()]),
+            ("jwt second", vec![api_key_caller("caller-keys"), jwt_caller()]),
         ] {
             let s = inbound_api_key_surface(&caller);
             assert!(refusal(validate_api_key_identities(&s, "")) == INBOUND_API_KEY_NEEDS_API_KEY_CALLER, "{case}");
@@ -7897,6 +7930,54 @@ mod validation_tests {
             }
             other => panic!("expected BadRequest, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn delegation_source_auth_rejects_a_later_jwt_bearer_method_on_the_authorization_header() {
+        use crate::source_auth::models::{ApiKeyAuthConfig, CredentialExtraction, SourceAuthConfig};
+        let mut s = delegated_mpp_surface();
+        let mut caller = jwt_bearer_auth("Authorization");
+        caller.methods.insert(
+            0,
+            SourceAuthConfig::ApiKey(ApiKeyAuthConfig {
+                extraction: CredentialExtraction::HttpHeader { field: "X-API-Key".into() },
+                secret_id: "keys".into(),
+            }),
+        );
+        s.access_point
+            .caller_authentication = Some(caller);
+        assert!(matches!(validate_delegation_source_auth(&s), Err(SurfaceApiError::BadRequest(_))));
+    }
+
+    #[test]
+    fn source_auth_validation_checks_each_enabled_variant() {
+        let mut s = didauth_surface(valid_didauth_config());
+        s.variants = vec![serde_json::from_value(serde_json::json!({
+            "id": "partner",
+            "alias": "partner",
+            "name": "Partner",
+            "enabled": true,
+            "overrides": {
+                "access_point": {
+                    "caller_authentication": {
+                        "methods": [
+                            {"type": "api_key", "extraction": {"source": "http_header", "field": "X-Key"}, "secret_id": "a"},
+                            {"type": "api_key", "extraction": {"source": "http_header", "field": "x-key"}, "secret_id": "b"}
+                        ]
+                    }
+                }
+            }
+        }))
+        .unwrap()];
+        match validate_source_auth(&s, None) {
+            Err(SurfaceApiError::BadRequest(msg)) => {
+                assert!(msg.starts_with("variant 'partner': ") && msg.contains("both read the 'x-key' header"), "{msg}")
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+
+        s.variants[0].enabled = false;
+        validate_source_auth(&s, None).expect("a disabled variant is not validated on save");
     }
 
     #[test]

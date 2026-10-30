@@ -1,0 +1,37 @@
+branch: feat/multiple-caller-auth-methods
+changes:
+  added:
+    - timestamp: '2026-10-30T14:00:00.000Z'
+      title: ⭐ Accept more than one source authentication method on one Access Point
+      description: >-
+        An Access Point accepted a list of caller authentication methods but enforced only the
+        first, so an agent called by internal users with a JWT and by partner agents with an API
+        key needed two surfaces, and two identities. Every method in
+        `caller_authentication.methods` now works: the gateway verifies each request with the
+        first method, in configured order, whose credential the request carries (a header, or
+        the client certificate for mTLS), or with the first method when it carries none, and
+        never retries a rejected credential with another method. Policy sees the method that
+        verified the caller as `input.source_auth.method`. Saving a surface now validates every
+        method and refuses two methods reading the same credential location, more than one DID
+        Auth method, and a `from_jwt_claim` identity unless every method is JWT bearer. The
+        credential headers of all methods are stripped before forwarding, and a forwarded JWT
+        header reaches the target only when the JWT method verified the request. On an MCP
+        Access Point that publishes protected resource metadata, only a failed JWT bearer
+        credential gets the `401` discovery challenge. The Surface Builder's Caller Context
+        editor adds, reorders and removes additional methods, and the sidebar lists them.
+  changed:
+    - timestamp: '2026-10-30T16:00:00.000Z'
+      title: Serve stored surfaces with extra source authentication methods safely on upgrade
+      description: >-
+        Methods after the first in a stored surface's `caller_authentication.methods` used to be
+        ignored and now take effect, so a request carrying one of their credentials is verified
+        by that method. A stored surface whose methods break the new rules (two methods on one
+        credential location, a second DID Auth method, a body-extracted method beside another, or
+        an invalid later method) no longer stops the gateway from starting: it keeps only its
+        first method, the gateway logs an error naming the surface and the rule, and local
+        storage persists the correction. A stored `from_jwt_claim` identity beside a method other
+        than JWT bearer is logged as a warning at startup and refused on the next save.
+  fixed: []
+  removed: []
+  security: []
+  breaking: []

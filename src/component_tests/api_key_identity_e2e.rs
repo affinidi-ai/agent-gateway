@@ -601,8 +601,9 @@ allow if {
     }
 }
 
-/// A stored surface whose first caller method is JWT Bearer refuses an
-/// authenticated JWT caller with a fixed body instead of resolving a caller DID.
+/// A stored surface with a JWT Bearer caller method, which a save refuses,
+/// refuses an authenticated JWT caller with a fixed body instead of resolving a
+/// caller DID.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_jwt_first_stored_surface_refuses_the_caller() {
     use helpers::jwt::{JwksFixture, now_secs, setup_jwt_claim_inbound_identity, sign_jwt};

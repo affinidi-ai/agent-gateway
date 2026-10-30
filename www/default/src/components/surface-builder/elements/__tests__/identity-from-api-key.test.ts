@@ -159,6 +159,19 @@ describe('identity From API Key — Caller Context dependency', () => {
     expect(fromApiKeyErrors([accessPoint, callerAuth(method), inbound], inbound)).toEqual([]);
   });
 
+  it('is an error when a further Caller Context method is not an API key', () => {
+    const mixed = {
+      ...callerAuth('api_key'),
+      config: {
+        ...callerAuth('api_key').config,
+        additional_methods: [{ method_type: 'jwt_bearer', jwt_strategy_id: 'idp' }],
+      },
+    };
+    expect(fromApiKeyErrors([accessPoint, mixed, inbound], inbound)).toEqual([
+      INBOUND_API_KEY_NEEDS_API_KEY_CALLER,
+    ]);
+  });
+
   it('does not apply to the protected node', () => {
     const node = identity(protectedNode, { type: 'from_api_key', api_key_id: 'atgk_agent' });
     expect(fromApiKeyErrors([accessPoint, callerAuth('jwt_bearer'), node], node)).toEqual([]);
@@ -166,7 +179,7 @@ describe('identity From API Key — Caller Context dependency', () => {
 
   it('uses the backend refusal text', () => {
     expect(INBOUND_API_KEY_NEEDS_API_KEY_CALLER).toBe(
-      "Identity 'From API Key' needs an API Key or API Key Provider as the first Caller Context method"
+      "Identity 'From API Key' needs every Caller Context method to be API Key or API Key Provider"
     );
   });
 });
