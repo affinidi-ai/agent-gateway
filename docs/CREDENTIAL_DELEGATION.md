@@ -120,7 +120,8 @@ provider that cannot be used.
 
 A Transit Point refuses such a request with `503`, and also refuses with `403` one whose
 transit token carries no caller identity, including every request to a Transit Point that sets
-`require_transit_token: false`, or for which neither its managed identity nor the transit
+`require_transit_token: false` (a valid transit token sent there names the caller to policy
+only, not to delegation), or for which neither its managed identity nor the transit
 token's caller DID gives the agent half of the vault key. It also refuses when its delegation
 stores are not available. An MCP Transit Point answers with a JSON-RPC error (`-32603` for
 `503`, `-32001` for `403`) carrying the request's id, and any other Transit Point with an
@@ -210,11 +211,41 @@ keyed by three values.
 | Key | Source |
 | --- | --- |
 | `agent_did` | The managed agent the delegation is for |
-| `user_identity_hash` | A SHA-256 hash of the identity source authentication established: the JWT `sub`, the API key name, the DID, or the mTLS principal |
+| `user_identity_hash` | The caller's [identity hash](#the-callers-identity-hash), from the identity source authentication established |
 | `credential_provider_id` | The provider |
 
 With API-key or mTLS source authentication, every caller presenting the same key or
 certificate identity therefore shares one set of delegated tokens.
+
+### The caller's identity hash
+
+`user_identity_hash` is the lowercase hex SHA-256 of the JSON array
+`[method, issuer, tenant, subject]`, written as RFC 8785 canonical JSON (no spaces):
+
+| Source authentication | `method` | `issuer` | `subject` |
+| --- | --- | --- | --- |
+| `jwt_bearer`, and a resource access token | `jwt_bearer` | The token's `iss` | The token's `sub` |
+| `api_key` | `api_key` | `""` | The `secret_id` |
+| `api_key_provider` | `api_key_provider` | The API Key Provider agent id | The key's id |
+| `did_auth` | `did_auth` | `""` | The DID |
+| `mtls` | `mtls` | The lowercase hex SHA-256 of the certificate the client certificate was verified against: the configured CA certificate its chain ends at, or with pinned trust the pinned certificate | The principal the `identity_binding` derives |
+
+`tenant` is the surface's `tenant_id`, or `null` on a surface with none. The same subject named
+by another method, issuer, API Key Provider agent or tenant is therefore another caller, with
+grants of its own. An mTLS caller is keyed by the certificate the gateway trusted, not by the
+issuer name its certificate states, so replacing a trusted CA certificate, or a pinned
+certificate, gives its callers new identity hashes. A JWT without a non-empty `sub`, or without an `iss`, names no caller: it has
+no identity hash, so it is given no delegated credential: an Access Point answers `403`
+`identity-required`, and a Transit Point `403`.
+
+The transit token carries the same value, a policy reads it as
+`input.transit.caller.user_identity_hash`, and a Workload Binding with `caller_source: did`
+puts it in `user_hash`. To compute it for a JWT subject `alice` from
+`https://login.example.com` on a surface with no tenant:
+
+```sh
+printf '%s' '["jwt_bearer","https://login.example.com",null,"alice"]' | shasum -a 256
+```
 
 Client-credentials tokens have no user, so they are cached under the fixed user hash
 `__client_credentials__`.
@@ -251,6 +282,27 @@ at rest on any appliance that holds real user tokens. See
 | `GET`, `DELETE /api/v1/delegation-vault/{id}` | Read or revoke one entry |
 | `DELETE /api/v1/delegation-vault/by-user/{user_hash}` | Revoke every delegation one user has granted |
 | `GET /api/v1/delegation-audit` | The delegation audit log |
+
+### Removing grants keyed by the old identity hash
+
+Before the [identity hash](#the-callers-identity-hash) took the method, issuer and tenant, it
+was the lowercase hex SHA-256 of the subject alone. A grant stored under that hash is never
+found again: the user connects the account again, and the old entry stays in the vault, with
+its refresh token, until it is revoked. Both hashes are 64 hex characters, so the vault list
+does not show which entries are old. Entries under `__client_credentials__` are not affected.
+
+For each user who connected an account before the upgrade, compute the old hash from the
+subject (the JWT `sub`, the API key `secret_id` or key id, the DID, or the mTLS principal) and
+revoke it:
+
+```sh
+OLD_HASH=$(printf '%s' 'alice' | shasum -a 256 | cut -d' ' -f1)
+curl -X DELETE "$GATEWAY/api/v1/delegation-vault/by-user/$OLD_HASH" -H "Authorization: Bearer $TOKEN"
+```
+
+When the subjects are not known, list the vault and revoke by `id` every entry, other than
+`__client_credentials__`, whose `created_at` is before the upgrade. Do this after every
+instance runs the new release, as an instance still on the old one writes the old hash.
 
 Credential providers have their own management routes in
 [`src/credential_providers/router.rs`](../src/credential_providers/router.rs), gated on

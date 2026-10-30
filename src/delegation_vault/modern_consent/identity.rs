@@ -127,11 +127,23 @@ pub async fn verify_id_token(
         .map_err(|_| ContinuationError::BindingMismatch)?;
     let principal =
         serde_json_canonicalizer::to_vec(&(&profile.issuer, &subject)).map_err(|_| ContinuationError::InvalidRecord)?;
+    let user_identity_hash = crate::source_auth::models::caller_identity_hash(
+        "jwt_bearer",
+        &profile.issuer,
+        ticket
+            .binding
+            .tenant_id
+            .as_deref(),
+        &subject,
+    );
     if hex::encode(Sha256::digest(principal)) != ticket.binding.principal
-        || hex::encode(Sha256::digest(subject.as_bytes()))
-            != ticket
-                .binding
-                .user_identity_hash
+        || user_identity_hash.as_deref()
+            != Some(
+                ticket
+                    .binding
+                    .user_identity_hash
+                    .as_str(),
+            )
     {
         return Err(ContinuationError::BindingMismatch);
     }
@@ -172,7 +184,7 @@ mod tests {
             "provider_digest": ([3; 32]), "surface_digest": ([4; 32]), "identity_strategy_digest": ([5; 32]),
             "callback_url": "https://gateway.example/mcp-consent/callback/provider", "code_verifier": "v".repeat(43),
             "binding": {"deployment": "deployment", "principal": hex::encode(Sha256::digest(serde_json_canonicalizer::to_vec(&(&profile.issuer, &subject)).unwrap())),
-                "agent_did": "did:web:agent", "user_identity_hash": hex::encode(Sha256::digest(subject.as_bytes())),
+                "agent_did": "did:web:agent", "user_identity_hash": crate::source_auth::models::caller_identity_hash("jwt_bearer", &profile.issuer, None, &subject),
                 "authorization_digest": ([1; 32]), "tenant_id": null, "surface_id": "surface", "variant_id": null, "route": {"kind": "access_point"},
                 "resource": "https://gateway.example/mcp", "provider_id": "provider", "scopes": ["openid"], "method": "tools/call", "arguments_digest": ([2; 32])}
         })).unwrap();
