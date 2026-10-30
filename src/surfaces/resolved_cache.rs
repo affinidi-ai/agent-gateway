@@ -274,6 +274,7 @@ mod tests {
                 didwebvh_identity: None,
                 terminate_trace_id: false,
                 a2a: None,
+                public: None,
             },
             target: Target {
                 endpoint: "http://upstream.example/".to_string(),

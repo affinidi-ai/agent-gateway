@@ -126,6 +126,42 @@ pub fn deny_response(
     }
 }
 
+/// What a caller refused for a missing or invalid credential is told. Why the
+/// credential failed is logged, never sent.
+pub const CALLER_CREDENTIAL_REFUSED: &str = "Caller credential missing or invalid";
+
+/// The `401` for a caller whose credential is missing or invalid, on an Access
+/// Point whose caller authentication rejects such callers. An MCP caller gets a
+/// JSON-RPC error answering `mcp_request_id`; any other caller gets
+/// `application/problem+json`. A JWT Bearer refusal carries a
+/// `WWW-Authenticate: Bearer` challenge.
+pub fn caller_refusal(
+    protocol: &SurfaceProtocol,
+    auth_config: &SourceAuthConfig,
+    mcp_request_id: Option<serde_json::Value>,
+) -> Response {
+    let status = StatusCode::UNAUTHORIZED;
+    match protocol {
+        SurfaceProtocol::Mcp => {
+            let mut response = crate::mcp::errors::create_mcp_error_response_with_status(
+                status,
+                mcp_request_id,
+                crate::mcp::errors::error_codes::INTERNAL_ERROR,
+                CALLER_CREDENTIAL_REFUSED,
+                None,
+            );
+            if matches!(auth_config, SourceAuthConfig::JwtBearer(_)) {
+                response.headers_mut().insert(
+                    axum::http::header::WWW_AUTHENTICATE,
+                    axum::http::HeaderValue::from_static("Bearer realm=\"agent-gateway\""),
+                );
+            }
+            response
+        }
+        _ => a2a_deny(auth_config, CALLER_CREDENTIAL_REFUSED, status, "Unauthorized", true),
+    }
+}
+
 fn a2a_deny(
     auth_config: &SourceAuthConfig,
     detail: &str,
@@ -249,6 +285,56 @@ mod tests {
             assert_eq!(resp.headers()["www-authenticate"], "Bearer realm=\"agent-gateway\"");
             let body = body_json(resp).await;
             assert_eq!(body["status"], 401);
+        }
+    }
+
+    fn api_key_config() -> SourceAuthConfig {
+        SourceAuthConfig::ApiKey(crate::source_auth::models::ApiKeyAuthConfig {
+            extraction: crate::source_auth::models::CredentialExtraction::HttpHeader { field: "x-api-key".to_string() },
+            secret_id: "key".to_string(),
+        })
+    }
+
+    #[tokio::test]
+    async fn a_refused_caller_is_told_only_that_its_credential_is_missing_or_invalid() {
+        for (protocol, config, challenge) in
+            [(SurfaceProtocol::A2a, jwt_config(), Some("Bearer")), (SurfaceProtocol::Ap2, api_key_config(), None)]
+        {
+            let resp = caller_refusal(&protocol, &config, Some(serde_json::json!(7)));
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(resp.headers()["content-type"], "application/problem+json");
+            assert_eq!(
+                resp.headers()
+                    .get("www-authenticate")
+                    .map(|value| value.to_str().unwrap()),
+                challenge
+            );
+            let body = body_json(resp).await;
+            assert_eq!(body["detail"], CALLER_CREDENTIAL_REFUSED);
+            assert_eq!(body["status"], 401);
+            assert!(body.get("id").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_mcp_caller_gets_a_json_rpc_error_answering_its_request() {
+        for (config, id, challenge) in [
+            (jwt_config(), Some(serde_json::json!("call-1")), Some("Bearer realm=\"agent-gateway\"")),
+            (api_key_config(), None, None),
+        ] {
+            let resp = caller_refusal(&SurfaceProtocol::Mcp, &config, id.clone());
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                resp.headers()
+                    .get("www-authenticate")
+                    .map(|value| value.to_str().unwrap()),
+                challenge
+            );
+            let body = body_json(resp).await;
+            assert_eq!(body["jsonrpc"], "2.0");
+            assert_eq!(body.get("id").cloned(), id);
+            assert_eq!(body["error"]["code"], crate::mcp::errors::error_codes::INTERNAL_ERROR);
+            assert_eq!(body["error"]["message"], CALLER_CREDENTIAL_REFUSED);
         }
     }
 

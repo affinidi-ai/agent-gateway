@@ -4370,22 +4370,34 @@ async fn process_forward_request_in_request_scope(
                     // its challenge; otherwise record the outcome for the
                     // policy layer and continue with no asserted caller identity.
                     Err(e) if e.is_caller_attributable() => {
-                        let challenged = protected_resource.is_some();
+                        let refused = protected_resource.is_some() || surface.rejects_failed_caller_authentication();
                         channel_warn!(
                             config_id,
                             "GW2: Source authentication failed (reason={}) — {}",
                             e,
-                            if challenged { "refusing before policy" } else { "deferring to policy" }
+                            if refused { "refusing before policy" } else { "deferring to policy" }
                         );
                         crate::audit::request_events::auth_failed(
                             &audit_facts,
                             crate::audit::request_events::source_auth_scheme(&resolved_auth_config),
                             crate::audit::request_events::source_auth_reason(&e),
-                            challenged,
+                            refused,
                             None,
                         );
                         if let Some(protected_resource) = &protected_resource {
                             return axum_response_to_forward_result(protected_resource.fabric_refusal(&e)).await;
+                        }
+                        if refused {
+                            let mcp_request_id = (surface.access_point.protocol
+                                == crate::config::agent_surface::SurfaceProtocol::Mcp)
+                                .then(|| crate::mcp::request_validation::request_id_from_bytes(&body_bytes))
+                                .flatten();
+                            let refusal = crate::source_auth::errors::caller_refusal(
+                                &surface.access_point.protocol,
+                                &resolved_auth_config,
+                                mcp_request_id,
+                            );
+                            return axum_response_to_forward_result(refusal).await;
                         }
                         source_auth_failure = Some(crate::surface_context::SourceAuthContext::Failed {
                             attempted_method: resolved_auth_config.method_tag().to_string(),

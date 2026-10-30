@@ -379,13 +379,24 @@ pub(crate) async fn answer_routing_refusal(
     versions: McpVersionPolicy<'static>,
     body: Option<axum::body::Body>,
 ) -> axum::response::Response {
+    let id = refused_request_id(mcp_http, public_endpoints, versions, body).await;
+    (*McpRequestValidationError::for_routing_refusal(refusal, id)).into_response()
+}
+
+/// The JSON-RPC `id` of a request refused before its body is read, read as
+/// [`answer_routing_refusal`] reads it.
+pub(crate) async fn refused_request_id(
+    mcp_http: Option<&crate::config::McpHttpConfig>,
+    public_endpoints: &[String],
+    versions: McpVersionPolicy<'static>,
+    body: Option<axum::body::Body>,
+) -> Option<JsonValue> {
     let limit = super::modern_http::EndpointHttpPolicy::with_versions(mcp_http, public_endpoints, versions)
         .map(|policy| policy.body_limit());
-    let id = match (body, limit) {
+    match (body, limit) {
         (Some(body), Ok(limit)) => read_request_id(body, limit).await,
         _ => None,
-    };
-    (*McpRequestValidationError::for_routing_refusal(refusal, id)).into_response()
+    }
 }
 
 /// Reads a refused request's body, within `limit`,

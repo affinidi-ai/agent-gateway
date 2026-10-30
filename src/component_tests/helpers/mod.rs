@@ -972,6 +972,34 @@ fn build_bootstrap_config(
     }
 }
 
+/// Store an API key secret a source authentication method can name by
+/// `secret_id`. Call from the harness `setup` closure, before the gateway boots.
+pub fn write_api_key_secret(
+    storage_path: &str,
+    secret_id: &str,
+    value: &str,
+) {
+    use crate::secrets::SecretsStore;
+
+    let store = crate::secrets::FilesystemSecretsStore::new(storage_path).expect("create secrets store");
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            store
+                .create(crate::secrets::CreateSecretRequest {
+                    tenant_id: None,
+                    name: "Component test source API key".to_string(),
+                    secret_id: secret_id.to_string(),
+                    description: Some("component-test source auth secret".to_string()),
+                    value: value.to_string(),
+                    secret_type: "ApiKey".to_string(),
+                    tags: vec!["component-test".to_string()],
+                })
+                .await
+                .expect("create source auth secret");
+        })
+    });
+}
+
 /// Mount the identity API at `/api` on the gateway listener and seed an
 /// approved administrator session. Returns a client that sends its bearer token.
 /// Call from the harness `setup` closure, before the gateway boots.
