@@ -165,6 +165,7 @@ const IssuersPage: React.FC<IssuersPageProps> = ({
                 variant="primary"
                 size="md"
                 className="shadow-sm"
+                data-testid="issuers-add-button"
                 onClick={() => (onAdd ? onAdd() : navigate('/issuers/new'))}
                 iconStart={<i className="fas fa-plus fa-sm me-2" aria-hidden="true" />}
               >
@@ -198,7 +199,7 @@ const IssuersPage: React.FC<IssuersPageProps> = ({
                   </thead>
                   <tbody>
                     {filteredIssuers.map(issuer => (
-                      <tr key={issuer.id}>
+                      <tr key={issuer.id} data-testid={`issuers-row-${issuer.id}`}>
                         <td>
                           <div>{issuer.name}</div>
                           {issuer.description && (
@@ -263,6 +264,7 @@ const IssuersPage: React.FC<IssuersPageProps> = ({
                             <AppButton
                               variant="outline-primary"
                               size="sm"
+                              data-testid={`issuers-edit-button-${issuer.id}`}
                               aria-label={`Edit issuer ${issuer.name}`}
                               onClick={() =>
                                 onEdit ? onEdit(issuer.id) : navigate(`/issuers/${issuer.id}`)
@@ -270,7 +272,10 @@ const IssuersPage: React.FC<IssuersPageProps> = ({
                             >
                               <i className="fas fa-edit" aria-hidden="true"></i>
                             </AppButton>
-                            <DeleteButton onDelete={() => handleDelete(issuer.id)} />
+                            <DeleteButton
+                              data-testid={`issuers-delete-button-${issuer.id}`}
+                              onDelete={() => handleDelete(issuer.id)}
+                            />
                           </div>
                         </td>
                       </tr>

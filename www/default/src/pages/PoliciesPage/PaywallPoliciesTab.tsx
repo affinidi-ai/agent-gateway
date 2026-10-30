@@ -31,6 +31,7 @@ const PaywallPoliciesTab: React.FC<PaywallPoliciesTabProps> = ({ onFilteredCount
           body="Paywall policies attach x402 (a pay-per-request protocol) pricing to surfaces. Add an Agent Surface with a paywall to start charging for access."
           docsHref={DOCS_URL.payments}
           ctaLabel="Add Agent Surface"
+          ctaTestId="paywall-policies-add-surface-button"
           onCtaClick={() => navigate('/surfaces')}
         />
       </div>

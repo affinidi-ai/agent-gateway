@@ -512,13 +512,14 @@ const SystemMetricsPage: React.FC = () => {
   const memPct = totalMem > 0 ? ((usedMem / totalMem) * 100).toFixed(1) : '—';
 
   return (
-    <div className="container-fluid">
+    <div className="container-fluid" data-testid="page-system-metrics">
       <div className="d-sm-flex align-items-start justify-content-end mb-4">
         <div className="d-flex align-items-center" style={{ gap: '0.5rem' }}>
           {/* Time Range selector */}
           <select
             className="form-control form-control-sm dropdown-styling"
             style={{ width: 'auto' }}
+            data-testid="system-metrics-range-select"
             value={timeRange}
             onChange={e => setTimeRange(e.target.value as TimeRange)}
           >
@@ -532,6 +533,7 @@ const SystemMetricsPage: React.FC = () => {
             <select
               className="form-control form-control-sm dropdown-styling"
               style={{ width: 'auto' }}
+              data-testid="system-metrics-interval-select"
               value={liveInterval}
               onChange={e => setLiveInterval(Number(e.target.value))}
             >
@@ -546,6 +548,7 @@ const SystemMetricsPage: React.FC = () => {
             variant={isLive ? 'secondary' : 'outline-secondary'}
             size="md"
             style={{ marginLeft: '16px' }}
+            data-testid="system-metrics-live-toggle-button"
             onClick={() => setIsLive(prev => !prev)}
             title={isLive ? 'Pause live updates' : 'Resume live updates'}
             iconStart={
@@ -561,6 +564,7 @@ const SystemMetricsPage: React.FC = () => {
             variant="primary"
             size="md"
             className="shadow-sm"
+            data-testid="system-metrics-refresh-button"
             onClick={fetchFull}
             loading={loading}
             loadingLabel="Refreshing..."
