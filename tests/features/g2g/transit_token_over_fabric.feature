@@ -67,7 +67,7 @@ Feature: Transit tokens for requests that arrive over Fabric
     When managed agents "delta" and "bravo" pass the request back and forth through Transit Points "to-alpha" and "to-charlie"
     Then the relay was refused with status 508 after 8 Transit Point calls crossed Fabric
 
-  Scenario: A Transit Point policy admits one partner gateway and refuses another
+  Scenario: A Transit Point policy refuses a partner gateway it does not admit
     Given a fabric with 3 gateways
     And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"
     And gateway 1 has an A2A surface "delta" targeting managed agent "foxtrot"
@@ -76,11 +76,21 @@ Feature: Transit tokens for requests that arrive over Fabric
     And surface "alpha" has A2A Transit Point "to-delta" over Fabric to gateway 1 surface "delta"
     And Transit Point "to-delta" requires a transit token
     And Transit Point "to-delta" admits only requests that gateway 1 sent
-    When the caller sends a Fabric A2A request through gateway 3 surface "echo"
-    And managed agent "bravo" calls Transit Point "to-delta" with the transit token it received
+    And the caller has sent a Fabric A2A request through gateway 3 surface "echo"
+    When managed agent "bravo" calls Transit Point "to-delta" with the transit token it received
     Then the response status is 403
     And managed agent "foxtrot" did not receive a forwarded message
-    When the caller sends a Fabric A2A request through gateway 1 surface "charlie"
-    And managed agent "bravo" calls Transit Point "to-delta" with the transit token it received
+
+  Scenario: A Transit Point policy admits the partner gateway it names
+    Given a fabric with 3 gateways
+    And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"
+    And gateway 1 has an A2A surface "delta" targeting managed agent "foxtrot"
+    And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
+    And gateway 3 has an A2A surface "echo" forwarding over fabric to gateway 2 surface "alpha"
+    And surface "alpha" has A2A Transit Point "to-delta" over Fabric to gateway 1 surface "delta"
+    And Transit Point "to-delta" requires a transit token
+    And Transit Point "to-delta" admits only requests that gateway 1 sent
+    And the caller has sent a Fabric A2A request through gateway 1 surface "charlie"
+    When managed agent "bravo" calls Transit Point "to-delta" with the transit token it received
     Then the response status is 200
     And managed agent "foxtrot" received the trace id managed agent "bravo" received
