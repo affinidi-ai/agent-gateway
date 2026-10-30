@@ -3,8 +3,10 @@
 //! never crosses Fabric, so no such refusal is the caller's to fix: it becomes a
 //! `502` with a fixed detail and no challenge.
 
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::header::WWW_AUTHENTICATE;
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
+use serde_json::Value;
 
 use crate::audit::request_events::{RejectionReason, RejectionStage, RequestFacts, request_rejected};
 use crate::channel_warn;
@@ -18,6 +20,27 @@ pub(crate) fn rejection_reason(refusal: PeerRefusal) -> RejectionReason {
         PeerRefusal::Token => RejectionReason::PeerTokenRefused,
         PeerRefusal::Scope => RejectionReason::PeerScopeRefused,
     }
+}
+
+/// The `WWW-Authenticate` challenges of a Fabric peer's ForwardResponse
+/// `headers`, each a string or an array of strings, for
+/// [`refuse_peer_authorization`]. No other header is read, so no limit on the
+/// rest of the response hides a challenge; a value no header can carry is
+/// skipped.
+pub(crate) fn peer_challenges(headers: Option<&Value>) -> HeaderMap {
+    headers
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter(|(name, _)| name.eq_ignore_ascii_case(WWW_AUTHENTICATE.as_str()))
+        .flat_map(|(_, value)| match value {
+            Value::Array(values) => values.as_slice(),
+            value => std::slice::from_ref(value),
+        })
+        .filter_map(Value::as_str)
+        .filter_map(|value| HeaderValue::from_str(value).ok())
+        .map(|value| (WWW_AUTHENTICATE, value))
+        .collect()
 }
 
 /// `Some(502)` when `status` and `headers`, a Fabric peer's answer, refuse the
@@ -43,9 +66,8 @@ pub(crate) fn refuse_peer_authorization(
 
 #[cfg(test)]
 mod tests {
-    use axum::http::HeaderValue;
-    use axum::http::header::{CONTENT_TYPE, WWW_AUTHENTICATE};
-    use serde_json::Value;
+    use axum::http::header::CONTENT_TYPE;
+    use serde_json::json;
 
     use super::*;
     use crate::delegation_vault::audit::DelegationAuditAction;
@@ -152,5 +174,47 @@ mod tests {
             assert!(response.is_none(), "{status}");
             assert!(events.is_empty(), "{status}");
         }
+    }
+
+    #[test]
+    fn peer_challenges_are_read_from_the_www_authenticate_entry_alone() {
+        let values = |headers: &HeaderMap| -> Vec<String> {
+            headers
+                .get_all(WWW_AUTHENTICATE)
+                .iter()
+                .map(|value| {
+                    value
+                        .to_str()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect()
+        };
+        let large = "a".repeat(17 * 1024);
+
+        for (case, headers, expected) in [
+            (
+                "a string beside a large header",
+                json!({"www-authenticate": PEER_SCOPE_CHALLENGE, "content-security-policy": large}),
+                vec![PEER_SCOPE_CHALLENGE],
+            ),
+            (
+                "an array, in any case",
+                json!({"WWW-Authenticate": [PEER_TOKEN_CHALLENGE, PEER_SCOPE_CHALLENGE]}),
+                vec![PEER_TOKEN_CHALLENGE, PEER_SCOPE_CHALLENGE],
+            ),
+            (
+                "values no header can carry are skipped",
+                json!({"www-authenticate": ["bad\nvalue", 7, PEER_SCOPE_CHALLENGE], "bad name": "x"}),
+                vec![PEER_SCOPE_CHALLENGE],
+            ),
+            ("no challenge", json!({"content-type": "application/json"}), vec![]),
+            ("no header object", json!(["www-authenticate"]), vec![]),
+        ] {
+            let challenges = peer_challenges(Some(&headers));
+            assert_eq!(values(&challenges), expected, "{case}");
+            assert_eq!(challenges.len(), expected.len(), "{case}: only challenges are kept");
+        }
+        assert!(peer_challenges(None).is_empty());
     }
 }

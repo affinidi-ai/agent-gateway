@@ -297,15 +297,20 @@ export function variantResource(resource: string, alias: string): string {
 
 /**
  * The failed-save message when it is about this discovery setting: a
- * `protected_resource` rule, or a resource-ownership refusal naming this
+ * `protected_resource` rule of the route edited (`alias` is the variant alias,
+ * absent for the base), or a resource-ownership refusal naming this
  * resource or one of its variants. Null otherwise.
  */
 export function discoverySaveError(
   error: string | null | undefined,
-  resource: string | undefined
+  resource: string | undefined,
+  alias?: string
 ): string | null {
   if (!error) return null;
-  if (error.includes('caller_authentication.protected_resource')) return error;
+  if (error.includes('caller_authentication.protected_resource')) {
+    const prefixed = /^variant '([^']*)': /.exec(error)?.[1];
+    return (prefixed ?? undefined) === alias ? error : null;
+  }
   const named = /^(?:MCP )?resource '([^']*)'/i.exec(error)?.[1];
   if (named && resource && (named === resource || named.startsWith(`${resource}$`))) return error;
   return null;
@@ -355,15 +360,26 @@ export type StrategyPin =
  */
 export function strategyPin(strategy: DeclarationStrategy): StrategyPin {
   const source = asRecord(strategy.jwks_source);
-  if (source?.type === 'static') return { state: 'static_jwks' };
   const pin = asRecord(strategy.authorization_server);
   const issuer = typeof pin?.issuer === 'string' ? pin.issuer : '';
-  if (!issuer) return { state: 'not_pinned' };
+  if (!issuer) return { state: source?.type === 'static' ? 'static_jwks' : 'not_pinned' };
   const jwksUri = typeof source?.jwks_uri === 'string' ? source.jwks_uri : undefined;
   const issuerMoved =
     typeof strategy.expected_issuer === 'string' && issuer !== strategy.expected_issuer;
   const jwksMoved = jwksUri !== undefined && pin?.jwks_uri !== jwksUri;
   return issuerMoved || jwksMoved ? { state: 'mismatch', issuer } : { state: 'pinned', issuer };
+}
+
+/** True when the saved surface stores a discovery setting on the route edited: the base, or the variant `variantId`. */
+export function storedDiscoveryOn(
+  saved: Partial<AgentSurface> | null | undefined,
+  variantId?: string
+): boolean {
+  if (!saved) return false;
+  const accessPoint = variantId
+    ? asRecord(saved.variants?.find(v => v.id === variantId)?.overrides)?.access_point
+    : saved.access_point;
+  return !!storedCallerAuthentication(accessPoint)?.protected_resource;
 }
 
 /** The entry of the route edited: the base for no alias, otherwise that variant. */

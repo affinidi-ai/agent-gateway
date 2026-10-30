@@ -4,6 +4,7 @@ import {
   type SurfaceDeclarationsState,
 } from '../../../../hooks/useSurfaceDeclarations';
 import {
+  cardCarriesScheme,
   describeDeclaration,
   type SurfaceDeclaration,
 } from '../../../../utils/surfaceDeclarations';
@@ -23,8 +24,12 @@ interface Described {
 
 const NEUTRAL: Pick<Described, 'tone' | 'icon'> = { tone: 'secondary', icon: 'fa-circle-info' };
 
-function describeOutcome(d: SurfaceDeclaration, protocol: Protocol | undefined): Described {
-  const described = describeDeclaration(d, protocol);
+function describeOutcome(
+  d: SurfaceDeclaration,
+  protocol: Protocol | undefined,
+  cardScheme: boolean
+): Described {
+  const described = describeDeclaration(d, protocol, cardScheme);
   if (d.outcome === 'unservable') {
     return { ...described, tone: 'danger', icon: 'fa-circle-xmark' };
   }
@@ -68,7 +73,7 @@ export const DeclarationOutcomeView: React.FC<DeclarationOutcomeViewProps> = ({
   } else if (state.status === 'ready') {
     const entry = declarationForVariant(state.declarations, meta?.activeVariantAlias);
     described = entry
-      ? describeOutcome(entry, shownProtocol)
+      ? describeOutcome(entry, shownProtocol, cardCarriesScheme(state.warnings, entry.variant))
       : { ...described, label: `${noun} outcome unavailable` };
   }
 

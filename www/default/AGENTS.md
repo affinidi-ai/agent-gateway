@@ -118,7 +118,7 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   `-warning`. There is no surface-wide switch.
 - **Target Authentication** on the Managed Agent has None plus six types. Four are header presets
   backed by a secret (`static_secret`). **Credential Provider** writes `{ credential_provider:
-  { credential_provider_id, scopes, inject_as } }` (field types in `utils/targetAuth.ts`,
+{ credential_provider_id, scopes, inject_as } }` (field types in `utils/targetAuth.ts`,
   config mapping in `managed-agent/targetAuthConfig.ts`). The provider picker
   (`_shared/CredentialProviderPicker.tsx`, test id `target-auth-credential-provider-select`)
   lists only providers whose type `permits` Target Authentication, so Authorization Code
@@ -191,10 +191,11 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   `caller-auth-discovery-switch-help`, with `field-help-caller-auth-discovery`). It is the single
   opt-in by which an A2A, AP2 or MCP Access Point with a JWT Bearer method declares, and it edits
   `caller_authentication.protected_resource`. Required scopes alone never declare. While it is off,
-  `caller-auth-discovery-off-summary` (a status region) says that no protected resource metadata is
-  published (on A2A and AP2 the card keeps the managed agent's own security) and that a caller whose
+  `caller-auth-discovery-off-summary` (plain text; only the cleared message and the off warning sit in
+  the live region) says that no protected resource metadata is published (on A2A and AP2 the card keeps the managed agent's own security) and that a caller whose
   token is missing, invalid or short of a scope reaches policy as `source_auth.method == "failed"`,
-  so a policy has to deny it. Turning it off on a saved surface whose stored setting is on shows
+  so a policy has to deny it. Turning it off on a saved surface whose saved record stores the setting on the route edited (read
+  from the saved surface, not from what the editor opened with) shows
   `caller-auth-discovery-off-warning`, because the gateway then stops refusing failed callers itself.
 - Turning discovery on prefills the resource with the Access Point's https listener URL plus its
   route (left empty otherwise, and then `caller-auth-discovery-resource-hint` says there is nothing
@@ -217,12 +218,14 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   empty, and callers without a valid token are still refused). The audience is the resource, or
   `<resource>$<alias>` on a variant (`-derived-audience`, `-derived-audience-source`). On A2A and
   AP2, `-card-pin` shows the strategy's pinned authorization server that the card's security scheme
-  names; when the strategy is not pinned or its pin no longer matches, `-strategy-link` opens
+  names (a static key set counts as pinned when its pinned issuer is the expected issuer, as in the
+  gateway); when the strategy is not pinned or its pin no longer matches, `-strategy-link` opens
   `/jwt-verification-strategies/<id>` to run Discover.
 - A surface that stores more than a resource shows `caller-auth-discovery-stored-overrides`: a stored
   `authorization_servers` list with **Use the strategy's issuer**
   (`-clear-authorization-servers-button`) and stored extra `scopes` with **Advertise required
-  scopes only** (`-clear-scopes-button`). The gateway advertises the strategy's issuer, so a stored
+  scopes only** (`-clear-scopes-button`; the "does not enforce" sentence lists only the stored scopes
+  that Required Scopes does not already hold). The gateway advertises the strategy's issuer, so a stored
   list that is not exactly `[expected_issuer]` blocks the save and shows
   `caller-auth-discovery-authorization-servers-error`. The editor has no input to add an
   authorization server or an advertised scope.
@@ -238,7 +241,9 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   `caller-auth-outcome-chip`, `caller-auth-outcome-icon`, `caller-auth-outcome-detail`) shows the
   outcome for the variant being edited (`activeVariantAlias`, the base when none) from
   `GET /api/v1/surfaces/{id}/declarations`, labelled **Agent card:** on A2A and AP2 and **Protected
-  resource metadata:** on MCP. The outcomes are **Declares OAuth**, **Not declared** (on every
+  resource metadata:** on MCP. The outcomes are **Declares OAuth** (on A2A and AP2 the detail says that only the protected resource metadata names
+  the authorization server when the save report carries `card_scheme_unavailable` for that variant),
+  **Not declared** (on every
   protocol, with the reason text from `STRIP_REASON_TEXT`: `not_declared` reads "Authorization
   server discovery is off for this route."; on A2A and AP2 the detail adds that the card keeps the
   managed agent's own security), **Upstream card unchanged** (**No metadata published** on MCP)
@@ -282,12 +287,15 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   unavailable. After creating a surface whose response carries warnings, the dashboard opens
   Surface Detail instead of the list so they stay visible (`surfacePathAfterCreate`).
   `toBackendSurface` never sends `warnings` or `declarations` back.
-- `protectedResource.ts` mirrors the gateway's save rules, which block Save: the resource must be a
-  public https URL of the Access Point's listener followed by its route, a variant of an Access
-  Point on `/` has no resource of its own (`rootVariantProblem`, also a feature dependency of the
-  editor), and a stored list must match the strategy's issuer. Leaving JWT Bearer drops the setting.
+- `protectedResource.ts` mirrors the gateway's save rules. The editor blocks Save on the resource
+  rules (a public https URL of the Access Point's listener followed by its route exactly) and the
+  JWT Bearer settings the gateway constrains. A variant of an Access Point on `/` has no resource of
+  its own (`rootVariantProblem`) and a stored authorization server list must be the strategy's
+  issuer: the section shows both, and the gateway refuses the save, the editor does not block it.
+  Leaving JWT Bearer drops the setting.
   A variant shows the resource it advertises, `<resource>$<alias>`, and keeps its own setting. A
-  failed save whose message names the setting shows in the section (the resource message under the
+  failed save whose message names the setting of the route edited (a `variant '<alias>': ` message
+  belongs to that variant only) shows in the section (the resource message under the
   resource input, the issuer messages under the stored overrides, others in
   `caller-auth-discovery-save-error`) and in the sidebar, which also shows whether Authorization
   server discovery is on or off.
@@ -416,7 +424,7 @@ surface, never the unsaved form.
   `SurfaceMetaContext.agentCardFetchRevision` changes, which the shell bumps on a save and on each
   successful Refresh in the Agent Cards view (`AgentCardTab` `onRefreshed`), so the line does not
   keep a stale status. It shows `Card fetch: checking…` while loading and `Card fetch: status
-  unavailable` when the read fails. Like the chip's
+unavailable` when the read fails. Like the chip's
   link, it reaches the view through `SurfaceMetaContext.onOpenAgentCard`, which `SurfaceFormShell`
   sets only while the view is offered, and it shows only for a saved surface. `SurfaceDetailPage`
   passes `isDirty`, the declarations revision as `agentCardRefreshKey` (so a save reads the cards
@@ -492,16 +500,16 @@ surface, never the unsaved form.
   Transit Point with a flagged migrated copy, on the canvas and in every other loaded variant
   snapshot (it says how many are in other variants), hidden at zero.
 
-| Element                            | Test id                                                                              |
-| ---------------------------------- | ------------------------------------------------------------------------------------ |
-| Per-Transit-Point scope line       | `trust-check-panel-transit-point-scope`                                              |
-| Fullscreen leg label               | `trust-check-fullscreen-leg`                                                         |
-| Managed Agent URL-target warning   | `trust-check-panel-managed-agent-target-warning`                                     |
-| Read-only migrated copy line       | `trust-check-panel-read-only`, `trust-check-fullscreen-read-only`                    |
-| Fullscreen query list             | `trust-check-fullscreen-queries`                                                     |
-| Migrated warning and Keep          | `trust-check-panel-migrated-warning`, `trust-check-fullscreen-migrated-warning`, each with `-keep` |
-| Review summary                     | `surface-migrated-trust-checks-summary`                                              |
-| Migrated canvas badge              | `surface-node-trust-check-migrated-badge`                                            |
+| Element                          | Test id                                                                                            |
+| -------------------------------- | -------------------------------------------------------------------------------------------------- |
+| Per-Transit-Point scope line     | `trust-check-panel-transit-point-scope`                                                            |
+| Fullscreen leg label             | `trust-check-fullscreen-leg`                                                                       |
+| Managed Agent URL-target warning | `trust-check-panel-managed-agent-target-warning`                                                   |
+| Read-only migrated copy line     | `trust-check-panel-read-only`, `trust-check-fullscreen-read-only`                                  |
+| Fullscreen query list            | `trust-check-fullscreen-queries`                                                                   |
+| Migrated warning and Keep        | `trust-check-panel-migrated-warning`, `trust-check-fullscreen-migrated-warning`, each with `-keep` |
+| Review summary                   | `surface-migrated-trust-checks-summary`                                                            |
+| Migrated canvas badge            | `surface-node-trust-check-migrated-badge`                                                          |
 
 ## Trust Recorder
 
@@ -869,19 +877,19 @@ parts `IdentityNameCell`, `IdentityOriginBadge`, and `IdentityRecorderChip`.
     recorder outcome changes; adding or removing a Trust Recorder shows on the next update or
     reload.
 
-| Element                                       | Test id                                                                                                                            |
-| --------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| Identity row                                  | `identities-row-<did>`                                                                                                             |
-| Name, pending, conflict, verified             | `identities-name`, `identities-name-pending`, `identities-name-conflict`, `identities-name-verified`                               |
-| Copy DID                                      | `identities-copy-did-button`                                                                                                       |
-| Origin badge                                  | `identities-origin-<origin>`                                                                                                       |
-| Surface link, credential principal            | `identities-surface-link`, `identities-credential-principal`                                                                       |
-| Unnamed filter                                | `identities-unnamed-filter-button`                                                                                                 |
-| Recorder filter                               | `identities-recorder-filter`                                                                                                       |
-| Recorder chip                                 | `identities-recorder-chip-<state>`                                                                                                 |
-| Recorder tooltip                              | `identities-recorder-tooltip`                                                                                                      |
-| Tooltip last attempt, reason                  | `identities-recorder-last-attempt`, `identities-recorder-reason`                                                                   |
-| Tooltip registry entry                        | `identities-recorder-entry-<registry id>`                                                                                          |
+| Element                            | Test id                                                                                              |
+| ---------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| Identity row                       | `identities-row-<did>`                                                                               |
+| Name, pending, conflict, verified  | `identities-name`, `identities-name-pending`, `identities-name-conflict`, `identities-name-verified` |
+| Copy DID                           | `identities-copy-did-button`                                                                         |
+| Origin badge                       | `identities-origin-<origin>`                                                                         |
+| Surface link, credential principal | `identities-surface-link`, `identities-credential-principal`                                         |
+| Unnamed filter                     | `identities-unnamed-filter-button`                                                                   |
+| Recorder filter                    | `identities-recorder-filter`                                                                         |
+| Recorder chip                      | `identities-recorder-chip-<state>`                                                                   |
+| Recorder tooltip                   | `identities-recorder-tooltip`                                                                        |
+| Tooltip last attempt, reason       | `identities-recorder-last-attempt`, `identities-recorder-reason`                                     |
+| Tooltip registry entry             | `identities-recorder-entry-<registry id>`                                                            |
 
 ## Remote gateway Issuer DIDs
 

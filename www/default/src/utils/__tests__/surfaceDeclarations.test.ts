@@ -1,4 +1,5 @@
 import {
+  cardCarriesScheme,
   describeDeclaration,
   fetchSurfaceDeclarations,
   parseSurfaceDeclarations,
@@ -40,6 +41,28 @@ describe('parseSurfaceDeclarations', () => {
       declarations: [],
       warnings: [],
     });
+  });
+});
+
+describe('declaration without a card scheme', () => {
+  it('says that only the protected resource metadata names the authorization server', () => {
+    const declare = { variant: null, resource: null, outcome: 'declare', reason: null } as const;
+    expect(describeDeclaration(declare, 'a2a', false).detail).toBe(
+      'Only the protected resource metadata names the authorization server of the selected strategy and the required scopes, and callers without a valid token are challenged. The agent card names no security scheme.'
+    );
+    expect(describeDeclaration(declare, 'a2a', true).detail).toMatch(/^The agent card and the/);
+    expect(describeDeclaration(declare, 'mcp', false).detail).toMatch(
+      /^The protected resource metadata names/
+    );
+  });
+
+  it('reads the card_scheme_unavailable warning of the variant', () => {
+    const warnings = [
+      { code: 'card_scheme_unavailable', message: 'm', path: null, variant: 'beta' },
+    ];
+    expect(cardCarriesScheme(warnings, 'beta')).toBe(false);
+    expect(cardCarriesScheme(warnings, null)).toBe(true);
+    expect(cardCarriesScheme([], 'beta')).toBe(true);
   });
 });
 

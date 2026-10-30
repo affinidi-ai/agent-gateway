@@ -173,6 +173,7 @@ const DerivedValues: React.FC<DerivedValuesProps> = ({
 
 interface StoredOverridesProps {
   setting: ProtectedResourceSetting;
+  requiredScopes: string[];
   serverErrors: string[];
   scopeErrors: string[];
   update: (next: ProtectedResourceSetting) => void;
@@ -185,15 +186,17 @@ interface StoredOverridesProps {
  */
 const StoredOverrides: React.FC<StoredOverridesProps> = ({
   setting,
+  requiredScopes,
   serverErrors,
   scopeErrors,
   update,
 }) => {
   const servers = setting.authorization_servers;
-  const scopes = setting.scopes ?? [];
+  const stored = setting.scopes ?? [];
+  const scopes = stored.filter(scope => !requiredScopes.includes(scope));
   if (
     servers === undefined &&
-    scopes.length === 0 &&
+    stored.length === 0 &&
     serverErrors.length === 0 &&
     scopeErrors.length === 0
   ) {
@@ -232,12 +235,14 @@ const StoredOverrides: React.FC<StoredOverridesProps> = ({
           {message}
         </div>
       ))}
-      {scopes.length > 0 && (
+      {stored.length > 0 && (
         <div className="mb-2">
-          <span className="d-block">
-            This surface also advertises <code className="text-break">{scopes.join(' ')}</code>,
-            which the gateway does not enforce.
-          </span>
+          {scopes.length > 0 && (
+            <span className="d-block">
+              This surface also advertises <code className="text-break">{scopes.join(' ')}</code>,
+              which the gateway does not enforce.
+            </span>
+          )}
           <button
             type="button"
             className="btn btn-outline-secondary btn-sm mt-1"
@@ -303,7 +308,7 @@ const CallerAuthDiscoverySection: React.FC<CallerAuthDiscoverySectionProps> = ({
   const requiredScopes = readRequiredScopes(config);
   const offersSwitch = declaresOn(protocol) || on;
 
-  const [storedOn] = useState(on);
+  const storedOn = !!meta?.storedDiscoveryOn;
   const [focusResource, setFocusResource] = useState(false);
   const [cleared, setCleared] = useState<string | null>(null);
   const resourceRef = useRef<HTMLInputElement>(null);
@@ -332,7 +337,7 @@ const CallerAuthDiscoverySection: React.FC<CallerAuthDiscoverySectionProps> = ({
     });
   };
 
-  const saveError = discoverySaveError(meta?.saveError, setting?.resource);
+  const saveError = discoverySaveError(meta?.saveError, setting?.resource, alias);
   const saveField = saveError ? discoverySaveErrorField(saveError) : null;
   const alertError =
     saveError && (!on || saveField === 'rules' || saveField === null) ? saveError : null;
@@ -590,6 +595,7 @@ const CallerAuthDiscoverySection: React.FC<CallerAuthDiscoverySectionProps> = ({
 
               <StoredOverrides
                 setting={setting}
+                requiredScopes={requiredScopes}
                 serverErrors={errorsFor('authorizationServers')}
                 scopeErrors={errorsFor('scopes')}
                 update={update}

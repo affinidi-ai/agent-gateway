@@ -249,6 +249,10 @@ pub struct ProtectedResourceConfig {
 }
 
 impl ProtectedResourceConfig {
+    /// Each listed issuer is checked here only as an issuer URL, `http` or
+    /// `https`: an `http` one is saved only as the whole list naming the issuer
+    /// of a strategy no tenant owns, which the save checks against the strategy
+    /// (see [`validate_authorization_server`]).
     pub fn validate(&self) -> Result<(), String> {
         validate_resource(&self.resource, &self.scopes)?;
         let Some(authorization_servers) = &self.authorization_servers else {
@@ -262,7 +266,9 @@ impl ProtectedResourceConfig {
         }
         let mut seen = std::collections::HashSet::new();
         for issuer in authorization_servers {
-            validate_authorization_server(issuer)?;
+            if !names_issuer(issuer, crate::authz_metadata::EgressPosture::CloudMetadataOnly) {
+                return Err(NOT_AN_AUTHORIZATION_SERVER.into());
+            }
             if !seen.insert(issuer.as_str()) {
                 return Err("authorization_servers must not repeat an issuer".into());
             }
@@ -326,12 +332,13 @@ pub(crate) fn refusal(
 /// issuer in the server's metadata.
 pub(crate) fn validate_authorization_server(issuer: &str) -> Result<(), String> {
     if !names_issuer(issuer, crate::authz_metadata::EgressPosture::Strict) {
-        return Err(
-            "authorization_servers entries must be https issuer URLs without credentials, query or fragment".into()
-        );
+        return Err(NOT_AN_AUTHORIZATION_SERVER.into());
     }
     Ok(())
 }
+
+const NOT_AN_AUTHORIZATION_SERVER: &str =
+    "authorization_servers entries must be https issuer URLs without credentials, query or fragment";
 
 /// Whether protected resource metadata can name a JWT verification strategy's
 /// issuer: an issuer [`validate_authorization_server`] accepts, or, for a
@@ -666,16 +673,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn protected_resource_settings_take_only_https_issuers_and_bounded_scopes() {
+    fn protected_resource_settings_take_issuer_urls_and_bounded_scopes() {
         assert_eq!(protected_resource("https://gateway.example/mcp/alpha").validate(), Ok(()));
-        let trailing_slash = ProtectedResourceConfig {
-            authorization_servers: Some(vec![
-                "https://tenant.auth0.example/".into(),
-                "https://accounts.example".into(),
-            ]),
-            ..protected_resource("https://gateway.example/mcp/alpha")
-        };
-        assert_eq!(trailing_slash.validate(), Ok(()));
+        for servers in [
+            vec!["https://tenant.auth0.example/".to_string(), "https://accounts.example".to_string()],
+            vec!["http://127.0.0.1:4444/".to_string()],
+        ] {
+            let config = ProtectedResourceConfig {
+                authorization_servers: Some(servers.clone()),
+                ..protected_resource("https://gateway.example/mcp/alpha")
+            };
+            assert_eq!(config.validate(), Ok(()), "{servers:?}");
+        }
         let empty = ProtectedResourceConfig {
             authorization_servers: Some(Vec::new()),
             ..protected_resource("https://gateway.example/mcp/alpha")
@@ -687,7 +696,7 @@ mod tests {
                 .to_string())
         );
         for servers in [
-            vec!["http://idp.example".to_string()],
+            vec!["did:web:idp.example".to_string()],
             vec!["https://idp.example?tenant=a".to_string()],
             vec!["https://idp.example#issuer".to_string()],
             vec!["https://user:secret@idp.example".to_string()],

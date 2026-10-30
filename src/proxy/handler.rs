@@ -12500,15 +12500,14 @@ async fn handle_fabric_request(
                     response_body.len()
                 );
 
-                let peer_headers = crate::proxy::fabric_stream::wire::headers_from_json(
+                let peer_challenges = crate::proxy::fabric_peer_refusal::peer_challenges(
                     response_msg
                         .message_body
                         .get("headers"),
-                )
-                .unwrap_or_default();
+                );
                 if let Some(refused) = crate::proxy::fabric_peer_refusal::refuse_peer_authorization(
                     StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
-                    &peer_headers,
+                    &peer_challenges,
                     &crate::audit::request_events::RequestFacts {
                         surface_id: config_id,
                         channel_name,
@@ -21365,6 +21364,58 @@ mod fabric_extended_card_tests {
                     .is_none()
             );
             assert!(rejections(&events).is_empty(), "{events:?}");
+        });
+    }
+
+    /// A peer's challenge decides its answer however large the peer's other
+    /// headers are.
+    #[test]
+    fn a_fabric_peer_challenge_is_read_beside_large_headers() {
+        run_on_large_stack(async {
+            const PAYMENT: &str = "Payment id=\"p1\", realm=\"gw2\", method=\"tempo\"";
+            let with_large = |challenge: Option<serde_json::Value>| {
+                let mut headers =
+                    json!({"content-type": "application/json", "content-security-policy": "a".repeat(17 * 1024)});
+                if let Some(challenge) = challenge {
+                    headers["www-authenticate"] = challenge;
+                }
+                headers
+            };
+
+            for (status, challenge, body, reason) in peer_refusals() {
+                for challenge in [json!(challenge), json!(["Basic realm=\"peer\"", challenge])] {
+                    let peer = fabric_peer_on("a2a", status, with_large(Some(challenge.clone())), body.clone()).await;
+
+                    let answer = answered(send_through_router(&peer)).await;
+
+                    assert_peer_refusal_answer(&format!("peer {status} with {challenge}"), answer, reason);
+                }
+            }
+
+            let refused = json!({"jsonrpc": "2.0", "id": "m-1", "error": {"code": -32000, "message": "refused"}});
+            for (status, challenge, expected_challenges) in [
+                (402, Some(json!(PAYMENT)), vec![PAYMENT.to_string()]),
+                (401, Some(json!(PAYMENT)), vec![PAYMENT.to_string()]),
+                (403, None, vec![]),
+            ] {
+                let peer = fabric_peer_on("a2a", status, with_large(challenge), refused.clone()).await;
+
+                let (response, events) = crate::audit::producer::capture(send_through_router(&peer)).await;
+
+                let challenges: Vec<String> = response
+                    .headers()
+                    .get_all(axum::http::header::WWW_AUTHENTICATE)
+                    .iter()
+                    .map(|value| {
+                        value
+                            .to_str()
+                            .unwrap()
+                            .to_string()
+                    })
+                    .collect();
+                assert_eq!((response.status().as_u16(), challenges), (status, expected_challenges), "peer {status}");
+                assert!(rejections(&events).is_empty(), "peer {status}: {events:?}");
+            }
         });
     }
 

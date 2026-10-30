@@ -311,9 +311,6 @@ exits non-zero on failure.
 
 It revokes the grant, so run `up.sh`, `gateway.sh start --fresh` and `seed.sh` again before repeating it.
 
-Storage seeded before surfaces declared through `protected_resource` holds a surface that no longer
-declares, so re-seed it (`gateway.sh start --fresh`, then `seed.sh`) before running the walkthrough.
-
 ## Coverage
 
 `make oidc-demo-run` is the end-to-end check: it runs the ten walkthrough steps, then the hop 2 checks,

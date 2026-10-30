@@ -26,7 +26,9 @@ const CallerAuthPanel: React.FC<ConfigPanelProps> = ({
   const surfaceId = useParams<{ surfaceId: string }>().surfaceId ?? meta?.surfaceId;
   const declares = method === 'jwt_bearer' && declaresOn(protocol);
   const discovery = readProtectedResource(config.protected_resource);
-  const discoveryError = declares ? discoverySaveError(meta?.saveError, discovery?.resource) : null;
+  const discoveryError = declares
+    ? discoverySaveError(meta?.saveError, discovery?.resource, meta?.activeVariantAlias)
+    : null;
 
   return (
     <>

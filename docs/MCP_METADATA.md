@@ -1390,7 +1390,7 @@ endpoint admits.
 
 ### Authorization Server Discovery for Caller Authentication
 
-An MCP or A2A Access Point (see [Agent card security](PROTOCOLS.md#agent-card-security) and
+An MCP, A2A or AP2 Access Point (see [Agent card security](PROTOCOLS.md#agent-card-security) and
 [Declaring an Access Point](SOURCE_AUTH.md#declaring-an-access-point)) whose caller
 authentication validates JWT Bearer tokens from an external authorization server can publish RFC 9728
 protected resource metadata naming that server, so a client finds where to get a
@@ -1450,11 +1450,12 @@ optional. Absent, the document names the JWT verification strategy's `expected_i
 every request, so a change of the strategy's issuer needs no save of the surface. Sent, it must be
 exactly `["<expected_issuer>"]`: a save that lists another server, beside it or instead of it, is
 refused with `400`, because every token a client got from that server would be refused, and so is
-an empty list. The issuer must be one the metadata can name, checked with the issuer rules of
+an empty list. Every entry of a sent list is checked with the issuer rules of
 [authorization server metadata discovery](SOURCE_AUTH.md#authorization-server-metadata-module-developer-reference)
 under the strict posture (HTTPS, a host, no credentials, query, fragment,
-whitespace or control character), printable ASCII and at most 2048 bytes; a strategy whose
-issuer fails them is refused on save with `400` and answers `503` at request time. The issuer is
+whitespace or control character), printable ASCII and at most 2048 bytes. The strategy's issuer
+must follow the same rules, except that a strategy no tenant owns may also have an `http` issuer;
+a strategy whose issuer fails them is refused on save with `400` and answers `503` at request time. The issuer is
 advertised exactly as written, since clients compare it byte for byte with the issuer in the
 server's own metadata. A stored list is never advertised; one that no longer equals the issuer
 after the strategy changed blocks the next save of the surface until it is updated or removed,
@@ -1593,8 +1594,6 @@ and stop serving it (`404`, fail closed). Before rolling back to such a release:
   surface policy that denies `input.source_auth.method == "failed"` first (see
   [Failed caller authentication](POLICY.md#failed-caller-authentication)), because those releases
   pass failed callers to policy.
-- A surface that declared through `required_scopes` alone, as stored by an earlier build of this
-  change, no longer declares: PATCH `protected_resource` onto it.
 
 `make mcp-discovery` ([`scripts/mcp-discovery/`](../scripts/mcp-discovery/README.md))
 runs the flow end to end against Ory Hydra with a scripted client and the

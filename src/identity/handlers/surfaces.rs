@@ -2163,7 +2163,9 @@ fn settle_retained_protected_resources(
 /// protected resource metadata, challenge and agent card name. A stored
 /// `authorization_servers`, which is never advertised, must be exactly that
 /// issuer or be omitted: only that issuer's tokens are accepted, so a list naming
-/// another server would mislead whoever reads the record.
+/// another server would mislead whoever reads the record. Its entries must be
+/// https issuers, except a list that is exactly the http issuer of a strategy
+/// no tenant owns, the value the gateway would advertise without it.
 /// `validate_surface_references` has already checked that the strategy exists
 /// and that the caller may use it.
 async fn validate_protected_resource_strategy(
@@ -2192,6 +2194,17 @@ async fn validate_protected_resource_strategy(
             .map_err(|e| SurfaceApiError::InternalError(format!("Failed to load the JWT verification strategy: {e}")))?
             .ok_or_else(|| SurfaceApiError::BadRequest(format!("{label}JWT verification strategy not found")))?;
         let issuer = &strategy.expected_issuer;
+        if let Some(listed) = &protected.authorization_servers
+            && !(strategy.tenant_id.is_none() && *listed == [issuer.as_str()])
+        {
+            for entry in listed {
+                crate::protocols::protected_resource::validate_authorization_server(entry).map_err(|error| {
+                    SurfaceApiError::BadRequest(format!(
+                        "{label}access_point.caller_authentication.protected_resource: {error}"
+                    ))
+                })?;
+            }
+        }
         if !crate::protocols::protected_resource::advertisable_strategy_issuer(&strategy) {
             return Err(SurfaceApiError::BadRequest(format!(
                 "{label}access_point.caller_authentication.protected_resource: the JWT verification strategy's \
@@ -4082,6 +4095,63 @@ mod validation_tests {
                 "{issuer} for {tenant:?} is accepted without a pinned authorization server"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_save_takes_an_http_authorization_server_only_as_the_issuer_of_a_strategy_no_tenant_owns() {
+        use crate::protocols::protected_resource::fixtures::fixture_strategy;
+        use crate::surfaces::save_report::tests::OneStrategy;
+        let http_issuer = "http://127.0.0.1:4444/";
+        let listing = |servers: serde_json::Value| {
+            Some(serde_json::json!({"resource": "https://gateway.example/mcp", "authorization_servers": servers}))
+        };
+        let strategy = |issuer: &str, tenant: Option<&str>| {
+            let mut strategy = fixture_strategy(false);
+            strategy.expected_issuer = issuer.to_string();
+            strategy.tenant_id = tenant.map(Into::into);
+            OneStrategy(strategy)
+        };
+
+        let accepted = declaring_surface(listing(serde_json::json!([http_issuer])), None);
+        assert_eq!(accepted.validate_mcp_metadata(), Ok(()));
+        assert_eq!(strategy_check(Some(&strategy(http_issuer, None)), &accepted).await, Ok(()));
+
+        let not_https = "access_point.caller_authentication.protected_resource: authorization_servers entries must be \
+                         https issuer URLs without credentials, query or fragment";
+        for (case, issuer, tenant, servers) in [
+            ("a tenant-owned strategy's http issuer", http_issuer, Some("tenant-a"), serde_json::json!([http_issuer])),
+            (
+                "an http issuer for a tenant-owned https strategy",
+                "https://idp.example",
+                Some("tenant-a"),
+                serde_json::json!([http_issuer]),
+            ),
+            ("another http server", http_issuer, None, serde_json::json!(["http://other.example/"])),
+            (
+                "the http issuer beside another",
+                http_issuer,
+                None,
+                serde_json::json!([http_issuer, "https://other.example"]),
+            ),
+            ("an http server for an https strategy", "https://idp.example", None, serde_json::json!([http_issuer])),
+        ] {
+            let surface = declaring_surface(listing(servers), None);
+            assert_eq!(surface.validate_mcp_metadata(), Ok(()), "{case}");
+            assert_eq!(
+                strategy_check(Some(&strategy(issuer, tenant)), &surface).await,
+                Err(not_https.to_string()),
+                "{case}"
+            );
+        }
+        assert_eq!(
+            strategy_check(
+                Some(&strategy(http_issuer, None)),
+                &declaring_surface(None, listing(serde_json::json!(["http://other.example/"])))
+            )
+            .await,
+            Err(format!("variant 'beta': {not_https}")),
+            "an enabled variant is checked with its own setting"
+        );
     }
 
     #[test]

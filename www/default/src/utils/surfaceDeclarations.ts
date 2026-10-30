@@ -87,18 +87,30 @@ const UNSERVABLE_FALLBACK =
 
 const CARD_KEEPS_SECURITY = 'The agent card keeps the managed agent’s own security.';
 
+export const CARD_SCHEME_UNAVAILABLE_CODE = 'card_scheme_unavailable';
+
+export function cardCarriesScheme(
+  warnings: readonly SurfaceWarning[],
+  variant: string | null
+): boolean {
+  return !warnings.some(w => w.code === CARD_SCHEME_UNAVAILABLE_CODE && w.variant === variant);
+}
+
 export function describeDeclaration(
   d: SurfaceDeclaration,
-  protocol?: Protocol
+  protocol?: Protocol,
+  cardScheme = true
 ): { label: string; detail: string } {
   const mcp = protocol === 'mcp';
   if (d.outcome === 'declare') {
-    return {
-      label: 'Declares OAuth',
-      detail: mcp
-        ? 'The protected resource metadata names the authorization server of the selected strategy and the required scopes, and callers without a valid token are challenged.'
-        : 'The agent card and the protected resource metadata name the authorization server of the selected strategy and the required scopes, and callers without a valid token are challenged.',
-    };
+    const named =
+      'the authorization server of the selected strategy and the required scopes, and callers without a valid token are challenged.';
+    let detail = `The agent card and the protected resource metadata name ${named}`;
+    if (mcp) detail = `The protected resource metadata names ${named}`;
+    else if (!cardScheme) {
+      detail = `Only the protected resource metadata names ${named} The agent card names no security scheme.`;
+    }
+    return { label: 'Declares OAuth', detail };
   }
   if (d.outcome === 'unservable') {
     return {

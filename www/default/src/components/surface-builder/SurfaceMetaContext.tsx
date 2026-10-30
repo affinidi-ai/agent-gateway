@@ -48,6 +48,8 @@ export interface SurfaceMetaValue {
   activeVariantAlias?: string;
   /** True when that variant is the surface's default, which also answers on its route. */
   activeVariantIsDefault?: boolean;
+  /** True when the saved surface stores authorization server discovery on the route the canvas shows. */
+  storedDiscoveryOn?: boolean;
   /** Message of the last failed save, so a panel can show it next to the field it names. */
   saveError?: string | null;
   setName: (v: string) => void;

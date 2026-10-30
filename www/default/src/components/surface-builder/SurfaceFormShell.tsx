@@ -20,6 +20,7 @@ import { registry } from './elements';
 import type { UseSurfaceBuilderReturn } from './hooks/useSurfaceBuilder';
 import type { CanvasNode } from './SurfaceCanvas';
 import type { SurfaceTemplateItem } from '../../api';
+import { storedDiscoveryOn } from './elements/caller-auth/protectedResource';
 import { SurfaceMetaProvider, type DidwebvhConfig } from './SurfaceMetaContext';
 import type { SurfacePolicyDefinitionLoadState } from './elements/policy/status';
 import { hasPolicyDefinitionReference, policyDefinitionsWarning } from './elements/policy/status';
@@ -157,6 +158,8 @@ export interface SurfaceFormShellProps {
   agentCardRefreshKey?: unknown;
   /** True when the saved surface has enabled Surface Variants. */
   hasVariants?: boolean;
+  /** The saved surface record, so panels can tell what it stores from what is being edited. */
+  savedSurface?: Partial<AgentSurface> | null;
 }
 
 /** True when `variantId` is the default variant in the canvas's variant catalog. */
@@ -313,6 +316,7 @@ const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
   isDirty = false,
   agentCardRefreshKey,
   hasVariants = false,
+  savedSurface,
 }) => {
   const surfacePolicyIds =
     surfacePolicyLoadState.status === 'loaded' ? surfacePolicyLoadState.ids : null;
@@ -819,6 +823,12 @@ const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
         surfaceId,
         activeVariantAlias: variantAlias(builder.state.nodes, activeVariantId),
         activeVariantIsDefault: isDefaultVariant(builder.state.nodes, activeVariantId),
+        storedDiscoveryOn: storedDiscoveryOn(
+          savedSurface,
+          variantAlias(builder.state.nodes, activeVariantId)
+            ? (activeVariantId ?? undefined)
+            : undefined
+        ),
         saveError,
         setName: setMeta.setName,
         setDescription: setMeta.setDescription,

@@ -1678,6 +1678,7 @@ const SurfaceDetailPage: React.FC = () => {
         surfacePolicyLoadState={surfacePolicyLoadState}
         hasAttemptedSave={hasAttemptedSave}
         saveError={error}
+        savedSurface={surface}
         isDirty={hasUnsavedConfig}
         agentCardRefreshKey={declarationsRevision}
         hasVariants={savedHasVariants}

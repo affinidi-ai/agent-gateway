@@ -16,6 +16,7 @@ import {
   resourceProblem,
   rootVariantProblem,
   scopeProblem,
+  storedDiscoveryOn,
   strategyPin,
   suggestedResource,
   variantResource,
@@ -330,9 +331,10 @@ describe('resource helpers', () => {
     const rule =
       'access_point.caller_authentication.protected_resource: requires empty JWT Bearer audiences (400)';
     expect(discoverySaveError(rule, SETTING.resource)).toBe(rule);
-    expect(discoverySaveError(`variant 'beta': ${rule}`, undefined)).toBe(
+    expect(discoverySaveError(`variant 'beta': ${rule}`, SETTING.resource, 'beta')).toBe(
       `variant 'beta': ${rule}`
     );
+    expect(discoverySaveError(rule, SETTING.resource, 'beta')).toBeNull();
     const owned = `MCP resource '${SETTING.resource}$beta' is already served by another endpoint (400)`;
     expect(discoverySaveError(owned, SETTING.resource)).toBe(owned);
     const generic = `Resource '${SETTING.resource}' is already served by another endpoint (400)`;
@@ -349,6 +351,13 @@ describe('resource helpers', () => {
     expect(discoverySaveError(othersResource, SETTING.resource)).toBeNull();
     expect(discoverySaveError('target.endpoint: invalid (400)', SETTING.resource)).toBeNull();
     expect(discoverySaveError(null, SETTING.resource)).toBeNull();
+  });
+
+  it('leaves a refusal about another route to that route', () => {
+    const rule =
+      'access_point.caller_authentication.protected_resource: a variant of an Access Point at / has no resource';
+    expect(discoverySaveError(`variant 'beta': ${rule}`, SETTING.resource)).toBeNull();
+    expect(discoverySaveError(`variant 'beta': ${rule}`, SETTING.resource, 'gamma')).toBeNull();
   });
 
   it('routes a refused save to the field it names', () => {
@@ -481,9 +490,37 @@ describe('declaring protocols and strategy pins', () => {
         strategy({ jwks_source: { type: 'remote', jwks_uri: 'https://idp.example/new' } })
       )
     ).toEqual({ state: 'mismatch', issuer: ISSUER });
-    expect(strategyPin(strategy({ jwks_source: { type: 'static', jwks: [] } }))).toEqual({
-      state: 'static_jwks',
+    expect(
+      strategyPin(
+        strategy({ jwks_source: { type: 'static', jwks: [] }, authorization_server: undefined })
+      )
+    ).toEqual({ state: 'static_jwks' });
+  });
+
+  it('pins a static key set whose pinned issuer is the expected issuer', () => {
+    const source = { jwks_source: { type: 'static', jwks: [] } };
+    expect(strategyPin(strategy(source))).toEqual({ state: 'pinned', issuer: ISSUER });
+    expect(strategyPin(strategy({ ...source, expected_issuer: 'https://other.example' }))).toEqual({
+      state: 'mismatch',
+      issuer: ISSUER,
     });
+  });
+
+  it('reads whether the saved surface stores discovery on the route edited', () => {
+    const on = { caller_authentication: { protected_resource: SETTING } };
+    const saved = {
+      access_point: on,
+      variants: [
+        { id: 'v-1', alias: 'beta', overrides: { access_point: on } },
+        { id: 'v-2', alias: 'gamma', overrides: {} },
+      ],
+    } as unknown as Partial<AgentSurface>;
+    expect(storedDiscoveryOn(saved)).toBe(true);
+    expect(storedDiscoveryOn(saved, 'v-1')).toBe(true);
+    expect(storedDiscoveryOn(saved, 'v-2')).toBe(false);
+    expect(storedDiscoveryOn(saved, 'missing')).toBe(false);
+    expect(storedDiscoveryOn({ access_point: {} } as Partial<AgentSurface>)).toBe(false);
+    expect(storedDiscoveryOn(null)).toBe(false);
   });
 
   it('picks the entry of the route edited', () => {

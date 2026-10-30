@@ -135,7 +135,7 @@ changes:
     - timestamp: '2026-10-30T12:00:00Z'
       title: ⭐ Declare A2A and AP2 Access Points as protected resources
       description: >-
-        An A2A or AP2 Access Point whose only caller authentication is one jwt_bearer method can set
+        An A2A or AP2 Access Point whose first caller authentication method is jwt_bearer can set
         caller_authentication.protected_resource, as an MCP Access Point can. It then publishes RFC
         9728 metadata at /.well-known/oauth-protected-resource followed by its route, accepts only
         tokens that carry the resource among their aud values (the resource is <resource>$<alias> on
@@ -428,16 +428,16 @@ changes:
         URL; the authorization server and scopes are shown read-only, taken from the JWT
         verification strategy and the required scopes, and an authorization server or scope list
         stored by an earlier release shows as an override that can be cleared. Required scopes alone
-        no longer declare, so removing them cannot turn the refusal of failed callers off.
+        do not declare, so removing them cannot turn the refusal of failed callers off.
     - timestamp: '2026-10-30T12:00:00Z'
       title: Derive protected resource authorization servers and scopes when omitted
       description: >-
         authorization_servers and scopes in protected_resource are now optional. Without them the
         metadata names the JWT verification strategy's expected issuer, read on every request, so a
         strategy issuer change shows without saving the surface, and advertises the method's
-        required scopes. A list that is given must still equal the strategy's issuer. An issuer that
-        is not an https URL is refused on save, and an Access Point whose strategy later changes to
-        one answers 503 with the reason issuer_not_advertisable. Existing settings are unchanged.
+        required scopes. A list that is given must still equal the strategy's issuer. An issuer
+        must be an https URL, or an http one too for a strategy no tenant owns; any other is
+        refused on save, and an Access Point whose strategy later changes to one answers 503 with the reason issuer_not_advertisable. Existing settings are unchanged.
         Earlier releases cannot read a setting without authorization_servers and skip the surface:
         before rolling back, PATCH each such setting with authorization_servers set to the
         strategy's issuer.

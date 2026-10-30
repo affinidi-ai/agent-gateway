@@ -305,8 +305,9 @@ fn declaration_warnings(
 }
 
 /// A stored `authorization_servers` that no longer names the issuer the
-/// strategy trusts, which the gateway advertises instead and the next save of
-/// the stored list refuses.
+/// strategy trusts, which the gateway advertises instead. Any later save of the
+/// surface that keeps the stored list is refused, including one that does not
+/// send it, until the list names that issuer or is removed.
 fn stale_authorization_servers(
     view: &AgentSurface,
     declaration: &Declaration,

@@ -285,7 +285,7 @@ gateway warning names the cause's detail.
 | `root_variant_resource` | With `protected_resource`, the route called is a Surface Variant of an Access Point at `/`, which has no resource of its own |
 | `resource_mismatch` | The `protected_resource` resource is not on a public origin of the Access Point's listener with the Access Point's own path |
 | `strategy_unavailable` | The strategy the method names is missing, or the surface's tenant may not reference it |
-| `issuer_not_advertisable` | The strategy's `expected_issuer` is not an `https` issuer URL protected resource metadata can name |
+| `issuer_not_advertisable` | The strategy's `expected_issuer` is not an `https` issuer URL (or an `http` one too for a strategy no tenant owns) that protected resource metadata can name |
 | `strategy_store_unavailable` | The strategy could not be read because the strategy store failed |
 | `network_unavailable` | Over Fabric, the receiving gateway has no network configuration to name the resource of an Access Point that declares |
 

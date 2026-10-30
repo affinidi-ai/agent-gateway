@@ -327,7 +327,7 @@ describe('Caller Context editor: authorization server discovery', () => {
   it('warns, on a saved surface, that turning it off leaves failed callers to policy', async () => {
     const { view } = await openEditor({
       initial: jwtConfig({ protected_resource: SETTING }),
-      meta: { surfaceId: 's-1' },
+      meta: { surfaceId: 's-1', storedDiscoveryOn: true },
     });
     expect(screen.queryByTestId('caller-auth-discovery-off-warning')).toBeNull();
     fireEvent.click(screen.getByTestId('caller-auth-discovery-switch'));
@@ -345,6 +345,52 @@ describe('Caller Context editor: authorization server discovery', () => {
     await openEditor({ initial: jwtConfig({ protected_resource: SETTING }) });
     fireEvent.click(screen.getByTestId('caller-auth-discovery-switch'));
     expect(screen.queryByTestId('caller-auth-discovery-off-warning')).toBeNull();
+  });
+
+  it('reads whether the setting is stored from the saved surface, not from the editor it opened with', async () => {
+    const { view } = await openEditor({
+      initial: jwtConfig({ protected_resource: SETTING }),
+      meta: { surfaceId: 's-1', storedDiscoveryOn: false },
+    });
+    fireEvent.click(screen.getByTestId('caller-auth-discovery-switch'));
+    expect(screen.queryByTestId('caller-auth-discovery-off-warning')).toBeNull();
+    view.unmount();
+
+    await openEditor({
+      initial: jwtConfig(),
+      meta: { surfaceId: 's-1', storedDiscoveryOn: true },
+    });
+    expect(screen.getByTestId('caller-auth-discovery-off-warning')).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('caller-auth-discovery-switch'));
+    expect(screen.queryByTestId('caller-auth-discovery-off-warning')).toBeNull();
+    fireEvent.click(screen.getByTestId('caller-auth-discovery-switch'));
+    expect(screen.getByTestId('caller-auth-discovery-off-warning')).toBeInTheDocument();
+  });
+
+  it('does not list a stored scope that Required Scopes already enforces as unenforced', async () => {
+    await openEditor({
+      initial: jwtConfig({
+        required_scopes: ['agent.invoke'],
+        protected_resource: { resource: RESOURCE, scopes: ['agent.invoke', 'extra'] },
+      }),
+    });
+    const overrides = screen.getByTestId('caller-auth-discovery-stored-overrides');
+    expect(overrides).toHaveTextContent(
+      'also advertises extra, which the gateway does not enforce'
+    );
+    expect(overrides).not.toHaveTextContent('agent.invoke, which');
+  });
+
+  it('keeps the clear button but names no scope when every stored scope is enforced', async () => {
+    await openEditor({
+      initial: jwtConfig({
+        required_scopes: ['agent.invoke'],
+        protected_resource: { resource: RESOURCE, scopes: ['agent.invoke'] },
+      }),
+    });
+    const overrides = screen.getByTestId('caller-auth-discovery-stored-overrides');
+    expect(overrides).not.toHaveTextContent('does not enforce');
+    expect(screen.getByTestId('caller-auth-discovery-clear-scopes-button')).toBeInTheDocument();
   });
 
   it.each([
@@ -471,7 +517,7 @@ describe('Caller Context editor: authorization server discovery', () => {
       "variant 'beta': access_point.caller_authentication.protected_resource: requires empty JWT Bearer audiences (400)";
     const { view } = await openEditor({
       initial: jwtConfig({ protected_resource: SETTING }),
-      meta: { saveError: refused },
+      meta: { saveError: refused, activeVariantAlias: 'beta' },
     });
     expect(screen.getByTestId('caller-auth-discovery-save-error')).toHaveTextContent(refused);
     expect(screen.queryByTestId('caller-auth-discovery-resource-error')).toBeNull();
@@ -484,6 +530,21 @@ describe('Caller Context editor: authorization server discovery', () => {
     });
     expect(screen.getByTestId('caller-auth-discovery-save-error')).toHaveTextContent(
       'is not an issuer URL protected resource metadata can name'
+    );
+  });
+
+  it('does not mark the base route for a refusal about a variant', async () => {
+    const refused =
+      "variant 'beta': access_point.caller_authentication.protected_resource: a variant of an Access Point at / has no resource of its own (400)";
+    await openEditor({
+      initial: jwtConfig({ protected_resource: SETTING }),
+      meta: { saveError: refused },
+    });
+    expect(screen.queryByTestId('caller-auth-discovery-resource-error')).toBeNull();
+    expect(screen.queryByTestId('caller-auth-discovery-save-error')).toBeNull();
+    expect(screen.getByTestId('caller-auth-discovery-resource-input')).toHaveAttribute(
+      'aria-invalid',
+      'false'
     );
   });
 
@@ -675,6 +736,29 @@ describe('Caller Context sidebar: authorization server discovery', () => {
     await openEditor({ initial: jwtConfig(), Panel: CallerAuthPanel, protocol: 'didcomm' });
     expect(screen.queryByTestId('caller-auth-panel-discovery-status')).toBeNull();
     expect(screen.queryByTestId('caller-auth-panel-outcome')).toBeNull();
+  });
+
+  it('says only the metadata names the authorization server when the card carries no scheme', async () => {
+    (apiClient.fetch as jest.Mock).mockResolvedValue({
+      ok: true,
+      json: () =>
+        Promise.resolve({
+          declarations: [
+            { variant: null, outcome: 'declare', reason: null, resource: 'https://gw/a' },
+          ],
+          warnings: [{ code: 'card_scheme_unavailable', message: 'm', path: null, variant: null }],
+        }),
+    });
+    await openEditor({
+      initial: jwtConfig(),
+      Panel: CallerAuthPanel,
+      protocol: 'a2a',
+      meta: { surfaceId: 's-9' },
+    });
+    expect(await screen.findByText('Declares OAuth')).toBeInTheDocument();
+    const detail = screen.getByTestId('caller-auth-outcome-detail');
+    expect(detail).toHaveTextContent('Only the protected resource metadata names');
+    expect(detail).toHaveTextContent('The agent card names no security scheme.');
   });
 
   it('reads the saved outcome of the surface it edits', async () => {
