@@ -60,7 +60,7 @@ CONF_DIR="${ABS_TARGET}/conf"
 
 mkdir -p "${CONF_DIR}"
 
-MEDIATOR_IMAGE="public.ecr.aws/affinidi/messaging-mediator:${MEDIATOR_VERSION}"
+MEDIATOR_IMAGE="ghcr.io/affinidi/messaging-mediator:${MEDIATOR_VERSION}"
 
 needs_regen=1
 if [[ -f "${CONF_DIR}/mediator.toml" && "${FORCE}" -eq 0 ]]; then
