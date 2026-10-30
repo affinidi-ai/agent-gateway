@@ -294,19 +294,28 @@ impl FileSystemDelegationVaultStore {
             stable_grant_ids,
             pepper_fingerprint: super::grants::pepper_fingerprint(),
         };
-        if store
-            .pepper_mismatch()
-            .await?
-        {
-            tracing::error!(
+        // Only grants by binding depend on the fingerprint, so failing to read
+        // it never keeps the vault, and its agent-keyed tokens, from starting.
+        match store.pepper_mismatch().await {
+            Ok(false) => {}
+            Ok(true) => tracing::error!(
                 target: "credential_delegation",
                 path = %store.grants_directory.display(),
                 "The delegated grants stored were written under another identity hash pepper than \
                  AG_IDENTITY_HASH_PEPPER now sets: no grant is stored or released, and no binding with consent_mode \
                  external can be removed, until the pepper they were written under is restored, or they are purged \
-                 (DELETE /api/v1/delegation-vault/grants/{{id}}, or by deleting the delegated_grants directory, which \
-                 leaves them unrevoked at the vendor)"
-            );
+                 (DELETE /api/v1/delegation-vault/grants/{{id}}, the ids being the file names in the delegated_grants \
+                 directory without .json.enc, or by deleting that directory, which leaves them unrevoked at the \
+                 vendor)"
+            ),
+            Err(error) => tracing::error!(
+                target: "credential_delegation",
+                path = %store.grants_directory.display(),
+                error = ?format!("{error:#}"),
+                "The delegated grants' pepper fingerprint cannot be read: no grant by binding is stored, and a \
+                 lookup or removal that finds no grant fails rather than answering none, until it can be read; \
+                 agent-keyed delegated tokens are unaffected"
+            ),
         }
         Ok(store)
     }
@@ -1680,6 +1689,68 @@ mod tests {
         let text = logs.text();
         assert!(text.contains("Delegated grant stored in vault"), "{text}");
         assert!(!text.contains("\nINFO forged"), "a stored name starts a log line of its own: {text}");
+    }
+
+    /// A pepper fingerprint that cannot be read at startup is named in an
+    /// `ERROR`, and disables only grants by binding: the vault still starts,
+    /// so agent-keyed tokens keep working.
+    #[tokio::test]
+    async fn an_unreadable_pepper_fingerprint_disables_grants_by_binding_only() {
+        use crate::component_tests::helpers::formatted_logs::FormattedLogs;
+        use crate::delegation_vault::grants::tests::{grant, key};
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(
+            directory
+                .path()
+                .join("delegated_grants")
+                .join(PEPPER_FINGERPRINT_FILE),
+        )
+        .unwrap();
+        with_at_rest_encryption();
+        crate::identity::credential_identity::configure_pepper_for_tests(true);
+        let logs = FormattedLogs::capture();
+        let vault = FileSystemDelegationVaultStore::new(directory.path().into())
+            .await
+            .expect("the vault starts");
+        let startup = logs.text();
+        assert!(startup.contains("ERROR"), "{startup}");
+        assert!(startup.contains("pepper fingerprint"), "{startup}");
+
+        let token: DelegationToken = serde_json::from_value(serde_json::json!({
+            "id": "agent-keyed", "agent_did": "did:web:agent.example",
+            "user_identity_hash": "sha256:user", "credential_provider_id": "provider",
+            "provider_id": "provider", "access_token": "agent-keyed-access", "scopes": ["read"],
+            "consent_granted_at": "2026-09-01T00:00:00Z",
+            "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+        }))
+        .unwrap();
+        vault
+            .store(token)
+            .await
+            .expect("agent-keyed tokens are stored");
+        assert_eq!(
+            vault
+                .get("agent-keyed")
+                .await
+                .unwrap()
+                .expect("and read")
+                .access_token,
+            "agent-keyed-access"
+        );
+        assert!(
+            vault
+                .store_grant(grant(&key(), "access"))
+                .await
+                .is_err(),
+            "no grant is stored while the fingerprint cannot be read"
+        );
+        assert!(
+            vault
+                .grant(&key())
+                .await
+                .is_err(),
+            "nor is a missing grant reported as none"
+        );
     }
 
     #[tokio::test]
