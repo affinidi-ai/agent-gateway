@@ -25,6 +25,7 @@ import {
 } from '../../helpers/oidc-live/hydra';
 import {names} from '../../helpers/oidc-live/names';
 import {loadWorld, saveWorld, World} from '../../helpers/oidc-live/world';
+import {ticket} from '../../helpers/ticket';
 
 const SURFACES = '**/api/v1/surfaces**';
 const SECOND_PROVIDER = `${names.providers.jwtBearer} 2`;
@@ -96,6 +97,7 @@ test.describe('Hop 2 after the trust grant is revoked', () => {
     });
 
     test('revoking the trust grant does not take back a token the gateway already holds', async () => {
+        ticket('FTL-30885');
         expect(await revokeTrustGrant(http, env.hydraB, world.grantId)).toBe(204);
         expect(await trustGrantExists(http, env.hydraB, world.grantId)).toBe(false);
 
@@ -103,6 +105,7 @@ test.describe('Hop 2 after the trust grant is revoked', () => {
     });
 
     test('a provider that has to ask Hydra for a new token fails the call with the generic gateway error', async ({page}) => {
+        ticket('FTL-30885', 'FTL-30886', 'FTL-30887', 'FTL-30888');
         await useProvider(page, `${SECOND_PROVIDER} (JWT Bearer)`);
         await resetAgentLog(http);
 
@@ -121,6 +124,7 @@ test.describe('Hop 2 after the trust grant is revoked', () => {
     });
 
     test('restoring the grant makes the same provider work again, and the original provider still works', async ({page}) => {
+        ticket('FTL-30885');
         world.grantId = await createTrustGrant(http, env.hydraB, {
             issuer: names.assertion.issuer,
             subject: names.assertion.subject,

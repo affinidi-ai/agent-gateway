@@ -86,14 +86,14 @@ test.describe('Strategy swap', () => {
     });
 
     test('before the swap hydra-a is declared and its tokens are accepted', async () => {
-        ticket('FTL-30890', 'FTL-30894');
+        ticket('FTL-30893', 'FTL-30894');
         expect(await declaredMetadataUrl()).toBe(`${env.hydraA.issuer}.well-known/oauth-authorization-server`);
         expect((await callAgent(http, await tokenFrom('a'))).status).toBe(200);
         expect((await callAgent(http, await tokenFrom('b'))).status).toBe(401);
     });
 
     test('pointing the surface at the hydra-b strategy changes the card and the metadata, without a restart', async ({page}) => {
-        ticket('FTL-30889', 'FTL-30890', 'FTL-30894');
+        ticket('FTL-30893', 'FTL-30894', 'FTL-30895');
         await swapTo(page, names.strategies.hydraB.name);
 
         const card = (await (await http.get(CARD_URL)).json()) as CardJson;
@@ -107,7 +107,7 @@ test.describe('Strategy swap', () => {
     });
 
     test('a token from hydra-a is now refused with a challenge and a token from hydra-b is accepted', async () => {
-        ticket('FTL-30894');
+        ticket('FTL-30893');
         const refused = await callAgent(http, await tokenFrom('a'));
         expect(refused.status).toBe(401);
         expect(refused.headers['www-authenticate']).toContain(`resource_metadata="${PRM_URL}"`);
@@ -115,7 +115,7 @@ test.describe('Strategy swap', () => {
     });
 
     test('the dashboard reports the new authorization server for the surface', async ({page}) => {
-        ticket('FTL-30889', 'FTL-30890');
+        ticket('FTL-30895');
         await openSurface(page, surfaceId);
         await openCallerAuth(page);
         await expect(page.getByTestId('caller-auth-jwt-strategy')).toHaveValue(names.strategies.hydraB.id);
@@ -126,7 +126,7 @@ test.describe('Strategy swap', () => {
     });
 
     test('swapping back restores hydra-a, still without a restart', async ({page}) => {
-        ticket('FTL-30889', 'FTL-30890', 'FTL-30894');
+        ticket('FTL-30893', 'FTL-30894');
         await swapTo(page, names.strategies.hydraA.name);
 
         expect(await declaredMetadataUrl()).toBe(`${env.hydraA.issuer}.well-known/oauth-authorization-server`);

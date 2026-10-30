@@ -167,7 +167,6 @@ test.describe('Surface builder save', () => {
     });
 
     test('creates a surface from the starter with its Managed Agent target', async ({page}) => {
-        ticket('FTL-30888');
         await startFromA2aStarter(page);
         await fillTargetUrl(page, TARGET_URL);
         const created = await createSurface(page);
@@ -181,7 +180,7 @@ test.describe('Surface builder save', () => {
     });
 
     test('saves JWT caller authentication with scopes and the entry point audience', async ({page}) => {
-        ticket('FTL-30892', 'FTL-30894');
+        ticket('FTL-30892', 'FTL-30895');
         await reportAccessPointUrl(page);
         await startFromA2aStarter(page);
         await addJwtCallerAuth(page, STRATEGY_NAME, REQUIRED_SCOPE);
@@ -212,7 +211,7 @@ test.describe('Surface builder save', () => {
     });
 
     test('moves focus to the Listed status after Add to Accepted Audiences', async ({page}) => {
-        ticket('FTL-30892');
+        ticket('FTL-30895');
         await reportAccessPointUrl(page);
         await startFromA2aStarter(page);
         await addJwtCallerAuth(page, STRATEGY_NAME, REQUIRED_SCOPE);
@@ -233,7 +232,7 @@ test.describe('Surface builder save', () => {
     });
 
     test('opens the new surface with its save warnings when failed callers are not denied', async ({page}) => {
-        ticket('FTL-30893', 'FTL-30894');
+        ticket('FTL-30891');
         await page.context().grantPermissions(['clipboard-read', 'clipboard-write'], {origin: new URL(BASE_URL).origin});
         await startFromA2aStarter(page);
         await addJwtCallerAuth(page, STRATEGY_NAME);
@@ -263,7 +262,6 @@ test.describe('Surface builder save', () => {
     });
 
     test('keeps the selected node highlighted when a resize redraws the canvas', async ({page}) => {
-        ticket('FTL-30895');
         await startFromA2aStarter(page);
         await selectNode(page, 'target');
         const canvas = page.getByTestId('surface-canvas');
@@ -277,7 +275,7 @@ test.describe('Surface builder save', () => {
     });
 
     test('saves a credential provider as the Target Authentication', async ({page}) => {
-        ticket('FTL-30888');
+        ticket('FTL-30886', 'FTL-30888');
         const providerName = `E2E target auth ${RUN_ID}`;
         const secret = await api.post<{id: string}>('/api/v1/secrets/new', {
             name: `E2E target key ${RUN_ID}`,

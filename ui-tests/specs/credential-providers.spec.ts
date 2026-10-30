@@ -115,6 +115,7 @@ test.describe('JWT bearer credential provider', () => {
     });
 
     test('creates the provider with its assertion settings nested under jwt_bearer', async ({page}) => {
+        ticket('FTL-30888', 'FTL-30885');
         const providerId = `e2e-vertex-${RUN_ID}`;
         let posted: Record<string, unknown> | null = null;
         await page.route('**/api/v1/credential-providers', async route => {
@@ -160,6 +161,7 @@ test.describe('JWT bearer credential provider', () => {
     });
 
     test('reopens a saved provider with its assertion settings filled in', async ({page}) => {
+        ticket('FTL-30888', 'FTL-30885');
         const providerId = `e2e-reopen-${RUN_ID}`;
         const created = await api.post<StoredProvider>('/api/v1/credential-providers', {
             name: `E2E reopen ${RUN_ID}`,

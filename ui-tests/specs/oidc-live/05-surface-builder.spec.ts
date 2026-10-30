@@ -65,7 +65,7 @@ test.describe('Surface builder', () => {
     });
 
     test('creates the surface with caller authentication, a required scope and Target Authentication, and only warns', async ({page}) => {
-        ticket('FTL-30888', 'FTL-30892', 'FTL-30893');
+        ticket('FTL-30885', 'FTL-30888', 'FTL-30892', 'FTL-30893', 'FTL-30894');
         await bridgeLoopbackScheme(page, SURFACES);
         await startA2aSurface(page);
         await nameSurface(page, names.surface);
@@ -111,7 +111,7 @@ test.describe('Surface builder', () => {
     });
 
     test('attaching the deny rule to the Target policy through the API clears the fail-open warning and the declaration warning stays', async ({page}) => {
-        ticket('FTL-30893');
+        ticket('FTL-30891', 'FTL-30894');
         const surface = (await surfaceByName(api)) as SavedSurface;
         denyRuleId = await ensureDenyRule(api);
         const patched = await api.patch(`/api/v1/surfaces/${surface.surface_id}`, {
@@ -128,7 +128,7 @@ test.describe('Surface builder', () => {
     });
 
     test('adding the entry point as audience in the Caller Context editor makes the Access Point declare hydra-a', async ({page}) => {
-        ticket('FTL-30889', 'FTL-30892', 'FTL-30893', 'FTL-30894');
+        ticket('FTL-30894', 'FTL-30895');
         await bridgeLoopbackScheme(page, SURFACES);
         const surface = (await surfaceByName(api)) as SavedSurface;
         await openSurface(page, surface.surface_id);

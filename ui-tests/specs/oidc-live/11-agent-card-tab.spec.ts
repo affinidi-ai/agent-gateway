@@ -301,7 +301,7 @@ test.describe('Agent Cards tab', () => {
     test('the authorization server, required scope and audience set in the Caller Context editor are what the served card declares', async ({
         page,
     }) => {
-        ticket(TICKET, 'FTL-30889', 'FTL-30892', 'FTL-30894');
+        ticket(TICKET, 'FTL-30894');
         await openSurface(page, surfaceIdOf(surface));
         await openCallerAuth(page);
         await expect(page.getByTestId('caller-auth-jwt-strategy')).toHaveValue(names.strategies.hydraA.id);
@@ -337,7 +337,7 @@ test.describe('Agent Cards tab', () => {
     });
 
     test('the Managed Agent panel shows the card fetch status and links to the tab', async ({page}) => {
-        ticket(TICKET, 'FTL-30887');
+        ticket('FTL-30895');
         await openSurface(page, surfaceIdOf(surface));
         await selectNode(page, 'target');
         await expect(page.getByTestId('managed-agent-card-fetch-status')).toHaveText('Card fetch: OK');
@@ -432,7 +432,7 @@ test.describe('Agent Cards tab', () => {
     });
 
     test('a surface on the same agent with no Target Authentication shows that the agent needs a token', async ({page}) => {
-        ticket(TICKET, 'FTL-30887', 'FTL-30888');
+        ticket('FTL-30895');
         await resetAgentLog(http);
         const created = await api.post<Entity>('/api/v1/surfaces', {
             name: NO_AUTH_SURFACE,
@@ -473,7 +473,7 @@ test.describe('Agent Cards tab', () => {
     });
 
     test('no token, client secret or Authorization value reaches the tab, its raw JSON or the preview responses', async ({page}) => {
-        ticket(TICKET, 'FTL-30886', 'FTL-30887');
+        ticket('FTL-30895', 'FTL-30888', 'FTL-30889');
         await openSurface(page, surfaceIdOf(surface));
         const body = await openTab(page, world);
         expect(body.auth.kind).toBe('credential_provider');

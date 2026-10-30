@@ -49,7 +49,7 @@ test.describe('Ory side', () => {
     });
 
     test('demo-good gets a JWT with the entry point as audience, the scope as a list and hydra-a as issuer', async () => {
-        ticket('FTL-30892', 'FTL-30894');
+        ticket('FTL-30892');
         const response = await clientCredentialsToken(hydra, env.hydraA, world.good, {
             audience: env.entryPointUrl,
             scope: names.scopes.caller,
@@ -80,7 +80,7 @@ test.describe('Ory side', () => {
     });
 
     test('demo-otheraud gets a token for another audience and cannot ask for the entry point', async () => {
-        ticket('FTL-30894');
+        ticket('FTL-30893');
         const other = await clientCredentialsToken(hydra, env.hydraA, world.otherAudience, {
             audience: names.otherAudience,
             scope: names.scopes.caller,
@@ -95,7 +95,7 @@ test.describe('Ory side', () => {
     });
 
     test('hydra-b accepts an assertion signed by the trusted key, refuses a replay and an unknown key', async () => {
-        ticket('FTL-30886');
+        ticket('FTL-30885');
         expect(await trustGrantExists(hydra, env.hydraB, world.grantId)).toBe(true);
         expect(publicKeyMatches(world.key)).toBe(true);
         const claims = {

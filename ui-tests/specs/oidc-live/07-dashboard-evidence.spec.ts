@@ -46,7 +46,6 @@ test.describe('Dashboard evidence', () => {
     });
 
     test('the operator turns the audit log on for policy decisions and failed authentication', async ({page}) => {
-        ticket('FTL-30894');
         await page.goto('/settings?tab=security');
         const toggle = page.getByTestId('vp-audit-enabled-toggle');
         if (!(await toggle.isChecked())) await page.locator('label[for=audit_enabled]').click();
@@ -67,7 +66,7 @@ test.describe('Dashboard evidence', () => {
     });
 
     test('three callers use the surface: one is allowed, two are refused before the surface policy', async ({page}) => {
-        ticket('FTL-30892', 'FTL-30894');
+        ticket('FTL-30892', 'FTL-30893');
         await page.goto('/audit');
         await expect(page.getByTestId('audit-refresh')).toBeVisible();
         await expect(page.getByTestId('audit-list').or(page.getByTestId('audit-empty'))).toBeVisible();
@@ -88,7 +87,7 @@ test.describe('Dashboard evidence', () => {
     });
 
     test('the audit page lists the allowed call with its caller and the two failed authentications, with no policy denial', async ({page}) => {
-        ticket('FTL-30892', 'FTL-30894');
+        ticket('FTL-30892', 'FTL-30893');
         await page.goto('/audit');
         await expect(async () => {
             await page.getByTestId('audit-refresh').click();
@@ -113,7 +112,6 @@ test.describe('Dashboard evidence', () => {
     });
 
     test('the Deny filter leaves out the allowed call and the Allow filter keeps it', async ({page}) => {
-        ticket('FTL-30894');
         await page.goto('/audit');
         await page.getByTestId('filter-chip-deny').click();
         await expect(page.getByTestId('audit-list').or(page.getByTestId('audit-empty'))).toBeVisible();
@@ -125,7 +123,7 @@ test.describe('Dashboard evidence', () => {
     });
 
     test('the gateway log shows the same three requests with their status', async ({page}) => {
-        ticket('FTL-30894');
+        ticket('FTL-30892');
         await page.goto('/logs');
         const route = env.route;
         for (const status of ['200', '403', '401']) {

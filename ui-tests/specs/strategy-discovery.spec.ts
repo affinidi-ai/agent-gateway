@@ -70,7 +70,7 @@ test.describe('Strategy discovery', () => {
     });
 
     test('refuses a non-https issuer without calling the gateway', async ({page}) => {
-        ticket('FTL-30889');
+        ticket('FTL-30890');
         let discoverCalls = 0;
         await page.route('**/api/v1/jwt-verification-strategies/discover', async route => {
             discoverCalls += 1;
@@ -88,7 +88,7 @@ test.describe('Strategy discovery', () => {
     });
 
     test('shows a fixed message and pins nothing when the gateway cannot discover the issuer', async ({page}) => {
-        ticket('FTL-30889', 'FTL-30890');
+        ticket('FTL-30890');
         await page.goto(`${BASE_URL}/jwt-verification-strategies/new`);
         await page.getByTestId('strategy-issuer').fill('https://127.0.0.1:1');
         const discover = page.waitForResponse(
@@ -107,7 +107,7 @@ test.describe('Strategy discovery', () => {
     });
 
     test('pins the discovered server and saves it with discover_metadata true', async ({page}) => {
-        ticket('FTL-30889', 'FTL-30890');
+        ticket('FTL-30890');
         await page.route('**/api/v1/jwt-verification-strategies/discover', async route => {
             await route.fulfill({status: 200, contentType: 'application/json', body: JSON.stringify(PINNED_SERVER)});
         });
@@ -147,7 +147,7 @@ test.describe('Strategy discovery', () => {
     });
 
     test('warns that static keys cannot be discovered and disables the Discover button', async ({page}) => {
-        ticket('FTL-30889', 'FTL-30890');
+        ticket('FTL-30890');
         await page.goto(`${BASE_URL}/jwt-verification-strategies/new`);
         await page.getByTestId('strategy-issuer').fill(ISSUER);
         await page.getByTestId('strategy-jwks-source-static').check();
@@ -228,7 +228,7 @@ test.describe('Strategy list', () => {
     });
 
     test('confirms a delete in the page, then removes the strategy', async ({page}) => {
-        ticket('FTL-30889');
+        ticket('FTL-30890');
         const name = uniqueName(LIST_PREFIX);
         const created = await api.post<StoredStrategy>('/api/v1/jwt-verification-strategies', {
             name,
@@ -253,7 +253,7 @@ test.describe('Strategy list', () => {
     });
 
     test('keeps the strategy when the delete is cancelled', async ({page}) => {
-        ticket('FTL-30889');
+        ticket('FTL-30890');
         const name = uniqueName(LIST_PREFIX);
         const created = await api.post<StoredStrategy>('/api/v1/jwt-verification-strategies', {
             name,

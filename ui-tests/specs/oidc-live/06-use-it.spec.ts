@@ -57,7 +57,7 @@ test.describe('Use the surface', () => {
     });
 
     test('hop 2: the card fetch and the first call reach the agent with a hydra-b token the gateway obtained', async () => {
-        ticket('FTL-30886', 'FTL-30887');
+        ticket('FTL-30885', 'FTL-30886', 'FTL-30887');
         await resetAgentLog(http);
         const before = await hydraBTokenRequests(http);
 
@@ -77,7 +77,7 @@ test.describe('Use the surface', () => {
     });
 
     test('hop 2: a second call reuses the token instead of asking hydra-b again', async () => {
-        ticket('FTL-30886');
+        ticket('FTL-30885', 'FTL-30886');
         const call = await callAgent(http, await callerToken('good'));
         expect(call.status).toBe(200);
 
@@ -87,7 +87,7 @@ test.describe('Use the surface', () => {
     });
 
     test("the public agent card declares hydra-a and the required scope, and drops the agent's own security and signatures", async () => {
-        ticket('FTL-30892', 'FTL-30894');
+        ticket('FTL-30887', 'FTL-30894');
         const response = await http.get(CARD_URL);
         expect(response.status()).toBe(200);
         const card = (await response.json()) as CardJson;
@@ -108,7 +108,7 @@ test.describe('Use the surface', () => {
     });
 
     test('the dashboard reports the same outcome for the saved surface', async ({page}) => {
-        ticket('FTL-30893', 'FTL-30894');
+        ticket('FTL-30894', 'FTL-30895');
         await openSurface(page, surfaceId);
         await openCallerAuth(page);
         await expect(page.getByTestId('caller-auth-outcome-chip').first()).toContainText('Declares OAuth');
@@ -117,7 +117,7 @@ test.describe('Use the surface', () => {
     });
 
     test('the protected resource metadata names the entry point, hydra-a and the scope', async () => {
-        ticket('FTL-30894');
+        ticket('FTL-30893');
         const response = await http.get(PRM_URL);
         expect(response.status()).toBe(200);
         expect(await response.json()).toEqual({
@@ -129,7 +129,7 @@ test.describe('Use the surface', () => {
     });
 
     test('a call without a token gets 401 with a challenge that points at the metadata', async () => {
-        ticket('FTL-30894');
+        ticket('FTL-30893');
         const call = await callAgent(http);
         expect(call.status).toBe(401);
         const challenge = call.headers['www-authenticate'];
@@ -139,7 +139,7 @@ test.describe('Use the surface', () => {
     });
 
     test("the good client gets the agent's reply", async () => {
-        ticket('FTL-30894');
+        ticket('FTL-30892', 'FTL-30893');
         const token = await callerToken('good');
         expect(jwtClaims(token).iss).toBe(env.hydraA.issuer);
         const call = await callAgent(http, token);
@@ -155,14 +155,14 @@ test.describe('Use the surface', () => {
     });
 
     test('the client with a token for another audience gets 401 with a challenge', async () => {
-        ticket('FTL-30894');
+        ticket('FTL-30893');
         const call = await callAgent(http, await callerToken('otherAudience'));
         expect(call.status).toBe(401);
         expect(call.headers['www-authenticate']).toContain(`resource_metadata="${PRM_URL}"`);
     });
 
     test('a token that hydra-b issued is refused with 401 while the surface trusts hydra-a', async () => {
-        ticket('FTL-30894');
+        ticket('FTL-30893');
         const token = accessToken(
             await clientCredentialsToken(http, env.hydraB, world.goodOnB, {
                 audience: env.entryPointUrl,

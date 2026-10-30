@@ -11,6 +11,7 @@ import {Entity, listEntities, secretLabels, secretValues} from '../../helpers/oi
 import {names} from '../../helpers/oidc-live/names';
 import {createSecretInDashboard, fillSecret} from '../../helpers/oidc-live/ui';
 import {loadWorld, World} from '../../helpers/oidc-live/world';
+import {ticket} from '../../helpers/ticket';
 
 function confidentialValues(values: Record<string, string>): string[] {
     return [names.secrets.hop2ClientSecret, names.secrets.ccClientSecret].map(id => values[id]).concat(
@@ -37,6 +38,7 @@ test.describe('Secrets', () => {
     });
 
     test('creates the client secrets and the signing key in the editor', async ({page}) => {
+        ticket('FTL-30885');
         const values = secretValues(world);
         for (const secretId of Object.keys(values)) {
             await createSecretInDashboard(page, {
@@ -53,6 +55,7 @@ test.describe('Secrets', () => {
     });
 
     test('lists the secrets by name and never shows a value', async ({page}) => {
+        ticket('FTL-30888');
         await page.goto('/secrets');
         const values = secretValues(world);
         for (const secretId of Object.keys(values)) {
@@ -65,6 +68,7 @@ test.describe('Secrets', () => {
     });
 
     test('opens a stored secret with the value hidden and disabled', async ({page}) => {
+        ticket('FTL-30888');
         const stored = (await listEntities(api, '/api/v1/secrets/')).find(
             secret => secret.secret_id === names.secrets.hop2ClientSecret
         ) as Entity;
@@ -80,6 +84,7 @@ test.describe('Secrets', () => {
     });
 
     test('the API never returns a stored value, and the editor hides it again after an update', async ({page}) => {
+        ticket('FTL-30885', 'FTL-30888');
         const values = secretValues(world);
         const listed = JSON.stringify((await api.get('/api/v1/secrets/')).body);
         for (const value of confidentialValues(values)) {

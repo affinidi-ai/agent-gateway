@@ -12,6 +12,7 @@ import {env} from '../../helpers/oidc-live/env';
 import {Entity, ensureSecrets, listEntities} from '../../helpers/oidc-live/gateway-state';
 import {names, PREFIX} from '../../helpers/oidc-live/names';
 import {loadWorld, World} from '../../helpers/oidc-live/world';
+import {ticket} from '../../helpers/ticket';
 
 async function findProvider(api: GatewayApi, name: string): Promise<Entity | undefined> {
     return (await listEntities(api, '/api/v1/credential-providers')).find(provider => provider.name === name);
@@ -37,6 +38,7 @@ test.describe('Credential providers', () => {
     });
 
     test('creates a client credentials provider for hydra-a from the stored secrets', async ({page}) => {
+        ticket('FTL-30886');
         await page.goto('/credential-providers/new');
         await page.getByTestId('provider-name').fill(names.providers.clientCredentials);
         await page.getByTestId('provider-type').selectOption('oauth2_client_credentials');
@@ -61,6 +63,7 @@ test.describe('Credential providers', () => {
     });
 
     test('creates a JWT bearer provider for hydra-b with the signing key and assertion settings', async ({page}) => {
+        ticket('FTL-30885', 'FTL-30888');
         await page.goto('/credential-providers/new');
         await page.getByTestId('provider-name').fill(names.providers.jwtBearer);
         await page.getByTestId('provider-type').selectOption('oauth2_jwt_bearer');
@@ -107,6 +110,7 @@ test.describe('Credential providers', () => {
     });
 
     test('reopens each provider with its references and without any secret value', async ({page}) => {
+        ticket('FTL-30885', 'FTL-30888');
         const jwt = (await findProvider(api, names.providers.jwtBearer)) as Entity;
         await page.goto(`/credential-providers/${jwt.id}`);
         await expect(page.getByTestId('provider-signing-key-secret-ref')).toHaveValue(names.secrets.signingKey);
@@ -125,6 +129,7 @@ test.describe('Credential providers', () => {
     });
 
     test('refuses an http token endpoint that the gateway has not been told to allow', async ({page}) => {
+        ticket('FTL-30888');
         await page.goto('/credential-providers/new');
         await page.getByTestId('provider-name').fill(`${PREFIX} refused`);
         await page.getByTestId('provider-type').selectOption('oauth2_client_credentials');
