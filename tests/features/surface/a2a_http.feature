@@ -158,6 +158,13 @@ Feature: A2A HTTP surface forwarding and identity
     And managed agent "bravo" received header "authorization" with value "Bearer bdd-target-provider-token"
     And the target's credential provider received 1 token request
 
+  Scenario: A caller cannot override the provider-issued credential on the agent card fetch
+    Given the surface authenticates its target with a client credentials provider
+    When the caller fetches the agent card with extra headers
+      | authorization | Bearer caller-forged |
+    Then the response status is 200
+    And managed agent "bravo" received header "authorization" with value "Bearer bdd-target-provider-token"
+
   Scenario: Without a target credential the agent card fetch forwards caller headers as before
     When the caller fetches the agent card with extra headers
       | cookie | session=caller |
