@@ -396,6 +396,14 @@ async fn a_fabric_request_past_the_hop_limit_or_with_a_malformed_count_is_refuse
                 .all(|event| event.via_fabric && event.trace_id.as_deref() == Some("trace-from-the-peer")),
             "{hops}"
         );
+        assert!(
+            events
+                .iter()
+                .all(|event| event
+                    .surface_variant
+                    .is_none()),
+            "{hops}: refused before a variant is resolved: {events:?}"
+        );
     }
     assert!(target.received().is_empty(), "a refused request never reaches the Target");
 
@@ -535,15 +543,15 @@ async fn a_framed_stream_past_the_hop_limit_or_with_a_malformed_count_is_refused
             .iter()
             .filter_map(|event| match &event.event {
                 DelegationAuditAction::RequestRejected { stage, reason, http_status, .. } => {
-                    Some((*stage, *reason, *http_status, event.trace_id.clone()))
+                    Some((*stage, *reason, *http_status, event.trace_id.clone(), event.surface_variant.clone()))
                 }
                 _ => None,
             })
             .collect();
         assert_eq!(
             rejected,
-            [(RejectionStage::Routing, reason, None, Some("trace-from-the-peer".to_string()))],
-            "{hops}"
+            [(RejectionStage::Routing, reason, None, Some("trace-from-the-peer".to_string()), None)],
+            "{hops}: no HTTP status on Fabric, and no variant before one is resolved"
         );
     }
     assert!(target.received().is_empty(), "a refused stream never reaches the agent");
