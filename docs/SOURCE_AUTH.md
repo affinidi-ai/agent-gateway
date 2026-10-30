@@ -338,9 +338,11 @@ A Transit Point never reads the longest lifetime: it checks a token against its 
 own lifetime, held to 30 to 900 seconds. Instances that share surfaces therefore accept each
 other's tokens even when their longest lifetimes differ, and lowering the longest lifetime
 does not refuse the longer tokens already issued; they stay valid until their own expiry.
-A release before this one refuses any token living longer than 300 seconds, so raise the
-longest lifetime above 300 only once every instance that shares surfaces, a Standby
-included, runs this release or later.
+Upgrade every instance that shares surface storage, a Standby included, to this release or
+later before setting any surface's lifetime or raising the longest lifetime above 300. An
+earlier release refuses any token living longer than 300 seconds, so a request it serves
+gets an intermittent `401`, and it does not know the lifetime, so the next time it saves the
+surface it drops the stored value, which sets the lifetime back to 300 seconds.
 
 A Transit Point checks a token against the lifetime its surface sets when the token is
 presented, so a change applies to tokens already issued:

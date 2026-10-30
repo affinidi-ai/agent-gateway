@@ -36,7 +36,9 @@ changes:
         the credentials they inject, until it expires, so a longer lifetime widens the window in
         which a leaked token can be replayed. A surface writer can lengthen it only up to the
         appliance's `transit_token_max_lifetime_secs`, 300 seconds unless an operator raises it,
-        to at most 900. Gateways before this release refuse tokens living longer than 300
-        seconds, so raise the ceiling above 300 only once every instance that shares surfaces,
-        a Standby included, runs this release.
+        to at most 900. Upgrade every instance that shares surface storage, a Standby included,
+        before raising the ceiling above 300 or setting any surface's lifetime: an earlier
+        release refuses tokens living longer than 300 seconds, so its requests get an
+        intermittent 401, and drops a stored lifetime the next time it saves the surface,
+        which sets the lifetime back to 300 seconds.
   breaking: []
