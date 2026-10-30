@@ -151,6 +151,13 @@ Feature: A2A HTTP surface forwarding and identity
     And managed agent "bravo" received header "authorization" with value "Bearer bdd-target-provider-token"
     And the target's credential provider received a JWT Bearer grant signed with the provider key
 
+  Scenario: A forwarded request presents a provider-issued target credential
+    Given the surface authenticates its target with a client credentials provider
+    When the caller sends a request to the surface
+    Then the response status is 200
+    And managed agent "bravo" received header "authorization" with value "Bearer bdd-target-provider-token"
+    And the target's credential provider received 1 token request
+
   Scenario: Without a target credential the agent card fetch forwards caller headers as before
     When the caller fetches the agent card with extra headers
       | cookie | session=caller |
