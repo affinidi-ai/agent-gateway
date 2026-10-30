@@ -104,6 +104,15 @@ describe('credential provider form', () => {
     });
   });
 
+  it('drops a signing algorithm the selected type does not support', () => {
+    expect(
+      providerCredentialFields({ ...jwtAuth, jwt_signing_algorithm: 'ES256' }).jwt_signing_algorithm
+    ).toBeUndefined();
+    expect(
+      providerCredentialFields({ ...jwtAuth, jwt_signing_algorithm: 'RS256' }).jwt_signing_algorithm
+    ).toBe('RS256');
+  });
+
   it('clears the JWT settings of a client-secret provider', () => {
     const fields = providerCredentialFields(
       form({ jwt_signing_key_secret_ref: 'OLD_KEY', jwt_issuer: 'old' })

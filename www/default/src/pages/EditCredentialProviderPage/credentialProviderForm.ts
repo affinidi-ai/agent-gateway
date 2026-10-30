@@ -143,8 +143,10 @@ export function providerCredentialFields(
   body.jwt_key_id = value(fields.jwt, form.jwt_key_id);
   body.jwt_issuer = value(fields.jwtIssuer, form.jwt_issuer);
   body.jwt_subject = value(fields.jwtIssuer, form.jwt_subject);
+  // An algorithm left over from the other JWT type is dropped, so the gateway default applies.
+  const algorithm = form.jwt_signing_algorithm;
   body.jwt_signing_algorithm =
-    fields.jwt && form.jwt_signing_algorithm ? form.jwt_signing_algorithm : undefined;
+    algorithm && JWT_ALGORITHMS[form.provider_type]?.includes(algorithm) ? algorithm : undefined;
   return body;
 }
 
