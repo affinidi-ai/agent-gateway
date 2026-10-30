@@ -1,7 +1,7 @@
 import React from 'react';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom';
-import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
+import { MemoryRouter, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
 import SurfaceDetailPage from '../SurfaceDetailPage';
 import { apiClient } from '../../api';
 import type { AgentSurface } from '../../api';
@@ -58,7 +58,14 @@ function MockSurfaceFormShell(props: any) {
 
 function LocationProbe() {
   const location = useLocation();
-  return <output data-testid="location-state">{JSON.stringify(location.state)}</output>;
+  const navigate = useNavigate();
+  return (
+    <>
+      <output data-testid="location-state">{JSON.stringify(location.state)}</output>
+      <output data-testid="location-url">{`${location.pathname}${location.search}${location.hash}`}</output>
+      <button onClick={() => navigate('/surfaces/s2')}>Open another surface</button>
+    </>
+  );
 }
 
 const surface = {
@@ -72,9 +79,9 @@ const surface = {
 const createWarning =
   "Transit Point 'crm' serves callers it does not authenticate and is reachable from other hosts: 0.0.0.0:8080";
 
-const renderAt = (state: unknown) =>
+const renderAt = (state: unknown, search = '', hash = '') =>
   render(
-    <MemoryRouter initialEntries={[{ pathname: '/surfaces/s1', state }]}>
+    <MemoryRouter initialEntries={[{ pathname: '/surfaces/s1', search, hash, state }]}>
       <Routes>
         <Route
           path="/surfaces/:surfaceId"
@@ -103,6 +110,26 @@ describe('SurfaceDetailPage save warnings', () => {
     expect(screen.getByTestId('meta-warnings')).toHaveTextContent(createWarning);
     expect(screen.getByTestId('surface-save-warnings')).toHaveTextContent(createWarning);
     expect(screen.getByTestId('location-state')).toHaveTextContent('null');
+  });
+
+  it('keeps the query string and hash when it clears the route state', async () => {
+    renderAt({ saveWarnings: [createWarning] }, '?tab=elements', '#crm');
+    await screen.findByTestId('meta-warnings');
+
+    expect(screen.getByTestId('location-state')).toHaveTextContent('null');
+    expect(screen.getByTestId('location-url')).toHaveTextContent('/surfaces/s1?tab=elements#crm');
+  });
+
+  it('does not show one surface warnings on another surface', async () => {
+    renderAt({ saveWarnings: [createWarning] });
+    await screen.findByTestId('meta-warnings');
+    expect(screen.getByTestId('meta-warnings')).toHaveTextContent(createWarning);
+
+    fireEvent.click(screen.getByText('Open another surface'));
+
+    await waitFor(() => expect(apiClient.getSurface).toHaveBeenCalledWith('s2'));
+    expect(await screen.findByTestId('meta-warnings')).toBeEmptyDOMElement();
+    expect(screen.queryByTestId('surface-save-warnings')).toBeNull();
   });
 
   it('ignores route state that is not a list of warnings', async () => {

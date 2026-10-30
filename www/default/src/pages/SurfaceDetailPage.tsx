@@ -111,19 +111,26 @@ const SurfaceDetailPage: React.FC = () => {
   const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // `Warning` headers of the last save, shown on the Transit Points they name.
-  // A create that drew warnings sends them here in the route state.
+  // A create that drew warnings sends them here in the route state. They are
+  // kept with the surface they are about, since this page stays mounted when
+  // the route moves to another surface.
   const location = useLocation();
-  const [saveWarnings, setSaveWarnings] = useState<readonly string[] | null>(() => {
+  const [savedWarnings, setSavedWarnings] = useState<{
+    surfaceId: string | undefined;
+    warnings: readonly string[];
+  } | null>(() => {
     const carried = (location.state as { saveWarnings?: unknown } | null)?.saveWarnings;
     return Array.isArray(carried) && carried.every(w => typeof w === 'string') && carried.length
-      ? (carried as string[])
+      ? { surfaceId, warnings: carried as string[] }
       : null;
   });
+  const saveWarnings = savedWarnings?.surfaceId === surfaceId ? savedWarnings.warnings : null;
   // The route state outlives the visit in `history.state`, so a refresh or a
   // Back return would show the create's warnings again; it is read once.
   useEffect(() => {
     if (location.state != null) {
-      navigate(location.pathname, { replace: true, state: null });
+      const { pathname, search, hash } = location;
+      navigate({ pathname, search, hash }, { replace: true, state: null });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -1263,7 +1270,7 @@ const SurfaceDetailPage: React.FC = () => {
           headerWarnings = warnings;
         },
       });
-      setSaveWarnings(headerWarnings);
+      setSavedWarnings({ surfaceId, warnings: headerWarnings });
       setSurface(updated);
       setJsonOverride(null);
       setJsonError(null);

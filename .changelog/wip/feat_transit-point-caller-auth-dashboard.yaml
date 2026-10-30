@@ -24,7 +24,8 @@ changes:
         that Transit Point's caller authentication, open marking or listener changes. The
         shared-audience and shared-issuer warnings now name the variant that defines the Transit
         Point, as the exposure warning does, so each lands on the right Transit Point. A create's
-        warnings are shown once on the new surface's page, not again on a refresh. Before
+        warnings are shown once on the new surface's page, not again on a refresh, and a save's
+        warnings never show on another surface. Before
         saving, the panel warns when an open Transit Point's listener URL is one other hosts
         reach.
   changed: []

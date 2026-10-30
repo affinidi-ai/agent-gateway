@@ -158,7 +158,9 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   gateway's own rule; the gateway also counts bind addresses and shared-domain inbound
   listeners, which the dashboard does not see, so only the header is complete. A create that
   drew warnings opens the new surface's page with them in the route state, which that page
-  reads once and then clears, so a refresh or a Back return does not show them again. A refused
+  reads once and then clears, keeping the query string and hash, so a refresh or a Back return
+  does not show them again. The page keeps save warnings with the surface they came from, so
+  they do not show on another surface the page moves to. A refused
   save shows the API's reason in plain words on the Transit Point it names, in the base view
   for `transit.points[i]: ...` and in that variant's view for `variant '<alias>' transit.points[i]: ...`
   (`transit-point-save-error`). A write never carries `transit_point_source_auth`: the gateway
