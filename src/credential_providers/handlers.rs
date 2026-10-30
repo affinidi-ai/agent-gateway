@@ -319,9 +319,7 @@ async fn validate_provider_settings(
     validate_jwt_provider(provider)?;
     validate_secret_references(
         state,
-        provider
-            .tenant_id
-            .as_deref(),
+        provider.tenant_id.as_deref(),
         [
             provider
                 .client_id_secret_ref
@@ -837,10 +835,7 @@ async fn validate_key_material_request(
     context: &Option<Extension<PatTenantContext>>,
     scope: &Option<Extension<PatResourceScope>>,
 ) -> Result<Option<JwtSigningAlgorithm>, ProviderValidationError> {
-    let jwt = req
-        .jwt
-        .clone()
-        .normalized();
+    let jwt = req.jwt.clone().normalized();
     let algorithm = req
         .provider_type
         .as_ref()
@@ -879,10 +874,7 @@ async fn validate_provider_with(
         Ok(tenant_id) => tenant_id,
         Err(message) => return (StatusCode::FORBIDDEN, Json(serde_json::json!({ "error": message }))).into_response(),
     };
-    let Some(token_endpoint) = req
-        .token_endpoint
-        .take()
-    else {
+    let Some(token_endpoint) = req.token_endpoint.take() else {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "token_endpoint is required"})))
             .into_response();
     };
