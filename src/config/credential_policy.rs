@@ -59,8 +59,19 @@ pub fn init_credential_policy(config: CredentialPolicyConfig) {
     let _ = GLOBAL_CREDENTIAL_POLICY.set(config);
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    /// The credential policy [`credential_policy`] returns inside a test's scope, instead of the
+    /// process-global one, which is set once per process.
+    pub(crate) static TEST_CREDENTIAL_POLICY: &'static CredentialPolicyConfig;
+}
+
 /// The process-global credential policy; the warn defaults before initialisation.
 pub fn credential_policy() -> &'static CredentialPolicyConfig {
+    #[cfg(test)]
+    if let Ok(policy) = TEST_CREDENTIAL_POLICY.try_with(|policy| *policy) {
+        return policy;
+    }
     GLOBAL_CREDENTIAL_POLICY.get_or_init(CredentialPolicyConfig::default)
 }
 

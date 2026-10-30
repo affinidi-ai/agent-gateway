@@ -9352,6 +9352,9 @@ async fn process_x402_settlement_complete(message: &ReceivedMessage) -> Processi
 }
 
 #[cfg(test)]
+mod credential_tenancy_tests;
+
+#[cfg(test)]
 mod mcp_receive_tests;
 
 #[cfg(test)]
