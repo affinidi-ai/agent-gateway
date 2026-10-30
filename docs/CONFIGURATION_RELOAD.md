@@ -231,6 +231,23 @@ surfaces on its first start. Upgrade nodes that share storage together, or set
 `cache_refresh_interval_secs` to `0` on the older node until it is upgraded (see
 [A2A surface settings](PROTOCOLS.md#a2a-surface-settings)).
 
+## Credential policy
+
+The bootstrap `[credential_policy]` table maps to `CredentialPolicyConfig` in
+[`src/config/credential_policy.rs`](../src/config/credential_policy.rs). It is read once at startup
+and held for the life of the process, so a configuration reload does not change it; changing it
+needs a restart.
+
+| Key | Default | Effect |
+| --- | --- | --- |
+| `token_endpoint_https` | `"warn"` | `"warn"` or `"enforce"`. Whether a credential provider's token endpoint must use https. |
+| `tenant_credential_isolation` | `"warn"` | `"warn"` or `"enforce"`. Whether a credential provider may only use secrets of its own tenant. |
+| `insecure_token_endpoints` | `[]` | Exact token endpoint URLs that may use http deliberately, for example an internal identity provider. Honoured in both modes. |
+
+`"warn"` keeps stored configurations that break a rule working and logs a warning; new or changed
+configurations that break a rule are refused on save. `"enforce"` also refuses them at runtime. An
+unknown value fails startup, and an absent section means both rules are `"warn"`.
+
 ## Fabric envelope lifetime
 
 A `forward-request` sent over the fabric carries a DIDComm `expires_time`. The sending gateway

@@ -384,6 +384,12 @@ async fn async_main() -> Result<()> {
         warn!("{warning}");
     }
 
+    crate::config::init_credential_policy(
+        bootstrap_config
+            .credential_policy
+            .clone(),
+    );
+
     // Load resource-limit configuration into the process-global. Placed after
     // logging init so a missing/misconfigured path is visible. A missing or
     // malformed file leaves every dimension unconstrained (limit 1_000_000).
@@ -1442,6 +1448,7 @@ fn render_default_bootstrap_toml(
         legacy_backup_encryption_keys: None,
         trust_registry: Default::default(),
         tenancy: Default::default(),
+        credential_policy: Default::default(),
         config_dir: None,
         server_mode: crate::server::mode::ServerMode::default(),
         cache_refresh_interval_secs: 0,

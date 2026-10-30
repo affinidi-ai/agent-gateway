@@ -5,6 +5,7 @@ mod agent_surface_accessors;
 pub(crate) mod agent_surface_compat;
 pub mod agent_surface_variants;
 mod bootstrap;
+pub mod credential_policy;
 pub mod encryption_config;
 pub mod header_metadata_mapping;
 pub mod limits_config;
@@ -17,6 +18,7 @@ pub mod rbac_config;
 pub mod types;
 
 // Re-export all public types
+pub use credential_policy::init_credential_policy;
 pub use encryption_config::*;
 pub use limits_config::*;
 pub use metrics_config::*;
