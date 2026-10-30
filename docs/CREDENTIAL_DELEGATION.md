@@ -157,9 +157,11 @@ method, which still loads from storage. The provider is a reference of the surfa
 cannot be deleted while a surface uses it.
 
 The token is a service token (see above), cached in the vault under the agent half
-`surface:<surface_id>` and the user half `__target_auth__:<provider digest>`. Changing the
-provider changes the digest, so a token issued under the old settings is never reused, and the
-token shows in the Credential Tokens tab like any other. The credential is sent only on a
+`surface:<surface_id>` and the user half `__target_auth__:<provider digest>:<scope hash>`, where
+the scope hash is the SHA-256 (hex) of the sorted, deduplicated scopes joined by spaces.
+Changing the provider changes the digest, so a token issued under the old settings is never
+reused; a Target and a Transit Point that use one provider with different scopes each keep
+their own token. The token shows in the Credential Tokens tab like any other. The credential is sent only on a
 request the gateway vetted (`CallerAssertion`), so a provider token is never spent on an
 unauthenticated discovery request, except on the gateway's own agent card fetch. A token that
 cannot be obtained follows `fallback`: `reject` answers 502 "Target authentication failed",
@@ -312,8 +314,8 @@ certificate identity therefore shares one set of delegated tokens.
 
 Service tokens have no user, so a legacy binding caches them under the fixed user hash
 `__client_credentials__`, a `2026-07-28` binding under `__mcp_client_credentials__:<provider
-digest>`, and target authentication under `__target_auth__:<provider digest>` with the agent
-half `surface:<surface_id>`.
+digest>`, and target authentication under `__target_auth__:<provider digest>:<scope hash>` with
+the agent half `surface:<surface_id>`.
 
 A lookup has four outcomes.
 

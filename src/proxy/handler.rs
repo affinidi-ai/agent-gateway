@@ -687,8 +687,9 @@ pub(crate) async fn inject_target_auth_header(
 }
 
 /// The service token of `provider_id` for target authentication, cached in the vault
-/// under the surface (`surface:<id>`) and the provider digest, so a changed provider
-/// never reuses a token issued under its old settings.
+/// under the surface (`surface:<id>`) and `__target_auth__:<provider digest>:<scope hash>`,
+/// so a changed provider never reuses a token issued under its old settings and two
+/// sets of scopes on one surface keep a token each.
 async fn target_provider_token(
     context: &TargetAuthContext<'_>,
     provider_id: &str,
@@ -729,7 +730,8 @@ async fn target_provider_token(
     let digest = crate::mcp::continuations::delegation::provider_digest(&provider)
         .map_err(|_| ServiceTokenError::ProviderChanged)?;
     let agent_did = format!("surface:{}", context.surface.surface_id);
-    let identity = format!("__target_auth__:{}", hex::encode(digest));
+    let scope_hash = <sha2::Sha256 as sha2::Digest>::digest(scopes.join(" ").as_bytes());
+    let identity = format!("__target_auth__:{}:{}", hex::encode(digest), hex::encode(scope_hash));
     let service = ServiceTokenContext {
         secrets,
         providers,
@@ -16772,6 +16774,35 @@ mod target_auth_tests {
                 .scopes,
             vec!["read", "write"]
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tokens_for_different_scopes_of_one_provider_are_cached_side_by_side() {
+        let fixture = Fixture::new(200).await;
+        let scoped = |scope: &str| -> TargetAuthConfig {
+            serde_json::from_value(json!({"method": {"credential_provider": {
+                "provider_id": "machine", "scopes": [scope]
+            }}}))
+            .unwrap()
+        };
+        for _ in 0..2 {
+            for scope in ["read", "write"] {
+                inject_target_auth_header(&scoped(scope), &fixture.context(), "surface", CallerAssertion::Authenticated)
+                    .await
+                    .unwrap();
+            }
+        }
+        assert_eq!(fixture.requests(), 2, "the token endpoint received one request per scope set");
+        let mut stored: Vec<Vec<String>> = fixture
+            .vault
+            .list_all()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|record| record.scopes)
+            .collect();
+        stored.sort();
+        assert_eq!(stored, vec![vec!["read".to_string()], vec!["write".to_string()]]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
