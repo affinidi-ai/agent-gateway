@@ -1700,6 +1700,18 @@ pub async fn run_axum_proxy(
                     None
                 }
             };
+        crate::egress::warn_when_vendor_clients_ignore_a_proxy(|name| std::env::var(name).ok());
+        let invalid_resource_origins = crate::credential_providers::external::invalid_resource_origin_entries(
+            &network_config.external_consent_resource_origins,
+        );
+        if !invalid_resource_origins.is_empty() {
+            error!(
+                target: "credential_delegation",
+                entries = ?invalid_resource_origins,
+                "external_consent_resource_origins in gateway.json names entries that are not https origins; they \
+                 permit nothing"
+            );
+        }
 
         if let Some(config) = bootstrap_config
             .mcp
@@ -3374,6 +3386,9 @@ pub async fn run_axum_proxy(
                     .clone()
                     .map(|store| store as Arc<dyn crate::surfaces::AgentSurfaceStore>),
                 Some(dv_store.clone()),
+                network_config
+                    .external_consent_resource_origins
+                    .clone(),
             );
 
             let dv_state = crate::delegation_vault::handlers::DelegationVaultState {

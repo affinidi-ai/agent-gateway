@@ -4897,9 +4897,19 @@ async fn step_inject_external_grant(
         state
             .egress_allowlist
             .as_deref(),
-    ) else {
+    )
+    .await
+    else {
         return Err(refuse_external_grant(ctx, DelegationRefusal::Unavailable, "destination_not_the_resource"));
     };
+    if !crate::credential_providers::external::resource_permitted(
+        &provider,
+        &state
+            .network_config
+            .external_consent_resource_origins,
+    ) {
+        return Err(refuse_external_grant(ctx, DelegationRefusal::Unavailable, "resource_not_permitted_for_issuer"));
+    }
     let surface = ctx.surface.clone();
     let tenant = surface.tenant_id.as_deref();
     let surface_id = surface.surface_id.as_str();
@@ -4926,6 +4936,8 @@ async fn step_inject_external_grant(
                 "encryption_required"
             } else if error.is::<crate::delegation_vault::grants::EphemeralPepper>() {
                 "identity_hash_pepper_ephemeral"
+            } else if error.is::<crate::delegation_vault::grants::PepperMismatch>() {
+                "identity_hash_pepper_mismatch"
             } else {
                 "vault_unavailable"
             };
@@ -14226,9 +14238,10 @@ mod tests {
                 .unwrap(),
         );
         for (id, tenant, issuer, resource) in [
-            ("vendor", None, Some("https://203.0.113.10"), Some("https://vendor.example/mcp")),
-            ("vendor-tenant-b", Some("tenant-b"), Some("https://203.0.113.10"), Some("https://vendor.example/mcp")),
-            ("vendor-private", None, Some("https://203.0.113.10"), Some("https://10.0.0.5/mcp")),
+            ("vendor", None, Some("https://vendor.example"), Some("https://vendor.example/mcp")),
+            ("vendor-tenant-b", Some("tenant-b"), Some("https://vendor.example"), Some("https://vendor.example/mcp")),
+            ("vendor-private", None, Some("https://10.0.0.5"), Some("https://10.0.0.5/mcp")),
+            ("vendor-elsewhere", None, Some("https://auth.vendor.example"), Some("https://vendor.example/mcp")),
             ("agent-keyed", None, None, None),
         ] {
             providers
@@ -14339,6 +14352,45 @@ mod tests {
                     .unwrap()
                     .to_string()
             })
+    }
+
+    /// A grant is released only while its provider's resource is permitted for
+    /// its issuer: a resource off the issuer's host needs the operator's entry
+    /// in gateway.json, and once the entry is removed the grant is refused and
+    /// the log says why.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grant_is_released_only_while_its_resource_is_permitted_for_its_issuer() {
+        use crate::component_tests::helpers::formatted_logs::FormattedLogs;
+        use crate::delegation_vault::grants::GrantKey;
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = external_grant_state(directory.path(), true).await;
+        let surface =
+            transit_surface(json!([vendor_transit_point(VENDOR_HOP, "vendor-elsewhere", "owner")]), json!([]));
+        store_grant(&state, GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "vendor-elsewhere"), "access", 3600)
+            .await;
+        let caller = "a".repeat(64);
+
+        let logs = FormattedLogs::capture();
+        let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&caller));
+        assert!(
+            step_inject_credentials(&state, &mut ctx)
+                .await
+                .is_err()
+        );
+        assert_eq!(bearer(&ctx), None);
+        let text = logs.text();
+        assert!(text.contains("resource_not_permitted_for_issuer"), "{text}");
+
+        Arc::make_mut(&mut state.network_config).external_consent_resource_origins =
+            std::collections::HashMap::from([(
+                "https://auth.vendor.example".to_string(),
+                vec!["https://vendor.example".to_string()],
+            )]);
+        let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&caller));
+        step_inject_credentials(&state, &mut ctx)
+            .await
+            .expect("the operator's entry permits the resource");
+        assert_eq!(bearer(&ctx).as_deref(), Some("Bearer access"));
     }
 
     /// An owner grant is released, for a caller the transit token names, on
@@ -14579,7 +14631,8 @@ mod tests {
             .create(
                 serde_json::from_value(json!({
                     "id": "vendor-fixture", "name": "vendor-fixture", "provider_id": "vendor-fixture",
-                    "issuer": "https://203.0.113.10", "resource": target.url,
+                    "issuer": url::Url::parse(&target.url).unwrap().origin().ascii_serialization(),
+                    "resource": target.url,
                     "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
                 }))
                 .unwrap(),

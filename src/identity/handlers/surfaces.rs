@@ -1851,19 +1851,22 @@ pub async fn create_surface(
         .map_err(|e| SurfaceApiError::Forbidden(e.message()))?;
     let allowlist = crate::egress::bdd_egress_allowlist();
     let actor = management_actor(&caller, &delegation);
-    super::surface_grants::remove_changed_binding_grants(
-        &super::surface_grants::GrantRemoval::of(&state, allowlist.as_deref(), actor.as_ref()),
-        None,
-        Some(&surface),
-    )
-    .await?;
-
     surface.trust_check_split = surface.has_trust_check_lists();
     surface.transit_point_source_auth = surface.has_transit_point_source_auth();
-    store
-        .save(&surface)
-        .await
-        .map_err(|e| SurfaceApiError::InternalError(format!("Failed to save surface: {}", e)))?;
+    super::surface_grants::write_surface(
+        &super::surface_grants::GrantRemoval::of(&state, allowlist.as_deref(), actor.as_ref()),
+        &**store,
+        &surface.surface_id,
+        super::surface_grants::Stored::Absent,
+        Some(&surface),
+        || async {
+            store
+                .save(&surface)
+                .await
+                .map_err(|e| SurfaceApiError::InternalError(format!("Failed to save surface: {}", e)))
+        },
+    )
+    .await?;
 
     info!("Created agent surface '{}' (surface_id={})", surface.name, surface.surface_id);
 
@@ -1944,6 +1947,7 @@ pub async fn update_surface(
         return Err(SurfaceApiError::Forbidden("surface is outside this token's permitted scope".to_string()));
     }
     settle_undeclared_put(&mut surface, &existing, &sent)?;
+    carry_transit_point_ids(&mut surface, &existing, &sent);
     surface.tenant_id = existing.tenant_id.clone();
     if surface
         .mcp_legacy_metadata_output
@@ -2317,6 +2321,93 @@ fn retain_transit_caller_authentication(
     }
 }
 
+/// A save that leaves out the `id` of a Transit Point with a
+/// `consent_mode: external` binding keeps the id stored for the Transit Point
+/// with its alias in the same place, the surface's own list or the variant's
+/// of the same id. Without this, every such save would give the Transit Point
+/// a new id, and with it a new binding, so its grants by binding would be
+/// revoked. Other Transit Points are left as sent: one sent without its id is
+/// a new Transit Point, which keeps none of the stored one's settings. `sent`
+/// is the JSON the request sent: a PUT's whole body or a merge PATCH's. A list
+/// the request did not send keeps its stored ids already.
+fn carry_transit_point_ids(
+    surface: &mut AgentSurface,
+    existing: &AgentSurface,
+    sent: &serde_json::Value,
+) {
+    if let Some(transit) = surface.transit.as_mut() {
+        carry_point_ids(&mut transit.points, existing.transit_points(), sent.pointer("/transit/points"));
+    }
+    for (index, variant) in surface
+        .variants
+        .iter_mut()
+        .enumerate()
+    {
+        let stored = existing
+            .variants
+            .iter()
+            .find(|stored| stored.id == variant.id)
+            .and_then(|stored| {
+                stored
+                    .overrides
+                    .transit
+                    .as_ref()
+            })
+            .and_then(|transit| transit.points.as_deref());
+        let points = variant
+            .overrides
+            .transit
+            .as_mut()
+            .and_then(|transit| transit.points.as_mut());
+        if let (Some(points), Some(stored)) = (points, stored) {
+            carry_point_ids(points, stored, sent.pointer(&format!("/variants/{index}/overrides/transit/points")));
+        }
+    }
+}
+
+/// [`carry_transit_point_ids`] for one list: each point with an external
+/// consent binding whose JSON in `sent_points` has no `id`, or an empty one,
+/// takes the stored id of the point with its alias, unless another point of the
+/// list already has that id.
+fn carry_point_ids(
+    points: &mut [crate::config::agent_surface::TransitPoint],
+    stored: &[crate::config::agent_surface::TransitPoint],
+    sent_points: Option<&serde_json::Value>,
+) {
+    let Some(sent_points) = sent_points.and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    let sends_id = |index: usize| {
+        sent_points
+            .get(index)
+            .and_then(|point| point.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| !id.is_empty())
+    };
+    let mut taken: std::collections::HashSet<String> = points
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| sends_id(*index))
+        .map(|(_, point)| point.id.clone())
+        .collect();
+    for (index, point) in points.iter_mut().enumerate() {
+        let external = point
+            .transit_credentials
+            .as_ref()
+            .is_some_and(|binding| binding.is_external());
+        if sends_id(index) || !external {
+            continue;
+        }
+        if let Some(previous) = stored
+            .iter()
+            .find(|previous| previous.alias == point.alias)
+            && taken.insert(previous.id.clone())
+        {
+            point.id = previous.id.clone();
+        }
+    }
+}
+
 /// Keeps each Transit Point's stored `source_auth`,
 /// `allow_unauthenticated_callers` and `delegated_credentials_for_fabric_callers`
 /// that `sent_points`, the JSON the request sent for `points`, leaves out; see
@@ -2648,19 +2739,22 @@ async fn validate_and_save_surface(
     validate_protected_resource_issuers(state, &surface).await?;
     validate_mcp_resource_declarations(state, &surface).await?;
     let allowlist = crate::egress::bdd_egress_allowlist();
-    super::surface_grants::remove_changed_binding_grants(
-        &super::surface_grants::GrantRemoval::of(state, allowlist.as_deref(), actor),
-        existing,
-        Some(&surface),
-    )
-    .await?;
-
     surface.trust_check_split = surface.has_trust_check_lists();
     surface.transit_point_source_auth = surface.has_transit_point_source_auth();
-    store
-        .save(&surface)
-        .await
-        .map_err(|e| SurfaceApiError::InternalError(format!("Failed to save surface: {}", e)))?;
+    super::surface_grants::write_surface(
+        &super::surface_grants::GrantRemoval::of(state, allowlist.as_deref(), actor),
+        &**store,
+        &surface.surface_id,
+        super::surface_grants::Stored::Any,
+        Some(&surface),
+        || async {
+            store
+                .save(&surface)
+                .await
+                .map_err(|e| SurfaceApiError::InternalError(format!("Failed to save surface: {}", e)))
+        },
+    )
+    .await?;
 
     info!("Updated agent surface '{}' (surface_id={})", surface.name, surface.surface_id);
 
@@ -2773,6 +2867,7 @@ pub async fn patch_surface(
     let mut surface: AgentSurface = serde_json::from_value(merged)
         .map_err(|e| SurfaceApiError::BadRequest(format!("Merged surface failed to deserialise: {}", e)))?;
     surface.surface_id = surface_id.clone();
+    carry_transit_point_ids(&mut surface, &existing, &patch);
     if patch_sets_a2a_settings(&patch) {
         refuse_a2a_settings_sent_on_other_protocols(&surface)?;
     }
@@ -2852,8 +2947,22 @@ pub async fn patch_variant(
         obj.insert("id".to_string(), serde_json::Value::String(variant_id.clone()));
     }
 
-    let new_variant: crate::config::agent_surface_variants::SurfaceVariant = serde_json::from_value(merged_variant)
+    let mut new_variant: crate::config::agent_surface_variants::SurfaceVariant = serde_json::from_value(merged_variant)
         .map_err(|e| SurfaceApiError::BadRequest(format!("Merged variant failed to deserialise: {}", e)))?;
+    if let (Some(points), Some(stored)) = (
+        new_variant
+            .overrides
+            .transit
+            .as_mut()
+            .and_then(|transit| transit.points.as_mut()),
+        existing.variants[variant_index]
+            .overrides
+            .transit
+            .as_ref()
+            .and_then(|transit| transit.points.as_deref()),
+    ) {
+        carry_point_ids(points, stored, patch.pointer("/overrides/transit/points"));
+    }
 
     let mut surface = existing.clone();
     surface.variants[variant_index] = new_variant;
@@ -2902,16 +3011,20 @@ pub async fn delete_surface(
         {
             let allowlist = crate::egress::bdd_egress_allowlist();
             let actor = management_actor(&caller, &delegation);
-            super::surface_grants::remove_changed_binding_grants(
+            super::surface_grants::write_surface(
                 &super::surface_grants::GrantRemoval::of(&state, allowlist.as_deref(), actor.as_ref()),
-                Some(&surface),
+                &**store,
+                &surface_id,
+                super::surface_grants::Stored::Any,
                 None,
+                || async {
+                    store
+                        .delete(&surface_id)
+                        .await
+                        .map_err(|e| SurfaceApiError::InternalError(format!("Failed to delete surface: {}", e)))
+                },
             )
             .await?;
-            store
-                .delete(&surface_id)
-                .await
-                .map_err(|e| SurfaceApiError::InternalError(format!("Failed to delete surface: {}", e)))?;
 
             info!("Deleted agent surface '{}' (surface_id={})", surface.name, surface_id);
 
@@ -3413,6 +3526,23 @@ pub async fn create_variant(
     } else {
         SurfaceOverrides::default()
     };
+    // A Transit Point with external consent is kept in one place, so the copy
+    // gets ids of its own for those, and its own grants once consented.
+    let mut seed_overrides = seed_overrides;
+    for point in seed_overrides
+        .transit
+        .iter_mut()
+        .filter_map(|transit| transit.points.as_mut())
+        .flatten()
+        .filter(|point| {
+            point
+                .transit_credentials
+                .as_ref()
+                .is_some_and(|binding| binding.is_external())
+        })
+    {
+        point.id = uuid::Uuid::new_v4().to_string();
+    }
 
     let new_variant = SurfaceVariant {
         id: uuid::Uuid::new_v4().to_string(),
@@ -3556,6 +3686,7 @@ pub async fn update_variant(
                 .as_ref()
                 .and_then(|transit| transit.points.as_ref()),
         ) {
+            carry_point_ids(points, stored_points, sent.pointer("/overrides/transit/points"));
             retain_transit_points_caller_authentication(
                 points,
                 stored_points,
@@ -4380,6 +4511,97 @@ mod validation_tests {
                 );
             }
         }
+    }
+
+    /// A save that leaves out the ids of Transit Points with external consent
+    /// keeps the stored ones, matched by alias in the same place, so each
+    /// binding keeps its id, and with it its grants. An id the request sends is
+    /// kept as sent, and a Transit Point without external consent sent without
+    /// its id is a new one, as before.
+    #[tokio::test]
+    async fn a_save_that_leaves_transit_point_ids_out_keeps_them_and_their_grants() {
+        let binding = serde_json::json!({"credential_provider_id": "vendor", "consent_mode": "external",
+            "subject": "owner"});
+        let stored_points = serde_json::json!([
+            { "id": "hop-vendor", "alias": "vendor", "target_endpoint": "https://203.0.113.30/mcp",
+                "require_transit_token": true, "transit_credentials": binding },
+            { "id": "hop-other", "alias": "other", "target_endpoint": "https://203.0.113.31/mcp",
+                "require_transit_token": true, "transit_credentials": binding },
+            { "id": "hop-plain", "alias": "plain", "target_endpoint": "https://203.0.113.33/mcp",
+                "require_transit_token": true }
+        ]);
+        let mut existing = surface_with_transit_points(stored_points.clone(), stored_points);
+        existing.surface_id = "surface".into();
+        let sent_points = serde_json::json!([
+            { "alias": "vendor", "target_endpoint": "https://203.0.113.30/mcp", "require_transit_token": true,
+                "transit_credentials": binding },
+            { "id": "", "alias": "other", "target_endpoint": "https://203.0.113.31/mcp",
+                "require_transit_token": true, "transit_credentials": binding },
+            { "id": "hop-new", "alias": "added", "target_endpoint": "https://203.0.113.32/mcp",
+                "require_transit_token": true },
+            { "alias": "plain", "target_endpoint": "https://203.0.113.33/mcp", "require_transit_token": true }
+        ]);
+        let sent = serde_json::json!({
+            "transit": { "points": sent_points },
+            "variants": [{ "id": "candidate", "overrides": { "transit": { "points": sent_points } } }]
+        });
+        let mut surface = surface_with_transit_points(sent_points.clone(), sent_points);
+        surface.surface_id = "surface".into();
+
+        carry_transit_point_ids(&mut surface, &existing, &sent);
+
+        let variant_points = surface.variants[0]
+            .overrides
+            .transit
+            .as_ref()
+            .and_then(|transit| transit.points.clone())
+            .unwrap();
+        for points in [
+            &surface
+                .transit
+                .as_ref()
+                .unwrap()
+                .points,
+            &variant_points,
+        ] {
+            let ids: Vec<&str> = points
+                .iter()
+                .map(|point| point.id.as_str())
+                .collect();
+            assert_eq!(ids[..3], ["hop-vendor", "hop-other", "hop-new"]);
+            assert_ne!(ids[3], "hop-plain", "a Transit Point without external consent is new");
+        }
+        let no_vault = super::super::surface_grants::GrantRemoval {
+            vault: None,
+            providers: None,
+            secrets: None,
+            exact_allowlist: None,
+            actor: None,
+        };
+        assert!(
+            super::super::surface_grants::remove_changed_binding_grants(&no_vault, Some(&existing), Some(&surface))
+                .await
+                .is_ok(),
+            "no binding changed, so no grant is revoked"
+        );
+
+        let mut renamed = surface_with_transit_points(
+            serde_json::json!([{ "id": "hop-vendor", "alias": "renamed", "target_endpoint": "https://203.0.113.30/mcp",
+                "require_transit_token": true, "transit_credentials": binding }]),
+            serde_json::json!([]),
+        );
+        let sent = serde_json::json!({ "transit": { "points": [{ "id": "hop-vendor", "alias": "renamed" }] } });
+        carry_transit_point_ids(&mut renamed, &existing, &sent);
+        assert_eq!(
+            renamed
+                .transit
+                .as_ref()
+                .unwrap()
+                .points[0]
+                .id,
+            "hop-vendor",
+            "a sent id is kept"
+        );
     }
 
     /// The Surface Builder does not show `delegated_credentials_for_fabric_callers`,

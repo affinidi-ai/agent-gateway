@@ -65,6 +65,9 @@ pub enum ExternalProviderError {
     MetadataMismatch(&'static str),
     /// The named field cannot change on an external consent provider.
     Immutable(&'static str),
+    /// The provider's `resource` is not permitted for its `issuer`
+    /// ([`resource_permitted`]).
+    ResourceNotPermitted,
 }
 
 impl ExternalProviderError {
@@ -103,6 +106,12 @@ impl IntoResponse for ExternalProviderError {
                 ),
                 "code": "provider_field_immutable",
                 "field": field,
+            }),
+            Self::ResourceNotPermitted => serde_json::json!({
+                "error": "resource is not permitted for the issuer: its host must be the issuer's host or one of its \
+                          subdomains, or its origin one the gateway's external_consent_resource_origins lists for \
+                          the issuer",
+                "code": "provider_resource_not_permitted",
             }),
         };
         (StatusCode::BAD_REQUEST, Json(body)).into_response()
@@ -491,6 +500,97 @@ pub fn refuse_changes(
     }
 }
 
+/// The origin of `provider`'s `resource`, as its ASCII serialization.
+pub fn resource_origin(provider: &CredentialProvider) -> Option<String> {
+    provider
+        .resource
+        .as_deref()
+        .and_then(|resource| url::Url::parse(resource).ok())
+        .map(|resource| {
+            resource
+                .origin()
+                .ascii_serialization()
+        })
+}
+
+/// An origin an operator wrote in `external_consent_resource_origins`, as its
+/// ASCII serialization: an `https` URL with a host and nothing after it but an
+/// optional `/`. `None` for anything else, which then permits nothing.
+fn configured_origin(value: &str) -> Option<String> {
+    let url = url::Url::parse(value.trim()).ok()?;
+    let bare = url.scheme() == "https"
+        && url.host().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.path() == "/"
+        && url.query().is_none()
+        && url.fragment().is_none();
+    bare.then(|| {
+        url.origin()
+            .ascii_serialization()
+    })
+}
+
+/// The entries of gateway.json's `external_consent_resource_origins` that are
+/// not `https` origins, issuers and resources alike: they permit nothing, and
+/// the gateway names them at startup.
+pub fn invalid_resource_origin_entries(permitted: &std::collections::HashMap<String, Vec<String>>) -> Vec<String> {
+    let mut invalid: Vec<String> = permitted
+        .iter()
+        .flat_map(|(issuer, resources)| std::iter::once(issuer).chain(resources))
+        .filter(|entry| configured_origin(entry).is_none())
+        .cloned()
+        .collect();
+    invalid.sort();
+    invalid
+}
+
+/// Whether `provider`'s `resource` is permitted for its `issuer`, so its grants
+/// may go there. By default the resource's host must be the issuer's host or
+/// one of its subdomains (an IP address only itself): hosts are compared as the
+/// URL parser normalises them, in lower case and with international names in
+/// punycode, label by label, so `evil-notion.com`, `notion.com.evil.example` or
+/// a look-alike name never passes for the issuer's. Any other resource origin
+/// must be one that `permitted`, gateway.json's
+/// `external_consent_resource_origins`, lists for the issuer's origin: only the
+/// operator's file sets it, never a tenant or an API caller. Both URLs must
+/// parse; the `https` rules of [`validate`] and [`check_grant_destination`]
+/// apply as well.
+pub fn resource_permitted(
+    provider: &CredentialProvider,
+    permitted: &std::collections::HashMap<String, Vec<String>>,
+) -> bool {
+    let parse = |value: Option<&str>| value.and_then(|value| url::Url::parse(value).ok());
+    let (Some(issuer), Some(resource)) = (parse(provider.issuer.as_deref()), parse(provider.resource.as_deref()))
+    else {
+        return false;
+    };
+    let on_the_issuers_host = match (issuer.host(), resource.host()) {
+        (Some(url::Host::Domain(issuer)), Some(url::Host::Domain(resource))) => {
+            resource == issuer
+                || resource
+                    .strip_suffix(issuer)
+                    .is_some_and(|label| label.ends_with('.') && label.len() > 1)
+        }
+        (Some(issuer), Some(resource)) => issuer == resource,
+        _ => false,
+    };
+    if on_the_issuers_host {
+        return true;
+    }
+    let issuer_origin = issuer
+        .origin()
+        .ascii_serialization();
+    let resource_origin = resource
+        .origin()
+        .ascii_serialization();
+    permitted
+        .iter()
+        .filter(|(listed_issuer, _)| configured_origin(listed_issuer).as_deref() == Some(issuer_origin.as_str()))
+        .flat_map(|(_, resources)| resources)
+        .any(|listed| configured_origin(listed).as_deref() == Some(resource_origin.as_str()))
+}
+
 /// Whether a Transit Point whose target is `target_endpoint` may carry the
 /// grants of the external consent provider `provider`, and if so the origin
 /// they may be sent to: the origin of the provider's `resource`.
@@ -500,8 +600,10 @@ pub fn refuse_changes(
 /// ([`crate::egress::bdd_egress_allowlist`] on the production path, so `None`):
 /// it can admit an `http` or loopback fixture, never another origin or Fabric.
 /// The check runs when the surface is saved and again on every call, so a grant
-/// is bound to where it is sent, not to a Transit Point id.
-pub fn check_grant_destination(
+/// is bound to where it is sent, not to a Transit Point id. It resolves nothing
+/// on the async executor: without an allow-list, as in production, it resolves
+/// nothing at all.
+pub async fn check_grant_destination(
     provider: &CredentialProvider,
     target_endpoint: &str,
     exact_allowlist: Option<&str>,
@@ -516,7 +618,9 @@ pub fn check_grant_destination(
         .ok_or("the credential provider names no resource")?;
     let target = url::Url::parse(target_endpoint)
         .map_err(|_| "consent_mode external needs a target_endpoint that is a public https URL")?;
-    if !is_strict_https_url(target_endpoint) && !crate::egress::exactly_allowlisted(target_endpoint, exact_allowlist) {
+    if !is_strict_https_url(target_endpoint)
+        && !crate::egress::exactly_allowlisted(target_endpoint, exact_allowlist).await
+    {
         return Err("consent_mode external needs a target_endpoint that is a public https URL");
     }
     if target.origin() != resource.origin() {
@@ -534,14 +638,14 @@ pub(crate) mod tests {
 
     const ISSUER: &str = "https://203.0.113.10";
 
-    #[test]
-    fn a_grant_goes_only_to_a_public_https_target_with_the_origin_of_the_providers_resource() {
+    #[tokio::test]
+    async fn a_grant_goes_only_to_a_public_https_target_with_the_origin_of_the_providers_resource() {
         let provider = external_provider();
         let resource = url::Url::parse("https://203.0.113.10/mcp")
             .unwrap()
             .origin();
         for target in ["https://203.0.113.10/mcp", "https://203.0.113.10/other/path?x=1", "https://203.0.113.10:443"] {
-            assert_eq!(check_grant_destination(&provider, target, None), Ok(resource.clone()), "{target}");
+            assert_eq!(check_grant_destination(&provider, target, None).await, Ok(resource.clone()), "{target}");
         }
         for (case, target) in [
             ("another host", "https://203.0.113.66/mcp"),
@@ -550,37 +654,139 @@ pub(crate) mod tests {
             ("Fabric", "fabric://gateway-b/channel"),
             ("not a URL", "vendor"),
         ] {
-            assert!(check_grant_destination(&provider, target, None).is_err(), "{case} must be refused");
+            assert!(
+                check_grant_destination(&provider, target, None)
+                    .await
+                    .is_err(),
+                "{case} must be refused"
+            );
         }
 
         let mut private = external_provider();
         private.resource = Some("https://10.0.0.5/mcp".into());
         assert!(
-            check_grant_destination(&private, "https://10.0.0.5/mcp", None).is_err(),
+            check_grant_destination(&private, "https://10.0.0.5/mcp", None)
+                .await
+                .is_err(),
             "a private address is refused even when a stored provider names it"
         );
         let mut loopback = external_provider();
         loopback.resource = Some("https://127.0.0.1/mcp".into());
-        assert!(check_grant_destination(&loopback, "https://127.0.0.1/mcp", None).is_err());
+        assert!(
+            check_grant_destination(&loopback, "https://127.0.0.1/mcp", None)
+                .await
+                .is_err()
+        );
         let mut without_resource = external_provider();
         without_resource.resource = None;
-        assert!(check_grant_destination(&without_resource, "https://203.0.113.10/mcp", None).is_err());
+        assert!(
+            check_grant_destination(&without_resource, "https://203.0.113.10/mcp", None)
+                .await
+                .is_err()
+        );
     }
 
-    #[test]
-    fn only_the_test_allowlist_admits_an_http_fixture_and_never_another_origin_or_fabric() {
+    #[tokio::test]
+    async fn only_the_test_allowlist_admits_an_http_fixture_and_never_another_origin_or_fabric() {
         let mut fixture = external_provider();
         fixture.resource = Some("http://127.0.0.1:9/mcp".into());
         let allowlist = Some("http://127.0.0.1:9");
         assert_eq!(
-            check_grant_destination(&fixture, "http://127.0.0.1:9/mcp", allowlist),
+            check_grant_destination(&fixture, "http://127.0.0.1:9/mcp", allowlist).await,
             Ok(url::Url::parse("http://127.0.0.1:9")
                 .unwrap()
                 .origin())
         );
-        assert!(check_grant_destination(&fixture, "http://127.0.0.1:9/mcp", None).is_err());
-        assert!(check_grant_destination(&fixture, "http://127.0.0.1:10/mcp", Some("http://127.0.0.1:10")).is_err());
-        assert!(check_grant_destination(&fixture, "fabric://127.0.0.1:9/mcp", allowlist).is_err());
+        assert!(
+            check_grant_destination(&fixture, "http://127.0.0.1:9/mcp", None)
+                .await
+                .is_err()
+        );
+        assert!(
+            check_grant_destination(&fixture, "http://127.0.0.1:10/mcp", Some("http://127.0.0.1:10"))
+                .await
+                .is_err()
+        );
+        assert!(
+            check_grant_destination(&fixture, "fabric://127.0.0.1:9/mcp", allowlist)
+                .await
+                .is_err()
+        );
+    }
+
+    fn issued_for(
+        issuer: &str,
+        resource: &str,
+    ) -> CredentialProvider {
+        let mut provider = external_provider();
+        provider.issuer = Some(issuer.into());
+        provider.resource = Some(resource.into());
+        provider
+    }
+
+    /// A provider's resource must be on its issuer's host or a subdomain, or be
+    /// an origin the operator lists for the issuer; look-alike hosts never pass.
+    #[test]
+    fn a_providers_resource_must_be_permitted_for_its_issuer() {
+        let none = std::collections::HashMap::new();
+        let issuer = "https://mcp.notion.com";
+        for resource in [
+            "https://mcp.notion.com/mcp",
+            "https://MCP.Notion.com/mcp",
+            "https://mcp.notion.com:8443/mcp",
+            "https://api.mcp.notion.com/v1",
+        ] {
+            assert!(resource_permitted(&issued_for(issuer, resource), &none), "{resource}");
+        }
+        for (case, resource) in [
+            ("another site", "https://collector.example/mcp"),
+            ("a name that ends like the issuer's", "https://evil-mcp.notion.com.example/mcp"),
+            ("a label that ends like the issuer's", "https://evilmcp.notion.com/mcp"),
+            ("a prefix of another domain", "https://evil-notion.com/mcp"),
+            ("the issuer's name under another domain", "https://notion.com.evil.example/mcp"),
+            ("the issuer's name under another domain", "https://mcp.notion.com.evil.example/mcp"),
+            ("a look-alike in punycode", "https://mcp.n\u{043e}tion.com/mcp"),
+            ("a sibling of the issuer", "https://api.notion.com/mcp"),
+            ("the issuer's parent", "https://notion.com/mcp"),
+            ("a trailing dot", "https://mcp.notion.com./mcp"),
+            ("an IP address", "https://203.0.113.10/mcp"),
+        ] {
+            assert!(!resource_permitted(&issued_for(issuer, resource), &none), "{case}: {resource}");
+        }
+        assert!(resource_permitted(&issued_for("https://203.0.113.10", "https://203.0.113.10/mcp"), &none));
+        assert!(!resource_permitted(&issued_for("https://203.0.113.10", "https://203.0.113.11/mcp"), &none));
+        let mut without_resource = external_provider();
+        without_resource.resource = None;
+        assert!(!resource_permitted(&without_resource, &none));
+    }
+
+    /// The operator's `external_consent_resource_origins` permits other origins
+    /// for one issuer, exactly as listed: no other issuer, origin or scheme.
+    #[test]
+    fn an_origin_the_operator_lists_for_the_issuer_is_permitted_and_no_other() {
+        let google = "https://accounts.google.com";
+        let permitted = std::collections::HashMap::from([
+            (format!("{google}/"), vec!["https://www.googleapis.com".to_string()]),
+            ("https://other-issuer.example".to_string(), vec!["https://collector.example".to_string()]),
+            ("not an origin".to_string(), vec!["https://collector.example/path".to_string()]),
+        ]);
+        assert!(resource_permitted(&issued_for(google, "https://www.googleapis.com/calendar/v3"), &permitted));
+        assert!(
+            !resource_permitted(
+                &issued_for(google, "https://www.googleapis.com/calendar/v3"),
+                &std::collections::HashMap::new()
+            ),
+            "without the operator's entry the sibling site is refused"
+        );
+        for resource in [
+            "https://collector.example/mcp",
+            "https://storage.googleapis.com/b",
+            "https://www.googleapis.com:8443/calendar",
+            "https://www.googleapis.com.evil.example/calendar",
+        ] {
+            assert!(!resource_permitted(&issued_for(google, resource), &permitted), "{resource}");
+        }
+        assert_eq!(invalid_resource_origin_entries(&permitted), ["https://collector.example/path", "not an origin"]);
     }
 
     pub(crate) fn external_provider() -> CredentialProvider {

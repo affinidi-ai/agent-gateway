@@ -1,6 +1,9 @@
 //! Filesystem storage for delegation vault tokens
 
-use super::grants::{DelegatedGrant, EncryptionRequired, EphemeralPepper, GRANTS_DIRECTORY, GrantKey, StoredGrant};
+use super::grants::{
+    DelegatedGrant, EncryptionRequired, EphemeralPepper, GRANTS_DIRECTORY, GrantBinding, GrantKey,
+    PEPPER_FINGERPRINT_FILE, PepperMismatch, Principals, StoredGrant, UnreadableGrant, UnreadableReason,
+};
 use super::{DelegationToken, VaultLookupResult};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -124,8 +127,9 @@ pub trait DelegationVaultStorage: Send + Sync {
 
     /// The grant stored under `key`, read with one lookup by its record id.
     /// Fails with [`EncryptionRequired`] while at-rest encryption is not active,
-    /// and with [`EphemeralPepper`] while the identity hash pepper is not
-    /// configured.
+    /// with [`EphemeralPepper`] while the identity hash pepper is not
+    /// configured, and with [`PepperMismatch`] when no grant is found and the
+    /// grants stored were written under another pepper.
     async fn grant(
         &self,
         _key: &GrantKey,
@@ -136,7 +140,8 @@ pub trait DelegationVaultStorage: Send + Sync {
     /// Store `grant` under its key, replacing a grant of the same key, which is
     /// returned so the caller can revoke its tokens. The record id is derived
     /// from the key; the grant's own `id` is ignored. Fails as [`Self::grant`]
-    /// does.
+    /// does, and with [`PepperMismatch`] while grants written under another
+    /// pepper are stored.
     #[allow(dead_code)]
     async fn store_grant(
         &self,
@@ -145,11 +150,22 @@ pub trait DelegationVaultStorage: Send + Sync {
         anyhow::bail!("This vault does not keep grants by binding")
     }
 
-    /// Every grant made with one credential provider, by the provider its own
-    /// record names, whether or not its id is its key's under the current
-    /// pepper, so a grant written under an earlier pepper can still be revoked
-    /// and deleted. Fails with [`EncryptionRequired`] while at-rest encryption
-    /// is not active.
+    /// The grants of `binding` that `principals` names, found by their record
+    /// ids, so no other binding's grant is read or decrypted. Fails with
+    /// [`UnreadableGrant`] when one of them cannot be read, including while
+    /// at-rest encryption is off, and with [`PepperMismatch`] when none is
+    /// found and the grants stored were written under another pepper.
+    async fn binding_grants(
+        &self,
+        _binding: &GrantBinding,
+        _principals: Principals,
+    ) -> Result<Vec<DelegatedGrant>> {
+        anyhow::bail!("This vault does not keep grants by binding")
+    }
+
+    /// Every grant made with one credential provider, found by their record
+    /// ids, so no other provider's grant is read. Fails as
+    /// [`Self::binding_grants`] does.
     async fn provider_grants(
         &self,
         _credential_provider_id: &str,
@@ -157,14 +173,12 @@ pub trait DelegationVaultStorage: Send + Sync {
         anyhow::bail!("This vault does not keep grants by binding")
     }
 
-    /// Every grant stored, as [`Self::provider_grants`] lists them.
-    async fn all_grants(&self) -> Result<Vec<DelegatedGrant>> {
-        anyhow::bail!("This vault does not keep grants by binding")
-    }
-
-    /// Whether any grant is stored, read without decrypting one, so it can be
-    /// answered while at-rest encryption is off.
-    async fn has_stored_grants(&self) -> Result<bool> {
+    /// The record ids of every grant stored for `binding`, read from the file
+    /// names alone, so it can be answered whatever the grants hold.
+    async fn binding_grant_ids(
+        &self,
+        _binding: &GrantBinding,
+    ) -> Result<Vec<String>> {
         anyhow::bail!("This vault does not keep grants by binding")
     }
 
@@ -173,6 +187,18 @@ pub trait DelegationVaultStorage: Send + Sync {
         &self,
         _id: &str,
     ) -> Result<Option<DelegatedGrant>> {
+        anyhow::bail!("This vault does not keep grants by binding")
+    }
+
+    /// Delete the grant record with this id without reading it, so an
+    /// unreadable grant can be removed. `tenant_id` is the tenant whose access
+    /// the removal changes, `None` when it is untenanted or unknown. Returns
+    /// whether a record was there. Refuses an id that is not a grant's.
+    async fn purge_grant(
+        &self,
+        _id: &str,
+        _tenant_id: Option<&str>,
+    ) -> Result<bool> {
         anyhow::bail!("This vault does not keep grants by binding")
     }
 
@@ -199,6 +225,21 @@ pub struct FileSystemDelegationVaultStore {
     /// Whether the identity hash pepper, which grant ids derive from, was
     /// configured rather than generated for this process.
     stable_grant_ids: bool,
+    /// [`super::grants::pepper_fingerprint`] of this gateway's pepper, kept
+    /// beside the grants it writes.
+    pepper_fingerprint: String,
+}
+
+/// How the pepper the stored grants were written under compares with ours.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoredPepper {
+    /// No fingerprint is stored: no grant was written since grants were
+    /// fingerprinted.
+    Unrecorded,
+    /// The grants were written under this gateway's pepper.
+    Ours,
+    /// The fingerprint names another pepper.
+    Another,
 }
 
 impl FileSystemDelegationVaultStore {
@@ -238,7 +279,7 @@ impl FileSystemDelegationVaultStore {
                  set AG_IDENTITY_HASH_PEPPER to the same value on every node"
             );
         }
-        Ok(Self {
+        let store = Self {
             storage: storage.into(),
             mutation_lock_path: path.join(".mutation.lock"),
             consents: consent::ConsentStorage::new(&path).await?,
@@ -249,7 +290,151 @@ impl FileSystemDelegationVaultStore {
             grants_directory: path.join(GRANTS_DIRECTORY),
             encrypted,
             stable_grant_ids,
-        })
+            pepper_fingerprint: super::grants::pepper_fingerprint(),
+        };
+        if store
+            .pepper_mismatch()
+            .await?
+        {
+            tracing::error!(
+                target: "credential_delegation",
+                path = %store.grants_directory.display(),
+                "The delegated grants stored were written under another identity hash pepper than \
+                 AG_IDENTITY_HASH_PEPPER now sets: no grant is stored or released, and no binding with consent_mode \
+                 external can be removed, until the pepper they were written under is restored, or they are purged \
+                 (DELETE /api/v1/delegation-vault/grants/{{id}}, or by deleting the delegated_grants directory, which \
+                 leaves them unrevoked at the vendor)"
+            );
+        }
+        Ok(store)
+    }
+
+    /// The record ids of the grants stored whose id starts with `prefix`, read
+    /// from the file names alone.
+    async fn grant_ids_with_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<String>> {
+        let mut entries = match tokio::fs::read_dir(&self.grants_directory).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error).context("Failed to read the delegated grants directory"),
+        };
+        let mut ids = std::collections::BTreeSet::new();
+        while let Some(entry) = entries.next_entry().await? {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Some(id) = name
+                .strip_suffix(".json.enc")
+                .or_else(|| name.strip_suffix(".json"))
+            else {
+                continue;
+            };
+            if id.starts_with(prefix) && super::grants::is_record_id(id) {
+                ids.insert(id.to_string());
+            }
+        }
+        Ok(ids.into_iter().collect())
+    }
+
+    async fn stored_pepper(&self) -> Result<StoredPepper> {
+        match tokio::fs::read_to_string(
+            self.grants_directory
+                .join(PEPPER_FINGERPRINT_FILE),
+        )
+        .await
+        {
+            Ok(stored) if stored.trim() == self.pepper_fingerprint => Ok(StoredPepper::Ours),
+            Ok(_) => Ok(StoredPepper::Another),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(StoredPepper::Unrecorded),
+            Err(error) => Err(error).context("Failed to read the delegated grants' pepper fingerprint"),
+        }
+    }
+
+    /// Whether grants are stored that were written under another pepper.
+    async fn pepper_mismatch(&self) -> Result<bool> {
+        Ok(self.stored_pepper().await? == StoredPepper::Another
+            && !self
+                .grant_ids_with_prefix("")
+                .await?
+                .is_empty())
+    }
+
+    /// Record this gateway's pepper beside the grants before one is written,
+    /// refusing while grants written under another are stored. A fingerprint
+    /// with no grant beside it is replaced. Called with the mutation lock held.
+    async fn claim_pepper_locked(&self) -> Result<()> {
+        match self.stored_pepper().await? {
+            StoredPepper::Ours => return Ok(()),
+            StoredPepper::Another
+                if !self
+                    .grant_ids_with_prefix("")
+                    .await?
+                    .is_empty() =>
+            {
+                return Err(PepperMismatch.into());
+            }
+            StoredPepper::Another => warn!(
+                target: "credential_delegation",
+                "The delegated grants' pepper fingerprint named another identity hash pepper, but no grant is \
+                 stored; it now names this gateway's"
+            ),
+            StoredPepper::Unrecorded => {}
+        }
+        crate::storage::filesystem::atomic_write_file_with_mode(
+            &self
+                .grants_directory
+                .join(PEPPER_FINGERPRINT_FILE),
+            self.pepper_fingerprint
+                .as_bytes(),
+            Some(0o600),
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("Failed to record the delegated grants' pepper fingerprint: {error:?}"))
+    }
+
+    /// Read the grants with these record ids, failing with [`UnreadableGrant`]
+    /// on the first that cannot be read, and with [`PepperMismatch`] when there
+    /// are none and grants written under another pepper are stored.
+    async fn read_grants(
+        &self,
+        ids: Vec<String>,
+    ) -> Result<Vec<DelegatedGrant>> {
+        if ids.is_empty() {
+            if self.pepper_mismatch().await? {
+                return Err(PepperMismatch.into());
+            }
+            return Ok(Vec::new());
+        }
+        let mut grants = Vec::with_capacity(ids.len());
+        for id in ids {
+            if !self.encrypted {
+                return Err(UnreadableGrant {
+                    grant_id: id,
+                    reason: UnreadableReason::EncryptionOff,
+                }
+                .into());
+            }
+            match self.grants.get(&id).await {
+                Ok(Some(grant)) => grants.push(grant),
+                Ok(None) => {}
+                Err(error) => {
+                    warn!(
+                        target: "credential_delegation",
+                        grant_id = %id,
+                        error = ?error.to_string(),
+                        "A delegated grant cannot be read; removing its binding or provider is refused until it can \
+                         be read or is purged"
+                    );
+                    return Err(UnreadableGrant {
+                        grant_id: id,
+                        reason: UnreadableReason::Undecryptable,
+                    }
+                    .into());
+                }
+            }
+        }
+        Ok(grants)
     }
 
     fn require_encryption(&self) -> Result<()> {
@@ -271,19 +456,18 @@ impl FileSystemDelegationVaultStore {
         }
     }
 
-    /// The grant stored under `key`'s record id, if its own key is `key`.
+    /// The grant stored under `id`, `key`'s record id, if its own key is `key`.
+    /// The id is computed by the caller, since a mutation runs on a task of its
+    /// own.
     async fn grant_locked(
         &self,
         key: &GrantKey,
+        id: &str,
     ) -> Result<Option<DelegatedGrant>> {
-        let Some(grant) = self
-            .grants
-            .get(&key.record_id())
-            .await?
-        else {
+        let Some(grant) = self.grants.get(id).await? else {
             return Ok(None);
         };
-        if grant.key() != *key || grant.id != key.record_id() {
+        if grant.key() != *key || grant.id != id {
             warn!(
                 target: "credential_delegation",
                 "A delegated grant record does not belong to the key it is stored under; it is not used"
@@ -789,7 +973,15 @@ impl DelegationVaultStorage for FileSystemDelegationVaultStore {
         key: &GrantKey,
     ) -> Result<Option<DelegatedGrant>> {
         self.require_grant_storage()?;
-        self.grant_locked(key).await
+        let found = self
+            .grant_locked(key, &key.record_id())
+            .await?;
+        // A grant found under its key's id was written under this pepper; when
+        // none is, say so if the grants stored were written under another.
+        if found.is_none() && self.pepper_mismatch().await? {
+            return Err(PepperMismatch.into());
+        }
+        Ok(found)
     }
 
     async fn store_grant(
@@ -803,8 +995,11 @@ impl DelegationVaultStorage for FileSystemDelegationVaultStore {
             let _access_change = crate::mcp::subscriptions::AccessChange::begin(
                 crate::mcp::subscriptions::AccessScope::owned_by(grant.tenant_id.as_deref()),
             );
+            store
+                .claim_pepper_locked()
+                .await?;
             let replaced = store
-                .grant_locked(&key)
+                .grant_locked(&key, &grant.id)
                 .await?;
             grant.updated_at = match replaced.as_ref() {
                 Some(previous) => next_version(previous.updated_at)?,
@@ -829,37 +1024,68 @@ impl DelegationVaultStorage for FileSystemDelegationVaultStore {
         .await
     }
 
+    async fn binding_grants(
+        &self,
+        binding: &GrantBinding,
+        principals: Principals,
+    ) -> Result<Vec<DelegatedGrant>> {
+        let ids = self
+            .grant_ids_with_prefix(&binding.record_id_prefix())
+            .await?
+            .into_iter()
+            .filter(|id| binding.names(principals, id))
+            .collect();
+        self.read_grants(ids).await
+    }
+
     async fn provider_grants(
         &self,
         credential_provider_id: &str,
     ) -> Result<Vec<DelegatedGrant>> {
-        Ok(self
-            .all_grants()
-            .await?
-            .into_iter()
-            .filter(|grant| grant.credential_provider_id == credential_provider_id)
-            .collect())
+        let ids = self
+            .grant_ids_with_prefix(&super::grants::provider_record_id_prefix(credential_provider_id))
+            .await?;
+        self.read_grants(ids).await
     }
 
-    async fn all_grants(&self) -> Result<Vec<DelegatedGrant>> {
-        self.require_encryption()?;
-        self.grants.list_all().await
+    async fn binding_grant_ids(
+        &self,
+        binding: &GrantBinding,
+    ) -> Result<Vec<String>> {
+        self.grant_ids_with_prefix(&binding.record_id_prefix())
+            .await
     }
 
-    async fn has_stored_grants(&self) -> Result<bool> {
-        let mut entries = match tokio::fs::read_dir(&self.grants_directory).await {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error).context("Failed to read the delegated grants directory"),
-        };
-        while let Some(entry) = entries.next_entry().await? {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.ends_with(".json") || name.ends_with(".json.enc") {
-                return Ok(true);
+    async fn purge_grant(
+        &self,
+        id: &str,
+        tenant_id: Option<&str>,
+    ) -> Result<bool> {
+        anyhow::ensure!(super::grants::is_record_id(id), "Not the id of a delegated grant");
+        let id = id.to_string();
+        let tenant_id = tenant_id.map(str::to_string);
+        self.mutate(move |store| async move {
+            let _access_change = crate::mcp::subscriptions::AccessChange::begin(
+                crate::mcp::subscriptions::AccessScope::owned_by(tenant_id.as_deref()),
+            );
+            let existed = ["json.enc", "json"]
+                .iter()
+                .any(|extension| {
+                    store
+                        .grants_directory
+                        .join(format!("{id}.{extension}"))
+                        .exists()
+                });
+            store
+                .grants
+                .delete(&id)
+                .await?;
+            if existed {
+                info!(target: "credential_delegation", grant_id = %id, "Delegated grant deleted without reading it");
             }
-        }
-        Ok(false)
+            Ok(existed)
+        })
+        .await
     }
 
     async fn delete_grant(
@@ -1485,43 +1711,297 @@ mod tests {
         );
     }
 
+    /// Grants are filed by binding under ids that derive from the pepper, so a
+    /// gateway with another pepper could neither find them to remove them nor
+    /// keep its own beside them: it refuses both, and says why at startup.
     #[tokio::test]
-    async fn a_providers_grants_include_those_stored_under_another_pepper() {
+    async fn grants_written_under_another_pepper_are_neither_released_nor_added_to() {
+        use crate::component_tests::helpers::formatted_logs::FormattedLogs;
         use crate::delegation_vault::grants::tests::{grant, key};
+        use crate::identity::credential_identity::configure_pepper_bytes_for_tests;
         let directory = tempfile::tempdir().unwrap();
-        let vault = encrypted_vault(directory.path()).await;
-        let mut earlier = grant(&key(), "earlier-access");
-        earlier.id = format!("grant-{}", "e".repeat(64));
-        vault
-            .grants
-            .save_atomic(&earlier)
+        configure_pepper_bytes_for_tests(&[1; 32]);
+        let first = encrypted_vault(directory.path()).await;
+        first
+            .store_grant(grant(&key(), "first-access"))
             .await
             .unwrap();
-        let listed = vault
-            .provider_grants("provider")
+        let fingerprint = std::fs::read_to_string(
+            directory
+                .path()
+                .join("delegated_grants/pepper-fingerprint"),
+        )
+        .expect("the pepper is fingerprinted beside the grants");
+        assert!(!fingerprint.contains(&hex::encode([1u8; 32])), "the fingerprint shows the pepper");
+
+        configure_pepper_bytes_for_tests(&[2; 32]);
+        let logs = FormattedLogs::capture();
+        let other = encrypted_vault(directory.path()).await;
+        let startup = logs.text();
+        assert!(startup.contains("ERROR"), "{startup}");
+        assert!(startup.contains("written under another identity hash pepper"), "{startup}");
+        let refused = other
+            .store_grant(grant(&key(), "second-access"))
             .await
-            .unwrap();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].id, earlier.id);
+            .unwrap_err();
+        assert!(refused.is::<super::super::grants::PepperMismatch>(), "{refused}");
         assert!(
-            vault
+            other
+                .grant(&key())
+                .await
+                .unwrap_err()
+                .is::<super::super::grants::PepperMismatch>()
+        );
+        assert!(
+            other
+                .binding_grants(&key().binding(), Principals::All)
+                .await
+                .unwrap_err()
+                .is::<super::super::grants::PepperMismatch>(),
+            "a removal must not pass for having found nothing"
+        );
+
+        configure_pepper_bytes_for_tests(&[1; 32]);
+        let stored_id = key().record_id();
+        configure_pepper_bytes_for_tests(&[2; 32]);
+        assert!(
+            other
+                .purge_grant(&stored_id, Some("tenant-a"))
+                .await
+                .unwrap(),
+            "an operator purges it by its id"
+        );
+        other
+            .store_grant(grant(&key(), "second-access"))
+            .await
+            .expect("with no grant left, the fingerprint is this gateway's");
+        assert_eq!(
+            other
                 .grant(&key())
                 .await
                 .unwrap()
-                .is_none(),
-            "a grant whose id is not its key's under this pepper is never released"
+                .unwrap()
+                .access_token,
+            "second-access"
         );
-        vault
-            .delete_grant(&earlier.id)
+    }
+
+    fn corrupt(
+        directory: &std::path::Path,
+        id: &str,
+    ) {
+        std::fs::write(
+            directory
+                .join("delegated_grants")
+                .join(format!("{id}.json.enc")),
+            "not a grant",
+        )
+        .unwrap();
+    }
+
+    /// Grants are read by the record ids of one binding or one provider, so a
+    /// grant that cannot be read is reported by its id and blocks only the
+    /// removals that need it.
+    #[tokio::test]
+    async fn an_unreadable_grant_is_named_and_blocks_only_its_own_binding_and_provider() {
+        use crate::delegation_vault::grants::tests::{grant, key};
+        use crate::delegation_vault::grants::{UnreadableGrant, UnreadableReason};
+        let directory = tempfile::tempdir().unwrap();
+        let vault = encrypted_vault(directory.path()).await;
+        let other_hop = GrantKey {
+            hop: "other-transit-point".into(),
+            ..key()
+        };
+        let other_provider = GrantKey {
+            credential_provider_id: "other-provider".into(),
+            ..key()
+        };
+        let caller =
+            GrantKey::caller(Some("tenant-a"), "surface", "transit-point-id", "provider", &"a".repeat(64)).unwrap();
+        for key in [key(), other_hop.clone(), other_provider.clone(), caller.clone()] {
+            vault
+                .store_grant(grant(&key, "access"))
+                .await
+                .unwrap();
+        }
+        corrupt(directory.path(), &key().record_id());
+
+        let refused = vault
+            .binding_grants(&key().binding(), Principals::All)
             .await
-            .unwrap()
-            .expect("the grant is deleted by the id it was stored under");
+            .unwrap_err();
+        assert_eq!(
+            refused.downcast_ref::<UnreadableGrant>(),
+            Some(&UnreadableGrant {
+                grant_id: key().record_id(),
+                reason: UnreadableReason::Undecryptable,
+            }),
+            "{refused}"
+        );
+        assert!(
+            vault
+                .binding_grants(&key().binding(), Principals::Owner)
+                .await
+                .is_err()
+        );
+        let callers = vault
+            .binding_grants(&key().binding(), Principals::Callers)
+            .await
+            .expect("the binding's caller grants are read without its owner grant");
+        assert_eq!(
+            callers
+                .iter()
+                .map(|grant| grant.id.clone())
+                .collect::<Vec<_>>(),
+            [caller.record_id()]
+        );
+        assert_eq!(
+            vault
+                .binding_grants(&other_hop.binding(), Principals::All)
+                .await
+                .expect("another binding is read without the unreadable grant")
+                .len(),
+            1
+        );
+        assert_eq!(
+            vault
+                .provider_grants("other-provider")
+                .await
+                .expect("another provider's grants are read without it")
+                .len(),
+            1
+        );
         assert!(
             vault
                 .provider_grants("provider")
                 .await
+                .unwrap_err()
+                .is::<UnreadableGrant>()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_grant_is_purged_by_its_id_or_its_binding_without_reading_it() {
+        use crate::delegation_vault::grants::tests::{grant, key};
+        let directory = tempfile::tempdir().unwrap();
+        let vault = encrypted_vault(directory.path()).await;
+        let caller =
+            GrantKey::caller(Some("tenant-a"), "surface", "transit-point-id", "provider", &"a".repeat(64)).unwrap();
+        let other_hop = GrantKey {
+            hop: "other-transit-point".into(),
+            ..key()
+        };
+        for key in [key(), caller.clone(), other_hop.clone()] {
+            vault
+                .store_grant(grant(&key, "access"))
+                .await
+                .unwrap();
+        }
+        corrupt(directory.path(), &key().record_id());
+        corrupt(directory.path(), &caller.record_id());
+
+        assert!(
+            vault
+                .purge_grant(&key().record_id(), Some("tenant-a"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !vault
+                .purge_grant(&key().record_id(), Some("tenant-a"))
+                .await
+                .unwrap(),
+            "it is gone"
+        );
+        let mut ids = vault
+            .binding_grant_ids(&key().binding())
+            .await
+            .unwrap();
+        assert_eq!(ids, [caller.record_id()]);
+        for id in ids.drain(..) {
+            assert!(
+                vault
+                    .purge_grant(&id, Some("tenant-a"))
+                    .await
+                    .unwrap()
+            );
+        }
+        assert!(
+            vault
+                .binding_grants(&key().binding(), Principals::All)
+                .await
                 .unwrap()
                 .is_empty()
+        );
+        assert!(
+            vault
+                .grant(&other_hop)
+                .await
+                .unwrap()
+                .is_some(),
+            "another binding's grant is kept"
+        );
+        for not_a_grant in ["pepper-fingerprint", "../vault", "grant-1"] {
+            assert!(
+                vault
+                    .purge_grant(not_a_grant, None)
+                    .await
+                    .is_err(),
+                "{not_a_grant}"
+            );
+        }
+        assert!(
+            directory
+                .path()
+                .join("delegated_grants/pepper-fingerprint")
+                .exists()
+        );
+    }
+
+    /// While at-rest encryption is off, a binding's grants cannot be read, but
+    /// a binding with none stored is not held back by another's.
+    #[tokio::test]
+    async fn with_encryption_off_only_a_binding_with_stored_grants_cannot_be_read() {
+        use crate::delegation_vault::grants::tests::{grant, key};
+        use crate::delegation_vault::grants::{UnreadableGrant, UnreadableReason};
+        let directory = tempfile::tempdir().unwrap();
+        encrypted_vault(directory.path())
+            .await
+            .store_grant(grant(&key(), "access"))
+            .await
+            .unwrap();
+        crate::storage::filesystem::init_global_encryption(crate::config::EncryptionConfig::default()).unwrap();
+        let vault = FileSystemDelegationVaultStore::new(directory.path().into())
+            .await
+            .unwrap();
+        let refused = vault
+            .binding_grants(&key().binding(), Principals::All)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refused.downcast_ref::<UnreadableGrant>(),
+            Some(&UnreadableGrant {
+                grant_id: key().record_id(),
+                reason: UnreadableReason::EncryptionOff,
+            })
+        );
+        let other_hop = GrantKey {
+            hop: "other-transit-point".into(),
+            ..key()
+        };
+        assert!(
+            vault
+                .binding_grants(&other_hop.binding(), Principals::All)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            vault
+                .binding_grant_ids(&key().binding())
+                .await
+                .unwrap(),
+            [key().record_id()]
         );
     }
 
@@ -1599,6 +2079,7 @@ mod tests {
         )
         .unwrap()
         .map(|entry| entry.unwrap().path())
+        .filter(|path| !path.ends_with(PEPPER_FINGERPRINT_FILE))
         .collect();
         assert_eq!(files.len(), 1, "{files:?}");
         let name = files[0]
@@ -1636,8 +2117,9 @@ mod tests {
             vault
                 .provider_grants("provider")
                 .await
-                .unwrap_err()
-                .is::<EncryptionRequired>()
+                .unwrap()
+                .is_empty(),
+            "with none stored, there is nothing to read"
         );
         assert!(
             !directory

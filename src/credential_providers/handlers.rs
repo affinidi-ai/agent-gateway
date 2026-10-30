@@ -49,6 +49,21 @@ pub struct CredentialProviderState {
     /// The test allow-list of authorization server fixtures a revocation may
     /// reach; `None` in production.
     pub egress_allowlist: Option<String>,
+    /// gateway.json's `external_consent_resource_origins`: the resource origins
+    /// permitted, beyond the issuer's own host, for each issuer's providers.
+    pub resource_origins: Arc<std::collections::HashMap<String, Vec<String>>>,
+}
+
+/// A provider as the API returns it, with `resource_origin`, the only origin
+/// an external consent provider's grants are sent to, so a client can show it.
+fn provider_body(provider: &CredentialProvider) -> serde_json::Value {
+    let mut body = serde_json::to_value(provider).unwrap_or_default();
+    if provider.is_external_consent()
+        && let (Some(fields), Some(origin)) = (body.as_object_mut(), super::external::resource_origin(provider))
+    {
+        fields.insert("resource_origin".to_string(), serde_json::Value::String(origin));
+    }
+    body
 }
 
 /// Why a provider's consent strategy or secret reference was rejected.
@@ -389,6 +404,15 @@ pub async fn create_provider(
         return error.into_response();
     }
 
+    if provider.is_external_consent() && !super::external::resource_permitted(&provider, &state.resource_origins) {
+        warn!(
+            target: "credential_delegation",
+            provider_id = ?provider.provider_id,
+            "Refused a credential provider whose resource is not permitted for its issuer"
+        );
+        return super::external::ExternalProviderError::ResourceNotPermitted.into_response();
+    }
+
     if let Some(issuer) = provider.issuer.clone() {
         let metadata = match (state.issuer_metadata)(issuer).await {
             Ok(metadata) => metadata,
@@ -419,7 +443,7 @@ pub async fn create_provider(
         .create(provider.clone())
         .await
     {
-        Ok(created) => (StatusCode::CREATED, Json(serde_json::to_value(created).unwrap())).into_response(),
+        Ok(created) => (StatusCode::CREATED, Json(provider_body(&created))).into_response(),
         Err(e) => {
             warn!(
                 target: "credential_delegation",
@@ -476,7 +500,7 @@ pub async fn get_provider(
                     &provider.id,
                 ) =>
         {
-            (StatusCode::OK, Json(serde_json::to_value(provider).unwrap())).into_response()
+            (StatusCode::OK, Json(provider_body(&provider))).into_response()
         }
         Ok(Some(_)) => {
             (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Credential provider not found"}))).into_response()
@@ -642,7 +666,7 @@ pub async fn update_provider(
         .update(updated.clone())
         .await
     {
-        Ok(u) => (StatusCode::OK, Json(serde_json::to_value(u).unwrap())).into_response(),
+        Ok(u) => (StatusCode::OK, Json(provider_body(&u))).into_response(),
         Err(e) => {
             (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("Failed to update: {}", e)})))
                 .into_response()
@@ -774,10 +798,12 @@ async fn refuse_bound_provider(
 
 /// Revoke at the authorization server, then delete, every grant by binding made
 /// with an external consent provider being deleted, naming `actor` in the
-/// audit. A revocation that fails is audited and the grant deleted all the
-/// same. A vault that cannot list or delete the grants keeps the provider, as
-/// does one that cannot read them because at-rest encryption is now off while
-/// grants are stored: they would otherwise be left unrevoked on disk.
+/// audit. Only this provider's grants are read. A revocation that fails is
+/// audited and the grant deleted all the same. A vault that cannot list or
+/// delete the grants keeps the provider, as does a grant of this provider that
+/// cannot be read, for example because at-rest encryption is now off: it would
+/// otherwise be left unrevoked on disk. The refusal names that grant, which an
+/// operator can purge.
 async fn remove_provider_grants(
     state: &CredentialProviderState,
     provider: &CredentialProvider,
@@ -794,24 +820,27 @@ async fn remove_provider_grants(
         .await
     {
         Ok(grants) => grants,
-        Err(error) if error.is::<crate::delegation_vault::grants::EncryptionRequired>() => {
-            return match vault
-                .has_stored_grants()
-                .await
-            {
-                Ok(false) => Ok(()),
-                Ok(true) => Err(unavailable(
-                    "Delegated grants are stored but cannot be read while at-rest encryption is off, so they \
-                     cannot be revoked or removed; enable [encryption] with the key they were written under, then \
-                     delete the provider",
-                )),
-                Err(error) => {
-                    warn!(target: "credential_delegation", error = %error, "Failed to look for stored grants");
-                    Err(unavailable("The delegation vault is unavailable, so the provider's grants cannot be removed"))
-                }
-            };
-        }
         Err(error) => {
+            if let Some(unreadable) = error.downcast_ref::<crate::delegation_vault::grants::UnreadableGrant>() {
+                let message = format!(
+                    "The provider's delegated grant {} cannot be read ({}), so it can be neither revoked nor removed \
+                     and the provider is kept. Make it readable again (for at-rest encryption, enable [encryption] \
+                     with the key it was written under), or have an operator purge it with DELETE \
+                     /api/v1/delegation-vault/grants/{}, which leaves it unrevoked at the vendor, then delete the \
+                     provider",
+                    unreadable.grant_id, unreadable.reason, unreadable.grant_id
+                );
+                return Err(
+                    (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "error": message }))).into_response()
+                );
+            }
+            if error.is::<crate::delegation_vault::grants::PepperMismatch>() {
+                return Err(unavailable(
+                    "The delegated grants stored were written under another identity hash pepper, so the provider's \
+                     grants cannot be found; restore the AG_IDENTITY_HASH_PEPPER they were written under, or have \
+                     an operator purge them",
+                ));
+            }
             warn!(target: "credential_delegation", error = %error, "Failed to list a provider's grants");
             return Err(unavailable("The delegation vault is unavailable, so the provider's grants cannot be removed"));
         }
@@ -952,6 +981,7 @@ mod consent_strategy_tests {
             surfaces: None,
             vault: None,
             egress_allowlist: None,
+            resource_origins: Default::default(),
         };
         let mut provider: CredentialProvider = serde_json::from_value(json!({
             "id": "provider", "name": "Provider", "provider_id": "provider", "tenant_id": "tenant-a",
@@ -1096,6 +1126,7 @@ mod consent_strategy_tests {
             )),
             vault: None,
             egress_allowlist: None,
+            resource_origins: Default::default(),
         };
         let provider: CredentialProvider = serde_json::from_value(json!({
             "id": "provider", "name": "Operator provider", "provider_id": "provider", "tenant_id": tenant_id,
@@ -1257,6 +1288,7 @@ mod external_provider_tests {
             surfaces: None,
             vault: None,
             egress_allowlist: None,
+            resource_origins: Default::default(),
         }
     }
 
@@ -1320,6 +1352,50 @@ mod external_provider_tests {
                 .as_deref(),
             Some("https://203.0.113.10/token")
         );
+    }
+
+    /// A provider's resource must be permitted for its issuer when it is
+    /// created: on the issuer's host or a subdomain, or an origin the operator
+    /// lists for the issuer in gateway.json. A request cannot widen the list.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_provider_whose_resource_is_not_permitted_for_its_issuer_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = state(&directory, Ok(metadata())).await;
+        for resource in
+            ["https://collector.example/mcp", "https://203.0.113.10.evil.example/mcp", "https://203.0.113.66/mcp"]
+        {
+            let (status, body) = create(
+                &state,
+                "tenant-a",
+                create_request(|body| {
+                    body["resource"] = json!(resource);
+                    body["external_consent_resource_origins"] =
+                        json!({"https://203.0.113.10": ["https://collector.example"]});
+                    body["resource_origins"] = json!(["https://collector.example"]);
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{resource}: {body}");
+            assert_eq!(body["code"], "provider_resource_not_permitted", "{resource}");
+        }
+        assert!(
+            stored(&state)
+                .await
+                .is_empty()
+        );
+
+        state.resource_origins = Arc::new(std::collections::HashMap::from([(
+            "https://203.0.113.10".to_string(),
+            vec!["https://collector.example".to_string()],
+        )]));
+        let (status, body) = create(
+            &state,
+            "tenant-a",
+            create_request(|body| body["resource"] = json!("https://collector.example/mcp")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "the operator's entry permits it: {body}");
+        assert_eq!(body["resource_origin"], "https://collector.example");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1868,6 +1944,45 @@ mod external_provider_tests {
             StatusCode::NO_CONTENT,
             "with no grant stored there is nothing to orphan"
         );
+    }
+
+    /// Deleting a provider reads only its own grants: another provider's
+    /// unreadable grant never blocks it, and its own is named in the refusal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_a_providers_own_unreadable_grant_keeps_it() {
+        use crate::delegation_vault::grants::GrantKey;
+        let directory = tempfile::tempdir().unwrap();
+        let server = crate::delegation_vault::revocation::tests::RecordingServer::start(200).await;
+        let state = delete_state(&directory, &server).await;
+        let vault = state.vault.clone().unwrap();
+        let own = GrantKey::owner(Some("tenant-a"), "surface", "tp-1", "provider");
+        let other = GrantKey::owner(Some("tenant-a"), "surface", "tp-2", "other-provider");
+        for key in [&own, &other] {
+            vault
+                .store_grant(crate::delegation_vault::grants::tests::grant(key, "access"))
+                .await
+                .unwrap();
+        }
+        let file = |key: &GrantKey| {
+            directory
+                .path()
+                .join("vault/delegated_grants")
+                .join(format!("{}.json.enc", key.record_id()))
+        };
+        std::fs::write(file(&own), "not a grant").unwrap();
+        let (status, body) = delete(&state, "provider").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        let error = body["error"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(error.contains(&own.record_id()), "{body}");
+        assert!(error.contains("DELETE /api/v1/delegation-vault/grants/"), "{body}");
+        assert!(file(&own).exists());
+
+        std::fs::remove_file(file(&own)).unwrap();
+        std::fs::write(file(&other), "not a grant").unwrap();
+        let (status, body) = delete(&state, "provider").await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "another provider's unreadable grant blocks nothing: {body}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
