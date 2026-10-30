@@ -859,8 +859,9 @@ type SavedSurface = (axum::http::HeaderMap, Json<AgentSurface>);
 /// `Warning` headers (code 299) naming each Transit Point of `surface` that
 /// serves callers it does not authenticate where other hosts reach it, each
 /// that accepts the Access Point's own tokens ([`shared_audience_warnings`]),
-/// and each whose JWT verification strategy names an issuer the surface also
-/// accepts through another ([`shared_issuer_warnings`]).
+/// each whose JWT verification strategy names an issuer the surface also
+/// accepts through another ([`shared_issuer_warnings`]), and each to a peer
+/// gateway that does not require the transit token ([`fabric_hop_limit_warnings`]).
 async fn transit_point_warnings(
     state: &IdentityApiState,
     surface: &AgentSurface,
@@ -873,6 +874,7 @@ async fn transit_point_warnings(
         .chain(shared_audience_warnings(surface))
         .chain(shared_issuer_warnings(surface, &issuers))
         .chain(modern_delegation_warnings(surface))
+        .chain(fabric_hop_limit_warnings(surface))
     {
         let quoted = warning
             .replace('\\', "\\\\")
@@ -1089,6 +1091,35 @@ fn shared_issuer_warnings(
                 if !warnings.contains(&warning) {
                     warnings.push(warning);
                 }
+            }
+        }
+    }
+    warnings
+}
+
+/// Each `fabric://` Transit Point, on the surface or in an enabled variant,
+/// that does not require the transit token: a call without one carries no
+/// Fabric hop count, so a chain through it can start again at 1.
+fn fabric_hop_limit_warnings(surface: &AgentSurface) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for (_, view) in surface_views(surface) {
+        for transit_point in view
+            .transit_points()
+            .iter()
+            .filter(|point| {
+                point
+                    .target_endpoint
+                    .starts_with("fabric://")
+                    && !point.require_transit_token
+            })
+        {
+            let warning = format!(
+                "Transit Point '{}' sends to a peer gateway without requiring the transit token, so the Fabric hop \
+                 limit holds through it only when the agent sends one; require the transit token",
+                transit_point.alias
+            );
+            if !warnings.contains(&warning) {
+                warnings.push(warning);
             }
         }
     }
@@ -2265,7 +2296,8 @@ fn retain_mcp_settings(
 
 /// PUT carries the whole record, or a variant PUT its whole overrides, but the
 /// Surface Builder shows neither a Transit Point's `source_auth` nor its
-/// `allow_unauthenticated_callers`, so a save from it omits both. An omitted
+/// `allow_unauthenticated_callers` or `allow_fabric_callers`, so a save from it
+/// omits them. An omitted `allow_fabric_callers` is kept. An omitted
 /// `source_auth` means unchanged, as an omitted `mcp_http.authorization` does;
 /// removal is explicit: a `null` `source_auth` in the PUT, or a merge PATCH
 /// whose Transit Points leave it out. The save rules then refuse a Transit
@@ -2336,9 +2368,10 @@ fn variant_stored_points<'a>(
         })
 }
 
-/// Keeps each Transit Point's stored `source_auth` and
-/// `allow_unauthenticated_callers` that `sent_points`, the JSON the request
-/// sent for `points`, leaves out; see `retain_transit_caller_authentication`.
+/// Keeps each Transit Point's stored `source_auth`,
+/// `allow_unauthenticated_callers` and `allow_fabric_callers` that
+/// `sent_points`, the JSON the request sent for `points`, leaves out; see
+/// `retain_transit_caller_authentication`.
 fn retain_transit_points_caller_authentication(
     points: &mut [crate::config::agent_surface::TransitPoint],
     stored: &[crate::config::agent_surface::TransitPoint],
@@ -2365,6 +2398,14 @@ fn retain_transit_points_caller_authentication(
         });
         if !sends_open_flag && previous.allow_unauthenticated_callers && !point.authenticates_callers() {
             point.allow_unauthenticated_callers = true;
+        }
+        let sends_fabric_flag = sent_point.is_some_and(|point| {
+            point
+                .get("allow_fabric_callers")
+                .is_some()
+        });
+        if !sends_fabric_flag && previous.allow_fabric_callers {
+            point.allow_fabric_callers = true;
         }
     }
 }
@@ -4109,6 +4150,53 @@ mod validation_tests {
         })
     }
 
+    /// A save warns of a `fabric://` Transit Point, on the surface or in a
+    /// variant, that does not require the transit token, once per alias, and
+    /// not of one that requires it or of an HTTP Transit Point that does not.
+    #[test]
+    fn a_save_warns_of_a_fabric_transit_point_that_does_not_require_the_transit_token() {
+        let point = |alias: &str, target: &str, require: bool| {
+            serde_json::json!({ "alias": alias, "target_endpoint": target, "require_transit_token": require,
+                "source_auth": caller_key() })
+        };
+        let warning = |alias: &str| {
+            format!(
+                "Transit Point '{alias}' sends to a peer gateway without requiring the transit token, so the Fabric \
+                 hop limit holds through it only when the agent sends one; require the transit token"
+            )
+        };
+
+        assert_eq!(
+            fabric_hop_limit_warnings(&surface_with_transit_points(
+                serde_json::json!([
+                    point("partner", "fabric://partner-gateway/partner-surface", false),
+                    point("crm", "https://crm.example", false),
+                    point("peer", "fabric://peer-gateway/peer-surface", true)
+                ]),
+                serde_json::json!([point("partner", "fabric://partner-gateway/partner-surface", false)]),
+            )),
+            vec![warning("partner")]
+        );
+        assert_eq!(
+            fabric_hop_limit_warnings(&surface_with_transit_points(
+                serde_json::json!([point("peer", "fabric://peer-gateway/peer-surface", true)]),
+                serde_json::json!([point("peer", "fabric://peer-gateway/peer-surface", false)]),
+            )),
+            vec![warning("peer")],
+            "a variant's Transit Point is warned of"
+        );
+        assert!(
+            fabric_hop_limit_warnings(&surface_with_transit_points(
+                serde_json::json!([
+                    point("peer", "fabric://peer-gateway/peer-surface", true),
+                    point("crm", "https://crm.example", false)
+                ]),
+                serde_json::json!(null),
+            ))
+            .is_empty()
+        );
+    }
+
     /// A save warns of a Transit Point whose `jwt_bearer` accepts tokens issued
     /// for the Access Point: the same strategy and an audience both name.
     #[test]
@@ -4442,6 +4530,55 @@ mod validation_tests {
                 .is_none(),
             "a variant that stores a list of its own is matched against that list, not the surface's"
         );
+    }
+
+    /// A PUT that leaves out a Transit Point's `allow_fabric_callers`, as a
+    /// Surface Builder save does, keeps the stored one, on the surface and in a
+    /// variant; one that sends it, `false` included, sets it.
+    #[test]
+    fn a_save_that_omits_allow_fabric_callers_keeps_it() {
+        let point = |allow: Option<bool>| {
+            let mut point = serde_json::json!({ "id": "tp-crm", "alias": "crm", "target_endpoint": "fabric://gw/crm",
+                "require_transit_token": true });
+            if let Some(allow) = allow {
+                point["allow_fabric_callers"] = serde_json::json!(allow);
+            }
+            point
+        };
+        let existing =
+            surface_with_transit_points(serde_json::json!([point(Some(true))]), serde_json::json!([point(Some(true))]));
+        let allows = |surface: &AgentSurface| {
+            (
+                surface
+                    .transit
+                    .as_ref()
+                    .unwrap()
+                    .points[0]
+                    .allow_fabric_callers,
+                surface.variants[0]
+                    .overrides
+                    .transit
+                    .as_ref()
+                    .and_then(|transit| transit.points.as_ref())
+                    .unwrap()[0]
+                    .allow_fabric_callers,
+            )
+        };
+        let save = |sent_point: serde_json::Value| {
+            let mut surface = surface_with_transit_points(
+                serde_json::json!([sent_point.clone()]),
+                serde_json::json!([sent_point.clone()]),
+            );
+            let sent = serde_json::json!({
+                "transit": { "points": [sent_point.clone()] },
+                "variants": [{ "id": "candidate", "overrides": { "transit": { "points": [sent_point] } } }]
+            });
+            retain_transit_caller_authentication(&mut surface, &existing, &sent);
+            allows(&surface)
+        };
+
+        assert_eq!(save(point(None)), (true, true), "an omitted setting is kept");
+        assert_eq!(save(point(Some(false))), (false, false), "a sent false turns it off");
     }
 
     /// A shared-issuer warning names the variant whose overrides define the

@@ -432,6 +432,35 @@ pub async fn surface_has_a2a_transit_point_over_fabric(
         });
 }
 
+#[given(expr = "Transit Point {string} requires a transit token")]
+pub async fn transit_point_requires_a_transit_token(
+    world: &mut G2gWorld,
+    transit_point: String,
+) {
+    transit_point_spec_mut(world, &transit_point).require_transit_token = true;
+}
+
+#[given(expr = "Transit Point {string} allows Fabric callers")]
+pub async fn transit_point_allows_fabric_callers(
+    world: &mut G2gWorld,
+    transit_point: String,
+) {
+    transit_point_spec_mut(world, &transit_point).allow_fabric_callers = true;
+}
+
+/// Boots the topology and sends the caller's A2A request, which must be
+/// answered `200`, so the managed agent that served it holds the transit token
+/// its gateway issued for it. Comes after every step that declares topology.
+#[given(expr = "the caller has sent a Fabric A2A request through gateway {int} surface {string}")]
+pub async fn the_caller_has_sent_a_fabric_a2a_request(
+    world: &mut G2gWorld,
+    gw_index: usize,
+    surface_name: String,
+) {
+    crate::steps::when::a2a_request_sent_to_surface(world, gw_index, surface_name).await;
+    assert_eq!(world.response_status, Some(200), "the caller's request was not served: body={:?}", world.response_body);
+}
+
 #[given(expr = "transit point {string} maps managed-agent header {string} to A2A metadata field {string}")]
 pub async fn transit_point_maps_managed_agent_header_to_a2a_metadata_field(
     world: &mut G2gWorld,

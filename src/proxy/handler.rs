@@ -135,6 +135,40 @@ fn should_forward_ap_request_header_with_mapping(
     true
 }
 
+/// The caller's headers an Access Point's Fabric send carries: those the
+/// Access Point forwards ([`should_forward_ap_request_header_with_mapping`]),
+/// as a buffered forward's map of upper-cased names and as a framed stream's
+/// headers, with the first Fabric crossing in place of any count the caller
+/// sent.
+fn access_point_fabric_headers(
+    headers: &HeaderMap,
+    source_auth_header: Option<&str>,
+    header_metadata_mapping: Option<&crate::config::header_metadata_mapping::HeaderMetadataMappingConfig>,
+) -> (std::collections::HashMap<String, String>, HeaderMap) {
+    use crate::proxy::fabric_hops::{FIRST_FABRIC_HOP, set_fabric_hops, set_stream_fabric_hops};
+    let mut stream_headers = HeaderMap::new();
+    let mut headers_map: std::collections::HashMap<String, String> = headers
+        .iter()
+        .filter_map(|(k, v)| {
+            if !should_forward_ap_request_header_with_mapping(
+                k.as_str(),
+                source_auth_header,
+                header_metadata_mapping,
+                false,
+            ) {
+                return None;
+            }
+            stream_headers.append(k.clone(), v.clone());
+            v.to_str()
+                .ok()
+                .map(|v| (k.as_str().to_uppercase(), v.to_string()))
+        })
+        .collect();
+    set_fabric_hops(&mut headers_map, FIRST_FABRIC_HOP);
+    set_stream_fabric_hops(&mut stream_headers, FIRST_FABRIC_HOP);
+    (headers_map, stream_headers)
+}
+
 /// Extract UCP operation type from request path and method
 /// Supports UCP REST, MCP, and A2A transport bindings per spec
 pub(crate) fn extract_ucp_operation(
@@ -12219,24 +12253,8 @@ async fn handle_fabric_request(
         .surface
         .access_point
         .header_metadata_mapping_if_supported();
-    let mut stream_headers = HeaderMap::new();
-    let mut headers_map: std::collections::HashMap<String, String> = headers
-        .iter()
-        .filter_map(|(k, v)| {
-            if !should_forward_ap_request_header_with_mapping(
-                k.as_str(),
-                fabric_source_cred,
-                header_metadata_mapping,
-                false,
-            ) {
-                return None;
-            }
-            stream_headers.append(k.clone(), v.clone());
-            v.to_str()
-                .ok()
-                .map(|v| (k.as_str().to_uppercase(), v.to_string()))
-        })
-        .collect();
+    let (mut headers_map, mut stream_headers) =
+        access_point_fabric_headers(&headers, fabric_source_cred, header_metadata_mapping);
 
     // Inject target authentication credentials into the forwarded headers so
     // GW2 delivers them to the upstream service.
@@ -14678,7 +14696,7 @@ async fn fetch_agent_card_from_surface_target(
         .endpoint
         .starts_with("fabric://")
     {
-        let forwarded_headers = headers
+        let mut forwarded_headers = headers
             .iter()
             .filter(|(key, _)| should_forward_header(key.as_str(), source_cred_header))
             .filter_map(|(key, value)| {
@@ -14688,6 +14706,7 @@ async fn fetch_agent_card_from_surface_target(
                     .map(|value| (key.as_str().to_string(), value.to_string()))
             })
             .collect::<HashMap<_, _>>();
+        crate::proxy::fabric_hops::set_fabric_hops(&mut forwarded_headers, crate::proxy::fabric_hops::FIRST_FABRIC_HOP);
         let trace_id = uuid::Uuid::new_v4().to_string();
         let path = agent_card_fabric_forward_path(&state.surface);
         let response = crate::proxy::fabric_forward::forward_via_fabric(
@@ -16893,12 +16912,12 @@ mod target_auth_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        Ap2InboundDecision, CHANNEL_SSE_SESSION_MGR, a2a_proxy_connection_status, agent_card_fabric_forward_path,
-        agent_card_response, ap2_experimental_enabled_from_flags, decode_bearer_jwt_claims,
-        delegates_credentials_over_fabric, evaluate_ap2_inbound_decision, fabric_mcp_gate_input,
-        is_forwarded_on_credentialed_card_fetch, modern_fabric_failure_response, normalize_route_for_match,
-        resolve_direct_surface_auth_config, resolve_legacy_mcp_session, route_tail_to_uri_path,
-        should_forward_ap_request_header_with_mapping,
+        Ap2InboundDecision, CHANNEL_SSE_SESSION_MGR, a2a_proxy_connection_status, access_point_fabric_headers,
+        agent_card_fabric_forward_path, agent_card_response, ap2_experimental_enabled_from_flags,
+        decode_bearer_jwt_claims, delegates_credentials_over_fabric, evaluate_ap2_inbound_decision,
+        fabric_mcp_gate_input, is_forwarded_on_credentialed_card_fetch, modern_fabric_failure_response,
+        normalize_route_for_match, resolve_direct_surface_auth_config, resolve_legacy_mcp_session,
+        route_tail_to_uri_path, should_forward_ap_request_header_with_mapping,
     };
     use axum::http::{HeaderMap, HeaderValue};
     use base64::Engine;
@@ -21085,6 +21104,39 @@ allow if {
             None,
             true,
         ));
+    }
+
+    /// An Access Point's Fabric send carries the first Fabric crossing, in the
+    /// buffered and the streamed form, never a count the caller sent; a direct
+    /// forward carries none.
+    #[test]
+    fn an_access_point_fabric_send_carries_the_first_crossing_and_never_the_callers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-gateway-fabric-hops", HeaderValue::from_static("6"));
+        headers.insert("x-partner-context", HeaderValue::from_static("kept"));
+
+        let (buffered, streamed) = access_point_fabric_headers(&headers, None, None);
+
+        let hops: Vec<_> = buffered
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("x-gateway-fabric-hops"))
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(hops, ["1"]);
+        assert_eq!(
+            streamed
+                .get_all("x-gateway-fabric-hops")
+                .iter()
+                .collect::<Vec<_>>(),
+            ["1"]
+        );
+        assert_eq!(
+            buffered
+                .get("X-PARTNER-CONTEXT")
+                .map(String::as_str),
+            Some("kept")
+        );
+        assert!(!should_forward_ap_request_header_with_mapping("X-Gateway-Fabric-Hops", None, None, false));
     }
 
     #[test]

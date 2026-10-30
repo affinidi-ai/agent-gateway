@@ -1,0 +1,84 @@
+branch: feat/fabric-receive-transit-token
+changes:
+  added:
+    - timestamp: '2026-10-30T09:00:00.000Z'
+      title: ⭐ Give managed agents a transit token for requests from paired gateways
+      description: >-
+        A request a paired gateway sent over Fabric reached the managed agent without a transit
+        token, so the agent could not call its own Transit Points while serving it, and a chain
+        of three or more organisations stopped there. A Transit Point can now set
+        `allow_fabric_callers: true`, off by default and set through the admin API only (a
+        Surface Builder save keeps it). The receiving gateway then issues the agent a transit
+        token for every such request it forwards to an HTTP or HTTPS Target of that surface,
+        opening only the Transit Points that set it, with the same key and lifetime setting as
+        its Access Point, on buffered requests and framed streams alike. A request whose token
+        cannot be issued is refused with `503` and recorded as a `request_rejected` audit event
+        (`transit_token_unavailable`) rather than forwarded without it. The token names the peer
+        gateway (its Remote gateway record and issuer DID) and the Fabric crossings the request
+        made, and a caller DID only when a presentation from one of the connection's issuers
+        carried it, in `fabric.caller_did`. It never sets `sub`, so a node that predates it
+        during a rolling upgrade sees an anonymous caller. It never carries a principal, so a
+        Transit Point releases no delegated per-user credential for it, and a Transit Point
+        policy sees the peer as the caller, with `verification` set to `fabric_peer`, the peer
+        in `input.transit.caller.fabric`, and the DID as the peer's assertion even when a
+        presentation from the peer carried it. Audit records name that DID with
+        `auth_method: fabric_asserted` and the peer as `iss`, and the identity presentation a
+        Transit Point signs for its agent never names it as the user the agent acts for. Static
+        `target_auth` credentials are added as for any caller. `proxy://` and `a2a-proxy://`
+        Targets never get a token, nor does a public discovery `GET` such as an agent card fetch,
+        nor a request relayed to an MCP Target over the legacy HTTP+SSE transport, on this path
+        or the Access Point's.
+    - timestamp: '2026-10-30T09:00:00.000Z'
+      title: Refuse requests that cross Fabric more than 8 times
+      description: >-
+        Agents that call each other through their gateways could pass a request back and forth
+        without end. Every Fabric send now sets `X-Gateway-Fabric-Hops`, the crossings the
+        request has made, and the receiving gateway carries the count in the transit token it
+        issues, so an agent cannot lower the count in the token it was given. A request past 8
+        crossings is refused with `508`, and one whose count is not an integer from 1 to 255
+        with `400`, before surface lookup (a framed stream resolves its surface and variant when
+        it opens, so it is refused for one that is not available first), each recorded as a `request_rejected` audit event
+        (`fabric_chain_too_long`, `fabric_hops_invalid`). A Transit Point to a peer gateway
+        refuses a call that would pass the limit with `508` before forwarding it, recorded the
+        same way at the `forward` stage. A request from a gateway that does not send the header
+        counts as its first crossing: during a rolling upgrade, a chain through a node that
+        predates the count starts again at 1 after it. A Transit Point reads the count from the
+        transit token the agent sends, required or not, so a call without one starts again at 1,
+        as does a public discovery `GET` through a Transit Point, and an agent holding an older
+        token can present it. The limit bounds chains
+        of Transit Point calls; agents calling each other's Access Points directly are not
+        bounded by it.
+    - timestamp: '2026-10-30T12:00:00.000Z'
+      title: Warn on save of a Fabric Transit Point that does not require the transit token
+      description: >-
+        A `fabric://` Transit Point with `require_transit_token: false` serves an agent that
+        sends no transit token, and a call without one carries no Fabric hop count, so a chain
+        through it can start again at 1. A create
+        or update of a surface or one of its variants now answers with a `Warning` header naming
+        each such Transit Point, on the surface or in a variant, so operators can turn the token
+        back on.
+  changed:
+    - timestamp: '2026-10-30T09:00:00.000Z'
+      title: Serve Transit Point calls from agents handling requests from partner gateways
+      description: >-
+        A Transit Point that requires a transit token answered `401` to a managed agent serving
+        a request from a paired gateway, because the agent had no token to send. One that sets
+        `allow_fabric_callers` now serves that agent with the token its gateway issued for the
+        request. The agent receives only
+        that token: an `X-Transit-Token` the peer gateway sent is removed on receive. No
+        `X-Gateway-Fabric-Hops` a caller, agent or peer sends is forwarded, to an HTTP target or
+        over Fabric.
+    - timestamp: '2026-10-30T09:00:00.000Z'
+      title: Turn a Transit Point's transit token back on for agents serving partners
+      description: >-
+        Operators who set `require_transit_token: false` on a Transit Point, with
+        `allow_unauthenticated_callers: true`, only so that agents serving requests from paired
+        gateways could call it, should set it back to `true`, set `allow_fabric_callers: true`
+        and remove `allow_unauthenticated_callers`: those agents then get a transit token. A
+        Transit Point
+        that does not require the token serves anyone who reaches it, and an agent that sends no
+        token starts the Fabric hop count again.
+  fixed: []
+  removed: []
+  security: []
+  breaking: []
