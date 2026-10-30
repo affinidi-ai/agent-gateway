@@ -96,8 +96,9 @@ pub type SourceAuthResult<T> = Result<T, SourceAuthError>;
 /// **401 Unauthorized**; server-side failures (config not found, internal) map
 /// to **500 Internal Server Error** — a 401 would misrepresent a server-side
 /// problem as the caller's fault. Note: caller-attributable failures are
-/// normally handed to the policy layer rather than blocked, so in practice this
-/// builder is reached for server-side (500) failures.
+/// handed to the policy layer unless the Access Point rejects failed callers
+/// (see [`caller_refusal`]), so in practice this builder is reached for
+/// server-side (500) failures.
 ///
 /// - **A2A / AP2**: `application/problem+json` with the A2A `proxy-error` type
 ///   URI. JWT Bearer 401s include a `WWW-Authenticate: Bearer` header.

@@ -52,6 +52,15 @@ describe('validateSurfacePayload', () => {
       expect(hasBlockingIssues(issues)).toBe(true);
     });
 
+    it('accepts a new MCP surface protected by a resource token without a Caller Context', () => {
+      const issues = validateSurfacePayload(
+        { ...open(), mcp_http: { authorization: { scopes: ['tools:call'] } } },
+        { isNew: true }
+      );
+      expect(issues.find(i => i.path?.startsWith('access_point.'))).toBeUndefined();
+      expect(hasBlockingIssues(issues)).toBe(false);
+    });
+
     it('blocks a stored closed surface that loses its Caller Context', () => {
       const issues = validateSurfacePayload(open({ public: false }));
       expect(issues.find(i => i.message === ACCESS_POINT_CLOSED_MESSAGE)).toMatchObject({

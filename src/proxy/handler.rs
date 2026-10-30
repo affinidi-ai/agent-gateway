@@ -1804,10 +1804,11 @@ async fn proxy_handler_with_mcp_runtime(
     // Must run before rate limiting so unauthenticated requests are rejected
     // before consuming any rate-limit budget.
     // Public paths (e.g. agent-card) bypass all authentication gates.
-    // Caller-attributable source-auth failures are non-blocking: the outcome is
-    // handed to the policy layer via `source_auth_context` below, which decides
-    // whether to allow or deny. Only server-side failures (setup/config
-    // resolution, internal errors) still block here (now with a 500).
+    // Caller-attributable source-auth failures are refused with 401 on an Access
+    // Point that publishes protected resource metadata or rejects failed callers;
+    // otherwise the outcome is handed to the policy layer via `source_auth_context`
+    // below, which decides whether to allow or deny. Server-side failures
+    // (setup/config resolution, internal errors) block with a 500.
     let resource_authorization = state
         .surface
         .mcp_http
