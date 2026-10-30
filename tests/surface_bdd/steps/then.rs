@@ -4014,11 +4014,12 @@ async fn target_credential_provider_received_token_requests(
     world: &mut SurfaceWorld,
     expected: usize,
 ) {
+    let observed = target_token_requests(world)
+        .await
+        .len();
     assert_eq!(
-        target_token_requests(world)
-            .await
-            .len(),
-        expected
+        observed, expected,
+        "the target's credential provider received {observed} token requests, expected {expected}"
     );
 }
 

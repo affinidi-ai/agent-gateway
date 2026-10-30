@@ -2287,14 +2287,17 @@ fn surface_authenticates_target_with_jwt_bearer(world: &mut SurfaceWorld) {
         .target_auth_provider = Some(SurfaceTargetAuthProviderConfig::new(TargetAuthProviderGrant::JwtBearer));
 }
 
-#[given(expr = "the target's credential provider refuses token requests and the fallback is {string}")]
-fn target_credential_provider_refuses_tokens(
+#[given("the target's credential provider is refusing token requests")]
+fn target_credential_provider_refuses_tokens(world: &mut SurfaceWorld) {
+    target_auth_provider(world).token_status = 401;
+}
+
+#[given(expr = "the target authentication fallback is {string}")]
+fn target_auth_provider_fallback(
     world: &mut SurfaceWorld,
     fallback: String,
 ) {
-    let provider = target_auth_provider(world);
-    provider.token_status = 401;
-    provider.fallback = fallback;
+    target_auth_provider(world).fallback = fallback;
 }
 
 #[given(expr = "the target's credential provider issues tokens that expire in {int} seconds")]
@@ -2305,6 +2308,9 @@ fn target_credential_provider_token_lifetime(
     target_auth_provider(world).expires_in = expires_in;
 }
 
+/// Fetches the card once and checks it succeeded, then clears only managed agent "bravo"'s
+/// recorded requests: a later header assertion is about the next fetch, while the token
+/// endpoint's request count stays cumulative across both.
 #[given("the caller has fetched the agent card")]
 async fn caller_has_fetched_agent_card(world: &mut SurfaceWorld) {
     crate::steps::when::fetch_agent_card_with_headers(world, vec![]).await;

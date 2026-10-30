@@ -120,6 +120,7 @@ Feature: A2A HTTP surface forwarding and identity
     And managed agent "bravo" received header "authorization" with value "Bearer bdd-target-provider-token"
     And the target's credential provider received 1 token request
 
+  # A token is renewed 60 seconds before it expires, so a 60 second token is already stale.
   Scenario: A provider token about to expire is renewed before the agent card fetch
     Given the surface authenticates its target with a client credentials provider
     And the target's credential provider issues tokens that expire in 60 seconds
@@ -131,7 +132,8 @@ Feature: A2A HTTP surface forwarding and identity
 
   Scenario: A refused provider token request fails the agent card when fallback is reject
     Given the surface authenticates its target with a client credentials provider
-    And the target's credential provider refuses token requests and the fallback is "reject"
+    And the target's credential provider is refusing token requests
+    And the target authentication fallback is "reject"
     When the caller fetches the agent card
     Then the response status is 502
     And the response body is error "agent_card_target_auth_failed"
@@ -139,7 +141,8 @@ Feature: A2A HTTP surface forwarding and identity
 
   Scenario: A refused provider token request fetches the agent card without it when fallback is passthrough
     Given the surface authenticates its target with a client credentials provider
-    And the target's credential provider refuses token requests and the fallback is "passthrough"
+    And the target's credential provider is refusing token requests
+    And the target authentication fallback is "passthrough"
     When the caller fetches the agent card
     Then the response status is 200
     And managed agent "bravo" did not receive header "authorization"
