@@ -7,9 +7,12 @@ use std::sync::atomic::Ordering;
 
 use serde_json::{Value, json};
 
+use crate::audit::events::AuthScheme;
 use crate::audit::request_events::{RejectionReason, RejectionStage};
 use crate::component_tests::helpers::MockServer;
+use crate::component_tests::helpers::jwt::{JwksFixture, now_secs, sign_jwt};
 use crate::config::agent_surface::AgentSurface;
+use crate::config::agent_surface_variants::SurfaceVariant;
 use crate::delegation_vault::audit::{DelegationAuditAction, DelegationAuditEvent};
 
 pub(super) fn surface(
@@ -864,7 +867,32 @@ fn surface_declaring_on_its_base(default_variant_id: Option<&str>) -> AgentSurfa
 /// [`router`] with source authentication, and the directory its strategies are
 /// stored in, which the caller keeps alive.
 async fn authenticating_router(surface: AgentSurface) -> (crate::state::MultiSurfaceProxyState, tempfile::TempDir) {
+    authenticating_router_trusting(surface, None).await
+}
+
+/// [`authenticating_router`] whose strategy `idp` trusts the tokens `fixture`
+/// signs, when one is given.
+async fn authenticating_router_trusting(
+    surface: AgentSurface,
+    fixture: Option<&JwksFixture>,
+) -> (crate::state::MultiSurfaceProxyState, tempfile::TempDir) {
     let directory = tempfile::tempdir().unwrap();
+    if let Some(fixture) = fixture {
+        let strategies = directory
+            .path()
+            .join("strategies");
+        std::fs::create_dir_all(&strategies).unwrap();
+        std::fs::write(
+            strategies.join("idp.json"),
+            json!({
+                "id": "idp", "name": "IdP", "expected_issuer": fixture.issuer,
+                "jwks_source": {"type": "remote", "jwks_uri": format!("{}/.well-known/jwks.json", fixture.issuer)},
+                "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
     let strategies = Arc::new(
         crate::jwt_bearer::storage::FileSystemJwtVerificationStrategyStore::new(
             directory
@@ -893,12 +921,25 @@ async fn send_without_credentials(
     router: crate::state::MultiSurfaceProxyState,
     path: &str,
 ) -> (u16, Option<String>, Vec<DelegationAuditEvent>) {
-    let request = axum::http::Request::builder()
+    send_with_bearer(router, path, None).await
+}
+
+/// [`send_without_credentials`] presenting `bearer`, when one is given.
+async fn send_with_bearer(
+    router: crate::state::MultiSurfaceProxyState,
+    path: &str,
+    bearer: Option<&str>,
+) -> (u16, Option<String>, Vec<DelegationAuditEvent>) {
+    let mut request = axum::http::Request::builder()
         .method("POST")
         .uri(path)
         .header("content-type", "application/json")
         .header("accept", "application/json, text/event-stream")
-        .header("mcp-protocol-version", crate::mcp::MCP_LEGACY_VERSION)
+        .header("mcp-protocol-version", crate::mcp::MCP_LEGACY_VERSION);
+    if let Some(bearer) = bearer {
+        request = request.header("authorization", format!("Bearer {bearer}"));
+    }
+    let request = request
         .body(axum::body::Body::from(json!({"jsonrpc": "2.0", "id": "variant", "method": "tools/list"}).to_string()))
         .unwrap();
     let (response, events) =
@@ -996,4 +1037,100 @@ async fn without_a_declaring_bare_route_an_unresolved_variant_is_refused_and_a_k
         Some("Bearer resource_metadata=\"https://gateway.example/.well-known/oauth-protected-resource/mcp$beta\""),
         "a known variant names its own resource"
     );
+}
+
+/// The surface variant, scheme, reason and blocking flag of each `auth_failed` record.
+fn auth_failure_records(events: &[DelegationAuditEvent]) -> Vec<(Option<String>, AuthScheme, String, bool)> {
+    events
+        .iter()
+        .filter_map(|event| match &event.event {
+            DelegationAuditAction::AuthFailed { scheme, reason, blocking, .. } => {
+                Some((event.surface_variant.clone(), *scheme, reason.clone(), *blocking))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The surface variant of each `request_rejected` record.
+fn refusal_variants(events: &[DelegationAuditEvent]) -> Vec<Option<String>> {
+    events
+        .iter()
+        .filter(|event| matches!(event.event, DelegationAuditAction::RequestRejected { .. }))
+        .map(|event| event.surface_variant.clone())
+        .collect()
+}
+
+/// A token the trusted IdP signs for the declared resource.
+fn resource_token(fixture: &JwksFixture) -> String {
+    sign_jwt(
+        json!({
+            "iss": fixture.issuer, "sub": "client", "aud": "https://gateway.example/mcp",
+            "exp": now_secs() + 300, "iat": now_secs(),
+        }),
+        &fixture.kid,
+    )
+}
+
+/// A caller that fails authentication on a declaring Access Point and names a
+/// variant that cannot be resolved is recorded once, as a blocking `auth_failed`
+/// naming the variant the refusal would have named, with the reason the
+/// declaration reports, and never as a routing refusal.
+#[tokio::test]
+async fn a_failed_caller_whose_variant_cannot_be_resolved_is_recorded_as_one_blocking_auth_failure() {
+    let fixture = JwksFixture::start().await;
+    let cases = [
+        ("unknown alias, no token", "/mcp$missing", None, SurfaceVariant::UNKNOWN, "missing_credential"),
+        (
+            "unknown alias, invalid token",
+            "/mcp$missing",
+            Some("not-a-jwt"),
+            SurfaceVariant::UNKNOWN,
+            "invalid_credential",
+        ),
+        ("disabled alias, no token", "/mcp$off", None, "off", "missing_credential"),
+        ("disabled alias, invalid token", "/mcp$off", Some("not-a-jwt"), "off", "invalid_credential"),
+    ];
+    for (case, path, bearer, variant, reason) in cases {
+        let (router, _strategies) =
+            authenticating_router_trusting(surface_declaring_through_variants(Some("v-prod")), Some(&fixture)).await;
+
+        let (status, _, events) = send_with_bearer(router, path, bearer).await;
+
+        assert_eq!(status, 401, "{case}");
+        assert_eq!(
+            auth_failure_records(&events),
+            vec![(Some(variant.to_string()), AuthScheme::Jwt, reason.to_string(), true)],
+            "{case}"
+        );
+        assert!(refusal_variants(&events).is_empty(), "{case}: no request_rejected record: {events:?}");
+    }
+}
+
+/// An authenticated caller naming a variant that cannot be resolved is refused
+/// at routing, recorded as a `request_rejected` naming the same variant a failed
+/// caller's `auth_failed` names, and never as an authentication failure.
+#[tokio::test]
+async fn an_authenticated_caller_whose_variant_cannot_be_resolved_is_recorded_as_a_routing_refusal() {
+    let fixture = JwksFixture::start().await;
+    let cases = [
+        (
+            "unknown alias",
+            "/mcp$missing",
+            SurfaceVariant::UNKNOWN,
+            refused(RejectionReason::UnknownVariant, 404, Some("missing")),
+        ),
+        ("disabled alias", "/mcp$off", "off", refused(RejectionReason::VariantDisabled, 404, None)),
+    ];
+    for (case, path, variant, expected) in cases {
+        let (router, _strategies) =
+            authenticating_router_trusting(surface_declaring_through_variants(Some("v-prod")), Some(&fixture)).await;
+
+        let (status, challenge, events) = send_with_bearer(router, path, Some(&resource_token(&fixture))).await;
+
+        assert_eq!((status, challenge), (404, None), "{case}");
+        assert_eq!(refusals(&events), expected, "{case}");
+        assert_eq!(refusal_variants(&events), vec![Some(variant.to_string())], "{case}");
+        assert!(auth_failure_records(&events).is_empty(), "{case}: no auth_failed record: {events:?}");
+    }
 }
