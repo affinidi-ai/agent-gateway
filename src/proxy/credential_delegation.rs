@@ -552,6 +552,10 @@ impl GatewayTokenTarget<'_> {
 ///   `oauth2_jwt_bearer` provider
 ///   ([`permits_jwt_bearer_leg`](crate::proxy::target_credentials::permits_jwt_bearer_leg)).
 ///   When it may not, such a binding is unavailable with detail `jwt_bearer_leg_forbidden`.
+/// * `client_credentials_leg_permitted` — whether this leg may carry the gateway's own token from
+///   an `oauth2_client_credentials` provider
+///   ([`permits_client_credentials_leg`](crate::proxy::target_credentials::permits_client_credentials_leg)).
+///   When it may not, such a binding is unavailable with detail `client_credentials_leg_forbidden`.
 pub async fn resolve_delegation_credentials(
     bindings: &[OutboundCredentialBinding],
     user_identity_hash: &str,
@@ -567,6 +571,7 @@ pub async fn resolve_delegation_credentials(
     consent_principal: Option<&str>,
     surface_tenant_id: Option<&str>,
     jwt_bearer_leg_permitted: bool,
+    client_credentials_leg_permitted: bool,
 ) -> Vec<DelegationResolution> {
     let mut results: Vec<DelegationResolution> = Vec::new();
     let surface_variant = crate::observability::policy_audit::current_request_variant();
@@ -677,6 +682,26 @@ pub async fn resolve_delegation_credentials(
                 None,
                 DelegationActionOutcome::ProviderUnavailable,
                 Some("jwt_bearer_leg_forbidden".to_string()),
+                DelegationLookupResult::Unavailable,
+            ));
+            continue;
+        }
+
+        if provider.provider_type == CredentialProviderType::OAuth2ClientCredentials
+            && !client_credentials_leg_permitted
+        {
+            warn!(
+                target: "credential_delegation",
+                surface_variant,
+                surface_id = %channel_id,
+                provider_id = %binding.credential_provider_id,
+                "This leg may not carry an oauth2_client_credentials token - refusing the request"
+            );
+            results.push(DelegationResolution::new(
+                binding,
+                None,
+                DelegationActionOutcome::ProviderUnavailable,
+                Some("client_credentials_leg_forbidden".to_string()),
                 DelegationLookupResult::Unavailable,
             ));
             continue;
@@ -2191,6 +2216,7 @@ mod tests {
             Some("verified-user"),
             None,
             true,
+            true,
         )
         .await;
         assert_eq!(results.len(), 1);
@@ -2242,6 +2268,7 @@ mod tests {
             None,
             consent_principal,
             None,
+            true,
             true,
         )
         .await
@@ -2303,6 +2330,7 @@ mod tests {
             None,
             None,
             None,
+            true,
             true,
         )
         .await;
@@ -2371,6 +2399,7 @@ mod tests {
             None,
             None,
             true,
+            true,
         )
         .await;
 
@@ -2411,6 +2440,7 @@ mod tests {
                 None,
                 None,
                 true,
+                true,
             )
             .await;
 
@@ -2445,6 +2475,7 @@ mod tests {
                 None,
                 None,
                 None,
+                true,
                 true,
             )
             .await
@@ -2483,6 +2514,7 @@ mod tests {
             None,
             None,
             None,
+            true,
             true,
         )
         .await;
@@ -2525,6 +2557,7 @@ mod tests {
             None,
             None,
             true,
+            true,
         )
         .await;
 
@@ -2555,6 +2588,7 @@ mod tests {
             None,
             None,
             None,
+            true,
             true,
         )
         .await;
@@ -2593,6 +2627,7 @@ mod tests {
             None,
             None,
             None,
+            true,
             true,
         )
         .await;
@@ -2633,6 +2668,7 @@ mod tests {
             None,
             None,
             None,
+            true,
             true,
         )
         .await;
@@ -2729,6 +2765,7 @@ mod tests {
             None,
             None,
             true,
+            true,
         )
         .await;
 
@@ -2761,6 +2798,7 @@ mod tests {
             None,
             None,
             true,
+            true,
         )
         .await;
 
@@ -2792,6 +2830,7 @@ mod tests {
             None,
             None,
             None,
+            true,
             true,
         )
         .await;
@@ -2855,6 +2894,7 @@ mod tests {
             None,
             None,
             true,
+            true,
         )
         .await;
 
@@ -2890,6 +2930,7 @@ mod tests {
             Some(&ctx),
             None,
             None,
+            true,
             true,
         ))
         .await;
@@ -2934,6 +2975,7 @@ mod tests {
             Some(&ctx),
             None,
             None,
+            true,
             true,
         )
         .await;
@@ -2986,6 +3028,7 @@ mod tests {
             Some(&ctx),
             None,
             None,
+            true,
             true,
         )
         .await;
@@ -3149,6 +3192,17 @@ mod tests {
         surface_tenant_id: Option<&str>,
         jwt_bearer_leg_permitted: bool,
     ) -> DelegationResolution {
+        resolve_binding_on_legs(provider, lookup, secrets, surface_tenant_id, jwt_bearer_leg_permitted, true).await
+    }
+
+    async fn resolve_binding_on_legs(
+        provider: CredentialProvider,
+        lookup: VaultLookupResult,
+        secrets: Arc<dyn SecretsStore>,
+        surface_tenant_id: Option<&str>,
+        jwt_bearer_leg_permitted: bool,
+        client_credentials_leg_permitted: bool,
+    ) -> DelegationResolution {
         let bindings = vec![make_binding(&provider.id)];
         let vault = MockVaultStore::new(lookup);
         let providers = MockProviderStore::with_provider(provider);
@@ -3167,6 +3221,7 @@ mod tests {
             None,
             surface_tenant_id,
             jwt_bearer_leg_permitted,
+            client_credentials_leg_permitted,
         )
         .await;
         assert_eq!(results.len(), 1);
@@ -3283,6 +3338,55 @@ mod tests {
                 .as_deref(),
             Some("api_key")
         );
+    }
+
+    #[tokio::test]
+    async fn test_a_leg_refused_a_client_credentials_token_refuses_only_client_credentials_bindings() {
+        let directory = tempfile::tempdir().unwrap();
+        let secrets = signing_key_secrets(&directory).await;
+        let versions = signing_key_version(&secrets, &jwt_bearer_provider("cp-jwt-cc")).await;
+        let cached = |provider: &CredentialProvider| {
+            let mut token = gateway_token(&provider.id, 0, 3_600);
+            token.secret_versions = Some(versions.clone());
+            VaultLookupResult::Found(token)
+        };
+        let client_credentials = || {
+            let mut provider = make_credential_provider("cp-cc-http", CredentialProviderType::OAuth2ClientCredentials);
+            provider.updated_at = Utc::now() - Duration::days(1);
+            provider
+        };
+
+        let provider = client_credentials();
+        let lookup = cached(&provider);
+        let refused = resolve_binding_on_legs(provider, lookup, secrets.clone(), None, true, false).await;
+        assert!(matches!(refused.result, DelegationLookupResult::Unavailable));
+        assert_eq!(refused.action.outcome, DelegationActionOutcome::ProviderUnavailable);
+        assert_eq!(
+            refused
+                .action
+                .detail
+                .as_deref(),
+            Some("client_credentials_leg_forbidden")
+        );
+        assert_eq!(injected_bearer(&refused), None);
+
+        let provider = client_credentials();
+        let lookup = cached(&provider);
+        let permitted = resolve_binding_on_legs(provider, lookup, secrets.clone(), None, false, true).await;
+        assert_eq!(permitted.action.outcome, DelegationActionOutcome::TokenInjected);
+        assert_eq!(injected_bearer(&permitted).as_deref(), Some("Bearer cached-gateway-token"));
+
+        let jwt = jwt_bearer_provider("cp-jwt-cc");
+        let lookup = cached(&jwt);
+        let resolution = resolve_binding_on_legs(jwt, lookup, secrets, None, true, false).await;
+        assert_eq!(
+            resolution
+                .action
+                .detail
+                .as_deref(),
+            Some("jwt_bearer_cached")
+        );
+        assert_eq!(injected_bearer(&resolution).as_deref(), Some("Bearer cached-gateway-token"));
     }
 
     fn injected_bearer(resolution: &DelegationResolution) -> Option<String> {
@@ -4076,6 +4180,7 @@ mod tests {
                 None,
                 None,
                 true,
+                true,
             )
             .await
         })
@@ -4402,6 +4507,7 @@ mod tests {
             None,
             Some("verified-user"),
             None,
+            true,
             true,
         )
         .await;

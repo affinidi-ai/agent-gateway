@@ -4310,6 +4310,10 @@ async fn step_inject_credentials(
                 .target_endpoint,
             None,
         ),
+        crate::proxy::target_credentials::permits_client_credentials_leg(
+            &ctx.virtual_channel
+                .target_endpoint,
+        ),
     )
     .await;
 

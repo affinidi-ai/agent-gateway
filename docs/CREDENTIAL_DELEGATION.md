@@ -433,8 +433,18 @@ leg: on the HTTP Target leg the upstream URL must also stay under the Target bas
 sending gateway's `fabric://` leg always fails it. Legacy resolution, on Access Points, Transit
 Points and Fabric receive, refuses the request with 503, outcome `provider_unavailable` and
 detail `jwt_bearer_leg_forbidden`, and never forwards it without that credential. Modern MCP
-delegation refuses the request with 403 `MCP credential authorization denied`. Client
-Credentials and API key bindings are not subject to this rule.
+delegation refuses the request with 403 `MCP credential authorization denied`. API key
+bindings are not subject to this rule.
+
+A binding to an `oauth2_client_credentials` provider is refused on a plain http leg too:
+saving a surface whose Target, or a Transit Point the binding reaches, is plain http is refused
+with 400, and each request checks the leg again (`permits_client_credentials_leg`). Only plain
+http is refused: https, `fabric://` (encrypted by DIDComm) and proxy routes whose upstream is
+configured elsewhere are unaffected. Under `AG_TEST_MODE` an http origin named in the test
+egress allowlist counts as https. Legacy resolution refuses the request with 503, outcome
+`provider_unavailable` and detail `client_credentials_leg_forbidden`; modern MCP delegation
+refuses it with 403. The caller-authentication and Target-base conditions apply to
+`oauth2_jwt_bearer` bindings only.
 
 ### Credential headers on a Transit Point
 
@@ -505,7 +515,7 @@ Outside these checks a request is still forwarded without the credential: on an 
 or Fabric receive whose delegation stores are not available, on Fabric receive for a request
 with no user identity, and on the `elicit` outcomes above. A binding whose provider is outside
 the surface's tenant (`provider_forbidden`), or that would send an `oauth2_jwt_bearer` token on
-a leg that may not carry it (`jwt_bearer_leg_forbidden`), is refused like a deleted provider
+a leg that may not carry it (`jwt_bearer_leg_forbidden` or `client_credentials_leg_forbidden`), is refused like a deleted provider
 (see [Binding a provider to a surface](#binding-a-provider-to-a-surface)).
 
 A grant is looked up by the managed agent's DID, the caller's identity hash and the provider,

@@ -627,7 +627,7 @@ Strict policy to tenant-owned providers at save and at use is Open question 4.
 | Provider type | Target Authentication | Legacy delegation | Modern delegation |
 | --- | --- | --- | --- |
 | `oauth2_authorization_code` | Rejected at save, `Unsupported` at use | Allowed (consent) | Allowed (consent) |
-| `oauth2_client_credentials` | Allowed (gateway token cache) | Allowed (vault, unchanged key) | Allowed (service credential) |
+| `oauth2_client_credentials` | Allowed (gateway token cache) | Allowed (vault, unchanged key), never to a plain http leg (checked at save and on every request through `permits_client_credentials_leg`; a binding that fails it at use refuses the request with 503 and detail `client_credentials_leg_forbidden`) | Allowed (service credential), under the same leg rule; a leg that fails it at use refuses the request with `BindingMismatch` (403) |
 | `oauth2_jwt_bearer` | Allowed (gateway token cache) | Allowed: the Client Credentials arm, through `request_gateway_grant`, on a surface that authenticates its callers, and only to https legs (checked at save, on a retype to this type, and on every request through `permits_jwt_bearer_leg`; a binding that fails it at use refuses the request with 503 and detail `jwt_bearer_leg_forbidden`) | Allowed: the service credential arm, through `request_gateway_grant`, under the same rule; a leg that fails it at use refuses the request with `BindingMismatch` (403) |
 | `api_key` | Allowed (secret value) | Allowed | Allowed |
 

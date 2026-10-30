@@ -416,6 +416,10 @@ impl ModernDelegationContext<'_> {
                         .resource
                         .as_deref()
                         .is_none_or(|resource| crate::sts::mcp_profile::canonical_https_url(resource).is_err()))
+                || (provider.provider_type == CredentialProviderType::OAuth2ClientCredentials
+                    && !self
+                        .leg_endpoint()
+                        .is_none_or(crate::proxy::target_credentials::permits_client_credentials_leg))
                 || (provider.provider_type == CredentialProviderType::OAuth2JwtBearer
                     && !self
                         .leg_endpoint()
@@ -2177,6 +2181,26 @@ mod tests {
 
     #[tokio::test]
     async fn a_jwt_bearer_provider_is_selected_only_for_an_https_leg_of_a_surface_that_authenticates_callers() {
+        assert_gateway_token_leg_selection(
+            "oauth2_jwt_bearer",
+            [true, false, false, true, false, false, false, false, false],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_client_credentials_provider_is_selected_for_any_leg_but_plain_http_without_caller_authentication() {
+        assert_gateway_token_leg_selection(
+            "oauth2_client_credentials",
+            [true, false, true, true, false, true, true, true, true],
+        )
+        .await;
+    }
+
+    async fn assert_gateway_token_leg_selection(
+        provider_type: &str,
+        expected: [bool; 9],
+    ) {
         let directory = tempfile::tempdir().unwrap();
         let providers = FileSystemCredentialProviderStore::new(
             directory
@@ -2198,7 +2222,7 @@ mod tests {
         providers
             .create(
                 serde_json::from_value(json!({
-                    "id": "jwt", "name": "JWT", "provider_id": "jwt", "provider_type": "oauth2_jwt_bearer",
+                    "id": "jwt", "name": "JWT", "provider_id": "jwt", "provider_type": provider_type,
                     "resource": "https://provider.example/api",
                     "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
                 }))
@@ -2262,18 +2286,19 @@ mod tests {
         let https = "https://agent.example/api";
         let http = "http://agent.example/api";
         let fabric = "fabric://peer-gateway/peer-surface";
-        for (case, (route, target, partner_endpoint, authenticated, selected)) in [
-            (&access_point, https, http, true, true),
-            (&access_point, http, https, true, false),
-            (&access_point, https, https, false, false),
-            (&partner, http, https, true, true),
-            (&partner, https, http, true, false),
-            (&partner, https, https, false, false),
-            (&unknown_partner, https, https, true, false),
-            (&fabric_send, fabric, https, true, false),
-            (&standalone, https, https, true, false),
+        for (case, ((route, target, partner_endpoint, authenticated), selected)) in [
+            (&access_point, https, http, true),
+            (&access_point, http, https, true),
+            (&access_point, https, https, false),
+            (&partner, http, https, true),
+            (&partner, https, http, true),
+            (&partner, https, https, false),
+            (&unknown_partner, https, https, true),
+            (&fabric_send, fabric, https, true),
+            (&standalone, https, https, true),
         ]
         .into_iter()
+        .zip(expected)
         .enumerate()
         {
             let surface = surface(target, partner_endpoint, authenticated);

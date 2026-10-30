@@ -342,10 +342,11 @@ fn colliding_delegated_header(surface: &AgentSurface) -> Option<String> {
         .then(|| header.to_string())
 }
 
-/// Validate delegation bindings to `oauth2_jwt_bearer` providers on the base surface and every
-/// variant. Such a binding sends a gateway token on every leg it reaches, so it needs what
-/// `credential_provider` Target Authentication needs.
-async fn validate_jwt_bearer_bindings(
+/// Validate delegation bindings to gateway-token providers on the base surface and every
+/// variant. An `oauth2_jwt_bearer` binding sends a gateway token on every leg it reaches, so it
+/// needs what `credential_provider` Target Authentication needs; an `oauth2_client_credentials`
+/// binding only needs legs that are not plain http.
+async fn validate_gateway_token_bindings(
     state: &IdentityApiState,
     surface: &AgentSurface,
 ) -> Result<(), SurfaceApiError> {
@@ -385,6 +386,7 @@ async fn validate_jwt_bearer_bindings(
         .as_ref()
         .ok_or_else(|| SurfaceApiError::InternalError("Credential provider store is not configured".into()))?;
     let mut jwt_bearer = std::collections::BTreeSet::new();
+    let mut client_credentials = std::collections::BTreeSet::new();
     for id in bound {
         let provider = store
             .get(&id)
@@ -393,41 +395,56 @@ async fn validate_jwt_bearer_bindings(
                 warn!(provider_id = %id, %error, "Failed to load a bound credential provider");
                 SurfaceApiError::InternalError("Failed to validate credential provider references".into())
             })?;
-        if provider.is_some_and(|provider| {
-            matches!(provider.provider_type, crate::credential_providers::CredentialProviderType::OAuth2JwtBearer)
-        }) {
-            jwt_bearer.insert(id);
+        match provider.map(|provider| provider.provider_type) {
+            Some(crate::credential_providers::CredentialProviderType::OAuth2JwtBearer) => {
+                jwt_bearer.insert(id);
+            }
+            Some(crate::credential_providers::CredentialProviderType::OAuth2ClientCredentials) => {
+                client_credentials.insert(id);
+            }
+            _ => {}
         }
     }
-    check_jwt_bearer_bindings(&views, |id| jwt_bearer.contains(id))
+    check_jwt_bearer_bindings(&views, |id| jwt_bearer.contains(id))?;
+    check_client_credentials_bindings(&views, |id| client_credentials.contains(id))
 }
 
 /// An `outbound_credentials` binding reaches the Target and every Transit Point; on a surface
-/// without one, a `transit_credentials` binding reaches its own Transit Point. Each leg a JWT
-/// bearer binding reaches needs an https endpoint, and the surface must authenticate its callers.
+/// without one, a `transit_credentials` binding reaches its own Transit Point. Returns each
+/// endpoint a binding to a provider selected by `is_provider` reaches, with its label.
+fn legs_reached_by_bindings(
+    view: &AgentSurface,
+    is_provider: &impl Fn(&str) -> bool,
+) -> Vec<(String, String)> {
+    let reaches = |bindings: &[crate::config::types::OutboundCredentialBinding]| {
+        bindings
+            .iter()
+            .any(|binding| is_provider(&binding.credential_provider_id))
+    };
+    let mut endpoints = Vec::new();
+    if reaches(&view.outbound_credentials) {
+        endpoints.push(("the Target endpoint".to_string(), view.target.endpoint.clone()));
+    }
+    for point in view
+        .transit
+        .iter()
+        .flat_map(|transit| transit.points.iter())
+    {
+        if reaches(&view.transit_point_outbound_credentials(point)) {
+            endpoints.push((format!("Transit Point '{}' endpoint", point.alias), point.target_endpoint.clone()));
+        }
+    }
+    endpoints
+}
+
+/// Each leg a JWT bearer binding reaches needs an https endpoint, and the surface must
+/// authenticate its callers.
 pub(crate) fn check_jwt_bearer_bindings(
     views: &[AgentSurface],
     is_jwt_bearer: impl Fn(&str) -> bool,
 ) -> Result<(), SurfaceApiError> {
-    let reaches = |bindings: &[crate::config::types::OutboundCredentialBinding]| {
-        bindings
-            .iter()
-            .any(|binding| is_jwt_bearer(&binding.credential_provider_id))
-    };
     for view in views {
-        let mut endpoints = Vec::new();
-        if reaches(&view.outbound_credentials) {
-            endpoints.push(("the Target endpoint".to_string(), view.target.endpoint.as_str()));
-        }
-        for point in view
-            .transit
-            .iter()
-            .flat_map(|transit| transit.points.iter())
-        {
-            if reaches(&view.transit_point_outbound_credentials(point)) {
-                endpoints.push((format!("Transit Point '{}' endpoint", point.alias), point.target_endpoint.as_str()));
-            }
-        }
+        let endpoints = legs_reached_by_bindings(view, &is_jwt_bearer);
         if endpoints.is_empty() {
             continue;
         }
@@ -445,6 +462,25 @@ pub(crate) fn check_jwt_bearer_bindings(
             return Err(SurfaceApiError::BadRequest(format!(
                 "A credential binding to an oauth2_jwt_bearer provider requires an https endpoint; {label} is not \
                  https"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// No leg a client credentials binding reaches may be plain http.
+pub(crate) fn check_client_credentials_bindings(
+    views: &[AgentSurface],
+    is_client_credentials: impl Fn(&str) -> bool,
+) -> Result<(), SurfaceApiError> {
+    for view in views {
+        if let Some((label, _)) = legs_reached_by_bindings(view, &is_client_credentials)
+            .into_iter()
+            .find(|(_, endpoint)| !crate::proxy::target_credentials::permits_client_credentials_leg(endpoint))
+        {
+            return Err(SurfaceApiError::BadRequest(format!(
+                "A credential binding to an oauth2_client_credentials provider cannot send its token over \
+                 plain http; {label} is plain http or not a URL"
             )));
         }
     }
@@ -2348,7 +2384,7 @@ async fn validate_surface_for_save(
     validate_transit_points(surface)?;
     validate_target_authentication(surface)?;
     super::surface_tenancy::validate_surface_references(state, surface, context, scope).await?;
-    validate_jwt_bearer_bindings(state, surface).await?;
+    validate_gateway_token_bindings(state, surface).await?;
     validate_listen_path_collisions(surface, store, &state.network_config).await?;
     validate_access_point_route_collisions(surface, store, &state.network_config).await?;
     validate_surface_payment_policies(surface).await?;
@@ -5224,6 +5260,52 @@ mod validation_tests {
         static_secret.outbound_credentials = vec![binding(bearer)];
         assert_eq!(colliding_delegated_header(&static_secret).as_deref(), Some("authorization"));
         validate_target_authentication(&static_secret).expect("a static secret collision still saves");
+    }
+
+    #[test]
+    fn a_client_credentials_binding_refuses_plain_http_legs() {
+        let client_credentials = |id: &str| id == "cp-cc";
+        let bound = |endpoint: &str, provider: &str, authenticated: bool| {
+            let mut surface = provider_surface(endpoint, serde_json::json!({"type": "bearer_header"}), authenticated);
+            surface.target.auth = None;
+            surface.outbound_credentials = vec![
+                serde_json::from_value(serde_json::json!({"credential_provider_id": provider})).expect("binding JSON"),
+            ];
+            vec![surface]
+        };
+        check_client_credentials_bindings(&bound("https://agent.example/api", "cp-cc", false), client_credentials)
+            .expect("an https Target needs no caller authentication");
+        check_client_credentials_bindings(&bound("fabric://gateway-1/surface-1", "cp-cc", false), client_credentials)
+            .expect("a Fabric Target is encrypted by DIDComm");
+        check_client_credentials_bindings(&bound("http://agent.example/api", "cp-other", false), client_credentials)
+            .expect("other provider types keep their rules");
+        let refusal = |views: &[AgentSurface]| match check_client_credentials_bindings(views, client_credentials) {
+            Err(SurfaceApiError::BadRequest(message)) => message,
+            other => panic!("expected a 400, got {other:?}"),
+        };
+        let target_refusal = refusal(&bound("http://agent.example/api?api_key=marker", "cp-cc", true));
+        assert_eq!(
+            target_refusal,
+            "A credential binding to an oauth2_client_credentials provider cannot send its token over plain http; the \
+             Target endpoint is plain http or not a URL"
+        );
+        assert!(!target_refusal.contains("marker"));
+
+        let mut through_transit =
+            provider_surface("https://agent.example/api", serde_json::json!({"type": "bearer_header"}), true);
+        through_transit.target.auth = None;
+        through_transit.transit = Some(
+            serde_json::from_value(serde_json::json!({"points": [{
+                "id": "tp-1", "name": "Partner", "alias": "partner", "target_endpoint": "http://partner.example",
+                "protocol": "a2a", "transit_credentials": {"credential_provider_id": "cp-cc"}
+            }]}))
+            .expect("transit JSON"),
+        );
+        assert_eq!(
+            refusal(&[through_transit]),
+            "A credential binding to an oauth2_client_credentials provider cannot send its token over plain http; \
+             Transit Point 'partner' endpoint is plain http or not a URL"
+        );
     }
 
     #[test]

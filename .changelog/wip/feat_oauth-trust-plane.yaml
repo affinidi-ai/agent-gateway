@@ -844,6 +844,16 @@ changes:
         fixed text such as Signing key not found, and a header that cannot be decoded gives Failed
         to decode JWT header.
   breaking:
+    - timestamp: '2026-10-30T13:30:00Z'
+      title: Refuse client credentials tokens on plain http legs
+      description: >-
+        A delegation binding to an oauth2_client_credentials provider no longer sends the gateway's
+        token on a plain http Target or Transit Point leg. Saving such a surface is refused with
+        400, and a request on such a leg is refused with 503 and detail
+        client_credentials_leg_forbidden, or 403 on modern MCP delegation. https, fabric:// and
+        proxy routes are unaffected, and the caller-authentication and Target-base rules still
+        apply only to JWT bearer bindings. Before upgrading, move the Target or Transit Point to
+        https.
     - timestamp: '2026-10-21T15:10:00Z'
       title: Refuse appliance-wide secrets in tenant credential providers
       description: >-

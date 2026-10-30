@@ -5400,6 +5400,7 @@ async fn process_forward_request_in_request_scope(
                         surface.target_endpoint(),
                         Some(&target_url),
                     ),
+                    crate::proxy::target_credentials::permits_client_credentials_leg(surface.target_endpoint()),
                 )
                 .await;
 

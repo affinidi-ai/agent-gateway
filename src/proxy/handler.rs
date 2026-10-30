@@ -6162,6 +6162,7 @@ pub(crate) async fn proxy_handler_with_mcp_runtime(
                         &state.surface.target.endpoint,
                         Some(&target_url),
                     ),
+                    crate::proxy::target_credentials::permits_client_credentials_leg(&state.surface.target.endpoint),
                 ))
                 .await;
 

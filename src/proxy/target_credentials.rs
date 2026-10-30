@@ -575,6 +575,14 @@ pub fn permits_jwt_bearer_leg(
         && destination.is_none_or(|destination| crate::proxy::paths::is_within_target_base(surface, destination))
 }
 
+/// Whether a request leg may carry the gateway's own token from an
+/// `oauth2_client_credentials` delegation binding: any parseable endpoint that is not plain
+/// http. Under test mode an http origin named in the egress allowlist counts as https.
+pub fn permits_client_credentials_leg(endpoint: &str) -> bool {
+    url::Url::parse(endpoint.trim())
+        .is_ok_and(|parsed| parsed.scheme() != "http" || permits_credential_provider_target(endpoint))
+}
+
 /// Header names a Target credential may never set.
 const FORBIDDEN_TARGET_HEADERS: &[&str] = &["host", "content-length", "transfer-encoding", "connection"];
 
@@ -1798,6 +1806,17 @@ mod tests {
         assert!(!permits_jwt_bearer_leg(&authenticated, "fabric://peer-gateway/peer-surface", None));
         assert!(!permits_jwt_bearer_leg(&authenticated, TARGET, Some("https://agent.example/other")));
         assert!(!permits_jwt_bearer_leg(&authenticated, TARGET, Some("https://elsewhere.example/api")));
+    }
+
+    #[test]
+    fn a_client_credentials_leg_is_anything_but_plain_http() {
+        let _production = crate::component_tests::helpers::test_mode::TestModeEnv::with(None, None, None);
+        assert!(permits_client_credentials_leg("https://agent.example/api"));
+        assert!(permits_client_credentials_leg("fabric://peer-gateway/peer-surface"));
+        assert!(!permits_client_credentials_leg("http://agent.example/api"));
+        assert!(permits_client_credentials_leg("proxy://mcp-proxy"));
+        assert!(!permits_client_credentials_leg("not a url"));
+        assert!(!permits_client_credentials_leg(""));
     }
 
     #[test]
