@@ -20,7 +20,6 @@ pub enum RuleMode {
 }
 
 impl RuleMode {
-    #[allow(dead_code)]
     pub fn is_enforced(self) -> bool {
         self == Self::Enforce
     }
@@ -38,13 +37,17 @@ pub struct CredentialPolicyConfig {
 }
 
 impl CredentialPolicyConfig {
-    #[allow(dead_code)]
+    /// Whether `insecure_token_endpoints` names `url` exactly, compared as parsed URLs.
     pub fn allows_insecure_token_endpoint(
         &self,
         url: &str,
     ) -> bool {
+        let Ok(url) = url::Url::parse(url.trim()) else {
+            return false;
+        };
         self.insecure_token_endpoints
             .iter()
+            .filter_map(|allowed| url::Url::parse(allowed.trim()).ok())
             .any(|allowed| allowed == url)
     }
 }
@@ -57,7 +60,6 @@ pub fn init_credential_policy(config: CredentialPolicyConfig) {
 }
 
 /// The process-global credential policy; the warn defaults before initialisation.
-#[allow(dead_code)]
 pub fn credential_policy() -> &'static CredentialPolicyConfig {
     GLOBAL_CREDENTIAL_POLICY.get_or_init(CredentialPolicyConfig::default)
 }
@@ -91,6 +93,9 @@ mod tests {
         assert!(config.allows_insecure_token_endpoint("http://idp.internal/token"));
         assert!(!config.allows_insecure_token_endpoint("http://idp.internal/token2"));
         assert!(!config.allows_insecure_token_endpoint("http://idp.internal"));
+        assert!(config.allows_insecure_token_endpoint(" HTTP://IDP.internal/token "));
+        assert!(!config.allows_insecure_token_endpoint("http://idp.internal:8080/token"));
+        assert!(!config.allows_insecure_token_endpoint("not a url"));
 
         let config: CredentialPolicyConfig = toml::from_str("tenant_credential_isolation = \"enforce\"").unwrap();
         assert_eq!(config.token_endpoint_https, RuleMode::Warn);

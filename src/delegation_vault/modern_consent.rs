@@ -555,6 +555,9 @@ pub async fn exchange_code(
         .token_endpoint
         .as_deref()
         .ok_or(ContinuationError::InvalidRecord)?;
+    egress
+        .check_token_endpoint(&provider.provider_id, endpoint)
+        .map_err(|_| ContinuationError::InvalidRecord)?;
     let resource = provider
         .resource
         .as_deref()
@@ -712,6 +715,7 @@ mod tests {
         let provider_egress = super::super::oauth::TokenEgress {
             timeout: std::time::Duration::from_secs(5),
             exact_allowlist: Some(token_endpoint.clone()),
+            policy: Default::default(),
         };
         let mut tasks = tokio::task::JoinSet::new();
         tasks.spawn(async move {
@@ -1230,6 +1234,7 @@ mod tests {
         let egress = super::super::oauth::TokenEgress {
             timeout: std::time::Duration::from_secs(5),
             exact_allowlist: None,
+            policy: Default::default(),
         };
         assert!(matches!(
             exchange_code(&provider, &ticket, "code", &secrets, &egress).await,
@@ -1237,6 +1242,56 @@ mod tests {
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         tasks.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exchange_code_refuses_an_http_endpoint_before_reading_a_secret_when_enforced() {
+        use crate::config::credential_policy::{CredentialPolicyConfig, RuleMode};
+
+        let directory = tempfile::tempdir().unwrap();
+        let secrets: std::sync::Arc<dyn crate::secrets::SecretsStore> = std::sync::Arc::new(
+            crate::secrets::FilesystemSecretsStore::new(
+                directory
+                    .path()
+                    .to_str()
+                    .unwrap(),
+            )
+            .unwrap(),
+        );
+        let provider: CredentialProvider = serde_json::from_value(json!({
+            "id": "provider", "name": "Provider", "provider_id": "provider",
+            "token_endpoint": "http://idp.example/token",
+            "client_id_secret_ref": "unstored-client-id", "client_secret_secret_ref": "unstored-client-secret",
+            "resource": "https://provider.example/api",
+            "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+        }))
+        .unwrap();
+        let ticket: ConsentTicket = serde_json::from_value(json!({
+            "id": uuid::Uuid::new_v4(), "continuation_id": uuid::Uuid::new_v4(), "issued_at": 10, "expires_at": 100,
+            "provider_digest": ([3; 32]), "surface_digest": ([4; 32]), "identity_strategy_digest": ([5; 32]),
+            "callback_url": "https://gateway.example/mcp-consent/callback/provider", "code_verifier": "v".repeat(43),
+            "binding": {"deployment": "deployment", "principal": "principal", "agent_did": "did:web:agent", "user_identity_hash": "user",
+                "authorization_digest": ([1; 32]), "tenant_id": null, "surface_id": "surface", "variant_id": null, "route": {"kind": "access_point"},
+                "resource": "https://gateway.example/mcp", "provider_id": "provider", "scopes": ["read"], "method": "tools/call", "arguments_digest": ([2; 32])}
+        }))
+        .unwrap();
+        let egress = |token_endpoint_https| super::super::oauth::TokenEgress {
+            timeout: std::time::Duration::from_secs(5),
+            exact_allowlist: None,
+            policy: CredentialPolicyConfig {
+                token_endpoint_https,
+                ..Default::default()
+            },
+        };
+        assert!(matches!(
+            exchange_code(&provider, &ticket, "code", &secrets, &egress(RuleMode::Enforce)).await,
+            Err(ContinuationError::InvalidRecord)
+        ));
+        // Warn mode lets the stored endpoint through, so the unstored secret is what fails.
+        assert!(matches!(
+            exchange_code(&provider, &ticket, "code", &secrets, &egress(RuleMode::Warn)).await,
+            Err(ContinuationError::Unavailable)
+        ));
     }
 
     #[test]

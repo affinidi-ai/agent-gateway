@@ -1,7 +1,8 @@
-//! Target authentication from a credential provider E2E: a surface save takes a
-//! machine credential provider and refuses `credential_lookup`, an unknown provider and
-//! a provider that needs a user's consent; a token endpoint the egress policy blocks
-//! fails the request without reaching the token endpoint or the Target.
+//! Target authentication from a credential provider E2E: a provider save refuses an http
+//! token endpoint; a surface save takes a machine credential provider and refuses
+//! `credential_lookup`, an unknown provider and a provider that needs a user's consent; a
+//! token endpoint the egress policy blocks fails the request without reaching the token
+//! endpoint or the Target.
 
 use super::helpers::{self, GatewayHarness, configure_admin_api};
 use serde_json::json;
@@ -26,6 +27,19 @@ async fn a_surface_save_accepts_only_a_target_auth_method_the_gateway_can_use() 
             .unwrap();
         assert_eq!(created.status(), 201, "{}", created.text().await.unwrap());
     }
+    let insecure = admin
+        .post(format!("{api}/credential-providers"))
+        .json(&json!({
+            "name": "insecure", "provider_id": "insecure", "provider_type": "oauth2_client_credentials",
+            "token_endpoint": "http://192.0.2.1/token",
+            "client_id_secret_ref": "target-client-id", "client_secret_secret_ref": "target-client-secret"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(insecure.status(), 400);
+    let body: serde_json::Value = insecure.json().await.unwrap();
+    assert_eq!(body["error"], "token_endpoint must be an https URL");
     let mut provider_ids = Vec::new();
     for (provider_id, provider_type) in
         [("machine", "oauth2_client_credentials"), ("consent", "oauth2_authorization_code")]
@@ -34,8 +48,8 @@ async fn a_surface_save_accepts_only_a_target_auth_method_the_gateway_can_use() 
             .post(format!("{api}/credential-providers"))
             .json(&json!({
                 "name": provider_id, "provider_id": provider_id, "provider_type": provider_type,
-                "authorization_endpoint": "http://192.0.2.1/authorize",
-                "token_endpoint": "http://192.0.2.1/token",
+                "authorization_endpoint": "https://192.0.2.1/authorize",
+                "token_endpoint": "https://192.0.2.1/token",
                 "client_id_secret_ref": "target-client-id", "client_secret_secret_ref": "target-client-secret"
             }))
             .send()

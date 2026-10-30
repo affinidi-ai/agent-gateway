@@ -40,6 +40,9 @@ pub struct IssuedToken {
     pub id: String,
     /// Whether it came from the vault cache rather than a token request just now.
     pub cached: bool,
+    /// Whether the provider's token endpoint breaks the https rule and is let through only
+    /// because the rule is in warn mode.
+    pub insecure_endpoint: bool,
 }
 
 impl ServiceToken {
@@ -50,10 +53,15 @@ impl ServiceToken {
     fn issued(
         token: DelegationToken,
         cached: bool,
+        insecure_endpoint: bool,
     ) -> Self {
         Self {
             value: zeroize::Zeroizing::new(token.access_token),
-            issued: Some(IssuedToken { id: token.id, cached }),
+            issued: Some(IssuedToken {
+                id: token.id,
+                cached,
+                insecure_endpoint,
+            }),
         }
     }
 }
@@ -68,6 +76,8 @@ pub enum ServiceTokenError {
     TokenRequestFailed,
     #[error("credential provider token endpoint refused by egress policy")]
     TokenEndpointRefused,
+    #[error("credential provider token endpoint is not https")]
+    TokenEndpointNotHttps,
     #[error("credential provider issued other scopes than requested")]
     ScopeMismatch,
     #[error("credential provider changed during the token request")]
@@ -105,13 +115,24 @@ pub async fn acquire(
             issued: None,
         });
     }
-    if let Some(token) = cached_token(provider, scopes, context, key, now).await? {
-        return Ok(ServiceToken::issued(token, true));
-    }
     let egress = context
         .egress
         .cloned()
         .unwrap_or_else(oauth::TokenEgress::from_environment);
+    let endpoint = provider
+        .token_endpoint
+        .as_deref();
+    if endpoint.is_some_and(|endpoint| !egress.admits_token_endpoint(endpoint)) {
+        warn!(target: "credential_delegation", provider_id = %provider.provider_id, "Refusing a credential provider token endpoint that is not https");
+        return Err(ServiceTokenError::TokenEndpointNotHttps);
+    }
+    let insecure_endpoint = endpoint.is_some_and(|endpoint| !egress.permits_token_endpoint(endpoint));
+    if let Some(token) = cached_token(provider, scopes, context, key, now).await? {
+        if insecure_endpoint {
+            warn!(target: "credential_delegation", provider_id = %provider.provider_id, "Using a service token from a credential provider token endpoint that is not https");
+        }
+        return Ok(ServiceToken::issued(token, true, insecure_endpoint));
+    }
     let response = match provider.provider_type {
         CredentialProviderType::OAuth2ClientCredentials => {
             oauth::fetch_scoped_client_credentials_token(provider, scopes, context.secrets, &egress).await
@@ -199,7 +220,7 @@ pub async fn acquire(
         })
         .await
         .map_err(|_| ServiceTokenError::StoreUnavailable)?;
-    Ok(ServiceToken::issued(token, false))
+    Ok(ServiceToken::issued(token, false, insecure_endpoint))
 }
 
 async fn cached_token(
@@ -351,6 +372,7 @@ mod tests {
                 egress: oauth::TokenEgress {
                     timeout: std::time::Duration::from_secs(5),
                     exact_allowlist: Some(token_endpoint.clone()),
+                    policy: Default::default(),
                 },
                 token_endpoint,
                 endpoint,
@@ -667,6 +689,124 @@ mod tests {
         assert_eq!(
             ServiceTokenError::TokenEndpointRefused.to_string(),
             "credential provider token endpoint refused by egress policy"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_http_token_endpoint_is_refused_before_any_secret_is_read_when_enforced() {
+        use crate::config::credential_policy::RuleMode;
+
+        let mut fixture = Fixture::new().await;
+        fixture.egress.exact_allowlist = None;
+        for settings in [
+            json!({"provider_type": "oauth2_client_credentials", "client_id_secret_ref": "UNSTORED_ID",
+                   "client_secret_secret_ref": "UNSTORED_SECRET"}),
+            json!({"provider_type": "oauth2_jwt_bearer", "jwt_issuer": "sa@example",
+                   "jwt_signing_key_secret_ref": "UNSTORED_KEY"}),
+            json!({"provider_type": "oauth2_client_credentials_jwt_auth", "client_id_secret_ref": "UNSTORED_ID",
+                   "jwt_signing_key_secret_ref": "UNSTORED_KEY"}),
+        ] {
+            let mut provider = fixture
+                .provider(settings)
+                .await;
+            provider.token_endpoint = Some("http://idp.example/token".into());
+            fixture
+                .egress
+                .policy
+                .token_endpoint_https = RuleMode::Enforce;
+            assert_eq!(
+                fixture
+                    .acquire(&provider, &["read"], Utc::now())
+                    .await
+                    .err(),
+                Some(ServiceTokenError::TokenEndpointNotHttps),
+                "{:?}",
+                provider.provider_type
+            );
+            // Warn mode lets it through to the secret read, which fails on the unstored reference.
+            fixture
+                .egress
+                .policy
+                .token_endpoint_https = RuleMode::Warn;
+            assert_eq!(
+                fixture
+                    .acquire(&provider, &["read"], Utc::now())
+                    .await
+                    .err(),
+                Some(ServiceTokenError::TokenRequestFailed),
+                "{:?}",
+                provider.provider_type
+            );
+            fixture
+                .providers
+                .delete(&provider.id)
+                .await
+                .unwrap();
+        }
+        assert!(fixture.requests().is_empty());
+        assert!(
+            fixture
+                .vault
+                .list_all()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stored_http_token_endpoint_keeps_its_token_in_warn_mode_and_loses_it_when_enforced() {
+        use crate::config::credential_policy::RuleMode;
+
+        let mut fixture = Fixture::new().await;
+        fixture
+            .egress
+            .policy
+            .token_endpoint_https = RuleMode::Enforce;
+        let provider = fixture
+            .provider(json!({"provider_type": "oauth2_client_credentials", "client_id_secret_ref": "CLIENT_ID",
+                             "client_secret_secret_ref": "CLIENT_SECRET"}))
+            .await;
+        let flags = |token: ServiceToken| {
+            let issued = token
+                .issued
+                .expect("expected an issued token");
+            (issued.cached, issued.insecure_endpoint)
+        };
+        let now = Utc::now();
+        let listed = fixture
+            .acquire(&provider, &[], now)
+            .await
+            .unwrap();
+        assert_eq!(flags(listed), (false, false), "an exactly listed http endpoint meets the rule");
+
+        fixture.egress.exact_allowlist = None;
+        fixture
+            .egress
+            .policy
+            .token_endpoint_https = RuleMode::Warn;
+        let grandfathered = fixture
+            .acquire(&provider, &[], now)
+            .await
+            .unwrap();
+        assert_eq!(grandfathered.value(), "issued");
+        assert_eq!(flags(grandfathered), (true, true));
+
+        fixture
+            .egress
+            .policy
+            .token_endpoint_https = RuleMode::Enforce;
+        assert_eq!(
+            fixture
+                .acquire(&provider, &[], now)
+                .await
+                .err(),
+            Some(ServiceTokenError::TokenEndpointNotHttps)
+        );
+        assert_eq!(fixture.requests().len(), 1);
+        assert_eq!(
+            ServiceTokenError::TokenEndpointNotHttps.to_string(),
+            "credential provider token endpoint is not https"
         );
     }
 

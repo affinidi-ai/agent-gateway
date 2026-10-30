@@ -36,6 +36,31 @@ A provider carries its authorization and token endpoints and its default scopes.
 client ID, client secret, signing key and certificate are **references** into the secrets
 store, such as `GOOGLE_CLIENT_SECRET`, and are never stored in the provider record itself.
 
+### https token endpoints
+
+Every type except `api_key` sends its client secret, assertion or code to the token endpoint,
+so the endpoint must be an https URL. An http endpoint meets the rule only when the bootstrap
+`[credential_policy] insecure_token_endpoints` lists it exactly (compared as parsed URLs, so
+another port or path does not match), or, under `AG_TEST_MODE=true`, when
+`AG_BDD_OAUTH_ENDPOINT_ALLOWLIST` lists it exactly. `credential_policy.token_endpoint_https`
+sets how the rule is applied (see [Credential policy](CONFIGURATION_RELOAD.md#credential-policy)):
+
+| | `warn` (default) | `enforce` |
+| --- | --- | --- |
+| Create, or an update that sets a new token endpoint or turns an `api_key` provider into an OAuth type | 400 `token_endpoint must be an https URL` | The same |
+| Update that keeps a stored http endpoint | Saved | 400 |
+| `POST /api/v1/credential-providers/validate` | 400, before the endpoint is contacted | The same |
+| Token request, refresh or code exchange of a stored http provider | Sent, with a warning log | Refused before any secret is read |
+
+The check runs before the provider's secrets are read. In `warn` mode every use of a stored
+http provider logs a warning, and a legacy binding's audit detail gains
+` insecure_token_endpoint` (for example `client_credentials_cached insecure_token_endpoint`,
+`after_refresh insecure_token_endpoint`). In `enforce` mode a service token reports
+`TokenEndpointNotHttps` ("credential provider token endpoint is not https"), even for a token
+already cached, the legacy code exchange and refresh fail with `token_endpoint must be an https
+URL`, and the `2026-07-28` consent exchange answers an invalid record. Move such providers to
+https, or list a deliberate http endpoint, before switching to `enforce`.
+
 ### Providers that sign a JWT
 
 The two JWT types share the settings in `JwtAssertionSettings`; create and update refuse a

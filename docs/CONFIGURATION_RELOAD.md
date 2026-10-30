@@ -240,7 +240,7 @@ needs a restart.
 
 | Key | Default | Effect |
 | --- | --- | --- |
-| `token_endpoint_https` | `"warn"` | `"warn"` or `"enforce"`. Whether a credential provider's token endpoint must use https. |
+| `token_endpoint_https` | `"warn"` | `"warn"` or `"enforce"`. Whether a credential provider's token endpoint must use https; see [https token endpoints](CREDENTIAL_DELEGATION.md#https-token-endpoints). |
 | `tenant_credential_isolation` | `"warn"` | `"warn"` or `"enforce"`. Whether a credential provider may only use secrets of its own tenant. |
 | `insecure_token_endpoints` | `[]` | Exact token endpoint URLs that may use http deliberately, for example an internal identity provider. Honoured in both modes. |
 

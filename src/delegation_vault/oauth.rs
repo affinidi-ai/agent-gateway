@@ -129,6 +129,11 @@ async fn exchange_code_for_tokens_with(
     code_verifier: Option<&str>,
     egress: &TokenEgress,
 ) -> Result<OAuthTokenResponse> {
+    let token_endpoint = provider
+        .token_endpoint
+        .as_deref()
+        .ok_or_else(|| anyhow!("Provider '{}' has no token_endpoint", provider.provider_id))?;
+    egress.check_token_endpoint(&provider.provider_id, token_endpoint)?;
     let client_id_ref = provider
         .client_id_secret_ref
         .as_deref()
@@ -149,10 +154,6 @@ async fn exchange_code_for_tokens_with(
         .as_deref()
         .map(|s| s.to_string())
         .unwrap_or_else(|| format!("{}{}", gateway_base_url, provider.callback_path));
-    let token_endpoint = provider
-        .token_endpoint
-        .as_deref()
-        .ok_or_else(|| anyhow!("Provider '{}' has no token_endpoint", provider.provider_id))?;
     crate::url_validation::validate_oauth_endpoint_url(&callback_url)
         .map_err(|e| anyhow!("Blocked callback_url for provider '{}': {}", provider.provider_id, e))?;
     let (http_client, token_url) = egress
@@ -280,6 +281,11 @@ async fn refresh_access_token_with(
     secrets_store: &Arc<dyn SecretsStore>,
     egress: &TokenEgress,
 ) -> Result<OAuthTokenResponse> {
+    let token_endpoint = provider
+        .token_endpoint
+        .as_deref()
+        .ok_or_else(|| anyhow!("Provider '{}' has no token_endpoint", provider.provider_id))?;
+    egress.check_token_endpoint(&provider.provider_id, token_endpoint)?;
     let client_id_ref = provider
         .client_id_secret_ref
         .as_deref()
@@ -294,11 +300,6 @@ async fn refresh_access_token_with(
     let client_secret = resolve_secret(secrets_store, client_secret_ref)
         .await
         .context("Failed to resolve client_secret for refresh")?;
-
-    let token_endpoint = provider
-        .token_endpoint
-        .as_deref()
-        .ok_or_else(|| anyhow!("Provider '{}' has no token_endpoint", provider.provider_id))?;
 
     let params = [
         ("grant_type", "refresh_token"),
@@ -405,7 +406,7 @@ async fn scoped_token_grant(
     secrets: &Arc<dyn SecretsStore>,
     egress: &TokenEgress,
 ) -> Result<Option<OAuthTokenResponse>> {
-    let endpoint = validated_token_endpoint(provider)?;
+    let endpoint = validated_token_endpoint(provider, egress)?;
     let resource = match provider.resource.as_deref() {
         Some(resource) => {
             crate::sts::mcp_profile::canonical_https_url(resource).map_err(|_| anyhow!("Invalid provider resource"))?;
@@ -468,7 +469,7 @@ pub async fn fetch_jwt_bearer_token(
     secrets: &Arc<dyn SecretsStore>,
     egress: &TokenEgress,
 ) -> Result<OAuthTokenResponse> {
-    let endpoint = validated_token_endpoint(provider)?;
+    let endpoint = validated_token_endpoint(provider, egress)?;
     let claims = super::jwt_assertion::grant_assertion_claims(provider, scopes, Utc::now().timestamp())
         .map_err(|e| anyhow!(e))?;
     let assertion = signed_assertion(provider, &claims, secrets).await?;
@@ -489,7 +490,7 @@ pub async fn fetch_client_credentials_jwt_auth_token(
     secrets: &Arc<dyn SecretsStore>,
     egress: &TokenEgress,
 ) -> Result<OAuthTokenResponse> {
-    let endpoint = validated_token_endpoint(provider)?;
+    let endpoint = validated_token_endpoint(provider, egress)?;
     let client_id = resolve_secret(
         secrets,
         provider
@@ -566,11 +567,16 @@ async fn signed_assertion(
     .map_err(|e| anyhow!(e))
 }
 
-fn validated_token_endpoint(provider: &CredentialProvider) -> Result<&str> {
-    provider
+fn validated_token_endpoint<'provider>(
+    provider: &'provider CredentialProvider,
+    egress: &TokenEgress,
+) -> Result<&'provider str> {
+    let endpoint = provider
         .token_endpoint
         .as_deref()
-        .ok_or_else(|| anyhow!("Missing provider token endpoint"))
+        .ok_or_else(|| anyhow!("Missing provider token endpoint"))?;
+    egress.check_token_endpoint(&provider.provider_id, endpoint)?;
+    Ok(endpoint)
 }
 
 /// How a token request reaches a credential provider's token endpoint.
@@ -579,6 +585,8 @@ pub struct TokenEgress {
     pub timeout: std::time::Duration,
     /// Exact test endpoints admitted under `AG_TEST_MODE=true`; `None` in production.
     pub exact_allowlist: Option<String>,
+    /// The bootstrap `[credential_policy]` the token endpoint is held to.
+    pub policy: crate::config::credential_policy::CredentialPolicyConfig,
 }
 
 /// The token endpoint resolved to an address the egress policy blocks.
@@ -586,12 +594,78 @@ pub struct TokenEgress {
 #[error("token endpoint refused by egress policy")]
 pub struct TokenEndpointRefused;
 
+/// The token endpoint is not https, and the credential policy refuses it.
+#[derive(Debug, thiserror::Error)]
+#[error("token_endpoint must be an https URL")]
+pub struct TokenEndpointNotHttps;
+
 impl TokenEgress {
     pub fn from_environment() -> Self {
         Self {
             timeout: std::time::Duration::from_secs(crate::http_client::EXTERNAL_TIMEOUT_SECS),
             exact_allowlist: crate::url_validation::bdd_oauth_endpoint_allowlist(),
+            policy: crate::config::credential_policy::credential_policy().clone(),
         }
+    }
+
+    /// Whether `endpoint` meets the https rule: an https URL, or one that
+    /// `insecure_token_endpoints` or the test allowlist names exactly.
+    pub fn permits_token_endpoint(
+        &self,
+        endpoint: &str,
+    ) -> bool {
+        let Ok(url) = url::Url::parse(endpoint.trim()) else {
+            return false;
+        };
+        url.scheme() == "https"
+            || self
+                .policy
+                .allows_insecure_token_endpoint(endpoint)
+            || self
+                .exact_allowlist
+                .as_deref()
+                .is_some_and(|allowlist| {
+                    allowlist
+                        .split(',')
+                        .filter_map(|entry| url::Url::parse(entry.trim()).ok())
+                        .any(|entry| entry == url)
+                })
+    }
+
+    /// Whether a stored provider may still send its credentials to `endpoint`: one that
+    /// meets the https rule, or an http one while the rule is only warned about.
+    pub fn admits_token_endpoint(
+        &self,
+        endpoint: &str,
+    ) -> bool {
+        self.permits_token_endpoint(endpoint)
+            || (!self
+                .policy
+                .token_endpoint_https
+                .is_enforced()
+                && url::Url::parse(endpoint.trim()).is_ok_and(|url| url.scheme() == "http"))
+    }
+
+    /// Checks a stored provider's `endpoint` before any of its secrets are read, logging a
+    /// warning for an http endpoint the warn mode still lets through.
+    pub(crate) fn check_token_endpoint(
+        &self,
+        provider_id: &str,
+        endpoint: &str,
+    ) -> Result<(), TokenEndpointNotHttps> {
+        if self.permits_token_endpoint(endpoint) {
+            return Ok(());
+        }
+        if !self.admits_token_endpoint(endpoint) {
+            warn!(target: "credential_delegation", provider_id, "Refusing a credential provider token endpoint that is not https");
+            return Err(TokenEndpointNotHttps);
+        }
+        warn!(
+            target: "credential_delegation",
+            provider_id,
+            "Credential provider token endpoint is not https; it will be refused once credential_policy.token_endpoint_https is enforce"
+        );
+        Ok(())
     }
 
     /// A redirect-off client pinned to the addresses `endpoint` resolved to when it was
@@ -1169,6 +1243,7 @@ mod tests {
                 egress: TokenEgress {
                     timeout: std::time::Duration::from_secs(5),
                     exact_allowlist: Some(url.clone()),
+                    policy: Default::default(),
                 },
                 url,
                 requests,
@@ -1624,12 +1699,132 @@ mod tests {
             assert_eq!(form["refresh_token"], "refresh");
         }
 
+        fn https_rule(
+            token_endpoint_https: crate::config::credential_policy::RuleMode,
+            exact_allowlist: Option<&str>,
+            insecure_token_endpoints: &[&str],
+        ) -> TokenEgress {
+            TokenEgress {
+                timeout: std::time::Duration::from_secs(5),
+                exact_allowlist: exact_allowlist.map(str::to_string),
+                policy: crate::config::credential_policy::CredentialPolicyConfig {
+                    token_endpoint_https,
+                    insecure_token_endpoints: insecure_token_endpoints
+                        .iter()
+                        .map(|url| url.to_string())
+                        .collect(),
+                    ..Default::default()
+                },
+            }
+        }
+
+        #[test]
+        fn only_https_or_an_exactly_listed_http_endpoint_meets_the_https_rule() {
+            use crate::config::credential_policy::RuleMode;
+
+            let egress = https_rule(
+                RuleMode::Warn,
+                Some("http://127.0.0.1:4000/token, http://127.0.0.1:5000"),
+                &["http://idp.internal/token"],
+            );
+            for (endpoint, permitted) in [
+                ("https://auth.example/token", true),
+                (" https://auth.example/token ", true),
+                ("http://127.0.0.1:4000/token", true),
+                ("http://idp.internal/token", true),
+                ("http://idp.internal/other", false),
+                ("http://127.0.0.1:4001/token", false),
+                ("http://127.0.0.1:4000/other", false),
+                ("http://127.0.0.1:5000/token", false),
+                ("http://auth.example/token", false),
+                ("ftp://auth.example/token", false),
+                ("not a url", false),
+                ("", false),
+            ] {
+                assert_eq!(egress.permits_token_endpoint(endpoint), permitted, "{endpoint}");
+            }
+            assert!(
+                !https_rule(RuleMode::Warn, None, &[]).permits_token_endpoint("http://127.0.0.1:4000/token"),
+                "outside test mode only https meets the rule"
+            );
+
+            let warn = https_rule(RuleMode::Warn, None, &[]);
+            let enforce = https_rule(RuleMode::Enforce, None, &["http://idp.internal/token"]);
+            for (endpoint, warned, enforced) in [
+                ("https://auth.example/token", true, true),
+                ("http://idp.internal/token", true, true),
+                ("http://auth.example/token", true, false),
+                ("ftp://auth.example/token", false, false),
+                ("not a url", false, false),
+            ] {
+                assert_eq!(warn.admits_token_endpoint(endpoint), warned, "warn {endpoint}");
+                assert_eq!(enforce.admits_token_endpoint(endpoint), enforced, "enforce {endpoint}");
+            }
+            assert!(
+                enforce
+                    .check_token_endpoint("provider", "http://auth.example/token")
+                    .is_err()
+            );
+            assert!(
+                warn.check_token_endpoint("provider", "http://auth.example/token")
+                    .is_ok()
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn an_http_token_endpoint_is_refused_before_any_secret_is_read_when_enforced() {
+            use crate::config::credential_policy::RuleMode;
+
+            let fixture = fixture().await;
+            let provider = provider(
+                "http://idp.example/token",
+                json!({"provider_type": "oauth2_client_credentials", "resource": "https://api.example/",
+                       "client_id_secret_ref": "UNSTORED_ID", "client_secret_secret_ref": "UNSTORED_SECRET"}),
+            );
+            let not_https = |error: anyhow::Error| {
+                error
+                    .downcast_ref::<TokenEndpointNotHttps>()
+                    .is_some()
+            };
+            for (mode, refused) in [(RuleMode::Enforce, true), (RuleMode::Warn, false)] {
+                let egress = https_rule(mode, None, &[]);
+                let error = refresh_scoped_access_token(&provider, "refresh", &[], &fixture.secrets, &egress)
+                    .await
+                    .unwrap_err();
+                assert_eq!(not_https(error), refused, "{mode:?} scoped refresh");
+                let error = refresh_access_token_with(&provider, "refresh", &fixture.secrets, &egress)
+                    .await
+                    .unwrap_err();
+                if refused {
+                    assert_eq!(error.to_string(), "token_endpoint must be an https URL");
+                } else {
+                    assert_eq!(error.to_string(), "Failed to resolve client_id for refresh");
+                }
+                let error = exchange_code_for_tokens_with(
+                    &provider,
+                    "code",
+                    "https://203.0.113.10",
+                    &fixture.secrets,
+                    None,
+                    &egress,
+                )
+                .await
+                .unwrap_err();
+                if refused {
+                    assert_eq!(error.to_string(), "token_endpoint must be an https URL");
+                } else {
+                    assert_eq!(error.to_string(), "Failed to resolve client_id");
+                }
+            }
+        }
+
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_metadata_endpoint_is_refused_even_when_listed() {
             let metadata = "http://169.254.169.254/token";
             let egress = TokenEgress {
                 timeout: std::time::Duration::from_secs(5),
                 exact_allowlist: Some(metadata.into()),
+                policy: Default::default(),
             };
             let error = egress
                 .pinned_client(metadata)

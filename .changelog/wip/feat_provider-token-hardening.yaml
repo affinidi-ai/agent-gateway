@@ -1,7 +1,16 @@
 branch: feat/provider-token-hardening
 changes:
   added: []
-  changed: []
+  changed:
+    - timestamp: '2026-10-30T21:30:00Z'
+      title: Refuse new http token endpoints and cross-tenant credential references on save
+      description: >-
+        Creating a credential provider, changing its token endpoint, or turning an API key
+        provider into an OAuth type now answers 400 "token_endpoint must be an https URL"
+        unless the endpoint is https or listed exactly in credential_policy
+        insecure_token_endpoints, and the Validate check refuses such an endpoint without
+        contacting it. Saving a stored provider that keeps its http endpoint still works
+        while credential_policy token_endpoint_https is warn.
   fixed: []
   removed: []
   security:
@@ -14,4 +23,13 @@ changes:
         DNS-rebinding gap. Redirects stay off, and a token endpoint resolving to loopback, an
         unspecified address or cloud metadata is refused before any request and reported as
         refused by egress policy.
+    - timestamp: '2026-10-30T21:30:00Z'
+      title: Warn about http token endpoints, enforced from the next release
+      description: >-
+        A credential provider whose stored token endpoint is plain http keeps working in this
+        release, but every use logs a warning and legacy delegation audit details gain
+        insecure_token_endpoint. Setting credential_policy token_endpoint_https to enforce
+        refuses such providers before any secret is read, including cached service tokens.
+        Upgrade note: move token endpoints to https, or list a deliberate internal http
+        endpoint in insecure_token_endpoints, before the default becomes enforce.
   breaking: []

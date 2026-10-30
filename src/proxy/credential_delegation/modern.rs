@@ -704,6 +704,7 @@ impl ModernDelegationContext<'_> {
                 | ServiceTokenError::SecretUnavailable
                 | ServiceTokenError::TokenRequestFailed
                 | ServiceTokenError::TokenEndpointRefused
+                | ServiceTokenError::TokenEndpointNotHttps
                 | ServiceTokenError::StoreUnavailable => ContinuationError::Unavailable,
             })
     }
@@ -1150,6 +1151,7 @@ mod tests {
             let egress = crate::delegation_vault::oauth::TokenEgress {
                 timeout: Duration::from_secs(5),
                 exact_allowlist: Some(token_endpoint.clone()),
+                policy: Default::default(),
             };
             let mut tasks = tokio::task::JoinSet::new();
             tasks.spawn(async move {
@@ -1521,6 +1523,7 @@ mod tests {
         let egress = crate::delegation_vault::oauth::TokenEgress {
             timeout: std::time::Duration::from_secs(5),
             exact_allowlist: Some(token_endpoint.clone()),
+            policy: Default::default(),
         };
         let mut tasks = tokio::task::JoinSet::new();
         tasks.spawn(async move {

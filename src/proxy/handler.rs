@@ -16684,6 +16684,7 @@ mod target_auth_tests {
                 egress: crate::delegation_vault::oauth::TokenEgress {
                     timeout: std::time::Duration::from_secs(5),
                     exact_allowlist: Some(token_endpoint),
+                    policy: Default::default(),
                 },
                 token_requests,
                 _server: server,

@@ -239,6 +239,10 @@ impl DelegationResolution {
     }
 }
 
+/// Appended to an audit detail when the provider's token endpoint breaks the https rule and
+/// is let through only because `credential_policy.token_endpoint_https` is `warn`.
+const INSECURE_TOKEN_ENDPOINT_DETAIL: &str = " insecure_token_endpoint";
+
 /// The grant name used in audit details, and the outcome recorded when it fails.
 fn service_grant(provider_type: &CredentialProviderType) -> (&'static str, DelegationActionOutcome) {
     match provider_type {
@@ -465,18 +469,25 @@ pub async fn resolve_delegation_credentials(
                 let acquired = service_token::acquire(&provider, effective_scopes, &context, key, Utc::now())
                     .await
                     .and_then(|mut token| match token.issued.take() {
-                        Some(IssuedToken { id, cached }) => Ok((id, cached, token)),
+                        Some(IssuedToken { id, cached, insecure_endpoint }) => {
+                            Ok((id, cached, insecure_endpoint, token))
+                        }
                         // Unreachable: acquire issues a vault token for each of these OAuth types.
                         None => Err(ServiceTokenError::Unsupported),
                     });
                 match acquired {
-                    Ok((token_id, cached, token)) => {
+                    Ok((token_id, cached, insecure_endpoint, token)) => {
                         let detail = format!(
-                            "{grant}_{}",
+                            "{grant}_{}{}",
                             if cached {
                                 "cached"
                             } else {
                                 "fresh"
+                            },
+                            if insecure_endpoint {
+                                INSECURE_TOKEN_ENDPOINT_DETAIL
+                            } else {
+                                ""
                             }
                         );
                         debug!(
@@ -770,6 +781,17 @@ pub async fn resolve_delegation_credentials(
                                     "Token refreshed successfully"
                                 );
 
+                                let refresh_detail = if provider
+                                    .token_endpoint
+                                    .as_deref()
+                                    .is_some_and(|endpoint| {
+                                        !oauth::TokenEgress::from_environment().permits_token_endpoint(endpoint)
+                                    }) {
+                                    INSECURE_TOKEN_ENDPOINT_DETAIL
+                                } else {
+                                    ""
+                                };
+
                                 // Audit: token refreshed
                                 audit::emit("token_refreshed", || {
                                     let mut evt = audit::audit_event(
@@ -795,7 +817,7 @@ pub async fn resolve_delegation_credentials(
                                     );
                                     evt.token_id = Some(token.id.clone());
                                     evt.via_fabric = via_fabric;
-                                    evt.detail = Some("after_refresh".to_string());
+                                    evt.detail = Some(format!("after_refresh{refresh_detail}"));
                                     enrich_audit_event(&mut evt, audit_ctx, binding, Some(&provider.name));
                                     evt
                                 });
@@ -2167,6 +2189,47 @@ mod tests {
                 .detail
                 .as_deref(),
             Some("client_credentials_cached")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_token_from_an_http_token_endpoint_is_named_in_the_audit_detail_in_warn_mode() {
+        let mut token = make_token(false, false);
+        token.user_identity_hash = "__client_credentials__".to_string();
+        token.access_token = "cached-service-token".to_string();
+        let vault = MockVaultStore::new(VaultLookupResult::Found(token));
+        let mut provider = make_credential_provider("cp-1", CredentialProviderType::OAuth2ClientCredentials);
+        provider.token_endpoint = Some("http://auth.example.com/token".into());
+        let providers = Arc::new(MockProviderStore {
+            providers: HashMap::from([("cp-1".to_string(), provider)]),
+        });
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+
+        let results = resolve_delegation_credentials(
+            &[make_binding("cp-1")],
+            "sha256:user1",
+            "did:web:agent.example",
+            "ch-1",
+            None,
+            &(vault as Arc<dyn DelegationVaultStorage>),
+            &(providers as Arc<dyn CredentialProviderStorage>),
+            &secrets,
+            "https://gw.example.com",
+            false,
+            None,
+            None,
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(result_tag(&results[0].result), "Inject");
+        assert_eq!(results[0].action.outcome, DelegationActionOutcome::TokenInjected);
+        assert_eq!(
+            results[0]
+                .action
+                .detail
+                .as_deref(),
+            Some("client_credentials_cached insecure_token_endpoint")
         );
     }
 

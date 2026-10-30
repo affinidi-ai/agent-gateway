@@ -17,6 +17,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::auth_manager::pat::{PatContext, PatResourceScope};
+use crate::delegation_vault::oauth::TokenEgress;
 use crate::secrets::SecretsStore;
 use crate::tenancy::{
     PatTenantContext, ResourceKind, can_access, can_mutate, can_reference, scope_allows_resource, tenant_for_create,
@@ -45,6 +46,8 @@ pub struct CredentialProviderState {
 /// Why a provider's settings, secret references or consent strategy were rejected.
 #[derive(Debug, thiserror::Error)]
 enum ProviderValidationError {
+    #[error("token_endpoint must be an https URL")]
+    TokenEndpointNotHttps,
     #[error("{0} is required for this provider type")]
     Missing(&'static str),
     #[error("client_secret_secret_ref is not allowed: this provider authenticates with a signed JWT")]
@@ -70,7 +73,8 @@ enum ProviderValidationError {
 impl IntoResponse for ProviderValidationError {
     fn into_response(self) -> Response {
         match self {
-            Self::Missing(_)
+            Self::TokenEndpointNotHttps
+            | Self::Missing(_)
             | Self::ClientSecretNotAllowed
             | Self::UnsupportedAlgorithm
             | Self::InvalidAudience(_)
@@ -301,14 +305,50 @@ async fn validate_jwt_key_material(
     Ok(())
 }
 
-/// The checks a provider passes before it is stored. Tenancy and token scope are checked
-/// on every secret reference before the key material is read.
+/// A new provider, or one whose token endpoint or type changes, must have a token endpoint
+/// that meets the https rule. A stored provider saved with the same http endpoint keeps it
+/// while `credential_policy.token_endpoint_https` is `warn`.
+fn validate_token_endpoint_scheme(
+    egress: &TokenEgress,
+    previous: Option<&CredentialProvider>,
+    provider: &CredentialProvider,
+) -> Result<(), ProviderValidationError> {
+    if provider.provider_type == CredentialProviderType::ApiKey {
+        return Ok(());
+    }
+    let Some(endpoint) = provider
+        .token_endpoint
+        .as_deref()
+    else {
+        return Ok(());
+    };
+    if egress.permits_token_endpoint(endpoint) {
+        return Ok(());
+    }
+    let unchanged = previous.is_some_and(|previous| {
+        previous.provider_type != CredentialProviderType::ApiKey
+            && previous
+                .token_endpoint
+                .as_deref()
+                == Some(endpoint)
+    });
+    if unchanged && egress.admits_token_endpoint(endpoint) {
+        return Ok(());
+    }
+    Err(ProviderValidationError::TokenEndpointNotHttps)
+}
+
+/// The checks a provider passes before it is stored, `previous` being the stored record an
+/// update replaces. Tenancy and token scope are checked on every secret reference before the
+/// key material is read.
 async fn validate_provider_settings(
     state: &CredentialProviderState,
     provider: &CredentialProvider,
+    previous: Option<&CredentialProvider>,
     context: &Option<Extension<PatTenantContext>>,
     scope: &Option<Extension<PatResourceScope>>,
 ) -> Result<(), ProviderValidationError> {
+    validate_token_endpoint_scheme(&TokenEgress::from_environment(), previous, provider)?;
     validate_jwt_provider(provider)?;
     validate_secret_references(
         state,
@@ -534,7 +574,7 @@ pub async fn create_provider(
         updated_at: now,
     };
 
-    if let Err(error) = validate_provider_settings(&state, &provider, &context, &scope).await {
+    if let Err(error) = validate_provider_settings(&state, &provider, None, &context, &scope).await {
         return error.into_response();
     }
 
@@ -676,6 +716,7 @@ pub async fn update_provider(
         return resp;
     }
 
+    let previous = existing.clone();
     let updated = CredentialProvider {
         id: existing.id,
         tenant_id: existing.tenant_id,
@@ -733,7 +774,7 @@ pub async fn update_provider(
         updated_at: Utc::now(),
     };
 
-    if let Err(error) = validate_provider_settings(&state, &updated, &context, &scope).await {
+    if let Err(error) = validate_provider_settings(&state, &updated, Some(&previous), &context, &scope).await {
         return error.into_response();
     }
 
@@ -816,7 +857,8 @@ pub async fn validate_provider(
     Json(req): Json<ValidateCredentialProviderRequest>,
 ) -> impl IntoResponse {
     let client = crate::http_client::with_short_timeout().unwrap_or_else(|_| reqwest::Client::new());
-    validate_provider_with(&state, &client, pat.is_some(), &context, &scope, req).await
+    validate_provider_with(&state, &client, &TokenEgress::from_environment(), pat.is_some(), &context, &scope, req)
+        .await
 }
 
 /// The algorithm the requested provider would sign with, once its key material checks
@@ -858,6 +900,7 @@ async fn validate_key_material_request(
 async fn validate_provider_with(
     state: &CredentialProviderState,
     client: &reqwest::Client,
+    egress: &TokenEgress,
     pat_authenticated: bool,
     context: &Option<Extension<PatTenantContext>>,
     scope: &Option<Extension<PatResourceScope>>,
@@ -875,6 +918,9 @@ async fn validate_provider_with(
     if let Err(e) = crate::url_validation::validate_oauth_endpoint_url(&token_endpoint) {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("token_endpoint: {}", e)})))
             .into_response();
+    }
+    if !egress.permits_token_endpoint(&token_endpoint) {
+        return ProviderValidationError::TokenEndpointNotHttps.into_response();
     }
 
     // Local checks first, so a request that fails them sends nothing to the endpoint.
@@ -1304,10 +1350,209 @@ mod jwt_provider_tests {
         );
     }
 
+    fn with_token_endpoint(
+        mut body: Value,
+        provider_id: &str,
+        token_endpoint: &str,
+    ) -> Value {
+        body["provider_id"] = json!(provider_id);
+        body["token_endpoint"] = json!(token_endpoint);
+        body
+    }
+
+    fn client_credentials(provider_type: &str) -> Value {
+        json!({
+            "name": "Provider", "provider_id": "p", "provider_type": provider_type,
+            "authorization_endpoint": "https://192.0.2.1/authorize",
+            "token_endpoint": "https://192.0.2.1/token",
+            "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET"
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn creating_an_oauth_provider_with_an_http_token_endpoint_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        for (index, body) in [
+            client_credentials("oauth2_authorization_code"),
+            client_credentials("oauth2_client_credentials"),
+            jwt_bearer("p"),
+            jwt_auth("p"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (status, response) =
+                create(&state, with_token_endpoint(body.clone(), &format!("http-{index}"), "http://192.0.2.1/token"))
+                    .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(response["error"], "token_endpoint must be an https URL");
+            let (status, response) =
+                create(&state, with_token_endpoint(body, &format!("https-{index}"), "https://192.0.2.1/token")).await;
+            assert_eq!(status, StatusCode::CREATED, "{response}");
+        }
+        let stored: Vec<String> = state
+            .store
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|provider| provider.provider_id)
+            .collect();
+        assert_eq!(stored.len(), 4);
+        assert!(
+            stored
+                .iter()
+                .all(|provider_id| provider_id.starts_with("https-")),
+            "{stored:?}"
+        );
+
+        let (status, response) = create(
+            &state,
+            json!({"name": "Key", "provider_id": "key", "provider_type": "api_key",
+                   "api_key_secret_ref": "CLIENT_SECRET", "token_endpoint": "http://192.0.2.1/token"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "an API key provider sends nothing to a token endpoint: {response}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_update_to_an_http_token_endpoint_is_refused_and_a_stored_one_is_kept_in_warn_mode() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let (status, created) = create(&state, client_credentials("oauth2_client_credentials")).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let id = created["id"]
+            .as_str()
+            .unwrap();
+        let (status, response) = update(&state, id, json!({"token_endpoint": "http://192.0.2.1/token"})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(response["error"], "token_endpoint must be an https URL");
+        let unchanged = state
+            .store
+            .get(id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            unchanged
+                .token_endpoint
+                .as_deref(),
+            Some("https://192.0.2.1/token")
+        );
+
+        let mut stored = unchanged;
+        stored.id = "stored-http".into();
+        stored.provider_id = "stored-http".into();
+        stored.token_endpoint = Some("http://192.0.2.1/token".into());
+        state
+            .store
+            .create(stored)
+            .await
+            .unwrap();
+        let (status, response) = update(&state, "stored-http", json!({"name": "Renamed"})).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["token_endpoint"], "http://192.0.2.1/token");
+        let (status, response) =
+            update(&state, "stored-http", json!({"name": "Again", "token_endpoint": "http://192.0.2.1/token"})).await;
+        assert_eq!(status, StatusCode::OK, "the same endpoint sent back is unchanged: {response}");
+        let (status, response) =
+            update(&state, "stored-http", json!({"token_endpoint": "http://192.0.2.1/other"})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(response["error"], "token_endpoint must be an https URL");
+        let (status, response) =
+            update(&state, "stored-http", json!({"token_endpoint": "https://192.0.2.1/token"})).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+    }
+
+    #[test]
+    fn the_save_check_keeps_a_stored_http_endpoint_only_in_warn_mode() {
+        use crate::config::credential_policy::{CredentialPolicyConfig, RuleMode};
+
+        let egress = |token_endpoint_https, insecure_token_endpoints: Vec<String>| TokenEgress {
+            timeout: std::time::Duration::from_secs(5),
+            exact_allowlist: None,
+            policy: CredentialPolicyConfig {
+                token_endpoint_https,
+                insecure_token_endpoints,
+                ..Default::default()
+            },
+        };
+        let provider = |provider_type: CredentialProviderType, token_endpoint: &str| {
+            let mut provider: CredentialProvider = serde_json::from_value(json!({
+                "id": "cp", "name": "Provider", "provider_id": "provider", "token_endpoint": token_endpoint,
+                "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+            }))
+            .unwrap();
+            provider.provider_type = provider_type;
+            provider
+        };
+        let http = provider(CredentialProviderType::OAuth2ClientCredentials, "http://idp.internal/token");
+        let https = provider(CredentialProviderType::OAuth2ClientCredentials, "https://idp.internal/token");
+        let was_api_key = provider(CredentialProviderType::ApiKey, "http://idp.internal/token");
+        let refused = |result: Result<(), ProviderValidationError>| {
+            matches!(result, Err(ProviderValidationError::TokenEndpointNotHttps))
+        };
+
+        let warn = egress(RuleMode::Warn, vec![]);
+        assert!(refused(validate_token_endpoint_scheme(&warn, None, &http)));
+        assert!(validate_token_endpoint_scheme(&warn, Some(&http), &http).is_ok());
+        assert!(refused(validate_token_endpoint_scheme(&warn, Some(&https), &http)));
+        assert!(refused(validate_token_endpoint_scheme(&warn, Some(&was_api_key), &http)));
+        assert!(validate_token_endpoint_scheme(&warn, None, &https).is_ok());
+        assert!(validate_token_endpoint_scheme(&warn, None, &was_api_key).is_ok());
+
+        let enforce = egress(RuleMode::Enforce, vec![]);
+        assert!(refused(validate_token_endpoint_scheme(&enforce, Some(&http), &http)));
+        assert!(validate_token_endpoint_scheme(&enforce, Some(&http), &https).is_ok());
+
+        let listed = egress(RuleMode::Enforce, vec!["http://idp.internal/token".into()]);
+        assert!(validate_token_endpoint_scheme(&listed, None, &http).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn validate_refuses_an_http_token_endpoint_without_contacting_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let (http, requests, _server) = token_endpoint_answering_get().await;
+        let production = TokenEgress {
+            policy: Default::default(),
+            ..listed_http_egress()
+        };
+        let (status, response) = validate_with(
+            &state,
+            &http,
+            &production,
+            None,
+            json!({"provider_type": "oauth2_client_credentials", "token_endpoint": "http://192.0.2.1/token"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(response["error"], "token_endpoint must be an https URL");
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let (status, response) = validate(
+            &state,
+            &http,
+            None,
+            json!({"provider_type": "oauth2_client_credentials", "token_endpoint": "http://192.0.2.1/token"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "an endpoint insecure_token_endpoints lists is checked: {response}");
+        assert_eq!(response["reachable"], true);
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
     /// A client whose every request reaches a local server that answers GET with 405, as a
-    /// token endpoint does.
-    async fn token_endpoint_answering_get() -> (reqwest::Client, tokio::task::JoinSet<()>) {
-        let app = axum::Router::new().fallback(axum::routing::get(|| async { StatusCode::METHOD_NOT_ALLOWED }));
+    /// token endpoint does, and the number of requests it received.
+    async fn token_endpoint_answering_get()
+    -> (reqwest::Client, Arc<std::sync::atomic::AtomicUsize>, tokio::task::JoinSet<()>) {
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = requests.clone();
+        let app = axum::Router::new().fallback(axum::routing::get(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { StatusCode::METHOD_NOT_ALLOWED }
+        }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .unwrap();
@@ -1322,7 +1567,20 @@ mod jwt_provider_tests {
                 .await
                 .unwrap();
         });
-        (client, server)
+        (client, requests, server)
+    }
+
+    /// The egress of an appliance whose credential policy allows the documentation address
+    /// the validate tests use as an http token endpoint.
+    fn listed_http_egress() -> TokenEgress {
+        TokenEgress {
+            timeout: std::time::Duration::from_secs(5),
+            exact_allowlist: None,
+            policy: crate::config::credential_policy::CredentialPolicyConfig {
+                insecure_token_endpoints: vec!["http://192.0.2.1/token".into()],
+                ..Default::default()
+            },
+        }
     }
 
     async fn validate(
@@ -1331,9 +1589,20 @@ mod jwt_provider_tests {
         context: Option<Extension<PatTenantContext>>,
         body: Value,
     ) -> (StatusCode, Value) {
+        validate_with(state, http, &listed_http_egress(), context, body).await
+    }
+
+    async fn validate_with(
+        state: &CredentialProviderState,
+        http: &reqwest::Client,
+        egress: &TokenEgress,
+        context: Option<Extension<PatTenantContext>>,
+        body: Value,
+    ) -> (StatusCode, Value) {
         let response = validate_provider_with(
             state,
             http,
+            egress,
             context.is_some(),
             &context,
             &None,
@@ -1354,7 +1623,7 @@ mod jwt_provider_tests {
     async fn validate_checks_reachability_and_the_key_material_of_a_jwt_provider() {
         let directory = tempfile::tempdir().unwrap();
         let state = with_key_material(&directory).await;
-        let (http, _server) = token_endpoint_answering_get().await;
+        let (http, _requests, _server) = token_endpoint_answering_get().await;
         let (status, response) = validate(&state, &http, None, validate_jwt_bearer("SA_KEY")).await;
         assert_eq!(status, StatusCode::OK, "{response}");
         assert_eq!(response["reachable"], true);
@@ -1383,7 +1652,7 @@ mod jwt_provider_tests {
     async fn validate_refuses_key_material_in_the_wrong_format_without_echoing_it() {
         let directory = tempfile::tempdir().unwrap();
         let state = with_key_material(&directory).await;
-        let (http, _server) = token_endpoint_answering_get().await;
+        let (http, _requests, _server) = token_endpoint_answering_get().await;
         let (status, response) = validate(&state, &http, None, validate_jwt_bearer("NOT_A_KEY")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(
@@ -1420,7 +1689,7 @@ mod jwt_provider_tests {
             })
             .await
             .unwrap();
-        let (http, _server) = token_endpoint_answering_get().await;
+        let (http, _requests, _server) = token_endpoint_answering_get().await;
         let tenant_a = Some(Extension(PatTenantContext {
             token_id: "token-a".into(),
             tenant_id: "tenant-a".into(),
