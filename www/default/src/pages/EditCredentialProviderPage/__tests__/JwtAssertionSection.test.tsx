@@ -3,14 +3,14 @@ import { render, screen } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { MemoryRouter } from 'react-router-dom';
 import JwtAssertionSection from '../JwtAssertionSection';
-import { CredentialProviderType, EMPTY_JWT_FIELDS } from '../credentialProviderForm';
+import { CredentialProviderType, EMPTY_JWT_FIELDS, JwtFormFields } from '../credentialProviderForm';
 
-const renderSection = (providerType: CredentialProviderType) =>
+const renderSection = (providerType: CredentialProviderType, form: Partial<JwtFormFields> = {}) =>
   render(
     <MemoryRouter>
       <JwtAssertionSection
         providerType={providerType}
-        form={EMPTY_JWT_FIELDS}
+        form={{ ...EMPTY_JWT_FIELDS, ...form }}
         secrets={[{ id: 's1', name: 'Service account key', secret_id: 'SA_KEY' }]}
         loadingSecrets={false}
         onChange={jest.fn()}
@@ -44,6 +44,27 @@ describe('JwtAssertionSection', () => {
     ).toBeInTheDocument();
     expect(screen.queryByTestId('credential-provider-jwt-issuer-input')).not.toBeInTheDocument();
     expect(algorithms()).toEqual(['PS256', 'RS256']);
+  });
+
+  it('offers the certificate as optional with the key ID right under it', () => {
+    renderSection('oauth2_client_credentials_jwt_auth');
+    const certificate = screen.getByTestId('credential-provider-jwt_certificate_secret_ref-select');
+    expect(screen.getByText(/^Certificate/, { selector: 'label' })).not.toHaveTextContent('*');
+    const keyId = screen.getByTestId('credential-provider-jwt-key-id-input');
+    const algorithm = screen.getByTestId('credential-provider-jwt-algorithm-select');
+    expect(certificate.compareDocumentPosition(keyId)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    expect(keyId.compareDocumentPosition(algorithm)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+  });
+
+  it('warns when the signed JWT names its key by neither certificate nor key ID', () => {
+    const warning = 'credential-provider-jwt-key-unidentified-warning';
+    const { unmount } = renderSection('oauth2_client_credentials_jwt_auth');
+    expect(screen.getByTestId(warning)).toHaveTextContent(
+      'The OAuth server may not be able to identify the correct public key'
+    );
+    unmount();
+    renderSection('oauth2_client_credentials_jwt_auth', { jwt_key_id: 'key1' });
+    expect(screen.queryByTestId(warning)).not.toBeInTheDocument();
   });
 
   it('renders nothing for a client-secret provider', () => {

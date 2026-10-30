@@ -111,13 +111,25 @@ export function missingProviderField(form: ProviderFormValues): string | null {
   if (fields.jwt && !form.jwt_signing_key_secret_ref) {
     return 'Signing key secret is required.';
   }
-  if (fields.jwtCertificate && !form.jwt_certificate_secret_ref) {
-    return 'Certificate secret is required.';
-  }
   if (form.provider_type === 'api_key' && !form.api_key_secret_ref) {
     return 'API Key secret is required.';
   }
   return null;
+}
+
+/**
+ * True when the type signs a JWT whose header names its key by neither a certificate
+ * thumbprint (`x5t#S256`) nor a key ID (`kid`), so the OAuth server must guess the key.
+ */
+export function jwtKeyUnidentified(
+  form: JwtFormFields & { provider_type: CredentialProviderType }
+): boolean {
+  const fields = providerTypeFields(form.provider_type);
+  return (
+    fields.jwt &&
+    !form.jwt_key_id.trim() &&
+    !(fields.jwtCertificate && form.jwt_certificate_secret_ref)
+  );
 }
 
 /**

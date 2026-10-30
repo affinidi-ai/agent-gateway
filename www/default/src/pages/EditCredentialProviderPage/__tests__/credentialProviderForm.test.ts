@@ -2,6 +2,7 @@ import {
   EMPTY_JWT_FIELDS,
   ProviderFormValues,
   jwtFieldsOf,
+  jwtKeyUnidentified,
   missingProviderField,
   providerCredentialFields,
   providerTypeFields,
@@ -69,9 +70,7 @@ describe('credential provider form', () => {
       'Signing key secret is required.'
     );
     expect(missingProviderField(jwtAuth)).toBeNull();
-    expect(missingProviderField({ ...jwtAuth, jwt_certificate_secret_ref: '' })).toBe(
-      'Certificate secret is required.'
-    );
+    expect(missingProviderField({ ...jwtAuth, jwt_certificate_secret_ref: '' })).toBeNull();
     expect(missingProviderField({ ...jwtAuth, client_id_secret_ref: '' })).toBe(
       'Client ID secret is required for OAuth providers.'
     );
@@ -102,6 +101,17 @@ describe('credential provider form', () => {
       jwt_issuer: '',
       jwt_signing_algorithm: 'RS256',
     });
+  });
+
+  it('flags a signed JWT that names its key by neither certificate nor key ID', () => {
+    const unidentified = (values: Partial<ProviderFormValues>) =>
+      jwtKeyUnidentified({ ...jwtAuth, ...values });
+    expect(unidentified({ jwt_certificate_secret_ref: 'CERT', jwt_key_id: '' })).toBe(false);
+    expect(unidentified({ jwt_certificate_secret_ref: '', jwt_key_id: 'key1' })).toBe(false);
+    expect(unidentified({ jwt_certificate_secret_ref: '', jwt_key_id: ' ' })).toBe(true);
+    expect(jwtKeyUnidentified({ ...jwtBearer, jwt_key_id: '' })).toBe(true);
+    expect(jwtKeyUnidentified(jwtBearer)).toBe(false);
+    expect(jwtKeyUnidentified(form({}))).toBe(false);
   });
 
   it('drops a signing algorithm the selected type does not support', () => {

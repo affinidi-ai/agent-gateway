@@ -5,6 +5,7 @@ import {
   CredentialProviderType,
   JWT_ALGORITHMS,
   JwtFormFields,
+  jwtKeyUnidentified,
   providerTypeFields,
 } from './credentialProviderForm';
 
@@ -79,14 +80,50 @@ const JwtAssertionSection: React.FC<JwtAssertionSectionProps> = ({
         <SecretSelect
           id="jwt_certificate_secret_ref"
           label="Certificate"
-          required
-          help="The certificate registered on the app in the identity provider. Its SHA-256 thumbprint tells the provider which key signed the assertion."
-          hint="Secret holding the PEM certificate (BEGIN CERTIFICATE)."
+          help="Optional. Needed for Entra (Microsoft identity platform): Entra matches the assertion to a certificate uploaded to the app registration by its SHA-256 thumbprint, sent as the x5t#S256 header. Issuers that find the key by Key ID, such as Ory, do not need it."
+          hint="Secret holding the PEM certificate (BEGIN CERTIFICATE) of the signing key."
           value={form.jwt_certificate_secret_ref}
           secrets={secrets}
           loading={loadingSecrets}
           onChange={onChange}
         />
+      )}
+
+      <div className="mb-3">
+        <div className="field-label-with-help">
+          <label htmlFor="jwt_key_id" className="mb-0">
+            Key ID
+          </label>
+          <FieldHelp ariaLabel="About Key ID" testId="field-help-jwt-key-id">
+            Optional <code>kid</code> header: the ID of the public key registered with the OAuth
+            server, such as the <code>kid</code> of a key in an Ory client&apos;s JWKS. For a Google
+            service account, the <code>private_key_id</code> of its JSON key file.
+          </FieldHelp>
+        </div>
+        <input
+          id="jwt_key_id"
+          name="jwt_key_id"
+          data-testid="credential-provider-jwt-key-id-input"
+          type="text"
+          className="form-control"
+          value={form.jwt_key_id}
+          onChange={onChange}
+        />
+      </div>
+
+      {jwtKeyUnidentified({ ...form, provider_type: providerType }) && (
+        <div
+          className="alert alert-warning py-2"
+          role="status"
+          data-testid="credential-provider-jwt-key-unidentified-warning"
+        >
+          <i className="fas fa-exclamation-triangle me-2" aria-hidden="true" />
+          {fields.jwtCertificate
+            ? 'Neither a certificate nor a key ID is set. '
+            : 'No key ID is set. '}
+          The OAuth server may not be able to identify the correct public key to verify the signed
+          JWT.
+        </div>
       )}
 
       <div className="row mb-3">
@@ -106,26 +143,6 @@ const JwtAssertionSection: React.FC<JwtAssertionSectionProps> = ({
               </option>
             ))}
           </select>
-        </div>
-        <div className="col-md-6">
-          <div className="field-label-with-help">
-            <label htmlFor="jwt_key_id" className="mb-0">
-              Key ID
-            </label>
-            <FieldHelp ariaLabel="About Key ID" testId="field-help-jwt-key-id">
-              Optional <code>kid</code> header. For a Google service account, the{' '}
-              <code>private_key_id</code> of its JSON key file.
-            </FieldHelp>
-          </div>
-          <input
-            id="jwt_key_id"
-            name="jwt_key_id"
-            data-testid="credential-provider-jwt-key-id-input"
-            type="text"
-            className="form-control"
-            value={form.jwt_key_id}
-            onChange={onChange}
-          />
         </div>
       </div>
 
