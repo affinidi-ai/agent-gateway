@@ -439,10 +439,10 @@ bindings are not subject to this rule.
 
 A binding to an `oauth2_client_credentials` provider is refused on a plain http leg too:
 saving a surface whose Target, or a Transit Point the binding reaches, is plain http is refused
-with 400, and each request checks the leg again (`permits_client_credentials_leg`). Only plain
-http is refused: https, `fabric://` (encrypted by DIDComm) and proxy routes whose upstream is
-configured elsewhere are unaffected. Under `AG_TEST_MODE` an http origin named in the test
-egress allowlist counts as https. Legacy resolution refuses the request with 503, outcome
+with 400, and each request checks the leg again (`permits_client_credentials_leg`). Only `https`,
+`fabric://` (encrypted by DIDComm), `proxy://` and `a2a-proxy://` legs are accepted: plain http
+and any other scheme are refused. Under `AG_TEST_MODE` an http origin named in the test egress
+allowlist counts as https. Legacy resolution refuses the request with 503, outcome
 `provider_unavailable` and detail `client_credentials_leg_forbidden`; modern MCP delegation
 refuses it with 403. Retyping a bound provider to Client Credentials is refused with 409 when it would
 break a leg. The caller-authentication and Target-base conditions apply to `oauth2_jwt_bearer` bindings only.
@@ -635,10 +635,13 @@ printf '%s' '["jwt_bearer","https://login.example.com",null,"alice"]' | shasum -
 Gateway tokens (client credentials and JWT bearer) have no user. Legacy delegation caches them
 under the user hash `__client_credentials__:<hex SHA-256 of the provider digest and the sorted,
 deduplicated scope set joined by spaces>`, so bindings with different scopes on one provider, or a
-token granted before the provider was edited, never share a token.
+token granted before the provider was edited, never share a token. Storing a fresh gateway token
+also deletes the expired records under `__client_credentials__:` keys for the same agent and
+provider, which an earlier provider version or scope set left behind; a record that has not
+expired is kept.
 After an upgrade each binding sends one new grant. Records under the old bare
-`__client_credentials__` key are no longer read. Nothing removes expired vault records, so
-they stay on disk and in the Credential Tokens list until an operator deletes them with
+`__client_credentials__` key are no longer read, and nothing removes them, so they stay on disk
+and in the Credential Tokens list until an operator deletes them with
 `DELETE /api/v1/delegation-vault/by-user/__client_credentials__`, which touches only the
 records stored under that exact key. Modern MCP delegation caches them under
 `__mcp_client_credentials__:<hex provider digest>`.

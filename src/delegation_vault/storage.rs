@@ -53,6 +53,19 @@ pub trait DelegationVaultStorage: Send + Sync {
         user_identity_hash: &str,
     ) -> Result<usize>;
 
+    /// Delete the expired tokens of one agent and provider whose user hash starts with
+    /// `user_hash_prefix`, except `keep_id`. Unlike a revoke, it leaves pending consents
+    /// alone: it removes only records that can no longer be used.
+    async fn prune_expired(
+        &self,
+        _agent_did: &str,
+        _provider_id: &str,
+        _user_hash_prefix: &str,
+        _keep_id: &str,
+    ) -> Result<usize> {
+        Ok(0)
+    }
+
     /// Update a token (e.g. after refresh)
     async fn update(
         &self,
@@ -468,6 +481,50 @@ impl DelegationVaultStorage for FileSystemDelegationVaultStore {
                 );
             }
             Ok(count)
+        })
+        .await
+    }
+
+    async fn prune_expired(
+        &self,
+        agent_did: &str,
+        provider_id: &str,
+        user_hash_prefix: &str,
+        keep_id: &str,
+    ) -> Result<usize> {
+        let (agent_did, provider_id, user_hash_prefix, keep_id) =
+            (agent_did.to_string(), provider_id.to_string(), user_hash_prefix.to_string(), keep_id.to_string());
+        self.mutate(move |store| async move {
+            let now = Utc::now();
+            let stale: Vec<String> = store
+                .storage
+                .list_all()
+                .await?
+                .into_iter()
+                .filter(|token| {
+                    token.id != keep_id
+                        && token.agent_did == agent_did
+                        && token.credential_provider_id == provider_id
+                        && token
+                            .user_identity_hash
+                            .starts_with(&user_hash_prefix)
+                        && token
+                            .expires_at
+                            .is_some_and(|expires_at| expires_at <= now)
+                })
+                .map(|token| token.id)
+                .collect();
+            for id in &stale {
+                store
+                    .refreshes
+                    .delete(id)
+                    .await?;
+                store
+                    .storage
+                    .delete(id)
+                    .await?;
+            }
+            Ok(stale.len())
         })
         .await
     }

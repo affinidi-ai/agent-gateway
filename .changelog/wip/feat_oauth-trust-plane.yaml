@@ -623,8 +623,9 @@ changes:
       description: >-
         Two routes that bound one provider with different scopes could receive each other's gateway
         token. Each scope set now has its own vault record, and the record is also keyed by a digest
-        of the provider, so a token granted with other provider settings is never found. After the
-        upgrade every binding sends one new grant.
+        of the provider, so a token granted with other provider settings is never found. Storing a
+        fresh gateway token deletes the expired records that an earlier provider version left for
+        the same agent and provider. After the upgrade every binding sends one new grant.
     - timestamp: '2026-10-30T09:00:00Z'
       title: Never send a gateway token that expired while its refresh failed
       description: >-
@@ -883,8 +884,9 @@ changes:
         A delegation binding to an oauth2_client_credentials provider no longer sends the gateway's
         token on a plain http Target or Transit Point leg. Saving such a surface is refused with
         400, and a request on such a leg is refused with 503 and detail
-        client_credentials_leg_forbidden, or 403 on modern MCP delegation. https, fabric:// and
-        proxy routes are unaffected, and the caller-authentication and Target-base rules still
+        client_credentials_leg_forbidden, or 403 on modern MCP delegation. Only https, fabric://,
+        proxy:// and a2a-proxy:// legs are accepted, so any other scheme is refused too. The
+        caller-authentication and Target-base rules still
         apply only to JWT bearer bindings. Changing a bound provider to Client Credentials is
         refused with 409 when it would break such a leg. Before upgrading, move the Target or
         Transit Point to https.

@@ -576,11 +576,13 @@ pub fn permits_jwt_bearer_leg(
 }
 
 /// Whether a request leg may carry the gateway's own token from an
-/// `oauth2_client_credentials` delegation binding: any parseable endpoint that is not plain
-/// http. Under test mode an http origin named in the egress allowlist counts as https.
+/// `oauth2_client_credentials` delegation binding: an `https` endpoint, or a `fabric://`,
+/// `proxy://` or `a2a-proxy://` route. Under test mode an http origin named in the egress
+/// allowlist counts as https. Any other scheme is refused.
 pub fn permits_client_credentials_leg(endpoint: &str) -> bool {
-    url::Url::parse(endpoint.trim())
-        .is_ok_and(|parsed| parsed.scheme() != "http" || permits_credential_provider_target(endpoint))
+    url::Url::parse(endpoint.trim()).is_ok_and(|parsed| {
+        matches!(parsed.scheme(), "fabric" | "proxy" | "a2a-proxy") || permits_credential_provider_target(endpoint)
+    })
 }
 
 /// Header names a Target credential may never set.
@@ -1809,12 +1811,15 @@ mod tests {
     }
 
     #[test]
-    fn a_client_credentials_leg_is_anything_but_plain_http() {
+    fn a_client_credentials_leg_is_https_or_a_gateway_route() {
         let _production = crate::component_tests::helpers::test_mode::TestModeEnv::with(None, None, None);
         assert!(permits_client_credentials_leg("https://agent.example/api"));
         assert!(permits_client_credentials_leg("fabric://peer-gateway/peer-surface"));
         assert!(!permits_client_credentials_leg("http://agent.example/api"));
         assert!(permits_client_credentials_leg("proxy://mcp-proxy"));
+        assert!(permits_client_credentials_leg("a2a-proxy://managed-agent"));
+        assert!(!permits_client_credentials_leg("ws://agent.example/socket"));
+        assert!(!permits_client_credentials_leg("wss-future://agent.example/socket"));
         assert!(!permits_client_credentials_leg("not a url"));
         assert!(!permits_client_credentials_leg(""));
     }

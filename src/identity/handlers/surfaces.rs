@@ -345,7 +345,7 @@ fn colliding_delegated_header(surface: &AgentSurface) -> Option<String> {
 /// Validate delegation bindings to gateway-token providers on the base surface and every
 /// variant. An `oauth2_jwt_bearer` binding sends a gateway token on every leg it reaches, so it
 /// needs what `credential_provider` Target Authentication needs; an `oauth2_client_credentials`
-/// binding only needs legs that are not plain http.
+/// binding only needs https or gateway route legs.
 async fn validate_gateway_token_bindings(
     state: &IdentityApiState,
     surface: &AgentSurface,
@@ -468,7 +468,7 @@ pub(crate) fn check_jwt_bearer_bindings(
     Ok(())
 }
 
-/// No leg a client credentials binding reaches may be plain http.
+/// Every leg a client credentials binding reaches must be https or a gateway route.
 pub(crate) fn check_client_credentials_bindings(
     views: &[AgentSurface],
     is_client_credentials: impl Fn(&str) -> bool,
@@ -480,7 +480,7 @@ pub(crate) fn check_client_credentials_bindings(
         {
             return Err(SurfaceApiError::BadRequest(format!(
                 "A credential binding to an oauth2_client_credentials provider cannot send its token over \
-                 plain http; {label} is plain http or not a URL"
+                 plain http or an unsupported scheme; {label} is plain http, another scheme or not a URL"
             )));
         }
     }
@@ -5458,8 +5458,8 @@ mod validation_tests {
         let target_refusal = refusal(&bound("http://agent.example/api?api_key=marker", "cp-cc", true));
         assert_eq!(
             target_refusal,
-            "A credential binding to an oauth2_client_credentials provider cannot send its token over plain http; the \
-             Target endpoint is plain http or not a URL"
+            "A credential binding to an oauth2_client_credentials provider cannot send its token over plain http or an \
+             unsupported scheme; the Target endpoint is plain http, another scheme or not a URL"
         );
         assert!(!target_refusal.contains("marker"));
 
@@ -5475,8 +5475,8 @@ mod validation_tests {
         );
         assert_eq!(
             refusal(&[through_transit]),
-            "A credential binding to an oauth2_client_credentials provider cannot send its token over plain http; \
-             Transit Point 'partner' endpoint is plain http or not a URL"
+            "A credential binding to an oauth2_client_credentials provider cannot send its token over plain http or an \
+             unsupported scheme; Transit Point 'partner' endpoint is plain http, another scheme or not a URL"
         );
     }
 

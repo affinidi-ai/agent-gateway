@@ -283,6 +283,26 @@ pub(crate) fn gateway_grant_user_hash(
     Ok(format!("{GATEWAY_GRANT_USER_HASH}:{}", hex::encode(hasher.finalize())))
 }
 
+/// Removes the expired legacy gateway tokens that an earlier provider version or scope set left
+/// for the same agent and provider. A token that has not expired stays: another binding may
+/// still be using it. This is not a revoke, so pending consents are left alone.
+async fn prune_expired_gateway_tokens(
+    vault_store: &Arc<dyn DelegationVaultStorage>,
+    stored: &DelegationToken,
+) {
+    if let Err(error) = vault_store
+        .prune_expired(
+            &stored.agent_did,
+            &stored.credential_provider_id,
+            &format!("{GATEWAY_GRANT_USER_HASH}:"),
+            &stored.id,
+        )
+        .await
+    {
+        warn!(target: "credential_delegation", error = %error, "Could not prune expired gateway tokens");
+    }
+}
+
 /// The binding a gateway token is injected for, with its audit context.
 struct GatewayTokenTarget<'a> {
     binding: &'a OutboundCredentialBinding,
@@ -424,6 +444,7 @@ impl GatewayTokenTarget<'_> {
                     .await
                 {
                     Ok(stored) => {
+                        prune_expired_gateway_tokens(vault_store, &stored).await;
                         self.inject(&user_hash, &stored.id, &stored.access_token, format!("{grant_label}_fresh"))
                     }
                     Err(error) => {
@@ -3739,6 +3760,100 @@ mod tests {
         hashes.sort();
         hashes.dedup();
         assert_eq!(hashes.len(), 2, "{hashes:?}");
+    }
+
+    #[tokio::test]
+    async fn test_a_fresh_gateway_grant_prunes_only_the_expired_records_of_the_same_provider() {
+        let mut fixture = GatewayGrantFixture::start(
+            "cp-jwt-prune",
+            axum::http::StatusCode::OK,
+            serde_json::json!({"access_token": "fresh-gateway-token", "token_type": "Bearer", "expires_in": 3600}),
+        )
+        .await;
+        assert_eq!(
+            fixture
+                .resolve()
+                .await
+                .action
+                .detail
+                .as_deref(),
+            Some("jwt_bearer_fresh")
+        );
+        let first = fixture
+            .vault
+            .list_all()
+            .await
+            .unwrap()
+            .remove(0);
+        fixture
+            .vault
+            .delete(&first.id)
+            .await
+            .unwrap();
+
+        let mut expired = first.clone();
+        expired.id = Uuid::new_v4().to_string();
+        expired.expires_at = Some(Utc::now() - Duration::seconds(60));
+        let mut other_scope = first.clone();
+        other_scope.id = Uuid::new_v4().to_string();
+        other_scope.user_identity_hash = gateway_grant_user_hash(&fixture.provider, &["other".to_string()]).unwrap();
+        other_scope.expires_at = Some(Utc::now() + Duration::seconds(600));
+        let mut other_provider = expired.clone();
+        other_provider.id = Uuid::new_v4().to_string();
+        other_provider.credential_provider_id = "cp-other".to_string();
+        for record in [&expired, &other_scope, &other_provider] {
+            fixture
+                .vault
+                .store(record.clone())
+                .await
+                .unwrap();
+        }
+
+        let epoch_before = fixture
+            .vault
+            .consent_snapshot(
+                &other_scope.agent_did,
+                &other_scope.user_identity_hash,
+                &other_scope.credential_provider_id,
+            )
+            .await
+            .unwrap()
+            .revocation_epoch;
+
+        fixture.provider.updated_at = Utc::now() + Duration::seconds(1);
+        assert_eq!(
+            fixture
+                .resolve()
+                .await
+                .action
+                .detail
+                .as_deref(),
+            Some("jwt_bearer_fresh")
+        );
+
+        let remaining: Vec<String> = fixture
+            .vault
+            .list_all()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|record| record.id)
+            .collect();
+        let epoch_after = fixture
+            .vault
+            .consent_snapshot(
+                &other_scope.agent_did,
+                &other_scope.user_identity_hash,
+                &other_scope.credential_provider_id,
+            )
+            .await
+            .unwrap()
+            .revocation_epoch;
+        assert_eq!(epoch_before, epoch_after, "pruning is not a revoke: pending consents stay valid");
+        assert!(!remaining.contains(&expired.id), "the expired record of an earlier provider version is pruned");
+        assert!(remaining.contains(&other_scope.id), "a record that has not expired stays");
+        assert!(remaining.contains(&other_provider.id), "a record of another provider stays");
+        assert_eq!(remaining.len(), 3, "{remaining:?}");
     }
 
     #[tokio::test]
