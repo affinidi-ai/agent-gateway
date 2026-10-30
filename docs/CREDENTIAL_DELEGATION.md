@@ -86,7 +86,10 @@ that needs one: legacy and `2026-07-28` delegation bindings, and target authenti
   refused; when none were requested, the issued scopes are kept.
 - The provider is read again after the token request, and a provider changed meanwhile
   refuses the token.
-- `resource` is sent only when the provider sets it.
+- `resource` is sent only when the provider sets it, on every path including legacy bindings.
+  The Microsoft identity platform v2.0 token endpoint rejects it (AADSTS901002): put the audience
+  in the scopes as `<resource>/.default` instead. The dashboard warns on the provider form and
+  list when an Entra v2.0 provider sets `resource`.
 
 Concurrent requests that all miss the cache each request a token; the last one stored wins.
 
