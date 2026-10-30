@@ -94,8 +94,10 @@ pub enum ServiceTokenError {
 pub const EXPIRY_MARGIN_SECS: i64 = 60;
 
 /// The provider's service token for `scopes`: its API key, or a cached token that grants
-/// them, or a new token from the provider's grant, stored under `key`. Issued scopes must
-/// equal requested ones; when none were requested the issuer's scopes are kept.
+/// them, or a new token from the provider's grant, stored under `key`. On this replica one
+/// token request per key is in flight at a time; a caller that missed the cache waits for it
+/// and reads the vault again before requesting. Issued scopes must equal requested ones; when
+/// none were requested the issuer's scopes are kept.
 pub async fn acquire(
     provider: &CredentialProvider,
     scopes: &[String],
@@ -143,11 +145,19 @@ pub async fn acquire(
             .tenant_credential_isolation,
     )
     .await?;
-    if let Some(token) = cached_token(provider, scopes, context, key.agent_did, &identity, now).await? {
+    let cached = |token| {
         if insecure_endpoint {
             warn!(target: "credential_delegation", provider_id = %provider.provider_id, "Using a service token from a credential provider token endpoint that is not https");
         }
-        return Ok(ServiceToken::issued(token, true, insecure_endpoint));
+        ServiceToken::issued(token, true, insecure_endpoint)
+    };
+    if let Some(token) = cached_token(provider, scopes, context, key.agent_did, &identity, now).await? {
+        return Ok(cached(token));
+    }
+    let slot = grant_slot(key.agent_did, &identity, &provider.id).await;
+    let _grant = slot.lock().await;
+    if let Some(token) = cached_token(provider, scopes, context, key.agent_did, &identity, now).await? {
+        return Ok(cached(token));
     }
     let response = match provider.provider_type {
         CredentialProviderType::OAuth2ClientCredentials => {
@@ -246,6 +256,32 @@ pub async fn acquire(
         warn!(target: "credential_delegation", provider_id = %provider.provider_id, %error, "Could not remove expired service tokens");
     }
     Ok(ServiceToken::issued(token, false, insecure_endpoint))
+}
+
+const GRANT_SLOT_ENTRIES: u64 = 16_384;
+const GRANT_SLOT_IDLE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+type GrantSlotKey = (String, String, String);
+
+/// One lock per vault row key on this replica, held while its token is requested and
+/// stored, so concurrent misses send one token request and the others then read its token
+/// from the vault. Holds no token values.
+static GRANT_SLOTS: std::sync::LazyLock<moka::future::Cache<GrantSlotKey, Arc<tokio::sync::Mutex<()>>>> =
+    std::sync::LazyLock::new(|| {
+        moka::future::Cache::builder()
+            .max_capacity(GRANT_SLOT_ENTRIES)
+            .time_to_idle(GRANT_SLOT_IDLE)
+            .build()
+    });
+
+async fn grant_slot(
+    agent_did: &str,
+    identity: &str,
+    credential_provider_id: &str,
+) -> Arc<tokio::sync::Mutex<()>> {
+    GRANT_SLOTS
+        .get_with((agent_did.into(), identity.into(), credential_provider_id.into()), async { Arc::default() })
+        .await
 }
 
 /// The vault user identity of the provider's token for `scopes`: `<purpose>:` and the hex
@@ -596,6 +632,33 @@ mod tests {
                 .find(|secret| secret.secret_id == secret_ref)
                 .unwrap()
                 .id
+        }
+
+        async fn grant_slot(
+            &self,
+            provider: &CredentialProvider,
+            scopes: &[&str],
+        ) -> (String, Arc<tokio::sync::Mutex<()>>) {
+            let scopes: Vec<String> = scopes
+                .iter()
+                .map(|scope| scope.to_string())
+                .collect();
+            let identity = cache_identity(
+                provider,
+                &scopes,
+                &self.secrets,
+                KEY.purpose,
+                self.egress
+                    .policy
+                    .tenant_credential_isolation,
+            )
+            .await
+            .unwrap();
+            let slot = grant_slot(KEY.agent_did, &identity, &provider.id).await;
+            GRANT_SLOTS
+                .run_pending_tasks()
+                .await;
+            (identity, slot)
         }
 
         fn requests(&self) -> Vec<HashMap<String, String>> {
@@ -1425,5 +1488,133 @@ mod tests {
             .collect();
         left.sort();
         assert_eq!(left, ["expired-other-purpose", "expired-other-surface", "live-other-scopes"]);
+    }
+
+    /// Waits until `waiters` callers besides the `holders` counted before they started hold
+    /// `slot`, that is, have missed the cache and are queued for its lock. The slot cache's
+    /// pending tasks run before `holders` is counted, so it holds one copy only.
+    async fn until_waiting(
+        slot: &Arc<tokio::sync::Mutex<()>>,
+        holders: usize,
+        waiters: usize,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while Arc::strong_count(slot) < holders + waiters {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("callers did not queue for the grant slot");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sixteen_concurrent_misses_send_one_token_request() {
+        let fixture = Fixture::new().await;
+        let provider = fixture
+            .provider(client_credentials())
+            .await;
+        let now = Utc::now();
+        let (_, slot) = fixture
+            .grant_slot(&provider, &["read"])
+            .await;
+        let held = slot.lock().await;
+        let holders = Arc::strong_count(&slot);
+        let (results, ()) = tokio::join!(
+            futures::future::join_all((0..16).map(|_| fixture.acquire(&provider, &["read"], now))),
+            async {
+                until_waiting(&slot, holders, 16).await;
+                drop(held);
+            }
+        );
+        let results: Vec<(String, bool)> = results
+            .into_iter()
+            .map(issued)
+            .collect();
+        assert!(
+            results
+                .iter()
+                .all(|(value, _)| value == "issued")
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|(_, cached)| *cached)
+                .count(),
+            15
+        );
+        assert_eq!(fixture.requests().len(), 1);
+        fixture.only_stored().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_token_stored_elsewhere_while_waiting_is_reused_without_a_request() {
+        let fixture = Fixture::new().await;
+        let provider = fixture
+            .provider(client_credentials())
+            .await;
+        let now = Utc::now();
+        let (identity, slot) = fixture
+            .grant_slot(&provider, &["read"])
+            .await;
+        let held = slot.lock().await;
+        let holders = Arc::strong_count(&slot);
+        let (token, ()) = tokio::join!(fixture.acquire(&provider, &["read"], now), async {
+            until_waiting(&slot, holders, 1).await;
+            fixture
+                .vault
+                .store(DelegationToken {
+                    id: "other-replica".into(),
+                    agent_did: KEY.agent_did.into(),
+                    user_identity_hash: identity.clone(),
+                    credential_provider_id: provider.id.clone(),
+                    provider_id: provider.provider_id.clone(),
+                    access_token: "from-other-replica".into(),
+                    refresh_token: None,
+                    token_type: "Bearer".into(),
+                    scopes: vec!["read".into()],
+                    expires_at: Some(now + chrono::Duration::hours(1)),
+                    delegation_vc: None,
+                    consent_identity: None,
+                    consent_granted_at: now,
+                    last_used_at: None,
+                    created_at: now,
+                    updated_at: now,
+                })
+                .await
+                .unwrap();
+            drop(held);
+        });
+        assert_eq!(issued(token), ("from-other-replica".into(), true));
+        assert!(fixture.requests().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_for_other_scopes_does_not_wait_for_another_key() {
+        let fixture = Fixture::new().await;
+        let provider = fixture
+            .provider(client_credentials())
+            .await;
+        let now = Utc::now();
+        let (_, slot) = fixture
+            .grant_slot(&provider, &["read"])
+            .await;
+        let held = slot.lock().await;
+        fixture.respond(json!({"access_token": "write", "token_type": "Bearer", "expires_in": 3600}));
+        let other =
+            tokio::time::timeout(std::time::Duration::from_secs(5), fixture.acquire(&provider, &["write"], now))
+                .await
+                .expect("a request for other scopes waited for another key's request");
+        assert_eq!(issued(other), ("write".into(), false));
+        drop(held);
+        fixture.respond(json!({"access_token": "read", "token_type": "Bearer", "expires_in": 3600}));
+        assert_eq!(
+            issued(
+                fixture
+                    .acquire(&provider, &["read"], now)
+                    .await
+            ),
+            ("read".into(), false)
+        );
+        assert_eq!(fixture.requests().len(), 2);
     }
 }

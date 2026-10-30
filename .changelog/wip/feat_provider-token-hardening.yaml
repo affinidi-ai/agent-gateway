@@ -74,6 +74,13 @@ changes:
         cached token at once. Expired service tokens of the same provider are removed from
         the vault when a new one is stored. Upgrade note: each binding and target
         authentication requests one new token after the upgrade.
+    - timestamp: '2026-10-31T00:30:00Z'
+      title: Send one token request per credential at a time
+      description: >-
+        Requests that need the same service token, for the same surface, provider, scopes
+        and secret versions, now wait for one token request on each replica and reuse its
+        token from the vault, instead of each sending its own request to the credential
+        provider when the cache is empty or expired.
   removed: []
   security:
     - timestamp: '2026-10-30T20:30:00Z'

@@ -156,7 +156,10 @@ that needs one: legacy and `2026-07-28` delegation bindings, and target authenti
   in the scopes as `<resource>/.default` instead. The dashboard warns on the provider form and
   list when an Entra v2.0 provider sets `resource`.
 
-Concurrent requests that all miss the cache each request a token; the last one stored wins.
+Each replica sends one token request per cache key at a time. Requests that miss the cache
+meanwhile wait for it, then read the vault again, so they reuse the token it stored, or one
+another replica stored, instead of requesting their own. Requests for other scopes, providers or
+surfaces do not wait. Replicas do not coordinate, so each may request one token for the same key.
 
 ## Binding a provider to a surface
 
