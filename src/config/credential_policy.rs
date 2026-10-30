@@ -66,10 +66,28 @@ tokio::task_local! {
     pub(crate) static TEST_CREDENTIAL_POLICY: &'static CredentialPolicyConfig;
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_THREAD_CREDENTIAL_POLICY: std::cell::Cell<Option<&'static CredentialPolicyConfig>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Makes the current thread read `policy` from [`credential_policy`], so every task a runtime
+/// runs on a thread prepared this way, such as an in-process gateway's, sees it.
+#[cfg(test)]
+pub(crate) fn use_thread_credential_policy(policy: CredentialPolicyConfig) {
+    let policy: &'static CredentialPolicyConfig = Box::leak(Box::new(policy));
+    TEST_THREAD_CREDENTIAL_POLICY.with(|slot| slot.set(Some(policy)));
+}
+
 /// The process-global credential policy; the warn defaults before initialisation.
 pub fn credential_policy() -> &'static CredentialPolicyConfig {
     #[cfg(test)]
     if let Ok(policy) = TEST_CREDENTIAL_POLICY.try_with(|policy| *policy) {
+        return policy;
+    }
+    #[cfg(test)]
+    if let Some(policy) = TEST_THREAD_CREDENTIAL_POLICY.with(std::cell::Cell::get) {
         return policy;
     }
     GLOBAL_CREDENTIAL_POLICY.get_or_init(CredentialPolicyConfig::default)

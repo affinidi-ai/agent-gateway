@@ -1426,14 +1426,21 @@ fn spawn_gateway_server(
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let startup_log = StartupLog::default();
     let thread_log = startup_log.clone();
+    let credential_policy = bootstrap
+        .credential_policy
+        .clone();
     let thread = std::thread::Builder::new()
         .name("gw-harness".to_string())
         .stack_size(8 * 1024 * 1024)
         .spawn(move || {
             let _log = thread_log.capture_on_this_thread();
+            crate::config::credential_policy::use_thread_credential_policy(credential_policy.clone());
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .thread_stack_size(8 * 1024 * 1024)
+                .on_thread_start(move || {
+                    crate::config::credential_policy::use_thread_credential_policy(credential_policy.clone())
+                })
                 .build()
                 .expect("build gateway harness runtime");
             rt.block_on(async move {
