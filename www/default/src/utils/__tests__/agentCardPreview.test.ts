@@ -1,9 +1,11 @@
 import {
   AUTH_FAILURE_TEXT,
   CARD_AUTH_FAILURES,
+  cardNamesGatewayScheme,
   CARD_FETCH_CAUSES,
   CARD_FETCH_CAUSE_LABEL,
   CARD_FETCH_CAUSE_TEXT,
+  CARD_PEER_REFUSED_TEXT,
   CARD_REJECTED_CREDENTIAL_TEXT,
   describeCardAuth,
   describeFetchCause,
@@ -74,6 +76,14 @@ describe('parseAgentCardPreview', () => {
     expect(parseAgentCardPreview(unsupportedBody('not_running'))).toMatchObject({
       unsupported_reason: 'not_running',
     });
+    expect(parseAgentCardPreview(unsupportedBody('operator_only'))).toEqual({
+      supported: false,
+      surface_id: 's-123',
+      unsupported_reason: 'operator_only',
+    });
+    expect(
+      parseAgentCardPreview({ ...unsupportedBody('not_a2a'), unsupported_reason: 'tenant_only' })
+    ).toBeNull();
   });
 
   it('parses the last caller fetch', () => {
@@ -202,6 +212,23 @@ describe('fetchAgentCardPreview and refreshAgentCardPreview', () => {
   });
 });
 
+describe('cardNamesGatewayScheme', () => {
+  it('is true for a card that carries the gateway scheme', () => {
+    expect(cardNamesGatewayScheme(AFTER_CARD)).toBe(true);
+    expect(cardNamesGatewayScheme({ securitySchemes: { agent_gateway: {} } })).toBe(true);
+  });
+
+  it.each([
+    ['no card', null],
+    ['no securitySchemes', { name: 'a' }],
+    ['only an upstream scheme', BEFORE_CARD],
+    ['a non-object securitySchemes', { securitySchemes: ['agent_gateway'] }],
+    ['a string securitySchemes', { securitySchemes: 'agent_gateway' }],
+  ])('is false for %s', (_name, card) => {
+    expect(cardNamesGatewayScheme(card as Record<string, unknown> | null)).toBe(false);
+  });
+});
+
 describe('safeHttpUrl', () => {
   it('accepts http and https', () => {
     expect(safeHttpUrl('https://gw.example/a/b?x=1')).toBe('https://gw.example/a/b?x=1');
@@ -267,6 +294,19 @@ describe('describeFetchCause', () => {
     );
     expect(describeFetchCause(failed('auth_failed'), auth({ result: 'failed' }))).toBe(
       'The gateway could not get its credential, so it did not ask the agent. Check Target Authentication on the Managed Agent.'
+    );
+  });
+
+  it("names a remote gateway's refusal of this gateway's authorization", () => {
+    const remote = auth({ kind: 'remote_gateway', result: 'not_configured' });
+    expect(describeFetchCause(failed('auth_failed', 401), remote)).toBe(
+      "The remote gateway refused this gateway's authorization (HTTP 401). Check the sign-in settings of the remote surface."
+    );
+    expect(describeFetchCause(failed('auth_failed', 403), remote)).toBe(
+      CARD_PEER_REFUSED_TEXT.replace('{s}', '403')
+    );
+    expect(describeFetchCause(failed('auth_failed', 401), auth({ result: 'sent' }))).toBe(
+      CARD_REJECTED_CREDENTIAL_TEXT
     );
   });
 

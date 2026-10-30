@@ -232,7 +232,7 @@ least effort. Effort is in engineer-days. For D1 to D4 the option first built is
 | D3-A (earlier default, rejected) | The resource is the first external URL of the Access Point's listener, plus the route, plus `$alias` for a variant. On a declaring route `bind_audience` replaces the method's audiences with exactly that resource. | A token minted for a sibling resource or another variant is refused. One URL for card, metadata, challenge and audience. | Reordering or adding an external URL changes every audience without a save or a check. A listener with several public hosts declares only its first, and the operator cannot pick the host. | 3 |
 | D3-B | Accept any of the listener's external URLs as the resource | Works for multi-host listeners | The metadata, the card and the challenge would name one host while tokens for another pass | 4 |
 | D3-C | Keep the method's other audiences on a declaring route, as any-of matching | Audiences such as Entra v2 GUIDs keep working | A token minted for any other listed audience passes the declaring Access Point | 2 |
-| **D3-D (Chosen)** | The stored, declared resource, validated at save against the listener's external URLs (any of them) with the route as path; `<resource>$<alias>` per variant; `audiences` must be empty; a token is accepted when the resource is one of its `aud` values | A token for a sibling resource or variant is refused. Audiences do not depend on the order of `external_urls`. One value in the metadata, the card, the dashboard and the authorization server's registration. The operator picks the host. | Providers that put an application GUID in `aud`, such as Entra v2, need an identifier URI equal to the resource | 3 |
+| **D3-D (Chosen)** | The stored, declared resource, validated at save against the listener's external URLs (any of them) with the route as path; `<resource>$<alias>` per variant; `audiences` must be empty; a token is accepted when the resource is one of its `aud` values | A token for a sibling resource or variant is refused. Audiences do not depend on the order of `external_urls`. One value in the metadata, the card, the dashboard and the authorization server's registration. The operator picks the host. | Providers that put an application GUID in `aud`, such as Entra v2.0, are refused until audience aliases exist; Entra v1.0 works with an identifier URI equal to the resource | 3 |
 
 | Aspect | Weight | D3-A | D3-B | D3-C | D3-D | Info |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -363,7 +363,7 @@ this filter runs.
     `oauth2MetadataUrl`, `securityRequirements` with `schemes`) match the a2a-python and a2a-js
     parsers.
   - An authorization server can mint a token whose `aud` is the declared resource: Hydra and
-    Auth0 through the requested audience, Entra through an `https` identifier URI equal to it.
+    Auth0 through the requested audience, Entra v1.0 through an `https` identifier URI equal to it (issuer `https://sts.windows.net/<tenant id>/`, short names in `scp`).
   - Auth0 adds its `/userinfo` audience when `openid` is requested, so `aud` matching is any-of.
 
 ## Decision
@@ -730,8 +730,8 @@ The contract ships in one release. What it changes and what gates it:
 - **Existing MCP `protected_resource` records** keep their metadata and challenge, except for the
   MCP responses listed under [Consequences](#negative-with-mitigations). A record whose stored
   `authorization_servers` differs from its strategy's issuer loads and advertises the issuer;
-  the save report warns `authorization_servers_stale`, and the next save must send the issuer
-  or omit the list.
+  the save report warns `authorization_servers_stale`, and later saves keep it while unchanged;
+  send the issuer, or `protected_resource` without the list, to clear the warning.
 - **Surfaces that set no `protected_resource`** keep their responses, except for the other
   changes listed there. D2-A was never released, so no released record declares through
   `required_scopes` alone, and operators of the previous release see no change in which MCP
@@ -880,5 +880,13 @@ question below is still open, and the current behaviour it names stays until it 
 - Declarations for Transit Points and for the gateway's own STS.
 - Carrying the sending gateway's caller authentication outcome over Fabric, and a two-gateway
   test harness that configures a declaring receiving gateway.
+- Microsoft Entra v2.0 tokens. Today an Entra token is accepted only when its `aud` is the
+  declared resource URL, which works for v1.0 tokens (issuer `https://sts.windows.net/<tenant id>/`)
+  whose App ID URI equals the resource. v2.0 tokens (issuer
+  `https://login.microsoftonline.com/<tenant id>/v2.0`) carry the API client ID in `aud` and are refused until per-Access-Point audience aliases
+  (for example `protected_resource.audience_aliases`, matched exactly, never advertised, owned by
+  one Access Point, and accepted on a variant only when it names its own) and a split between the
+  advertised scope and the checked scope are added. Both are planned as a follow-up change in
+  `src/protocols/protected_resource.rs`, so they cover MCP too.
 
 Each item gets its own ADR when it changes a contract.

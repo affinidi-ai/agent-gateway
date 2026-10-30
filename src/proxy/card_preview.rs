@@ -217,6 +217,9 @@ pub struct CallerFetch {
 pub enum UnsupportedReason {
     NotA2a,
     NotRunning,
+    /// A tenant token asked for an appliance-wide surface, whose fetch would use
+    /// the appliance's Target credential.
+    OperatorOnly,
 }
 
 /// `GET /v1/surfaces/{surface_id}/agent-card` and its refresh. Every field is
@@ -482,6 +485,46 @@ pub(crate) async fn fetch_preview_within(
         display_limit_bytes: DISPLAY_LIMIT_BYTES,
         last_caller_fetch: None,
     }
+}
+
+/// The wire spelling of a preview enum, empty for none.
+fn spelling<T: Serialize>(value: Option<T>) -> String {
+    value
+        .and_then(|value| serde_json::to_value(value).ok())
+        .and_then(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
+}
+
+/// Records on the `audit` target that a management user started a card fetch.
+/// Never a credential, a provider name, a token expiry, a URL or card content.
+pub(crate) fn audit_preview_fetch(
+    user_id: &str,
+    tenant_id: Option<&str>,
+    request: PreviewRequest,
+    preview: &AgentCardPreview,
+) {
+    let auth = preview.auth.as_ref();
+    let fetch = preview.fetch.as_ref();
+    info!(
+        target: "audit",
+        event = "agent_card.preview_fetch",
+        request = match request {
+            PreviewRequest::Read => "read",
+            PreviewRequest::Refresh => "refresh",
+        },
+        caller_user_id = %user_id,
+        tenant_id = tenant_id.unwrap_or(""),
+        surface_id = %preview.surface_id,
+        auth_kind = %spelling(auth.map(|auth| auth.kind)),
+        auth_result = %spelling(auth.map(|auth| auth.result)),
+        fetch_status = %spelling(fetch.map(|fetch| fetch.status)),
+        cause = %spelling(fetch.and_then(|fetch| fetch.cause)),
+        "Agent card preview fetch"
+    );
 }
 
 /// The SHA-256 digest of the running surface a snapshot was taken from.
@@ -934,6 +977,7 @@ mod tests {
                 json!(CardAuthResult::Failed),
                 json!(UnsupportedReason::NotA2a),
                 json!(UnsupportedReason::NotRunning),
+                json!(UnsupportedReason::OperatorOnly),
                 json!(CardFetchStatus::Ok),
             ]),
             [
@@ -948,6 +992,7 @@ mod tests {
                 "failed",
                 "not_a2a",
                 "not_running",
+                "operator_only",
                 "ok"
             ]
         );
@@ -1229,6 +1274,105 @@ mod tests {
             (sent.result, sent.provider_name, sent.token_expires_at),
             (CardAuthResult::Sent, None, None),
             "only a credential provider names a provider and an expiry"
+        );
+    }
+
+    const PREVIEW_FETCH_EVENT: &str = "agent_card.preview_fetch";
+
+    #[test]
+    fn test_a_preview_fetch_is_audited_without_its_credential_details() {
+        let audit = crate::component_tests::helpers::audit_events::AuditEvents::capture();
+        let mut fetched = preview("surface-1");
+        fetched.auth = Some(CardAuthReport {
+            kind: CardAuthKind::CredentialProvider,
+            result: CardAuthResult::Sent,
+            provider_name: Some("Agent provider".into()),
+            token_expires_at: Some("2027-01-15T08:00:00Z".into()),
+            failure: None,
+        });
+
+        audit_preview_fetch("user-1", Some("tenant-a"), PreviewRequest::Refresh, &fetched);
+
+        let events = audit.named(PREVIEW_FETCH_EVENT);
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        for (field, expected) in [
+            ("request", "refresh"),
+            ("caller_user_id", "user-1"),
+            ("tenant_id", "tenant-a"),
+            ("surface_id", "surface-1"),
+            ("auth_kind", "credential_provider"),
+            ("auth_result", "sent"),
+            ("fetch_status", "ok"),
+            ("cause", ""),
+        ] {
+            assert_eq!(event.get(field), Some(expected), "{field}");
+        }
+        for field in ["provider_name", "token_expires_at"] {
+            assert_eq!(event.get(field), None, "{field}");
+        }
+        for (field, value) in
+            ["request", "caller_user_id", "tenant_id", "surface_id", "auth_kind", "message"].map(|field| {
+                (
+                    field,
+                    event
+                        .get(field)
+                        .unwrap_or_default(),
+                )
+            })
+        {
+            assert!(!value.contains("Agent provider"), "{field}: {value}");
+            assert!(!value.contains("2027-01-15"), "{field}: {value}");
+        }
+
+        let mut failed = preview("surface-2");
+        failed.fetch = Some(CardFetchReport {
+            status: CardFetchStatus::Failed,
+            cause: Some(CardFetchCause::AuthFailed),
+            http_status: Some(401),
+            duration_ms: 1,
+        });
+        audit_preview_fetch("user-2", None, PreviewRequest::Read, &failed);
+        let events = audit.named(PREVIEW_FETCH_EVENT);
+        assert_eq!(events.len(), 2);
+        for (field, expected) in [
+            ("request", "read"),
+            ("tenant_id", ""),
+            ("auth_kind", ""),
+            ("fetch_status", "failed"),
+            ("cause", "auth_failed"),
+        ] {
+            assert_eq!(events[1].get(field), Some(expected), "{field}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_a_snapshot_answer_audits_no_fetch() {
+        let audit = crate::component_tests::helpers::audit_events::AuditEvents::capture();
+        let service = CardPreviewService::new(FETCHES_PER_MINUTE);
+        let audited_fetch = || async {
+            let fetched = preview("surface-1");
+            audit_preview_fetch("u-audit", None, PreviewRequest::Read, &fetched);
+            fetched
+        };
+
+        let first = service
+            .preview(&key(1, "u-audit"), PreviewRequest::Read, audited_fetch)
+            .await
+            .expect("first read fetches");
+        let again = service
+            .preview(&key(1, "u-audit"), PreviewRequest::Read, audited_fetch)
+            .await
+            .expect("second read");
+
+        assert!(!first.cached);
+        assert!(again.cached);
+        assert_eq!(
+            audit
+                .named(PREVIEW_FETCH_EVENT)
+                .len(),
+            1,
+            "only the fetch is audited"
         );
     }
 

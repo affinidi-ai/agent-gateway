@@ -138,6 +138,7 @@ export interface CredentialProviderForm {
   assertion_issuer: string;
   subject: string;
   key_id: string;
+  audience: string;
   default_scopes: string;
   token_refresh_enabled: boolean;
   additional_params: string;
@@ -159,6 +160,7 @@ export const EMPTY_PROVIDER_FORM: CredentialProviderForm = {
   assertion_issuer: '',
   subject: '',
   key_id: '',
+  audience: '',
   default_scopes: '',
   token_refresh_enabled: true,
   additional_params: '',
@@ -242,6 +244,7 @@ export function providerFormFromWire(
     assertion_issuer: str(jwtBearer.assertion_issuer),
     subject: str(jwtBearer.assertion_subject),
     key_id: str(jwtBearer.key_id),
+    audience: str(jwtBearer.audience),
     default_scopes: Array.isArray(data.default_scopes) ? data.default_scopes.join(', ') : '',
     token_refresh_enabled:
       typeof data.token_refresh_enabled === 'boolean' ? data.token_refresh_enabled : true,
@@ -259,6 +262,35 @@ export function deriveProviderId(name: string): string {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-|-$/g, '');
+}
+
+export const GOOGLE_TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token';
+
+/**
+ * The token endpoint after a Provider Type change. A new provider whose endpoint the operator has
+ * not edited gets Google's endpoint when it becomes JWT Bearer, and loses that prefill again when
+ * it changes to another type.
+ */
+export function tokenEndpointForType(
+  form: CredentialProviderForm,
+  nextType: CredentialProviderType,
+  mayPrefill: boolean
+): string {
+  if (!mayPrefill) return form.token_endpoint;
+  if (nextType === 'oauth2_jwt_bearer') {
+    return form.token_endpoint.trim() ? form.token_endpoint : GOOGLE_TOKEN_ENDPOINT;
+  }
+  return form.token_endpoint === GOOGLE_TOKEN_ENDPOINT ? '' : form.token_endpoint;
+}
+
+function isValidAudience(audience: string): boolean {
+  let bytes = 0;
+  for (const ch of audience) {
+    const code = ch.codePointAt(0)!;
+    if (/\s/.test(ch) || code < 0x20 || (code >= 0x7f && code <= 0x9f)) return false;
+    bytes += code < 0x80 ? 1 : code < 0x800 ? 2 : code < 0x10000 ? 3 : 4;
+  }
+  return bytes <= 512;
 }
 
 export function validateProviderForm(form: CredentialProviderForm): string | null {
@@ -282,6 +314,9 @@ export function validateProviderForm(form: CredentialProviderForm): string | nul
   if (caps.signingKey) {
     if (!form.signing_key_secret_ref) return 'Signing key secret is required.';
     if (!form.assertion_issuer.trim()) return 'Assertion issuer is required.';
+    if (form.audience.trim() && !isValidAudience(form.audience.trim())) {
+      return 'Audience must be at most 512 bytes, with no spaces or control characters.';
+    }
     if (form.client_id_secret_ref && !form.client_secret_secret_ref) {
       return 'Client Secret secret is required when a Client ID secret is set.';
     }
@@ -311,7 +346,7 @@ export function buildProviderBody(
     provider_type: form.provider_type,
     default_scopes: parseScopes(form.default_scopes),
     token_refresh_enabled: form.token_refresh_enabled,
-    description: form.description.trim() || undefined,
+    description: form.description.trim() || (isNew ? undefined : null),
   };
   if (caps.tokenEndpoint) body.token_endpoint = form.token_endpoint.trim();
   if (
@@ -320,11 +355,12 @@ export function buildProviderBody(
   ) {
     body.client_id_secret_ref = form.client_id_secret_ref;
     body.client_secret_secret_ref = form.client_secret_secret_ref;
-  } else if (caps.clientRefs === 'optional' && !isNew) {
+  } else if (!isNew) {
     body.client_id_secret_ref = null;
     body.client_secret_secret_ref = null;
   }
   if (caps.apiKey && form.api_key_secret_ref) body.api_key_secret_ref = form.api_key_secret_ref;
+  else if (!caps.apiKey && !isNew) body.api_key_secret_ref = null;
   if (caps.signingKey) {
     const jwtBearer: Record<string, string> = {
       signing_key_secret_ref: form.signing_key_secret_ref,
@@ -333,13 +369,20 @@ export function buildProviderBody(
     };
     if (form.subject.trim()) jwtBearer.assertion_subject = form.subject.trim();
     if (form.key_id.trim()) jwtBearer.key_id = form.key_id.trim();
+    if (form.audience.trim()) jwtBearer.audience = form.audience.trim();
     body.jwt_bearer = jwtBearer;
   }
-  if (form.authorization_endpoint.trim()) {
-    body.authorization_endpoint = form.authorization_endpoint.trim();
+  const authorizationEndpoint = form.authorization_endpoint.trim();
+  if (isNew) {
+    if (authorizationEndpoint) body.authorization_endpoint = authorizationEndpoint;
+  } else {
+    body.authorization_endpoint = (caps.authorizationEndpoint && authorizationEndpoint) || null;
   }
-  if (form.additional_params.trim()) {
-    const params = JSON.parse(form.additional_params) as Record<string, string>;
+  const rawParams = form.additional_params.trim();
+  if (!isNew) {
+    body.additional_params = caps.additionalParams && rawParams ? JSON.parse(rawParams) : {};
+  } else if (rawParams) {
+    const params = JSON.parse(rawParams) as Record<string, string>;
     if (Object.keys(params).length > 0) body.additional_params = params;
   }
   if (caps.callback && form.callback_host && callbackPathPrefix !== null) {

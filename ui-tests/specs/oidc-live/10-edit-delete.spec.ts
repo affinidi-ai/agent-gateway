@@ -93,7 +93,8 @@ test.describe('Edit and delete', () => {
         const confirm = page.getByTestId('strategy-delete-confirm');
         await expect(confirm).toContainText('Used by 1 surface:');
         await expect(confirm).toContainText(names.surface);
-        await expect(confirm).toContainText('A caller that presents a token is refused with 500');
+        await expect(confirm).toContainText('a caller that presents a token is refused with 500');
+        await expect(confirm).toContainText('A surface that advertises an authorization server can no longer be served');
 
         await page.getByTestId('strategy-delete-cancel-button').click();
         await expect(confirm).toHaveCount(0);

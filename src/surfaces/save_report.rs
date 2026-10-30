@@ -305,9 +305,9 @@ fn declaration_warnings(
 }
 
 /// A stored `authorization_servers` that no longer names the issuer the
-/// strategy trusts, which the gateway advertises instead. Any later save of the
-/// surface that keeps the stored list is refused, including one that does not
-/// send it, until the list names that issuer or is removed.
+/// strategy trusts, which the gateway advertises instead. A save that keeps the
+/// stored list unchanged is accepted and warned again; a save that changes it
+/// must send that issuer or no list.
 fn stale_authorization_servers(
     view: &AgentSurface,
     declaration: &Declaration,
@@ -326,7 +326,8 @@ fn stale_authorization_servers(
         WarningCode::AuthorizationServersStale,
         format!(
             "authorization_servers lists {stored:?} but the JWT verification strategy now trusts {issuer}; the \
-             gateway advertises {issuer}. Send authorization_servers as [\"{issuer}\"] or omit it."
+             gateway advertises {issuer}. Send authorization_servers as [\"{issuer}\"], or send protected_resource \
+             without it."
         ),
         AUTHORIZATION_SERVERS_PATH,
         alias,
@@ -736,7 +737,7 @@ pub(crate) mod tests {
         assert!(
             fail_open
                 .message
-                .contains("36 of 36"),
+                .contains("69 of 69"),
             "{}",
             fail_open.message
         );
@@ -763,7 +764,7 @@ pub(crate) mod tests {
         assert!(
             fabric
                 .message
-                .contains("kind missing on message/send; 36 of 36"),
+                .contains("kind missing on message/send; 69 of 69"),
             "{}",
             fabric.message
         );
@@ -1131,7 +1132,7 @@ pub(crate) mod tests {
             stale.warnings[0].message,
             "authorization_servers lists [\"https://old.example/\"] but the JWT verification strategy now trusts \
              https://as.example/; the gateway advertises https://as.example/. Send authorization_servers as \
-             [\"https://as.example/\"] or omit it."
+             [\"https://as.example/\"], or send protected_resource without it."
         );
 
         let current = report(&listing(json!([ISSUER])), &strategy(true)).await;

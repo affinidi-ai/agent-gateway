@@ -146,6 +146,13 @@ describe('field checks', () => {
     }
   });
 
+  it('accepts an http issuer only when asked to', () => {
+    expect(authorizationServerProblem('http://idp.example', true)).toBeNull();
+    expect(authorizationServerProblem('http://idp.example')).toMatch(/https issuer URL/);
+    expect(authorizationServerProblem('ftp://idp.example', true)).toMatch(/https issuer URL/);
+    expect(authorizationServerProblem('http://user@idp.example', true)).toMatch(/https issuer URL/);
+  });
+
   it('accepts OAuth scope tokens only', () => {
     expect(scopeProblem('tools')).toBeNull();
     expect(scopeProblem('mcp:tools.read')).toBeNull();
@@ -233,7 +240,7 @@ describe('the strategy issuer rule', () => {
         .map(p => p.message);
     expect(servers([issuer])).toEqual([]);
     expect(servers(['https://other.example'])).toEqual([
-      `The stored authorization server https://other.example is not the issuer the JWT verification strategy trusts (${issuer}), so the save is refused. Use the strategy's issuer.`,
+      `The stored authorization server https://other.example is not the issuer the JWT verification strategy trusts (${issuer}), so the gateway advertises the strategy's issuer and keeps this stored list only while it is unchanged. Use the strategy's issuer or clear the list.`,
     ]);
     for (const listed of [
       ['https://other.example', issuer],
@@ -250,6 +257,31 @@ describe('the strategy issuer rule', () => {
         })
       )
     ).toEqual([]);
+  });
+});
+
+describe('a stored http authorization server', () => {
+  const httpIssuer = 'http://idp.local:8080/realms/a';
+  const serverProblems = (authorization_servers: string[], strategyIssuer?: string) =>
+    discoveryProblems(
+      jwtConfig({ protected_resource: { ...SETTING, authorization_servers } }),
+      strategyIssuer
+    )
+      .filter(p => p.field === 'protected_resource.authorization_servers')
+      .map(p => p.message);
+
+  it('accepts a sole http entry that is the strategy issuer, or with the issuer unknown', () => {
+    expect(serverProblems([httpIssuer])).toEqual([]);
+    expect(serverProblems([httpIssuer], httpIssuer)).toEqual([]);
+  });
+
+  it('keeps the https rule for a longer list or an entry that is not the strategy issuer', () => {
+    expect(serverProblems(['http://a.example', 'https://b.example'])).toEqual([
+      expect.stringContaining('must be an https issuer URL'),
+    ]);
+    expect(serverProblems(['http://other.example'], 'http://idp.example')).toEqual([
+      expect.stringContaining('must be an https issuer URL'),
+    ]);
   });
 });
 

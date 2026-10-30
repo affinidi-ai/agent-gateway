@@ -13,6 +13,12 @@
 
 Accepted on 2026-10-30. This is the first ADR in this repository. It amends, extends and supersedes nothing.
 
+Amended on 2026-10-30: a JWT bearer assertion carries `sub` only when `assertion_subject` is
+set, and the optional `jwt_bearer.audience` sets `aud`, which defaults to the token endpoint.
+Statements below that the subject defaults to the issuer, that there is no audience field or
+that `aud` is always the token endpoint are superseded by
+[JWT bearer providers](../CREDENTIAL_DELEGATION.md#jwt-bearer-providers).
+
 - Extended by [2. Resolve hop 2 Target Authentication through one gateway-scoped credential resolver](0002-hop-two-target-authentication.md)
 - Extended by [3. Specify the hop 1 resource server contract for scopes, challenges, metadata and card declarations](0003-hop-one-resource-server-contract.md)
 

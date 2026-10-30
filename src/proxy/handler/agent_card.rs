@@ -125,6 +125,7 @@ impl CardFailure {
 pub(crate) enum FetchFault {
     CredentialRejected,
     Status { status: u16, credential_sent: bool },
+    PeerRefused { status: u16 },
     Unreachable,
     TimedOut,
     TooLarge,
@@ -162,6 +163,7 @@ pub(crate) fn classify(fault: FetchFault) -> (CardFetchCause, Option<u16>) {
         FetchFault::Status { status, credential_sent } => {
             (classify_status(status, credential_sent).unwrap_or(CardFetchCause::UpstreamError), Some(status))
         }
+        FetchFault::PeerRefused { status } => (CardFetchCause::AuthFailed, Some(status)),
         FetchFault::Unreachable => (CardFetchCause::Unreachable, None),
         FetchFault::TimedOut => (CardFetchCause::Timeout, None),
         FetchFault::TooLarge => (CardFetchCause::TooLarge, None),
@@ -625,10 +627,10 @@ fn record_served_effects(
 }
 
 /// The gateway's own read of the agent card from the Target.
-struct TargetCardFetch<'a> {
-    state: &'a ProxyState,
-    source_addr: &'a str,
-    mode: CardMode,
+pub(super) struct TargetCardFetch<'a> {
+    pub(super) state: &'a ProxyState,
+    pub(super) source_addr: &'a str,
+    pub(super) mode: CardMode,
 }
 
 impl TargetCardFetch<'_> {
@@ -669,6 +671,31 @@ impl TargetCardFetch<'_> {
             self.fetch_over_http(headers, target_url, auth)
                 .await
         }
+    }
+
+    /// The answer to a Fabric peer that refused the gateway's authorization, or
+    /// `None`. Only a served card records the refusal.
+    fn refuse_peer(
+        &self,
+        status: StatusCode,
+        challenges: &HeaderMap,
+        trace_id: &str,
+    ) -> Option<Response> {
+        if !self.mode.serves() {
+            return crate::source_auth::challenge::peer_refusal(status, challenges)
+                .map(|_| crate::proxy::fabric_peer_refusal::peer_refused_response());
+        }
+        let surface = &self.state.surface;
+        crate::proxy::fabric_peer_refusal::refuse_peer_authorization(
+            status,
+            challenges,
+            &crate::audit::request_events::RequestFacts {
+                surface_id: &surface.surface_id,
+                channel_name: &surface.name,
+                trace_id: Some(trace_id),
+                via_fabric: false,
+            },
+        )
     }
 
     async fn fetch_via_fabric(
@@ -714,8 +741,25 @@ impl TargetCardFetch<'_> {
                 create_error_response(StatusCode::BAD_GATEWAY, &format!("Failed to fetch from upstream: {}", e)),
             )
         })?;
+        self.read_fabric_answer(&response, &trace_id)
+    }
 
+    /// The card in a Fabric peer's answer to the card fetch, or why there is none.
+    pub(super) fn read_fabric_answer(
+        &self,
+        response: &crate::proxy::fabric_forward::FabricForwardResponse,
+        trace_id: &str,
+    ) -> Result<JsonValue, CardFailure> {
+        let channel_name = self
+            .state
+            .surface
+            .name
+            .as_str();
         let status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::BAD_GATEWAY);
+        let challenges = crate::proxy::fabric_peer_refusal::peer_challenges_of(&response.headers);
+        if let Some(live) = self.refuse_peer(status, &challenges, trace_id) {
+            return Err(self.fail(FetchFault::PeerRefused { status: status.as_u16() }, live));
+        }
         if !status.is_success() {
             error!(channel = channel_name, status = %status, "Fabric upstream returned error for agent card - gateway fault");
             return Err(self.fail(
@@ -944,12 +988,13 @@ fn record_agent_card_gateway_fault(
 mod tests {
     use super::*;
 
-    const EVERY_FAULT: [FetchFault; 10] = [
+    const EVERY_FAULT: [FetchFault; 11] = [
         FetchFault::CredentialRejected,
         FetchFault::Status {
             status: 500,
             credential_sent: false,
         },
+        FetchFault::PeerRefused { status: 403 },
         FetchFault::Unreachable,
         FetchFault::TimedOut,
         FetchFault::TooLarge,
@@ -1011,9 +1056,11 @@ mod tests {
             }),
             (CardFetchCause::UpstreamError, Some(503))
         );
+        assert_eq!(classify(FetchFault::PeerRefused { status: 401 }), (CardFetchCause::AuthFailed, Some(401)));
         let expected = [
             CardFetchCause::AuthFailed,
             CardFetchCause::UpstreamError,
+            CardFetchCause::AuthFailed,
             CardFetchCause::Unreachable,
             CardFetchCause::Timeout,
             CardFetchCause::TooLarge,
@@ -1029,7 +1076,11 @@ mod tests {
         {
             let (classified, http_status) = classify(fault);
             assert_eq!(classified, cause, "{fault:?}");
-            assert_eq!(http_status.is_some(), matches!(fault, FetchFault::Status { .. }), "{fault:?}");
+            assert_eq!(
+                http_status.is_some(),
+                matches!(fault, FetchFault::Status { .. } | FetchFault::PeerRefused { .. }),
+                "{fault:?}"
+            );
         }
     }
 

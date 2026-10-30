@@ -98,7 +98,7 @@ export function failedBody(cause: string, httpStatus: number | null, auth: Json 
   });
 }
 
-export function unsupportedBody(reason: 'not_a2a' | 'not_running'): Json {
+export function unsupportedBody(reason: 'not_a2a' | 'not_running' | 'operator_only'): Json {
   return {
     surface_id: 's-123',
     supported: false,

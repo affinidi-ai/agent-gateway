@@ -1,6 +1,6 @@
 //! Where a declaring Access Point answers a caller that fails source
 //! authentication: before its body is read, before any admission refusal, and
-//! never on a public path.
+//! never on the well-known card path.
 
 use std::time::Duration;
 
@@ -280,21 +280,44 @@ async fn an_unresolvable_variant_of_a_declaring_a2a_route_gets_the_problem_body_
     assert_eq!(unresolved.header("www-authenticate"), bare.header("www-authenticate"));
 }
 
-/// A GET or HEAD of a public path skips source authentication on a declaring
-/// Access Point; the same path with any other method is challenged.
+/// On a declaring Access Point only a GET or HEAD of its well-known card skips
+/// source authentication; a path that only ends like a discovery document, and
+/// the card path with any other method, is challenged before the Target is asked.
 #[tokio::test]
-async fn a_public_path_of_a_declaring_access_point_is_never_challenged() {
+async fn only_the_well_known_card_of_a_declaring_access_point_is_never_challenged() {
     let target =
         MockServer::start_with_response(json!({"name": "orders", "supportedInterfaces": []}).to_string()).await;
-    for path in ["/a2a/.well-known/agent-card.json", "/a2a/agent.json"] {
+    for method in ["GET", "HEAD"] {
         let (router, _strategies) = authenticating_router(a2a_surface_declaring_on_its_base(&target.url())).await;
 
-        let public = answer(router, request(Protocol::A2a, "GET", path, None, axum::body::Body::empty())).await;
+        let public = answer(
+            router,
+            request(Protocol::A2a, method, "/a2a/.well-known/agent-card.json", None, axum::body::Body::empty()),
+        )
+        .await;
 
-        assert_ne!(public.status, StatusCode::UNAUTHORIZED, "{path}: {}", String::from_utf8_lossy(&public.body));
-        assert_eq!(public.header("www-authenticate"), None, "{path}");
-        assert!(auth_failure_records(&public.events).is_empty(), "{path}: {:?}", public.events);
+        assert_ne!(public.status, StatusCode::UNAUTHORIZED, "{method}: {}", String::from_utf8_lossy(&public.body));
+        assert_eq!(public.header("www-authenticate"), None, "{method}");
+        assert!(auth_failure_records(&public.events).is_empty(), "{method}: {:?}", public.events);
     }
+
+    let asked = target
+        .request_count
+        .load(std::sync::atomic::Ordering::SeqCst);
+    for path in ["/a2a/agent.json", "/a2a/tasks/discovery", "/a2a/x/.well-known/ucp"] {
+        let (router, _strategies) = authenticating_router(a2a_surface_declaring_on_its_base(&target.url())).await;
+
+        let challenged = answer(router, request(Protocol::A2a, "GET", path, None, axum::body::Body::empty())).await;
+
+        assert_missing_token_challenge(&format!("GET {path}"), Protocol::A2a, &challenged);
+    }
+    assert_eq!(
+        target
+            .request_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        asked,
+        "a challenged discovery-suffix path never reaches the Target"
+    );
 
     let (router, _strategies) = authenticating_router(a2a_surface_declaring_on_its_base(&target.url())).await;
     let posted = answer(
@@ -303,4 +326,159 @@ async fn a_public_path_of_a_declaring_access_point_is_never_challenged() {
     )
     .await;
     assert_missing_token_challenge("POST of a public path", Protocol::A2a, &posted);
+}
+
+/// An authenticated GET of a discovery-suffix path on a declaring Access Point is
+/// an ordinary request: surface policy decides it.
+#[tokio::test]
+async fn an_authenticated_discovery_suffix_path_of_a_declaring_access_point_meets_surface_policy() {
+    let fixture = JwksFixture::start().await;
+    let target =
+        MockServer::start_with_response(json!({"name": "orders", "supportedInterfaces": []}).to_string()).await;
+    let policies_directory = tempfile::tempdir().unwrap();
+    let policies = std::sync::Arc::new(
+        crate::policies::policy_definitions::FileSystemPolicyDefinitionStore::new(
+            policies_directory
+                .path()
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .await
+        .unwrap(),
+    );
+    policies
+        .save(
+            serde_json::from_value(json!({
+                "id": "deny-all", "name": "Deny all", "policy_type": "agent_surface",
+                "policy": "package surface.policy\ndefault allow = false", "created_at": "2026-10-30T00:00:00Z"
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut surface = a2a_surface_declaring_on_its_base(&target.url());
+    surface.target.policy = serde_json::from_value(json!({"policy_definition_id": "deny-all"})).unwrap();
+    let manager = std::sync::Arc::new(crate::policies::SurfacePolicyManager::new());
+    manager.set_policy_definition_store(policies);
+    manager
+        .update_channel_policy(&surface)
+        .await
+        .unwrap();
+    let (mut router, _strategies) = authenticating_router_trusting(surface, Some(&fixture)).await;
+    router.policy_manager = Some(manager);
+    let token = idp_token(&fixture, "https://gateway.example/a2a");
+
+    let denied =
+        answer(router, request(Protocol::A2a, "GET", "/a2a/tasks/discovery", Some(&token), axum::body::Body::empty()))
+            .await;
+
+    assert_eq!(denied.status, StatusCode::FORBIDDEN, "{}", String::from_utf8_lossy(&denied.body));
+    assert!(auth_failure_records(&denied.events).is_empty(), "{:?}", denied.events);
+    assert_eq!(
+        target
+            .request_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a denied request never reaches the Target"
+    );
+}
+
+/// A declaring Access Point without required scopes refuses an ID-shaped token
+/// with the invalid-token challenge, before surface policy, while an access token
+/// for the same resource is served.
+#[tokio::test]
+async fn a_declaring_access_point_without_scopes_challenges_an_id_token_as_invalid() {
+    let fixture = JwksFixture::start().await;
+    let resource = "https://gateway.example/a2a";
+    let id_token = crate::component_tests::helpers::jwt::sign_jwt(
+        json!({
+            "iss": "https://idp.example", "sub": "client", "aud": resource, "nonce": "n-1",
+            "exp": crate::component_tests::helpers::jwt::now_secs() + 300,
+            "iat": crate::component_tests::helpers::jwt::now_secs(),
+        }),
+        &fixture.kid,
+    );
+    let (router, _strategies) = authenticating_router_trusting(Protocol::A2a.declaring_surface(), Some(&fixture)).await;
+
+    let refused = answer(
+        router,
+        request(Protocol::A2a, "POST", "/a2a", Some(&id_token), axum::body::Body::from(message(Protocol::A2a))),
+    )
+    .await;
+
+    assert_eq!(refused.status, StatusCode::UNAUTHORIZED, "{}", String::from_utf8_lossy(&refused.body));
+    let challenge = refused
+        .header("www-authenticate")
+        .unwrap_or_default();
+    assert!(challenge.contains("error=\"invalid_token\""), "{challenge}");
+    assert_eq!(
+        auth_failure_records(&refused.events),
+        vec![(Some("prod".to_string()), AuthScheme::Jwt, "invalid_credential".to_string(), true)]
+    );
+    assert!(refusals(&refused.events).is_empty(), "{:?}", refused.events);
+
+    let (router, _strategies) = authenticating_router_trusting(Protocol::A2a.declaring_surface(), Some(&fixture)).await;
+    let served = answer(
+        router,
+        request(
+            Protocol::A2a,
+            "POST",
+            "/a2a",
+            Some(&idp_token(&fixture, resource)),
+            axum::body::Body::from(message(Protocol::A2a)),
+        ),
+    )
+    .await;
+    assert!(auth_failure_records(&served.events).is_empty(), "{:?}", served.events);
+}
+
+/// On a declaring Access Point that terminates traces, an authenticated GET of a
+/// discovery-suffix path reaches the Target and records one trace bridge, while
+/// the well-known card records none.
+#[tokio::test]
+async fn only_an_authenticated_discovery_suffix_path_of_a_declaring_access_point_records_a_trace_bridge() {
+    let fixture = JwksFixture::start().await;
+    let target =
+        MockServer::start_with_response(json!({"name": "orders", "supportedInterfaces": []}).to_string()).await;
+    let terminating = || {
+        let mut surface = a2a_surface_declaring_on_its_base(&target.url());
+        surface
+            .access_point
+            .terminate_trace_id = true;
+        surface
+    };
+    let bridges = |answer: &Answer| {
+        answer
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(event.event, crate::delegation_vault::audit::DelegationAuditAction::TraceTerminated { .. })
+            })
+            .count()
+    };
+    let token = idp_token(&fixture, "https://gateway.example/a2a");
+
+    let (router, _strategies) = authenticating_router_trusting(terminating(), Some(&fixture)).await;
+    let discovery =
+        answer(router, request(Protocol::A2a, "GET", "/a2a/tasks/discovery", Some(&token), axum::body::Body::empty()))
+            .await;
+
+    assert_eq!(discovery.status, StatusCode::OK, "{}", String::from_utf8_lossy(&discovery.body));
+    assert_eq!(
+        target
+            .request_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_eq!(bridges(&discovery), 1, "{:?}", discovery.events);
+
+    let (router, _strategies) = authenticating_router_trusting(terminating(), Some(&fixture)).await;
+    let card = answer(
+        router,
+        request(Protocol::A2a, "GET", "/a2a/.well-known/agent-card.json", None, axum::body::Body::empty()),
+    )
+    .await;
+
+    assert_ne!(card.status, StatusCode::UNAUTHORIZED, "{}", String::from_utf8_lossy(&card.body));
+    assert_eq!(bridges(&card), 0, "{:?}", card.events);
 }

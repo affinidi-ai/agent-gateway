@@ -104,21 +104,25 @@ fn select_surface_agent_did(
 
 /// Refuse a verified token that does not grant every `required_scopes` entry.
 ///
-/// An Access Point that requires scopes expects access tokens, so a token shaped as
-/// an ID token fails as invalid before its scopes are read.
+/// An Access Point that requires scopes or declares itself a protected resource
+/// expects access tokens, so a token shaped as an ID token fails as invalid before
+/// its scopes are read.
 fn check_required_scopes(
     config: &JwtBearerAuthConfig,
     token: &str,
     claims: &serde_json::Value,
     scope_claims: &[String],
 ) -> SourceAuthResult<()> {
-    if config
+    let scopes_required = !config
         .required_scopes
-        .is_empty()
-    {
+        .is_empty();
+    if !scopes_required && !config.access_tokens_only {
         return Ok(());
     }
     access_token::check_access_token_shape(token, claims)?;
+    if !scopes_required {
+        return Ok(());
+    }
     let granted = access_token::granted_scopes(claims, scope_claims);
     let missing: Vec<String> = access_token::missing_scopes(&granted, &config.required_scopes)
         .into_iter()
@@ -2060,6 +2064,8 @@ MC4CAQAwBQYDK2VwBCIEIPiOVQaSEcxl/NogGyUAX88ouBy1bWJFMp4gi0pcCgcY
         for (claims, typ) in [
             (access_token(json!({"scope": "read", "nonce": "n-1"})), Some("JWT")),
             (access_token(json!({"scope": "read", "at_hash": "h"})), None),
+            (access_token(json!({"scope": "read", "s_hash": "h"})), Some("at+jwt")),
+            (access_token(json!({"scope": "read", "typ": "ID"})), None),
             (access_token(json!({"scope": "read"})), Some("id+jwt")),
         ] {
             let token = make_typed_token(claims.clone(), kid, typ);
@@ -2084,6 +2090,50 @@ MC4CAQAwBQYDK2VwBCIEIPiOVQaSEcxl/NogGyUAX88ouBy1bWJFMp4gi0pcCgcY
                 .await
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn id_token_shapes_are_invalid_on_a_declaring_access_point_without_scopes() {
+        let kid = "source-auth-test-key";
+        let (mw, strategy_id, _server) = jwt_test_setup().await;
+        let SourceAuthConfig::JwtBearer(unscoped) = scoped_config(strategy_id, &[]) else {
+            unreachable!();
+        };
+        let declaring = SourceAuthConfig::JwtBearer(JwtBearerAuthConfig {
+            access_tokens_only: true,
+            ..unscoped.clone()
+        });
+        let unscoped = SourceAuthConfig::JwtBearer(unscoped);
+
+        for (claims, typ) in [
+            (access_token(json!({"nonce": "n-1"})), Some("JWT")),
+            (access_token(json!({"c_hash": "h"})), None),
+            (access_token(json!({})), Some("id+jwt")),
+        ] {
+            let token = make_typed_token(claims.clone(), kid, typ);
+            assert!(
+                matches!(
+                    authenticate_token(&mw, &declaring, &token).await,
+                    Err(SourceAuthError::InvalidCredential { .. })
+                ),
+                "{claims} {typ:?}"
+            );
+            assert!(
+                authenticate_token(&mw, &unscoped, &token)
+                    .await
+                    .is_ok(),
+                "{claims} {typ:?}"
+            );
+        }
+
+        let access = make_typed_token(access_token(json!({})), kid, Some("at+jwt"));
+        let AuthenticatedIdentity::JwtBearer { subject, .. } = authenticate_token(&mw, &declaring, &access)
+            .await
+            .expect("an access token authenticates without required scopes")
+        else {
+            panic!("expected JwtBearer identity");
+        };
+        assert_eq!(subject, "client-1");
     }
 
     // ── Credential extraction unit tests ────────────────────────────────────

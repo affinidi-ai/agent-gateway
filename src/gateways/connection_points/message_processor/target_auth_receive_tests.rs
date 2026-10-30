@@ -770,8 +770,8 @@ async fn fabric_delegated_credentials_reach_the_target_and_a_jwt_bearer_binding_
             "api_key_secret_ref": "UPSTREAM_KEY"}),
         json!({"id": "cp-jwt", "name": "jwt", "provider_id": "jwt", "provider_type": "oauth2_jwt_bearer",
             "token_endpoint": receiver.auth_server.token_endpoint(),
-            "jwt_bearer": {"assertion_issuer": "https://agent.example", "signing_key_secret_ref": "JWT_SIGNING_KEY",
-                "signing_algorithm": "ES256", "key_id": "key-1"}}),
+            "jwt_bearer": {"assertion_issuer": "https://agent.example", "assertion_subject": "https://agent.example",
+                "signing_key_secret_ref": "JWT_SIGNING_KEY", "signing_algorithm": "ES256", "key_id": "key-1"}}),
     ] {
         let mut provider = provider;
         provider["created_at"] = "2026-10-21T00:00:00Z".into();

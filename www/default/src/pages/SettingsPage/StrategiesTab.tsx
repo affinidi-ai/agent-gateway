@@ -7,7 +7,12 @@ import { formatDateTime, topAndTail } from '../../utils/stringUtils';
 import { AppButton } from '../../components/shared/AppButton';
 import { EmptyState } from '../../components/shared/EmptyState';
 import { DOCS_URL } from '../../config/docs';
-import { surfacesUsingStrategy, type SurfaceRef } from '../../utils/strategyUsage';
+import {
+  providersUsingStrategy,
+  surfacesUsingStrategy,
+  type ProviderRef,
+  type SurfaceRef,
+} from '../../utils/strategyUsage';
 import { useInPageConfirm } from '../../hooks/useInPageConfirm';
 
 export interface JwksSource {
@@ -24,6 +29,17 @@ export interface JwtVerificationStrategy {
   authorization_server?: { issuer: string } | null;
   created_at: string;
   updated_at: string;
+}
+
+interface StrategyUsage {
+  surfaces: SurfaceRef[] | 'unknown';
+  providers: ProviderRef[] | 'unknown';
+}
+
+async function readList(url: string): Promise<unknown> {
+  const response = await apiClient.fetch(url);
+  if (!response.ok) throw new Error(response.statusText);
+  return response.json();
 }
 
 interface StrategiesTabProps {
@@ -46,7 +62,7 @@ const StrategiesTab: React.FC<StrategiesTabProps> = ({
   const setSearchTerm = setInternalSearchTerm;
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [confirming, setConfirming] = useState<JwtVerificationStrategy | null>(null);
-  const [usedBy, setUsedBy] = useState<SurfaceRef[] | 'loading' | 'unknown'>('loading');
+  const [usedBy, setUsedBy] = useState<StrategyUsage | 'loading'>('loading');
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const checkingId = useRef<string | null>(null);
   const headingRef = useRef<HTMLHeadingElement>(null);
@@ -84,15 +100,23 @@ const StrategiesTab: React.FC<StrategiesTabProps> = ({
     setConfirming(strategy);
     setDeleteError(null);
     setUsedBy('loading');
-    let result: SurfaceRef[] | 'unknown';
-    try {
-      const response = await apiClient.fetch('/api/v1/surfaces');
-      if (!response.ok) throw new Error(response.statusText);
-      result = surfacesUsingStrategy(await response.json(), strategy.id);
-    } catch {
-      result = 'unknown';
-    }
-    if (checkingId.current === strategy.id) setUsedBy(result);
+    const [surfaceList, providerList] = await Promise.allSettled([
+      readList('/api/v1/surfaces'),
+      readList('/api/v1/credential-providers'),
+    ]);
+    const providers =
+      providerList.status === 'fulfilled'
+        ? providersUsingStrategy(providerList.value, strategy.id)
+        : 'unknown';
+    const surfaces =
+      surfaceList.status === 'fulfilled'
+        ? surfacesUsingStrategy(
+            surfaceList.value,
+            strategy.id,
+            providers === 'unknown' ? [] : providers.map(p => p.id)
+          )
+        : 'unknown';
+    if (checkingId.current === strategy.id) setUsedBy({ surfaces, providers });
   };
 
   const cancelDelete = () => {
@@ -196,31 +220,38 @@ const StrategiesTab: React.FC<StrategiesTabProps> = ({
                 Delete JWT verification strategy &quot;{confirming.name}&quot;?
               </strong>
               <p className="mb-1 mt-2">
-                A surface that still references it cannot verify tokens. A caller that presents a
-                token is refused with 500, a caller without one is left to the surface&apos;s
-                policy, and the surface stops advertising an authorization server in its agent card
-                or protected resource metadata.
+                A surface that still references it cannot verify tokens. Without authorization
+                server discovery, a caller that presents a token is refused with 500 and a caller
+                without one is left to the surface&apos;s policy. A surface that advertises an
+                authorization server can no longer be served and refuses every caller until the
+                strategy is restored. A credential provider that uses it for consent identity can no
+                longer obtain credentials that need the user&apos;s consent.
               </p>
               <div aria-live="polite">
                 {usedBy === 'loading' && <p className="mb-1">Checking which surfaces use it…</p>}
-                {usedBy === 'unknown' && (
+                {usedBy !== 'loading' && usedBy.surfaces === 'unknown' && (
                   <p className="mb-1">Could not check which surfaces use it.</p>
                 )}
-                {Array.isArray(usedBy) && usedBy.length === 0 && (
-                  <p className="mb-1">No surface uses it.</p>
+                {usedBy !== 'loading' && usedBy.providers === 'unknown' && (
+                  <p className="mb-1">Could not check which credential providers use it.</p>
                 )}
-                {Array.isArray(usedBy) && usedBy.length > 0 && (
-                  <>
-                    <p className="mb-1">
-                      Used by {usedBy.length} {usedBy.length === 1 ? 'surface' : 'surfaces'}:
-                    </p>
-                    <ul className="mb-2">
-                      {usedBy.map(surface => (
-                        <li key={surface.id}>{surface.name}</li>
-                      ))}
-                    </ul>
-                  </>
+                {usedBy !== 'loading' && Array.isArray(usedBy.surfaces) && (
+                  <UsageList
+                    items={usedBy.surfaces}
+                    none="No surface uses it."
+                    heading={n => `Used by ${n} ${n === 1 ? 'surface' : 'surfaces'}:`}
+                  />
                 )}
+                {usedBy !== 'loading' &&
+                  Array.isArray(usedBy.providers) &&
+                  usedBy.providers.length > 0 && (
+                    <UsageList
+                      items={usedBy.providers}
+                      heading={n =>
+                        `Used by ${n} ${n === 1 ? 'credential provider' : 'credential providers'} for consent identity:`
+                      }
+                    />
+                  )}
               </div>
               {deleteError && (
                 <div className="text-danger mb-2" role="alert" data-testid="strategy-delete-error">
@@ -398,6 +429,24 @@ const StrategiesTab: React.FC<StrategiesTabProps> = ({
           )}
         </div>
       </div>
+    </>
+  );
+};
+
+const UsageList: React.FC<{
+  items: SurfaceRef[];
+  none?: string;
+  heading: (count: number) => string;
+}> = ({ items, none, heading }) => {
+  if (items.length === 0) return none ? <p className="mb-1">{none}</p> : null;
+  return (
+    <>
+      <p className="mb-1">{heading(items.length)}</p>
+      <ul className="mb-2">
+        {items.map(item => (
+          <li key={item.id}>{item.name}</li>
+        ))}
+      </ul>
     </>
   );
 };

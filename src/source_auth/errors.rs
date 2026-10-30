@@ -57,8 +57,8 @@ impl From<JwtBearerError> for SourceAuthError {
             JwtBearerError::InvalidToken(msg) => SourceAuthError::InvalidCredential {
                 reason: format!("Invalid token: {msg}"),
             },
-            JwtBearerError::KeyNotFound(kid) => SourceAuthError::InvalidCredential {
-                reason: format!("Key not found for kid: {kid}"),
+            JwtBearerError::KeyNotFound(_) => SourceAuthError::InvalidCredential {
+                reason: "Signing key not found".to_string(),
             },
             JwtBearerError::JwksFetchFailed(msg) => SourceAuthError::Internal {
                 reason: format!("JWKS fetch failed: {msg}"),
@@ -247,6 +247,14 @@ mod tests {
             .await
             .expect("read body");
         serde_json::from_slice(&bytes).expect("parse problem+json")
+    }
+
+    #[test]
+    fn key_not_found_reason_names_no_token_value() {
+        let error = SourceAuthError::from(JwtBearerError::KeyNotFound("evil\r\nx".to_string()));
+        let text = error.to_string();
+        assert_eq!(text, "Invalid credential: Signing key not found");
+        assert!(!text.contains("evil") && !text.contains(['\r', '\n']), "{text}");
     }
 
     #[test]

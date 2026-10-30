@@ -221,7 +221,7 @@ An MCP, A2A or AP2 Access Point declares its OAuth protection with
 | Field | Required | Meaning |
 | --- | --- | --- |
 | `resource` | Yes | The canonical HTTPS URL of the Access Point on a public origin of its listener, with the route as its path. It is the one audience a token must name and the resource the metadata and challenge publish. |
-| `authorization_servers` | No | Absent, the document names the JWT verification strategy's `expected_issuer`. Sent, it must be exactly `["<expected_issuer>"]`; a save refuses anything else. |
+| `authorization_servers` | No | Absent, the document names the JWT verification strategy's `expected_issuer`. A save that sends or changes it must send exactly `["<expected_issuer>"]`, or it is refused; a stored list that the save leaves unchanged is kept and reported as `authorization_servers_stale`. |
 | `scopes` | No | Extra scopes advertised as `scopes_supported` after the method's `required_scopes`; never enforced. |
 
 The setting makes the Access Point refuse a failed caller at source authentication; see

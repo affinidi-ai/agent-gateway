@@ -23,6 +23,7 @@ pub const ASSERTION_IAT_BACKDATE_SECS: i64 = 30;
 
 const MAX_CLAIM_BYTES: usize = 1024;
 const MAX_KEY_ID_BYTES: usize = 256;
+const MAX_AUDIENCE_BYTES: usize = 512;
 
 /// Signing algorithm for the assertion.
 #[derive(Serialize, Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -48,7 +49,7 @@ impl JwtBearerAlgorithm {
 pub struct JwtBearerSettings {
     /// The assertion `iss`, for example a Google service account email.
     pub assertion_issuer: String,
-    /// The assertion `sub`; the issuer when absent.
+    /// The assertion `sub`; the assertion carries no `sub` when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assertion_subject: Option<String>,
     /// Secret holding a PKCS#8 PEM private key or a Google service account JSON key.
@@ -58,17 +59,37 @@ pub struct JwtBearerSettings {
     /// The `kid` header; a Google service account key's `private_key_id` when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_id: Option<String>,
+    /// The assertion `aud`; the token endpoint when absent. Read trimmed, and a blank
+    /// value reads as absent.
+    #[serde(default, deserialize_with = "deserialize_audience", skip_serializing_if = "Option::is_none")]
+    pub audience: Option<String>,
+}
+
+fn deserialize_audience<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    Ok(Option::<String>::deserialize(deserializer)?
+        .map(|audience| audience.trim().to_string())
+        .filter(|audience| !audience.is_empty()))
 }
 
 impl JwtBearerSettings {
-    pub fn subject(&self) -> &str {
+    pub fn subject(&self) -> Option<&str> {
         self.assertion_subject
             .as_deref()
-            .unwrap_or(&self.assertion_issuer)
+            .filter(|subject| !subject.trim().is_empty())
+    }
+
+    pub fn audience<'a>(
+        &'a self,
+        token_endpoint: &'a str,
+    ) -> &'a str {
+        self.audience
+            .as_deref()
+            .unwrap_or(token_endpoint)
     }
 
     /// Checks the fields that need no secret: issuer, subject and key id are
-    /// non-empty printable text of bounded length, and the key reference is set.
+    /// non-empty printable text of bounded length, the audience is 1 to 512 bytes
+    /// with no whitespace or control characters, and the key reference is set.
     pub fn validate(&self) -> Result<(), &'static str> {
         if !is_claim_text(&self.assertion_issuer, MAX_CLAIM_BYTES) {
             return Err("jwt_bearer.assertion_issuer must be non-empty printable text of at most 1024 bytes");
@@ -86,6 +107,19 @@ impl JwtBearerSettings {
             .is_some_and(|key_id| !is_claim_text(key_id, MAX_KEY_ID_BYTES))
         {
             return Err("jwt_bearer.key_id must be non-empty printable text of at most 256 bytes");
+        }
+        if self
+            .audience
+            .as_deref()
+            .is_some_and(|audience| {
+                audience.is_empty()
+                    || audience.len() > MAX_AUDIENCE_BYTES
+                    || audience
+                        .chars()
+                        .any(|c| c.is_whitespace() || c.is_control())
+            })
+        {
+            return Err("jwt_bearer.audience must be 1 to 512 bytes with no whitespace or control characters");
         }
         if self
             .signing_key_secret_ref
@@ -118,6 +152,8 @@ pub struct JwtBearerSummary {
     pub signing_algorithm: JwtBearerAlgorithm,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audience: Option<String>,
 }
 
 impl From<&JwtBearerSettings> for JwtBearerSummary {
@@ -131,6 +167,7 @@ impl From<&JwtBearerSettings> for JwtBearerSummary {
                 .clone(),
             signing_algorithm: settings.signing_algorithm,
             key_id: settings.key_id.clone(),
+            audience: settings.audience.clone(),
         }
     }
 }
@@ -256,16 +293,17 @@ fn ecdsa_from_pkcs8(der: &[u8]) -> Result<EcdsaKeyPair, ring::error::KeyRejected
 /// The claims an assertion carries besides its timestamps and `jti`.
 pub struct AssertionClaims<'a> {
     pub issuer: &'a str,
-    pub subject: &'a str,
-    /// The token endpoint, exactly as the request is sent to it.
+    pub subject: Option<&'a str>,
+    /// The provider's audience, or the token endpoint exactly as the request is sent to it.
     pub audience: &'a str,
     pub scopes: &'a [String],
     pub key_id: Option<&'a str>,
 }
 
-/// Signs an RFC 7523 assertion: `iss`, `sub`, `aud`, `iat` backdated by
-/// [`ASSERTION_IAT_BACKDATE_SECS`], `exp` [`ASSERTION_LIFETIME_SECS`] after `now`,
-/// a random `jti`, and `scope` when scopes are requested. `now` is Unix seconds.
+/// Signs an RFC 7523 assertion: `iss`, `sub` when a subject is set, `aud`, `iat`
+/// backdated by [`ASSERTION_IAT_BACKDATE_SECS`], `exp` [`ASSERTION_LIFETIME_SECS`]
+/// after `now`, a random `jti`, and `scope` when scopes are requested. `now` is Unix
+/// seconds.
 pub fn sign_assertion(
     key: &SigningKey,
     claims: &AssertionClaims<'_>,
@@ -277,12 +315,14 @@ pub fn sign_assertion(
     }
     let mut payload = serde_json::json!({
         "iss": claims.issuer,
-        "sub": claims.subject,
         "aud": claims.audience,
         "iat": now - ASSERTION_IAT_BACKDATE_SECS,
         "exp": now + ASSERTION_LIFETIME_SECS,
         "jti": uuid::Uuid::new_v4().to_string(),
     });
+    if let Some(subject) = claims.subject {
+        payload["sub"] = subject.into();
+    }
     if !claims.scopes.is_empty() {
         payload["scope"] = claims.scopes.join(" ").into();
     }
@@ -348,6 +388,7 @@ mod tests {
             signing_key_secret_ref: "SIGNING_KEY".into(),
             signing_algorithm: algorithm,
             key_id: Some("key-1".into()),
+            audience: None,
         }
     }
 
@@ -374,7 +415,7 @@ mod tests {
         AssertionClaims {
             issuer: &settings.assertion_issuer,
             subject: settings.subject(),
-            audience: TOKEN_ENDPOINT,
+            audience: settings.audience(TOKEN_ENDPOINT),
             scopes,
             key_id: settings.key_id.as_deref(),
         }
@@ -390,7 +431,7 @@ mod tests {
         let (header, payload, signature, signing_input) = split(&assertion);
         assert_eq!(header, serde_json::json!({"alg": "RS256", "typ": "JWT", "kid": "key-1"}));
         assert_eq!(payload["iss"], "gateway@project.iam.gserviceaccount.com");
-        assert_eq!(payload["sub"], "gateway@project.iam.gserviceaccount.com");
+        assert!(payload.get("sub").is_none(), "no sub claim when no subject is set");
         assert_eq!(payload["aud"], TOKEN_ENDPOINT);
         assert_eq!(payload["scope"], "https://www.googleapis.com/auth/cloud-platform openid");
         assert_eq!(payload["iat"], 1_800_000_000 - ASSERTION_IAT_BACKDATE_SECS);
@@ -434,7 +475,13 @@ mod tests {
         )
         .expect("assertion validates");
         assert_eq!(decoded.header.kid.as_deref(), Some("key-1"));
-        assert_eq!(decoded.claims["sub"], "gateway@project.iam.gserviceaccount.com");
+        assert!(
+            decoded
+                .claims
+                .get("sub")
+                .is_none(),
+            "no sub claim when no subject is set"
+        );
         assert!(
             decoded
                 .claims
@@ -559,11 +606,79 @@ mod tests {
     }
 
     #[test]
-    fn test_settings_subject_defaults_to_issuer() {
+    fn test_settings_subject_is_absent_unless_set() {
         let mut settings = settings(JwtBearerAlgorithm::Rs256);
-        assert_eq!(settings.subject(), "gateway@project.iam.gserviceaccount.com");
+        assert_eq!(settings.subject(), None);
+        settings.assertion_subject = Some("  ".into());
+        assert_eq!(settings.subject(), None);
         settings.assertion_subject = Some("agent-1".into());
-        assert_eq!(settings.subject(), "agent-1");
+        assert_eq!(settings.subject(), Some("agent-1"));
+    }
+
+    #[test]
+    fn test_assertion_aud_is_the_audience_when_set_and_the_token_endpoint_otherwise() {
+        let mut settings = settings(JwtBearerAlgorithm::Es256);
+        let key = SigningKey::parse(ec_pkcs8_pem(), JwtBearerAlgorithm::Es256).expect("EC key parses");
+        let payload = split(&sign_assertion(&key, &claims(&settings, &[]), 1).expect("signs")).1;
+        assert_eq!(payload["aud"], TOKEN_ENDPOINT);
+
+        settings.audience = Some("urn:example:authorization-server".into());
+        settings.assertion_subject = Some("agent-1".into());
+        let payload = split(&sign_assertion(&key, &claims(&settings, &[]), 1).expect("signs")).1;
+        assert_eq!(payload["aud"], "urn:example:authorization-server");
+        assert_eq!(payload["sub"], "agent-1");
+        assert_eq!(payload["iss"], "gateway@project.iam.gserviceaccount.com");
+    }
+
+    #[test]
+    fn test_settings_audience_is_trimmed_and_blank_reads_as_absent() {
+        let read = |audience: serde_json::Value| -> JwtBearerSettings {
+            serde_json::from_value(serde_json::json!({
+                "assertion_issuer": "issuer", "signing_key_secret_ref": "KEY", "audience": audience
+            }))
+            .expect("settings deserialize")
+        };
+        assert_eq!(
+            read(" https://auth.example/ ".into())
+                .audience
+                .as_deref(),
+            Some("https://auth.example/")
+        );
+        assert_eq!(read("   ".into()).audience, None);
+        assert_eq!(read("".into()).audience, None);
+        assert_eq!(read(serde_json::Value::Null).audience, None);
+    }
+
+    #[test]
+    fn test_settings_validate_checks_the_audience() {
+        let mut settings = settings(JwtBearerAlgorithm::Rs256);
+        for accepted in ["https://auth.example/token", "urn:example:as", &"a".repeat(MAX_AUDIENCE_BYTES)] {
+            settings.audience = Some(accepted.to_string());
+            assert_eq!(settings.validate(), Ok(()), "{accepted:?}");
+        }
+        for refused in
+            [String::new(), "a b".into(), "a\u{7f}b".into(), "a\tb".into(), "a".repeat(MAX_AUDIENCE_BYTES + 1)]
+        {
+            settings.audience = Some(refused.clone());
+            assert_eq!(
+                settings.validate(),
+                Err("jwt_bearer.audience must be 1 to 512 bytes with no whitespace or control characters"),
+                "{refused:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_stored_settings_without_audience_load_and_serialize_unchanged() {
+        let stored = serde_json::json!({
+            "assertion_issuer": "issuer", "assertion_subject": "agent-1",
+            "signing_key_secret_ref": "KEY", "signing_algorithm": "RS256", "key_id": "key-1"
+        });
+        let settings: JwtBearerSettings = serde_json::from_value(stored.clone()).expect("stored settings load");
+        assert_eq!(settings.audience, None);
+        assert_eq!(settings.audience(TOKEN_ENDPOINT), TOKEN_ENDPOINT);
+        assert_eq!(settings.validate(), Ok(()));
+        assert_eq!(serde_json::to_value(&settings).expect("settings serialize"), stored);
     }
 
     #[test]

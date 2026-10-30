@@ -160,14 +160,18 @@ export function resourceProblem(resource: string): string | null {
   return null;
 }
 
-/** Why `issuer` is not an authorization server the gateway accepts, or null. */
-export function authorizationServerProblem(issuer: string): string | null {
+/**
+ * Why `issuer` is not an authorization server the gateway accepts, or null.
+ * `allowHttp` also accepts an http issuer, which the gateway allows only as
+ * the sole entry naming the issuer of a strategy no tenant owns.
+ */
+export function authorizationServerProblem(issuer: string, allowHttp = false): string | null {
   const parsed = parseUrl(issuer);
   if (
     !parsed ||
     issuer.length > MAX_AUTHORIZATION_SERVER_BYTES ||
     !ASCII_GRAPHIC.test(issuer) ||
-    parsed.protocol !== 'https:' ||
+    !(parsed.protocol === 'https:' || (allowHttp && parsed.protocol === 'http:')) ||
     !parsed.hostname ||
     hasCredentialsQueryOrFragment(issuer, parsed)
   ) {
@@ -205,22 +209,24 @@ function storedAuthorizationServersProblem(
   if (servers.length === 0 || servers.length > MAX_AUTHORIZATION_SERVERS) {
     return `List 1 to ${MAX_AUTHORIZATION_SERVERS} authorization servers`;
   }
-  const invalid = servers.map(authorizationServerProblem).find(Boolean);
+  const soleIssuer = servers.length === 1 && (!strategyIssuer || servers[0] === strategyIssuer);
+  const invalid = servers.map(s => authorizationServerProblem(s, soleIssuer)).find(Boolean);
   if (invalid) return invalid;
   if (new Set(servers).size !== servers.length) return 'List each authorization server once';
   if (strategyIssuer && (servers.length !== 1 || servers[0] !== strategyIssuer)) {
-    return `The stored authorization server ${servers.join(', ')} is not the issuer the JWT verification strategy trusts (${strategyIssuer}), so the save is refused. Use the strategy's issuer.`;
+    return `The stored authorization server ${servers.join(', ')} is not the issuer the JWT verification strategy trusts (${strategyIssuer}), so the gateway advertises the strategy's issuer and keeps this stored list only while it is unchanged. Use the strategy's issuer or clear the list.`;
   }
   return null;
 }
 
 /**
- * Every problem the gateway would refuse the discovery setting of a
- * caller-auth config for, in field order. Empty when discovery is off or the
+ * Every problem with the discovery setting of a caller-auth config, in field
+ * order; a stored-list issuer mismatch is shown for cleanup and the gateway
+ * accepts it while the list is unchanged. Empty when discovery is off or the
  * method is not JWT Bearer, whose payload carries no setting. A stored list is
  * checked only when present; `strategyIssuer` is the expected issuer of the
  * selected JWT verification strategy, when known, and a stored authorization
- * server list must be exactly that issuer.
+ * server list should be exactly that issuer.
  */
 export function discoveryProblems(
   config: Record<string, unknown>,

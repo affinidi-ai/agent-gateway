@@ -779,6 +779,17 @@ mod tests {
     }
 
     #[test]
+    fn source_auth_failed_for_an_unknown_kid_publishes_a_fixed_reason() {
+        let error = crate::source_auth::errors::SourceAuthError::from(
+            crate::jwt_bearer::errors::JwtBearerError::KeyNotFound("evil\r\nkid".to_string()),
+        );
+        let value = serde_json::to_value(SourceAuthContext::failed("jwt_bearer", &error).expect("caller-attributable"))
+            .unwrap();
+        assert_eq!(value["kind"], "invalid");
+        assert_eq!(value["reason"], "Invalid credential: Signing key not found");
+    }
+
+    #[test]
     fn source_auth_failed_carries_the_failure_kind_and_skips_server_errors() {
         use crate::source_auth::errors::SourceAuthError;
         let kind = |error: SourceAuthError| {

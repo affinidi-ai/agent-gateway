@@ -61,6 +61,8 @@ pub enum GatewayTokenError {
     InvalidResponse,
     #[error("assertion_failed")]
     AssertionFailed,
+    #[error("scope_mismatch")]
+    ScopeMismatch,
 }
 
 impl GatewayTokenError {
@@ -72,6 +74,7 @@ impl GatewayTokenError {
             Self::Unavailable => "unavailable",
             Self::InvalidResponse => "invalid_response",
             Self::AssertionFailed => "assertion_failed",
+            Self::ScopeMismatch => "scope_mismatch",
         }
     }
 
@@ -79,7 +82,9 @@ impl GatewayTokenError {
     pub fn delegation_failure_reason(self) -> DelegationFailureReason {
         match self {
             Self::AssertionFailed => DelegationFailureReason::AssertionFailed,
-            Self::Unavailable | Self::InvalidResponse => DelegationFailureReason::TokenEndpointFailed,
+            Self::Unavailable | Self::InvalidResponse | Self::ScopeMismatch => {
+                DelegationFailureReason::TokenEndpointFailed
+            }
             Self::Unsupported | Self::SecretUnavailable | Self::Forbidden => {
                 DelegationFailureReason::CredentialsUnavailable
             }
@@ -89,7 +94,7 @@ impl GatewayTokenError {
     /// Whether this failure starts the retry backoff. Only a token endpoint failure does;
     /// a local failure is reported as itself on every request.
     pub fn backs_off(self) -> bool {
-        matches!(self, Self::Unavailable | Self::InvalidResponse)
+        matches!(self, Self::Unavailable | Self::InvalidResponse | Self::ScopeMismatch)
     }
 }
 
@@ -130,9 +135,9 @@ impl GrantEgress {
         }
     }
 
-    /// Whether a JWT bearer provider may send its assertion to `endpoint`: an https
-    /// URL, or a URL the test allowlist names exactly.
-    pub fn permits_jwt_bearer_endpoint(
+    /// Whether a provider may send its client secret or assertion to `endpoint`: an
+    /// https URL, or a URL the test allowlist names exactly.
+    pub fn permits_token_endpoint(
         &self,
         endpoint: &str,
     ) -> bool {
@@ -152,11 +157,20 @@ impl GrantEgress {
     }
 }
 
+/// A secret a gateway grant read, identified by the last change of the copy it read.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, Deserialize)]
+pub struct SecretVersion {
+    pub secret_id: String,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// Resolves a provider's secret references, only when the secret belongs to the
-/// provider's own tenant (appliance-wide providers use appliance-wide secrets).
+/// provider's own tenant (appliance-wide providers use appliance-wide secrets), and
+/// records the version of each secret it resolves.
 pub struct ProviderSecrets<'a> {
     store: &'a Arc<dyn SecretsStore>,
     provider_tenant_id: Option<&'a str>,
+    read: std::sync::Mutex<Vec<SecretVersion>>,
 }
 
 impl<'a> ProviderSecrets<'a> {
@@ -167,6 +181,7 @@ impl<'a> ProviderSecrets<'a> {
         Self {
             store,
             provider_tenant_id: provider.tenant_id.as_deref(),
+            read: std::sync::Mutex::default(),
         }
     }
 
@@ -183,7 +198,54 @@ impl<'a> ProviderSecrets<'a> {
         if secret.tenant_id.as_deref() != self.provider_tenant_id {
             return Err(GatewayTokenError::Forbidden);
         }
+        self.read
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(SecretVersion {
+                secret_id: secret_ref.to_string(),
+                updated_at: secret.updated_at,
+            });
         Ok(Zeroizing::new(secret.value))
+    }
+
+    /// The versions of the secrets resolved so far, sorted and without repeats.
+    pub fn versions_read(&self) -> Vec<SecretVersion> {
+        let mut versions = self
+            .read
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        versions.sort_unstable();
+        versions.dedup();
+        versions
+    }
+
+    /// Whether each recorded secret still belongs to the provider's tenant at exactly the
+    /// recorded version. No record, or an empty one, is never current.
+    pub async fn still_current(
+        &self,
+        versions: Option<&[SecretVersion]>,
+    ) -> bool {
+        let Some(versions) = versions.filter(|versions| !versions.is_empty()) else {
+            return false;
+        };
+        for version in versions {
+            match self
+                .store
+                .get_by_secret_id(&version.secret_id)
+                .await
+            {
+                Ok(Some(secret)) => {
+                    let _value = Zeroizing::new(secret.value);
+                    if secret.tenant_id.as_deref() != self.provider_tenant_id || secret.updated_at != version.updated_at
+                    {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+        }
+        true
     }
 }
 
@@ -206,18 +268,23 @@ pub fn refresh_margin_secs(lifetime_secs: i64) -> i64 {
 /// Requests a gateway token from the provider's token endpoint.
 ///
 /// Client Credentials posts the client id and secret in the form. JWT bearer signs an
-/// assertion whose `aud` is the token endpoint, sends the scopes both in the assertion
+/// assertion whose `aud` is its audience or else the token endpoint, sends the scopes both in the assertion
 /// and as the `scope` form parameter, and authenticates the client with HTTP Basic
-/// when both client references are set. The token endpoint of a JWT bearer provider
-/// must be https unless the test allowlist names it exactly. The response must be a
-/// Bearer token; any refresh token is dropped and the lifetime is bounded.
+/// when both client references are set. The token endpoint must be https unless the
+/// test allowlist names it exactly; it is checked before any secret is read. The
+/// timeout covers secret reads and signing as well as the request. The response must
+/// be a Bearer token; any refresh token is dropped and the lifetime is bounded. A
+/// response whose `scope` lacks a requested scope is refused; one without `scope` is
+/// taken to grant the requested scopes (RFC 6749 section 5.1).
 pub async fn request_gateway_grant(
     provider: &CredentialProvider,
     scopes: &[String],
     secrets: &ProviderSecrets<'_>,
     egress: &GrantEgress,
 ) -> Result<OAuthTokenResponse, GatewayTokenError> {
-    let result = send_gateway_grant(provider, scopes, secrets, egress).await;
+    let result = tokio::time::timeout(egress.timeout, send_gateway_grant(provider, scopes, secrets, egress))
+        .await
+        .unwrap_or(Err(GatewayTokenError::Unavailable));
     crate::metrics::backends::prometheus::track_token_fetch(
         token_fetch_grant(&provider.provider_type),
         match &result {
@@ -240,6 +307,9 @@ async fn send_gateway_grant(
         .map(str::trim)
         .filter(|endpoint| !endpoint.is_empty())
         .ok_or(GatewayTokenError::Unsupported)?;
+    if !egress.permits_token_endpoint(endpoint) {
+        return Err(GatewayTokenError::Forbidden);
+    }
     let mut form: Vec<(&'static str, Zeroizing<String>)> = Vec::new();
     let mut basic_credentials = None;
     match provider.provider_type {
@@ -263,9 +333,6 @@ async fn send_gateway_grant(
             form.push(("client_secret", client_secret));
         }
         CredentialProviderType::OAuth2JwtBearer => {
-            if !egress.permits_jwt_bearer_endpoint(endpoint) {
-                return Err(GatewayTokenError::Forbidden);
-            }
             let settings = provider
                 .jwt_bearer
                 .as_ref()
@@ -280,7 +347,7 @@ async fn send_gateway_grant(
                 &AssertionClaims {
                     issuer: &settings.assertion_issuer,
                     subject: settings.subject(),
-                    audience: endpoint,
+                    audience: settings.audience(endpoint),
                     scopes,
                     key_id: settings
                         .key_id
@@ -328,51 +395,66 @@ async fn send_gateway_grant(
     if let Some(resource) = provider.resource.as_deref() {
         form.push(("resource", Zeroizing::new(resource.to_string())));
     }
-    let grant = async {
-        let raw = endpoint.to_string();
-        let timeout = egress.timeout;
-        let allowlist = egress.exact_allowlist.clone();
-        let (client, target) = tokio::task::spawn_blocking(move || {
-            crate::egress::pinned_configured_client(&raw, timeout, allowlist.as_deref())
-        })
+    let raw = endpoint.to_string();
+    let timeout = egress.timeout;
+    let allowlist = egress.exact_allowlist.clone();
+    let (client, target) = tokio::task::spawn_blocking(move || {
+        crate::egress::pinned_configured_client(&raw, timeout, allowlist.as_deref())
+    })
+    .await
+    .map_err(|_| GatewayTokenError::Unavailable)?
+    .map_err(|error| match error {
+        crate::egress::EgressError::Blocked(_) => GatewayTokenError::Forbidden,
+        _ => GatewayTokenError::Unavailable,
+    })?;
+    let pairs: Vec<(&str, &str)> = form
+        .iter()
+        .map(|(name, value)| (*name, value.as_str()))
+        .collect();
+    let mut request = client
+        .post(target.url)
+        .header(ACCEPT, "application/json")
+        .form(&pairs);
+    if let Some(credentials) = basic_credentials {
+        request = request.header(AUTHORIZATION, credentials);
+    }
+    let response = request
+        .send()
         .await
-        .map_err(|_| GatewayTokenError::Unavailable)?
-        .map_err(|error| match error {
-            crate::egress::EgressError::Blocked(_) => GatewayTokenError::Forbidden,
-            _ => GatewayTokenError::Unavailable,
-        })?;
-        let pairs: Vec<(&str, &str)> = form
-            .iter()
-            .map(|(name, value)| (*name, value.as_str()))
-            .collect();
-        let mut request = client
-            .post(target.url)
-            .header(ACCEPT, "application/json")
-            .form(&pairs);
-        if let Some(credentials) = basic_credentials {
-            request = request.header(AUTHORIZATION, credentials);
-        }
-        let response = request
-            .send()
-            .await
-            .map_err(|_| GatewayTokenError::Unavailable)?;
-        let status = response.status();
-        let body = super::oauth::read_token_response(response).await?;
-        if !status.is_success() {
-            warn!(
-                target: "credential_delegation",
-                provider_id = %provider.provider_id,
-                status = status.as_u16(),
-                error_code = oauth_error_code(&body).unwrap_or("none"),
-                "Gateway grant rejected by the token endpoint"
-            );
-            return Err(GatewayTokenError::Unavailable);
-        }
-        parse_grant_response(&body)
+        .map_err(|_| GatewayTokenError::Unavailable)?;
+    let status = response.status();
+    let body = super::oauth::read_token_response(response).await?;
+    if !status.is_success() {
+        warn!(
+            target: "credential_delegation",
+            provider_id = %provider.provider_id,
+            status = status.as_u16(),
+            error_code = oauth_error_code(&body).unwrap_or("none"),
+            "Gateway grant rejected by the token endpoint"
+        );
+        return Err(GatewayTokenError::Unavailable);
+    }
+    let response = parse_grant_response(&body)?;
+    if !issued_scopes_cover(response.scope.as_deref(), scopes) {
+        return Err(GatewayTokenError::ScopeMismatch);
+    }
+    Ok(response)
+}
+
+fn issued_scopes_cover(
+    issued: Option<&str>,
+    requested: &[String],
+) -> bool {
+    let Some(issued) = issued else {
+        return true;
     };
-    tokio::time::timeout(egress.timeout, grant)
-        .await
-        .map_err(|_| GatewayTokenError::Unavailable)?
+    let issued: std::collections::HashSet<&str> = issued
+        .split_whitespace()
+        .collect();
+    requested
+        .iter()
+        .flat_map(|scope| scope.split_whitespace())
+        .all(|scope| issued.contains(scope))
 }
 
 fn required_ref(secret_ref: Option<&str>) -> Result<&str, GatewayTokenError> {
@@ -950,7 +1032,7 @@ pub(crate) async fn with_own_target_token_cache<F: std::future::Future>(future: 
 /// Single-flight cached acquisition: at most one grant per key is in flight on this
 /// replica. A request that finds no valid token waits for it; while a still-valid
 /// token is being refreshed, other requests keep using it. A failed refresh keeps
-/// the valid token, and retries after a token endpoint failure back off from 1 s to
+/// the token while it is still valid when the grant fails, and retries after a token endpoint failure back off from 1 s to
 /// 60 s, counted from when the failed grant completed.
 pub async fn acquire_gateway_token(
     cache: &GatewayTokenCache,
@@ -981,33 +1063,38 @@ pub(crate) async fn acquire_gateway_token_at(
         },
         SlotView::Empty => slot.grant.lock().await,
     };
-    let valid = match slot.view(now) {
+    let refreshing = match slot.view(now) {
         SlotView::Fresh(token) => return cached(token),
         SlotView::RefreshDue(token) if slot.backed_off(now) => return cached(token),
-        SlotView::RefreshDue(token) => Some(token),
+        SlotView::RefreshDue(_) => true,
         SlotView::Empty if slot.backed_off(now) => {
             held_back_by_backoff(provider);
             return Err(GatewayTokenError::Unavailable);
         }
-        SlotView::Empty => None,
+        SlotView::Empty => false,
     };
     match request_gateway_grant(provider, &key.scopes, secrets, &cache.egress()).await {
         Ok(response) => Ok(slot
             .store(response, now)
             .grant(Freshness::Fresh)),
         Err(error) => {
+            let failed_at = now + entered.elapsed();
+            let kept = match slot.view(failed_at) {
+                SlotView::Fresh(held) | SlotView::RefreshDue(held) if refreshing => Some(held),
+                _ => None,
+            };
             warn!(
                 target: "credential_delegation",
                 provider_id = %provider.provider_id,
                 grant = grant_label(&provider.provider_type),
                 category = error.category(),
-                stale_token_kept = valid.is_some(),
+                stale_token_kept = kept.is_some(),
                 "Gateway grant failed"
             );
             if error.backs_off() {
-                slot.record_failure(now + entered.elapsed());
+                slot.record_failure(failed_at);
             }
-            match valid {
+            match kept {
                 Some(held) => Ok(held.grant(Freshness::StaleAfterRefreshFailure)),
                 None => Err(error),
             }
@@ -1088,6 +1175,11 @@ pub(crate) mod test_endpoint {
             }
         }
 
+        pub(crate) fn grants(&self) -> usize {
+            self.calls
+                .load(Ordering::SeqCst)
+        }
+
         pub(crate) fn egress(&self) -> GrantEgress {
             GrantEgress {
                 timeout: Duration::from_secs(5),
@@ -1114,6 +1206,33 @@ pub(crate) mod test_endpoint {
                 .cloned()
                 .expect("a request was recorded")
         }
+    }
+
+    /// Gives the secret a new value, which moves its `updated_at` on.
+    pub(crate) async fn replace_secret(
+        store: &Arc<dyn SecretsStore>,
+        secret_id: &str,
+        value: &str,
+    ) {
+        let secret = store
+            .get_by_secret_id(secret_id)
+            .await
+            .expect("secret reads")
+            .expect("secret exists");
+        store
+            .update(
+                &secret.id,
+                crate::secrets::UpdateSecretRequest {
+                    name: None,
+                    description: secret.description,
+                    value: Some(value.to_string()),
+                    update_value: Some(true),
+                    secret_type: None,
+                    tags: None,
+                },
+            )
+            .await
+            .expect("secret updates");
     }
 }
 
@@ -1205,6 +1324,7 @@ mod tests {
             signing_key_secret_ref: "SIGNING_KEY".into(),
             signing_algorithm: algorithm,
             key_id: Some("rs-key-1".into()),
+            audience: None,
         });
         provider
     }
@@ -1226,6 +1346,7 @@ mod tests {
             (GatewayTokenError::AssertionFailed, AssertionFailed),
             (GatewayTokenError::Unavailable, TokenEndpointFailed),
             (GatewayTokenError::InvalidResponse, TokenEndpointFailed),
+            (GatewayTokenError::ScopeMismatch, TokenEndpointFailed),
             (GatewayTokenError::SecretUnavailable, CredentialsUnavailable),
             (GatewayTokenError::Forbidden, CredentialsUnavailable),
             (GatewayTokenError::Unsupported, CredentialsUnavailable),
@@ -1365,10 +1486,59 @@ mod tests {
             .split('.')
             .collect();
         assert_eq!(decode_segment(segments[0])["kid"], "sa-kid");
-        assert_eq!(decode_segment(segments[1])["sub"], "https://issuer.demo.example");
+        assert!(
+            decode_segment(segments[1])
+                .get("sub")
+                .is_none(),
+            "no sub claim without a subject"
+        );
+        assert_eq!(decode_segment(segments[1])["aud"], endpoint.url.as_str());
         assert!(!form.contains_key("scope"));
         assert!(!form.contains_key("client_id"));
         assert_eq!(endpoint.last_authorization(), None);
+    }
+
+    #[tokio::test]
+    async fn test_jwt_bearer_grant_uses_the_provider_audience_as_aud() {
+        let endpoint = TokenEndpoint::start(StatusCode::OK, token_body(serde_json::json!({}))).await;
+        let directory = tempfile::tempdir().expect("tempdir");
+        let secrets = secrets_with(&directory, &[("SIGNING_KEY", ec_pkcs8_pem(), None)]).await;
+        let mut provider = jwt_provider(&endpoint.url, JwtBearerAlgorithm::Es256);
+        if let Some(settings) = provider.jwt_bearer.as_mut() {
+            settings.audience = Some("https://issuer.demo.example".into());
+        }
+
+        request_gateway_grant(&provider, &[], &ProviderSecrets::new(&secrets, &provider), &endpoint.egress())
+            .await
+            .expect("grant succeeds");
+        let form = endpoint.last_form();
+        let segments: Vec<&str> = form["assertion"]
+            .split('.')
+            .collect();
+        let claims = decode_segment(segments[1]);
+        assert_eq!(claims["aud"], "https://issuer.demo.example");
+        assert_eq!(claims["sub"], "agent-1");
+    }
+
+    #[test]
+    fn test_gateway_token_key_changes_with_the_jwt_bearer_audience() {
+        let mut provider = jwt_provider("https://auth.example/token", JwtBearerAlgorithm::Es256);
+        let without = GatewayTokenKey::for_target_auth(&provider, &[]).expect("key");
+        if let Some(settings) = provider.jwt_bearer.as_mut() {
+            settings.audience = Some("urn:example:a".into());
+        }
+        let first = GatewayTokenKey::for_target_auth(&provider, &[]).expect("key");
+        if let Some(settings) = provider.jwt_bearer.as_mut() {
+            settings.audience = Some("urn:example:b".into());
+        }
+        let second = GatewayTokenKey::for_target_auth(&provider, &[]).expect("key");
+        assert_ne!(without, first);
+        assert_ne!(first, second);
+        assert_ne!(first.provider_digest, second.provider_digest);
+        if let Some(settings) = provider.jwt_bearer.as_mut() {
+            settings.audience = Some("urn:example:a".into());
+        }
+        assert_eq!(GatewayTokenKey::for_target_auth(&provider, &[]).expect("key"), first);
     }
 
     fn mock_egress(server: &MockAuthServer) -> GrantEgress {
@@ -1719,22 +1889,171 @@ mod tests {
     }
 
     #[test]
-    fn test_jwt_bearer_endpoint_is_https_or_exactly_allowlisted() {
+    fn test_token_endpoint_is_https_or_exactly_allowlisted() {
         let egress = GrantEgress {
             timeout: Duration::from_secs(1),
             exact_allowlist: Some("not a url, http://127.0.0.1:4000/token".into()),
         };
-        assert!(egress.permits_jwt_bearer_endpoint(" https://auth.example/token "));
-        assert!(egress.permits_jwt_bearer_endpoint("http://127.0.0.1:4000/token"));
-        assert!(!egress.permits_jwt_bearer_endpoint("http://127.0.0.1:4000/other"));
-        assert!(!egress.permits_jwt_bearer_endpoint("http://auth.example/token"));
-        assert!(!egress.permits_jwt_bearer_endpoint("not a url"));
-        assert!(!egress.permits_jwt_bearer_endpoint(""));
+        assert!(egress.permits_token_endpoint(" https://auth.example/token "));
+        assert!(egress.permits_token_endpoint("http://127.0.0.1:4000/token"));
+        assert!(!egress.permits_token_endpoint("http://127.0.0.1:4000/other"));
+        assert!(!egress.permits_token_endpoint("http://auth.example/token"));
+        assert!(!egress.permits_token_endpoint("not a url"));
+        assert!(!egress.permits_token_endpoint(""));
         let production = GrantEgress {
             timeout: Duration::from_secs(1),
             exact_allowlist: None,
         };
-        assert!(!production.permits_jwt_bearer_endpoint("http://127.0.0.1:4000/token"));
+        assert!(!production.permits_token_endpoint("http://127.0.0.1:4000/token"));
+    }
+
+    struct SlowSecrets {
+        inner: Arc<dyn SecretsStore>,
+        delay: Duration,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl SecretsStore for SlowSecrets {
+        async fn create(
+            &self,
+            request: CreateSecretRequest,
+        ) -> anyhow::Result<crate::secrets::Secret> {
+            self.inner
+                .create(request)
+                .await
+        }
+        async fn get(
+            &self,
+            id: &str,
+        ) -> anyhow::Result<Option<crate::secrets::Secret>> {
+            self.inner.get(id).await
+        }
+        async fn get_by_secret_id(
+            &self,
+            secret_id: &str,
+        ) -> anyhow::Result<Option<crate::secrets::Secret>> {
+            self.reads
+                .fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            self.inner
+                .get_by_secret_id(secret_id)
+                .await
+        }
+        async fn list_all(&self) -> anyhow::Result<Vec<crate::secrets::SecretListItem>> {
+            self.inner.list_all().await
+        }
+        async fn update(
+            &self,
+            id: &str,
+            request: crate::secrets::UpdateSecretRequest,
+        ) -> anyhow::Result<crate::secrets::Secret> {
+            self.inner
+                .update(id, request)
+                .await
+        }
+        async fn delete(
+            &self,
+            id: &str,
+        ) -> anyhow::Result<()> {
+            self.inner.delete(id).await
+        }
+        async fn find_by_tag(
+            &self,
+            tag: &str,
+        ) -> anyhow::Result<Vec<crate::secrets::SecretListItem>> {
+            self.inner
+                .find_by_tag(tag)
+                .await
+        }
+    }
+
+    async fn slow_client_credentials(
+        directory: &tempfile::TempDir,
+        delay: Duration,
+    ) -> Arc<SlowSecrets> {
+        Arc::new(SlowSecrets {
+            inner: secrets_with(directory, &[("CC_ID", "cc-client", None), ("CC_SECRET", "cc-secret", None)]).await,
+            delay,
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    #[tokio::test]
+    async fn test_client_credentials_grant_to_an_http_endpoint_sends_nothing() {
+        let endpoint = TokenEndpoint::start(StatusCode::OK, token_body(serde_json::json!({}))).await;
+        let directory = tempfile::tempdir().expect("tempdir");
+        let counting = slow_client_credentials(&directory, Duration::ZERO).await;
+        let secrets: Arc<dyn SecretsStore> = counting.clone();
+        let mut provider = provider(CredentialProviderType::OAuth2ClientCredentials, &endpoint.url);
+        provider.client_id_secret_ref = Some("CC_ID".into());
+        provider.client_secret_secret_ref = Some("CC_SECRET".into());
+        let unlisted = GrantEgress {
+            timeout: Duration::from_secs(5),
+            exact_allowlist: Some("http://192.0.2.10/token".into()),
+        };
+
+        assert_eq!(
+            request_gateway_grant(&provider, &[], &ProviderSecrets::new(&secrets, &provider), &unlisted)
+                .await
+                .map(|_| ()),
+            Err(GatewayTokenError::Forbidden)
+        );
+        assert_eq!(
+            counting
+                .reads
+                .load(Ordering::SeqCst),
+            0,
+            "no secret is read for an http endpoint"
+        );
+        assert_eq!(
+            endpoint
+                .calls
+                .load(Ordering::SeqCst),
+            0
+        );
+
+        let granted =
+            request_gateway_grant(&provider, &[], &ProviderSecrets::new(&secrets, &provider), &endpoint.egress())
+                .await
+                .expect("an exactly allowlisted endpoint is granted");
+        assert_eq!(granted.access_token, "gateway-token");
+        assert_eq!(
+            counting
+                .reads
+                .load(Ordering::SeqCst),
+            2
+        );
+        assert_eq!(endpoint.last_form()["client_secret"], "cc-secret");
+    }
+
+    #[tokio::test]
+    async fn test_a_grant_whose_secret_read_outlasts_the_timeout_is_unavailable() {
+        let endpoint = TokenEndpoint::start(StatusCode::OK, token_body(serde_json::json!({}))).await;
+        let directory = tempfile::tempdir().expect("tempdir");
+        let secrets: Arc<dyn SecretsStore> = slow_client_credentials(&directory, Duration::from_secs(2)).await;
+        let mut provider = provider(CredentialProviderType::OAuth2ClientCredentials, &endpoint.url);
+        provider.client_id_secret_ref = Some("CC_ID".into());
+        provider.client_secret_secret_ref = Some("CC_SECRET".into());
+        let egress = GrantEgress {
+            timeout: Duration::from_millis(200),
+            exact_allowlist: Some(endpoint.url.clone()),
+        };
+
+        let started = Instant::now();
+        assert_eq!(
+            request_gateway_grant(&provider, &[], &ProviderSecrets::new(&secrets, &provider), &egress)
+                .await
+                .map(|_| ()),
+            Err(GatewayTokenError::Unavailable)
+        );
+        assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+        assert_eq!(
+            endpoint
+                .calls
+                .load(Ordering::SeqCst),
+            0
+        );
     }
 
     #[tokio::test]
@@ -1991,6 +2310,7 @@ mod tests {
         assert!(!GatewayTokenError::Forbidden.backs_off());
         assert!(GatewayTokenError::Unavailable.backs_off());
         assert!(GatewayTokenError::InvalidResponse.backs_off());
+        assert!(GatewayTokenError::ScopeMismatch.backs_off());
     }
 
     #[tokio::test]
@@ -2575,6 +2895,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_a_refresh_that_fails_after_the_token_expired_never_returns_it() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let url = serve_token_route(axum::routing::post({
+            let calls = calls.clone();
+            move || async move {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return (
+                        StatusCode::OK,
+                        [("content-type", "application/json")],
+                        token_body(serde_json::json!({"expires_in": 2})),
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [("content-type", "application/json")],
+                    r#"{"error":"temporarily_unavailable"}"#.to_string(),
+                )
+            }
+        }))
+        .await;
+        let directory = tempfile::tempdir().expect("tempdir");
+        let secrets = secrets_with(&directory, &[("CC_ID", "id", None), ("CC_SECRET", "secret", None)]).await;
+        let mut provider = provider(CredentialProviderType::OAuth2ClientCredentials, &url);
+        provider.client_id_secret_ref = Some("CC_ID".into());
+        provider.client_secret_secret_ref = Some("CC_SECRET".into());
+        let cache = GatewayTokenCache::new(GrantEgress {
+            timeout: Duration::from_secs(5),
+            exact_allowlist: Some(url),
+        });
+        let key = GatewayTokenKey::for_target_auth(&provider, &[]).expect("key");
+        let secrets = ProviderSecrets::new(&secrets, &provider);
+        let start = Instant::now();
+
+        let first = acquire_gateway_token_at(&cache, &key, &provider, &secrets, start)
+            .await
+            .expect("first grant");
+        assert_eq!(first.freshness, Freshness::Fresh);
+
+        let refresh_due = start + Duration::from_millis(1_900);
+        assert_eq!(
+            acquire_gateway_token_at(&cache, &key, &provider, &secrets, refresh_due)
+                .await
+                .map(|grant| grant.freshness),
+            Err(GatewayTokenError::Unavailable)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
     async fn test_jwt_bearer_renewal_signs_a_fresh_assertion_and_returns_a_new_token() {
         let server = MockAuthServer::start().await;
         let fixture = SigningFixture::es256(0);
@@ -2710,6 +3080,278 @@ mod tests {
             GatewayTokenKey::for_target_auth(&provider, &["a".into(), "b".into()])
                 .expect("key")
                 .provider_digest
+        );
+    }
+
+    #[test]
+    fn test_issued_scopes_must_cover_every_requested_scope() {
+        let requested = vec!["read".to_string(), " write ".to_string(), "read".to_string()];
+        assert!(issued_scopes_cover(None, &requested));
+        assert!(issued_scopes_cover(Some("write read"), &requested));
+        assert!(issued_scopes_cover(Some("  read   write extra "), &requested));
+        assert!(!issued_scopes_cover(Some("read"), &requested));
+        assert!(!issued_scopes_cover(Some(""), &requested));
+        assert!(!issued_scopes_cover(Some("Read write"), &requested));
+        assert!(issued_scopes_cover(Some(""), &[]));
+        assert!(issued_scopes_cover(Some("read"), &[]));
+        let one_entry = vec!["openid profile".to_string()];
+        assert!(issued_scopes_cover(Some("profile openid"), &one_entry));
+        assert!(!issued_scopes_cover(Some("openid"), &one_entry));
+    }
+
+    #[tokio::test]
+    async fn test_a_grant_missing_a_requested_scope_is_refused_and_never_cached() {
+        let endpoint = TokenEndpoint::start(StatusCode::OK, token_body(serde_json::json!({"scope": "read"}))).await;
+        let directory = tempfile::tempdir().expect("tempdir");
+        let secrets = secrets_with(&directory, &[("CC_ID", "id", None), ("CC_SECRET", "secret", None)]).await;
+        let mut provider = provider(CredentialProviderType::OAuth2ClientCredentials, &endpoint.url);
+        provider.client_id_secret_ref = Some("CC_ID".into());
+        provider.client_secret_secret_ref = Some("CC_SECRET".into());
+        let provider_secrets = ProviderSecrets::new(&secrets, &provider);
+        let wider = vec!["read".to_string(), "write".to_string()];
+
+        assert_eq!(
+            request_gateway_grant(&provider, &["read".to_string()], &provider_secrets, &endpoint.egress())
+                .await
+                .map(|response| response.access_token),
+            Ok("gateway-token".to_string())
+        );
+        assert_eq!(
+            request_gateway_grant(&provider, &wider, &provider_secrets, &endpoint.egress())
+                .await
+                .map(|_| ()),
+            Err(GatewayTokenError::ScopeMismatch)
+        );
+
+        let cache = GatewayTokenCache::new(endpoint.egress());
+        let key = GatewayTokenKey::for_target_auth(&provider, &wider).expect("key");
+        let start = Instant::now();
+        for at in [start, start + BACKOFF_MAX] {
+            assert_eq!(
+                acquire_gateway_token_at(&cache, &key, &provider, &provider_secrets, at)
+                    .await
+                    .map(|_| ()),
+                Err(GatewayTokenError::ScopeMismatch)
+            );
+        }
+        assert_eq!(endpoint.grants(), 4, "each refused grant left nothing to serve from the cache");
+    }
+
+    #[tokio::test]
+    async fn test_a_grant_stays_current_only_while_each_secret_it_read_keeps_its_version() {
+        use super::test_endpoint::replace_secret;
+        let endpoint = TokenEndpoint::start(StatusCode::OK, token_body(serde_json::json!({}))).await;
+        let directory = tempfile::tempdir().expect("tempdir");
+        let secrets = secrets_with(
+            &directory,
+            &[
+                ("CC_ID", "id", Some("tenant-a")),
+                ("CC_SECRET", "secret", Some("tenant-a")),
+                ("UNUSED_KEY", "kept from an earlier type", Some("tenant-a")),
+                ("UNRELATED", "other", Some("tenant-a")),
+                ("TENANT_B", "other", Some("tenant-b")),
+            ],
+        )
+        .await;
+        let mut provider = provider(CredentialProviderType::OAuth2ClientCredentials, &endpoint.url);
+        provider.tenant_id = Some("tenant-a".into());
+        provider.client_id_secret_ref = Some("CC_ID".into());
+        provider.client_secret_secret_ref = Some("CC_SECRET".into());
+        provider.api_key_secret_ref = Some("UNUSED_KEY".into());
+        let granting = ProviderSecrets::new(&secrets, &provider);
+        assert_eq!(
+            request_gateway_grant(&provider, &[], &granting, &endpoint.egress())
+                .await
+                .map(|response| response.access_token),
+            Ok("gateway-token".to_string())
+        );
+        let versions = granting.versions_read();
+        assert_eq!(
+            versions
+                .iter()
+                .map(|version| version.secret_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["CC_ID", "CC_SECRET"]
+        );
+        let check = ProviderSecrets::new(&secrets, &provider);
+        assert!(
+            check
+                .still_current(Some(&versions))
+                .await
+        );
+        assert!(
+            !check
+                .still_current(None)
+                .await
+        );
+        assert!(
+            !check
+                .still_current(Some(&[]))
+                .await
+        );
+
+        for unrelated in ["UNRELATED", "TENANT_B", "UNUSED_KEY"] {
+            replace_secret(&secrets, unrelated, "changed").await;
+        }
+        let unused = secrets
+            .get_by_secret_id("UNUSED_KEY")
+            .await
+            .expect("read")
+            .expect("exists");
+        secrets
+            .delete(&unused.id)
+            .await
+            .expect("deletes");
+        assert!(
+            check
+                .still_current(Some(&versions))
+                .await,
+            "secrets the grant did not read never matter"
+        );
+
+        replace_secret(&secrets, "CC_SECRET", "rotated").await;
+        assert!(
+            !check
+                .still_current(Some(&versions))
+                .await
+        );
+        let rereading = ProviderSecrets::new(&secrets, &provider);
+        for secret_ref in ["CC_ID", "CC_SECRET"] {
+            rereading
+                .resolve(secret_ref)
+                .await
+                .expect("resolves");
+        }
+        let current = rereading.versions_read();
+        assert!(
+            check
+                .still_current(Some(&current))
+                .await
+        );
+        let mut newer_than_stored = current.clone();
+        newer_than_stored[1].updated_at += chrono::Duration::seconds(1);
+        assert!(
+            !check
+                .still_current(Some(&newer_than_stored))
+                .await,
+            "a stored copy older than the recorded version, as after a restore, is not current"
+        );
+
+        let client_id = secrets
+            .get_by_secret_id("CC_ID")
+            .await
+            .expect("read")
+            .expect("exists");
+        secrets
+            .set_tenant_id(&client_id.id, Some("tenant-b".into()))
+            .await
+            .expect("moves");
+        assert!(
+            !check
+                .still_current(Some(&current))
+                .await
+        );
+        secrets
+            .set_tenant_id(&client_id.id, Some("tenant-a".into()))
+            .await
+            .expect("moves back");
+        assert!(
+            !check
+                .still_current(Some(&current))
+                .await,
+            "moving the secret back is a further change"
+        );
+
+        secrets
+            .delete(&client_id.id)
+            .await
+            .expect("deletes");
+        assert!(
+            !check
+                .still_current(Some(&current))
+                .await
+        );
+    }
+
+    struct UnreadableSecrets {
+        inner: Arc<dyn SecretsStore>,
+    }
+
+    #[async_trait::async_trait]
+    impl SecretsStore for UnreadableSecrets {
+        async fn create(
+            &self,
+            request: CreateSecretRequest,
+        ) -> anyhow::Result<crate::secrets::Secret> {
+            self.inner
+                .create(request)
+                .await
+        }
+        async fn get(
+            &self,
+            id: &str,
+        ) -> anyhow::Result<Option<crate::secrets::Secret>> {
+            self.inner.get(id).await
+        }
+        async fn get_by_secret_id(
+            &self,
+            _secret_id: &str,
+        ) -> anyhow::Result<Option<crate::secrets::Secret>> {
+            Err(anyhow::anyhow!("secret store unavailable"))
+        }
+        async fn list_all(&self) -> anyhow::Result<Vec<crate::secrets::SecretListItem>> {
+            self.inner.list_all().await
+        }
+        async fn update(
+            &self,
+            id: &str,
+            request: crate::secrets::UpdateSecretRequest,
+        ) -> anyhow::Result<crate::secrets::Secret> {
+            self.inner
+                .update(id, request)
+                .await
+        }
+        async fn delete(
+            &self,
+            id: &str,
+        ) -> anyhow::Result<()> {
+            self.inner.delete(id).await
+        }
+        async fn find_by_tag(
+            &self,
+            tag: &str,
+        ) -> anyhow::Result<Vec<crate::secrets::SecretListItem>> {
+            self.inner
+                .find_by_tag(tag)
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_grant_is_not_current_while_the_secrets_it_read_cannot_be_read() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let secrets = secrets_with(&directory, &[("CC_ID", "id", None), ("CC_SECRET", "secret", None)]).await;
+        let provider = provider(CredentialProviderType::OAuth2ClientCredentials, "https://auth.example/token");
+        let granting = ProviderSecrets::new(&secrets, &provider);
+        for secret_ref in ["CC_ID", "CC_SECRET"] {
+            granting
+                .resolve(secret_ref)
+                .await
+                .expect("resolves");
+        }
+        let versions = granting.versions_read();
+        assert_eq!(versions.len(), 2);
+        assert!(
+            ProviderSecrets::new(&secrets, &provider)
+                .still_current(Some(&versions))
+                .await
+        );
+
+        let unreadable: Arc<dyn SecretsStore> = Arc::new(UnreadableSecrets { inner: secrets });
+        assert!(
+            !ProviderSecrets::new(&unreadable, &provider)
+                .still_current(Some(&versions))
+                .await
         );
     }
 }

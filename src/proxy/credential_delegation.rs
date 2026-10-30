@@ -258,8 +258,21 @@ fn enrich_audit_event(
     evt.inject_as = Some(format!("{:?}", binding.inject_as).to_lowercase());
 }
 
-/// The vault identity under which gateway tokens of legacy bindings are cached.
-pub(crate) const GATEWAY_GRANT_USER_HASH: &str = "__client_credentials__";
+/// The prefix of the vault identity under which gateway tokens of legacy bindings are cached.
+const GATEWAY_GRANT_USER_HASH: &str = "__client_credentials__";
+
+/// The vault identity of a legacy gateway token for one scope set, so bindings of one
+/// provider with different scopes never share a token. Scope order and repeats are ignored.
+pub(crate) fn gateway_grant_user_hash(scopes: &[String]) -> String {
+    use sha2::Digest;
+    let mut scopes: Vec<&str> = scopes
+        .iter()
+        .map(String::as_str)
+        .collect();
+    scopes.sort_unstable();
+    scopes.dedup();
+    format!("{GATEWAY_GRANT_USER_HASH}:{}", hex::encode(sha2::Sha256::digest(scopes.join(" "))))
+}
 
 /// The binding a gateway token is injected for, with its audit context.
 struct GatewayTokenTarget<'a> {
@@ -273,9 +286,18 @@ struct GatewayTokenTarget<'a> {
 }
 
 impl GatewayTokenTarget<'_> {
-    /// Injects the cached gateway token while it is outside its refresh margin and was
-    /// granted after the provider's last change; otherwise sends a new grant, falling
-    /// back to a cached token that is still valid when the grant fails.
+    fn scopes(&self) -> &[String] {
+        if self.binding.scopes.is_empty() {
+            &self.provider.default_scopes
+        } else {
+            &self.binding.scopes
+        }
+    }
+
+    /// Injects the cached gateway token while it is outside its refresh margin, was
+    /// requested after the provider's last change, and every secret its grant read is
+    /// still at the version it read. Otherwise sends a new grant, falling back to a
+    /// cached token that is still valid when the grant fails.
     async fn resolve(
         &self,
         vault_store: &Arc<dyn DelegationVaultStorage>,
@@ -286,11 +308,25 @@ impl GatewayTokenTarget<'_> {
         let provider = self.provider;
         let surface_variant = self.surface_variant;
         let grant_label = grant_label(&provider.provider_type);
+        let effective_scopes = self.scopes();
+        let user_hash = gateway_grant_user_hash(effective_scopes);
+        let secrets = ProviderSecrets::new(secrets_store, provider);
         let cached = match vault_store
-            .lookup(self.agent_did, GATEWAY_GRANT_USER_HASH, &binding.credential_provider_id)
+            .lookup(self.agent_did, &user_hash, &binding.credential_provider_id)
             .await
         {
-            Ok(VaultLookupResult::Found(token)) if token.consent_granted_at >= provider.updated_at => Some(token),
+            Ok(VaultLookupResult::Found(token))
+                if token.consent_granted_at >= provider.updated_at
+                    && secrets
+                        .still_current(
+                            token
+                                .secret_versions
+                                .as_deref(),
+                        )
+                        .await =>
+            {
+                Some(token)
+            }
             Ok(
                 VaultLookupResult::Found(token)
                 | VaultLookupResult::ExpiredRefreshable(token)
@@ -300,7 +336,7 @@ impl GatewayTokenTarget<'_> {
                     target: "credential_delegation",
                     surface_variant,
                     token_id = %token.id,
-                    "Gateway token is expired or predates the provider's last change and will be replaced"
+                    "Gateway token is expired or predates a change to the provider or its secrets and will be replaced"
                 );
                 None
             }
@@ -322,16 +358,12 @@ impl GatewayTokenTarget<'_> {
                     "Failed to mark gateway token as used"
                 );
             }
-            return self.inject(&token.id, &token.access_token, format!("{grant_label}_cached"));
+            return self.inject(&user_hash, &token.id, &token.access_token, format!("{grant_label}_cached"));
         }
 
-        let effective_scopes = if binding.scopes.is_empty() {
-            &provider.default_scopes
-        } else {
-            &binding.scopes
-        };
+        let requested_at = Utc::now();
         let grant = GATEWAY_GRANT_BACKOFF
-            .request(provider, effective_scopes, &ProviderSecrets::new(secrets_store, provider), egress)
+            .request(provider, effective_scopes, &secrets, egress)
             .await;
         match grant {
             Ok(token_response) => {
@@ -347,7 +379,7 @@ impl GatewayTokenTarget<'_> {
                 let delegation_token = DelegationToken {
                     id: Uuid::new_v4().to_string(),
                     agent_did: self.agent_did.to_string(),
-                    user_identity_hash: GATEWAY_GRANT_USER_HASH.to_string(),
+                    user_identity_hash: user_hash.clone(),
                     credential_provider_id: binding
                         .credential_provider_id
                         .clone(),
@@ -361,7 +393,8 @@ impl GatewayTokenTarget<'_> {
                         .map(|secs| now + chrono::Duration::seconds(secs)),
                     delegation_vc: None,
                     consent_identity: None,
-                    consent_granted_at: now,
+                    secret_versions: Some(secrets.versions_read()),
+                    consent_granted_at: requested_at,
                     last_used_at: Some(now),
                     created_at: now,
                     updated_at: now,
@@ -370,7 +403,9 @@ impl GatewayTokenTarget<'_> {
                     .store(delegation_token)
                     .await
                 {
-                    Ok(stored) => self.inject(&stored.id, &stored.access_token, format!("{grant_label}_fresh")),
+                    Ok(stored) => {
+                        self.inject(&user_hash, &stored.id, &stored.access_token, format!("{grant_label}_fresh"))
+                    }
                     Err(error) => {
                         error!(
                             target: "credential_delegation",
@@ -401,7 +436,7 @@ impl GatewayTokenTarget<'_> {
                     "Gateway token fetch failed"
                 );
                 if let Some(token) = cached.filter(|token| token.is_provably_valid(Utc::now())) {
-                    return self.inject(&token.id, &token.access_token, format!("{grant_label}_stale"));
+                    return self.inject(&user_hash, &token.id, &token.access_token, format!("{grant_label}_stale"));
                 }
                 let detail = format!("{grant_label}_{}", error.category());
                 audit::emit("delegation_failed", || {
@@ -429,7 +464,7 @@ impl GatewayTokenTarget<'_> {
                     let mut evt = audit::audit_event(
                         DelegationAuditAction::TokenNotFound,
                         Some(self.agent_did),
-                        Some(GATEWAY_GRANT_USER_HASH),
+                        Some(&user_hash),
                         Some(&binding.credential_provider_id),
                         Some(self.channel_id),
                     );
@@ -451,6 +486,7 @@ impl GatewayTokenTarget<'_> {
 
     fn inject(
         &self,
+        user_hash: &str,
         token_id: &str,
         access_token: &str,
         detail: String,
@@ -467,7 +503,7 @@ impl GatewayTokenTarget<'_> {
             let mut evt = audit::audit_event(
                 DelegationAuditAction::TokenInjected,
                 Some(self.agent_did),
-                Some(GATEWAY_GRANT_USER_HASH),
+                Some(user_hash),
                 Some(
                     &self
                         .binding
@@ -1662,6 +1698,7 @@ mod tests {
 
     use crate::config::types::{ConsentMode, CredentialInjection, CredentialRequirement, OutboundCredentialBinding};
     use crate::credential_providers::CredentialProvider;
+    use crate::delegation_vault::gateway_token::SecretVersion;
     use crate::delegation_vault::gateway_token::test_endpoint::TokenEndpoint;
     use crate::delegation_vault::{DelegationToken, VaultLookupResult};
     use crate::secrets::{CreateSecretRequest, Secret, SecretListItem, UpdateSecretRequest};
@@ -1840,6 +1877,65 @@ mod tests {
         }
     }
 
+    /// Answers every secret id with an unusable value at the version `gateway_token` records.
+    struct UnchangedSecretsStore;
+
+    #[async_trait]
+    impl crate::secrets::store::SecretsStore for UnchangedSecretsStore {
+        async fn create(
+            &self,
+            _request: CreateSecretRequest,
+        ) -> Result<Secret> {
+            unimplemented!()
+        }
+        async fn get(
+            &self,
+            _id: &str,
+        ) -> Result<Option<Secret>> {
+            Ok(None)
+        }
+        async fn get_by_secret_id(
+            &self,
+            secret_id: &str,
+        ) -> Result<Option<Secret>> {
+            let earlier = chrono::DateTime::<Utc>::UNIX_EPOCH;
+            Ok(Some(Secret {
+                id: secret_id.into(),
+                tenant_id: None,
+                name: secret_id.into(),
+                secret_id: secret_id.into(),
+                description: None,
+                value: "unusable".into(),
+                secret_type: "General".into(),
+                tags: vec![],
+                created_at: earlier,
+                updated_at: earlier,
+            }))
+        }
+        async fn list_all(&self) -> Result<Vec<SecretListItem>> {
+            Ok(vec![])
+        }
+        async fn update(
+            &self,
+            _id: &str,
+            _request: UpdateSecretRequest,
+        ) -> Result<Secret> {
+            unimplemented!()
+        }
+        async fn delete(
+            &self,
+            _id: &str,
+        ) -> Result<()> {
+            Ok(())
+        }
+        async fn find_by_tag(
+            &self,
+            _tag: &str,
+        ) -> Result<Vec<SecretListItem>> {
+            Ok(vec![])
+        }
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────
 
     #[test]
@@ -1980,6 +2076,7 @@ mod tests {
             },
             delegation_vc: None,
             consent_identity: None,
+            secret_versions: None,
             consent_granted_at: now,
             last_used_at: None,
             created_at: now,
@@ -3011,6 +3108,7 @@ mod tests {
             signing_key_secret_ref: "SIGNING_KEY".into(),
             signing_algorithm: crate::credential_providers::jwt_assertion::JwtBearerAlgorithm::Es256,
             key_id: None,
+            audience: None,
         });
         provider.created_at = Utc::now() - Duration::days(1);
         provider.updated_at = provider.created_at;
@@ -3024,8 +3122,12 @@ mod tests {
     ) -> DelegationToken {
         let mut token = make_token(false, false);
         token.credential_provider_id = provider_id.to_string();
-        token.user_identity_hash = GATEWAY_GRANT_USER_HASH.to_string();
+        token.user_identity_hash = gateway_grant_user_hash(&["repo".to_string()]);
         token.access_token = "cached-gateway-token".to_string();
+        token.secret_versions = Some(vec![SecretVersion {
+            secret_id: "SIGNING_KEY".into(),
+            updated_at: chrono::DateTime::<Utc>::UNIX_EPOCH,
+        }]);
         token.consent_granted_at = Utc::now() - Duration::seconds(issued_secs_ago);
         token.created_at = token.consent_granted_at;
         token.expires_at = Some(Utc::now() + Duration::seconds(expires_in_secs));
@@ -3075,7 +3177,7 @@ mod tests {
     async fn test_bindings_send_the_gateways_own_credential_only_within_the_providers_tenant() {
         let directory = tempfile::tempdir().unwrap();
         let secrets = signing_key_secrets(&directory).await;
-        let cached = |provider: &CredentialProvider| VaultLookupResult::Found(gateway_token(&provider.id, 10, 3_600));
+        let cached = |provider: &CredentialProvider| VaultLookupResult::Found(gateway_token(&provider.id, 0, 3_600));
         let api_key = {
             let mut provider = make_credential_provider("cp-key", CredentialProviderType::ApiKey);
             provider.api_key_secret_ref = Some("SIGNING_KEY".into());
@@ -3108,8 +3210,12 @@ mod tests {
         }
 
         let own = in_tenant(jwt_bearer_provider("cp-jwt"), "tenant-a");
-        let lookup = cached(&own);
-        let resolution = resolve_binding_for_surface(own, lookup, secrets.clone(), Some("tenant-a"), true).await;
+        let tenant_directory = tempfile::tempdir().unwrap();
+        let tenant_secrets = tenant_signing_key_secrets(&tenant_directory, Some("tenant-a")).await;
+        let mut token = gateway_token(&own.id, 0, 3_600);
+        token.secret_versions = Some(signing_key_version(&tenant_secrets, &own).await);
+        let lookup = VaultLookupResult::Found(token);
+        let resolution = resolve_binding_for_surface(own, lookup, tenant_secrets, Some("tenant-a"), true).await;
         assert_eq!(injected_bearer(&resolution).as_deref(), Some("Bearer cached-gateway-token"));
         let mut consented = make_token(false, false);
         consented.credential_provider_id = consent.id.clone();
@@ -3126,7 +3232,12 @@ mod tests {
     async fn test_a_leg_refused_a_jwt_bearer_token_refuses_only_jwt_bearer_bindings() {
         let directory = tempfile::tempdir().unwrap();
         let secrets = signing_key_secrets(&directory).await;
-        let cached = |provider: &CredentialProvider| VaultLookupResult::Found(gateway_token(&provider.id, 10, 3_600));
+        let versions = signing_key_version(&secrets, &jwt_bearer_provider("cp-jwt-leg")).await;
+        let cached = |provider: &CredentialProvider| {
+            let mut token = gateway_token(&provider.id, 0, 3_600);
+            token.secret_versions = Some(versions.clone());
+            VaultLookupResult::Found(token)
+        };
 
         let jwt = jwt_bearer_provider("cp-jwt-leg");
         let lookup = cached(&jwt);
@@ -3188,7 +3299,26 @@ mod tests {
         }
     }
 
+    async fn signing_key_version(
+        secrets: &Arc<dyn SecretsStore>,
+        provider: &CredentialProvider,
+    ) -> Vec<SecretVersion> {
+        let read = ProviderSecrets::new(secrets, provider);
+        read.resolve("SIGNING_KEY")
+            .await
+            .unwrap();
+        read.versions_read()
+    }
+
     async fn signing_key_secrets(directory: &tempfile::TempDir) -> Arc<dyn SecretsStore> {
+        tenant_signing_key_secrets(directory, None).await
+    }
+
+    /// The signing key and the client id and secret of the test providers, in `tenant_id`.
+    async fn tenant_signing_key_secrets(
+        directory: &tempfile::TempDir,
+        tenant_id: Option<&str>,
+    ) -> Arc<dyn SecretsStore> {
         let secrets = crate::secrets::FilesystemSecretsStore::new_async(
             directory
                 .path()
@@ -3198,18 +3328,24 @@ mod tests {
         )
         .await
         .unwrap();
-        secrets
-            .create(CreateSecretRequest {
-                tenant_id: None,
-                name: "SIGNING_KEY".into(),
-                secret_id: "SIGNING_KEY".into(),
-                description: None,
-                value: crate::credential_providers::jwt_assertion::test_keys::ec_pkcs8_pem().to_string(),
-                secret_type: "General".into(),
-                tags: vec![],
-            })
-            .await
-            .unwrap();
+        for (secret_id, value) in [
+            ("SIGNING_KEY", crate::credential_providers::jwt_assertion::test_keys::ec_pkcs8_pem()),
+            ("CLIENT_ID", "client-id"),
+            ("CLIENT_SECRET", "client-secret"),
+        ] {
+            secrets
+                .create(CreateSecretRequest {
+                    tenant_id: tenant_id.map(str::to_string),
+                    name: secret_id.into(),
+                    secret_id: secret_id.into(),
+                    description: None,
+                    value: value.to_string(),
+                    secret_type: "General".into(),
+                    tags: vec![],
+                })
+                .await
+                .unwrap();
+        }
         Arc::new(secrets)
     }
 
@@ -3270,6 +3406,84 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_gateway_grant_user_hash_ignores_scope_order_and_differs_by_scope_set() {
+        let scopes = |names: &[&str]| -> Vec<String> {
+            names
+                .iter()
+                .map(|name| name.to_string())
+                .collect()
+        };
+        let read_write = gateway_grant_user_hash(&scopes(&["b", "a"]));
+        assert_eq!(read_write, gateway_grant_user_hash(&scopes(&["a", "b", "a"])));
+        assert_ne!(read_write, gateway_grant_user_hash(&scopes(&["a"])));
+        assert_ne!(gateway_grant_user_hash(&[]), gateway_grant_user_hash(&scopes(&["a"])));
+        for hash in [read_write, gateway_grant_user_hash(&[])] {
+            let digest = hash
+                .strip_prefix("__client_credentials__:")
+                .expect("the hash keeps the gateway grant prefix");
+            assert_eq!(digest.len(), 64, "{hash}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_routes_with_different_scopes_never_share_a_gateway_token() {
+        let mut fixture = GatewayGrantFixture::start(
+            "cp-jwt-scopes",
+            axum::http::StatusCode::OK,
+            serde_json::json!({"access_token": "fresh-gateway-token", "token_type": "Bearer", "expires_in": 3600}),
+        )
+        .await;
+        let narrow = vec!["orders.read".to_string()];
+        let wide = vec!["orders.read".to_string(), "orders.write".to_string()];
+
+        fixture.binding.scopes = narrow.clone();
+        assert_eq!(
+            fixture
+                .resolve()
+                .await
+                .action
+                .detail
+                .as_deref(),
+            Some("jwt_bearer_fresh")
+        );
+        fixture.binding.scopes = wide.clone();
+        assert_eq!(
+            fixture
+                .resolve()
+                .await
+                .action
+                .detail
+                .as_deref(),
+            Some("jwt_bearer_fresh")
+        );
+        assert_eq!(fixture.grants(), 2, "a wider scope set never reuses the narrower token");
+        fixture.binding.scopes = narrow.clone();
+        assert_eq!(
+            fixture
+                .resolve()
+                .await
+                .action
+                .detail
+                .as_deref(),
+            Some("jwt_bearer_cached")
+        );
+        assert_eq!(fixture.grants(), 2);
+
+        let mut stored: Vec<(String, Vec<String>)> = fixture
+            .vault
+            .list_all()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|token| (token.user_identity_hash, token.scopes))
+            .collect();
+        stored.sort();
+        let mut expected = vec![(gateway_grant_user_hash(&narrow), narrow), (gateway_grant_user_hash(&wide), wide)];
+        expected.sort();
+        assert_eq!(stored, expected);
+    }
+
     #[tokio::test]
     async fn test_gateway_binding_sends_one_grant_for_requests_inside_the_refresh_margin() {
         let fixture = GatewayGrantFixture::start(
@@ -3280,6 +3494,7 @@ mod tests {
         .await;
         let mut first_grant = gateway_token("cp-jwt-margin", 1_000, 10);
         first_grant.agent_did = "did:web:agent.example".into();
+        first_grant.secret_versions = Some(signing_key_version(&fixture.secrets, &fixture.provider).await);
         fixture
             .vault
             .store(first_grant)
@@ -3352,6 +3567,281 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_gateway_binding_never_serves_a_token_granted_before_a_secret_it_uses_changed() {
+        use crate::delegation_vault::gateway_token::test_endpoint::replace_secret;
+        let fixture = GatewayGrantFixture::start(
+            "cp-jwt-secret-changed",
+            axum::http::StatusCode::OK,
+            serde_json::json!({"access_token": "fresh-gateway-token", "token_type": "Bearer", "expires_in": 3600}),
+        )
+        .await;
+        let resolve = async || {
+            let resolution = fixture.resolve().await;
+            (
+                resolution
+                    .action
+                    .detail
+                    .clone(),
+                injected_bearer(&resolution),
+                fixture.grants(),
+            )
+        };
+        let injected = Some("Bearer fresh-gateway-token".to_string());
+        assert_eq!(resolve().await, (Some("jwt_bearer_fresh".into()), injected.clone(), 1));
+
+        replace_secret(&fixture.secrets, "CLIENT_ID", "not-used-by-this-provider").await;
+        assert_eq!(resolve().await, (Some("jwt_bearer_cached".into()), injected.clone(), 1));
+
+        let rotated_key = crate::component_tests::helpers::oidc_keys::SigningFixture::es256(1);
+        replace_secret(&fixture.secrets, "SIGNING_KEY", rotated_key.private_pkcs8_pem()).await;
+        assert_eq!(resolve().await, (Some("jwt_bearer_fresh".into()), injected.clone(), 2));
+        assert_eq!(resolve().await, (Some("jwt_bearer_cached".into()), injected.clone(), 2));
+
+        let signing_key = fixture
+            .secrets
+            .get_by_secret_id("SIGNING_KEY")
+            .await
+            .unwrap()
+            .unwrap();
+        fixture
+            .secrets
+            .set_tenant_id(&signing_key.id, Some("tenant-b".into()))
+            .await
+            .unwrap();
+        assert_eq!(resolve().await, (Some("jwt_bearer_forbidden".into()), None, 2));
+
+        fixture
+            .secrets
+            .delete(&signing_key.id)
+            .await
+            .unwrap();
+        assert_eq!(resolve().await, (Some("jwt_bearer_secret_unavailable".into()), None, 2));
+        assert_eq!(
+            fixture
+                .vault
+                .list_all()
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the still-valid token granted with the old key stays stored but is never served"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_gateway_grant_sent_before_its_secret_changed_is_not_served_afterwards() {
+        use crate::delegation_vault::gateway_token::test_endpoint::replace_secret;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let release = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let url = format!("http://{}/token", listener.local_addr().unwrap());
+        let app = axum::Router::new().route(
+            "/token",
+            axum::routing::post({
+                let (release, calls) = (release.clone(), calls.clone());
+                move || async move {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        release.notified().await;
+                    }
+                    axum::Json(serde_json::json!({"access_token": "slow-token", "token_type": "Bearer",
+                        "expires_in": 3600}))
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let mut fixture = GatewayGrantFixture::start(
+            "cp-jwt-secret-race",
+            axum::http::StatusCode::OK,
+            serde_json::json!({"access_token": "unused", "token_type": "Bearer"}),
+        )
+        .await;
+        fixture
+            .provider
+            .token_endpoint = Some(url.clone());
+        let fixture = Arc::new(fixture);
+        let egress = GrantEgress {
+            timeout: std::time::Duration::from_secs(5),
+            exact_allowlist: Some(url),
+        };
+        let resolve = |fixture: Arc<GatewayGrantFixture>, egress: GrantEgress| async move {
+            GatewayTokenTarget {
+                binding: &fixture.binding,
+                provider: &fixture.provider,
+                agent_did: "did:web:agent.example",
+                channel_id: "ch-1",
+                via_fabric: false,
+                audit_ctx: None,
+                surface_variant: None,
+            }
+            .resolve(&fixture.vault, &fixture.secrets, &egress)
+            .await
+            .action
+            .detail
+        };
+
+        let in_flight = tokio::spawn(resolve(fixture.clone(), egress.clone()));
+        while calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        let rotated_key = crate::component_tests::helpers::oidc_keys::SigningFixture::es256(1);
+        replace_secret(&fixture.secrets, "SIGNING_KEY", rotated_key.private_pkcs8_pem()).await;
+        release.notify_one();
+        assert_eq!(
+            in_flight
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("jwt_bearer_fresh")
+        );
+
+        assert_eq!(
+            resolve(fixture.clone(), egress.clone())
+                .await
+                .as_deref(),
+            Some("jwt_bearer_fresh")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "the token granted with the old key is not reused");
+        assert_eq!(
+            resolve(fixture.clone(), egress)
+                .await
+                .as_deref(),
+            Some("jwt_bearer_cached")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_a_gateway_grant_sent_before_its_provider_changed_is_not_served_afterwards() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let release = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let url = format!("http://{}/token", listener.local_addr().unwrap());
+        let app = axum::Router::new().route(
+            "/token",
+            axum::routing::post({
+                let (release, calls) = (release.clone(), calls.clone());
+                move || async move {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        release.notified().await;
+                    }
+                    axum::Json(serde_json::json!({"access_token": "slow-token", "token_type": "Bearer",
+                        "expires_in": 3600}))
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let mut fixture = GatewayGrantFixture::start(
+            "cp-jwt-provider-race",
+            axum::http::StatusCode::OK,
+            serde_json::json!({"access_token": "unused", "token_type": "Bearer"}),
+        )
+        .await;
+        fixture
+            .provider
+            .token_endpoint = Some(url.clone());
+        let fixture = Arc::new(fixture);
+        let egress = GrantEgress {
+            timeout: std::time::Duration::from_secs(5),
+            exact_allowlist: Some(url),
+        };
+        let resolve = |fixture: Arc<GatewayGrantFixture>, provider: CredentialProvider, egress: GrantEgress| async move {
+            GatewayTokenTarget {
+                binding: &fixture.binding,
+                provider: &provider,
+                agent_did: "did:web:agent.example",
+                channel_id: "ch-1",
+                via_fabric: false,
+                audit_ctx: None,
+                surface_variant: None,
+            }
+            .resolve(&fixture.vault, &fixture.secrets, &egress)
+            .await
+            .action
+            .detail
+        };
+
+        let in_flight = tokio::spawn(resolve(fixture.clone(), fixture.provider.clone(), egress.clone()));
+        while calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let mut edited = fixture.provider.clone();
+        edited.updated_at = Utc::now();
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        release.notify_one();
+        assert_eq!(
+            in_flight
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("jwt_bearer_fresh")
+        );
+        let stored = fixture
+            .vault
+            .list_all()
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        assert!(stored[0].consent_granted_at < edited.updated_at, "consent is the time the grant was sent");
+        assert!(stored[0].created_at > edited.updated_at);
+
+        assert_eq!(
+            resolve(fixture.clone(), edited.clone(), egress.clone())
+                .await
+                .as_deref(),
+            Some("jwt_bearer_fresh")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "the token granted before the provider changed is not reused");
+        assert_eq!(
+            resolve(fixture.clone(), edited, egress)
+                .await
+                .as_deref(),
+            Some("jwt_bearer_cached")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_gateway_binding_refuses_a_grant_missing_a_requested_scope_and_stores_nothing() {
+        let fixture = GatewayGrantFixture::start(
+            "cp-jwt-narrowed",
+            axum::http::StatusCode::OK,
+            serde_json::json!({"access_token": "narrow-token", "token_type": "Bearer", "expires_in": 3600,
+                "scope": "other"}),
+        )
+        .await;
+        let resolution = fixture.resolve().await;
+        assert_eq!(resolution.action.outcome, DelegationActionOutcome::ClientCredentialsFailed);
+        assert_eq!(
+            resolution
+                .action
+                .detail
+                .as_deref(),
+            Some("jwt_bearer_scope_mismatch")
+        );
+        assert!(matches!(resolution.result, DelegationLookupResult::Unavailable));
+        assert!(
+            fixture
+                .vault
+                .list_all()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(fixture.grants(), 1);
+    }
+
+    #[tokio::test]
     async fn test_gateway_binding_does_not_fall_back_to_a_token_granted_before_the_provider_changed() {
         let mut fixture = GatewayGrantFixture::start(
             "cp-jwt-edited-failing",
@@ -3361,6 +3851,7 @@ mod tests {
         .await;
         let mut earlier = gateway_token("cp-jwt-edited-failing", 60, 3_540);
         earlier.agent_did = "did:web:agent.example".into();
+        earlier.secret_versions = Some(signing_key_version(&fixture.secrets, &fixture.provider).await);
         fixture
             .vault
             .store(earlier)
@@ -3386,7 +3877,7 @@ mod tests {
         let resolution = resolve_gateway_binding(
             jwt_bearer_provider("cp-jwt-cached"),
             VaultLookupResult::Found(gateway_token("cp-jwt-cached", 0, 3600)),
-            Arc::new(MockSecretsStore),
+            Arc::new(UnchangedSecretsStore),
         )
         .await;
         assert_eq!(resolution.action.outcome, DelegationActionOutcome::TokenInjected);
@@ -3405,7 +3896,7 @@ mod tests {
         let resolution = resolve_gateway_binding(
             jwt_bearer_provider("cp-jwt-stale"),
             VaultLookupResult::Found(gateway_token("cp-jwt-stale", 3400, 200)),
-            Arc::new(MockSecretsStore),
+            Arc::new(UnchangedSecretsStore),
         )
         .await;
         assert_eq!(resolution.action.outcome, DelegationActionOutcome::TokenInjected);
@@ -3426,7 +3917,7 @@ mod tests {
         let resolution = resolve_gateway_binding(
             jwt_bearer_provider("cp-jwt-no-expiry"),
             VaultLookupResult::Found(token),
-            Arc::new(MockSecretsStore),
+            Arc::new(UnchangedSecretsStore),
         )
         .await;
         assert_eq!(resolution.action.outcome, DelegationActionOutcome::ClientCredentialsFailed);
@@ -3439,6 +3930,82 @@ mod tests {
         );
         assert!(injected_bearer(&resolution).is_none());
         assert!(matches!(resolution.result, DelegationLookupResult::Unavailable));
+    }
+
+    fn gateway_token_without_secret_versions(
+        provider_id: &str,
+        issued_secs_ago: i64,
+        expires_in_secs: i64,
+    ) -> DelegationToken {
+        let mut token = gateway_token(provider_id, issued_secs_ago, expires_in_secs);
+        token.agent_did = "did:web:agent.example".into();
+        token.secret_versions = None;
+        token
+    }
+
+    #[tokio::test]
+    async fn test_gateway_binding_replaces_a_stored_token_without_secret_versions_with_a_new_grant() {
+        let fixture = GatewayGrantFixture::start(
+            "cp-jwt-unversioned",
+            axum::http::StatusCode::OK,
+            serde_json::json!({"access_token": "fresh-gateway-token", "token_type": "Bearer", "expires_in": 3600}),
+        )
+        .await;
+        fixture
+            .vault
+            .store(gateway_token_without_secret_versions("cp-jwt-unversioned", 0, 3_600))
+            .await
+            .unwrap();
+
+        let resolution = fixture.resolve().await;
+        assert_eq!(
+            resolution
+                .action
+                .detail
+                .as_deref(),
+            Some("jwt_bearer_fresh")
+        );
+        assert_eq!(injected_bearer(&resolution).as_deref(), Some("Bearer fresh-gateway-token"));
+        assert_eq!(fixture.grants(), 1);
+
+        let stored = match fixture
+            .vault
+            .lookup("did:web:agent.example", &gateway_grant_user_hash(&fixture.binding.scopes), "cp-jwt-unversioned")
+            .await
+            .unwrap()
+        {
+            VaultLookupResult::Found(token) => token,
+            _ => panic!("expected the new token to be stored"),
+        };
+        assert_eq!(stored.access_token, "fresh-gateway-token");
+        assert_eq!(stored.secret_versions, Some(signing_key_version(&fixture.secrets, &fixture.provider).await));
+    }
+
+    #[tokio::test]
+    async fn test_gateway_binding_does_not_fall_back_to_a_stored_token_without_secret_versions() {
+        let fixture = GatewayGrantFixture::start(
+            "cp-jwt-unversioned-failing",
+            axum::http::StatusCode::BAD_REQUEST,
+            serde_json::json!({"error": "invalid_grant"}),
+        )
+        .await;
+        fixture
+            .vault
+            .store(gateway_token_without_secret_versions("cp-jwt-unversioned-failing", 3_400, 200))
+            .await
+            .unwrap();
+
+        let resolution = fixture.resolve().await;
+        assert_eq!(resolution.action.outcome, DelegationActionOutcome::ClientCredentialsFailed);
+        assert!(
+            resolution
+                .action
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.starts_with("jwt_bearer_") && !detail.ends_with("_stale"))
+        );
+        assert!(injected_bearer(&resolution).is_none());
+        assert_eq!(fixture.grants(), 1);
     }
 
     #[tokio::test]
@@ -3709,7 +4276,9 @@ mod tests {
     async fn test_gateway_binding_injects_a_cached_token_when_the_vault_cannot_record_its_use() {
         let provider_id = "cp-jwt-mark-used";
         let cached = gateway_token(provider_id, 10, 3_600);
-        let fixture = faulty_gateway_fixture(provider_id, Some(VaultLookupResult::Found(cached)), true, false).await;
+        let mut fixture =
+            faulty_gateway_fixture(provider_id, Some(VaultLookupResult::Found(cached)), true, false).await;
+        fixture.secrets = Arc::new(UnchangedSecretsStore);
 
         let resolution = fixture.resolve().await;
 
@@ -3776,7 +4345,7 @@ mod tests {
             event
                 .user_identity_hash
                 .as_deref(),
-            Some(GATEWAY_GRANT_USER_HASH)
+            Some(gateway_grant_user_hash(&fixture.binding.scopes).as_str())
         );
         assert_eq!(event.agent_did.as_deref(), Some("did:web:agent.example"));
         assert_eq!(event.surface_id.as_deref(), Some("ch-1"));

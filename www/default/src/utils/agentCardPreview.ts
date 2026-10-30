@@ -45,7 +45,7 @@ export const CARD_AUTH_FAILURES = [
 ] as const;
 export type CardAuthFailure = (typeof CARD_AUTH_FAILURES)[number];
 
-export const UNSUPPORTED_REASONS = ['not_a2a', 'not_running'] as const;
+export const UNSUPPORTED_REASONS = ['not_a2a', 'not_running', 'operator_only'] as const;
 export type CardUnsupportedReason = (typeof UNSUPPORTED_REASONS)[number];
 
 export interface CardFetch {
@@ -236,6 +236,12 @@ export async function refreshAgentCardPreview(
   }
 }
 
+export const GATEWAY_CARD_SCHEME = 'agent_gateway';
+
+export function cardNamesGatewayScheme(card: CardJson | null): boolean {
+  return !!card && isRecord(card.securitySchemes) && GATEWAY_CARD_SCHEME in card.securitySchemes;
+}
+
 export function safeHttpUrl(value: unknown): string | null {
   if (typeof value !== 'string' || value.trim() === '') return null;
   try {
@@ -293,6 +299,9 @@ export const AUTH_FAILED_ACTION_TEXT = 'Check Target Authentication on the Manag
 export const CARD_REJECTED_CREDENTIAL_TEXT =
   "The agent rejected the gateway's credential (HTTP 401). Check the provider's scopes and audience.";
 
+export const CARD_PEER_REFUSED_TEXT =
+  "The remote gateway refused this gateway's authorization (HTTP {s}). Check the sign-in settings of the remote surface.";
+
 export const AUTH_FAILURE_TEXT: Record<CardAuthFailure, string> = {
   secret_unavailable: 'A secret the credential needs is missing.',
   provider_not_found: 'The credential provider no longer exists.',
@@ -317,6 +326,11 @@ export function describeFetchCause(fetch: CardFetch, auth: CardAuthReport): stri
   const cause = fetch.cause;
   if (!cause) return '';
   if (cause === 'auth_failed') {
+    if (auth.kind === 'remote_gateway') {
+      return fetch.http_status !== null
+        ? CARD_PEER_REFUSED_TEXT.replace('{s}', String(fetch.http_status))
+        : CARD_PEER_REFUSED_TEXT.replace(' (HTTP {s})', '');
+    }
     if (auth.result === 'sent') return CARD_REJECTED_CREDENTIAL_TEXT;
     const reason = auth.failure ? AUTH_FAILURE_TEXT[auth.failure] : null;
     return [CARD_FETCH_CAUSE_TEXT.auth_failed, reason, AUTH_FAILED_ACTION_TEXT]

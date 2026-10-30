@@ -143,13 +143,14 @@ impl Declaration {
     /// The caller authentication the Access Point enforces: a JWT Bearer token
     /// must name the resource of the route called as its audience (RFC 8707),
     /// so a token the same authorization server issued for another resource or
-    /// variant is refused.
+    /// variant is refused, and must not be shaped as an ID token.
     pub fn bind_audience(
         &self,
         config: &JwtBearerAuthConfig,
     ) -> JwtBearerAuthConfig {
         JwtBearerAuthConfig {
             audiences: vec![self.resource.clone()],
+            access_tokens_only: true,
             ..config.clone()
         }
     }
@@ -748,9 +749,11 @@ mod tests {
                 .await
                 .bind_audience(&method);
             assert_eq!(bound.audiences, [audience]);
+            assert!(bound.access_tokens_only);
             assert_eq!(
                 JwtBearerAuthConfig {
                     audiences: method.audiences.clone(),
+                    access_tokens_only: false,
                     ..bound
                 },
                 method

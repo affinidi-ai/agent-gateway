@@ -226,7 +226,10 @@ transit token validation → rate limit → protocol context → Transit Point h
 identity → custom metadata → trust context → Trust Check (the Transit Point's own list) → gateway OPA →
 surface OPA → Transit Point OPA → MCP tool gating (`tools/call`) → credential injection and
 Target authentication → forward → response and agent-card rewrite → metrics. The stages from trust context to MCP
-tool gating are skipped for public discovery GETs.
+tool gating are skipped for public discovery GETs. On an inbound Access Point that declares a
+protected resource, public discovery reads are limited to the exact well-known card and UCP URLs
+under its route; every other path goes through source authentication, policy and Trust Check. The
+Transit Point path still treats any discovery-suffix GET as public.
 
 This page is the authority on pipeline ordering. When it disagrees with a summary
 elsewhere, the source is the arbiter and this page is corrected.

@@ -22,7 +22,7 @@
 /// the gateway recognises. The canonical form is the v0.3 slash-form.
 ///
 /// The legacy pre-0.2 `tasks/send` alias is intentionally absent (dropped).
-const METHOD_TABLE: &[(&str, &str)] = &[
+pub(crate) const METHOD_TABLE: &[(&str, &str)] = &[
     ("message/send", "SendMessage"),
     ("message/stream", "SendStreamingMessage"),
     ("tasks/get", "GetTask"),

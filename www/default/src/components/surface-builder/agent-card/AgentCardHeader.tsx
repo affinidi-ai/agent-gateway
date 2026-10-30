@@ -6,6 +6,7 @@ import { showToast } from '../../../utils/toaster';
 import { describeDeclaration } from '../../../utils/surfaceDeclarations';
 import {
   CARD_FETCH_STATUS_LABEL,
+  cardNamesGatewayScheme,
   describeCardAuth,
   describeFetchFailure,
   formatLocalTime,
@@ -41,7 +42,13 @@ const AgentCardHeader: React.FC<AgentCardHeaderProps> = ({
   const openUrl = safeHttpUrl(preview.served_url);
   const fetchedAbsolute = formatLocalTime(preview.fetched_at);
   const fetchedRelative = formatRelativeTime(preview.fetched_at, now);
-  const outcome = preview.outcome ? describeDeclaration(preview.outcome) : null;
+  const outcome = preview.outcome
+    ? describeDeclaration(
+        preview.outcome,
+        undefined,
+        preview.after ? cardNamesGatewayScheme(preview.after) : null
+      )
+    : null;
   const caller = preview.last_caller_fetch;
   const callerRelative = caller ? formatRelativeTime(caller.at, now) : null;
   const callerFailure = caller ? describeFetchFailure(caller) : null;

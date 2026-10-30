@@ -1458,8 +1458,8 @@ must follow the same rules, except that a strategy no tenant owns may also have 
 a strategy whose issuer fails them is refused on save with `400` and answers `503` at request time. The issuer is
 advertised exactly as written, since clients compare it byte for byte with the issuer in the
 server's own metadata. A stored list is never advertised; one that no longer equals the issuer
-after the strategy changed blocks the next save of the surface until it is updated or removed,
-and the save report warns beforehand (`authorization_servers_stale`). `scopes` is optional and
+after the strategy changed is kept while unchanged and reported by the save report as
+`authorization_servers_stale`; a save that sends a different list must send exactly the issuer. `scopes` is optional and
 only advertised: `scopes_supported` lists the method's `required_scopes`, which the Access Point
 enforces (see below), then each extra scope in `scopes`. A variant that overrides
 `caller_authentication` carries its own setting or none.

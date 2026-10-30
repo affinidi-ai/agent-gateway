@@ -13253,6 +13253,22 @@ mod tests {
             )
             .await
             .unwrap();
+        let secrets = state
+            .secrets_store
+            .as_ref()
+            .unwrap();
+        let signing_key = secrets
+            .create(crate::secrets::CreateSecretRequest {
+                tenant_id: None,
+                name: "SIGNING_KEY".into(),
+                secret_id: "SIGNING_KEY".into(),
+                description: None,
+                value: "signing-key".into(),
+                secret_type: "General".into(),
+                tags: vec![],
+            })
+            .await
+            .unwrap();
         state
             .delegation_vault_store
             .as_ref()
@@ -13260,9 +13276,10 @@ mod tests {
             .store(
                 serde_json::from_value(json!({
                     "id": "jwt-token", "agent_did": "did:web:agent.example",
-                    "user_identity_hash": crate::proxy::credential_delegation::GATEWAY_GRANT_USER_HASH,
+                    "user_identity_hash": crate::proxy::credential_delegation::gateway_grant_user_hash(&["read".to_string()]),
                     "credential_provider_id": "jwt", "provider_id": "jwt", "access_token": "gateway-jwt-token",
                     "scopes": ["read"], "expires_at": chrono::Utc::now() + chrono::Duration::hours(1),
+                    "secret_versions": [{"secret_id": signing_key.secret_id, "updated_at": signing_key.updated_at}],
                     "consent_granted_at": chrono::Utc::now(),
                     "created_at": chrono::Utc::now(), "updated_at": chrono::Utc::now()
                 }))

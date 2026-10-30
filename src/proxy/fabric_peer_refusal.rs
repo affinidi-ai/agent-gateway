@@ -3,6 +3,8 @@
 //! never crosses Fabric, so no such refusal is the caller's to fix: it becomes a
 //! `502` with a fixed detail and no challenge.
 
+use std::collections::HashMap;
+
 use axum::http::header::WWW_AUTHENTICATE;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
@@ -10,6 +12,7 @@ use serde_json::Value;
 
 use crate::audit::request_events::{RejectionReason, RejectionStage, RequestFacts, request_rejected};
 use crate::channel_warn;
+use crate::proxy::fabric_forward::fabric_header_values;
 use crate::source_auth::challenge::{PeerRefusal, peer_refusal};
 
 pub(crate) const PEER_REFUSED_DETAIL: &str = "The Fabric peer refused the gateway's authorization";
@@ -28,19 +31,39 @@ pub(crate) fn rejection_reason(refusal: PeerRefusal) -> RejectionReason {
 /// rest of the response hides a challenge; a value no header can carry is
 /// skipped.
 pub(crate) fn peer_challenges(headers: Option<&Value>) -> HeaderMap {
+    challenges_of(
+        headers
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+            .flat_map(|(name, value)| fabric_header_values(value).map(move |value| (name.as_str(), value))),
+    )
+}
+
+/// [`peer_challenges`] of the headers of a decoded ForwardResponse.
+pub(crate) fn peer_challenges_of(headers: &HashMap<String, Vec<String>>) -> HeaderMap {
+    challenges_of(
+        headers
+            .iter()
+            .flat_map(|(name, values)| {
+                values
+                    .iter()
+                    .map(move |value| (name.as_str(), value.as_str()))
+            }),
+    )
+}
+
+fn challenges_of<'a>(headers: impl Iterator<Item = (&'a str, &'a str)>) -> HeaderMap {
     headers
-        .and_then(Value::as_object)
-        .into_iter()
-        .flatten()
         .filter(|(name, _)| name.eq_ignore_ascii_case(WWW_AUTHENTICATE.as_str()))
-        .flat_map(|(_, value)| match value {
-            Value::Array(values) => values.as_slice(),
-            value => std::slice::from_ref(value),
-        })
-        .filter_map(Value::as_str)
-        .filter_map(|value| HeaderValue::from_str(value).ok())
+        .filter_map(|(_, value)| HeaderValue::from_str(value).ok())
         .map(|value| (WWW_AUTHENTICATE, value))
         .collect()
+}
+
+/// The answer to a peer refusal: a `502` with a fixed detail and no challenge.
+pub(crate) fn peer_refused_response() -> Response {
+    crate::a2a::errors::create_error_response(StatusCode::BAD_GATEWAY, PEER_REFUSED_DETAIL)
 }
 
 /// `Some(502)` when `status` and `headers`, a Fabric peer's answer, refuse the
@@ -61,7 +84,7 @@ pub(crate) fn refuse_peer_authorization(
         status.as_u16(),
         reason
     );
-    Some(crate::a2a::errors::create_error_response(StatusCode::BAD_GATEWAY, PEER_REFUSED_DETAIL))
+    Some(peer_refused_response())
 }
 
 #[cfg(test)]
@@ -216,5 +239,24 @@ mod tests {
             assert_eq!(challenges.len(), expected.len(), "{case}: only challenges are kept");
         }
         assert!(peer_challenges(None).is_empty());
+    }
+
+    #[test]
+    fn peer_challenges_of_a_decoded_response_keep_every_challenge_and_nothing_else() {
+        let headers = HashMap::from([
+            ("WWW-Authenticate".to_string(), vec![PEER_TOKEN_CHALLENGE.to_string(), "bad\nvalue".to_string()]),
+            ("content-type".to_string(), vec!["application/json".to_string()]),
+        ]);
+        let challenges = peer_challenges_of(&headers);
+        assert_eq!(
+            challenges
+                .get_all(WWW_AUTHENTICATE)
+                .iter()
+                .filter_map(|value| { value.to_str().ok() })
+                .collect::<Vec<_>>(),
+            [PEER_TOKEN_CHALLENGE]
+        );
+        assert_eq!(challenges.len(), 1);
+        assert!(peer_challenges_of(&HashMap::new()).is_empty());
     }
 }

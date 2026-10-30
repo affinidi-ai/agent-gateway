@@ -470,6 +470,9 @@ delegated credential from another caller header and per-caller authority wins. A
 fallback, with a `token_not_found` audit event whose detail is `target_auth_header_conflict`. Use a
 `custom_header` for one of them when a surface needs both.
 
+A response header the Target repeats arrives in the `ForwardResponse` as an array of strings, and
+the sending gateway relays every value to the caller.
+
 The receiving gateway's agent card read for its surface policy context uses `fetch_target_card`
 ([`src/proxy/target_card.rs`](../src/proxy/target_card.rs)). It resolves the credential with the
 same function as the card route (`card_fetch_credential`): each agent card URL in turn, with the

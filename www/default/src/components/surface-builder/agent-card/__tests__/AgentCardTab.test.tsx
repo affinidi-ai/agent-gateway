@@ -147,6 +147,10 @@ describe('AgentCardTab, states without a card', () => {
       'not_running',
       'This surface is not running on this gateway, so its card cannot be fetched. Check that it is active.',
     ],
+    [
+      'operator_only',
+      'Only an appliance operator can preview the card of an appliance-wide surface.',
+    ],
   ] as const)('explains an unsupported surface (%s)', async (reason, copy) => {
     mockFetch.mockResolvedValue(reply(200, unsupportedBody(reason)));
     renderTab();
@@ -607,6 +611,23 @@ describe('AgentCardTab, caller authentication in the served card', () => {
     expect(screen.getByTestId('agent-card-outcome-reason')).toHaveTextContent(
       'The agent card and the protected resource metadata name the authorization server of the selected strategy and the required scopes, and callers without a valid token are challenged.'
     );
+  });
+
+  it('says only the metadata names the authorization server when the card has no gateway scheme', async () => {
+    await showBody(previewBody({ after: BEFORE_CARD }));
+    expect(screen.getByTestId('agent-card-outcome')).toHaveTextContent('Declares OAuth');
+    expect(screen.getByTestId('agent-card-outcome-reason')).toHaveTextContent(
+      'Only the protected resource metadata names the authorization server of the selected strategy and the required scopes, and callers without a valid token are challenged. The agent card names no security scheme.'
+    );
+  });
+
+  it('makes no claim about the card when no served card is shown', async () => {
+    await showBody(previewBody({ after: null, after_bytes: 310000 }));
+    const reason = screen.getByTestId('agent-card-outcome-reason');
+    expect(reason).toHaveTextContent(
+      'The protected resource metadata names the authorization server of the selected strategy and the required scopes, and callers without a valid token are challenged.'
+    );
+    expect(reason).not.toHaveTextContent('agent card');
   });
 
   it('gives the reason a card is not declared and says it keeps the agent’s security', async () => {

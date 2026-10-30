@@ -56,6 +56,13 @@ describe('declaration without a card scheme', () => {
     );
   });
 
+  it('makes no claim about the card when the card scheme is unknown', () => {
+    const declare = { variant: null, resource: null, outcome: 'declare', reason: null } as const;
+    expect(describeDeclaration(declare, 'a2a', null).detail).toBe(
+      'The protected resource metadata names the authorization server of the selected strategy and the required scopes, and callers without a valid token are challenged.'
+    );
+  });
+
   it('reads the card_scheme_unavailable warning of the variant', () => {
     const warnings = [
       { code: 'card_scheme_unavailable', message: 'm', path: null, variant: 'beta' },

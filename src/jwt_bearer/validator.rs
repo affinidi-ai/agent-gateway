@@ -25,7 +25,8 @@ pub type Claims = Value;
 /// Extract the bearer token from a raw header value.
 ///
 /// `scheme` is the authentication scheme keyword (e.g. `Bearer`). When non-empty,
-/// the header value must start with `"{scheme} "` and the prefix is stripped.
+/// the header value must start with the scheme, matched case-insensitively
+/// (RFC 9110 §11.1), followed by a space, and that prefix is stripped.
 /// When empty, the entire trimmed header value is treated as the token.
 ///
 /// Returns `MissingToken` when the header is absent, the scheme prefix is required
@@ -38,10 +39,17 @@ pub fn extract_bearer_with_scheme<'a>(
     let token = if scheme.is_empty() {
         raw.trim()
     } else {
-        let prefix = format!("{} ", scheme);
-        raw.strip_prefix(prefix.as_str())
-            .ok_or(JwtBearerError::MissingToken)?
-            .trim()
+        let matches_scheme = raw
+            .get(..scheme.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
+            && raw
+                .as_bytes()
+                .get(scheme.len())
+                == Some(&b' ');
+        if !matches_scheme {
+            return Err(JwtBearerError::MissingToken);
+        }
+        raw[scheme.len() + 1..].trim()
     };
     if token.is_empty() {
         return Err(JwtBearerError::MissingToken);
@@ -77,13 +85,13 @@ impl JwtBearerVerifier {
     ) -> JwtBearerResult<Claims> {
         // 1. Decode header to get kid and algorithm
         let header: Header = decode_header(token)
-            .map_err(|e| JwtBearerError::InvalidToken(format!("Failed to decode JWT header: {}", e)))?;
+            .map_err(|_| JwtBearerError::InvalidToken("Failed to decode JWT header".to_string()))?;
 
         let kid = header
             .kid
             .clone()
             .unwrap_or_default();
-        debug!(strategy_id = %strategy.id, kid = %kid, "Validating JWT");
+        debug!(strategy_id = %strategy.id, kid = ?kid, "Validating JWT");
 
         // 2. Fetch the matching JWK from the configured source
         let jwk = match &strategy.jwks_source {
@@ -140,7 +148,7 @@ impl JwtBearerVerifier {
                 ErrorKind::ExpiredSignature => JwtBearerError::ExpiredToken,
                 ErrorKind::ImmatureSignature => JwtBearerError::InvalidToken("JWT is not valid yet (nbf)".to_string()),
                 ErrorKind::InvalidIssuer => JwtBearerError::InvalidIssuer,
-                ErrorKind::MissingRequiredClaim(claim) if claim == "iss" => JwtBearerError::InvalidAudience,
+                ErrorKind::MissingRequiredClaim(claim) if claim == "iss" => JwtBearerError::InvalidIssuer,
                 ErrorKind::InvalidAudience => JwtBearerError::InvalidAudience,
                 ErrorKind::MissingRequiredClaim(claim) if claim == "aud" => JwtBearerError::InvalidAudience,
                 _ => JwtBearerError::InvalidToken(format!("JWT verification failed: {}", e)),
@@ -470,6 +478,39 @@ BNGV7kU9kiKxYO6H5k+Yb+kp
     }
 
     #[tokio::test]
+    async fn test_missing_iss_claim_is_an_issuer_failure() {
+        let kid = "test-key-iss-missing";
+        let (base, _handle) = start_test_jwks_server(kid).await;
+        let (validator, strategy) = make_validator_with_pem_key(&base);
+
+        let token =
+            make_token(json!({"sub": "user-123", "aud": "https://api.example.com", "exp": now_secs() + 3600}), kid);
+
+        let result = validator
+            .validate(&token, &strategy, &["https://api.example.com".to_string()])
+            .await;
+
+        assert!(matches!(result, Err(JwtBearerError::InvalidIssuer)), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn test_undecodable_header_has_a_fixed_reason() {
+        use base64::Engine;
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"alg":"evil\r\nx","kid":"k"}"#);
+        let token = format!("{header}.e30.sig");
+        let (validator, strategy) = make_validator_with_pem_key("http://127.0.0.1:1");
+
+        let result = validator
+            .validate(&token, &strategy, &[])
+            .await;
+
+        match result {
+            Err(JwtBearerError::InvalidToken(reason)) => assert_eq!(reason, "Failed to decode JWT header"),
+            other => panic!("expected InvalidToken, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn test_array_audience_accepted_when_one_matches() {
         let kid = "test-key-aud-arr";
         let (base, _handle) = start_test_jwks_server(kid).await;
@@ -683,6 +724,23 @@ BNGV7kU9kiKxYO6H5k+Yb+kp
     #[test]
     fn extract_bearer_with_scheme_empty_scheme_returns_raw() {
         assert_eq!(extract_bearer_with_scheme(Some(" abc "), "").unwrap(), "abc");
+    }
+
+    #[test]
+    fn extract_bearer_with_scheme_matches_the_scheme_case_insensitively() {
+        for header in ["bearer abc", "BEARER abc", "bEaReR  abc "] {
+            assert_eq!(extract_bearer_with_scheme(Some(header), "Bearer").unwrap(), "abc", "{header}");
+        }
+    }
+
+    #[test]
+    fn extract_bearer_with_scheme_refuses_a_scheme_without_a_space_or_a_different_scheme() {
+        for header in ["Bearerabc", "Basic abc", "Bear abc", "Bearer", "Beare\u{e9} abc", "\u{e9}\u{e9}\u{e9} abc"] {
+            assert!(
+                matches!(extract_bearer_with_scheme(Some(header), "Bearer"), Err(JwtBearerError::MissingToken)),
+                "{header}"
+            );
+        }
     }
 
     #[test]

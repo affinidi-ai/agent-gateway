@@ -256,6 +256,33 @@ pub fn is_public_request(
     (method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD")) && is_public_path(path)
 }
 
+/// Whether a request to `surface` is a public discovery read, `route_tail` being
+/// its path after the route and any `$alias`. An Access Point that declares
+/// (`protected_resource`) publishes only its well-known card and UCP URLs, so
+/// on it only a `GET` or `HEAD` of exactly one of those is public. Any other
+/// Access Point follows [`is_public_request`].
+pub fn is_public_surface_request(
+    surface: &crate::config::agent_surface::AgentSurface,
+    method: &str,
+    route_tail: &str,
+) -> bool {
+    if !crate::source_auth::declaration::requests_declaration(surface) {
+        return is_public_request(method, route_tail);
+    }
+    let tail = route_tail
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(route_tail);
+    let tail = tail
+        .strip_suffix('/')
+        .unwrap_or(tail);
+    (method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD"))
+        && matches!(
+            tail,
+            "/.well-known/agent-card.json" | "/.well-known/agent.json" | "/.well-known/agent-card" | "/.well-known/ucp"
+        )
+}
+
 /// Top-level paths owned by the dashboard SPA (www/default).
 /// A channel prefix that shadows any of these would silently break the
 /// dashboard, since channel routes take precedence over the SPA fallback
@@ -556,6 +583,60 @@ mod tests {
             );
         }
         assert!(!is_public_request("GET", "/surface/tools"));
+    }
+
+    #[test]
+    fn a_declaring_access_point_publishes_only_its_exact_card_and_ucp_urls() {
+        use crate::protocols::protected_resource::fixtures::{discovery_surface, jwt_bearer_method};
+        let declaring = discovery_surface(
+            jwt_bearer_method(),
+            Some(serde_json::json!({"resource": "https://gateway.example/mcp/alpha", "scopes": ["tools"]})),
+        );
+        assert!(crate::source_auth::declaration::requests_declaration(&declaring));
+        for (method, tail) in [
+            ("GET", "/.well-known/agent-card.json"),
+            ("HEAD", "/.well-known/agent.json"),
+            ("GET", "/.well-known/agent-card"),
+            ("GET", "/.well-known/ucp"),
+            ("get", "/.well-known/agent-card.json/?x=1"),
+        ] {
+            assert!(is_public_surface_request(&declaring, method, tail), "{method} {tail}");
+        }
+        for (method, tail) in [
+            ("GET", "/agent.json"),
+            ("GET", "/agent-card.json"),
+            ("GET", "/tasks/discovery"),
+            ("GET", "/x/.well-known/ucp"),
+            ("GET", "/x/.well-known/agent-card.json"),
+            ("POST", "/.well-known/agent-card.json"),
+            ("GET", "/"),
+        ] {
+            assert!(!is_public_surface_request(&declaring, method, tail), "{method} {tail}");
+        }
+    }
+
+    #[test]
+    fn an_access_point_that_does_not_declare_keeps_the_suffix_rule() {
+        use crate::protocols::protected_resource::fixtures::{discovery_surface, jwt_bearer_method};
+        let plain = discovery_surface(jwt_bearer_method(), None);
+        assert!(!crate::source_auth::declaration::requests_declaration(&plain));
+        for method in ["GET", "HEAD", "POST"] {
+            for tail in [
+                "/agent.json",
+                "/agent-card.json",
+                "/tasks/discovery",
+                "/x/.well-known/ucp",
+                "/x/.well-known/agent-card",
+                "/.well-known/agent-card.json",
+                "/tools",
+            ] {
+                assert_eq!(
+                    is_public_surface_request(&plain, method, tail),
+                    is_public_request(method, tail),
+                    "{method} {tail}"
+                );
+            }
+        }
     }
 
     const ROOT_TARGET: &str = "http://target.example";

@@ -38,6 +38,7 @@ const json = (body: unknown, ok = true) => ({
 });
 
 let surfaces: unknown;
+let providers: unknown;
 let deleteReply: ReturnType<typeof json>;
 
 beforeEach(() => {
@@ -51,10 +52,12 @@ beforeEach(() => {
       },
     },
   ];
+  providers = [];
   deleteReply = json({});
   mockFetch.mockImplementation(async (url: string, init?: { method?: string }) => {
     if (init?.method === 'DELETE') return deleteReply;
     if (url === '/api/v1/surfaces') return json(surfaces);
+    if (url === '/api/v1/credential-providers') return json(providers);
     return json([strategy('a', true), strategy('b', false)]);
   });
 });
@@ -85,9 +88,12 @@ describe('Strategies list', () => {
     expect(panel).toHaveAttribute('role', 'alertdialog');
     await waitFor(() => expect(panel).toHaveTextContent('Helpdesk'));
     expect(panel).toHaveTextContent('A surface that still references it cannot verify tokens');
-    expect(panel).toHaveTextContent('A caller that presents a token is refused with 500');
+    expect(panel).toHaveTextContent('a caller that presents a token is refused with 500');
     expect(panel).toHaveTextContent("a caller without one is left to the surface's policy");
-    expect(panel).toHaveTextContent('stops advertising an authorization server');
+    expect(panel).toHaveTextContent(
+      'A surface that advertises an authorization server can no longer be served and refuses every caller until the strategy is restored.'
+    );
+    expect(panel).not.toHaveTextContent('credential provider for consent identity');
     expect(panel).not.toHaveTextContent('403');
     expect(panel).not.toHaveTextContent('401');
     expect(mockFetch.mock.calls.some(([, init]) => init?.method === 'DELETE')).toBe(false);
@@ -133,6 +139,44 @@ describe('Strategies list', () => {
     expect(error).toHaveAttribute('role', 'alert');
     expect(error).toHaveTextContent('Delete failed: Conflict');
     expect(screen.getByText('Strategy b')).toBeInTheDocument();
+  });
+
+  it('names the consent provider and the surface whose Transit Point uses it', async () => {
+    providers = [{ id: 'p1', name: 'Calendar', consent_identity_strategy_id: 'b' }];
+    surfaces = [
+      {
+        surface_id: 'sf2',
+        name: 'Scheduler',
+        transit: { points: [{ transit_credentials: { credential_provider_id: 'p1' } }] },
+      },
+    ];
+    renderTab();
+    await screen.findByText('Strategy b');
+    fireEvent.click(screen.getByRole('button', { name: 'Delete strategy Strategy b' }));
+    const panel = await screen.findByTestId('strategy-delete-confirm');
+    await waitFor(() => expect(panel).toHaveTextContent('Scheduler'));
+    expect(panel).toHaveTextContent('Used by 1 surface:');
+    expect(panel).toHaveTextContent('Used by 1 credential provider for consent identity:');
+    expect(panel).toHaveTextContent('Calendar');
+    expect(panel).not.toHaveTextContent('No surface uses it.');
+  });
+
+  it('says so when the credential provider check fails and keeps Delete available', async () => {
+    mockFetch.mockImplementation(async (url: string, init?: { method?: string }) => {
+      if (init?.method === 'DELETE') return deleteReply;
+      if (url === '/api/v1/surfaces') return json([]);
+      if (url === '/api/v1/credential-providers') return { ...json({}, false), status: 403 };
+      return json([strategy('b', false)]);
+    });
+    renderTab();
+    await screen.findByText('Strategy b');
+    fireEvent.click(screen.getByRole('button', { name: 'Delete strategy Strategy b' }));
+    const panel = await screen.findByTestId('strategy-delete-confirm');
+    await waitFor(() =>
+      expect(panel).toHaveTextContent('Could not check which credential providers use it.')
+    );
+    expect(panel).toHaveTextContent('No surface uses it.');
+    expect(screen.getByTestId('strategy-delete-confirm-button')).toBeEnabled();
   });
 
   it('moves focus into the confirmation and back to the Delete button on Cancel', async () => {
@@ -192,7 +236,7 @@ describe('Strategies list', () => {
     pending[1](surfaces);
     await waitFor(() => expect(panel).toHaveTextContent('Helpdesk'));
     pending[0]([]);
-    await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(5));
     await new Promise(resolve => setTimeout(resolve, 0));
     expect(panel).toHaveTextContent('Helpdesk');
     expect(panel).not.toHaveTextContent('No surface uses it.');

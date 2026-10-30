@@ -62,7 +62,8 @@ An `oauth2_jwt_bearer` provider holds its assertion settings under `jwt_bearer`.
 | Field | Meaning |
 | --- | --- |
 | `assertion_issuer` | The assertion `iss`. Required. |
-| `assertion_subject` | The assertion `sub`. Defaults to the issuer. |
+| `assertion_subject` | The assertion `sub`. Optional: when absent the assertion carries no `sub` claim. A blank value is refused at save, so omit the field to send no `sub`. Set it for an authorization server that requires `sub` (RFC 7523 section 3), such as Ory Hydra. Google service account grants need none. |
+| `audience` | The assertion `aud`. Optional, defaults to the provider's `token_endpoint`. Surrounding whitespace is trimmed and a blank value means unset. When set it must be 1 to 512 bytes with no whitespace or control characters; any URI or identifier is accepted, not only `https`. |
 | `signing_key_secret_ref` | The `secret_id` of a secrets-store entry holding the private key. Required. |
 | `signing_algorithm` | `RS256` (default) or `ES256`. |
 | `key_id` | The `kid` header. Defaults to the `private_key_id` of a Google service account key; omitted when neither is set. |
@@ -81,12 +82,23 @@ Each grant signs a fresh assertion with these claims:
 
 | Claim | Value |
 | --- | --- |
-| `iss`, `sub` | `assertion_issuer` and `assertion_subject` |
-| `aud` | The provider's `token_endpoint` with surrounding whitespace removed. There is no separate audience setting. |
+| `iss` | `assertion_issuer` |
+| `sub` | `assertion_subject`, present only when it is set |
+| `aud` | `audience` when set, else the provider's `token_endpoint` with surrounding whitespace removed |
 | `iat` | 30 seconds in the past, to allow for clock skew at the authorization server |
 | `exp` | 300 seconds after signing, so at most 330 seconds after `iat` |
 | `jti` | A random UUID |
 | `scope` | The requested scopes, space-separated, when there are any |
+
+A change of `audience` changes the provider digest, so a gateway token cached for the old
+audience is never reused. A provider stored without an audience keeps signing with `aud` equal
+to the token endpoint. Provider listings include `audience` in the JWT bearer summary when it
+is set.
+
+In the dashboard, a new JWT Bearer provider with an empty Token Endpoint is prefilled with
+Google's `https://oauth2.googleapis.com/token`, with a hint that other servers use their own.
+The field stays editable, and neither the prefill nor the hint applies to an existing
+provider. The optional Audience field defaults to the token endpoint.
 
 The request posts `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer` and the
 `assertion`, repeats the scopes as the `scope` form parameter, and sends the provider's
@@ -96,7 +108,12 @@ with HTTP Basic (Ory Hydra requires it), when only the client ID is set it is se
 `client_id`, and when neither is set no client authentication is sent (Google). A client
 secret without a client ID is refused at save.
 
-The token endpoint of a JWT bearer provider must be `https`. Under `AG_TEST_MODE=true` an
+The `token_endpoint` of every OAuth provider (authorization code, Client Credentials and JWT
+bearer) must be an `https` URL. The check runs when a provider is created and on any update that sends `token_endpoint`,
+changes the type, clears a reference or sends `jwt_bearer` (every dashboard save does), so a
+stored authorization code provider with an http token endpoint is refused on any dashboard
+save until its endpoint is https. It also runs before every gateway grant, before any secret
+is read. The authorization code exchange and refresh do not check it yet. Under `AG_TEST_MODE=true` an
 `http` endpoint listed exactly in `AG_BDD_OAUTH_ENDPOINT_ALLOWLIST` is also accepted, for
 a local authorization server.
 
@@ -117,7 +134,8 @@ its own identity, with no user. Both grants are sent by `request_gateway_grant`
 through the shared `GATEWAY_GRANT_BACKOFF`, for legacy and modern delegation alike.
 
 - The connection is pinned to the addresses the token endpoint resolved to when it was
-  checked, redirects are off, and the whole grant times out after 10 seconds. A token
+  checked, redirects are off, and the whole grant, secret reads and assertion signing
+  included, times out after 10 seconds. A token
   endpoint that resolves to loopback, an unspecified address or cloud metadata is never
   contacted.
 - The response is read to at most 64 KiB in zeroizing memory; a larger declared length is
@@ -134,6 +152,20 @@ through the shared `GATEWAY_GRANT_BACKOFF`, for legacy and modern delegation ali
   key could not be parsed or the assertion could not be signed). The token endpoint's response body is
   never logged, returned or recorded; the log line carries the HTTP status and, when the
   body names one, the standard OAuth error code such as `invalid_grant`.
+- A gateway grant is refused as `scope_mismatch`, a further fixed category, when the token
+  endpoint's response carries a `scope` that lacks a requested scope. Both sides are split on
+  whitespace and compared as sets of exact strings, so a configured entry such as
+  `openid profile` counts as two scopes (modern MCP delegation does not accept a binding scope
+  that contains whitespace), and a response without `scope` is taken to grant the requested
+  scopes (RFC 6749 section 5.1). A refused grant is never cached and starts the retry
+  backoff, in `GATEWAY_GRANT_BACKOFF` and in the gateway token cache, like a token endpoint
+  failure. Like any failed grant, a refused refresh keeps a cached token that is still valid;
+  with none, Target Authentication fails with `502 Target authentication failed`, a legacy
+  delegation binding is unavailable, and modern MCP delegation answers 503
+  `MCP credential service unavailable`. Modern MCP delegation also refuses a response whose
+  `scope` adds a scope the binding did not request, with 403
+  `MCP credential authorization denied`, and stores nothing; legacy delegation and Target
+  Authentication accept such a response.
 - After a token endpoint failure (unreachable, refused, timed out or an invalid response),
   `GATEWAY_GRANT_BACKOFF` holds back further grants for that provider record and scope set for 1
   second, doubling to at most 60 seconds, counted from when the failed grant completes. A grant
@@ -315,7 +347,9 @@ changed to a type that use does not allow; both answer 409.
 `PUT /api/v1/credential-providers/{id}` keeps the stored value of every field the request
 leaves out. Sending `null` clears an optional reference: `client_id_secret_ref`,
 `client_secret_secret_ref`, `api_key_secret_ref`, `callback_url`, `resource` or
-`consent_identity_strategy_id`. A cleared reference is checked against the provider type, so
+`consent_identity_strategy_id`. Sending `null` for `authorization_endpoint` or `description`
+clears them the same way, and an absent field keeps the stored value. `additional_params`
+is replaced as a whole, so `{}` clears it. A cleared reference is checked against the provider type, so
 clearing one the type requires answers 400. The dashboard sends `null` for the client fields
 of a JWT bearer provider when they are emptied, and the next grant then sends no client
 authentication. Every update drops the provider's cached gateway token.
@@ -334,8 +368,8 @@ a secret are not checked.
 
 Each resolution through a provider that injects a credential or fails emits a delegation audit
 event: `token_injected` with
-detail `target_auth_fresh`, `target_auth_cached`, `target_auth_stale` (refresh failed, valid
-token used) or `target_auth_api_key`, or `token_not_found` with detail
+detail `target_auth_fresh`, `target_auth_cached`, `target_auth_stale` (refresh failed and the
+kept token was still valid when the failed grant ended) or `target_auth_api_key`, or `token_not_found` with detail
 `target_auth_<category>`, such as `target_auth_outside_target_base`. It carries the provider,
 surface, scopes, injection shape, `via_fabric` and trace ID, and never a user hash, agent DID,
 token ID or token. A resolution that withholds the credential from a caller emits none.
@@ -557,7 +591,11 @@ With API-key or mTLS source authentication, every caller presenting the same key
 certificate identity therefore shares one set of delegated tokens.
 
 Gateway tokens (client credentials and JWT bearer) have no user. Legacy delegation caches them
-under the fixed user hash `__client_credentials__`. Modern MCP delegation caches them under
+under the user hash `__client_credentials__:<hex SHA-256 of the sorted, deduplicated scope set
+joined by spaces>`, so bindings with different scopes on one provider never share a token.
+After an upgrade each binding sends one new grant; records under the old bare
+`__client_credentials__` key are no longer read and stay listed until they expire or are
+revoked. Modern MCP delegation caches them under
 `__mcp_client_credentials__:<hex provider digest>`.
 
 A lookup has four outcomes.
@@ -583,6 +621,19 @@ stored is the one reused. The audit detail names the grant and the outcome, for 
 `jwt_bearer_cached`, `client_credentials_fresh` or `jwt_bearer_unavailable`. Modern MCP
 delegation reuses its cached gateway token only until it expires, then sends a new grant, with
 no `_stale` fallback.
+
+A cached gateway token records each secret its grant read (the client id and secret, or the JWT
+bearer signing key and any client id and secret it sends) with that secret's last-change time
+as read. The token is served, on the legacy and the modern path, only while each of those
+secrets still exists in the provider's tenant with exactly that last-change time. Updating,
+deleting or moving such a secret to another tenant therefore stops every cached token whose
+grant read it, for every scope set, including the `_stale` fallback after a failed refresh;
+moving the secret back is a further change and does not revive them. A grant that read a secret
+just before it changed recorded the earlier time, so its token is not served afterwards, and
+neither is a token when an older copy of the secret is restored. Changes to other secrets,
+including a secret the provider references but its grant does not read, keep the cached tokens.
+Each cache hit reads those secrets from the secrets store to compare their last-change times.
+A gateway token stored before secret versions were recorded is never served: the next use sends a new grant.
 
 ### Storage
 

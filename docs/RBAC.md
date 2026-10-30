@@ -107,7 +107,10 @@ resource-scoped PAT reaches only its own surface ids
 ([`ACCESS_TOKENS.md`](ACCESS_TOKENS.md#what-tenancy-does-not-partition)). The save report that
 surface writes return is covered by the write's own permission. See
 [`SOURCE_AUTH.md`](SOURCE_AUTH.md#agent-card-preview) and
-[`POLICY.md`](POLICY.md#surface-save-warnings).
+[`POLICY.md`](POLICY.md#surface-save-warnings). A tenant token that reads the card preview of an
+appliance-wide surface gets `200` with `supported` false and `unsupported_reason`
+`operator_only`, because the fetch would use the appliance's Target credential; a tenant refresh
+of it is still `403`.
 
 ## Integrations
 

@@ -1,5 +1,6 @@
 import {
   EMPTY_PROVIDER_FORM,
+  GOOGLE_TOKEN_ENDPOINT,
   PROVIDER_TYPES,
   buildProviderBody,
   deriveProviderId,
@@ -11,6 +12,7 @@ import {
   providersUsingSecret,
   providerTypeBadgeClass,
   providerTypeLabel,
+  tokenEndpointForType,
   unknownProviderType,
   validateProviderForm,
   type CredentialProviderForm,
@@ -307,6 +309,95 @@ describe('updating an existing provider', () => {
     expect(body).toMatchObject({ client_id_secret_ref: 'id', client_secret_secret_ref: 'sec' });
   });
 
+  const authCodeForm: CredentialProviderForm = {
+    ...EMPTY_PROVIDER_FORM,
+    name: 'Calendar',
+    provider_id: 'calendar',
+    provider_type: 'oauth2_authorization_code',
+    token_endpoint: 'https://idp.example/token',
+    client_id_secret_ref: 'id',
+    client_secret_secret_ref: 'sec',
+  };
+
+  it('clears an emptied description, authorization endpoint and additional parameters', () => {
+    const body = buildProviderBody(
+      { ...authCodeForm, description: '  ', authorization_endpoint: '', additional_params: '' },
+      null,
+      false
+    );
+    expect(body.description).toBeNull();
+    expect(body.authorization_endpoint).toBeNull();
+    expect(body.additional_params).toEqual({});
+    expect(body.api_key_secret_ref).toBeNull();
+  });
+
+  it('sends the filled description, authorization endpoint and parameters, not null', () => {
+    const body = buildProviderBody(
+      {
+        ...authCodeForm,
+        description: ' Team calendar ',
+        authorization_endpoint: ' https://idp.example/authorize ',
+        additional_params: '{"prompt":"consent"}',
+      },
+      null,
+      false
+    );
+    expect(body).toMatchObject({
+      description: 'Team calendar',
+      authorization_endpoint: 'https://idp.example/authorize',
+      additional_params: { prompt: 'consent' },
+      client_id_secret_ref: 'id',
+      client_secret_secret_ref: 'sec',
+    });
+  });
+
+  it('clears the authorization endpoint and parameters of a type that has none', () => {
+    const body = buildProviderBody(
+      { ...jwtForm, authorization_endpoint: 'https://stale.example/authorize' },
+      null,
+      false
+    );
+    expect(body.authorization_endpoint).toBeNull();
+    expect(body.additional_params).toEqual({});
+  });
+
+  it('clears the client references after a change to API key', () => {
+    const body = buildProviderBody(
+      {
+        ...authCodeForm,
+        provider_type: 'api_key',
+        client_id_secret_ref: 'id',
+        client_secret_secret_ref: 'sec',
+        api_key_secret_ref: 'key',
+      },
+      null,
+      false
+    );
+    expect(body.client_id_secret_ref).toBeNull();
+    expect(body.client_secret_secret_ref).toBeNull();
+    expect(body.api_key_secret_ref).toBe('key');
+  });
+
+  it('clears the API key reference after a change to an OAuth type', () => {
+    const body = buildProviderBody({ ...authCodeForm, api_key_secret_ref: 'key' }, null, false);
+    expect(body.api_key_secret_ref).toBeNull();
+    expect(body).toMatchObject({ client_id_secret_ref: 'id', client_secret_secret_ref: 'sec' });
+  });
+
+  it('sends none of the cleared fields when creating a provider', () => {
+    for (const form of [
+      authCodeForm,
+      { ...jwtForm },
+      { ...authCodeForm, provider_type: 'api_key' as const, api_key_secret_ref: 'key' },
+    ]) {
+      expect(Object.values(buildProviderBody(form, null, true))).not.toContain(null);
+    }
+    const created = buildProviderBody(authCodeForm, null, true);
+    expect(created).not.toHaveProperty('authorization_endpoint');
+    expect(created).not.toHaveProperty('additional_params');
+    expect(created.description).toBeUndefined();
+  });
+
   it('reports a provider type the dashboard does not know', () => {
     expect(unknownProviderType({ provider_type: 'future_type' })).toBe('future_type');
     expect(unknownProviderType({ provider_type: 'api_key' })).toBeNull();
@@ -370,5 +461,59 @@ describe('providersUsingSecret', () => {
     ).toEqual({
       ok: false,
     });
+  });
+});
+
+describe('JWT bearer audience', () => {
+  it('sends a trimmed audience and omits a blank one', () => {
+    expect(
+      buildProviderBody({ ...jwtForm, audience: ' https://aud.example ' }, null)
+    ).toMatchObject({ jwt_bearer: { audience: 'https://aud.example' } });
+    expect(buildProviderBody({ ...jwtForm, audience: '  ' }, null).jwt_bearer).not.toHaveProperty(
+      'audience'
+    );
+  });
+
+  it('accepts an identifier audience and refuses whitespace, control characters or length', () => {
+    expect(validateProviderForm({ ...jwtForm, audience: 'urn:example:api' })).toBeNull();
+    expect(validateProviderForm({ ...jwtForm, audience: 'a'.repeat(512) })).toBeNull();
+    const refused = 'Audience must be at most 512 bytes, with no spaces or control characters.';
+    expect(validateProviderForm({ ...jwtForm, audience: 'two words' })).toBe(refused);
+    expect(validateProviderForm({ ...jwtForm, audience: 'aud\u0007' })).toBe(refused);
+    expect(validateProviderForm({ ...jwtForm, audience: 'a'.repeat(513) })).toBe(refused);
+    expect(validateProviderForm({ ...jwtForm, audience: 'é'.repeat(257) })).toBe(refused);
+  });
+
+  it('reads the audience back and leaves it empty for a provider stored without one', () => {
+    const body = buildProviderBody({ ...jwtForm, audience: 'urn:example:api' }, null);
+    expect(providerFormFromWire(body, '').audience).toBe('urn:example:api');
+    expect(providerFormFromWire(buildProviderBody(jwtForm, null), '').audience).toBe('');
+  });
+});
+
+describe('tokenEndpointForType', () => {
+  const blank = { ...EMPTY_PROVIDER_FORM, token_endpoint: '' };
+
+  it("prefills Google's endpoint for a JWT bearer provider with an empty endpoint", () => {
+    expect(tokenEndpointForType(blank, 'oauth2_jwt_bearer', true)).toBe(GOOGLE_TOKEN_ENDPOINT);
+  });
+
+  it('keeps an endpoint the operator entered', () => {
+    const own = { ...blank, token_endpoint: 'https://idp.example/token' };
+    expect(tokenEndpointForType(own, 'oauth2_jwt_bearer', true)).toBe('https://idp.example/token');
+    expect(tokenEndpointForType(own, 'oauth2_client_credentials', true)).toBe(
+      'https://idp.example/token'
+    );
+  });
+
+  it('removes the prefill when the type changes away from JWT bearer', () => {
+    const prefilled = { ...blank, token_endpoint: GOOGLE_TOKEN_ENDPOINT };
+    expect(tokenEndpointForType(prefilled, 'oauth2_client_credentials', true)).toBe('');
+  });
+
+  it('changes nothing when prefilling is not allowed', () => {
+    expect(tokenEndpointForType(blank, 'oauth2_jwt_bearer', false)).toBe('');
+    const prefilled = { ...blank, token_endpoint: GOOGLE_TOKEN_ENDPOINT };
+    expect(tokenEndpointForType(prefilled, 'api_key', false)).toBe(GOOGLE_TOKEN_ENDPOINT);
   });
 });

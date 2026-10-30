@@ -673,6 +673,7 @@ mod tests {
             token_scheme: String::new(),
             forward_header: false,
             required_scopes: Vec::new(),
+            access_tokens_only: false,
         });
         let json = serde_json::to_string(&config).unwrap();
         let back: SourceAuthConfig = serde_json::from_str(&json).unwrap();

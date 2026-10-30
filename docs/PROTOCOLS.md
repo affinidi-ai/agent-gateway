@@ -22,7 +22,11 @@ changelog when behavior must match this source revision exactly.
 
 Agent-card discovery is unauthenticated by design. Caller-leg Trust Check is bypassed for the public
 agent-card and UCP well-known paths recognized by `src/proxy/paths.rs`, and for paths ending in
-`/discovery`; unrelated `.well-known/*` paths do not receive that bypass. A surface-configured
+`/discovery`; unrelated `.well-known/*` paths do not receive that bypass. That suffix rule applies
+only to Access Points that do not declare a protected resource. A declaring Access Point
+publishes only its exact well-known card and UCP URLs: `{route}/.well-known/agent-card.json`,
+`{route}/.well-known/agent.json`, `{route}/.well-known/agent-card` and `{route}/.well-known/ucp`.
+A surface-configured
 caller identity (`inbound_identity`: `static`, `from_mtls`, `from_api_key`, `from_jwt_claim`) is not
 resolved on those paths either, on the direct or fabric send leg, so a credential that cannot be
 resolved does not fail discovery.

@@ -183,9 +183,10 @@ fn default_true() -> bool {
 
 impl CredentialProvider {
     /// Whether a surface of `surface_tenant_id` may send this provider's credential to its
-    /// upstreams. The gateway's own credential stays inside the provider's tenant, so a
-    /// tenant surface cannot carry an appliance-wide key or gateway token to an endpoint it
-    /// chose; a user's consented token may come from an appliance-wide provider.
+    /// upstreams. An api_key, Client Credentials or JWT bearer provider sends the gateway's
+    /// own credential, so only a surface in the provider's tenant may use it; any surface
+    /// may use an appliance-wide authorization code provider, whose token a user consented
+    /// to. Secrets that verify callers are outside this rule.
     pub fn usable_by(
         &self,
         surface_tenant_id: Option<&str>,
@@ -267,16 +268,17 @@ pub struct CreateCredentialProviderRequest {
 
 /// Request to update an existing credential provider.
 ///
-/// Optional references take three states: an absent field keeps the stored value,
-/// `null` clears it, and a string replaces it.
+/// Optional references, the authorization endpoint and the description take three
+/// states: an absent field keeps the stored value, `null` clears it, and a string
+/// replaces it. `additional_params` replaces the stored map as a whole.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateCredentialProviderRequest {
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
     pub provider_type: Option<CredentialProviderType>,
-    #[serde(default)]
-    pub authorization_endpoint: Option<String>,
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    pub authorization_endpoint: Option<Option<String>>,
     #[serde(default)]
     pub token_endpoint: Option<String>,
     #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
@@ -293,8 +295,8 @@ pub struct UpdateCredentialProviderRequest {
     pub api_key_secret_ref: Option<Option<String>>,
     #[serde(default)]
     pub jwt_bearer: Option<JwtBearerSettings>,
-    #[serde(default)]
-    pub description: Option<String>,
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    pub description: Option<Option<String>>,
     /// Full callback URL (host + path) — overrides auto-generated callback URL
     #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
     pub callback_url: Option<Option<String>>,
@@ -545,6 +547,7 @@ mod tests {
             signing_key_secret_ref: "KEY".into(),
             signing_algorithm: JwtBearerAlgorithm::Es256,
             key_id: None,
+            audience: None,
         });
         assert_eq!(
             provider
@@ -563,12 +566,15 @@ mod tests {
     #[test]
     fn test_update_request_tells_an_absent_reference_from_a_cleared_one() {
         let req: UpdateCredentialProviderRequest = serde_json::from_str(
-            r#"{"client_id_secret_ref": null, "client_secret_secret_ref": "NEW_SECRET", "resource": null}"#,
+            r#"{"client_id_secret_ref": null, "client_secret_secret_ref": "NEW_SECRET", "resource": null,
+                "authorization_endpoint": null, "description": null}"#,
         )
         .unwrap();
         assert_eq!(req.client_id_secret_ref, Some(None));
         assert_eq!(req.client_secret_secret_ref, Some(Some("NEW_SECRET".to_string())));
         assert_eq!(req.resource, Some(None));
+        assert_eq!(req.authorization_endpoint, Some(None));
+        assert_eq!(req.description, Some(None));
         assert_eq!(req.api_key_secret_ref, None);
         assert_eq!(req.callback_url, None);
         assert_eq!(req.consent_identity_strategy_id, None);
@@ -576,7 +582,14 @@ mod tests {
         let round_trip: UpdateCredentialProviderRequest =
             serde_json::from_value(serde_json::to_value(&req).unwrap()).unwrap();
         assert_eq!(round_trip.client_id_secret_ref, Some(None));
+        assert_eq!(round_trip.authorization_endpoint, Some(None));
+        assert_eq!(round_trip.description, Some(None));
         assert_eq!(round_trip.api_key_secret_ref, None);
+
+        let absent: UpdateCredentialProviderRequest =
+            serde_json::from_str(r#"{"description": "Calendar", "name": "Renamed"}"#).unwrap();
+        assert_eq!(absent.description, Some(Some("Calendar".to_string())));
+        assert_eq!(absent.authorization_endpoint, None);
     }
 
     #[test]

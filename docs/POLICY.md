@@ -271,8 +271,8 @@ On an Access Point that does not declare (see
 refuse a request whose credential is missing or invalid, or whose JWT lacks a required scope.
 The request continues with no caller identity, `input.source_auth` is
 `{"method": "failed", "attempted_method": ..., "kind": ..., "reason": ...}`. `kind` is
-`missing`, `invalid` or `insufficient_scope`; `reason` is free text for logs and policy
-authors and is never sent to the caller. On every forwarding
+`missing`, `invalid` or `insufficient_scope`; `reason` is fixed text the gateway chooses, for
+example `Invalid credential: Signing key not found` or `Invalid credential: Invalid token: Failed to decode JWT header`, never a value taken from the token, and it is never sent to the caller. On every forwarding
 path (direct inbound, `proxy://` MCP Targets, `a2a-proxy://` Targets, Fabric send and
 Fabric receive) the surface's Target Authentication credential, or the A2A proxy's Direct
 Line secret, is not attached, because it vouches that the gateway vetted the caller. A
@@ -342,7 +342,7 @@ the permissions and tenancy of `GET /v1/surfaces/{id}`
 | `payment_before_policy` | The variant takes payment (an enabled x402 or MPP policy) and only a surface-level plane denies failed callers. Payment runs before surface policy, so such a caller can be asked to pay first; deny it in a gateway policy to refuse it before payment. |
 | `dry_run_skipped` | The variant has caller authentication, does not declare, and comes after the first 16 routes with caller authentication, so the dry run did not check it. |
 | `fabric_only_declaration` | The Access Point declares, or its `protected_resource` cannot be served, and its `listen_address` names no listener of this gateway, so callers reach it only over Fabric. Over Fabric the receiving gateway refuses a failed caller without naming metadata, and the sending gateway answers its own caller `502` when it lacks a credential; only the sending gateway challenges its callers. `path` is `access_point.listen_address`. |
-| `authorization_servers_stale` | The Access Point declares and its stored `protected_resource.authorization_servers` differs from the strategy's `expected_issuer`, which the gateway advertises instead. Every later save of the surface, including a PATCH of another field or a PUT that omits `protected_resource`, is refused until the stored list is `["<expected_issuer>"]` or removed. `path` is `access_point.caller_authentication.protected_resource.authorization_servers`. |
+| `authorization_servers_stale` | The Access Point declares and its stored `protected_resource.authorization_servers` differs from the strategy's `expected_issuer`, which the gateway advertises instead. A save that keeps the stored list unchanged is accepted and warned again. A save that sends a different list must send exactly `["<expected_issuer>"]` or no list, or it is refused. To remove the list, send `protected_resource` without `authorization_servers`. `path` is `access_point.caller_authentication.protected_resource.authorization_servers`. |
 | `card_scheme_unavailable` | An A2A or AP2 Access Point declares and its strategy has no pinned authorization server matching its `expected_issuer` and key set, so the agent card names no security scheme. Run Discover on the strategy. `path` is `access_point.caller_authentication.methods[0].jwt_verification_strategy_id`. |
 | `protected_resource_dropped` | A `PUT` or variant `PUT` left out a stored `protected_resource` that no longer fits the edited caller authentication, so it was removed. `path` is `access_point.caller_authentication.protected_resource`. |
 
@@ -362,8 +362,9 @@ any other variant it builds the input a `POST` to the variant's Access Point URL
 
 | Protocol | Methods |
 | --- | --- |
-| A2A and AP2, version 1.0 | `SendMessage`, `SendStreamingMessage`, `GetTask`, `CancelTask`, `SubscribeToTask`, `GetExtendedAgentCard` (`input.a2a.method`) |
-| A2A and AP2, version 0.3 | `message/send`, `message/stream`, `tasks/get`, `tasks/cancel`, `tasks/resubscribe`, `agent/getAuthenticatedExtendedCard` |
+| A2A and AP2, version 1.0 | `SendMessage`, `SendStreamingMessage`, `GetTask`, `ListTasks`, `CancelTask`, `SubscribeToTask`, `CreateTaskPushNotificationConfig`, `GetTaskPushNotificationConfig`, `ListTaskPushNotificationConfigs`, `DeleteTaskPushNotificationConfig`, `GetExtendedAgentCard` (`input.a2a.method`) |
+| A2A and AP2, version 0.3 | `message/send`, `message/stream`, `tasks/get`, `tasks/list`, `tasks/cancel`, `tasks/resubscribe`, `tasks/pushNotificationConfig/set`, `tasks/pushNotificationConfig/get`, `tasks/pushNotificationConfig/list`, `tasks/pushNotificationConfig/delete`, `agent/getAuthenticatedExtendedCard` |
+| A2A and AP2, either version | One unrecognised method, checked once per view: `input.a2a.method` is set and `input.a2a.method_canonical` is absent |
 | MCP | `initialize`, `tools/list`, `tools/call`, `resources/read`, `prompts/get` (`input.mcp.method`) |
 
 A2A methods are spelled as each version the variant accepts spells them, so a rule that
@@ -376,6 +377,8 @@ then evaluated as Fabric receive evaluates it: the gateway planes get the input 
 `input.a2a`, and the surface planes are the appliance-wide surface plane and `target.policy`
 only, because Fabric receive runs no `access_point.inbound_policy`. A case passes when some
 plane denies it on both paths.
+
+The A2A set is every method in the gateway's A2A method table, in each accepted spelling, plus one unrecognised method. With JWT Bearer and `required_scopes`, a variant that accepts both versions gives 69 cases (3 kinds times 23); one version gives 36.
 
 The dry run is a heuristic over this fixed set. A policy that branches on anything else (the
 path, headers, tool name or time) can still admit a failed caller unseen. The controls are the

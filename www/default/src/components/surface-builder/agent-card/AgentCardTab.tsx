@@ -10,6 +10,7 @@ import {
   describeFetchFailure,
   formatRelativeTime,
   type AgentCardPreview,
+  type CardUnsupportedReason,
   type SupportedAgentCardPreview,
 } from '../../../utils/agentCardPreview';
 import { useOptionalSurfaceMeta } from '../SurfaceMetaContext';
@@ -28,6 +29,13 @@ interface AgentCardTabProps {
 }
 
 const kb = (bytes: number) => Math.max(1, Math.round(bytes / 1024));
+
+const UNSUPPORTED_TEXT: Record<CardUnsupportedReason, string> = {
+  not_a2a: 'Only A2A and AP2 surfaces have agent cards.',
+  not_running:
+    'This surface is not running on this gateway, so its card cannot be fetched. Check that it is active.',
+  operator_only: 'Only an appliance operator can preview the card of an appliance-wide surface.',
+};
 
 const Notice: React.FC<{
   testId: string;
@@ -266,9 +274,7 @@ const AgentCardTab: React.FC<AgentCardTabProps> = ({
     if (!preview.supported) {
       return (
         <Notice testId="agent-card-unsupported" variant="secondary" role="status">
-          {preview.unsupported_reason === 'not_a2a'
-            ? 'Only A2A and AP2 surfaces have agent cards.'
-            : 'This surface is not running on this gateway, so its card cannot be fetched. Check that it is active.'}
+          {UNSUPPORTED_TEXT[preview.unsupported_reason]}
         </Notice>
       );
     }

@@ -1563,6 +1563,7 @@ mod tests {
             expires_at: chrono::DateTime::from_timestamp(100, 0),
             delegation_vc: None,
             consent_identity: None,
+            secret_versions: None,
             consent_granted_at: created_at,
             last_used_at: None,
             created_at,

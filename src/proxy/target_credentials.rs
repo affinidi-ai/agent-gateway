@@ -172,7 +172,8 @@ impl From<GatewayTokenError> for TargetCredentialError {
             GatewayTokenError::SecretUnavailable => Self::SecretUnavailable,
             GatewayTokenError::Unavailable
             | GatewayTokenError::InvalidResponse
-            | GatewayTokenError::AssertionFailed => Self::TokenUnavailable,
+            | GatewayTokenError::AssertionFailed
+            | GatewayTokenError::ScopeMismatch => Self::TokenUnavailable,
         }
     }
 }
@@ -919,6 +920,7 @@ mod tests {
                     signing_key_secret_ref: "SIGNING_KEY".into(),
                     signing_algorithm: JwtBearerAlgorithm::Es256,
                     key_id: Some(key.kid.clone()),
+                    audience: None,
                 });
             })
             .await;
@@ -1821,6 +1823,7 @@ mod tests {
             (GatewayTokenError::Unavailable, TargetCredentialError::TokenUnavailable),
             (GatewayTokenError::InvalidResponse, TargetCredentialError::TokenUnavailable),
             (GatewayTokenError::AssertionFailed, TargetCredentialError::TokenUnavailable),
+            (GatewayTokenError::ScopeMismatch, TargetCredentialError::TokenUnavailable),
         ] {
             assert_eq!(TargetCredentialError::from(grant_error), expected);
         }

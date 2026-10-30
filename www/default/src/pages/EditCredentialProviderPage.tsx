@@ -12,14 +12,17 @@ import { deepLinks } from '../utils/deepLinks';
 import { DOCS_URL } from '../config/docs';
 import {
   EMPTY_PROVIDER_FORM,
+  GOOGLE_TOKEN_ENDPOINT,
   PROVIDER_TYPES,
   PROVIDER_TYPE_CAPABILITIES,
   buildProviderBody,
   providerFormFromWire,
   unknownProviderType,
   deriveProviderId,
+  tokenEndpointForType,
   validateProviderForm,
   type CredentialProviderForm,
+  type CredentialProviderType,
 } from '../utils/credentialProviders';
 
 interface Secret {
@@ -116,6 +119,7 @@ const EditCredentialProviderPage: React.FC = () => {
   const [loadingSecrets, setLoadingSecrets] = useState(true);
   const [routingConfig, setRoutingConfig] = useState<RoutingConfig | null>(null);
   const formRef = useRef<HTMLFormElement>(null);
+  const tokenEndpointEdited = useRef(false);
 
   useEffect(() => {
     loadSecrets();
@@ -192,10 +196,18 @@ const EditCredentialProviderPage: React.FC = () => {
       setForm(prev => ({ ...prev, [name]: (e.target as HTMLInputElement).checked }));
     } else if (name === 'name' && isNew) {
       setForm(prev => ({ ...prev, name: value, provider_id: deriveProviderId(value) }));
+    } else if (name === 'provider_type') {
+      const nextType = value as CredentialProviderType;
+      setForm(prev => ({
+        ...prev,
+        provider_type: nextType,
+        token_endpoint: tokenEndpointForType(prev, nextType, isNew && !tokenEndpointEdited.current),
+      }));
     } else if (name === 'provider_id') {
       const sanitized = value.replace(/[^A-Za-z0-9_-]+/g, '-').replace(/^-|-$/g, '');
       setForm(prev => ({ ...prev, provider_id: sanitized }));
     } else {
+      if (name === 'token_endpoint') tokenEndpointEdited.current = true;
       setForm(prev => ({ ...prev, [name]: value }));
     }
   };
@@ -261,6 +273,8 @@ const EditCredentialProviderPage: React.FC = () => {
   }, [saving, canEdit, handleSubmit]);
 
   const caps = PROVIDER_TYPE_CAPABILITIES[form.provider_type];
+  const showGoogleEndpointHint =
+    isNew && caps.signingKey && form.token_endpoint.trim() === GOOGLE_TOKEN_ENDPOINT;
 
   if (loading) {
     return (
@@ -458,11 +472,24 @@ const EditCredentialProviderPage: React.FC = () => {
                       value={form.token_endpoint}
                       onChange={handleChange}
                       required
+                      aria-describedby={
+                        showGoogleEndpointHint ? 'token_endpoint-google-hint' : undefined
+                      }
                     />
                     <small className="form-text text-muted">
                       The URL the gateway calls to trade an authorization code (or its own client
                       credentials) for an actual access token.
                     </small>
+                    {showGoogleEndpointHint && (
+                      <small
+                        id="token_endpoint-google-hint"
+                        className="form-text text-muted d-block"
+                        data-testid="provider-token-endpoint-google-hint"
+                      >
+                        This is Google's token endpoint. Other authorization servers use their own;
+                        replace it with yours.
+                      </small>
+                    )}
                   </div>
                 </div>
               )}
@@ -702,10 +729,30 @@ const EditCredentialProviderPage: React.FC = () => {
                         onChange={handleChange}
                       />
                       <small className="form-text text-muted">
-                        The <code>sub</code> claim. Defaults to the issuer. The assertion audience
-                        is always the token endpoint.
+                        The <code>sub</code> claim, sent only when set. Servers that require it,
+                        such as Ory Hydra, need a subject here.
                       </small>
                     </div>
+                  </div>
+                  <div className="mb-3">
+                    <label htmlFor="audience">
+                      Audience <span className="text-muted">(optional)</span>
+                    </label>
+                    <input
+                      id="audience"
+                      data-testid="provider-audience"
+                      name="audience"
+                      type="text"
+                      className="form-control"
+                      value={form.audience}
+                      onChange={handleChange}
+                      placeholder={form.token_endpoint.trim()}
+                      aria-describedby="audience-help"
+                    />
+                    <small id="audience-help" className="form-text text-muted">
+                      The <code>aud</code> claim. Defaults to the token endpoint; set it only when
+                      the authorization server expects another audience.
+                    </small>
                   </div>
                 </div>
               )}

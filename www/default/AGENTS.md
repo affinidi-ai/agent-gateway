@@ -226,8 +226,9 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   (`-clear-authorization-servers-button`) and stored extra `scopes` with **Advertise required
   scopes only** (`-clear-scopes-button`; the "does not enforce" sentence lists only the stored scopes
   that Required Scopes does not already hold). The gateway advertises the strategy's issuer, so a stored
-  list that is not exactly `[expected_issuer]` blocks the save and shows
-  `caller-auth-discovery-authorization-servers-error`. The editor has no input to add an
+  list that is not exactly `[expected_issuer]` shows
+  `caller-auth-discovery-authorization-servers-error` after a save attempt, for cleanup; the gateway
+  keeps an unchanged stored list and reports `authorization_servers_stale`. The editor has no input to add an
   authorization server or an advertised scope.
 - The Caller Context editor's intro (`caller-auth-jwt-intro`) says that while Authorization server
   discovery is on, a missing or invalid token gets `401` with a challenge and a token short of a
@@ -291,7 +292,11 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   rules (a public https URL of the Access Point's listener followed by its route exactly) and the
   JWT Bearer settings the gateway constrains. A variant of an Access Point on `/` has no resource of
   its own (`rootVariantProblem`) and a stored authorization server list must be the strategy's
-  issuer: the section shows both, and the gateway refuses the save, the editor does not block it.
+  issuer: the section shows both. The gateway refuses a root variant, and keeps an unchanged stored
+  list with an `authorization_servers_stale` warning; the editor does not block either.
+  Stored authorization server entries must be https URLs, except a single entry that is the
+  strategy's http issuer (or any single http entry while the strategy issuer is unknown); the
+  gateway accepts that only for a strategy no tenant owns and refuses the save otherwise.
   Leaving JWT Bearer drops the setting.
   A variant shows the resource it advertises, `<resource>$<alias>`, and keeps its own setting. A
   failed save whose message names the setting of the route edited (a `variant '<alias>': ` message
@@ -370,7 +375,10 @@ surface, never the unsaved form.
   secret**, **Looked-up credential**, **No Target Authentication**, **The remote gateway signs in**,
   **Credential not obtained** or **No credential sent**), **Last fetched** (`agent-card-fetched-at`,
   a `time` element with the absolute time as its title), **Outcome** (`agent-card-outcome`, `agent-card-outcome-reason`, from
-  `describeDeclaration`) and **Last caller fetch** (`agent-card-last-caller-fetch`, per gateway
+  `describeDeclaration`; for a declaring route the reason says the agent card names the
+  authorization server only when the served card carries the `agent_gateway` scheme
+  (`cardNamesGatewayScheme`), says only the protected resource metadata names it when the served
+  card lacks that scheme, and makes no claim about the card when no served card is shown) and **Last caller fetch** (`agent-card-last-caller-fetch`, per gateway
   replica). A failed fetch names the cause with the HTTP status (`describeFetchFailure`), for
   example "Sign-in failed — HTTP 401". The longer cause text (`CARD_FETCH_CAUSE_TEXT`) says what
   happened and what to do, for example "Check that the agent is running, then Refresh."
@@ -401,7 +409,10 @@ surface, never the unsaved form.
   (`agent-card-unsaved-changes`, a banner above the content; moving or zooming the canvas does not
   count, see `utils/surfaceDirtySignature.ts`), loading (`agent-card-loading`), read failed with
   **Retry** (`agent-card-error`, `agent-card-retry-button`), `not_a2a` ("Only A2A and AP2 surfaces
-  have agent cards.") and `not_running` (`agent-card-unsupported`), a card over the display limit
+  have agent cards.") and `not_running` (`agent-card-unsupported`; `operator_only` reads "Only an
+  appliance operator can preview the card of an appliance-wide surface."; an `auth_failed` cause on
+  a `remote_gateway` sign-in reads "The remote gateway refused this gateway's authorization (HTTP
+  {status}). Check the sign-in settings of the remote surface."), a card over the display limit
   (`agent-card-too-large`), a gateway-generated A2A proxy card (`agent-card-generated`, served column
   only), callers paying first (`agent-card-payment`) and Surface Variants existing
   (`agent-card-variant-note`, because the view shows the base route). `hasVariants` comes from the
@@ -668,11 +679,17 @@ Keep labels associated, timestamps exact, and clipboard failures visible.
   response, which returns the pinned metadata at the top level of the body.
 - The list marks a strategy with a pinned server with a **Discovered** badge
   (`strategy-discovered-badge`). Deleting asks in the page (`strategy-delete-confirm`, role
-  `alertdialog`, confirm and cancel buttons), lists the surfaces whose Access Point or variants
-  use the strategy (read from `/api/v1/surfaces`; "Could not check" when that fails), and states
-  that a caller presenting a token is refused with `500` and a caller without one is left to the
-  surface's policy, and that the surface stops advertising an authorization server in its agent
-  card or protected resource metadata (see `docs/SOURCE_AUTH.md#source-authentication`). A refused delete shows
+  `alertdialog`, confirm and cancel buttons). It lists the credential providers that use the
+  strategy for consent identity (read from `/api/v1/credential-providers`; "Could not check which
+  credential providers use it." when that read fails, and Delete stays available) and the surfaces
+  whose Access Point or variants use the strategy, or whose Transit Points or outbound credential
+  bindings (base or variant) use one of those providers (read from `/api/v1/surfaces`; "Could not
+  check" when that fails). It states that, without authorization server discovery, a caller
+  presenting a token is refused with `500` and a caller without one is left to the surface's
+  policy; that a surface that advertises an authorization server can no longer be served and
+  refuses every caller until the strategy is restored; and that a credential provider using it for
+  consent identity can no longer obtain credentials that need the user's consent (see
+  `docs/SOURCE_AUTH.md#source-authentication`). A refused delete shows
   inline in `strategy-delete-error`. Opening the confirmation moves focus into it and scrolls it
   into view; Escape or Cancel closes it and returns focus to the row's Delete button, and a
   confirmed delete moves focus to the list heading (`hooks/useInPageConfirm.ts`). Only the
@@ -690,19 +707,30 @@ Keep labels associated, timestamps exact, and clipboard failures visible.
   for labels, badge colors, which fields apply, and which uses a type permits
   (`providerPermits`, `filterProvidersForUse`). Never compare `provider_type` to a string
   elsewhere. Request building and validation live in the same module
-  (`validateProviderForm`, `buildProviderBody`, `providerFormFromWire`).
+  (`validateProviderForm`, `buildProviderBody`, `providerFormFromWire`). Updating a provider sends
+  `null` for an emptied description or authorization endpoint, `{}` for emptied or unsupported
+  additional parameters, and `null` for the client and API key secret references the provider's
+  type does not use; creating a provider sends none of these.
 - **JWT Bearer** (`oauth2_jwt_bearer`) shows `jwt-bearer-section`: Signing Key Secret
-  (required), Algorithm (RS256 or ES256), Key ID, Assertion Issuer (required) and Subject.
-  The client ID and client secret references are optional and sent only as a pair. There is no
-  audience field: the assertion audience is always the token endpoint. The section carries an
+  (required), Algorithm (RS256 or ES256), Key ID, Assertion Issuer (required), Subject (the
+  `sub` claim, sent only when set) and Audience (`provider-audience`, optional, described by
+  `audience-help`, its placeholder the current token endpoint; sent trimmed as `audience`, left
+  out when blank, refused before saving when it holds whitespace or control characters or
+  exceeds 512 bytes, and the assertion audience is the token endpoint when unset).
+  The client ID and client secret references are optional and sent only as a pair. The section carries an
   always-visible `jwt-bearer-encryption-banner` because encryption at rest is off by default.
   The signing key is an ordinary secret (type Certificate or General); the dashboard has no
   separate private-key secret type. The assertion settings travel in a nested `jwt_bearer`
   object (`signing_key_secret_ref`, `signing_algorithm`, `assertion_issuer`,
-  `assertion_subject`, `key_id`), which a save replaces as a whole. Clearing the optional
+  `assertion_subject`, `key_id`, `audience`), which a save replaces as a whole. Clearing the optional
   client references on an existing provider sends them as `null`; the gateway removes both
   stored references (an omitted field keeps them), and the next grant sends no client
   authentication.
+- Choosing JWT Bearer for a new provider whose Token Endpoint is empty prefills Google's
+  endpoint (`GOOGLE_TOKEN_ENDPOINT`, `tokenEndpointForType`) with the hint
+  `provider-token-endpoint-google-hint`, shown only on a new provider; the field stays editable, choosing another type removes
+  the untouched prefill, and nothing is prefilled once the operator has edited the endpoint or on
+  an existing provider.
 - Create and update both send `provider_type`, so changing the Provider Type of an existing
   provider saves the new type; the gateway answers 409 while a surface uses the provider in a way
   the new type cannot serve: Target Authentication with Authorization Code, or a delegation

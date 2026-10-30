@@ -233,13 +233,13 @@ async fn surface_saves_report_fail_open_policies_per_variant_and_recompute_on_re
     let message = created["warnings"][0]["message"]
         .as_str()
         .expect("message");
-    assert!(message.contains("kind missing on message/send; 22 of 24 checked cases"), "{message}");
+    assert!(message.contains("kind missing on message/send; 44 of 46 checked cases"), "{message}");
     assert_eq!(created["warnings"][0]["path"], "access_point.inbound_policy");
     let over_fabric = created["warnings"][1]["message"]
         .as_str()
         .expect("message");
     assert!(
-        over_fabric.contains("over Fabric") && over_fabric.contains("24 of 24 checked cases"),
+        over_fabric.contains("over Fabric") && over_fabric.contains("46 of 46 checked cases"),
         "an inbound policy alone does not deny failed callers arriving over Fabric: {over_fabric}"
     );
     assert_eq!(created["warnings"][1]["path"], "target.policy");
@@ -416,7 +416,7 @@ async fn a_declaring_access_point_reports_its_declaration_and_no_fail_open_polic
     let fail_open = warning(&forwarding, "fail_open_policy")["message"]
         .as_str()
         .expect("message");
-    assert!(fail_open.contains("36 of 36 checked cases"), "{fail_open}");
+    assert!(fail_open.contains("69 of 69 checked cases"), "{fail_open}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -568,6 +568,83 @@ async fn a_strategy_issuer_change_is_advertised_without_a_surface_save() {
             .iter()
             .all(|warning| warning["code"] != "authorization_servers_stale"),
         "a surface that stored no list is never stale: {read}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_stored_authorization_servers_list_does_not_block_later_saves() {
+    let (h, admin) = declaring_admin().await;
+    let route = "/smoke/stale-servers";
+    let resource = format!("{PUBLIC_ORIGIN}{route}");
+    let mut listing = jwt_bearer_caller_authentication(Some(&resource));
+    listing["protected_resource"]["authorization_servers"] = json!([ISSUER]);
+    let body = surface_on(&h, route, "a2a", listing.clone());
+    let (status, created) = admin
+        .post("surfaces", &body)
+        .await;
+    assert_eq!(status, 201, "{created}");
+    let surface_id = created["surface_id"]
+        .as_str()
+        .expect("surface id")
+        .to_string();
+    let path = format!("surfaces/{surface_id}");
+
+    let new_issuer = "https://as2.example";
+    let (status, updated) = admin
+        .put(
+            &format!("jwt-verification-strategies/{STRATEGY_ID}"),
+            &json!({
+                "name": "Card security", "expected_issuer": new_issuer, "discover_metadata": false,
+                "jwks_source": {"type": "remote", "jwks_uri": format!("{new_issuer}/.well-known/jwks.json")}
+            }),
+        )
+        .await;
+    assert_eq!(status, 200, "{updated}");
+    let stale = |body: &Value| {
+        warning_codes(body)
+            .iter()
+            .any(|(code, _)| code == "authorization_servers_stale")
+    };
+
+    let (status, renamed) = admin
+        .merge_patch(&path, &json!({"name": "renamed"}))
+        .await;
+    assert_eq!(status, 200, "a save that keeps the stored list unchanged is accepted: {renamed}");
+    assert!(stale(&renamed), "{renamed}");
+
+    let mut omitted = body.clone();
+    omitted["access_point"]["caller_authentication"] = jwt_bearer_caller_authentication(None);
+    let (status, kept) = admin
+        .put(&path, &omitted)
+        .await;
+    assert_eq!(status, 200, "a PUT without protected_resource keeps the stored list: {kept}");
+    assert!(stale(&kept), "{kept}");
+
+    let mut changed = body.clone();
+    changed["access_point"]["caller_authentication"]["protected_resource"]["authorization_servers"] =
+        json!(["https://other.example"]);
+    let (status, refused) = admin
+        .put(&path, &changed)
+        .await;
+    assert_eq!(status, 400, "{refused}");
+    assert!(
+        refused
+            .to_string()
+            .contains("To remove the list, send protected_resource without authorization_servers"),
+        "{refused}"
+    );
+
+    let mut cleared = body;
+    cleared["access_point"]["caller_authentication"] = jwt_bearer_caller_authentication(Some(&resource));
+    let (status, saved) = admin
+        .put(&path, &cleared)
+        .await;
+    assert_eq!(status, 200, "{saved}");
+    assert!(!stale(&saved), "{saved}");
+    assert_eq!(
+        saved["access_point"]["caller_authentication"]["protected_resource"]["authorization_servers"],
+        Value::Null,
+        "{saved}"
     );
 }
 

@@ -553,18 +553,20 @@ impl CallerAssertion {
         }
     }
 
-    /// A caller request the gateway forwards to its target. A caller whose
-    /// source authentication failed has been vetted by nobody, whatever the
-    /// path; otherwise [`Self::for_request`] decides.
+    /// A caller request the gateway forwards to `surface`'s target, `path` being
+    /// its route tail. A caller whose source authentication failed has been
+    /// vetted by nobody, whatever the path; otherwise only a public discovery
+    /// read of the surface skipped caller authentication.
     pub(crate) fn for_forwarded_request(
+        surface: &crate::config::agent_surface::AgentSurface,
         method: &str,
         path: &str,
         source_auth_failed: bool,
     ) -> Self {
-        if source_auth_failed {
+        if source_auth_failed || crate::proxy::paths::is_public_surface_request(surface, method, path) {
             Self::Unauthenticated
         } else {
-            Self::for_request(method, path)
+            Self::Authenticated
         }
     }
 }
@@ -1401,7 +1403,7 @@ pub(crate) async fn proxy_handler_with_mcp_runtime(
     // Public/discovery paths are skipped too (no caller identity, bypass OPA/VP), so
     // a discovery fetch doesn't add a noise bridge record.
     if egress_trace_id != trace_id
-        && !crate::proxy::paths::is_public_request(method.as_str(), uri.path())
+        && !crate::proxy::paths::is_public_surface_request(&state.surface, method.as_str(), uri.path())
         && !state
             .surface
             .target
@@ -1433,7 +1435,10 @@ pub(crate) async fn proxy_handler_with_mcp_runtime(
     }
 
     // Extract UCP operation type from request path and method (if this is a UCP channel).
-    let mut ucp_operation = extract_ucp_operation(uri.path(), &method);
+    let mut ucp_operation = extract_ucp_operation(uri.path(), &method).filter(|operation| {
+        operation != "discovery"
+            || crate::proxy::paths::is_public_surface_request(&state.surface, method.as_str(), uri.path())
+    });
 
     if let Some(ref op) = ucp_operation {
         channel_info!(
@@ -1699,7 +1704,7 @@ pub(crate) async fn proxy_handler_with_mcp_runtime(
                 return Ok(authorization.challenge(error));
             }
         }
-    } else if !crate::proxy::paths::is_public_request(method.as_str(), uri.path())
+    } else if !crate::proxy::paths::is_public_surface_request(&state.surface, method.as_str(), uri.path())
         && let (Some(auth_config), installed_middleware) = (state.surface.source_auth(), &state.source_auth_middleware)
     {
         let sa_middleware = match crate::source_auth::middleware::require_installed(installed_middleware.clone()) {
@@ -2442,7 +2447,7 @@ pub(crate) async fn proxy_handler_with_mcp_runtime(
     // even when surface OPA is absent, because its template resolver reads
     // `input.agent.*` directly. Skipped only for discovery requests.
     let mut agent_context: Option<crate::surface_context::AgentContext> =
-        if !crate::proxy::paths::is_public_request(method.as_str(), uri.path())
+        if !crate::proxy::paths::is_public_surface_request(&state.surface, method.as_str(), uri.path())
             && ucp_operation.as_deref() != Some("discovery")
             && (state.surface.opa_enabled()
                 || !state
@@ -2537,7 +2542,7 @@ pub(crate) async fn proxy_handler_with_mcp_runtime(
     // ── Gateway-level OPA policy enforcement ─────────────────────────────────
     // Evaluated AFTER trust registry fetch so that `input.agent` is available.
     // A gateway deny cannot be overridden by a channel allow (no privilege escalation).
-    if !crate::proxy::paths::is_public_request(method.as_str(), uri.path())
+    if !crate::proxy::paths::is_public_surface_request(&state.surface, method.as_str(), uri.path())
         && let Some(ref gw_policy_manager) = state.gateway_policy_manager
         && let Some(self_gateway_id) = gw_policy_manager.get_self_gateway_id()
         && gw_policy_manager.is_enforced(&self_gateway_id)
@@ -4557,7 +4562,7 @@ pub(crate) async fn proxy_handler_with_mcp_runtime(
     // Skipped on public/discovery paths (`is_public_path`): source auth is
     // bypassed there, so no JWT claims exist and there is no caller identity to
     // resolve — mirrors the Trust Check and surface OPA discovery bypasses.
-    if !crate::proxy::paths::is_public_request(method.as_str(), uri.path())
+    if !crate::proxy::paths::is_public_surface_request(&state.surface, method.as_str(), uri.path())
         && identity_result.is_none()
         && let Some(crate::source_auth::ManagedIdentityConfig::FromJwtClaim { claim, namespace_claims }) = state
             .surface
@@ -4970,7 +4975,7 @@ pub(crate) async fn proxy_handler_with_mcp_runtime(
             .access_point
             .trust_check_list;
         if !caller_elements.is_empty()
-            && !crate::proxy::paths::is_public_request(method.as_str(), uri.path())
+            && !crate::proxy::paths::is_public_surface_request(&state.surface, method.as_str(), uri.path())
             && let Some(manager) = state
                 .trust_registry_listener_manager
                 .clone()
@@ -5102,7 +5107,7 @@ pub(crate) async fn proxy_handler_with_mcp_runtime(
     // target-side processing. Independent of `state.surface.opa_enabled()`
     // (which gates `target.policy`) — both can fire on the same request.
     // Sees the caller-leg `trust_check_results` populated above.
-    if !crate::proxy::paths::is_public_request(method.as_str(), uri.path())
+    if !crate::proxy::paths::is_public_surface_request(&state.surface, method.as_str(), uri.path())
         && state
             .surface
             .inbound_opa_enabled()
@@ -5294,7 +5299,7 @@ pub(crate) async fn proxy_handler_with_mcp_runtime(
 
     // Surface-Level OPA Policy check (evaluated against resolved AgentContext)
     // Skip for discovery requests (agent-card, /.well-known/ucp, etc.) — no trust check needed
-    if !crate::proxy::paths::is_public_request(method.as_str(), uri.path())
+    if !crate::proxy::paths::is_public_surface_request(&state.surface, method.as_str(), uri.path())
         && state.surface.opa_enabled()
         && let Some(config_id_str) = state.surface.config_id()
     {
@@ -5457,7 +5462,7 @@ pub(crate) async fn proxy_handler_with_mcp_runtime(
     // installed. The gate condition is evaluated against the same `PolicyInput`
     // the surface OPA gate and the tools/list filter see, so a gate that hides
     // a tool from the list decides identically here.
-    if !crate::proxy::paths::is_public_request(method.as_str(), uri.path())
+    if !crate::proxy::paths::is_public_surface_request(&state.surface, method.as_str(), uri.path())
         && state
             .surface
             .channel_protocol()
@@ -5572,7 +5577,8 @@ pub(crate) async fn proxy_handler_with_mcp_runtime(
             return Ok(response);
         };
         channel_info!(config_id, "🔌 Routing A2A request through A2A proxy backend proxy_id={}", proxy_id);
-        let caller = CallerAssertion::for_forwarded_request(method.as_str(), uri.path(), source_auth_failed);
+        let caller =
+            CallerAssertion::for_forwarded_request(&state.surface, method.as_str(), uri.path(), source_auth_failed);
         let response = handle_a2a_proxy_target_request(&state, proxy_id, &body_bytes, &channel_name, caller).await;
         let response = record_a2a_proxy_connection_metric(
             &state,
@@ -6475,7 +6481,12 @@ pub(crate) async fn proxy_handler_with_mcp_runtime(
                     surface: &state.surface,
                     destination: &target_url,
                     leg: crate::proxy::target_credentials::TargetLeg::HttpTarget,
-                    caller: CallerAssertion::for_forwarded_request(method.as_str(), uri.path(), source_auth_failed),
+                    caller: CallerAssertion::for_forwarded_request(
+                        &state.surface,
+                        method.as_str(),
+                        uri.path(),
+                        source_auth_failed,
+                    ),
                     via_fabric: false,
                     trace_id: Some(&egress_trace_id),
                     occupied_headers: &delegated_headers,
@@ -9198,7 +9209,8 @@ async fn multi_channel_proxy_handler_in_request_scope(
                     let surface = Arc::clone(&ch.surface);
                     drop(sorted_channels);
                     drop(channels);
-                    let public = crate::proxy::paths::is_public_request(
+                    let public = crate::proxy::paths::is_public_surface_request(
+                        &surface,
                         req.method().as_str(),
                         &route_tail_to_uri_path(&stripped_tail),
                     );
@@ -9770,7 +9782,7 @@ async fn resolve_configured_caller_identity(
     use crate::identity::credential_identity::CredentialIdentity;
     use crate::source_auth::ManagedIdentityConfig;
 
-    if crate::proxy::paths::is_public_request(method, path) {
+    if crate::proxy::paths::is_public_surface_request(&state.surface, method, path) {
         return Ok(None);
     }
     let (mi, from_managed_slot) = match state
@@ -10070,7 +10082,9 @@ async fn handle_fabric_request(
     // paths (agent-card fetch, `.well-known/*`) — those carry no caller identity and
     // bypass OPA/VP injection, so a bridge record for them is only noise (matching
     // the discovery bypass every other stage already applies).
-    if egress_trace_id != trace_id && !crate::proxy::paths::is_public_request(method.as_str(), uri.path()) {
+    if egress_trace_id != trace_id
+        && !crate::proxy::paths::is_public_surface_request(&state.surface, method.as_str(), uri.path())
+    {
         channel_info!(
             config_id,
             "🔀 Trace terminated at egress: own trace {} continues downstream as {}",
@@ -10279,7 +10293,7 @@ async fn handle_fabric_request(
     // Skipped on public/discovery paths (`is_public_path`): source auth is
     // bypassed there, so no JWT claims exist and there is no caller identity to
     // resolve — mirrors the Trust Check and surface OPA discovery bypasses.
-    if !crate::proxy::paths::is_public_request(method.as_str(), uri.path())
+    if !crate::proxy::paths::is_public_surface_request(&state.surface, method.as_str(), uri.path())
         && identity_result.is_none()
         && let Some(crate::source_auth::ManagedIdentityConfig::FromJwtClaim { claim, namespace_claims }) = state
             .surface
@@ -10444,7 +10458,7 @@ async fn handle_fabric_request(
     // Fail-closed: the gate enters purely on `inbound_opa_enabled()` — a
     // missing policy manager or a policy that failed to load/compile
     // returns 403 (matches the direct path).
-    if !crate::proxy::paths::is_public_request(method.as_str(), uri.path())
+    if !crate::proxy::paths::is_public_surface_request(&state.surface, method.as_str(), uri.path())
         && state
             .surface
             .inbound_opa_enabled()
@@ -11770,7 +11784,12 @@ async fn handle_fabric_request(
                     surface: &state.surface,
                     destination: &state.surface.target.endpoint,
                     leg: crate::proxy::target_credentials::TargetLeg::FabricForward,
-                    caller: CallerAssertion::for_forwarded_request(method.as_str(), uri.path(), source_auth_failed),
+                    caller: CallerAssertion::for_forwarded_request(
+                        &state.surface,
+                        method.as_str(),
+                        uri.path(),
+                        source_auth_failed,
+                    ),
                     via_fabric: true,
                     trace_id: Some(&trace_id),
                     occupied_headers: &occupied_headers,
@@ -12534,11 +12553,13 @@ async fn handle_fabric_request(
                         let mut response_builder = Response::builder().status(StatusCode::PAYMENT_REQUIRED);
 
                         for (key, value) in response_headers.iter() {
-                            if let Ok(header_name) = axum::http::HeaderName::try_from(key)
-                                && let Some(value_str) = value.as_str()
-                                && let Ok(header_value) = axum::http::HeaderValue::try_from(value_str)
-                            {
-                                response_builder = response_builder.header(header_name, header_value);
+                            let Ok(header_name) = axum::http::HeaderName::try_from(key) else {
+                                continue;
+                            };
+                            for value_str in crate::proxy::fabric_forward::fabric_header_values(value) {
+                                if let Ok(header_value) = axum::http::HeaderValue::try_from(value_str) {
+                                    response_builder = response_builder.header(&header_name, header_value);
+                                }
                             }
                         }
 
@@ -12628,11 +12649,13 @@ async fn handle_fabric_request(
                         let mut response_builder = Response::builder().status(mcp_error_status);
 
                         for (key, value) in response_headers.iter() {
-                            if let Ok(header_name) = axum::http::HeaderName::try_from(key)
-                                && let Some(value_str) = value.as_str()
-                                && let Ok(header_value) = axum::http::HeaderValue::try_from(value_str)
-                            {
-                                response_builder = response_builder.header(header_name, header_value);
+                            let Ok(header_name) = axum::http::HeaderName::try_from(key) else {
+                                continue;
+                            };
+                            for value_str in crate::proxy::fabric_forward::fabric_header_values(value) {
+                                if let Ok(header_value) = axum::http::HeaderValue::try_from(value_str) {
+                                    response_builder = response_builder.header(&header_name, header_value);
+                                }
                             }
                         }
 
@@ -12669,11 +12692,13 @@ async fn handle_fabric_request(
                     let mut response_builder = Response::builder().status(StatusCode::PAYMENT_REQUIRED);
 
                     for (key, value) in response_headers.iter() {
-                        if let Ok(header_name) = axum::http::HeaderName::try_from(key)
-                            && let Some(value_str) = value.as_str()
-                            && let Ok(header_value) = axum::http::HeaderValue::try_from(value_str)
-                        {
-                            response_builder = response_builder.header(header_name, header_value);
+                        let Ok(header_name) = axum::http::HeaderName::try_from(key) else {
+                            continue;
+                        };
+                        for value_str in crate::proxy::fabric_forward::fabric_header_values(value) {
+                            if let Ok(header_value) = axum::http::HeaderValue::try_from(value_str) {
+                                response_builder = response_builder.header(&header_name, header_value);
+                            }
                         }
                     }
 
@@ -13553,28 +13578,8 @@ async fn handle_fabric_request(
                         continue;
                     }
 
-                    let values = if is_modern_response {
-                        match value {
-                            serde_json::Value::String(value) => vec![value],
-                            serde_json::Value::Array(values) => values
-                                .into_iter()
-                                .filter_map(|value| {
-                                    value
-                                        .as_str()
-                                        .map(str::to_string)
-                                })
-                                .collect(),
-                            _ => Vec::new(),
-                        }
-                    } else {
-                        value
-                            .as_str()
-                            .map(str::to_string)
-                            .into_iter()
-                            .collect()
-                    };
                     channel_info!(config_id, "  Header: {}", key);
-                    for value_str in values {
+                    for value_str in crate::proxy::fabric_forward::fabric_header_values(&value) {
                         response_builder = response_builder.header(key.as_str(), value_str);
                     }
                 }
@@ -14489,7 +14494,7 @@ async fn evaluate_mcp_proxy_opa_policies(
             .access_point
             .trust_check_list;
         if !caller_elements.is_empty()
-            && !crate::proxy::paths::is_public_request(method, uri.path())
+            && !crate::proxy::paths::is_public_surface_request(&state.surface, method, uri.path())
             && let Some(manager) = state
                 .trust_registry_listener_manager
                 .clone()
@@ -14984,7 +14989,12 @@ async fn handle_mcp_proxy_request(
                         surface: &state.surface,
                         destination: &state.surface.target.endpoint,
                         leg: crate::proxy::target_credentials::TargetLeg::McpProxy,
-                        caller: CallerAssertion::for_forwarded_request(method.as_str(), uri.path(), source_auth_failed),
+                        caller: CallerAssertion::for_forwarded_request(
+                            &state.surface,
+                            method.as_str(),
+                            uri.path(),
+                            source_auth_failed,
+                        ),
                         via_fabric: false,
                         trace_id: Some(&trace_id),
                         occupied_headers: &[],
@@ -15932,21 +15942,56 @@ mod caller_assertion_tests {
 
     #[test]
     fn a_failed_source_authentication_never_carries_the_target_credential() {
+        let surface = plain_surface();
         for (method, path) in [("POST", "/surface/mcp"), ("GET", "/payments/garlic/station")] {
-            let assertion = CallerAssertion::for_forwarded_request(method, path, true);
+            let assertion = CallerAssertion::for_forwarded_request(&surface, method, path, true);
             assert_eq!(assertion, CallerAssertion::Unauthenticated, "{method} {path}");
             assert!(!assertion.permits_target_credential(), "{method} {path}");
         }
     }
 
+    fn plain_surface() -> crate::config::agent_surface::AgentSurface {
+        use crate::protocols::protected_resource::fixtures::{discovery_surface, jwt_bearer_method};
+        discovery_surface(jwt_bearer_method(), None)
+    }
+
+    fn declaring_surface() -> crate::config::agent_surface::AgentSurface {
+        use crate::protocols::protected_resource::fixtures::{discovery_surface, jwt_bearer_method};
+        discovery_surface(
+            jwt_bearer_method(),
+            Some(serde_json::json!({"resource": "https://gateway.example/mcp/alpha", "scopes": ["tools"]})),
+        )
+    }
+
     #[test]
     fn a_forwarded_request_without_a_failure_keeps_the_path_rule() {
+        let surface = plain_surface();
         for (method, path, expected) in [
             ("POST", "/surface/mcp", CallerAssertion::Authenticated),
             ("GET", "/surface/.well-known/agent-card.json", CallerAssertion::Unauthenticated),
             ("HEAD", "/surface/agent.json", CallerAssertion::Unauthenticated),
         ] {
-            assert_eq!(CallerAssertion::for_forwarded_request(method, path, false), expected, "{method} {path}");
+            assert_eq!(
+                CallerAssertion::for_forwarded_request(&surface, method, path, false),
+                expected,
+                "{method} {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_forwarded_discovery_suffix_on_a_declaring_access_point_is_an_asserted_caller() {
+        let surface = declaring_surface();
+        for (method, path, expected) in [
+            ("GET", "/.well-known/agent-card.json", CallerAssertion::Unauthenticated),
+            ("GET", "/tasks/discovery", CallerAssertion::Authenticated),
+            ("HEAD", "/agent.json", CallerAssertion::Authenticated),
+        ] {
+            assert_eq!(
+                CallerAssertion::for_forwarded_request(&surface, method, path, false),
+                expected,
+                "{method} {path}"
+            );
         }
     }
 }
@@ -21392,13 +21437,17 @@ mod fabric_extended_card_tests {
                 }
             }
 
+            const OTHER_PAYMENT: &str = "Payment id=\"p2\", realm=\"gw2\", method=\"card\"";
             let refused = json!({"jsonrpc": "2.0", "id": "m-1", "error": {"code": -32000, "message": "refused"}});
             for (status, challenge, expected_challenges) in [
                 (402, Some(json!(PAYMENT)), vec![PAYMENT.to_string()]),
                 (401, Some(json!(PAYMENT)), vec![PAYMENT.to_string()]),
+                (401, Some(json!([PAYMENT, PEER_INVALID_TOKEN])), vec![PAYMENT.to_string()]),
+                (402, Some(json!([PAYMENT, OTHER_PAYMENT])), vec![PAYMENT.to_string(), OTHER_PAYMENT.to_string()]),
                 (403, None, vec![]),
+                (403, Some(json!(["Basic realm=\"peer\""])), vec![]),
             ] {
-                let peer = fabric_peer_on("a2a", status, with_large(challenge), refused.clone()).await;
+                let peer = fabric_peer_on("a2a", status, with_large(challenge.clone()), refused.clone()).await;
 
                 let (response, events) = crate::audit::producer::capture(send_through_router(&peer)).await;
 
@@ -21413,9 +21462,156 @@ mod fabric_extended_card_tests {
                             .to_string()
                     })
                     .collect();
-                assert_eq!((response.status().as_u16(), challenges), (status, expected_challenges), "peer {status}");
+                assert_eq!(
+                    (response.status().as_u16(), challenges),
+                    (status, expected_challenges),
+                    "peer {status} with {challenge:?}"
+                );
+                assert!(rejections(&events).is_empty(), "peer {status} with {challenge:?}: {events:?}");
+            }
+        });
+    }
+
+    #[test]
+    fn a_header_the_fabric_peer_repeats_reaches_the_caller_with_every_value() {
+        run_on_large_stack(async {
+            let peer = fabric_peer_on(
+                "a2a",
+                200,
+                json!({"content-type": "application/json", "link": ["<https://a.example>", "<https://b.example>"]}),
+                json!({"jsonrpc": "2.0", "id": "m-1", "result": {}}),
+            )
+            .await;
+
+            let response = send_through_router(&peer).await;
+
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            let links: Vec<&str> = response
+                .headers()
+                .get_all(axum::http::header::LINK)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .collect();
+            assert_eq!(links, ["<https://a.example>", "<https://b.example>"]);
+        });
+    }
+
+    /// The answer the card route gives, or the failure a preview reports, for a
+    /// Fabric peer's answer to the gateway's card fetch.
+    async fn card_fetch_answer(
+        mode: super::agent_card::CardMode,
+        status: u16,
+        challenge: Option<&str>,
+    ) -> (
+        Result<serde_json::Value, super::agent_card::CardFailure>,
+        Vec<crate::delegation_vault::audit::DelegationAuditEvent>,
+    ) {
+        let peer = fabric_peer_on("a2a", 200, json!({}), json!({})).await;
+        let mut headers = std::collections::HashMap::from([(
+            "content-type".to_string(),
+            vec!["application/problem+json".to_string()],
+        )]);
+        if let Some(challenge) = challenge {
+            headers.insert("www-authenticate".to_string(), vec![challenge.to_string()]);
+        }
+        let response = crate::proxy::fabric_forward::FabricForwardResponse {
+            status,
+            headers,
+            body: json!({"type": "about:blank", "status": status})
+                .to_string()
+                .into_bytes(),
+        };
+        let fetch = super::agent_card::TargetCardFetch {
+            state: &peer.state,
+            source_addr: "127.0.0.1",
+            mode,
+        };
+        crate::audit::producer::capture(async { fetch.read_fabric_answer(&response, "trace-card") }).await
+    }
+
+    async fn served_failure(
+        failure: Result<serde_json::Value, super::agent_card::CardFailure>
+    ) -> (axum::http::StatusCode, axum::http::HeaderMap, serde_json::Value) {
+        let response = axum::response::IntoResponse::into_response(super::agent_card::CardRefusal::Failed(
+            failure.expect_err("the card fetch failed"),
+        ));
+        let (parts, body) = response.into_parts();
+        let bytes = axum::body::to_bytes(body, 65536)
+            .await
+            .unwrap();
+        (parts.status, parts.headers, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[test]
+    fn a_fabric_peer_refusal_of_the_card_fetch_is_a_502() {
+        run_on_large_stack(async {
+            for (status, challenge, _, reason) in peer_refusals() {
+                let (failure, events) =
+                    card_fetch_answer(super::agent_card::CardMode::Serve, status, Some(challenge)).await;
+
+                let (answered_status, headers, body) = served_failure(failure).await;
+
+                assert_peer_refusal_answer(
+                    &format!("card fetch, peer {status}"),
+                    (answered_status, headers, body, events),
+                    reason,
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn a_fabric_peer_policy_403_or_404_on_the_card_fetch_keeps_its_status() {
+        run_on_large_stack(async {
+            for status in [403, 404] {
+                let (failure, events) = card_fetch_answer(super::agent_card::CardMode::Serve, status, None).await;
+
+                let (answered_status, headers, body) = served_failure(failure).await;
+
+                assert_eq!(answered_status.as_u16(), status, "{body}");
+                assert!(
+                    body["detail"]
+                        .as_str()
+                        .is_some_and(|detail| detail.starts_with("Upstream error")),
+                    "{body}"
+                );
+                assert!(
+                    headers
+                        .get(axum::http::header::WWW_AUTHENTICATE)
+                        .is_none()
+                );
                 assert!(rejections(&events).is_empty(), "peer {status}: {events:?}");
             }
+        });
+    }
+
+    #[test]
+    fn a_preview_reports_a_fabric_peer_refusal_without_recording_it() {
+        run_on_large_stack(async {
+            for (status, challenge, _, _) in peer_refusals() {
+                let (failure, events) =
+                    card_fetch_answer(super::agent_card::CardMode::Preview, status, Some(challenge)).await;
+
+                let failure = failure.expect_err("the card fetch failed");
+                assert_eq!(failure.cause, crate::proxy::card_preview::CardFetchCause::AuthFailed, "peer {status}");
+                assert_eq!(failure.http_status, Some(status), "peer {status}");
+                assert!(events.is_empty(), "peer {status}: {events:?}");
+                let (answered_status, _, body) = served_failure(Err(failure)).await;
+                assert_eq!(answered_status, axum::http::StatusCode::BAD_GATEWAY, "{body}");
+                assert_eq!(body["detail"], crate::proxy::fabric_peer_refusal::PEER_REFUSED_DETAIL, "{body}");
+            }
+            let (failure, _) = card_fetch_answer(super::agent_card::CardMode::Preview, 401, None).await;
+            let failure = failure.expect_err("the card fetch failed");
+            assert_eq!(
+                (failure.cause, failure.http_status),
+                (crate::proxy::card_preview::CardFetchCause::AuthFailed, Some(401)),
+                "a peer 401 with no challenge is a refusal too"
+            );
+            let peer = fabric_peer_on("a2a", 200, json!({}), json!({})).await;
+            assert_eq!(
+                crate::proxy::card_preview::CardAuthReport::for_surface(&peer.state.surface).kind,
+                crate::proxy::card_preview::CardAuthKind::RemoteGateway
+            );
         });
     }
 

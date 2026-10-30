@@ -229,18 +229,28 @@ fn is_blank(value: Option<&str>) -> bool {
     value.is_none_or(|value| value.trim().is_empty())
 }
 
+#[allow(clippy::result_large_err)]
+fn require_https_token_endpoint(endpoint: &str) -> Result<(), Response> {
+    if GrantEgress::from_environment().permits_token_endpoint(endpoint) {
+        Ok(())
+    } else {
+        Err(bad_request("token_endpoint must be an https URL"))
+    }
+}
+
 /// Checks the fields each provider type needs, without reading any secret.
 #[allow(clippy::result_large_err)]
 fn validate_provider_shape(provider: &CredentialProvider) -> Result<(), Response> {
     match provider.provider_type {
         CredentialProviderType::OAuth2AuthorizationCode | CredentialProviderType::OAuth2ClientCredentials => {
-            if is_blank(
-                provider
-                    .token_endpoint
-                    .as_deref(),
-            ) {
+            let Some(endpoint) = provider
+                .token_endpoint
+                .as_deref()
+                .filter(|endpoint| !endpoint.trim().is_empty())
+            else {
                 return Err(bad_request("token_endpoint is required for OAuth providers"));
-            }
+            };
+            require_https_token_endpoint(endpoint)?;
             if is_blank(
                 provider
                     .client_id_secret_ref
@@ -263,9 +273,7 @@ fn validate_provider_shape(provider: &CredentialProvider) -> Result<(), Response
             else {
                 return Err(bad_request("token_endpoint is required for JWT bearer providers"));
             };
-            if !GrantEgress::from_environment().permits_jwt_bearer_endpoint(endpoint) {
-                return Err(bad_request("token_endpoint must be an https URL for JWT bearer providers"));
-            }
+            require_https_token_endpoint(endpoint)?;
             let Some(settings) = provider.jwt_bearer.as_ref() else {
                 return Err(bad_request("jwt_bearer settings are required for JWT bearer providers"));
             };
@@ -630,7 +638,8 @@ pub async fn update_provider(
         (
             "authorization_endpoint",
             req.authorization_endpoint
-                .as_deref(),
+                .as_ref()
+                .and_then(Option::as_deref),
         ),
         (
             "callback_url",
@@ -647,6 +656,7 @@ pub async fn update_provider(
         .clone()
         .unwrap_or_else(|| existing.provider_type.clone());
     let retyped = effective_type != existing.provider_type;
+    let changes_token_endpoint = req.token_endpoint.is_some();
     let clears_a_reference = [
         &req.client_id_secret_ref,
         &req.client_secret_secret_ref,
@@ -667,7 +677,7 @@ pub async fn update_provider(
         provider_type: effective_type.clone(),
         authorization_endpoint: req
             .authorization_endpoint
-            .or(existing.authorization_endpoint),
+            .unwrap_or(existing.authorization_endpoint),
         token_endpoint: req
             .token_endpoint
             .or(existing.token_endpoint),
@@ -709,12 +719,12 @@ pub async fn update_provider(
         },
         description: req
             .description
-            .or(existing.description),
+            .unwrap_or(existing.description),
         created_at: existing.created_at,
         updated_at: Utc::now(),
     };
 
-    if (retyped || clears_a_reference || updated.jwt_bearer.is_some())
+    if (retyped || changes_token_endpoint || clears_a_reference || updated.jwt_bearer.is_some())
         && let Err(response) = validate_provider_shape(&updated)
     {
         return response;
@@ -1572,6 +1582,155 @@ mod consent_strategy_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_update_keeps_an_absent_description_and_authorization_endpoint_and_clears_a_null_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state_with_provider(&directory, None).await;
+        let stored = || async {
+            state
+                .store
+                .get("provider")
+                .await
+                .unwrap()
+                .expect("provider is stored")
+        };
+
+        let set = json!({"description": "Calendar", "authorization_endpoint": "https://192.0.2.10/authorize"});
+        let (status, body) = update_as_operator(&state, set).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["description"], "Calendar");
+        assert_eq!(body["authorization_endpoint"], "https://192.0.2.10/authorize");
+
+        let (status, body) = update_as_operator(&state, json!({"name": "Renamed"})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            stored()
+                .await
+                .description
+                .as_deref(),
+            Some("Calendar")
+        );
+        assert_eq!(
+            stored()
+                .await
+                .authorization_endpoint
+                .as_deref(),
+            Some("https://192.0.2.10/authorize")
+        );
+
+        let (status, body) = update_as_operator(&state, json!({"description": "x"})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            stored()
+                .await
+                .description
+                .as_deref(),
+            Some("x")
+        );
+
+        let (status, body) = update_as_operator(&state, json!({"authorization_endpoint": "not a url"})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            stored()
+                .await
+                .authorization_endpoint
+                .is_some()
+        );
+
+        let clear = json!({"description": null, "authorization_endpoint": null});
+        let (status, body) = update_as_operator(&state, clear).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            body.get("description")
+                .is_none_or(serde_json::Value::is_null),
+            "{body}"
+        );
+        assert!(
+            body.get("authorization_endpoint")
+                .is_none_or(serde_json::Value::is_null),
+            "{body}"
+        );
+        assert_eq!(stored().await.description, None);
+        assert_eq!(
+            stored()
+                .await
+                .authorization_endpoint,
+            None
+        );
+        assert_eq!(stored().await.name, "Renamed");
+    }
+
+    #[tokio::test]
+    async fn save_refuses_an_http_token_endpoint_for_every_oauth_provider_type() {
+        for provider_type in [
+            CredentialProviderType::OAuth2AuthorizationCode,
+            CredentialProviderType::OAuth2ClientCredentials,
+            CredentialProviderType::OAuth2JwtBearer,
+        ] {
+            let mut provider: CredentialProvider = serde_json::from_value(json!({
+                "id": "provider", "name": "Provider", "provider_id": "provider",
+                "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET",
+                "jwt_bearer": {"assertion_issuer": "gateway@example.test", "signing_key_secret_ref": "KEY",
+                    "signing_algorithm": "ES256"},
+                "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+            }))
+            .unwrap();
+            if provider_type != CredentialProviderType::OAuth2JwtBearer {
+                provider.jwt_bearer = None;
+            }
+            provider.provider_type = provider_type.clone();
+
+            provider.token_endpoint = Some("http://auth.example/token".into());
+            let response = validate_provider_shape(&provider).expect_err("an http token endpoint is refused");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{provider_type:?}");
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(std::str::from_utf8(&bytes).unwrap(), r#"{"error":"token_endpoint must be an https URL"}"#);
+
+            provider.token_endpoint = Some("https://auth.example/token".into());
+            assert!(validate_provider_shape(&provider).is_ok(), "{provider_type:?}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_update_that_moves_the_token_endpoint_to_http_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state_with_provider(&directory, None).await;
+        let mut provider = state
+            .store
+            .get("provider")
+            .await
+            .unwrap()
+            .expect("provider is stored");
+        provider.provider_type = CredentialProviderType::OAuth2ClientCredentials;
+        provider.token_endpoint = Some("https://auth.example/token".into());
+        provider.client_id_secret_ref = Some("CLIENT_ID".into());
+        provider.client_secret_secret_ref = Some("CLIENT_SECRET".into());
+        state
+            .store
+            .update(provider)
+            .await
+            .unwrap();
+
+        let (status, body) = update_as_operator(&state, json!({"token_endpoint": "http://192.0.2.10/token"})).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "token_endpoint must be an https URL");
+        let stored = state
+            .store
+            .get("provider")
+            .await
+            .unwrap()
+            .expect("provider is stored");
+        assert_eq!(
+            stored
+                .token_endpoint
+                .as_deref(),
+            Some("https://auth.example/token")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_update_refuses_a_secret_reference_that_is_not_accessible() {
         let directory = tempfile::tempdir().unwrap();
         let state = state_with_provider(&directory, None).await;
@@ -2026,6 +2185,89 @@ mod jwt_bearer_api_tests {
                 .get("jwt_bearer")
                 .is_none(),
             "settings are dropped when the type changes"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_jwt_bearer_audience_is_trimmed_stored_and_round_tripped() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let state = state(&directory).await;
+        let mut body = request("vertex", "EC_KEY", "ES256");
+        body["jwt_bearer"]["audience"] = "  https://issuer.example/  ".into();
+        let (status, created) = create(&state, None, body).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        assert_eq!(created["jwt_bearer"]["audience"], "https://issuer.example/");
+        let id = created["id"]
+            .as_str()
+            .expect("id is a string")
+            .to_string();
+
+        let (status, listed) = body_of(
+            list_providers(State(state.clone()), None, None)
+                .await
+                .into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listed[0]["jwt_bearer"]["audience"], "https://issuer.example/");
+
+        let settings = |audience: Value| {
+            json!({"jwt_bearer": {"assertion_issuer": "gateway@project.iam.gserviceaccount.com",
+                "signing_key_secret_ref": "EC_KEY", "signing_algorithm": "ES256", "audience": audience}})
+        };
+        let (status, updated) = update(&state, &id, settings("urn:example:as".into())).await;
+        assert_eq!(status, StatusCode::OK, "{updated}");
+        assert_eq!(updated["jwt_bearer"]["audience"], "urn:example:as");
+
+        let (status, updated) = update(&state, &id, settings("   ".into())).await;
+        assert_eq!(status, StatusCode::OK, "{updated}");
+        assert!(
+            updated["jwt_bearer"]
+                .get("audience")
+                .is_none(),
+            "{updated}"
+        );
+        let stored = state
+            .store
+            .get(&id)
+            .await
+            .expect("get")
+            .expect("provider is stored");
+        assert_eq!(
+            stored
+                .jwt_bearer
+                .expect("settings are stored")
+                .audience,
+            None
+        );
+
+        let (status, response) = update(&state, &id, settings("https://issuer.example/ a".into())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+        assert_eq!(
+            response["error"],
+            "jwt_bearer.audience must be 1 to 512 bytes with no whitespace or control characters"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_refuses_an_invalid_jwt_bearer_audience() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let state = state(&directory).await;
+        let message = "jwt_bearer.audience must be 1 to 512 bytes with no whitespace or control characters";
+        for audience in ["two words".to_string(), "a\u{1}b".to_string(), "a".repeat(513)] {
+            let mut body = request("bad-audience", "EC_KEY", "ES256");
+            body["jwt_bearer"]["audience"] = audience.clone().into();
+            let (status, response) = create(&state, None, body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+            assert_eq!(response["error"], message, "{audience:?}");
+        }
+        assert!(
+            state
+                .store
+                .list()
+                .await
+                .expect("list")
+                .is_empty()
         );
     }
 

@@ -438,26 +438,29 @@ fn stream_failure(
 /// map. A header value is either a plain string (single-valued) or a JSON
 /// array of strings (a header repeated more than once, e.g. MPP's per-method
 /// `WWW-Authenticate`) — mirrors the delegated payment gateway's header encoding.
+/// The values of one ForwardResponse header entry: a string is one value, an
+/// array gives its strings in order (a header the Target repeated), and any
+/// other value gives none.
+pub(crate) fn fabric_header_values(value: &serde_json::Value) -> impl Iterator<Item = &str> {
+    let values = match value {
+        serde_json::Value::Array(values) => values.as_slice(),
+        value => std::slice::from_ref(value),
+    };
+    values
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+}
+
 fn parse_fabric_response_headers(value: Option<&serde_json::Value>) -> HashMap<String, Vec<String>> {
     value
         .and_then(|v| v.as_object())
         .map(|m| {
             m.iter()
                 .filter_map(|(k, v)| {
-                    if let Some(s) = v.as_str() {
-                        Some((k.clone(), vec![s.to_string()]))
-                    } else if let Some(arr) = v.as_array() {
-                        let values: Vec<String> = arr
-                            .iter()
-                            .filter_map(|item| {
-                                item.as_str()
-                                    .map(str::to_string)
-                            })
-                            .collect();
-                        (!values.is_empty()).then_some((k.clone(), values))
-                    } else {
-                        None
-                    }
+                    let values: Vec<String> = fabric_header_values(v)
+                        .map(str::to_string)
+                        .collect();
+                    (!values.is_empty()).then_some((k.clone(), values))
                 })
                 .collect()
         })
@@ -1810,5 +1813,19 @@ mod tests {
     #[test]
     fn test_parse_fabric_response_headers_missing_is_empty() {
         assert!(parse_fabric_response_headers(None).is_empty());
+    }
+
+    #[test]
+    fn fabric_header_values_reads_a_string_or_the_strings_of_an_array() {
+        let values = |value: serde_json::Value| -> Vec<String> {
+            fabric_header_values(&value)
+                .map(str::to_string)
+                .collect()
+        };
+        assert_eq!(values(serde_json::json!("one")), vec!["one"]);
+        assert_eq!(values(serde_json::json!(["a", 7, null, "b"])), vec!["a", "b"]);
+        assert!(values(serde_json::json!(7)).is_empty());
+        assert!(values(serde_json::json!({"a": "b"})).is_empty());
+        assert!(values(serde_json::json!([])).is_empty());
     }
 }

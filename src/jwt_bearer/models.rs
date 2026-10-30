@@ -164,6 +164,12 @@ pub struct JwtBearerAuthConfig {
     /// Scopes every token must grant. Empty means no scope is required.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_scopes: Vec<String>,
+
+    /// Refuse a token shaped as an ID token even when no scope is required. Set
+    /// at request time for an Access Point that declares itself a protected
+    /// resource; never stored.
+    #[serde(skip)]
+    pub access_tokens_only: bool,
 }
 
 fn default_token_header() -> String {
@@ -183,6 +189,7 @@ impl Default for JwtBearerAuthConfig {
             token_scheme: default_token_scheme(),
             forward_header: false,
             required_scopes: Vec::new(),
+            access_tokens_only: false,
         }
     }
 }
@@ -206,6 +213,25 @@ mod tests {
     }
 
     // ── Serialisation round-trips ────────────────────────────────────────────
+
+    #[test]
+    fn access_tokens_only_is_never_stored() {
+        let config = JwtBearerAuthConfig {
+            access_tokens_only: true,
+            ..Default::default()
+        };
+        let stored = serde_json::to_value(&config).unwrap();
+        assert!(
+            stored
+                .get("access_tokens_only")
+                .is_none(),
+            "{stored}"
+        );
+        let mut forged = stored;
+        forged["access_tokens_only"] = serde_json::json!(true);
+        let loaded: JwtBearerAuthConfig = serde_json::from_value(forged).unwrap();
+        assert!(!loaded.access_tokens_only);
+    }
 
     #[test]
     fn test_jwt_verification_strategy_roundtrip() {

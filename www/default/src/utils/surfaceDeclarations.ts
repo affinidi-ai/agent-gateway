@@ -99,14 +99,14 @@ export function cardCarriesScheme(
 export function describeDeclaration(
   d: SurfaceDeclaration,
   protocol?: Protocol,
-  cardScheme = true
+  cardScheme: boolean | null = true
 ): { label: string; detail: string } {
   const mcp = protocol === 'mcp';
   if (d.outcome === 'declare') {
     const named =
       'the authorization server of the selected strategy and the required scopes, and callers without a valid token are challenged.';
     let detail = `The agent card and the protected resource metadata name ${named}`;
-    if (mcp) detail = `The protected resource metadata names ${named}`;
+    if (mcp || cardScheme === null) detail = `The protected resource metadata names ${named}`;
     else if (!cardScheme) {
       detail = `Only the protected resource metadata names ${named} The agent card names no security scheme.`;
     }

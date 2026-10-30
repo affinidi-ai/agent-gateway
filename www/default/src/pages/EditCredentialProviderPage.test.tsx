@@ -270,4 +270,160 @@ describe('Edit credential provider, JWT bearer', () => {
     fireEvent.keyDown(document, { key: 's', ctrlKey: true });
     expect(savedRequest()).toBeNull();
   });
+
+  describe("Google's token endpoint prefill", () => {
+    const tokenEndpoint = () => screen.getByLabelText(/^Token Endpoint/);
+    const chooseType = (value: string) =>
+      fireEvent.change(screen.getByLabelText(/^Provider Type/), { target: { value } });
+
+    it('prefills an editable endpoint with a hint for a new JWT bearer provider', async () => {
+      renderPage('/credential-providers/new');
+      await screen.findByLabelText(/^Provider Type/);
+      chooseType('oauth2_jwt_bearer');
+      expect(tokenEndpoint()).toHaveValue('https://oauth2.googleapis.com/token');
+      expect(tokenEndpoint()).not.toHaveAttribute('readonly');
+      expect(tokenEndpoint()).toHaveAttribute('aria-describedby', 'token_endpoint-google-hint');
+      expect(screen.getByTestId('provider-token-endpoint-google-hint')).toHaveTextContent(
+        "This is Google's token endpoint. Other authorization servers use their own"
+      );
+
+      fireEvent.change(tokenEndpoint(), { target: { value: 'https://idp.example/token' } });
+      expect(tokenEndpoint()).toHaveValue('https://idp.example/token');
+      expect(screen.queryByTestId('provider-token-endpoint-google-hint')).not.toBeInTheDocument();
+    });
+
+    it('removes the untouched prefill when another type is chosen', async () => {
+      renderPage('/credential-providers/new');
+      await screen.findByLabelText(/^Provider Type/);
+      chooseType('oauth2_jwt_bearer');
+      chooseType('oauth2_client_credentials');
+      expect(tokenEndpoint()).toHaveValue('');
+    });
+
+    it('does not prefill again after the operator clears the endpoint', async () => {
+      renderPage('/credential-providers/new');
+      await screen.findByLabelText(/^Provider Type/);
+      chooseType('oauth2_jwt_bearer');
+      fireEvent.change(tokenEndpoint(), { target: { value: '' } });
+      chooseType('oauth2_client_credentials');
+      chooseType('oauth2_jwt_bearer');
+      expect(tokenEndpoint()).toHaveValue('');
+    });
+
+    it('keeps an endpoint entered before choosing JWT bearer', async () => {
+      renderPage('/credential-providers/new');
+      await screen.findByLabelText(/^Provider Type/);
+      chooseType('oauth2_client_credentials');
+      fireEvent.change(tokenEndpoint(), { target: { value: 'https://idp.example/token' } });
+      chooseType('oauth2_jwt_bearer');
+      expect(tokenEndpoint()).toHaveValue('https://idp.example/token');
+    });
+
+    it('never prefills when an existing provider changes to JWT bearer', async () => {
+      route('/api/v1/credential-providers/cp-1', {
+        id: 'cp-1',
+        name: 'Key',
+        provider_id: 'key',
+        provider_type: 'api_key',
+        api_key_secret_ref: 'sa-key',
+      });
+      renderPage('/credential-providers/cp-1');
+      await waitFor(() => expect(screen.getByLabelText(/^Provider Type/)).toHaveValue('api_key'));
+      chooseType('oauth2_jwt_bearer');
+      expect(tokenEndpoint()).toHaveValue('');
+    });
+
+    it("shows no hint on an existing provider that uses Google's endpoint", async () => {
+      route('/api/v1/credential-providers/cp-1', {
+        id: 'cp-1',
+        name: 'Google',
+        provider_id: 'google',
+        provider_type: 'oauth2_jwt_bearer',
+        token_endpoint: 'https://oauth2.googleapis.com/token',
+        jwt_bearer: { signing_key_secret_ref: 'sa-key', assertion_issuer: 'iss' },
+      });
+      renderPage('/credential-providers/cp-1');
+      await waitFor(() =>
+        expect(tokenEndpoint()).toHaveValue('https://oauth2.googleapis.com/token')
+      );
+      expect(screen.queryByTestId('provider-token-endpoint-google-hint')).not.toBeInTheDocument();
+      expect(tokenEndpoint()).not.toHaveAttribute('aria-describedby');
+    });
+  });
+
+  describe('audience', () => {
+    async function fillNewJwtBearer(audience: string) {
+      renderPage('/credential-providers/new');
+      await screen.findByLabelText(/^Provider Type/);
+      fireEvent.change(screen.getByLabelText(/^Name/), { target: { value: 'Hydra' } });
+      fireEvent.change(screen.getByLabelText(/^Provider Type/), {
+        target: { value: 'oauth2_jwt_bearer' },
+      });
+      await waitFor(() => expect(screen.getByLabelText(/^Signing Key Secret/)).not.toBeDisabled());
+      fireEvent.change(screen.getByLabelText(/^Signing Key Secret/), {
+        target: { value: 'sa-key' },
+      });
+      fireEvent.change(screen.getByLabelText(/^Assertion Issuer/), { target: { value: 'iss' } });
+      fireEvent.change(screen.getByLabelText(/^Audience/), { target: { value: audience } });
+      fireEvent.click(screen.getByRole('button', { name: /Create/ }));
+      await waitFor(() => expect(savedRequest()).not.toBeNull());
+      return savedRequest()!.body as { jwt_bearer: Record<string, string> };
+    }
+
+    it('shows the effective token endpoint as the placeholder with a hint', async () => {
+      renderPage('/credential-providers/new');
+      await screen.findByLabelText(/^Provider Type/);
+      fireEvent.change(screen.getByLabelText(/^Provider Type/), {
+        target: { value: 'oauth2_jwt_bearer' },
+      });
+      const audience = screen.getByLabelText(/^Audience/);
+      expect(audience).not.toBeRequired();
+      expect(audience).toHaveAttribute('placeholder', 'https://oauth2.googleapis.com/token');
+      expect(audience).toHaveAccessibleDescription(/Defaults to the token endpoint/);
+    });
+
+    it('sends a trimmed audience', async () => {
+      const body = await fillNewJwtBearer('  https://hydra.example/oauth2/token  ');
+      expect(body.jwt_bearer.audience).toBe('https://hydra.example/oauth2/token');
+    });
+
+    it('omits a blank audience', async () => {
+      const body = await fillNewJwtBearer('   ');
+      expect(body.jwt_bearer).not.toHaveProperty('audience');
+      expect(body.jwt_bearer.assertion_issuer).toBe('iss');
+    });
+
+    it('loads a stored audience and saves it back on edit', async () => {
+      route('/api/v1/credential-providers/cp-1', {
+        id: 'cp-1',
+        name: 'Hydra',
+        provider_id: 'hydra',
+        provider_type: 'oauth2_jwt_bearer',
+        token_endpoint: 'https://hydra.example/oauth2/token',
+        jwt_bearer: {
+          signing_key_secret_ref: 'sa-key',
+          assertion_issuer: 'iss',
+          assertion_subject: 'svc',
+          audience: 'urn:hydra:api',
+        },
+      });
+      renderPage('/credential-providers/cp-1');
+      await waitFor(() => expect(screen.getByLabelText(/^Audience/)).toHaveValue('urn:hydra:api'));
+      expect(screen.getByLabelText(/^Token Endpoint/)).toHaveValue(
+        'https://hydra.example/oauth2/token'
+      );
+      fireEvent.click(screen.getByRole('button', { name: /Save/ }));
+      await waitFor(() => expect(savedRequest()).not.toBeNull());
+      expect(savedRequest()).toMatchObject({
+        method: 'PUT',
+        body: {
+          jwt_bearer: {
+            assertion_issuer: 'iss',
+            assertion_subject: 'svc',
+            audience: 'urn:hydra:api',
+          },
+        },
+      });
+    });
+  });
 });

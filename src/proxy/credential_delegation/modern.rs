@@ -721,6 +721,7 @@ impl ModernDelegationContext<'_> {
             ProviderGrant::GatewayToken => {}
         }
         let cache_identity = format!("__mcp_client_credentials__:{}", hex::encode(provider_digest(provider)?));
+        let provider_secrets = crate::delegation_vault::gateway_token::ProviderSecrets::new(secrets, provider);
         if let VaultLookupResult::Found(token) = self
             .vault
             .lookup(self.agent_did, &cache_identity, &provider.id)
@@ -741,14 +742,22 @@ impl ModernDelegationContext<'_> {
                 .scopes
                 .iter()
                 .all(|scope| token.scopes.contains(scope))
+            && provider_secrets
+                .still_current(
+                    token
+                        .secret_versions
+                        .as_deref(),
+                )
+                .await
         {
             return Ok(token.access_token);
         }
+        let requested_at = chrono::Utc::now();
         let response = crate::delegation_vault::gateway_token::GATEWAY_GRANT_BACKOFF
             .request(
                 provider,
                 &selected.binding.scopes,
-                &crate::delegation_vault::gateway_token::ProviderSecrets::new(secrets, provider),
+                &provider_secrets,
                 &self
                     .grant_egress
                     .cloned()
@@ -781,12 +790,7 @@ impl ModernDelegationContext<'_> {
                 .binding
                 .scopes
                 .contains(scope)
-        }) || selected
-            .binding
-            .scopes
-            .iter()
-            .any(|scope| !scopes.contains(scope))
-        {
+        }) {
             return Err(ContinuationError::Denied);
         }
         let current = self
@@ -818,7 +822,8 @@ impl ModernDelegationContext<'_> {
                 expires_at: Some(expires_at),
                 delegation_vc: None,
                 consent_identity: None,
-                consent_granted_at: created,
+                secret_versions: Some(provider_secrets.versions_read()),
+                consent_granted_at: requested_at,
                 last_used_at: None,
                 created_at: created,
                 updated_at: created,
@@ -2303,8 +2308,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_service_credential_fails_closed_for_an_empty_key_and_a_failed_grant() {
-        use crate::delegation_vault::gateway_token::test_endpoint::TokenEndpoint;
+    async fn a_service_credential_fails_closed_and_is_regranted_after_its_secret_changes() {
+        use crate::delegation_vault::gateway_token::test_endpoint::{TokenEndpoint, replace_secret};
 
         let directory = tempfile::tempdir().unwrap();
         let providers = FileSystemCredentialProviderStore::new(
@@ -2335,7 +2340,9 @@ mod tests {
             .await
             .unwrap(),
         );
-        for (secret_id, value) in [("empty-key", ""), ("client-id", "client"), ("client-secret", "secret")] {
+        for (secret_id, value) in
+            [("empty-key", ""), ("client-id", "client"), ("client-secret", "secret"), ("unrelated", "other")]
+        {
             secrets
                 .create(crate::secrets::CreateSecretRequest {
                     tenant_id: None,
@@ -2352,9 +2359,16 @@ mod tests {
         let rejecting =
             TokenEndpoint::start(axum::http::StatusCode::BAD_REQUEST, json!({"error": "invalid_client"}).to_string())
                 .await;
+        let token_with_scope = |scope: &str| {
+            json!({"access_token": "service-token", "token_type": "Bearer", "expires_in": 3600, "scope": scope})
+                .to_string()
+        };
+        let narrowing = TokenEndpoint::start(axum::http::StatusCode::OK, token_with_scope("other")).await;
+        let widening = TokenEndpoint::start(axum::http::StatusCode::OK, token_with_scope("read extra")).await;
+        let granting = TokenEndpoint::start(axum::http::StatusCode::OK, token_with_scope("read")).await;
         let grant_egress = crate::delegation_vault::gateway_token::GrantEgress {
             timeout: std::time::Duration::from_secs(5),
-            exact_allowlist: Some(rejecting.url.clone()),
+            exact_allowlist: Some(format!("{},{},{},{}", rejecting.url, narrowing.url, widening.url, granting.url)),
         };
         let provider = |id: &str, provider_type: &str, extra: serde_json::Value| {
             let mut provider = json!({
@@ -2385,6 +2399,9 @@ mod tests {
             provider("empty", "api_key", json!({"api_key_secret_ref": "empty-key"})),
             client_credentials("rejected", &rejecting.url),
             client_credentials("blocked", "http://127.0.0.1:9/token"),
+            client_credentials("narrowed", &narrowing.url),
+            client_credentials("widened", &widening.url),
+            client_credentials("granted", &granting.url),
         ] {
             providers
                 .create(configured)
@@ -2401,7 +2418,13 @@ mod tests {
                 {"credential_provider_id": "rejected", "scopes": ["read"],
                     "inject_as": {"type": "custom_header", "name": "X-Rejected", "format": "{value}"}},
                 {"credential_provider_id": "blocked", "scopes": ["read"],
-                    "inject_as": {"type": "custom_header", "name": "X-Blocked", "format": "{value}"}}
+                    "inject_as": {"type": "custom_header", "name": "X-Blocked", "format": "{value}"}},
+                {"credential_provider_id": "narrowed", "scopes": ["read"],
+                    "inject_as": {"type": "custom_header", "name": "X-Narrowed", "format": "{value}"}},
+                {"credential_provider_id": "widened", "scopes": ["read"],
+                    "inject_as": {"type": "custom_header", "name": "X-Widened", "format": "{value}"}},
+                {"credential_provider_id": "granted", "scopes": ["read"],
+                    "inject_as": {"type": "custom_header", "name": "X-Granted", "format": "{value}"}}
             ]
         }))
         .unwrap();
@@ -2486,6 +2509,41 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             1
         );
+        assert_eq!(
+            with_endpoint
+                .service_credential(by_id("narrowed"), 100)
+                .await,
+            Err(ContinuationError::Unavailable)
+        );
+        assert_eq!(narrowing.grants(), 1);
+        assert_eq!(
+            with_endpoint
+                .service_credential(by_id("widened"), 100)
+                .await,
+            Err(ContinuationError::Denied)
+        );
+        assert_eq!(widening.grants(), 1);
+        assert!(
+            vault
+                .list_all()
+                .await
+                .unwrap()
+                .is_empty(),
+            "a grant missing a requested scope or adding one is never stored"
+        );
+
+        for (expected_grants, change) in [(1, None), (1, Some("unrelated")), (2, Some("client-secret"))] {
+            if let Some(secret_id) = change {
+                replace_secret(&secrets, secret_id, "changed").await;
+            }
+            assert_eq!(
+                with_endpoint
+                    .service_credential(by_id("granted"), 100)
+                    .await,
+                Ok("service-token".to_string())
+            );
+            assert_eq!(granting.grants(), expected_grants, "after a change to {change:?}");
+        }
 
         let from_environment = context!(None);
         let selected = from_environment

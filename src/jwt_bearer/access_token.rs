@@ -14,7 +14,7 @@ use crate::jwt_bearer::errors::JwtBearerError;
 const MAX_REQUIRED_SCOPES: usize = 32;
 const MAX_SCOPE_LEN: usize = 128;
 const CLIENT_ID_CLAIMS: [&str; 3] = ["client_id", "azp", "appid"];
-const ID_TOKEN_CLAIMS: [&str; 2] = ["nonce", "at_hash"];
+const ID_TOKEN_CLAIMS: [&str; 4] = ["nonce", "at_hash", "c_hash", "s_hash"];
 const ACCESS_TOKEN_TYPES: [&str; 3] = ["at+jwt", "application/at+jwt", "JWT"];
 
 /// Refuse `required_scopes` entries that are not RFC 6749 scope tokens.
@@ -109,16 +109,26 @@ pub fn client_id(claims: &Value) -> Option<String> {
 
 /// Refuse a verified token that is shaped as an ID token rather than an access token.
 ///
-/// A token fails when it carries `nonce` or `at_hash`, or when its JOSE `typ` header is
-/// present and is not `at+jwt`, `application/at+jwt` or `JWT` (case-insensitive,
-/// RFC 9068 §4). `JWT` stays accepted because common providers issue access tokens with it.
+/// A token fails when it carries `nonce`, `at_hash`, `c_hash` or `s_hash`, when its
+/// payload `typ` claim is `ID` (case-insensitive, as Keycloak marks ID tokens), or when
+/// its JOSE `typ` header is present and is not `at+jwt`, `application/at+jwt` or `JWT`
+/// (case-insensitive, RFC 9068 §4). `JWT` stays accepted because common providers issue
+/// access tokens with it.
+///
+/// The check is best-effort: an ID token without these markers, such as a Google
+/// service-account ID token, passes, so required scopes or policy are the real control.
 pub fn check_access_token_shape(
     token: &str,
     claims: &Value,
 ) -> Result<(), JwtBearerError> {
-    if ID_TOKEN_CLAIMS
-        .iter()
-        .any(|name| claims.get(*name).is_some())
+    let id_typ = claims
+        .get("typ")
+        .and_then(Value::as_str)
+        .is_some_and(|typ| typ.eq_ignore_ascii_case("ID"));
+    if id_typ
+        || ID_TOKEN_CLAIMS
+            .iter()
+            .any(|name| claims.get(*name).is_some())
     {
         return Err(JwtBearerError::InvalidToken("ID token presented as an access token".to_string()));
     }
@@ -236,12 +246,26 @@ mod tests {
     fn access_token_shape_refuses_id_token_claims() {
         let token = unsigned_token(json!({"alg": "RS256", "typ": "JWT"}));
         assert!(check_access_token_shape(&token, &json!({"sub": "s"})).is_ok());
-        for claims in [json!({"nonce": "n"}), json!({"at_hash": "h"})] {
+        for claims in [
+            json!({"nonce": "n"}),
+            json!({"at_hash": "h"}),
+            json!({"c_hash": "h"}),
+            json!({"s_hash": "h"}),
+            json!({"typ": "ID"}),
+            json!({"typ": "id"}),
+        ] {
             assert!(
                 matches!(check_access_token_shape(&token, &claims), Err(JwtBearerError::InvalidToken(_))),
                 "{claims}"
             );
         }
+    }
+
+    #[test]
+    fn access_token_shape_accepts_access_token_payload_typ() {
+        let token = unsigned_token(json!({"alg": "RS256", "typ": "JWT"}));
+        assert!(check_access_token_shape(&token, &json!({"typ": "Bearer"})).is_ok());
+        assert!(check_access_token_shape(&token, &json!({"sub": "s", "scope": "read"})).is_ok());
     }
 
     #[test]

@@ -73,6 +73,11 @@ pub struct DelegationToken {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consent_identity: Option<modern_consent::identity::VerifiedConsentIdentity>,
 
+    /// The secrets a gateway grant read, each at the version it read; `None` for any
+    /// other token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_versions: Option<Vec<gateway_token::SecretVersion>>,
+
     /// When the user granted consent
     pub consent_granted_at: DateTime<Utc>,
 
@@ -108,6 +113,7 @@ impl std::fmt::Debug for DelegationToken {
             .field("expires_at", &self.expires_at)
             .field("delegation_vc", &self.delegation_vc)
             .field("consent_identity", &self.consent_identity)
+            .field("secret_versions", &self.secret_versions)
             .field("consent_granted_at", &self.consent_granted_at)
             .field("last_used_at", &self.last_used_at)
             .field("created_at", &self.created_at)
@@ -148,7 +154,7 @@ impl DelegationToken {
     /// `min(300 s, lifetime / 2)` of expiry, or with no recorded expiry.
     ///
     /// The lifetime runs from `consent_granted_at`, which a gateway grant sets to the
-    /// time the token was issued. `created_at` is not used because a vault record keeps
+    /// time its request was sent. `created_at` is not used because a vault record keeps
     /// it from the first token it ever held when a new token replaces the old one.
     pub fn needs_refresh(
         &self,
@@ -349,6 +355,7 @@ mod tests {
             expires_at: expires_in_secs.map(|s| now + Duration::seconds(s)),
             delegation_vc: None,
             consent_identity: None,
+            secret_versions: None,
             consent_granted_at: now,
             last_used_at: None,
             created_at: now,

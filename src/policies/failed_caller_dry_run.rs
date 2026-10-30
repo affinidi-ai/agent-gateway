@@ -9,14 +9,16 @@
 //! kind and protocol method, and reports which plane, if any, denies each one. A case
 //! denied on the direct path is also run through the planes Fabric receive evaluates,
 //! which skip the inbound policy and give gateway policy no `input.a2a`. It is a
-//! heuristic over a fixed method set: a policy that branches on anything else can still
-//! admit a failed caller.
+//! heuristic over a fixed method set, which for A2A and AP2 is every method of the
+//! gateway's A2A method table plus one unrecognised method: a policy that branches on
+//! anything else can still admit a failed caller.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use tracing::error;
 
+use crate::a2a::methods::METHOD_TABLE;
 use crate::config::agent_surface::{AgentSurface, SurfaceProtocol};
 use crate::policies::global_policy::{GlobalPolicyManager, PLANE_AGENT_SURFACE, PLANE_GATEWAY};
 use crate::policies::{FileSystemPolicyDefinitionStore, GatewayPolicyManager, OpaEngine, PlaneVerdict};
@@ -25,15 +27,9 @@ use crate::source_auth::declaration::{DeclarationOutcome, refuses_failed_callers
 use crate::source_auth::errors::SourceAuthFailureKind;
 use crate::surface_context::{A2aContext, McpContext, PolicyInput, SourceAuthContext};
 
-/// A2A methods checked, as `(v0.3 spelling, v1.0 spelling)`.
-const A2A_METHODS: &[(&str, &str)] = &[
-    ("message/send", "SendMessage"),
-    ("message/stream", "SendStreamingMessage"),
-    ("tasks/get", "GetTask"),
-    ("tasks/cancel", "CancelTask"),
-    ("tasks/resubscribe", "SubscribeToTask"),
-    ("agent/getAuthenticatedExtendedCard", "GetExtendedAgentCard"),
-];
+/// An A2A method the gateway does not recognise. It still reaches policy, with
+/// `input.a2a.method` set and `input.a2a.method_canonical` absent.
+const UNRECOGNISED_A2A_METHOD: &str = "x-dry-run/unrecognised";
 
 const MCP_METHODS: &[&str] = &["initialize", "tools/list", "tools/call", "resources/read", "prompts/get"];
 
@@ -345,7 +341,7 @@ fn protocol_methods(view: &AgentSurface) -> Vec<Option<&'static str>> {
                 });
             spellings
                 .flat_map(|pascal| {
-                    A2A_METHODS
+                    METHOD_TABLE
                         .iter()
                         .map(move |(slash, pascal_name)| {
                             Some(if pascal {
@@ -355,6 +351,7 @@ fn protocol_methods(view: &AgentSurface) -> Vec<Option<&'static str>> {
                             })
                         })
                 })
+                .chain(std::iter::once(Some(UNRECOGNISED_A2A_METHOD)))
                 .collect()
         }
         SurfaceProtocol::Mcp => MCP_METHODS
@@ -584,7 +581,7 @@ mod tests {
     #[tokio::test]
     async fn test_dry_run_covers_every_kind_and_method_of_both_a2a_versions() {
         let cases = run(&a2a(Some("deny")), &[("deny", DENY_FAILED)]).await;
-        assert_eq!(cases.len(), 3 * 12);
+        assert_eq!(cases.len(), 3 * 23);
         assert_eq!(outcomes(&cases), vec![CaseOutcome::DeniedBySurfacePolicy]);
         let methods: Vec<&str> = cases
             .iter()
@@ -593,13 +590,61 @@ mod tests {
             .collect();
         assert!(methods.contains(&"message/send") && methods.contains(&"SendMessage"), "{methods:?}");
         assert!(methods.contains(&"agent/getAuthenticatedExtendedCard"), "{methods:?}");
+        assert!(methods.contains(&"ListTasks") && methods.contains(&UNRECOGNISED_A2A_METHOD), "{methods:?}");
+    }
+
+    #[tokio::test]
+    async fn test_dry_run_checks_every_method_of_the_a2a_method_table_and_an_unrecognised_one() {
+        let cases = run(&a2a(None), &[]).await;
+        let mut checked: Vec<&str> = cases
+            .iter()
+            .filter(|case| case.kind == SourceAuthFailureKind::Missing)
+            .filter_map(|case| case.method)
+            .collect();
+        checked.sort_unstable();
+        let mut expected: Vec<&str> = METHOD_TABLE
+            .iter()
+            .flat_map(|(slash, pascal)| [*slash, *pascal])
+            .chain([UNRECOGNISED_A2A_METHOD])
+            .collect();
+        expected.sort_unstable();
+        assert_eq!(checked, expected);
+        assert_eq!(crate::a2a::recognised_canonical(UNRECOGNISED_A2A_METHOD), None);
+    }
+
+    #[tokio::test]
+    async fn test_dry_run_finds_a_failed_caller_on_a_method_the_old_sample_left_out() {
+        let sampled = "package surface.policy\ndefault allow := true\nallow := false if {\n  input.source_auth.method == \"failed\"\n  input.a2a.method_canonical in {\"message/send\", \"message/stream\", \"tasks/get\", \"tasks/cancel\", \"tasks/resubscribe\", \"agent/getAuthenticatedExtendedCard\"}\n}\n";
+        let cases = run(&a2a(Some("sampled")), &[("sampled", sampled)]).await;
+        let admitted: Vec<Option<&str>> = cases
+            .iter()
+            .filter(|case| case.outcome == CaseOutcome::Admitted)
+            .map(|case| case.method)
+            .collect();
+        assert_eq!(admitted.len(), 3 * 11, "five table methods in two spellings and the unrecognised one");
+        for method in ["ListTasks", "tasks/list", "CreateTaskPushNotificationConfig", UNRECOGNISED_A2A_METHOD] {
+            assert!(admitted.contains(&Some(method)), "{method}: {admitted:?}");
+        }
+        assert!(!admitted.contains(&Some("SendMessage")));
+    }
+
+    #[tokio::test]
+    async fn test_dry_run_a_deny_keyed_on_the_canonical_method_admits_only_the_unrecognised_method() {
+        let canonical_only = "package surface.policy\ndefault allow := true\nallow := false if {\n  input.source_auth.method == \"failed\"\n  input.a2a.method_canonical\n}\n";
+        let cases = run(&a2a(Some("canonical")), &[("canonical", canonical_only)]).await;
+        let admitted: Vec<Option<&str>> = cases
+            .iter()
+            .filter(|case| case.outcome == CaseOutcome::Admitted)
+            .map(|case| case.method)
+            .collect();
+        assert_eq!(admitted, vec![Some(UNRECOGNISED_A2A_METHOD); 3], "one unrecognised case per kind");
     }
 
     #[tokio::test]
     async fn test_dry_run_without_required_scopes_skips_the_scope_kind() {
         let view = surface("a2a", vec![jwt_method(&[])], Some("deny"));
         let cases = run(&view, &[("deny", DENY_FAILED)]).await;
-        assert_eq!(cases.len(), 2 * 12);
+        assert_eq!(cases.len(), 2 * 23);
         assert!(
             cases
                 .iter()
@@ -612,10 +657,18 @@ mod tests {
         let mut view = a2a(Some("deny"));
         view.access_point.a2a = Some(serde_json::from_value(json!({"accepted_versions": ["0.3"]})).expect("a2a"));
         let cases = run(&view, &[("deny", DENY_FAILED)]).await;
-        assert_eq!(cases.len(), 3 * 6);
-        assert!(cases.iter().all(|case| {
+        assert_eq!(cases.len(), 3 * 12);
+        let (unrecognised, recognised): (Vec<_>, Vec<_>) = cases
+            .iter()
+            .partition(|case| case.method == Some(UNRECOGNISED_A2A_METHOD));
+        assert_eq!(unrecognised.len(), 3, "the unrecognised method is checked once per kind");
+        assert!(recognised.iter().all(|case| {
             case.method
-                .is_some_and(|method| method.contains('/'))
+                .is_some_and(|method| {
+                    METHOD_TABLE
+                        .iter()
+                        .any(|(slash, _)| *slash == method)
+                })
         }));
     }
 
@@ -627,7 +680,7 @@ mod tests {
             .filter(|case| case.outcome == CaseOutcome::Admitted)
             .map(|case| case.method)
             .collect();
-        assert_eq!(admitted.len(), 3 * 11);
+        assert_eq!(admitted.len(), 3 * 22);
         assert!(admitted.contains(&Some("SendStreamingMessage")));
         assert!(!admitted.contains(&Some("SendMessage")));
     }
@@ -680,7 +733,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dry_run_a_gateway_deny_keyed_on_the_a2a_method_admits_failed_callers_over_fabric() {
-        let keyed_on_a2a = "package gateway.policy\ndefault allow := true\nallow := false if {\n  input.source_auth.method == \"failed\"\n  input.a2a.method_canonical\n}\n";
+        let keyed_on_a2a = "package gateway.policy\ndefault allow := true\nallow := false if {\n  input.source_auth.method == \"failed\"\n  input.a2a.method\n}\n";
         let planes = PolicyPlanes {
             gateway: Some(Arc::new(gateway_denying(keyed_on_a2a).await)),
             ..Default::default()
@@ -759,7 +812,7 @@ mod tests {
     async fn test_dry_run_a_declaring_access_point_refuses_every_case_before_policy() {
         let planes = definitions(&[("allow", ALLOW_ALL)]).await;
         let cases = cases_of(&declaring(a2a(Some("allow"))), declares(), &planes).await;
-        assert_eq!(cases.len(), 3 * 12, "every kind and method is still reported");
+        assert_eq!(cases.len(), 3 * 23, "every kind and method is still reported");
         assert_eq!(outcomes(&cases), vec![CaseOutcome::RefusedBeforePolicy]);
 
         let mcp = declaring(surface("mcp", vec![jwt_method(&["tools.call"])], None));

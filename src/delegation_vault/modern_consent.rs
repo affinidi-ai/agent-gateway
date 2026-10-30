@@ -387,6 +387,7 @@ async fn callback(
                 .and_then(|seconds| now.checked_add_signed(chrono::Duration::seconds(seconds))),
             delegation_vc: None,
             consent_identity: Some(consent_identity),
+            secret_versions: None,
             consent_granted_at: now,
             last_used_at: None,
             created_at: now,

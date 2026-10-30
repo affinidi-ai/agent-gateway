@@ -7,7 +7,9 @@
 //!
 //! # Cache TTL
 //! The TTL is taken from the `Cache-Control: max-age=N` response header, clamped to
-//! between 60 seconds and 24 hours. When the header is absent, 24 hours is used.
+//! between 60 seconds and 6 hours. `no-store` or `no-cache` gives 60 seconds. Directive
+//! names are matched case-insensitively. When no usable directive is present, 1 hour
+//! is used.
 //!
 //! # Refetch limits
 //! - A token whose `kid` is not in a fresh set triggers at most one refetch per
@@ -41,9 +43,9 @@ pub const MAX_JWKS_BYTES: usize = 64 * 1024;
 /// Most keys accepted in one JWKS.
 pub const MAX_JWKS_KEYS: usize = 64;
 
-const DEFAULT_TTL: Duration = Duration::from_secs(86_400);
+const DEFAULT_TTL: Duration = Duration::from_secs(3_600);
 const MIN_TTL: Duration = Duration::from_secs(60);
-const MAX_TTL: Duration = DEFAULT_TTL;
+const MAX_TTL: Duration = Duration::from_secs(6 * 3_600);
 const KID_MISS_COOLDOWN: Duration = Duration::from_secs(60);
 const FAILURE_BACKOFF: Duration = Duration::from_secs(10);
 const STALE_IF_ERROR: Duration = Duration::from_secs(3600);
@@ -392,13 +394,12 @@ fn settled(decision: Decision) -> Option<JwtBearerResult<Jwk>> {
 async fn fetch_entry(jwks_uri: &str) -> JwtBearerResult<CacheEntry> {
     let fetched = fetch_key_set(jwks_uri, EgressPosture::CloudMetadataOnly)
         .await
-        .and_then(|(jwks, max_age)| index_keys(&jwks.keys).map(|keys| (keys, max_age)));
+        .and_then(|(jwks, ttl)| index_keys(&jwks.keys).map(|keys| (keys, ttl)));
     crate::metrics::backends::prometheus::track_jwks_fetch(match &fetched {
         Ok(_) => "ok",
         Err(error) => error.failure().code(),
     });
-    let (keys, max_age) = fetched.map_err(|e| JwtBearerError::JwksFetchFailed(e.to_string()))?;
-    let ttl = ttl_from(max_age);
+    let (keys, ttl) = fetched.map_err(|e| JwtBearerError::JwksFetchFailed(e.to_string()))?;
     debug!("Fetched {} key(s) from JWKS, TTL={:?}", keys.len(), ttl);
     Ok(CacheEntry {
         keys,
@@ -407,18 +408,18 @@ async fn fetch_entry(jwks_uri: &str) -> JwtBearerResult<CacheEntry> {
     })
 }
 
-/// GET and parse a JWKS through the pinned client, returning it with the response's `max-age`.
+/// GET and parse a JWKS through the pinned client, returning it with the cache TTL its response allows.
 ///
 /// The pinned client is also a defense-in-depth SSRF guard: the write-path handler
 /// validates too, but strategies could have been stored before that check existed.
 async fn fetch_key_set(
     jwks_uri: &str,
     posture: EgressPosture,
-) -> Result<(JwksResponse, Option<u64>), FetchError> {
+) -> Result<(JwksResponse, Duration), FetchError> {
     let (body, headers) = get_bounded(jwks_uri, posture, MAX_JWKS_BYTES).await?;
     let jwks = serde_json::from_slice::<JwksResponse>(&body)
         .map_err(|e| FetchError::new(FetchFailure::InvalidDocument, format!("Failed to parse JWKS: {e}")))?;
-    Ok((jwks, parse_max_age(&headers)))
+    Ok((jwks, ttl_from_headers(&headers)))
 }
 
 /// Index a key set by `kid`, refusing sets a token could not select a key from unambiguously.
@@ -450,28 +451,35 @@ fn index_keys(keys: &[Jwk]) -> Result<HashMap<String, Jwk>, FetchError> {
     Ok(indexed)
 }
 
-fn ttl_from(max_age: Option<u64>) -> Duration {
-    max_age.map_or(DEFAULT_TTL, |secs| Duration::from_secs(secs).clamp(MIN_TTL, MAX_TTL))
-}
-
-/// Parse `Cache-Control: max-age=N` from response headers.
-/// Returns `None` if the header is absent or unparseable.
-fn parse_max_age(headers: &reqwest::header::HeaderMap) -> Option<u64> {
-    let value = headers
-        .get(reqwest::header::CACHE_CONTROL)?
-        .to_str()
-        .ok()?;
-
+/// The cache TTL a JWKS response's `Cache-Control` header allows.
+///
+/// Directive names are matched case-insensitively. `no-store` or `no-cache` gives
+/// [`MIN_TTL`]; otherwise `max-age=N` is clamped to [`MIN_TTL`]..=[`MAX_TTL`]. An absent
+/// header, or one without a usable directive, gives [`DEFAULT_TTL`].
+fn ttl_from_headers(headers: &reqwest::header::HeaderMap) -> Duration {
+    let Some(value) = headers
+        .get(reqwest::header::CACHE_CONTROL)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return DEFAULT_TTL;
+    };
+    let mut max_age = None;
     for directive in value.split(',') {
-        let directive = directive.trim();
-        if let Some(rest) = directive.strip_prefix("max-age=") {
-            return rest
+        let (name, argument) = directive
+            .split_once('=')
+            .unwrap_or((directive, ""));
+        let name = name.trim();
+        if name.eq_ignore_ascii_case("no-store") || name.eq_ignore_ascii_case("no-cache") {
+            return MIN_TTL;
+        }
+        if name.eq_ignore_ascii_case("max-age") && max_age.is_none() {
+            max_age = argument
                 .trim()
                 .parse::<u64>()
                 .ok();
         }
     }
-    None
+    max_age.map_or(DEFAULT_TTL, |secs| Duration::from_secs(secs).clamp(MIN_TTL, MAX_TTL))
 }
 
 /// Look up a key by `kid` in a static (inline) JWKS slice.
@@ -585,42 +593,44 @@ mod tests {
         });
     }
 
-    // ── parse_max_age and TTL clamp ───────────────────────────────────────────
+    // ── Cache-Control TTL ─────────────────────────────────────────────────────
 
-    #[test]
-    fn test_parse_max_age_present() {
+    fn ttl_for(cache_control: Option<&'static str>) -> Duration {
         let mut headers = HeaderMap::new();
-        headers.insert(CACHE_CONTROL, HeaderValue::from_static("public, max-age=3600"));
-        assert_eq!(parse_max_age(&headers), Some(3600));
+        if let Some(value) = cache_control {
+            headers.insert(CACHE_CONTROL, HeaderValue::from_static(value));
+        }
+        ttl_from_headers(&headers)
     }
 
     #[test]
-    fn test_parse_max_age_only_value() {
-        let mut headers = HeaderMap::new();
-        headers.insert(CACHE_CONTROL, HeaderValue::from_static("max-age=7200"));
-        assert_eq!(parse_max_age(&headers), Some(7200));
+    fn ttl_follows_max_age_matched_case_insensitively() {
+        assert_eq!(ttl_for(Some("public, max-age=3600")), Duration::from_secs(3600));
+        assert_eq!(ttl_for(Some("Max-Age=120")), Duration::from_secs(120));
+        assert_eq!(ttl_for(Some("public, MAX-AGE = 1800 ")), Duration::from_secs(1800));
     }
 
     #[test]
-    fn test_parse_max_age_absent() {
-        let headers = HeaderMap::new();
-        assert_eq!(parse_max_age(&headers), None);
+    fn ttl_is_clamped_between_one_minute_and_six_hours() {
+        assert_eq!(ttl_for(Some("max-age=0")), Duration::from_secs(60));
+        assert_eq!(ttl_for(Some("max-age=10")), Duration::from_secs(60));
+        assert_eq!(ttl_for(Some("public, max-age=999999")), Duration::from_secs(6 * 3600));
+        assert_eq!(ttl_for(Some("max-age=18446744073709551615")), Duration::from_secs(6 * 3600));
     }
 
     #[test]
-    fn test_parse_max_age_no_directive() {
-        let mut headers = HeaderMap::new();
-        headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store, no-cache"));
-        assert_eq!(parse_max_age(&headers), None);
+    fn no_store_or_no_cache_gives_the_minimum_ttl() {
+        assert_eq!(ttl_for(Some("no-store")), Duration::from_secs(60));
+        assert_eq!(ttl_for(Some("No-Cache")), Duration::from_secs(60));
+        assert_eq!(ttl_for(Some("max-age=3600, no-cache")), Duration::from_secs(60));
     }
 
     #[test]
-    fn ttl_is_clamped_between_one_minute_and_one_day() {
-        assert_eq!(ttl_from(Some(0)), Duration::from_secs(60));
-        assert_eq!(ttl_from(Some(59)), Duration::from_secs(60));
-        assert_eq!(ttl_from(Some(1800)), Duration::from_secs(1800));
-        assert_eq!(ttl_from(Some(u64::MAX)), Duration::from_secs(86_400));
-        assert_eq!(ttl_from(None), Duration::from_secs(86_400));
+    fn absent_or_unusable_cache_control_gives_one_hour() {
+        assert_eq!(ttl_for(None), Duration::from_secs(3600));
+        assert_eq!(ttl_for(Some("max-age=abc")), Duration::from_secs(3600));
+        assert_eq!(ttl_for(Some("public")), Duration::from_secs(3600));
+        assert_eq!(ttl_for(Some("max-age")), Duration::from_secs(3600));
     }
 
     // ── Key set rules ─────────────────────────────────────────────────────────
@@ -989,7 +999,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_missing_max_age_defaults_to_24h() {
+    async fn test_missing_max_age_defaults_to_one_hour() {
         let (base, _server) = start_jwks_server(rsa_jwks_body("key-1", DUMMY_N, DUMMY_E), None).await;
         let jwks_uri = format!("{}/.well-known/jwks.json", base);
         let client = JwksClient::new();

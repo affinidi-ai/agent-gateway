@@ -2470,7 +2470,7 @@ async fn evaluate_gateway_policy_for_fabric(
     }
 
     // The per-gateway policy does not apply to public discovery reads.
-    if crate::proxy::paths::is_public_request(method, path) {
+    if crate::proxy::paths::is_public_surface_request(surface, method, path) {
         return Ok(());
     }
 
@@ -2701,7 +2701,7 @@ async fn enrich_and_evaluate_surface_policies(
         }
     }
 
-    let is_agent_card_request = crate::proxy::paths::is_public_request(method, path);
+    let is_agent_card_request = crate::proxy::paths::is_public_surface_request(surface, method, path);
 
     // ── Trust Check stage (caller leg) ──────────────────────────────────────
     // GW2 fabric-receive counterpart of the direct-inbound caller seam in
@@ -4287,7 +4287,7 @@ async fn process_forward_request_in_request_scope(
             }
             resource_authorization = Some(authorization);
             Some(identity)
-        } else if !crate::proxy::paths::is_public_request(method, path) {
+        } else if !crate::proxy::paths::is_public_surface_request(&surface, method, path) {
             // Rebuild an axum HeaderMap from the JSON headers map so the middleware
             // can use the same extract_bearer path as the direct handler.
             let to_header_option = |(k, v): (&String, &Value)| -> Option<(axum::http::HeaderName, axum::http::HeaderValue)> {
@@ -4865,7 +4865,7 @@ async fn process_forward_request_in_request_scope(
         return result;
     }
 
-    let is_agent_card_request = crate::proxy::paths::is_public_request(method, path);
+    let is_agent_card_request = crate::proxy::paths::is_public_surface_request(&surface, method, path);
 
     let modern_payment = if modern_request.is_some() {
         let payment_headers = match stream_request.as_ref().map(|request| Ok(request.headers.clone()))
@@ -5128,7 +5128,7 @@ async fn process_forward_request_in_request_scope(
             proxy_id,
             body_bytes,
             caller_identity,
-            crate::proxy::handler::CallerAssertion::for_forwarded_request(method, path, source_auth_failed),
+            crate::proxy::handler::CallerAssertion::for_forwarded_request(&surface, method, path, source_auth_failed),
         )
         .await;
     }
@@ -5572,7 +5572,7 @@ async fn process_forward_request_in_request_scope(
         } else {
             forwarded_headers.extend(delegated_headers);
             (
-                crate::proxy::handler::CallerAssertion::for_forwarded_request(method, path, source_auth_failed),
+                crate::proxy::handler::CallerAssertion::for_forwarded_request(&surface, method, path, source_auth_failed),
                 forwarded_headers,
             )
         };
@@ -8019,6 +8019,7 @@ async fn handle_mcp_proxy_forward(
                         destination: surface.target_endpoint(),
                         leg: crate::proxy::target_credentials::TargetLeg::McpProxy,
                         caller: crate::proxy::handler::CallerAssertion::for_forwarded_request(
+                            surface,
                             method,
                             path,
                             source_auth_failed,

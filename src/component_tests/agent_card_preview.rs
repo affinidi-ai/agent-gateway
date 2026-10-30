@@ -1399,6 +1399,9 @@ async fn the_agent_card_routes_keep_tenants_apart_and_refresh_needs_edit() {
     let card = |client: &reqwest::Client| client.get(admin.url(&format!("surfaces/{appliance_id}/agent-card")));
     let refresh =
         |client: &reqwest::Client| client.post(admin.url(&format!("surfaces/{appliance_id}/agent-card/refresh")));
+    admin
+        .running_card(&appliance_id)
+        .await;
     let viewer = admin
         .pat(None, &["surfaces.view"])
         .await;
@@ -1407,10 +1410,41 @@ async fn the_agent_card_routes_keep_tenants_apart_and_refresh_needs_edit() {
         .await;
     assert_eq!(status, 200, "surfaces.view reads the card: {body}");
     assert_eq!(body["surface_id"], appliance_id.as_str());
+    assert_eq!(body["supported"], true, "{body}");
+    assert_ne!(body["before"], Value::Null, "{body}");
     let (status, body, _) = admin
         .send(refresh(&viewer))
         .await;
     assert_eq!(status, 403, "only surfaces.edit refreshes: {body}");
+
+    let tenant = admin
+        .pat(Some(("tenant-a", "TENANT:${x-external-account}:surfaces:.*")), &[])
+        .await;
+    let requests = harness
+        .mock
+        .request_count
+        .load(Ordering::SeqCst);
+    let (status, body, _) = admin
+        .send(card(&tenant))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["supported"], false, "{body}");
+    assert_eq!(body["unsupported_reason"], "operator_only", "{body}");
+    for field in ["before", "after", "auth", "fetch"] {
+        assert_eq!(body[field], Value::Null, "a tenant sees no {field} of an appliance-wide card: {body}");
+    }
+    assert_eq!(
+        harness
+            .mock
+            .request_count
+            .load(Ordering::SeqCst),
+        requests,
+        "a tenant's read of an appliance-wide card fetches nothing"
+    );
+    let (status, body, _) = admin
+        .send(refresh(&tenant))
+        .await;
+    assert_eq!(status, 403, "a tenant never refreshes an appliance-wide card: {body}");
 
     let editor = admin
         .pat(None, &["surfaces.view", "surfaces.edit"])

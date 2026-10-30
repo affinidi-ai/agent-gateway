@@ -7,7 +7,7 @@
 | Is Global    | false                                                                           |
 | Categories   | authentication, oauth, credential-delegation, target-authentication, tenancy, fabric |
 | Date         | 2026-10-21                                                                      |
-| Last Updated | 2026-10-29                                                                      |
+| Last Updated | 2026-10-30                                                                      |
 
 ## Status
 
@@ -15,6 +15,12 @@ Proposed.
 
 Extends [1. Adopt OpenID Connect and OAuth 2.0 as a provider-neutral trust plane in Agent Gateway](0001-openid-oauth-agent-gateway.md),
 whose Status carries the matching `Extended by` link.
+
+Amended on 2026-10-30: a JWT bearer assertion carries `sub` only when `assertion_subject` is
+set, and the optional `jwt_bearer.audience` sets `aud`, which defaults to the token endpoint.
+Statements below that the subject defaults to the issuer, that there is no audience field or
+that `aud` is always the token endpoint are superseded by
+[JWT bearer providers](../CREDENTIAL_DELEGATION.md#jwt-bearer-providers).
 
 This ADR records the contract for hop 2: how Target Authentication obtains a credential from a
 credential provider, where a gateway token is cached, which provider types may be used where, how
@@ -152,9 +158,9 @@ described in [`CREDENTIAL_DELEGATION.md`](../CREDENTIAL_DELEGATION.md).
 - `credential_provider` Target Authentication on Transit Points, MCP proxy targets (`proxy://`),
   A2A proxy targets (`a2a-proxy://`) and on the sending gateway of a Fabric route. Each is rejected
   at save. Transit Points keep `transit_credentials` for provider tokens.
-- Changing the legacy delegation vault key for Client Credentials bindings. It stays
-  `(agent_did, "__client_credentials__", provider id)`; its missing-scope weakness is recorded under
-  Consequences.
+- Changing the shape of the legacy delegation vault key for Client Credentials bindings. It is
+  `(agent_did, "__client_credentials__:<scope-set hash>", provider id)`, so scope sets no longer
+  share a token; the original bare key is in the option table below.
 - `static_secret` Target Authentication across Fabric. Its behaviour is kept, except for the
   receiving gateway's header rule under [Precedence](#precedence).
 - Path confinement on Transit Point and MCP proxy legs. They keep their `static_secret`
@@ -278,7 +284,7 @@ described in [`CREDENTIAL_DELEGATION.md`](../CREDENTIAL_DELEGATION.md).
 | Topic | Decision |
 | --- | --- |
 | Target Authentication method | `TargetAuthMethod` gains `CredentialProvider { credential_provider_id, scopes, inject_as }`. The field name matches `OutboundCredentialBinding` and `TransitCredentials`, and avoids confusion with the provider's slug `provider_id`. |
-| JWT bearer provider type | `CredentialProviderType` gains `oauth2_jwt_bearer`, with `jwt_bearer` settings `assertion_issuer`, optional `assertion_subject` (the issuer when absent), `signing_key_secret_ref` (a PKCS#8 PEM private key or a Google service account JSON key), `signing_algorithm` (`RS256`, the default, or `ES256`) and optional `key_id`. There is no `audience` field: the assertion `aud` is always the provider's `token_endpoint`, which must be https. |
+| JWT bearer provider type | `CredentialProviderType` gains `oauth2_jwt_bearer`, with `jwt_bearer` settings `assertion_issuer`, optional `assertion_subject` (the issuer when absent), `signing_key_secret_ref` (a PKCS#8 PEM private key or a Google service account JSON key), `signing_algorithm` (`RS256`, the default, or `ES256`) and optional `key_id`. There is no `audience` field: the assertion `aud` is always the provider's `token_endpoint`, which must be https, as must the `token_endpoint` of Client Credentials and authorization code providers. The authorization code exchange and refresh do not enforce it yet. |
 | Token storage | Target Authentication tokens live in a per-replica in-memory cache (D1) and are never persisted. Delegation bindings keep using the vault. |
 | Fabric | Only the receiving gateway resolves `credential_provider` (E1); the sending gateway rejects it on a `fabric://` Target. |
 | Latency | The first use of a key and each refresh block the request that triggers them, bounded by the grant client's 10 s timeout. Other requests use the still-valid token or wait on the single in-flight grant. |
@@ -531,7 +537,7 @@ exactly. That difference is accepted without a new parameter: the allowlist is r
   `key_id` or the service account key's `private_key_id`, and `scope` when scopes are requested.
   It authenticates the client with HTTP Basic when both client references are set, sends
   `client_id` in the form when only the id is set, and sends no client authentication otherwise.
-  A token endpoint that is not https, unless the test allowlist names it exactly, is `Forbidden`;
+  A token endpoint that is not https, unless the test allowlist names it exactly, is `Forbidden` before any secret is read, as for Client Credentials;
   a signing key that does not parse for its algorithm is `AssertionFailed`.
 - Both send `scope` when scopes are set and `resource` when the provider has one.
 
@@ -746,7 +752,7 @@ PAT resource scoping (`scope_allows_resource`) applies to every reference above.
 | `SecretUnavailable` | Secrets store missing; secret not found | 502 | Forwarded without the credential | 502 `Target authentication failed` |
 | `ProviderNotFound` | Provider deleted or missing | 502 | Forwarded without the credential | Same |
 | `TokenUnavailable` | Grant failed, timed out, was refused, returned an invalid response, could not sign its assertion, or is inside the backoff window with no valid token | 502 | Forwarded without the credential | Same |
-| `Forbidden` | Provider or secret tenancy mismatch, non-https Target, a token endpoint the egress policy blocks, or a JWT bearer token endpoint that is not https | 502 | 502 (fallback ignored) | Same |
+| `Forbidden` | Provider or secret tenancy mismatch, non-https Target, a token endpoint the egress policy blocks, or a Client Credentials or JWT bearer token endpoint that is not https, unless exactly allowlisted | 502 | 502 (fallback ignored) | Same |
 | `OutsideTargetBase` | The upstream URL leaves the Target origin or base path, and is not a card URL | 502 | 502 (fallback ignored) | Same |
 | `HeaderConflict` | A `credential_provider` header name is also carried by a delegated or forwarded header | 502 | 502 (fallback ignored) | Same |
 | `Unsupported` | Provider type, leg or `inject_as` not allowed | 502 | 502 (fallback ignored) | Same |
@@ -865,8 +871,8 @@ audit event. Every gateway grant, for Target Authentication and for delegation, 
 | Repudiation: gateway token use not recorded | Audit events above, including on the receiving gateway |
 | Assertion replay | `aud` fixed to the token endpoint, RS256 or ES256 signatures, `exp` 300 s after issue and a random `jti` per assertion |
 
-- **Data in transit:** https to token endpoints of JWT bearer providers and to Targets using a
-  provider.
+- **Data in transit:** https to token endpoints of Client Credentials and JWT bearer providers (authorization
+  code exchange and refresh do not check it yet) and to Targets using a provider.
 - **Data at rest:** Target Authentication tokens are never persisted. Provider secrets stay in the
   secrets store under the gateway's encryption-at-rest setting.
 - **Least privilege:** existing RBAC features and PAT resource scoping apply unchanged.
@@ -1052,15 +1058,22 @@ sequenceDiagram
 
 ## Known limitations
 
-- Legacy Client Credentials and JWT bearer delegation bindings keep the vault key
-  `(agent_did, "__client_credentials__", provider id)`, which ignores scopes.
+- Legacy Client Credentials and JWT bearer delegation bindings use the vault key
+  `(agent_did, "__client_credentials__:<scope-set hash>", provider id)`, so scope sets no longer
+  share a token. Records under the old bare key are no longer read and stay listed until they
+  expire or are revoked.
+- The authorization code exchange and refresh do not check that the provider's `token_endpoint`
+  is https; a stored authorization code provider with an http token endpoint still sends its
+  client secret over http.
 - `credential_provider` Target Authentication is not available on Transit Points or MCP proxy
   targets, and path confinement does not apply on those legs, for `static_secret` either.
 - A paired, exposed Fabric peer is never accepted as the authenticated caller for
   `credential_provider`.
 - Two `CredentialInjection` enums remain, in `src/config/types.rs` and
   `src/config/agent_surface.rs`.
-- Tenant surfaces cannot use appliance-wide providers (N2 is not provided).
+- Tenant surfaces cannot send an appliance-wide credential upstream (a Target secret or provider,
+  or a bound `api_key`, Client Credentials or JWT bearer provider); N2 is not provided.
+  Authorization code providers and secrets that verify callers may be appliance-wide.
 - Gateway tokens are not shared across replicas.
 - Anonymous card GETs reach the Target on every request; the rewritten card is not cached per
   surface.
