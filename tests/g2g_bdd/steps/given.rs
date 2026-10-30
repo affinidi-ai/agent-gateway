@@ -572,6 +572,32 @@ pub async fn surface_requires_api_key(
     });
 }
 
+/// Saves the surface through its gateway's admin API with
+/// `access_point.public: false`, the state a surface created through the
+/// admin API has: its Access Point refuses a caller whose credential is
+/// missing or invalid.
+#[given(expr = "the operator has closed the Access Point of surface {string}")]
+async fn operator_has_closed_the_access_point(
+    world: &mut G2gWorld,
+    surface_name: String,
+) {
+    let (gw_index, surface_id) = world.surface(&surface_name);
+    world.start().await;
+    let admin = &world
+        .harness()
+        .gw(gw_index)
+        .admin;
+    let mut surface = admin
+        .get_surface(&surface_id)
+        .await
+        .expect("read surface");
+    surface["access_point"]["public"] = serde_json::json!(false);
+    admin
+        .update_surface(&surface_id, &surface)
+        .await
+        .expect("close the Access Point");
+}
+
 #[given(
     regex = r#"^surface "([^"]+)" injects target authentication from secret "([^"]+)" with value "([^"]+)" as header "([^"]+)"$"#
 )]
