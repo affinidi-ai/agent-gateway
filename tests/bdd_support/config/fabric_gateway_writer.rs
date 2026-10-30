@@ -209,6 +209,9 @@ fn build_surface_fixture(
                 if !tp.require_transit_token {
                     point["allow_unauthenticated_callers"] = serde_json::json!(true);
                 }
+                if tp.allow_fabric_callers {
+                    point["allow_fabric_callers"] = serde_json::json!(true);
+                }
                 // A Transit Point only mints the surface's managed identity
                 // into its outbound request when its own inject_vp is on.
                 if surface.managed_identity {

@@ -1400,6 +1400,12 @@ pub struct TransitPoint {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fabric_delegated_credentials: bool,
 
+    /// Lets the managed agent call this Transit Point while it serves a
+    /// request a paired gateway sent over Fabric: the transit token issued for
+    /// that request opens only the Transit Points that set it. Off by default.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_fabric_callers: bool,
+
     /// Target-leg Trust Checks run on requests the managed agent sends
     /// through this Transit Point, whatever its protocol.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -4986,6 +4992,7 @@ mod tests {
                         allow_unauthenticated_callers: false,
                         extension_inspection: crate::config::types::ExtensionInspectionConfig::default(),
                         fabric_delegated_credentials: false,
+                        allow_fabric_callers: false,
                         trust_check_list: Vec::new(),
                         trust_check_migrated: false,
                     },
@@ -5017,6 +5024,7 @@ mod tests {
                         allow_unauthenticated_callers: false,
                         extension_inspection: crate::config::types::ExtensionInspectionConfig::default(),
                         fabric_delegated_credentials: false,
+                        allow_fabric_callers: false,
                         trust_check_list: Vec::new(),
                         trust_check_migrated: false,
                     },

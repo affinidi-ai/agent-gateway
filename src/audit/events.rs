@@ -50,6 +50,9 @@ pub enum RejectionReason {
     FabricHopsInvalid,
     /// A Fabric request past the limit of Fabric crossings.
     FabricChainTooLong,
+    /// A Fabric request whose managed agent should get a transit token, which
+    /// could not be issued.
+    TransitTokenUnavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

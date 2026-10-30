@@ -305,9 +305,11 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
     headers, HTTP method, per-request capabilities, `_meta`), `extension_rejected` (request
     extension rules, and an inbound identity that is missing or invalid),
     `consent_identity_required` (credential delegation for an anonymous caller).
-  - `forward`: `ssrf_blocked` (egress policy refuses the target address), and
+  - `forward`: `ssrf_blocked` (egress policy refuses the target address),
     `fabric_chain_too_long` (`508`) from a Transit Point to a `fabric://` target whose call would
-    pass 8 Fabric crossings, recorded against its surface with the call's trace id.
+    pass 8 Fabric crossings, recorded against its surface with the call's trace id, and on Fabric
+    receive `transit_token_unavailable` (the peer is answered `503`): the managed agent should
+    get a transit token for the request and it could not be issued.
 
   Requests answered before any gateway handler runs (a path under no configured route) and
   gateway faults (a failed egress check task) are not recorded.

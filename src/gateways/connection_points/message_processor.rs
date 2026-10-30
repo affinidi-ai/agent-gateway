@@ -3839,6 +3839,31 @@ fn fabric_hops_refusal(
     }
 }
 
+/// The answer to a Fabric request whose managed agent should get a transit
+/// token that could not be issued: `503`, recorded as a `request_rejected`.
+fn transit_token_unavailable_refusal(
+    surface: &crate::config::agent_surface::AgentSurface,
+    trace_id: Option<&str>,
+) -> ProcessingResult {
+    use crate::audit::request_events::{RejectionReason, RejectionStage, RequestFacts, request_rejected};
+    request_rejected(
+        &RequestFacts {
+            surface_id: &surface.surface_id,
+            channel_name: &surface.name,
+            trace_id,
+            via_fabric: true,
+        },
+        RejectionStage::Forward,
+        RejectionReason::TransitTokenUnavailable,
+        503,
+        None,
+    );
+    ProcessingResult::RequiresResponse {
+        response_type: MessageType::ForwardResponse.to_string(),
+        response_body: refused_forward_response(503, "Service Unavailable", "The request could not be forwarded"),
+    }
+}
+
 /// Who sent a request over Fabric, for the transit token issued with it: the
 /// peer the handshake verified, and the caller the peer's request names.
 pub(super) struct FabricReceiveCaller<'caller> {
@@ -3849,32 +3874,33 @@ pub(super) struct FabricReceiveCaller<'caller> {
     pub verification: crate::surface_context::IdentityVerification,
 }
 
-/// The `sub` and `identity_source` of a transit token issued on Fabric
-/// receive: the caller only when it is a DID, never a payload pseudonym, and
-/// `fabric-presentation` only when a connection issuer's presentation carried
-/// it.
+/// The caller DID and `identity_source` of a transit token issued on Fabric
+/// receive: a DID only when a presentation from one of the peer's connection
+/// issuers carried it (`fabric-presentation`). A payload pseudonym, a DID this
+/// gateway computed from fields the peer sent, or any other DID the peer named
+/// is not carried (`fabric-asserted`).
 pub(super) fn fabric_caller_did_and_source(
     caller_identity: Option<&str>,
     verification: crate::surface_context::IdentityVerification,
 ) -> (Option<&str>, crate::proxy::caller_identity::IdentitySource) {
     use crate::proxy::caller_identity::IdentitySource;
-    let did = caller_identity.filter(|identity| identity.starts_with("did:"));
-    let source = if did.is_some() && verification == crate::surface_context::IdentityVerification::Vp {
-        IdentitySource::FabricPresentation
-    } else {
-        IdentitySource::FabricAsserted
-    };
-    (did, source)
+    match caller_identity.filter(|identity| {
+        identity.starts_with("did:") && verification == crate::surface_context::IdentityVerification::Vp
+    }) {
+        Some(did) => (Some(did), IdentitySource::FabricPresentation),
+        None => (None, IdentitySource::FabricAsserted),
+    }
 }
 
 /// The transit token the managed agent behind `surface` gets with a request a
-/// Fabric peer sent, as the Access Point gives one with a direct request: when
-/// the surface has Transit Points and `target_url`, the Target, is the agent
-/// itself, by HTTP or HTTPS. A Target the gateway runs has no agent to hold
-/// one, and an agent card fetch is no request of the agent's own.
-/// `max_lifetime_secs` is the appliance's `transit_token_max_lifetime_secs`.
-/// Returns the token and its `jti`; one that cannot be issued is logged and
-/// the request goes on without it.
+/// Fabric peer sent: when `target_url`, the Target, is the agent itself, by
+/// HTTP or HTTPS, and a Transit Point of the surface sets
+/// `allow_fabric_callers`. The token opens only those Transit Points. A Target
+/// the gateway runs has no agent to hold one, and an agent card fetch is no
+/// request of the agent's own. `max_lifetime_secs` is the appliance's
+/// `transit_token_max_lifetime_secs`. Returns the token and its `jti`, or
+/// `Err` when the agent should get one and it cannot be issued, so the
+/// request is refused rather than forwarded as one no peer sent.
 pub(super) fn fabric_receive_transit_token(
     issuer: Option<&crate::proxy::transit_token::TransitTokenIssuer>,
     max_lifetime_secs: Option<u64>,
@@ -3883,32 +3909,28 @@ pub(super) fn fabric_receive_transit_token(
     agent_card_request: bool,
     caller: &FabricReceiveCaller<'_>,
     trace_id: Option<&str>,
-) -> Option<(String, String)> {
+) -> Result<Option<(String, String)>, ()> {
     let agent_target = url::Url::parse(target_url).is_ok_and(|url| matches!(url.scheme(), "http" | "https"));
-    if surface
+    let allowed_transit_points: Vec<String> = surface
         .transit_points()
-        .is_empty()
-        || !agent_target
-        || agent_card_request
-    {
-        return None;
+        .iter()
+        .filter(|point| point.allow_fabric_callers)
+        .map(|point| point.alias.clone())
+        .collect();
+    if allowed_transit_points.is_empty() || !agent_target || agent_card_request {
+        return Ok(None);
     }
     let (Some(issuer), Some(max_lifetime_secs)) = (issuer, max_lifetime_secs) else {
-        warn!(surface_id = %surface.surface_id, "Transit token issuance is unavailable; forwarding the fabric request without one");
-        return None;
+        warn!(surface_id = %surface.surface_id, "Transit token issuance is unavailable; refusing the fabric request");
+        return Err(());
     };
     let (caller_did, identity_source) = fabric_caller_did_and_source(caller.caller_identity, caller.verification);
     let identity_source = identity_source.to_string();
     let request = crate::proxy::transit_token::FabricTransitTokenRequest {
         surface_id: &surface.surface_id,
-        caller_did,
         identity_source: &identity_source,
         trace_id,
-        allowed_transit_points: surface
-            .transit_points()
-            .iter()
-            .map(|point| point.alias.clone())
-            .collect(),
+        allowed_transit_points,
         fabric: crate::proxy::transit_token::FabricTransitClaims {
             peer_gateway_id: caller
                 .peer_gateway_id
@@ -3917,13 +3939,14 @@ pub(super) fn fabric_receive_transit_token(
                 .peer_issuer_did
                 .map(str::to_string),
             hops: caller.hops,
+            caller_did: caller_did.map(str::to_string),
         },
     };
     match issuer.issue_for_fabric_request(request, surface.issued_transit_token_lifetime_secs(max_lifetime_secs)) {
-        Ok(issued) => Some(issued),
+        Ok(issued) => Ok(Some(issued)),
         Err(error) => {
-            warn!(surface_id = %surface.surface_id, error = %error, "Failed to issue a transit token for a fabric request");
-            None
+            warn!(surface_id = %surface.surface_id, error = %error, "Failed to issue a transit token for a fabric request; refusing it");
+            Err(())
         }
     }
 }
@@ -5856,7 +5879,7 @@ async fn process_forward_request_in_request_scope(
     // The managed agent's transit token for its own Transit Points, as the
     // Access Point issues one: the peer is the caller it names, the onward trace
     // is the one its Transit Point calls continue.
-    if let Some((token, jti)) = fabric_receive_transit_token(
+    match fabric_receive_transit_token(
         crate::proxy::server::get_transit_token_issuer().as_deref(),
         GLOBAL_MCP_AUTH_NETWORK
             .get()
@@ -5873,8 +5896,12 @@ async fn process_forward_request_in_request_scope(
         },
         onward_trace_id.as_deref(),
     ) {
-        req = req.header("X-Transit-Token", token);
-        channel_debug!(config_id, "Injected a transit token for the fabric request (jti={})", jti);
+        Ok(Some((token, jti))) => {
+            req = req.header("X-Transit-Token", token);
+            channel_debug!(config_id, "Injected a transit token for the fabric request (jti={})", jti);
+        }
+        Ok(None) => {}
+        Err(()) => return transit_token_unavailable_refusal(&surface, audit_trace_id),
     }
 
     // Send the request

@@ -719,6 +719,16 @@ pub async fn managed_agent_received_a_transit_token_for_the_peers_request(
             .is_none(),
         "a peer's request carries no principal: {claims}"
     );
+    assert!(claims.get("sub").is_none(), "a peer's caller is never the token's subject: {claims}");
+}
+
+#[then(expr = "managed agent {string} received no transit token")]
+pub async fn managed_agent_received_no_transit_token(
+    world: &mut G2gWorld,
+    agent_name: String,
+) {
+    let token = crate::steps::when::last_transit_token_received_by(world, &agent_name).await;
+    assert!(token.is_none(), "managed agent '{agent_name}' received a transit token: {token:?}");
 }
 
 #[then(expr = "managed agent {string} received the trace id managed agent {string} received")]

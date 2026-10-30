@@ -191,15 +191,18 @@ pub struct FabricTransitClaims {
     pub peer_issuer_did: Option<String>,
     /// Fabric crossings, the one that delivered the request included.
     pub hops: u8,
+    /// The caller DID a presentation from one of the peer's connection issuers
+    /// carried. Kept out of `sub`, which a release that predates this claim
+    /// would read as the caller this gateway verified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_did: Option<String>,
 }
 
 /// What a token issued on Fabric receive carries about the caller beyond the
-/// `fabric` claim. It never carries a principal: only the peer gateway is
-/// verified.
+/// `fabric` claim. It never carries a principal or a `sub`: only the peer
+/// gateway is verified.
 pub struct FabricTransitTokenRequest<'request> {
     pub surface_id: &'request str,
-    /// The caller DID the peer's request names, when it names one.
-    pub caller_did: Option<&'request str>,
     pub identity_source: &'request str,
     pub trace_id: Option<&'request str>,
     pub allowed_transit_points: Vec<String>,
@@ -302,9 +305,7 @@ impl TransitTokenIssuer {
         let jti = uuid::Uuid::new_v4().to_string();
         let claims = TransitTokenClaims {
             iss: self.gateway_id.clone(),
-            sub: request
-                .caller_did
-                .map(str::to_string),
+            sub: None,
             surface_id: request.surface_id.to_string(),
             iat,
             exp,
@@ -1222,7 +1223,6 @@ mod tests {
     fn fabric_request(caller_did: Option<&str>) -> FabricTransitTokenRequest<'_> {
         FabricTransitTokenRequest {
             surface_id: "surf-001",
-            caller_did,
             identity_source: "fabric-presentation",
             trace_id: Some("trace-1"),
             allowed_transit_points: vec!["delta".to_string()],
@@ -1230,13 +1230,14 @@ mod tests {
                 peer_gateway_id: "peer-record".to_string(),
                 peer_issuer_did: Some("did:web:partner.example".to_string()),
                 hops: 3,
+                caller_did: caller_did.map(str::to_string),
             },
         }
     }
 
-    /// A token issued on Fabric receive names the peer and the crossings, never a
-    /// principal, lives the lifetime asked for, and opens only the Transit Points
-    /// it lists.
+    /// A token issued on Fabric receive names the peer, the crossings and the
+    /// caller DID in its `fabric` claim, never a principal or a `sub`, lives the
+    /// lifetime asked for, and opens only the Transit Points it lists.
     #[test]
     fn a_fabric_token_carries_the_peer_and_its_crossings_and_no_principal() {
         let issuer = test_issuer();
@@ -1249,7 +1250,7 @@ mod tests {
             .unwrap();
         assert_eq!(claims.jti, jti);
         assert_eq!(claims.exp - claims.iat, 120);
-        assert_eq!(claims.sub.as_deref(), Some("did:web:caller.example"));
+        assert_eq!(claims.sub, None);
         assert_eq!(
             claims
                 .identity_source
@@ -1270,6 +1271,7 @@ mod tests {
                 peer_gateway_id: "peer-record".to_string(),
                 peer_issuer_did: Some("did:web:partner.example".to_string()),
                 hops: 3,
+                caller_did: Some("did:web:caller.example".to_string()),
             })
         );
         assert!(
@@ -1286,7 +1288,8 @@ mod tests {
     }
 
     /// A release that predates the `fabric` claim reads a Fabric token's claims
-    /// without it, and so sees no principal.
+    /// without it, and so sees no principal and no `sub`: it never takes the
+    /// caller DID a peer vouched for as a caller it verified.
     #[test]
     fn a_reader_without_the_fabric_claim_sees_no_principal_in_a_fabric_token() {
         #[derive(Deserialize)]
@@ -1304,6 +1307,6 @@ mod tests {
             .unwrap()
             .claims;
         assert_eq!(earlier.user_identity_hash, None);
-        assert_eq!(earlier.sub.as_deref(), Some("did:web:caller.example"));
+        assert_eq!(earlier.sub, None);
     }
 }

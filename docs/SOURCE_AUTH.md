@@ -475,7 +475,7 @@ Which requests carry one:
 | Pipeline | Issues a transit token |
 | --- | --- |
 | Access Point (direct HTTP: MCP, A2A, HTTP) | For every request it forwards to the managed agent of a surface with Transit Points, an anonymous caller's included, but not for an agent card fetch |
-| Fabric receive, buffered and framed stream | For every request a paired gateway sends that it forwards to an HTTP or HTTPS Target of a surface with Transit Points, but not for a public discovery `GET` such as an agent card fetch |
+| Fabric receive, buffered and framed stream | For every request a paired gateway sends that it forwards to an HTTP or HTTPS Target of a surface with a Transit Point that sets `allow_fabric_callers`, but not for a public discovery `GET` such as an agent card fetch. The token lists only those Transit Points. When one should be issued and cannot be, the request is refused with `503` |
 | `proxy://` and `a2a-proxy://` Targets, on either path | Never: the gateway runs the MCP Proxy and there is no agent, and an A2A Proxy's backend, such as Direct Line, must never see one |
 | Fabric send, the STS, the management API | Never |
 
@@ -491,27 +491,27 @@ so its agent gets exactly one. It differs from an Access Point token:
 
 | Claim | Fabric receive |
 | --- | --- |
-| `sub` | The caller DID the peer's request names, only when it is a DID; a payload pseudonym (`sha256:...`) is left out |
-| `identity_source` | `fabric-presentation` when a presentation signed by one of the connection's issuers carried the DID, `fabric-asserted` otherwise |
+| `sub` | Never present, so a release that predates the `fabric` claim never reads the peer's caller as one this gateway verified |
+| `identity_source` | `fabric-presentation` when a presentation signed by one of the connection's issuers carried the caller DID, `fabric-asserted` otherwise |
+| `allowed_transit_points` | Only the surface's Transit Points that set `allow_fabric_callers` |
 | `user_identity_hash`, `caller_context_fields`, `caller_dna_uai` | Never present: the peer gateway is verified, its caller is not. Even when the receiving surface's `source_auth` verified a credential the peer sent, the token carries no principal |
 | `trace_id` | The trace this gateway sends on to its agent, so the agent's Transit Point calls continue it |
-| `fabric` | `peer_gateway_id` (the sender's Remote gateway record), `peer_issuer_did` (its issuer DID, once pairing established it) and `hops`, the Fabric crossings the request made (see [`FABRIC.md`](FABRIC.md#chains-across-gateways)) |
+| `fabric` | `peer_gateway_id` (the sender's Remote gateway record), `peer_issuer_did` (its issuer DID, once pairing established it), `hops`, the Fabric crossings the request made (see [`FABRIC.md`](FABRIC.md#chains-across-gateways)), and `caller_did`, only when a presentation from one of the connection's issuers carried it: never a DID the peer only named, one this gateway computed from fields the peer sent, or a payload pseudonym |
 
 A Transit Point accepts such a token as it accepts an Access Point's, and its policy sees the
 peer as the caller (`verification: fabric_peer`, see
-[`POLICY.md`](POLICY.md#caller-in-transit-point-policy-input)), with the DID unverified
-(`did_verified: false`) even when a presentation carried it. Static `target_auth`
+[`POLICY.md`](POLICY.md#caller-in-transit-point-policy-input)), with the DID as the peer's
+assertion even when a presentation carried it. Static `target_auth`
 credentials are added as for any caller; delegated per-user credentials are never released for
 it (see [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-a-transit-point)).
 A Transit Point's audit records name its caller with `auth_method: fabric_asserted`, the peer
-(its issuer DID, else its Remote gateway record id) as `iss` and the DID as `sub`, below a caller
-the Transit Point verified itself. The identity presentation a Transit Point with a
+(its issuer DID, else its Remote gateway record id) as `iss` and `fabric.caller_did` as `sub`,
+even when the Transit Point verified a client itself. The identity presentation a Transit Point with a
 `workload_binding` signs for its agent never names that DID as the user it acts for
 (`userIdentity`), as it does the DID of an Access Point token.
-A release that predates the `fabric` claim reads such a token as one naming an unverified DID,
-with no principal. So during a rolling upgrade, a Transit Point served by such a node still
-names that DID as the user its agent acts for (`userIdentity`) in the identity presentation it
-signs, and audits it with `auth_method: transit_token`, until every node is upgraded. A release
+A release that predates the `fabric` claim reads such a token as one with no principal and no
+caller DID, so during a rolling upgrade a Transit Point served by such a node treats its caller
+as anonymous: it never names a DID as the user its agent acts for or keys a grant by one. A release
 that predates the hop count neither reads nor sends
 `X-Gateway-Fabric-Hops`, so a chain through such a gateway starts counting again at 1 after it
 (see [`FABRIC.md`](FABRIC.md#chains-across-gateways)).

@@ -543,11 +543,20 @@ reset the count. The limit bounds a chain of Transit Point calls through gateway
 these rules; agents that call each other's Access Points directly are not bounded by it, and it
 is not an access control.
 
+A managed agent serving a partner's request gets a transit token only for the Transit Points
+that set `allow_fabric_callers: true`, off by default and set through the admin API only (a
+Surface Builder save keeps it, as it keeps a Transit Point's `source_auth`). Without one, the
+agent gets no token, and a Transit Point that requires one refuses its calls with `401`. A
+surface variant's Transit Points set it for that variant. When a token should be issued and
+cannot be, the receiving gateway refuses the request with `503`, recorded as a
+`request_rejected` audit event (stage `forward`, reason `transit_token_unavailable`), rather than
+forwarding a partner's request as one with no token.
+
 A Transit Point that was set to `require_transit_token: false`, with
 `allow_unauthenticated_callers: true`, only so that agents serving partner requests could call
-it should require the token again and drop `allow_unauthenticated_callers`: those agents now get
-a token, and while the Transit Point does not require it, an agent that sends none starts the
-hop count again.
+it should require the token again, set `allow_fabric_callers` and drop
+`allow_unauthenticated_callers`: those agents then get a token, and while the Transit Point does
+not require it, an agent that sends none starts the hop count again.
 A create or update of a surface or of one of its variants is answered with a `Warning` header
 for each `fabric://` Transit Point, on the surface or in a variant, that does not require the
 transit token:

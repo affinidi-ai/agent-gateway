@@ -165,7 +165,7 @@ impl TransitCallerContext {
                 verification: TransitCallerVerification::FabricPeer,
                 identity_source: claims.identity_source.clone(),
                 user_identity_hash: None,
-                did: claims.sub.clone(),
+                did: fabric.caller_did.clone(),
                 fields: serde_json::Map::new(),
                 fabric: Some(fabric.into()),
             };

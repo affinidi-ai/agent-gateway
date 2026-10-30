@@ -440,6 +440,14 @@ pub async fn transit_point_requires_a_transit_token(
     transit_point_spec_mut(world, &transit_point).require_transit_token = true;
 }
 
+#[given(expr = "Transit Point {string} allows Fabric callers")]
+pub async fn transit_point_allows_fabric_callers(
+    world: &mut G2gWorld,
+    transit_point: String,
+) {
+    transit_point_spec_mut(world, &transit_point).allow_fabric_callers = true;
+}
+
 /// Boots the topology and sends the caller's A2A request, which must be
 /// answered `200`, so the managed agent that served it holds the transit token
 /// its gateway issued for it. Comes after every step that declares topology.

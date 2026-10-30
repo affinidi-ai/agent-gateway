@@ -2296,7 +2296,8 @@ fn retain_mcp_settings(
 
 /// PUT carries the whole record, or a variant PUT its whole overrides, but the
 /// Surface Builder shows neither a Transit Point's `source_auth` nor its
-/// `allow_unauthenticated_callers`, so a save from it omits both. An omitted
+/// `allow_unauthenticated_callers` or `allow_fabric_callers`, so a save from it
+/// omits them. An omitted `allow_fabric_callers` is kept. An omitted
 /// `source_auth` means unchanged, as an omitted `mcp_http.authorization` does;
 /// removal is explicit: a `null` `source_auth` in the PUT, or a merge PATCH
 /// whose Transit Points leave it out. The save rules then refuse a Transit
@@ -2367,9 +2368,10 @@ fn variant_stored_points<'a>(
         })
 }
 
-/// Keeps each Transit Point's stored `source_auth` and
-/// `allow_unauthenticated_callers` that `sent_points`, the JSON the request
-/// sent for `points`, leaves out; see `retain_transit_caller_authentication`.
+/// Keeps each Transit Point's stored `source_auth`,
+/// `allow_unauthenticated_callers` and `allow_fabric_callers` that
+/// `sent_points`, the JSON the request sent for `points`, leaves out; see
+/// `retain_transit_caller_authentication`.
 fn retain_transit_points_caller_authentication(
     points: &mut [crate::config::agent_surface::TransitPoint],
     stored: &[crate::config::agent_surface::TransitPoint],
@@ -2396,6 +2398,14 @@ fn retain_transit_points_caller_authentication(
         });
         if !sends_open_flag && previous.allow_unauthenticated_callers && !point.authenticates_callers() {
             point.allow_unauthenticated_callers = true;
+        }
+        let sends_fabric_flag = sent_point.is_some_and(|point| {
+            point
+                .get("allow_fabric_callers")
+                .is_some()
+        });
+        if !sends_fabric_flag && previous.allow_fabric_callers {
+            point.allow_fabric_callers = true;
         }
     }
 }
@@ -4520,6 +4530,55 @@ mod validation_tests {
                 .is_none(),
             "a variant that stores a list of its own is matched against that list, not the surface's"
         );
+    }
+
+    /// A PUT that leaves out a Transit Point's `allow_fabric_callers`, as a
+    /// Surface Builder save does, keeps the stored one, on the surface and in a
+    /// variant; one that sends it, `false` included, sets it.
+    #[test]
+    fn a_save_that_omits_allow_fabric_callers_keeps_it() {
+        let point = |allow: Option<bool>| {
+            let mut point = serde_json::json!({ "id": "tp-crm", "alias": "crm", "target_endpoint": "fabric://gw/crm",
+                "require_transit_token": true });
+            if let Some(allow) = allow {
+                point["allow_fabric_callers"] = serde_json::json!(allow);
+            }
+            point
+        };
+        let existing =
+            surface_with_transit_points(serde_json::json!([point(Some(true))]), serde_json::json!([point(Some(true))]));
+        let allows = |surface: &AgentSurface| {
+            (
+                surface
+                    .transit
+                    .as_ref()
+                    .unwrap()
+                    .points[0]
+                    .allow_fabric_callers,
+                surface.variants[0]
+                    .overrides
+                    .transit
+                    .as_ref()
+                    .and_then(|transit| transit.points.as_ref())
+                    .unwrap()[0]
+                    .allow_fabric_callers,
+            )
+        };
+        let save = |sent_point: serde_json::Value| {
+            let mut surface = surface_with_transit_points(
+                serde_json::json!([sent_point.clone()]),
+                serde_json::json!([sent_point.clone()]),
+            );
+            let sent = serde_json::json!({
+                "transit": { "points": [sent_point.clone()] },
+                "variants": [{ "id": "candidate", "overrides": { "transit": { "points": [sent_point] } } }]
+            });
+            retain_transit_caller_authentication(&mut surface, &existing, &sent);
+            allows(&surface)
+        };
+
+        assert_eq!(save(point(None)), (true, true), "an omitted setting is kept");
+        assert_eq!(save(point(Some(false))), (false, false), "a sent false turns it off");
     }
 
     /// A shared-issuer warning names the variant whose overrides define the

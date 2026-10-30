@@ -12335,19 +12335,21 @@ mod tests {
     }
 
     /// A transit token issued for a request that arrived over Fabric, with the
-    /// peer's `hops`; `user_identity_hash` is one no Fabric token carries.
+    /// peer's `hops` and `caller_did`; `user_identity_hash` is one no Fabric
+    /// token carries.
     fn fabric_claims(
-        sub: Option<&str>,
+        caller_did: Option<&str>,
         identity_source: &str,
         user_identity_hash: Option<&str>,
         hops: u8,
     ) -> crate::proxy::transit_token::TransitTokenClaims {
         let mut claims =
-            caller_claims(sub, Some(identity_source), user_identity_hash, json!({ "email": "a@b.example" }));
+            caller_claims(None, Some(identity_source), user_identity_hash, json!({ "email": "a@b.example" }));
         claims.fabric = Some(crate::proxy::transit_token::FabricTransitClaims {
             peer_gateway_id: "partner-record".to_string(),
             peer_issuer_did: Some("did:web:partner.example".to_string()),
             hops,
+            caller_did: caller_did.map(str::to_string),
         });
         claims
     }

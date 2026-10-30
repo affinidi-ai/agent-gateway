@@ -120,6 +120,7 @@ fn fabric_issued(
             .unwrap(),
     )
     .unwrap();
+    claims.sub = None;
     claims.user_identity_hash = None;
     claims
         .caller_context_fields
@@ -129,6 +130,7 @@ fn fabric_issued(
         peer_gateway_id: "partner-record".to_string(),
         peer_issuer_did: Some("did:web:partner.example".to_string()),
         hops,
+        caller_did: None,
     });
     crate::proxy::server::get_transit_token_issuer()
         .expect("the gateway's transit token issuer")
