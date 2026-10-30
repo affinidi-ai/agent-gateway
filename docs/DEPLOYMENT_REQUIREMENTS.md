@@ -160,6 +160,16 @@ The gateway only calls out to what you configure. Allow egress to:
 | `login.microsoftonline.com` and `graph.microsoft.com` | SAML login uses `graph_api` for Microsoft Entra ID provisioning and profile photos |
 | SMTP, Slack, webhooks, Kafka, Kinesis, Pulsar or Redis Streams | An integration uses them ([details](INTEGRATIONS.md)) |
 
+**Proxies and external consent.** The vendor calls of external consent connect directly and
+ignore `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and the system proxy settings: reading an
+external consent provider's authorization server metadata, revoking its grants (RFC 7009), and
+forwarding a Transit Point request that carries a grant by binding to the provider's
+`resource`. A proxy would resolve each vendor's host again and connect to an address the
+gateway never vetted, so the gateway pins these calls to the addresses it checked. On a network
+where egress goes only through a proxy, allow direct egress to those vendors, or external
+consent fails to connect. The gateway logs a warning at startup when a proxy variable is set.
+All other outbound calls use a configured proxy as before.
+
 ## Secrets and keys
 
 | Secret | Required | How to set it |
