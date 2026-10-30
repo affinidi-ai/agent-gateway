@@ -12,8 +12,10 @@
 //! returned, logged and audited with the actor that caused it, and a failed
 //! revocation never keeps a grant that is being removed. [`remove_grants`]
 //! revokes and deletes many grants at most [`REVOCATION_CONCURRENCY`] at a time;
-//! [`delete_then_revoke`] deletes them first and revokes them on a task of its
-//! own, so the change that removed them never waits on a vendor.
+//! [`delete_then_revoke`] deletes them first, then revokes what the vault
+//! deleted, both on one task of its own, so the change that removed them never
+//! waits on a vendor, and a change dropped part way never leaves a deleted
+//! grant unrevoked.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -250,34 +252,50 @@ pub struct Revoker {
     pub actor: Option<AuditCallerContext>,
 }
 
-/// Delete each of `grants` from the vault, which ends its release at once,
-/// then revoke the deleted ones at their authorization servers on a task of
-/// their own, at most [`REVOCATION_CONCURRENCY`] at a time, auditing each
-/// outcome, so the caller never waits on a vendor. Every grant is tried; the
-/// call fails if any could not be deleted, and the ones that were are revoked
-/// all the same. The returned task ends when every revocation has.
-pub async fn delete_then_revoke(
+/// Delete the grant with each of these record ids from the vault, which ends
+/// its release at once, then revoke what the vault deleted at its
+/// authorization server, at most [`REVOCATION_CONCURRENCY`] at a time,
+/// auditing each outcome. A grant rewritten since it was read, by a refresh
+/// that rotated its tokens, has its current tokens revoked; one already gone
+/// was removed, and is revoked, by whoever removed it.
+///
+/// The deletions and the revocations run on one task of their own. The caller
+/// waits only until every deletion has ended, never on a vendor, and dropping
+/// the caller, as a request whose client disconnects is dropped, stops neither:
+/// every grant deleted is still revoked and audited. `hold` is dropped once
+/// every deletion has ended, so a lock it carries covers the deletions even
+/// when the caller is gone. Every grant is tried; the call fails if any could
+/// not be deleted, and the ones that were are revoked all the same. The
+/// returned task ends when every revocation has.
+pub async fn delete_then_revoke<Hold: Send + 'static>(
     vault: &Arc<dyn DelegationVaultStorage>,
-    grants: Vec<DelegatedGrant>,
+    grant_ids: Vec<String>,
     revoker: Revoker,
+    hold: Hold,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
-    let mut deleted = Vec::with_capacity(grants.len());
-    let mut failure = None;
-    for grant in grants {
-        match vault
-            .purge_grant(&grant.id, grant.tenant_id.as_deref())
-            .await
-        {
-            Ok(_) => deleted.push(grant),
-            Err(error) => {
-                failure.get_or_insert(error);
+    let vault = Arc::clone(vault);
+    let (report, deletions) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let mut deleted = Vec::with_capacity(grant_ids.len());
+        let mut failure = None;
+        for id in grant_ids {
+            match vault.delete_grant(&id).await {
+                Ok(Some(grant)) => deleted.push(grant),
+                Ok(None) => {}
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
             }
         }
-    }
-    let revocations = tokio::spawn(revoke_removed(deleted, revoker));
-    match failure {
-        Some(error) => Err(error.context("Failed to delete a delegated grant")),
-        None => Ok(revocations),
+        drop(hold);
+        // The caller may be gone; the revocations go ahead all the same.
+        let _ = report.send(failure);
+        revoke_removed(deleted, revoker).await;
+    });
+    match deletions.await {
+        Ok(None) => Ok(task),
+        Ok(Some(error)) => Err(error.context("Failed to delete a delegated grant")),
+        Err(_) => Err(anyhow::anyhow!("The task deleting delegated grants ended before it reported")),
     }
 }
 
@@ -968,8 +986,12 @@ pub(crate) mod tests {
             actor: Some(actor()),
         };
 
+        let ids = grants
+            .into_iter()
+            .map(|grant| grant.id)
+            .collect();
         let started = std::time::Instant::now();
-        let revocations = delete_then_revoke(&vault, grants, revoker)
+        let revocations = delete_then_revoke(&vault, ids, revoker, ())
             .await
             .unwrap();
         assert!(started.elapsed() < delay / 2, "the removal waited on the vendor: {:?}", started.elapsed());
@@ -986,6 +1008,50 @@ pub(crate) mod tests {
             .expect("the revocations end")
             .unwrap();
         assert_eq!(server.revoked_tokens().len(), 6);
+    }
+
+    /// Removal revokes the grant the vault deleted, not a copy read before
+    /// it: a grant rotated in between, as a refresh that rotates its refresh
+    /// token would, has its new tokens revoked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grant_rotated_after_it_was_read_has_its_new_tokens_revoked() {
+        let directory = tempfile::tempdir().unwrap();
+        let secrets = secrets_with(&directory, Some("tenant-a")).await;
+        let server = RecordingServer::start(200).await;
+        let (vault, read) = vault_with(&directory, 1).await;
+        let mut rotated = read[0].clone();
+        rotated.access_token = "rotated-access".to_string();
+        rotated.refresh_token = Some("rotated-refresh".to_string());
+        vault
+            .store_grant(rotated)
+            .await
+            .unwrap();
+        let revoker = Revoker {
+            providers: HashMap::from([("provider".to_string(), provider(Some(&server.url), "none", None))]),
+            secrets: Some(secrets),
+            exact_allowlist: Some(server.origin()),
+            actor: None,
+        };
+
+        let ids = read
+            .into_iter()
+            .map(|grant| grant.id)
+            .collect();
+        let revocations = delete_then_revoke(&vault, ids, revoker, ())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), revocations)
+            .await
+            .expect("the revocations end")
+            .unwrap();
+        assert_eq!(server.revoked_tokens(), ["rotated-access", "rotated-refresh"]);
+        assert!(
+            vault
+                .provider_grants("provider")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// Without a secrets store a client that authenticates with a secret cannot
