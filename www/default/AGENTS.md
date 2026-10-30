@@ -399,6 +399,11 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
   the Secrets page and pastes the PEM there. The gateway checks the PEM on save.
 - Save sends a field the type does not use as empty, which the gateway reads as cleared, so
   switching a provider to Client Credentials JWT drops its client secret.
+- `resource` has no input (it is set through the API or YAML) and is never sent on save. When
+  `entraRejectsResource` finds it set on a Microsoft identity platform v2.0 token endpoint, which
+  rejects it (AADSTS901002), the form warns under Token Endpoint
+  (`credential-provider-entra-resource-warning`) and the list row shows a warning icon
+  (`credential-provider-entra-resource-badge`).
 - The Credential Providers tab labels the types from `PROVIDER_TYPE_LABELS` in the same module.
 
 ## Secret editor

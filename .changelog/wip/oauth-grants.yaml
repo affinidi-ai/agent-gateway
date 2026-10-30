@@ -19,6 +19,12 @@ changes:
         Authorization Bearer by default. Issued tokens are cached in the delegation vault per
         surface and renewed before they expire. The dashboard offers it on the Managed Agent
         and Transit Point, and a surface save refuses an authorization-code provider.
+    - timestamp: '2026-10-30T12:40:00Z'
+      title: Warn in the dashboard when an Entra v2.0 provider sets resource
+      description: >-
+        The Microsoft identity platform v2.0 token endpoint rejects the resource parameter
+        (AADSTS901002), so the credential provider form and list now warn when a provider with
+        such an endpoint sets one, and say to put the audience in the scopes as /.default.
   changed:
     - timestamp: '2026-10-30T09:30:00Z'
       title: Check JWT key material on the credential provider validate endpoint

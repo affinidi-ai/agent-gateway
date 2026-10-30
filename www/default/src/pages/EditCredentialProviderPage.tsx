@@ -15,6 +15,8 @@ import {
   CredentialProviderType,
   EMPTY_JWT_FIELDS,
   JwtFormFields,
+  entraRejectsResource,
+  entraResourceMessage,
   jwtFieldsOf,
   missingProviderField,
   providerCredentialFields,
@@ -35,6 +37,8 @@ interface CredentialProviderForm extends JwtFormFields {
   additional_params: string;
   description: string;
   callback_host: string;
+  /** The stored resource, shown only through the Entra warning; never sent on save. */
+  resource: string;
 }
 
 interface RoutingConfig {
@@ -56,6 +60,7 @@ const EMPTY_FORM: CredentialProviderForm = {
   additional_params: '',
   description: '',
   callback_host: '',
+  resource: '',
   ...EMPTY_JWT_FIELDS,
 };
 
@@ -147,6 +152,7 @@ const EditCredentialProviderPage: React.FC = () => {
           : '',
         description: data.description ?? '',
         callback_host: callbackHost,
+        resource: data.resource ?? '',
         ...jwtFieldsOf(data),
       });
     } catch (e: any) {
@@ -478,6 +484,16 @@ const EditCredentialProviderPage: React.FC = () => {
                       ? 'The tenant-specific token URL (login.microsoftonline.com/<tenant>/oauth2/v2.0/token), not the common one.'
                       : 'The URL the gateway calls to trade an authorization code (or its own client credentials) for an actual access token.'}
                   </small>
+                  {entraRejectsResource(form.token_endpoint, form.resource) && (
+                    <div
+                      className="alert alert-warning py-2 mt-2"
+                      role="status"
+                      data-testid="credential-provider-entra-resource-warning"
+                    >
+                      <i className="fas fa-exclamation-triangle me-2" aria-hidden="true" />
+                      {entraResourceMessage(form.resource)}
+                    </div>
+                  )}
                 </div>
               </div>
             )}

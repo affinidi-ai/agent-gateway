@@ -12,6 +12,8 @@ import { formatDateTime } from '../../utils/stringUtils';
 import {
   CredentialProviderType,
   PROVIDER_TYPE_LABELS,
+  entraRejectsResource,
+  entraResourceMessage,
 } from '../EditCredentialProviderPage/credentialProviderForm';
 
 interface CredentialProviderListItem {
@@ -20,6 +22,7 @@ interface CredentialProviderListItem {
   provider_id: string;
   provider_type: CredentialProviderType;
   token_endpoint?: string;
+  resource?: string | null;
   default_scopes: string[];
   token_refresh_enabled: boolean;
   description?: string;
@@ -200,6 +203,16 @@ const CredentialProvidersTab: React.FC<CredentialProvidersTabProps> = ({
                   >
                     <td>
                       <strong>{provider.name}</strong>
+                      {provider.resource &&
+                        entraRejectsResource(provider.token_endpoint ?? '', provider.resource) && (
+                          <i
+                            className="fas fa-exclamation-triangle text-warning ms-2"
+                            role="img"
+                            aria-label={entraResourceMessage(provider.resource)}
+                            title={entraResourceMessage(provider.resource)}
+                            data-testid="credential-provider-entra-resource-badge"
+                          />
+                        )}
                       {provider.description && (
                         <div>
                           <small className="text-muted">{provider.description}</small>

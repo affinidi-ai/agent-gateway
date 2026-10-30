@@ -1,6 +1,7 @@
 import {
   EMPTY_JWT_FIELDS,
   ProviderFormValues,
+  entraRejectsResource,
   jwtFieldsOf,
   jwtKeyUnidentified,
   missingProviderField,
@@ -112,6 +113,30 @@ describe('credential provider form', () => {
     expect(jwtKeyUnidentified({ ...jwtBearer, jwt_key_id: '' })).toBe(true);
     expect(jwtKeyUnidentified(jwtBearer)).toBe(false);
     expect(jwtKeyUnidentified(form({}))).toBe(false);
+  });
+
+  it('flags a resource sent to a Microsoft identity platform v2.0 token endpoint', () => {
+    const v2 = 'https://login.microsoftonline.com/tenant-id/oauth2/v2.0/token';
+    expect(entraRejectsResource(v2, 'https://ai.azure.com')).toBe(true);
+    expect(entraRejectsResource(v2, ' ')).toBe(false);
+    expect(entraRejectsResource(v2, null)).toBe(false);
+    expect(entraRejectsResource(v2, undefined)).toBe(false);
+    expect(
+      entraRejectsResource(
+        'https://login.microsoftonline.com/tenant-id/oauth2/token',
+        'https://ai.azure.com'
+      )
+    ).toBe(false);
+    expect(entraRejectsResource('https://oauth2.googleapis.com/token', 'https://api.example')).toBe(
+      false
+    );
+    expect(
+      entraRejectsResource(
+        'https://LOGIN.MicrosoftOnline.US/tenant-id/oauth2/v2.0/token',
+        'https://ai.azure.us'
+      )
+    ).toBe(true);
+    expect(entraRejectsResource('not a url', 'https://ai.azure.com')).toBe(false);
   });
 
   it('drops a signing algorithm the selected type does not support', () => {

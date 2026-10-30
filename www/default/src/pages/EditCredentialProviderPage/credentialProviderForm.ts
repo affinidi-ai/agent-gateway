@@ -132,6 +132,43 @@ export function jwtKeyUnidentified(
   );
 }
 
+/** Hosts of the Microsoft identity platform, public and national clouds. */
+const ENTRA_HOSTS = new Set([
+  'login.microsoftonline.com',
+  'login.microsoftonline.us',
+  'login.microsoftonline.de',
+  'login.partner.microsoftonline.cn',
+  'login.chinacloudapi.cn',
+  'login.windows.net',
+  'sts.windows.net',
+]);
+
+/**
+ * True when `resource` is set and the token endpoint is a Microsoft identity platform v2.0
+ * endpoint, which rejects the parameter (AADSTS901002). A v1.0 endpoint accepts it.
+ */
+export function entraRejectsResource(
+  tokenEndpoint: string,
+  resource: string | null | undefined
+): boolean {
+  if (!resource?.trim()) return false;
+  try {
+    const url = new URL(tokenEndpoint);
+    return ENTRA_HOSTS.has(url.hostname.toLowerCase()) && url.pathname.includes('/oauth2/v2.0/');
+  } catch {
+    return false;
+  }
+}
+
+/** Why an Entra v2.0 provider with `resource` fails, and what to set instead. */
+export function entraResourceMessage(resource: string): string {
+  return (
+    `This provider sets resource "${resource}", which the Microsoft identity platform v2.0 ` +
+    'token endpoint rejects (AADSTS901002), so every token request will fail. Put the ' +
+    `audience in the scopes as "${resource}/.default" and clear resource through the API.`
+  );
+}
+
 /**
  * The request fields for the type's client credentials and signed JWT. A field the type
  * does not use is sent empty, which the gateway reads as cleared, so switching a provider
