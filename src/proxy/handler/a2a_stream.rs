@@ -408,8 +408,8 @@ impl AccessPointEvents {
         ) else {
             return Ok(());
         };
-        let input = ResponsePolicyInput {
-            response: ResponseContext {
+        let input = ResponsePolicyInput::new(
+            ResponseContext {
                 status_code: self.request.status.as_u16(),
                 body: Some(event.clone()),
                 content_type: Some(mime::TEXT_EVENT_STREAM.to_string()),
@@ -426,11 +426,10 @@ impl AccessPointEvents {
                         .is_some_and(|error| !error.is_null()),
                 method: None,
             },
-            caller: self
-                .request
+            self.request
                 .policy_caller
                 .clone(),
-            surface: SurfaceContext {
+            SurfaceContext {
                 id: state
                     .surface
                     .surface_id
@@ -441,8 +440,7 @@ impl AccessPointEvents {
                     .clone(),
                 protocol: self.protocol(),
             },
-            metadata: None,
-        };
+        );
         let decision = crate::proxy::response_policy::evaluate_response_policy(
             policy_manager,
             &format!("response:{policy_id}"),

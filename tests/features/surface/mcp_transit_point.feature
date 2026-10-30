@@ -67,6 +67,22 @@ Feature: MCP Transit Point forwarding
     Then the response status is 503
     And MCP server "bravo" was not called
 
+  Scenario: A Transit Point policy can allow only a named caller
+    Given Transit Point "alpha" requires a transit token
+    And Transit Point "alpha" has a policy that allows only caller "alice"
+    And managed agent "example-agent" holds a transit token naming caller "alice"
+    When managed agent "example-agent" asks for available tools through Transit Point "alpha" with its transit token
+    Then the response status is 200
+    And MCP server "bravo" received MCP method "tools/list"
+
+  Scenario: A Transit Point policy that allows only a named caller refuses another caller
+    Given Transit Point "alpha" requires a transit token
+    And Transit Point "alpha" has a policy that allows only caller "alice"
+    And managed agent "example-agent" holds a transit token naming caller "bob"
+    When managed agent "example-agent" asks for available tools through Transit Point "alpha" with its transit token
+    Then the response status is 403
+    And MCP server "bravo" was not called
+
   Scenario: A delegated credential reaches the Transit Point's destination and the managed agent cannot replace it
     Given MCP server "bravo" supports tool invocation
     And Transit Point "alpha" requires a transit token
@@ -94,3 +110,51 @@ Feature: MCP Transit Point forwarding
     And MCP server "bravo" did not receive header "cookie"
     And the response does not include header "set-cookie"
     And the response does not include header "www-authenticate"
+
+  Scenario: A transit token opens its surface's Transit Point for the lifetime the surface sets
+    Given the appliance lets transit tokens live up to 900 seconds
+    And the surface's transit tokens live 600 seconds
+    And Transit Point "alpha" requires a transit token
+    And managed agent "example-agent" holds the transit token the Access Point gave it 400 seconds ago
+    When managed agent "example-agent" asks for available tools through Transit Point "alpha" with its transit token
+    Then the response status is 200
+    And MCP server "bravo" received MCP method "tools/list"
+
+  Scenario: A transit token past the lifetime its surface sets is refused
+    Given the appliance lets transit tokens live up to 900 seconds
+    And the surface's transit tokens live 600 seconds
+    And Transit Point "alpha" requires a transit token
+    And managed agent "example-agent" holds the transit token the Access Point gave it 610 seconds ago
+    When managed agent "example-agent" asks for available tools through Transit Point "alpha" with its transit token
+    Then the response status is 401
+    And MCP server "bravo" was not called
+
+  Scenario: A transit token that lives longer than its surface allows is refused
+    Given the appliance lets transit tokens live up to 900 seconds
+    And the surface's transit tokens live 600 seconds
+    And Transit Point "alpha" requires a transit token
+    And managed agent "example-agent" holds a transit token the gateway issued to live 601 seconds
+    When managed agent "example-agent" asks for available tools through Transit Point "alpha" with its transit token
+    Then the response status is 401
+    And MCP server "bravo" was not called
+
+  Scenario: Shortening the transit token lifetime refuses the tokens already issued for longer
+    Given the appliance lets transit tokens live up to 900 seconds
+    And the surface's transit tokens live 600 seconds
+    And Transit Point "alpha" requires a transit token
+    And managed agent "example-agent" holds the transit token the Access Point gave it
+    And the operator has shortened the surface's transit token lifetime to 300 seconds
+    When managed agent "example-agent" asks for available tools through Transit Point "alpha" with its transit token
+    Then the response status is 401
+    And MCP server "bravo" was not called
+
+  Scenario: A transit token lifetime longer than 900 seconds is refused
+    Given the appliance lets transit tokens live up to 900 seconds
+    When the operator sets the surface's transit token lifetime to 901 seconds
+    Then the admin API response status is 400
+    And the admin API error response mentions "transit.transit_token_lifetime_secs must be from 30 to 900 seconds, not 901"
+
+  Scenario: A transit token lifetime above the appliance's longest is refused
+    When the operator sets the surface's transit token lifetime to 600 seconds
+    Then the admin API response status is 400
+    And the admin API error response mentions "transit.transit_token_lifetime_secs must be from 30 to 300 seconds, not 600 (300 is transit_token_max_lifetime_secs in gateway.json)"

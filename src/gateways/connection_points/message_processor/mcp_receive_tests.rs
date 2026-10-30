@@ -1489,7 +1489,9 @@ async fn fabric_consent_flow() {
     }
 
     vault.store(serde_json::from_value(json!({
-        "id": "verified-token", "agent_did": holder_did, "user_identity_hash": hex::encode(Sha256::digest(b"user")),
+        "id": "verified-token", "agent_did": holder_did,
+        "user_identity_hash": crate::source_auth::models::caller_identity_hash(
+            "jwt_bearer", "https://receiver.example/api/oauth2/mcp", surface.tenant_id.as_deref(), "user"),
         "credential_provider_id": "provider", "provider_id": "provider", "access_token": "verified-remote-credential", "scopes": ["read"],
         "consent_granted_at": "2026-09-01T00:00:00Z", "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z",
         "consent_identity": {"principal": hex::encode(Sha256::digest(serde_json_canonicalizer::to_vec(&("https://receiver.example/api/oauth2/mcp", "user")).unwrap())),

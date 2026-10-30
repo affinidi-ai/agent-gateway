@@ -968,6 +968,7 @@ fn build_bootstrap_config(
         config_dir: None,
         server_mode: crate::server::mode::ServerMode::default(),
         cache_refresh_interval_secs: 0,
+        pinned_transit_token_max_lifetime_secs: None,
     }
 }
 
@@ -1413,6 +1414,7 @@ fn build_gateway_config(bootstrap: &BootstrapConfig) -> GatewayConfig {
 /// tests abort with a stack overflow (SIGABRT).
 struct GatewayServer {
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    startup_log: StartupLog,
     _thread: std::thread::JoinHandle<()>,
 }
 
@@ -1435,23 +1437,92 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// A dispatcher writing `info` and higher events, and every `policy_audit`
+/// A layer writing `info` and higher events, and every `policy_audit`
 /// decision, to `log` as the gateway's log file renders them.
-fn gateway_log_dispatch(log: std::fs::File) -> tracing::Dispatch {
+fn gateway_log_layer<S>(log: Arc<std::fs::File>) -> impl tracing_subscriber::Layer<S>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
     use tracing_subscriber::Layer;
     use tracing_subscriber::filter::{LevelFilter, Targets};
-    use tracing_subscriber::layer::SubscriberExt;
 
-    let layer = tracing_subscriber::fmt::layer()
+    tracing_subscriber::fmt::layer()
         .event_format(crate::observability::SimpleFormat)
-        .with_writer(Arc::new(log))
+        .with_writer(log)
         .with_ansi(false)
         .with_filter(
             Targets::new()
                 .with_default(LevelFilter::INFO)
                 .with_target("policy_audit", LevelFilter::DEBUG),
-        );
-    tracing::Dispatch::new(tracing_subscriber::registry().with(layer))
+        )
+}
+
+fn gateway_log_dispatch(log: Arc<std::fs::File>) -> tracing::Dispatch {
+    use tracing_subscriber::layer::SubscriberExt;
+
+    tracing::Dispatch::new(tracing_subscriber::registry().with(gateway_log_layer(log)))
+}
+
+/// The `WARN` and `ERROR` lines a harness gateway logs on its own thread, which
+/// runs `run_axum_proxy` and so its startup checks. Work the gateway spawns,
+/// such as serving requests, runs on the runtime's workers and is not kept.
+#[derive(Clone, Default)]
+struct StartupLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for StartupLog {
+    fn write(
+        &mut self,
+        bytes: &[u8],
+    ) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap()
+            .extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl StartupLog {
+    /// Makes this thread log to `gateway_log`, or without one to the test
+    /// output as [`ensure_tracing`] does, and keep its `WARN` and `ERROR`
+    /// lines, until the guard drops.
+    fn capture_on_this_thread(
+        &self,
+        gateway_log: Option<Arc<std::fs::File>>,
+    ) -> tracing::subscriber::DefaultGuard {
+        use tracing_subscriber::Layer;
+        use tracing_subscriber::layer::SubscriberExt;
+        let log = self.clone();
+        let test_output = gateway_log
+            .is_none()
+            .then(|| {
+                tracing_subscriber::fmt::layer()
+                    .with_test_writer()
+                    .with_filter(
+                        tracing_subscriber::EnvFilter::try_from_default_env()
+                            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                    )
+            });
+        thread_subscriber::set_thread_default(
+            tracing_subscriber::registry()
+                .with(gateway_log.map(gateway_log_layer))
+                .with(test_output)
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_ansi(false)
+                        .with_writer(move || log.clone())
+                        .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+                ),
+        )
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
 }
 
 /// Runs the gateway on its own thread and runtime. With `log`, every thread of
@@ -1462,19 +1533,19 @@ fn spawn_gateway_server(
     log: Option<std::fs::File>,
 ) -> GatewayServer {
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let startup_log = StartupLog::default();
+    let thread_log = startup_log.clone();
     let thread = std::thread::Builder::new()
         .name("gw-harness".to_string())
         .stack_size(8 * 1024 * 1024)
         .spawn(move || {
-            let log = log.map(gateway_log_dispatch);
-            let _log = log
-                .as_ref()
-                .map(thread_subscriber::set_thread_dispatch);
+            let log = log.map(Arc::new);
+            let _log = thread_log.capture_on_this_thread(log.clone());
             let mut runtime = tokio::runtime::Builder::new_multi_thread();
             runtime
                 .enable_all()
                 .thread_stack_size(8 * 1024 * 1024);
-            if let Some(log) = log {
+            if let Some(log) = log.map(gateway_log_dispatch) {
                 runtime
                     .on_thread_start(move || GATEWAY_LOG.set(Some(thread_subscriber::set_thread_dispatch(&log))))
                     .on_thread_stop(|| GATEWAY_LOG.set(None));
@@ -1499,6 +1570,7 @@ fn spawn_gateway_server(
         .expect("spawn gateway harness thread");
     GatewayServer {
         shutdown: Some(shutdown_tx),
+        startup_log,
         _thread: thread,
     }
 }
@@ -1832,10 +1904,48 @@ impl GatewayHarness {
     }
 }
 
+impl GatewayHarness {
+    /// The `WARN` and `ERROR` lines the gateway logged from `run_axum_proxy`
+    /// itself, such as its startup checks, but not from the work it spawns.
+    pub fn startup_warnings(&self) -> String {
+        self._gw_server
+            .startup_log
+            .text()
+    }
+}
+
 impl Drop for GatewayHarness {
     fn drop(&mut self) {
         self._gw_server.shutdown();
     }
+}
+
+/// Sets a top-level `gateway.json` key, such as `transit_token_max_lifetime_secs`.
+pub fn configure_gateway_setting(
+    bootstrap: &crate::config::BootstrapConfig,
+    key: &str,
+    value: serde_json::Value,
+) {
+    set_gateway_json_setting(&bootstrap.config_files.gateway, key, value);
+}
+
+/// Sets a top-level key in the `gateway.json` at `gateway_path`, also while the
+/// gateway that read it runs.
+pub fn set_gateway_json_setting(
+    gateway_path: &str,
+    key: &str,
+    value: serde_json::Value,
+) {
+    let gateway_path = std::path::Path::new(gateway_path);
+    let mut gateway_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(gateway_path).expect("read gateway network config"))
+            .expect("gateway network config JSON");
+    gateway_json[key] = value;
+    std::fs::write(
+        gateway_path,
+        serde_json::to_string_pretty(&gateway_json).expect("serialize gateway network config"),
+    )
+    .expect("write gateway network config");
 }
 
 /// Declare `(id, name, prefix)` route prefixes in the gateway network config,

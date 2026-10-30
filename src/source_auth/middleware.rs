@@ -351,6 +351,7 @@ impl SourceAuthMiddleware {
                 );
                 return Ok(AuthenticatedIdentity::ApiKey {
                     key_name: config.secret_id.clone(),
+                    provider_agent_id: None,
                 });
             }
         }
@@ -391,7 +392,10 @@ impl SourceAuthMiddleware {
                     key_id = %meta.key_id,
                     "API Key Provider source authentication succeeded"
                 );
-                Ok(AuthenticatedIdentity::ApiKey { key_name: meta.key_id })
+                Ok(AuthenticatedIdentity::ApiKey {
+                    key_name: meta.key_id,
+                    provider_agent_id: Some(config.agent_id.clone()),
+                })
             }
             Ok(None) => {
                 debug!(channel = %channel_name, agent_id = %config.agent_id, "API key not found or revoked");
@@ -1194,7 +1198,8 @@ mod tests {
         assert_eq!(
             identity,
             AuthenticatedIdentity::ApiKey {
-                key_name: "my-secret".to_string()
+                key_name: "my-secret".to_string(),
+                provider_agent_id: None,
             }
         );
     }
@@ -1223,7 +1228,8 @@ mod tests {
         assert_eq!(
             identity,
             AuthenticatedIdentity::ApiKey {
-                key_name: "my-secret".to_string()
+                key_name: "my-secret".to_string(),
+                provider_agent_id: None,
             }
         );
     }
@@ -1298,7 +1304,8 @@ mod tests {
         assert_eq!(
             identity,
             AuthenticatedIdentity::ApiKey {
-                key_name: "key-id-1".to_string()
+                key_name: "key-id-1".to_string(),
+                provider_agent_id: Some("agent-1".to_string()),
             }
         );
     }

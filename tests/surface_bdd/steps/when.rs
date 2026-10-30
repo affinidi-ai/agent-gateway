@@ -1358,6 +1358,46 @@ pub async fn update_transit_point_listen_path(
     record_admin_response(world, response);
 }
 
+#[when(expr = "the operator sets the surface's transit token lifetime to {int} seconds")]
+async fn operator_sets_the_transit_token_lifetime(
+    world: &mut SurfaceWorld,
+    lifetime_secs: u64,
+) {
+    set_transit_token_lifetime(world, lifetime_secs).await;
+}
+
+/// Save `lifetime_secs` as the surface's transit token lifetime through the
+/// admin API, and record its answer.
+pub(crate) async fn set_transit_token_lifetime(
+    world: &mut SurfaceWorld,
+    lifetime_secs: u64,
+) {
+    ensure_admin_session(world).await;
+    let surface_id = get_tracked_surface_id(world, "setting the transit token lifetime");
+    let client = world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist");
+    let current = client
+        .get_surface_recorded(&surface_id)
+        .await
+        .unwrap_or_else(|error| panic!("fetch surface before setting the transit token lifetime: {error}"));
+    assert_eq!(
+        current.status, 200,
+        "fetch surface before setting the transit token lifetime should succeed, got status {} body {}",
+        current.status, current.body
+    );
+
+    let mut payload = current.body;
+    payload["transit"]["transit_token_lifetime_secs"] = serde_json::json!(lifetime_secs);
+    let response = client
+        .update_surface_recorded(&surface_id, &payload)
+        .await
+        .unwrap_or_else(|error| panic!("set the transit token lifetime through admin API: {error}"));
+
+    record_admin_response(world, response);
+}
+
 pub(crate) async fn delete_surface(world: &mut SurfaceWorld) {
     ensure_admin_session(world).await;
     let surface_id = get_tracked_surface_id(world, "deleting the surface");
@@ -2372,6 +2412,22 @@ pub(crate) async fn transit_token_from_the_access_point(world: &mut SurfaceWorld
         })
 }
 
+/// The claims a transit token carries.
+pub(crate) fn transit_token_claims(token: &str) -> serde_json::Value {
+    use base64::Engine as _;
+
+    let payload = token
+        .split('.')
+        .nth(1)
+        .expect("a transit token is a JWT");
+    serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload)
+            .expect("a transit token's claims are base64url"),
+    )
+    .expect("a transit token's claims are JSON")
+}
+
 /// `token` with the claims in `changes` replaced, signed with the gateway's
 /// transit token key and naming it, as the gateway itself would issue it.
 pub(crate) fn reissued_transit_token(
@@ -2379,8 +2435,6 @@ pub(crate) fn reissued_transit_token(
     token: &str,
     changes: serde_json::Value,
 ) -> String {
-    use base64::Engine as _;
-
     let key_file = world
         .infra
         .as_ref()
@@ -2397,16 +2451,7 @@ pub(crate) fn reissued_transit_token(
             .expect("the transit token key file names its key"),
     )
     .expect("the transit token key is hexadecimal");
-    let payload = token
-        .split('.')
-        .nth(1)
-        .expect("a transit token is a JWT");
-    let mut claims: serde_json::Value = serde_json::from_slice(
-        &base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(payload)
-            .expect("a transit token's claims are base64url"),
-    )
-    .expect("a transit token's claims are JSON");
+    let mut claims = transit_token_claims(token);
     for (name, value) in changes
         .as_object()
         .expect("claim changes are a JSON object")

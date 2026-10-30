@@ -366,6 +366,9 @@ fn write_single_surface_config_inner(
                 "secret_id": "bdd-transit-caller-key"
             });
         }
+        if let Some(secs) = surface_config.transit_token_lifetime_secs {
+            transit_json["transit_token_lifetime_secs"] = serde_json::json!(secs);
+        }
         surface_fixture = surface_fixture.with_transit(transit_json);
     }
     for element in &surface_config.caller_trust_check_list {
@@ -554,6 +557,19 @@ fn write_single_surface_config_inner(
     if let Some(url) = &surface_config.external_url_listed_first {
         insert_https_origin_first(base_dir, url);
     }
+    if let Some(max_secs) = surface_config.transit_token_max_lifetime_secs {
+        set_transit_token_max_lifetime(base_dir, max_secs);
+    }
+}
+
+fn set_transit_token_max_lifetime(
+    base_dir: &Path,
+    max_secs: u64,
+) {
+    let path = base_dir.join("gateway.json");
+    let mut gateway: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    gateway["transit_token_max_lifetime_secs"] = serde_json::json!(max_secs);
+    std::fs::write(&path, serde_json::to_string_pretty(&gateway).unwrap()).unwrap();
 }
 
 fn declares_authorization_server(surface_config: &SurfaceConfigBuilder) -> bool {

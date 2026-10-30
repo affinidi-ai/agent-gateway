@@ -1149,7 +1149,7 @@ pub fn build_caller_context(identity: &crate::source_auth::AuthenticatedIdentity
                 mtls_source: None,
             }
         }
-        crate::source_auth::AuthenticatedIdentity::ApiKey { key_name } => AuditCallerContext {
+        crate::source_auth::AuthenticatedIdentity::ApiKey { key_name, .. } => AuditCallerContext {
             auth_method: "api_key".to_string(),
             iss: None,
             aud: None,

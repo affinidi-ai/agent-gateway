@@ -47,6 +47,165 @@ pub struct PolicyInput {
     /// is an empty list, so OPA rules don't need null checks).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trust_check_results: Option<crate::trust_registry_verification::TrustCheckResultsContext>,
+
+    /// The Transit Point call's own context. Present on every outbound
+    /// evaluation, never on an inbound one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transit: Option<TransitContext>,
+}
+
+/// `input.transit`: what the gateway knows about a Transit Point call.
+#[derive(Debug, Clone, Serialize)]
+pub struct TransitContext {
+    /// The end user the transit token names.
+    pub caller: TransitCallerContext,
+    /// The client the Transit Point authenticated itself on this request,
+    /// kept apart from `caller`. Absent when it authenticated none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client: Option<TransitClientContext>,
+}
+
+/// What established the caller of a Transit Point call. Serialized as
+/// `verification`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransitCallerVerification {
+    /// The gateway-signed transit token carries a principal that source
+    /// authentication verified on the Access Point.
+    TransitToken,
+    /// A valid transit token names a caller DID, but nothing it carries was
+    /// verified by credential: the DID was asserted or derived from request
+    /// fields on the Access Point.
+    Unverified,
+    /// Nothing identifies the caller.
+    Anonymous,
+}
+
+/// `input.transit.caller`: the caller of a Transit Point call and how the
+/// gateway came to know it.
+#[derive(Debug, Clone, Serialize)]
+pub struct TransitCallerContext {
+    /// `true` for a `transit_token` caller; `false` for `unverified` and
+    /// `anonymous`.
+    pub verified: bool,
+    pub verification: TransitCallerVerification,
+    /// How the Access Point established the caller DID: the transit token's
+    /// `identity_source` (`gateway-computed`, `self-presented`,
+    /// `verified-presentation`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity_source: Option<String>,
+    /// The caller's identity hash
+    /// ([`AuthenticatedIdentity::principal_hash`](crate::source_auth::AuthenticatedIdentity::principal_hash))
+    /// the Access Point computed. Present only when `verified`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_identity_hash: Option<String>,
+    /// The caller DID the transit token carries (`sub`). Always asserted:
+    /// nothing on the Access Point verifies a DID presentation yet, so there
+    /// is no `did_verified` and no Agent DNA UAI here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub did: Option<String>,
+    /// The operator-allowlisted `caller_context_fields` the transit token
+    /// carries, verbatim. Empty unless the caller is `verified`.
+    #[serde(skip_serializing_if = "serde_json::Map::is_empty")]
+    pub fields: serde_json::Map<String, serde_json::Value>,
+}
+
+impl TransitCallerContext {
+    pub fn anonymous() -> Self {
+        Self {
+            verified: false,
+            verification: TransitCallerVerification::Anonymous,
+            identity_source: None,
+            user_identity_hash: None,
+            did: None,
+            fields: serde_json::Map::new(),
+        }
+    }
+
+    /// The caller a validated transit token carries. Only a token whose
+    /// `user_identity_hash` came from source authentication verifies the
+    /// caller; the allowlisted fields are copied from that authenticated
+    /// identity, so they are dropped when there is no hash.
+    pub fn from_transit_token(claims: &crate::proxy::transit_token::TransitTokenClaims) -> Self {
+        let verified = claims
+            .user_identity_hash
+            .is_some();
+        let did = claims.sub.clone();
+        if !verified && did.is_none() {
+            return Self::anonymous();
+        }
+        Self {
+            verified,
+            verification: if verified {
+                TransitCallerVerification::TransitToken
+            } else {
+                TransitCallerVerification::Unverified
+            },
+            identity_source: claims.identity_source.clone(),
+            user_identity_hash: claims
+                .user_identity_hash
+                .clone(),
+            did,
+            fields: if verified {
+                claims
+                    .caller_context_fields
+                    .clone()
+            } else {
+                serde_json::Map::new()
+            },
+        }
+    }
+}
+
+/// What authenticated the client of a Transit Point call. Serialized as
+/// `verification`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransitClientVerification {
+    /// The Transit Point verified the client's resource-server token
+    /// (`mcp_http.authorization`) on this request.
+    ResourceToken,
+}
+
+/// `input.transit.client`: the principal the Transit Point authenticated
+/// itself, and how.
+#[derive(Debug, Clone, Serialize)]
+pub struct TransitClientContext {
+    pub verification: TransitClientVerification,
+    /// The source-auth method that verified the credential (`jwt_bearer`,
+    /// `api_key`, `did_auth`, `mtls`).
+    pub method: String,
+    /// The client's identity hash
+    /// ([`AuthenticatedIdentity::principal_hash`](crate::source_auth::AuthenticatedIdentity::principal_hash)).
+    /// Absent for a credential that names no subject.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_identity_hash: Option<String>,
+    /// The verified principal itself. Absent with the hash.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+}
+
+impl TransitClientContext {
+    /// A client `verification` authenticated on a surface of `tenant_id`.
+    pub fn new(
+        identity: &crate::source_auth::AuthenticatedIdentity,
+        verification: TransitClientVerification,
+        tenant_id: Option<&str>,
+    ) -> Self {
+        let user_identity_hash = identity.principal_hash(tenant_id);
+        Self {
+            verification,
+            method: identity.method().to_string(),
+            subject: user_identity_hash
+                .as_ref()
+                .map(|_| {
+                    identity
+                        .principal()
+                        .to_string()
+                }),
+            user_identity_hash,
+        }
+    }
 }
 
 impl PolicyInput {
@@ -426,7 +585,7 @@ impl From<&crate::source_auth::AuthenticatedIdentity> for SourceAuthContext {
                         .and_then(|strategy| strategy.tenant_id.clone()),
                 }
             }
-            AuthenticatedIdentity::ApiKey { key_name } => SourceAuthContext::ApiKey { key_name: key_name.clone() },
+            AuthenticatedIdentity::ApiKey { key_name, .. } => SourceAuthContext::ApiKey { key_name: key_name.clone() },
             AuthenticatedIdentity::DidAuth { did } => SourceAuthContext::DidAuth { did: did.clone() },
             AuthenticatedIdentity::Mtls {
                 principal,
@@ -434,7 +593,7 @@ impl From<&crate::source_auth::AuthenticatedIdentity> for SourceAuthContext {
                 subject_dn,
                 issuer_dn,
                 sans,
-                source: _,
+                ..
             } => SourceAuthContext::Mtls {
                 principal: principal.clone(),
                 fingerprint: fingerprint.clone(),

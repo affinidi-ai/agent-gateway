@@ -72,6 +72,32 @@ pub struct NetworkConfig {
     /// Proxies trusted to report the caller's address for per-client-IP limits.
     #[serde(default)]
     pub client_ip: crate::config::types::ClientIpConfig,
+
+    /// The longest lifetime, in seconds, a surface may set for its transit
+    /// tokens (`transit.transit_token_lifetime_secs`), and the longest the
+    /// Access Point issues, from 30 to 900; 300 when unset. The shortest, 30,
+    /// is fixed. Read and checked once, when the gateway starts
+    /// (`BootstrapConfig::pin_transit_token_max_lifetime`); a reload keeps that
+    /// value, so a load reads a value that is not a whole number as 300 rather
+    /// than failing.
+    #[serde(
+        default = "default_transit_token_max_lifetime_secs",
+        deserialize_with = "deserialize_transit_token_max_lifetime_secs"
+    )]
+    pub transit_token_max_lifetime_secs: u64,
+}
+
+fn default_transit_token_max_lifetime_secs() -> u64 {
+    crate::config::agent_surface::DEFAULT_TRANSIT_TOKEN_MAX_LIFETIME_SECS
+}
+
+fn deserialize_transit_token_max_lifetime_secs<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(serde_json::Value::deserialize(deserializer)?
+        .as_u64()
+        .unwrap_or_else(default_transit_token_max_lifetime_secs))
 }
 
 /// DID configuration
@@ -182,6 +208,15 @@ pub struct RouteCategory {
 
 impl NetworkConfig {
     /// Load network configuration from a JSON file
+    /// `transit_token_max_lifetime_secs` exactly as the file at `path` holds
+    /// it, whatever its type, or `None` when the file does not set it.
+    pub fn transit_token_max_lifetime_in_file(path: &str) -> anyhow::Result<Option<serde_json::Value>> {
+        let mut file: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+        Ok(file
+            .get_mut("transit_token_max_lifetime_secs")
+            .map(serde_json::Value::take))
+    }
+
     pub fn load_from_file(path: &str) -> anyhow::Result<Self> {
         let contents = std::fs::read_to_string(path)?;
         let config: NetworkConfig = serde_json::from_str(&contents)?;
@@ -810,5 +845,68 @@ mod url_mapping_tests {
                 .route_prefixes()
                 .is_empty()
         );
+    }
+
+    fn load_with_max_lifetime(max_secs: Option<serde_json::Value>) -> anyhow::Result<NetworkConfig> {
+        let mut cfg = serde_json::json!({
+            "did": { "domain": "test.local" },
+            "webauthn": { "rp_id": "localhost", "external_origin": "https://localhost" },
+            "integration": { "types": [], "categories": [] },
+            "listeners": [],
+            "routes": {},
+        });
+        if let Some(max_secs) = max_secs {
+            cfg["transit_token_max_lifetime_secs"] = max_secs;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("gateway.json");
+        std::fs::write(&path, cfg.to_string()).unwrap();
+        NetworkConfig::load_from_file(path.to_str().unwrap())
+    }
+
+    #[test]
+    fn the_longest_transit_token_lifetime_defaults_to_300_seconds_and_gateway_json_may_set_it() {
+        assert_eq!(
+            load_with_max_lifetime(None)
+                .unwrap()
+                .transit_token_max_lifetime_secs,
+            300
+        );
+        for max_secs in [30, 600, 900] {
+            assert_eq!(
+                load_with_max_lifetime(Some(serde_json::json!(max_secs)))
+                    .unwrap()
+                    .transit_token_max_lifetime_secs,
+                max_secs
+            );
+        }
+    }
+
+    /// A load does not judge the longest lifetime: only the startup pin does
+    /// (`BootstrapConfig::pin_transit_token_max_lifetime`), so a reload never
+    /// fails on it, and reads a value that is not a whole number as 300.
+    #[test]
+    fn a_load_never_fails_on_the_longest_transit_token_lifetime() {
+        for max_secs in [0, 901] {
+            assert_eq!(
+                load_with_max_lifetime(Some(serde_json::json!(max_secs)))
+                    .unwrap()
+                    .transit_token_max_lifetime_secs,
+                max_secs
+            );
+        }
+        for not_whole in
+            [serde_json::json!("ten"), serde_json::json!(-1), serde_json::json!(60.5), serde_json::Value::Null]
+        {
+            assert_eq!(
+                load_with_max_lifetime(Some(not_whole.clone()))
+                    .unwrap()
+                    .transit_token_max_lifetime_secs,
+                300,
+                "{not_whole}"
+            );
+        }
     }
 }

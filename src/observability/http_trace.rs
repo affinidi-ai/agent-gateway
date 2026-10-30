@@ -40,7 +40,7 @@ pub fn caller_span_fields(identity: &crate::source_auth::AuthenticatedIdentity) 
         AuthenticatedIdentity::JwtBearer { subject, .. } => {
             vec![("caller.auth_method", "jwt_bearer".to_string()), ("caller.principal", subject.clone())]
         }
-        AuthenticatedIdentity::ApiKey { key_name } => {
+        AuthenticatedIdentity::ApiKey { key_name, .. } => {
             vec![("caller.auth_method", "api_key".to_string()), ("caller.principal", key_name.clone())]
         }
         AuthenticatedIdentity::DidAuth { did } => vec![
@@ -479,6 +479,7 @@ mod tests {
     fn caller_span_fields_api_key() {
         let id = AuthenticatedIdentity::ApiKey {
             key_name: "key-prod-01".to_string(),
+            provider_agent_id: None,
         };
         let f = caller_span_fields(&id);
         assert_eq!(field(&f, "caller.auth_method").as_deref(), Some("api_key"));
@@ -504,6 +505,7 @@ mod tests {
             fingerprint: "abc123".to_string(),
             subject_dn: "CN=client,O=Acme".to_string(),
             issuer_dn: "CN=Acme CA".to_string(),
+            trust_anchor_fingerprint: "def456".to_string(),
             sans: MtlsSans::default(),
             source: PeerCertSource::DirectTls,
         };

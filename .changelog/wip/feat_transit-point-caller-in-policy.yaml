@@ -1,0 +1,48 @@
+branch: feat/transit-point-caller-in-policy
+changes:
+  added:
+    - timestamp: '2026-10-29T09:30:00.000Z'
+      title: Let a Transit Point policy allow or deny a call by its verified caller
+      description: >-
+        A Transit Point policy could not tell its callers apart, because the caller the transit
+        token carries reached the audit record but not the policy input. Outbound policy input
+        now has `input.transit.caller`, the end user the transit token names: whether the caller
+        is `verified`, how (`transit_token`, `unverified` or `anonymous`), the caller's
+        `user_identity_hash`, the DID the token asserts, and the caller context fields that
+        Transit Point allowlists. MCP tool gating conditions on a Transit Point read the same
+        input. A call without a valid transit token says it is anonymous. A Transit Point that
+        does not require a transit token still verifies one the agent sends, so the caller it
+        names reaches policy; a token there that does not verify is ignored, not refused. Only
+        policy reads that token: such a Transit Point still delegates no credential, binds no
+        `caller_source: transit_token` field and does not end a stream when the token expires. A
+        client the Transit Point verified itself, by its resource-server token, is in
+        `input.transit.client` with its method, `user_identity_hash` and subject, so a policy can
+        tell the end user and the client apart when a call carries both. A Transit Point's
+        response policy gets the same `input.transit`, and `input.source_auth` for a client the
+        Transit Point verified, so it can decide who receives a response. Inbound response
+        policies have no `input.transit`, so a response policy shared with the inbound legs must
+        not deny or allow on `not input.transit.caller.verified`. A policy that allows
+        only one caller should test `verified` first, as a token that only names a DID is
+        reported as unverified.
+  changed: []
+  fixed: []
+  removed: []
+  security: []
+  breaking:
+    - timestamp: '2026-10-30T12:00:00.000Z'
+      title: Key a caller by how it was identified, not by its name alone
+      description: >-
+        The caller's identity hash, which keys delegated credentials, travels in the transit
+        token as `user_identity_hash` and is in Transit Point policy input as
+        `input.transit.caller.user_identity_hash`, was the SHA-256 of the bare principal, so an
+        API key named `admin` and a JWT whose `sub` is `admin`, from any issuer, were one caller.
+        It is now the SHA-256 of the authentication method, its issuer (the JWT `iss`, the API
+        Key Provider agent, or the certificate an mTLS client certificate was verified against),
+        the surface's tenant and the principal. The Workload Binding `user_hash` for
+        `caller_source: did` follows the same rule. A JWT without an `iss` or a `sub` has no
+        identity hash, so an Access Point that would give its caller a delegated credential
+        answers it with `403`. Every delegated credential stored before this release is keyed by
+        the old hash and is no longer found, so users who connected an account connect it again,
+        and policies that compare `user_identity_hash` need the new value. The old entries stay in
+        the delegation vault, with their refresh tokens, until an operator revokes them; see
+        "Removing grants keyed by the old identity hash" in `docs/CREDENTIAL_DELEGATION.md`.

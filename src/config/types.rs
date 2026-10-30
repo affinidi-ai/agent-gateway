@@ -1017,7 +1017,7 @@ pub enum CallerContextSource {
     /// Caller context derived from a DID-authenticated session on the current
     /// Access Point hop. The caller must be authenticated via
     /// [`SourceAuthConfig::DidAuth`](crate::source_auth::models::SourceAuthConfig::DidAuth);
-    /// the resolved DID becomes the caller identity and its SHA-256 hash the
+    /// the resolved DID becomes the caller identity and its identity hash the
     /// delegation-vault key.
     Did,
 }
@@ -2974,6 +2974,12 @@ pub struct BootstrapConfig {
     /// serves fresh state the moment it is promoted.
     #[serde(default)]
     pub cache_refresh_interval_secs: u64,
+
+    /// `gateway.json`'s `transit_token_max_lifetime_secs` as the gateway started
+    /// with it ([`Self::pin_transit_token_max_lifetime`]). Every later load of
+    /// `gateway.json` takes this value instead of the file's.
+    #[serde(skip)]
+    pub pinned_transit_token_max_lifetime_secs: Option<u64>,
 }
 
 /// DID document cache configuration
