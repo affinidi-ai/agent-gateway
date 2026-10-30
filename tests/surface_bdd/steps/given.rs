@@ -1359,6 +1359,41 @@ fn assert_surface_setup_created(
     );
 }
 
+#[given(expr = "the operator has created the surface for route {string}")]
+async fn operator_has_created_the_surface(
+    world: &mut SurfaceWorld,
+    route: String,
+) {
+    create_new_surface(world, &route, false).await;
+}
+
+#[given(expr = "the operator has created the surface for route {string} as a public Access Point")]
+async fn operator_has_created_the_surface_as_public(
+    world: &mut SurfaceWorld,
+    route: String,
+) {
+    create_new_surface(world, &route, true).await;
+}
+
+async fn create_new_surface(
+    world: &mut SurfaceWorld,
+    route: &str,
+    public: bool,
+) {
+    let payload = crate::steps::when::build_new_surface_payload(world, route, public).await;
+    crate::steps::when::create_surface(world, payload).await;
+
+    assert_surface_setup_created(world, "new surface setup");
+    match world
+        .surface_config
+        .surface_name
+        .clone()
+    {
+        Some(surface_name) => remember_named_surface_under_test_id(world, &surface_name),
+        None => remember_surface_under_test_id(world),
+    }
+}
+
 #[given(expr = "the operator has attempted to create a surface for route {string} with invalid configuration")]
 async fn operator_has_attempted_invalid_surface_create(
     world: &mut SurfaceWorld,
