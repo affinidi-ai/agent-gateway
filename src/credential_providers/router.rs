@@ -16,12 +16,20 @@ pub fn create_credential_providers_router(
     oauth_callback_route: String,
     guard: Option<RbacGuard>,
     identity_strategies: Option<Arc<dyn crate::jwt_bearer::JwtVerificationStrategyStorage>>,
+    surfaces: Option<Arc<dyn crate::surfaces::AgentSurfaceStore>>,
+    vault: Option<Arc<dyn crate::delegation_vault::storage::DelegationVaultStorage>>,
+    resource_origins: std::collections::HashMap<String, Vec<String>>,
 ) -> Router {
     let state = handlers::CredentialProviderState {
         store,
         secrets_store,
         identity_strategies,
         oauth_callback_route,
+        issuer_metadata: super::external::strict_issuer_metadata(),
+        surfaces,
+        vault,
+        egress_allowlist: crate::egress::bdd_egress_allowlist(),
+        resource_origins: Arc::new(resource_origins),
     };
     let gate = guard.as_ref();
     Router::new()

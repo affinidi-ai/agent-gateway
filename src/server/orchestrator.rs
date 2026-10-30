@@ -1345,6 +1345,7 @@ pub async fn run_axum_proxy(
             certificate_store: None,
             jwt_verification_strategy_store: None,
             credential_provider_store: None,
+            delegation_vault_store: None,
             sts_client_store: None,
             resolved_surface_cache: resolved_surface_cache.clone(),
             surface_reload_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -1702,6 +1703,18 @@ pub async fn run_axum_proxy(
                     None
                 }
             };
+        crate::egress::warn_when_vendor_clients_ignore_a_proxy(|name| std::env::var(name).ok());
+        let invalid_resource_origins = crate::credential_providers::external::invalid_resource_origin_entries(
+            &network_config.external_consent_resource_origins,
+        );
+        if !invalid_resource_origins.is_empty() {
+            error!(
+                target: "credential_delegation",
+                entries = ?invalid_resource_origins,
+                "external_consent_resource_origins in gateway.json names entries that are not plain https origins \
+                 (each must be an exact origin, with no wildcard, path or userinfo); they permit nothing"
+            );
+        }
 
         if let Some(config) = bootstrap_config
             .mcp
@@ -2186,6 +2199,9 @@ pub async fn run_axum_proxy(
         identity_state.credential_provider_store = credential_provider_store
             .clone()
             .map(|store| store as Arc<dyn crate::credential_providers::storage::CredentialProviderStorage>);
+        identity_state.delegation_vault_store = delegation_vault_store
+            .clone()
+            .map(|store| store as Arc<dyn crate::delegation_vault::storage::DelegationVaultStorage>);
         identity_state.sts_client_store = sts_client_store.clone();
 
         // Initialize gateway-level OPA policy manager
@@ -3368,6 +3384,14 @@ pub async fn run_axum_proxy(
                     .clone(),
                 vault_rbac_guard.clone(),
                 Some(source_auth_middleware.provider_store()),
+                identity_state
+                    .agent_surface_store
+                    .clone()
+                    .map(|store| store as Arc<dyn crate::surfaces::AgentSurfaceStore>),
+                Some(dv_store.clone()),
+                network_config
+                    .external_consent_resource_origins
+                    .clone(),
             );
 
             let dv_state = crate::delegation_vault::handlers::DelegationVaultState {

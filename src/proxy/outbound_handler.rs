@@ -403,6 +403,10 @@ pub struct OutboundPipelineContext {
     /// managed agent's headers and sent after the agent's headers are filtered, in
     /// place of any agent header of the same name.
     pub delegated_credential_headers: HeaderMap,
+    /// The only origin a request carrying a grant by binding may be sent to: its
+    /// provider's `resource`. Set when such a grant is injected; the forward then
+    /// goes through Strict pinned egress to that origin only, never over Fabric.
+    pub grant_destination: Option<url::Origin>,
     /// Request path (used to build target URL).
     pub request_path: String,
     /// Protected agent identity resolved by `step_resolve_agent_identity`.
@@ -667,6 +671,7 @@ impl OutboundPipelineContext {
             original_method,
             original_headers,
             delegated_credential_headers: HeaderMap::new(),
+            grant_destination: None,
             request_path,
             resolved_identity: ProtectedAgentIdentity::Anonymous,
             protocol: None,
@@ -4565,13 +4570,20 @@ async fn step_inject_credentials(
     let mut outbound_creds = ctx
         .surface
         .transit_point_outbound_credentials(&ctx.virtual_channel);
-    if !outbound_creds.is_empty()
+    let external = ctx
+        .surface
+        .transit_point_external_credentials(&ctx.virtual_channel)
+        .cloned();
+    if (!outbound_creds.is_empty() || external.is_some())
         && ctx
             .virtual_channel
             .withholds_delegated_credentials()
     {
         log_fabric_delegation_withheld(ctx);
         return Ok(());
+    }
+    if let Some(binding) = external.as_ref() {
+        step_inject_external_grant(state, ctx, binding).await?;
     }
     if let Some(prepared) = ctx.modern_delegation.as_ref() {
         outbound_creds.retain(|binding| {
@@ -4758,73 +4770,246 @@ async fn step_inject_credentials(
 
     for resolution in &results {
         if let crate::proxy::credential_delegation::DelegationLookupResult::Inject(injections) = &resolution.result {
-            for injection in injections {
-                match injection {
-                    crate::proxy::credential_delegation::ResolvedCredentialInjection::McpMeta { field, value } => {
-                        let Some(body_bytes) = ctx.body_bytes.as_ref() else {
-                            warn!(
-                                target: "credential_delegation",
-                                request_id = %ctx.request_id,
-                                surface_variant = surface_variant.as_deref(),
-                                meta_field = %field,
-                                "Failed to inject delegated credential into outbound MCP metadata because body is unavailable"
-                            );
-                            return Err(OutboundPipelineError::MetadataInjectionFailed);
-                        };
-                        match crate::proxy::credential_delegation::inject_delegated_credential_into_mcp_meta(
-                            body_bytes, field, value,
-                        ) {
-                            Ok(modified) => {
-                                ctx.body_bytes = Some(modified.into());
-                                debug!(
-                                    target: "credential_delegation",
-                                    request_id = %ctx.request_id,
-                                    surface_variant = surface_variant.as_deref(),
-                                    meta_field = %field,
-                                    "Injecting delegated credential into outbound MCP metadata"
-                                );
-                            }
-                            Err(error) => {
-                                warn!(
-                                    target: "credential_delegation",
-                                    request_id = %ctx.request_id,
-                                    surface_variant = surface_variant.as_deref(),
-                                    meta_field = %field,
-                                    error = %error,
-                                    "Failed to inject delegated credential into outbound MCP metadata"
-                                );
-                                return Err(OutboundPipelineError::MetadataInjectionFailed);
-                            }
-                        }
-                    }
-                    crate::proxy::credential_delegation::ResolvedCredentialInjection::Header { name, value } => {
+            apply_credential_injections(ctx, injections)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Put resolved delegated credentials into the outbound request: headers into
+/// the delegated credential headers, `_meta` values into the MCP body.
+fn apply_credential_injections(
+    ctx: &mut OutboundPipelineContext,
+    injections: &[crate::proxy::credential_delegation::ResolvedCredentialInjection],
+) -> Result<(), OutboundPipelineError> {
+    let surface_variant = crate::observability::policy_audit::current_request_variant();
+    for injection in injections {
+        match injection {
+            crate::proxy::credential_delegation::ResolvedCredentialInjection::McpMeta { field, value } => {
+                let Some(body_bytes) = ctx.body_bytes.as_ref() else {
+                    warn!(
+                        target: "credential_delegation",
+                        request_id = %ctx.request_id,
+                        surface_variant = surface_variant.as_deref(),
+                        meta_field = %field,
+                        "Failed to inject delegated credential into outbound MCP metadata because body is unavailable"
+                    );
+                    return Err(OutboundPipelineError::MetadataInjectionFailed);
+                };
+                match crate::proxy::credential_delegation::inject_delegated_credential_into_mcp_meta(
+                    body_bytes, field, value,
+                ) {
+                    Ok(modified) => {
+                        ctx.body_bytes = Some(modified.into());
                         debug!(
                             target: "credential_delegation",
                             request_id = %ctx.request_id,
                             surface_variant = surface_variant.as_deref(),
-                            header = %name,
-                            "Injecting delegated credential header into outbound request"
+                            meta_field = %field,
+                            "Injecting delegated credential into outbound MCP metadata"
                         );
-                        let (Ok(header_name), Ok(header_value)) = (
-                            name.parse::<axum::http::header::HeaderName>(),
-                            value.parse::<axum::http::header::HeaderValue>(),
-                        ) else {
-                            warn!(
-                                target: "credential_delegation",
-                                request_id = %ctx.request_id,
-                                header = %name,
-                                "Delegated credential is not a valid header - refusing the request"
-                            );
-                            return Err(refuse_delegation(ctx, DelegationRefusal::Unavailable));
-                        };
-                        ctx.delegated_credential_headers
-                            .insert(header_name, header_value);
+                    }
+                    Err(error) => {
+                        warn!(
+                            target: "credential_delegation",
+                            request_id = %ctx.request_id,
+                            surface_variant = surface_variant.as_deref(),
+                            meta_field = %field,
+                            error = %error,
+                            "Failed to inject delegated credential into outbound MCP metadata"
+                        );
+                        return Err(OutboundPipelineError::MetadataInjectionFailed);
                     }
                 }
             }
+            crate::proxy::credential_delegation::ResolvedCredentialInjection::Header { name, value } => {
+                debug!(
+                    target: "credential_delegation",
+                    request_id = %ctx.request_id,
+                    surface_variant = surface_variant.as_deref(),
+                    header = %name,
+                    "Injecting delegated credential header into outbound request"
+                );
+                let (Ok(header_name), Ok(header_value)) =
+                    (name.parse::<axum::http::header::HeaderName>(), value.parse::<axum::http::header::HeaderValue>())
+                else {
+                    warn!(
+                        target: "credential_delegation",
+                        request_id = %ctx.request_id,
+                        surface_variant = surface_variant.as_deref(),
+                        header = %name,
+                        "Delegated credential is not a valid header - refusing the request"
+                    );
+                    return Err(refuse_delegation(ctx, DelegationRefusal::Unavailable));
+                };
+                ctx.delegated_credential_headers
+                    .insert(header_name, header_value);
+            }
         }
     }
+    Ok(())
+}
 
+/// Refuse a Transit Point request whose `consent_mode = external` grant
+/// cannot be released, logging why.
+fn refuse_external_grant(
+    ctx: &OutboundPipelineContext,
+    refusal: DelegationRefusal,
+    reason: &'static str,
+) -> OutboundPipelineError {
+    warn!(
+        target: "credential_delegation",
+        request_id = %ctx.request_id,
+        surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
+        reason,
+        "The Transit Point's grant by binding cannot be released - refusing the request"
+    );
+    refuse_delegation(ctx, refusal)
+}
+
+/// [11a] A Transit Point's `consent_mode = external` binding: release the
+/// grant kept for this binding and principal, keyed by the surface's tenant,
+/// the surface, this Transit Point's id, the provider and the principal
+/// (`owner`, or the caller [`delegation_caller_hash`] names). No managed agent
+/// identity is needed, and no authorization URL is ever built: a call with no
+/// releasable grant is refused before it is forwarded. Like every delegated
+/// credential, the grant is released only for a request whose caller is
+/// identified, whichever account it is.
+async fn step_inject_external_grant(
+    state: &OutboundProxyState,
+    ctx: &mut OutboundPipelineContext,
+    binding: &crate::config::agent_surface::TransitCredentials,
+) -> Result<(), OutboundPipelineError> {
+    use crate::config::agent_surface::GrantSubject;
+    use crate::delegation_vault::grants::GrantKey;
+
+    let (Some(vault), Some(providers)) = (&state.delegation_vault_store, &state.credential_provider_store) else {
+        return Err(refuse_external_grant(ctx, DelegationRefusal::Unavailable, "stores_unavailable"));
+    };
+    if !ctx
+        .surface
+        .outbound_credentials
+        .is_empty()
+    {
+        return Err(refuse_external_grant(ctx, DelegationRefusal::Unavailable, "surface_outbound_credentials"));
+    }
+    let Some(caller) = delegation_caller_hash(ctx) else {
+        return Err(refuse_external_grant(ctx, DelegationRefusal::CallerIdentityMissing, "caller_not_identified"));
+    };
+    let provider = match providers
+        .get(&binding.credential_provider_id)
+        .await
+    {
+        Ok(Some(provider)) => provider,
+        Ok(None) | Err(_) => {
+            return Err(refuse_external_grant(ctx, DelegationRefusal::Unavailable, "provider_unavailable"));
+        }
+    };
+    if !provider.is_external_consent() {
+        return Err(refuse_external_grant(ctx, DelegationRefusal::Unavailable, "provider_without_issuer"));
+    }
+    if provider.tenant_id != ctx.surface.tenant_id {
+        return Err(refuse_external_grant(ctx, DelegationRefusal::Unavailable, "provider_of_another_tenant"));
+    }
+    let Ok(destination) = crate::credential_providers::external::check_grant_destination(
+        &provider,
+        &ctx.virtual_channel
+            .target_endpoint,
+        state
+            .egress_allowlist
+            .as_deref(),
+    )
+    .await
+    else {
+        return Err(refuse_external_grant(ctx, DelegationRefusal::Unavailable, "destination_not_the_resource"));
+    };
+    if !crate::credential_providers::external::resource_permitted(
+        &provider,
+        &state
+            .network_config
+            .external_consent_resource_origins,
+    ) {
+        return Err(refuse_external_grant(ctx, DelegationRefusal::Unavailable, "resource_not_permitted_for_issuer"));
+    }
+    let surface = ctx.surface.clone();
+    let tenant = surface.tenant_id.as_deref();
+    let surface_id = surface.surface_id.as_str();
+    let hop = ctx.virtual_channel.id.clone();
+    let hop = hop.as_str();
+    if hop.is_empty() {
+        return Err(refuse_external_grant(ctx, DelegationRefusal::Unavailable, "transit_point_without_id"));
+    }
+    let key = match binding.subject {
+        Some(GrantSubject::Owner) => GrantKey::owner(tenant, surface_id, hop, &provider.id),
+        Some(GrantSubject::Caller) => match GrantKey::caller(tenant, surface_id, hop, &provider.id, &caller) {
+            Some(key) => key,
+            None => {
+                return Err(refuse_external_grant(ctx, DelegationRefusal::Unavailable, "caller_without_identity_hash"));
+            }
+        },
+        None => return Err(refuse_external_grant(ctx, DelegationRefusal::Unavailable, "no_subject")),
+    };
+    let grant = match vault.grant(&key).await {
+        Ok(Some(grant)) => grant,
+        Ok(None) => return Err(refuse_external_grant(ctx, DelegationRefusal::Unavailable, "no_grant")),
+        Err(error) => {
+            let reason = if error.is::<crate::delegation_vault::grants::EncryptionRequired>() {
+                "encryption_required"
+            } else if error.is::<crate::delegation_vault::grants::EphemeralPepper>() {
+                "identity_hash_pepper_ephemeral"
+            } else if error.is::<crate::delegation_vault::grants::PepperMismatch>() {
+                "identity_hash_pepper_mismatch"
+            } else {
+                "vault_unavailable"
+            };
+            return Err(refuse_external_grant(ctx, DelegationRefusal::Unavailable, reason));
+        }
+    };
+    if grant.is_expired() {
+        return Err(refuse_external_grant(ctx, DelegationRefusal::Unavailable, "grant_expired"));
+    }
+    let injections = crate::proxy::credential_delegation::build_injection_headers(
+        &binding
+            .inject_as
+            .to_binding_injection(),
+        &grant.access_token,
+    );
+    ctx.grant_destination = Some(destination);
+    apply_credential_injections(ctx, &injections)?;
+    if let Err(error) = vault
+        .mark_grant_used(&grant.id)
+        .await
+    {
+        debug!(
+            target: "credential_delegation",
+            request_id = %ctx.request_id,
+            surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
+            error = %error,
+            "Failed to record a grant's use"
+        );
+    }
+    crate::delegation_vault::audit::emit("token_injected", || {
+        let mut event = crate::delegation_vault::audit::audit_event(
+            crate::delegation_vault::audit::DelegationAuditAction::TokenInjected,
+            None,
+            Some(&caller),
+            Some(&provider.id),
+            Some(surface_id),
+        );
+        event.token_id = Some(grant.id.clone());
+        event.provider_name = Some(provider.name.clone());
+        event.scopes = Some(grant.scopes.clone());
+        event.detail = Some(
+            match binding.subject {
+                Some(GrantSubject::Owner) => "grant_by_binding:owner",
+                _ => "grant_by_binding:caller",
+            }
+            .to_string(),
+        );
+        event.caller = outbound_caller(ctx);
+        event
+    });
     Ok(())
 }
 
@@ -4858,11 +5043,50 @@ async fn step_forward_request(
         .target_endpoint
         .starts_with("fabric://")
     {
+        if ctx
+            .grant_destination
+            .is_some()
+        {
+            return Err(refuse_external_grant(ctx, DelegationRefusal::Unavailable, "forward_over_fabric"));
+        }
         return step_forward_request_fabric(state, ctx).await;
     }
 
     let response = step_forward_request_http(state, ctx).await?;
     Ok(UpstreamResponse::Http(response))
+}
+
+/// The client a request carrying a grant by binding is sent with: to the
+/// grant's origin only, through Strict, `https`-only egress pinned to the vetted
+/// addresses, with redirects refused.
+async fn grant_forward_client(
+    state: &OutboundProxyState,
+    ctx: &mut OutboundPipelineContext,
+    target_url: &str,
+    destination: &url::Origin,
+    timeout: std::time::Duration,
+) -> Result<reqwest::Client, OutboundPipelineError> {
+    if !url::Url::parse(target_url).is_ok_and(|url| url.origin() == *destination) {
+        return Err(refuse_external_grant(ctx, DelegationRefusal::Unavailable, "forward_outside_the_grants_origin"));
+    }
+    crate::egress::pinned_vendor_client(
+        target_url,
+        timeout,
+        state
+            .egress_allowlist
+            .as_deref(),
+    )
+    .await
+    .map_err(|error| {
+        warn!(
+            target: "credential_delegation",
+            request_id = %ctx.request_id,
+            surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
+            error = ?error.to_string(),
+            "The target of a request carrying a grant by binding was refused by Strict egress"
+        );
+        refuse_external_grant(ctx, DelegationRefusal::Unavailable, "forward_refused_by_strict_egress")
+    })
 }
 
 /// The headers a Fabric forward carries, built by [`transit_request_headers`]:
@@ -5086,10 +5310,13 @@ async fn step_forward_request_http(
     // window between vetting and connect and returning an upstream 3xx to the
     // caller rather than following it to an unvetted `Location`. Loopback and
     // RFC 1918 stay allowed on purpose — a transit point legitimately targets a
-    // localhost sidecar or same-VPC host.
+    // localhost sidecar or same-VPC host. A request carrying a grant by binding
+    // is held to its grant's origin under the Strict policy instead.
     let candidate = target_url.clone();
     let forward_timeout = resolve_outbound_timeout(ctx);
-    let forward_client =
+    let forward_client = if let Some(destination) = ctx.grant_destination.clone() {
+        grant_forward_client(state, ctx, &target_url, &destination, forward_timeout).await?
+    } else {
         match tokio::task::spawn_blocking(move || crate::egress::pinned_forward_client(&candidate, forward_timeout))
             .await
         {
@@ -5112,7 +5339,8 @@ async fn step_forward_request_http(
                 );
                 return Err(OutboundPipelineError::TargetAuthUnavailable);
             }
-        };
+        }
+    };
 
     debug!(
         request_id = %ctx.request_id,
@@ -6287,6 +6515,7 @@ mod tests {
             original_method: Method::POST,
             original_headers: HeaderMap::new(),
             delegated_credential_headers: HeaderMap::new(),
+            grant_destination: None,
             request_path: "/outbound/surfaces/order/partner-a/message/send".to_string(),
             resolved_identity: ProtectedAgentIdentity::Anonymous,
             protocol: None,
@@ -6350,6 +6579,7 @@ mod tests {
             gateway_base_url: None,
             task_monitor: None,
             max_response_bytes: crate::config::A2aConfig::default().max_body_size,
+            egress_allowlist: None,
             vc_alias_override: None,
         }
     }
@@ -14261,6 +14491,762 @@ mod tests {
             ),
             "{refused:?}"
         );
+    }
+
+    /// The stores of a gateway whose vault keeps grants by binding: at-rest
+    /// encryption on (when asked), an external consent provider per tenant,
+    /// and an agent-keyed provider.
+    async fn external_grant_state(
+        directory: &std::path::Path,
+        encrypted: bool,
+    ) -> OutboundProxyState {
+        use crate::credential_providers::storage::{CredentialProviderStorage, FileSystemCredentialProviderStore};
+        if encrypted {
+            unsafe {
+                std::env::set_var("EXTERNAL_GRANT_TEST_MASTER_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+            }
+            crate::storage::filesystem::init_global_encryption(crate::config::EncryptionConfig {
+                enabled: true,
+                key_env_var: "EXTERNAL_GRANT_TEST_MASTER_KEY".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        crate::identity::credential_identity::configure_pepper_for_tests(true);
+        let providers = Arc::new(
+            FileSystemCredentialProviderStore::new(directory.join("providers"))
+                .await
+                .unwrap(),
+        );
+        for (id, tenant, issuer, resource) in [
+            ("vendor", None, Some("https://vendor.example"), Some("https://vendor.example/mcp")),
+            ("vendor-tenant-b", Some("tenant-b"), Some("https://vendor.example"), Some("https://vendor.example/mcp")),
+            ("vendor-private", None, Some("https://10.0.0.5"), Some("https://10.0.0.5/mcp")),
+            ("vendor-elsewhere", None, Some("https://auth.vendor.example"), Some("https://vendor.example/mcp")),
+            ("agent-keyed", None, None, None),
+        ] {
+            providers
+                .create(
+                    serde_json::from_value(json!({
+                        "id": id, "tenant_id": tenant, "name": id, "provider_id": id, "issuer": issuer,
+                        "resource": resource,
+                        "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        let mut state = test_outbound_state();
+        state.credential_provider_store = Some(providers);
+        state.delegation_vault_store = Some(Arc::new(
+            crate::delegation_vault::storage::FileSystemDelegationVaultStore::new(directory.join("vault"))
+                .await
+                .unwrap(),
+        ));
+        state.secrets_store = Some(Arc::new(
+            crate::secrets::FilesystemSecretsStore::new(
+                directory
+                    .join("secrets")
+                    .to_str()
+                    .unwrap(),
+            )
+            .unwrap(),
+        ));
+        state.gateway_base_url = Some("https://gateway.example".into());
+        state
+    }
+
+    const VENDOR_HOP: &str = "vendor-transit-point";
+
+    /// A Transit Point to a vendor, with no managed identity, whose binding
+    /// asks for external consent.
+    fn vendor_transit_point(
+        id: &str,
+        provider: &str,
+        subject: &str,
+    ) -> serde_json::Value {
+        json!({"id": id, "alias": format!("{id}-alias"), "target_endpoint": "https://vendor.example/mcp",
+            "require_transit_token": true,
+            "transit_credentials": {"credential_provider_id": provider, "consent_mode": "external",
+                "subject": subject, "scopes": ["read"]}})
+    }
+
+    fn external_grant_context(
+        surface: &crate::config::agent_surface::AgentSurface,
+        hop: &str,
+        caller_hash: Option<&str>,
+    ) -> OutboundPipelineContext {
+        external_grant_variant_context(surface, None, hop, caller_hash)
+    }
+
+    fn external_grant_variant_context(
+        surface: &crate::config::agent_surface::AgentSurface,
+        variant: Option<&str>,
+        hop: &str,
+        caller_hash: Option<&str>,
+    ) -> OutboundPipelineContext {
+        let resolved = Arc::new(
+            surface
+                .resolve_variant(variant)
+                .unwrap(),
+        );
+        let point = resolved
+            .transit_points()
+            .iter()
+            .find(|point| point.id == hop)
+            .cloned()
+            .unwrap();
+        let mut ctx = legacy_delegation_context(resolved, point);
+        ctx.resolved_identity = ProtectedAgentIdentity::Anonymous;
+        ctx.transit_token_claims = caller_hash.map(|hash| {
+            serde_json::from_value(json!({"iss": "https://gateway.example", "surface_id": "transit-fabric",
+                "iat": 0, "exp": u64::MAX, "jti": "jti", "user_identity_hash": hash}))
+            .unwrap()
+        });
+        ctx
+    }
+
+    async fn store_grant(
+        state: &OutboundProxyState,
+        key: crate::delegation_vault::grants::GrantKey,
+        access_token: &str,
+        expires_in_secs: i64,
+    ) {
+        let mut grant = crate::delegation_vault::grants::tests::grant(&key, access_token);
+        grant.expires_at = Some(chrono::Utc::now() + chrono::Duration::seconds(expires_in_secs));
+        state
+            .delegation_vault_store
+            .as_ref()
+            .unwrap()
+            .store_grant(grant)
+            .await
+            .unwrap();
+    }
+
+    fn bearer(ctx: &OutboundPipelineContext) -> Option<String> {
+        ctx.delegated_credential_headers
+            .get(axum::http::header::AUTHORIZATION)
+            .map(|value| {
+                value
+                    .to_str()
+                    .unwrap()
+                    .to_string()
+            })
+    }
+
+    /// A grant is released only while its provider's resource is permitted for
+    /// its issuer: a resource off the issuer's host needs the operator's entry
+    /// in gateway.json, and once the entry is removed the grant is refused and
+    /// the log says why.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grant_is_released_only_while_its_resource_is_permitted_for_its_issuer() {
+        use crate::component_tests::helpers::formatted_logs::FormattedLogs;
+        use crate::delegation_vault::grants::GrantKey;
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = external_grant_state(directory.path(), true).await;
+        let surface =
+            transit_surface(json!([vendor_transit_point(VENDOR_HOP, "vendor-elsewhere", "owner")]), json!([]));
+        store_grant(&state, GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "vendor-elsewhere"), "access", 3600)
+            .await;
+        let caller = "a".repeat(64);
+
+        let logs = FormattedLogs::capture();
+        let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&caller));
+        assert!(
+            step_inject_credentials(&state, &mut ctx)
+                .await
+                .is_err()
+        );
+        assert_eq!(bearer(&ctx), None);
+        let text = logs.text();
+        assert!(text.contains("resource_not_permitted_for_issuer"), "{text}");
+
+        Arc::make_mut(&mut state.network_config).external_consent_resource_origins =
+            std::collections::HashMap::from([(
+                "https://auth.vendor.example".to_string(),
+                vec!["https://vendor.example".to_string()],
+            )]);
+        let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&caller));
+        step_inject_credentials(&state, &mut ctx)
+            .await
+            .expect("the operator's entry permits the resource");
+        assert_eq!(bearer(&ctx).as_deref(), Some("Bearer access"));
+    }
+
+    /// An owner grant is released, for a caller the transit token names, on
+    /// its own Transit Point only, without any managed agent identity.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_owner_grant_is_released_on_its_own_transit_point_without_an_agent_identity() {
+        use crate::delegation_vault::grants::GrantKey;
+        let directory = tempfile::tempdir().unwrap();
+        let state = external_grant_state(directory.path(), true).await;
+        let surface = transit_surface(
+            json!([
+                vendor_transit_point(VENDOR_HOP, "vendor", "owner"),
+                vendor_transit_point("other-hop", "vendor", "owner")
+            ]),
+            json!([]),
+        );
+        store_grant(&state, GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "vendor"), "owner-access", 3600).await;
+        let caller = "a".repeat(64);
+
+        let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&caller));
+        step_inject_credentials(&state, &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(bearer(&ctx).as_deref(), Some("Bearer owner-access"));
+
+        let mut other_hop = external_grant_context(&surface, "other-hop", Some(&caller));
+        let refused = step_inject_credentials(&state, &mut other_hop)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                OutboundPipelineError::DelegationRefused {
+                    refusal: DelegationRefusal::Unavailable,
+                    ..
+                }
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(bearer(&other_hop), None, "another Transit Point of the surface never gets the grant");
+
+        let mut anonymous = external_grant_context(&surface, VENDOR_HOP, None);
+        let refused = step_inject_credentials(&state, &mut anonymous)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                OutboundPipelineError::DelegationRefused {
+                    refusal: DelegationRefusal::CallerIdentityMissing,
+                    ..
+                }
+            ),
+            "a call that names no caller never acts as the owner: {refused:?}"
+        );
+        assert_eq!(bearer(&anonymous), None);
+    }
+
+    /// A caller grant is released only to the caller it was made for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_caller_grant_is_released_only_to_its_caller() {
+        use crate::delegation_vault::grants::GrantKey;
+        let directory = tempfile::tempdir().unwrap();
+        let state = external_grant_state(directory.path(), true).await;
+        let surface = transit_surface(json!([vendor_transit_point(VENDOR_HOP, "vendor", "caller")]), json!([]));
+        let alice = "a".repeat(64);
+        let bob = "b".repeat(64);
+        store_grant(
+            &state,
+            GrantKey::caller(None, "transit-fabric", VENDOR_HOP, "vendor", &alice).unwrap(),
+            "alice-access",
+            3600,
+        )
+        .await;
+        store_grant(&state, GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "vendor"), "owner-access", 3600).await;
+
+        let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&alice));
+        step_inject_credentials(&state, &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(bearer(&ctx).as_deref(), Some("Bearer alice-access"));
+
+        for (case, caller) in
+            [("another caller", bob.as_str()), ("a caller named without an identity hash", "sha256:user")]
+        {
+            let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(caller));
+            assert!(
+                step_inject_credentials(&state, &mut ctx)
+                    .await
+                    .is_err(),
+                "{case}"
+            );
+            assert_eq!(bearer(&ctx), None, "{case} gets neither alice's nor the owner's grant");
+        }
+    }
+
+    /// Every case a grant by binding cannot be released is refused before the
+    /// request is forwarded, and none falls back to an agent-keyed token.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grant_by_binding_that_cannot_be_released_refuses_the_call() {
+        use crate::delegation_vault::grants::GrantKey;
+        let directory = tempfile::tempdir().unwrap();
+        let state = external_grant_state(directory.path(), true).await;
+        let caller = "a".repeat(64);
+        store_grant(&state, GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "vendor"), "owner-access", -60).await;
+        for provider in ["vendor-tenant-b", "agent-keyed"] {
+            store_grant(&state, GrantKey::owner(None, "transit-fabric", VENDOR_HOP, provider), "owner-access", 3600)
+                .await;
+        }
+
+        let expired = transit_surface(json!([vendor_transit_point(VENDOR_HOP, "vendor", "owner")]), json!([]));
+        let another_tenants =
+            transit_surface(json!([vendor_transit_point(VENDOR_HOP, "vendor-tenant-b", "owner")]), json!([]));
+        let without_issuer =
+            transit_surface(json!([vendor_transit_point(VENDOR_HOP, "agent-keyed", "owner")]), json!([]));
+        let mut with_outbound_credentials =
+            transit_surface(json!([vendor_transit_point(VENDOR_HOP, "vendor", "owner")]), json!([]));
+        with_outbound_credentials.outbound_credentials =
+            serde_json::from_value(json!([{"credential_provider_id": "agent-keyed"}])).unwrap();
+        let mut without_subject = vendor_transit_point(VENDOR_HOP, "vendor", "owner");
+        without_subject["transit_credentials"]
+            .as_object_mut()
+            .unwrap()
+            .remove("subject");
+        let without_subject = transit_surface(json!([without_subject]), json!([]));
+
+        for (case, surface) in [
+            ("an expired grant", expired),
+            ("another tenant's provider", another_tenants),
+            ("a provider without an issuer", without_issuer),
+            ("a surface with outbound_credentials", with_outbound_credentials),
+            ("a binding without a subject", without_subject),
+        ] {
+            let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&caller));
+            let refused = step_inject_credentials(&state, &mut ctx)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    refused,
+                    OutboundPipelineError::DelegationRefused {
+                        refusal: DelegationRefusal::Unavailable,
+                        ..
+                    }
+                ),
+                "{case}: {refused:?}"
+            );
+            assert_eq!(bearer(&ctx), None, "{case}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grant_by_binding_is_never_read_without_at_rest_encryption() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = external_grant_state(directory.path(), false).await;
+        let surface = transit_surface(json!([vendor_transit_point(VENDOR_HOP, "vendor", "owner")]), json!([]));
+        let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&"a".repeat(64)));
+        let refused = step_inject_credentials(&state, &mut ctx)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                OutboundPipelineError::DelegationRefused {
+                    refusal: DelegationRefusal::Unavailable,
+                    ..
+                }
+            ),
+            "{refused:?}"
+        );
+    }
+
+    /// An agent-keyed binding never releases a token for a provider with an
+    /// issuer, so such a provider's grants are reached only by binding.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_agent_keyed_binding_refuses_a_provider_with_an_issuer() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = external_grant_state(directory.path(), true).await;
+        let surface = transit_surface(
+            json!([meta_transit_point("partner", "https://partner.example/mcp", false, Some("vendor"))]),
+            json!([]),
+        );
+        state
+            .delegation_vault_store
+            .as_ref()
+            .unwrap()
+            .store(
+                serde_json::from_value(json!({
+                    "id": "vendor-token", "agent_did": "did:web:agent.example",
+                    "user_identity_hash": "sha256:user", "credential_provider_id": "vendor",
+                    "provider_id": "vendor", "access_token": "agent-keyed-access", "scopes": ["read"],
+                    "expires_at": chrono::Utc::now() + chrono::Duration::hours(1),
+                    "consent_granted_at": "2026-09-01T00:00:00Z",
+                    "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (resolved, point) = resolved_transit_point(&surface, None, "partner");
+        let mut ctx = legacy_delegation_context(resolved, point);
+        let refused = step_inject_credentials(&state, &mut ctx)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                OutboundPipelineError::DelegationRefused {
+                    refusal: DelegationRefusal::Unavailable,
+                    ..
+                }
+            ),
+            "{refused:?}"
+        );
+        assert!(
+            !String::from_utf8_lossy(
+                ctx.body_bytes
+                    .as_deref()
+                    .unwrap()
+            )
+            .contains("agent-keyed-access")
+        );
+    }
+
+    /// At the wire: the vendor receives the grant of its own binding in place
+    /// of the `Authorization` the agent sent, and a Transit Point of the same
+    /// surface with no grant of its own never calls its target.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_vendor_receives_only_its_bindings_grant_in_place_of_the_agents_authorization() {
+        use crate::delegation_vault::grants::GrantKey;
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = external_grant_state(directory.path(), true).await;
+        let target = crate::component_tests::helpers::RecordingTarget::start(StatusCode::OK, &[]).await;
+        state
+            .credential_provider_store
+            .as_ref()
+            .unwrap()
+            .create(
+                serde_json::from_value(json!({
+                    "id": "vendor-fixture", "name": "vendor-fixture", "provider_id": "vendor-fixture",
+                    "issuer": url::Url::parse(&target.url).unwrap().origin().ascii_serialization(),
+                    "resource": target.url,
+                    "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        state.egress_allowlist = Some(
+            url::Url::parse(&target.url)
+                .unwrap()
+                .origin()
+                .ascii_serialization(),
+        );
+        let point = |id: &str| {
+            let mut point = vendor_transit_point(id, "vendor-fixture", "owner");
+            point["target_endpoint"] = json!(target.url);
+            point
+        };
+        let surface = transit_surface(json!([point(VENDOR_HOP), point("unconnected-hop")]), json!([]));
+        store_grant(
+            &state,
+            GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "vendor-fixture"),
+            "vendor-access",
+            3600,
+        )
+        .await;
+        let caller = "a".repeat(64);
+
+        let mut ctx = with_agent_supplied_credentials(external_grant_context(&surface, VENDOR_HOP, Some(&caller)));
+        step_inject_credentials(&state, &mut ctx)
+            .await
+            .unwrap();
+        step_forward_request(&state, &mut ctx)
+            .await
+            .unwrap();
+        let received = target.received();
+        assert_eq!(received.len(), 1);
+        assert_eq!(header_values(&received[0], "authorization"), vec!["Bearer vendor-access"]);
+        assert!(!format!("{:?}", received[0]).contains("agent-supplied-token"), "{:?}", received[0]);
+
+        let mut unconnected =
+            with_agent_supplied_credentials(external_grant_context(&surface, "unconnected-hop", Some(&caller)));
+        assert!(
+            step_inject_credentials(&state, &mut unconnected)
+                .await
+                .is_err()
+        );
+        assert_eq!(target.received().len(), 1, "the refused call never reaches the target");
+
+        state.egress_allowlist = None;
+        let mut unlisted = with_agent_supplied_credentials(external_grant_context(&surface, VENDOR_HOP, Some(&caller)));
+        assert!(
+            step_inject_credentials(&state, &mut unlisted)
+                .await
+                .is_err(),
+            "an http loopback target is a vendor only for the test allow-list"
+        );
+        assert_eq!(bearer(&unlisted), None);
+        assert_eq!(target.received().len(), 1);
+    }
+
+    /// A grant by binding goes only to its provider's `resource` origin over
+    /// public `https`: a Transit Point repointed elsewhere, a variant reusing
+    /// its id with another target, an `http` target, a private address and a
+    /// Fabric route never receive it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grant_by_binding_is_sent_only_to_its_providers_resource() {
+        use crate::delegation_vault::grants::GrantKey;
+        let directory = tempfile::tempdir().unwrap();
+        let state = external_grant_state(directory.path(), true).await;
+        let caller = "a".repeat(64);
+        for provider in ["vendor", "vendor-private"] {
+            store_grant(&state, GrantKey::owner(None, "transit-fabric", VENDOR_HOP, provider), "owner-access", 3600)
+                .await;
+        }
+        let at = |target: &str, provider: &str| {
+            let mut point = vendor_transit_point(VENDOR_HOP, provider, "owner");
+            point["target_endpoint"] = json!(target);
+            point
+        };
+        let reaches = transit_surface(json!([at("https://vendor.example/other", "vendor")]), json!([]));
+        let mut ctx = external_grant_context(&reaches, VENDOR_HOP, Some(&caller));
+        step_inject_credentials(&state, &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(bearer(&ctx).as_deref(), Some("Bearer owner-access"), "any path of the resource's origin");
+        assert_eq!(
+            ctx.grant_destination,
+            Some(
+                url::Url::parse("https://vendor.example")
+                    .unwrap()
+                    .origin()
+            )
+        );
+
+        let variant = transit_surface(
+            json!([at("https://vendor.example/mcp", "vendor")]),
+            json!([{"id": "v-1", "alias": "candidate", "name": "candidate", "enabled": true,
+                "overrides": {"transit": {"points": [at("https://attacker.example/mcp", "vendor")]}}}]),
+        );
+        let mut fabric = at("fabric://gateway-b/channel", "vendor");
+        let withheld = transit_surface(json!([fabric.clone()]), json!([]));
+        let mut ctx = external_grant_context(&withheld, VENDOR_HOP, Some(&caller));
+        step_inject_credentials(&state, &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(bearer(&ctx), None, "a Fabric route withholds delegated credentials");
+        fabric["fabric_delegated_credentials"] = json!(true);
+        for (case, surface, variant_alias) in [
+            (
+                "a repointed target",
+                transit_surface(json!([at("https://attacker.example/mcp", "vendor")]), json!([])),
+                None,
+            ),
+            ("a variant reusing the id", variant, Some("candidate")),
+            ("an http target", transit_surface(json!([at("http://vendor.example/mcp", "vendor")]), json!([])), None),
+            (
+                "a private address",
+                transit_surface(json!([at("https://10.0.0.5/mcp", "vendor-private")]), json!([])),
+                None,
+            ),
+            ("a Fabric route that sends delegated credentials", transit_surface(json!([fabric]), json!([])), None),
+        ] {
+            let mut ctx = external_grant_variant_context(&surface, variant_alias, VENDOR_HOP, Some(&caller));
+            let refused = step_inject_credentials(&state, &mut ctx)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{case} must be refused"));
+            assert!(
+                matches!(
+                    refused,
+                    OutboundPipelineError::DelegationRefused {
+                        refusal: DelegationRefusal::Unavailable,
+                        ..
+                    }
+                ),
+                "{case}: {refused:?}"
+            );
+            assert_eq!(bearer(&ctx), None, "{case}");
+            assert_eq!(ctx.grant_destination, None, "{case}");
+        }
+    }
+
+    /// The forward of a request that carries a grant by binding re-checks its
+    /// destination: only the grant's origin, through Strict pinned egress, and
+    /// never over Fabric.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_carrying_a_grant_is_forwarded_only_to_its_origin_through_strict_egress() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = external_grant_state(directory.path(), true).await;
+        let target = crate::component_tests::helpers::RecordingTarget::start(StatusCode::OK, &[]).await;
+        let origin = url::Url::parse(&target.url)
+            .unwrap()
+            .origin();
+        let at = |endpoint: &str| {
+            let mut point = vendor_transit_point(VENDOR_HOP, "vendor", "owner");
+            point["target_endpoint"] = json!(endpoint);
+            transit_surface(json!([point]), json!([]))
+        };
+        let carrying = |surface: &crate::config::agent_surface::AgentSurface, destination: url::Origin| {
+            let mut ctx = external_grant_context(surface, VENDOR_HOP, Some(&"a".repeat(64)));
+            ctx.delegated_credential_headers
+                .insert(
+                    axum::http::header::AUTHORIZATION,
+                    "Bearer owner-access"
+                        .parse()
+                        .unwrap(),
+                );
+            ctx.grant_destination = Some(destination);
+            ctx
+        };
+
+        let mut unlisted = carrying(&at(&target.url), origin.clone());
+        assert!(
+            step_forward_request(&state, &mut unlisted)
+                .await
+                .is_err(),
+            "a loopback http target is refused by Strict egress"
+        );
+        let mut elsewhere = carrying(
+            &at(&target.url),
+            url::Url::parse("https://vendor.example")
+                .unwrap()
+                .origin(),
+        );
+        let mut listed_state = state.clone();
+        listed_state.egress_allowlist = Some(origin.ascii_serialization());
+        assert!(
+            step_forward_request(&listed_state, &mut elsewhere)
+                .await
+                .is_err(),
+            "a target outside the grant's origin is refused"
+        );
+        let mut fabric = carrying(&at("fabric://gateway-b/channel"), origin.clone());
+        let refused = step_forward_request(&listed_state, &mut fabric)
+            .await
+            .err()
+            .expect("a grant never crosses Fabric");
+        assert!(
+            matches!(
+                refused,
+                OutboundPipelineError::DelegationRefused {
+                    refusal: DelegationRefusal::Unavailable,
+                    ..
+                }
+            ),
+            "refused before any Fabric forward: {refused:?}"
+        );
+        assert!(target.received().is_empty(), "no refused forward reaches the target");
+
+        let mut listed = carrying(&at(&target.url), origin);
+        step_forward_request(&listed_state, &mut listed)
+            .await
+            .unwrap();
+        assert_eq!(target.received().len(), 1);
+    }
+
+    /// Every `credential_delegation` line a Transit Point's delegated
+    /// credentials write while serving a request names the surface variant
+    /// that served it: the injection lines of an agent-keyed binding and of a
+    /// grant by binding, their refusals, a grant by binding that cannot be
+    /// released, an agent-keyed binding to a provider with an issuer, and a
+    /// forward that Strict egress refuses.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_delegated_credential_line_of_a_transit_point_names_the_request_variant() {
+        use crate::delegation_vault::grants::GrantKey;
+
+        /// Runs `run` as a request that variant `beta` served, returning its
+        /// result and the log lines it wrote.
+        async fn served_by_beta<T>(run: impl std::future::Future<Output = T>) -> (T, String) {
+            let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+            let result = crate::observability::policy_audit::in_request(
+                crate::observability::policy_audit::RequestScope::fresh(),
+                async {
+                    crate::observability::policy_audit::set_request_variant("beta");
+                    run.await
+                },
+            )
+            .await;
+            (result, logs.text())
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let state = external_grant_state(directory.path(), true).await;
+        let agent_keyed_directory = tempfile::tempdir().unwrap();
+        let agent_keyed_state = delegation_state(agent_keyed_directory.path(), &[("provider", "transit-access")]).await;
+        let caller = "a".repeat(64);
+        store_grant(&state, GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "vendor"), "owner-access", 3600).await;
+        store_grant(&state, GrantKey::owner(None, "transit-fabric", "unprintable", "vendor"), "owner\u{1}access", 3600)
+            .await;
+        let by_binding = transit_surface(
+            json!([
+                vendor_transit_point(VENDOR_HOP, "vendor", "owner"),
+                vendor_transit_point("unprintable", "vendor", "owner"),
+                vendor_transit_point("no-grant", "vendor", "owner")
+            ]),
+            json!([]),
+        );
+        let agent_keyed = |provider: &str| {
+            let surface = transit_surface(
+                json!([meta_transit_point("partner", "https://partner.example/mcp", false, Some(provider))]),
+                json!([]),
+            );
+            let (resolved, point) = resolved_transit_point(&surface, None, "partner");
+            legacy_delegation_context(resolved, point)
+        };
+        let plain_http = {
+            let mut point = vendor_transit_point(VENDOR_HOP, "vendor", "owner");
+            point["target_endpoint"] = json!("http://127.0.0.1:9/mcp");
+            let mut ctx =
+                external_grant_context(&transit_surface(json!([point]), json!([])), VENDOR_HOP, Some(&caller));
+            ctx.grant_destination = Some(
+                url::Url::parse("http://127.0.0.1:9")
+                    .unwrap()
+                    .origin(),
+            );
+            ctx
+        };
+
+        let mut missing = Vec::new();
+        let mut expect_named = |text: &str, message: &str| {
+            let lines: Vec<&str> = text
+                .lines()
+                .filter(|line| line.contains(message))
+                .collect();
+            if lines.is_empty() {
+                missing.push(format!("no line `{message}` was written: {text}"));
+            }
+            missing.extend(
+                lines
+                    .into_iter()
+                    .filter(|line| !line.contains("surface_variant=\"beta\""))
+                    .map(|line| format!("`{message}` names no variant: {line}")),
+            );
+        };
+
+        let mut ctx = external_grant_context(&by_binding, VENDOR_HOP, Some(&caller));
+        let (released, text) = served_by_beta(step_inject_credentials(&state, &mut ctx)).await;
+        released.expect("the owner grant is released");
+        expect_named(&text, "Injecting delegated credential header into outbound request");
+
+        let mut ctx = external_grant_context(&by_binding, "unprintable", Some(&caller));
+        let (refused, text) = served_by_beta(step_inject_credentials(&state, &mut ctx)).await;
+        assert!(refused.is_err(), "a grant that is not a valid header value is refused");
+        expect_named(&text, "Delegated credential is not a valid header - refusing the request");
+
+        let mut ctx = external_grant_context(&by_binding, "no-grant", Some(&caller));
+        let (refused, text) = served_by_beta(step_inject_credentials(&state, &mut ctx)).await;
+        assert!(refused.is_err(), "a binding with no grant is refused");
+        expect_named(&text, "grant by binding cannot be released - refusing the request");
+
+        let mut ctx = agent_keyed("vendor");
+        let (refused, text) = served_by_beta(step_inject_credentials(&state, &mut ctx)).await;
+        assert!(refused.is_err(), "an agent-keyed binding never uses a provider with an issuer");
+        expect_named(&text, "A provider with an issuer serves only consent_mode external bindings");
+
+        let mut ctx = agent_keyed("provider");
+        let (released, text) = served_by_beta(step_inject_credentials(&agent_keyed_state, &mut ctx)).await;
+        released.expect("the agent-keyed token is released");
+        expect_named(&text, "Injecting delegated credential into outbound MCP metadata");
+
+        let mut ctx = agent_keyed("provider");
+        ctx.body_bytes = None;
+        let (refused, text) = served_by_beta(step_inject_credentials(&agent_keyed_state, &mut ctx)).await;
+        assert!(matches!(refused, Err(OutboundPipelineError::MetadataInjectionFailed)), "{refused:?}");
+        expect_named(&text, "outbound MCP metadata because body is unavailable");
+
+        let mut ctx = plain_http;
+        let (refused, text) = served_by_beta(step_forward_request(&state, &mut ctx)).await;
+        assert!(refused.is_err(), "a plain http target is refused by Strict egress");
+        expect_named(&text, "was refused by Strict egress");
+        expect_named(&text, "forward_refused_by_strict_egress");
+
+        assert!(missing.is_empty(), "{missing:#?}");
     }
 
     /// A caller the Transit Point's `source_auth` verified reaches only the

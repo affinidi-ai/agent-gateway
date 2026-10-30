@@ -1030,6 +1030,11 @@ mod tests {
             callback_url: None,
             resource: None,
             consent_identity_strategy_id: None,
+            issuer: None,
+            revocation_endpoint: None,
+            token_endpoint_auth_method: None,
+            client_id: None,
+            allow_unadvertised_pkce: false,
         };
 
         let consent =
@@ -1072,6 +1077,11 @@ mod tests {
             callback_url: None,
             resource: None,
             consent_identity_strategy_id: None,
+            issuer: None,
+            revocation_endpoint: None,
+            token_endpoint_auth_method: None,
+            client_id: None,
+            allow_unadvertised_pkce: false,
         };
 
         // Test without signer (unsigned fallback)
@@ -1238,6 +1248,11 @@ mod tests {
             callback_url: None,
             resource: None,
             consent_identity_strategy_id: None,
+            issuer: None,
+            revocation_endpoint: None,
+            token_endpoint_auth_method: None,
+            client_id: None,
+            allow_unadvertised_pkce: false,
         };
 
         let vc = build_delegation_vc(

@@ -249,7 +249,7 @@ fn validate_and_pin_inner(
 /// Builds a redirect-disabled client pinned to `target`'s vetted addresses.
 ///
 /// `resolve_to_addrs` is builder-only in reqwest 0.13, so a fresh client is
-/// built per pinned target — acceptable for guarded egress.
+/// built per pinned target, which is acceptable for guarded egress.
 fn pinned_client(
     target: &PinnedTarget,
     timeout: Duration,
@@ -260,6 +260,51 @@ fn pinned_client(
         .resolve_to_addrs(&target.host, &target.addrs)
         .build()
         .map_err(EgressError::Http)
+}
+
+/// [`pinned_client`] for a vendor call of external consent, which carries a
+/// client's credentials or a person's token: it ignores any proxy the
+/// environment or the system names and connects directly, since a proxy would
+/// resolve the host again and connect to an address nobody vetted, voiding the
+/// pin. [`warn_when_vendor_clients_ignore_a_proxy`] says so at startup.
+fn pinned_direct_client(
+    target: &PinnedTarget,
+    timeout: Duration,
+) -> Result<Client, EgressError> {
+    Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .resolve_to_addrs(&target.host, &target.addrs)
+        .build()
+        .map_err(EgressError::Http)
+}
+
+/// The proxy variables a vendor client of external consent ignores.
+pub(crate) const PROXY_VARIABLES: [&str; 6] =
+    ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"];
+
+/// Warn, once at startup, when the environment names a proxy: the vendor
+/// clients of external consent (authorization server metadata, token
+/// revocation, and requests that carry a grant by binding) ignore it and
+/// connect directly, so the host needs direct egress to those vendors. Every
+/// other egress uses the proxy as before. Returns the variables found set.
+pub(crate) fn warn_when_vendor_clients_ignore_a_proxy(lookup: impl Fn(&str) -> Option<String>) -> Vec<&'static str> {
+    let set: Vec<&'static str> = PROXY_VARIABLES
+        .into_iter()
+        .filter(|name| lookup(name).is_some_and(|value| !value.trim().is_empty()))
+        .collect();
+    if !set.is_empty() {
+        tracing::warn!(
+            target: "credential_delegation",
+            variables = ?set,
+            "A proxy is set, but the vendor clients of external consent (authorization server metadata, token \
+             revocation, and requests that carry a grant by binding) ignore it and connect directly, since a proxy \
+             would resolve each vendor's host again and void the pin to its vetted addresses; allow direct egress \
+             to those vendors. Other egress still uses the proxy"
+        );
+    }
+    set
 }
 
 /// Resolve + pin `vetted_url` with `blocked` and return a redirect-disabled
@@ -315,6 +360,86 @@ pub(crate) fn pinned_strict_client(
 ) -> Result<(Client, PinnedTarget), EgressError> {
     let url = validate_resolved_url(raw_url).map_err(EgressError::Blocked)?;
     pin_and_build(url, |ip| EgressPolicy::Strict.is_blocked_ip(ip), timeout)
+}
+
+/// Vet and pin an authorization server's metadata URL, for a credential
+/// provider of external consent, as [`pinned_strict_client`] does, or as
+/// [`pinned_forward_client`] does when `strict` is false, with a client that
+/// ignores proxies like every vendor client of external consent
+/// ([`pinned_direct_client`]).
+///
+/// Resolves DNS (blocking OS resolver); call from a blocking context.
+pub(crate) fn pinned_metadata_client(
+    raw_url: &str,
+    strict: bool,
+    timeout: Duration,
+) -> Result<(Client, PinnedTarget), EgressError> {
+    let target = if strict {
+        let url = validate_resolved_url(raw_url).map_err(EgressError::Blocked)?;
+        pin_url(url, |ip| EgressPolicy::Strict.is_blocked_ip(ip))?
+    } else {
+        let url = validate_resolved_cloud_metadata_url(raw_url).map_err(EgressError::Blocked)?;
+        pin_url(url, is_cloud_metadata_resolved_ip)?
+    };
+    let client = pinned_direct_client(&target, timeout)?;
+    Ok((client, target))
+}
+
+/// Vet a vendor endpoint for a call that carries a client's credentials or a
+/// user's token: an authorization server (revocation, token exchange, refresh),
+/// or the resource a grant by binding is sent to. The Strict policy, `https`
+/// only, pinned to the vetted addresses, redirects refused, proxies ignored
+/// ([`pinned_direct_client`]).
+///
+/// `exact_allowlist` is the BDD allow-list ([`bdd_egress_allowlist`] on the
+/// production path), which alone can admit an `http` or loopback fixture, never
+/// cloud metadata.
+pub(crate) async fn pinned_vendor_client(
+    raw_url: &str,
+    timeout: Duration,
+    exact_allowlist: Option<&str>,
+) -> Result<Client, EgressError> {
+    let url = Url::parse(raw_url).map_err(|e| EgressError::Parse(e.to_string()))?;
+    if url.scheme() != "https" && !exactly_allowlisted(raw_url, exact_allowlist).await {
+        return Err(EgressError::Blocked("a vendor endpoint is reached over https only".into()));
+    }
+    let target = resolve_pin_blocking(raw_url.to_string(), EgressPolicy::Strict, exact_allowlist).await?;
+    pinned_direct_client(&target, timeout)
+}
+
+fn allowlisted(
+    url: &Url,
+    exact_allowlist: Option<&str>,
+) -> Result<bool, EgressError> {
+    Ok(match exact_allowlist {
+        Some(raw) => parse_egress_allowlist(raw)?
+            .iter()
+            .any(|entry| allowlist_entry_matches(entry, url)),
+        None => false,
+    })
+}
+
+/// Whether the BDD allow-list `exact_allowlist` admits `raw_url`. Never true on
+/// the production path, where the allow-list is `None`, which is answered at
+/// once, without resolving anything; nor for cloud metadata. Vetting an
+/// allow-listed URL resolves its host and the allow-list's, which runs on the
+/// blocking pool, never on the async executor.
+pub(crate) async fn exactly_allowlisted(
+    raw_url: &str,
+    exact_allowlist: Option<&str>,
+) -> bool {
+    let Some(allowlist) = exact_allowlist else {
+        return false;
+    };
+    let raw_url = raw_url.to_string();
+    let allowlist = allowlist.to_string();
+    tokio::task::spawn_blocking(move || {
+        validate_resolved_cloud_metadata_url(&raw_url)
+            .ok()
+            .is_some_and(|url| allowlisted(&url, Some(&allowlist)).unwrap_or(false))
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// Vet a stored backend with [`EgressPolicy::Configured`] and return a
@@ -617,6 +742,124 @@ mod tests {
         addr
     }
 
+    /// A vendor client of external consent never sends through a proxy the
+    /// environment names: the proxy would resolve the host again and connect
+    /// to an address nobody vetted. Every other pinned client uses the proxy
+    /// as before. Runs in a process of its own, since the proxy variables are
+    /// process-wide.
+    #[test]
+    fn only_the_vendor_clients_of_external_consent_ignore_a_proxy() {
+        if !crate::a2a::version::run_isolated_from_other_tests() {
+            return;
+        }
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let proxy = spawn_server("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await;
+                let proxied = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let listener = TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .unwrap();
+                let recording_proxy = listener.local_addr().unwrap();
+                let seen = proxied.clone();
+                tokio::spawn(async move {
+                    while let Ok((mut sock, _)) = listener.accept().await {
+                        seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                        let mut buf = [0u8; 1024];
+                        let _ = sock.read(&mut buf).await;
+                        let mut upstream = tokio::net::TcpStream::connect(proxy)
+                            .await
+                            .unwrap();
+                        let _ = upstream
+                            .write_all(b"GET / HTTP/1.1\r\nHost: proxy\r\n\r\n")
+                            .await;
+                        let mut answer = [0u8; 1024];
+                        let read = upstream
+                            .read(&mut answer)
+                            .await
+                            .unwrap_or(0);
+                        let _ = sock
+                            .write_all(&answer[..read])
+                            .await;
+                    }
+                });
+                for name in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"] {
+                    unsafe { std::env::set_var(name, format!("http://{recording_proxy}")) };
+                }
+                for name in ["NO_PROXY", "no_proxy"] {
+                    unsafe { std::env::remove_var(name) };
+                }
+
+                let target = spawn_server("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await;
+                let url = format!("http://{target}/direct");
+                let through_proxy = |client: Client| {
+                    let url = url.clone();
+                    let proxied = proxied.clone();
+                    async move {
+                        proxied.store(false, std::sync::atomic::Ordering::SeqCst);
+                        assert_eq!(
+                            client
+                                .get(&url)
+                                .send()
+                                .await
+                                .unwrap()
+                                .status(),
+                            200
+                        );
+                        proxied.load(std::sync::atomic::Ordering::SeqCst)
+                    }
+                };
+
+                let (forward, _) = pinned_forward_client(&url, Duration::from_secs(5)).unwrap();
+                assert!(through_proxy(forward).await, "a forward uses the proxy, as before");
+                let (configured, _) = pinned_configured_client(&url, Duration::from_secs(5), Some(&url)).unwrap();
+                assert!(through_proxy(configured).await, "a configured backend uses the proxy, as before");
+
+                let vendor = pinned_vendor_client(&url, Duration::from_secs(5), Some(&format!("http://{target}")))
+                    .await
+                    .unwrap();
+                assert!(!through_proxy(vendor).await, "a vendor call of external consent connects directly");
+                let (metadata, _) = pinned_metadata_client(&url, false, Duration::from_secs(5)).unwrap();
+                assert!(!through_proxy(metadata).await, "authorization server metadata is read directly");
+            });
+    }
+
+    #[test]
+    fn a_proxy_the_vendor_clients_ignore_is_named_at_startup() {
+        use crate::component_tests::helpers::formatted_logs::FormattedLogs;
+        let logs = FormattedLogs::capture();
+        let set = warn_when_vendor_clients_ignore_a_proxy(|name| {
+            matches!(name, "HTTPS_PROXY" | "all_proxy").then(|| "http://proxy.internal:3128".to_string())
+        });
+        assert_eq!(set, ["HTTPS_PROXY", "all_proxy"]);
+        let text = logs.text();
+        assert!(text.contains("WARN"), "{text}");
+        assert!(text.contains("connect directly"), "{text}");
+        assert!(!text.contains("proxy.internal"), "the proxy's address is not logged: {text}");
+
+        let logs = FormattedLogs::capture();
+        assert!(warn_when_vendor_clients_ignore_a_proxy(|name| (name == "HTTP_PROXY").then(String::new)).is_empty());
+        assert!(!logs.text().contains("WARN"), "an empty variable names no proxy");
+    }
+
+    /// Whether a target is allow-listed is answered without resolving anything
+    /// when there is no allow-list, which is always so in production, and
+    /// otherwise on the blocking pool, never on the thread that awaits it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn checking_the_allowlist_never_resolves_on_the_async_executor() {
+        let before = crate::url_validation::resolutions_on_this_thread();
+        assert!(!exactly_allowlisted("http://localhost:9/mcp", None).await);
+        assert!(exactly_allowlisted("http://localhost:9/mcp", Some("http://localhost:9")).await);
+        assert!(!exactly_allowlisted("http://localhost:9/mcp", Some("http://localhost:10")).await);
+        assert_eq!(
+            crate::url_validation::resolutions_on_this_thread(),
+            before,
+            "a host was resolved on the async executor"
+        );
+    }
+
     #[tokio::test]
     async fn guarded_send_rejects_redirect_to_blocked_host() {
         let addr =
@@ -780,6 +1023,54 @@ mod tests {
         let lower = received.to_ascii_lowercase();
         assert!(!lower.contains("authorization"), "Authorization must be stripped cross-origin, got:\n{received}");
         assert!(!received.contains("secret-body"), "request body must be dropped cross-origin, got:\n{received}");
+    }
+
+    #[tokio::test]
+    async fn a_vendor_endpoint_is_reached_over_https_on_public_addresses_only() {
+        for raw in [
+            "http://203.0.113.10/revoke",
+            "https://127.0.0.1/revoke",
+            "https://10.0.0.5/revoke",
+            "https://169.254.169.254/latest/meta-data/",
+            "not a url",
+        ] {
+            assert!(
+                pinned_vendor_client(raw, Duration::from_secs(1), None)
+                    .await
+                    .is_err(),
+                "{raw}"
+            );
+        }
+        assert!(
+            pinned_vendor_client("https://203.0.113.10/revoke", Duration::from_secs(1), None)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn only_the_allowlist_admits_an_http_or_loopback_vendor_fixture() {
+        let fixture = "http://127.0.0.1:9/revoke";
+        assert!(
+            pinned_vendor_client(fixture, Duration::from_secs(1), Some("http://127.0.0.1:9"))
+                .await
+                .is_ok()
+        );
+        assert!(
+            pinned_vendor_client(fixture, Duration::from_secs(1), Some("http://127.0.0.1:10"))
+                .await
+                .is_err()
+        );
+        assert!(
+            pinned_vendor_client(
+                "http://169.254.169.254/latest/",
+                Duration::from_secs(1),
+                Some("http://169.254.169.254")
+            )
+            .await
+            .is_err(),
+            "metadata is never allow-listed"
+        );
     }
 
     #[test]

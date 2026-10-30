@@ -528,7 +528,9 @@ Set the same `AG_IDENTITY_HASH_PEPPER` on every node of a multi-node gateway. Th
 derives the DIDs of agents identified by mTLS, API key or a JWT claim, so nodes with
 different peppers give the same agent different DIDs. With encryption at rest off it also
 seals the OAuth delegation `state`, so a callback that lands on another node can open the
-state only when both nodes share the pepper.
+state only when both nodes share the pepper. It also derives the ids of delegated grants by
+binding, which the vault keeps only while the pepper is set, so a node with another pepper
+finds none of them.
 
 Used OAuth `state` nonces are checked per node, not across nodes. Each node remembers for
 15 minutes the nonces its own callbacks used, so a state already used on one node is not

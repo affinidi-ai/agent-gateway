@@ -28,8 +28,11 @@ pub trait CredentialProviderStorage: Send + Sync {
         &self,
         id: &str,
     ) -> Result<bool>;
+    /// The provider with this slug among those of `tenant_id`, or among the
+    /// untenanted providers when it is `None`: slugs are unique per tenant.
     async fn find_by_provider_id(
         &self,
+        tenant_id: Option<&str>,
         provider_id: &str,
     ) -> Result<Option<CredentialProvider>>;
 }
@@ -139,6 +142,7 @@ impl CredentialProviderStorage for FileSystemCredentialProviderStore {
 
     async fn find_by_provider_id(
         &self,
+        tenant_id: Option<&str>,
         provider_id: &str,
     ) -> Result<Option<CredentialProvider>> {
         let all = self
@@ -147,6 +151,6 @@ impl CredentialProviderStorage for FileSystemCredentialProviderStore {
             .await?;
         Ok(all
             .into_iter()
-            .find(|p| p.provider_id == provider_id))
+            .find(|p| p.tenant_id.as_deref() == tenant_id && p.provider_id == provider_id))
     }
 }

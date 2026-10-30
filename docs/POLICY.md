@@ -439,6 +439,19 @@ blocked target fails closed (inbound
 and Fabric receive `403` "Request blocked by egress policy"; outbound
 `TargetAuthUnavailable`) with the resolved IP log-only.
 
+A Transit Point request that carries a grant by binding (`consent_mode: external`) is held to
+more: the outbound forward sends it only to the origin of its provider's `resource`, through
+`egress::pinned_vendor_client` (the Strict policy, `https` only), and never over Fabric. See
+[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#external-consent-on-a-transit-point).
+
+The vendor clients of external consent, which carry a client's credentials or a person's token,
+ignore proxy settings (`HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and the system proxy) and always
+connect directly: the authorization server metadata fetch, RFC 7009 revocation, and the forward
+of a request that carries a grant by binding. A proxy would resolve the host again and connect
+to an address nobody vetted, voiding the pin. The gateway warns at startup when a proxy variable
+is set. Every other pinned client uses a configured proxy as before; the proxy then resolves the
+host itself, so the pin does not hold through it.
+
 ```mermaid
 flowchart LR
     F[Forward step] --> V{"Target passes<br/>egress policy?"}
@@ -512,6 +525,18 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   redirects. The fetch has a 5-second timeout and a 64 KiB limit and runs in the
   background, off the request path. A blocked URL or a failed fetch yields no
   name; see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#external-callers).
+- An **external consent provider's issuer metadata** is read when the provider
+  is created (`src/credential_providers/external.rs`), through
+  `authz_metadata::discover_client` under the Strict posture
+  (`egress::pinned_metadata_client`): `https` only, internal addresses blocked,
+  redirects refused, no proxy, a 64 KiB body and a 10-second timeout per step. See
+  [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#external-consent-providers).
+- A grant's **RFC 7009 revocation** (`src/delegation_vault/revocation.rs`) goes
+  through `egress::pinned_vendor_client`: the Strict policy, `https`
+  only, pinned, redirects refused, no proxy, a 10-second timeout, and the response body is
+  never read. Under `AG_TEST_MODE=true`, `AG_BDD_EGRESS_ALLOWLIST` can admit an
+  exact `http` or loopback fixture, never cloud metadata. See
+  [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#revoking-grants-at-the-vendor).
 
 Both helpers share one `pin_and_build` body.
 

@@ -9,8 +9,17 @@ use sha2::{Digest, Sha256};
 use std::sync::LazyLock;
 
 /// Directories excluded entirely from export (contain key material / auth credentials)
-pub const EXCLUDED_DIRS: &[&str] =
-    &["identities", "secrets", "vc_keys", "passkeys", "apikeys", "certificates", "sessions", "avatars"];
+pub const EXCLUDED_DIRS: &[&str] = &[
+    "identities",
+    "secrets",
+    "vc_keys",
+    "passkeys",
+    "apikeys",
+    "certificates",
+    "sessions",
+    "avatars",
+    crate::delegation_vault::grants::GRANTS_DIRECTORY,
+];
 
 /// JSON keys whose values are DIDs — replaced with `did:redacted:{hash8}`
 const DID_KEYS: &[&str] = &[

@@ -4,7 +4,7 @@ use bytes::Bytes;
 use url::Url;
 
 use super::{DiscoveryError, DiscoveryFailure, DiscoveryOptions, EgressPosture};
-use crate::egress::{EgressError, pinned_forward_client, pinned_strict_client};
+use crate::egress::{EgressError, pinned_metadata_client};
 use crate::proxy::upstream_body::{UpstreamBodyError, UpstreamBodyLimits, read_bounded};
 
 /// `raw` parsed as an absolute URL with a host and no credentials, whose scheme
@@ -41,11 +41,9 @@ async fn pinned_client(
 ) -> Result<reqwest::Client, DiscoveryError> {
     let raw = url.to_string();
     let timeout = options.timeout;
-    let pinned = resolve_within(timeout, move || match posture {
-        EgressPosture::CloudMetadataOnly => pinned_forward_client(&raw, timeout),
-        EgressPosture::Strict => pinned_strict_client(&raw, timeout),
-    })
-    .await?;
+    let pinned =
+        resolve_within(timeout, move || pinned_metadata_client(&raw, posture == EgressPosture::Strict, timeout))
+            .await?;
     pinned
         .map(|(client, _target)| client)
         .map_err(egress_failure)
@@ -102,11 +100,11 @@ fn read_deadline_secs(options: DiscoveryOptions) -> u64 {
 /// call can take up to twice the timeout. The body is bounded by `options.max_bytes`
 /// (`too_large`). The request asks for `application/json`.
 ///
-/// The vetting and pinning do not hold when a proxy is configured, through the environment
-/// variables `HTTPS_PROXY`, `HTTP_PROXY` or `ALL_PROXY` (also in lower case) or the system
-/// proxy settings of macOS and Windows: the shared pinned egress clients do not disable
-/// proxies, so the request then goes to the proxy, which resolves the host again and
-/// connects to an address nobody vetted.
+/// The pinned client ignores proxy settings (`HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and
+/// the system proxy), which would resolve the host again and connect to an address nobody
+/// vetted, so the request always connects directly. This fetch reads the authorization
+/// server metadata of credential providers for external consent, one of the vendor clients
+/// that alone connect directly; other pinned egress uses a configured proxy.
 ///
 /// Failure codes: `invalid_url`, `blocked`, `unreachable`, `http_status`, `too_large`.
 pub async fn get_bounded(
