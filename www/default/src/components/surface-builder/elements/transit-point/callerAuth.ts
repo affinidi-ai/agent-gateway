@@ -34,8 +34,6 @@ export const OPEN_WITH_AUTH_PROBLEM =
 export const SOURCE_AUTH_WITH_RESOURCE_TOKEN_PROBLEM =
   'This Transit Point also sets a resource access token (set through the API). Keep one way to authenticate callers: remove the resource access token through the API, or choose no caller authentication here.';
 
-export { parseWarningHeader, joinWarnings } from '../../../../utils/warningHeader';
-
 type Config = Record<string, unknown> | null | undefined;
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -161,9 +159,6 @@ export function sourceAuthProblem(sourceAuth: TransitSourceAuth | null): string 
       if (!text(sourceAuth.token_header)) {
         return 'Name the header callers send their token in, such as Authorization.';
       }
-      if (!text(sourceAuth.token_scheme)) {
-        return 'Name the scheme callers send their token with, such as Bearer.';
-      }
       const audiences = Array.isArray(sourceAuth.audiences) ? sourceAuth.audiences : [];
       return audiences.some(a => text(a))
         ? null
@@ -276,7 +271,9 @@ export function exposureWarning(config: Config, alias: string): string | null {
 /**
  * The save warnings that name the Transit Point with this alias, in the base
  * surface or, with `variant`, in that variant. The gateway words a variant's
- * as `Transit Point 'x' in variant 'v' ...` and the base's without it.
+ * as `Transit Point 'x' in variant 'v' ...` when the variant defines its own
+ * Transit Points, which every variant a dashboard save writes does, and the
+ * base's without it.
  */
 export function warningsForTransitPoint(
   warnings: readonly string[],
@@ -294,18 +291,20 @@ export function warningsForTransitPoint(
 
 /**
  * The gateway's reason for refusing a save of the Transit Point with this alias,
- * in plain words, or null when the error names another. The gateway words it
+ * in the base surface or, with `variant`, in that variant, in plain words, or
+ * null when the error names another. The gateway words it
  * `transit.points[0]: Transit Point 'x' ...`, and for a variant
  * `variant 'v' transit.points[0]: ...`.
  */
 export function transitPointSaveError(
   error: string | null | undefined,
-  alias: string
+  alias: string,
+  variant?: string
 ): string | null {
   if (!error || !alias || !error.includes(`Transit Point '${alias}'`)) return null;
-  return error
-    .replace(/^(?:variant '[^']*' )?transit\.points\[\d+\]:\s*/, '')
-    .replace(/\s*\(400\)$/, '');
+  const path = /^(?:variant '([^']*)' )?transit\.points\[\d+\]:\s*/.exec(error);
+  if (path?.[1] !== variant) return null;
+  return error.slice(path?.[0].length ?? 0).replace(/\s*\(400\)$/, '');
 }
 
 /**

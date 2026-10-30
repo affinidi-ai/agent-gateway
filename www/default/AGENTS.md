@@ -141,17 +141,26 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   it off. The save rules the API enforces apply before the save, through the element's
   `validate`, which faults the node and blocks Save: no way to authenticate and not open,
   open beside the token or a method, `source_auth` beside `mcp_http.authorization`, and an API
-  key with no secret or header, a JWT with no strategy or no audience (or one that forwards
-  the token). Each shows as `transit-point-caller-auth-problem`.
+  key with no secret or header, a JWT with no strategy, token header or audience (or one that
+  forwards the token); an empty token scheme is allowed, as the gateway reads the raw header
+  value then. Each shows as `transit-point-caller-auth-problem`. Choosing the API Key Provider
+  shows `transit-point-caller-auth-provider-scope`: its keys are the surface's own, the same an
+  Access Point using the provider accepts. The strategy and API key secret lists load through
+  `useJwtStrategies` and `useApiKeySecrets` (`elements/caller-auth/useCallerAuthOptions.ts`),
+  shared with the Access Point's caller authentication editor.
 - The exposure warning: when a save answers with `Warning: 299` headers, `apiClient.createSurface`
   and `updateSurface` pass their messages to an `onWarnings` option, the pages toast them and
-  `SurfaceMetaContext.saveWarnings` hands them to the Transit Point whose alias they name
+  `SurfaceMetaContext.saveWarnings` hands them to the Transit Point whose alias they name, in
+  the base view, or in the variant view a warning's `in variant '<alias>'` names
   (`transit-point-save-warning`), where each stays until that Transit Point's token, caller
   authentication, open marking or listener changes. Before the save, the panel predicts the
   exposure from the Transit Point's listener URL (`transit-point-exposure-warning`) with the
   gateway's own rule; the gateway also counts bind addresses and shared-domain inbound
-  listeners, which the dashboard does not see, so only the header is complete. A refused save
-  shows the API's reason in plain words on the Transit Point it names
+  listeners, which the dashboard does not see, so only the header is complete. A create that
+  drew warnings opens the new surface's page with them in the route state, which that page
+  reads once and then clears, so a refresh or a Back return does not show them again. A refused
+  save shows the API's reason in plain words on the Transit Point it names, in the base view
+  for `transit.points[i]: ...` and in that variant's view for `variant '<alias>' transit.points[i]: ...`
   (`transit-point-save-error`). A write never carries `transit_point_source_auth`: the gateway
   derives it from the stored Transit Points.
 - A new surface is named `<protocol>_surface_<n>` (`surfaceNaming.ts`), where `n` is one more

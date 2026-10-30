@@ -1,6 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Alert, Button, Form, Modal } from 'react-bootstrap';
-import { apiClient } from '../../../../api';
 import AddResourceLink from '../../../shared/AddResourceLink';
 import { deepLinks } from '../../../../utils/deepLinks';
 import { useOptionalSurfaceMeta } from '../../SurfaceMetaContext';
@@ -21,18 +20,7 @@ import {
   type CallerAuthChoice,
   type TransitSourceAuth,
 } from './callerAuth';
-
-interface SecretOption {
-  id: string;
-  name: string;
-  secret_id?: string;
-  secret_type?: string;
-}
-
-interface JwtStrategy {
-  id: string;
-  name: string;
-}
+import { useApiKeySecrets, useJwtStrategies } from '../caller-auth/useCallerAuthOptions';
 
 interface Props {
   /** The Transit Point node's config. */
@@ -68,29 +56,9 @@ const TransitCallerSection: React.FC<Props> = ({ config, alias, updateField, upd
   const open = isOpenToAnyCaller(config);
   const [confirmingOpen, setConfirmingOpen] = useState(false);
 
-  const [secrets, setSecrets] = useState<SecretOption[]>([]);
-  const [strategies, setStrategies] = useState<JwtStrategy[]>([]);
+  const { secrets } = useApiKeySecrets(choice === 'api_key');
+  const strategies = useJwtStrategies(choice === 'jwt_bearer');
   const [audienceInput, setAudienceInput] = useState('');
-
-  useEffect(() => {
-    if (choice !== 'api_key') return;
-    apiClient
-      .get<SecretOption[]>('/secrets/')
-      .then(res => {
-        const list = Array.isArray(res.data) ? res.data : [];
-        setSecrets(list.filter(s => !s.secret_type || s.secret_type === 'ApiKey'));
-      })
-      .catch(() => setSecrets([]));
-  }, [choice]);
-
-  useEffect(() => {
-    if (choice !== 'jwt_bearer') return;
-    apiClient
-      .fetch('/api/v1/jwt-verification-strategies')
-      .then(r => (r.ok ? r.json() : []))
-      .then((data: JwtStrategy[]) => setStrategies(Array.isArray(data) ? data : []))
-      .catch(() => setStrategies([]));
-  }, [choice]);
 
   const problems = callerAuthProblems(config);
   const predicted = exposureWarning(config, alias);
@@ -116,7 +84,7 @@ const TransitCallerSection: React.FC<Props> = ({ config, alias, updateField, upd
   // not already say it.
   const saveSaidExposure =
     showSavedWarnings && savedWarnings.some(w => w.includes('does not authenticate'));
-  const refusal = transitPointSaveError(meta?.saveError, alias);
+  const refusal = transitPointSaveError(meta?.saveError, alias, variant);
 
   const setSourceAuth = (next: TransitSourceAuth | null) => {
     updateFields({
@@ -317,11 +285,17 @@ const TransitCallerSection: React.FC<Props> = ({ config, alias, updateField, upd
               </Form.Group>
             )}
             {choice === 'api_key_provider' && (
-              <Form.Text className="text-muted d-block mb-2" style={{ fontSize: '10px' }}>
+              <Alert
+                variant="warning"
+                className="py-1 px-2 small mb-2"
+                data-testid="transit-point-caller-auth-provider-scope"
+              >
                 Keys are validated against the API Key Provider for agent{' '}
                 <code>{String(sourceAuth.agent_id || 'this surface')}</code>; each issued key is one
-                caller.
-              </Form.Text>
+                caller. These are the same keys an Access Point using the API Key Provider accepts,
+                so its callers can call this Transit Point too. To accept a separate set of callers,
+                use an API key from the secret store.
+              </Alert>
             )}
           </>
         )}

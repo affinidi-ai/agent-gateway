@@ -5,14 +5,13 @@ import {
   callerAuthSignature,
   callerAuthToWire,
   exposureWarning,
-  joinWarnings,
   NO_CALLER_AUTH_PROBLEM,
   OPEN_WITH_AUTH_PROBLEM,
-  parseWarningHeader,
   reachableFromOtherHosts,
   transitPointSaveError,
   warningsForTransitPoint,
 } from '../transit-point/callerAuth';
+import { joinWarnings, parseWarningHeader } from '../../../../utils/warningHeader';
 
 function makeCtx(nodes: any[]): SurfaceContext {
   return {
@@ -319,7 +318,16 @@ describe('what a save answers with', () => {
     expect(warningsForTransitPoint(all, 'crm', 'v2')).toEqual([]);
   });
 
-  it('refuses an mTLS method that trusts no certificate, and a blank token header or scheme', () => {
+  it("lands a variant's JWT warning on that variant's Transit Point only", () => {
+    const base =
+      "Transit Point 'crm' accepts the Access Point's own tokens (JWT verification strategy 'idp', audience 'a')";
+    const variant =
+      "Transit Point 'crm' in variant 'beta' accepts the Access Point's own tokens (JWT verification strategy 'idp', audience 'a')";
+    expect(warningsForTransitPoint([base, variant], 'crm')).toEqual([base]);
+    expect(warningsForTransitPoint([base, variant], 'crm', 'beta')).toEqual([variant]);
+  });
+
+  it('refuses an mTLS method that trusts no certificate, and a blank token header', () => {
     const mtls = (trust: unknown) => ({
       id: 'x',
       require_transit_token: false,
@@ -347,7 +355,7 @@ describe('what a save answers with', () => {
     });
     expect(callerAuthProblems(jwt({}))).toEqual([]);
     expect(callerAuthProblems(jwt({ token_header: '  ' }))[0]).toMatch(/header/);
-    expect(callerAuthProblems(jwt({ token_scheme: '' }))[0]).toMatch(/scheme/);
+    expect(callerAuthProblems(jwt({ token_scheme: '' }))).toEqual([]);
   });
 
   it('keeps a source_auth without a readable type as set', () => {
@@ -362,16 +370,17 @@ describe('what a save answers with', () => {
     expect(joinWarnings(['x'.repeat(400)], 3, 10)).toBe('xxxxxxx...');
   });
 
-  it('puts a refusal in plain words, whichever Transit Point or variant it names', () => {
-    expect(
-      transitPointSaveError(
-        "transit.points[1]: Transit Point 'crm' authenticates no caller: require a transit token (400)",
-        'crm'
-      )
-    ).toBe("Transit Point 'crm' authenticates no caller: require a transit token");
-    expect(
-      transitPointSaveError("variant 'v' transit.points[0]: Transit Point 'crm' sets x", 'crm')
-    ).toBe("Transit Point 'crm' sets x");
+  it('puts a refusal in plain words on the Transit Point and variant it names', () => {
+    const baseError =
+      "transit.points[1]: Transit Point 'crm' authenticates no caller: require a transit token (400)";
+    const variantError = "variant 'v' transit.points[0]: Transit Point 'crm' sets x";
+    expect(transitPointSaveError(baseError, 'crm')).toBe(
+      "Transit Point 'crm' authenticates no caller: require a transit token"
+    );
+    expect(transitPointSaveError(baseError, 'crm', 'v')).toBeNull();
+    expect(transitPointSaveError(variantError, 'crm', 'v')).toBe("Transit Point 'crm' sets x");
+    expect(transitPointSaveError(variantError, 'crm')).toBeNull();
+    expect(transitPointSaveError(variantError, 'crm', 'w')).toBeNull();
     expect(transitPointSaveError("transit.points[0]: Transit Point 'hr' x", 'crm')).toBeNull();
     expect(transitPointSaveError(null, 'crm')).toBeNull();
   });

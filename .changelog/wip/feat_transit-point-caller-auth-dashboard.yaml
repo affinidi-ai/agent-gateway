@@ -11,15 +11,20 @@ changes:
         confirmation. The panel applies the gateway's save rules first: a Transit Point that
         authenticates no caller and is not open, one that is open beside the token or a method,
         and a method missing its secret, header, strategy or audience cannot be saved, and the
-        panel says why; a refusal from the gateway shows in the same section in plain words. A
-        `source_auth` set through the API with mTLS is shown and kept.
+        panel says why; an empty token scheme is allowed, as the gateway accepts it. A refusal
+        from the gateway shows in plain words in the same section, of the base or the variant it
+        names. Choosing the API key provider warns that it accepts the same keys as an Access
+        Point using the provider. A `source_auth` set through the API with mTLS is shown and kept.
     - timestamp: '2026-10-30T09:00:00.000Z'
       title: Show the gateway's save warnings on the Transit Point they name
       description: >-
         A save answered with `Warning` headers, such as an open Transit Point reachable from
         other hosts, a JWT that accepts the Access Point's own tokens, or a strategy that shares
         an issuer, now shows each one on its Transit Point and in a toast, and keeps it until
-        that Transit Point's caller authentication, open marking or listener changes. Before
+        that Transit Point's caller authentication, open marking or listener changes. The
+        shared-audience and shared-issuer warnings now name the variant that defines the Transit
+        Point, as the exposure warning does, so each lands on the right Transit Point. A create's
+        warnings are shown once on the new surface's page, not again on a refresh. Before
         saving, the panel warns when an open Transit Point's listener URL is one other hosts
         reach.
   changed: []

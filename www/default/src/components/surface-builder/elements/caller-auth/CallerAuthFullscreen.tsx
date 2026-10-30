@@ -15,25 +15,13 @@ import {
   readsAuthorizationHeader,
   usesBearerScheme,
 } from './protectedResource';
+import { useApiKeySecrets, useJwtStrategies } from './useCallerAuthOptions';
 
 interface Certificate {
   id: string;
   name: string;
   active: boolean;
   expires_at?: string;
-}
-
-interface JwtVerificationStrategy {
-  id: string;
-  name: string;
-  expected_issuer?: string;
-}
-
-interface SecretOption {
-  id: string;
-  name: string;
-  secret_id?: string;
-  secret_type?: string;
 }
 
 /**
@@ -57,20 +45,13 @@ const CallerAuthFullscreen: React.FC<ConfigPanelProps> = ({
 }) => {
   const { surfaceId } = useParams<{ surfaceId: string }>();
   const method: CallerAuthMethodType = (config.method_type as CallerAuthMethodType) || 'jwt_bearer';
-  const [jwtStrategies, setJwtStrategies] = useState<JwtVerificationStrategy[]>([]);
+  const jwtStrategies = useJwtStrategies();
   const [certificates, setCertificates] = useState<Certificate[]>([]);
-  const [apiKeySecrets, setApiKeySecrets] = useState<SecretOption[]>([]);
+  const { secrets: apiKeySecrets, loading: loadingApiKeySecrets } = useApiKeySecrets(
+    method === 'api_key'
+  );
   const [loadingCertificates, setLoadingCertificates] = useState(false);
-  const [loadingApiKeySecrets, setLoadingApiKeySecrets] = useState(false);
   const [audienceInput, setAudienceInput] = useState('');
-
-  useEffect(() => {
-    apiClient
-      .fetch('/api/v1/jwt-verification-strategies')
-      .then(r => (r.ok ? r.json() : []))
-      .then((data: JwtVerificationStrategy[]) => setJwtStrategies(Array.isArray(data) ? data : []))
-      .catch(() => setJwtStrategies([]));
-  }, []);
 
   useEffect(() => {
     if (method !== 'mtls') return;
@@ -83,21 +64,6 @@ const CallerAuthFullscreen: React.FC<ConfigPanelProps> = ({
       })
       .catch(() => setCertificates([]))
       .finally(() => setLoadingCertificates(false));
-  }, [method]);
-
-  useEffect(() => {
-    if (method !== 'api_key') return;
-    setLoadingApiKeySecrets(true);
-    apiClient
-      .get<SecretOption[]>('/secrets/')
-      .then(res => {
-        const list: SecretOption[] = Array.isArray(res.data) ? res.data : [];
-        setApiKeySecrets(
-          list.filter(secret => !secret.secret_type || secret.secret_type === 'ApiKey')
-        );
-      })
-      .catch(() => setApiKeySecrets([]))
-      .finally(() => setLoadingApiKeySecrets(false));
   }, [method]);
 
   const audiences: string[] = Array.isArray(config.audiences) ? config.audiences : [];

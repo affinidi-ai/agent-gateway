@@ -119,6 +119,14 @@ const SurfaceDetailPage: React.FC = () => {
       ? (carried as string[])
       : null;
   });
+  // The route state outlives the visit in `history.state`, so a refresh or a
+  // Back return would show the create's warnings again; it is read once.
+  useEffect(() => {
+    if (location.state != null) {
+      navigate(location.pathname, { replace: true, state: null });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const [hasAttemptedSave, setHasAttemptedSave] = useState(false);
   const surfacePolicyLoadState = useSurfacePolicyDefinitions();
   const surfacePolicyIds =

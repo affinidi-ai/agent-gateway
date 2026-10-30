@@ -93,6 +93,18 @@ describe('Who can call this Transit Point', () => {
     expect(callerAuthProblems(latest)).toEqual([]);
   });
 
+  it("warns that the API Key Provider accepts the Access Point's keys too", () => {
+    render(<Harness initial={{ id: 'tp', require_transit_token: false }} />);
+    expect(screen.queryByTestId('transit-point-caller-auth-provider-scope')).toBeNull();
+    fireEvent.change(screen.getByTestId('transit-point-caller-auth-method'), {
+      target: { value: 'api_key_provider' },
+    });
+    expect(latest.source_auth.agent_id).toBe('surface-1');
+    expect(screen.getByTestId('transit-point-caller-auth-provider-scope')).toHaveTextContent(
+      /same keys an Access Point using the API Key Provider accepts/
+    );
+  });
+
   it('configures a JWT: strategy, audiences, and no forwarding', async () => {
     render(<Harness initial={{ id: 'tp', require_transit_token: false }} />);
     fireEvent.change(screen.getByTestId('transit-point-caller-auth-method'), {
@@ -315,6 +327,31 @@ describe('the exposure warning', () => {
   });
 });
 
+describe('a save warning after the save rehydrates the canvas', () => {
+  const warning =
+    "Transit Point 'crm' serves callers it does not authenticate and is reachable from other hosts: 0.0.0.0:8080";
+
+  const section = (config: Record<string, any>, saveWarnings: string[] | null) => (
+    <SurfaceMetaProvider value={{ surfaceId: 's', saveWarnings } as any}>
+      <TransitCallerSection
+        config={config}
+        alias="crm"
+        updateField={() => {}}
+        updateFields={() => {}}
+      />
+    </SurfaceMetaProvider>
+  );
+
+  it('keeps the warning when the saved config arrives in the same render as it', () => {
+    const before = { id: 'tp', ...open, listen_address: 'http://localhost:8080' };
+    const { rerender } = render(section(before, null));
+    rerender(section({ ...before, listen_address: 'https://gateway.example.com' }, [warning]));
+    expect(screen.getAllByTestId('transit-point-save-warning')).toHaveLength(1);
+    rerender(section({ ...before, listen_address: 'https://gateway.example.com' }, [warning]));
+    expect(screen.getAllByTestId('transit-point-save-warning')).toHaveLength(1);
+  });
+});
+
 describe('a save warning for a variant', () => {
   const base = "Transit Point 'crm' serves callers it does not authenticate and is reachable: a";
   const inVariant =
@@ -373,6 +410,35 @@ describe('a refused save', () => {
       <Harness
         initial={{ id: 'tp' }}
         meta={{ saveError: "transit.points[0]: Transit Point 'hr' authenticates no caller" }}
+      />
+    );
+    expect(screen.queryByTestId('transit-point-save-error')).toBeNull();
+  });
+
+  it('shows a variant refusal only in that variant, and a base refusal only on the base', () => {
+    const variantError = "variant 'beta' transit.points[0]: Transit Point 'crm' sets x (400)";
+    const { unmount } = render(
+      <Harness
+        initial={{ id: 'tp' }}
+        meta={{ saveError: variantError, activeVariantAlias: 'beta' }}
+      />
+    );
+    expect(screen.getByTestId('transit-point-save-error')).toHaveTextContent(
+      "The gateway refused the last save: Transit Point 'crm' sets x"
+    );
+    unmount();
+    const { unmount: unmountBase } = render(
+      <Harness initial={{ id: 'tp' }} meta={{ saveError: variantError }} />
+    );
+    expect(screen.queryByTestId('transit-point-save-error')).toBeNull();
+    unmountBase();
+    render(
+      <Harness
+        initial={{ id: 'tp' }}
+        meta={{
+          saveError: "transit.points[0]: Transit Point 'crm' sets x",
+          activeVariantAlias: 'other',
+        }}
       />
     );
     expect(screen.queryByTestId('transit-point-save-error')).toBeNull();

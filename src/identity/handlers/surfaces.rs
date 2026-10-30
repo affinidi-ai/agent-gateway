@@ -935,6 +935,34 @@ fn surface_views(surface: &AgentSurface) -> Vec<(Option<String>, AgentSurface)> 
         .collect()
 }
 
+/// How a warning names the Transit Point `alias` of the view `variant`: with
+/// the variant when that variant's overrides define its Transit Points, as
+/// [`crate::proxy::server::OpenTransitPoint::exposure`] does, and as the
+/// surface's own when the view inherits them.
+fn transit_point_name(
+    surface: &AgentSurface,
+    variant: Option<&str>,
+    alias: &str,
+) -> String {
+    let defined_by = variant.filter(|variant| {
+        surface
+            .variants
+            .iter()
+            .any(|candidate| {
+                candidate.alias == *variant
+                    && candidate
+                        .overrides
+                        .transit
+                        .as_ref()
+                        .is_some_and(|transit| transit.points.is_some())
+            })
+    });
+    match defined_by {
+        Some(variant) => format!("'{alias}' in variant '{variant}'"),
+        None => format!("'{alias}'"),
+    }
+}
+
 /// The `jwt_bearer` configurations a view's Access Point accepts, and those of
 /// its Transit Points with each Transit Point's alias. An Access Point that
 /// publishes protected resource metadata accepts only the resource of the
@@ -1025,8 +1053,8 @@ fn shared_issuer_warnings(
     issuers: &std::collections::HashMap<String, String>,
 ) -> Vec<String> {
     let mut warnings = Vec::new();
-    for (alias, view) in surface_views(surface) {
-        let (access_point, transit_points) = jwt_bearer_methods(&view, alias.as_deref());
+    for (variant, view) in surface_views(surface) {
+        let (access_point, transit_points) = jwt_bearer_methods(&view, variant.as_deref());
         let accepted: Vec<&str> = access_point
             .iter()
             .chain(
@@ -1051,8 +1079,9 @@ fn shared_issuer_warnings(
                 .iter()
                 .filter(|other| **other != strategy && issuers.get(**other) == Some(issuer))
             {
+                let name = transit_point_name(surface, variant.as_deref(), alias);
                 let warning = format!(
-                    "Transit Point '{alias}' accepts tokens from issuer '{issuer}' through JWT verification \
+                    "Transit Point {name} accepts tokens from issuer '{issuer}' through JWT verification \
                      strategy '{strategy}', and this surface accepts that issuer through '{other}' too: a caller \
                      with the same subject through either is one caller, with the same delegated credentials; use \
                      one strategy per issuer"
@@ -1076,14 +1105,14 @@ fn shared_issuer_warnings(
 fn shared_audience_warnings(surface: &AgentSurface) -> Vec<String> {
     let views: Vec<_> = surface_views(surface)
         .into_iter()
-        .map(|(alias, view)| jwt_bearer_methods(&view, alias.as_deref()))
+        .map(|(variant, view)| (variant.clone(), jwt_bearer_methods(&view, variant.as_deref())))
         .collect();
     let access_point: Vec<_> = views
         .iter()
-        .flat_map(|(access_point, _)| access_point.iter())
+        .flat_map(|(_, (access_point, _))| access_point.iter())
         .collect();
     let mut warnings = Vec::new();
-    for (_, transit_points) in &views {
+    for (variant, (_, transit_points)) in &views {
         for (alias, transit_point) in transit_points {
             for accepted in access_point
                 .iter()
@@ -1101,10 +1130,11 @@ fn shared_audience_warnings(surface: &AgentSurface) -> Vec<String> {
                     continue;
                 };
                 let warning = format!(
-                    "Transit Point '{}' accepts the Access Point's own tokens (JWT verification strategy '{}', \
+                    "Transit Point {} accepts the Access Point's own tokens (JWT verification strategy '{}', \
                      audience '{audience}'), so a caller of the Access Point can call it directly; give it an \
                      audience of its own",
-                    alias, transit_point.jwt_verification_strategy_id
+                    transit_point_name(surface, variant.as_deref(), alias),
+                    transit_point.jwt_verification_strategy_id
                 );
                 if !warnings.contains(&warning) {
                     warnings.push(warning);
@@ -4173,7 +4203,15 @@ mod validation_tests {
             ] }))
             .unwrap(),
         );
-        assert_eq!(shared_audience_warnings(&variant_only), vec![warning("https://gateway.example/mcp")]);
+        assert_eq!(
+            shared_audience_warnings(&variant_only),
+            vec![
+                "Transit Point 'crm' in variant 'beta' accepts the Access Point's own tokens (JWT verification \
+                 strategy 'idp', audience 'https://gateway.example/mcp'), so a caller of the Access Point can call it \
+                 directly; give it an audience of its own"
+                    .to_string()
+            ]
+        );
         for (case, surface) in [
             ("an audience of its own", surface_with(true, jwt(serde_json::json!(["api://crm-transit"])))),
             (
@@ -4404,6 +4442,55 @@ mod validation_tests {
                 .is_none(),
             "a variant that stores a list of its own is matched against that list, not the surface's"
         );
+    }
+
+    /// A shared-issuer warning names the variant whose overrides define the
+    /// Transit Point, and names a Transit Point a variant inherits as the
+    /// surface's own, once.
+    #[test]
+    fn a_shared_issuer_warning_names_the_variant_that_defines_the_transit_point() {
+        let point = |strategy: &str| {
+            serde_json::json!({ "alias": "crm", "target_endpoint": "https://crm.example", "require_transit_token": false,
+                "source_auth": { "type": "jwt_bearer", "jwt_verification_strategy_id": strategy,
+                    "audiences": ["api://crm-transit"] } })
+        };
+        let surface_with = |variant_overrides: serde_json::Value| -> AgentSurface {
+            serde_json::from_value(serde_json::json!({
+                "name": "agent",
+                "access_point": { "listen_address": "0.0.0.0:8443", "route": "/a2a", "protocol": "a2a",
+                    "caller_authentication": { "methods": [{ "type": "jwt_bearer",
+                        "jwt_verification_strategy_id": "workforce", "audiences": ["api://agent"] }] } },
+                "target": { "endpoint": "https://agent.internal" },
+                "transit": { "outbound_listen_address": "http://localhost:9111", "points": [point("own-issuer")] },
+                "variants": [{ "id": "beta", "alias": "beta", "name": "Beta", "enabled": true,
+                    "overrides": variant_overrides }]
+            }))
+            .unwrap()
+        };
+        let issuers = std::collections::HashMap::from([
+            ("workforce".to_string(), "https://login.example".to_string()),
+            ("partner-keys".to_string(), "https://login.example".to_string()),
+            ("own-issuer".to_string(), "https://crm.example".to_string()),
+        ]);
+        let warning = |name: &str| {
+            format!(
+                "Transit Point {name} accepts tokens from issuer 'https://login.example' through JWT verification \
+                 strategy 'partner-keys', and this surface accepts that issuer through 'workforce' too: a caller \
+                 with the same subject through either is one caller, with the same delegated credentials; use one \
+                 strategy per issuer"
+            )
+        };
+
+        let defined = surface_with(serde_json::json!({ "transit": { "points": [point("partner-keys")] } }));
+        assert_eq!(shared_issuer_warnings(&defined, &issuers), vec![warning("'crm' in variant 'beta'")]);
+
+        let mut inherited = surface_with(serde_json::json!({}));
+        inherited
+            .transit
+            .as_mut()
+            .unwrap()
+            .points = vec![serde_json::from_value(point("partner-keys")).unwrap()];
+        assert_eq!(shared_issuer_warnings(&inherited, &issuers), vec![warning("'crm'")]);
     }
 
     #[test]

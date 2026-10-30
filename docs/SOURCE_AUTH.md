@@ -283,8 +283,12 @@ The Surface Builder's Transit Point panel has a **Who can call this Transit Poin
 with the transit token switch, a **Caller authentication** choice (an API key from the secret
 store or from the provider, or a JWT bearer with its strategy, audiences, token header and
 scheme), and an **Open to any caller** switch that asks for confirmation. The switch shows
-only while the Transit Point has no transit token, `source_auth` or `mcp_http.authorization`;
-choosing the token or a method turns the marking off. A `source_auth` set through the API with
+while the Transit Point has no transit token, `source_auth` or `mcp_http.authorization`, and
+while it is already marked open; choosing the token or a method turns the marking off. An
+empty token scheme is allowed: the gateway then reads the token as the raw header value. The
+API key provider validates the surface's own keys, the same keys an Access Point using the
+provider accepts, so the panel warns that the Access Point's callers can call the Transit Point
+too; an API key from the secret store keeps a separate set of callers. A `source_auth` set through the API with
 mTLS shows as such and is kept; the panel does not edit it, nor DID Auth, which a Transit
 Point does not support. The panel applies the rules above before the save: a Transit Point that
 authenticates no caller and is not open, one that is open beside the token or a method, and a
@@ -436,6 +440,10 @@ answered with a `Warning` header naming those URLs and bind addresses:
 ```
 Warning: 299 - "Transit Point 'crm' serves callers it does not authenticate and is reachable from other hosts: 0.0.0.0:8080, https://gateway.example.com"
 ```
+
+This warning, and the shared-audience and shared-issuer warnings above, name a Transit Point
+that a variant's overrides define as `Transit Point 'crm' in variant 'beta'`. A Transit Point a
+variant inherits from the surface is named as the surface's own, once.
 
 The dashboard shows each such header on the Transit Point it names, in its **Who can call
 this Transit Point** section and in a toast, and keeps it there until that Transit Point's
