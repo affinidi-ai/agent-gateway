@@ -29,7 +29,7 @@ has five types, set by `provider_type`.
 | `oauth2_authorization_code` | Three-legged OAuth. The user signs in to the provider and approves the scopes. | Required, per user |
 | `oauth2_client_credentials` | Two-legged, machine to machine. The gateway authenticates as the client with a client secret. | None |
 | `oauth2_jwt_bearer` | JWT Bearer grant (RFC 7523 section 2.1). The gateway signs a JWT with the provider's private key and posts it as the `assertion`; no client ID or secret. A Google service account for Vertex AI Agent Engine works this way. | None |
-| `oauth2_client_credentials_jwt_auth` | Client Credentials grant whose client authenticates with a signed JWT (`private_key_jwt`, RFC 7523 section 2.2) and a certificate thumbprint instead of a client secret. An Entra certificate credential works this way. | None |
+| `oauth2_client_credentials_jwt_auth` | Client Credentials grant whose client authenticates with a signed JWT (`private_key_jwt`, RFC 7523 section 2.2) instead of a client secret. An Entra certificate credential (key named by certificate thumbprint) and an Ory `private_key_jwt` client (key named by `kid`) work this way. | None |
 | `api_key` | A static key resolved from the secrets store. No OAuth. | None |
 
 A provider carries its authorization and token endpoints and its default scopes. Its
@@ -47,11 +47,11 @@ record that misses a required one.
 | `jwt_signing_algorithm` | `RS256` (default) or `ES256` | `PS256` (default) or `RS256` |
 | `jwt_issuer` | Required: the `iss` claim, a service account's `client_email` | Not used: `iss` and `sub` are the client ID |
 | `jwt_subject` | Optional `sub` (domain-wide delegation) | Not used |
-| `jwt_certificate_secret_ref` | Not used | Required: the PEM certificate, whose SHA-256 thumbprint goes in the `x5t#S256` header |
+| `jwt_certificate_secret_ref` | Not used | Optional: the PEM certificate, whose SHA-256 thumbprint goes in the `x5t#S256` header. Entra needs it; issuers that find the key by `kid`, such as Ory, do not |
 | `client_id_secret_ref` | Not used | Required, sent as `client_id` |
 | `client_secret_secret_ref` | Not used | Refused, so a misconfiguration cannot fall back to a client secret |
 | `jwt_audience` | Optional `aud`; the token endpoint when unset | The same |
-| `jwt_key_id` | Optional `kid` header, a Google key's `private_key_id` | The same |
+| `jwt_key_id` | Optional `kid` header, a Google key's `private_key_id` | Optional `kid` header, such as the `kid` of the key in an Ory client's JWKS. The dashboard warns when neither it nor a certificate is set, since the server may then not find the key |
 
 Create and update resolve the referenced key and certificate after checking the caller may
 use them, and refuse with 400 a key that cannot sign with the algorithm or a certificate that

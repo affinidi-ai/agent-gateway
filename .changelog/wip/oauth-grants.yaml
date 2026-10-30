@@ -7,9 +7,10 @@ changes:
         Credential providers gain oauth2_jwt_bearer, which signs an RS256 or ES256 JWT as
         the grant (RFC 7523 section 2.1, for example a Google service account for Vertex AI
         Agent Engine), and oauth2_client_credentials_jwt_auth, which authenticates the
-        client with a signed JWT and certificate thumbprint instead of a client secret
-        (private_key_jwt, for example an Entra certificate credential). The private key and
-        certificate are secret references, checked to be PEM when the provider is saved.
+        client with a signed JWT instead of a client secret (private_key_jwt, for example an
+        Entra certificate credential or an Ory client with a JWKS). The private key and the
+        optional certificate, whose thumbprint Entra uses to find the key, are secret
+        references, checked to be PEM when the provider is saved.
     - timestamp: '2026-10-29T23:30:00Z'
       title: Let target authentication use a credential provider
       description: >-

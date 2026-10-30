@@ -389,9 +389,11 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
 
 - **JWT Bearer** asks for Token Endpoint, Issuer, Signing Key, and optionally Key ID, Audience
   and Subject, with no client ID or secret. **Client Credentials JWT** asks for Token Endpoint,
-  Client ID, Signing Key and Certificate, with no client secret. Both share the **Signed JWT**
-  section (`JwtAssertionSection.tsx`, `credential-provider-jwt-section`), whose algorithm select
-  lists the type's algorithms, default first.
+  Client ID and Signing Key, and optionally Certificate (Entra) and Key ID, with no client
+  secret. Both share the **Signed JWT** section (`JwtAssertionSection.tsx`,
+  `credential-provider-jwt-section`): Key ID sits under Certificate, a warning
+  (`credential-provider-jwt-key-unidentified-warning`, from `jwtKeyUnidentified`) shows when
+  neither names the key, and the algorithm select lists the type's algorithms, default first.
 - Key material is never typed into this form. Signing key and certificate are secret pickers
   (`SecretSelect.tsx`, `credential-provider-<field>-select`); the operator creates the secret on
   the Secrets page and pastes the PEM there. The gateway checks the PEM on save.
