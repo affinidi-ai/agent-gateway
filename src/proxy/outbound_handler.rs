@@ -14228,9 +14228,10 @@ mod tests {
     }
 
     /// The `credential_delegation` lines that refuse a Transit Point call for
-    /// want of a caller or an agent to key its delegated credentials by name
-    /// the surface variant that served it; a `source_auth` caller with no
-    /// managed agent identity takes the second.
+    /// want of a caller or an agent to key its delegated credentials by, or
+    /// because it arrived over Fabric, name the surface variant that served
+    /// it; a `source_auth` caller with no managed agent identity takes the
+    /// agent line.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_delegation_refusal_line_names_the_request_variant() {
         use crate::observability::policy_audit::{RequestScope, in_request, set_request_variant};
@@ -14255,10 +14256,18 @@ mod tests {
         });
         no_agent.authenticated_by = Some(SourceAuth);
         no_agent.resolved_identity = ProtectedAgentIdentity::Anonymous;
+        let mut over_fabric = no_caller();
+        over_fabric.transit_token_claims =
+            Some(fabric_claims(Some("did:web:agent.example"), "fabric-asserted", Some("sha256:user"), 2));
 
         for (mut ctx, expected, line) in [
             (no_caller(), DelegationRefusal::CallerIdentityMissing, "identifies the caller - refusing the request"),
             (no_agent, DelegationRefusal::AgentIdentityMissing, "No managed agent identity for delegated credentials"),
+            (
+                over_fabric,
+                DelegationRefusal::CallerIdentityMissing,
+                "not released for requests that arrived over Fabric",
+            ),
         ] {
             let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
             let refused = in_request(RequestScope::fresh(), async {
@@ -14504,7 +14513,8 @@ mod tests {
 
     /// A Transit Point records the call it refuses at the hop limit as a
     /// `request_rejected` in the call's trace, with the JSON-RPC code an MCP
-    /// caller gets, and records nothing for a call it forwards.
+    /// caller gets and the surface variant that served it, and records nothing
+    /// for a call it forwards.
     #[tokio::test]
     async fn a_fabric_transit_point_records_the_call_it_refuses_at_the_hop_limit() {
         use crate::audit::request_events::{RejectionReason, RejectionStage};
@@ -14517,7 +14527,14 @@ mod tests {
             ctx.virtual_channel
                 .target_endpoint = "fabric://peer-gateway/peer-surface".into();
             ctx.transit_token_claims = Some(fabric_claims(None, "fabric-asserted", None, hops));
-            let (_, events) = crate::audit::producer::capture(async { step_check_fabric_hops(&ctx) }).await;
+            let (_, events) = crate::audit::producer::capture(crate::observability::policy_audit::in_request(
+                crate::observability::policy_audit::RequestScope::fresh(),
+                async {
+                    crate::observability::policy_audit::set_request_variant("beta");
+                    step_check_fabric_hops(&ctx)
+                },
+            ))
+            .await;
             events
                 .into_iter()
                 .filter_map(|event| match event.event {
@@ -14534,6 +14551,7 @@ mod tests {
                         rpc_error_code,
                         event.trace_id == Some(ctx.request_id.clone()),
                         event.surface_id == Some(ctx.surface.surface_id.clone()),
+                        event.surface_variant == Some("beta".to_string()),
                     )),
                     _ => None,
                 })
@@ -14542,11 +14560,11 @@ mod tests {
 
         assert_eq!(
             rejections(8, false).await,
-            [(RejectionStage::Forward, RejectionReason::FabricChainTooLong, Some(508), None, true, true)]
+            [(RejectionStage::Forward, RejectionReason::FabricChainTooLong, Some(508), None, true, true, true)]
         );
         assert_eq!(
             rejections(8, true).await,
-            [(RejectionStage::Forward, RejectionReason::FabricChainTooLong, Some(508), Some(-32603), true, true)]
+            [(RejectionStage::Forward, RejectionReason::FabricChainTooLong, Some(508), Some(-32603), true, true, true)]
         );
         assert!(
             rejections(7, false)
