@@ -6,6 +6,8 @@ pub mod q3_resource_config;
 pub mod reader;
 pub mod reference_fields;
 pub mod store;
+#[cfg(test)]
+pub(crate) mod test_builds;
 pub mod types;
 pub mod worker;
 

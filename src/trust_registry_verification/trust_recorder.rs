@@ -343,10 +343,7 @@ async fn lookup_entry_tr_did(
     };
 
     let tr_did = tr
-        .main_did
-        .as_deref()
-        .or(tr.registry_did.as_deref())
-        .or(tr.did.as_deref())
+        .query_did()
         .map(str::to_string);
     tr_did.ok_or_else(|| {
         warn!(

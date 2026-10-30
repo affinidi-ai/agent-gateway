@@ -872,10 +872,13 @@ async fn persist_tenant_id(
                 .ok_or_else(|| missing(kind, id))?;
             resource.tenant_id = tenant_id;
             resource.updated_at = chrono::Utc::now();
-            store
-                .update(&resource)
+            if !store
+                .update_if_exists(&resource)
                 .await
-                .map_err(internal)?;
+                .map_err(internal)?
+            {
+                return Err(missing(kind, id));
+            }
         }
         ResourceKind::Authorities => {
             let store = state

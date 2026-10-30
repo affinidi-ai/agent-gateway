@@ -180,7 +180,8 @@ A node runs in one of two modes, set by `server_mode` in the bootstrap config (d
   journal.
 - **Standby** keeps the fabric and trust listeners inactive, keeps no audit records, and reports not
   ready. It takes over the audit journal when it becomes Active (see
-  [Governance audit delivery](OBSERVABILITY.md)).
+  [Governance audit delivery](OBSERVABILITY.md)). It opens no trust registry connection: creating or
+  reconnecting a trust registry returns 503 before anything is written.
 
 On becoming Active, before the audit pipeline starts, a node re-reads the dashboard settings
 (`settings.json`) from disk and empties its integration cache. The audit sinks are then built from

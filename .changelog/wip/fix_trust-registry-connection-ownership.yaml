@@ -1,0 +1,74 @@
+branch: fix/trust-registry-connection-ownership
+changes:
+  added: []
+  changed:
+    - timestamp: '2026-10-28T16:11:17Z'
+      title: Rebuild a trust registry from its stored keys when it is reconnected
+      description: >-
+        Reconnect no longer falls back to accepting the registry's OOB invitation again
+        once the registry has an identity. That fallback created a new identity over the
+        stored keys, which the registry admin rejects, and for `did:peer` and `did:webvh`
+        registries it could not be undone. A failed reconnect now returns 502, logs the
+        cause instead of returning it, and leaves the stored status and identity unchanged.
+        A registry whose setup never connected has no identity yet, so reconnecting it
+        still accepts its OOB invitation again and completes the setup, unless a connection
+        for it is already installed. The new identity is saved onto the registry's current
+        record even when the request is dropped during the build, so edits made meanwhile
+        are kept. A successful reconnect moves a Failed registry to Connecting, where it
+        waits for the registry to approve it, and keeps any other status, so a registry is
+        no longer shown as Connected before the registry approves it. A registry marked
+        Failed before this change by a dropped connection stays Connecting after it is
+        reconnected until the registry approves it again.
+    - timestamp: '2026-10-28T16:11:17Z'
+      title: Refuse to create or reconnect trust registries on a Standby node
+      description: >-
+        Create and reconnect now return 503 on a Standby node before anything is written,
+        and queries there fail without opening a connection. A Standby node could open
+        sessions under the Active node's DIDs, dropping its sessions, and write Failed into
+        the shared store.
+  fixed:
+    - timestamp: '2026-10-28T16:11:17Z'
+      title: Build each trust registry's connection once, however many queries need it
+      description: >-
+        Trust Checks, Trust Recorders, issuer registration, startup and reconnect could
+        each build a trust registry client at the same time, and the mediator's single
+        websocket per DID made them drop each other's sessions. The gateway now runs one
+        build per registry, which every caller joins and waits for within its own
+        timeout. A build that outlives its caller is still installed for the next query
+        instead of being left half-built, and a build aborted after 90 seconds shuts down the
+        client it created so it cannot hold the registry's websocket. Public registries share
+        one temporary connection per DID, and a stored registry is never queried under a
+        throwaway identity: a query fails when the trust registry store cannot be read.
+    - timestamp: '2026-10-28T16:11:17Z'
+      title: Retry a trust registry in the background after its connection fails
+      description: >-
+        A dropped or failed connection to a connected trust registry no longer marks it
+        Failed. A build that fails is retried in the background by the bootstrap
+        reconnect_policy (by default 30 seconds after the first failure, doubling up to every
+        30 minutes) until it connects, is deleted or the node goes to Standby; a websocket
+        that drops on a working connection is reconnected by the DIDComm client. Reconnect
+        starts a build at once and restarts the backoff. Failed is now set only when the
+        registry rejects the gateway or the first OOB acceptance fails, and a problem report
+        answering a query that already timed out no longer marks a registry Failed.
+        Failed registries are neither retried nor queried automatically, so a registry
+        marked Failed before this change by a dropped connection fails its Trust Checks,
+        Trust Recorders and issuer registration until it is reconnected from the dashboard.
+    - timestamp: '2026-10-28T16:11:17Z'
+      title: Keep a deleted trust registry deleted
+      description: >-
+        A connection still being built, a status change from the registry or an update
+        could write a deleted trust registry back to storage or open a connection for it.
+        Deleting a registry now stops its builds and retries and fails the queries waiting
+        on it, waiting up to 90 seconds for a build still running, and every write except
+        create skips a registry that no longer exists. An update of a registry deleted at
+        the same time returns 404. A delete whose record cannot be removed returns 500 and
+        keeps the registry and its keys usable.
+  removed: []
+  security:
+    - timestamp: '2026-10-29T15:00:00Z'
+      title: Update libz-sys to 1.1.31
+      description: >-
+        libz-sys 1.1.29, which the Kafka client links, has a build script that leaks
+        environment variables into its build directory (rust-lang/libz-sys#280), and
+        cargo-audit reports it. The lockfile now uses the patched 1.1.31.
+  breaking: []

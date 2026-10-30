@@ -173,8 +173,8 @@ enable_sse = true
 enable_stdio = false
 fabric_gateway_timeout_ms = 5000
 
-# Reconnect policy for connection-point DIDComm links.
-# A broken connection is retried with exponential backoff up to
+# Reconnect policy for connection-point DIDComm links and trust registry
+# connections. A broken connection is retried with exponential backoff up to
 # max_backoff_seconds, then keeps retrying at that fixed interval.
 [reconnect_policy]
 # Initial delay after the first failed attempt (default: 30).

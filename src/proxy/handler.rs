@@ -21490,13 +21490,14 @@ mod fabric_extended_card_tests {
         let registry_dir = tempfile::tempdir().unwrap();
         peer.state
             .trust_registry_listener_manager =
-            Some(Arc::new(crate::trust_registries::TrustRegistryListenerManager::new(
+            Some(crate::trust_registries::TrustRegistryListenerManager::with_retry_policy(
                 "gateway.example".to_string(),
                 registry_dir
                     .path()
                     .to_path_buf(),
                 None,
-            )));
+                crate::comm::connection_health::ReconnectPolicy::default(),
+            ));
         let element = |id: &str, authority: &str| {
             json!({
                 "id": id,

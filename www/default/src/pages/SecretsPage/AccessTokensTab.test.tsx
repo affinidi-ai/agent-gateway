@@ -68,7 +68,9 @@ describe('AccessTokensTab', () => {
     await screen.findByTestId('access-token-row-agat_token1');
 
     await userEvent.click(screen.getByTestId('access-token-new-button'));
-    expect(screen.getByTestId('location')).toHaveTextContent('/access-tokens/new');
+    await waitFor(() =>
+      expect(screen.getByTestId('location')).toHaveTextContent('/access-tokens/new')
+    );
   });
 
   it('opens the edit page when the token row is clicked', async () => {
@@ -77,7 +79,9 @@ describe('AccessTokensTab', () => {
 
     expect(screen.queryByTestId('access-token-edit-agat_token1')).not.toBeInTheDocument();
     await userEvent.click(row);
-    expect(screen.getByTestId('location')).toHaveTextContent('/access-tokens/agat_token1');
+    await waitFor(() =>
+      expect(screen.getByTestId('location')).toHaveTextContent('/access-tokens/agat_token1')
+    );
   });
 
   it('uses the danger revoke action without opening the row', async () => {

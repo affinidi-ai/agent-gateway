@@ -117,6 +117,15 @@ impl TrustRegistry {
             updated_at: now,
         }
     }
+
+    /// The DID queries and records for this registry are addressed to: its
+    /// canonical DID, else the DID it answered the OOB invitation with.
+    pub fn query_did(&self) -> Option<&str> {
+        self.main_did
+            .as_deref()
+            .or(self.registry_did.as_deref())
+            .or(self.did.as_deref())
+    }
 }
 
 impl StorableEntity for TrustRegistry {
@@ -365,6 +374,26 @@ pub struct UpdateReferenceFieldRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_did_prefers_the_canonical_then_the_registry_then_the_inviter_did() {
+        let mut registry = TrustRegistry::new(
+            "registry".into(),
+            String::new(),
+            "https://registry.example/oob".into(),
+            DidMethod::default(),
+        );
+        assert_eq!(registry.query_did(), None);
+
+        registry.did = Some("did:example:inviter".into());
+        assert_eq!(registry.query_did(), Some("did:example:inviter"));
+
+        registry.registry_did = Some("did:example:registry".into());
+        assert_eq!(registry.query_did(), Some("did:example:registry"));
+
+        registry.main_did = Some("did:example:main".into());
+        assert_eq!(registry.query_did(), Some("did:example:main"));
+    }
 
     /// Some trust registries return only the decision boolean on the
     /// not-matched path (`{ "recognized": false }`). The decision field is

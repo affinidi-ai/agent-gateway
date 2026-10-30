@@ -17,7 +17,7 @@ use tracing::{debug, error, info, warn};
 
 use super::communication::{TrustRegistryConnection, connection};
 use super::store::TrustRegistryStore;
-use super::types::TrustRegistryConnectionStatus;
+use super::types::{TrustRegistry, TrustRegistryConnectionStatus};
 use crate::comm::didcomm::trust_registry::PollResult;
 use crate::server::websocket::WsState;
 
@@ -126,9 +126,16 @@ async fn handle_message(
                 .await
             {
                 debug!("TR reader: delivered problem-report to waiter (thid {})", thid);
+            } else if connection
+                .timed_out_queries
+                .contains(&thid)
+            {
+                warn!(
+                    "TR reader: problem-report for '{}' answers a query that timed out (thid {}), ignoring",
+                    connection.trust_registry_id, thid
+                );
             } else {
-                // No query waiter → a connection-level problem (e.g. the
-                // registry rejected the setup / approval).
+                // No query waiter → the registry rejected the gateway.
                 let code = message
                     .body
                     .get("code")
@@ -174,30 +181,125 @@ async fn update_status(
     };
     let tr_id = &connection.trust_registry_id;
 
-    let mut tr = match store.get(tr_id).await {
-        Ok(Some(tr)) => tr,
+    let status_label = format!("{:?}", new_status);
+    let change = Box::new(move |tr: &mut TrustRegistry| {
+        tr.connection_status = new_status;
+        tr.updated_at = chrono::Utc::now();
+    });
+    match store
+        .modify(tr_id, change)
+        .await
+    {
+        Ok(Some(_)) => {}
         Ok(None) => {
-            warn!("TR reader: trust registry '{}' not found in store", tr_id);
+            debug!("TR reader: trust registry '{}' was deleted; its status was not written", tr_id);
             return;
         }
         Err(e) => {
-            error!("TR reader: failed to get trust registry '{}': {}", tr_id, e);
+            error!("TR reader: failed to update status for '{}': {}", tr_id, e);
             return;
         }
-    };
-
-    let status_label = format!("{:?}", new_status);
-    tr.connection_status = new_status;
-    tr.updated_at = chrono::Utc::now();
-
-    if let Err(e) = store.update(&tr).await {
-        error!("TR reader: failed to update status for '{}': {}", tr_id, e);
-        return;
     }
 
     info!("TR reader: updated '{}' status to {}", tr_id, status_label);
 
     if let Some(ws_state) = ws_state {
         ws_state.broadcast(crate::server::WsUpdate::RefreshDashboard);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::trust_registries::FileSystemTrustRegistryStore;
+    use crate::trust_registries::communication::TimedOutQueries;
+    use crate::trust_registries::did_manager::DidMethod;
+    use crate::trust_registries::types::TrustRegistry;
+    use tokio::sync::Mutex;
+
+    async fn registry_with(
+        status: TrustRegistryConnectionStatus
+    ) -> (TrustRegistryConnection, Option<Arc<dyn TrustRegistryStore>>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = FileSystemTrustRegistryStore::new(dir.path().join("records"))
+            .await
+            .expect("store");
+        let mut registry = TrustRegistry::new(
+            "registry".to_string(),
+            String::new(),
+            "https://registry.example/oob".to_string(),
+            DidMethod::Peer,
+        );
+        registry.connection_status = status;
+        store
+            .create(&registry)
+            .await
+            .expect("create");
+        let connection = TrustRegistryConnection {
+            trust_registry_id: registry.id,
+            our_did: "did:example:gateway".to_string(),
+            registry_did: "did:example:registry".to_string(),
+            main_did: None,
+            mediator_did: "did:example:mediator".to_string(),
+            is_temporary: false,
+            client: crate::trust_registries::test_builds::offline_client().await,
+            response_waiters: Arc::new(Mutex::new(HashMap::new())),
+            timed_out_queries: TimedOutQueries::default(),
+        };
+        (connection, Some(Arc::new(store) as Arc<dyn TrustRegistryStore>), dir)
+    }
+
+    fn problem_report(thid: &str) -> DIDCommMessage {
+        DIDCommMessage::build(
+            uuid::Uuid::new_v4().to_string(),
+            MSG_TYPE_PROBLEM_REPORT.to_string(),
+            serde_json::json!({ "code": "e.p.rejected", "comment": "rejected" }),
+        )
+        .thid(thid.to_string())
+        .finalize()
+    }
+
+    async fn status_of(
+        store: &Option<Arc<dyn TrustRegistryStore>>,
+        connection: &TrustRegistryConnection,
+    ) -> TrustRegistryConnectionStatus {
+        store
+            .as_ref()
+            .expect("store")
+            .get(&connection.trust_registry_id)
+            .await
+            .expect("get")
+            .expect("the registry is stored")
+            .connection_status
+    }
+
+    #[tokio::test]
+    async fn a_problem_report_answering_a_timed_out_query_keeps_the_status() {
+        let (connection, store, _dir) = registry_with(TrustRegistryConnectionStatus::Connected).await;
+        connection
+            .timed_out_queries
+            .record("thid-timed-out");
+
+        handle_message(problem_report("thid-timed-out"), &connection, &store, &None).await;
+
+        assert_eq!(status_of(&store, &connection).await, TrustRegistryConnectionStatus::Connected);
+    }
+
+    #[tokio::test]
+    async fn any_other_unmatched_problem_report_marks_the_registry_failed() {
+        for status in [
+            TrustRegistryConnectionStatus::Connecting,
+            TrustRegistryConnectionStatus::AwaitingApproval,
+            TrustRegistryConnectionStatus::Connected,
+        ] {
+            let (connection, store, _dir) = registry_with(status).await;
+            connection
+                .timed_out_queries
+                .record("thid-timed-out");
+
+            handle_message(problem_report("thid-rejection"), &connection, &store, &None).await;
+
+            assert_eq!(status_of(&store, &connection).await, TrustRegistryConnectionStatus::Failed);
+        }
     }
 }
