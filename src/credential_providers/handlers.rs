@@ -17,6 +17,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::auth_manager::pat::{PatContext, PatResourceScope};
+use crate::config::credential_policy::RuleMode;
 use crate::delegation_vault::oauth::TokenEgress;
 use crate::secrets::SecretsStore;
 use crate::tenancy::{
@@ -139,17 +140,18 @@ async fn validate_consent_strategy(
     Ok(())
 }
 
+/// Every reference must name a secret of the provider's own tenant that the caller may use.
+/// A reference already stored on the provider is kept while `mode` is `warn`.
 async fn validate_secret_references(
     state: &CredentialProviderState,
     tenant_id: Option<&str>,
-    references: impl IntoIterator<Item = Option<&str>>,
+    references: &[&str],
+    stored: &[&str],
+    mode: RuleMode,
     context: &Option<Extension<PatTenantContext>>,
     scope: &Option<Extension<PatResourceScope>>,
 ) -> Result<(), ProviderValidationError> {
-    for secret_id in references
-        .into_iter()
-        .flatten()
-    {
+    for &secret_id in references {
         let secret = state
             .secrets_store
             .get_by_secret_id(secret_id)
@@ -159,7 +161,11 @@ async fn validate_secret_references(
                 ProviderValidationError::SecretLookupFailed
             })?
             .ok_or(ProviderValidationError::SecretNotAccessible)?;
-        if !can_reference(tenant_id, secret.tenant_id.as_deref())
+        let own_tenant = secret.tenant_id.as_deref() == tenant_id;
+        if !(own_tenant
+            || !mode.is_enforced()
+                && stored.contains(&secret_id)
+                && can_reference(tenant_id, secret.tenant_id.as_deref()))
             || !scope_allows_resource(
                 resource_scope(scope),
                 tenant_context(context),
@@ -345,33 +351,24 @@ async fn validate_provider_settings(
     state: &CredentialProviderState,
     provider: &CredentialProvider,
     previous: Option<&CredentialProvider>,
+    egress: &TokenEgress,
     context: &Option<Extension<PatTenantContext>>,
     scope: &Option<Extension<PatResourceScope>>,
 ) -> Result<(), ProviderValidationError> {
-    validate_token_endpoint_scheme(&TokenEgress::from_environment(), previous, provider)?;
+    validate_token_endpoint_scheme(egress, previous, provider)?;
     validate_jwt_provider(provider)?;
+    let stored = match previous {
+        Some(previous) => previous.secret_refs(),
+        None => Vec::new(),
+    };
     validate_secret_references(
         state,
         provider.tenant_id.as_deref(),
-        [
-            provider
-                .client_id_secret_ref
-                .as_deref(),
-            provider
-                .client_secret_secret_ref
-                .as_deref(),
-            provider
-                .api_key_secret_ref
-                .as_deref(),
-            provider
-                .jwt
-                .jwt_signing_key_secret_ref
-                .as_deref(),
-            provider
-                .jwt
-                .jwt_certificate_secret_ref
-                .as_deref(),
-        ],
+        &provider.secret_refs(),
+        &stored,
+        egress
+            .policy
+            .tenant_credential_isolation,
         context,
         scope,
     )
@@ -574,7 +571,9 @@ pub async fn create_provider(
         updated_at: now,
     };
 
-    if let Err(error) = validate_provider_settings(&state, &provider, None, &context, &scope).await {
+    if let Err(error) =
+        validate_provider_settings(&state, &provider, None, &TokenEgress::from_environment(), &context, &scope).await
+    {
         return error.into_response();
     }
 
@@ -774,7 +773,16 @@ pub async fn update_provider(
         updated_at: Utc::now(),
     };
 
-    if let Err(error) = validate_provider_settings(&state, &updated, Some(&previous), &context, &scope).await {
+    if let Err(error) = validate_provider_settings(
+        &state,
+        &updated,
+        Some(&previous),
+        &TokenEgress::from_environment(),
+        &context,
+        &scope,
+    )
+    .await
+    {
         return error.into_response();
     }
 
@@ -865,6 +873,7 @@ pub async fn validate_provider(
 /// out; `None` for a type that signs nothing.
 async fn validate_key_material_request(
     state: &CredentialProviderState,
+    egress: &TokenEgress,
     tenant_id: Option<&str>,
     req: &ValidateCredentialProviderRequest,
     context: &Option<Extension<PatTenantContext>>,
@@ -883,12 +892,19 @@ async fn validate_key_material_request(
     validate_secret_references(
         state,
         tenant_id,
-        [
+        &[
             jwt.jwt_signing_key_secret_ref
                 .as_deref(),
             jwt.jwt_certificate_secret_ref
                 .as_deref(),
-        ],
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>(),
+        &[],
+        egress
+            .policy
+            .tenant_credential_isolation,
         context,
         scope,
     )
@@ -924,7 +940,8 @@ async fn validate_provider_with(
     }
 
     // Local checks first, so a request that fails them sends nothing to the endpoint.
-    let algorithm = match validate_key_material_request(state, tenant_id.as_deref(), &req, context, scope).await {
+    let algorithm = match validate_key_material_request(state, egress, tenant_id.as_deref(), &req, context, scope).await
+    {
         Ok(algorithm) => algorithm,
         Err(error) => return error.into_response(),
     };
@@ -1669,6 +1686,180 @@ mod jwt_provider_tests {
         let (status, response) = validate(&state, &http, None, pss_bearer).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(response["error"], "jwt_signing_algorithm is not supported for this provider type");
+    }
+
+    fn tenant_a_context() -> Option<Extension<PatTenantContext>> {
+        Some(Extension(PatTenantContext {
+            token_id: "token-a".into(),
+            tenant_id: "tenant-a".into(),
+        }))
+    }
+
+    async fn add_tenant_a_secret(
+        state: &CredentialProviderState,
+        secret_id: &str,
+    ) {
+        state
+            .secrets_store
+            .create(crate::secrets::CreateSecretRequest {
+                tenant_id: Some("tenant-a".into()),
+                name: secret_id.into(),
+                secret_id: secret_id.into(),
+                description: None,
+                value: "tenant-value".into(),
+                secret_type: "general".into(),
+                tags: vec![],
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn create_as_tenant_a(
+        state: &CredentialProviderState,
+        body: Value,
+    ) -> (StatusCode, Value) {
+        let response = create_provider(
+            State(state.clone()),
+            None,
+            tenant_a_context(),
+            None,
+            Json(serde_json::from_value(body).unwrap()),
+        )
+        .await
+        .into_response();
+        body_of(response).await
+    }
+
+    fn api_key_provider(
+        provider_id: &str,
+        secret_ref: &str,
+    ) -> Value {
+        json!({"name": "Key", "provider_id": provider_id, "provider_type": "api_key", "api_key_secret_ref": secret_ref})
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_new_tenant_provider_must_reference_its_own_tenants_secrets() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        add_tenant_a_secret(&state, "TENANT_KEY").await;
+
+        let (status, response) = create_as_tenant_a(&state, api_key_provider("wide", "CLIENT_SECRET")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+        assert_eq!(response["error"], "Secret reference is not accessible");
+        let mut client = client_credentials("oauth2_client_credentials");
+        client["client_secret_secret_ref"] = json!("TENANT_KEY");
+        let (status, response) = create_as_tenant_a(&state, client).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "the client id is appliance-wide: {response}");
+        let (status, response) = create_as_tenant_a(&state, api_key_provider("own", "TENANT_KEY")).await;
+        assert_eq!(status, StatusCode::CREATED, "{response}");
+        assert_eq!(response["tenant_id"], "tenant-a");
+
+        let stored = state
+            .store
+            .list()
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+
+        let (status, response) = create(&state, api_key_provider("operator", "CLIENT_SECRET")).await;
+        assert_eq!(status, StatusCode::CREATED, "an appliance-wide provider keeps appliance-wide secrets: {response}");
+        add_tenant_a_secret(&state, "TENANT_ONLY").await;
+        let (status, response) = create(&state, api_key_provider("operator-2", "TENANT_ONLY")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stored_cross_tenant_reference_is_kept_in_warn_mode_and_a_changed_one_is_refused() {
+        use crate::config::credential_policy::CredentialPolicyConfig;
+
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        add_tenant_a_secret(&state, "TENANT_KEY").await;
+        let stored: CredentialProvider = serde_json::from_value(json!({
+            "id": "stored", "name": "Key", "provider_id": "stored", "provider_type": "api_key",
+            "api_key_secret_ref": "CLIENT_SECRET", "tenant_id": "tenant-a",
+            "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+        }))
+        .unwrap();
+        state
+            .store
+            .create(stored.clone())
+            .await
+            .unwrap();
+
+        let response = update_provider(
+            State(state.clone()),
+            Path("stored".into()),
+            tenant_a_context(),
+            None,
+            Json(serde_json::from_value(json!({"name": "Renamed"})).unwrap()),
+        )
+        .await
+        .into_response();
+        let (status, response) = body_of(response).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["api_key_secret_ref"], "CLIENT_SECRET");
+
+        let reassign = |secret_ref: &'static str| {
+            update_provider(
+                State(state.clone()),
+                Path("stored".into()),
+                tenant_a_context(),
+                None,
+                Json(serde_json::from_value(json!({"api_key_secret_ref": secret_ref})).unwrap()),
+            )
+        };
+        let (status, response) = body_of(
+            reassign("NOT_A_KEY")
+                .await
+                .into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "a changed appliance-wide reference is refused: {response}");
+        let (status, response) = body_of(
+            reassign("TENANT_KEY")
+                .await
+                .into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+
+        let egress = |mode| TokenEgress {
+            timeout: std::time::Duration::from_secs(5),
+            exact_allowlist: None,
+            policy: CredentialPolicyConfig {
+                tenant_credential_isolation: mode,
+                ..Default::default()
+            },
+        };
+        let check = |mode| {
+            let state = state.clone();
+            let stored = stored.clone();
+            async move {
+                validate_provider_settings(&state, &stored, Some(&stored), &egress(mode), &tenant_a_context(), &None)
+                    .await
+            }
+        };
+        assert!(
+            check(RuleMode::Warn)
+                .await
+                .is_ok()
+        );
+        assert!(matches!(check(RuleMode::Enforce).await, Err(ProviderValidationError::SecretNotAccessible)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn validate_refuses_an_appliance_wide_key_for_a_tenant_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        add_tenant_a_secret(&state, "TENANT_KEY").await;
+        let (http, requests, _server) = token_endpoint_answering_get().await;
+        let (status, response) = validate(&state, &http, tenant_a_context(), validate_jwt_bearer("SA_KEY")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+        assert_eq!(response["error"], "Secret reference is not accessible");
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let (status, response) = validate(&state, &http, None, validate_jwt_bearer("SA_KEY")).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

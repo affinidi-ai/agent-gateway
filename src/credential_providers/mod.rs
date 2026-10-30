@@ -258,6 +258,27 @@ impl StorableEntity for CredentialProvider {
 }
 
 impl CredentialProvider {
+    /// The secret ids this provider reads: client, API key, signing key and certificate.
+    pub fn secret_refs(&self) -> Vec<&str> {
+        [
+            self.client_id_secret_ref
+                .as_deref(),
+            self.client_secret_secret_ref
+                .as_deref(),
+            self.api_key_secret_ref
+                .as_deref(),
+            self.jwt
+                .jwt_signing_key_secret_ref
+                .as_deref(),
+            self.jwt
+                .jwt_certificate_secret_ref
+                .as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
     /// The algorithm this provider signs its JWT with: the configured one, or its
     /// type's default. `None` for types that sign nothing.
     pub fn jwt_signing_algorithm(&self) -> Option<JwtSigningAlgorithm> {

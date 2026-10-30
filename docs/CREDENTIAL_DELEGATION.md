@@ -61,6 +61,25 @@ already cached, the legacy code exchange and refresh fail with `token_endpoint m
 URL`, and the `2026-07-28` consent exchange answers an invalid record. Move such providers to
 https, or list a deliberate http endpoint, before switching to `enforce`.
 
+### Provider secrets belong to the provider's tenant
+
+Every secret a provider references (client ID, client secret, API key, signing key,
+certificate) must belong to the provider's own tenant: a tenant provider uses its tenant's
+secrets, an appliance-wide provider uses appliance-wide secrets. `credential_policy.tenant_credential_isolation`
+sets how the rule is applied (see [Credential policy](CONFIGURATION_RELOAD.md#credential-policy)):
+
+| | `warn` (default) | `enforce` |
+| --- | --- | --- |
+| Create, or an update that sets a reference to another tenant's or an appliance-wide secret on a tenant provider | 400 `Secret reference is not accessible` | The same |
+| Update that keeps a stored reference | Saved | 400 |
+| `POST /api/v1/credential-providers/validate` | 400 for a signing key or certificate in another tenant, before the key is read | The same |
+| Authorization URL, code exchange, refresh, service token grant or API key read | The secret is read, with a warning log naming the provider and secret id | Refused before the secret is read |
+
+In `enforce` mode a service token or API key whose secret is outside the provider's tenant
+reports `SecretUnavailable`, and no token request is sent. A cached service token is served
+without reading the provider's secrets, so it stays valid until it expires. Move such secrets
+into the provider's tenant before switching to `enforce`.
+
 ### Providers that sign a JWT
 
 The two JWT types share the settings in `JwtAssertionSettings`; create and update refuse a

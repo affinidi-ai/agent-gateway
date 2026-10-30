@@ -15,6 +15,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use super::{ConsentRequired, OAuthState, OAuthTokenResponse};
+use crate::config::credential_policy::{RuleMode, credential_policy};
 use crate::credential_providers::CredentialProvider;
 use crate::identity::ssi::vc_issuer::VcSigner;
 use crate::secrets::SecretsStore;
@@ -40,7 +41,7 @@ pub async fn build_authorization_url(
         .client_id_secret_ref
         .as_deref()
         .ok_or_else(|| anyhow!("Provider '{}' has no client_id_secret_ref", provider.provider_id))?;
-    let client_id = resolve_secret(secrets_store, client_id_ref)
+    let client_id = resolve_secret(provider, secrets_store, client_id_ref, isolation_mode())
         .await
         .context("Failed to resolve client_id secret")?;
 
@@ -142,12 +143,26 @@ async fn exchange_code_for_tokens_with(
         .client_secret_secret_ref
         .as_deref()
         .ok_or_else(|| anyhow!("Provider '{}' has no client_secret_secret_ref", provider.provider_id))?;
-    let client_id = resolve_secret(secrets_store, client_id_ref)
-        .await
-        .context("Failed to resolve client_id")?;
-    let client_secret = resolve_secret(secrets_store, client_secret_ref)
-        .await
-        .context("Failed to resolve client_secret")?;
+    let client_id = resolve_secret(
+        provider,
+        secrets_store,
+        client_id_ref,
+        egress
+            .policy
+            .tenant_credential_isolation,
+    )
+    .await
+    .context("Failed to resolve client_id")?;
+    let client_secret = resolve_secret(
+        provider,
+        secrets_store,
+        client_secret_ref,
+        egress
+            .policy
+            .tenant_credential_isolation,
+    )
+    .await
+    .context("Failed to resolve client_secret")?;
 
     let callback_url = provider
         .callback_url
@@ -294,12 +309,26 @@ async fn refresh_access_token_with(
         .client_secret_secret_ref
         .as_deref()
         .ok_or_else(|| anyhow!("Provider '{}' has no client_secret_secret_ref", provider.provider_id))?;
-    let client_id = resolve_secret(secrets_store, client_id_ref)
-        .await
-        .context("Failed to resolve client_id for refresh")?;
-    let client_secret = resolve_secret(secrets_store, client_secret_ref)
-        .await
-        .context("Failed to resolve client_secret for refresh")?;
+    let client_id = resolve_secret(
+        provider,
+        secrets_store,
+        client_id_ref,
+        egress
+            .policy
+            .tenant_credential_isolation,
+    )
+    .await
+    .context("Failed to resolve client_id for refresh")?;
+    let client_secret = resolve_secret(
+        provider,
+        secrets_store,
+        client_secret_ref,
+        egress
+            .policy
+            .tenant_credential_isolation,
+    )
+    .await
+    .context("Failed to resolve client_secret for refresh")?;
 
     let params = [
         ("grant_type", "refresh_token"),
@@ -416,20 +445,28 @@ async fn scoped_token_grant(
         None => None,
     };
     let client_id = resolve_secret(
+        provider,
         secrets,
         provider
             .client_id_secret_ref
             .as_deref()
             .ok_or_else(|| anyhow!("Missing provider client"))?,
+        egress
+            .policy
+            .tenant_credential_isolation,
     )
     .await?;
     let client_secret = zeroize::Zeroizing::new(
         resolve_secret(
+            provider,
             secrets,
             provider
                 .client_secret_secret_ref
                 .as_deref()
                 .ok_or_else(|| anyhow!("Missing provider client secret"))?,
+            egress
+                .policy
+                .tenant_credential_isolation,
         )
         .await?,
     );
@@ -472,7 +509,15 @@ pub async fn fetch_jwt_bearer_token(
     let endpoint = validated_token_endpoint(provider, egress)?;
     let claims = super::jwt_assertion::grant_assertion_claims(provider, scopes, Utc::now().timestamp())
         .map_err(|e| anyhow!(e))?;
-    let assertion = signed_assertion(provider, &claims, secrets).await?;
+    let assertion = signed_assertion(
+        provider,
+        &claims,
+        secrets,
+        egress
+            .policy
+            .tenant_credential_isolation,
+    )
+    .await?;
     let mut params = vec![("grant_type", JWT_BEARER_GRANT_TYPE), ("assertion", assertion.as_str())];
     if let Some(resource) = provider.resource.as_deref() {
         params.push(("resource", resource));
@@ -492,16 +537,28 @@ pub async fn fetch_client_credentials_jwt_auth_token(
 ) -> Result<OAuthTokenResponse> {
     let endpoint = validated_token_endpoint(provider, egress)?;
     let client_id = resolve_secret(
+        provider,
         secrets,
         provider
             .client_id_secret_ref
             .as_deref()
             .ok_or_else(|| anyhow!("Missing provider client"))?,
+        egress
+            .policy
+            .tenant_credential_isolation,
     )
     .await?;
     let claims = super::jwt_assertion::client_auth_assertion_claims(provider, &client_id, Utc::now().timestamp())
         .map_err(|e| anyhow!(e))?;
-    let assertion = signed_assertion(provider, &claims, secrets).await?;
+    let assertion = signed_assertion(
+        provider,
+        &claims,
+        secrets,
+        egress
+            .policy
+            .tenant_credential_isolation,
+    )
+    .await?;
     let scope = scopes.join(" ");
     let mut params = vec![
         ("grant_type", "client_credentials"),
@@ -526,18 +583,21 @@ async fn signed_assertion(
     provider: &CredentialProvider,
     claims: &super::jwt_assertion::AssertionClaims,
     secrets: &Arc<dyn SecretsStore>,
+    mode: RuleMode,
 ) -> Result<zeroize::Zeroizing<String>> {
     let algorithm = provider
         .jwt_signing_algorithm()
         .ok_or_else(|| anyhow!("Provider does not sign assertions"))?;
     let key = zeroize::Zeroizing::new(
         resolve_secret(
+            provider,
             secrets,
             provider
                 .jwt
                 .jwt_signing_key_secret_ref
                 .as_deref()
                 .ok_or_else(|| anyhow!("Missing provider signing key"))?,
+            mode,
         )
         .await?,
     );
@@ -546,7 +606,7 @@ async fn signed_assertion(
         .jwt_certificate_secret_ref
         .as_deref()
     {
-        Some(secret_ref) => Some(zeroize::Zeroizing::new(resolve_secret(secrets, secret_ref).await?)),
+        Some(secret_ref) => Some(zeroize::Zeroizing::new(resolve_secret(provider, secrets, secret_ref, mode).await?)),
         None => None,
     };
     super::jwt_assertion::sign_assertion(
@@ -848,12 +908,13 @@ pub async fn build_delegation_vc(
 pub async fn resolve_api_key(
     provider: &CredentialProvider,
     secrets_store: &Arc<dyn SecretsStore>,
+    mode: RuleMode,
 ) -> Result<String> {
     let secret_ref = provider
         .api_key_secret_ref
         .as_deref()
         .ok_or_else(|| anyhow!("API key provider '{}' has no api_key_secret_ref", provider.provider_id))?;
-    resolve_secret(secrets_store, secret_ref)
+    resolve_secret(provider, secrets_store, secret_ref, mode)
         .await
         .context("Failed to resolve API key secret")
 }
@@ -981,25 +1042,51 @@ pub async fn claim_oauth_state(state: &OAuthState) -> bool {
         .is_fresh()
 }
 
-/// Resolve a secret value from the secrets store by secret_id
+/// Why a provider's secret could not be read.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ProviderSecretError {
+    #[error("provider secret not found")]
+    NotFound,
+    #[error("provider secret belongs to another tenant")]
+    OutsideTenant,
+    #[error("provider secret store unavailable")]
+    Store,
+}
+
+/// Resolve a provider's secret value by secret_id. The secret must belong to the provider's own
+/// tenant; under `mode` `warn` a secret outside it is still read, with a warning.
 pub(super) async fn resolve_secret(
+    provider: &CredentialProvider,
     secrets_store: &Arc<dyn SecretsStore>,
     secret_ref: &str,
-) -> Result<String> {
+    mode: RuleMode,
+) -> Result<String, ProviderSecretError> {
     let secrets = secrets_store
         .list_all()
         .await
-        .context("Failed to list secrets")?;
+        .map_err(|_| ProviderSecretError::Store)?;
     let secret = secrets
         .iter()
         .find(|s| s.secret_id == secret_ref)
-        .ok_or_else(|| anyhow!("Secret with secret_id '{}' not found", secret_ref))?;
+        .ok_or(ProviderSecretError::NotFound)?;
+    if secret.tenant_id != provider.tenant_id {
+        if mode.is_enforced() {
+            warn!(target: "credential_delegation", provider_id = %provider.provider_id, secret_ref, "Refusing a credential provider secret outside the provider's tenant");
+            return Err(ProviderSecretError::OutsideTenant);
+        }
+        warn!(target: "credential_delegation", provider_id = %provider.provider_id, secret_ref, "Using a credential provider secret outside the provider's tenant");
+    }
     let full_secret = secrets_store
         .get(&secret.id)
         .await
-        .context("Failed to get secret by id")?
-        .ok_or_else(|| anyhow!("Secret '{}' disappeared during resolution", secret_ref))?;
+        .map_err(|_| ProviderSecretError::Store)?
+        .ok_or(ProviderSecretError::NotFound)?;
     Ok(full_secret.value)
+}
+
+/// The tenant isolation mode of the running process.
+pub fn isolation_mode() -> RuleMode {
+    credential_policy().tenant_credential_isolation
 }
 
 fn base64_url_encode(data: &str) -> String {
@@ -1194,6 +1281,110 @@ mod tests {
         assert_eq!(
             token_error_reason(r#"{"error":{"code":"nested-secret-marker"}}"#),
             "no OAuth error code in response"
+        );
+    }
+
+    async fn secrets_with_tenants() -> (tempfile::TempDir, Arc<dyn SecretsStore>) {
+        init_test_encryption();
+        let directory = tempfile::tempdir().unwrap();
+        let secrets: Arc<dyn SecretsStore> = Arc::new(
+            crate::secrets::FilesystemSecretsStore::new(
+                directory
+                    .path()
+                    .join("secrets")
+                    .to_str()
+                    .unwrap(),
+            )
+            .unwrap(),
+        );
+        for (secret_id, tenant_id) in [("WIDE", None), ("OWN", Some("tenant-a")), ("OTHER", Some("tenant-b"))] {
+            secrets
+                .create(crate::secrets::CreateSecretRequest {
+                    tenant_id: tenant_id.map(String::from),
+                    name: secret_id.into(),
+                    secret_id: secret_id.into(),
+                    description: None,
+                    value: format!("value-{secret_id}"),
+                    secret_type: "General".into(),
+                    tags: vec![],
+                })
+                .await
+                .unwrap();
+        }
+        (directory, secrets)
+    }
+
+    fn tenant_provider(tenant_id: Option<&str>) -> CredentialProvider {
+        serde_json::from_value(json!({
+            "id": "cp", "name": "Provider", "provider_id": "provider", "tenant_id": tenant_id,
+            "provider_type": "api_key", "api_key_secret_ref": "OWN",
+            "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_provider_secret_must_belong_to_the_provider_tenant_when_enforced() {
+        let (_directory, secrets) = secrets_with_tenants().await;
+        let tenant = tenant_provider(Some("tenant-a"));
+        let wide = tenant_provider(None);
+        let read = |provider: &CredentialProvider, secret_ref: &'static str| {
+            let secrets = secrets.clone();
+            let provider = provider.clone();
+            async move { resolve_secret(&provider, &secrets, secret_ref, RuleMode::Enforce).await }
+        };
+        assert_eq!(
+            read(&tenant, "OWN")
+                .await
+                .as_deref(),
+            Ok("value-OWN")
+        );
+        assert_eq!(
+            read(&wide, "WIDE")
+                .await
+                .as_deref(),
+            Ok("value-WIDE")
+        );
+        assert_eq!(read(&tenant, "WIDE").await, Err(ProviderSecretError::OutsideTenant));
+        assert_eq!(read(&tenant, "OTHER").await, Err(ProviderSecretError::OutsideTenant));
+        assert_eq!(read(&wide, "OWN").await, Err(ProviderSecretError::OutsideTenant));
+        assert_eq!(read(&tenant, "MISSING").await, Err(ProviderSecretError::NotFound));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_provider_secret_outside_the_tenant_is_still_read_in_warn_mode() {
+        let (_directory, secrets) = secrets_with_tenants().await;
+        let tenant = tenant_provider(Some("tenant-a"));
+        for secret_ref in ["WIDE", "OTHER", "OWN"] {
+            assert_eq!(
+                resolve_secret(&tenant, &secrets, secret_ref, RuleMode::Warn)
+                    .await
+                    .unwrap(),
+                format!("value-{secret_ref}")
+            );
+        }
+        assert_eq!(
+            resolve_secret(&tenant, &secrets, "MISSING", RuleMode::Warn).await,
+            Err(ProviderSecretError::NotFound)
+        );
+        assert_eq!(
+            resolve_api_key(&tenant, &secrets, RuleMode::Enforce)
+                .await
+                .unwrap(),
+            "value-OWN"
+        );
+        let mut crossing = tenant.clone();
+        crossing.api_key_secret_ref = Some("WIDE".into());
+        assert!(
+            resolve_api_key(&crossing, &secrets, RuleMode::Enforce)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            resolve_api_key(&crossing, &secrets, RuleMode::Warn)
+                .await
+                .unwrap(),
+            "value-WIDE"
         );
     }
 

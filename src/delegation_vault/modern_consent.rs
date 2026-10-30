@@ -220,11 +220,13 @@ async fn connect(
             .await
             .map_err(failure)?;
         let client_id = super::oauth::resolve_secret(
+            &provider,
             &state.vault.secrets_store,
             provider
                 .client_id_secret_ref
                 .as_deref()
                 .ok_or_else(|| failure(ContinuationError::InvalidRecord))?,
+            super::oauth::isolation_mode(),
         )
         .await
         .map_err(|_| failure(ContinuationError::Unavailable))?;
@@ -564,21 +566,29 @@ pub async fn exchange_code(
         .ok_or(ContinuationError::InvalidRecord)?;
     crate::sts::mcp_profile::canonical_https_url(resource).map_err(|_| ContinuationError::InvalidRecord)?;
     let client_id = super::oauth::resolve_secret(
+        provider,
         secrets,
         provider
             .client_id_secret_ref
             .as_deref()
             .ok_or(ContinuationError::InvalidRecord)?,
+        egress
+            .policy
+            .tenant_credential_isolation,
     )
     .await
     .map_err(|_| ContinuationError::Unavailable)?;
     let client_secret = zeroize::Zeroizing::new(
         super::oauth::resolve_secret(
+            provider,
             secrets,
             provider
                 .client_secret_secret_ref
                 .as_deref()
                 .ok_or(ContinuationError::InvalidRecord)?,
+            egress
+                .policy
+                .tenant_credential_isolation,
         )
         .await
         .map_err(|_| ContinuationError::Unavailable)?,

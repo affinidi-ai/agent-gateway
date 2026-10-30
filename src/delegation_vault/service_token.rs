@@ -100,8 +100,12 @@ pub async fn acquire(
     key: ServiceTokenKey<'_>,
     now: DateTime<Utc>,
 ) -> Result<ServiceToken, ServiceTokenError> {
+    let egress = context
+        .egress
+        .cloned()
+        .unwrap_or_else(oauth::TokenEgress::from_environment);
     if provider.provider_type == CredentialProviderType::ApiKey {
-        let value = oauth::resolve_api_key(provider, context.secrets)
+        let value = oauth::resolve_api_key(provider, context.secrets, egress.policy.tenant_credential_isolation)
             .await
             .map_err(|error| {
                 warn!(target: "credential_delegation", provider_id = %provider.provider_id, %error, "API key resolution failed");
@@ -115,10 +119,6 @@ pub async fn acquire(
             issued: None,
         });
     }
-    let egress = context
-        .egress
-        .cloned()
-        .unwrap_or_else(oauth::TokenEgress::from_environment);
     let endpoint = provider
         .token_endpoint
         .as_deref();
@@ -154,6 +154,8 @@ pub async fn acquire(
             .is_some()
         {
             ServiceTokenError::TokenEndpointRefused
+        } else if error.downcast_ref::<oauth::ProviderSecretError>() == Some(&oauth::ProviderSecretError::OutsideTenant) {
+            ServiceTokenError::SecretUnavailable
         } else {
             ServiceTokenError::TokenRequestFailed
         }
@@ -807,6 +809,96 @@ mod tests {
         assert_eq!(
             ServiceTokenError::TokenEndpointNotHttps.to_string(),
             "credential provider token endpoint is not https"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tenant_providers_appliance_wide_secrets_are_refused_when_enforced_and_used_in_warn_mode() {
+        use crate::config::credential_policy::RuleMode;
+
+        let mut fixture = Fixture::new().await;
+        let tenant = json!({"tenant_id": "tenant-a"});
+        let mut settings = vec![
+            json!({"provider_type": "oauth2_client_credentials", "client_id_secret_ref": "CLIENT_ID",
+                   "client_secret_secret_ref": "CLIENT_SECRET"}),
+            json!({"provider_type": "oauth2_jwt_bearer", "jwt_issuer": "sa@example",
+                   "jwt_signing_key_secret_ref": "SIGNING_KEY"}),
+            json!({"provider_type": "oauth2_client_credentials_jwt_auth", "client_id_secret_ref": "CLIENT_ID",
+                   "jwt_signing_key_secret_ref": "SIGNING_KEY"}),
+            json!({"provider_type": "api_key", "api_key_secret_ref": "API_KEY"}),
+        ];
+        for setting in &mut settings {
+            setting
+                .as_object_mut()
+                .unwrap()
+                .extend(
+                    tenant
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                );
+        }
+        fixture
+            .egress
+            .policy
+            .tenant_credential_isolation = RuleMode::Enforce;
+        for setting in &settings {
+            let provider = fixture
+                .provider(setting.clone())
+                .await;
+            assert_eq!(
+                fixture
+                    .acquire(&provider, &["read"], Utc::now())
+                    .await
+                    .err(),
+                Some(ServiceTokenError::SecretUnavailable),
+                "{:?}",
+                provider.provider_type
+            );
+            fixture
+                .providers
+                .delete(&provider.id)
+                .await
+                .unwrap();
+        }
+        assert!(fixture.requests().is_empty());
+        assert!(
+            fixture
+                .vault
+                .list_all()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        fixture
+            .egress
+            .policy
+            .tenant_credential_isolation = RuleMode::Warn;
+        let provider = fixture
+            .provider(settings[0].clone())
+            .await;
+        let token = fixture
+            .acquire(&provider, &["read"], Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(token.value(), "issued");
+        assert_eq!(fixture.requests().len(), 1);
+        fixture
+            .providers
+            .delete(&provider.id)
+            .await
+            .unwrap();
+        let api_key = fixture
+            .provider(settings[3].clone())
+            .await;
+        assert_eq!(
+            fixture
+                .acquire(&api_key, &[], Utc::now())
+                .await
+                .unwrap()
+                .value(),
+            "static-key"
         );
     }
 

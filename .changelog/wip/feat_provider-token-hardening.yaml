@@ -11,6 +11,14 @@ changes:
         insecure_token_endpoints, and the Validate check refuses such an endpoint without
         contacting it. Saving a stored provider that keeps its http endpoint still works
         while credential_policy token_endpoint_https is warn.
+    - timestamp: '2026-10-30T22:00:00Z'
+      title: Refuse new credential provider references to another tenant's secrets
+      description: >-
+        Creating a credential provider, or changing a secret reference, now answers 400
+        "Secret reference is not accessible" unless the secret belongs to the provider's own
+        tenant; an appliance-wide secret no longer counts for a tenant provider. Validate
+        applies the same rule to a signing key or certificate. Stored references keep working
+        while credential_policy tenant_credential_isolation is warn.
   fixed: []
   removed: []
   security:
@@ -32,4 +40,12 @@ changes:
         refuses such providers before any secret is read, including cached service tokens.
         Upgrade note: move token endpoints to https, or list a deliberate internal http
         endpoint in insecure_token_endpoints, before the default becomes enforce.
+    - timestamp: '2026-10-30T22:00:00Z'
+      title: Warn when tenants use appliance-wide credentials, enforced next release
+      description: >-
+        A credential provider that reads a secret outside its own tenant keeps working in
+        this release, but every read logs a warning. Setting credential_policy
+        tenant_credential_isolation to enforce refuses the read before the secret is
+        loaded, so no token request is sent. Upgrade note: move the secrets into the
+        provider's tenant before the default becomes enforce.
   breaking: []

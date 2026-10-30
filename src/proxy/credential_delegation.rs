@@ -396,7 +396,7 @@ pub async fn resolve_delegation_credentials(
         match &provider.provider_type {
             CredentialProviderType::ApiKey => {
                 // Direct secret resolution — no OAuth, no vault
-                match oauth::resolve_api_key(&provider, secrets_store).await {
+                match oauth::resolve_api_key(&provider, secrets_store, oauth::isolation_mode()).await {
                     Ok(api_key) => {
                         debug!(
                             target: "credential_delegation",
