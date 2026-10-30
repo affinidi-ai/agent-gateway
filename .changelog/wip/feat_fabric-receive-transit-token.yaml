@@ -30,13 +30,27 @@ changes:
         request has made, and the receiving gateway carries the count in the transit token it
         issues, so an agent cannot lower the count in the token it was given. A request past 8
         crossings is refused with `508`, and one whose count is not an integer from 1 to 255
-        with `400`, before surface lookup, each recorded as a `request_rejected` audit event
+        with `400`, before surface lookup (a framed stream resolves its surface and variant when
+        it opens, so it is refused for one that is not available first), each recorded as a `request_rejected` audit event
         (`fabric_chain_too_long`, `fabric_hops_invalid`). A Transit Point to a peer gateway
         refuses a call that would pass the limit with `508` before forwarding it, recorded the
         same way at the `forward` stage. A request from a gateway that does not send the header
         counts as its first crossing: during a rolling upgrade, a chain through a node that
-        predates the count starts again at 1 after it. Only a Transit Point that requires a
-        transit token reads the count, and an agent holding an older token can present it.
+        predates the count starts again at 1 after it. A Transit Point reads the count from the
+        transit token the agent sends, required or not, so a call without one starts again at 1,
+        as does a public discovery `GET` through a Transit Point, and an agent holding an older
+        token can present it. The limit bounds chains
+        of Transit Point calls; agents calling each other's Access Points directly are not
+        bounded by it.
+    - timestamp: '2026-10-30T12:00:00.000Z'
+      title: Warn on save of a Fabric Transit Point that does not require the transit token
+      description: >-
+        A `fabric://` Transit Point with `require_transit_token: false` serves an agent that
+        sends no transit token, and a call without one carries no Fabric hop count, so a chain
+        through it can start again at 1. A create
+        or update of a surface or one of its variants now answers with a `Warning` header naming
+        each such Transit Point, on the surface or in a variant, so operators can turn the token
+        back on.
   changed:
     - timestamp: '2026-10-30T09:00:00.000Z'
       title: Serve Transit Point calls from agents handling requests from partner gateways
@@ -54,8 +68,8 @@ changes:
         `allow_unauthenticated_callers: true`, only so that agents serving requests from paired
         gateways could call it, should set it back to `true` and remove
         `allow_unauthenticated_callers`: those agents now get a transit token. A Transit Point
-        that does not require the token does not read it, so the Fabric hop limit does not hold
-        through it and anyone who reaches it is served.
+        that does not require the token serves anyone who reaches it, and an agent that sends no
+        token starts the Fabric hop count again.
   fixed: []
   removed: []
   security: []

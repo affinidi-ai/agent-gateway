@@ -295,7 +295,9 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
     On Fabric receive, `fabric_hops_invalid` (an `X-Gateway-Fabric-Hops` that is not one integer
     from 1 to 255; the peer is answered `400`) and `fabric_chain_too_long` (a request past 8
     Fabric crossings; `508`) are recorded against the surface id the peer addressed, before it is
-    looked up; see [`FABRIC.md`](FABRIC.md#chains-across-gateways).
+    looked up and before a variant is resolved, so with no `surface_variant`. A framed stream
+    resolves its surface and variant when it opens, so one to a surface or variant that is not
+    available is refused for that first; see [`FABRIC.md`](FABRIC.md#chains-across-gateways).
   - `admission`: `body_too_large`, `protocol_mismatch` (an MCP body on an A2A Access Point or the
     reverse), `invalid_envelope` (not JSON, or not a JSON-RPC request, on every protocol and MCP
     revision), `invalid_request_shape` (A2A fields), `version_unsupported` (A2A or MCP),

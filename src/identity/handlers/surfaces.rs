@@ -859,8 +859,9 @@ type SavedSurface = (axum::http::HeaderMap, Json<AgentSurface>);
 /// `Warning` headers (code 299) naming each Transit Point of `surface` that
 /// serves callers it does not authenticate where other hosts reach it, each
 /// that accepts the Access Point's own tokens ([`shared_audience_warnings`]),
-/// and each whose JWT verification strategy names an issuer the surface also
-/// accepts through another ([`shared_issuer_warnings`]).
+/// each whose JWT verification strategy names an issuer the surface also
+/// accepts through another ([`shared_issuer_warnings`]), and each to a peer
+/// gateway that does not require the transit token ([`fabric_hop_limit_warnings`]).
 async fn transit_point_warnings(
     state: &IdentityApiState,
     surface: &AgentSurface,
@@ -873,6 +874,7 @@ async fn transit_point_warnings(
         .chain(shared_audience_warnings(surface))
         .chain(shared_issuer_warnings(surface, &issuers))
         .chain(modern_delegation_warnings(surface))
+        .chain(fabric_hop_limit_warnings(surface))
     {
         let quoted = warning
             .replace('\\', "\\\\")
@@ -1089,6 +1091,35 @@ fn shared_issuer_warnings(
                 if !warnings.contains(&warning) {
                     warnings.push(warning);
                 }
+            }
+        }
+    }
+    warnings
+}
+
+/// Each `fabric://` Transit Point, on the surface or in an enabled variant,
+/// that does not require the transit token: a call without one carries no
+/// Fabric hop count, so a chain through it can start again at 1.
+fn fabric_hop_limit_warnings(surface: &AgentSurface) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for (_, view) in surface_views(surface) {
+        for transit_point in view
+            .transit_points()
+            .iter()
+            .filter(|point| {
+                point
+                    .target_endpoint
+                    .starts_with("fabric://")
+                    && !point.require_transit_token
+            })
+        {
+            let warning = format!(
+                "Transit Point '{}' sends to a peer gateway without requiring the transit token, so the Fabric hop \
+                 limit holds through it only when the agent sends one; require the transit token",
+                transit_point.alias
+            );
+            if !warnings.contains(&warning) {
+                warnings.push(warning);
             }
         }
     }
@@ -4107,6 +4138,53 @@ mod validation_tests {
             "type": "api_key", "extraction": { "source": "http_header", "field": "X-API-Key" },
             "secret_id": "partner-callers"
         })
+    }
+
+    /// A save warns of a `fabric://` Transit Point, on the surface or in a
+    /// variant, that does not require the transit token, once per alias, and
+    /// not of one that requires it or of an HTTP Transit Point that does not.
+    #[test]
+    fn a_save_warns_of_a_fabric_transit_point_that_does_not_require_the_transit_token() {
+        let point = |alias: &str, target: &str, require: bool| {
+            serde_json::json!({ "alias": alias, "target_endpoint": target, "require_transit_token": require,
+                "source_auth": caller_key() })
+        };
+        let warning = |alias: &str| {
+            format!(
+                "Transit Point '{alias}' sends to a peer gateway without requiring the transit token, so the Fabric \
+                 hop limit holds through it only when the agent sends one; require the transit token"
+            )
+        };
+
+        assert_eq!(
+            fabric_hop_limit_warnings(&surface_with_transit_points(
+                serde_json::json!([
+                    point("partner", "fabric://partner-gateway/partner-surface", false),
+                    point("crm", "https://crm.example", false),
+                    point("peer", "fabric://peer-gateway/peer-surface", true)
+                ]),
+                serde_json::json!([point("partner", "fabric://partner-gateway/partner-surface", false)]),
+            )),
+            vec![warning("partner")]
+        );
+        assert_eq!(
+            fabric_hop_limit_warnings(&surface_with_transit_points(
+                serde_json::json!([point("peer", "fabric://peer-gateway/peer-surface", true)]),
+                serde_json::json!([point("peer", "fabric://peer-gateway/peer-surface", false)]),
+            )),
+            vec![warning("peer")],
+            "a variant's Transit Point is warned of"
+        );
+        assert!(
+            fabric_hop_limit_warnings(&surface_with_transit_points(
+                serde_json::json!([
+                    point("peer", "fabric://peer-gateway/peer-surface", true),
+                    point("crm", "https://crm.example", false)
+                ]),
+                serde_json::json!(null),
+            ))
+            .is_empty()
+        );
     }
 
     /// A save warns of a Transit Point whose `jwt_bearer` accepts tokens issued

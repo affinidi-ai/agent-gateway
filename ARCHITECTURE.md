@@ -299,7 +299,8 @@ as from a legacy-only endpoint.
 | Framed streams | [`src/proxy/fabric_stream/`](src/proxy/fabric_stream/) |
 
 On receive, sender authorization, envelope admission, meaning expiry and replay checks,
-and the hop count check run **before** surface lookup and source auth. A request forwarded to
+and the hop count check run **before** surface lookup and source auth; a framed stream resolves
+its surface and variant when it opens, so it reads the hop count after them. A request forwarded to
 an HTTP(S) Target of a surface with Transit Points carries a transit token the receiving
 gateway issued, naming the peer and the hop count (see
 [`docs/FABRIC.md`](docs/FABRIC.md#chains-across-gateways)). Each gateway keeps its own trust

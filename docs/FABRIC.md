@@ -356,7 +356,9 @@ request received by the destination gateway:
    receiver's cap; the caller deadline (`deadline_ms`) keeps the full timeout.
 3. Read the hop count (`X-Gateway-Fabric-Hops`) and remove it, and every `X-Transit-Token` the peer
    sent, from the request, buffered or framed. A count that is not one integer from 1 to 255 is
-   refused with `400`, and one above the limit with `508`, before surface lookup; see
+   refused with `400`, and one above the limit with `508`, before surface lookup. A framed stream
+   resolves its surface and variant when it opens, so one to a surface or variant that is not
+   available is refused for that before its hop count is read; see
    [Chains across gateways](#chains-across-gateways).
 4. Resolve the destination surface from the legacy wire field `channel_id`.
 5. Run the destination surface's configured source authentication and MCP request-boundary
@@ -473,9 +475,9 @@ When the agent behind the receiving surface then calls one of its own Transit Po
 transit token it got for the peer's request, that Transit Point releases it no delegated per-user
 credential: the token names the peer, never a principal, and never keys a vault lookup. A binding
 that applies refuses the call with `403`, and the Transit Point's target is not called; the log
-says delegated credentials are not released for requests that arrived over Fabric. A caller the
-Transit Point's own `source_auth` verified still gets its own grant, and static `target_auth`
-credentials are added as for any caller (see
+says delegated credentials are not released for requests that arrived over Fabric. The token
+names the call's caller, so a client the Transit Point's own `source_auth` verified on the same
+call gets no grant either; static `target_auth` credentials are added as for any caller (see
 [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-a-transit-point)).
 
 `make gw-e2e` verifies the Access Point Target case between two gateway binaries
@@ -533,15 +535,26 @@ request back and forth without end. A hop count bounds them.
 
 Hops are counted only across Fabric. A chain through an `http` Transit Point into another
 gateway's Access Point, or an agent calling another surface's Access Point directly, starts
-again at 1, and so does a call through a Transit Point that does not require a transit token,
-which does not read one. So does a chain through a gateway that predates the hop count, which
-neither reads nor sends it. A peer that does not follow these rules can reset the count; the
-limit stops honest gateways and runaway agents, it is not an access control.
+again at 1, and so does a call without a transit token through a Transit Point that does not
+require one (it reads the count from a token the agent sends), and a public discovery `GET` (an
+agent card or `.well-known` document) through any Transit Point, which reads no token. So does a chain through a gateway that predates
+the hop count, which neither reads nor sends it. A peer that does not follow these rules can
+reset the count. The limit bounds a chain of Transit Point calls through gateways that follow
+these rules; agents that call each other's Access Points directly are not bounded by it, and it
+is not an access control.
 
 A Transit Point that was set to `require_transit_token: false`, with
 `allow_unauthenticated_callers: true`, only so that agents serving partner requests could call
 it should require the token again and drop `allow_unauthenticated_callers`: those agents now get
-a token, and until the Transit Point reads it, the hop limit does not hold through it.
+a token, and while the Transit Point does not require it, an agent that sends none starts the
+hop count again.
+A create or update of a surface or of one of its variants is answered with a `Warning` header
+for each `fabric://` Transit Point, on the surface or in a variant, that does not require the
+transit token:
+
+```
+Warning: 299 - "Transit Point 'partner' sends to a peer gateway without requiring the transit token, so the Fabric hop limit holds through it only when the agent sends one; require the transit token"
+```
 
 `make gw-e2e` verifies a chain across three gateway binaries and the hop limit between two
 (`tests/features/g2g/transit_token_over_fabric.feature`): an agent serving a partner's request

@@ -458,9 +458,9 @@ pub struct OutboundPipelineContext {
     /// Carries the original caller context from the inbound request.
     pub transit_token_claims: Option<crate::proxy::transit_token::TransitTokenClaims>,
     /// Claims of a valid transit token sent to a Transit Point that does not
-    /// require one. Only `input.transit.caller` reads them: delegation,
-    /// Workload Binding, stream expiry and the trace id keep treating the call
-    /// as carrying no token.
+    /// require one. Only `input.transit.caller` and the Fabric hop count read
+    /// them: delegation, Workload Binding, stream expiry and the trace id keep
+    /// treating the call as carrying no token.
     pub optional_transit_token_claims: Option<crate::proxy::transit_token::TransitTokenClaims>,
     /// Size in bytes of the upstream response body, captured by
     /// `step_process_response` before the body is consumed. Used by
@@ -1242,13 +1242,16 @@ fn adopt_transit_token(
 }
 
 /// The Fabric crossings a call to a `fabric://` target makes: one more than
-/// the managed agent's Fabric-issued transit token records, or the first for
-/// any other token or none. A call that would pass the limit is refused, so
-/// nothing is resolved or forwarded for it.
+/// the managed agent's Fabric-issued transit token records, required or not,
+/// or the first for any other token or none. A call that would pass the limit
+/// is refused, so nothing is resolved or forwarded for it.
 fn outgoing_fabric_hops(ctx: &OutboundPipelineContext) -> Result<u8, OutboundPipelineError> {
     crate::proxy::fabric_hops::next_fabric_hops(
         ctx.transit_token_claims
             .as_ref()
+            .or(ctx
+                .optional_transit_token_claims
+                .as_ref())
             .and_then(|claims| claims.fabric.as_ref())
             .map(|fabric| fabric.hops),
     )
@@ -14959,6 +14962,96 @@ mod tests {
                 .await
                 .is_empty()
         );
+    }
+
+    /// The outbound pipeline refuses a Fabric Transit Point call at the hop
+    /// limit itself, before it forwards anything: one `request_rejected` at the
+    /// `forward` stage, which the send-time check does not write. A Transit
+    /// Point that does not require the token reads the count from one the agent
+    /// sends too.
+    #[tokio::test]
+    async fn the_outbound_pipeline_refuses_a_fabric_call_at_the_hop_limit_before_forwarding() {
+        use crate::audit::request_events::{RejectionReason, RejectionStage};
+        use crate::proxy::transit_token::{TransitTokenIssuer, TransitTokenKey};
+
+        let issuer = TransitTokenIssuer::new(TransitTokenKey::generate().unwrap(), "gateway".into());
+        let refuse = |hops: u8, require_transit_token: bool| {
+            let issuer = issuer.clone();
+            async move {
+                let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+                    "surface_id": "fabric-surface", "name": "Fabric surface",
+                    "access_point": {"listen_address": "https://gateway.example", "route": "/a2a", "protocol": "a2a"},
+                    "target": {"endpoint": "http://127.0.0.1:1"},
+                    "transit": {"points": [{"alias": "partner", "protocol": "a2a",
+                        "require_transit_token": require_transit_token,
+                        "allow_unauthenticated_callers": !require_transit_token,
+                        "target_endpoint": "fabric://peer-gateway/peer-surface"}]}
+                }))
+                .unwrap();
+                let mut state = test_outbound_state();
+                state.transit_token_issuer = Some(Arc::new(issuer.clone()));
+                state
+                    .channel_state
+                    .write()
+                    .unwrap()
+                    .surface = Arc::new(surface);
+                let mut claims = fabric_claims(None, "fabric-asserted", None, hops);
+                claims.iss = "gateway".into();
+                claims.surface_id = "fabric-surface".into();
+                claims.allowed_transit_points = vec!["partner".into()];
+                claims.iat = crate::proxy::credential_delegation::modern::now_secs().unwrap();
+                claims.exp = claims.iat + 200;
+                let request = Request::builder()
+                    .method("POST")
+                    .uri("/outbound/a2a/partner")
+                    .header("content-type", "application/json")
+                    .header("x-transit-token", issuer.sign(&claims).unwrap())
+                    .body(axum::body::Body::from(
+                        json!({"jsonrpc": "2.0", "id": 1, "method": "message/send"}).to_string(),
+                    ))
+                    .unwrap();
+                let (response, events) =
+                    crate::audit::producer::capture(Box::pin(outbound_proxy_handler_with_mcp_versions(
+                        "127.0.0.1:12345"
+                            .parse()
+                            .unwrap(),
+                        state,
+                        request,
+                        crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+                    )))
+                    .await;
+                let rejections = events
+                    .into_iter()
+                    .filter_map(|event| match event.event {
+                        crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                            stage,
+                            reason,
+                            ..
+                        } => Some((stage, reason)),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                let status = match response {
+                    Ok(response) => response.status(),
+                    Err(error) => error.into_response().status(),
+                };
+                (status, rejections)
+            }
+        };
+
+        for require_transit_token in [true, false] {
+            assert_eq!(
+                refuse(8, require_transit_token).await,
+                (StatusCode::LOOP_DETECTED, vec![(RejectionStage::Forward, RejectionReason::FabricChainTooLong)]),
+                "require_transit_token: {require_transit_token}"
+            );
+            let (status, rejections) = refuse(7, require_transit_token).await;
+            assert_ne!(status, StatusCode::LOOP_DETECTED, "require_transit_token: {require_transit_token}");
+            assert!(
+                !rejections.contains(&(RejectionStage::Forward, RejectionReason::FabricChainTooLong)),
+                "require_transit_token: {require_transit_token}: {rejections:?}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
