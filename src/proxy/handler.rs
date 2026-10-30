@@ -16787,9 +16787,14 @@ mod target_auth_tests {
         };
         for _ in 0..2 {
             for scope in ["read", "write"] {
-                inject_target_auth_header(&scoped(scope), &fixture.context(), "surface", CallerAssertion::Authenticated)
-                    .await
-                    .unwrap();
+                inject_target_auth_header(
+                    &scoped(scope),
+                    &fixture.context(),
+                    "surface",
+                    CallerAssertion::Authenticated,
+                )
+                .await
+                .unwrap();
             }
         }
         assert_eq!(fixture.requests(), 2, "the token endpoint received one request per scope set");
