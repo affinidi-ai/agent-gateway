@@ -1271,6 +1271,7 @@ export interface CallerAuthentication {
 
 export interface AgentSurface {
   surface_id: string;
+  tenant_id?: string | null;
   name: string;
   description: string;
   status: SurfaceStatus;

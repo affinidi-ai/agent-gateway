@@ -41,6 +41,14 @@ changes:
         credential provider or surface whose stored configuration breaks the https token
         endpoint or tenant credential isolation rule, with its id, tenant and the rule, so
         operators can fix them before the rules are enforced.
+    - timestamp: '2026-10-30T23:15:00Z'
+      title: Offer tenant surfaces only their own providers and secrets in the dashboard
+      description: >-
+        The Surface Builder and the credential provider editor list only the credential
+        providers and secrets of the surface's or provider's own tenant. A stored choice
+        outside that tenant stays visible, labelled as stopping to work once tenant isolation
+        is enforced. The Token Endpoint field shows an inline error for an http URL and
+        points to the bootstrap credential_policy.insecure_token_endpoints list.
   fixed: []
   removed: []
   security:

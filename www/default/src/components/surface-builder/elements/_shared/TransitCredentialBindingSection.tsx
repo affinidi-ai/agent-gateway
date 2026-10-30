@@ -2,6 +2,8 @@ import React, { useEffect, useState } from 'react';
 import { Form } from 'react-bootstrap';
 import { apiClient } from '../../../../api';
 import FieldHelp from '../../../shared/FieldHelp';
+import { splitByTenant, outOfTenantLabel } from '../../../../utils/tenantScope';
+import { useSurfaceTenant } from '../../SurfaceMetaContext';
 
 interface CredentialProviderOption {
   id: string;
@@ -9,6 +11,7 @@ interface CredentialProviderOption {
   provider_id?: string;
   provider_type?: string;
   callback_url?: string;
+  tenant_id?: string | null;
 }
 
 export interface TransitCredentialsForm {
@@ -117,6 +120,7 @@ interface Props {
 const TransitCredentialBindingSection: React.FC<Props> = ({ value, onChange }) => {
   const [providers, setProviders] = useState<CredentialProviderOption[]>([]);
   const [loading, setLoading] = useState(true);
+  const { offered, outside } = splitByTenant(providers, useSurfaceTenant());
 
   useEffect(() => {
     let alive = true;
@@ -175,12 +179,19 @@ const TransitCredentialBindingSection: React.FC<Props> = ({ value, onChange }) =
               disabled={loading}
             >
               <option value="">{loading ? '-- Loading… --' : '-- Select provider --'}</option>
-              {providers.map(p => (
+              {offered.map(p => (
                 <option key={p.id} value={p.id}>
                   {p.name}
                   {p.provider_id ? ` (${p.provider_id})` : ''}
                 </option>
               ))}
+              {outside
+                .filter(p => p.id === value.credential_provider_id)
+                .map(p => (
+                  <option key={p.id} value={p.id}>
+                    {p.name} ({outOfTenantLabel(p)})
+                  </option>
+                ))}
             </Form.Select>
             {(() => {
               const selected = providers.find(p => p.id === value.credential_provider_id);

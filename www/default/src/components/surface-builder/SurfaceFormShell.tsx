@@ -88,6 +88,7 @@ export interface SurfaceFormShellProps {
   onCloseFullscreenEditor: () => void;
   canvasOverlay?: React.ReactNode;
   surfaceId?: string;
+  tenantId?: string | null;
   lastActivity?: string | null;
   /**
    * Page-specific Save / Delete / etc. buttons rendered as a 'Manage'
@@ -282,6 +283,7 @@ const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
   onCloseFullscreenEditor,
   canvasOverlay,
   surfaceId,
+  tenantId,
   lastActivity,
   manageActions,
   surfaceSizeRef,
@@ -756,6 +758,7 @@ const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
         isCreate: mode === 'create',
         lastActivity,
         surfaceId,
+        tenantId,
         activeVariantAlias: variantAlias(builder.state.nodes, activeVariantId),
         activeVariantIsDefault: isDefaultVariant(builder.state.nodes, activeVariantId),
         saveError,

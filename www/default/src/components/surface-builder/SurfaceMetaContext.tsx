@@ -44,6 +44,8 @@ export interface SurfaceMetaValue {
   lastActivity?: string | null;
   /** Surface UUID; read-only display in edit mode. */
   surfaceId?: string;
+  /** Owning tenant of the stored surface: `null` when appliance-wide, absent while creating. */
+  tenantId?: string | null;
   /** Alias of the named variant the canvas shows; absent while it shows the base. */
   activeVariantAlias?: string;
   /** True when that variant is the surface's default, which also answers on its route. */
@@ -82,4 +84,9 @@ export function useSurfaceMeta(): SurfaceMetaValue {
 
 export function useOptionalSurfaceMeta(): SurfaceMetaValue | null {
   return useContext(SurfaceMetaContext);
+}
+
+/** The tenant of the surface being edited, or undefined when unknown (create mode, no provider). */
+export function useSurfaceTenant(): string | null | undefined {
+  return useContext(SurfaceMetaContext)?.tenantId;
 }

@@ -1,6 +1,7 @@
 import React from 'react';
 import FieldHelp from '../../components/shared/FieldHelp';
 import SecretSelect, { SecretOption } from './SecretSelect';
+import type { OwnerTenant } from '../../utils/tenantScope';
 import {
   CredentialProviderType,
   JWT_ALGORITHMS,
@@ -13,6 +14,7 @@ interface JwtAssertionSectionProps {
   providerType: CredentialProviderType;
   form: JwtFormFields;
   secrets: SecretOption[];
+  ownerTenant: OwnerTenant;
   loadingSecrets: boolean;
   onChange: (
     event: React.ChangeEvent<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>
@@ -27,6 +29,7 @@ const JwtAssertionSection: React.FC<JwtAssertionSectionProps> = ({
   providerType,
   form,
   secrets,
+  ownerTenant,
   loadingSecrets,
   onChange,
 }) => {
@@ -72,6 +75,7 @@ const JwtAssertionSection: React.FC<JwtAssertionSectionProps> = ({
         hint="Secret holding a PEM private key (PKCS#1 or PKCS#8 for RSA, PKCS#8 for EC) or a Google service account JSON key file."
         value={form.jwt_signing_key_secret_ref}
         secrets={secrets}
+        ownerTenant={ownerTenant}
         loading={loadingSecrets}
         onChange={onChange}
       />
@@ -84,6 +88,7 @@ const JwtAssertionSection: React.FC<JwtAssertionSectionProps> = ({
           hint="Secret holding the PEM certificate (BEGIN CERTIFICATE) of the signing key."
           value={form.jwt_certificate_secret_ref}
           secrets={secrets}
+          ownerTenant={ownerTenant}
           loading={loadingSecrets}
           onChange={onChange}
         />

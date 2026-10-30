@@ -1697,6 +1697,7 @@ const SurfaceDetailPage: React.FC = () => {
         saveError={error}
         saveWarnings={saveWarnings}
         surfaceId={surface?.surface_id}
+        tenantId={surface ? (surface.tenant_id ?? null) : undefined}
         lastActivity={
           // Backend doesn't carry `last_activity` on the surface payload;
           // pull it from runtime channel_stats keyed by surface_id.
