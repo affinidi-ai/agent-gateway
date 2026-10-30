@@ -96,8 +96,8 @@ changes:
       title: Back off token requests to a failing credential provider for up to 60 s
       description: >-
         After a service token request fails or returns other scopes than requested, the next
-        request for the same surface, provider, scopes and secret versions waits 1 s, doubling
-        to 60 s, and callers meanwhile fail at once without contacting the provider. A success
+        request for the same surface, provider, scopes and secret versions waits 1 s from the end
+        of the failed request, doubling to 60 s, and callers meanwhile fail at once without contacting the provider. A success
         clears the wait. Missing secrets, store errors and refused token endpoints never start
         one, and a secret that cannot be read is now reported as unavailable rather than as a
         failed token request.

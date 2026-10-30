@@ -143,6 +143,8 @@ pub async fn acquire(
     key: ServiceTokenKey<'_>,
     now: DateTime<Utc>,
 ) -> Result<ServiceToken, ServiceTokenError> {
+    let arrived = Utc::now();
+    let elapsed = || now + (Utc::now() - arrived);
     let egress = context
         .egress
         .cloned()
@@ -205,26 +207,27 @@ pub async fn acquire(
                 .await
         }
     };
-    let renewing = match cached_token(provider, scopes, context, key.agent_did, &identity, now).await? {
+    let locked_at = elapsed();
+    let renewing = match cached_token(provider, scopes, context, key.agent_did, &identity, locked_at).await? {
         CachedToken::Fresh(token) => return Ok(served(token, Freshness::Cached)),
-        CachedToken::RenewalDue(token) if backoff.holds_back(now) => {
+        CachedToken::RenewalDue(token) if backoff.holds_back(locked_at) => {
             warn!(target: "credential_delegation", provider_id = %provider.provider_id, token_id = %token.id, "Service token renewal held back by the retry backoff, serving the cached token as stale");
             return Ok(served(token, Freshness::Stale));
         }
         CachedToken::RenewalDue(token) => Some(token),
-        CachedToken::None if backoff.holds_back(now) => {
+        CachedToken::None if backoff.holds_back(locked_at) => {
             debug!(target: "credential_delegation", provider_id = %provider.provider_id, "Service token request held back by the retry backoff");
             return Err(ServiceTokenError::TokenRequestFailed);
         }
         CachedToken::None => None,
     };
-    let requested_at = Utc::now();
-    let (response, granted) = match backoff.record(token_grant(provider, scopes, context.secrets, &egress).await, now) {
+    let outcome = token_grant(provider, scopes, context.secrets, &egress).await;
+    let finished_at = elapsed();
+    let (response, granted) = match backoff.record(outcome, finished_at) {
         Ok(granted) => granted,
         Err(error) => {
-            let failed_at = now + (Utc::now() - requested_at);
             return match renewing {
-                Some(token) if error.backs_off() && usable_at(&token, failed_at) => {
+                Some(token) if error.backs_off() && usable_at(&token, finished_at) => {
                     warn!(target: "credential_delegation", provider_id = %provider.provider_id, token_id = %token.id, %error, "Service token renewal failed, serving the cached token as stale");
                     Ok(served(token, Freshness::Stale))
                 }
@@ -377,7 +380,8 @@ async fn grant_slot(
 }
 
 /// The token requests to one key that failed in a row, and the time before which the next
-/// one is not sent: 1 s after the first failure, doubling up to 60 s. A success clears it.
+/// one is not sent: 1 s after the first failed request ends, doubling up to 60 s. A success
+/// clears it.
 #[derive(Debug, Default)]
 struct Backoff {
     failures: u32,
@@ -547,7 +551,7 @@ mod tests {
     use serde_json::{Value, json};
     use std::collections::HashMap;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
     /// The fixture's secrets store, counting value reads and able to fail its listing or
     /// lose its values.
@@ -629,6 +633,7 @@ mod tests {
     struct Endpoint {
         response: Mutex<Value>,
         failing: AtomicBool,
+        delay_millis: AtomicU64,
         forms: Mutex<Vec<HashMap<String, String>>>,
     }
 
@@ -664,6 +669,12 @@ mod tests {
                             .lock()
                             .unwrap()
                             .push(form);
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            endpoint
+                                .delay_millis
+                                .load(Ordering::SeqCst),
+                        ))
+                        .await;
                         let status = if endpoint
                             .failing
                             .load(Ordering::SeqCst)
@@ -2062,7 +2073,7 @@ mod tests {
             assert_eq!(fixture.requests().len(), 1, "{error}");
             assert_eq!(
                 fixture
-                    .acquire(&provider, &["read"], after(now, 1_100))
+                    .acquire(&provider, &["read"], after(now, 1_200))
                     .await
                     .err(),
                 Some(error)
@@ -2080,19 +2091,41 @@ mod tests {
         fixture.fail(true);
         let now = Utc::now();
         let attempt = |millis| fixture.acquire(&provider, &["read"], after(now, millis));
-        for (millis, requests) in [(0, 1), (900, 1), (1_000, 2), (2_900, 2), (3_000, 3), (6_900, 3), (7_000, 4)] {
+        for (millis, requests) in [(0, 1), (900, 1), (1_200, 2), (3_100, 2), (3_400, 3), (7_300, 3), (7_600, 4)] {
             assert_eq!(attempt(millis).await.err(), Some(ServiceTokenError::TokenRequestFailed), "{millis}");
             assert_eq!(fixture.requests().len(), requests, "{millis}");
         }
         fixture.fail(false);
-        assert_eq!(issued(attempt(15_000).await), ("issued".into(), Freshness::Fresh));
+        assert_eq!(issued(attempt(16_000).await), ("issued".into(), Freshness::Fresh));
 
         fixture.fail(true);
-        let expired = 15_000 + 3_600_000;
-        for (millis, requests) in [(expired, 6), (expired + 900, 6), (expired + 1_000, 7)] {
+        let expired = 16_000 + 3_600_000;
+        for (millis, requests) in [(expired, 6), (expired + 900, 6), (expired + 1_200, 7)] {
             assert_eq!(attempt(millis).await.err(), Some(ServiceTokenError::TokenRequestFailed), "{millis}");
             assert_eq!(fixture.requests().len(), requests, "{millis}");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_backoff_starts_when_a_slow_failed_request_ends() {
+        let fixture = Fixture::new().await;
+        let provider = fixture
+            .provider(client_credentials())
+            .await;
+        fixture.fail(true);
+        fixture
+            .endpoint
+            .delay_millis
+            .store(2_000, Ordering::SeqCst);
+        let (first, queued) = tokio::join!(fixture.acquire(&provider, &["read"], Utc::now()), async {
+            tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+            fixture
+                .acquire(&provider, &["read"], Utc::now())
+                .await
+        });
+        assert_eq!(first.err(), Some(ServiceTokenError::TokenRequestFailed));
+        assert_eq!(queued.err(), Some(ServiceTokenError::TokenRequestFailed));
+        assert_eq!(fixture.requests().len(), 1);
     }
 
     #[test]
