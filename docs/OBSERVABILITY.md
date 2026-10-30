@@ -127,8 +127,7 @@ item that could not be parsed; the other channels still load.
 The counter increments for each unreadable record on every load or refresh scan, and a lookup
 that misses the cache runs a scan too, so after a downgrade each request that names a dropped
 record adds to it. Its value and rate are not a count of bad records: alert on it being non-zero
-or rising for a sustained period, for example after an upgrade or a rollback; see
-[Rollback](adrs/0002-hop-two-target-authentication.md#migration-and-change-management).
+or rising for a sustained period, for example after an upgrade or a rollback.
 
 ## Logging initialization
 

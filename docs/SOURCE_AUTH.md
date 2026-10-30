@@ -174,7 +174,7 @@ for v1.0 tokens whose App ID URI equals the resource. v2.0 tokens (issuer
 `https://login.microsoftonline.com/<tenant id>/v2.0`) carry the API's client ID in
 `aud` and are refused until per-Access-Point audience aliases, and a split between the scope
 the metadata advertises and the scope the gateway checks, are added. Both are planned as a
-follow-up change ([ADR 0003](adrs/0003-hop-one-resource-server-contract.md#future-work)).
+follow-up change.
 
 **Other consumers of a strategy.** STS subject and ID-JAG verification ([`STS.md`](STS.md))
 selects a strategy by `expected_issuer` and checks no audience; modern consent verifies the

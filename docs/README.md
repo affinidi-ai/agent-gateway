@@ -53,14 +53,6 @@ adds procedures for deploying and operating an appliance, operator guides, and F
 | [Onboarding capture](AGENT_ONBOARDING_CAPTURE.md)                     | Capture security boundary, lifetime, and emitted events                                                                                                                                   |
 | [Rust design patterns](DESIGN_PATTERNS.md)                            | Internal concurrency, lifecycle, and storage patterns                                                                                                                                     |
 
-## Architecture Decisions
-
-| Document                                                                           | Decision                                                                                                                                                                             |
-| ---------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| [OpenID Connect and OAuth trust plane](adrs/0001-openid-oauth-agent-gateway.md)    | One configuration per hop: the JWT verification strategy as the authorization server record for hop 1, and Target Authentication through a credential provider for hop 2             |
-| [Hop 2 Target Authentication contract](adrs/0002-hop-two-target-authentication.md) | One gateway-scoped credential resolver for Target Authentication: provider use matrix, precedence, Fabric ownership, tenancy, path confinement, and token cache invalidation         |
-| [Hop 1 resource server contract](adrs/0003-hop-one-resource-server-contract.md)    | Extends 0001: required scopes, the declaring Access Point and its challenge before payment, the Access Point URL and audience, metadata, relayed challenges, card security and Fabric |
-
 ## Coverage
 
 The [module map in `ARCHITECTURE.md`](../ARCHITECTURE.md#module-map) is the single record of

@@ -6,9 +6,7 @@ through the gateway. On the second hop the gateway gets its own token from Hydra
 JWT bearer grant and sends it to the agent, which accepts nothing else. The demo needs Docker for
 the two Hydra containers.
 
-Decision records: [ADR 0003](../adrs/0003-hop-one-resource-server-contract.md) (hop 1) and
-[ADR 0002](../adrs/0002-hop-two-target-authentication.md) (hop 2). The scripts are in
-[`scripts/oidc-demo/`](../../scripts/oidc-demo/).
+The scripts are in [`scripts/oidc-demo/`](../../scripts/oidc-demo/).
 
 ## What runs where
 

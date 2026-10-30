@@ -680,8 +680,7 @@ management API, which reads either store: in `GET /api/v1/surfaces`, a `credenti
 key under `target.auth.method` on a surface or a variant, and in
 `GET /api/v1/credential-providers`, a `provider_type` of `oauth2_jwt_bearer`. The gateway
 token cache is not persisted, so it leaves nothing behind. The caller side has its own
-rollback steps under [Required scopes](SOURCE_AUTH.md#required-scopes), and the design record
-is ADR 0002's [Migration and change management](adrs/0002-hop-two-target-authentication.md#migration-and-change-management).
+rollback steps under [Required scopes](SOURCE_AUTH.md#required-scopes).
 
 ## Management API
 
