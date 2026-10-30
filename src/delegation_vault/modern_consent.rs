@@ -564,6 +564,9 @@ pub async fn exchange_code(
         .as_deref()
         .ok_or(ContinuationError::InvalidRecord)?;
     crate::url_validation::validate_oauth_endpoint_url(endpoint).map_err(|_| ContinuationError::InvalidRecord)?;
+    if !super::gateway_token::GrantEgress::from_environment().permits_token_endpoint(endpoint) {
+        return Err(ContinuationError::InvalidRecord);
+    }
     crate::sts::mcp_profile::canonical_https_url(resource).map_err(|_| ContinuationError::InvalidRecord)?;
     let client_id = super::oauth::resolve_secret(
         secrets,
@@ -718,6 +721,7 @@ mod tests {
             .build()
             .unwrap();
         let token_endpoint = "http://192.0.2.1/token";
+        let _env = crate::component_tests::helpers::test_mode::TestModeEnv::enabled(token_endpoint, token_endpoint);
         let mut tasks = tokio::task::JoinSet::new();
         tasks.spawn(async move {
             axum::serve(listener, provider_app)
@@ -1170,6 +1174,45 @@ mod tests {
             }
         }
         tasks.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn exchange_code_refuses_an_unlisted_http_token_endpoint() {
+        let _env = crate::component_tests::helpers::test_mode::TestModeEnv::with(None, None, None);
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = crate::secrets::FilesystemSecretsStore::new_async(
+            directory
+                .path()
+                .to_str()
+                .expect("utf-8 path"),
+        )
+        .await
+        .expect("secrets store opens");
+        for secret_id in ["client-id", "client-secret"] {
+            crate::secrets::SecretsStore::create(
+                &store,
+                crate::secrets::CreateSecretRequest {
+                    tenant_id: None,
+                    name: secret_id.into(),
+                    secret_id: secret_id.into(),
+                    description: None,
+                    value: format!("{secret_id}-value"),
+                    secret_type: "General".into(),
+                    tags: vec![],
+                },
+            )
+            .await
+            .expect("secret is created");
+        }
+        let secrets: std::sync::Arc<dyn crate::secrets::SecretsStore> = std::sync::Arc::new(store);
+        let (mut provider, ticket) = consent_fixture("https://identity.example/authorize");
+        provider.token_endpoint = Some("http://192.0.2.1/token".into());
+        provider.client_id_secret_ref = Some("client-id".into());
+        provider.client_secret_secret_ref = Some("client-secret".into());
+
+        let result = exchange_code(&provider, &ticket, "auth-code", &secrets, &reqwest::Client::new()).await;
+
+        assert!(matches!(result, Err(ContinuationError::InvalidRecord)));
     }
 
     fn consent_fixture(authorization_endpoint: &str) -> (CredentialProvider, ConsentTicket) {

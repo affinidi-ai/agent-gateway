@@ -928,7 +928,8 @@ changes:
         read. The check also runs on any update that sends token_endpoint, changes the type, clears
         a reference or sends jwt_bearer, which every dashboard save does, so a stored authorization
         code provider with an http token endpoint is refused on any dashboard save until its
-        endpoint is https. Move such token endpoints to https before upgrading.
+        endpoint is https. A stored authorization code provider with an http token endpoint now
+        fails each exchange and refresh, so move such endpoints to https before upgrading.
     - timestamp: '2026-10-30T09:00:00Z'
       title: Refuse required_scopes on a later caller authentication method
       description: >-

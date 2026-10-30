@@ -113,7 +113,7 @@ bearer) must be an `https` URL. The check runs when a provider is created and on
 changes the type, clears a reference or sends `jwt_bearer` (every dashboard save does), so a
 stored authorization code provider with an http token endpoint is refused on any dashboard
 save until its endpoint is https. It also runs before every gateway grant, before any secret
-is read. The authorization code exchange and refresh do not check it yet. Under `AG_TEST_MODE=true` an
+is read, and before every authorization code exchange, refresh and modern consent exchange. Under `AG_TEST_MODE=true` an
 `http` endpoint listed exactly in `AG_BDD_OAUTH_ENDPOINT_ALLOWLIST` is also accepted, for
 a local authorization server.
 
