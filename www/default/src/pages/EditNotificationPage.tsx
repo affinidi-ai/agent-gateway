@@ -113,9 +113,13 @@ const EditNotificationPage: React.FC = () => {
   }
 
   return (
-    <div className="container-fluid">
+    <div className="container-fluid" data-testid="page-notification-editor">
       <div className="mb-3">
-        <button className="btn btn-sm btn-secondary" onClick={() => navigate('/notifications')}>
+        <button
+          className="btn btn-sm btn-secondary"
+          data-testid="notification-editor-back-button"
+          onClick={() => navigate('/notifications')}
+        >
           <i className="fas fa-arrow-left"></i>
         </button>
       </div>
@@ -207,7 +211,12 @@ const EditNotificationPage: React.FC = () => {
               </div>
             )}
             <div className="d-flex gap-2">
-              <button type="submit" className="btn btn-primary" disabled={saving}>
+              <button
+                type="submit"
+                data-testid="notification-editor-save-button"
+                className="btn btn-primary"
+                disabled={saving}
+              >
                 {saving ? (
                   <>
                     <span
@@ -225,13 +234,19 @@ const EditNotificationPage: React.FC = () => {
                 )}
               </button>
               {isEditMode && (
-                <DeleteButton onDelete={handleDelete} disabled={saving} variant="danger">
+                <DeleteButton
+                  data-testid="notification-editor-delete-button"
+                  onDelete={handleDelete}
+                  disabled={saving}
+                  variant="danger"
+                >
                   Delete
                 </DeleteButton>
               )}
               <button
                 type="button"
                 className="btn btn-secondary"
+                data-testid="notification-editor-cancel-button"
                 onClick={() => navigate('/notifications')}
                 disabled={saving}
               >

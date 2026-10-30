@@ -26,6 +26,7 @@ const IntegrationsPage: React.FC = () => {
     <div className="container-fluid" data-testid="page-integrations">
       <div className="d-sm-flex align-items-center justify-content-between mb-4">
         <SearchInput
+          data-testid="integrations-search-input"
           value={searchTerm}
           onChange={setSearchTerm}
           placeholder="Filter integrations, endpoints and event sets..."

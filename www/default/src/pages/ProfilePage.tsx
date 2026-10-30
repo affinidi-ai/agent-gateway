@@ -161,9 +161,13 @@ const ProfilePage: React.FC = () => {
   }
 
   return (
-    <div className="container-fluid">
+    <div className="container-fluid" data-testid="page-profile">
       <div className="mb-3">
-        <button className="btn btn-sm btn-secondary" onClick={handleGoBack}>
+        <button
+          className="btn btn-sm btn-secondary"
+          data-testid="profile-back-button"
+          onClick={handleGoBack}
+        >
           <i className="fas fa-arrow-left"></i>
         </button>
       </div>
@@ -199,7 +203,11 @@ const ProfilePage: React.FC = () => {
                     />
                   </div>
                   <div>
-                    <label htmlFor="avatar-upload" className="btn btn-sm btn-primary">
+                    <label
+                      htmlFor="avatar-upload"
+                      data-testid="profile-avatar-upload-button"
+                      className="btn btn-sm btn-primary"
+                    >
                       <i className="fas fa-upload me-1"></i>
                       {uploading ? 'Uploading...' : 'Upload Avatar'}
                     </label>
@@ -321,10 +329,20 @@ const ProfilePage: React.FC = () => {
                 </div>
 
                 <div className="d-flex justify-content-end gap-2">
-                  <button type="button" className="btn btn-secondary" onClick={handleGoBack}>
+                  <button
+                    type="button"
+                    className="btn btn-secondary"
+                    data-testid="profile-cancel-button"
+                    onClick={handleGoBack}
+                  >
                     Cancel
                   </button>
-                  <button type="submit" className="btn btn-primary" disabled={saving}>
+                  <button
+                    type="submit"
+                    data-testid="profile-save-button"
+                    className="btn btn-primary"
+                    disabled={saving}
+                  >
                     {saving ? (
                       <>
                         <span

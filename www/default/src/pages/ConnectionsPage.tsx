@@ -68,12 +68,13 @@ const ConnectionsPage: React.FC = () => {
   };
 
   return (
-    <div className="container-fluid">
+    <div className="container-fluid" data-testid="page-connections">
       <div className="d-sm-flex align-items-center justify-content-between mb-4">
         <div className="d-flex align-items-center">
           <SearchInput
             value={searchTerm}
             onChange={setSearchTerm}
+            data-testid="connections-search-input"
             placeholder="Filter Connections..."
           />
         </div>
@@ -104,6 +105,7 @@ const ConnectionsPage: React.FC = () => {
         >
           <Tab
             eventKey="gateways"
+            tabAttrs={{ 'data-testid': 'connections-gateways-tab-trigger' }}
             title={
               <>
                 <i className="fas fa-server"></i> Gateways {tabBadge('gateways')}
@@ -119,6 +121,7 @@ const ConnectionsPage: React.FC = () => {
 
           <Tab
             eventKey="mediators"
+            tabAttrs={{ 'data-testid': 'connections-mediators-tab-trigger' }}
             title={
               <>
                 <i className="fas fa-exchange-alt"></i> Mediators {tabBadge('mediators')}
@@ -130,6 +133,7 @@ const ConnectionsPage: React.FC = () => {
 
           <Tab
             eventKey="trust-registries"
+            tabAttrs={{ 'data-testid': 'connections-trust-registries-tab-trigger' }}
             title={
               <>
                 <i className="fas fa-shield-alt"></i> Registries {tabBadge('trust-registries')}
