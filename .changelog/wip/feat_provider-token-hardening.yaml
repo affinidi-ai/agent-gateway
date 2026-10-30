@@ -34,6 +34,13 @@ changes:
         bearer provider, is refused with 400, and a tenant reassignment that would create
         such a reference answers 409. References already stored are kept until
         credential_policy tenant_credential_isolation is enforce.
+    - timestamp: '2026-10-30T22:45:00Z'
+      title: Report providers and surfaces that break the credential rules at startup
+      description: >-
+        At startup and on every configuration reload the gateway logs one warning per
+        credential provider or surface whose stored configuration breaks the https token
+        endpoint or tenant credential isolation rule, with its id, tenant and the rule, so
+        operators can fix them before the rules are enforced.
   fixed: []
   removed: []
   security:

@@ -2,6 +2,7 @@
 pub mod agents;
 pub mod audit_log;
 pub mod config;
+mod credential_policy_report;
 pub mod credentials;
 pub mod debug_export;
 pub mod didcomm;
@@ -26,6 +27,7 @@ pub use agents::get_agents;
 pub use config::{
     get_networking_config, get_payment_policy, get_surface_routing_config, reload_configuration, reload_single_channel,
 };
+pub(crate) use credential_policy_report::report_credential_policy;
 pub use credentials::{
     get_did_document, issue_credential, resolve_did_document, resolve_did_document_spec, serve_agent_did_document,
     serve_gateway_did_document, serve_gateway_did_jsonl, serve_gateway_did_witness, serve_surface_did_jsonl,

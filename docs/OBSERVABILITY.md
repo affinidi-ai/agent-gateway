@@ -221,6 +221,30 @@ missing or invalid credential, the `403` it returns to a PAT with a `resource_pa
 access-token routes are not a resource-scoped path family, a required header that does not
 match, or Terms the token owner has not accepted.
 
+## Credential policy report
+
+At startup and on every configuration reload (including the reload that follows a surface
+change) the gateway logs one `WARN` line per credential provider or surface whose stored
+configuration breaks a [`credential_policy`](CONFIGURATION_REFERENCE.md) rule, so operators can
+find what to fix before the rules are enforced. A clean appliance logs one `INFO` line instead.
+Nothing else changes: the report writes no audit record and carries no secret value or token
+endpoint URL.
+
+| Field | Value |
+| --- | --- |
+| `subject` | `credential_provider` or `surface` |
+| `id` | The provider's `id` or the surface's `surface_id` |
+| `tenant` | The owning tenant, or `appliance` for an appliance-wide resource |
+| `rule` | `token_endpoint_https` or `tenant_credential_isolation` |
+| `enforced` | `true` when that rule's mode is `enforce`, so the configuration is also refused at runtime |
+
+An OAuth provider breaks `token_endpoint_https` when its token endpoint fails the check its token
+requests are held to: not an `https` URL and not listed in `insecure_token_endpoints`. An `api_key`
+provider sends no token request and is never reported for it. It breaks `tenant_credential_isolation` when it belongs to a
+tenant but names an appliance-wide secret. A surface breaks `tenant_credential_isolation` when it
+belongs to a tenant but sends an appliance-wide secret or credential provider upstream. A secret
+or provider that no longer exists is not reported.
+
 ## Governance audit forwarding
 
 Governance audit records go to **sinks**: the VP Audit Log (`delegation-audit.jsonl`, read by
