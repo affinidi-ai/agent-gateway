@@ -456,7 +456,7 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   uses the same client and the same rules.
 - `egress::pinned_forward_client` also pins the **agent-card fetch** from an
   `http(s)` surface target whenever it carries `target.auth`
-  (`src/proxy/handler.rs::fetch_agent_card_from_surface_target`), so the
+  (`src/proxy/handler/agent_card.rs`), so the
   credential cannot follow a 3xx to another host. A 3xx answers `502`
   "Upstream redirected"; a blocked target answers `403` "Request blocked by
   egress policy". It shares the `pinned_target_client` helper with the
