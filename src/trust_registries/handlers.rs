@@ -9,6 +9,7 @@ const RECONNECT_READINESS_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 use super::TrustRegistryStore;
 use super::communication::TrustRegistryListenerManager;
 use super::did_manager::DidMethod;
+use super::store::RegistryChange;
 use super::types::{
     TrustRegistry, TrustRegistryConnectionStatus, TrustRegistryListRecordsResponse, TrustRegistryStatus,
 };
@@ -115,70 +116,67 @@ pub async fn get_trust_registry<S: TrustRegistryStore>(
     Ok(Json(trust_registry))
 }
 
-/// Writes `trust_registry` only while its record still exists, so a write racing a
-/// delete never brings the record back.
-async fn update_existing<S: TrustRegistryStore + ?Sized>(
+/// Applies `change` to the record of `trust_registry_id` only while it still exists,
+/// so a write racing a delete never brings the record back.
+async fn modify_existing<S: TrustRegistryStore + ?Sized>(
     store: &S,
-    trust_registry: &TrustRegistry,
-) -> Result<(), anyhow::Error> {
-    if store
-        .update_if_exists(trust_registry)
+    trust_registry_id: &str,
+    change: RegistryChange,
+) -> Result<TrustRegistry, anyhow::Error> {
+    store
+        .modify(trust_registry_id, change)
         .await?
-    {
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!("trust registry '{}' was deleted", trust_registry.id))
-    }
+        .ok_or_else(|| anyhow::anyhow!("trust registry '{}' was deleted", trust_registry_id))
 }
 
-/// Saves `trust_registry` on its own task, so a cancelled request cannot report the DID
-/// it announced as failed while the record is written, and reports it `created` once the
-/// record, which now names that DID, is stored.
+/// Applies `change` on its own task, so a cancelled request cannot report the DID it
+/// announced as failed while the record is written, and reports it `created` as `saved`
+/// once the record, which now names that DID, is stored.
 async fn save_announced<S: TrustRegistryStore + 'static>(
     store: &Arc<S>,
-    trust_registry: &TrustRegistry,
+    trust_registry_id: &str,
+    change: RegistryChange,
     announcement: crate::event_hook::CreationGuard,
-) -> Result<(), anyhow::Error> {
-    let (Some(our_did), Some(mediator_did)) = (&trust_registry.our_did, &trust_registry.mediator_did) else {
-        return update_existing(store.as_ref(), trust_registry).await;
-    };
-    let saved = super::communication::trust_registry_payload(&trust_registry.id, mediator_did, our_did);
-    let record = trust_registry.clone();
-    let store = store.clone();
+    saved: crate::event_hook::ConnectionPointPayload,
+) -> Result<TrustRegistry, anyhow::Error> {
+    let (store, id) = (store.clone(), trust_registry_id.to_string());
     tokio::spawn(async move {
         announcement
-            .complete(async move { update_existing(store.as_ref(), &record).await }, saved)
+            .complete(async move { modify_existing(store.as_ref(), &id, change).await }, saved)
             .await
     })
     .await
     .map_err(|e| anyhow::anyhow!("the save task failed: {e}"))?
 }
 
-/// Records an accepted OOB invitation on `trust_registry`, which is then
-/// Connecting until the registry approves it unless the registry has already
-/// answered the setup, and returns the announcement of its new DID for the save.
+/// Splits an accepted OOB invitation into the change that records its identity on
+/// the registry's current record, which is then Connecting until the registry
+/// approves it unless the registry has already answered the setup, and the
+/// announcement of its new DID.
 fn record_oob_connection(
-    trust_registry: &mut TrustRegistry,
-    connection_info: super::communication::OobConnectionInfo,
-) -> crate::event_hook::CreationGuard {
-    trust_registry.our_did = Some(connection_info.our_did);
-    trust_registry.registry_did = Some(
-        connection_info
-            .registry_did
-            .clone(),
-    );
-    trust_registry.did = Some(connection_info.registry_did);
-    trust_registry.main_did = connection_info.main_did;
-    trust_registry.mediator_url = Some(connection_info.mediator_url);
-    trust_registry.mediator_did = Some(connection_info.mediator_did);
-    if !matches!(
-        trust_registry.connection_status,
-        TrustRegistryConnectionStatus::AwaitingApproval | TrustRegistryConnectionStatus::Connected
-    ) {
-        trust_registry.connection_status = TrustRegistryConnectionStatus::Connecting;
-    }
-    trust_registry.updated_at = chrono::Utc::now();
-    connection_info.announcement
+    connection_info: super::communication::OobConnectionInfo
+) -> (RegistryChange, crate::event_hook::CreationGuard) {
+    let announcement = connection_info.announcement;
+    let change: RegistryChange = Box::new(move |trust_registry| {
+        trust_registry.our_did = Some(connection_info.our_did);
+        trust_registry.registry_did = Some(
+            connection_info
+                .registry_did
+                .clone(),
+        );
+        trust_registry.did = Some(connection_info.registry_did);
+        trust_registry.main_did = connection_info.main_did;
+        trust_registry.mediator_url = Some(connection_info.mediator_url);
+        trust_registry.mediator_did = Some(connection_info.mediator_did);
+        if !matches!(
+            trust_registry.connection_status,
+            TrustRegistryConnectionStatus::AwaitingApproval | TrustRegistryConnectionStatus::Connected
+        ) {
+            trust_registry.connection_status = TrustRegistryConnectionStatus::Connecting;
+        }
+        trust_registry.updated_at = chrono::Utc::now();
+    });
+    (change, announcement)
 }
 
 /// Why accepting a registry's OOB invitation and saving its identity failed.
@@ -227,13 +225,13 @@ async fn save_oob_connection<S: TrustRegistryStore + 'static>(
     trust_registry_id: &str,
     connection_info: super::communication::OobConnectionInfo,
 ) -> Result<TrustRegistry, anyhow::Error> {
-    let mut current = store
-        .get(trust_registry_id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("trust registry '{}' was deleted", trust_registry_id))?;
-    let announcement = record_oob_connection(&mut current, connection_info);
-    save_announced(store, &current, announcement).await?;
-    Ok(current)
+    let saved = super::communication::trust_registry_payload(
+        trust_registry_id,
+        &connection_info.mediator_did,
+        &connection_info.our_did,
+    );
+    let (change, announcement) = record_oob_connection(connection_info);
+    save_announced(store, trust_registry_id, change, announcement, saved).await
 }
 
 /// The status a successful reconnect stores, when it changes one: rebuilding the
@@ -694,22 +692,22 @@ pub async fn reconnect_trust_registry<S: TrustRegistryStore + 'static>(
         return Err((StatusCode::BAD_GATEWAY, "Reconnection failed: WebSocket not ready after retries".to_string()));
     }
 
-    let mut current = store
-        .get(&id)
+    let current = store
+        .modify(
+            &id,
+            Box::new(|trust_registry| {
+                if let Some(status) = status_after_reconnect(&trust_registry.connection_status) {
+                    trust_registry.connection_status = status;
+                    trust_registry.updated_at = chrono::Utc::now();
+                }
+            }),
+        )
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get trust registry: {}", e)))?
+        .map_err(|e| {
+            tracing::error!("Saving the reconnected status of trust registry '{}' failed: {}", id, e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Failed to update trust registry".to_string())
+        })?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Trust registry not found".to_string()))?;
-    if let Some(status) = status_after_reconnect(&current.connection_status) {
-        current.connection_status = status;
-        current.updated_at = chrono::Utc::now();
-        let written = store
-            .update_if_exists(&current)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update trust registry: {}", e)))?;
-        if !written {
-            return Err((StatusCode::NOT_FOUND, "Trust registry not found".to_string()));
-        }
-    }
 
     Ok(Json(current))
 }
@@ -869,9 +867,7 @@ mod tests {
     }
 
     async fn events_of_a_save(deleted_first: bool) -> (bool, Vec<(String, String)>) {
-        let (store, mut registry, _dir) = stored_registry(None).await;
-        registry.our_did = Some("did:peer:2.new".into());
-        registry.mediator_did = Some("did:web:mediator.example".into());
+        let (store, registry, _dir) = stored_registry(None).await;
         if deleted_first {
             store
                 .delete(&registry.id)
@@ -885,16 +881,18 @@ mod tests {
             ..crate::event_hook::EventHookSettings::default()
         })
         .unwrap();
-        let announcement = crate::event_hook::CreationGuard::start(
-            Some(hook),
-            super::super::communication::trust_registry_payload(
-                &registry.id,
-                "did:web:mediator.example",
-                "did:peer:2.new",
-            ),
+        let payload = super::super::communication::trust_registry_payload(
+            &registry.id,
+            "did:web:mediator.example",
+            "did:peer:2.new",
         );
+        let announcement = crate::event_hook::CreationGuard::start(Some(hook), payload.clone());
+        let change: RegistryChange = Box::new(|registry| {
+            registry.our_did = Some("did:peer:2.new".into());
+            registry.mediator_did = Some("did:web:mediator.example".into());
+        });
 
-        let saved = save_announced(&store, &registry, announcement)
+        let saved = save_announced(&store, &registry.id, change, announcement, payload)
             .await
             .is_ok();
 
@@ -1388,6 +1386,15 @@ mod tests {
         ) -> anyhow::Result<bool> {
             self.0
                 .update_if_exists(trust_registry)
+                .await
+        }
+        async fn modify(
+            &self,
+            id: &str,
+            change: RegistryChange,
+        ) -> anyhow::Result<Option<TrustRegistry>> {
+            self.0
+                .modify(id, change)
                 .await
         }
     }
