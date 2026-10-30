@@ -4383,11 +4383,7 @@ async fn step_prepare_modern_credentials(
     else {
         return Ok(None);
     };
-    if ctx
-        .surface
-        .outbound_credentials
-        .is_empty()
-    {
+    if !crate::proxy::credential_delegation::modern::transit_point_bindings_apply(&ctx.surface) {
         return Ok(None);
     }
     if ctx
@@ -11905,6 +11901,74 @@ mod tests {
             .err()
             .expect("a caller only a transit token names is refused on the modern path too");
         assert!(matches!(refused, ModernDelegationError::Continuation(ContinuationError::BindingMismatch)));
+    }
+
+    /// On a `2026-07-28` MCP request a Transit Point whose caller `source_auth`
+    /// verified has no resource-server authorization to key a grant by. A
+    /// request that no binding applies to, such as `tools/list` with tool-scoped
+    /// bindings, is sent on without delegated credentials; one an `all` binding
+    /// applies to is answered `403` with `-32001` and its own id, and never
+    /// reaches the target.
+    #[tokio::test]
+    async fn a_modern_mcp_request_through_a_source_auth_transit_point_is_refused_only_where_a_binding_applies() {
+        use crate::mcp::continuations::negative_cases::continuation_runtime;
+        use crate::mcp::request_validation::{McpMessageKind, McpRequestClassification, ValidatedModernMessage};
+
+        let now = crate::proxy::credential_delegation::modern::now_secs().unwrap();
+        let mut state = test_outbound_state();
+        state.mcp_continuations = Some(continuation_runtime(now, 60));
+        let tool_scoped = {
+            let mut surface = test_surface();
+            surface.outbound_credentials = vec![
+                serde_json::from_value(json!({
+                    "credential_provider_id": "provider",
+                    "required_for": {"tools": ["get_current_date_time"]}
+                }))
+                .unwrap(),
+            ];
+            surface
+        };
+        let mut all = tool_scoped.clone();
+        all.outbound_credentials[0].required_for = crate::config::types::CredentialRequirement::All;
+
+        for (surface, refused) in [(tool_scoped, false), (all, true)] {
+            let mut ctx = test_pipeline_context();
+            ctx.surface = Arc::new(surface);
+            ctx.mcp_classification = Some(McpRequestClassification::Modern(Box::new(ValidatedModernMessage {
+                protocol_version: crate::mcp::MCP_MODERN_VERSION.into(),
+                client_capabilities: None,
+                client_info: None,
+                method: "tools/list".into(),
+                params: None,
+                id: Some(json!(7)),
+                kind: McpMessageKind::Request,
+            })));
+            ctx.authenticated_identity = Some(crate::source_auth::AuthenticatedIdentity::ApiKey {
+                key_name: "copilot-studio".to_string(),
+                provider_agent_id: None,
+            });
+            ctx.authenticated_by = Some(crate::surface_context::TransitClientVerification::SourceAuth);
+            ctx.transit_token_claims = Some(caller_claims(Some("did:example:agent"), None, None, json!({})));
+
+            let answer = step_prepare_modern_credentials(&state, &mut ctx)
+                .await
+                .unwrap();
+            match (answer, refused) {
+                (None, false) => {}
+                (Some(response), true) => {
+                    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+                    let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+                        .await
+                        .unwrap();
+                    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(body["error"]["code"], -32001, "{body}");
+                    assert_eq!(body["id"], 7, "the refusal answers the request's own id: {body}");
+                }
+                (answer, refused) => {
+                    panic!("refused: {refused}, but the step answered {:?}", answer.map(|r| r.status()))
+                }
+            }
+        }
     }
 
     fn bearer_workload_binding() -> crate::config::types::WorkloadBindingConfig {

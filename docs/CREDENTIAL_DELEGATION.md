@@ -156,10 +156,15 @@ it authenticated the same way. So:
 - a JWT without a `sub` names no caller and is given no grant.
 
 A caller verified by a resource access token (`mcp_http.authorization`) keys a grant only on
-a `2026-07-28` MCP request, and a `2026-07-28` MCP request keys a grant only that way: a
-Transit Point cannot have both a resource access token and `source_auth`, so a caller its
-`source_auth` verified, or one named only by a transit token, is refused there and uses
-delegated credentials on legacy MCP, A2A and HTTP requests. The agent half of the key is the Transit Point's
+a `2026-07-28` MCP request, and a `2026-07-28` MCP request keys a grant only that way. A
+Transit Point cannot have both a resource access token and `source_auth`, so when the
+surface has an outbound credential binding for every request (`required_for: all`), every
+`2026-07-28` MCP request to a Transit Point whose caller `source_auth` verified, or that a
+transit token alone names, is refused with `403` and JSON-RPC error `-32001`, whatever its
+method, `tools/list` included, and never reaches the target; a save of such a Transit Point
+answers with a `Warning` header. Bindings scoped to tools never apply on a Transit Point, so a
+surface with only those sends the request on without delegated credentials. Such a caller
+uses delegated credentials on legacy MCP, A2A and HTTP requests. The agent half of the key is the Transit Point's
 [managed identity](SOURCE_AUTH.md#managed-identity), else the caller DID the transit token
 carries, so a `source_auth` caller without a transit token needs a managed identity for the
 Transit Point.
