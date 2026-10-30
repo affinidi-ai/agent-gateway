@@ -1463,8 +1463,12 @@ mod tests {
             );
             let key = test_keys::rsa_pkcs8();
             let certificate = test_keys::certificate_pem();
+            let key_file =
+                json!({"type": "service_account", "private_key_id": "file-key-id", "private_key": key.private_pem})
+                    .to_string();
             for (secret_id, value) in [
                 ("SIGNING_KEY", key.private_pem.as_str()),
+                ("SIGNING_JSON", key_file.as_str()),
                 ("CERTIFICATE", certificate.as_str()),
                 ("CLIENT_ID", "client-123"),
                 ("CLIENT_SECRET", "client-secret"),
@@ -1577,6 +1581,39 @@ mod tests {
                         .unwrap(),
                 300
             );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_service_account_json_key_signs_with_its_private_key_id_as_kid() {
+            let fixture = fixture().await;
+            for (key_id, expected) in [(None, "file-key-id"), (Some("configured-id"), "configured-id")] {
+                let mut endpoint = token_endpoint(200, issued()).await;
+                let mut body = json!({
+                    "provider_type": "oauth2_jwt_bearer",
+                    "jwt_issuer": "agent@project.iam.gserviceaccount.com",
+                    "jwt_signing_key_secret_ref": "SIGNING_JSON"
+                });
+                if let Some(key_id) = key_id {
+                    body["jwt_key_id"] = key_id.into();
+                }
+                let provider = provider(&endpoint.url, body);
+                fetch_jwt_bearer_token(&provider, &[], &fixture.secrets, &endpoint.egress)
+                    .await
+                    .unwrap();
+                let form = endpoint
+                    .requests
+                    .recv()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    decode_header(&form["assertion"])
+                        .unwrap()
+                        .kid
+                        .as_deref(),
+                    Some(expected)
+                );
+                claims(&form["assertion"], &fixture.key.public_pem, Algorithm::RS256, &endpoint.url);
+            }
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1755,7 +1792,10 @@ mod tests {
             let error = fetch_jwt_bearer_token(&unknown_key, &[], &fixture.secrets, &endpoint.egress)
                 .await
                 .unwrap_err();
-            assert_eq!(error.to_string(), "signing key must be a PEM private key matching the signing algorithm");
+            assert_eq!(
+                error.to_string(),
+                "signing key must be a PEM private key or a service account JSON key matching the signing algorithm"
+            );
         }
 
         fn unlisted(endpoint: &TokenEndpoint) -> TokenEgress {

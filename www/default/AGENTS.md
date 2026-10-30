@@ -439,7 +439,9 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
   neither names the key, and the algorithm select lists the type's algorithms, default first.
 - Key material is never typed into this form. Signing key and certificate are secret pickers
   (`SecretSelect.tsx`, `credential-provider-<field>-select`); the operator creates the secret on
-  the Secrets page and pastes the PEM there. The gateway checks the PEM on save.
+  the Secrets page and pastes the PEM, or a whole Google service account JSON key file (16 KiB
+  at most), there. Key ID may stay empty for a JSON key, whose `private_key_id` is then sent as
+  `kid`; a Key ID overrides it. The gateway checks the key on save.
 - Save sends a field the type does not use as empty, which the gateway reads as cleared, so
   switching a provider to Client Credentials JWT drops its client secret.
 - `resource` has no input (it is set through the API or YAML) and is never sent on save. When

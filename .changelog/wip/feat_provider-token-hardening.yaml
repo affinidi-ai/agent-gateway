@@ -1,6 +1,13 @@
 branch: feat/provider-token-hardening
 changes:
-  added: []
+  added:
+    - timestamp: '2026-10-30T23:00:00Z'
+      title: Accept a Google service account JSON key as a provider signing key
+      description: >-
+        The signing-key secret of an oauth2_jwt_bearer or oauth2_client_credentials_jwt_auth
+        provider may now hold the whole service account key file, up to 16 KiB. The gateway
+        signs with its private_key and sends its private_key_id as the kid header unless
+        Key ID is set, so the downloaded file no longer needs to be taken apart.
   changed:
     - timestamp: '2026-10-30T21:30:00Z'
       title: Refuse new http token endpoints and cross-tenant credential references on save

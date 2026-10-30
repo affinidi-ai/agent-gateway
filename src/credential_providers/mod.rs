@@ -89,7 +89,8 @@ pub enum JwtSigningAlgorithm {
 /// references; the PEM values never leave the secrets store except to sign.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct JwtAssertionSettings {
-    /// Secret holding the PEM private key (PKCS#1 or PKCS#8 for RSA, PKCS#8 for EC)
+    /// Secret holding the PEM private key (PKCS#1 or PKCS#8 for RSA, PKCS#8 for EC) or a
+    /// Google service account JSON key file
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jwt_signing_key_secret_ref: Option<String>,
     /// Secret holding the PEM certificate whose SHA-256 thumbprint goes in `x5t#S256`;

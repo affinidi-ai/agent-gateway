@@ -87,7 +87,7 @@ record that misses a required one.
 
 | Field | `oauth2_jwt_bearer` | `oauth2_client_credentials_jwt_auth` |
 | --- | --- | --- |
-| `jwt_signing_key_secret_ref` | Required: a PEM private key (PKCS#1 or PKCS#8 for RSA, PKCS#8 for EC) | Required |
+| `jwt_signing_key_secret_ref` | Required: a PEM private key (PKCS#1 or PKCS#8 for RSA, PKCS#8 for EC), or a Google service account JSON key file, whose `private_key` is used | Required |
 | `jwt_signing_algorithm` | `RS256` (default) or `ES256` | `PS256` (default) or `RS256` |
 | `jwt_issuer` | Required: the `iss` claim, a service account's `client_email` | Not used: `iss` and `sub` are the client ID |
 | `jwt_subject` | Optional `sub` (domain-wide delegation) | Not used |
@@ -95,11 +95,12 @@ record that misses a required one.
 | `client_id_secret_ref` | Not used | Required, sent as `client_id` |
 | `client_secret_secret_ref` | Not used | Refused, so a misconfiguration cannot fall back to a client secret |
 | `jwt_audience` | Optional `aud`; the token endpoint when unset | The same |
-| `jwt_key_id` | Optional `kid` header, a Google key's `private_key_id` | Optional `kid` header, such as the `kid` of the key in an Ory client's JWKS. The dashboard warns when neither it nor a certificate is set, since the server may then not find the key |
+| `jwt_key_id` | Optional `kid` header. It overrides the `private_key_id` of a JSON key file, which is the default `kid` | Optional `kid` header, such as the `kid` of the key in an Ory client's JWKS. The dashboard warns when neither it nor a certificate is set, since the server may then not find the key |
 
 Create and update resolve the referenced key and certificate after checking the caller may
 use them, and refuse with 400 a key that cannot sign with the algorithm or a certificate that
-is not PEM, so a wrong format fails the save rather than the first token request.
+is not PEM, so a wrong format fails the save rather than the first token request. A JSON key
+file is checked the same way; the key secret may be at most 16 KiB.
 `POST /api/v1/credential-providers/validate` runs the same check before a save: it needs the
 credential provider edit permission, applies the caller's tenant to the secrets it names, and
 answers `"key_material": "ok"` beside the token endpoint's reachability. JWK keys are not

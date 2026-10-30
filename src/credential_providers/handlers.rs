@@ -65,7 +65,9 @@ enum ProviderValidationError {
     SecretNotAccessible,
     #[error("Secret reference lookup failed")]
     SecretLookupFailed,
-    #[error("jwt_signing_key_secret_ref must reference a PEM private key matching jwt_signing_algorithm")]
+    #[error(
+        "jwt_signing_key_secret_ref must reference a PEM private key or a Google service account JSON key matching jwt_signing_algorithm"
+    )]
     InvalidSigningKey,
     #[error("jwt_certificate_secret_ref must reference a PEM certificate")]
     InvalidCertificate,
@@ -1108,6 +1110,11 @@ mod jwt_provider_tests {
         add_secret(&state, "CLIENT_ID", "client-123").await;
         add_secret(&state, "CLIENT_SECRET", "client-secret").await;
         add_secret(&state, "NOT_A_KEY", "key-secret-marker").await;
+        let key_file = |private_key: &str| {
+            json!({"type": "service_account", "private_key_id": "abc123", "private_key": private_key}).to_string()
+        };
+        add_secret(&state, "SA_JSON", &key_file(&test_keys::rsa_pkcs8().private_pem)).await;
+        add_secret(&state, "BAD_JSON", &key_file("key-secret-marker")).await;
         state
     }
 
@@ -1267,6 +1274,42 @@ mod jwt_provider_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_service_account_json_key_is_accepted_on_create_and_validate() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let mut body = jwt_bearer("vertex-json");
+        body["jwt_signing_key_secret_ref"] = json!("SA_JSON");
+        let (status, response) = create(&state, body).await;
+        assert_eq!(status, StatusCode::CREATED, "{response}");
+        let (http, _requests, _server) = token_endpoint_answering_get().await;
+        let (status, response) = validate(&state, &http, None, validate_jwt_bearer("SA_JSON")).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["key_material"], "ok");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_service_account_json_key_without_a_usable_private_key_is_refused_without_echoing_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let mut body = jwt_bearer("vertex-bad-json");
+        body["jwt_signing_key_secret_ref"] = json!("BAD_JSON");
+        let (status, response) = create(&state, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response["error"],
+            "jwt_signing_key_secret_ref must reference a PEM private key or a Google service account JSON key matching jwt_signing_algorithm"
+        );
+        assert!(
+            !response
+                .to_string()
+                .contains("key-secret-marker")
+        );
+        let (http, _requests, _server) = token_endpoint_answering_get().await;
+        let (status, _) = validate(&state, &http, None, validate_jwt_bearer("BAD_JSON")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn key_material_in_the_wrong_format_fails_the_save_without_echoing_it() {
         let directory = tempfile::tempdir().unwrap();
         let state = with_key_material(&directory).await;
@@ -1279,7 +1322,7 @@ mod jwt_provider_tests {
             assert_eq!(status, StatusCode::BAD_REQUEST);
             assert_eq!(
                 response["error"],
-                "jwt_signing_key_secret_ref must reference a PEM private key matching jwt_signing_algorithm"
+                "jwt_signing_key_secret_ref must reference a PEM private key or a Google service account JSON key matching jwt_signing_algorithm"
             );
             assert!(
                 !response
@@ -1349,7 +1392,7 @@ mod jwt_provider_tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(
             response["error"],
-            "jwt_signing_key_secret_ref must reference a PEM private key matching jwt_signing_algorithm"
+            "jwt_signing_key_secret_ref must reference a PEM private key or a Google service account JSON key matching jwt_signing_algorithm"
         );
         let (status, response) = update(&state, id, json!({"jwt_signing_key_secret_ref": " "})).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -1674,7 +1717,7 @@ mod jwt_provider_tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(
             response["error"],
-            "jwt_signing_key_secret_ref must reference a PEM private key matching jwt_signing_algorithm"
+            "jwt_signing_key_secret_ref must reference a PEM private key or a Google service account JSON key matching jwt_signing_algorithm"
         );
         assert!(
             !response
