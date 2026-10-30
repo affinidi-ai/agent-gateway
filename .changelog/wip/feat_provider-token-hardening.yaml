@@ -4,5 +4,14 @@ changes:
   changed: []
   fixed: []
   removed: []
-  security: []
+  security:
+    - timestamp: '2026-10-30T20:30:00Z'
+      title: Pin credential provider token requests to the vetted address
+      description: >-
+        Client Credentials, JWT Bearer and private_key_jwt grants, refreshes and
+        authorization-code exchanges, including the 2026-07-28 consent exchange, now connect
+        only to the address the token endpoint resolved to when it was checked, closing a
+        DNS-rebinding gap. Redirects stay off, and a token endpoint resolving to loopback, an
+        unspecified address or cloud metadata is refused before any request and reported as
+        refused by egress policy.
   breaking: []

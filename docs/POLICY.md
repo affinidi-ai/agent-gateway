@@ -438,6 +438,13 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   `AG_TEST_MODE=true`, `AG_BDD_EGRESS_ALLOWLIST` can admit an exact loopback
   fixture (never cloud metadata); the MCP conformance runner uses this for its
   REST fixture.
+- `egress::pinned_configured_client` also pins every **credential provider
+  token request** (`src/delegation_vault/oauth.rs`): service-token grants,
+  refreshes, and the legacy and `2026-07-28` authorization-code exchanges. The
+  token endpoint is resolved once, off the async runtime, and the request goes
+  to that address with redirects off; a blocked address is refused before any
+  request. RFC 1918 token endpoints stay reachable. Under `AG_TEST_MODE=true`,
+  `AG_BDD_OAUTH_ENDPOINT_ALLOWLIST` admits listed loopback test endpoints.
 - `egress::pinned_forward_client` (cloud-metadata-only) pins the **JWKS** fetch
   (`src/jwt_bearer/jwks.rs`, fresh client per fetch) and the **x402
   remote-facilitator** client (`src/x402/remote_facilitator.rs`, re-pinned per

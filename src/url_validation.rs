@@ -318,7 +318,7 @@ pub fn validate_resolved_cloud_metadata_url(raw: &str) -> Result<Url, String> {
     validate_resolved_url_inner(raw, false)
 }
 
-fn bdd_oauth_endpoint_allowlist() -> Option<String> {
+pub(crate) fn bdd_oauth_endpoint_allowlist() -> Option<String> {
     if std::env::var("AG_TEST_MODE").as_deref() != Ok("true") {
         return None;
     }

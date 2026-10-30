@@ -17,8 +17,8 @@ pub struct ServiceTokenContext<'a> {
     pub secrets: &'a Arc<dyn SecretsStore>,
     pub providers: &'a dyn CredentialProviderStorage,
     pub vault: &'a dyn DelegationVaultStorage,
-    /// The client for token requests; the external client when `None`.
-    pub http: Option<&'a reqwest::Client>,
+    /// How token requests reach the provider; [`oauth::TokenEgress::from_environment`] when `None`.
+    pub egress: Option<&'a oauth::TokenEgress>,
 }
 
 /// Where an issued token is cached: the vault row of `agent_did` and the synthetic
@@ -66,6 +66,8 @@ pub enum ServiceTokenError {
     SecretUnavailable,
     #[error("credential provider token request failed")]
     TokenRequestFailed,
+    #[error("credential provider token endpoint refused by egress policy")]
+    TokenEndpointRefused,
     #[error("credential provider issued other scopes than requested")]
     ScopeMismatch,
     #[error("credential provider changed during the token request")]
@@ -106,19 +108,19 @@ pub async fn acquire(
     if let Some(token) = cached_token(provider, scopes, context, key, now).await? {
         return Ok(ServiceToken::issued(token, true));
     }
-    let client = match context.http {
-        Some(client) => client.clone(),
-        None => crate::http_client::external().map_err(|_| ServiceTokenError::TokenRequestFailed)?,
-    };
+    let egress = context
+        .egress
+        .cloned()
+        .unwrap_or_else(oauth::TokenEgress::from_environment);
     let response = match provider.provider_type {
         CredentialProviderType::OAuth2ClientCredentials => {
-            oauth::fetch_scoped_client_credentials_token(provider, scopes, context.secrets, &client).await
+            oauth::fetch_scoped_client_credentials_token(provider, scopes, context.secrets, &egress).await
         }
         CredentialProviderType::OAuth2JwtBearer => {
-            oauth::fetch_jwt_bearer_token(provider, scopes, context.secrets, &client).await
+            oauth::fetch_jwt_bearer_token(provider, scopes, context.secrets, &egress).await
         }
         CredentialProviderType::OAuth2ClientCredentialsJwtAuth => {
-            oauth::fetch_client_credentials_jwt_auth_token(provider, scopes, context.secrets, &client).await
+            oauth::fetch_client_credentials_jwt_auth_token(provider, scopes, context.secrets, &egress).await
         }
         CredentialProviderType::OAuth2AuthorizationCode | CredentialProviderType::ApiKey => {
             return Err(ServiceTokenError::Unsupported);
@@ -126,7 +128,14 @@ pub async fn acquire(
     }
     .map_err(|error| {
         warn!(target: "credential_delegation", provider_id = %provider.provider_id, error = %format!("{error:#}"), "Service token request failed");
-        ServiceTokenError::TokenRequestFailed
+        if error
+            .downcast_ref::<oauth::TokenEndpointRefused>()
+            .is_some()
+        {
+            ServiceTokenError::TokenEndpointRefused
+        } else {
+            ServiceTokenError::TokenRequestFailed
+        }
     })?;
     let granted = response
         .scope
@@ -249,7 +258,8 @@ mod tests {
         secrets: Arc<dyn SecretsStore>,
         providers: FileSystemCredentialProviderStore,
         vault: FileSystemDelegationVaultStore,
-        client: reqwest::Client,
+        token_endpoint: String,
+        egress: oauth::TokenEgress,
         endpoint: Arc<Endpoint>,
         _server: tokio::task::JoinSet<()>,
         _directory: tempfile::TempDir,
@@ -288,11 +298,7 @@ mod tests {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .unwrap();
-            let client = reqwest::Client::builder()
-                .no_proxy()
-                .proxy(reqwest::Proxy::http(format!("http://{}", listener.local_addr().unwrap())).unwrap())
-                .build()
-                .unwrap();
+            let token_endpoint = format!("http://{}/token", listener.local_addr().unwrap());
             let mut server = tokio::task::JoinSet::new();
             server.spawn(async move {
                 axum::serve(listener, app)
@@ -342,7 +348,11 @@ mod tests {
                 vault: FileSystemDelegationVaultStore::new(directory.path().join("vault"))
                     .await
                     .unwrap(),
-                client,
+                egress: oauth::TokenEgress {
+                    timeout: std::time::Duration::from_secs(5),
+                    exact_allowlist: Some(token_endpoint.clone()),
+                },
+                token_endpoint,
                 endpoint,
                 _server: server,
                 _directory: directory,
@@ -355,7 +365,7 @@ mod tests {
         ) -> CredentialProvider {
             let mut value = json!({
                 "id": "provider", "name": "Provider", "provider_id": "provider",
-                "token_endpoint": "http://192.0.2.1/token",
+                "token_endpoint": self.token_endpoint,
                 "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
             });
             value
@@ -387,7 +397,7 @@ mod tests {
                 secrets: &self.secrets,
                 providers: &self.providers,
                 vault: &self.vault,
-                http: Some(&self.client),
+                egress: Some(&self.egress),
             };
             acquire(provider, &scopes, &context, KEY, now).await
         }
@@ -603,6 +613,61 @@ mod tests {
 
     fn requests_have_scope(form: &HashMap<String, String>) -> bool {
         form.contains_key("scope")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_token_endpoint_on_an_unlisted_loopback_address_is_refused_without_a_request() {
+        let mut fixture = Fixture::new().await;
+        fixture.egress.exact_allowlist = None;
+        let loopback = fixture.token_endpoint.clone();
+        for (settings, endpoint) in [
+            (
+                json!({"provider_type": "oauth2_client_credentials", "client_id_secret_ref": "CLIENT_ID",
+                       "client_secret_secret_ref": "CLIENT_SECRET"}),
+                loopback.clone(),
+            ),
+            (
+                json!({"provider_type": "oauth2_jwt_bearer", "jwt_issuer": "sa@example",
+                       "jwt_signing_key_secret_ref": "SIGNING_KEY"}),
+                loopback.replace("127.0.0.1", "localhost"),
+            ),
+            (
+                json!({"provider_type": "oauth2_client_credentials_jwt_auth", "client_id_secret_ref": "CLIENT_ID",
+                       "jwt_signing_key_secret_ref": "SIGNING_KEY"}),
+                loopback.clone(),
+            ),
+        ] {
+            let mut provider = fixture
+                .provider(settings)
+                .await;
+            provider.token_endpoint = Some(endpoint.clone());
+            assert_eq!(
+                fixture
+                    .acquire(&provider, &["read"], Utc::now())
+                    .await
+                    .err(),
+                Some(ServiceTokenError::TokenEndpointRefused),
+                "{endpoint}"
+            );
+            fixture
+                .providers
+                .delete(&provider.id)
+                .await
+                .unwrap();
+        }
+        assert!(fixture.requests().is_empty());
+        assert!(
+            fixture
+                .vault
+                .list_all()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            ServiceTokenError::TokenEndpointRefused.to_string(),
+            "credential provider token endpoint refused by egress policy"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

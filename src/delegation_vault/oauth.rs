@@ -110,6 +110,25 @@ pub async fn exchange_code_for_tokens(
     secrets_store: &Arc<dyn SecretsStore>,
     code_verifier: Option<&str>,
 ) -> Result<OAuthTokenResponse> {
+    exchange_code_for_tokens_with(
+        provider,
+        code,
+        gateway_base_url,
+        secrets_store,
+        code_verifier,
+        &TokenEgress::from_environment(),
+    )
+    .await
+}
+
+async fn exchange_code_for_tokens_with(
+    provider: &CredentialProvider,
+    code: &str,
+    gateway_base_url: &str,
+    secrets_store: &Arc<dyn SecretsStore>,
+    code_verifier: Option<&str>,
+    egress: &TokenEgress,
+) -> Result<OAuthTokenResponse> {
     let client_id_ref = provider
         .client_id_secret_ref
         .as_deref()
@@ -134,12 +153,11 @@ pub async fn exchange_code_for_tokens(
         .token_endpoint
         .as_deref()
         .ok_or_else(|| anyhow!("Provider '{}' has no token_endpoint", provider.provider_id))?;
-    crate::url_validation::validate_oauth_endpoint_url(token_endpoint)
-        .map_err(|e| anyhow!("Blocked token_endpoint for provider '{}': {}", provider.provider_id, e))?;
     crate::url_validation::validate_oauth_endpoint_url(&callback_url)
         .map_err(|e| anyhow!("Blocked callback_url for provider '{}': {}", provider.provider_id, e))?;
-
-    let http_client = crate::http_client::external()?;
+    let (http_client, token_url) = egress
+        .pinned_client(token_endpoint)
+        .await?;
 
     let mut params = vec![
         ("grant_type", "authorization_code".to_string()),
@@ -162,7 +180,7 @@ pub async fn exchange_code_for_tokens(
     );
 
     let response = http_client
-        .post(token_endpoint)
+        .post(token_url)
         .header("Accept", "application/json")
         .form(&params)
         .send()
@@ -253,6 +271,15 @@ pub async fn refresh_access_token(
     refresh_token: &str,
     secrets_store: &Arc<dyn SecretsStore>,
 ) -> Result<OAuthTokenResponse> {
+    refresh_access_token_with(provider, refresh_token, secrets_store, &TokenEgress::from_environment()).await
+}
+
+async fn refresh_access_token_with(
+    provider: &CredentialProvider,
+    refresh_token: &str,
+    secrets_store: &Arc<dyn SecretsStore>,
+    egress: &TokenEgress,
+) -> Result<OAuthTokenResponse> {
     let client_id_ref = provider
         .client_id_secret_ref
         .as_deref()
@@ -272,8 +299,6 @@ pub async fn refresh_access_token(
         .token_endpoint
         .as_deref()
         .ok_or_else(|| anyhow!("Provider '{}' has no token_endpoint", provider.provider_id))?;
-    crate::url_validation::validate_oauth_endpoint_url(token_endpoint)
-        .map_err(|e| anyhow!("Blocked token_endpoint for provider '{}': {}", provider.provider_id, e))?;
 
     let params = [
         ("grant_type", "refresh_token"),
@@ -289,10 +314,12 @@ pub async fn refresh_access_token(
         "Refreshing access token"
     );
 
-    let http_client = crate::http_client::external()?;
+    let (http_client, token_url) = egress
+        .pinned_client(token_endpoint)
+        .await?;
 
     let response = http_client
-        .post(token_endpoint)
+        .post(token_url)
         .header("Accept", "application/json")
         .form(&params)
         .send()
@@ -354,19 +381,19 @@ pub async fn refresh_scoped_access_token(
     refresh_token: &str,
     scopes: &[String],
     secrets: &Arc<dyn SecretsStore>,
-    client: &reqwest::Client,
+    egress: &TokenEgress,
 ) -> Result<Option<OAuthTokenResponse>> {
     anyhow::ensure!(!refresh_token.is_empty() && refresh_token.len() <= 32 * 1024, "Invalid refresh credential");
-    scoped_token_grant(provider, Some(refresh_token), scopes, secrets, client).await
+    scoped_token_grant(provider, Some(refresh_token), scopes, secrets, egress).await
 }
 
 pub async fn fetch_scoped_client_credentials_token(
     provider: &CredentialProvider,
     scopes: &[String],
     secrets: &Arc<dyn SecretsStore>,
-    client: &reqwest::Client,
+    egress: &TokenEgress,
 ) -> Result<OAuthTokenResponse> {
-    scoped_token_grant(provider, None, scopes, secrets, client)
+    scoped_token_grant(provider, None, scopes, secrets, egress)
         .await?
         .ok_or_else(|| anyhow!("Provider credential grant rejected"))
 }
@@ -376,7 +403,7 @@ async fn scoped_token_grant(
     refresh_token: Option<&str>,
     scopes: &[String],
     secrets: &Arc<dyn SecretsStore>,
-    client: &reqwest::Client,
+    egress: &TokenEgress,
 ) -> Result<Option<OAuthTokenResponse>> {
     let endpoint = validated_token_endpoint(provider)?;
     let resource = match provider.resource.as_deref() {
@@ -427,7 +454,7 @@ async fn scoped_token_grant(
     if let Some(refresh_token) = refresh_token {
         params.push(("refresh_token", refresh_token));
     }
-    request_token(provider, endpoint, &params, refresh_token.is_some(), client).await
+    request_token(provider, endpoint, &params, refresh_token.is_some(), egress).await
 }
 
 const JWT_BEARER_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:jwt-bearer";
@@ -439,7 +466,7 @@ pub async fn fetch_jwt_bearer_token(
     provider: &CredentialProvider,
     scopes: &[String],
     secrets: &Arc<dyn SecretsStore>,
-    client: &reqwest::Client,
+    egress: &TokenEgress,
 ) -> Result<OAuthTokenResponse> {
     let endpoint = validated_token_endpoint(provider)?;
     let claims = super::jwt_assertion::grant_assertion_claims(provider, scopes, Utc::now().timestamp())
@@ -449,7 +476,7 @@ pub async fn fetch_jwt_bearer_token(
     if let Some(resource) = provider.resource.as_deref() {
         params.push(("resource", resource));
     }
-    request_token(provider, endpoint, &params, false, client)
+    request_token(provider, endpoint, &params, false, egress)
         .await?
         .ok_or_else(|| anyhow!("Provider credential grant rejected"))
 }
@@ -460,7 +487,7 @@ pub async fn fetch_client_credentials_jwt_auth_token(
     provider: &CredentialProvider,
     scopes: &[String],
     secrets: &Arc<dyn SecretsStore>,
-    client: &reqwest::Client,
+    egress: &TokenEgress,
 ) -> Result<OAuthTokenResponse> {
     let endpoint = validated_token_endpoint(provider)?;
     let client_id = resolve_secret(
@@ -487,7 +514,7 @@ pub async fn fetch_client_credentials_jwt_auth_token(
     if let Some(resource) = provider.resource.as_deref() {
         params.push(("resource", resource));
     }
-    request_token(provider, endpoint, &params, false, client)
+    request_token(provider, endpoint, &params, false, egress)
         .await?
         .ok_or_else(|| anyhow!("Provider credential grant rejected"))
 }
@@ -540,13 +567,53 @@ async fn signed_assertion(
 }
 
 fn validated_token_endpoint(provider: &CredentialProvider) -> Result<&str> {
-    let endpoint = provider
+    provider
         .token_endpoint
         .as_deref()
-        .ok_or_else(|| anyhow!("Missing provider token endpoint"))?;
-    crate::url_validation::validate_oauth_endpoint_url(endpoint)
-        .map_err(|_| anyhow!("Invalid provider token endpoint"))?;
-    Ok(endpoint)
+        .ok_or_else(|| anyhow!("Missing provider token endpoint"))
+}
+
+/// How a token request reaches a credential provider's token endpoint.
+#[derive(Debug, Clone)]
+pub struct TokenEgress {
+    pub timeout: std::time::Duration,
+    /// Exact test endpoints admitted under `AG_TEST_MODE=true`; `None` in production.
+    pub exact_allowlist: Option<String>,
+}
+
+/// The token endpoint resolved to an address the egress policy blocks.
+#[derive(Debug, thiserror::Error)]
+#[error("token endpoint refused by egress policy")]
+pub struct TokenEndpointRefused;
+
+impl TokenEgress {
+    pub fn from_environment() -> Self {
+        Self {
+            timeout: std::time::Duration::from_secs(crate::http_client::EXTERNAL_TIMEOUT_SECS),
+            exact_allowlist: crate::url_validation::bdd_oauth_endpoint_allowlist(),
+        }
+    }
+
+    /// A redirect-off client pinned to the addresses `endpoint` resolved to when it was
+    /// vetted, and the URL to post to. A blocked address is [`TokenEndpointRefused`].
+    pub(crate) async fn pinned_client(
+        &self,
+        endpoint: &str,
+    ) -> Result<(reqwest::Client, url::Url)> {
+        let raw = endpoint.to_string();
+        let timeout = self.timeout;
+        let allowlist = self.exact_allowlist.clone();
+        let (client, target) = tokio::task::spawn_blocking(move || {
+            crate::egress::pinned_configured_client(&raw, timeout, allowlist.as_deref())
+        })
+        .await
+        .context("Provider token request failed")?
+        .map_err(|error| match error {
+            crate::egress::EgressError::Blocked(_) => anyhow::Error::new(TokenEndpointRefused),
+            _ => anyhow!("Provider token request failed"),
+        })?;
+        Ok((client, target.url))
+    }
 }
 
 /// POST a token request and read its JSON response, at most 64 KiB within 30 seconds.
@@ -558,11 +625,14 @@ async fn request_token(
     endpoint: &str,
     params: &[(&str, &str)],
     refresh: bool,
-    client: &reqwest::Client,
+    egress: &TokenEgress,
 ) -> Result<Option<OAuthTokenResponse>> {
     let operation = async {
+        let (client, url) = egress
+            .pinned_client(endpoint)
+            .await?;
         let mut response = client
-            .post(endpoint)
+            .post(url)
             .header("accept", "application/json")
             .form(params)
             .send()
@@ -1061,7 +1131,8 @@ mod tests {
         use std::collections::HashMap;
 
         struct TokenEndpoint {
-            client: reqwest::Client,
+            url: String,
+            egress: TokenEgress,
             requests: tokio::sync::mpsc::Receiver<HashMap<String, String>>,
             _server: tokio::task::JoinSet<()>,
         }
@@ -1087,11 +1158,7 @@ mod tests {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .unwrap();
-            let client = reqwest::Client::builder()
-                .no_proxy()
-                .proxy(reqwest::Proxy::http(format!("http://{}", listener.local_addr().unwrap())).unwrap())
-                .build()
-                .unwrap();
+            let url = format!("http://{}/token", listener.local_addr().unwrap());
             let mut server = tokio::task::JoinSet::new();
             server.spawn(async move {
                 axum::serve(listener, app)
@@ -1099,7 +1166,11 @@ mod tests {
                     .unwrap();
             });
             TokenEndpoint {
-                client,
+                egress: TokenEgress {
+                    timeout: std::time::Duration::from_secs(5),
+                    exact_allowlist: Some(url.clone()),
+                },
+                url,
                 requests,
                 _server: server,
             }
@@ -1153,10 +1224,13 @@ mod tests {
             }
         }
 
-        fn provider(body: Value) -> CredentialProvider {
+        fn provider(
+            token_endpoint: &str,
+            body: Value,
+        ) -> CredentialProvider {
             let mut value = json!({
                 "id": "cp", "name": "Provider", "provider_id": "provider",
-                "token_endpoint": "http://192.0.2.1/token",
+                "token_endpoint": token_endpoint,
                 "jwt_signing_key_secret_ref": "SIGNING_KEY",
                 "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
             });
@@ -1175,9 +1249,10 @@ mod tests {
             assertion: &str,
             public_pem: &str,
             algorithm: Algorithm,
+            audience: &str,
         ) -> Value {
             let mut validation = Validation::new(algorithm);
-            validation.set_audience(&["http://192.0.2.1/token"]);
+            validation.set_audience(&[audience]);
             decode::<Value>(assertion, &DecodingKey::from_rsa_pem(public_pem.as_bytes()).unwrap(), &validation)
                 .unwrap()
                 .claims
@@ -1191,13 +1266,16 @@ mod tests {
         async fn a_jwt_bearer_grant_posts_only_the_signed_assertion() {
             let fixture = fixture().await;
             let mut endpoint = token_endpoint(200, issued()).await;
-            let provider = provider(json!({
+            let provider = provider(
+                &endpoint.url,
+                json!({
                 "provider_type": "oauth2_jwt_bearer",
                 "jwt_issuer": "agent@project.iam.gserviceaccount.com",
                 "jwt_key_id": "google-key-id"
-            }));
+                }),
+            );
             let scopes = vec!["https://www.googleapis.com/auth/cloud-platform".to_string()];
-            let response = fetch_jwt_bearer_token(&provider, &scopes, &fixture.secrets, &endpoint.client)
+            let response = fetch_jwt_bearer_token(&provider, &scopes, &fixture.secrets, &endpoint.egress)
                 .await
                 .unwrap();
             assert_eq!(response.access_token, "issued-access");
@@ -1221,7 +1299,7 @@ mod tests {
                     .as_deref(),
                 Some("google-key-id")
             );
-            let claims = claims(&form["assertion"], &fixture.key.public_pem, Algorithm::RS256);
+            let claims = claims(&form["assertion"], &fixture.key.public_pem, Algorithm::RS256, &endpoint.url);
             assert_eq!(claims["iss"], "agent@project.iam.gserviceaccount.com");
             assert_eq!(claims["scope"], "https://www.googleapis.com/auth/cloud-platform");
             assert_eq!(
@@ -1239,11 +1317,14 @@ mod tests {
         async fn a_jwt_bearer_grant_sends_the_resource_only_when_configured() {
             let fixture = fixture().await;
             let mut endpoint = token_endpoint(200, issued()).await;
-            let provider = provider(json!({
-                "provider_type": "oauth2_jwt_bearer", "jwt_issuer": "sa@example",
-                "resource": "https://api.example/"
-            }));
-            fetch_jwt_bearer_token(&provider, &[], &fixture.secrets, &endpoint.client)
+            let provider = provider(
+                &endpoint.url,
+                json!({
+                    "provider_type": "oauth2_jwt_bearer", "jwt_issuer": "sa@example",
+                    "resource": "https://api.example/"
+                }),
+            );
+            fetch_jwt_bearer_token(&provider, &[], &fixture.secrets, &endpoint.egress)
                 .await
                 .unwrap();
             let form = endpoint
@@ -1270,9 +1351,14 @@ mod tests {
                 if let Some(resource) = resource {
                     settings["resource"] = json!(resource);
                 }
-                fetch_scoped_client_credentials_token(&provider(settings), &scopes, &fixture.secrets, &endpoint.client)
-                    .await
-                    .unwrap();
+                fetch_scoped_client_credentials_token(
+                    &provider(&endpoint.url, settings),
+                    &scopes,
+                    &fixture.secrets,
+                    &endpoint.egress,
+                )
+                .await
+                .unwrap();
                 let form = endpoint
                     .requests
                     .recv()
@@ -1300,14 +1386,17 @@ mod tests {
         async fn a_client_credentials_jwt_grant_authenticates_with_a_client_assertion() {
             let fixture = fixture().await;
             let mut endpoint = token_endpoint(200, issued()).await;
-            let provider = provider(json!({
-                "provider_type": "oauth2_client_credentials_jwt_auth",
-                "client_id_secret_ref": "CLIENT_ID",
-                "jwt_certificate_secret_ref": "CERTIFICATE"
-            }));
+            let provider = provider(
+                &endpoint.url,
+                json!({
+                    "provider_type": "oauth2_client_credentials_jwt_auth",
+                    "client_id_secret_ref": "CLIENT_ID",
+                    "jwt_certificate_secret_ref": "CERTIFICATE"
+                }),
+            );
             let scopes = vec!["api://foundry/.default".to_string()];
             let response =
-                fetch_client_credentials_jwt_auth_token(&provider, &scopes, &fixture.secrets, &endpoint.client)
+                fetch_client_credentials_jwt_auth_token(&provider, &scopes, &fixture.secrets, &endpoint.egress)
                     .await
                     .unwrap();
             assert_eq!(response.access_token, "issued-access");
@@ -1332,7 +1421,7 @@ mod tests {
                 header.x5t_s256,
                 Some(crate::delegation_vault::jwt_assertion::certificate_thumbprint(&fixture.certificate).unwrap())
             );
-            let claims = claims(&form["client_assertion"], &fixture.key.public_pem, Algorithm::PS256);
+            let claims = claims(&form["client_assertion"], &fixture.key.public_pem, Algorithm::PS256, &endpoint.url);
             assert_eq!(claims["iss"], "client-123");
             assert_eq!(claims["sub"], "client-123");
             assert!(
@@ -1346,13 +1435,16 @@ mod tests {
         async fn a_client_assertion_without_a_certificate_names_its_key_by_kid_only() {
             let fixture = fixture().await;
             let mut endpoint = token_endpoint(200, issued()).await;
-            let provider = provider(json!({
-                "provider_type": "oauth2_client_credentials_jwt_auth",
-                "client_id_secret_ref": "CLIENT_ID",
-                "jwt_signing_algorithm": "RS256",
-                "jwt_key_id": "key1"
-            }));
-            fetch_client_credentials_jwt_auth_token(&provider, &[], &fixture.secrets, &endpoint.client)
+            let provider = provider(
+                &endpoint.url,
+                json!({
+                    "provider_type": "oauth2_client_credentials_jwt_auth",
+                    "client_id_secret_ref": "CLIENT_ID",
+                    "jwt_signing_algorithm": "RS256",
+                    "jwt_key_id": "key1"
+                }),
+            );
+            fetch_client_credentials_jwt_auth_token(&provider, &[], &fixture.secrets, &endpoint.egress)
                 .await
                 .unwrap();
             let form = endpoint
@@ -1365,7 +1457,7 @@ mod tests {
             assert_eq!(header.kid.as_deref(), Some("key1"));
             assert_eq!(header.x5t_s256, None);
             assert_eq!(
-                claims(&form["client_assertion"], &fixture.key.public_pem, Algorithm::RS256)["iss"],
+                claims(&form["client_assertion"], &fixture.key.public_pem, Algorithm::RS256, &endpoint.url)["iss"],
                 "client-123"
             );
         }
@@ -1373,7 +1465,7 @@ mod tests {
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_refused_or_incomplete_token_response_is_an_error_without_key_material() {
             let fixture = fixture().await;
-            let provider = provider(json!({"provider_type": "oauth2_jwt_bearer", "jwt_issuer": "sa@example"}));
+            let settings = json!({"provider_type": "oauth2_jwt_bearer", "jwt_issuer": "sa@example"});
             for (status, body) in [
                 (400, json!({"error": "invalid_grant", "error_description": "Invalid JWT Signature."})),
                 (200, json!({"access_token": "issued-access", "token_type": "Bearer"})),
@@ -1381,22 +1473,169 @@ mod tests {
                 (200, json!({"access_token": "", "token_type": "Bearer", "expires_in": 60})),
             ] {
                 let endpoint = token_endpoint(status, body).await;
-                let error = fetch_jwt_bearer_token(&provider, &[], &fixture.secrets, &endpoint.client)
+                let provider = provider(&endpoint.url, settings.clone());
+                let error = fetch_jwt_bearer_token(&provider, &[], &fixture.secrets, &endpoint.egress)
                     .await
                     .unwrap_err();
                 let text = format!("{error:#}");
                 assert!(!text.contains("PRIVATE KEY"), "{text}");
                 assert!(!text.contains("issued-access"), "{text}");
             }
-            let mut unknown_key = provider.clone();
+            let endpoint = token_endpoint(200, issued()).await;
+            let mut unknown_key = provider(&endpoint.url, settings);
             unknown_key
                 .jwt
                 .jwt_signing_key_secret_ref = Some("CERTIFICATE".into());
-            let endpoint = token_endpoint(200, issued()).await;
-            let error = fetch_jwt_bearer_token(&unknown_key, &[], &fixture.secrets, &endpoint.client)
+            let error = fetch_jwt_bearer_token(&unknown_key, &[], &fixture.secrets, &endpoint.egress)
                 .await
                 .unwrap_err();
             assert_eq!(error.to_string(), "signing key must be a PEM private key matching the signing algorithm");
+        }
+
+        fn unlisted(endpoint: &TokenEndpoint) -> TokenEgress {
+            TokenEgress {
+                exact_allowlist: None,
+                ..endpoint.egress.clone()
+            }
+        }
+
+        fn refused(error: &anyhow::Error) -> bool {
+            error
+                .downcast_ref::<TokenEndpointRefused>()
+                .is_some()
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_token_request_does_not_follow_a_redirect() {
+            let fixture = fixture().await;
+            let mut target = token_endpoint(200, issued()).await;
+            let location = target.url.clone();
+            let app = axum::Router::new().fallback(axum::routing::post(move || {
+                let location = location.clone();
+                async move { (axum::http::StatusCode::FOUND, [(axum::http::header::LOCATION, location)]) }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .unwrap();
+            let redirecting = format!("http://{}/token", listener.local_addr().unwrap());
+            let mut server = tokio::task::JoinSet::new();
+            server.spawn(async move {
+                axum::serve(listener, app)
+                    .await
+                    .unwrap();
+            });
+            let egress = TokenEgress {
+                exact_allowlist: Some(format!("{redirecting},{}", target.url)),
+                ..target.egress.clone()
+            };
+            let provider = provider(
+                &redirecting,
+                json!({"provider_type": "oauth2_client_credentials",
+                       "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET"}),
+            );
+            assert!(
+                fetch_scoped_client_credentials_token(&provider, &[], &fixture.secrets, &egress)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                target
+                    .requests
+                    .try_recv()
+                    .is_err()
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn every_token_request_refuses_an_unlisted_loopback_endpoint_before_sending() {
+            let fixture = fixture().await;
+            let mut endpoint = token_endpoint(200, issued()).await;
+            let egress = unlisted(&endpoint);
+            let provider = provider(
+                &endpoint.url,
+                json!({"provider_type": "oauth2_client_credentials", "resource": "https://api.example/",
+                       "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET"}),
+            );
+            let error = refresh_scoped_access_token(&provider, "refresh", &[], &fixture.secrets, &egress)
+                .await
+                .unwrap_err();
+            assert!(refused(&error), "{error:#}");
+            let error = refresh_access_token_with(&provider, "refresh", &fixture.secrets, &egress)
+                .await
+                .unwrap_err();
+            assert!(refused(&error), "{error:#}");
+            let error = exchange_code_for_tokens_with(
+                &provider,
+                "code",
+                "https://203.0.113.10",
+                &fixture.secrets,
+                None,
+                &egress,
+            )
+            .await
+            .unwrap_err();
+            assert!(refused(&error), "{error:#}");
+            assert_eq!(error.to_string(), "token endpoint refused by egress policy");
+            assert!(
+                endpoint
+                    .requests
+                    .try_recv()
+                    .is_err()
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_legacy_exchange_and_refresh_reach_an_exactly_listed_endpoint() {
+            let fixture = fixture().await;
+            let mut endpoint = token_endpoint(200, issued()).await;
+            let provider = provider(
+                &endpoint.url,
+                json!({"provider_type": "oauth2_authorization_code",
+                       "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET"}),
+            );
+            let exchanged = exchange_code_for_tokens_with(
+                &provider,
+                "code",
+                "https://203.0.113.10",
+                &fixture.secrets,
+                Some("verifier"),
+                &endpoint.egress,
+            )
+            .await
+            .unwrap();
+            assert_eq!(exchanged.access_token, "issued-access");
+            let form = endpoint
+                .requests
+                .recv()
+                .await
+                .unwrap();
+            assert_eq!(form["grant_type"], "authorization_code");
+            assert_eq!(form["code_verifier"], "verifier");
+            let refreshed = refresh_access_token_with(&provider, "refresh", &fixture.secrets, &endpoint.egress)
+                .await
+                .unwrap();
+            assert_eq!(refreshed.access_token, "issued-access");
+            let form = endpoint
+                .requests
+                .recv()
+                .await
+                .unwrap();
+            assert_eq!(form["grant_type"], "refresh_token");
+            assert_eq!(form["refresh_token"], "refresh");
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_metadata_endpoint_is_refused_even_when_listed() {
+            let metadata = "http://169.254.169.254/token";
+            let egress = TokenEgress {
+                timeout: std::time::Duration::from_secs(5),
+                exact_allowlist: Some(metadata.into()),
+            };
+            let error = egress
+                .pinned_client(metadata)
+                .await
+                .unwrap_err();
+            assert!(refused(&error), "{error:#}");
         }
     }
 

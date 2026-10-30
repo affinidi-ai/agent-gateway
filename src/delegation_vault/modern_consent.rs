@@ -24,7 +24,7 @@ pub struct ModernConsentState {
     pub identity_strategies: std::sync::Arc<dyn crate::jwt_bearer::JwtVerificationStrategyStorage>,
     pub verifier: std::sync::Arc<crate::jwt_bearer::JwtBearerVerifier>,
     pub continuations: std::sync::Arc<crate::mcp::continuations::service::ContinuationService>,
-    pub provider_http: reqwest::Client,
+    pub provider_egress: super::oauth::TokenEgress,
 }
 
 /// The OAuth authorization response. Providers add their own parameters
@@ -314,7 +314,7 @@ async fn callback(
                 .as_deref()
                 .unwrap_or_default(),
             &state.vault.secrets_store,
-            &state.provider_http,
+            &state.provider_egress,
         )
         .await
         .map_err(failure)?;
@@ -541,7 +541,7 @@ pub async fn exchange_code(
     ticket: &ConsentTicket,
     code: &str,
     secrets: &std::sync::Arc<dyn crate::secrets::SecretsStore>,
-    client: &reqwest::Client,
+    egress: &super::oauth::TokenEgress,
 ) -> Result<ExchangedProviderResponse, ContinuationError> {
     if code.is_empty()
         || code.len() > 4096
@@ -559,7 +559,6 @@ pub async fn exchange_code(
         .resource
         .as_deref()
         .ok_or(ContinuationError::InvalidRecord)?;
-    crate::url_validation::validate_oauth_endpoint_url(endpoint).map_err(|_| ContinuationError::InvalidRecord)?;
     crate::sts::mcp_profile::canonical_https_url(resource).map_err(|_| ContinuationError::InvalidRecord)?;
     let client_id = super::oauth::resolve_secret(
         secrets,
@@ -586,8 +585,12 @@ pub async fn exchange_code(
         .as_deref()
         .ok_or(ContinuationError::InvalidRecord)?;
     let operation = async {
+        let (client, url) = egress
+            .pinned_client(endpoint)
+            .await
+            .map_err(|_| ContinuationError::Unavailable)?;
         let mut response = client
-            .post(endpoint)
+            .post(url)
             .header("accept", "application/json")
             .form(&[
                 ("grant_type", "authorization_code"),
@@ -705,13 +708,11 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .unwrap();
-        let provider_http = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .no_proxy()
-            .proxy(reqwest::Proxy::http(format!("http://{}", listener.local_addr().unwrap())).unwrap())
-            .build()
-            .unwrap();
-        let token_endpoint = "http://192.0.2.1/token";
+        let token_endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+        let provider_egress = super::super::oauth::TokenEgress {
+            timeout: std::time::Duration::from_secs(5),
+            exact_allowlist: Some(token_endpoint.clone()),
+        };
         let mut tasks = tokio::task::JoinSet::new();
         tasks.spawn(async move {
             axum::serve(listener, provider_app)
@@ -888,7 +889,7 @@ mod tests {
                 crate::jwt_bearer::JwksClient::new(),
             ))),
             continuations: service.clone(),
-            provider_http,
+            provider_egress,
         });
 
         for (provider_subject, expected_status) in [
@@ -1162,6 +1163,79 @@ mod tests {
                     .unwrap();
             }
         }
+        tasks.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exchange_code_refuses_a_loopback_endpoint_that_is_not_listed() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let app = axum::Router::new().fallback(axum::routing::post(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            async { axum::Json(json!({})) }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let token_endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .unwrap();
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let secrets: std::sync::Arc<dyn crate::secrets::SecretsStore> = Arc::new(
+            crate::secrets::FilesystemSecretsStore::new(
+                directory
+                    .path()
+                    .to_str()
+                    .unwrap(),
+            )
+            .unwrap(),
+        );
+        for secret_id in ["provider-client-id", "provider-client-secret"] {
+            secrets
+                .create(crate::secrets::CreateSecretRequest {
+                    tenant_id: None,
+                    name: secret_id.into(),
+                    secret_id: secret_id.into(),
+                    description: None,
+                    value: "value".into(),
+                    secret_type: "General".into(),
+                    tags: vec![],
+                })
+                .await
+                .unwrap();
+        }
+        let provider: CredentialProvider = serde_json::from_value(json!({
+            "id": "provider", "name": "Provider", "provider_id": "provider", "token_endpoint": token_endpoint,
+            "client_id_secret_ref": "provider-client-id", "client_secret_secret_ref": "provider-client-secret",
+            "resource": "https://provider.example/api",
+            "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+        }))
+        .unwrap();
+        let ticket: ConsentTicket = serde_json::from_value(json!({
+            "id": uuid::Uuid::new_v4(), "continuation_id": uuid::Uuid::new_v4(), "issued_at": 10, "expires_at": 100,
+            "provider_digest": ([3; 32]), "surface_digest": ([4; 32]), "identity_strategy_digest": ([5; 32]),
+            "callback_url": "https://gateway.example/mcp-consent/callback/provider", "code_verifier": "v".repeat(43),
+            "binding": {"deployment": "deployment", "principal": "principal", "agent_did": "did:web:agent", "user_identity_hash": "user",
+                "authorization_digest": ([1; 32]), "tenant_id": null, "surface_id": "surface", "variant_id": null, "route": {"kind": "access_point"},
+                "resource": "https://gateway.example/mcp", "provider_id": "provider", "scopes": ["read"], "method": "tools/call", "arguments_digest": ([2; 32])}
+        }))
+        .unwrap();
+        let egress = super::super::oauth::TokenEgress {
+            timeout: std::time::Duration::from_secs(5),
+            exact_allowlist: None,
+        };
+        assert!(matches!(
+            exchange_code(&provider, &ticket, "code", &secrets, &egress).await,
+            Err(ContinuationError::Unavailable)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
         tasks.shutdown().await;
     }
 

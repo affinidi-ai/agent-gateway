@@ -1,9 +1,12 @@
 //! Target authentication from a credential provider E2E: a surface save takes a
 //! machine credential provider and refuses `credential_lookup`, an unknown provider and
-//! a provider that needs a user's consent.
+//! a provider that needs a user's consent; a token endpoint the egress policy blocks
+//! fails the request without reaching the token endpoint or the Target.
 
-use super::helpers::{GatewayHarness, configure_admin_api};
+use super::helpers::{self, GatewayHarness, configure_admin_api};
 use serde_json::json;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_surface_save_accepts_only_a_target_auth_method_the_gateway_can_use() {
@@ -87,4 +90,108 @@ async fn a_surface_save_accepts_only_a_target_auth_method_the_gateway_can_use() 
         let body = refused.text().await.unwrap();
         assert!(body.contains(reason), "{case}: {body}");
     }
+}
+
+fn write_machine_provider(
+    bootstrap: &crate::config::BootstrapConfig,
+    token_endpoint: &str,
+) {
+    use crate::credential_providers::storage::{CredentialProviderStorage, FileSystemCredentialProviderStore};
+    use crate::secrets::SecretsStore;
+
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            let secrets = crate::secrets::FilesystemSecretsStore::new(
+                &bootstrap
+                    .storage_paths
+                    .secrets,
+            )
+            .unwrap();
+            for secret_id in ["target-client-id", "target-client-secret"] {
+                secrets
+                    .create(crate::secrets::CreateSecretRequest {
+                        tenant_id: None,
+                        name: secret_id.into(),
+                        secret_id: secret_id.into(),
+                        description: None,
+                        value: "value".into(),
+                        secret_type: "General".into(),
+                        tags: vec![],
+                    })
+                    .await
+                    .unwrap();
+            }
+            FileSystemCredentialProviderStore::new(
+                bootstrap
+                    .storage_paths
+                    .credential_providers
+                    .clone()
+                    .into(),
+            )
+            .await
+            .unwrap()
+            .create(
+                serde_json::from_value(json!({
+                    "id": "machine", "name": "machine", "provider_id": "machine",
+                    "provider_type": "oauth2_client_credentials", "token_endpoint": token_endpoint,
+                    "client_id_secret_ref": "target-client-id", "client_secret_secret_ref": "target-client-secret",
+                    "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        })
+    });
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_token_endpoint_the_egress_policy_blocks_fails_the_request_before_the_target() {
+    let token_requests = Arc::new(AtomicUsize::new(0));
+    let counter = token_requests.clone();
+    let token_app = axum::Router::new().fallback(axum::routing::post(move || {
+        counter.fetch_add(1, Ordering::SeqCst);
+        async { axum::Json(json!({"access_token": "provider-token", "token_type": "Bearer", "expires_in": 3600})) }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap();
+    let token_endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+    let mut token_server = tokio::task::JoinSet::new();
+    token_server.spawn(async move {
+        axum::serve(listener, token_app)
+            .await
+            .unwrap();
+    });
+    let h = GatewayHarness::start(|_, gw_config, bootstrap| {
+        write_machine_provider(bootstrap, &token_endpoint);
+        let mut surface = helpers::build_minimal_channel();
+        surface.target.auth = Some(
+            serde_json::from_value(json!({"method": {"credential_provider": {"provider_id": "machine"}}})).unwrap(),
+        );
+        gw_config.surfaces = vec![surface];
+    })
+    .await;
+
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post(&h.gateway_url)
+        .header("content-type", "application/json")
+        .body(r#"{"jsonrpc":"2.0","method":"message/send","id":1,"params":{}}"#)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 502);
+    let body = response.text().await.unwrap();
+    assert!(body.contains("Target authentication failed"), "{body}");
+    assert_eq!(
+        h.mock
+            .request_count
+            .load(Ordering::SeqCst),
+        0
+    );
+    assert_eq!(token_requests.load(Ordering::SeqCst), 0);
 }

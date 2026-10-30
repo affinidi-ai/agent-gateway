@@ -34,7 +34,7 @@ pub struct ModernDelegationContext<'context> {
     pub providers: &'context dyn CredentialProviderStorage,
     pub strategies: &'context dyn JwtVerificationStrategyStorage,
     pub secrets: Option<&'context std::sync::Arc<dyn crate::secrets::SecretsStore>>,
-    pub provider_http: Option<&'context reqwest::Client>,
+    pub provider_egress: Option<&'context crate::delegation_vault::oauth::TokenEgress>,
 }
 
 pub enum ModernDelegationResult {
@@ -197,7 +197,7 @@ pub async fn prepare_direct(
             .ok_or(ContinuationError::Unavailable)?,
         strategies: strategies.as_ref(),
         secrets: state.secrets_store.as_ref(),
-        provider_http: None,
+        provider_egress: None,
     }
     .prepare_with_payment(request, now_secs()?, unpaid)
     .await
@@ -276,7 +276,7 @@ pub async fn prepare_transit(
             .as_deref()
             .ok_or(ContinuationError::Unavailable)?,
         secrets: state.secrets_store.as_ref(),
-        provider_http: None,
+        provider_egress: None,
     }
     .prepare(request, now_secs()?)
     .await
@@ -688,7 +688,7 @@ impl ModernDelegationContext<'_> {
                 .ok_or(ContinuationError::Unavailable)?,
             providers: self.providers,
             vault: self.vault,
-            http: self.provider_http,
+            egress: self.provider_egress,
         };
         let key = ServiceTokenKey {
             agent_did: self.agent_did,
@@ -703,6 +703,7 @@ impl ModernDelegationContext<'_> {
                 ServiceTokenError::Unsupported
                 | ServiceTokenError::SecretUnavailable
                 | ServiceTokenError::TokenRequestFailed
+                | ServiceTokenError::TokenEndpointRefused
                 | ServiceTokenError::StoreUnavailable => ContinuationError::Unavailable,
             })
     }
@@ -736,10 +737,10 @@ impl ModernDelegationContext<'_> {
             Err(RefreshError::Uncertain | RefreshError::NotRefreshable) => return Ok(None),
             Err(_) => return Err(ContinuationError::Unavailable),
         };
-        let client = match self.provider_http {
-            Some(client) => client.clone(),
-            None => crate::http_client::external().map_err(|_| ContinuationError::Unavailable)?,
-        };
+        let egress = self
+            .provider_egress
+            .cloned()
+            .unwrap_or_else(crate::delegation_vault::oauth::TokenEgress::from_environment);
         let Some(response) = crate::delegation_vault::oauth::refresh_scoped_access_token(
             &provider.provider,
             claim
@@ -750,7 +751,7 @@ impl ModernDelegationContext<'_> {
             &claim.token().scopes,
             self.secrets
                 .ok_or(ContinuationError::Unavailable)?,
-            &client,
+            &egress,
         )
         .await
         .map_err(|_| ContinuationError::Unavailable)?
@@ -1145,12 +1146,11 @@ mod tests {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .unwrap();
-            let client = reqwest::Client::builder()
-                .no_proxy()
-                .proxy(reqwest::Proxy::http(format!("http://{}", listener.local_addr().unwrap())).unwrap())
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .unwrap();
+            let token_endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+            let egress = crate::delegation_vault::oauth::TokenEgress {
+                timeout: Duration::from_secs(5),
+                exact_allowlist: Some(token_endpoint.clone()),
+            };
             let mut tasks = tokio::task::JoinSet::new();
             tasks.spawn(async move {
                 axum::serve(listener, provider_app)
@@ -1214,7 +1214,7 @@ mod tests {
                 .unwrap();
             let provider = providers.create(serde_json::from_value(json!({
                 "id": "provider", "name": "Provider", "provider_id": "provider", "resource": "https://provider.example/api",
-                "token_endpoint": "http://192.0.2.1/token", "client_id_secret_ref": "client-id", "client_secret_secret_ref": "client-secret",
+                "token_endpoint": token_endpoint, "client_id_secret_ref": "client-id", "client_secret_secret_ref": "client-secret",
                 "consent_identity_strategy_id": strategy.id, "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
             })).unwrap()).await.unwrap();
             let surface: AgentSurface = serde_json::from_value(json!({
@@ -1257,7 +1257,7 @@ mod tests {
                 providers: &providers,
                 strategies: &strategies,
                 secrets: Some(&secrets),
-                provider_http: Some(&client),
+                provider_egress: Some(&egress),
             };
             let other_context = ModernDelegationContext {
                 vault: &other_vault,
@@ -1517,11 +1517,11 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .unwrap();
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .proxy(reqwest::Proxy::http(format!("http://{}", listener.local_addr().unwrap())).unwrap())
-            .build()
-            .unwrap();
+        let token_endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+        let egress = crate::delegation_vault::oauth::TokenEgress {
+            timeout: std::time::Duration::from_secs(5),
+            exact_allowlist: Some(token_endpoint.clone()),
+        };
         let mut tasks = tokio::task::JoinSet::new();
         tasks.spawn(async move {
             axum::serve(listener, app)
@@ -1572,7 +1572,7 @@ mod tests {
         }
         providers.create(serde_json::from_value(json!({
             "id": "provider", "name": "Provider", "provider_id": "provider", "provider_type": "oauth2_client_credentials",
-            "resource": "https://provider.example/api", "token_endpoint": "http://192.0.2.1/token",
+            "resource": "https://provider.example/api", "token_endpoint": token_endpoint,
             "client_id_secret_ref": "client-id", "client_secret_secret_ref": "client-secret",
             "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
         })).unwrap()).await.unwrap();
@@ -1615,7 +1615,7 @@ mod tests {
             providers: &providers,
             strategies: &strategies,
             secrets: Some(&secrets),
-            provider_http: Some(&client),
+            provider_egress: Some(&egress),
         };
         let request = ValidatedModernMessage {
             protocol_version: crate::mcp::MCP_MODERN_VERSION.into(),
@@ -1700,6 +1700,24 @@ mod tests {
             Err(ContinuationError::Denied)
         ));
         assert_eq!(calls(), 3);
+
+        let unlisted = crate::delegation_vault::oauth::TokenEgress {
+            exact_allowlist: None,
+            ..egress.clone()
+        };
+        let blocked = ModernDelegationContext {
+            provider_egress: Some(&unlisted),
+            route: context.route.clone(),
+            variant_id: context.variant_id.clone(),
+            ..context
+        };
+        assert!(matches!(
+            blocked
+                .service_credential(&selected[0], now)
+                .await,
+            Err(ContinuationError::Unavailable)
+        ));
+        assert_eq!(calls(), 3);
         tasks.shutdown().await;
     }
 
@@ -1777,7 +1795,7 @@ mod tests {
             providers: &providers,
             strategies: &strategies,
             secrets: None,
-            provider_http: None,
+            provider_egress: None,
         };
         let mut request = ValidatedModernMessage {
             protocol_version: crate::mcp::MCP_MODERN_VERSION.into(),
@@ -2166,7 +2184,7 @@ mod tests {
                 providers: &providers,
                 strategies: &strategies,
                 secrets: None,
-                provider_http: None,
+                provider_egress: None,
             };
             let request = ValidatedModernMessage {
                 protocol_version: crate::mcp::MCP_MODERN_VERSION.into(),

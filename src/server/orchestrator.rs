@@ -3414,7 +3414,7 @@ pub async fn run_axum_proxy(
                             source_auth_middleware.jwks_client(),
                         )),
                         continuations: runtime.service.clone(),
-                        provider_http: crate::http_client::external().map_err(|error| anyhow::anyhow!(error))?,
+                        provider_egress: crate::delegation_vault::oauth::TokenEgress::from_environment(),
                     },
                 ));
             }

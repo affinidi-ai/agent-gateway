@@ -78,6 +78,13 @@ reads an empty reference as none.
 that needs one: legacy and `2026-07-28` delegation bindings, and target authentication.
 
 - An API key is read from the secrets store on every use and never cached.
+- Every token request (Client Credentials, JWT Bearer, `private_key_jwt` and refresh) is sent
+  on a client pinned to the addresses the token endpoint resolved to when it was checked, with
+  redirects off. A host resolving to loopback, an unspecified address or cloud metadata is
+  refused before any request, reported as `TokenEndpointRefused` ("credential provider token
+  endpoint refused by egress policy"); RFC 1918 addresses stay allowed. Under
+  `AG_TEST_MODE=true`, `AG_BDD_OAUTH_ENDPOINT_ALLOWLIST` admits listed loopback test endpoints
+  (never cloud metadata).
 - An issued token is cached in the delegation vault until 60 seconds before its `expires_at`,
   then a new one is requested. A token response without `expires_in`, with an empty token, or
   with a `token_type` other than `Bearer` is refused, as is a response over 64 KiB or slower
@@ -334,6 +341,10 @@ Used nonces are remembered in the gateway process for 15 minutes, longer than a 
 lives, so a restart or a different gateway instance does not know about them. A state is
 used up only when its credential is stored, so a callback that fails before then, for
 example at the token exchange, can be retried with the same state.
+
+The code exchange, the legacy and `2026-07-28` refresh, and the `2026-07-28` consent exchange
+use the same pinned client as service tokens (see _Service tokens_): redirects are not
+followed, and a token endpoint resolving to a blocked address is refused before any request.
 
 The callback lands on `/v1/identity/oauth/callback` unless `gateway.json` sets
 `oauth_callback_route`. On success the gateway stores the

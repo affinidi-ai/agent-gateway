@@ -4930,7 +4930,7 @@ async fn process_forward_request_in_request_scope(
                 agent_did: caller_identity.as_deref().ok_or(ContinuationError::BindingMismatch)?,
                 profile: network.sts.mcp_issuer.as_ref().ok_or(ContinuationError::Unavailable)?,
                 vault: vault.as_ref(), providers: providers.as_ref(), strategies: strategies.as_ref(),
-                secrets: secrets.as_ref(), provider_http: None,
+                secrets: secrets.as_ref(), provider_egress: None,
             }.prepare_with_payment(request, crate::proxy::credential_delegation::modern::now_secs()?,
                 modern_payment.as_ref().is_some_and(|(headers, config)| {
                     crate::proxy::handler::surface_payment::LocalPayment::inspect(

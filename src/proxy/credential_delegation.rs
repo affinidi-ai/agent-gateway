@@ -456,7 +456,7 @@ pub async fn resolve_delegation_credentials(
                     secrets: secrets_store,
                     providers: provider_store.as_ref(),
                     vault: vault_store.as_ref(),
-                    http: None,
+                    egress: None,
                 };
                 let key = ServiceTokenKey {
                     agent_did,
@@ -1000,7 +1000,6 @@ async fn refresh_verified_credential(
         .claim_refresh(token, now)
         .await
         .map_err(|_| ())?;
-    let client = crate::http_client::external().map_err(|_| ())?;
     let response = oauth::refresh_scoped_access_token(
         provider,
         claim
@@ -1010,7 +1009,7 @@ async fn refresh_verified_credential(
             .ok_or(())?,
         &claim.token().scopes,
         secrets,
-        &client,
+        &oauth::TokenEgress::from_environment(),
     )
     .await
     .map_err(|_| ())?
@@ -2221,6 +2220,71 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_token_endpoint_the_egress_policy_blocks_is_named_in_the_audit_detail() {
+        let directory = tempfile::tempdir().unwrap();
+        let secrets: Arc<dyn SecretsStore> = Arc::new(
+            crate::secrets::FilesystemSecretsStore::new(
+                directory
+                    .path()
+                    .to_str()
+                    .unwrap(),
+            )
+            .unwrap(),
+        );
+        for secret_id in ["CLIENT_ID", "CLIENT_SECRET"] {
+            secrets
+                .create(CreateSecretRequest {
+                    tenant_id: None,
+                    name: secret_id.into(),
+                    secret_id: secret_id.into(),
+                    description: None,
+                    value: "value".into(),
+                    secret_type: "General".into(),
+                    tags: vec![],
+                })
+                .await
+                .unwrap();
+        }
+        let mut provider = make_credential_provider("cp-1", CredentialProviderType::OAuth2ClientCredentials);
+        provider.token_endpoint = Some("http://127.0.0.1:9/token".into());
+        let providers = Arc::new(MockProviderStore {
+            providers: HashMap::from([("cp-1".to_string(), provider)]),
+        });
+        let vault = MockVaultStore::new(VaultLookupResult::NotFound);
+
+        let results = resolve_delegation_credentials(
+            &[make_binding("cp-1")],
+            "sha256:user1",
+            "did:web:agent.example",
+            "ch-1",
+            None,
+            &(vault as Arc<dyn DelegationVaultStorage>),
+            &(providers as Arc<dyn CredentialProviderStorage>),
+            &secrets,
+            "https://gw.example.com",
+            false,
+            None,
+            None,
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(result_tag(&results[0].result), "Unavailable");
+        assert_eq!(results[0].action.outcome, DelegationActionOutcome::ClientCredentialsFailed);
+        assert_eq!(
+            results[0]
+                .action
+                .detail
+                .as_deref(),
+            Some(
+                ServiceTokenError::TokenEndpointRefused
+                    .to_string()
+                    .as_str()
+            )
+        );
     }
 
     #[tokio::test]

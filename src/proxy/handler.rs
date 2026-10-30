@@ -576,8 +576,8 @@ pub(crate) struct TargetAuthContext<'a> {
     pub secrets: Option<&'a Arc<dyn crate::secrets::SecretsStore>>,
     pub providers: Option<&'a dyn crate::credential_providers::storage::CredentialProviderStorage>,
     pub vault: Option<&'a dyn crate::delegation_vault::storage::DelegationVaultStorage>,
-    /// The client for token requests; the external client when `None`.
-    pub http: Option<&'a reqwest::Client>,
+    /// How token requests reach the provider; the environment's egress when `None`.
+    pub egress: Option<&'a crate::delegation_vault::oauth::TokenEgress>,
     pub surface: &'a crate::config::agent_surface::AgentSurface,
 }
 
@@ -592,7 +592,7 @@ impl<'a> TargetAuthContext<'a> {
             secrets,
             providers: providers.map(|providers| providers.as_ref()),
             vault: vault.map(|vault| vault.as_ref()),
-            http: None,
+            egress: None,
             surface,
         }
     }
@@ -737,7 +737,7 @@ async fn target_provider_token(
         secrets,
         providers,
         vault,
-        http: context.http,
+        egress: context.egress,
     };
     let key = ServiceTokenKey {
         agent_did: &agent_did,
@@ -16587,7 +16587,7 @@ mod target_auth_tests {
         secrets: Arc<dyn SecretsStore>,
         providers: FileSystemCredentialProviderStore,
         vault: FileSystemDelegationVaultStore,
-        client: reqwest::Client,
+        egress: crate::delegation_vault::oauth::TokenEgress,
         token_requests: Arc<AtomicUsize>,
         _server: tokio::task::JoinSet<()>,
         _directory: tempfile::TempDir,
@@ -16612,11 +16612,7 @@ mod target_auth_tests {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .unwrap();
-            let client = reqwest::Client::builder()
-                .no_proxy()
-                .proxy(reqwest::Proxy::http(format!("http://{}", listener.local_addr().unwrap())).unwrap())
-                .build()
-                .unwrap();
+            let token_endpoint = format!("http://{}/token", listener.local_addr().unwrap());
             let mut server = tokio::task::JoinSet::new();
             server.spawn(async move {
                 axum::serve(listener, app)
@@ -16664,7 +16660,7 @@ mod target_auth_tests {
                     .create(
                         serde_json::from_value(json!({
                             "id": id, "name": id, "provider_id": id, "provider_type": provider_type, "tenant_id": tenant,
-                            "token_endpoint": "http://192.0.2.1/token", "client_id_secret_ref": "CLIENT_ID",
+                            "token_endpoint": token_endpoint, "client_id_secret_ref": "CLIENT_ID",
                             "client_secret_secret_ref": "CLIENT_SECRET", "default_scopes": ["read"],
                             "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
                         }))
@@ -16685,7 +16681,10 @@ mod target_auth_tests {
                 vault: FileSystemDelegationVaultStore::new(directory.path().join("vault"))
                     .await
                     .unwrap(),
-                client,
+                egress: crate::delegation_vault::oauth::TokenEgress {
+                    timeout: std::time::Duration::from_secs(5),
+                    exact_allowlist: Some(token_endpoint),
+                },
                 token_requests,
                 _server: server,
                 _directory: directory,
@@ -16697,7 +16696,7 @@ mod target_auth_tests {
                 secrets: Some(&self.secrets),
                 providers: Some(&self.providers),
                 vault: Some(&self.vault),
-                http: Some(&self.client),
+                egress: Some(&self.egress),
                 surface: &self.surface,
             }
         }
@@ -16861,6 +16860,30 @@ mod target_auth_tests {
         .unwrap_err();
         assert_eq!(error, TargetAuthError::ServiceToken(ServiceTokenError::TokenRequestFailed));
         assert_eq!(error.to_string(), "credential provider token request failed");
+        assert!(
+            fixture
+                .vault
+                .list_all()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_token_endpoint_the_egress_policy_blocks_is_refused_without_a_request() {
+        let mut fixture = Fixture::new(200).await;
+        fixture.egress.exact_allowlist = None;
+        let error = inject_target_auth_header(
+            &provider_auth("machine"),
+            &fixture.context(),
+            "surface",
+            CallerAssertion::GatewayOriginated,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, TargetAuthError::ServiceToken(ServiceTokenError::TokenEndpointRefused));
+        assert_eq!(fixture.requests(), 0);
         assert!(
             fixture
                 .vault
