@@ -2205,17 +2205,7 @@ fn retain_transit_caller_authentication(
         .iter_mut()
         .enumerate()
     {
-        let stored_points = existing
-            .variants
-            .iter()
-            .find(|previous| previous.id == variant.id)
-            .and_then(|previous| {
-                previous
-                    .overrides
-                    .transit
-                    .as_ref()
-            })
-            .and_then(|transit| transit.points.as_ref());
+        let stored_points = variant_stored_points(existing, &variant.id);
         let points = variant
             .overrides
             .transit
@@ -2230,6 +2220,33 @@ fn retain_transit_caller_authentication(
             retain_transit_points_caller_authentication(points, stored_points, sent_points(sent_transit));
         }
     }
+}
+
+/// The Transit Points a stored variant's own overrides define, else the stored
+/// surface's: a variant without its own list, or one added in this save,
+/// inherits them, and the Surface Builder sends it a copy of the surface's list
+/// that leaves out each Transit Point's caller authentication.
+fn variant_stored_points<'a>(
+    existing: &'a AgentSurface,
+    variant_id: &str,
+) -> Option<&'a [crate::config::agent_surface::TransitPoint]> {
+    existing
+        .variants
+        .iter()
+        .find(|previous| previous.id == variant_id)
+        .and_then(|previous| {
+            previous
+                .overrides
+                .transit
+                .as_ref()
+        })
+        .and_then(|transit| transit.points.as_deref())
+        .or_else(|| {
+            existing
+                .transit
+                .as_ref()
+                .map(|transit| transit.points.as_slice())
+        })
 }
 
 /// Keeps each Transit Point's stored `source_auth` and
@@ -3427,11 +3444,7 @@ pub async fn update_variant(
                 .transit
                 .as_mut()
                 .and_then(|transit| transit.points.as_mut()),
-            variant
-                .overrides
-                .transit
-                .as_ref()
-                .and_then(|transit| transit.points.as_ref()),
+            variant_stored_points(&existing, &variant_id),
         ) {
             retain_transit_points_caller_authentication(
                 points,
@@ -4113,6 +4126,114 @@ mod validation_tests {
         ] {
             assert!(shared_audience_warnings(&surface).is_empty(), "{case}");
         }
+    }
+
+    /// The Surface Builder sends every variant a copy of the surface's Transit
+    /// Points, without their `source_auth`. A variant that stored no list of its
+    /// own, or one added in the same save, keeps the caller authentication of
+    /// the surface's Transit Point with the same id, unless the save removes it.
+    #[test]
+    fn a_variant_that_inherits_the_surfaces_transit_points_keeps_their_caller_authentication() {
+        let stored_points = serde_json::json!([
+            { "id": "keyed", "alias": "keyed", "target_endpoint": "https://keyed.example",
+                "require_transit_token": false, "source_auth": caller_key() },
+            { "id": "dropped", "alias": "dropped", "target_endpoint": "https://dropped.example",
+                "require_transit_token": true, "source_auth": caller_key() },
+            { "id": "bare", "alias": "bare", "target_endpoint": "https://bare.example",
+                "require_transit_token": true }
+        ]);
+        let mut existing = surface_with_transit_points(stored_points, serde_json::json!(null));
+        assert!(
+            existing.variants[0]
+                .overrides
+                .transit
+                .as_ref()
+                .unwrap()
+                .points
+                .is_none()
+        );
+
+        let frozen = serde_json::json!([
+            { "id": "keyed", "alias": "keyed", "target_endpoint": "https://keyed.example",
+                "require_transit_token": false },
+            { "id": "dropped", "alias": "dropped", "target_endpoint": "https://dropped.example",
+                "require_transit_token": true, "source_auth": null },
+            { "id": "bare", "alias": "bare", "target_endpoint": "https://bare.example",
+                "require_transit_token": true },
+            { "id": "variant-only", "alias": "variant-only", "target_endpoint": "https://only.example",
+                "require_transit_token": true }
+        ]);
+        let mut surface = surface_with_transit_points(frozen.clone(), frozen.clone());
+        let mut added = surface.variants[0].clone();
+        added.id = "added".to_string();
+        added.alias = "added".to_string();
+        surface.variants.push(added);
+        let sent = serde_json::json!({
+            "transit": { "points": frozen },
+            "variants": [
+                { "id": "candidate", "overrides": { "transit": { "points": frozen } } },
+                { "id": "added", "overrides": { "transit": { "points": frozen } } }
+            ]
+        });
+
+        retain_transit_caller_authentication(&mut surface, &existing, &sent);
+
+        for variant in &surface.variants {
+            let points = variant
+                .overrides
+                .transit
+                .as_ref()
+                .and_then(|transit| transit.points.as_ref())
+                .unwrap();
+            assert_eq!(
+                points[0].source_auth,
+                Some(serde_json::from_value(caller_key()).unwrap()),
+                "{}: kept from the surface's Transit Point with the same id",
+                variant.alias
+            );
+            assert!(
+                points[1]
+                    .source_auth
+                    .is_none(),
+                "{}: a null in the save removes it",
+                variant.alias
+            );
+            assert!(
+                points[2]
+                    .source_auth
+                    .is_none(),
+                "{}: nothing stored, nothing invented",
+                variant.alias
+            );
+            assert!(
+                points[3]
+                    .source_auth
+                    .is_none(),
+                "{}: a Transit Point the surface does not have keeps none",
+                variant.alias
+            );
+        }
+
+        existing.variants[0]
+            .overrides
+            .transit
+            .as_mut()
+            .unwrap()
+            .points = Some(Vec::new());
+        let mut surface = surface_with_transit_points(frozen.clone(), frozen.clone());
+        let sent = serde_json::json!({ "variants": [{ "id": "candidate", "overrides": { "transit": { "points": frozen } } }] });
+        retain_transit_caller_authentication(&mut surface, &existing, &sent);
+        assert!(
+            surface.variants[0]
+                .overrides
+                .transit
+                .as_ref()
+                .and_then(|transit| transit.points.as_ref())
+                .unwrap()[0]
+                .source_auth
+                .is_none(),
+            "a variant that stores a list of its own is matched against that list, not the surface's"
+        );
     }
 
     #[test]
