@@ -1,0 +1,28 @@
+branch: feat/secure-ap-by-default
+changes:
+  added:
+    - timestamp: '2026-10-30T12:00:00Z'
+      title: Add access_point.public and caller_authentication.on_failure to surfaces
+      description: >-
+        `access_point.public: true` lets a surface admit callers without credentials, and every
+        save of such a surface returns a `warnings` entry. `caller_authentication.on_failure:
+        reject` refuses a missing or invalid credential with `401` before policy, as a JSON-RPC
+        error carrying the request id for MCP callers and `application/problem+json` otherwise,
+        on direct inbound, `proxy://`, `a2a-proxy://` and Fabric receive. The dashboard adds a
+        Public access switch to the Access Point panel. A gateway rolled back to an earlier
+        release skips surfaces that store either field, with a logged error, until it is
+        upgraded again; the files stay on disk.
+  changed:
+    - timestamp: '2026-10-30T12:00:00Z'
+      title: ⭐ Create new Access Points closed to callers without credentials
+      description: >-
+        The admin API and dashboard now create surfaces with `access_point.public: false` and
+        `on_failure: reject`, and refuse with `400` a closed surface, update or variant without
+        caller authentication, so an Access Point no longer admits anonymous callers until
+        someone adds a Caller Context. Set `public: true` to opt out. Surfaces stored before
+        this release, built from DynamoDB, or restored without the fields keep their behaviour,
+        and the dashboard warns when one is saved without a Caller Context.
+  fixed: []
+  removed: []
+  security: []
+  breaking: []
