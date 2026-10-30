@@ -745,10 +745,10 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
         assert_eq!(
             refusals,
             expected_refusal
-                .map(|reason| (reason, expected_status))
+                .map(|reason| (reason, None))
                 .into_iter()
                 .collect::<Vec<_>>(),
-            "recorded refusals for a {expected_status}"
+            "recorded refusals for a {expected_status}, with no HTTP status on Fabric"
         );
     }
     let mut unknown_surface = forward_message(legacy_body, json!({"MCP-Protocol-Version": MCP_LEGACY_VERSION}));
@@ -985,8 +985,12 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
                 headers,
                 body,
                 surface: configured.clone(),
-                variant_id: None,
+                variant: crate::config::agent_surface_variants::ForwardedVariant {
+                    id: None,
+                    recorded: "_base_".into(),
+                },
                 capabilities: crate::proxy::fabric_stream::peer::StreamCapabilities::local(true, true),
+                scope: crate::observability::policy_audit::RequestScope::fresh(),
             },
             crate::mcp::request_validation::LEGACY_ONLY_POLICY,
             None,
@@ -1396,8 +1400,12 @@ async fn fabric_consent_flow() {
                     .unwrap()
                     .into(),
                 surface: surface.clone(),
-                variant_id: None,
+                variant: crate::config::agent_surface_variants::ForwardedVariant {
+                    id: None,
+                    recorded: "_base_".into(),
+                },
                 capabilities: crate::proxy::fabric_stream::peer::StreamCapabilities::local(true, true),
+                scope: crate::observability::policy_audit::RequestScope::fresh(),
             },
         )
     };
@@ -2022,7 +2030,10 @@ async fn fabric_consent_flow() {
             if let Some(alias) = alias {
                 message.message_body["virtual_channel_alias"] = json!(alias);
             }
-            stream.variant_id = Some("credential-variant".into());
+            stream.variant = crate::config::agent_surface_variants::ForwardedVariant {
+                id: Some("credential-variant".into()),
+                recorded: "candidate".into(),
+            };
             (message, stream)
         };
         let before = calls.lock().await.len();
@@ -2506,8 +2517,8 @@ fn fabric_receive_binds_tokens_to_the_routes_protected_resource() {
 /// one, or one issued for another resource or variant, gets a 401 before
 /// policy without `resource_metadata`, one for the route's resource that lacks
 /// a required scope gets a 403, and only one for the route's resource with the
-/// required scope, or the default's when a named alias does not resolve,
-/// reaches the Target.
+/// required scope reaches the Target. A named alias that does not resolve is
+/// refused before any token is read, never served by the default.
 async fn fabric_discovery_flow() {
     use std::sync::Arc;
 
@@ -2633,9 +2644,6 @@ async fn fabric_discovery_flow() {
         (None, Some(token_for("https://gateway.example/other")), true),
         (None, Some(token_for("https://gateway.example/mcp$beta")), true),
         (Some("beta"), Some(token_for("https://gateway.example/mcp")), true),
-        // An alias that does not resolve falls back to the default, whose
-        // resource the token must name.
-        (Some("ghost"), Some(token_for("https://gateway.example/mcp$ghost")), true),
     ] {
         let response = send(alias, token).await;
         assert_eq!(response["status"], 401, "{response}");
@@ -2658,11 +2666,8 @@ async fn fabric_discovery_flow() {
         assert_eq!(reached(), 0, "a token short of the required scope never reaches the Target");
     }
 
-    for (alias, audience) in [
-        (None, "https://gateway.example/mcp"),
-        (Some("beta"), "https://gateway.example/mcp$beta"),
-        (Some("ghost"), "https://gateway.example/mcp"),
-    ] {
+    for (alias, audience) in [(None, "https://gateway.example/mcp"), (Some("beta"), "https://gateway.example/mcp$beta")]
+    {
         let before = reached();
         let response = send(alias, Some(token_for(audience))).await;
         assert_eq!(response["status"], 200, "{response}");
@@ -2679,6 +2684,17 @@ async fn fabric_discovery_flow() {
                 .any(|name| name.eq_ignore_ascii_case("authorization")),
             "the caller's token never reaches the Target"
         );
+    }
+
+    // A named alias that does not resolve is refused, with or without a token
+    // and whatever it names, and never reaches the Target.
+    for token in
+        [None, Some(token_for("https://gateway.example/mcp")), Some(token_for("https://gateway.example/mcp$ghost"))]
+    {
+        let before = reached();
+        let response = send(Some("ghost"), token).await;
+        assert_eq!(response["status"], 404, "{response}");
+        assert_eq!(reached(), before, "an unresolved alias never reaches the Target");
     }
 }
 
@@ -2989,16 +3005,14 @@ impl crate::jwt_bearer::JwtVerificationStrategyStorage for FailingStrategies {
     }
 }
 
-/// An A2A Access Point whose derived declaration cannot be resolved because the
-/// strategy store fails refuses a Fabric request with `503` and the A2A detail,
-/// not the MCP one, and never reaches the Target.
-#[tokio::test]
-async fn fabric_receive_refuses_an_unservable_a2a_declaration_with_the_a2a_detail() {
+/// Sends a Fabric `ForwardRequest` naming `alias` to an A2A Access Point without
+/// variants whose derived declaration cannot be resolved because the strategy
+/// store fails, and returns the `ForwardResponse` body, the audit records the
+/// request wrote and how many requests reached the Target.
+async fn receive_on_an_unservable_a2a_access_point(
+    alias: Option<&str>
+) -> (Value, Vec<crate::delegation_vault::audit::DelegationAuditEvent>, usize) {
     use std::sync::Arc;
-
-    if crate::gateways::test_helpers::rerun_in_isolated_process() {
-        return;
-    }
 
     let target = MockServer::start_with_response(json!({"jsonrpc": "2.0", "id": 1, "result": {}}).to_string()).await;
     let temp_dir = tempfile::tempdir().unwrap();
@@ -3032,6 +3046,13 @@ async fn fabric_receive_refuses_an_unservable_a2a_declaration_with_the_a2a_detai
     )))
     .await;
 
+    let mut body = json!({"channel_id": surface.surface_id, "method": "POST", "path": "/agent",
+        "headers": {"content-type": "application/json"},
+        "body": {"jsonrpc": "2.0", "id": 1, "method": "message/send", "params": {"message": {
+            "role": "user", "messageId": "m-1", "parts": [{"kind": "text", "text": "hi"}]}}}});
+    if let Some(alias) = alias {
+        body["virtual_channel_alias"] = json!(alias);
+    }
     let message = ReceivedMessage::new(
         "receiver-connection".to_string(),
         "receiver-gateway".to_string(),
@@ -3042,10 +3063,7 @@ async fn fabric_receive_refuses_an_unservable_a2a_declaration_with_the_a2a_detai
         vec!["did:web:receiver.example".to_string()],
         None,
         Some(super::super::envelope_replay::now_secs() + 60),
-        json!({"channel_id": surface.surface_id, "method": "POST", "path": "/agent",
-            "headers": {"content-type": "application/json"},
-            "body": {"jsonrpc": "2.0", "id": 1, "method": "message/send", "params": {"message": {
-                "role": "user", "messageId": "m-1", "parts": [{"kind": "text", "text": "hi"}]}}}}),
+        body,
         MessageMetadata {
             encrypted: true,
             authenticated: true,
@@ -3054,19 +3072,70 @@ async fn fabric_receive_refuses_an_unservable_a2a_declaration_with_the_a2a_detai
         },
     )
     .with_context("agent_surface_storage_path", json!(storage_path));
-    let result = tokio::time::timeout(Duration::from_secs(10), Box::pin(process_forward_request(&message)))
-        .await
-        .expect("Fabric receive handler timed out");
+    let (result, events) = crate::audit::producer::capture(async {
+        tokio::time::timeout(Duration::from_secs(10), Box::pin(process_forward_request(&message)))
+            .await
+            .expect("Fabric receive handler timed out")
+    })
+    .await;
     let ProcessingResult::RequiresResponse { response_type, response_body } = result else {
         panic!("expected a ForwardResponse, got {result:?}");
     };
     assert_eq!(response_type, MessageType::ForwardResponse.to_string());
-    assert_eq!(response_body, json!({"error": "Caller authentication unavailable", "status": 503}));
-    assert_eq!(
+    (
+        response_body,
+        events,
         target
             .request_count
             .load(Ordering::SeqCst),
-        0,
-        "an unservable declaration never reaches the Target"
+    )
+}
+
+/// An A2A Access Point whose derived declaration cannot be resolved because the
+/// strategy store fails refuses a Fabric request with `503` and the A2A detail,
+/// not the MCP one, records the refusal on its base surface, and never reaches
+/// the Target.
+#[tokio::test]
+async fn fabric_receive_refuses_an_unservable_a2a_declaration_with_the_a2a_detail() {
+    if crate::gateways::test_helpers::rerun_in_isolated_process() {
+        return;
+    }
+
+    let (response_body, events, reached) = receive_on_an_unservable_a2a_access_point(None).await;
+    assert_eq!(response_body, json!({"error": "Caller authentication unavailable", "status": 503}));
+    assert!(!events.is_empty(), "the refusal is recorded");
+    for event in &events {
+        assert_eq!(
+            event
+                .surface_variant
+                .as_deref(),
+            Some("_base_"),
+            "{event:?}"
+        );
+    }
+    assert_eq!(reached, 0, "an unservable declaration never reaches the Target");
+}
+
+/// An alias forwarded to an Access Point without variants is refused at routing
+/// with `404` and recorded as `_unknown_`, before its declaration is resolved or
+/// any caller is authenticated, so it is never served by the base surface.
+#[tokio::test]
+async fn fabric_receive_refuses_an_alias_on_an_access_point_without_variants_before_its_declaration() {
+    if crate::gateways::test_helpers::rerun_in_isolated_process() {
+        return;
+    }
+
+    let (response_body, events, reached) = receive_on_an_unservable_a2a_access_point(Some("x")).await;
+    assert_eq!(response_body["status"], 404, "{response_body}");
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event
+                .surface_variant
+                .as_deref())
+            .collect::<Vec<_>>(),
+        vec![Some("_unknown_")],
+        "only the routing refusal is recorded: {events:?}"
     );
+    assert_eq!(reached, 0, "a refused alias never reaches the Target");
 }

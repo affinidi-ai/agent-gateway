@@ -64,6 +64,7 @@ pub fn audit_variables(event: &DelegationAuditEvent) -> HashMap<String, String> 
         ("AUDIT_TRACE_ID".to_string(), text(&event.trace_id)),
         ("AUDIT_SURFACE_ID".to_string(), text(&event.surface_id)),
         ("AUDIT_SURFACE_NAME".to_string(), text(&event.channel_name)),
+        ("AUDIT_SURFACE_VARIANT".to_string(), text(&event.surface_variant)),
         ("AUDIT_PROTOCOL".to_string(), text(&event.protocol)),
         ("AUDIT_AGENT_DID".to_string(), text(&event.agent_identity_did)),
         ("AUDIT_VIA_FABRIC".to_string(), event.via_fabric.to_string()),
@@ -219,6 +220,7 @@ mod tests {
             Some("surface-1"),
         );
         event.channel_name = Some("Billing agent".to_string());
+        event.surface_variant = Some("beta".to_string());
         event.protocol = Some("a2a".to_string());
         event.agent_identity_did = Some("did:web:agent".to_string());
         event.trace_id = Some("trace-1".to_string());
@@ -299,6 +301,12 @@ mod tests {
         assert_eq!(variables["AUDIT_TRACE_ID"], "trace-1");
         assert_eq!(variables["AUDIT_SURFACE_ID"], "surface-1");
         assert_eq!(variables["AUDIT_SURFACE_NAME"], "Billing agent");
+        assert_eq!(
+            variables
+                .get("AUDIT_SURFACE_VARIANT")
+                .map(String::as_str),
+            Some("beta")
+        );
         assert_eq!(variables["AUDIT_PROTOCOL"], "a2a");
         assert_eq!(variables["AUDIT_AGENT_DID"], "did:web:agent");
         assert_eq!(variables["AUDIT_VIA_FABRIC"], "false");
@@ -337,7 +345,28 @@ mod tests {
         assert_eq!(variables["AUDIT_PRINCIPAL_NAME"], "");
         assert_eq!(variables["AUDIT_AUTH_METHOD"], "");
         assert_eq!(variables["AUDIT_SURFACE_NAME"], "");
+        assert_eq!(
+            variables
+                .get("AUDIT_SURFACE_VARIANT")
+                .map(String::as_str),
+            Some(""),
+            "outside a surface request the variant is empty"
+        );
         assert_eq!(variables["AUDIT_VP_FINGERPRINT"], "");
+    }
+
+    #[test]
+    fn the_surface_variant_variable_carries_the_special_values_as_they_are() {
+        for variant in ["_base_", "_unknown_"] {
+            let mut event = policy_decision("deny");
+            event.surface_variant = Some(variant.to_string());
+            assert_eq!(
+                audit_variables(&event)
+                    .get("AUDIT_SURFACE_VARIANT")
+                    .map(String::as_str),
+                Some(variant)
+            );
+        }
     }
 
     #[test]
@@ -530,8 +559,9 @@ mod tests {
             DelegationAuditAction::RequestRejected {
                 stage: RejectionStage::Routing,
                 reason: RejectionReason::NoRoute,
-                http_status: 404,
+                http_status: Some(404),
                 rpc_error_code: None,
+                requested_variant: None,
             },
             DelegationAuditAction::IdentityBindingFailed {
                 outcome: IdentityBindingFailure::Absent,
@@ -561,7 +591,6 @@ mod tests {
                 request_bytes: 0,
                 response_bytes: 0,
                 ucp_op: None,
-                variant_alias: None,
             },
             DelegationAuditAction::PolicyCreated(policy_change()),
             DelegationAuditAction::PolicyUpdated(policy_change()),

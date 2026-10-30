@@ -334,7 +334,6 @@ impl CardGateway {
             a2a_proxy_store: Some(proxies),
             active_variant_alias: None,
             active_variant_id: None,
-            variant_resolution_error: None,
             access_point_declaration: None,
             surface: Arc::new(surface),
         };
@@ -1106,7 +1105,8 @@ fn the_base_route_preview_runs_what_a_bare_card_request_gets() {
             bare_card_request(listener.clone())
                 .await
                 .status(),
-            StatusCode::SERVICE_UNAVAILABLE
+            StatusCode::NOT_FOUND,
+            "a disabled default variant is refused at routing"
         );
 
         let mut missing = surface.clone();

@@ -604,10 +604,7 @@ fn record_served_effects(
         .surface
         .is_ucp()
         .then(|| "discovery".to_string());
-    let variant_alias = state
-        .active_variant_alias
-        .clone();
-    tokio::spawn(async move {
+    crate::observability::policy_audit::spawn_in_request(async move {
         metrics
             .record_connection_with_ucp(
                 channel_config_id,
@@ -622,7 +619,6 @@ fn record_served_effects(
                 None,
                 None,
                 0,
-                variant_alias,
             )
             .await;
     });
@@ -924,7 +920,7 @@ fn record_agent_card_gateway_fault(
             .endpoint
             .clone();
         let trace_id = uuid::Uuid::new_v4().to_string();
-        tokio::spawn(async move {
+        crate::observability::policy_audit::spawn_in_request(async move {
             metrics
                 .record_connection(
                     channel_config_id,
@@ -938,7 +934,6 @@ fn record_agent_card_gateway_fault(
                     None,
                     None,
                     0,
-                    None,
                 )
                 .await;
         });

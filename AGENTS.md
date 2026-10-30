@@ -117,6 +117,10 @@ credential providers) take focus when they open, close on Escape, and return foc
 button; see _JWT verification strategies_ and _Secret editor_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#secret-editor).
 
+The Audit Log names the surface variant of each request record and describes `request_rejected`
+records, and the Metrics page badges configured variant aliases only; see _Audit page: surface
+variants and refusals_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#audit-page-surface-variants-and-refusals).
+
 The Identities page shows a Trust Recorder status chip and a Recorder filter, and the Trust
 Recorder panel shows a Last outcome row; see _Identities page_ and _Trust Recorder panel_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#trust-recorder-panel).
@@ -181,7 +185,10 @@ of a method's `required_scopes`) with its `WWW-Authenticate` challenge, a `401` 
 with `error="insufficient_scope"`, and no surface policy can admit that caller. An MCP
 Access Point refuses at the source authentication stage, before policy. Any other declaring
 Access Point refuses after gateway policy and before the AP2 gate and payment, so nothing is
-settled and the Target is never reached. Every other stage that refuses such a caller answers
+settled and the Target is never reached. When the request's Surface Variant cannot be
+resolved, a failed caller on an Access Point whose bare route (served by the default variant,
+else the base surface) declares gets that route's challenge at routing, before any policy, on
+every protocol. Every other stage that refuses such a caller answers
 with the same challenge, through one mapping. Only the sending gateway's challenge names the
 metadata: the receiving gateway of a Fabric route answers with a `realm` and no
 `resource_metadata`. An

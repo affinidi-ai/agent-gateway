@@ -408,10 +408,7 @@ async fn inbound_with_percent_encoded_alias_routes() {
     assert_eq!(received.path, "/rpc", "percent-encoded alias suffix should be stripped");
 }
 
-/// Plan §4: an unknown variant alias is rejected before any forwarding occurs.
-/// Today the inbound handler returns 400; the spec calls for 404 once
-/// surface-side variants land. Either is acceptable here — what matters is
-/// that the mock target never receives the request.
+/// An unknown variant alias is refused with 404 before any forwarding occurs.
 #[tokio::test(flavor = "multi_thread")]
 async fn inbound_with_unknown_alias_is_rejected() {
     let h = GatewayHarness::start(|_, gw_config, _| {
@@ -430,8 +427,7 @@ async fn inbound_with_unknown_alias_is_rejected() {
         .await
         .expect("request failed");
 
-    let status = resp.status().as_u16();
-    assert!(matches!(status, 400 | 404), "expected 400 or 404 for unknown alias, got {status}");
+    assert_eq!(resp.status(), 404, "unknown alias is refused with 404");
 
     // Mock must NOT have seen the request.
     assert!(
@@ -443,12 +439,10 @@ async fn inbound_with_unknown_alias_is_rejected() {
     );
 }
 
-/// Plan §4.5: a disabled variant returns 503 ("listener temporarily
-/// unavailable") and is never forwarded. The route exists and is
-/// recognised — an operator has intentionally switched it off — so 404
-/// (which means "no such variant") would be misleading.
+/// A disabled variant is refused with 404, the same answer as an unknown
+/// alias: nothing is served at that URL. It is never forwarded.
 #[tokio::test(flavor = "multi_thread")]
-async fn inbound_with_disabled_variant_returns_503() {
+async fn inbound_with_disabled_variant_returns_404() {
     let h = GatewayHarness::start(|_, gw_config, _| {
         gw_config.surfaces = vec![helpers::build_channel_with_disabled_variant()];
     })
@@ -465,7 +459,7 @@ async fn inbound_with_disabled_variant_returns_503() {
         .await
         .expect("request failed");
 
-    assert_eq!(resp.status(), 503, "disabled variant should return 503");
+    assert_eq!(resp.status(), 404, "disabled variant is refused with 404");
 
     assert!(
         h.mock
@@ -575,11 +569,11 @@ async fn surface_policy_sees_the_variant_alias_of_the_request_url() {
     assert_forwarded_request(&h.mock, body);
 }
 
-/// An alias in the URL of a surface without variants selects nothing, so policy does
-/// not see it and a rule that admits failed callers on that alias does not apply. The
-/// surface sits under a wider route prefix, so such a URL reaches it.
+/// An alias in the URL of a surface without variants selects nothing, so it is refused
+/// at routing before policy runs, and a rule that admits failed callers on that alias
+/// never applies. The surface sits under a wider route prefix, so such a URL reaches it.
 #[tokio::test(flavor = "multi_thread")]
-async fn policy_does_not_see_an_alias_that_selects_no_variant() {
+async fn an_alias_that_selects_no_variant_is_refused_before_policy() {
     let fixture = JwksFixture::start().await;
     let h = start_with_surface_policy(
         &fixture,
@@ -591,7 +585,7 @@ async fn policy_does_not_see_an_alias_that_selects_no_variant() {
     let body = r#"{"jsonrpc":"2.0","method":"test","id":1}"#;
 
     let forged = post_rpc(&h, "/smoke/inner$public", body).await;
-    assert_eq!(forged.status(), 403, "an alias that selects no variant must not admit a failed caller");
+    assert_eq!(forged.status(), 404, "an alias that selects no variant is refused at routing, not admitted");
     let base = post_rpc(&h, "/smoke/inner", body).await;
     assert_eq!(base.status(), 403, "a failed caller on the base surface is denied");
     assert!(

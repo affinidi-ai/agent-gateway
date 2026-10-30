@@ -429,9 +429,9 @@ changes:
       description: >-
         Gateway, surface and tool-gating policy input for a request that selects an enabled
         Surface Variant through its $alias URL now carries input.channel.variant_alias, as Fabric
-        requests already did. An alias that selects no enabled variant is not published, on the
-        direct path and over Fabric alike. Policies keyed on variant_alias may now match direct
-        requests they did not match before.
+        requests already did. An alias that selects no enabled variant is refused at routing and
+        never reaches policy, on the direct path and over Fabric alike. Policies keyed on
+        variant_alias may now match direct requests they did not match before.
     - timestamp: '2026-10-29T12:00:00Z'
       title: Answer an unprocessable public agent card with one generic 502 detail
       description: >-
@@ -556,6 +556,17 @@ changes:
         the gateway has no matching API. Configure trust through JWT verification strategies and
         credential providers.
   security:
+    - timestamp: '2026-10-30T09:00:00Z'
+      title: Challenge a failed caller before refusing an unresolvable Surface Variant
+      description: >-
+        On an Access Point whose bare route (served by the default variant, else the base surface)
+        declares its authorization server, a caller that fails source authentication on a URL
+        whose variant is unknown, disabled or unresolvable now gets the bare route's 401 or 403
+        challenge, recorded as auth_failed with its surface_variant, before the routing refusal,
+        so it never reaches policy, payment or the Target. An authenticated caller gets the 404 or
+        500 refusal. Variant aliases are not secret, as each variant publishes its own metadata
+        and challenge. Any alias on a surface without variants is refused rather than served by
+        the base route.
     - timestamp: '2026-10-21T10:49:49Z'
       title: Pin, bound and redact Client Credentials and JWT bearer token requests
       description: >-

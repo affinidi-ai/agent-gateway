@@ -31,10 +31,6 @@ pub struct ExtensionInspectionContext<'a> {
     pub source_authenticated: bool,
     pub metrics_store: &'a Option<Arc<crate::metrics::MetricsStore>>,
     pub ws_state: &'a Option<Arc<crate::server::WsState>>,
-    /// Active surface variant alias. Threaded into payload-capture
-    /// broadcasts so dashboard consumers can attribute traffic to the
-    /// variant.
-    pub variant_alias: Option<&'a str>,
 }
 
 /// Context for response extension inspection operations
@@ -186,7 +182,6 @@ pub async fn inspect_message_extensions(
                     "Non-JSON Body",
                     None,
                     None,
-                    ctx.variant_alias,
                 )
                 .await;
             }
@@ -259,7 +254,6 @@ pub async fn inspect_message_extensions(
                     "Failed Validation",
                     Some(error_msg.clone()),
                     None,
-                    ctx.variant_alias,
                 )
                 .await;
                 return Err(crate::a2a::errors::create_error_response(StatusCode::FORBIDDEN, &error_msg));
@@ -280,7 +274,6 @@ pub async fn inspect_message_extensions(
                     "MCP Inspection",
                     None,
                     None,
-                    ctx.variant_alias,
                 )
                 .await;
             } else {
@@ -295,7 +288,6 @@ pub async fn inspect_message_extensions(
                     "MCP No Meta",
                     None,
                     None,
-                    ctx.variant_alias,
                 )
                 .await;
             }
@@ -354,7 +346,6 @@ pub async fn inspect_message_extensions(
                                 "Failed Validation",
                                 Some(error_msg.clone()),
                                 None,
-                                ctx.variant_alias,
                             )
                             .await;
                             return Err(crate::a2a::errors::create_error_response(StatusCode::FORBIDDEN, &error_msg));
@@ -392,7 +383,6 @@ pub async fn inspect_message_extensions(
                             "Failed Validation",
                             Some(error_msg.clone()),
                             None,
-                            ctx.variant_alias,
                         )
                         .await;
                         return Err(crate::a2a::create_identity_error_response(
@@ -443,7 +433,6 @@ pub async fn inspect_message_extensions(
                                 "success",
                                 None,
                                 Some(result.hash.clone()),
-                                ctx.variant_alias,
                             )
                             .await;
                             return Ok(Some(result));
@@ -465,7 +454,6 @@ pub async fn inspect_message_extensions(
                                 "Failed Validation",
                                 Some(error_msg.clone()),
                                 None,
-                                ctx.variant_alias,
                             )
                             .await;
                             return Err(crate::a2a::create_identity_error_response(
@@ -494,7 +482,6 @@ pub async fn inspect_message_extensions(
                     "success",
                     None,
                     None,
-                    ctx.variant_alias,
                 )
                 .await;
                 return Ok(None);
@@ -513,7 +500,6 @@ pub async fn inspect_message_extensions(
                 "MCP No Meta",
                 None,
                 None,
-                ctx.variant_alias,
             )
             .await;
         }
@@ -544,7 +530,6 @@ pub async fn inspect_message_extensions(
                 "Failed Validation",
                 Some(error_msg.clone()),
                 None,
-                ctx.variant_alias,
             )
             .await;
             return Err(crate::a2a::create_identity_error_response(
@@ -603,7 +588,6 @@ pub async fn inspect_message_extensions(
             "Failed Validation",
             Some(error_msg.clone()),
             None,
-            ctx.variant_alias,
         )
         .await;
         return Err(crate::a2a::create_identity_error_response(
@@ -670,7 +654,6 @@ pub async fn inspect_message_extensions(
                     "Failed Validation",
                     Some(error_msg.clone()),
                     None,
-                    ctx.variant_alias,
                 )
                 .await;
                 return Err(crate::a2a::create_identity_error_response(
@@ -692,7 +675,6 @@ pub async fn inspect_message_extensions(
                 "No Extensions",
                 None,
                 None,
-                ctx.variant_alias,
             )
             .await;
             return Ok(None);
@@ -809,7 +791,6 @@ pub async fn inspect_message_extensions(
                                 identity_result
                                     .as_ref()
                                     .map(|r| r.hash.clone()),
-                                ctx.variant_alias,
                             )
                             .await;
                             return Err(crate::a2a::errors::create_error_response(StatusCode::FORBIDDEN, &error_msg));
@@ -886,7 +867,6 @@ pub async fn inspect_message_extensions(
                             "Failed Validation",
                             Some(error_msg.clone()),
                             None,
-                            ctx.variant_alias,
                         )
                         .await;
                         return Err(crate::a2a::create_identity_error_response(
@@ -957,7 +937,6 @@ pub async fn inspect_message_extensions(
                                 "Failed Validation",
                                 Some(error_msg.clone()),
                                 None,
-                                ctx.variant_alias,
                             )
                             .await;
                             return Err(crate::a2a::create_identity_error_response(
@@ -1020,7 +999,6 @@ pub async fn inspect_message_extensions(
             identity_result
                 .as_ref()
                 .map(|r| r.hash.clone()),
-            ctx.variant_alias,
         )
         .await;
         return Err(crate::a2a::create_identity_error_response(

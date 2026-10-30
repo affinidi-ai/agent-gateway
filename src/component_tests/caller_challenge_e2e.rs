@@ -667,12 +667,12 @@ async fn a_derived_declaration_refuses_a_token_for_another_audience_its_method_l
     assert_eq!(target_calls(&h), 1);
 }
 
-/// An alias on a surface without variants selects nothing and the base route answers,
-/// so the request is refused as the base route refuses it, with the base route's
-/// challenge, and never reaches the Target. A catch-all route on the listener is what
-/// carries such a path to the surface.
+/// An alias on a surface without variants selects nothing and is refused at routing.
+/// A caller that fails authentication gets the bare route's challenge first, whatever
+/// alias it named, and an authenticated caller gets the refusal; neither reaches the
+/// Target. A catch-all route on the listener is what carries such a path to the surface.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_alias_that_selects_no_variant_is_challenged_as_the_base_route() {
+async fn an_alias_that_selects_no_variant_is_challenged_as_the_bare_route() {
     let fixture = JwksFixture::start().await;
     for setup in [Setup::a2a(DERIVED, None), Setup::mcp(DERIVED, None)] {
         let mock = if setup.mcp {
@@ -710,9 +710,14 @@ async fn an_alias_that_selects_no_variant_is_challenged_as_the_base_route() {
         assert_eq!(target_calls(&h), 0, "mcp={}: no refused caller reached the target", setup.mcp);
 
         let url = format!("{}/smoke$x", h.gateway_base);
-        let (admitted, body) = send_to(&url, Some(&token(&fixture)), setup.request(), None).await;
-        assert_eq!((admitted.status, admitted.challenges), (200, vec![]), "mcp={}: {body}", setup.mcp);
-        assert_eq!(target_calls(&h), 1, "mcp={}", setup.mcp);
+        let (authenticated, body) = send_to(&url, Some(&token(&fixture)), setup.request(), None).await;
+        assert_eq!(
+            (authenticated.status, authenticated.challenges),
+            (404, vec![]),
+            "mcp={}: an authenticated caller is refused at routing: {body}",
+            setup.mcp
+        );
+        assert_eq!(target_calls(&h), 0, "mcp={}", setup.mcp);
     }
 }
 

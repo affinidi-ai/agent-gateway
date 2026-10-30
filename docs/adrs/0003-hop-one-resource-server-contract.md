@@ -516,7 +516,17 @@ least effort. Effort is in engineer-days.
   resource, `<route>$alias`.
 - Policy input for a request that selects an enabled variant carries
   `input.channel.variant_alias`, on the direct path as over Fabric. An alias that selects no
-  enabled variant is not published.
+  enabled variant, including any alias on a surface without variants, is refused at routing and
+  never reaches policy.
+- On an Access Point whose bare route declares (the route without an alias, served by the
+  default variant, else the base surface), a caller that fails source authentication on a URL
+  whose variant cannot be resolved gets the bare route's challenge before that refusal, whichever
+  alias it named, so it never reaches policy, payment or the Target. When the bare route does not
+  declare, or cannot serve its declaration, the refusal answers. Variant aliases are not secret:
+  each variant publishes its own metadata and card at `<route>$alias`, and its challenge names
+  that resource. Over Fabric the alias is
+  the one the sending route's Target pins, not one the caller chose, so the receiving gateway
+  refuses an unresolvable variant before source authentication.
 
 ### 11. Isolation points
 

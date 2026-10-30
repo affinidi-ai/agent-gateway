@@ -227,18 +227,6 @@ pub async fn prepare_transit(
             .and_then(|claims| claims.sub.as_deref())
     })
     .ok_or(ContinuationError::BindingMismatch)?;
-    if context
-        .variant_resolution_error
-        .is_some()
-        || (context
-            .active_variant_alias
-            .is_some()
-            && context
-                .active_variant_id
-                .is_none())
-    {
-        return Err(ContinuationError::BindingMismatch.into());
-    }
     let variant_id = context
         .active_variant_id
         .clone();

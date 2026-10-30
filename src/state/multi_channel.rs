@@ -77,8 +77,6 @@ pub struct ActiveVariant {
     pub alias: Option<String>,
     /// The selected variant, `None` in base mode.
     pub id: Option<String>,
-    /// Set when the requested alias could not select a variant.
-    pub resolution_error: Option<crate::config::agent_surface_variants::VariantResolveError>,
 }
 
 impl MultiSurfaceProxyState {
@@ -101,7 +99,8 @@ impl MultiSurfaceProxyState {
                 self.resolved_surface_cache
                     .resolve(surface_id, alias)
                     .ok()
-            });
+            })
+            .map(|cached| cached.surface);
         match cached {
             Some(surface) => Ok(surface),
             None => channel
@@ -179,7 +178,6 @@ impl MultiSurfaceProxyState {
             vc_issuer: self.vc_issuer.clone(),
             active_variant_alias: variant.alias,
             active_variant_id: variant.id,
-            variant_resolution_error: variant.resolution_error,
             access_point_declaration: Some(Arc::new(access_point_declaration)),
             surface,
         }

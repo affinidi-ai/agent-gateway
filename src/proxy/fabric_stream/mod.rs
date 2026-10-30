@@ -231,14 +231,18 @@ impl StreamRuntime {
             stream_id: frame.stream_id,
             payload: wire::FramePayload::Open { request: request.clone() },
         })?;
-        let (surface, variant_id) =
-            crate::gateways::connection_points::message_processor::resolve_stream_surface(message, &request).await?;
-        if !crate::gateways::connection_points::message_processor::fabric_peer_may_reach_surface(
-            peer.tenant_id.as_deref(),
-            surface.tenant_id.as_deref(),
-        ) {
-            return Err("Fabric stream peer or route is unavailable".into());
-        }
+        // The Open is one request from here on: a routing refusal records under
+        // it, and the served stream runs as it.
+        let scope = crate::observability::policy_audit::RequestScope::fresh();
+        let (surface, variant) = Box::pin(crate::observability::policy_audit::in_request(
+            Arc::clone(&scope),
+            crate::gateways::connection_points::message_processor::resolve_stream_surface(
+                message,
+                &request,
+                peer.tenant_id.as_deref(),
+            ),
+        ))
+        .await?;
         if !versions.supports_modern(crate::mcp::MCP_MODERN_VERSION) {
             return Err(OpenRefusal::new(
                 wire::StreamErrorCode::LegacyOnly,
@@ -335,11 +339,12 @@ impl StreamRuntime {
             message,
             headers,
             surface,
-            variant_id,
+            variant,
             declared_bytes: request.body_bytes,
             limits,
             deadline,
             rejection,
+            scope,
         })
     }
 
@@ -584,12 +589,14 @@ pub(crate) struct IncomingStream {
     message: ReceivedMessage,
     headers: axum::http::HeaderMap,
     surface: crate::config::agent_surface::AgentSurface,
-    variant_id: Option<String>,
+    variant: crate::config::agent_surface_variants::ForwardedVariant,
     declared_bytes: u64,
     limits: crate::config::McpHttpConfig,
     deadline: tokio::time::Instant,
     /// Answered in place of executing the request.
     rejection: Option<Box<crate::mcp::request_validation::McpRequestValidationError>>,
+    /// The request the Open was admitted as; the served stream runs as it.
+    scope: Arc<crate::observability::policy_audit::RequestScope>,
 }
 
 impl IncomingStream {
@@ -652,8 +659,9 @@ impl IncomingStream {
                         body,
                         headers: self.headers,
                         surface: self.surface,
-                        variant_id: self.variant_id,
+                        variant: self.variant,
                         capabilities: self.capabilities,
+                        scope: self.scope,
                     },
                     versions,
                     continuations,
@@ -1143,6 +1151,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(incoming.surface.surface_id, surface.surface_id);
+        assert_eq!(incoming.variant.recorded, "_base_", "no alias and no default: the base serves");
         assert_eq!(
             incoming
                 .surface
@@ -1197,7 +1206,14 @@ mod tests {
             "https://candidate.example/mcp"
         );
         assert_eq!(variant.message.message_body["virtual_channel_alias"], "candidate");
-        assert_eq!(variant.variant_id.as_deref(), Some("variant"));
+        assert_eq!(
+            variant.variant,
+            crate::config::agent_surface_variants::ForwardedVariant {
+                id: Some("variant".into()),
+                recorded: "candidate".into(),
+            },
+            "a stream whose target pins $candidate records candidate"
+        );
         assert_eq!(
             variant
                 .surface
@@ -1270,11 +1286,41 @@ mod tests {
                 "disabled-variant" => request["variant_alias"] = json!("disabled"),
                 _ => unreachable!(),
             }
-            let refusal = runtime
-                .prepare_incoming_with_versions(&invalid, &invalid_connection, &invalid_peer, versions)
-                .await
+            let (refusal, records) = crate::audit::producer::capture(runtime.prepare_incoming_with_versions(
+                &invalid,
+                &invalid_connection,
+                &invalid_peer,
+                versions,
+            ))
+            .await;
+            let refusal = refusal
                 .err()
                 .unwrap_or_else(|| panic!("{rejected} was admitted"));
+            let routing_refusals: Vec<_> = records
+                .iter()
+                .filter_map(|record| match &record.event {
+                    crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                        reason,
+                        http_status,
+                        requested_variant,
+                        ..
+                    } => Some((*reason, *http_status, requested_variant.clone(), record.via_fabric)),
+                    _ => None,
+                })
+                .collect();
+            use crate::audit::request_events::RejectionReason;
+            let expected_records = match rejected {
+                "missing-variant" => vec![(RejectionReason::UnknownVariant, None, Some("missing".to_string()), true)],
+                "disabled-variant" => vec![(RejectionReason::VariantDisabled, None, None, true)],
+                _ => vec![],
+            };
+            assert_eq!(routing_refusals, expected_records, "{rejected}: recorded refusal");
+            assert!(
+                records
+                    .iter()
+                    .all(|record| record.request_id.is_some()),
+                "{rejected}: an Open refusal records under the Open's request: {records:?}"
+            );
             // Only a missing offer asks the sender to negotiate again.
             let expected = if rejected == "missing-offer" {
                 wire::StreamErrorCode::StaleOffer
@@ -1289,6 +1335,44 @@ mod tests {
                     .unwrap_or_else(|error| panic!("{rejected} consumed admission state: {error}")),
             );
         }
+        let mut dangling = surface.clone();
+        dangling.variants.clear();
+        dangling.default_variant_id = Some("removed".into());
+        store
+            .save(&dangling)
+            .await
+            .unwrap();
+        let (refusal, records) = crate::audit::producer::capture(runtime.prepare_incoming_with_versions(
+            &fresh_message(),
+            &connection,
+            &peer,
+            versions,
+        ))
+        .await;
+        assert_eq!(
+            refusal
+                .err()
+                .expect("a dangling default variant is refused")
+                .code,
+            wire::StreamErrorCode::Unavailable
+        );
+        assert!(
+            records
+                .iter()
+                .any(|record| matches!(
+                    record.event,
+                    crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                        reason: crate::audit::request_events::RejectionReason::MisconfiguredDefault,
+                        http_status: None,
+                        ..
+                    }
+                )),
+            "{records:?}"
+        );
+        store
+            .save(&surface)
+            .await
+            .unwrap();
         // An Open envelope is admitted like a forward-request: without a valid
         // expiry it is refused, and the refusal consumes no admission state.
         let now_secs = crate::gateways::connection_points::envelope_replay::now_secs();
@@ -1443,6 +1527,59 @@ mod tests {
                 .await;
             assert_eq!(result.is_ok(), admitted, "peer tenant {peer_tenant:?}");
         }
+        // A peer that may not reach the surface is refused before its alias is
+        // resolved, so it records and logs nothing on the surface's tenant.
+        for (peer_tenant, message, recorded, warnings) in [
+            (Some("tenant-b"), "Fabric stream peer or route is unavailable", vec![], 0),
+            (
+                Some("tenant-a"),
+                "Fabric stream variant is unavailable",
+                vec![crate::audit::request_events::RejectionReason::UnknownVariant],
+                1,
+            ),
+        ] {
+            let mut tenant_peer = peer.clone();
+            tenant_peer.tenant_id = peer_tenant.map(str::to_string);
+            let mut unknown = fresh_message();
+            unknown.message_body["payload"]["request"]["variant_alias"] = json!("missing");
+            let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+            let (result, records) = crate::audit::producer::capture(runtime.prepare_incoming_with_versions(
+                &unknown,
+                &connection,
+                &tenant_peer,
+                versions,
+            ))
+            .await;
+            let refusal = result
+                .err()
+                .unwrap_or_else(|| panic!("peer tenant {peer_tenant:?}: an unknown alias was admitted"));
+            assert_eq!(refusal.code, wire::StreamErrorCode::Unavailable, "peer tenant {peer_tenant:?}");
+            assert_eq!(refusal.to_string(), message, "peer tenant {peer_tenant:?}");
+            let reasons: Vec<_> = records
+                .iter()
+                .filter_map(|record| match &record.event {
+                    crate::delegation_vault::audit::DelegationAuditAction::RequestRejected { reason, .. } => {
+                        Some(*reason)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(reasons, recorded, "peer tenant {peer_tenant:?}: {records:?}");
+            let text = logs.text();
+            let refusal_lines: Vec<&str> = text
+                .lines()
+                .filter(|line| line.contains("Surface variant cannot be resolved"))
+                .collect();
+            assert_eq!(refusal_lines.len(), warnings, "peer tenant {peer_tenant:?}: {text}");
+            for line in refusal_lines {
+                assert!(line.contains("WARN"), "{line}");
+                assert!(
+                    line.contains("[CHANNEL:surface] Surface variant cannot be resolved"),
+                    "the dashboard's log filter keys on the channel prefix: {line}"
+                );
+                assert!(line.contains("UnknownVariant"), "{line}");
+            }
+        }
         store
             .save(&surface)
             .await
@@ -1563,6 +1700,7 @@ mod tests {
             } else {
                 versions
             };
+            let admitted_in = Arc::clone(&incoming.scope);
             let run =
                 Box::pin(incoming.run_with_mcp_runtime(Arc::new(RecordingSink(frames_tx)), receiver_versions, None));
             let consume = async {
@@ -1624,6 +1762,15 @@ mod tests {
             if case == "valid" {
                 assert_eq!(status, 200, "{received}");
                 assert_eq!(received, target_result);
+                let served_variant = crate::observability::policy_audit::in_request(admitted_in, async {
+                    crate::observability::policy_audit::current_request_variant()
+                })
+                .await;
+                assert_eq!(
+                    served_variant.as_deref(),
+                    Some("candidate"),
+                    "the served stream runs as the request its Open was admitted in"
+                );
                 let request = target
                     .last_request_rx
                     .borrow()

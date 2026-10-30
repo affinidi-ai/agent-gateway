@@ -354,7 +354,10 @@ request received by the destination gateway:
    whatever the request timeout says (see [Fabric envelope
    lifetime](CONFIGURATION_RELOAD.md#fabric-envelope-lifetime)), leaving 120 s of clock skew below the
    receiver's cap; the caller deadline (`deadline_ms`) keeps the full timeout.
-3. Resolve the destination surface from the legacy wire field `channel_id`.
+3. Resolve the destination surface from the legacy wire field `channel_id`, then the variant that
+   serves it (see [Which variant serves a request over Fabric](#which-variant-serves-a-request-over-fabric)).
+   A variant that cannot be resolved is refused here, before source authentication: the alias is
+   the one the sending gateway's Target pins, not one the caller chose.
 4. Run the destination surface's configured source authentication and MCP request-boundary
    validation. DIDComm authentication proves the sending Gateway; source authentication separately
    evaluates caller evidence presented to the destination surface. On a declaring Access Point,
@@ -418,6 +421,25 @@ with `Retry-After: 5`; the receiving gateway refuses with `capacity_reached`. Th
 [Framed Fabric limits](MCP_METADATA.md#framed-fabric-limits). A buffered `ForwardRequest` receiver
 does not recheck the caller's browser Origin against its own `mcp_http.allowed_origins`; it trusts
 the paired sending gateway's check, as it trusts that peer for every other forwarded header.
+
+### Which variant serves a request over Fabric
+
+Each gateway picks its own surface variant. The sending gateway serves a request with the variant
+its URL names (`/route$beta`), else its default variant, else its base surface, and records that
+one. The URL's `$alias` stays on the sending gateway: it names a variant of the sending surface,
+not of the peer's.
+
+The receiving gateway serves the request with its own default variant, else its base surface,
+unless the sending route's `fabric://` Target pins one of its variants:
+`fabric://<gateway>/<surface>$<alias>`. A pinned alias is sent with the request, as
+`active_variant_alias` (and `virtual_channel_alias`) on a buffered `ForwardRequest` and as the
+`variant_alias` of a framed stream's `Open`, and the receiving gateway serves and records that
+variant. The `ForwardRequest` an Access Point resends after MPP auto-pay pays a `402` carries the
+same alias. This applies to an Access Point's Target and to a Transit Point's endpoint alike. To send
+one variant of the sending surface to a particular peer variant, override that variant's Target
+with the pinned URL. A pinned alias the receiving surface doesn't have, or has disabled, is refused
+there (`unknown_variant` or `variant_disabled`); the sending gateway passes the `404` on to its
+caller on a `ForwardRequest`, and answers `502` when a stream's `Open` is refused.
 
 ### Target authentication over Fabric
 

@@ -30,10 +30,9 @@ Every inbound request, on the direct Access Point and on Fabric receive alike, c
 request names an existing, enabled Surface Variant by its alias (`/route$alias/...`, or the
 alias the sending gateway forwards). The field is absent when the request names no alias,
 including when the surface's default variant serves an unmarked URL, so a rule keyed on the
-default variant's alias does not match its unmarked URL. It is also absent when the alias
-selects no variant: a surface without variants serves such a request (other than a modern
-MCP request, which is refused) from the base surface, and Fabric receive serves an unknown
-or disabled alias from the default or base surface. `input.http.path` is the request path
+default variant's alias does not match its unmarked URL. A request whose alias selects no
+enabled variant, including any alias on a surface without variants, is refused at routing
+before policy runs, on the Access Point and on Fabric receive alike. `input.http.path` is the request path
 after the route and any `$alias` are stripped, so a request to the Access Point URL itself
 has the path `/`.
 
@@ -732,7 +731,13 @@ stored. They do not record which policy a request ends up under:
 - A variant's transit overrides (shared or per transit point) are recorded as written, but the
   runtime compiles transit policies from the base surface only, so they are not enforced.
 
-What actually decided a request is in its `policy_decision` records.
+A surface change record names the slot it wrote in `surface_variant`: the variant's alias for a
+slot in a variant's overrides, or `_base_` for a slot on the base surface. A base change also
+applies to every variant that inherits that slot, so it can change what several variants enforce.
+Gateway and appliance targets have no variants and no `surface_variant`.
+
+What actually decided a request is in its `policy_decision` records, each naming the
+`surface_variant` that served the request.
 
 The policy write routes are listed once, in `PolicyWrite` (`src/audit/policy_refusals.rs`); the
 router registers each through it, so a route's own refusals and those made before it by

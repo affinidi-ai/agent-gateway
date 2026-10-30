@@ -89,8 +89,9 @@ pub fn rate_limited(
     })
 }
 
-/// The Access Point refused the request. `http_status` and `rpc_error_code`
-/// are what the caller received.
+/// The gateway refused the request. `http_status` and `rpc_error_code` are
+/// what the caller received; a Fabric refusal records no HTTP status, as no
+/// HTTP response is involved.
 pub fn request_rejected(
     facts: &RequestFacts<'_>,
     stage: RejectionStage,
@@ -98,14 +99,152 @@ pub fn request_rejected(
     http_status: u16,
     rpc_error_code: Option<i64>,
 ) {
+    record_rejection(facts, stage, reason, http_status, rpc_error_code, None)
+}
+
+fn record_rejection(
+    facts: &RequestFacts<'_>,
+    stage: RejectionStage,
+    reason: RejectionReason,
+    http_status: u16,
+    rpc_error_code: Option<i64>,
+    requested_variant: Option<&str>,
+) {
     emit("request_rejected", || {
         facts.record(DelegationAuditAction::RequestRejected {
             stage,
             reason,
-            http_status,
+            http_status: (!facts.via_fabric).then_some(http_status),
             rpc_error_code,
+            requested_variant: requested_variant.map(str::to_string),
         })
     })
+}
+
+/// A request refused at routing because the surface variant it selects can't
+/// be resolved. Only [`refuse_routing`] builds one, and it records the refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutingRefusal {
+    reason: RejectionReason,
+    status: axum::http::StatusCode,
+    requested_variant: Option<String>,
+    /// On `variant_disabled`: the disabled variant's configured alias.
+    disabled_variant: Option<String>,
+}
+
+impl RoutingRefusal {
+    pub fn reason(&self) -> RejectionReason {
+        self.reason
+    }
+
+    pub fn status(&self) -> axum::http::StatusCode {
+        self.status
+    }
+
+    /// Logs the refusal of a request to `surface` from what was recorded:
+    /// the reason, the requested alias as cut for the record, on a disabled
+    /// variant its configured alias in full, and on a misconfigured default
+    /// the configured `default_variant_id`. The caller's raw alias is never
+    /// logged. The message carries the `[CHANNEL:<config_id>]` prefix the
+    /// dashboard's channel log filter matches.
+    pub fn warn(
+        &self,
+        surface: &crate::config::agent_surface::AgentSurface,
+    ) {
+        let default_variant_id = (self.reason() == RejectionReason::MisconfiguredDefault)
+            .then_some(
+                surface
+                    .default_variant_id
+                    .as_deref(),
+            )
+            .flatten();
+        let config_id = surface
+            .config_id()
+            .unwrap_or_default();
+        tracing::warn!(
+            config_id,
+            surface = %surface.name,
+            reason = ?self.reason(),
+            requested_variant = ?self.requested_variant(),
+            disabled_variant = ?self.disabled_variant.as_deref(),
+            default_variant_id = ?default_variant_id,
+            "[CHANNEL:{config_id}] Surface variant cannot be resolved"
+        );
+    }
+
+    pub fn requested_variant(&self) -> Option<&str> {
+        self.requested_variant
+            .as_deref()
+    }
+
+    /// What the caller is told. Both 404s say the same thing: nothing is
+    /// served at that URL.
+    pub fn message(&self) -> &'static str {
+        match self.reason {
+            RejectionReason::MisconfiguredDefault => "Surface variant configuration error",
+            _ => "No surface variant is served at this URL",
+        }
+    }
+}
+
+/// Sets the surface variant of a request whose variant can't be resolved:
+/// `_unknown_` for an unknown alias, the disabled variant's alias, or nothing
+/// for a misconfigured default.
+pub fn set_unresolved_request_variant(error: &crate::config::agent_surface_variants::VariantResolveError) {
+    use crate::config::agent_surface_variants::{SurfaceVariant, VariantResolveError};
+    use crate::observability::policy_audit::set_request_variant;
+
+    match error {
+        VariantResolveError::UnknownAlias(_) => set_request_variant(SurfaceVariant::UNKNOWN),
+        VariantResolveError::DisabledVariant(alias) => set_request_variant(alias),
+        VariantResolveError::MisconfiguredDefault(_) => {}
+    }
+}
+
+/// Records a routing refusal for `error` and returns how to answer it. The
+/// request's surface variant is set first: `_unknown_` for an unknown alias,
+/// the disabled variant's alias, or nothing for a misconfigured default. The
+/// alias the caller named goes only to `requested_variant`. `rpc_error_code`
+/// is the JSON-RPC error code the caller is answered with, when the refusal
+/// is one.
+pub fn refuse_routing(
+    facts: &RequestFacts<'_>,
+    error: &crate::config::agent_surface_variants::VariantResolveError,
+    rpc_error_code: Option<i64>,
+) -> RoutingRefusal {
+    use crate::config::agent_surface_variants::{SurfaceVariant, VariantResolveError};
+    use axum::http::StatusCode;
+
+    set_unresolved_request_variant(error);
+    let refusal = match error {
+        VariantResolveError::UnknownAlias(alias) => RoutingRefusal {
+            reason: RejectionReason::UnknownVariant,
+            status: StatusCode::NOT_FOUND,
+            requested_variant: Some(SurfaceVariant::cut_alias(alias)),
+            disabled_variant: None,
+        },
+        VariantResolveError::DisabledVariant(alias) => RoutingRefusal {
+            reason: RejectionReason::VariantDisabled,
+            status: StatusCode::NOT_FOUND,
+            requested_variant: None,
+            disabled_variant: Some(alias.clone()),
+        },
+        VariantResolveError::MisconfiguredDefault(_) => RoutingRefusal {
+            reason: RejectionReason::MisconfiguredDefault,
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            requested_variant: None,
+            disabled_variant: None,
+        },
+    };
+    record_rejection(
+        facts,
+        RejectionStage::Routing,
+        refusal.reason,
+        refusal.status.as_u16(),
+        rpc_error_code,
+        refusal.requested_variant(),
+    );
+    refusal
 }
 
 /// The reason for an MCP transport refusal, from the HTTP status and JSON-RPC
@@ -294,7 +433,7 @@ mod tests {
 
     fn rejected(
         events: &[crate::delegation_vault::audit::DelegationAuditEvent]
-    ) -> Vec<(RejectionStage, RejectionReason, u16, Option<i64>)> {
+    ) -> Vec<(RejectionStage, RejectionReason, Option<u16>, Option<i64>)> {
         events
             .iter()
             .map(|event| match &event.event {
@@ -303,6 +442,7 @@ mod tests {
                     reason,
                     http_status,
                     rpc_error_code,
+                    ..
                 } => (*stage, *reason, *http_status, *rpc_error_code),
                 other => panic!("expected RequestRejected, got {other:?}"),
             })
@@ -320,11 +460,119 @@ mod tests {
         assert_eq!(
             rejected(&events),
             vec![
-                (RejectionStage::Admission, RejectionReason::InvalidEnvelope, 200, Some(-32700)),
-                (RejectionStage::Forward, RejectionReason::SsrfBlocked, 403, None),
+                (RejectionStage::Admission, RejectionReason::InvalidEnvelope, Some(200), Some(-32700)),
+                (RejectionStage::Forward, RejectionReason::SsrfBlocked, Some(403), None),
             ]
         );
         assert_eq!(events[0].trace_id.as_deref(), Some("trace-1"));
+    }
+
+    #[tokio::test]
+    async fn a_fabric_refusal_records_no_http_status() {
+        use crate::config::agent_surface_variants::VariantResolveError;
+        let fabric = RequestFacts { via_fabric: true, ..facts() };
+        let ((), events) = crate::audit::producer::capture(async {
+            request_rejected(&fabric, RejectionStage::Admission, RejectionReason::BodyTooLarge, 413, None);
+            refuse_routing(&fabric, &VariantResolveError::UnknownAlias("typo".into()), None);
+            request_rejected(&facts(), RejectionStage::Admission, RejectionReason::BodyTooLarge, 413, None);
+        })
+        .await;
+
+        assert_eq!(
+            rejected(&events),
+            vec![
+                (RejectionStage::Admission, RejectionReason::BodyTooLarge, None, None),
+                (RejectionStage::Routing, RejectionReason::UnknownVariant, None, None),
+                (RejectionStage::Admission, RejectionReason::BodyTooLarge, Some(413), None),
+            ]
+        );
+        let stored = serde_json::to_value(&events[0]).unwrap();
+        assert!(
+            stored["event"]["request_rejected"]
+                .get("http_status")
+                .is_none(),
+            "{stored}"
+        );
+    }
+
+    #[test]
+    fn a_stored_refusal_with_an_http_status_still_reads() {
+        let read: DelegationAuditAction = serde_json::from_value(serde_json::json!({"request_rejected": {
+            "stage": "routing", "reason": "unknown_variant", "http_status": 404, "requested_variant": "typo"
+        }}))
+        .unwrap();
+        match read {
+            DelegationAuditAction::RequestRejected { http_status, .. } => assert_eq!(http_status, Some(404)),
+            other => panic!("expected RequestRejected, got {other:?}"),
+        }
+    }
+
+    fn requested_variants(events: &[crate::delegation_vault::audit::DelegationAuditEvent]) -> Vec<Option<String>> {
+        events
+            .iter()
+            .map(|event| match &event.event {
+                DelegationAuditAction::RequestRejected { requested_variant, .. } => requested_variant.clone(),
+                other => panic!("expected RequestRejected, got {other:?}"),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn each_routing_refusal_is_recorded_with_one_status_per_reason() {
+        use crate::config::agent_surface_variants::VariantResolveError;
+        let errors = [
+            VariantResolveError::UnknownAlias("typo".into()),
+            VariantResolveError::DisabledVariant("beta".into()),
+            VariantResolveError::MisconfiguredDefault("removed".into()),
+        ];
+        let (refusals, events) = crate::audit::producer::capture(async {
+            errors
+                .iter()
+                .map(|error| refuse_routing(&facts(), error, None))
+                .collect::<Vec<_>>()
+        })
+        .await;
+
+        let answered: Vec<_> = refusals
+            .iter()
+            .map(|refusal| (refusal.status().as_u16(), refusal.requested_variant()))
+            .collect();
+        assert_eq!(answered, vec![(404, Some("typo")), (404, None), (500, None),]);
+        assert_eq!(
+            rejected(&events),
+            vec![
+                (RejectionStage::Routing, RejectionReason::UnknownVariant, Some(404), None),
+                (RejectionStage::Routing, RejectionReason::VariantDisabled, Some(404), None),
+                (RejectionStage::Routing, RejectionReason::MisconfiguredDefault, Some(500), None),
+            ]
+        );
+        assert_eq!(requested_variants(&events), vec![Some("typo".to_string()), None, None]);
+        assert_eq!(refusals[0].message(), refusals[1].message(), "both 404s tell the caller the same");
+        assert!(
+            !refusals[0]
+                .message()
+                .contains("typo"),
+            "the caller's alias is not echoed back"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_requested_variant_is_cut_to_the_longest_alias() {
+        use crate::config::agent_surface_variants::VariantResolveError;
+        let long = "a".repeat(40);
+        let accented = "é".repeat(40);
+        let (_, events) = crate::audit::producer::capture(async {
+            refuse_routing(&facts(), &VariantResolveError::UnknownAlias(long.clone()), None);
+            refuse_routing(&facts(), &VariantResolveError::UnknownAlias(accented.clone()), None);
+        })
+        .await;
+
+        assert_eq!(requested_variants(&events), vec![Some("a".repeat(32)), Some("é".repeat(32))]);
+    }
+
+    #[test]
+    fn a_misconfigured_default_is_stored_in_snake_case() {
+        assert_eq!(serde_json::to_value(RejectionReason::MisconfiguredDefault).unwrap(), "misconfigured_default");
     }
 
     #[tokio::test]
@@ -334,7 +582,7 @@ mod tests {
         })
         .await;
 
-        assert_eq!(rejected(&events), vec![(RejectionStage::Routing, RejectionReason::NoRoute, 404, None)]);
+        assert_eq!(rejected(&events), vec![(RejectionStage::Routing, RejectionReason::NoRoute, Some(404), None)]);
         assert_eq!(
             events[0]
                 .surface_id
@@ -366,7 +614,7 @@ mod tests {
 
         assert_eq!(
             rejected(&events),
-            vec![(RejectionStage::Admission, RejectionReason::VersionUnsupported, 400, Some(-32022))]
+            vec![(RejectionStage::Admission, RejectionReason::VersionUnsupported, Some(400), Some(-32022))]
         );
     }
 
@@ -384,10 +632,10 @@ mod tests {
         assert_eq!(
             rejected(&events),
             vec![
-                (RejectionStage::Admission, RejectionReason::InvalidEnvelope, 200, Some(-32700)),
-                (RejectionStage::Admission, RejectionReason::InvalidEnvelope, 200, Some(-32600)),
-                (RejectionStage::Admission, RejectionReason::InvalidEnvelope, 422, None),
-                (RejectionStage::Admission, RejectionReason::InvalidEnvelope, 400, Some(-32600)),
+                (RejectionStage::Admission, RejectionReason::InvalidEnvelope, Some(200), Some(-32700)),
+                (RejectionStage::Admission, RejectionReason::InvalidEnvelope, Some(200), Some(-32600)),
+                (RejectionStage::Admission, RejectionReason::InvalidEnvelope, Some(422), None),
+                (RejectionStage::Admission, RejectionReason::InvalidEnvelope, Some(400), Some(-32600)),
             ]
         );
     }

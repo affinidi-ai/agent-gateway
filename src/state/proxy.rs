@@ -99,11 +99,6 @@ pub struct ProxyState {
     pub active_variant_alias: Option<String>,
     pub active_variant_id: Option<String>,
 
-    /// Set when the requested alias could not select a variant and the
-    /// request fell back to the base surface. Legacy requests keep that
-    /// fallback; admitted modern requests are rejected instead.
-    pub variant_resolution_error: Option<crate::config::agent_surface_variants::VariantResolveError>,
-
     /// Whether the Access Point variant this request selected declares itself
     /// a protected resource, resolved once per request. `None` when the state
     /// was not built for a routed request, which reads as no declaration.
@@ -130,8 +125,8 @@ impl ProxyState {
     }
 
     /// The policy input for an inbound request on this surface, carrying the alias of
-    /// the Surface Variant the request URL selected. An alias that selects no variant,
-    /// such as one on a surface without variants, is not published.
+    /// the Surface Variant the request URL selected. A state whose alias selected no
+    /// variant publishes none.
     pub fn inbound_policy_input(
         &self,
         method: &str,

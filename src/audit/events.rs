@@ -47,6 +47,8 @@ pub enum RejectionReason {
     NoRoute,
     UnknownVariant,
     VariantDisabled,
+    /// The surface's `default_variant_id` names no variant.
+    MisconfiguredDefault,
     BodyTooLarge,
     ProtocolMismatch,
     InvalidEnvelope,

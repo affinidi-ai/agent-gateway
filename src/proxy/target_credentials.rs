@@ -1195,11 +1195,13 @@ mod tests {
                         reason,
                         http_status,
                         rpc_error_code,
+                        requested_variant,
                     } => {
                         assert_eq!(*stage, RejectionStage::Forward);
                         assert_eq!(*reason, RejectionReason::TargetAuthUnavailable);
-                        assert_eq!(*http_status, 502);
+                        assert_eq!(*http_status, Some(502));
                         assert_eq!(*rpc_error_code, None);
+                        assert_eq!(*requested_variant, None);
                     }
                     other => panic!("unexpected {other:?}"),
                 }

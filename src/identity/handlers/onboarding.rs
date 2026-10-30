@@ -577,7 +577,7 @@ async fn respond_to_onboarding_message(
         validation_status: "success".to_string(),
         validation_error: None,
         derived_schema: Box::new(derived_schema.clone()),
-        variant_alias: None,
+        surface_variant: None,
     };
 
     info!("Broadcasting payload capture for onboarding session {}", loggable::secret(&uuid));
@@ -715,7 +715,7 @@ async fn handle_mcp_onboarding_message(
         validation_status: "success".to_string(),
         validation_error: None,
         derived_schema: Box::new(derived_schema),
-        variant_alias: None,
+        surface_variant: None,
     };
     ws_state.broadcast(ws_update);
 

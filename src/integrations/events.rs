@@ -113,6 +113,11 @@ const VARIABLES: &[VariableSpec] = &[
     ),
     var("AUDIT_SURFACE_ID", "Surface ID", "ID of the Agent Surface the record belongs to"),
     var("AUDIT_SURFACE_NAME", "Surface Name", "Name of the Agent Surface the record belongs to"),
+    var(
+        "AUDIT_SURFACE_VARIANT",
+        "Surface Variant",
+        "The variant the request resolved to: the variant's alias, _base_ when the base surface served it, _unknown_ when the URL named a variant the surface doesn't have, or the disabled variant's alias when it was refused as disabled. Empty outside surface requests and when the surface's default variant is misconfigured.",
+    ),
     var("AUDIT_PROTOCOL", "Protocol", "Protocol of the surface (a2a, mcp, …)"),
     var("AUDIT_AGENT_DID", "Agent DID", "DID of the agent the record was written for"),
     var(
@@ -205,6 +210,7 @@ const AUDIT_VARIABLES: &[&str] = &[
     "AUDIT_TRACE_ID",
     "AUDIT_SURFACE_ID",
     "AUDIT_SURFACE_NAME",
+    "AUDIT_SURFACE_VARIANT",
     "AUDIT_PROTOCOL",
     "AUDIT_AGENT_DID",
     "AUDIT_VIA_FABRIC",

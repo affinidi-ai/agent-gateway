@@ -290,8 +290,17 @@ gateway warning names the cause's detail.
 
 The resource a derived declaration names is the Access Point URL above, with `$alias` for a
 Surface Variant (`%24` is read as `$`). Each variant is resolved on its own, against its own
-URL. An alias on a surface without variants selects nothing and is ignored: the base route
-answers, directly or over Fabric, with the base route's declaration and challenge. On a declaring route `aud` must contain that resource: the accepted audience is the
+URL. An alias that selects no enabled variant, including any alias on a surface without
+variants, is refused at routing (`404` `unknown_variant` or `variant_disabled`; see
+[`request_rejected`](OBSERVABILITY.md#governance-audit-forwarding)). On an Access Point whose bare
+route declares (the route without an alias, served by the default variant, else the base
+surface), a caller that fails source authentication on such a URL first gets the bare route's
+challenge, whichever alias it named, and never reaches policy, payment or the Target; an
+authenticated caller gets the refusal, and so does every caller when the bare route does not
+declare or cannot serve its declaration. Variant aliases are not secret: each variant publishes
+its own metadata at `<route>$alias`, and its challenge names that resource. Over Fabric the alias is the one the
+sending route's `fabric://` Target pins, so the receiving gateway refuses an unresolvable one
+before source authentication. On a declaring route `aud` must contain that resource: the accepted audience is the
 resource of the route called, so a token issued for the base route does not open a variant and
 an extra value in `audiences` is not accepted. A route that holds `$` or `%24` is refused with
 `400` on save, because it would claim another surface's variant URL.
@@ -365,6 +374,7 @@ is written once in [`AGENTS.md`](../AGENTS.md#architecture). In request order:
 
 | Stage | A failed caller on a declaring Access Point |
 | --- | --- |
+| Routing, when the request's Surface Variant cannot be resolved | The bare route's challenge, before any policy, on every protocol |
 | Source authentication of an MCP Access Point | The challenge, before any policy |
 | Appliance-wide and gateway policy | A caller either refuses gets the challenge in place of the stage's `403`; a caller they admit continues |
 | Built-in default, on every other protocol, right after gateway policy | The challenge, before AP2 and payment and before the request reaches the Target or Fabric |

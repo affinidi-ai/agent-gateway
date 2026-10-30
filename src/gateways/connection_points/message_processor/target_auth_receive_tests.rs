@@ -507,7 +507,7 @@ async fn fabric_card_fetch_with_an_unavailable_provider_is_a_generic_502() {
         RequestRejected { stage, reason, http_status, .. } => {
             assert_eq!(*stage, RejectionStage::Forward);
             assert_eq!(*reason, RejectionReason::TargetAuthUnavailable);
-            assert_eq!(*http_status, 502);
+            assert_eq!(*http_status, None, "a Fabric refusal records no HTTP status");
         }
         other => panic!("expected RequestRejected, got {other:?}"),
     }

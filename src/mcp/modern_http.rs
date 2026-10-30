@@ -5,7 +5,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 
 use super::request_validation::{
     LegacySessionEvidence, McpMessageKind, McpRequestClassification, McpRequestValidationError, McpVersionPolicy,
-    recover_request_id, validate_mcp_post,
+    request_id_from_bytes, validate_mcp_post,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -269,13 +269,8 @@ fn admit_post(
 ) -> Result<McpRequestClassification, Box<McpRequestValidationError>> {
     let transport_error = |error: HttpAdmissionError| {
         let id = (body.len() <= limits.max_request_bytes.get())
-            .then(|| serde_json::from_slice::<serde_json::Value>(body).ok())
-            .flatten()
-            .and_then(|value| {
-                value
-                    .as_object()
-                    .and_then(recover_request_id)
-            });
+            .then(|| request_id_from_bytes(body))
+            .flatten();
         error.into_validation_error(id)
     };
     validate_header_budget(headers, limits).map_err(transport_error)?;
