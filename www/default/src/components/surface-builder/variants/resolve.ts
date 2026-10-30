@@ -77,7 +77,7 @@ const SHARED_TRANSIT_FIELDS = [
 /**
  * Surface-level access point fields. The URL identifiers identify the
  * listener and route, and `a2a` (accepted A2A versions and message
- * validation) is surface-level on the backend, so all of them MUST be
+ * validation) and `public` are surface-level on the backend, so all of them MUST be
  * identical across the base surface and every variant — a variant can never
  * carry a different URL or A2A settings. They are never emitted as
  * per-variant overrides: `computeOverridesFromPayload` omits them and
@@ -89,6 +89,7 @@ export const ACCESS_POINT_IDENTIFIER_FIELDS = [
   'protocol',
   'name',
   'a2a',
+  'public',
 ] as const;
 
 /**

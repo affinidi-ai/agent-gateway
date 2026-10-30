@@ -2,15 +2,22 @@
  * `validateSurfacePayload` unit tests.
  */
 
-import { validateSurfacePayload, hasBlockingIssues } from '../validateSurface';
+import {
+  ACCESS_POINT_CLOSED_MESSAGE,
+  ACCESS_POINT_NO_CALLER_CONTEXT_MESSAGE,
+  ACCESS_POINT_PUBLIC_MESSAGE,
+  validateSurfacePayload,
+  hasBlockingIssues,
+} from '../validateSurface';
 // Side-effect import: registers every element definition so the
 // validator's registry-aware checks (e.g. parent-type classification
 // for the chain-leak watchdog) can resolve types.
 import '../index';
 
 describe('validateSurfacePayload', () => {
-  const ok = () => ({
+  const ok = (): Record<string, any> => ({
     name: 'My Surface',
+    access_point: { caller_authentication: { methods: [{ type: 'did_auth' }] } },
     target: { endpoint: 'https://upstream/y' },
   });
 
@@ -18,6 +25,70 @@ describe('validateSurfacePayload', () => {
     const issues = validateSurfacePayload(ok());
     expect(issues).toEqual([]);
     expect(hasBlockingIssues(issues)).toBe(false);
+  });
+
+  describe('caller access', () => {
+    const open = (extra: Record<string, unknown> = {}) => ({
+      ...ok(),
+      access_point: { route: '/a', ...extra },
+    });
+
+    it('blocks a new surface with no Caller Context and Public access off', () => {
+      const issues = validateSurfacePayload(open(), { isNew: true });
+      expect(issues).toContainEqual(
+        expect.objectContaining({
+          severity: 'error',
+          message: ACCESS_POINT_CLOSED_MESSAGE,
+          nodeId: 'access-point',
+        })
+      );
+    });
+
+    it('treats an empty methods list as no Caller Context', () => {
+      const issues = validateSurfacePayload(
+        open({ caller_authentication: { methods: [] }, public: false }),
+        { isNew: true }
+      );
+      expect(hasBlockingIssues(issues)).toBe(true);
+    });
+
+    it('blocks a stored closed surface that loses its Caller Context', () => {
+      const issues = validateSurfacePayload(open({ public: false }));
+      expect(issues.find(i => i.message === ACCESS_POINT_CLOSED_MESSAGE)).toMatchObject({
+        severity: 'error',
+      });
+    });
+
+    it('warns, without blocking, when Public access is on', () => {
+      for (const isNew of [true, false]) {
+        const issues = validateSurfacePayload(open({ public: true }), { isNew });
+        expect(hasBlockingIssues(issues)).toBe(false);
+        expect(issues).toContainEqual(
+          expect.objectContaining({ severity: 'warning', message: ACCESS_POINT_PUBLIC_MESSAGE })
+        );
+      }
+      const withAuth = validateSurfacePayload({
+        ...ok(),
+        access_point: { ...ok().access_point, public: true },
+      });
+      expect(withAuth.map(i => i.message)).toEqual([ACCESS_POINT_PUBLIC_MESSAGE]);
+    });
+
+    it('warns, without blocking, on a surface stored without public and no Caller Context', () => {
+      const issues = validateSurfacePayload(open());
+      expect(hasBlockingIssues(issues)).toBe(false);
+      expect(issues).toContainEqual(
+        expect.objectContaining({
+          severity: 'warning',
+          message: ACCESS_POINT_NO_CALLER_CONTEXT_MESSAGE,
+        })
+      );
+    });
+
+    it('lists the access warning before the other warnings', () => {
+      const issues = validateSurfacePayload({ ...open(), target: { endpoint: '' } });
+      expect(issues[0].message).toBe(ACCESS_POINT_NO_CALLER_CONTEXT_MESSAGE);
+    });
   });
 
   it('flags missing surface name as an error', () => {

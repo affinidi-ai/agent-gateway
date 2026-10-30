@@ -17,6 +17,9 @@ import {
   selectedA2aValidation,
 } from './a2aSettings';
 
+const PUBLIC_ACCESS_HELP =
+  'Let anyone call this Access Point without credentials. Leave this off unless your agent is meant to be public.';
+
 const AccessPointPanel: React.FC<ConfigPanelProps> = ({
   config,
   updateField,
@@ -49,6 +52,35 @@ const AccessPointPanel: React.FC<ConfigPanelProps> = ({
         replaceCommit={replaceCommit}
         hasAttemptedSave={hasAttemptedSave}
       />
+
+      <div className="config-section">
+        <label>Access</label>
+        <Form.Check
+          type="switch"
+          id="ap-public-access"
+          data-testid="access-point-public-switch"
+          label={
+            <span className="d-flex align-items-center gap-1">
+              Public access
+              <FieldHelp testId="field-help-access-point-public" ariaLabel="About Public access">
+                {PUBLIC_ACCESS_HELP}
+              </FieldHelp>
+            </span>
+          }
+          checked={config.public === true}
+          onChange={e => updateField('public', e.target.checked)}
+        />
+        {config.public === true && (
+          <Form.Text
+            className="d-block text-warning"
+            style={{ fontSize: '10px' }}
+            data-testid="access-point-public-warning"
+          >
+            <i className="fas fa-exclamation-triangle me-1" aria-hidden="true" />
+            Anyone who can reach this Access Point can call your agent without credentials.
+          </Form.Text>
+        )}
+      </div>
 
       {isA2aLike && (
         <div className="config-section" data-testid="access-point-a2a-protocol">

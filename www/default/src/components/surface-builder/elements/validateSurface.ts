@@ -31,10 +31,66 @@ export interface ValidationIssue {
   path?: string;
 }
 
+export interface ValidateSurfaceOptions {
+  /** The payload is for a surface that does not exist yet. */
+  isNew?: boolean;
+}
+
+export const ACCESS_POINT_CLOSED_MESSAGE =
+  'This Access Point is closed to all callers. Add a Caller Context, or turn on Public access.';
+export const ACCESS_POINT_PUBLIC_MESSAGE =
+  'This Access Point is public. Anyone who can reach it can call your agent without credentials.';
+export const ACCESS_POINT_NO_CALLER_CONTEXT_MESSAGE =
+  'This Access Point has no Caller Context. Anyone who can reach it can call your agent without credentials.';
+
+/**
+ * Caller access rules. A new surface, or one stored with `public: false`,
+ * needs a caller authentication method unless it is public. A surface stored
+ * without `public` keeps admitting anonymous callers, so it only warns.
+ */
+function accessPointAccessIssues(payload: any, isNew: boolean): ValidationIssue[] {
+  const ap = payload?.access_point;
+  const methods = ap?.caller_authentication?.methods;
+  const hasCallerAuth = Array.isArray(methods) && methods.length > 0;
+  const isPublic = ap?.public === true;
+  if (isPublic) {
+    return [
+      {
+        severity: 'warning',
+        message: ACCESS_POINT_PUBLIC_MESSAGE,
+        nodeId: 'access-point',
+        path: 'access_point.public',
+      },
+    ];
+  }
+  if (hasCallerAuth) return [];
+  if (isNew || ap?.public === false) {
+    return [
+      {
+        severity: 'error',
+        message: ACCESS_POINT_CLOSED_MESSAGE,
+        nodeId: 'access-point',
+        path: 'access_point.caller_authentication',
+      },
+    ];
+  }
+  return [
+    {
+      severity: 'warning',
+      message: ACCESS_POINT_NO_CALLER_CONTEXT_MESSAGE,
+      nodeId: 'access-point',
+      path: 'access_point.caller_authentication',
+    },
+  ];
+}
+
 /**
  * Validate the built payload. Cheap, side-effect-free, no async.
  */
-export function validateSurfacePayload(payload: any): ValidationIssue[] {
+export function validateSurfacePayload(
+  payload: any,
+  options: ValidateSurfaceOptions = {}
+): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
   if (!payload || typeof payload !== 'object') {
     issues.push({ severity: 'error', message: 'Surface payload is missing or malformed.' });
@@ -49,6 +105,9 @@ export function validateSurfacePayload(payload: any): ValidationIssue[] {
       path: 'name',
     });
   }
+
+  // Listed before the other warnings, which the save toasts cap at three.
+  issues.push(...accessPointAccessIssues(payload, options.isNew === true));
 
   // Target endpoint — required for any surface that proxies to an
   // upstream. Surfaces wired exclusively to NPCs (managed agents) may
