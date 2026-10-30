@@ -19,6 +19,8 @@ pub use handlers::{backup_storage, restore_storage};
 
 use tracing::warn;
 
+use crate::observability::loggable;
+
 /// Directories to skip when building a backup ZIP (ephemeral / regenerated data).
 const BACKUP_SKIP_DIRS: &[&str] = &["logs", "system_metrics"];
 
@@ -160,7 +162,7 @@ fn build_zip(
                 let content = match std::fs::read(&path) {
                     Ok(c) => c,
                     Err(e) => {
-                        warn!("Skipping unreadable file {}: {}", relative_str, e);
+                        warn!("Skipping unreadable file {}: {}", loggable::record_path(relative).display(), e);
                         continue;
                     }
                 };
@@ -980,6 +982,32 @@ mod tests {
     }
 
     // ── backup tests ─────────────────────────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_logs_an_unreadable_file_by_its_directory_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let storage_root = dir.path().join("_storage");
+        let sessions = storage_root.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let token = "0f2c9d7e-1b3a-4c5d-8e9f-a0b1c2d3e4f5";
+        let session_file = sessions.join(format!("{token}.json"));
+        fs::write(&session_file, "{}").unwrap();
+        fs::set_permissions(&session_file, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read(&session_file).is_ok() {
+            // Root reads the file regardless of its mode, so nothing is unreadable.
+            return;
+        }
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        build_full_zip(&storage_root).expect("an unreadable file is skipped");
+
+        let text = logs.text();
+        assert!(text.contains("Skipping unreadable file sessions/<redacted>"), "{text}");
+        assert!(!text.contains(token), "{text}");
+    }
 
     #[test]
     fn backup_creates_valid_zip() {

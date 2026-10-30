@@ -152,11 +152,13 @@ pub fn record_trust_check(event: TrustCheckAuditEvent<'_>) {
         _ => Some(latency_ms as f64 / 1000.0),
     };
     track_trust_check(trust_registry_id, query_type_str, result, duration_secs);
+    let surface_variant = crate::observability::policy_audit::current_request_variant();
 
     if ok {
         tracing::debug!(
             target: "trust_check_audit",
             surface_id = surface_id,
+            surface_variant = surface_variant.as_deref(),
             transit_point = transit_point_str,
             leg = leg_str,
             element_id = element_id,
@@ -173,6 +175,7 @@ pub fn record_trust_check(event: TrustCheckAuditEvent<'_>) {
         tracing::warn!(
             target: "trust_check_audit",
             surface_id = surface_id,
+            surface_variant = surface_variant.as_deref(),
             transit_point = transit_point_str,
             leg = leg_str,
             element_id = element_id,
@@ -557,20 +560,22 @@ mod tests {
     #[test]
     fn ok_event_carries_full_structured_context_at_debug() {
         let captured = capture(|| {
-            record_trust_check(TrustCheckAuditEvent {
-                surface_id: "surface-a",
-                transit_point: None,
-                leg: TrustCheckLeg::Caller,
-                element_id: "tc-id-a",
-                element_name: Some("primary registry"),
-                authority_id: Some("did:authority:42"),
-                entity_id: Some("did:entity:42"),
-                trust_registry_id: "tr-42",
-                query_type: TrqpQueryType::Recognition,
-                ok: true,
-                error_code: None,
-                error_detail: None,
-                latency_ms: 17,
+            crate::observability::policy_audit::with_request_variant("beta", || {
+                record_trust_check(TrustCheckAuditEvent {
+                    surface_id: "surface-a",
+                    transit_point: None,
+                    leg: TrustCheckLeg::Caller,
+                    element_id: "tc-id-a",
+                    element_name: Some("primary registry"),
+                    authority_id: Some("did:authority:42"),
+                    entity_id: Some("did:entity:42"),
+                    trust_registry_id: "tr-42",
+                    query_type: TrqpQueryType::Recognition,
+                    ok: true,
+                    error_code: None,
+                    error_detail: None,
+                    latency_ms: 17,
+                })
             });
         });
 
@@ -580,6 +585,7 @@ mod tests {
             .expect("trust check audit event not captured");
 
         assert_eq!(ev.level, "DEBUG");
+        assert_eq!(field(ev, "surface_variant"), Some("beta"));
         assert_eq!(field(ev, "leg"), Some("caller"));
         assert_eq!(field(ev, "element_id"), Some("tc-id-a"));
         assert_eq!(field(ev, "element_name"), Some("primary registry"));
@@ -630,6 +636,7 @@ mod tests {
         assert_eq!(field(ev, "ok"), Some("false"));
         assert_eq!(field(ev, "error_code"), Some(""));
         assert_eq!(field(ev, "latency_ms"), Some("23"));
+        assert_eq!(field(ev, "surface_variant"), None, "outside a request there is no variant");
     }
 
     #[test]

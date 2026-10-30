@@ -396,6 +396,25 @@ with `Retry-After: 5`; the receiving gateway refuses with `capacity_reached`. Th
 does not recheck the caller's browser Origin against its own `mcp_http.allowed_origins`; it trusts
 the paired sending gateway's check, as it trusts that peer for every other forwarded header.
 
+### Which variant serves a request over Fabric
+
+Each gateway picks its own surface variant. The sending gateway serves a request with the variant
+its URL names (`/route$beta`), else its default variant, else its base surface, and records that
+one. The URL's `$alias` stays on the sending gateway: it names a variant of the sending surface,
+not of the peer's.
+
+The receiving gateway serves the request with its own default variant, else its base surface,
+unless the sending route's `fabric://` Target pins one of its variants:
+`fabric://<gateway>/<surface>$<alias>`. A pinned alias is sent with the request, as
+`active_variant_alias` (and `virtual_channel_alias`) on a buffered `ForwardRequest` and as the
+`variant_alias` of a framed stream's `Open`, and the receiving gateway serves and records that
+variant. The `ForwardRequest` an Access Point resends after MPP auto-pay pays a `402` carries the
+same alias. This applies to an Access Point's Target and to a Transit Point's endpoint alike. To send
+one variant of the sending surface to a particular peer variant, override that variant's Target
+with the pinned URL. A pinned alias the receiving surface doesn't have, or has disabled, is refused
+there (`unknown_variant` or `variant_disabled`); the sending gateway passes the `404` on to its
+caller on a `ForwardRequest`, and answers `502` when a stream's `Open` is refused.
+
 ### Delegated credentials over Fabric
 
 A sending surface's `outbound_credentials` reach a `fabric://` peer only when the route to that

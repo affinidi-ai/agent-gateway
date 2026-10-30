@@ -113,6 +113,9 @@ fn summary(
         "user.deleted" => "User ${USERNAME} was deleted",
         "user.login" => "User ${USERNAME} logged in",
         "user.accessed" => "User ${USERNAME}'s profile was viewed",
+        "connection_point.created" => "Connection point ${CP_NAME} was created",
+        "connection_point.updated" => "Connection point ${CP_NAME} was updated",
+        "connection_point.deleted" => "Connection point ${CP_NAME} was deleted",
         "connection_point.connected" => "${FROM_DID} connected through connection point ${CP_NAME}",
         "x402.verification.failed" => {
             "x402 payment ${TX_HASH} on surface ${SURFACE_ID} failed verification: ${ERROR_MESSAGE}"
@@ -283,6 +286,19 @@ mod tests {
         );
 
         assert_eq!(values["EVENT_SUMMARY"], "did:peer:partner connected through connection point Orders");
+    }
+
+    #[test]
+    fn a_connection_point_change_summary_names_the_connection_point() {
+        for (id, verb) in [
+            ("connection_point.created", "created"),
+            ("connection_point.updated", "updated"),
+            ("connection_point.deleted", "deleted"),
+        ] {
+            let values = event_values(event(id), trigger(&[("CP_NAME", "Orders")]), None);
+
+            assert_eq!(values["EVENT_SUMMARY"], format!("Connection point Orders was {verb}"));
+        }
     }
 
     #[test]

@@ -127,7 +127,7 @@ impl EventHook {
         .unwrap_or(0);
         let previous = self
             .sequence
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |last| Some((last + 1).max(clock)))
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |last| Some((last + 1).max(clock)))
             .unwrap_or_default();
         (previous + 1).max(clock)
     }

@@ -31,6 +31,7 @@ use crate::a2a::create_error_response;
 use crate::config::ChannelProtocol;
 use crate::config::agent_surface::SharedTransitConfig;
 use crate::config::agent_surface::TransitPoint;
+use crate::observability::loggable;
 use crate::proxy::backend_identity::ProtectedAgentIdentity;
 use crate::state::OutboundProxyState;
 
@@ -68,6 +69,9 @@ pub(crate) enum OutboundPipelineError {
 
     #[error("Unknown outbound virtual channel alias: '{0}'")]
     UnknownVirtualChannelAlias(String),
+
+    #[error("{}", .0.message())]
+    VariantRefused(crate::audit::request_events::RoutingRefusal),
 
     #[error("Failed to read request body: {0}")]
     BodyReadFailed(String),
@@ -221,6 +225,7 @@ impl OutboundPipelineError {
     fn status_code(&self) -> StatusCode {
         match self {
             Self::McpValidation(error) => error.status,
+            Self::VariantRefused(refusal) => refusal.status(),
             Self::McpIdentityInvalid | Self::McpBodyRefused(crate::mcp::tool_analyzer::BodyRefusal::Batch) => {
                 StatusCode::UNPROCESSABLE_ENTITY
             }
@@ -438,7 +443,9 @@ pub struct OutboundPipelineContext {
     /// `None` when the request targets the default variant.
     pub active_variant_alias: Option<String>,
     pub active_variant_id: Option<String>,
-    pub variant_resolution_error: Option<crate::config::agent_surface_variants::VariantResolveError>,
+    /// A modern MCP request refused at routing, already recorded. It is
+    /// answered before any other step, once the body has been read for its `id`.
+    pub pending_variant_refusal: Option<crate::audit::request_events::RoutingRefusal>,
     /// Resolved [`AgentSurface`] for this outbound request, symmetric
     /// to inbound `ProxyState::surface`. Built once per request via
     /// `from_channel_mapping → resolve_variant(alias)` so downstream
@@ -464,6 +471,7 @@ impl OutboundPipelineContext {
         addr: SocketAddr,
         req: Request,
         state: &OutboundProxyState,
+        versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
     ) -> Result<Self, OutboundPipelineError> {
         // Read the latest channel state (sub-microsecond lock).
         let cs = state
@@ -529,44 +537,16 @@ impl OutboundPipelineContext {
             resolve_virtual_channel(path, &surface_for_resolve)?
         };
 
-        // Resolve the variant from the surface. On failure we fall
-        // back to the unresolved base surface so the request still
-        // proceeds.
-        let active_variant_id = match active_variant_alias.as_deref() {
-            Some(alias) => surface_for_resolve
-                .variants
-                .iter()
-                .find(|variant| variant.enabled && variant.alias == alias)
-                .map(|variant| variant.id.clone()),
-            None => surface_for_resolve
-                .default_variant_id
-                .clone(),
-        };
-        let (surface, variant_resolution_error) =
-            match surface_for_resolve.resolve_variant(active_variant_alias.as_deref()) {
-                Ok(resolved) => {
-                    let error = active_variant_alias
-                        .as_deref()
-                        .filter(|alias| {
-                            !surface_for_resolve
-                                .variants
-                                .iter()
-                                .any(|variant| variant.alias == *alias)
-                        })
-                        .map(|alias| {
-                            crate::config::agent_surface_variants::VariantResolveError::UnknownAlias(alias.to_string())
-                        });
-                    (Arc::new(resolved), error)
+        // The URL's alias, else the default variant, else the base surface
+        // serves the request. A variant that can't be resolved leaves the
+        // request on the unresolved surface, to be refused below.
+        let (active_variant_id, surface, unresolved) =
+            match surface_for_resolve.serve_variant(active_variant_alias.as_deref()) {
+                Ok(served) => {
+                    crate::observability::policy_audit::set_request_variant(&served.recorded);
+                    (served.id, Arc::new(served.surface), None)
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        surface = %cs_surface_for_resolve.name,
-                        alias = ?active_variant_alias,
-                        error = %e,
-                        "AgentSurface variant resolution failed; using base surface"
-                    );
-                    (surface_for_resolve, Some(e))
-                }
+                Err(error) => (None, Arc::clone(&surface_for_resolve), Some(error)),
             };
 
         let virtual_channel = surface
@@ -581,6 +561,35 @@ impl OutboundPipelineContext {
                         .clone(),
                 )
             })?;
+
+        // The refusal is recorded only once nothing else can fail, so its record
+        // matches the answer. A modern MCP request, whatever its method, is
+        // answered later, once its body is read for the `id`; every other
+        // request now. So a request that reaches any later step and names an
+        // alias always has that alias's `active_variant_id`.
+        let modern_mcp = matched_virtual_channel.protocol == crate::config::agent_surface::TransitProtocol::Mcp
+            && crate::mcp::request_validation::has_modern_header(&original_headers, versions);
+        let pending_variant_refusal = match unresolved {
+            None => None,
+            Some(error) => {
+                let rpc_error_code = modern_mcp.then_some(i64::from(crate::mcp::error_codes::INTERNAL_ERROR));
+                let refusal = crate::audit::request_events::refuse_routing(
+                    &crate::audit::request_events::RequestFacts {
+                        surface_id: &surface_for_resolve.surface_id,
+                        channel_name: &surface_for_resolve.name,
+                        trace_id: None,
+                        via_fabric: false,
+                    },
+                    &error,
+                    rpc_error_code,
+                );
+                refusal.warn(&surface_for_resolve);
+                if !modern_mcp {
+                    return Err(OutboundPipelineError::VariantRefused(refusal));
+                }
+                Some(refusal)
+            }
+        };
         let outbound_shared = surface
             .transit
             .as_ref()
@@ -658,11 +667,36 @@ impl OutboundPipelineContext {
             response_bytes: None,
             active_variant_alias,
             active_variant_id,
-            variant_resolution_error,
+            pending_variant_refusal,
             surface,
             identity_rules_engine,
             identity_selector,
         })
+    }
+
+    /// Answers a modern MCP request refused at routing with the JSON-RPC error,
+    /// reading the body within the Transit Point's MCP body limit only to echo
+    /// its `id`. A body that can't be read is answered without one.
+    async fn answer_variant_refusal(
+        &mut self,
+        state: &OutboundProxyState,
+        versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
+        refusal: &crate::audit::request_events::RoutingRefusal,
+    ) -> Response {
+        crate::mcp::request_validation::answer_routing_refusal(
+            refusal,
+            self.virtual_channel
+                .mcp_http
+                .as_ref(),
+            &state
+                .network_config
+                .get_outbound_external_urls(),
+            versions,
+            self.request
+                .take()
+                .map(Request::into_body),
+        )
+        .await
     }
 }
 
@@ -779,12 +813,12 @@ async fn outbound_proxy_handler_with_mcp_versions(
     req: Request,
     versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
 ) -> Result<Response, OutboundPipelineError> {
-    use crate::observability::policy_audit::{in_request, new_request_id, response_in_request};
+    use crate::observability::policy_audit::{RequestScope, in_request, response_in_request};
 
-    let id = new_request_id();
-    in_request(id.clone(), Box::pin(outbound_proxy_handler_in_request_scope(addr, state, req, versions)))
+    let scope = RequestScope::fresh();
+    in_request(scope.clone(), Box::pin(outbound_proxy_handler_in_request_scope(addr, state, req, versions)))
         .await
-        .map(|response| response_in_request(id, response))
+        .map(|response| response_in_request(scope, response))
 }
 
 async fn outbound_proxy_handler_in_request_scope(
@@ -795,7 +829,15 @@ async fn outbound_proxy_handler_in_request_scope(
 ) -> Result<Response, OutboundPipelineError> {
     let mut subscription_access =
         crate::mcp::subscriptions::SubscriptionLifetime::new(std::time::Duration::from_secs(86_400), None);
-    let mut ctx = OutboundPipelineContext::new(addr, req, &state)?;
+    let mut ctx = OutboundPipelineContext::new(addr, req, &state, versions)?;
+    if let Some(refusal) = ctx
+        .pending_variant_refusal
+        .take()
+    {
+        return Ok(ctx
+            .answer_variant_refusal(&state, versions, &refusal)
+            .await);
+    }
 
     step_source_auth(&state, &mut ctx).await?;
 
@@ -812,28 +854,10 @@ async fn outbound_proxy_handler_in_request_scope(
         return Ok(response);
     }
 
-    if let Some(crate::mcp::request_validation::McpRequestClassification::Modern(request)) = ctx
+    if let Some(crate::mcp::request_validation::McpRequestClassification::Modern(_)) = ctx
         .mcp_classification
         .as_ref()
     {
-        if let Some(error) = ctx
-            .variant_resolution_error
-            .as_ref()
-        {
-            let status = match error {
-                crate::config::agent_surface_variants::VariantResolveError::UnknownAlias(_) => StatusCode::NOT_FOUND,
-                _ => StatusCode::SERVICE_UNAVAILABLE,
-            };
-            return Err(OutboundPipelineError::McpValidation(Box::new(
-                crate::mcp::request_validation::McpRequestValidationError {
-                    status,
-                    id: request.id.clone(),
-                    code: crate::mcp::error_codes::INTERNAL_ERROR,
-                    message: "MCP Transit Point variant is unavailable".into(),
-                    data: None,
-                },
-            )));
-        }
         step_validate_transit_token(&state, &mut ctx).await?;
     }
 
@@ -2580,6 +2604,7 @@ pub(crate) async fn fetch_agent_card(
     };
 
     for card_url in &urls {
+        let logged_url = loggable::url(card_url);
         let candidate = card_url.clone();
         let client = match tokio::task::spawn_blocking(move || {
             crate::egress::pinned_forward_client(&candidate, timeout)
@@ -2588,11 +2613,11 @@ pub(crate) async fn fetch_agent_card(
         {
             Ok(Ok((client, _target))) => client,
             Ok(Err(e)) => {
-                warn!(request_id = %request_id, url = %card_url, "Agent card URL blocked by egress policy: {}", e);
+                warn!(request_id = %request_id, url = %logged_url, "Agent card URL blocked by egress policy: {}", e);
                 continue;
             }
             Err(e) => {
-                warn!(request_id = %request_id, url = %card_url, "Agent card egress validation task failed: {}", e);
+                warn!(request_id = %request_id, url = %logged_url, "Agent card egress validation task failed: {}", e);
                 continue;
             }
         };
@@ -2612,7 +2637,7 @@ pub(crate) async fn fetch_agent_card(
                         debug!(
                             request_id = %request_id,
                             error = %e,
-                            url = %card_url,
+                            url = %logged_url,
                             "Agent card URL response exceeded its bounds, trying next"
                         );
                     }
@@ -2622,15 +2647,15 @@ pub(crate) async fn fetch_agent_card(
                 debug!(
                     request_id = %request_id,
                     status = %resp.status(),
-                    url = %card_url,
+                    url = %logged_url,
                     "Agent card URL returned non-success status, trying next"
                 );
             }
             Err(e) => {
                 debug!(
                     request_id = %request_id,
-                    error = %e,
-                    url = %card_url,
+                    error = %e.without_url(),
+                    url = %logged_url,
                     "Failed to fetch agent card URL, trying next"
                 );
             }
@@ -3087,7 +3112,7 @@ async fn step_gateway_opa_policy(
     ctx: &mut OutboundPipelineContext,
 ) -> Result<(), OutboundPipelineError> {
     let Some(ref gw_pm) = state.gateway_policy_manager else {
-        info!(request_id = %ctx.request_id, "[OPA-INPUT] Outbound gateway OPA skipped: no gateway_policy_manager");
+        info!(request_id = %ctx.request_id, "[OPA] Outbound gateway OPA skipped: no gateway_policy_manager");
         return Ok(());
     };
 
@@ -3101,23 +3126,21 @@ async fn step_gateway_opa_policy(
     // policy is actually found and enforced on egress too. The policy can branch
     // on `input.gateway.direction == "outbound"` to gate egress specifically.
     let Some(gateway_id) = gw_pm.get_self_gateway_id() else {
-        info!(request_id = %ctx.request_id, "[OPA-INPUT] Outbound gateway OPA skipped: no self gateway id");
+        info!(request_id = %ctx.request_id, "[OPA] Outbound gateway OPA skipped: no self gateway id");
         return Ok(());
     };
     if !gw_pm.is_enforced(&gateway_id) {
         info!(
             request_id = %ctx.request_id,
             gateway_id = %gateway_id,
-            "[OPA-INPUT] Outbound gateway OPA skipped: no gateway policy configured, allowing"
+            "[OPA] Outbound gateway OPA skipped: no gateway policy configured, allowing"
         );
         return Ok(());
     }
-    info!(request_id = %ctx.request_id, "[OPA-INPUT] Outbound gateway OPA using gateway_id={}", gateway_id);
+    info!(request_id = %ctx.request_id, "[OPA] Outbound gateway OPA using gateway_id={}", gateway_id);
 
     let policy_input = build_outbound_policy_input(ctx);
     let input_value = serde_json::to_value(&policy_input).unwrap_or_default();
-    // [OPA-INPUT] Outbound gateway policy input before eval
-    info!(request_id = %ctx.request_id, "[OPA-INPUT] Outbound gateway policy input before eval: {}", input_value);
     let (policy_definition_id, policy_name, policy_version, policy_hash) = match gw_pm.policy_evidence(&gateway_id) {
         Some((id, version, hash)) => {
             let name = gw_pm
@@ -3204,14 +3227,14 @@ async fn step_surface_opa_policy(
         .outbound_shared
         .opa_policy_definition_id
     else {
-        info!(request_id = %ctx.request_id, "[OPA-INPUT] Outbound channel OPA skipped: no opa_policy_definition_id on outbound config");
+        info!(request_id = %ctx.request_id, "[OPA] Outbound channel OPA skipped: no opa_policy_definition_id on outbound config");
         return Ok(());
     };
 
     let Some(pm) = &state.policy_manager else {
         warn!(
             request_id = %ctx.request_id,
-            "[OPA-INPUT] Outbound channel OPA skipped: SurfacePolicyManager not available; denying"
+            "[OPA] Outbound channel OPA skipped: SurfacePolicyManager not available; denying"
         );
         return Err(record_surface_policy_unavailable(
             ctx,
@@ -3247,16 +3270,6 @@ async fn step_surface_opa_policy(
 
     let policy_input = build_outbound_policy_input(ctx);
     let input_value = serde_json::to_value(&policy_input).unwrap_or_default();
-    // [OPA-INPUT] Outbound surface policy input before eval
-    info!(request_id = %ctx.request_id, config_id = %config_id,
-        "[OPA-INPUT] Outbound surface policy input before eval: {}", input_value);
-
-    debug!(
-        request_id = %ctx.request_id,
-        config_id = %config_id,
-        input = %serde_json::to_string_pretty(&input_value).unwrap_or_default(),
-        "Outbound channel OPA policy input"
-    );
 
     let def_id = ctx
         .outbound_shared
@@ -3401,9 +3414,6 @@ async fn step_transit_point_opa_policy(
 
     let policy_input = build_outbound_policy_input(ctx);
     let input_value = serde_json::to_value(&policy_input).unwrap_or_default();
-    // [OPA-INPUT] Outbound transit point policy input before eval
-    info!(request_id = %ctx.request_id, alias = %ctx.virtual_channel.alias,
-        "[OPA-INPUT] Outbound transit point policy input before eval: {}", input_value);
 
     let (policy_name, policy_version, policy_hash) = pm
         .resolve_policy_decision_evidence(Some(tp_def_id.as_str()))
@@ -4148,6 +4158,7 @@ fn log_fabric_delegation_withheld(ctx: &OutboundPipelineContext) {
         target: "credential_delegation",
         request_id = %ctx.request_id,
         surface_id = %ctx.surface.surface_id,
+        surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
         route = %ctx.virtual_channel.alias,
         reason = "fabric_delegated_credentials=false",
         "Delegated credentials withheld from Fabric peer"
@@ -4198,11 +4209,9 @@ async fn step_inject_credentials(
     state: &OutboundProxyState,
     ctx: &mut OutboundPipelineContext,
 ) -> Result<(), OutboundPipelineError> {
-    if ctx
-        .variant_resolution_error
-        .is_some()
-        || !crate::proxy::handler::CallerAssertion::for_request(ctx.original_method.as_str(), &ctx.request_path)
-            .permits_target_credential()
+    let surface_variant = crate::observability::policy_audit::current_request_variant();
+    if !crate::proxy::handler::CallerAssertion::for_request(ctx.original_method.as_str(), &ctx.request_path)
+        .permits_target_credential()
     {
         return Ok(());
     }
@@ -4244,6 +4253,7 @@ async fn step_inject_credentials(
             warn!(
                 target: "credential_delegation",
                 request_id = %ctx.request_id,
+                surface_variant = surface_variant.as_deref(),
                 "Credential delegation configured but stores not available - refusing the request"
             );
             return Err(refuse_delegation(ctx, DelegationRefusal::Unavailable));
@@ -4263,6 +4273,7 @@ async fn step_inject_credentials(
             warn!(
                 target: "credential_delegation",
                 request_id = %ctx.request_id,
+                surface_variant = surface_variant.as_deref(),
                 "Transit token does not carry user_identity_hash - refusing the request"
             );
             return Err(refuse_delegation(ctx, DelegationRefusal::CallerIdentityMissing));
@@ -4369,6 +4380,7 @@ async fn step_inject_credentials(
         info!(
             target: "credential_delegation",
             request_id = %ctx.request_id,
+            surface_variant = surface_variant.as_deref(),
             providers = %consent_entries.len(),
             user_hash = %user_hash,
             agent_did = %agent_did,
@@ -4397,6 +4409,7 @@ async fn step_inject_credentials(
                             warn!(
                                 target: "credential_delegation",
                                 request_id = %ctx.request_id,
+                                surface_variant = surface_variant.as_deref(),
                                 meta_field = %field,
                                 "Failed to inject delegated credential into outbound MCP metadata because body is unavailable"
                             );
@@ -4410,6 +4423,7 @@ async fn step_inject_credentials(
                                 debug!(
                                     target: "credential_delegation",
                                     request_id = %ctx.request_id,
+                                    surface_variant = surface_variant.as_deref(),
                                     meta_field = %field,
                                     "Injecting delegated credential into outbound MCP metadata"
                                 );
@@ -4418,6 +4432,7 @@ async fn step_inject_credentials(
                                 warn!(
                                     target: "credential_delegation",
                                     request_id = %ctx.request_id,
+                                    surface_variant = surface_variant.as_deref(),
                                     meta_field = %field,
                                     error = %error,
                                     "Failed to inject delegated credential into outbound MCP metadata"
@@ -4430,6 +4445,7 @@ async fn step_inject_credentials(
                         debug!(
                             target: "credential_delegation",
                             request_id = %ctx.request_id,
+                            surface_variant = surface_variant.as_deref(),
                             header = %name,
                             "Injecting delegated credential header into outbound request"
                         );
@@ -4719,18 +4735,28 @@ async fn step_forward_request_http(
         {
             Ok(Ok((client, _target))) => client,
             Ok(Err(e)) => {
-                warn!(request_id = %ctx.request_id, target = %target_url, "SSRF blocked at forwarding layer: {}", e);
+                warn!(
+                    request_id = %ctx.request_id,
+                    target = %loggable::url(&target_url),
+                    "SSRF blocked at forwarding layer: {}",
+                    e
+                );
                 return Err(OutboundPipelineError::TargetAuthUnavailable);
             }
             Err(e) => {
-                warn!(request_id = %ctx.request_id, target = %target_url, "SSRF egress validation task failed: {}", e);
+                warn!(
+                    request_id = %ctx.request_id,
+                    target = %loggable::url(&target_url),
+                    "SSRF egress validation task failed: {}",
+                    e
+                );
                 return Err(OutboundPipelineError::TargetAuthUnavailable);
             }
         };
 
     debug!(
         request_id = %ctx.request_id,
-        target = %target_url,
+        target = %loggable::url(&target_url),
         method = %ctx.original_method,
         "Outbound: forwarding request"
     );
@@ -4790,7 +4816,11 @@ async fn step_forward_request_http(
                 if error.is_timeout() {
                     OutboundPipelineError::UpstreamTimeout
                 } else {
-                    OutboundPipelineError::UpstreamConnectionFailed(error.to_string())
+                    OutboundPipelineError::UpstreamConnectionFailed(
+                        error
+                            .without_url()
+                            .to_string(),
+                    )
                 }
             });
     }
@@ -4805,6 +4835,7 @@ async fn step_forward_request_http(
         .send()
         .await
         .map_err(|e| {
+            let e = e.without_url();
             if e.is_timeout() {
                 warn!(request_id = %ctx.request_id, error = %e, "Outbound request timed out");
                 OutboundPipelineError::UpstreamTimeout
@@ -5534,9 +5565,6 @@ fn step_record_metrics(
             .virtual_channel
             .alias
             .clone();
-        let variant_alias = ctx
-            .active_variant_alias
-            .clone();
         let metrics = Arc::clone(metrics);
         let status = if succeeded {
             crate::metrics::ConnectionStatus::Success
@@ -5544,7 +5572,7 @@ fn step_record_metrics(
             crate::metrics::ConnectionStatus::Failed
         };
 
-        tokio::spawn(async move {
+        crate::observability::policy_audit::spawn_in_request(async move {
             metrics
                 .record_connection_with_transit_point(
                     channel_config_id,
@@ -5562,7 +5590,6 @@ fn step_record_metrics(
                     None,
                     None,
                     latency_ms,
-                    variant_alias,
                 )
                 .await;
         });
@@ -5921,7 +5948,7 @@ mod tests {
             response_bytes: None,
             active_variant_alias: None,
             active_variant_id: None,
-            variant_resolution_error: None,
+            pending_variant_refusal: None,
             surface,
             identity_rules_engine: None,
             identity_selector: None,
@@ -6887,7 +6914,13 @@ mod tests {
                     .insert("x-transit-token", token.parse().unwrap());
                 let mut context_request = subscription_request();
                 *context_request.uri_mut() = variant_uri.parse().unwrap();
-                let context = OutboundPipelineContext::new(address, context_request, &request_state).unwrap();
+                let context = OutboundPipelineContext::new(
+                    address,
+                    context_request,
+                    &request_state,
+                    crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+                )
+                .unwrap();
                 assert_eq!(
                     context
                         .active_variant_id
@@ -8376,7 +8409,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn modern_transit_variant_failures_never_dispatch_the_base_target() {
+    async fn transit_variant_failures_are_refused_and_never_dispatch_the_base_target() {
+        use crate::audit::request_events::{RejectionReason, RejectionStage};
         let target = crate::component_tests::helpers::MockServer::start_with_response(
             json!({
                 "jsonrpc": "2.0", "id": "variant", "result": {
@@ -8387,7 +8421,23 @@ mod tests {
         )
         .await;
         let versions = crate::mcp::request_validation::MODERN_CAPABLE_POLICY;
-        for case in ["empty-catalog", "unknown", "disabled", "missing-default", "disabled-default"] {
+        let code = i64::from(crate::mcp::error_codes::INTERNAL_ERROR);
+        for (case, modern, sent, status, reason, requested_variant) in [
+            ("empty-catalog", true, "envelope", 404, RejectionReason::UnknownVariant, Some("unknown")),
+            ("unknown", true, "envelope", 404, RejectionReason::UnknownVariant, Some("unknown")),
+            ("unknown", true, "malformed", 404, RejectionReason::UnknownVariant, Some("unknown")),
+            ("unknown", true, "20 KiB", 404, RejectionReason::UnknownVariant, Some("unknown")),
+            ("unknown", true, "GET", 404, RejectionReason::UnknownVariant, Some("unknown")),
+            ("unknown", true, "DELETE", 404, RejectionReason::UnknownVariant, Some("unknown")),
+            ("unknown", false, "envelope", 404, RejectionReason::UnknownVariant, Some("unknown")),
+            ("disabled", true, "envelope", 404, RejectionReason::VariantDisabled, None),
+            ("disabled", false, "envelope", 404, RejectionReason::VariantDisabled, None),
+            ("missing-default", true, "envelope", 500, RejectionReason::MisconfiguredDefault, None),
+            ("missing-default", false, "envelope", 500, RejectionReason::MisconfiguredDefault, None),
+            ("empty-catalog-missing-default", false, "envelope", 500, RejectionReason::MisconfiguredDefault, None),
+            ("disabled-default", true, "envelope", 404, RejectionReason::VariantDisabled, None),
+        ] {
+            let label = format!("{case} modern={modern} body={sent}");
             let mut surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
                 "surface_id": "variant-surface", "name": "Variant surface",
                 "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "a2a"},
@@ -8397,10 +8447,10 @@ mod tests {
                 "variants": [{"id": "candidate", "alias": "candidate", "name": "Candidate", "enabled": false}]
             }))
             .unwrap();
-            if case == "empty-catalog" {
+            if case.starts_with("empty-catalog") {
                 surface.variants.clear();
             }
-            if case == "missing-default" {
+            if case.ends_with("missing-default") {
                 surface.default_variant_id = Some("absent".into());
             }
             if case == "disabled-default" {
@@ -8408,9 +8458,174 @@ mod tests {
             }
             let path = match case {
                 "disabled" => "/outbound/mcp$candidate/partner-a",
-                "missing-default" | "disabled-default" => "/outbound/mcp/partner-a",
+                "missing-default" | "disabled-default" | "empty-catalog-missing-default" => "/outbound/mcp/partner-a",
                 _ => "/outbound/mcp$unknown/partner-a",
             };
+            let state = test_outbound_state();
+            state
+                .channel_state
+                .write()
+                .unwrap()
+                .surface = Arc::new(surface);
+            let method = match sent {
+                "GET" | "DELETE" => sent,
+                _ => "POST",
+            };
+            let mut request = Request::builder()
+                .method(method)
+                .uri(path)
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream");
+            let mut body = json!({"jsonrpc": "2.0", "id": "variant", "method": "tools/list"});
+            if modern {
+                request = request
+                    .header("mcp-method", "tools/list")
+                    .header("mcp-protocol-version", crate::mcp::MCP_MODERN_VERSION);
+                body["params"] = json!({"_meta": {
+                    "io.modelcontextprotocol/protocolVersion": crate::mcp::MCP_MODERN_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }});
+            }
+            if sent == "20 KiB" {
+                body["params"]["padding"] = json!("x".repeat(20 * 1024));
+            }
+            let body = match sent {
+                "malformed" => "not json".to_string(),
+                "GET" | "DELETE" => String::new(),
+                _ => body.to_string(),
+            };
+            let request = request
+                .body(axum::body::Body::from(body))
+                .unwrap();
+            let (response, events) =
+                crate::audit::producer::capture(Box::pin(outbound_proxy_handler_with_mcp_versions(
+                    "127.0.0.1:12345"
+                        .parse()
+                        .unwrap(),
+                    state,
+                    request,
+                    versions,
+                )))
+                .await;
+            let response = response.unwrap_or_else(|error| error.into_response());
+            assert_eq!(response.status().as_u16(), status, "{label}");
+            let content_type = response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            let answer: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 16384)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            if modern {
+                assert_eq!(content_type, "application/json", "{label}");
+                assert_eq!(answer["jsonrpc"], "2.0", "{label}: {answer}");
+                let id = (sent == "envelope").then_some("variant");
+                assert_eq!(
+                    answer
+                        .get("id")
+                        .and_then(serde_json::Value::as_str),
+                    id,
+                    "{label}: {answer}"
+                );
+                assert_eq!(answer.get("id").is_some(), id.is_some(), "{label}: no null id: {answer}");
+                assert_eq!(answer["error"]["code"], code, "{label}: {answer}");
+            } else {
+                assert_eq!(content_type, "application/problem+json", "{label}");
+                assert!(
+                    answer
+                        .get("jsonrpc")
+                        .is_none(),
+                    "{label}: {answer}"
+                );
+            }
+            let refusals: Vec<_> = events
+                .iter()
+                .filter_map(|event| match &event.event {
+                    crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                        stage,
+                        reason,
+                        http_status,
+                        rpc_error_code,
+                        requested_variant,
+                    } => Some((*stage, *reason, *http_status, *rpc_error_code, requested_variant.clone())),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                refusals,
+                vec![(
+                    RejectionStage::Routing,
+                    reason,
+                    Some(status),
+                    modern.then_some(code),
+                    requested_variant.map(str::to_string)
+                )],
+                "{label}"
+            );
+            let expected_variant = match reason {
+                RejectionReason::UnknownVariant => Some("_unknown_"),
+                RejectionReason::VariantDisabled => Some("candidate"),
+                _ => None,
+            };
+            assert_eq!(
+                events[0]
+                    .surface_variant
+                    .as_deref(),
+                expected_variant,
+                "{label}"
+            );
+            assert_eq!(
+                target
+                    .request_count
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_credential_delegation_line_names_the_request_variant() {
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+        let ctx = test_pipeline_context();
+
+        crate::observability::policy_audit::with_request_variant("beta", || log_fabric_delegation_withheld(&ctx));
+        log_fabric_delegation_withheld(&ctx);
+
+        let lines: Vec<String> = logs
+            .text()
+            .lines()
+            .filter(|line| line.contains("Delegated credentials withheld"))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("surface_variant=\"beta\""), "{}", lines[0]);
+        assert!(!lines[1].contains("surface_variant"), "{}", lines[1]);
+    }
+
+    #[tokio::test]
+    async fn every_transit_point_record_names_the_variant_that_served_it() {
+        for (variants, path, expected) in [
+            (json!([{"id": "v-beta", "alias": "beta", "name": "Beta"}]), "/outbound/mcp$beta/partner-a", "beta"),
+            (json!([]), "/outbound/mcp/partner-a", "_base_"),
+        ] {
+            let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+                "surface_id": "variant-surface", "name": "Variant surface",
+                "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "a2a"},
+                "target": {"endpoint": "http://127.0.0.1:1"},
+                "transit": {
+                    "shared": {"opa_policy_definition_id": "unavailable"},
+                    "points": [{"alias": "partner-a", "protocol": "mcp",
+                        "require_transit_token": false, "target_endpoint": "http://127.0.0.1:1"}]
+                },
+                "variants": variants
+            }))
+            .unwrap();
             let state = test_outbound_state();
             state
                 .channel_state
@@ -8420,52 +8635,28 @@ mod tests {
             let request = Request::builder()
                 .method("POST")
                 .uri(path)
-                .header("mcp-method", "tools/list")
-                .header("mcp-protocol-version", crate::mcp::MCP_MODERN_VERSION)
                 .header("content-type", "application/json")
-                .header("accept", "application/json, text/event-stream")
-                .body(axum::body::Body::from(
-                    json!({"jsonrpc": "2.0", "id": "variant", "method": "tools/list", "params": {"_meta": {
-                        "io.modelcontextprotocol/protocolVersion": crate::mcp::MCP_MODERN_VERSION,
-                        "io.modelcontextprotocol/clientCapabilities": {}
-                    }}})
-                    .to_string(),
-                ))
+                .body(axum::body::Body::from(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).to_string()))
                 .unwrap();
-            let response = Box::pin(outbound_proxy_handler_with_mcp_versions(
+            let (_, events) = crate::audit::producer::capture(Box::pin(outbound_proxy_handler_with_mcp_versions(
                 "127.0.0.1:12345"
                     .parse()
                     .unwrap(),
                 state,
                 request,
-                versions,
-            ))
-            .await
-            .unwrap_or_else(|error| error.into_response());
-            assert_eq!(
-                response.status(),
-                if matches!(case, "empty-catalog" | "unknown") {
-                    StatusCode::NOT_FOUND
-                } else {
-                    StatusCode::SERVICE_UNAVAILABLE
-                },
-                "{case}"
-            );
-            let error: serde_json::Value = serde_json::from_slice(
-                &axum::body::to_bytes(response.into_body(), 16384)
-                    .await
-                    .unwrap(),
-            )
-            .unwrap();
-            assert_eq!(error["id"], "variant");
-            assert!(error.get("result").is_none());
-            assert_eq!(
-                target
-                    .request_count
-                    .load(std::sync::atomic::Ordering::SeqCst),
-                0,
-                "{case}"
-            );
+                crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+            )))
+            .await;
+            assert!(!events.is_empty(), "{path}: the Transit Point request writes records");
+            for event in &events {
+                assert_eq!(
+                    event
+                        .surface_variant
+                        .as_deref(),
+                    Some(expected),
+                    "{path}: {event:?}"
+                );
+            }
         }
     }
 
@@ -8528,6 +8719,7 @@ mod tests {
                 .unwrap(),
             req,
             &state,
+            crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
         )
         .expect("context should resolve variant Transit Point");
 
@@ -8581,6 +8773,7 @@ mod tests {
                     .unwrap(),
                 request,
                 state,
+                crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
             );
             assert!(matches!(result, Err(OutboundPipelineError::OutboundDisabled)), "{path}");
         }
@@ -11535,6 +11728,7 @@ mod tests {
                     .unwrap(),
                 req,
                 &state,
+                crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
             )
             .expect("context resolves the Transit Point");
             step_collect_trust_context(&state, &mut ctx)
@@ -12635,30 +12829,6 @@ mod tests {
                 expected,
                 "{variant:?}"
             );
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn legacy_requests_get_no_delegated_credentials_after_variant_resolution_fails() {
-        let directory = tempfile::tempdir().unwrap();
-        let state = delegation_state(directory.path(), &[("provider", "transit-access")]).await;
-        let surface = transit_surface(
-            json!([meta_transit_point("partner", "https://partner.example/mcp", false, Some("provider"))]),
-            json!([]),
-        );
-
-        for (error, expected) in [
-            (None, json!("transit-access")),
-            (
-                Some(crate::config::agent_surface_variants::VariantResolveError::UnknownAlias("missing".into())),
-                serde_json::Value::Null,
-            ),
-        ] {
-            let (resolved, partner) = resolved_transit_point(&surface, None, "partner");
-            let mut ctx = legacy_delegation_context(resolved, partner);
-            let failed = error.is_some();
-            ctx.variant_resolution_error = error;
-            assert_eq!(injected_credential(&state, ctx).await, expected, "variant_resolution_failed={failed}");
         }
     }
 
