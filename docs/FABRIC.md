@@ -354,16 +354,23 @@ request received by the destination gateway:
    whatever the request timeout says (see [Fabric envelope
    lifetime](CONFIGURATION_RELOAD.md#fabric-envelope-lifetime)), leaving 120 s of clock skew below the
    receiver's cap; the caller deadline (`deadline_ms`) keeps the full timeout.
-3. Resolve the destination surface from the legacy wire field `channel_id`.
+3. Resolve the destination surface from the legacy wire field `channel_id`, then the variant that
+   serves it (see [Which variant serves a request over Fabric](#which-variant-serves-a-request-over-fabric)).
+   A variant that cannot be resolved is refused here, before source authentication: the alias is
+   the one the sending gateway's Target pins, not one the caller chose.
 4. Run the destination surface's configured source authentication and MCP request-boundary
    validation. DIDComm authentication proves the sending Gateway; source authentication separately
-   evaluates caller evidence presented to the destination surface. On an MCP surface that
-   publishes protected resource metadata, a missing or refused token is answered here with a
-   `401` before policy, without `resource_metadata`: the sending Gateway strips the caller's
-   own `Authorization` header, so only a credential it injects, issued for this surface's
-   resource, can pass. There is no A2A counterpart:
-   `A2A-Version` is negotiated and A2A requests are validated on the sending gateway, not here
-   (see below).
+   evaluates caller evidence presented to the destination surface. On a declaring Access Point,
+   MCP or A2A, a missing or refused token is answered here with a `401` before policy, and a
+   token short of the method's `required_scopes` with a `403` `error="insufficient_scope"`, both
+   with `realm="agent-gateway"` and without `resource_metadata`: the receiving gateway never
+   points a Fabric caller at protected resource metadata, and the sending gateway strips the caller's own `Authorization`
+   header, so only a credential it injects, issued for this surface's resource, can pass. The
+   sending gateway answers its caller `502` for both, with the detail `The Fabric peer refused the
+   gateway's authorization` and no challenge, and records `request_rejected` (stage `forward`, reason
+   `peer_token_refused` or `peer_scope_refused`); this receiving gateway records a blocking
+   `auth_failed` with `via_fabric: true` (see [Relayed challenges](SOURCE_AUTH.md#relayed-challenges)). A2A requests are validated, and
+   `A2A-Version` is negotiated, on the sending gateway, not here (see below).
 5. Build policy input containing the authenticated sending Gateway and any source-auth result. An
    identity presentation is attributed to the caller only when its issuer is one of the sending
    connection's issuers (see [Peer issuer DIDs](#peer-issuer-dids)).
@@ -375,6 +382,29 @@ request received by the destination gateway:
 
 The sending and receiving gateways enforce their own policies independently. For MCP surfaces, tool
 gating on each side composes: a tool hidden or denied by either surface remains unavailable.
+
+### Resource server across the Fabric
+
+The sending gateway is the resource server for its callers. Its Access Point declares,
+publishes protected resource metadata and challenges failed callers
+([declaring an Access Point](SOURCE_AUTH.md#declaring-an-access-point)), including when the
+Target is `fabric://` and the Access Point sets `protected_resource`. The refusal comes at source
+authentication, before the body is read and before rate limiting, policy, AP2, payment and the
+Fabric send, so a failed caller never costs a Fabric round trip.
+
+The send leg never forwards the caller's own token, whatever the method's `forward_header`
+says. The receiving gateway trusts the sending one through DIDComm peer authentication. Its own
+source authentication, step 4 above, sees only the headers the sending gateway forwarded, so
+`jwt_bearer` caller authentication on a surface that only Fabric callers reach sees them as
+failed unless the sending gateway injects a credential for it. Only the
+sending gateway declares and sends the challenge that names the metadata: a declaring Access Point on the receiving gateway
+refuses with the realm-only `401` or `403` above, and the sending gateway turns that `401` (when it carries no `Payment` challenge), and
+that `403` `insufficient_scope`, into `502` and removes every challenge but `Payment` from any
+other relayed response, so the caller never sees the receiving gateway's or its agent's
+authorization server ([caller challenge](SOURCE_AUTH.md#caller-challenge)). The mapping applies to
+every `fabric://` Access Point, declaring or not, because the caller's token never crosses Fabric,
+so no peer `401` is the caller's to fix. A sending gateway older than this release relays the
+receiving gateway's `401` and its challenge to its caller.
 
 ### Modern MCP activation
 
@@ -414,6 +444,49 @@ one variant of the sending surface to a particular peer variant, override that v
 with the pinned URL. A pinned alias the receiving surface doesn't have, or has disabled, is refused
 there (`unknown_variant` or `variant_disabled`); the sending gateway passes the `404` on to its
 caller on a `ForwardRequest`, and answers `502` when a stream's `Open` is refused.
+
+### Target authentication over Fabric
+
+A provider's credential never crosses Fabric. A surface whose Target is `fabric://` cannot save
+`credential_provider` Target Authentication, and a record loaded from disk fails with 502
+whatever its fallback. The receiving gateway resolves its own surface's `credential_provider`
+for its `https` Target, with the same caller gate and path confinement as a local request: DIDComm
+proves the sending gateway, not the caller, so the receiving surface needs its own caller
+authentication. A forwarded `GET` counts as the gateway's own card fetch, and carries the
+credential without a caller, only when its upstream URL, query included, is exactly one of the
+receiving surface's agent card URLs. On a surface with Target Authentication the receiving gateway
+then sends a `GET` it builds itself: no caller body, and of the caller's headers only `Accept`,
+`Accept-Language` and `User-Agent`, with the credential set last. A method override header, a body
+or a peer's `Authorization` therefore never rides on a credentialed request. Any other public
+discovery read, including the card path with a query, skips caller authentication and is forwarded
+without the credential, whatever Target Authentication method the surface uses.
+
+On a forwarded call the receiving gateway sends at most one credential under a header name. When a
+header that arrived in the `ForwardRequest` (after the source-auth credential and mapped headers are
+stripped), or a delegated credential the receiving gateway injects, has the Target Authentication
+header's name, a `static_secret` header is not added, because the receiving gateway cannot tell a
+delegated credential from another caller header and per-caller authority wins. A
+`credential_provider` header instead fails the call with `HeaderConflict`: 502 whatever the
+fallback, with a `token_not_found` audit event whose detail is `target_auth_header_conflict`. Use a
+`custom_header` for one of them when a surface needs both.
+
+A response header the Target repeats arrives in the `ForwardResponse` as an array of strings, and
+the sending gateway relays every value to the caller.
+
+The receiving gateway's agent card read for its surface policy context uses `fetch_target_card`
+([`src/proxy/target_card.rs`](../src/proxy/target_card.rs)). It resolves the credential with the
+same function as the card route (`card_fetch_credential`): each agent card URL in turn, with the
+surface's Target Authentication and fallback. When the
+surface's fallback refuses to read the card without the credential, the read yields no card, the
+surface policy runs without card context, and no rejection is recorded. A forwarded call that
+fails Target Authentication is answered with a 502 `ForwardResponse` whose problem `detail` is
+`Target authentication failed`. A modern delegated credential the receiving gateway cannot
+inject is answered with a 500 problem `ForwardResponse` (`Invalid delegated credential metadata`
+or `Invalid delegated credential header`). A `static_secret` Target Authentication on the sending
+gateway travels in the `ForwardRequest`, unless a modern delegated credential on the same leg
+already uses its header name, in which case the delegated credential takes its place. The sending gateway's own card read for a `fabric://` surface goes through its
+Access Point and the Fabric, so the receiving gateway attaches the credential. See
+[Target Authentication through a provider](CREDENTIAL_DELEGATION.md#target-authentication-through-a-provider).
 
 ### Delegated credentials over Fabric
 

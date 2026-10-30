@@ -7,9 +7,12 @@ use std::sync::atomic::Ordering;
 
 use serde_json::{Value, json};
 
+use crate::audit::events::AuthScheme;
 use crate::audit::request_events::{RejectionReason, RejectionStage};
 use crate::component_tests::helpers::MockServer;
+use crate::component_tests::helpers::jwt::{JwksFixture, now_secs, sign_jwt};
 use crate::config::agent_surface::AgentSurface;
+use crate::config::agent_surface_variants::SurfaceVariant;
 use crate::delegation_vault::audit::{DelegationAuditAction, DelegationAuditEvent};
 
 pub(super) fn surface(
@@ -640,7 +643,7 @@ async fn a_modern_mcp_body_over_sixteen_kib_is_refused_for_its_variant_without_a
 
 /// A body that sends the start of an envelope with an id, then nothing more.
 /// `stalled` is told once the reader waits for the rest.
-fn stalled_body(stalled: tokio::sync::oneshot::Sender<()>) -> axum::body::Body {
+pub(super) fn stalled_body(stalled: tokio::sync::oneshot::Sender<()>) -> axum::body::Body {
     let mut stalled = Some(stalled);
     let prefix = futures::stream::iter([Ok::<_, std::io::Error>(bytes::Bytes::from_static(
         br#"{"jsonrpc":"2.0","id":"variant","#,
@@ -825,4 +828,326 @@ async fn a_surface_with_variants_but_no_default_serves_an_alias_less_request_fro
             .load(Ordering::SeqCst),
         1
     );
+}
+
+/// The issuer the strategy `idp` trusts.
+const IDP_ISSUER: &str = "https://idp.example";
+
+/// JWT Bearer caller authentication declaring the protected resource at `route`.
+pub(super) fn declaring_caller_authentication(route: &str) -> Value {
+    json!({
+        "methods": [{"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": []}],
+        "protected_resource": {"resource": format!("https://gateway.example{route}")}
+    })
+}
+
+/// An MCP surface at `/mcp` whose base does not authenticate callers and whose
+/// variants `prod` and `beta` declare; `off` is disabled.
+fn surface_declaring_through_variants(default_variant_id: Option<&str>) -> AgentSurface {
+    let mut surface = mcp_surface(default_variant_id);
+    for variant in surface
+        .variants
+        .iter_mut()
+        .filter(|variant| variant.alias != "off")
+    {
+        variant.overrides = serde_json::from_value(
+            json!({"access_point": {"caller_authentication": declaring_caller_authentication("/mcp")}}),
+        )
+        .unwrap();
+    }
+    surface
+}
+
+/// [`mcp_surface`] whose base declares.
+pub(super) fn surface_declaring_on_its_base(default_variant_id: Option<&str>) -> AgentSurface {
+    let mut surface = mcp_surface(default_variant_id);
+    surface
+        .access_point
+        .caller_authentication = Some(serde_json::from_value(declaring_caller_authentication("/mcp")).unwrap());
+    surface
+}
+
+/// [`router`] with source authentication, and the directory its strategies are
+/// stored in, which the caller keeps alive.
+pub(super) async fn authenticating_router(
+    surface: AgentSurface
+) -> (crate::state::MultiSurfaceProxyState, tempfile::TempDir) {
+    authenticating_router_trusting(surface, None).await
+}
+
+/// [`authenticating_router`] whose strategy `idp` reads the keys `fixture`
+/// serves, when one is given.
+pub(super) async fn authenticating_router_trusting(
+    surface: AgentSurface,
+    fixture: Option<&JwksFixture>,
+) -> (crate::state::MultiSurfaceProxyState, tempfile::TempDir) {
+    let directory = tempfile::tempdir().unwrap();
+    let mut router = router(surface);
+    router.source_auth_middleware =
+        Some(idp_middleware(directory.path(), fixture, Arc::clone(&router.didauth_session_store)).await);
+    (router, directory)
+}
+
+/// Source authentication whose strategy `idp`, stored under `directory`, trusts
+/// [`IDP_ISSUER`] and reads its keys from `fixture`, when one is given.
+pub(super) async fn idp_middleware(
+    directory: &std::path::Path,
+    fixture: Option<&JwksFixture>,
+    didauth_sessions: Arc<crate::didauth::DidAuthSessionStore>,
+) -> Arc<crate::source_auth::SourceAuthMiddleware> {
+    let strategies = directory.join("strategies");
+    std::fs::create_dir_all(&strategies).unwrap();
+    let jwks_uri = format!("{}/.well-known/jwks.json", fixture.map_or(IDP_ISSUER, |fixture| fixture.issuer.as_str()));
+    std::fs::write(
+        strategies.join("idp.json"),
+        json!({
+            "id": "idp", "name": "IdP", "expected_issuer": IDP_ISSUER,
+            "jwks_source": {"type": "remote", "jwks_uri": jwks_uri},
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let strategies = Arc::new(
+        crate::jwt_bearer::storage::FileSystemJwtVerificationStrategyStore::new(strategies)
+            .await
+            .unwrap(),
+    );
+    Arc::new(crate::source_auth::SourceAuthMiddleware::new(
+        didauth_sessions,
+        strategies,
+        Arc::new(crate::jwt_bearer::JwksClient::new()),
+        None,
+        Arc::new(dashmap::DashMap::new()),
+        None,
+        None,
+    ))
+}
+
+/// Sends a legacy MCP `tools/list` without credentials and returns the status,
+/// the `WWW-Authenticate` challenge and every audit record the request wrote.
+async fn send_without_credentials(
+    router: crate::state::MultiSurfaceProxyState,
+    path: &str,
+) -> (u16, Option<String>, Vec<DelegationAuditEvent>) {
+    send_with_bearer(router, path, None).await
+}
+
+/// [`send_without_credentials`] presenting `bearer`, when one is given.
+async fn send_with_bearer(
+    router: crate::state::MultiSurfaceProxyState,
+    path: &str,
+    bearer: Option<&str>,
+) -> (u16, Option<String>, Vec<DelegationAuditEvent>) {
+    let mut request = axum::http::Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-protocol-version", crate::mcp::MCP_LEGACY_VERSION);
+    if let Some(bearer) = bearer {
+        request = request.header("authorization", format!("Bearer {bearer}"));
+    }
+    let request = request
+        .body(axum::body::Body::from(json!({"jsonrpc": "2.0", "id": "variant", "method": "tools/list"}).to_string()))
+        .unwrap();
+    let (response, events) =
+        crate::audit::producer::capture(Box::pin(super::multi_channel_proxy_handler_with_mcp_runtime(
+            "127.0.0.1:12345"
+                .parse()
+                .unwrap(),
+            router,
+            request,
+            crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+            None,
+        )))
+        .await;
+    let challenge = response
+        .headers()
+        .get("www-authenticate")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    (response.status().as_u16(), challenge, events)
+}
+
+/// The `surface_variant` of each `auth_failed` record.
+fn auth_failures(events: &[DelegationAuditEvent]) -> Vec<Option<String>> {
+    events
+        .iter()
+        .filter(|event| matches!(event.event, DelegationAuditAction::AuthFailed { .. }))
+        .map(|event| event.surface_variant.clone())
+        .collect()
+}
+
+const BARE_ROUTE_CHALLENGE: &str =
+    "Bearer resource_metadata=\"https://gateway.example/.well-known/oauth-protected-resource/mcp\"";
+
+/// A caller without credentials whose variant cannot be resolved gets the
+/// challenge the route answers when its URL names no variant, built from the
+/// surface that route serves, and the refusal is not recorded.
+#[tokio::test]
+async fn a_failed_caller_whose_variant_cannot_be_resolved_gets_the_bare_routes_challenge() {
+    let cases = [
+        (
+            "default variant declares, unknown alias",
+            surface_declaring_through_variants(Some("v-prod")),
+            "/mcp$missing",
+            Some("_unknown_"),
+        ),
+        (
+            "default variant declares, disabled alias",
+            surface_declaring_through_variants(Some("v-prod")),
+            "/mcp$off",
+            Some("off"),
+        ),
+        ("base declares, misconfigured default", surface_declaring_on_its_base(Some("removed")), "/mcp", None),
+        ("base declares, disabled default", surface_declaring_on_its_base(Some("v-off")), "/mcp", Some("off")),
+    ];
+    for (case, surface, path, variant) in cases {
+        let (router, _strategies) = authenticating_router(surface).await;
+
+        let (status, challenge, events) = send_without_credentials(router, path).await;
+
+        assert_eq!(status, 401, "{case}");
+        assert_eq!(challenge.as_deref(), Some(BARE_ROUTE_CHALLENGE), "{case}");
+        assert_eq!(auth_failures(&events), vec![variant.map(str::to_string)], "{case}: one auth_failed record");
+        assert!(refusals(&events).is_empty(), "{case}: no routing refusal: {events:?}");
+    }
+}
+
+/// The bare route's challenge is the one the bare route itself answers.
+#[tokio::test]
+async fn the_bare_route_answers_the_challenge_an_unresolved_variant_is_given() {
+    let (router, _strategies) = authenticating_router(surface_declaring_through_variants(Some("v-prod"))).await;
+
+    let (status, challenge, events) = send_without_credentials(router, "/mcp").await;
+
+    assert_eq!(status, 401);
+    assert_eq!(challenge.as_deref(), Some(BARE_ROUTE_CHALLENGE));
+    assert_eq!(auth_failures(&events), vec![Some("prod".to_string())]);
+}
+
+/// Where only variants declare and no default is set, the bare route does not
+/// declare, so a caller without credentials gets the routing refusal for an
+/// unknown alias, while a known declaring variant answers with its own challenge.
+#[tokio::test]
+async fn without_a_declaring_bare_route_an_unresolved_variant_is_refused_and_a_known_one_challenges() {
+    let (router, _strategies) = authenticating_router(surface_declaring_through_variants(None)).await;
+    let (status, challenge, events) = send_without_credentials(router, "/mcp$missing").await;
+    assert_eq!((status, challenge), (404, None));
+    assert_eq!(refusals(&events).len(), 1, "{events:?}");
+    assert!(auth_failures(&events).is_empty(), "{events:?}");
+
+    let (router, _strategies) = authenticating_router(surface_declaring_through_variants(None)).await;
+    let (status, challenge, _) = send_without_credentials(router, "/mcp$beta").await;
+    assert_eq!(status, 401);
+    assert_eq!(
+        challenge.as_deref(),
+        Some("Bearer resource_metadata=\"https://gateway.example/.well-known/oauth-protected-resource/mcp$beta\""),
+        "a known variant names its own resource"
+    );
+}
+
+/// The surface variant, scheme, reason and blocking flag of each `auth_failed` record.
+pub(super) fn auth_failure_records(events: &[DelegationAuditEvent]) -> Vec<(Option<String>, AuthScheme, String, bool)> {
+    events
+        .iter()
+        .filter_map(|event| match &event.event {
+            DelegationAuditAction::AuthFailed { scheme, reason, blocking, .. } => {
+                Some((event.surface_variant.clone(), *scheme, reason.clone(), *blocking))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The surface variant of each `request_rejected` record.
+fn refusal_variants(events: &[DelegationAuditEvent]) -> Vec<Option<String>> {
+    events
+        .iter()
+        .filter(|event| matches!(event.event, DelegationAuditAction::RequestRejected { .. }))
+        .map(|event| event.surface_variant.clone())
+        .collect()
+}
+
+/// A token [`IDP_ISSUER`] signs, with the keys `fixture` serves, for `audience`.
+pub(super) fn idp_token(
+    fixture: &JwksFixture,
+    audience: &str,
+) -> String {
+    sign_jwt(
+        json!({
+            "iss": IDP_ISSUER, "sub": "client", "aud": audience,
+            "exp": now_secs() + 300, "iat": now_secs(),
+        }),
+        &fixture.kid,
+    )
+}
+
+/// A token the trusted IdP signs for the declared resource.
+fn resource_token(fixture: &JwksFixture) -> String {
+    idp_token(fixture, "https://gateway.example/mcp")
+}
+
+/// A caller that fails authentication on a declaring Access Point and names a
+/// variant that cannot be resolved is recorded once, as a blocking `auth_failed`
+/// naming the variant the refusal would have named, with the reason the
+/// declaration reports, and never as a routing refusal.
+#[tokio::test]
+async fn a_failed_caller_whose_variant_cannot_be_resolved_is_recorded_as_one_blocking_auth_failure() {
+    let fixture = JwksFixture::start().await;
+    let cases = [
+        ("unknown alias, no token", "/mcp$missing", None, SurfaceVariant::UNKNOWN, "missing_credential"),
+        (
+            "unknown alias, invalid token",
+            "/mcp$missing",
+            Some("not-a-jwt"),
+            SurfaceVariant::UNKNOWN,
+            "invalid_credential",
+        ),
+        ("disabled alias, no token", "/mcp$off", None, "off", "missing_credential"),
+        ("disabled alias, invalid token", "/mcp$off", Some("not-a-jwt"), "off", "invalid_credential"),
+    ];
+    for (case, path, bearer, variant, reason) in cases {
+        let (router, _strategies) =
+            authenticating_router_trusting(surface_declaring_through_variants(Some("v-prod")), Some(&fixture)).await;
+
+        let (status, _, events) = send_with_bearer(router, path, bearer).await;
+
+        assert_eq!(status, 401, "{case}");
+        assert_eq!(
+            auth_failure_records(&events),
+            vec![(Some(variant.to_string()), AuthScheme::Jwt, reason.to_string(), true)],
+            "{case}"
+        );
+        assert!(refusal_variants(&events).is_empty(), "{case}: no request_rejected record: {events:?}");
+    }
+}
+
+/// An authenticated caller naming a variant that cannot be resolved is refused
+/// at routing, recorded as a `request_rejected` naming the same variant a failed
+/// caller's `auth_failed` names, and never as an authentication failure.
+#[tokio::test]
+async fn an_authenticated_caller_whose_variant_cannot_be_resolved_is_recorded_as_a_routing_refusal() {
+    let fixture = JwksFixture::start().await;
+    let cases = [
+        (
+            "unknown alias",
+            "/mcp$missing",
+            SurfaceVariant::UNKNOWN,
+            refused(RejectionReason::UnknownVariant, 404, Some("missing")),
+        ),
+        ("disabled alias", "/mcp$off", "off", refused(RejectionReason::VariantDisabled, 404, None)),
+    ];
+    for (case, path, variant, expected) in cases {
+        let (router, _strategies) =
+            authenticating_router_trusting(surface_declaring_through_variants(Some("v-prod")), Some(&fixture)).await;
+
+        let (status, challenge, events) = send_with_bearer(router, path, Some(&resource_token(&fixture))).await;
+
+        assert_eq!((status, challenge), (404, None), "{case}");
+        assert_eq!(refusals(&events), expected, "{case}");
+        assert_eq!(refusal_variants(&events), vec![Some(variant.to_string())], "{case}");
+        assert!(auth_failure_records(&events).is_empty(), "{case}: no auth_failed record: {events:?}");
+    }
 }

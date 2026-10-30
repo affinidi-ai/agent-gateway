@@ -4,9 +4,14 @@
 //! lightweight axum mock target server and exposes the channel listen address for
 //! test assertions.
 
+pub(crate) mod admin_api;
 pub(crate) mod audit_events;
+pub(crate) mod card_security;
 pub(crate) mod formatted_logs;
 pub mod jwt;
+pub(crate) mod mock_auth_server;
+pub(crate) mod oidc_keys;
+pub(crate) mod test_mode;
 pub(crate) mod thread_subscriber;
 
 use std::collections::HashMap;
@@ -179,6 +184,25 @@ pub fn free_port() -> (u16, ReservedPort) {
 
 // ── mock target server ───────────────────────────────────────────────────────
 
+/// The request's headers by name. A header sent more than once keeps every value,
+/// joined with `, ` in the order received, so a test can see a duplicate.
+fn received_headers(headers: &axum::http::HeaderMap) -> HashMap<String, String> {
+    let mut received: HashMap<String, String> = HashMap::new();
+    for (name, value) in headers {
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        received
+            .entry(name.as_str().to_string())
+            .and_modify(|joined| {
+                joined.push_str(", ");
+                joined.push_str(value);
+            })
+            .or_insert_with(|| value.to_string());
+    }
+    received
+}
+
 /// The details of a request received by the mock server.
 #[derive(Clone, Debug)]
 pub struct ReceivedRequest {
@@ -285,15 +309,7 @@ impl MockServer {
                     counter.fetch_add(1, Ordering::SeqCst);
                     let method = req.method().to_string();
                     let path = req.uri().path().to_string();
-                    let headers: HashMap<String, String> = req
-                        .headers()
-                        .iter()
-                        .filter_map(|(k, v)| {
-                            v.to_str()
-                                .ok()
-                                .map(|v| (k.as_str().to_string(), v.to_string()))
-                        })
-                        .collect();
+                    let headers = received_headers(req.headers());
                     let body = axum::body::to_bytes(req.into_body(), usize::MAX)
                         .await
                         .unwrap_or_default();
@@ -389,15 +405,7 @@ impl MockServer {
                         counter.fetch_add(1, Ordering::SeqCst);
                         let method = req.method().to_string();
                         let path = req.uri().path().to_string();
-                        let headers: HashMap<String, String> = req
-                            .headers()
-                            .iter()
-                            .filter_map(|(k, v)| {
-                                v.to_str()
-                                    .ok()
-                                    .map(|v| (k.as_str().to_string(), v.to_string()))
-                            })
-                            .collect();
+                        let headers = received_headers(req.headers());
                         let body = axum::body::to_bytes(req.into_body(), usize::MAX)
                             .await
                             .unwrap_or_default();
@@ -473,15 +481,7 @@ impl MockServer {
                         counter.fetch_add(1, Ordering::SeqCst);
                         let method = req.method().to_string();
                         let path = req.uri().path().to_string();
-                        let headers: HashMap<String, String> = req
-                            .headers()
-                            .iter()
-                            .filter_map(|(k, v)| {
-                                v.to_str()
-                                    .ok()
-                                    .map(|v| (k.as_str().to_string(), v.to_string()))
-                            })
-                            .collect();
+                        let headers = received_headers(req.headers());
                         let body = axum::body::to_bytes(req.into_body(), usize::MAX)
                             .await
                             .unwrap_or_default();
@@ -1030,6 +1030,78 @@ pub fn configure_admin_api(bootstrap: &BootstrapConfig) -> reqwest::Client {
         .unwrap()
 }
 
+/// Seed an administrator and an access token they own into the gateway's stores
+/// before it boots: with `resource_pattern`, a token scoped to tenant
+/// `tenant-a`'s surfaces; without one, a token scoped by its required
+/// `x-external-account` header alone. Returns a client that sends the token and
+/// the header.
+pub(crate) fn seed_scoped_access_token(
+    bootstrap: &crate::config::BootstrapConfig,
+    resource_pattern: Option<&str>,
+) -> reqwest::Client {
+    let now = chrono::Utc::now();
+    let owner = "tenant-token-owner";
+    let user: crate::auth::storage::UserData = serde_json::from_value(serde_json::json!({
+        "user_id": owner, "username": owner, "passkeys": [], "role": "administrator", "status": "approved",
+        "created_at": now, "updated_at": now
+    }))
+    .unwrap();
+    let passkeys = std::path::Path::new(
+        &bootstrap
+            .storage_paths
+            .passkeys,
+    );
+    std::fs::create_dir_all(passkeys).unwrap();
+    std::fs::write(passkeys.join(format!("{owner}.json")), serde_json::to_vec(&user).unwrap()).unwrap();
+
+    let (id, secret) = crate::access_tokens::generate_token();
+    let token = crate::access_tokens::AccessToken {
+        id: id.clone(),
+        name: "tenant token".to_string(),
+        description: String::new(),
+        token_hash: crate::access_tokens::store::hash_secret(&secret),
+        user_id: owner.to_string(),
+        scopes: Vec::new(),
+        resource_pattern: resource_pattern.map(str::to_string),
+        required_headers: vec![crate::auth_manager::resource_scope::RequiredHeader {
+            name: "x-external-account".to_string(),
+            pattern: "tenant-a".to_string(),
+        }],
+        created_by: owner.to_string(),
+        parent_token_id: None,
+        delegation_depth: 0,
+        created_at: now,
+        last_used_at: None,
+        expires_at: None,
+        revoked_at: None,
+        rotation_generation: 0,
+        rotated_at: None,
+        rotated_by: None,
+    };
+    let tokens = std::path::Path::new(
+        &bootstrap
+            .storage_paths
+            .secrets,
+    )
+    .parent()
+    .unwrap()
+    .join("access_tokens");
+    std::fs::create_dir_all(&tokens).unwrap();
+    std::fs::write(tokens.join(format!("{id}.json")), serde_json::to_vec(&token).unwrap()).unwrap();
+
+    let mut headers = reqwest::header::HeaderMap::new();
+    let mut authorization = reqwest::header::HeaderValue::from_str(&format!("Bearer {secret}")).unwrap();
+    authorization.set_sensitive(true);
+    headers.insert(reqwest::header::AUTHORIZATION, authorization);
+    headers.insert("x-external-account", reqwest::header::HeaderValue::from_static("tenant-a"));
+    reqwest::Client::builder()
+        .no_proxy()
+        .default_headers(headers)
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap()
+}
+
 /// Build a single `ChannelMapping` with placeholder addresses.
 ///
 /// Uses JSON deserialization so serde defaults apply for every optional field,
@@ -1360,6 +1432,37 @@ impl Drop for GatewayServer {
     }
 }
 
+thread_local! {
+    static GATEWAY_LOG: std::cell::RefCell<Option<tracing::subscriber::DefaultGuard>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A layer writing `info` and higher events, and every `policy_audit`
+/// decision, to `log` as the gateway's log file renders them.
+fn gateway_log_layer<S>(log: Arc<std::fs::File>) -> impl tracing_subscriber::Layer<S>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::filter::{LevelFilter, Targets};
+
+    tracing_subscriber::fmt::layer()
+        .event_format(crate::observability::SimpleFormat)
+        .with_writer(log)
+        .with_ansi(false)
+        .with_filter(
+            Targets::new()
+                .with_default(LevelFilter::INFO)
+                .with_target("policy_audit", LevelFilter::DEBUG),
+        )
+}
+
+fn gateway_log_dispatch(log: Arc<std::fs::File>) -> tracing::Dispatch {
+    use tracing_subscriber::layer::SubscriberExt;
+
+    tracing::Dispatch::new(tracing_subscriber::registry().with(gateway_log_layer(log)))
+}
+
 /// The `WARN` and `ERROR` lines a harness gateway logs on its own thread, which
 /// runs `run_axum_proxy` and so its startup checks. Work the gateway spawns,
 /// such as serving requests, runs on the runtime's workers and is not kept.
@@ -1384,22 +1487,30 @@ impl std::io::Write for StartupLog {
 }
 
 impl StartupLog {
-    /// Makes this thread log to the test output as [`ensure_tracing`] does and
-    /// keep its `WARN` and `ERROR` lines, until the guard drops.
-    fn capture_on_this_thread(&self) -> tracing::subscriber::DefaultGuard {
+    /// Makes this thread log to `gateway_log`, or without one to the test
+    /// output as [`ensure_tracing`] does, and keep its `WARN` and `ERROR`
+    /// lines, until the guard drops.
+    fn capture_on_this_thread(
+        &self,
+        gateway_log: Option<Arc<std::fs::File>>,
+    ) -> tracing::subscriber::DefaultGuard {
         use tracing_subscriber::Layer;
         use tracing_subscriber::layer::SubscriberExt;
         let log = self.clone();
+        let test_output = gateway_log
+            .is_none()
+            .then(|| {
+                tracing_subscriber::fmt::layer()
+                    .with_test_writer()
+                    .with_filter(
+                        tracing_subscriber::EnvFilter::try_from_default_env()
+                            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                    )
+            });
         thread_subscriber::set_thread_default(
             tracing_subscriber::registry()
-                .with(
-                    tracing_subscriber::fmt::layer()
-                        .with_test_writer()
-                        .with_filter(
-                            tracing_subscriber::EnvFilter::try_from_default_env()
-                                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-                        ),
-                )
+                .with(gateway_log.map(gateway_log_layer))
+                .with(test_output)
                 .with(
                     tracing_subscriber::fmt::layer()
                         .with_ansi(false)
@@ -1414,9 +1525,12 @@ impl StartupLog {
     }
 }
 
+/// Runs the gateway on its own thread and runtime. With `log`, every thread of
+/// that runtime writes its log there instead of to the test output.
 fn spawn_gateway_server(
     gw_config: GatewayConfig,
     bootstrap: BootstrapConfig,
+    log: Option<std::fs::File>,
 ) -> GatewayServer {
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let startup_log = StartupLog::default();
@@ -1425,10 +1539,18 @@ fn spawn_gateway_server(
         .name("gw-harness".to_string())
         .stack_size(8 * 1024 * 1024)
         .spawn(move || {
-            let _log = thread_log.capture_on_this_thread();
-            let rt = tokio::runtime::Builder::new_multi_thread()
+            let log = log.map(Arc::new);
+            let _log = thread_log.capture_on_this_thread(log.clone());
+            let mut runtime = tokio::runtime::Builder::new_multi_thread();
+            runtime
                 .enable_all()
-                .thread_stack_size(8 * 1024 * 1024)
+                .thread_stack_size(8 * 1024 * 1024);
+            if let Some(log) = log.map(gateway_log_dispatch) {
+                runtime
+                    .on_thread_start(move || GATEWAY_LOG.set(Some(thread_subscriber::set_thread_dispatch(&log))))
+                    .on_thread_stop(|| GATEWAY_LOG.set(None));
+            }
+            let rt = runtime
                 .build()
                 .expect("build gateway harness runtime");
             rt.block_on(async move {
@@ -1470,6 +1592,7 @@ pub struct GatewayHarness {
     _port_guard: ReservedPort,
     _outbound_port_guard: Option<ReservedPort>,
     _gw_server: GatewayServer,
+    log: Option<PathBuf>,
 }
 
 async fn wait_for_gateway_http(
@@ -1543,7 +1666,7 @@ impl GatewayHarness {
         let mode_boot_guard = crate::server::mode::TEST_GUARD
             .lock()
             .await;
-        let gw_server = spawn_gateway_server(gw_config, bootstrap);
+        let gw_server = spawn_gateway_server(gw_config, bootstrap, None);
 
         wait_for_gateway_http(channel_port, "gateway").await;
         drop(mode_boot_guard);
@@ -1557,6 +1680,7 @@ impl GatewayHarness {
             _port_guard: port_guard,
             _outbound_port_guard: None,
             _gw_server: gw_server,
+            log: None,
         }
     }
 
@@ -1565,6 +1689,39 @@ impl GatewayHarness {
     pub async fn start_with_mock<F>(
         mock: MockServer,
         setup: F,
+    ) -> Self
+    where
+        F: FnOnce(&std::path::Path, &mut GatewayConfig, &mut BootstrapConfig),
+    {
+        Self::boot_with_mock(mock, setup, false).await
+    }
+
+    /// Same as [`start_with_mock`](Self::start_with_mock), keeping the
+    /// gateway's log for [`logs`](Self::logs).
+    pub(crate) async fn start_with_mock_and_logs<F>(
+        mock: MockServer,
+        setup: F,
+    ) -> Self
+    where
+        F: FnOnce(&std::path::Path, &mut GatewayConfig, &mut BootstrapConfig),
+    {
+        Self::boot_with_mock(mock, setup, true).await
+    }
+
+    /// The `info` and higher lines, and the `policy_audit` decisions, the gateway
+    /// logged so far, as its log file renders them.
+    pub(crate) fn logs(&self) -> String {
+        let log = self
+            .log
+            .as_ref()
+            .expect("start the harness with start_with_mock_and_logs to read its logs");
+        std::fs::read_to_string(log).expect("read the gateway log")
+    }
+
+    async fn boot_with_mock<F>(
+        mock: MockServer,
+        setup: F,
+        keep_log: bool,
     ) -> Self
     where
         F: FnOnce(&std::path::Path, &mut GatewayConfig, &mut BootstrapConfig),
@@ -1579,6 +1736,13 @@ impl GatewayHarness {
             .tempdir()
             .expect("tempdir");
         let gateway_json = write_gateway_json(temp.path(), channel_port, None);
+        let log = keep_log.then(|| {
+            temp.path()
+                .join("gateway.log")
+        });
+        let log_file = log
+            .as_ref()
+            .map(|path| std::fs::File::create(path).expect("create the gateway log"));
 
         let mut bootstrap = build_bootstrap_config(&temp, gateway_json);
         let mut gw_config = build_gateway_config(&bootstrap);
@@ -1597,7 +1761,7 @@ impl GatewayHarness {
         let mode_boot_guard = crate::server::mode::TEST_GUARD
             .lock()
             .await;
-        let gw_server = spawn_gateway_server(gw_config, bootstrap);
+        let gw_server = spawn_gateway_server(gw_config, bootstrap, log_file);
 
         wait_for_gateway_http(channel_port, "gateway").await;
         drop(mode_boot_guard);
@@ -1611,6 +1775,7 @@ impl GatewayHarness {
             _port_guard: port_guard,
             _outbound_port_guard: None,
             _gw_server: gw_server,
+            log,
         }
     }
 
@@ -1660,7 +1825,7 @@ impl GatewayHarness {
         let mode_boot_guard = crate::server::mode::TEST_GUARD
             .lock()
             .await;
-        let gw_server = spawn_gateway_server(gw_config, bootstrap);
+        let gw_server = spawn_gateway_server(gw_config, bootstrap, None);
 
         wait_for_gateway_http(channel_port, "gateway").await;
         wait_for_gateway_http(outbound_port, "outbound listener").await;
@@ -1675,6 +1840,7 @@ impl GatewayHarness {
             _port_guard: port_guard,
             _outbound_port_guard: Some(outbound_port_guard),
             _gw_server: gw_server,
+            log: None,
         }
     }
 
@@ -1718,7 +1884,7 @@ impl GatewayHarness {
         let mode_boot_guard = crate::server::mode::TEST_GUARD
             .lock()
             .await;
-        let gw_server = spawn_gateway_server(gw_config, bootstrap);
+        let gw_server = spawn_gateway_server(gw_config, bootstrap, None);
 
         wait_for_gateway_http(channel_port, "gateway").await;
         wait_for_gateway_http(outbound_port, "outbound listener").await;
@@ -1733,6 +1899,7 @@ impl GatewayHarness {
             _port_guard: port_guard,
             _outbound_port_guard: Some(outbound_port_guard),
             _gw_server: gw_server,
+            log: None,
         }
     }
 }
@@ -1802,4 +1969,77 @@ pub fn configure_gateway_route_prefixes(
         serde_json::to_string_pretty(&gateway_json).expect("serialize gateway network config"),
     )
     .expect("write gateway network config");
+}
+
+/// A listener's state holding one running surface, as the listener builds it from
+/// `state`'s stores.
+pub(crate) fn direct_router_state(
+    state: &crate::state::ProxyState,
+    surface: AgentSurface,
+) -> crate::state::MultiSurfaceProxyState {
+    crate::state::MultiSurfaceProxyState {
+        config: state.config.clone(),
+        network_config: state.network_config.clone(),
+        client: state.client.clone(),
+        channels: Arc::new(tokio::sync::RwLock::new(vec![crate::state::SurfaceInfo {
+            surface: Arc::new(surface),
+            identity_rules_engine: None,
+            identity_selector: None,
+            protected_rules_engine: None,
+            protected_selector: None,
+            external_rules_engine: None,
+            external_selector: None,
+            task_id: "router-fixture".into(),
+            variant_engines: HashMap::new(),
+        }])),
+        metrics_store: state.metrics_store.clone(),
+        task_monitor: state.task_monitor.clone(),
+        ws_state: state.ws_state.clone(),
+        listener_manager: state.listener_manager.clone(),
+        secrets_store: state.secrets_store.clone(),
+        certificates_store: state
+            .certificates_store
+            .clone(),
+        vc_issuer: state.vc_issuer.clone(),
+        policy_manager: state.policy_manager.clone(),
+        gateway_policy_manager: state
+            .gateway_policy_manager
+            .clone(),
+        didauth_session_store: state
+            .didauth_session_store
+            .clone(),
+        transaction_store: state
+            .transaction_store
+            .clone(),
+        mpp_transaction_store: state
+            .mpp_transaction_store
+            .clone(),
+        trust_registry_listener_manager: state
+            .trust_registry_listener_manager
+            .clone(),
+        source_auth_middleware: state
+            .source_auth_middleware
+            .clone(),
+        #[cfg(feature = "didwebvh")]
+        didwebvh_identity_store: state
+            .didwebvh_identity_store
+            .clone(),
+        #[cfg(feature = "didwebvh")]
+        didwebvh_log_manager: state
+            .didwebvh_log_manager
+            .clone(),
+        credential_provider_store: state
+            .credential_provider_store
+            .clone(),
+        delegation_vault_store: state
+            .delegation_vault_store
+            .clone(),
+        gateway_base_url: state.gateway_base_url.clone(),
+        transit_token_issuer: state
+            .transit_token_issuer
+            .clone(),
+        mcp_proxy_store: state.mcp_proxy_store.clone(),
+        a2a_proxy_store: state.a2a_proxy_store.clone(),
+        resolved_surface_cache: Arc::new(crate::surfaces::ResolvedSurfaceCache::new()),
+    }
 }

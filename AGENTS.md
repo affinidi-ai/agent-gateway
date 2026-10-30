@@ -32,7 +32,7 @@ Project glossary (ubiquitous language) lives in [`CONTEXT.md`](CONTEXT.md). Use 
 9. **Single Rust binary** (`agent-gateway`), source in `src/`, DashMap cache + filesystem JSON storage, surfaces hot-reloadable. No restart unless modifying startup-only config. Runs in Active or Standby mode (`server_mode` in bootstrap config, default `active`). Health is `GET /api/v1/health` (200 Active-and-ready, 503 Standby); liveness is `GET /api/v1/alive` (always 200); router-relative paths are `/v1/health` and `/v1/alive`. See [`docs/CONFIGURATION_RELOAD.md`](docs/CONFIGURATION_RELOAD.md#server-mode) for the modes and `cache_refresh_interval_secs`.
 10. **`AgentSurface`** (`src/config/agent_surface.rs`) is the central routing unit. All proxy behavior hangs off it. Read the surface before touching the pipeline. (Channel-shaped accessors on `AgentSurface`, mirroring the legacy `ChannelMapping` field shapes, live in `src/config/agent_surface_accessors.rs` for mechanical call-site sweeps.)
 11. **OPA = Regorus** (Rust-native Rego, no external process). Gateway-level before surface-level.
-12. **DashMap is authoritative at runtime.** Disk writes immediate. Manual `_storage/` edits need restart or `POST /v1/config/reload` — unless `cache_refresh_interval_secs` > 0, in which case **DashMap-backed** cached stores pick up external/manual disk writes within that interval (their serialized refresh scans reconcile cache with disk). RwLock-backed stores (policy definitions, global policies) do not poll on this interval and reconcile from disk on restart; explicit configuration reload uses their current in-memory state.
+12. **DashMap is authoritative at runtime.** Disk writes immediate. Manual `_storage/` edits need restart or `POST /v1/config/reload` — unless `cache_refresh_interval_secs` > 0, in which case **DashMap-backed** cached stores pick up external/manual disk writes within that interval (their serialized refresh scans reconcile cache with disk). RwLock-backed stores (policy definitions, global policies) do not poll on this interval and reconcile from disk on restart and when the node becomes Active; explicit configuration reload uses their current in-memory state.
 13. **Leave code better** — DRY, no dead code, single-responsibility functions.
 14. **Always test** — positive and negative cases.
 
@@ -92,6 +92,12 @@ _Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-bui
 
 The CLI consent page (`/cli-consent`) is shown outside the dashboard shell and reuses the login card styles from `www/default/src/pages/LoginPage.module.css`; see _CLI consent page_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#cli-consent-page).
 
+The Managed Agent's Target Authentication offers a **Credential Provider** type, and the Credential
+Provider page has a **JWT Bearer** type; both, the `credential_providers.*` permission gating,
+and the rule that unsupported Target Authentication variants are saved unchanged live in
+_Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder) and
+_Credential providers_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#credential-providers).
+
 The secret editor has one save button and never shows a stored secret value; see
 _Secret editor_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#secret-editor).
 
@@ -108,6 +114,11 @@ The Trust Recorder panel and its entries warn while an entry uses the surface Is
 Authority and the surface has no Issuer or its Issuer no longer exists; see _Trust Recorder_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#trust-recorder).
 
+Delete confirmations shown in the page (JWT verification strategies, secrets referenced by
+credential providers) take focus when they open, close on Escape, and return focus to the Delete
+button; see _JWT verification strategies_ and _Secret editor_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#secret-editor).
+
 The Audit Log names the surface variant of each request record and describes `request_rejected`
 records, and the Metrics page badges configured variant aliases only; see _Audit page: surface
 variants and refusals_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#audit-page-surface-variants-and-refusals).
@@ -116,10 +127,28 @@ The Identities page shows a Trust Recorder status chip and a Recorder filter, an
 Recorder panel shows a Last outcome row; see _Identities page_ and _Trust Recorder panel_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#trust-recorder-panel).
 
-The Caller Context editor of an MCP surface with JWT Bearer edits authorization server
-discovery (`caller_authentication.protected_resource`), and Save removes a setting the
-operator switched off in the same PUT; see _Authorization server discovery_ in
-[`www/default/AGENTS.md`](www/default/AGENTS.md).
+The JWT verification strategy editor discovers and pins an authorization server and edits the
+scope claims, and the strategy list marks a strategy with a pinned server **Discovered**; see _JWT verification strategies_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#jwt-verification-strategies).
+
+The Caller Context editor of an A2A, AP2 or MCP surface with JWT Bearer edits authorization server
+discovery (`caller_authentication.protected_resource`), the one opt-in by which an Access Point
+declares; the authorization server and scopes are shown as derived from the strategy and the
+required scopes, and Save removes a setting the operator switched off in the same PUT; see _Authorization server discovery_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
+
+The Surface Detail **Agent Cards** view, for A2A and AP2 surfaces only, sits after Elements and
+before Monitoring. It shows the Managed Agent Card beside the Gateway-Served Agent Card, with each
+difference marked by colour and an icon with a text label, the raw JSON of both, the card fetch
+status with its cause and HTTP status, a Refresh action, the served card discovery URL with a copy
+action and a link back to the Surface view. When the fetch fails, it shows the card the gateway
+last served, marked as possibly from earlier, and no comparison. `CallerAuthDiscoverySection` is the one caller-auth
+declaration section for A2A, AP2 and MCP: it sets the required scopes and the authorization server
+discovery resource, and shows the authorization server, scopes and audience the served card or
+metadata carries, derived from the strategy and the required scopes; the declaration outcome
+chip shows the result. Surface Detail shows surface save
+warnings, with a copyable deny rule for the fail-open ones. See _Agent Cards tab_ and _Surface
+Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#agent-cards-tab).
 
 Keep `AGENTS.md` and any local `AGENTS.md` in sync in the same change when UI patterns evolve. Instruction drift is a blocker.
 
@@ -153,9 +182,37 @@ are `data.gateway.policy.deny_reason` and `data.surface.policy.deny_reason`.
 **Policy planes and identity attribution fail closed.** Two stages publish results and
 let OPA decide instead: Trust Check, and caller source authentication. A surface that must
 reject unauthenticated callers needs a policy denying `input.source_auth.method == "failed"`.
-An MCP Access Point that publishes protected resource metadata is the exception: a request to
-it, direct or over Fabric, is refused before policy with a `401` (direct requests get the
-discovery challenge).
+A declaring Access Point, one that publishes protected resource metadata, is the only
+exception, and this paragraph is where the rule is stated; other documents link here. An
+Access Point declares only through `access_point.caller_authentication.protected_resource`, on
+MCP, A2A and AP2 (`supports_protected_resource`); the dashboard calls the switch Authorization
+server discovery. `resource` is explicit, validated at save and the audience a token must carry
+among its `aud` values; the advertised authorization server is the JWT verification
+strategy's `expected_issuer` and the advertised scopes are its `required_scopes`. A declaring
+Access Point refuses a caller whose source authentication failed (no token, an invalid one, or a
+JWT short of a method's `required_scopes`) with its `WWW-Authenticate` challenge, a `401` or a
+`403` with `error="insufficient_scope"`, and no policy can admit that caller. It refuses at
+source authentication, on every protocol: before rate limiting, before the request body is
+read and before every policy plane, the AP2 gate and payment, so no policy sees that caller,
+nothing is settled and the Target is never reached. Public paths (the agent card, protected
+resource metadata) are exempt. When the request's Surface Variant cannot be resolved, a failed
+caller on an Access Point whose bare route (served by the default variant, else the base
+surface) declares gets that route's challenge at routing, before any policy, on every
+protocol. Only the sending gateway's challenge names the metadata: the receiving gateway of a
+Fabric route answers with a `realm` and no `resource_metadata`, and the sending gateway
+answers its own caller `502` with a fixed detail for that peer's `401`, or `403` with a Bearer
+`insufficient_scope` challenge, never relays the challenge, and records `request_rejected`
+(`forward`, `peer_token_refused` or `peer_scope_refused`); see
+[`src/proxy/fabric_peer_refusal.rs`](src/proxy/fabric_peer_refusal.rs). A declaring Access
+Point never forwards the caller's token, and every challenge the gateway builds goes through
+`mark_gateway_challenge`
+([`src/protocols/protected_resource.rs`](src/protocols/protected_resource.rs)); relayed Target
+challenges other than `Payment` are dropped on such an Access Point and on a `fabric://`
+Target. The refusal is `challenge_failed_caller`
+([`src/proxy/caller_denial.rs`](src/proxy/caller_denial.rs)), called from the source
+authentication stage and from routing in `src/proxy/handler.rs`; the dry run and the save
+report read `refuses_failed_callers_by_default`
+([`src/source_auth/declaration.rs`](src/source_auth/declaration.rs)).
 See [`docs/POLICY.md`](docs/POLICY.md#failed-caller-authentication).
 
 **MCP revisions are admitted per transport path.** Every MCP endpoint admits `2026-07-28`

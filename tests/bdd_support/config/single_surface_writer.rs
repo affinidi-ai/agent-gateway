@@ -8,13 +8,18 @@ use crate::bdd_support::config::config_tree::{
     ApiKeyProviderFixture, CredentialProviderFixture, GatewayBootstrapFixture, JwtVerificationStrategyFixture,
     PolicyDefinitionFixture, SecretFixture, write_gateway_config_tree,
 };
-use crate::bdd_support::config::gateway_bootstrap::GatewayBootstrapSurface;
+use crate::bdd_support::config::gateway_bootstrap::{
+    GatewayBootstrapSurface, declared_access_point_url, insert_https_origin_first,
+};
+use crate::bdd_support::config::jwt_verification_strategy::SURFACE_JWT_STRATEGY_ID;
 use crate::bdd_support::config::mcp_proxy::McpProxyFixture;
 use crate::bdd_support::config::single_surface_fixture::{
     CredentialProviderKind, DelegatedCredentialInjection, DidWebVhIdentityFixture, PROTECTED_RESOURCE_PUBLIC_ORIGIN,
     SurfaceConfigBuilder, SurfaceSourceAuthConfig, SurfaceTransitPointConfig,
 };
-use crate::bdd_support::config::target_auth::static_secret_target_auth_json;
+use crate::bdd_support::config::target_auth::{
+    credential_provider_target_auth_json, static_secret_target_auth_json, write_target_token_provider,
+};
 
 struct SingleSurfaceOptions<'a> {
     outbound: Option<(u16, &'a HashMap<String, String>)>,
@@ -182,11 +187,14 @@ fn write_single_surface_config_inner(
             GatewayBootstrapSurface::new(id.clone(), id, route.clone())
         })
         .collect::<Vec<_>>();
-    let mut config_tree = GatewayBootstrapFixture::new(gateway_port, "api", bootstrap_surfaces, "");
+    let mut config_tree = GatewayBootstrapFixture::new(gateway_port, "api", bootstrap_surfaces, "bdd-gateway");
     config_tree.outbound_listener_port = outbound_port;
     if surface_config.audit_log_keeps_every_event {
         config_tree.settings = Some(crate::bdd_support::admin_client::audit_log_keeping_every_event());
     }
+    config_tree.policy_opa_entry = surface_config
+        .gateway_policy_rego
+        .clone();
     config_tree.terms_enabled = options
         .affinidi_terms_url
         .is_some();
@@ -235,6 +243,17 @@ fn write_single_surface_config_inner(
         let method = crate::bdd_support::config::source_auth::caller_authentication_method_json(auth);
         surface_fixture = surface_fixture.with_caller_auth_method(method);
     }
+    if declares_authorization_server(surface_config) {
+        assert!(
+            surface_config
+                .protected_resource
+                .is_none(),
+            "declare through one setting"
+        );
+        surface_fixture = surface_fixture.with_caller_protected_resource(serde_json::json!({
+            "resource": declared_access_point_url(gateway_port, &surface_config.route),
+        }));
+    }
     if let Some(protected) = &surface_config.protected_resource {
         surface_fixture = surface_fixture.with_caller_protected_resource(serde_json::json!({
             "resource": format!("{PROTECTED_RESOURCE_PUBLIC_ORIGIN}{}", surface_config.route),
@@ -248,6 +267,14 @@ fn write_single_surface_config_inner(
             &target_auth.header_name,
             &target_auth.header_format,
             &target_auth.fallback,
+        ));
+    }
+    if let Some(token_auth) = &surface_config.target_token_auth {
+        surface_fixture = surface_fixture.with_target_auth(credential_provider_target_auth_json(
+            &token_auth
+                .provider
+                .provider_id,
+            &token_auth.fallback,
         ));
     }
     if let Some(policy) = &surface_config.mcp_tool_policy {
@@ -432,17 +459,31 @@ fn write_single_surface_config_inner(
     }
 
     if let Some(jwks) = jwks_fixture {
+        let strategy_issuer = surface_config.jwt_strategy_issuer(&jwks.issuer);
+        let mut strategy = JwtVerificationStrategyFixture::new(
+            SURFACE_JWT_STRATEGY_ID,
+            "BDD EdDSA Test",
+            strategy_issuer.clone(),
+            format!("{}/.well-known/jwks.json", jwks.issuer),
+        )
+        .with_authorization_server(
+            surface_config
+                .jwt_strategy_authorization_server
+                .clone(),
+        );
+        if declares_authorization_server(surface_config)
+            && strategy
+                .authorization_server
+                .is_none()
+        {
+            strategy = strategy.pinned_to_authorization_server(
+                format!("{strategy_issuer}/.well-known/oauth-authorization-server"),
+                format!("{strategy_issuer}/token"),
+            );
+        }
         config_tree
             .jwt_strategies
-            .insert(
-                "bdd-jwt-strategy".to_string(),
-                JwtVerificationStrategyFixture::new(
-                    "bdd-jwt-strategy",
-                    "BDD EdDSA Test",
-                    jwks.issuer.clone(),
-                    format!("{}/.well-known/jwks.json", jwks.issuer),
-                ),
-            );
+            .insert(SURFACE_JWT_STRATEGY_ID.to_string(), strategy);
     }
 
     config_tree.secrets.extend(
@@ -501,11 +542,20 @@ fn write_single_surface_config_inner(
     }
 
     write_gateway_config_tree(base_dir, &config_tree, true);
+    if let Some(token_auth) = &surface_config.target_token_auth {
+        write_target_token_provider(base_dir, &token_auth.provider);
+    }
     if surface_config
         .protected_resource
         .is_some()
     {
-        add_inbound_public_origin(base_dir, PROTECTED_RESOURCE_PUBLIC_ORIGIN);
+        insert_https_origin_first(base_dir, PROTECTED_RESOURCE_PUBLIC_ORIGIN);
+    }
+    if declares_authorization_server(surface_config) {
+        insert_https_origin_first(base_dir, &format!("https://localhost:{gateway_port}"));
+    }
+    if let Some(url) = &surface_config.external_url_listed_first {
+        insert_https_origin_first(base_dir, url);
     }
     if let Some(max_secs) = surface_config.transit_token_max_lifetime_secs {
         set_transit_token_max_lifetime(base_dir, max_secs);
@@ -522,19 +572,11 @@ fn set_transit_token_max_lifetime(
     std::fs::write(&path, serde_json::to_string_pretty(&gateway).unwrap()).unwrap();
 }
 
-/// Adds a public origin to the inbound listener, the origin a protected
-/// resource must be published under.
-fn add_inbound_public_origin(
-    base_dir: &Path,
-    origin: &str,
-) {
-    let path = base_dir.join("gateway.json");
-    let mut gateway: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    gateway["listeners"][0]["external_urls"]
-        .as_array_mut()
-        .expect("inbound listener external_urls")
-        .push(serde_json::json!(origin));
-    std::fs::write(&path, serde_json::to_string_pretty(&gateway).unwrap()).unwrap();
+fn declares_authorization_server(surface_config: &SurfaceConfigBuilder) -> bool {
+    matches!(
+        &surface_config.source_auth,
+        Some(SurfaceSourceAuthConfig::JwtBearer(jwt)) if jwt.declares_authorization_server
+    )
 }
 
 pub struct JwksFiles {
@@ -724,4 +766,61 @@ fn policy_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<PolicyDefinitio
         ));
     }
     policies
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::bdd_support::config::single_surface_fixture::{
+        JwtSourceAuthConfig, SurfaceConfigBuilder, SurfaceSourceAuthConfig,
+    };
+
+    fn jwt_surface(declares_authorization_server: bool) -> SurfaceConfigBuilder {
+        SurfaceConfigBuilder {
+            source_auth: Some(SurfaceSourceAuthConfig::JwtBearer(JwtSourceAuthConfig {
+                declares_authorization_server,
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn declaring_writes_protected_resource_and_no_audience() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut surface = jwt_surface(true);
+        surface.route = "/a2a/buyer".to_string();
+        super::write_single_surface_config(
+            dir.path(),
+            4321,
+            "http://127.0.0.1:1",
+            &surface,
+            Some(&super::JwksFiles {
+                issuer: "https://idp.example".to_string(),
+            }),
+        );
+        let surfaces = std::fs::read_dir(
+            dir.path()
+                .join("_storage")
+                .join("agent_surfaces"),
+        )
+        .expect("surface dir")
+        .map(|entry| std::fs::read_to_string(entry.expect("entry").path()).expect("surface file"))
+        .map(|text| serde_json::from_str::<serde_json::Value>(&text).expect("surface json"))
+        .collect::<Vec<_>>();
+        let auth = &surfaces[0]["access_point"]["caller_authentication"];
+        assert_eq!(auth["protected_resource"]["resource"], super::declared_access_point_url(4321, "/a2a/buyer"));
+        assert!(auth["protected_resource"]["authorization_servers"].is_null());
+        assert!(
+            auth["methods"][0]["audiences"]
+                .as_array()
+                .is_none_or(Vec::is_empty)
+        );
+    }
+
+    #[test]
+    fn only_a_jwt_surface_that_declares_is_a_declaring_surface() {
+        assert!(super::declares_authorization_server(&jwt_surface(true)));
+        assert!(!super::declares_authorization_server(&jwt_surface(false)));
+        assert!(!super::declares_authorization_server(&SurfaceConfigBuilder::default()));
+    }
 }

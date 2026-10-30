@@ -88,6 +88,30 @@ both routers deny every request instead of serving unauthenticated. The built-in
 `payments.view` and `payments.retry` to `poweruser` and `payments.edit` / `payments.delete` to
 `administrator`; the base `user` role holds no payments permission.
 
+## JWT verification strategy probes
+
+`POST /v1/jwt-verification-strategies/discover` and
+`POST /v1/jwt-verification-strategies/validate-jwks-uri` need `jwt_verification_strategies.edit`,
+not `.view`, because each makes an outbound request on the caller's behalf; a viewer-only user or
+a view-scoped token gets 403. See
+[`SOURCE_AUTH.md`](SOURCE_AUTH.md#authorization-server-discovery).
+
+## Surface declarations and Agent card preview
+
+`GET /v1/surfaces/{id}/declarations` and `GET /v1/surfaces/{id}/agent-card` need
+`surfaces.view`; `POST /v1/surfaces/{id}/agent-card/refresh` needs `surfaces.edit`, because it
+makes an outbound request to the agent on the caller's behalf. A viewer-only user or a
+view-scoped token gets `403` on the refresh. All three load the surface for the caller's tenant
+first, so a surface of another tenant answers `404` and its card is never returned, and a
+resource-scoped PAT reaches only its own surface ids
+([`ACCESS_TOKENS.md`](ACCESS_TOKENS.md#what-tenancy-does-not-partition)). The save report that
+surface writes return is covered by the write's own permission. See
+[`SOURCE_AUTH.md`](SOURCE_AUTH.md#agent-card-preview) and
+[`POLICY.md`](POLICY.md#surface-save-warnings). A tenant token that reads the card preview of an
+appliance-wide surface gets `200` with `supported` false and `unsupported_reason`
+`operator_only`, because the fetch would use the appliance's Target credential; a tenant refresh
+of it is still `403`.
+
 ## Integrations
 
 Every route under `/v1/integrations` needs one of `integrations.view` (lists, reads and the

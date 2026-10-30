@@ -717,6 +717,7 @@ allow := false if contains(input.response.body.result.text, "SECRET")
             a2a_proxy_store: None,
             active_variant_alias: None,
             active_variant_id: None,
+            access_point_declaration: None,
             surface: std::sync::Arc::new(surface),
         };
         AccessPointEvents::new(

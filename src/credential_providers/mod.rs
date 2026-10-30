@@ -10,8 +10,11 @@
 //! via secret_id (e.g. "GOOGLE_CLIENT_SECRET").
 
 pub mod handlers;
+pub mod jwt_assertion;
 pub mod router;
 pub mod storage;
+
+pub use jwt_assertion::{JwtBearerSettings, JwtBearerSummary};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -29,9 +32,64 @@ pub enum CredentialProviderType {
     /// Client Credentials flow (2-legged OAuth) — machine-to-machine
     #[serde(rename = "oauth2_client_credentials")]
     OAuth2ClientCredentials,
+    /// RFC 7523 JWT bearer grant: the gateway signs an assertion with its own key
+    #[serde(rename = "oauth2_jwt_bearer")]
+    OAuth2JwtBearer,
     /// Static API key — resolved directly from the secrets store, no OAuth
     #[serde(rename = "api_key")]
     ApiKey,
+}
+
+impl CredentialProviderType {
+    /// The value the type has in stored and API records.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::OAuth2AuthorizationCode => "oauth2_authorization_code",
+            Self::OAuth2ClientCredentials => "oauth2_client_credentials",
+            Self::OAuth2JwtBearer => "oauth2_jwt_bearer",
+            Self::ApiKey => "api_key",
+        }
+    }
+}
+
+/// How a provider type obtains the credential it injects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderGrant {
+    /// A user consents through the Authorization Code flow.
+    UserConsent,
+    /// The gateway obtains a token for its own identity, with no user.
+    GatewayToken,
+    /// A static key is read from the secrets store.
+    StaticKey,
+}
+
+impl ProviderGrant {
+    /// Whether the credential is the gateway's own (an operator's API key, or a token
+    /// granted with the provider's client secret or signing key) rather than a consenting
+    /// user's.
+    pub fn sends_gateway_credential(self) -> bool {
+        match self {
+            Self::UserConsent => false,
+            Self::GatewayToken | Self::StaticKey => true,
+        }
+    }
+}
+
+impl CredentialProviderType {
+    pub fn grant(&self) -> ProviderGrant {
+        match self {
+            Self::OAuth2AuthorizationCode => ProviderGrant::UserConsent,
+            Self::OAuth2ClientCredentials | Self::OAuth2JwtBearer => ProviderGrant::GatewayToken,
+            Self::ApiKey => ProviderGrant::StaticKey,
+        }
+    }
+
+    /// Whether this provider type may serve Target Authentication. Target Authentication is
+    /// the gateway's own identity, so it never uses a provider that needs a user's consent.
+    pub fn serves_target_authentication(&self) -> bool {
+        self.grant()
+            .sends_gateway_credential()
+    }
 }
 
 /// A configured OAuth 2.0 credential provider
@@ -107,6 +165,10 @@ pub struct CredentialProvider {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_secret_ref: Option<String>,
 
+    /// Assertion settings (only used when provider_type = OAuth2JwtBearer)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwt_bearer: Option<JwtBearerSettings>,
+
     /// Optional description
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -117,6 +179,47 @@ pub struct CredentialProvider {
 
 fn default_true() -> bool {
     true
+}
+
+impl CredentialProvider {
+    /// Whether a surface of `surface_tenant_id` may send this provider's credential to its
+    /// upstreams. An api_key, Client Credentials or JWT bearer provider sends the gateway's
+    /// own credential, so only a surface in the provider's tenant may use it; any surface
+    /// may use an appliance-wide authorization code provider, whose token a user consented
+    /// to. Secrets that verify callers are outside this rule.
+    pub fn usable_by(
+        &self,
+        surface_tenant_id: Option<&str>,
+    ) -> bool {
+        crate::tenancy::can_reference_with_rule(
+            surface_tenant_id,
+            self.tenant_id.as_deref(),
+            self.provider_type
+                .grant()
+                .sends_gateway_credential(),
+        )
+    }
+
+    /// Every secret reference the provider holds, in a fixed order.
+    pub fn secret_refs(&self) -> impl Iterator<Item = &str> {
+        [
+            self.client_id_secret_ref
+                .as_deref(),
+            self.client_secret_secret_ref
+                .as_deref(),
+            self.api_key_secret_ref
+                .as_deref(),
+            self.jwt_bearer
+                .as_ref()
+                .map(|settings| {
+                    settings
+                        .signing_key_secret_ref
+                        .as_str()
+                }),
+        ]
+        .into_iter()
+        .flatten()
+    }
 }
 
 impl StorableEntity for CredentialProvider {
@@ -151,6 +254,8 @@ pub struct CreateCredentialProviderRequest {
     #[serde(default)]
     pub api_key_secret_ref: Option<String>,
     #[serde(default)]
+    pub jwt_bearer: Option<JwtBearerSettings>,
+    #[serde(default)]
     pub description: Option<String>,
     /// Full callback URL (host + path) — overrides auto-generated callback URL
     #[serde(default)]
@@ -161,38 +266,51 @@ pub struct CreateCredentialProviderRequest {
     pub consent_identity_strategy_id: Option<String>,
 }
 
-/// Request to update an existing credential provider
+/// Request to update an existing credential provider.
+///
+/// Optional references, the authorization endpoint and the description take three
+/// states: an absent field keeps the stored value, `null` clears it, and a string
+/// replaces it. `additional_params` replaces the stored map as a whole.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateCredentialProviderRequest {
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
     pub provider_type: Option<CredentialProviderType>,
-    #[serde(default)]
-    pub authorization_endpoint: Option<String>,
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    pub authorization_endpoint: Option<Option<String>>,
     #[serde(default)]
     pub token_endpoint: Option<String>,
-    #[serde(default)]
-    pub client_id_secret_ref: Option<String>,
-    #[serde(default)]
-    pub client_secret_secret_ref: Option<String>,
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    pub client_id_secret_ref: Option<Option<String>>,
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    pub client_secret_secret_ref: Option<Option<String>>,
     #[serde(default)]
     pub default_scopes: Option<Vec<String>>,
     #[serde(default)]
     pub token_refresh_enabled: Option<bool>,
     #[serde(default)]
     pub additional_params: Option<HashMap<String, String>>,
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    pub api_key_secret_ref: Option<Option<String>>,
     #[serde(default)]
-    pub api_key_secret_ref: Option<String>,
-    #[serde(default)]
-    pub description: Option<String>,
+    pub jwt_bearer: Option<JwtBearerSettings>,
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    pub description: Option<Option<String>>,
     /// Full callback URL (host + path) — overrides auto-generated callback URL
-    #[serde(default)]
-    pub callback_url: Option<String>,
-    #[serde(default)]
-    pub resource: Option<String>,
-    #[serde(default)]
-    pub consent_identity_strategy_id: Option<String>,
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    pub callback_url: Option<Option<String>>,
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    pub resource: Option<Option<String>>,
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    pub consent_identity_strategy_id: Option<Option<String>>,
+}
+
+fn present<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
 }
 
 /// List response item (no sensitive data)
@@ -217,6 +335,8 @@ pub struct CredentialProviderListItem {
     pub resource: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub consent_identity_strategy_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jwt_bearer: Option<JwtBearerSummary>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -241,6 +361,10 @@ impl From<&CredentialProvider> for CredentialProviderListItem {
             consent_identity_strategy_id: p
                 .consent_identity_strategy_id
                 .clone(),
+            jwt_bearer: p
+                .jwt_bearer
+                .as_ref()
+                .map(JwtBearerSummary::from),
             created_at: p.created_at,
             updated_at: p.updated_at,
         }
@@ -249,6 +373,7 @@ impl From<&CredentialProvider> for CredentialProviderListItem {
 
 #[cfg(test)]
 mod tests {
+    use super::jwt_assertion::JwtBearerAlgorithm;
     use super::*;
 
     fn make_provider(
@@ -271,6 +396,7 @@ mod tests {
             token_refresh_enabled: true,
             additional_params: HashMap::new(),
             api_key_secret_ref: None,
+            jwt_bearer: None,
             description: Some("Test provider".to_string()),
             created_at: now,
             updated_at: now,
@@ -278,6 +404,26 @@ mod tests {
             resource: None,
             consent_identity_strategy_id: None,
         }
+    }
+
+    #[test]
+    fn gateway_credentials_stay_in_the_providers_tenant_and_consented_tokens_may_be_shared() {
+        let usable = |provider_type: CredentialProviderType, provider_tenant: Option<&str>| {
+            let mut provider = make_provider("P", "p");
+            provider.provider_type = provider_type;
+            provider.tenant_id = provider_tenant.map(str::to_string);
+            [None, Some("tenant-a"), Some("tenant-b")].map(|surface_tenant| provider.usable_by(surface_tenant))
+        };
+        for gateway_type in [
+            CredentialProviderType::ApiKey,
+            CredentialProviderType::OAuth2ClientCredentials,
+            CredentialProviderType::OAuth2JwtBearer,
+        ] {
+            assert_eq!(usable(gateway_type.clone(), None), [true, false, false], "{gateway_type:?}");
+            assert_eq!(usable(gateway_type.clone(), Some("tenant-a")), [false, true, false], "{gateway_type:?}");
+        }
+        assert_eq!(usable(CredentialProviderType::OAuth2AuthorizationCode, None), [true, true, true]);
+        assert_eq!(usable(CredentialProviderType::OAuth2AuthorizationCode, Some("tenant-a")), [false, true, false]);
     }
 
     #[test]
@@ -349,9 +495,101 @@ mod tests {
     }
 
     #[test]
+    fn test_provider_type_grants() {
+        assert_eq!(CredentialProviderType::OAuth2AuthorizationCode.grant(), ProviderGrant::UserConsent);
+        assert_eq!(CredentialProviderType::OAuth2ClientCredentials.grant(), ProviderGrant::GatewayToken);
+        assert_eq!(CredentialProviderType::OAuth2JwtBearer.grant(), ProviderGrant::GatewayToken);
+        assert_eq!(CredentialProviderType::ApiKey.grant(), ProviderGrant::StaticKey);
+    }
+
+    #[test]
+    fn test_jwt_bearer_provider_round_trips_and_lists_without_the_key_reference() {
+        let json = r#"{
+            "id": "cp-jwt", "name": "Vertex", "provider_id": "vertex",
+            "provider_type": "oauth2_jwt_bearer",
+            "token_endpoint": "https://oauth2.googleapis.com/token",
+            "default_scopes": ["https://www.googleapis.com/auth/cloud-platform"],
+            "jwt_bearer": {
+                "assertion_issuer": "gateway@project.iam.gserviceaccount.com",
+                "signing_key_secret_ref": "VERTEX_SA_KEY",
+                "signing_algorithm": "RS256"
+            },
+            "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+        }"#;
+        let provider: CredentialProvider = serde_json::from_str(json).unwrap();
+        assert_eq!(provider.provider_type, CredentialProviderType::OAuth2JwtBearer);
+        assert_eq!(
+            provider
+                .secret_refs()
+                .collect::<Vec<_>>(),
+            vec!["VERTEX_SA_KEY"]
+        );
+        let stored = serde_json::to_value(&provider).unwrap();
+        assert_eq!(stored["provider_type"], "oauth2_jwt_bearer");
+        assert_eq!(stored["jwt_bearer"]["signing_key_secret_ref"], "VERTEX_SA_KEY");
+        let listed = serde_json::to_value(CredentialProviderListItem::from(&provider)).unwrap();
+        assert_eq!(listed["jwt_bearer"]["assertion_issuer"], "gateway@project.iam.gserviceaccount.com");
+        assert_eq!(listed["jwt_bearer"]["signing_algorithm"], "RS256");
+        assert!(
+            !listed
+                .to_string()
+                .contains("VERTEX_SA_KEY")
+        );
+    }
+
+    #[test]
+    fn test_secret_refs_lists_every_reference_in_order() {
+        let mut provider = make_provider("GitHub", "github");
+        provider.api_key_secret_ref = Some("API".into());
+        provider.jwt_bearer = Some(JwtBearerSettings {
+            assertion_issuer: "issuer".into(),
+            assertion_subject: None,
+            signing_key_secret_ref: "KEY".into(),
+            signing_algorithm: JwtBearerAlgorithm::Es256,
+            key_id: None,
+            audience: None,
+        });
+        assert_eq!(
+            provider
+                .secret_refs()
+                .collect::<Vec<_>>(),
+            vec!["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "API", "KEY"]
+        );
+    }
+
+    #[test]
     fn test_callback_path_format() {
         let provider = make_provider("GitHub", "github");
         assert_eq!(provider.callback_path, "/oauth/callback/github");
+    }
+
+    #[test]
+    fn test_update_request_tells_an_absent_reference_from_a_cleared_one() {
+        let req: UpdateCredentialProviderRequest = serde_json::from_str(
+            r#"{"client_id_secret_ref": null, "client_secret_secret_ref": "NEW_SECRET", "resource": null,
+                "authorization_endpoint": null, "description": null}"#,
+        )
+        .unwrap();
+        assert_eq!(req.client_id_secret_ref, Some(None));
+        assert_eq!(req.client_secret_secret_ref, Some(Some("NEW_SECRET".to_string())));
+        assert_eq!(req.resource, Some(None));
+        assert_eq!(req.authorization_endpoint, Some(None));
+        assert_eq!(req.description, Some(None));
+        assert_eq!(req.api_key_secret_ref, None);
+        assert_eq!(req.callback_url, None);
+        assert_eq!(req.consent_identity_strategy_id, None);
+
+        let round_trip: UpdateCredentialProviderRequest =
+            serde_json::from_value(serde_json::to_value(&req).unwrap()).unwrap();
+        assert_eq!(round_trip.client_id_secret_ref, Some(None));
+        assert_eq!(round_trip.authorization_endpoint, Some(None));
+        assert_eq!(round_trip.description, Some(None));
+        assert_eq!(round_trip.api_key_secret_ref, None);
+
+        let absent: UpdateCredentialProviderRequest =
+            serde_json::from_str(r#"{"description": "Calendar", "name": "Renamed"}"#).unwrap();
+        assert_eq!(absent.description, Some(Some("Calendar".to_string())));
+        assert_eq!(absent.authorization_endpoint, None);
     }
 
     #[test]
@@ -398,6 +636,7 @@ mod tests {
             token_refresh_enabled: false,
             additional_params: HashMap::new(),
             api_key_secret_ref: Some("MY_API_KEY".to_string()),
+            jwt_bearer: None,
             description: None,
             created_at: now,
             updated_at: now,
@@ -432,5 +671,31 @@ mod tests {
                 .is_none()
         );
         assert_eq!(req.token_endpoint.as_deref(), Some("https://auth.example.com/token"));
+    }
+
+    #[test]
+    fn test_target_authentication_refuses_only_user_consent_providers() {
+        let cases = [
+            (CredentialProviderType::OAuth2AuthorizationCode, false),
+            (CredentialProviderType::OAuth2ClientCredentials, true),
+            (CredentialProviderType::OAuth2JwtBearer, true),
+            (CredentialProviderType::ApiKey, true),
+        ];
+        for (provider_type, allowed) in cases {
+            assert_eq!(provider_type.serves_target_authentication(), allowed, "{provider_type:?}");
+        }
+    }
+
+    #[test]
+    fn provider_type_labels_match_their_stored_form() {
+        for (provider_type, label) in [
+            (CredentialProviderType::OAuth2AuthorizationCode, "oauth2_authorization_code"),
+            (CredentialProviderType::OAuth2ClientCredentials, "oauth2_client_credentials"),
+            (CredentialProviderType::OAuth2JwtBearer, "oauth2_jwt_bearer"),
+            (CredentialProviderType::ApiKey, "api_key"),
+        ] {
+            assert_eq!(provider_type.as_str(), label);
+            assert_eq!(serde_json::to_value(&provider_type).unwrap(), serde_json::json!(label));
+        }
     }
 }

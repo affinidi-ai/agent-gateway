@@ -7,6 +7,15 @@ import { validateUrl } from '../utils/urlValidation';
 import FieldHelp from '../components/shared/FieldHelp';
 import { Link } from '../components/shared/Link';
 import { DOCS_URL } from '../config/docs';
+import {
+  DEFAULT_SCOPE_CLAIMS,
+  discoverAuthorizationServer,
+  discoverMetadataValue,
+  parseAuthorizationServer,
+  parseScopeClaims,
+  type AuthorizationServer,
+  type DiscoverMode,
+} from '../utils/authorizationServer';
 
 interface JwksSourceForm {
   type: 'remote' | 'static';
@@ -18,6 +27,7 @@ interface JwtVerificationStrategyForm {
   name: string;
   expected_issuer: string;
   jwks_source: JwksSourceForm;
+  scope_claims: string;
 }
 
 const EMPTY_FORM: JwtVerificationStrategyForm = {
@@ -28,6 +38,7 @@ const EMPTY_FORM: JwtVerificationStrategyForm = {
     jwks_uri: '',
     jwks: '',
   },
+  scope_claims: '',
 };
 
 const EditJwtVerificationStrategyPage: React.FC = () => {
@@ -45,6 +56,13 @@ const EditJwtVerificationStrategyPage: React.FC = () => {
   );
   const [jwksUriCheckError, setJwksUriCheckError] = useState<string | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [pinned, setPinned] = useState<AuthorizationServer | null>(null);
+  const [discovered, setDiscovered] = useState<AuthorizationServer | null>(null);
+  const [clearRequested, setClearRequested] = useState(false);
+  const discoverRequest = useRef(0);
+  const [discovering, setDiscovering] = useState(false);
+  const [discoverError, setDiscoverError] = useState<string | null>(null);
+  const [loadedJwksUri, setLoadedJwksUri] = useState('');
 
   useEffect(() => {
     if (!isNew) {
@@ -72,7 +90,10 @@ const EditJwtVerificationStrategyPage: React.FC = () => {
           jwks_uri: src.jwks_uri ?? '',
           jwks: src.jwks ? JSON.stringify(src.jwks, null, 2) : '',
         },
+        scope_claims: Array.isArray(data.scope_claims) ? data.scope_claims.join(', ') : '',
       });
+      setPinned(parseAuthorizationServer(data.authorization_server));
+      setLoadedJwksUri(src.jwks_uri ?? '');
     } catch (e: any) {
       setError(e.message ?? 'Unknown error');
     } finally {
@@ -85,10 +106,65 @@ const EditJwtVerificationStrategyPage: React.FC = () => {
   ) => {
     const { name, value } = e.target;
     setForm(prev => ({ ...prev, [name]: value }));
+    if (name === 'expected_issuer') {
+      discoverRequest.current += 1;
+      setDiscovering(false);
+      setDiscovered(null);
+      setDiscoverError(null);
+    }
+  };
+
+  const isStatic = form.jwks_source.type === 'static';
+  const discoverMode: DiscoverMode = discovered
+    ? 'discover'
+    : clearRequested || (isStatic && pinned)
+      ? 'clear'
+      : 'keep';
+  const shownServer = discovered ?? (discoverMode === 'clear' ? null : pinned);
+  const pinIsStale =
+    !discovered &&
+    shownServer !== null &&
+    (shownServer.issuer !== form.expected_issuer.trim() ||
+      (form.jwks_source.type === 'remote' &&
+        shownServer.jwks_uri !== form.jwks_source.jwks_uri.trim()));
+
+  const handleDiscover = async () => {
+    const issuerCheck = validateUrl(form.expected_issuer, { requireHttps: true });
+    if (!issuerCheck.valid) {
+      setDiscoverError(`Expected Issuer: ${issuerCheck.error}`);
+      return;
+    }
+    const request = ++discoverRequest.current;
+    setDiscovering(true);
+    setDiscoverError(null);
+    const result = await discoverAuthorizationServer(
+      (url, init) => apiClient.fetch(url, init),
+      form.expected_issuer.trim()
+    );
+    if (request !== discoverRequest.current) return;
+    setDiscovering(false);
+    if (!result.ok) {
+      setDiscoverError(result.message);
+      return;
+    }
+    setDiscovered(result.server);
+    setClearRequested(false);
+    setForm(prev => ({
+      ...prev,
+      jwks_source: { ...prev.jwks_source, jwks_uri: result.server.jwks_uri },
+    }));
+    setJwksUriCheckState('idle');
+    setJwksUriCheckError(null);
+  };
+
+  const handleClearPin = () => {
+    setDiscovered(null);
+    setClearRequested(true);
   };
 
   const handleJwksSourceTypeChange = (type: 'remote' | 'static') => {
     setForm(prev => ({ ...prev, jwks_source: { ...prev.jwks_source, type } }));
+    if (type === 'static') setDiscovered(null);
     setJwksUriCheckState('idle');
     setJwksUriCheckError(null);
   };
@@ -99,6 +175,7 @@ const EditJwtVerificationStrategyPage: React.FC = () => {
     const { name, value } = e.target;
     setForm(prev => ({ ...prev, jwks_source: { ...prev.jwks_source, [name]: value } }));
     if (name === 'jwks_uri') {
+      setDiscovered(null);
       setJwksUriCheckState('idle');
       setJwksUriCheckError(null);
       if (debounceRef.current) clearTimeout(debounceRef.current);
@@ -156,7 +233,11 @@ const EditJwtVerificationStrategyPage: React.FC = () => {
         return;
       }
     }
-    if (form.jwks_source.type === 'remote' && jwksUriCheckState !== 'ok') {
+    const jwksUriNeedsCheck =
+      form.jwks_source.type === 'remote' &&
+      !discovered &&
+      form.jwks_source.jwks_uri.trim() !== loadedJwksUri;
+    if (jwksUriNeedsCheck && jwksUriCheckState !== 'ok') {
       if (jwksUriCheckState === 'checking') {
         setError('Please wait, JWKS URI check is still in progress.');
       } else if (jwksUriCheckState === 'error') {
@@ -188,10 +269,18 @@ const EditJwtVerificationStrategyPage: React.FC = () => {
     setSaving(true);
     setError(null);
 
+    const scopeClaims = parseScopeClaims(form.scope_claims);
+    const discoverMetadata = discoverMetadataValue(discoverMode);
     const body = {
       name: form.name.trim(),
       expected_issuer: form.expected_issuer.trim(),
       jwks_source: jwksSourcePayload,
+      ...(scopeClaims.length > 0
+        ? { scope_claims: scopeClaims }
+        : isNew
+          ? {}
+          : { scope_claims: DEFAULT_SCOPE_CLAIMS }),
+      ...(discoverMetadata !== undefined ? { discover_metadata: discoverMetadata } : {}),
     };
 
     try {
@@ -244,7 +333,7 @@ const EditJwtVerificationStrategyPage: React.FC = () => {
         </div>
         <div className="card-body">
           {error && (
-            <div className="alert alert-danger">
+            <div className="alert alert-danger" role="alert" data-testid="strategy-error">
               <i className="fas fa-exclamation-triangle me-2"></i>
               {error}
             </div>
@@ -268,6 +357,7 @@ const EditJwtVerificationStrategyPage: React.FC = () => {
               </label>
               <input
                 id="name"
+                data-testid="strategy-name"
                 name="name"
                 type="text"
                 className="form-control"
@@ -294,6 +384,7 @@ const EditJwtVerificationStrategyPage: React.FC = () => {
               </div>
               <input
                 id="expected_issuer"
+                data-testid="strategy-issuer"
                 name="expected_issuer"
                 type="text"
                 className="form-control"
@@ -305,6 +396,137 @@ const EditJwtVerificationStrategyPage: React.FC = () => {
               <small className="form-text text-muted">
                 If a token's issuer doesn't match exactly, it's rejected, even if the signature is
                 valid.
+              </small>
+            </div>
+
+            <div className="mb-3" data-testid="strategy-discovery-section">
+              <div className="field-label-with-help">
+                <span className="fw-bold">Authorization server metadata</span>
+                <FieldHelp
+                  ariaLabel="About authorization server discovery"
+                  testId="field-help-discovery"
+                >
+                  Discovery reads the issuer's published metadata and pins its token endpoint and
+                  JWKS URI. A surface can then advertise this authorization server in its agent card
+                  or protected resource metadata. It needs Remote URL keys and an https issuer.
+                </FieldHelp>
+              </div>
+              <div className="d-flex align-items-center gap-2 mt-1">
+                <button
+                  type="button"
+                  className="btn btn-outline-secondary btn-sm"
+                  data-testid="strategy-discover-button"
+                  onClick={handleDiscover}
+                  disabled={discovering || isStatic || !form.expected_issuer.trim()}
+                >
+                  {discovering ? (
+                    <>
+                      <span className="spinner-border spinner-border-sm me-1" aria-hidden="true" />
+                      Discovering…
+                    </>
+                  ) : (
+                    <>
+                      <i className="fas fa-search me-1" aria-hidden="true" />
+                      Discover
+                    </>
+                  )}
+                </button>
+                {shownServer && (
+                  <button
+                    type="button"
+                    className="btn btn-outline-danger btn-sm"
+                    data-testid="strategy-pinned-clear"
+                    onClick={handleClearPin}
+                  >
+                    Clear pinned metadata
+                  </button>
+                )}
+              </div>
+              <div aria-live="polite">
+                {discoverError && (
+                  <div
+                    className="alert alert-danger py-1 px-2 mt-2 mb-0 small"
+                    role="alert"
+                    data-testid="strategy-discover-error"
+                  >
+                    {discoverError}
+                  </div>
+                )}
+                {discovered && (
+                  <div
+                    className="alert alert-success py-1 px-2 mt-2 mb-0 small"
+                    role="status"
+                    data-testid="strategy-discover-success"
+                  >
+                    Discovered. The metadata is pinned when you save.
+                  </div>
+                )}
+              </div>
+              {isStatic && (
+                <div
+                  className="alert alert-warning py-1 px-2 mt-2 mb-0 small"
+                  data-testid="strategy-static-pin-warning"
+                >
+                  Discovery needs Remote URL keys, so it is off for static keys.
+                  {pinned && ' Saving clears the pinned authorization server.'}
+                </div>
+              )}
+              {shownServer && (
+                <dl className="small mt-2 mb-0" data-testid="strategy-pinned-server">
+                  <dt>Issuer</dt>
+                  <dd>
+                    <code>{shownServer.issuer}</code>
+                  </dd>
+                  <dt>Metadata URL</dt>
+                  <dd>
+                    <code>{shownServer.metadata_url}</code>
+                  </dd>
+                  <dt>Token endpoint</dt>
+                  <dd>
+                    <code>{shownServer.token_endpoint}</code>
+                  </dd>
+                  <dt>JWKS URI</dt>
+                  <dd>
+                    <code>{shownServer.jwks_uri}</code>
+                  </dd>
+                </dl>
+              )}
+              {pinIsStale && (
+                <div
+                  className="alert alert-warning py-1 px-2 mt-2 mb-0 small"
+                  data-testid="strategy-pinned-stale"
+                >
+                  The issuer or JWKS URI no longer matches the pinned metadata, so surfaces using
+                  this strategy stop advertising an authorization server. Saving a changed issuer or
+                  JWKS URI tries to discover it again; if that fails, the save still succeeds and
+                  clears the pin when the issuer changed. Run Discover to pin matching metadata.
+                </div>
+              )}
+              {!shownServer && !isStatic && (
+                <small className="form-text text-muted d-block" data-testid="strategy-no-pin">
+                  No authorization server is pinned, so surfaces using this strategy do not
+                  advertise one in their agent card or protected resource metadata.
+                </small>
+              )}
+            </div>
+
+            <div className="mb-3">
+              <label htmlFor="scope_claims">Scope claims</label>
+              <input
+                id="scope_claims"
+                name="scope_claims"
+                type="text"
+                className="form-control"
+                value={form.scope_claims}
+                onChange={handleChange}
+                placeholder="scope, scp"
+                aria-describedby="scope_claims-help"
+                data-testid="strategy-scope-claims"
+              />
+              <small id="scope_claims-help" className="form-text text-muted">
+                Token claims read for granted scopes, separated by commas. The first claim present
+                wins. Leave empty for <code>scope</code> and <code>scp</code>; add{' '}
+                <code>roles</code> for Entra app-only tokens.
               </small>
             </div>
 
@@ -330,6 +552,7 @@ const EditJwtVerificationStrategyPage: React.FC = () => {
                     className="form-check-input"
                     type="radio"
                     id="jwks-source-remote"
+                    data-testid="strategy-jwks-source-remote"
                     name="jwks_source_type"
                     value="remote"
                     checked={form.jwks_source.type === 'remote'}
@@ -347,6 +570,7 @@ const EditJwtVerificationStrategyPage: React.FC = () => {
                     className="form-check-input"
                     type="radio"
                     id="jwks-source-static"
+                    data-testid="strategy-jwks-source-static"
                     name="jwks_source_type"
                     value="static"
                     checked={form.jwks_source.type === 'static'}
@@ -369,6 +593,7 @@ const EditJwtVerificationStrategyPage: React.FC = () => {
                 <div className="input-group">
                   <input
                     id="jwks_uri"
+                    data-testid="strategy-jwks-uri"
                     name="jwks_uri"
                     type="url"
                     className={`form-control${jwksUriCheckState === 'error' ? ' is-invalid' : jwksUriCheckState === 'ok' ? ' is-valid' : ''}`}
@@ -428,6 +653,7 @@ const EditJwtVerificationStrategyPage: React.FC = () => {
                 </label>
                 <textarea
                   id="jwks"
+                  data-testid="strategy-jwks"
                   name="jwks"
                   className="form-control font-monospace"
                   rows={10}
@@ -449,9 +675,9 @@ const EditJwtVerificationStrategyPage: React.FC = () => {
             <div className="d-flex">
               <button
                 type="submit"
-                data-testid="jwt-strategy-editor-save-button"
                 className="btn btn-primary me-2"
                 disabled={saving}
+                data-testid="strategy-save-button"
               >
                 {saving ? (
                   <>

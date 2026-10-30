@@ -8,7 +8,7 @@ use axum::{
 use serde::Deserialize;
 use url::Url;
 
-use crate::credential_providers::{CredentialProvider, CredentialProviderType};
+use crate::credential_providers::{CredentialProvider, ProviderGrant};
 use crate::mcp::continuations::ContinuationError;
 use crate::mcp::continuations::protected::ConsentTicket;
 
@@ -165,9 +165,7 @@ async fn authorize_ticket(
         .await
         .map_err(|_| ContinuationError::Unavailable)?
         .ok_or(ContinuationError::NotFound)?;
-    if provider_digest(&provider)? != ticket.provider_digest
-        || !crate::tenancy::can_reference(surface.tenant_id.as_deref(), provider.tenant_id.as_deref())
-    {
+    if provider_digest(&provider)? != ticket.provider_digest || !provider.usable_by(surface.tenant_id.as_deref()) {
         return Err(ContinuationError::BindingMismatch);
     }
     let strategy_id = provider
@@ -221,6 +219,7 @@ async fn connect(
             .map_err(failure)?;
         let client_id = super::oauth::resolve_secret(
             &state.vault.secrets_store,
+            &provider,
             provider
                 .client_id_secret_ref
                 .as_deref()
@@ -388,6 +387,7 @@ async fn callback(
                 .and_then(|seconds| now.checked_add_signed(chrono::Duration::seconds(seconds))),
             delegation_vc: None,
             consent_identity: Some(consent_identity),
+            secret_versions: None,
             consent_granted_at: now,
             last_used_at: None,
             created_at: now,
@@ -423,7 +423,11 @@ pub fn authorization_url(
     client_id: &str,
     callback_state: &str,
 ) -> Result<Url, ContinuationError> {
-    if provider.provider_type != CredentialProviderType::OAuth2AuthorizationCode
+    let consent_provider = match provider.provider_type.grant() {
+        ProviderGrant::UserConsent => true,
+        ProviderGrant::GatewayToken | ProviderGrant::StaticKey => false,
+    };
+    if !consent_provider
         || provider.id != ticket.binding.provider_id
         || client_id.is_empty()
         || client_id.len() > 4096
@@ -560,9 +564,13 @@ pub async fn exchange_code(
         .as_deref()
         .ok_or(ContinuationError::InvalidRecord)?;
     crate::url_validation::validate_oauth_endpoint_url(endpoint).map_err(|_| ContinuationError::InvalidRecord)?;
+    if !super::gateway_token::GrantEgress::from_environment().permits_token_endpoint(endpoint) {
+        return Err(ContinuationError::InvalidRecord);
+    }
     crate::sts::mcp_profile::canonical_https_url(resource).map_err(|_| ContinuationError::InvalidRecord)?;
     let client_id = super::oauth::resolve_secret(
         secrets,
+        provider,
         provider
             .client_id_secret_ref
             .as_deref()
@@ -573,6 +581,7 @@ pub async fn exchange_code(
     let client_secret = zeroize::Zeroizing::new(
         super::oauth::resolve_secret(
             secrets,
+            provider,
             provider
                 .client_secret_secret_ref
                 .as_deref()
@@ -712,6 +721,7 @@ mod tests {
             .build()
             .unwrap();
         let token_endpoint = "http://192.0.2.1/token";
+        let _env = crate::component_tests::helpers::test_mode::TestModeEnv::enabled(token_endpoint, token_endpoint);
         let mut tasks = tokio::task::JoinSet::new();
         tasks.spawn(async move {
             axum::serve(listener, provider_app)
@@ -832,6 +842,7 @@ mod tests {
         let caller = crate::source_auth::AuthenticatedIdentity::JwtBearer {
             subject: subject.clone(),
             claims: json!({"iss": profile.issuer, "sub": subject, "scope": "read", "exp": now + 300}),
+            strategy: None,
         };
         let request = ValidatedModernMessage {
             protocol_version: crate::mcp::MCP_MODERN_VERSION.into(),
@@ -1165,10 +1176,48 @@ mod tests {
         tasks.shutdown().await;
     }
 
-    #[test]
-    fn modern_consent_binds_pkce_callback_and_resource_without_parameter_override() {
-        let mut provider: CredentialProvider = serde_json::from_value(json!({
-            "id": "provider", "name": "Provider", "provider_id": "provider", "authorization_endpoint": "https://idp.example/authorize?prompt=consent",
+    #[tokio::test]
+    async fn exchange_code_refuses_an_unlisted_http_token_endpoint() {
+        let _env = crate::component_tests::helpers::test_mode::TestModeEnv::with(None, None, None);
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = crate::secrets::FilesystemSecretsStore::new_async(
+            directory
+                .path()
+                .to_str()
+                .expect("utf-8 path"),
+        )
+        .await
+        .expect("secrets store opens");
+        for secret_id in ["client-id", "client-secret"] {
+            crate::secrets::SecretsStore::create(
+                &store,
+                crate::secrets::CreateSecretRequest {
+                    tenant_id: None,
+                    name: secret_id.into(),
+                    secret_id: secret_id.into(),
+                    description: None,
+                    value: format!("{secret_id}-value"),
+                    secret_type: "General".into(),
+                    tags: vec![],
+                },
+            )
+            .await
+            .expect("secret is created");
+        }
+        let secrets: std::sync::Arc<dyn crate::secrets::SecretsStore> = std::sync::Arc::new(store);
+        let (mut provider, ticket) = consent_fixture("https://identity.example/authorize");
+        provider.token_endpoint = Some("http://192.0.2.1/token".into());
+        provider.client_id_secret_ref = Some("client-id".into());
+        provider.client_secret_secret_ref = Some("client-secret".into());
+
+        let result = exchange_code(&provider, &ticket, "auth-code", &secrets, &reqwest::Client::new()).await;
+
+        assert!(matches!(result, Err(ContinuationError::InvalidRecord)));
+    }
+
+    fn consent_fixture(authorization_endpoint: &str) -> (CredentialProvider, ConsentTicket) {
+        let provider: CredentialProvider = serde_json::from_value(json!({
+            "id": "provider", "name": "Provider", "provider_id": "provider", "authorization_endpoint": authorization_endpoint,
             "resource": "https://provider.example/api", "consent_identity_strategy_id": "strategy",
             "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
         })).unwrap();
@@ -1180,6 +1229,12 @@ mod tests {
                 "authorization_digest": ([1; 32]), "tenant_id": null, "surface_id": "surface", "variant_id": null, "route": {"kind": "access_point"},
                 "resource": "https://gateway.example/mcp", "provider_id": "provider", "scopes": ["read"], "method": "tools/call", "arguments_digest": ([2; 32])}
         })).unwrap();
+        (provider, ticket)
+    }
+
+    #[test]
+    fn modern_consent_binds_pkce_callback_and_resource_without_parameter_override() {
+        let (mut provider, ticket) = consent_fixture("https://idp.example/authorize?prompt=consent");
         let url = authorization_url(&provider, &ticket, "client", "opaque-callback-state").unwrap();
         let fields = url
             .query_pairs()
@@ -1204,5 +1259,27 @@ mod tests {
             .clear();
         provider.resource = None;
         assert!(authorization_url(&provider, &ticket, "client", "opaque").is_err());
+    }
+
+    #[test]
+    fn modern_consent_is_refused_for_providers_that_need_no_user_consent() {
+        use crate::credential_providers::CredentialProviderType;
+        let (mut provider, ticket) = consent_fixture("https://idp.example/authorize");
+
+        assert!(authorization_url(&provider, &ticket, "client", "opaque").is_ok());
+        for provider_type in [
+            CredentialProviderType::OAuth2ClientCredentials,
+            CredentialProviderType::OAuth2JwtBearer,
+            CredentialProviderType::ApiKey,
+        ] {
+            provider.provider_type = provider_type.clone();
+            assert!(
+                matches!(
+                    authorization_url(&provider, &ticket, "client", "opaque"),
+                    Err(ContinuationError::InvalidRecord)
+                ),
+                "{provider_type:?}"
+            );
+        }
     }
 }

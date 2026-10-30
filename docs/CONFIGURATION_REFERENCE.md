@@ -146,7 +146,7 @@ The bootstrap file. Startup only; changes need a restart.
 | `[mcp]` | Default MCP revision, validation, timeouts, SSE and stdio transports. Gateway-originated `2026-07-28` consent needs `[mcp.continuations]`; see [`MCP_METADATA.md`](MCP_METADATA.md#protected-continuations). |
 | `[reconnect_policy]` | Backoff for DIDComm connection points |
 | `[oob_connection]` | How long an out-of-band pairing invitation stays pending |
-| `[a2a]` | Default A2A revision, body size, timeouts, fabric timeouts and envelope lifetime, inbound cache sizing |
+| `[a2a]` | Default A2A revision, body size, timeouts, fabric timeouts and envelope lifetime, inbound cache sizing. The body size and `timeout_seconds` also bound the [Agent card preview](SOURCE_AUTH.md#agent-card-preview) fetch. |
 | `[logging]` | Level, JSON output, log directory. Log redaction is not read here; see [Log redaction](#log-redaction). |
 | `[extension_inspection]` | Whether to parse A2A extensions, and which URIs to watch |
 
@@ -200,10 +200,37 @@ storage unencrypted.
 One listener can serve several Access Points, and one transit listener several Transit
 Points. A request is matched to its surface by route.
 
+Some paths are reserved. A `channels` or `proxy` route prefix that shadows a dashboard page, or a
+`channels`, `routes` (of any type, `redirect` and `static` included) or `mcp_proxies` prefix
+at or under `/.well-known/oauth-protected-resource`, stops the gateway at startup with exit
+code `2` and a banner naming each prefix. Every served inbound listener serves protected resource
+metadata on that path itself (see
+[`MCP_METADATA.md`](MCP_METADATA.md#authorization-server-discovery-for-caller-authentication)).
+A configuration reload refuses a `gateway.json` with such a metadata path prefix and keeps the
+running configuration (see [Reserved routes](CONFIGURATION_RELOAD.md#reserved-routes)). A
+stored surface whose route is at or under this path is logged as an error and not mounted;
+change its route.
+
 ![An inbound listener route-matching to two Access Points, and an outbound listener route-matching to two Transit Points](assets/diagrams/listeners-route-matching.png)
 
 The type is [`NetworkConfig`](../src/config/network.rs). Surfaces themselves are stored
 records rather than file content; see [`src/config/agent_surface.rs`](../src/config/agent_surface.rs).
+
+An MCP, A2A or AP2 Access Point declares its OAuth protection with
+`access_point.caller_authentication.protected_resource`, next to a JWT Bearer method:
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `resource` | Yes | The canonical HTTPS URL of the Access Point on a public origin of its listener, with the route as its path. It is the one audience a token must name and the resource the metadata and challenge publish. |
+| `authorization_servers` | No | Absent, the document names the JWT verification strategy's `expected_issuer`. A save that sends or changes it must send exactly `["<expected_issuer>"]`, or it is refused; a stored list that the save leaves unchanged is kept and reported as `authorization_servers_stale`. |
+| `scopes` | No | Extra scopes advertised as `scopes_supported` after the method's `required_scopes`; never enforced. |
+
+The setting makes the Access Point refuse a failed caller at source authentication; see
+[Authorization server discovery](MCP_METADATA.md#authorization-server-discovery-for-caller-authentication)
+and [`SOURCE_AUTH.md`](SOURCE_AUTH.md#declaring-an-access-point). Before rolling back to a release
+up to v1.0.3, read the downgrade notes there: a setting stored without
+`authorization_servers` cannot be read by those releases, and an A2A or AP2 surface with the
+setting answers `503` on them.
 
 `webauthn.external_origin` is the value a browser must be visiting for passkey
 registration to succeed. A mismatch is the most common local-setup failure, and

@@ -2,11 +2,7 @@ import { apiClient, type AgentSurface } from './api';
 
 const fetchMock = jest.fn();
 
-const SETTING = {
-  resource: 'https://gateway.example/mcp/alpha',
-  authorization_servers: ['https://idp.example/realms/agents'],
-  scopes: ['tools'],
-};
+const SETTING = { resource: 'https://gateway.example/mcp/alpha' };
 
 const SURFACE: AgentSurface = {
   surface_id: 's-1',
@@ -69,6 +65,29 @@ describe('surface API and authorization server discovery', () => {
     expect(saved.target.agent_identity).toEqual(agent_identity);
   });
 
+  it('sends a stored authorization server list back unchanged', async () => {
+    const stored = {
+      ...SETTING,
+      authorization_servers: ['https://idp.example/realms/agents'],
+      scopes: ['tools'],
+    };
+    const callerAuthentication = {
+      methods: SURFACE.access_point.caller_authentication!.methods,
+      protected_resource: stored,
+    };
+    const surface = {
+      ...SURFACE,
+      access_point: { ...SURFACE.access_point, caller_authentication: callerAuthentication },
+    };
+    fetchMock.mockResolvedValue(ok(surface));
+
+    const saved = await apiClient.updateSurface('s-1', surface);
+
+    const { body } = sent();
+    expect((body.access_point as any).caller_authentication.protected_resource).toEqual(stored);
+    expect(saved.access_point.caller_authentication?.protected_resource).toEqual(stored);
+  });
+
   it('sends a null that removes the setting on the same PUT', async () => {
     fetchMock.mockResolvedValue(ok(SURFACE));
 
@@ -87,6 +106,66 @@ describe('surface API and authorization server discovery', () => {
       methods: [],
       protected_resource: null,
     });
+  });
+
+  it('keeps the setting and required scopes when a save response carries warnings and declarations', async () => {
+    const methods = [
+      {
+        type: 'jwt_bearer',
+        jwt_verification_strategy_id: 'idp',
+        audiences: [],
+        required_scopes: ['tools.call'],
+      },
+    ];
+    const callerAuthentication = { methods, protected_resource: SETTING };
+    const declarations = [
+      { variant: null, outcome: 'declare', reason: null, resource: SETTING.resource },
+    ];
+    const warnings = [
+      {
+        code: 'fail_open_policy',
+        message: 'A caller whose token fails reaches policy, and no policy denies it.',
+        path: 'access_point.caller_authentication',
+        variant: 'beta',
+      },
+    ];
+    fetchMock.mockResolvedValue(
+      ok({
+        ...SURFACE,
+        access_point: { ...SURFACE.access_point, caller_authentication: callerAuthentication },
+        warnings,
+        declarations,
+      })
+    );
+
+    const saved = await apiClient.updateSurface('s-1', {
+      ...SURFACE,
+      access_point: { ...SURFACE.access_point, caller_authentication: callerAuthentication },
+    });
+
+    expect(saved.access_point.caller_authentication).toEqual(callerAuthentication);
+    expect(saved.declarations).toEqual(declarations);
+    expect(saved.warnings).toEqual(warnings);
+
+    fetchMock.mockReset();
+    fetchMock.mockResolvedValue(ok(SURFACE));
+    await apiClient.updateSurface('s-1', saved);
+    const { body } = sent();
+    expect((body.access_point as any).caller_authentication).toEqual(callerAuthentication);
+    expect(body).not.toHaveProperty('warnings');
+    expect(body).not.toHaveProperty('declarations');
+  });
+
+  it('reads a save response without warnings or declarations from an older gateway', async () => {
+    fetchMock.mockResolvedValue(ok(SURFACE));
+
+    const saved = await apiClient.updateSurface('s-1', SURFACE);
+
+    expect(saved.access_point.caller_authentication).toEqual(
+      SURFACE.access_point.caller_authentication
+    );
+    expect(saved.warnings).toBeUndefined();
+    expect(saved.declarations).toBeUndefined();
   });
 
   it('keeps the JSON content type and session on ordinary requests', async () => {

@@ -4,6 +4,13 @@ import { urlError } from '../validators';
 import ManagedAgentPanel from './ManagedAgentPanel';
 import ManagedAgentAuthFullscreen from './ManagedAgentAuthFullscreen';
 import { DOCS_URL } from '../../../../config/docs';
+import { credentialProviderAuthError, parseTargetAuth } from '../../../../utils/targetAuth';
+import {
+  CREDENTIAL_PROVIDER_AUTH_TYPE,
+  PRESERVED_AUTH_TYPE,
+  credentialProviderFieldsFromConfig,
+  targetAuthFromConfig,
+} from './targetAuthConfig';
 import { a2aProxyIdFromEndpoint, isA2aProxyEndpoint } from '../_shared/a2aProxyEndpoint';
 
 export const managedAgentDefinition: NodeDefinition = {
@@ -75,6 +82,22 @@ export const managedAgentDefinition: NodeDefinition = {
     } else if (type === 'mcp-proxy') {
       if (!c.mcp_proxy_id)
         errs.push({ field: 'mcp_proxy_id', message: 'MCP Proxy selection is required' });
+    }
+    if (c.target_auth_enabled && c.target_auth_type === CREDENTIAL_PROVIDER_AUTH_TYPE) {
+      const e = credentialProviderAuthError(credentialProviderFieldsFromConfig(c));
+      if (e) errs.push({ field: 'target_auth_credential_provider_id', message: e });
+      if (type === 'url' && typeof c.endpoint === 'string' && !c.endpoint.startsWith('https://')) {
+        errs.push({
+          field: 'endpoint',
+          message: 'A credential provider needs an https:// target.',
+        });
+      }
+      if (type !== 'url') {
+        errs.push({
+          field: 'target_auth_type',
+          message: 'A credential provider needs a direct https URL target.',
+        });
+      }
     }
     return errs;
   },
@@ -165,22 +188,16 @@ export const managedAgentDefinition: NodeDefinition = {
       c.inject_vp = true;
     }
     if (slice?.auth) {
-      const ta = slice.auth;
+      const parsed = parseTargetAuth(slice.auth);
       c.target_auth_enabled = true;
-      c.target_auth_fallback = ta.fallback || 'reject';
-      const m = ta.method;
-      // Wire shape uses an externally-tagged enum: { static_secret: { ... } }.
-      // Older saved configs may use the flattened shape with `method: 'static_secret'`
-      // and sibling fields, so handle both.
-      const ss =
-        (typeof m === 'object' ? m?.static_secret : null) || (m === 'static_secret' ? ta : null);
-      if (ss) {
-        c.target_auth_secret_id = ss.secret_id || '';
-        c.target_auth_header_name = ss.header_name || 'Authorization';
-        c.target_auth_header_format = ss.header_format || '{value}';
-
-        if (typeof ta.auth_type === 'string') {
-          c.target_auth_type = ta.auth_type;
+      c.target_auth_fallback =
+        parsed?.kind === 'unsupported' ? 'reject' : slice.auth.fallback || 'reject';
+      if (parsed?.kind === 'static_secret') {
+        c.target_auth_secret_id = parsed.secretId;
+        c.target_auth_header_name = parsed.headerName;
+        c.target_auth_header_format = parsed.headerFormat;
+        if (parsed.authType) {
+          c.target_auth_type = parsed.authType;
         } else {
           const fmt: string = c.target_auth_header_format;
           if (fmt.startsWith('Bearer ')) c.target_auth_type = 'bearer';
@@ -188,6 +205,19 @@ export const managedAgentDefinition: NodeDefinition = {
           else if (c.target_auth_header_name === 'X-API-Key') c.target_auth_type = 'api_key';
           else c.target_auth_type = 'custom';
         }
+      } else if (parsed?.kind === 'credential_provider') {
+        c.target_auth_type = CREDENTIAL_PROVIDER_AUTH_TYPE;
+        c.target_auth_fallback = parsed.fallback;
+        c.target_auth_credential_provider_id = parsed.credentialProviderId;
+        c.target_auth_scopes = parsed.scopes.join(', ');
+        c.target_auth_inject_as = parsed.injectAs.type;
+        if (parsed.injectAs.type === 'custom_header') {
+          c.target_auth_inject_name = parsed.injectAs.name;
+          c.target_auth_inject_format = parsed.injectAs.format;
+        }
+      } else if (parsed?.kind === 'unsupported') {
+        c.target_auth_type = PRESERVED_AUTH_TYPE;
+        c.target_auth_raw = parsed.raw;
       }
       delete c.auth;
     }
@@ -200,19 +230,8 @@ export const managedAgentDefinition: NodeDefinition = {
     if (isA2aProxyEndpoint(c.endpoint)) {
       tgt.a2a_proxy_id = c.a2a_proxy_id || a2aProxyIdFromEndpoint(c.endpoint);
     }
-    if (c.target_auth_enabled && c.target_auth_secret_id) {
-      tgt.auth = {
-        method: {
-          static_secret: {
-            secret_id: c.target_auth_secret_id,
-            header_name: c.target_auth_header_name || 'Authorization',
-            header_format: c.target_auth_header_format || '{value}',
-          },
-        },
-        auth_type: c.target_auth_type || 'bearer',
-        fallback: c.target_auth_fallback || 'reject',
-      };
-    }
+    const auth = targetAuthFromConfig(c);
+    if (auth) tgt.auth = auth;
     if (typeof c.endpoint === 'string' && c.endpoint.startsWith('fabric://')) {
       if (c.fabric_target_name) tgt.fabric_target_name = c.fabric_target_name;
       if (c.fabric_delegated_credentials === true) tgt.fabric_delegated_credentials = true;

@@ -1,6 +1,10 @@
 //! Source authentication error types
 
-use axum::{body::Body, http::StatusCode, response::Response};
+use axum::body::Body;
+use axum::http::header::CONTENT_TYPE;
+use axum::http::{HeaderValue, StatusCode};
+use axum::response::Response;
+use serde::Serialize;
 use thiserror::Error;
 
 use crate::config::agent_surface::SurfaceProtocol;
@@ -18,7 +22,14 @@ pub enum SourceAuthError {
     #[error("Invalid credential: {reason}")]
     InvalidCredential { reason: String },
 
-    /// The referenced authentication configuration was not found.
+    /// The credential verified but does not grant every required scope.
+    #[error("Insufficient scope: missing {}", .missing.join(" "))]
+    InsufficientScope { missing: Vec<String> },
+
+    /// The referenced authentication configuration was not found, for example a
+    /// JWT verification strategy or trust certificate that was deleted while a
+    /// surface still references it. The id is for the gateway log only; callers
+    /// get [`CONFIG_NOT_FOUND_DETAIL`], which names nothing.
     #[error("Auth config not found: {id}")]
     ConfigNotFound { id: String },
 
@@ -46,8 +57,8 @@ impl From<JwtBearerError> for SourceAuthError {
             JwtBearerError::InvalidToken(msg) => SourceAuthError::InvalidCredential {
                 reason: format!("Invalid token: {msg}"),
             },
-            JwtBearerError::KeyNotFound(kid) => SourceAuthError::InvalidCredential {
-                reason: format!("Key not found for kid: {kid}"),
+            JwtBearerError::KeyNotFound(_) => SourceAuthError::InvalidCredential {
+                reason: "Signing key not found".to_string(),
             },
             JwtBearerError::JwksFetchFailed(msg) => SourceAuthError::Internal {
                 reason: format!("JWKS fetch failed: {msg}"),
@@ -59,31 +70,64 @@ impl From<JwtBearerError> for SourceAuthError {
     }
 }
 
+/// The `detail` a caller gets for [`SourceAuthError::ConfigNotFound`].
+pub const CONFIG_NOT_FOUND_DETAIL: &str = "Caller authentication is unavailable";
+
+/// Why a caller's credential failed, published to policy as `input.source_auth.kind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceAuthFailureKind {
+    Missing,
+    Invalid,
+    InsufficientScope,
+}
+
 impl SourceAuthError {
-    /// Whether this failure is attributable to the caller's credential (missing
-    /// or invalid) rather than a server-side problem (config resolution, JWKS
-    /// fetch, storage). Caller-attributable failures are handed to the policy
-    /// layer instead of being blocked at the source-auth stage.
-    pub fn is_caller_attributable(&self) -> bool {
-        matches!(self, SourceAuthError::MissingCredential { .. } | SourceAuthError::InvalidCredential { .. })
+    /// The failure kind when this failure is attributable to the caller's
+    /// credential (missing, invalid or short of scope), `None` for a server-side
+    /// problem (config resolution, JWKS fetch, storage).
+    pub fn failure_kind(&self) -> Option<SourceAuthFailureKind> {
+        match self {
+            SourceAuthError::MissingCredential { .. } => Some(SourceAuthFailureKind::Missing),
+            SourceAuthError::InvalidCredential { .. } => Some(SourceAuthFailureKind::Invalid),
+            SourceAuthError::InsufficientScope { .. } => Some(SourceAuthFailureKind::InsufficientScope),
+            SourceAuthError::ConfigNotFound { .. } | SourceAuthError::Internal { .. } => None,
+        }
     }
 
-    /// HTTP status for a blocking denial. Caller-credential failures map to
-    /// 401; server-side failures (config not found, internal) map to 500 —
-    /// 401 would misrepresent a server-side problem as the caller's fault.
+    /// Whether this failure is attributable to the caller's credential rather
+    /// than a server-side problem. Caller-attributable failures are handed to
+    /// the policy layer instead of being blocked at the source-auth stage.
+    pub fn is_caller_attributable(&self) -> bool {
+        self.failure_kind().is_some()
+    }
+
+    /// HTTP status for a blocking denial. A missing or invalid credential maps
+    /// to 401 and a scope shortfall to 403. Server-side failures (config not
+    /// found, internal) map to 500, because 401 would misrepresent a
+    /// server-side problem as the caller's fault.
     fn http_status(&self) -> StatusCode {
-        if self.is_caller_attributable() {
-            StatusCode::UNAUTHORIZED
-        } else {
-            StatusCode::INTERNAL_SERVER_ERROR
+        match self.failure_kind() {
+            Some(SourceAuthFailureKind::InsufficientScope) => StatusCode::FORBIDDEN,
+            Some(_) => StatusCode::UNAUTHORIZED,
+            None => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 
     fn problem_title(&self) -> &'static str {
-        if self.is_caller_attributable() {
-            "Unauthorized"
-        } else {
-            "Internal Server Error"
+        match self.http_status() {
+            StatusCode::FORBIDDEN => "Forbidden",
+            StatusCode::UNAUTHORIZED => "Unauthorized",
+            _ => "Internal Server Error",
+        }
+    }
+
+    /// The `detail` a caller sees. A missing configuration gets a fixed text,
+    /// because its message names a strategy or certificate id.
+    pub fn public_detail(&self) -> String {
+        match self {
+            SourceAuthError::ConfigNotFound { .. } => CONFIG_NOT_FOUND_DETAIL.to_string(),
+            _ => self.to_string(),
         }
     }
 }
@@ -92,10 +136,11 @@ impl SourceAuthError {
 pub type SourceAuthResult<T> = Result<T, SourceAuthError>;
 
 /// Build a protocol-appropriate denial response for a source authentication
-/// failure. Caller-attributable failures (missing/invalid credential) map to
-/// **401 Unauthorized**; server-side failures (config not found, internal) map
+/// failure. A missing or invalid credential maps to **401 Unauthorized** and a
+/// scope shortfall to **403 Forbidden**; server-side failures (config not found, internal) map
 /// to **500 Internal Server Error** — a 401 would misrepresent a server-side
-/// problem as the caller's fault. Note: caller-attributable failures are
+/// problem as the caller's fault. The body's `detail` is
+/// [`SourceAuthError::public_detail`], so a missing configuration names no id. Note: caller-attributable failures are
 /// normally handed to the policy layer rather than blocked, so in practice this
 /// builder is reached for server-side (500) failures.
 ///
@@ -103,21 +148,22 @@ pub type SourceAuthResult<T> = Result<T, SourceAuthError>;
 ///   URI. JWT Bearer 401s include a `WWW-Authenticate: Bearer` header.
 /// - **MCP**: JWT Bearer 401s return `application/problem+json` *without*
 ///   the A2A error URI, plus a `WWW-Authenticate: Bearer` header with `realm`.
-///   API key failures use an `about:blank` problem type.
+///   It names no `resource_metadata`. API key failures use an `about:blank` problem type.
 /// - **Other protocols**: fall back to the A2A shape (matches the previous
 ///   behaviour).
 ///
-/// A `WWW-Authenticate` challenge is only emitted for a genuine 401.
+/// A `WWW-Authenticate` challenge is only emitted for a genuine 401, and it
+/// carries the gateway challenge marker.
 pub fn deny_response(
     protocol: &SurfaceProtocol,
     auth_config: &SourceAuthConfig,
     error: &SourceAuthError,
 ) -> Response {
-    let detail = error.to_string();
+    let detail = error.public_detail();
     let status = error.http_status();
     let title = error.problem_title();
-    // Only a genuine 401 warrants a `WWW-Authenticate` challenge; a 500 is a
-    // server-side fault, not a prompt for the caller to re-authenticate.
+    // Only a genuine 401 warrants a `WWW-Authenticate` challenge; a 403 or 500
+    // is not a prompt for the caller to re-authenticate.
     let challenge = status == StatusCode::UNAUTHORIZED;
 
     match protocol {
@@ -140,17 +186,11 @@ fn a2a_deny(
         "detail": detail,
     });
 
-    let mut builder = Response::builder()
-        .status(status)
-        .header("content-type", "application/problem+json");
-
-    if challenge && matches!(auth_config, SourceAuthConfig::JwtBearer(_)) {
-        builder = builder.header("www-authenticate", "Bearer");
-    }
-
-    builder
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap()
+    problem_response(
+        status,
+        &body,
+        (challenge && matches!(auth_config, SourceAuthConfig::JwtBearer(_))).then_some("Bearer"),
+    )
 }
 
 fn mcp_deny(
@@ -167,17 +207,31 @@ fn mcp_deny(
         "detail": detail,
     });
 
-    let mut builder = Response::builder()
-        .status(status)
-        .header("content-type", "application/problem+json");
+    problem_response(
+        status,
+        &body,
+        (challenge && matches!(auth_config, SourceAuthConfig::JwtBearer(_)))
+            .then_some("Bearer realm=\"agent-gateway\""),
+    )
+}
 
-    if challenge && matches!(auth_config, SourceAuthConfig::JwtBearer(_)) {
-        builder = builder.header("www-authenticate", "Bearer realm=\"agent-gateway\"");
+fn problem_response(
+    status: StatusCode,
+    body: &serde_json::Value,
+    challenge: Option<&'static str>,
+) -> Response {
+    let mut response = Response::new(Body::from(body.to_string()));
+    *response.status_mut() = status;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/problem+json"));
+    if let Some(challenge) = challenge {
+        crate::protocols::protected_resource::mark_gateway_challenge(
+            &mut response,
+            HeaderValue::from_static(challenge),
+        );
     }
-
-    builder
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap()
+    response
 }
 
 #[cfg(test)]
@@ -196,11 +250,132 @@ mod tests {
     }
 
     #[test]
+    fn key_not_found_reason_names_no_token_value() {
+        let error = SourceAuthError::from(JwtBearerError::KeyNotFound("evil\r\nx".to_string()));
+        let text = error.to_string();
+        assert_eq!(text, "Invalid credential: Signing key not found");
+        assert!(!text.contains("evil") && !text.contains(['\r', '\n']), "{text}");
+    }
+
+    #[test]
     fn caller_attributable_classification() {
         assert!(SourceAuthError::MissingCredential { reason: "x".into() }.is_caller_attributable());
         assert!(SourceAuthError::InvalidCredential { reason: "x".into() }.is_caller_attributable());
+        assert!(SourceAuthError::InsufficientScope { missing: vec!["x".into()] }.is_caller_attributable());
         assert!(!SourceAuthError::ConfigNotFound { id: "x".into() }.is_caller_attributable());
         assert!(!SourceAuthError::Internal { reason: "x".into() }.is_caller_attributable());
+    }
+
+    #[test]
+    fn failure_kind_names_each_caller_failure() {
+        assert_eq!(
+            SourceAuthError::MissingCredential { reason: "x".into() }.failure_kind(),
+            Some(SourceAuthFailureKind::Missing)
+        );
+        assert_eq!(
+            SourceAuthError::InvalidCredential { reason: "x".into() }.failure_kind(),
+            Some(SourceAuthFailureKind::Invalid)
+        );
+        assert_eq!(
+            SourceAuthError::InsufficientScope { missing: vec!["x".into()] }.failure_kind(),
+            Some(SourceAuthFailureKind::InsufficientScope)
+        );
+        assert_eq!(SourceAuthError::ConfigNotFound { id: "x".into() }.failure_kind(), None);
+        assert_eq!(SourceAuthError::Internal { reason: "x".into() }.failure_kind(), None);
+        for (kind, value) in [
+            (SourceAuthFailureKind::Missing, "missing"),
+            (SourceAuthFailureKind::Invalid, "invalid"),
+            (SourceAuthFailureKind::InsufficientScope, "insufficient_scope"),
+        ] {
+            assert_eq!(serde_json::to_value(kind).expect("serialize"), serde_json::json!(value));
+        }
+    }
+
+    #[test]
+    fn insufficient_scope_message_lists_every_missing_scope() {
+        let err = SourceAuthError::InsufficientScope {
+            missing: vec!["a2a:invoke".into(), "mcp:tools".into()],
+        };
+        assert_eq!(err.to_string(), "Insufficient scope: missing a2a:invoke mcp:tools");
+    }
+
+    #[tokio::test]
+    async fn insufficient_scope_is_403_without_challenge() {
+        for protocol in [SurfaceProtocol::A2a, SurfaceProtocol::Mcp] {
+            let err = SourceAuthError::InsufficientScope {
+                missing: vec!["a2a:invoke".into()],
+            };
+            let resp = deny_response(&protocol, &jwt_config(), &err);
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+            assert!(
+                resp.headers()
+                    .get("www-authenticate")
+                    .is_none()
+            );
+            let body = body_json(resp).await;
+            assert_eq!(body["status"], 403);
+            assert_eq!(body["title"], "Forbidden");
+        }
+    }
+
+    #[tokio::test]
+    async fn every_challenge_carries_the_gateway_marker() {
+        for protocol in [SurfaceProtocol::A2a, SurfaceProtocol::Mcp] {
+            let err = SourceAuthError::MissingCredential { reason: "no token".into() };
+            let resp = deny_response(&protocol, &jwt_config(), &err);
+            assert!(
+                resp.headers()
+                    .contains_key("www-authenticate")
+            );
+            assert!(crate::protocols::protected_resource::is_gateway_challenge(&resp));
+        }
+        let err = SourceAuthError::Internal { reason: "x".into() };
+        let resp = deny_response(&SurfaceProtocol::A2a, &jwt_config(), &err);
+        assert!(!crate::protocols::protected_resource::is_gateway_challenge(&resp));
+    }
+
+    #[tokio::test]
+    async fn problem_body_and_content_type_are_unchanged() {
+        let err = SourceAuthError::InvalidCredential { reason: "expired".into() };
+        let resp = deny_response(&SurfaceProtocol::A2a, &jwt_config(), &err);
+        assert_eq!(resp.headers()["content-type"], "application/problem+json");
+        assert_eq!(resp.headers()["www-authenticate"], "Bearer");
+        let body = body_json(resp).await;
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "type": "https://a2a-protocol.org/errors/proxy-error",
+                "title": "Unauthorized",
+                "status": 401,
+                "detail": "Invalid credential: expired",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn api_key_failure_carries_no_challenge() {
+        let api_key = SourceAuthConfig::ApiKey(crate::source_auth::models::ApiKeyAuthConfig {
+            extraction: crate::source_auth::models::CredentialExtraction::HttpHeader { field: "X-API-Key".to_string() },
+            secret_id: "s".to_string(),
+        });
+        let err = SourceAuthError::MissingCredential { reason: "no key".into() };
+        let resp = deny_response(&SurfaceProtocol::Mcp, &api_key, &err);
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            resp.headers()
+                .get("www-authenticate")
+                .is_none()
+        );
+        assert!(!crate::protocols::protected_resource::is_gateway_challenge(&resp));
+    }
+
+    #[tokio::test]
+    async fn internal_error_detail_is_unchanged() {
+        let err = SourceAuthError::Internal {
+            reason: "jwks fetch failed".into(),
+        };
+        let body = body_json(deny_response(&SurfaceProtocol::A2a, &jwt_config(), &err)).await;
+        assert_eq!(body["detail"], "Internal source auth error: jwks fetch failed");
     }
 
     #[tokio::test]
@@ -252,18 +427,69 @@ mod tests {
         }
     }
 
+    #[test]
+    fn public_detail_is_exact_for_every_variant_and_names_no_config_id() {
+        for (err, public) in [
+            (SourceAuthError::MissingCredential { reason: "no token".into() }, "Missing credential: no token"),
+            (SourceAuthError::InvalidCredential { reason: "expired".into() }, "Invalid credential: expired"),
+            (
+                SourceAuthError::InsufficientScope {
+                    missing: vec!["a2a:invoke".into()],
+                },
+                "Insufficient scope: missing a2a:invoke",
+            ),
+            (SourceAuthError::ConfigNotFound { id: "strategy-7f3a".into() }, "Caller authentication is unavailable"),
+            (
+                SourceAuthError::Internal {
+                    reason: "jwks fetch failed".into(),
+                },
+                "Internal source auth error: jwks fetch failed",
+            ),
+        ] {
+            assert_eq!(err.public_detail(), public);
+            assert!(
+                !err.public_detail()
+                    .contains("strategy-7f3a")
+            );
+        }
+    }
+
+    #[test]
+    fn config_not_found_keeps_the_id_in_its_log_message_only() {
+        let err = SourceAuthError::ConfigNotFound { id: "cert-91c2".into() };
+        assert_eq!(err.to_string(), "Auth config not found: cert-91c2");
+        assert_eq!(err.public_detail(), CONFIG_NOT_FOUND_DETAIL);
+    }
+
     #[tokio::test]
-    async fn mcp_config_not_found_is_500_without_challenge() {
-        let err = SourceAuthError::ConfigNotFound { id: "missing".into() };
-        let resp = deny_response(&SurfaceProtocol::Mcp, &jwt_config(), &err);
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(
-            resp.headers()
-                .get("www-authenticate")
-                .is_none()
-        );
-        let body = body_json(resp).await;
-        assert_eq!(body["status"], 500);
-        assert_eq!(body["title"], "Internal Server Error");
+    async fn config_not_found_is_500_without_challenge_or_id() {
+        for (protocol, problem_type) in [
+            (SurfaceProtocol::Mcp, "about:blank"),
+            (SurfaceProtocol::A2a, "https://a2a-protocol.org/errors/proxy-error"),
+        ] {
+            let err = SourceAuthError::ConfigNotFound { id: "strategy-7f3a".into() };
+            let resp = deny_response(&protocol, &jwt_config(), &err);
+            assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            assert!(
+                resp.headers()
+                    .get("www-authenticate")
+                    .is_none()
+            );
+            let body = body_json(resp).await;
+            assert_eq!(
+                body,
+                serde_json::json!({
+                    "type": problem_type,
+                    "title": "Internal Server Error",
+                    "status": 500,
+                    "detail": "Caller authentication is unavailable",
+                })
+            );
+            assert!(
+                !body
+                    .to_string()
+                    .contains("strategy-7f3a")
+            );
+        }
     }
 }

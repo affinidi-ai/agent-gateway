@@ -65,7 +65,10 @@ the stores, listeners, and middleware.
 8. Build the source authentication middleware, then the management and dashboard routers,
    and hand them to the surface task manager. Startup aborts if the JWT verification
    strategy store cannot be opened.
-9. Bind listeners and start each surface.
+9. Bind listeners and start each surface. A prefix that shadows a dashboard page or the
+   protected resource metadata path every listener serves stops the gateway with exit code
+   `2` first, and a stored surface whose route is at or under that path is skipped; see
+   [`CONFIGURATION_REFERENCE.md`](docs/CONFIGURATION_REFERENCE.md#gatewayjson).
 10. Mark the process ready, at which point `/api/v1/health` returns 200.
 
 Connection points come up before the management router and before any surface listener,
@@ -89,7 +92,7 @@ External caller → Access Point → Target. Implemented in
 flowchart TB
     subgraph E["Edge"]
         direction LR
-        A1["Source auth, or Resource<br/>Server token"] --> A2[Rate limit] --> A3[Body extraction] --> A4[MCP wire validation]
+        A1["Source auth (declaring: challenge),<br/>or Resource Server token"] --> A2[Rate limit] --> A3[Body extraction] --> A4[MCP wire validation]
     end
     subgraph G["Gateway plane"]
         direction LR
@@ -129,7 +132,7 @@ logic.
 
 | Stage | Owns | Lives in |
 | --- | --- | --- |
-| Source authentication | Establishing the caller's identity. A missing or invalid credential is passed to policy, not refused, except on an MCP Access Point that publishes protected resource metadata, which answers with a `401` discovery challenge | [`src/source_auth/`](src/source_auth/), [`src/protocols/protected_resource.rs`](src/protocols/protected_resource.rs) |
+| Source authentication | Establishing the caller's identity. A missing or invalid credential, or a JWT short of a required scope, is passed to policy, not refused, except on a declaring Access Point, which refuses such a caller here with its challenge on every protocol (the token check, then the scope check), before rate limiting, the body and any policy; when the request's Surface Variant cannot be resolved, the bare route's challenge is answered at routing, before any policy, on every protocol (see the [invariant on declaring Access Points](AGENTS.md#architecture)). The sending gateway of a Fabric route challenges; the receiving gateway answers `401`, or `403` with `error="insufficient_scope"`, with a `realm` and no `resource_metadata`, which the sending gateway answers `502` | [`src/source_auth/`](src/source_auth/), [`src/source_auth/declaration.rs`](src/source_auth/declaration.rs), [`src/protocols/protected_resource.rs`](src/protocols/protected_resource.rs) |
 | Resource Server token | Replaces source authentication on an MCP surface that sets `mcp_http.authorization`: a bearer token for this resource and its scopes is required, and a missing, invalid or insufficient one is refused at once with a `WWW-Authenticate` challenge, not passed to policy | [`src/mcp/resource_server.rs`](src/mcp/resource_server.rs) |
 | Rate limiting | Per-surface request limits | [`src/policies/rate_limiter.rs`](src/policies/rate_limiter.rs) |
 | Body extraction | Reading the request body once | [`src/proxy/handler.rs`](src/proxy/handler.rs) |
@@ -151,10 +154,12 @@ logic.
 | Access Point OPA | `access_point.inbound_policy`, its own deny gate, independent of the surface policy | [`src/policies/surface_manager.rs`](src/policies/surface_manager.rs) |
 | Appliance-wide surface policy | The global surface-plane set, deny-overrides, ahead of the surface's own policy | [`src/policies/global_policy.rs`](src/policies/global_policy.rs) |
 | Surface OPA | The per-surface policy gate | [`src/policies/surface_manager.rs`](src/policies/surface_manager.rs) |
+| Caller refusal | The answer to a caller a policy stage refuses: the stage's `403` (`CallerDenial::refusal`). A caller whose source authentication failed on a declaring Access Point never reaches a policy stage. Responses drop relayed challenges other than `Payment` when the Access Point declares or the Target is `fabric://`. A Fabric peer's `401`, or `403` with a Bearer `insufficient_scope` challenge, becomes `502` with a fixed detail | [`src/proxy/caller_denial.rs`](src/proxy/caller_denial.rs), [`src/source_auth/challenge.rs`](src/source_auth/challenge.rs), [`src/proxy/fabric_peer_refusal.rs`](src/proxy/fabric_peer_refusal.rs) |
 | MCP tool gating | The allow/deny firewall over tool names | [`src/policies/mcp_tool_gating.rs`](src/policies/mcp_tool_gating.rs) |
 | Headers | Trace ID, `did:webvh` identity headers, and caller-info headers | [`src/proxy/handler.rs`](src/proxy/handler.rs) |
 | Transit token | The token a managed agent echoes back on its Transit Point calls | [`src/proxy/transit_token.rs`](src/proxy/transit_token.rs) |
 | Credential delegation | Injecting delegated OAuth tokens, or signalling consent | [`src/proxy/credential_delegation.rs`](src/proxy/credential_delegation.rs) |
+| Target authentication | The gateway's own credential for the Target (a static secret, or a provider's API key or cached gateway token), never sent for a caller nobody vouched for. On an `http(s)` Target, a credentialed request whose URL leaves the Target base path (the agent card URLs excepted) is answered `502` whatever the fallback. Resolved after delegation, so a header carries at most one credential | [`src/proxy/target_credentials.rs`](src/proxy/target_credentials.rs) |
 | VP injection | The deferred identity presentation added to the upstream request | [`src/identity/`](src/identity/) |
 | Forward | Vetting the target and sending the request | [`src/egress.rs`](src/egress.rs) |
 | Upstream response bounds | Buffering the upstream response within `[a2a] max_body_size`, the target's `networking.timeout.idle_secs` and its request timeout; `502` over the size, `504` on a stall. An MCP event-stream passthrough is not buffered. | [`src/proxy/upstream_body.rs`](src/proxy/upstream_body.rs) |
@@ -198,7 +203,7 @@ appliance-wide policies.
 
 Inbound:
 
-source auth (or, on an MCP surface with `mcp_http.authorization`, the Resource Server
+source auth (a declaring Access Point refuses here: token, then scope; or, on an MCP surface with `mcp_http.authorization`, the Resource Server
 token, which refuses rather than passing to policy) → rate limit → body extraction → MCP
 wire validation and context → agent
 context → appliance-wide gateway policy → gateway OPA → AP2 gate → A2A version negotiation
@@ -208,7 +213,8 @@ dispatch) → forward-target egress check → body-size limit → local x402/MPP
 policies → extension inspection → caller identity → custom metadata → Trust Check (caller
 leg) → Access Point OPA → appliance-wide surface policy → surface OPA → MCP tool gating
 (`tools/call`) → identity and caller-info headers → transit token generation → MCP custom
-metadata → credential delegation and consent → deferred VP injection → forward → resolve
+metadata → credential delegation and consent → Target authentication → deferred VP injection →
+forward → resolve
 protected identity → response processing, including the `tools/list` filter → metrics.
 
 Outbound:
@@ -218,9 +224,12 @@ refused here; on a Transit Point with `mcp_http.authorization`, the Resource Ser
 transit token validation → rate limit → protocol context → Transit Point header mapping
 (A2A and AP2) → outbound extension inspection (A2A) → identity resolution → trusted
 identity → custom metadata → trust context → Trust Check (the Transit Point's own list) → gateway OPA →
-surface OPA → Transit Point OPA → MCP tool gating (`tools/call`) → credential injection →
-forward → response and agent-card rewrite → metrics. The stages from trust context to MCP
-tool gating are skipped for public discovery GETs.
+surface OPA → Transit Point OPA → MCP tool gating (`tools/call`) → credential injection and
+Target authentication → forward → response and agent-card rewrite → metrics. The stages from trust context to MCP
+tool gating are skipped for public discovery GETs. On an inbound Access Point that declares a
+protected resource, public discovery reads are limited to the exact well-known card and UCP URLs
+under its route; every other path goes through source authentication, policy and Trust Check. The
+Transit Point path still treats any discovery-suffix GET as public.
 
 This page is the authority on pipeline ordering. When it disagrees with a summary
 elsewhere, the source is the arbiter and this page is corrected.
@@ -309,7 +318,10 @@ Breaking one of these is a correctness bug, not a style question.
 | DashMap is authoritative at runtime; disk is written immediately. | Reads and writes would disagree after a reload. |
 | Identity attribution fails closed. A presentation that does not verify never becomes the caller identity. | An unverified DID would reach policy as if it were proven. |
 | Every event of a forwarded A2A event stream gets the response checks a non-streaming reply gets before it is sent, and one that fails them ends the stream. | Streaming would bypass the response policy and the agent identity credential. |
-| A caller whose source authentication failed is never forwarded with the surface's stored target credential, or the A2A proxy's Direct Line secret, on the inbound and Fabric forwarding paths (direct, `proxy://` MCP, `a2a-proxy://`, Fabric send, Fabric receive). Transit Point listeners do not authenticate callers, so this does not cover them. | An unauthenticated caller would reach the Target with the operator's credential. |
+| A declaring Access Point never forwards the caller's own token, on the direct path or the Fabric send leg, and refuses a caller whose source authentication failed, at source authentication on every protocol (stated once under _Policy planes and identity attribution fail closed_ in [`AGENTS.md`](AGENTS.md#architecture)). | The gateway would hand a token issued for it to the Target, and a failed caller would reach payment or the Target on a policy's say-so. |
+| A caller whose source authentication failed is never forwarded with the surface's Target Authentication credential, or the A2A proxy's Direct Line secret, on the inbound and Fabric forwarding paths (direct, `proxy://` MCP, `a2a-proxy://`, Fabric send, Fabric receive). Transit Point listeners do not authenticate callers, so this does not cover them. | An unauthenticated caller would reach the Target with the operator's credential. |
+| Every `Bearer` `WWW-Authenticate` challenge the gateway builds on an Access Point carries the `GatewayChallenge` marker (`mark_gateway_challenge` in `src/protocols/protected_resource.rs`); `Payment` challenges are kept by scheme. | The relayed-challenge filter would drop the gateway's own challenge and turn its `401` into a `502`. |
+| The sending gateway never relays a receiving gateway's Bearer challenge: a peer `401`, or `403` with `insufficient_scope`, reaches the caller as `502` with a fixed detail and is recorded (`src/proxy/fabric_peer_refusal.rs`). | A caller would be sent to re-authenticate for a token it cannot deliver, and loop. |
 | The Agent Surface is the only routing unit. | Routing behaviour would drift away from what an operator configured. |
 | x402 verification and settlement use the surface's configured payment requirement, or on a fabric facilitator the requirement the requesting peer sends; a credential's `accepted` must name it exactly. | A caller could name its own recipient and amount and still be granted the resource. |
 
@@ -323,7 +335,7 @@ from.
 
 | Module | Owns | Document |
 | --- | --- | --- |
-| [`proxy/`](src/proxy/) | Both pipelines, surface manager, listener lifecycle, response policy, bounded upstream response reads | [Inbound path](#inbound-path), [Outbound path](#outbound-path) |
+| [`proxy/`](src/proxy/) | Both pipelines, surface manager, listener lifecycle, response policy, bounded upstream response reads, Target authentication resolution, the gateway's own agent card reads, the Fabric peer refusal mapping (`fabric_peer_refusal.rs`) | [Inbound path](#inbound-path), [Outbound path](#outbound-path) |
 | [`server/`](src/server/) | Startup orchestration, TLS, WebSocket, active/standby mode | [`CONFIGURATION_RELOAD.md`](docs/CONFIGURATION_RELOAD.md) |
 | [`state/`](src/state/) | Per-surface runtime state shared across handlers | [`DESIGN_PATTERNS.md`](docs/DESIGN_PATTERNS.md) |
 | [`protocols/`](src/protocols/) | Protocol-agnostic extension inspection, metadata injection, header rules, and RFC 9728 protected resource metadata and challenges shared by A2A, MCP, and others (the resource side; the authorization server side is `authz_metadata/`) | [`PROTOCOLS.md`](docs/PROTOCOLS.md) |
@@ -336,9 +348,9 @@ from.
 
 | Module | Owns | Document |
 | --- | --- | --- |
-| [`a2a/`](src/a2a/) | A2A-specific schema, auth, errors, agent-card URL rewriting, event-stream forwarding | [`PROTOCOLS.md`](docs/PROTOCOLS.md) |
+| [`a2a/`](src/a2a/) | A2A-specific schema, auth, errors, agent-card URL rewriting, card security (the `agent_gateway` scheme a declaring Access Point's card carries, in place of the Target's security), event-stream forwarding | [`PROTOCOLS.md`](docs/PROTOCOLS.md) |
 | [`a2a_proxies/`](src/a2a_proxies/) | Exposing a non-A2A agent as an A2A endpoint | [`PROTOCOLS.md`](docs/PROTOCOLS.md) |
-| [`mcp/`](src/mcp/) | MCP wire handling, metadata, transports | [`MCP_TOOL_GATING.md`](docs/MCP_TOOL_GATING.md), [`PROTOCOLS.md`](docs/PROTOCOLS.md) |
+| [`mcp/`](src/mcp/) | MCP wire handling, metadata, transports, and the protected resource metadata every inbound listener serves for each declaring Access Point and MCP Proxy that publishes it (`resource_server.rs`) | [`MCP_TOOL_GATING.md`](docs/MCP_TOOL_GATING.md), [`PROTOCOLS.md`](docs/PROTOCOLS.md) |
 | [`mcp_proxies/`](src/mcp_proxies/) | Exposing REST APIs as MCP tool servers | [`PROTOCOLS.md`](docs/PROTOCOLS.md) |
 | [`ap2/`](src/ap2/) | AP2, experimental and disabled by default | [`PROTOCOLS.md`](docs/PROTOCOLS.md) |
 | [`comm/`](src/comm/) | DIDComm message construction and handling | [`FABRIC.md`](docs/FABRIC.md) |
@@ -349,10 +361,10 @@ from.
 | Module | Owns | Document |
 | --- | --- | --- |
 | [`identity/`](src/identity/) | Agent DIDs, `did:webvh` logs, credential issuance, VP verification, display names (including dashboard-only managed-agent Agent Card names) | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#managed-identity), [`POLICY.md`](docs/POLICY.md) |
-| [`source_auth/`](src/source_auth/) | JWT bearer, API key, DID Auth, mTLS on the inbound edge | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md) |
+| [`source_auth/`](src/source_auth/) | JWT bearer, API key, DID Auth, mTLS on the inbound edge, required scopes, the Access Point's declaration, the caller challenge and the relayed-challenge filter | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md) |
 | [`event_hook/`](src/event_hook/) | Operator-configured notifications of Connection Point lifecycle events to a receiver: signed, sequenced, delivered from background tasks with retries, nothing persisted. `directory.rs` is the cached client of the operator-configured mediator directory, whose entries `mediators/` lists next to stored records | [`INTEGRATIONS.md`](docs/INTEGRATIONS.md#event-hook), [`INTEGRATIONS.md`](docs/INTEGRATIONS.md#mediator-directory) |
 | [`didauth/`](src/didauth/) | The DID Auth challenge and JWS ceremony | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#did-auth) |
-| [`jwt_bearer/`](src/jwt_bearer/) | JWT verification strategies and JWKS fetching | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md) |
+| [`jwt_bearer/`](src/jwt_bearer/) | JWT verification strategies, JWKS fetching, authorization server discovery and pinning, which run through `authz_metadata`, and the access token rules Access Points apply (granted scopes, client id, ID token refusal) | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md) |
 | [`authz_metadata/`](src/authz_metadata/) | Fetching and validating an authorization server's metadata document (RFC 8414, then OpenID Connect discovery) through a pinned, bounded GET, for callers that need an issuer's token endpoint and JWKS URI, and the issuer rules protected resource metadata (`protocols/protected_resource.rs`) applies to the authorization servers it advertises | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#authorization-server-metadata-module-developer-reference) |
 | [`api_keys/`](src/api_keys/) | Data-plane API keys | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md) |
 | [`certificates/`](src/certificates/) | TLS and mTLS certificate records | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#mtls) |
@@ -396,9 +408,9 @@ from.
 | [`surface_templates/`](src/surface_templates/) | Built-in and user surface templates | [`templates README`](config/examples/agent_surface_templates/README.md) |
 | [`agents_api/`](src/agents_api/) | Agent self-registration: `/agents-api/v1/onboard` mints a DID from identity fields, with `sign-jwt` and `verify-jwt` | Source only: [`src/agents_api/handlers/onboard.rs`](src/agents_api/handlers/onboard.rs). The onboarding capture endpoint is in `identity/`; see [`AGENT_ONBOARDING_CAPTURE.md`](docs/AGENT_ONBOARDING_CAPTURE.md). |
 | [`terms/`](src/terms/) | Terms versions, acceptance records, consent gating | [`TERMS_AND_CONSENT.md`](docs/TERMS_AND_CONSENT.md) |
-| [`credential_providers/`](src/credential_providers/) | OAuth credential provider records | [`CREDENTIAL_DELEGATION.md`](docs/CREDENTIAL_DELEGATION.md) |
-| [`delegation_vault/`](src/delegation_vault/) | Per-caller OAuth tokens, the consent flow, and the shape of governance audit records. Tokens are encrypted only when encryption at rest is enabled. | [`CREDENTIAL_DELEGATION.md`](docs/CREDENTIAL_DELEGATION.md) |
-| [`audit/`](src/audit/) | Governance audit pipeline: event catalog, per-sink selection, producer, durable journal, and per-sink delivery to the VP Audit Log and Governance Audit integrations | [`OBSERVABILITY.md`](docs/OBSERVABILITY.md#governance-audit-forwarding) |
+| [`credential_providers/`](src/credential_providers/) | OAuth credential provider records and RFC 7523 JWT bearer assertion signing | [`CREDENTIAL_DELEGATION.md`](docs/CREDENTIAL_DELEGATION.md) |
+| [`delegation_vault/`](src/delegation_vault/) | Per-caller OAuth tokens, the consent flow, pinned and bounded gateway grants (Client Credentials and JWT bearer), the per-replica gateway token cache for Target authentication, and the shape of governance audit records. Tokens are encrypted only when encryption at rest is enabled. | [`CREDENTIAL_DELEGATION.md`](docs/CREDENTIAL_DELEGATION.md) |
+| [`audit/`](src/audit/) | Governance audit pipeline: event catalog, configuration change events (strategies, credential providers, Target Authentication), per-sink selection, producer, durable journal, and per-sink delivery to the VP Audit Log and Governance Audit integrations | [`OBSERVABILITY.md`](docs/OBSERVABILITY.md#governance-audit-forwarding) |
 | [`integrations/`](src/integrations/) | Webhooks, notifications, and outbound integrations | [`INTEGRATIONS.md`](docs/INTEGRATIONS.md) |
 | [`secrets/`](src/secrets/) | Secret records and the loader schemes | [`CONFIGURATION_REFERENCE.md`](docs/CONFIGURATION_REFERENCE.md#secret-references) |
 
@@ -409,10 +421,10 @@ from.
 | [`config/`](src/config/) | Bootstrap parsing, `AgentSurface`, variants, limits, loaders | [`CONFIGURATION_RELOAD.md`](docs/CONFIGURATION_RELOAD.md) |
 | [`storage/`](src/storage/) | Store traits, filesystem JSON, config cache, DID artifacts | [`DESIGN_PATTERNS.md`](docs/DESIGN_PATTERNS.md) |
 | [`encryption/`](src/encryption/) | Encryption at rest and key sources | [`CONFIGURATION_REFERENCE.md`](docs/CONFIGURATION_REFERENCE.md#configtoml) |
-| [`backup_restore/`](src/backup_restore/) | `.agbak` backup and restore | [`DEVELOPMENT.md`](docs/development/DEVELOPMENT.md) |
+| [`backup_restore/`](src/backup_restore/) | `.agbak` backup and restore, the manifest's release stamp and the refusal of a backup from a newer release | [`DEVELOPMENT.md`](docs/development/DEVELOPMENT.md) |
 | [`export/`](src/export/) | Redacted `.atgx` storage export | [`DEVELOPMENT.md`](docs/development/DEVELOPMENT.md) |
 | [`observability/`](src/observability/) | Tracing, policy audit events, dashboard event stream, identity view and caller names | [`OBSERVABILITY.md`](docs/OBSERVABILITY.md) |
-| [`metrics/`](src/metrics/) | Metric collection, retention, aggregation | [`OBSERVABILITY.md`](docs/OBSERVABILITY.md) |
+| [`metrics/`](src/metrics/) | Metric collection, retention, aggregation, and the gateway token, JWKS fetch and discovery counters | [`OBSERVABILITY.md`](docs/OBSERVABILITY.md) |
 | [`component_tests/`](src/component_tests/) | Cross-module tests that need no Docker | [`CONTRIBUTING.md`](CONTRIBUTING.md) |
 
 ## Where to look

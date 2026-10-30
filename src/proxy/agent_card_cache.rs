@@ -8,7 +8,9 @@
 //!
 //! The cache is keyed on the tuple `(target_endpoint, agent_card_path)`
 //! so two surfaces sharing an endpoint but overriding the card path do
-//! **not** collide. Positive entries live for [`POSITIVE_TTL`]; negative
+//! **not** collide. It holds only cards fetched without a Target
+//! credential, so a card one surface reads with its credential never
+//! reaches another surface through the cache. Positive entries live for [`POSITIVE_TTL`]; negative
 //! (fetch-failure) entries live for the shorter [`NEGATIVE_TTL`] so a
 //! transient outage clears quickly.
 //!

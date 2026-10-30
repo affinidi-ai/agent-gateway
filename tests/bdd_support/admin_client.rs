@@ -226,6 +226,23 @@ impl AdminApiClient {
         recorded_response(response).await
     }
 
+    /// Like [`Self::send_recorded_json`], but keeps a plain-text error body.
+    pub async fn send_recorded_keeping_text<B>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&B>,
+    ) -> Result<RecordedResponse>
+    where
+        B: Serialize + ?Sized,
+    {
+        let url = self.admin_url(path);
+        let response = self
+            .send_request(method, &url, body)
+            .await?;
+        recorded_response_keeping_text(response).await
+    }
+
     pub async fn create_surface_recorded(
         &self,
         surface: &Value,

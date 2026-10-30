@@ -1,9 +1,12 @@
 import React, { useEffect, useState } from 'react';
 import { useParams } from 'react-router-dom';
 import { apiClient } from '../../../../api';
+import { useSurfaceDeclarations } from '../../../../hooks/useSurfaceDeclarations';
 import AddResourceLink from '../../../shared/AddResourceLink';
 import { deepLinks } from '../../../../utils/deepLinks';
+import { useOptionalSurfaceMeta } from '../../SurfaceMetaContext';
 import type { ConfigPanelProps } from '../types';
+import { DeclarationOutcomeView } from './DeclarationOutcomeChip';
 import {
   CALLER_AUTH_METHOD_OPTIONS,
   type CallerAuthMethodType,
@@ -11,9 +14,11 @@ import {
 } from './methodOptions';
 import CallerAuthDiscoverySection from './CallerAuthDiscoverySection';
 import {
+  declaresOn,
   readProtectedResource,
   readsAuthorizationHeader,
   usesBearerScheme,
+  type DeclarationStrategy,
 } from './protectedResource';
 
 interface Certificate {
@@ -23,10 +28,8 @@ interface Certificate {
   expires_at?: string;
 }
 
-interface JwtVerificationStrategy {
-  id: string;
+interface JwtVerificationStrategy extends DeclarationStrategy {
   name: string;
-  expected_issuer?: string;
 }
 
 interface SecretOption {
@@ -55,8 +58,15 @@ const CallerAuthFullscreen: React.FC<ConfigPanelProps> = ({
   closeFullscreenEditor,
   hasAttemptedSave,
 }) => {
-  const { surfaceId } = useParams<{ surfaceId: string }>();
+  const params = useParams<{ surfaceId: string }>();
+  const meta = useOptionalSurfaceMeta();
+  const surfaceId = params.surfaceId ?? meta?.surfaceId;
   const method: CallerAuthMethodType = (config.method_type as CallerAuthMethodType) || 'jwt_bearer';
+  const declares = method === 'jwt_bearer' && declaresOn(protocol);
+  const declarations = useSurfaceDeclarations(
+    declares ? surfaceId : undefined,
+    meta?.agentCardRevision
+  );
   const [jwtStrategies, setJwtStrategies] = useState<JwtVerificationStrategy[]>([]);
   const [certificates, setCertificates] = useState<Certificate[]>([]);
   const [apiKeySecrets, setApiKeySecrets] = useState<SecretOption[]>([]);
@@ -103,7 +113,8 @@ const CallerAuthFullscreen: React.FC<ConfigPanelProps> = ({
   const audiences: string[] = Array.isArray(config.audiences) ? config.audiences : [];
   const hasDiscovery = readProtectedResource(config.protected_resource) !== null;
   const discoveryOn = method === 'jwt_bearer' && hasDiscovery;
-  const showsDiscovery = method === 'jwt_bearer' && (protocol === 'mcp' || hasDiscovery);
+  const showsDiscovery = method === 'jwt_bearer' && (declares || hasDiscovery);
+  const selectedStrategy = jwtStrategies.find(s => s.id === config.jwt_strategy_id);
   // While discovery is on, each control the gateway constrains is locked once
   // it holds the required value, and stays editable until then.
   const tokenHeaderLocked = discoveryOn && readsAuthorizationHeader(config);
@@ -170,6 +181,7 @@ const CallerAuthFullscreen: React.FC<ConfigPanelProps> = ({
             <button
               type="button"
               className="btn btn-sm btn-outline-secondary"
+              data-testid="caller-auth-close-button"
               onClick={closeFullscreenEditor}
             >
               <i className="fas fa-times me-1" /> Close tab
@@ -201,17 +213,31 @@ const CallerAuthFullscreen: React.FC<ConfigPanelProps> = ({
 
         {method === 'jwt_bearer' && (
           <>
-            <p className="text-muted mb-3">
+            <p className="text-muted mb-3" data-testid="caller-auth-jwt-intro">
               Validate incoming requests using a bearer token verified against a configured JWT
-              verification strategy. Requests without a valid token will receive{' '}
-              <code>403 Forbidden</code>.
+              verification strategy. While <strong>Authorization server discovery</strong> is on, a
+              missing or invalid token gets <code>401</code> with a challenge and a token short of a
+              required scope gets <code>403</code> with <code>insufficient_scope</code>, before rate
+              limiting, any policy, the AP2 gate and payment. Otherwise a failed caller reaches
+              policy as <code>source_auth.method == &quot;failed&quot;</code>, so add a policy that
+              denies it.
             </p>
 
+            {declares && (
+              <DeclarationOutcomeView
+                state={declarations}
+                surfaceId={surfaceId}
+                protocol={protocol}
+              />
+            )}
+
             <div className="mb-3">
-              <label className="form-label fw-bold">
+              <label htmlFor="caller-auth-jwt-strategy" className="form-label fw-bold">
                 JWT Verification Strategy <span className="text-danger">*</span>
               </label>
               <select
+                id="caller-auth-jwt-strategy"
+                data-testid="caller-auth-jwt-strategy"
                 className="form-control dropdown-styling"
                 value={config.jwt_strategy_id || ''}
                 onChange={e => updateField('jwt_strategy_id', e.target.value)}
@@ -244,7 +270,9 @@ const CallerAuthFullscreen: React.FC<ConfigPanelProps> = ({
             </div>
 
             <div className="mb-3">
-              <label className="form-label fw-bold">Accepted Audiences</label>
+              <label htmlFor="caller-auth-audience-input" className="form-label fw-bold">
+                Accepted Audiences
+              </label>
               <div className="d-flex flex-wrap gap-2 mb-2">
                 {audiences.map((aud, idx) => (
                   <span
@@ -262,7 +290,7 @@ const CallerAuthFullscreen: React.FC<ConfigPanelProps> = ({
                       type="button"
                       className="btn btn-outline-danger p-0"
                       style={{ lineHeight: 1, width: '1.4rem', height: '1.4rem' }}
-                      aria-label="Remove"
+                      aria-label={`Remove audience ${aud}`}
                       onClick={() =>
                         updateField(
                           'audiences',
@@ -270,13 +298,14 @@ const CallerAuthFullscreen: React.FC<ConfigPanelProps> = ({
                         )
                       }
                     >
-                      <i className="fas fa-trash"></i>
+                      <i className="fas fa-trash" aria-hidden="true"></i>
                     </button>
                   </span>
                 ))}
               </div>
               <div className="input-group">
                 <input
+                  id="caller-auth-audience-input"
                   type="text"
                   className="form-control"
                   placeholder="e.g. https://api.example.com"
@@ -311,13 +340,13 @@ const CallerAuthFullscreen: React.FC<ConfigPanelProps> = ({
               </div>
               {discoveryOn ? (
                 <div className="form-text" data-testid="caller-auth-audiences-discovery-note">
-                  Stays empty while authorization server discovery is on: the gateway accepts only
-                  tokens whose audience is the resource URL.
+                  Stays empty while authorization server discovery is on: a token is accepted when
+                  the resource URL is one of its audiences.
                 </div>
               ) : (
                 audiences.length === 0 && (
                   <div className="alert alert-warning py-1 px-2 mt-2 mb-0 small d-flex align-items-center gap-2">
-                    <i className="fas fa-exclamation-triangle"></i>
+                    <i className="fas fa-exclamation-triangle" aria-hidden="true"></i>
                     <span>
                       No audience configured. <code>aud</code> claim validation will be skipped. It
                       is strongly recommended to set at least one audience value to prevent tokens
@@ -400,8 +429,8 @@ const CallerAuthFullscreen: React.FC<ConfigPanelProps> = ({
                   className="form-text d-block"
                   data-testid="caller-auth-jwt-forward-header-discovery-note"
                 >
-                  Off while authorization server discovery is on: MCP forbids passing the
-                  caller&apos;s token to the managed agent.
+                  Off while authorization server discovery is on: the caller&apos;s token never
+                  reaches the managed agent.
                 </small>
               )}
             </div>
@@ -410,11 +439,12 @@ const CallerAuthFullscreen: React.FC<ConfigPanelProps> = ({
               <CallerAuthDiscoverySection
                 config={config}
                 updateFields={updateFields}
+                protocol={protocol}
                 allNodes={allNodes}
                 hasAttemptedSave={hasAttemptedSave}
-                strategyIssuer={
-                  jwtStrategies.find(s => s.id === config.jwt_strategy_id)?.expected_issuer
-                }
+                strategy={selectedStrategy}
+                strategyName={selectedStrategy?.name}
+                saved={!!surfaceId}
               />
             )}
           </>

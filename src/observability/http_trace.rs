@@ -467,6 +467,7 @@ mod tests {
         let id = AuthenticatedIdentity::JwtBearer {
             subject: "alice@example.com".to_string(),
             claims: serde_json::json!({"sub": "alice@example.com"}),
+            strategy: None,
         };
         let f = caller_span_fields(&id);
         assert_eq!(field(&f, "caller.auth_method").as_deref(), Some("jwt_bearer"));
@@ -692,6 +693,7 @@ mod tests {
                     let identity = AuthenticatedIdentity::JwtBearer {
                         subject: "alice@example.com".to_string(),
                         claims: serde_json::json!({"sub": "alice@example.com"}),
+                        strategy: None,
                     };
                     record_caller_identity_on_current_span(&identity);
                     "ok"
@@ -819,6 +821,7 @@ mod tests {
                     let identity = AuthenticatedIdentity::JwtBearer {
                         subject: "agent-oid-123".to_string(),
                         claims: serde_json::json!({"oid": "agent-oid-123"}),
+                        strategy: None,
                     };
                     record_caller_identity_on_current_span(&identity);
                     // …then a DID is derived later in the pipeline (from_jwt_claim).

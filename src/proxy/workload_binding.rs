@@ -543,6 +543,7 @@ mod tests {
         let jwt = crate::source_auth::AuthenticatedIdentity::JwtBearer {
             subject: "alice".to_string(),
             claims: serde_json::json!({}),
+            strategy: None,
         };
         let err = capture_from_did(&jwt, &[], None).unwrap_err();
         assert_eq!(err, CallerContextCaptureError::NotDidAuthenticated { actual: "jwt_bearer" });

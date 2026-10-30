@@ -815,6 +815,10 @@ async fn load_all_entities_from_disk<T: StorableEntity>(
                                     deserialize_error_kind(&e)
                                 );
                                 error_count += 1;
+                                crate::metrics::backends::prometheus::track_storage_load_error(
+                                    entity_name,
+                                    "invalid_json",
+                                );
                                 processed_ids.insert(id);
                                 continue;
                             }
@@ -826,6 +830,10 @@ async fn load_all_entities_from_disk<T: StorableEntity>(
                             Err(e) => {
                                 error!("Failed to migrate {} from {:?}: {}", entity_name, logged_file_to_load, e);
                                 error_count += 1;
+                                crate::metrics::backends::prometheus::track_storage_load_error(
+                                    entity_name,
+                                    "migration_failed",
+                                );
                                 processed_ids.insert(id);
                                 continue;
                             }
@@ -933,6 +941,10 @@ async fn load_all_entities_from_disk<T: StorableEntity>(
                                     deserialize_error_kind(&e)
                                 );
                                 error_count += 1;
+                                crate::metrics::backends::prometheus::track_storage_load_error(
+                                    entity_name,
+                                    "unreadable_record",
+                                );
                             }
                         }
                     }
@@ -5286,6 +5298,123 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(message.contains("encryption at rest is disabled"), "unexpected error message: {message}");
+    }
+
+    #[tokio::test]
+    async fn a_record_this_release_cannot_read_is_skipped_alone_and_counted() {
+        let entity_name = "metric_probe_entity_unreadable";
+        let temp_dir = TempDir::new().unwrap();
+        let storage = CachedFilesystemStorage::<TestEntity>::new(temp_dir.path().to_path_buf(), entity_name)
+            .await
+            .unwrap();
+        storage
+            .save(&TestEntity {
+                id: "readable".to_string(),
+                name: "Readable".to_string(),
+                value: 1,
+            })
+            .await
+            .unwrap();
+        drop(storage);
+        std::fs::write(
+            temp_dir
+                .path()
+                .join("from-a-newer-release.json"),
+            r#"{"id":"from-a-newer-release","name":7}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            temp_dir
+                .path()
+                .join("truncated.json"),
+            r#"{"id":"truncated","na"#,
+        )
+        .unwrap();
+
+        let reopened = CachedFilesystemStorage::<TestEntity>::new(temp_dir.path().to_path_buf(), entity_name)
+            .await
+            .unwrap();
+
+        let loaded: Vec<String> = reopened
+            .list_all()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entity| entity.id)
+            .collect();
+        assert_eq!(loaded, vec!["readable".to_string()], "only the unreadable records are dropped");
+        let counted = |reason: &str| {
+            crate::metrics::backends::prometheus::STORAGE_LOAD_ERRORS
+                .with_label_values(&[entity_name, reason])
+                .get()
+        };
+        assert_eq!(counted("unreadable_record"), 1);
+        assert_eq!(counted("invalid_json"), 1);
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    struct RefusingMigrationEntity {
+        id: String,
+    }
+
+    impl StorableEntity for RefusingMigrationEntity {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        fn migrate_raw_json(value: &mut serde_json::Value) -> Result<bool> {
+            if value.get("legacy") == Some(&serde_json::Value::Bool(true)) {
+                anyhow::bail!("legacy record cannot be migrated");
+            }
+            Ok(false)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_record_whose_migration_fails_is_skipped_alone_and_counted() {
+        let entity_name = "metric_probe_entity_migration_failed";
+        let temp_dir = TempDir::new().unwrap();
+        std::fs::write(
+            temp_dir
+                .path()
+                .join("fine.json"),
+            r#"{"id":"fine"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            temp_dir
+                .path()
+                .join("legacy.json"),
+            r#"{"id":"legacy","legacy":true}"#,
+        )
+        .unwrap();
+
+        let storage =
+            CachedFilesystemStorage::<RefusingMigrationEntity>::new(temp_dir.path().to_path_buf(), entity_name)
+                .await
+                .unwrap();
+
+        let loaded: Vec<String> = storage
+            .list_all()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entity| entity.id)
+            .collect();
+        assert_eq!(loaded, vec!["fine".to_string()]);
+        assert_eq!(
+            crate::metrics::backends::prometheus::STORAGE_LOAD_ERRORS
+                .with_label_values(&[entity_name, "migration_failed"])
+                .get(),
+            1
+        );
+        assert!(
+            temp_dir
+                .path()
+                .join("legacy.json")
+                .exists(),
+            "the unmigratable file is left on disk"
+        );
     }
 
     #[tokio::test]

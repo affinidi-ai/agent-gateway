@@ -61,12 +61,17 @@ Every new interactive element ships with a `data-testid`. Tests under `ui-tests/
 are the consumer; the convention is documented in
 [`ui-tests/README.md`](../../ui-tests/README.md).
 
-| Element       | Pattern                                                                              |
-| ------------- | ------------------------------------------------------------------------------------ |
-| Page root     | `page-<area>`                                                                        |
-| Action button | `<area>-<verb>-button`                                                               |
-| List item     | `<area>-card-<id>` or `<area>-row-<id>`                                              |
-| Wizard        | `wizard-<name>`, `wizard-step-<name>`, `wizard-next`, `wizard-back`, `wizard-submit` |
+| Element                 | Pattern                                                                                                                                                   |
+| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Page root               | `page-<area>`                                                                                                                                             |
+| Action button           | `<area>-<verb>-button`                                                                                                                                    |
+| List item               | `<area>-card-<id>` or `<area>-row-<id>`                                                                                                                   |
+| Wizard                  | `wizard-<name>`, `wizard-step-<name>`, `wizard-next`, `wizard-back`, `wizard-submit`                                                                      |
+| Form field              | `<form>-<field>`, for example `strategy-issuer`, `provider-token-endpoint`                                                                                |
+| Canvas                  | `surface-node-<type>`, `surface-canvas` (the canvas svg), `canvas-link` (each pipeline link)                                                              |
+| Element palette         | `palette-section-<category>` (section header), `palette-item-<type>`                                                                                      |
+| Surface Builder actions | `surface-starter-use-<templateId>`, `surface-create-button` and `surface-welcome-dismiss` (Add Surface page), `surface-save-button` (surface detail page) |
+| Caller Context editor   | `caller-auth-configure` (panel button), `caller-auth-jwt-strategy` (strategy select), `caller-auth-close-button`                                          |
 
 ## CLI consent page
 
@@ -111,6 +116,37 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   always-visible warning names the receiving gateway. Test ids:
   `<managed-agent|transit-point>-fabric-delegated-credentials-switch` and
   `-warning`. There is no surface-wide switch.
+- **Target Authentication** on the Managed Agent has None plus six types. Four are header presets
+  backed by a secret (`static_secret`). **Credential Provider** writes `{ credential_provider:
+{ credential_provider_id, scopes, inject_as } }` (field types in `utils/targetAuth.ts`,
+  config mapping in `managed-agent/targetAuthConfig.ts`). The provider picker
+  (`_shared/CredentialProviderPicker.tsx`, test id `target-auth-credential-provider-select`)
+  lists only providers whose type `permits` Target Authentication, so Authorization Code
+  providers are absent. A saved provider that is missing or not allowed shows a warning and is
+  kept until the operator picks another; the client cannot see the type at validation, so
+  the gateway rejects that combination on save and stays the authoritative check.
+  Scopes (`target-auth-scopes`, empty means the provider's default scopes) and the header shape (`target-auth-inject-as`: Authorization
+  Bearer, or a custom header with `target-auth-inject-name` and `-format`, which must
+  contain `{value}`, and a name other than `Host`, `Content-Length`, `Transfer-Encoding` or
+  `Connection`) sit beside it. The option is offered only for a direct URL, in both the
+  sidebar and the fullscreen editor: a `fabric://` target cannot use a provider on the sending
+  gateway. Save is blocked (`managedAgentDefinition.validate`) while the type is Credential
+  Provider and no provider is picked, the custom header name or `{value}` format is wrong, the
+  URL is not `https://`, or the endpoint is not a direct URL. The fullscreen editor ties that
+  reason (`target-auth-error`, from `credentialProviderAuthProblem`) and the picker's
+  `-unusable` and `-error` messages to the field they concern with `aria-describedby` and
+  `aria-invalid`, and marks the starred fields `aria-required`. The sixth type, **Unsupported method
+  (kept as saved)**, is never chosen by hand. Any `target.auth` variant the dashboard cannot
+  edit (an unknown method, `credential_lookup`, a `credential_provider` with an `inject_as`
+  type other than `bearer_header` or `custom_header`, or with fields the form does not model)
+  is hydrated into `target_auth_raw` and written
+  back byte for byte on save, unless the operator picks another type or None. A Transit Point
+  keeps its `target_auth` unchanged on save for every method while no `auth_type` is picked
+  (`hasUnpickedTargetAuth`, so a surface never opened in the panel loses nothing; the panel's
+  own notice uses `hasPreservedTargetAuth` and covers only the variants it cannot edit), and has no credential provider option because the backend rejects
+  one there.
+- The route controls of the Access Point panel have test ids: `route-listener-listen-address`,
+  `route-listener-surface-prefix` and `route-listener-custom-path`.
 - **Entry point URL** is the label for an Access Point's composed URL, with "The URL used to
   access this gateway" behind its `FieldHelp`. It shows at the top of the Access Point panel
   and as a banner along the top of the canvas, both rendered by `RouteListenerBanner`
@@ -130,36 +166,281 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   JSON; typing the generated name back keeps it generated. It never derives from the route. The
   unsaved-changes check ignores the generated name, so the surface list arriving never marks
   the page dirty and edits made while it loads still do.
+- The canvas redraws when it is shown again after a structure change made while another view was
+  open (`resizeNeedsRebuild` in `canvasResize.ts`), and a redraw keeps the selected node marked
+  `node-single-selected`.
 - **Networking** retryable status codes: an empty field means the gateway default and
   saves no `retryable_status_codes`, and its placeholder says so. The **Retry on
   connection errors only** switch saves an empty list and disables the field. A field
   that isn't a comma-separated list of HTTP status codes (100 to 599) blocks Save. Test
   ids: `networking-retry-status-codes-input` and
   `networking-retry-connection-errors-only-switch`.
-- **Authorization server discovery** (`caller-auth/CallerAuthDiscoverySection.tsx`) edits
-  `caller_authentication.protected_resource` in the Caller Context editor of an MCP surface whose
-  method is JWT Bearer. Turning it on prefills the resource with the Access Point's https listener
-  URL plus its route (left empty otherwise), empties Accepted Audiences, turns token forwarding
-  off and sets the `Authorization` header with the `Bearer` scheme; each of those controls stays
-  locked while discovery is on, once it holds that value. Authorization servers (1 to 8) and
-  scopes are lists checked as each value is added, and `protectedResource.ts` mirrors the
-  gateway's save rules, which block Save. Leaving JWT Bearer drops the setting. A variant shows
-  the resource it advertises, `<resource>$<alias>`, and keeps its own setting. A failed save whose
-  message names the setting shows in the section and in the sidebar, which also shows whether
-  discovery is on.
+- **Caller Context** (JWT bearer) on an A2A, AP2 or MCP surface carries the authorization server discovery controls in
+  one section, `caller-auth/CallerAuthDiscoverySection.tsx` (`caller-auth-discovery`), for all three
+  protocols; DIDComm has none of them. It mounts `ScopesInput.tsx`, the **Required Scopes** chip
+  input (test ids `caller-auth-scopes`, `caller-auth-scope-input`, `caller-auth-scope-add` and
+  `caller-auth-scope-error`). Each entry must be an RFC 6749 scope token (no spaces, double quotes or
+  backslashes), 1 to 128 characters, at most 32, no duplicates (`scopes.ts`); a bad entry shows an
+  inline error tied to the input with `aria-invalid` and `aria-describedby` and is not added, and
+  each chip's remove button is named `Remove scope <scope>`; removing a chip moves focus to the
+  scope input. The field round-trips through
+  `definition.ts` as `required_scopes` on the `jwt_bearer` method, is left out when empty, and
+  `validate` reports scopes the gateway would refuse.
+- **Authorization server discovery** is the one switch of that section
+  (`caller-auth-discovery-explicit`, switch `caller-auth-discovery-switch`, described by
+  `caller-auth-discovery-switch-help`, with `field-help-caller-auth-discovery`). It is the single
+  opt-in by which an A2A, AP2 or MCP Access Point with a JWT Bearer method declares, and it edits
+  `caller_authentication.protected_resource`. Required scopes alone never declare. While it is off,
+  `caller-auth-discovery-off-summary` (plain text; only the cleared message and the off warning sit in
+  the live region) says that no protected resource metadata is published (on A2A and AP2 the card keeps the managed agent's own security) and that a caller whose
+  token is missing, invalid or short of a scope reaches policy as `source_auth.method == "failed"`,
+  so a policy has to deny it. Turning it off on a saved surface whose saved record stores the setting on the route edited (read
+  from the saved surface, not from what the editor opened with) shows
+  `caller-auth-discovery-off-warning`, because the gateway then stops refusing failed callers itself.
+- Turning discovery on prefills the resource with the Access Point's https listener URL plus its
+  route (left empty otherwise, and then `caller-auth-discovery-resource-hint` says there is nothing
+  to suggest), moves focus to the resource input, empties Accepted Audiences, turns token
+  forwarding off and sets the `Authorization` header with the `Bearer` scheme; each of those
+  controls stays locked while discovery is on, once it holds that value, and
+  `caller-auth-discovery-cleared` says what was removed. The resource input
+  (`caller-auth-discovery-resource-input`) is `aria-invalid` and described by its hint and error
+  while it has a problem. The banner says what changes: protected resource metadata is published on
+  the Access Point's listener, a caller without a valid token gets `401` with a challenge and a token
+  short of a required scope gets `403` `insufficient_scope`, both before rate limiting, any policy,
+  the AP2 gate and payment, a token is accepted when the resource URL is one of its audiences, and
+  the token is never forwarded to the managed agent.
+- Below the resource, a read-only definition list (`caller-auth-discovery-derived`, headed "What
+  callers are told") shows what the gateway publishes, never a token or a secret. The authorization
+  server is the selected strategy's `expected_issuer` (`-derived-authorization-server`, with its
+  source line `-derived-authorization-server-source`, "From the JWT verification strategy <name>";
+  "Select a JWT verification strategy." when none is selected). The scopes are the Required Scopes
+  plus any stored extra scopes (`-derived-scopes`, `-derived-scopes-source`; "None required" when
+  empty, and callers without a valid token are still refused). The audience is the resource, or
+  `<resource>$<alias>` on a variant (`-derived-audience`, `-derived-audience-source`). On A2A and
+  AP2, `-card-pin` shows the strategy's pinned authorization server that the card's security scheme
+  names (a static key set counts as pinned when its pinned issuer is the expected issuer, as in the
+  gateway); when the strategy is not pinned or its pin no longer matches, `-strategy-link` opens
+  `/jwt-verification-strategies/<id>` to run Discover.
+- A surface that stores more than a resource shows `caller-auth-discovery-stored-overrides`: a stored
+  `authorization_servers` list with **Use the strategy's issuer**
+  (`-clear-authorization-servers-button`) and stored extra `scopes` with **Advertise required
+  scopes only** (`-clear-scopes-button`; the "does not enforce" sentence lists only the stored scopes
+  that Required Scopes does not already hold). The gateway advertises the strategy's issuer, so a stored
+  list that is not exactly `[expected_issuer]` shows
+  `caller-auth-discovery-authorization-servers-error` after a save attempt, for cleanup; the gateway
+  keeps an unchanged stored list and reports `authorization_servers_stale`. The editor has no input to add an
+  authorization server or an advertised scope.
+- The Caller Context editor's intro (`caller-auth-jwt-intro`) says that while Authorization server
+  discovery is on, a missing or invalid token gets `401` with a challenge and a token short of a
+  required scope gets `403` `insufficient_scope` before rate limiting, any policy, the AP2 gate and
+  payment; otherwise a failed caller reaches policy as `source_auth.method == "failed"`. While
+  discovery is on, `caller-auth-audiences-discovery-note` says Accepted Audiences stay empty because
+  the resource URL is the audience. The strategy select is `caller-auth-jwt-strategy` and the
+  audience input `caller-auth-audience-input`, each with a `htmlFor` label; audience chips are
+  named `Remove audience <audience>`.
+- The **declaration outcome chip** (`DeclarationOutcomeChip.tsx`, `caller-auth-outcome`,
+  `caller-auth-outcome-chip`, `caller-auth-outcome-icon`, `caller-auth-outcome-detail`) shows the
+  outcome for the variant being edited (`activeVariantAlias`, the base when none) from
+  `GET /api/v1/surfaces/{id}/declarations`, labelled **Agent card:** on A2A and AP2 and **Protected
+  resource metadata:** on MCP. The outcomes are **Declares OAuth** (on A2A and AP2 the detail says that only the protected resource metadata names
+  the authorization server when the save report carries `card_scheme_unavailable` for that variant),
+  **Not declared** (on every
+  protocol, with the reason text from `STRIP_REASON_TEXT`: `not_declared` reads "Authorization
+  server discovery is off for this route."; on A2A and AP2 the detail adds that the card keeps the
+  managed agent's own security), **Upstream card unchanged** (**No metadata published** on MCP)
+  and **Cannot be served** (`unservable`, with the action for the reason code from
+  `UNSERVABLE_REASON_TEXT`, which has exactly the gateway's nine codes, or a general sentence when
+  the reason is missing or unknown). The chip is the shared
+  `Badge` (tinted `app-badge`, tones success, warning, danger and secondary, with the class
+  `caller-auth-outcome-chip`; `SurfaceBuilder.css` darkens the light warning text of this chip and
+  of the Agent Cards badges to `#92400e` to keep 4.5:1 contrast), never a solid `badge text-bg-*`. Each badge carries an icon and a text label, never
+  colour alone. It reflects the saved surface, so a new
+  surface shows "Outcome shown after the first save", and a failed read, or a gateway without that
+  endpoint, shows "<noun> outcome unavailable" without breaking the page. It appears in the Caller
+  Context sidebar (`caller-auth-panel-outcome`, beside the discovery status line) and in the
+  editor under the intro, with a **See the card** link button (`caller-auth-outcome-card-link`)
+  that opens the Agent Cards view, shown only on A2A and AP2 for a saved surface. A view switch
+  started from content (**See the card**, **View agent cards**, **Open the Surface view**) goes
+  through `openViewFromContent` in `SurfaceFormShell`, which then moves focus to the destination's
+  sidebar view button (or the Agent Cards heading when the sidebar is collapsed); a click on a
+  sidebar view button leaves focus where it is.
+- **Surface warnings** are the `warnings` array of a surface save response (`code`, `message`,
+  `path`, `variant`). `SurfaceWarningsAlert` keeps an empty polite live container
+  (`surface-warnings-live`) always mounted on Surface Detail, so warnings that arrive after a save
+  are announced, and shows them inside it as a labelled region (`surface-warnings-alert`,
+  `surface-warning-<code>`). For the fail-open codes (`fail_open_policy`, `fail_open_undetermined`)
+  it offers **Copy deny rule** (`surface-warnings-copy-rule`), which copies
+  `DENY_FAILED_CALLERS_REGO` (`utils/denyRule.ts`), a whole surface policy denying failed callers,
+  with a hint (`surface-warnings-copy-rule-hint`) to attach it to the Managed Agent
+  (`target.policy`) when that has no policy, so callers arriving over Fabric are denied too, and
+  otherwise to add `not input.source_auth.method == "failed"` to each existing allow rule rather
+  than paste the whole policy. For `payment_before_policy` it offers **Copy gateway deny rule**
+  (`surface-warnings-copy-gateway-rule`), which copies `GATEWAY_DENY_FAILED_CALLERS_REGO`, the
+  same rule under `package gateway.policy`, with the matching hint
+  (`surface-warnings-copy-gateway-rule-hint`) for the gateway policy; a surface policy cannot fix
+  that warning because payment runs before it. When the surface has a JWT Bearer first method on
+  a protocol that can declare and no `protected_resource`, the fail-open block also shows
+  `surface-warnings-discovery-hint` (the `offersDiscovery` prop, set by Surface Detail), pointing
+  at the **Authorization server discovery** switch as the other way to refuse failed callers. The
+  dashboard never creates or attaches either policy itself. Surface Detail reads `GET /api/v1/surfaces/{id}/declarations` (the
+  `useSurfaceDeclarations` hook, refreshed after each save), so it shows the current result, not
+  the snapshot from the last save, and falls back to the save response when that read is
+  unavailable. After creating a surface whose response carries warnings, the dashboard opens
+  Surface Detail instead of the list so they stay visible (`surfacePathAfterCreate`).
+  `toBackendSurface` never sends `warnings` or `declarations` back.
+- `protectedResource.ts` mirrors the gateway's save rules. The editor blocks Save on the resource
+  rules (a public https URL of the Access Point's listener followed by its route exactly) and the
+  JWT Bearer settings the gateway constrains. A variant of an Access Point on `/` has no resource of
+  its own (`rootVariantProblem`) and a stored authorization server list must be the strategy's
+  issuer: the section shows both. The gateway refuses a root variant, and keeps an unchanged stored
+  list with an `authorization_servers_stale` warning; the editor does not block either.
+  Stored authorization server entries must be https URLs, except a single entry that is the
+  strategy's http issuer (or any single http entry while the strategy issuer is unknown); the
+  gateway accepts that only for a strategy no tenant owns, and otherwise refuses a list the
+  save sends or changes (an unchanged stored list is kept, as above).
+  Leaving JWT Bearer drops the setting.
+  A variant shows the resource it advertises, `<resource>$<alias>`, and keeps its own setting. A
+  failed save whose message names the setting of the route edited (a `variant '<alias>': ` message
+  belongs to that variant only) shows in the section (the resource message under the
+  resource input, the issuer messages under the stored overrides, others in
+  `caller-auth-discovery-save-error`) and in the sidebar, which also shows whether Authorization
+  server discovery is on or off.
 - A PUT that leaves out a stored `protected_resource` keeps it, so Save sends a setting the
   operator switched off as `protected_resource: null` in the same PUT
   (`withDroppedProtectedResourcesRemoved`), for the surface and each variant. A save that fails
   leaves it in place. The default variant's note says it also answers on the surface's route
   with the resource as written.
 
-| Element                                                        | Test id                                                                                                                                                                                            |
-| -------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Discovery switch, resource, use listener URL                   | `caller-auth-discovery-switch`, `caller-auth-discovery-resource-input`, `caller-auth-discovery-use-listener-url-button`                                                                            |
-| List, where `<list>` is `authorization-server` or `scope`      | `caller-auth-discovery-<list>-input`, `caller-auth-discovery-add-<list>-button`, `caller-auth-discovery-<list>-<index>`, `caller-auth-discovery-remove-<list>-<index>-button`                      |
-| Variant resource, default variant note, rules explainer toggle | `caller-auth-discovery-variant-resource`, `caller-auth-discovery-default-variant-note`, `caller-auth-discovery-context-toggle`                                                                     |
-| Errors                                                         | `caller-auth-discovery-save-error`, `caller-auth-discovery-rules-error`, `caller-auth-discovery-resource-error`, `caller-auth-discovery-<list>s-error`, `caller-auth-discovery-<list>-input-error` |
-| Sidebar status and error                                       | `caller-auth-panel-discovery-status`, `caller-auth-panel-discovery-save-error`                                                                                                                     |
+| Element                                                        | Test id                                                                                                                                                                                                                                                                                                                                                                                                       |
+| -------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Discovery switch, its help and the off summary                 | `caller-auth-discovery-switch`, `caller-auth-discovery-switch-help`, `caller-auth-discovery-off-summary`, `caller-auth-discovery-off-warning`, `caller-auth-discovery-cleared`                                                                                                                                                                                                                                |
+| Resource, hint, use listener URL                               | `caller-auth-discovery-resource-input`, `caller-auth-discovery-resource-hint`, `caller-auth-discovery-use-listener-url-button`                                                                                                                                                                                                                                                                                |
+| What callers are told                                          | `caller-auth-discovery-derived`, `caller-auth-discovery-derived-authorization-server`, `caller-auth-discovery-derived-authorization-server-source`, `caller-auth-discovery-derived-scopes`, `caller-auth-discovery-derived-scopes-source`, `caller-auth-discovery-derived-audience`, `caller-auth-discovery-derived-audience-source`, `caller-auth-discovery-card-pin`, `caller-auth-discovery-strategy-link` |
+| Stored overrides                                               | `caller-auth-discovery-stored-overrides`, `caller-auth-discovery-clear-authorization-servers-button`, `caller-auth-discovery-clear-scopes-button`                                                                                                                                                                                                                                                             |
+| Variant resource, default variant note, rules explainer toggle | `caller-auth-discovery-variant-resource`, `caller-auth-discovery-default-variant-note`, `caller-auth-discovery-context-toggle`                                                                                                                                                                                                                                                                                |
+| Errors                                                         | `caller-auth-discovery-save-error`, `caller-auth-discovery-rules-error`, `caller-auth-discovery-resource-error`, `caller-auth-discovery-authorization-servers-error`, `caller-auth-discovery-scopes-error`                                                                                                                                                                                                    |
+| Sidebar status and error                                       | `caller-auth-panel-discovery-status`, `caller-auth-panel-discovery-save-error`                                                                                                                                                                                                                                                                                                                                |
+| Surface Detail hint                                            | `surface-warnings-discovery-hint`                                                                                                                                                                                                                                                                                                                                                                             |
+
+## Agent Cards tab
+
+The **Agent Cards** view (`components/surface-builder/agent-card/`, view key `agent-card`, button
+`surface-view-agent-card`) is a first-class Surface Builder view placed directly after **Elements**
+and before **Monitoring** in `SIDEBAR_VIEWS` of `SurfaceFormShell.tsx` (Surface, Templates,
+Elements, Agent Cards, Monitoring, Config). `visibleSidebarViews(mode, protocol)` offers it for
+A2A and AP2 surfaces (`AGENT_CARD_PROTOCOLS`) and never for MCP or DIDComm; when the protocol
+changes away while it is open, the shell returns to the Surface view. Every view button has the
+test id `surface-view-<key>` and `aria-current="page"` while active. The view shows the saved
+surface, never the unsaved form.
+
+- `AgentCardTab` orchestrates and calls `useAgentCardPreview` (`GET /api/v1/surfaces/{id}/agent-card`;
+  Refresh is `POST .../agent-card/refresh`). A Refresh answer that arrives after the surface, the
+  refresh key or the tab changed comes back as `{ kind: 'stale' }` and changes nothing, with no
+  toast. The parts are `AgentCardHeader` (facts),
+  `AgentCardCompare` (summary, legend, side by side cards) and `AgentCardRawJson`. The wire types,
+  `parseAgentCardPreview` (rejects unknown enum values), the cause and sign-in copy,
+  `describeFetchFailure` and `safeHttpUrl` live in `utils/agentCardPreview.ts`; the pure comparison
+  lives in `utils/agentCardDiff.ts` (`diffAgentCards` with `addedCount`, `modifiedCount` and
+  `removedCount`, and `cardEra`). Tests build bodies with `utils/agentCardTestFixtures.ts`. A
+  gateway without these endpoints, a thrown request or a body that does not parse shows the
+  read-failed state, and the rest of the page keeps working.
+- The **Managed Agent Card** (the agent's own card, `agent-card-before`) and the **Gateway-Served
+  Agent Card** (what callers see, `agent-card-after`) sit side by side. Rows are
+  `agent-card-row-signin|scope|signature|endpoint|other`, each with
+  `data-status="same|changed|removed|absent"`. Each item carries a tag with a distinct colour and
+  always an icon with a text label, never colour alone: **Added** on the served side
+  (`agent-card-item-added`), **Modified** on both sides (`agent-card-item-changed`), **Removed** on
+  the managed side (`agent-card-item-removed`) and **Unchanged**. The summary strip
+  (`agent-card-summary`, `agent-card-change-count`) reads "N added, N modified, N removed", and the
+  legend is a list named **Legend** (`agent-card-legend`, `agent-card-legend-added|changed|removed|same`).
+  **Show raw JSON** (`agent-card-raw-toggle`) shows the full content of each card side by side, each
+  in a focusable `pre` region named by its heading (`agent-card-raw-before|after`, sections
+  `agent-card-raw-<side>-section`), with copy buttons named "Copy the <card title> JSON"
+  (`agent-card-copy-before-button`, `agent-card-copy-after-button`). The colours are local tokens on
+  `.agent-card-tab` in `SurfaceBuilder.css`, redefined under `body.dark-theme`; the light tokens
+  (added `#065f46`, modified `#92400e`, removed `#b91c1c`) keep the tag text at 4.5:1 or more on
+  its 8% tint. The tab sizes itself
+  with a container query (`container-type: inline-size` on `.agent-card-tab`), not a viewport query,
+  because the app nav and the Surface sidebar take part of the width: below 640px of tab width the
+  cards and raw panels stack and the facts become one column.
+- The Surface Entry point URL stays in the Surface view. The Agent Cards view links back to it:
+  "The Entry point URL and the rest of the surface settings are in the Surface view." with an
+  **Open the Surface view** button (`agent-card-surface-link`, `agent-card-open-surface-button`),
+  through `SurfaceMetaContext.onOpenSurfaceView`; outside a surface editor the link is absent.
+- The header is a definition list: **Served card discovery URL** (the gateway-served card
+  discovery URL, `agent-card-served-url`, **Copy** named "Copy the served card discovery URL"
+  `agent-card-url-copy-button`, **Open** `agent-card-open-button`, **Refresh**
+  `agent-card-refresh-button`), **Fetched from** (`agent-card-source-url`, with "(query hidden)"),
+  **Fetch** (`agent-card-fetch`, holding the `agent-card-fetch-status` badge and
+  `agent-card-fetch-cause` with `data-cause`, not a live region), **Target Authentication** (`agent-card-auth`: the provider and token expiry, **Static
+  secret**, **Looked-up credential**, **No Target Authentication**, **The remote gateway signs in**,
+  **Credential not obtained** or **No credential sent**), **Last fetched** (`agent-card-fetched-at`,
+  a `time` element with the absolute time as its title), **Outcome** (`agent-card-outcome`, `agent-card-outcome-reason`, from
+  `describeDeclaration`; for a declaring route the reason says the agent card names the
+  authorization server only when the served card carries the `agent_gateway` scheme
+  (`cardNamesGatewayScheme`), says only the protected resource metadata names it when the served
+  card lacks that scheme, and makes no claim about the card when no served card is shown) and **Last caller fetch** (`agent-card-last-caller-fetch`, per gateway
+  replica). A failed fetch names the cause with the HTTP status (`describeFetchFailure`), for
+  example "Sign-in failed — HTTP 401". The longer cause text (`CARD_FETCH_CAUSE_TEXT`) says what
+  happened and what to do, for example "Check that the agent is running, then Refresh."
+  **Refresh** needs `surfaces.edit`; without it the button is disabled with the reason as its title
+  and description. A successful Refresh replaces the failed state with the new cards and puts
+  "Card refreshed." with the fetch result (OK, failing or not served, never the cause, which the
+  alert gives) in a visually hidden status region (`agent-card-refresh-status`), cleared when the
+  next Refresh starts; a 429 shows a warning toast and keeps the cards on screen; a refused or
+  failed Refresh shows an error toast. The tab heading (`agent-card-heading`, `tabIndex=-1`) takes
+  focus when **Retry** replaces itself with the loading status.
+- A failed or not-served fetch shows a danger alert with the cause text (`agent-card-failed`,
+  `agent-card-failed-cause`) and opens both raw panels. The managed panel reads "Not available:
+  <cause — HTTP n>." (`agent-card-raw-before-missing`), or shows the managed card when the gateway
+  fetched it but will not serve it. The served panel shows, in this order: the card the gateway
+  returns in `after` whatever the fetch status, with "The card the gateway last served for this
+  surface, before the latest fetch failed. Callers do not get it until this is fixed." (or "before
+  the gateway refused to serve the card it fetched.") as `agent-card-raw-after-note`, never in the
+  present tense, because the card route keeps no stale card for callers; when `after` is
+  `null` because the card is over the display limit, "The card the gateway last served is N KB, more
+  than the N KB the dashboard shows. Open the card URL to read it."; on a gateway that returns no
+  served card, the last Gateway-Served Agent Card the dashboard saw for this surface
+  (`useAgentCardPreview` `lastServed`, never carried to another surface) with "The last card the
+  gateway served, fetched <time>."; otherwise "The gateway serves no card while the fetch fails."
+  (`agent-card-raw-after-missing`). A failed or not-served fetch shows no comparison, summary or
+  **Added** marks, because there is no managed card from the same fetch to compare against.
+- Other states, each with its own test id and fixed copy: create mode or no id
+  (`agent-card-unsaved`, "Save the surface to see its agent cards."), unsaved edits
+  (`agent-card-unsaved-changes`, a banner above the content; moving or zooming the canvas does not
+  count, see `utils/surfaceDirtySignature.ts`), loading (`agent-card-loading`), read failed with
+  **Retry** (`agent-card-error`, `agent-card-retry-button`), `not_a2a` ("Only A2A and AP2 surfaces
+  have agent cards.") and `not_running` (`agent-card-unsupported`; `operator_only` reads "Only an
+  appliance operator can preview the card of an appliance-wide surface."; an `auth_failed` cause on
+  a `remote_gateway` sign-in reads "The remote gateway refused this gateway's authorization (HTTP
+  {status}). Check the sign-in settings of the remote surface."), a card over the display limit
+  (`agent-card-too-large`), a gateway-generated A2A proxy card (`agent-card-generated`, served column
+  only), callers paying first (`agent-card-payment`) and Surface Variants existing
+  (`agent-card-variant-note`, because the view shows the base route). `hasVariants` comes from the
+  saved surface's enabled variants.
+- The required scopes and the Authorization server discovery resource are set in the A2A surface's
+  Caller Context editor (see _Surface Builder_ above); the authorization server comes from the
+  strategy and appears with the scopes in the served card. Card content comes from the agent, so it
+  is untrusted: every value renders as React text, there is no `dangerouslySetInnerHTML`, and no
+  card URL (`iconUrl`, `documentationUrl`, `provider.url`) becomes a link or an image. The only link
+  is the served card URL, and only when `safeHttpUrl` passes (http or https, no user info), opened
+  with `rel="noopener noreferrer"`. The parser keeps no token, secret, secret id or upstream error
+  body, so the view has nothing of that kind to show.
+- The Managed Agent panel shows one line, **Card fetch: OK**, **Card fetch: failing (<cause — HTTP
+  n>)** or **Card: generated by the gateway**, with an icon, and a **View agent cards** link button
+  (`managed-agent-card-fetch`, `managed-agent-card-fetch-status`, `managed-agent-card-fetch-icon`,
+  `managed-agent-card-fetch-link`), through `agent-card/AgentCardFetchLine.tsx`. The status text
+  uses `agent-card-fetch-ok` and `agent-card-fetch-failing` (AA colours in both themes, scoped to
+  `.agent-card-fetch-line`), not `text-success` or `text-danger`. `AgentCardFetchLine` reads the
+  preview with its own `useAgentCardPreview` call and never calls Refresh; it reads again when
+  `SurfaceMetaContext.agentCardFetchRevision` changes, which the shell bumps on a save and on each
+  successful Refresh in the Agent Cards view (`AgentCardTab` `onRefreshed`), so the line does not
+  keep a stale status. It shows `Card fetch: checking…` while loading and `Card fetch: status
+unavailable` when the read fails. Like the chip's
+  link, it reaches the view through `SurfaceMetaContext.onOpenAgentCard`, which `SurfaceFormShell`
+  sets only while the view is offered, and it shows only for a saved surface. `SurfaceDetailPage`
+  passes `isDirty`, the declarations revision as `agentCardRefreshKey` (so a save reads the cards
+  again; the shell also exposes it as `SurfaceMetaContext.agentCardRevision`) and `hasVariants`.
 
 ## Trust Check
 
@@ -231,16 +512,16 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   Transit Point with a flagged migrated copy, on the canvas and in every other loaded variant
   snapshot (it says how many are in other variants), hidden at zero.
 
-| Element                            | Test id                                                                              |
-| ---------------------------------- | ------------------------------------------------------------------------------------ |
-| Per-Transit-Point scope line       | `trust-check-panel-transit-point-scope`                                              |
-| Fullscreen leg label               | `trust-check-fullscreen-leg`                                                         |
-| Managed Agent URL-target warning   | `trust-check-panel-managed-agent-target-warning`                                     |
-| Read-only migrated copy line       | `trust-check-panel-read-only`, `trust-check-fullscreen-read-only`                    |
-| Fullscreen query list             | `trust-check-fullscreen-queries`                                                     |
-| Migrated warning and Keep          | `trust-check-panel-migrated-warning`, `trust-check-fullscreen-migrated-warning`, each with `-keep` |
-| Review summary                     | `surface-migrated-trust-checks-summary`                                              |
-| Migrated canvas badge              | `surface-node-trust-check-migrated-badge`                                            |
+| Element                          | Test id                                                                                            |
+| -------------------------------- | -------------------------------------------------------------------------------------------------- |
+| Per-Transit-Point scope line     | `trust-check-panel-transit-point-scope`                                                            |
+| Fullscreen leg label             | `trust-check-fullscreen-leg`                                                                       |
+| Managed Agent URL-target warning | `trust-check-panel-managed-agent-target-warning`                                                   |
+| Read-only migrated copy line     | `trust-check-panel-read-only`, `trust-check-fullscreen-read-only`                                  |
+| Fullscreen query list            | `trust-check-fullscreen-queries`                                                                   |
+| Migrated warning and Keep        | `trust-check-panel-migrated-warning`, `trust-check-fullscreen-migrated-warning`, each with `-keep` |
+| Review summary                   | `surface-migrated-trust-checks-summary`                                                            |
+| Migrated canvas badge            | `surface-node-trust-check-migrated-badge`                                                          |
 
 ## Trust Recorder
 
@@ -367,6 +648,122 @@ Management personal access tokens live in the Secrets page's **Access Tokens** t
 
 Keep labels associated, timestamps exact, and clipboard failures visible.
 
+## JWT verification strategies
+
+- A failed save shows the gateway's message in `strategy-error` (role `alert`).
+- The editor (`EditJwtVerificationStrategyPage.tsx`) sends `discover_metadata` explicitly:
+  `true` after **Discover** (`strategy-discover-button`), `false` after **Clear pinned
+  metadata** (`strategy-pinned-clear`) or when the keys become static while a server is pinned,
+  and omitted otherwise, which keeps the pin. Discover posts `{ issuer }` to
+  `/api/v1/jwt-verification-strategies/discover`, needs Remote URL keys and an `https` issuer
+  (the editor refuses any other issuer in `strategy-discover-error` without calling the gateway,
+  which itself requires `https` only when the caller uses a tenant-scoped token, the strict
+  posture), and shows the result in the pinned card (`strategy-pinned-server`: issuer, metadata URL, token
+  endpoint, JWKS URI). A discovered JWKS URI replaces the typed one. Editing the issuer or JWKS
+  URI after Discover drops the result; a pin that no longer matches the issuer or JWKS URI shows
+  `strategy-pinned-stale`, which says that surfaces using the strategy stop advertising an
+  authorization server, that saving a changed issuer or JWKS URI tries discovery
+  again and, when that fails, still saves and clears the pin when the issuer changed (it keeps
+  the pin when only the JWKS URI changed), and that Discover pins matching metadata. Without a
+  pin, `strategy-no-pin` says surfaces using the strategy advertise no authorization server in
+  their agent card or protected resource metadata.
+  A failed discovery shows one generic `strategy-discover-error` alert, never the gateway's
+  detail.
+- The **Check URI** save gate applies only to a JWKS URI the operator typed or changed, not to a
+  discovered or unchanged one.
+- **Scope claims** (`strategy-scope-claims`, described by its help text `scope_claims-help`
+  through `aria-describedby`) is a comma separated list sent as `scope_claims`. A new
+  strategy leaves it out when empty. Saving an existing strategy with the field cleared sends
+  `["scope", "scp"]`, because the gateway keeps the stored list when the field is omitted and
+  rejects an empty list; the default list is stored as absent.
+- The authorization server fields (`authorization_server`) follow the gateway's discovery
+  response, which returns the pinned metadata at the top level of the body.
+- The list marks a strategy with a pinned server with a **Discovered** badge
+  (`strategy-discovered-badge`). Deleting asks in the page (`strategy-delete-confirm`, role
+  `alertdialog`, confirm and cancel buttons). It lists the credential providers that use the
+  strategy for consent identity (read from `/api/v1/credential-providers`; "Could not check which
+  credential providers use it." when that read fails, and Delete stays available) and the surfaces
+  whose Access Point or variants use the strategy, or whose Transit Points or outbound credential
+  bindings (base or variant) use one of those providers (read from `/api/v1/surfaces`; "Could not
+  check" when that fails). It states that, without authorization server discovery, a caller
+  presenting a token is refused with `500` and a caller without one is left to the surface's
+  policy; that a surface that advertises an authorization server can no longer be served and
+  refuses every caller until the strategy is restored; and that a credential provider using it for
+  consent identity can no longer obtain credentials that need the user's consent (see
+  `docs/SOURCE_AUTH.md#source-authentication`). A refused delete shows
+  inline in `strategy-delete-error`. Opening the confirmation moves focus into it and scrolls it
+  into view; Escape or Cancel closes it and returns focus to the row's Delete button, and a
+  confirmed delete moves focus to the list heading (`hooks/useInPageConfirm.ts`). Only the
+  surfaces of the strategy asked about last are shown.
+- A Discover that answers after the Expected Issuer was edited is ignored, so the page never
+  shows or saves metadata for an issuer it no longer names.
+- Provider-neutral trust is configured through JWT verification strategies and credential
+  providers; the dashboard has no OIDC Providers page.
+
+## Credential providers
+
+- One descriptor, `PROVIDER_TYPE_CAPABILITIES` in `utils/credentialProviders.ts`, is a
+  `Record<CredentialProviderType, ...>` so TypeScript rejects a type with no entry. The form
+  (`EditCredentialProviderPage`), the list (`CredentialProvidersTab`) and the pickers read it
+  for labels, badge colors, which fields apply, and which uses a type permits
+  (`providerPermits`, `filterProvidersForUse`). Never compare `provider_type` to a string
+  elsewhere. Request building and validation live in the same module
+  (`validateProviderForm`, `buildProviderBody`, `providerFormFromWire`). Updating a provider sends
+  `null` for an emptied description or authorization endpoint, `{}` for emptied or unsupported
+  additional parameters, and `null` for the client and API key secret references the provider's
+  type does not use; creating a provider sends none of these.
+- **JWT Bearer** (`oauth2_jwt_bearer`) shows `jwt-bearer-section`: Signing Key Secret
+  (required), Algorithm (RS256 or ES256), Key ID, Assertion Issuer (required), Subject (the
+  `sub` claim, sent only when set) and Audience (`provider-audience`, optional, described by
+  `audience-help`, its placeholder the current token endpoint; sent trimmed as `audience`, left
+  out when blank, refused before saving when it holds whitespace or control characters or
+  exceeds 512 bytes, and the assertion audience is the token endpoint when unset).
+  The client ID and client secret references are optional and sent only as a pair. The section carries an
+  always-visible `jwt-bearer-encryption-banner` because encryption at rest is off by default.
+  The signing key is an ordinary secret (type Certificate or General); the dashboard has no
+  separate private-key secret type. The assertion settings travel in a nested `jwt_bearer`
+  object (`signing_key_secret_ref`, `signing_algorithm`, `assertion_issuer`,
+  `assertion_subject`, `key_id`, `audience`), which a save replaces as a whole. Clearing the optional
+  client references on an existing provider sends them as `null`; the gateway removes both
+  stored references (an omitted field keeps them), and the next grant sends no client
+  authentication.
+- Choosing JWT Bearer for a new provider whose Token Endpoint is empty prefills Google's
+  endpoint (`GOOGLE_TOKEN_ENDPOINT`, `tokenEndpointForType`) with the hint
+  `provider-token-endpoint-google-hint`, shown only on a new provider; the field stays editable, choosing another type removes
+  the untouched prefill, and nothing is prefilled once the operator has edited the endpoint or on
+  an existing provider.
+- Create and update both send `provider_type`, so changing the Provider Type of an existing
+  provider saves the new type; the gateway answers 409 while a surface uses the provider in a way
+  the new type cannot serve: Target Authentication with Authorization Code, or a delegation
+  binding that breaks the JWT Bearer binding rule (an https leg and caller authentication), or a
+  surface of another tenant uses the provider and the new type sends the gateway's own
+  credential (see `docs/CREDENTIAL_DELEGATION.md#binding-a-provider-to-a-surface`). A provider
+  whose `provider_type` the dashboard does not know opens read-only with `provider-unknown-type` (disabled form, no save button, no
+  `Cmd+S` save), so it can never be saved with a guessed type.
+- A form error (`provider-error`, role `alert`) is announced. The Provider ID is derived from the
+  Name for every type except Authorization Code, so a Name with no ASCII letter or digit is
+  refused with "Name must contain at least one letter or number."; for Authorization Code the
+  error names the **Callback URL Route** field.
+- The delegation pickers (the surface-level outbound bindings and the Transit Point
+  credential binding) list only providers whose type permits `legacy_delegation`, and keep a
+  saved provider that is no longer allowed selectable with a `not usable here` label
+  (`keptProviderLabel`). They do not check the JWT Bearer binding rule; the gateway refuses such
+  a surface on save with 400. The Credential Delegation sidebar panel only looks up the bound
+  providers' callback URLs and does not filter.
+- The list deletes with the two-step `DeleteButton`. A refused delete (`409` while a surface
+  still uses the provider) shows the gateway's reason and status inline in
+  `credential-provider-delete-error` (role `alert`), never a native alert.
+- The strategy editor's **Discover** button calls `/discover`; see _JWT verification
+  strategies_.
+- Permissions: the list, add, delete, and the provider picker use `credential_providers.view`,
+  `.edit` and `.delete` (administrator by default, matching `src/rbac/mod.rs`), not
+  `settings.edit`. `/credential-providers/new` needs `.edit`, `/credential-providers/:id` needs
+  `.view` and shows the form read-only without `.edit`, with a `provider-read-only` notice
+  saying the role can view but not change it. Each list row's name is a link to the provider,
+  so every role that can list providers can open one from the keyboard. Without `.view` the list shows a
+  notice and the Target Authentication picker keeps the saved provider id read-only, because a
+  role that can edit surfaces cannot list providers.
+
 ## Secret editor
 
 - `/secrets/new` and `/secrets/:id` have one save button, at the bottom of the form beside
@@ -377,6 +774,19 @@ Keep labels associated, timestamps exact, and clipboard failures visible.
   the value field is disabled with a **Stored value is hidden** placeholder until **Update
   Secret Value** is checked. Unchecking it, or a successful save, clears the entered value
   and returns the field to that hidden state.
+- Deleting a secret warns first when credential providers reference it, in the Secrets list and
+  in the editor (`hooks/useSecretDeleteGuard.tsx`; the guard is rendered once per page as
+  `warningNode`). The two-step delete button still comes first. The hook then reads the providers
+  (`providersUsingSecret` in `utils/credentialProviders.ts`: the list, then each provider, because
+  the list omits secret references) and, when any reference the secret's Secret ID, shows
+  `secret-delete-warning` (role `alertdialog`) naming them (`secret-delete-warning-provider`), with
+  `secret-delete-warning-confirm-button` (**Delete secret anyway**) and
+  `secret-delete-warning-cancel-button`. The gateway does not block the delete, so confirming
+  deletes. A secret nothing references deletes at once; a failed read shows
+  `secret-delete-warning-unknown` and still allows the delete; without `credential_providers.view`
+  there is no check. The warning takes focus when it opens; Escape or Cancel returns focus to
+  the Delete button, and a confirmed delete in the Secrets list moves focus to the list heading
+  (`hooks/useInPageConfirm.ts`).
 - **Show the value you entered** (`secret-value-reveal-checkbox`) appears only while the
   value field is editable, and reveals only what was typed or generated on this page. The
   value field is `secret-value-input`.
@@ -496,19 +906,19 @@ parts `IdentityNameCell`, `IdentityOriginBadge`, and `IdentityRecorderChip`.
     recorder outcome changes; adding or removing a Trust Recorder shows on the next update or
     reload.
 
-| Element                                       | Test id                                                                                                                            |
-| --------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| Identity row                                  | `identities-row-<did>`                                                                                                             |
-| Name, pending, conflict, verified             | `identities-name`, `identities-name-pending`, `identities-name-conflict`, `identities-name-verified`                               |
-| Copy DID                                      | `identities-copy-did-button`                                                                                                       |
-| Origin badge                                  | `identities-origin-<origin>`                                                                                                       |
-| Surface link, credential principal            | `identities-surface-link`, `identities-credential-principal`                                                                       |
-| Unnamed filter                                | `identities-unnamed-filter-button`                                                                                                 |
-| Recorder filter                               | `identities-recorder-filter`                                                                                                       |
-| Recorder chip                                 | `identities-recorder-chip-<state>`                                                                                                 |
-| Recorder tooltip                              | `identities-recorder-tooltip`                                                                                                      |
-| Tooltip last attempt, reason                  | `identities-recorder-last-attempt`, `identities-recorder-reason`                                                                   |
-| Tooltip registry entry                        | `identities-recorder-entry-<registry id>`                                                                                          |
+| Element                            | Test id                                                                                              |
+| ---------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| Identity row                       | `identities-row-<did>`                                                                               |
+| Name, pending, conflict, verified  | `identities-name`, `identities-name-pending`, `identities-name-conflict`, `identities-name-verified` |
+| Copy DID                           | `identities-copy-did-button`                                                                         |
+| Origin badge                       | `identities-origin-<origin>`                                                                         |
+| Surface link, credential principal | `identities-surface-link`, `identities-credential-principal`                                         |
+| Unnamed filter                     | `identities-unnamed-filter-button`                                                                   |
+| Recorder filter                    | `identities-recorder-filter`                                                                         |
+| Recorder chip                      | `identities-recorder-chip-<state>`                                                                   |
+| Recorder tooltip                   | `identities-recorder-tooltip`                                                                        |
+| Tooltip last attempt, reason       | `identities-recorder-last-attempt`, `identities-recorder-reason`                                     |
+| Tooltip registry entry             | `identities-recorder-entry-<registry id>`                                                            |
 
 ## Remote gateway Issuer DIDs
 

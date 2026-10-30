@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::http::Method;
+use axum::http::{HeaderName, HeaderValue, Method};
 use bytes::Bytes;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
@@ -434,6 +434,38 @@ fn stream_failure(
     }
 }
 
+/// The values of one ForwardResponse header entry: a string is one value, an
+/// array gives its strings in order (a header the Target repeated), and any
+/// other value gives none.
+pub(crate) fn fabric_header_values(value: &serde_json::Value) -> impl Iterator<Item = &str> {
+    let values = match value {
+        serde_json::Value::Array(values) => values.as_slice(),
+        value => std::slice::from_ref(value),
+    };
+    values
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+}
+
+/// The `(name, value)` pairs one ForwardResponse header entry contributes to an
+/// HTTP response. A name or value HTTP cannot carry is skipped, so one bad
+/// header from the peer does not fail the whole relayed response.
+pub(crate) fn fabric_header_pairs<'a>(
+    key: &'a str,
+    value: &'a serde_json::Value,
+) -> impl Iterator<Item = (HeaderName, HeaderValue)> + 'a {
+    HeaderName::try_from(key)
+        .ok()
+        .into_iter()
+        .flat_map(move |name| {
+            fabric_header_values(value).filter_map(move |value| {
+                HeaderValue::try_from(value)
+                    .ok()
+                    .map(|value| (name.clone(), value))
+            })
+        })
+}
+
 /// Parse the `headers` field of a `ForwardResponse` body into a multi-value
 /// map. A header value is either a plain string (single-valued) or a JSON
 /// array of strings (a header repeated more than once, e.g. MPP's per-method
@@ -444,20 +476,10 @@ fn parse_fabric_response_headers(value: Option<&serde_json::Value>) -> HashMap<S
         .map(|m| {
             m.iter()
                 .filter_map(|(k, v)| {
-                    if let Some(s) = v.as_str() {
-                        Some((k.clone(), vec![s.to_string()]))
-                    } else if let Some(arr) = v.as_array() {
-                        let values: Vec<String> = arr
-                            .iter()
-                            .filter_map(|item| {
-                                item.as_str()
-                                    .map(str::to_string)
-                            })
-                            .collect();
-                        (!values.is_empty()).then_some((k.clone(), values))
-                    } else {
-                        None
-                    }
+                    let values: Vec<String> = fabric_header_values(v)
+                        .map(str::to_string)
+                        .collect();
+                    (!values.is_empty()).then_some((k.clone(), values))
                 })
                 .collect()
         })
@@ -1810,5 +1832,52 @@ mod tests {
     #[test]
     fn test_parse_fabric_response_headers_missing_is_empty() {
         assert!(parse_fabric_response_headers(None).is_empty());
+    }
+
+    #[test]
+    fn fabric_header_values_reads_a_string_or_the_strings_of_an_array() {
+        let values = |value: serde_json::Value| -> Vec<String> {
+            fabric_header_values(&value)
+                .map(str::to_string)
+                .collect()
+        };
+        assert_eq!(values(serde_json::json!("one")), vec!["one"]);
+        assert_eq!(values(serde_json::json!(["a", 7, null, "b"])), vec!["a", "b"]);
+        assert!(values(serde_json::json!(7)).is_empty());
+        assert!(values(serde_json::json!({"a": "b"})).is_empty());
+        assert!(values(serde_json::json!([])).is_empty());
+    }
+
+    fn header_pairs(
+        key: &str,
+        value: serde_json::Value,
+    ) -> Vec<(String, String)> {
+        fabric_header_pairs(key, &value)
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_string(),
+                    value
+                        .to_str()
+                        .unwrap()
+                        .to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fabric_header_pairs_keeps_each_valid_value_of_a_header() {
+        assert_eq!(header_pairs("x-good", serde_json::json!("a")), vec![("x-good".into(), "a".into())]);
+        assert_eq!(
+            header_pairs("x-multi", serde_json::json!(["1", "bad\r\nx", "2"])),
+            vec![("x-multi".into(), "1".into()), ("x-multi".into(), "2".into())]
+        );
+    }
+
+    #[test]
+    fn fabric_header_pairs_skips_a_name_or_value_http_cannot_carry() {
+        assert!(header_pairs("bad name", serde_json::json!("v")).is_empty());
+        assert!(header_pairs("x-ctl", serde_json::json!("a\u{0}b")).is_empty());
+        assert!(header_pairs("x-num", serde_json::json!(5)).is_empty());
     }
 }

@@ -11,7 +11,9 @@ import FabricDelegatedCredentialsSection, {
   fabricPeerGatewayId,
   hasOutboundCredentialBindings,
 } from '../_shared/FabricDelegatedCredentialsSection';
+import AgentCardFetchLine from '../../agent-card/AgentCardFetchLine';
 import A2aProxyEndpointFields, { type A2aProxyOption } from './A2aProxyEndpointFields';
+import { CREDENTIAL_PROVIDER_AUTH_TYPE, PRESERVED_AUTH_TYPE } from './targetAuthConfig';
 
 interface Gateway {
   id: string;
@@ -198,6 +200,7 @@ const ManagedAgentPanel: React.FC<ConfigPanelProps> = ({
               value={config.endpoint || ''}
               onChange={e => updateField('endpoint', e.target.value)}
               isInvalid={!!errorByField?.endpoint}
+              data-testid="managed-agent-endpoint-url"
             />
             {errorByField?.endpoint ? (
               <Form.Control.Feedback type="invalid" style={{ fontSize: '10px' }}>
@@ -454,15 +457,28 @@ const ManagedAgentPanel: React.FC<ConfigPanelProps> = ({
                   Otherwise, pick the format the target expects. You'll fill in the exact secret and
                   header on the next screen.
                 </p>
+                <p>
+                  <strong>Credential Provider</strong>: the gateway signs in with a credential
+                  provider (OAuth client credentials, JWT bearer or API key) and sends its token.
+                </p>
               </FieldHelp>
             </div>
             <Form.Select
               size="sm"
+              data-testid="managed-agent-auth-type"
               value={config.target_auth_enabled ? config.target_auth_type || 'bearer' : 'none'}
               onChange={e => {
                 const v = e.target.value;
                 if (v === 'none') {
                   updateField('target_auth_enabled', false);
+                } else if (v === PRESERVED_AUTH_TYPE) {
+                  return;
+                } else if (v === CREDENTIAL_PROVIDER_AUTH_TYPE) {
+                  updateFields({
+                    target_auth_enabled: true,
+                    target_auth_type: v,
+                    target_auth_fallback: config.target_auth_fallback || 'reject',
+                  });
                 } else {
                   const defaults: Record<string, { headerName: string; headerFormat: string }> = {
                     bearer: { headerName: 'Authorization', headerFormat: 'Bearer {value}' },
@@ -486,11 +502,33 @@ const ManagedAgentPanel: React.FC<ConfigPanelProps> = ({
               <option value="basic">Basic Auth</option>
               <option value="api_key">API Key</option>
               <option value="custom">Custom</option>
+              {(endpointType === 'url' ||
+                config.target_auth_type === CREDENTIAL_PROVIDER_AUTH_TYPE) && (
+                <option value={CREDENTIAL_PROVIDER_AUTH_TYPE}>Credential Provider</option>
+              )}
+              {config.target_auth_enabled && config.target_auth_type === PRESERVED_AUTH_TYPE && (
+                <option value={PRESERVED_AUTH_TYPE} disabled>
+                  Unsupported method (kept as saved)
+                </option>
+              )}
             </Form.Select>
           </Form.Group>
+          {config.target_auth_enabled &&
+            config.target_auth_type === CREDENTIAL_PROVIDER_AUTH_TYPE && (
+              <div
+                className={`small mb-2 ${endpointType === 'gateway' ? 'text-danger' : 'text-muted'}`}
+                data-testid="managed-agent-credential-provider-note"
+                role={endpointType === 'gateway' ? 'alert' : undefined}
+              >
+                {endpointType === 'gateway'
+                  ? 'A credential provider cannot be used on a gateway connection. The gateway that owns the target holds the provider. Choose another type or a direct https URL.'
+                  : 'Needs an https target and a surface that authenticates its callers.'}
+              </div>
+            )}
           {config.target_auth_enabled && (
             <button
               className="btn btn-outline-primary btn-sm w-100"
+              data-testid="managed-agent-auth-configure"
               onClick={() => openFullscreenEditor?.()}
               disabled={!openFullscreenEditor}
             >
@@ -499,6 +537,8 @@ const ManagedAgentPanel: React.FC<ConfigPanelProps> = ({
           )}
         </div>
       )}
+
+      <AgentCardFetchLine />
 
       <div className="config-section">
         <label>Identity Binding VP</label>

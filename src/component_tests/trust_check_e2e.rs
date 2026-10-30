@@ -600,7 +600,7 @@ async fn a_tenant_token_references_only_its_own_trust_registries_from_transit_po
         write_tenant_trust_registry_fixture(temp_dir, "tr-tenant-b", Some("tenant-b"));
         write_tenant_trust_registry_fixture(temp_dir, "tr-global", None);
         super::helpers::configure_admin_api(bootstrap);
-        tenant = Some(super::a2a_flow_e2e::seed_scoped_access_token(
+        tenant = Some(super::helpers::seed_scoped_access_token(
             bootstrap,
             Some("TENANT:${x-external-account}:(?:surfaces:.*|trust-registries:.*)"),
         ));

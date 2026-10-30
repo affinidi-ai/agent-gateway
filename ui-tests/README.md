@@ -66,6 +66,29 @@ npm run test:ui
 make ui-test
 ```
 
+### Keep screenshots and traces of passing tests
+
+By default a run keeps screenshots and traces only for failed tests. Set
+`AG_UI_ARTIFACTS=all` to keep a full-page screenshot and a trace of every test, passing or
+not; videos are still kept only for failed tests:
+
+```bash
+AG_UI_ARTIFACTS=all make ui-test
+```
+
+The live OIDC suite ignores this setting and records no screenshots, traces or videos,
+because its pages can show secret material.
+
+### Live OIDC suite
+
+`make oidc-ui-e2e` runs `playwright.oidc-live.config.ts` and the specs under `specs/oidc-live/`
+against two live Ory Hydra instances and the mock A2A agent, with a gateway of its own. It is a
+separate Playwright config, so `make ui-test` neither runs nor waits for it. Its surface-builder
+spec turns on **Authorization server discovery** in the Caller Context editor, which is the only way a
+surface declares, and proves that removing the required scope keeps the gateway refusing a caller
+without a token. See
+[`docs/development/TESTING.md`](../docs/development/TESTING.md#live-oidc-dashboard-tests).
+
 ### Run in Headed Mode (Visible Browser)
 
 ```bash
@@ -103,7 +126,7 @@ test_results/
 ├── result_20260128_143052/   # Timestamped result directory
 │   ├── html/                 # Interactive HTML report
 │   ├── screenshots/          # Test screenshots
-│   ├── traces/               # Playwright traces (on failure)
+│   ├── traces/               # Playwright traces (on failure, or all with AG_UI_ARTIFACTS=all)
 │   ├── test-output/          # Raw test output
 │   ├── results.json          # Machine-readable JSON results
 │   ├── junit.xml             # JUnit XML for CI integration
@@ -136,17 +159,25 @@ ui-tests/
 │   ├── channels.spec.ts      # Channel management tests
 │   ├── api-keys.spec.ts      # API Keys page tests
 │   ├── credentials.spec.ts   # Outbound Credentials tests
+│   ├── strategy-discovery.spec.ts   # JWT strategy discovery, scope claims, list and delete
+│   ├── credential-providers.spec.ts # JWT bearer credential provider form, create and reopen
+│   ├── surface-builder-save.spec.ts # Surface Builder save path: target, caller auth, authorization server discovery, warnings
+│   ├── agent-card-layout.spec.ts    # Agent Cards tab: placement, compare, URLs, failed fetch, layout
 │   ├── accessibility.spec.ts # WCAG accessibility tests
-│   └── laptop-layout.spec.ts # Every page at every laptop viewport (layout)
+│   ├── laptop-layout.spec.ts # Every page at every laptop viewport (layout)
+│   └── oidc-live/            # Live Ory Hydra suite, run by make oidc-ui-e2e
 ├── helpers/                  # Test utilities
 │   ├── test-auth.ts          # Authentication helpers
+│   ├── gateway-api.ts        # Authenticated gateway API client for seeding and read-back
+│   ├── feature.ts            # Feature annotations and acceptance screenshots
 │   ├── fixtures.ts           # Shared `test`/`expect` with the session bridge
 │   ├── layout-pages.ts       # Page inventory for the laptop layout spec
 │   ├── layout-fixtures.ts    # Long-identifier list fixtures (page.route)
 │   ├── layout-assertions.ts  # Sideways-scroll and action reachability checks
 │   ├── screenshots.ts        # Screenshot utilities
 │   ├── wait.ts               # Custom wait functions
-│   └── index.ts              # Helper exports
+│   ├── index.ts              # Helper exports
+│   └── oidc-live/            # Helpers for the live OIDC suite
 ├── test_results/             # Test output (gitignored)
 │   ├── screenshots/          # Test screenshots
 │   ├── traces/               # Playwright traces
@@ -157,6 +188,7 @@ ui-tests/
 ├── global-setup.ts           # Test suite setup
 ├── global-teardown.ts        # Test suite teardown
 ├── playwright.config.ts      # Playwright configuration
+├── playwright.oidc-live.config.ts # Live OIDC suite configuration
 ├── package.json              # Dependencies
 └── tsconfig.json             # TypeScript config
 ```
@@ -233,7 +265,7 @@ After running tests, results are available in `test_results/`:
 | File/Directory       | Description                        |
 |----------------------|------------------------------------|
 | `screenshots/`       | Full-page and element screenshots  |
-| `traces/`            | Playwright traces for failed tests |
+| `traces/`            | Playwright traces for failed tests, or every test with `AG_UI_ARTIFACTS=all` |
 | `html/`              | Interactive HTML report            |
 | `results.json`       | JSON test results                  |
 | `junit.xml`          | JUnit XML for CI integration       |
@@ -304,6 +336,15 @@ test.describe('Channels', () => {
   });
 });
 ```
+
+### Feature annotations and acceptance screenshots
+
+Call `feature(...tags)` from `helpers/feature.ts` at the start of a test, or in a `beforeEach`,
+to add one `feature` annotation per tag; the HTML and JSON reports list them with the test.
+`attachCriterion(tag, criterion, title, target)` attaches a screenshot named
+`<tag> criterion <n>: <title>` to the report, of a locator or of a PNG the spec took. Take it
+of the area under test only, and in the live OIDC suite only after asserting the area shows
+no secret.
 
 ### Using Helpers
 

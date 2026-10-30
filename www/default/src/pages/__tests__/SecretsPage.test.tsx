@@ -1,5 +1,5 @@
 import React from 'react';
-import { render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import '@testing-library/jest-dom';
 import { MemoryRouter } from 'react-router-dom';
@@ -183,5 +183,88 @@ describe('SecretsPage secret delete', () => {
       })
     );
     expect(apiClient.fetch).toHaveBeenCalledWith('/api/v1/secrets/secret-1', { method: 'DELETE' });
+  });
+});
+
+describe('SecretsPage secret deletion', () => {
+  const requests = () =>
+    (apiClient.fetch as jest.Mock).mock.calls as Array<[string, { method?: string } | undefined]>;
+  const deletes = () => requests().filter(([, init]) => init?.method === 'DELETE');
+
+  const json = (body: unknown) => Promise.resolve({ ok: true, json: () => Promise.resolve(body) });
+
+  const withProviders = (providers: Record<string, Record<string, unknown>>) =>
+    (apiClient.fetch as jest.Mock).mockImplementation((url: string, init?: { method?: string }) => {
+      if (url === '/api/v1/credential-providers') {
+        return json(Object.keys(providers).map(id => ({ id, name: `Provider ${id}` })));
+      }
+      if (url.startsWith('/api/v1/credential-providers/')) {
+        return json(providers[url.split('/').pop() as string]);
+      }
+      if (url.startsWith('/api/v1/certificates/')) return json([]);
+      if (url.startsWith('/api/v1/secrets')) {
+        return init?.method === 'DELETE' ? json({}) : json(mockSecrets);
+      }
+      return json([]);
+    });
+
+  const clickDelete = () => {
+    fireEvent.click(screen.getByTitle('Delete secret'));
+    fireEvent.click(screen.getByTitle('Click again to confirm deletion'));
+  };
+
+  const openList = async () => {
+    renderAt('/secrets?tab=secrets');
+    await screen.findByText('Gateway Secret');
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    (apiClient.listSurfaces as jest.Mock).mockResolvedValue([]);
+    (apiClient.listAllApiKeys as jest.Mock).mockResolvedValue([]);
+    (apiClient.listAccessTokens as jest.Mock).mockResolvedValue([]);
+  });
+
+  it('warns with the provider names and deletes after the operator confirms', async () => {
+    withProviders({
+      p1: { client_secret_secret_ref: 'gateway-secret' },
+      p2: { api_key_secret_ref: 'another-secret' },
+    });
+    await openList();
+    clickDelete();
+
+    const warning = await screen.findByTestId('secret-delete-warning');
+    expect(warning).toHaveTextContent('Delete secret "Gateway Secret"?');
+    expect(
+      screen.getAllByTestId('secret-delete-warning-provider').map(li => li.textContent)
+    ).toEqual(['Provider p1']);
+    expect(deletes()).toHaveLength(0);
+
+    fireEvent.click(screen.getByTestId('secret-delete-warning-confirm-button'));
+    await waitFor(() => expect(deletes()).toHaveLength(1));
+    expect(deletes()[0][0]).toBe('/api/v1/secrets/secret-1');
+    await waitFor(() =>
+      expect(screen.queryByTestId('secret-delete-warning')).not.toBeInTheDocument()
+    );
+  });
+
+  it('keeps the secret when the warning is cancelled', async () => {
+    withProviders({ p1: { client_secret_secret_ref: 'gateway-secret' } });
+    await openList();
+    clickDelete();
+    fireEvent.click(await screen.findByTestId('secret-delete-warning-cancel-button'));
+
+    expect(screen.queryByTestId('secret-delete-warning')).not.toBeInTheDocument();
+    expect(deletes()).toHaveLength(0);
+  });
+
+  it('deletes a secret that no provider references without a warning', async () => {
+    withProviders({ p1: { client_secret_secret_ref: 'another-secret' } });
+    await openList();
+    clickDelete();
+
+    await waitFor(() => expect(deletes()).toHaveLength(1));
+    expect(deletes()[0][0]).toBe('/api/v1/secrets/secret-1');
+    expect(screen.queryByTestId('secret-delete-warning')).not.toBeInTheDocument();
   });
 });

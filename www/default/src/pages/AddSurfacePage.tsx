@@ -11,7 +11,9 @@ import { registry, validateSurfacePayload } from '../components/surface-builder/
 import { useSurfaceBuilder } from '../components/surface-builder/hooks/useSurfaceBuilder';
 import { useSaveShortcut } from '../components/surface-builder/hooks/useSaveShortcut';
 import { useDiscardWithUndo } from '../components/surface-builder/hooks/useDiscardWithUndo';
-import SurfaceFormShell from '../components/surface-builder/SurfaceFormShell';
+import SurfaceFormShell, {
+  type SurfaceFormView,
+} from '../components/surface-builder/SurfaceFormShell';
 import { useSurfacePolicyDefinitions } from '../components/surface-builder/hooks/useSurfacePolicyDefinitions';
 import { surfacePolicyBlockingReason } from '../components/surface-builder/elements/policy/status';
 import { freezeEmptyVariantOverrides } from '../components/surface-builder/variants/resolve';
@@ -33,6 +35,7 @@ import {
   getTemplateProtocolBadge,
 } from '../components/surface-builder/templates/templateSort';
 import { showToast } from '../utils/toaster';
+import { surfacePathAfterCreate } from '../utils/surfaceDeclarations';
 import './SurfaceBuilder.css';
 
 const WELCOME_DISMISSED_KEY = 'surface-builder-welcome-dismissed';
@@ -123,9 +126,7 @@ const AddSurfacePage: React.FC = () => {
   const surfacePolicyIds =
     surfacePolicyLoadState.status === 'loaded' ? surfacePolicyLoadState.ids : null;
 
-  const [activeTab, setActiveTab] = useState<
-    'surface' | 'elements' | 'monitoring' | 'config' | 'editor'
-  >('surface');
+  const [activeTab, setActiveTab] = useState<SurfaceFormView>('surface');
 
   const [editorTabNodeId, setEditorTabNodeId] = useState<string | null>(null);
   const [jsonOverride, setJsonOverride] = useState<string | null>(null);
@@ -449,7 +450,7 @@ const AddSurfacePage: React.FC = () => {
     setError(null);
     try {
       const payload: Partial<AgentSurface> = withA2aValidationSettled(buildSurfacePayload());
-      await apiClient.createSurface(payload);
+      const created = await apiClient.createSurface(payload);
       justCreatedRef.current = true;
       showToast('success', `Agent Surface "${name}" created`);
       // Surface non-blocking structural warnings AFTER create. See
@@ -458,7 +459,7 @@ const AddSurfacePage: React.FC = () => {
       for (const w of warnings.slice(0, 3)) {
         showToast('error', `Warning: ${w.message}`, { autoRemove: true, duration: 8000 });
       }
-      navigate('/surfaces');
+      navigate(surfacePathAfterCreate(created ?? {}));
     } catch (err: any) {
       setError(err.message || 'Failed to create surface');
     } finally {
@@ -731,9 +732,9 @@ const AddSurfacePage: React.FC = () => {
                             type="button"
                             className="btn btn-sm btn-primary surface-template-row__action"
                             disabled={applying}
-                            data-testid={`surface-template-use-button-${tpl.id}`}
                             aria-label={`Use template ${tpl.name}`}
                             title={`Use template ${tpl.name}`}
+                            data-testid={`surface-starter-use-${tpl.id}`}
                             onClick={e => {
                               e.stopPropagation();
                               void handleApplyStarterTemplate(tpl);
@@ -844,8 +845,8 @@ const AddSurfacePage: React.FC = () => {
             <button
               type="button"
               className="btn btn-success btn-sm"
-              data-testid="add-surface-create-button"
               onClick={handleCreate}
+              data-testid="surface-create-button"
               disabled={saving || !!saveDisabledReason}
               title={saveDisabledReason || (saving ? 'Creating…' : 'Create surface')}
             >
@@ -904,6 +905,7 @@ const AddSurfacePage: React.FC = () => {
                   type="button"
                   className="btn btn-sm btn-primary"
                   onClick={handleCloseWelcome}
+                  data-testid="surface-welcome-dismiss"
                 >
                   Got it
                 </button>

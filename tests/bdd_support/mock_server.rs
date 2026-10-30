@@ -153,6 +153,24 @@ impl From<serde_json::Value> for MockResponse {
     }
 }
 
+/// One `WWW-Authenticate` value holding a Target challenge for each
+/// space-separated scheme in `schemes` (`Bearer` or `Payment`), in order,
+/// each naming `realm`.
+pub fn target_challenges(
+    schemes: &str,
+    realm: &str,
+) -> String {
+    schemes
+        .split_whitespace()
+        .map(|scheme| match scheme {
+            "Bearer" => format!("Bearer realm=\"{realm}\", resource_metadata=\"https://idp.internal/prm\""),
+            "Payment" => format!("Payment id=\"p1\", realm=\"{realm}\", method=\"tempo\""),
+            other => panic!("no Target challenge for scheme '{other}'"),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[derive(Debug, Clone)]
 enum MockBehavior {
     Static,
@@ -876,6 +894,25 @@ async fn default_handler(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn target_challenges_hold_one_challenge_per_scheme_in_order() {
+        assert_eq!(
+            super::target_challenges("Payment", "bravo"),
+            "Payment id=\"p1\", realm=\"bravo\", method=\"tempo\""
+        );
+        assert_eq!(
+            super::target_challenges("Bearer Payment", "bravo"),
+            "Bearer realm=\"bravo\", resource_metadata=\"https://idp.internal/prm\", \
+             Payment id=\"p1\", realm=\"bravo\", method=\"tempo\""
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "no Target challenge for scheme 'DPoP'")]
+    fn target_challenges_refuse_an_unknown_scheme() {
+        super::target_challenges("DPoP", "bravo");
+    }
+
     #[tokio::test]
     async fn mock_server_starts_without_requests() {
         let mock = super::MockServer::start(serde_json::json!({"ok": true})).await;

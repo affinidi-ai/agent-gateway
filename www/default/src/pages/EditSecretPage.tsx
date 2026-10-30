@@ -10,6 +10,7 @@ import FieldHelp from '../components/shared/FieldHelp';
 import { Link } from '../components/shared/Link';
 import { DOCS_URL } from '../config/docs';
 import { useSafeNavigate } from '../hooks/useSafeNavigate';
+import { useSecretDeleteGuard } from '../hooks/useSecretDeleteGuard';
 import { KNOWN_SECRET_TAGS } from '../utils/secretTags';
 
 interface Secret {
@@ -74,6 +75,7 @@ const EditSecretPage: React.FC = () => {
   const [isSaving, setIsSaving] = useState(false);
   const [error, setError] = useState('');
   const [secretData, setSecretData] = useState<Secret | null>(null);
+  const { guardDelete, warningNode } = useSecretDeleteGuard();
   const [isSecretIdManuallyEdited, setIsSecretIdManuallyEdited] = useState(false);
   const [secretIdError, setSecretIdError] = useState('');
   const secretIdCheckTimeoutRef = useRef<NodeJS.Timeout | null>(null);
@@ -310,7 +312,7 @@ const EditSecretPage: React.FC = () => {
     }
   };
 
-  const handleDelete = async () => {
+  const deleteSecret = async () => {
     if (!id) return;
 
     try {
@@ -323,6 +325,15 @@ const EditSecretPage: React.FC = () => {
       showToast('error', errorMessage);
     }
   };
+
+  const handleDelete = () =>
+    guardDelete(
+      {
+        secret_id: secretData?.secret_id ?? formData.secret_id,
+        name: secretData?.name ?? formData.name,
+      },
+      deleteSecret
+    );
 
   const handleInputChange = (field: string, value: any) => {
     setFormData(prev => ({ ...prev, [field]: value }));
@@ -737,6 +748,8 @@ const EditSecretPage: React.FC = () => {
                 </div>
 
                 <hr />
+
+                {warningNode}
 
                 <div className="d-flex justify-content-between align-items-center">
                   {isEditMode && (

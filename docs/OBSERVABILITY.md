@@ -87,6 +87,48 @@ with `method_era` showing which method names they send. Requests later refused b
 request-shape validation are counted under their negotiated version. Fabric traffic is counted on
 the sending gateway only (see [Fabric coverage gap](PROTOCOLS.md#fabric-coverage-gap)).
 
+## Trust plane metrics
+
+Prometheus counters for the OAuth and OIDC trust plane. Every label value is a fixed code, so
+cardinality is bounded. A failure label is one of the same codes the API and audit records use;
+none carries a URL, host, issuer, token or provider name.
+
+| Metric | Labels | Counted |
+| --- | --- | --- |
+| `agent_gateway_token_fetch_total` | `grant`: `client_credentials`, `jwt_bearer`, `unsupported` (a provider type the gateway never grants for). `result`: `ok`, `unsupported`, `secret_unavailable`, `forbidden`, `unavailable`, `invalid_response`, `assertion_failed`, `scope_mismatch` | Each gateway token request that was not answered from cache or held back by the retry backoff. `unavailable` covers an unreachable endpoint, a refused grant and a timeout; `assertion_failed` is a JWT bearer assertion that could not be signed; `scope_mismatch` is a response whose `scope` lacks a requested scope |
+| `agent_gateway_jwks_fetch_total` | `result`: `ok`, `invalid_url`, `blocked`, `unreachable`, `http_status`, `too_large`, `invalid_document` | Each network fetch of a remote strategy's key set, successful or failed. A host that does not resolve counts as `blocked`. A cache hit, a static key set and the validate-jwks-uri probe are not counted |
+| `agent_gateway_discovery_total` | `result`: `ok`, `invalid_url`, `blocked`, `unreachable`, `http_status`, `too_large`, `invalid_document`, `issuer_mismatch` | Each authorization server metadata discovery, whether from a probe, a save or a re-discovery after an issuer change |
+| `agent_gateway_scope_denied_total` | `scheme`: the `auth_failed` scheme, `jwt` for a `jwt_bearer` method's [`required_scopes`](SOURCE_AUTH.md#required-scopes) (an Access Point with `protected_resource` included) and `mcp_resource_token` for `mcp_http.authorization` | Each request whose caller token lacked a required scope, whether the gateway refused it or left the decision to policy. Counted whether or not a sink selects `auth_failed`. An operator's card preview is not a caller request and is not counted |
+| `agent_gateway_card_security_total` | `outcome`: `declare`, `strip`, `pass_through`, `unservable`. `reason`: the [strip reason code](SOURCE_AUTH.md#declaring-an-access-point) for `strip` (`not_declared`, `fabric_target`, or `transit_point` for a Transit Point card), one of the nine unservable reason codes for `unservable`, otherwise `none` | Each agent card an Access Point serves after rewriting it, and each Transit Point card whose security the gateway removes because its Access Point's cards are secured ([Agent card security](PROTOCOLS.md#agent-card-security)). An operator's [Agent card preview](SOURCE_AUTH.md#agent-card-preview) is not counted |
+
+Alert on `agent_gateway_token_fetch_total{result!="ok"}` and
+`agent_gateway_jwks_fetch_total{result!="ok"}` as a rate against their `ok` series: a gateway
+that cannot reach an authorization server refuses callers (JWKS) or, after a failed token fetch
+that leaves no still-valid token, refuses the request with 503 `Delegated credentials
+unavailable` (an `outbound_credentials` or `transit_credentials` binding), answers 502 `Target
+authentication failed` (Target Authentication with the default `reject` fallback), or sends it
+without the credential (Target Authentication with `fallback: passthrough` only), while the rest
+of the appliance looks healthy.
+
+To find the provider behind a Target Authentication failure, search the `credential_delegation`
+log target for the `Gateway grant failed` warning: one per failed grant, with `provider_id`,
+`grant`, `category` (the `result` code above) and `stale_token_kept`. Requests held back by the
+retry backoff log `Gateway grant held back by the retry backoff` at debug level and are not
+counted.
+
+A record the gateway cannot read at load is skipped and counted in
+`agent_gateway_storage_load_errors_total{entity, reason}`. `reason` is `invalid_json`,
+`migration_failed`, `decrypt_failed` (an encrypted record that could not be decrypted),
+`encrypted_but_encryption_disabled` (an encrypted record while encryption at rest is off) or
+`unreadable_record` (a well-formed record this release cannot interpret, which is what a record
+written by a newer release looks like). The `entity` `dynamodb_channel` counts a DynamoDB channel
+item that could not be parsed; the other channels still load.
+
+The counter increments for each unreadable record on every load or refresh scan, and a lookup
+that misses the cache runs a scan too, so after a downgrade each request that names a dropped
+record adds to it. Its value and rate are not a count of bad records: alert on it being non-zero
+or rising for a sustained period, for example after an upgrade or a rollback.
+
 ## Logging initialization
 
 Logging is initialized after the encryption service so secret-backed OTLP headers can be resolved.
@@ -242,13 +284,24 @@ entry with its `event` name, `label`, `description`, `group` and `group_label`, 
 **Request events.** Raised at the Access Point on the direct, MCP-proxy and fabric paths.
 Reasons are fixed codes; no record carries a credential, token or validator message.
 
+An operator's [Agent card preview](SOURCE_AUTH.md#agent-card-preview) records no
+`request_rejected` or `auth_failed` event and counts in no request metric, because it is not a
+caller's request. It still records the Target Authentication delegation events the gateway's own
+credential use produces, other than a rejected request. The last caller card fetch is kept per
+replica, in memory, until the gateway restarts (up to 512 surfaces). The last served card the
+preview falls back to is kept per replica, in memory, for 10 minutes, and only by its size when
+it is over the preview's 256 KiB display limit.
+
 - `auth_failed`: the caller failed authentication. `scheme` is `jwt`, `api_key`, `did_auth`,
   `mtls` or `mcp_resource_token`. `reason` is `missing_credential`, `invalid_credential`,
   `insufficient_scope`, `config_not_found`, `internal`, `setup_failed` or `unavailable` (no MCP
   resource authorization context). `blocking` is false when the failure was handed to policy
   (`input.source_auth.method == "failed"`) instead of refusing the request. `client_ip` is the
   resolved client address (forwarded headers only from `client_ip.trusted_proxies`); absent on
-  the fabric path, where the caller connected to the sending gateway.
+  the fabric path, where the caller connected to the sending gateway. On a declaring Access
+  Point the refusal is recorded at source authentication, before rate limiting, so a refused
+  caller is not counted against the surface's rate limit; it writes one blocking `auth_failed`
+  record and no `policy_decision` record, on every protocol.
 - `rate_limited`: the request was refused with 429. `scope` is `surface` (the Access Point's
   rate limit), `sse_sessions` (the legacy SSE session cap) or `fabric_capacity` (a full Fabric
   stream cap on the way to a fabric target). `retry_after_ms` is the wait the caller is given,
@@ -280,6 +333,18 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
     carries `rpc_error_code` `-32603` on both HTTP paths. The record is written once, at routing,
     whatever happens to the body.
 
+    On an Access Point whose bare route declares (the route without an alias, served by the
+    default variant, else the base surface; see
+    [caller challenge](SOURCE_AUTH.md#caller-challenge)), a caller that fails source
+    authentication on a request whose variant can't be resolved is answered with the bare
+    route's `401` or `403` challenge instead, and recorded as `auth_failed` with the
+    `surface_variant` the refusal would have named and no `request_rejected` record. An
+    authenticated caller, and every caller when the bare route does not declare or cannot serve
+    its declaration, gets the refusal. This keeps a failed caller from anything past
+    authentication; it does not hide which variants exist, as each variant publishes its own
+    protected resource metadata and card at `<route>$alias` and its challenge names that
+    resource.
+
     On Fabric, the receiving gateway records the refusal (with its reason, and no `http_status`),
     and the reason stays in that record: it does not cross the wire. What the sending gateway's
     HTTP caller receives depends on the Fabric path:
@@ -295,7 +360,20 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
     headers, HTTP method, per-request capabilities, `_meta`), `extension_rejected` (request
     extension rules, and an inbound identity that is missing or invalid),
     `consent_identity_required` (credential delegation for an anonymous caller).
-  - `forward`: `ssrf_blocked` (egress policy refuses the target address).
+  - `forward`: `ssrf_blocked` (egress policy refuses the target address),
+    `target_auth_unavailable` (Target Authentication failed to produce a credential: a missing
+    secret or provider, or a failed token request, when the surface's fallback is `reject`; or a
+    failure the fallback never covers: a header conflict, an invalid header, a credential outside
+    the Target base path, an unsupported provider type, leg or injection, a provider or secret
+    the surface's tenant may not use, or a Target endpoint a credential provider may not be sent
+    to; `http_status` is 502, the status the gateway answers with, including on the agent card
+    route's fetch), `peer_token_refused` and `peer_scope_refused` (the receiving gateway of a
+    Fabric route answered `401`, or `403` with a Bearer `insufficient_scope` challenge, so the
+    sending gateway answers its caller `502` with the detail `The Fabric peer refused the
+    gateway's authorization` and no challenge; `http_status` is 502, the status the sending
+    gateway answers with, and the receiving gateway's own `auth_failed` record holds the reason). The receiving gateway's card read for its policy context answers no caller
+    and is not recorded. A credential deliberately withheld, and a failure under
+    `fallback: passthrough` that the fallback covers, is not recorded.
 
   Requests answered before any gateway handler runs (a path under no configured route) and
   gateway faults (a failed egress check task) are not recorded.
@@ -355,6 +433,46 @@ so a change joins to the decisions it causes. No record carries the Rego text, t
 or a request body. Writes made outside a management request (startup migrations, replication)
 record nothing, and neither do writes a configuration reload makes, though the reload is asked
 for through the management API: it is the gateway's own work, not the user's change.
+
+**Delegation failures.** `delegation_failed` is recorded when the gateway cannot obtain a
+credential for an `outbound_credentials` binding of a client-credentials or JWT bearer
+provider, and the request is left without it. `reason` is `assertion_failed` (the JWT bearer
+assertion could not be signed: an unreadable or mismatched signing key), `token_endpoint_failed`
+(the token endpoint was unreachable, refused the grant, timed out, or returned an invalid
+response) or `credentials_unavailable` (a secret is missing, belongs to another tenant, the
+token endpoint is blocked by the egress policy, or the provider cannot grant for this use).
+`detail` is the grant and a fixed failure category, for example `jwt_bearer_unavailable`; the
+token endpoint's text never reaches the record. The same failure also records `token_not_found`
+with the same detail. The
+actor (`caller.auth_method`) is `gateway`, because the gateway acts for itself, not for the
+caller. A stale cached token that is still valid is injected instead, and nothing is recorded.
+
+**Configuration events.** Group `configuration`. Each is recorded after the management API saves
+the change, with the actor in `caller`: `auth_method` is `session` for a signed-in user or
+`access_token` for a personal access token, `sub` is the user and `token_id` the token. A change
+the API refuses (permission, tenant, validation) records nothing. Records carry identifiers and
+fixed values only, never a secret, key or token.
+- `verification_strategy_changed`: a JWT verification strategy was created, updated or deleted.
+  `change` is `created`, `updated` or `deleted`; the record carries `strategy_id`, `name`,
+  `expected_issuer`, `jwks_source` (`remote` or `static`), `pinned` (the strategy holds pinned
+  authorization server metadata after the change, so always `false` for a delete) and
+  `pin_changed` (the pinned metadata differs from before, which covers a first pin, a re-pin after
+  discovery and clearing the pin; a delete of a pinned strategy reports `true`).
+- `credential_provider_changed`: a credential provider was created, updated or deleted. The
+  provider's `provider_id` and `provider_name` are on the record, with `provider_type`.
+- `target_auth_changed`: the Target Authentication of a surface, or of a variant that sets its
+  own, was set, changed or removed through a surface or variant write. `change` is `created`
+  (set), `updated` or `deleted` (removed). The surface is on the record; `method` is `credential_lookup`, `static_secret` or `credential_provider`, and
+  `credential_provider_id` names the provider when there is one. A variant's change carries its
+  `variant_id` and the `variant_alias` it had then, and both are absent for the surface's own.
+  Variants are matched by id, so deleting, adding, reordering or promoting a variant never
+  attributes a change to another one: deleting a variant that had its own Target Authentication
+  records one `deleted` event for it. A variant that takes the surface's Target Authentication
+  before and after records nothing, because the surface's own event covers it. A write that
+  leaves every Target Authentication as it was records nothing.
+
+Changes made by editing `_storage/` on disk, by a backup restore, or through the legacy MCP proxy
+routes are not recorded.
 
 **Volume.** Request events are unbounded by design: each is recorded once per request, with no
 aggregation or sampling. `auth_failed` and the routing `request_rejected` are recorded before

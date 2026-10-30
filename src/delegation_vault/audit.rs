@@ -8,9 +8,9 @@
 //! `_storage/audit/delegation-audit.jsonl` if no log directory is configured.
 
 use crate::audit::events::{
-    Actor, AuthScheme, DelegationFailureReason, IdentityBindingFailure, PolicyChangeAction, PolicyChangeSource,
-    PolicyField, PolicyMode, PolicySlot, PolicyTargetKind, RateLimitScope, RefusalReason, RejectionReason,
-    RejectionStage, RequestFailureOutcome, TargetKind,
+    Actor, AuthScheme, ConfigChange, DelegationFailureReason, IdentityBindingFailure, PolicyChangeAction,
+    PolicyChangeSource, PolicyField, PolicyMode, PolicySlot, PolicyTargetKind, RateLimitScope, RefusalReason,
+    RejectionReason, RejectionStage, RequestFailureOutcome, TargetAuthKind, TargetKind,
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
@@ -556,6 +556,39 @@ pub enum DelegationAuditAction {
     PolicyAttachmentChanged(Box<PolicyChangeDetails>),
     /// A policy change was refused; `action` names the change attempted.
     PolicyChangeRefused(Box<PolicyChangeDetails>),
+    /// A JWT verification strategy, a trust anchor for caller tokens, was
+    /// created, updated or deleted through the management API.
+    VerificationStrategyChanged {
+        change: ConfigChange,
+        strategy_id: String,
+        name: String,
+        expected_issuer: String,
+        /// `remote` or `static`.
+        jwks_source: String,
+        /// The strategy holds pinned authorization server metadata after the change.
+        pinned: bool,
+        /// The pinned metadata differs from what the strategy held before.
+        pin_changed: bool,
+    },
+    /// A credential provider was created, updated or deleted through the
+    /// management API. The provider's id and name are on the record.
+    CredentialProviderChanged { change: ConfigChange, provider_type: String },
+    /// The Target Authentication a surface presents to its Target was set,
+    /// changed or removed through the management API. The surface's id and
+    /// name are on the record.
+    TargetAuthChanged {
+        change: ConfigChange,
+        method: TargetAuthKind,
+        /// The credential provider the surface authenticates through, if any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        credential_provider_id: Option<String>,
+        /// The variant whose own Target Authentication changed; absent for the surface's own.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        variant_id: Option<String>,
+        /// The alias that variant carried when the change was recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        variant_alias: Option<String>,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -609,6 +642,9 @@ impl DelegationAuditAction {
                 | Self::PolicyDetached(_)
                 | Self::PolicyAttachmentChanged(_)
                 | Self::PolicyChangeRefused(_)
+                | Self::VerificationStrategyChanged { .. }
+                | Self::CredentialProviderChanged { .. }
+                | Self::TargetAuthChanged { .. }
         )
     }
 }
@@ -1070,7 +1106,7 @@ pub fn vp_fingerprint(vp_jwt: &str) -> String {
 /// Build an `AuditCallerContext` from a source-auth identity
 pub fn build_caller_context(identity: &crate::source_auth::AuthenticatedIdentity) -> AuditCallerContext {
     match identity {
-        crate::source_auth::AuthenticatedIdentity::JwtBearer { subject, claims } => {
+        crate::source_auth::AuthenticatedIdentity::JwtBearer { subject, claims, .. } => {
             let iss = claims
                 .get("iss")
                 .and_then(|v| v.as_str())
@@ -1281,6 +1317,26 @@ pub fn management_caller_context(
     })
 }
 
+/// The actor of a record the gateway raises about its own credentials, as
+/// opposed to one made on behalf of a caller or a management user.
+pub fn gateway_caller_context() -> AuditCallerContext {
+    AuditCallerContext {
+        auth_method: "gateway".to_string(),
+        iss: None,
+        aud: None,
+        sub: None,
+        token_id: None,
+        email: None,
+        name: None,
+        email_redacted: None,
+        name_redacted: None,
+        mtls_fingerprint: None,
+        mtls_subject_dn: None,
+        mtls_issuer_dn: None,
+        mtls_source: None,
+    }
+}
+
 /// Paginated audit log response
 #[derive(Debug, Serialize)]
 pub struct AuditLogPage {
@@ -1334,6 +1390,9 @@ pub fn action_category(action: &DelegationAuditAction) -> &'static str {
         DelegationAuditAction::PolicyDetached(_) => "policy_detached",
         DelegationAuditAction::PolicyAttachmentChanged(_) => "policy_attachment_changed",
         DelegationAuditAction::PolicyChangeRefused(_) => "policy_change_refused",
+        DelegationAuditAction::VerificationStrategyChanged { .. } => "verification_strategy_changed",
+        DelegationAuditAction::CredentialProviderChanged { .. } => "credential_provider_changed",
+        DelegationAuditAction::TargetAuthChanged { .. } => "target_auth_changed",
     }
 }
 
@@ -1693,6 +1752,7 @@ mod tests {
                 "email": "alice@example.com",
                 "name": "Alice Example"
             }),
+            strategy: None,
         };
 
         let caller = build_caller_context(&identity);
@@ -2385,6 +2445,7 @@ mod tests {
         let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
             subject: "user-123".to_string(),
             claims: serde_json::json!({"email": "ada@example.com", "name": "Ada Lovelace"}),
+            strategy: None,
         };
         let ((), events) = crate::audit::producer::capture(async {
             let decide = |caller| {
@@ -2547,6 +2608,7 @@ mod tests {
         let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
             subject: "user-1".to_string(),
             claims: serde_json::json!({}),
+            strategy: None,
         };
         let event = vp_injected_event(injection(Some(build_caller_context(&identity))));
 
@@ -2577,6 +2639,7 @@ mod tests {
         let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
             subject: "user-2".to_string(),
             claims: serde_json::json!({}),
+            strategy: None,
         };
         let event = crate::audit::context::with_caller(Some(build_caller_context(&identity)), async {
             vp_injected_event(injection(None))

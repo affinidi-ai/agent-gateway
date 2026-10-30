@@ -16,7 +16,7 @@ use crate::bdd_support::config::single_surface_fixture::{
 };
 use crate::bdd_support::config::source_auth::caller_authentication_method_json;
 use crate::bdd_support::gateway_process::SURFACE_TEST_AUTH_TOKEN as TEST_AUTH_TOKEN;
-use crate::bdd_support::mock_server::{MockAgentFixture, MockResponse, MockStream};
+use crate::bdd_support::mock_server::{MockAgentFixture, MockResponse, MockStream, target_challenges};
 use crate::bdd_support::policies::{
     build_gateway_request_path_policy, build_mcp_tool_allow_all_policy, build_mcp_tool_allow_policy,
     build_mcp_tool_deny_all_policy, build_surface_a2a_method_policy, build_surface_request_content_policy,
@@ -1990,7 +1990,7 @@ fn a2a_surface_targeting_managed_agent(
 }
 
 #[given(expr = "managed agent {string} is failing with status {int}")]
-fn managed_agent_is_failing_with_status(
+async fn managed_agent_is_failing_with_status(
     world: &mut SurfaceWorld,
     agent_name: String,
     status: u16,
@@ -2007,7 +2007,9 @@ fn managed_agent_is_failing_with_status(
         }
     }));
     response.status = status;
-    world.set_primary_target_response(response);
+    world
+        .change_primary_target_response(response)
+        .await;
 }
 
 #[given(expr = "managed agent {string} responds with header {string} set to {string}")]
@@ -2051,11 +2053,7 @@ fn surface_requires_source_auth(
         "JWT Bearer" => {
             world
                 .surface_config
-                .source_auth = Some(SurfaceSourceAuthConfig::JwtBearer(JwtSourceAuthConfig {
-                jwks_url: String::new(),
-                issuer: String::new(),
-                audiences: Vec::new(),
-            }));
+                .source_auth = Some(SurfaceSourceAuthConfig::JwtBearer(JwtSourceAuthConfig::default()));
         }
         "API Key" => {
             world
@@ -2132,6 +2130,31 @@ async fn mcp_server_is_slow_to_respond(
         .actors
         .expect_target_kind(&server_name, TargetActorKind::McpServer);
     set_target_response_delay(world, &server_name, seconds).await;
+}
+
+#[given(expr = "MCP server {string} is refusing requests with status {int} and challenges {string}")]
+fn mcp_server_is_refusing_requests_with_challenges(
+    world: &mut SurfaceWorld,
+    server_name: String,
+    status: u16,
+    schemes: String,
+) {
+    world
+        .actors
+        .expect_target_kind(&server_name, TargetActorKind::McpServer);
+    let mut response = MockResponse::json(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "server-placeholder",
+        "error": {
+            "code": -32001,
+            "message": format!("mock MCP server status {status}")
+        }
+    }));
+    response.status = status;
+    response
+        .headers
+        .insert("www-authenticate".to_string(), target_challenges(&schemes, &server_name));
+    world.set_primary_target_response(response);
 }
 
 async fn set_target_response_delay(
@@ -3103,6 +3126,26 @@ fn surface_accepts_jwt_audience(
     {
         SurfaceSourceAuthConfig::JwtBearer(config) => config.audiences = vec![audience],
         _ => panic!("JWT source authentication must be configured before setting audiences"),
+    }
+}
+
+#[given(expr = "the surface requires scopes {string}")]
+fn surface_requires_scopes(
+    world: &mut SurfaceWorld,
+    scopes: String,
+) {
+    match world
+        .surface_config
+        .source_auth
+        .as_mut()
+    {
+        Some(SurfaceSourceAuthConfig::JwtBearer(config)) => {
+            config.required_scopes = scopes
+                .split_whitespace()
+                .map(str::to_string)
+                .collect();
+        }
+        _ => panic!("JWT source authentication must be configured before requiring scopes"),
     }
 }
 

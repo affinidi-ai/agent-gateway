@@ -2,22 +2,28 @@
 
 use axum::{body::Body, http::StatusCode, response::Response};
 
+/// The problem+json body of a generic gateway error.
+pub fn proxy_error_body(
+    status: StatusCode,
+    detail: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "https://a2a-protocol.org/errors/proxy-error",
+        "title": status.canonical_reason().unwrap_or("Error"),
+        "status": status.as_u16(),
+        "detail": detail,
+    })
+}
+
 /// Create generic error response
 pub fn create_error_response(
     status: StatusCode,
     message: &str,
 ) -> Response {
-    let error_body = serde_json::json!({
-        "type": "https://a2a-protocol.org/errors/proxy-error",
-        "title": status.canonical_reason().unwrap_or("Error"),
-        "status": status.as_u16(),
-        "detail": message,
-    });
-
     Response::builder()
         .status(status)
         .header("content-type", "application/problem+json")
-        .body(Body::from(serde_json::to_string(&error_body).unwrap()))
+        .body(Body::from(proxy_error_body(status, message).to_string()))
         .unwrap()
 }
 
@@ -216,6 +222,39 @@ mod tests {
             .await
             .unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_generic_error_response_carries_the_proxy_error_body() {
+        let response = create_error_response(StatusCode::FORBIDDEN, "Request blocked by gateway policy");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.headers()["content-type"], "application/problem+json");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+            serde_json::json!({
+                "type": "https://a2a-protocol.org/errors/proxy-error",
+                "title": "Forbidden",
+                "status": 403,
+                "detail": "Request blocked by gateway policy",
+            })
+        );
+    }
+
+    #[test]
+    fn a_status_without_a_reason_phrase_gets_a_generic_title() {
+        let status = StatusCode::from_u16(599).unwrap();
+        assert_eq!(
+            proxy_error_body(status, "x"),
+            serde_json::json!({
+                "type": "https://a2a-protocol.org/errors/proxy-error",
+                "title": "Error",
+                "status": 599,
+                "detail": "x",
+            })
+        );
     }
 
     #[tokio::test]

@@ -281,6 +281,15 @@ pub enum CredentialExtraction {
 
 // ── Authenticated identity (result of authentication) ────────────────────────
 
+/// The JWT verification strategy that verified a caller's token.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VerifyingStrategy {
+    pub id: String,
+    pub tenant_id: Option<String>,
+    /// Claims read for granted scopes, in order.
+    pub scope_claims: Vec<String>,
+}
+
 /// The identity extracted after successful source authentication.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AuthenticatedIdentity {
@@ -290,6 +299,9 @@ pub enum AuthenticatedIdentity {
         subject: String,
         /// All decoded claims.
         claims: Value,
+        /// The strategy that verified the token. `None` for tokens the gateway's
+        /// own Resource Server verified.
+        strategy: Option<VerifyingStrategy>,
     },
 
     /// API Key authentication succeeded.
@@ -371,7 +383,7 @@ impl AuthenticatedIdentity {
         tenant_id: Option<&str>,
     ) -> Option<String> {
         let (method, issuer, subject) = match self {
-            AuthenticatedIdentity::JwtBearer { subject, claims } => {
+            AuthenticatedIdentity::JwtBearer { subject, claims, .. } => {
                 let issuer = claims
                     .get("iss")
                     .and_then(Value::as_str)
@@ -720,9 +732,29 @@ mod tests {
                 assert_eq!(c.token_header, "Authorization");
                 assert_eq!(c.token_scheme, "Bearer");
                 assert!(!c.forward_header);
+                assert!(c.required_scopes.is_empty());
             }
             _ => panic!("expected JwtBearer"),
         }
+    }
+
+    #[test]
+    fn jwt_bearer_required_scopes_round_trip_and_stay_absent_when_empty() {
+        let scoped = SourceAuthConfig::JwtBearer(JwtBearerAuthConfig {
+            jwt_verification_strategy_id: "strat-1".to_string(),
+            required_scopes: vec!["a2a:invoke".to_string()],
+            ..Default::default()
+        });
+        let json = serde_json::to_value(&scoped).unwrap();
+        assert_eq!(json["required_scopes"], serde_json::json!(["a2a:invoke"]));
+        assert_eq!(serde_json::from_value::<SourceAuthConfig>(json).unwrap(), scoped);
+
+        let unscoped = serde_json::to_value(SourceAuthConfig::JwtBearer(JwtBearerAuthConfig::default())).unwrap();
+        assert!(
+            unscoped
+                .get("required_scopes")
+                .is_none()
+        );
     }
 
     #[test]
@@ -733,6 +765,8 @@ mod tests {
             token_header: "X-Auth-Token".to_string(),
             token_scheme: String::new(),
             forward_header: false,
+            required_scopes: Vec::new(),
+            access_tokens_only: false,
         });
         let json = serde_json::to_string(&config).unwrap();
         let back: SourceAuthConfig = serde_json::from_str(&json).unwrap();
@@ -783,6 +817,7 @@ mod tests {
         let id = AuthenticatedIdentity::JwtBearer {
             subject: "agent-1".to_string(),
             claims: serde_json::json!({"oid": "abc", "tid": "tenant-1"}),
+            strategy: None,
         };
         let claims = id
             .jwt_claims()
@@ -813,6 +848,7 @@ mod tests {
                 .unwrap_or("<none>")
                 .to_string(),
             claims,
+            strategy: None,
         };
         let api_key = |name: &str, provider: Option<&str>| AuthenticatedIdentity::ApiKey {
             key_name: name.to_string(),
@@ -860,6 +896,7 @@ mod tests {
                 AuthenticatedIdentity::JwtBearer {
                     subject: "alice".into(),
                     claims: serde_json::json!({"iss": "https://idp.example", "sub": "bob"}),
+                    strategy: None,
                 },
             ),
             ("an empty key name", api_key("", None)),

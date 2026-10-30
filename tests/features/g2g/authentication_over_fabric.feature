@@ -98,6 +98,24 @@ Feature: Source authentication and target authentication over fabric
     When the caller fetches the agent card from gateway 1 surface "charlie"
     Then managed agent "bravo" received header "x-target-api-key" with value "bdd-target-secret"
 
+  Scenario: gateway 2 sends its credential provider token when gateway 1 fetches the agent card over fabric
+    Given a fabric with 2 gateways
+    And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"
+    And surface "alpha" sends its Target a gateway token from OAuth provider "agent-idp"
+    And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
+    When the caller fetches the agent card from gateway 1 surface "charlie"
+    Then managed agent "bravo" received the gateway token from OAuth provider "agent-idp" as a bearer token
+    And OAuth provider "agent-idp" received 1 token request
+
+  Scenario: gateway 2 keeps its credential provider token off other public reads over fabric
+    Given a fabric with 2 gateways
+    And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"
+    And surface "alpha" sends its Target a gateway token from OAuth provider "agent-idp"
+    And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
+    When the caller reads public path "/discovery" from gateway 1 surface "charlie"
+    Then managed agent "bravo" did not receive the gateway token from OAuth provider "agent-idp"
+    And OAuth provider "agent-idp" received 0 token requests
+
   Scenario: gateway 1 blocks unverified callers when a gateway-level policy denies them
     Given a fabric with 2 gateways
     And gateway 2 has an MCP surface "alpha" targeting MCP server "bravo"

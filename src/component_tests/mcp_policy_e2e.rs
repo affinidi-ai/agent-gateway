@@ -113,12 +113,13 @@ async fn mcp_http_survives_older_put_and_patch_null_while_protocol_mode_is_dropp
         .await
         .unwrap();
     assert_eq!(ignored.status(), 200);
-    let ignored: serde_json::Value = ignored.json().await.unwrap();
+    let mut ignored: serde_json::Value = ignored.json().await.unwrap();
     assert!(
         ignored
             .get("mcp_protocol_mode")
             .is_none()
     );
+    strip_save_report(&mut ignored);
     assert_eq!(ignored["mcp_http"], stored["mcp_http"]);
     let readback: serde_json::Value = client
         .get(&endpoint)
@@ -133,7 +134,8 @@ async fn mcp_http_survives_older_put_and_patch_null_while_protocol_mode_is_dropp
         .json(&json!({"mcp_protocol_mode": null, "mcp_http": null, "transit": original["transit"], "variants": original["variants"]}))
         .send().await.unwrap();
     assert_eq!(response.status(), 200);
-    let removed: serde_json::Value = response.json().await.unwrap();
+    let mut removed: serde_json::Value = response.json().await.unwrap();
+    strip_save_report(&mut removed);
     for path in mode_paths {
         assert!(
             removed
@@ -159,6 +161,18 @@ async fn mcp_http_survives_older_put_and_patch_null_while_protocol_mode_is_dropp
         .unwrap()
         .unwrap();
     assert_eq!(serde_json::to_value(restored).unwrap(), removed);
+}
+
+fn strip_save_report(saved: &mut serde_json::Value) {
+    for field in ["warnings", "declarations"] {
+        assert!(
+            saved
+                .as_object_mut()
+                .and_then(|saved| saved.remove(field))
+                .is_some(),
+            "a save response reports {field}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

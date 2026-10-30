@@ -8,6 +8,7 @@
 
 pub mod audit_log_sink;
 pub mod catalog;
+pub mod config_events;
 pub mod context;
 pub mod cursors;
 pub mod dispatch;

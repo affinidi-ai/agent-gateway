@@ -8,16 +8,18 @@ pub use crate::bdd_support::admin_client::RecordedResponse;
 use crate::bdd_support::actors::{
     ActorRegistry, PRIMARY_COLLABORATOR_KEY, RuntimeRegistry, SECONDARY_COLLABORATOR_KEY, TargetActorKind,
 };
+use crate::bdd_support::authz_metadata_server::AuthorizationServers;
 use crate::bdd_support::gateway_process::GatewayProcess;
 use crate::bdd_support::jwt::JwksServer;
 use crate::bdd_support::mock_server::{MockResponse, MockServer, ReceivedRequest};
+use crate::bdd_support::oidc::OidcProvider;
 use crate::bdd_support::temp::TempDirGuard;
 
 pub use crate::bdd_support::config::single_surface_fixture::{
     ApiKeyProviderSourceAuthConfig, ApiKeySourceAuthConfig, CredentialProviderKind, DelegatedCredentialInjection,
     JwtSourceAuthConfig, RequestPolicyFixture, SurfaceConfigBuilder, SurfaceCredentialDelegationConfig,
-    SurfaceCustomMetadataConfig, SurfaceSourceAuthConfig, SurfaceTargetAuthConfig, SurfaceTransitPointConfig,
-    TransitPointHeaderMetadataMappingRow, TransitPointManagedIdentityConfig,
+    SurfaceCustomMetadataConfig, SurfaceSourceAuthConfig, SurfaceTargetAuthConfig, SurfaceTargetTokenAuthConfig,
+    SurfaceTransitPointConfig, TransitPointHeaderMetadataMappingRow, TransitPointManagedIdentityConfig,
 };
 
 use tempfile::TempDir;
@@ -116,6 +118,8 @@ pub struct SurfaceWorld {
     pub operator_roles: HashMap<String, String>,
     pub operator_clients: HashMap<String, AdminApiClient>,
     pub human_clients: HashMap<String, Vec<AdminApiClient>>,
+    /// Management access tokens the operator issued, by tenant.
+    pub access_tokens: HashMap<String, String>,
     pub terms_enabled: bool,
     pub affinidi_cache_seeded: bool,
     pub affinidi_well_available: bool,
@@ -140,6 +144,9 @@ pub struct SurfaceWorld {
     pub a2a_stream_ended: bool,
     /// The query of the last OAuth callback sent with a gateway-issued state.
     pub oauth_callback_query: Option<String>,
+    /// OAuth providers that grant the gateway its own access token, by name.
+    pub oauth_providers: HashMap<String, OidcProvider>,
+    pub authorization_servers: AuthorizationServers,
     /// The transit token the managed agent sends on its Transit Point calls.
     pub transit_token: Option<String>,
     pub temp_dir: TempDir,
@@ -177,6 +184,7 @@ impl SurfaceWorld {
             operator_roles: HashMap::new(),
             operator_clients: HashMap::new(),
             human_clients: HashMap::new(),
+            access_tokens: HashMap::new(),
             terms_enabled: false,
             affinidi_cache_seeded: false,
             affinidi_well_available: true,
@@ -205,6 +213,8 @@ impl SurfaceWorld {
             a2a_stream_events: Vec::new(),
             a2a_stream_ended: false,
             oauth_callback_query: None,
+            oauth_providers: HashMap::new(),
+            authorization_servers: AuthorizationServers::default(),
             transit_token: None,
             temp_dir: get_default_temp_dir(),
             debug: is_debug,
@@ -220,6 +230,22 @@ impl SurfaceWorld {
         self.collaborator_mut(PRIMARY_COLLABORATOR_KEY)
             .target
             .configured_response = response;
+    }
+
+    /// Sets the primary target's response, on its running mock as well once the
+    /// scenario gateway is up.
+    pub(crate) async fn change_primary_target_response(
+        &mut self,
+        response: impl Into<MockResponse>,
+    ) {
+        let response = response.into();
+        if let Some(infra) = self.infra.as_ref() {
+            infra
+                .mock
+                .set_response(response.clone())
+                .await;
+        }
+        self.set_primary_target_response(response);
     }
 
     pub(crate) fn set_secondary_target_response(

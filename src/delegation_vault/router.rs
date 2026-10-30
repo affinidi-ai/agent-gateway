@@ -261,6 +261,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             consent_identity: None,
+            secret_versions: None,
         }
     }
 

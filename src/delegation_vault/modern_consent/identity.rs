@@ -165,8 +165,53 @@ mod tests {
 
     use super::*;
 
-    #[tokio::test]
-    async fn provider_id_token_requires_bound_nonce_audience_issuer_and_subject() {
+    struct ConsentFixture {
+        signing: ed25519_dalek::SigningKey,
+        strategy: JwtVerificationStrategy,
+        verifier: JwtBearerVerifier,
+        profile: McpIssuerProfile,
+        ticket: ConsentTicket,
+        claims: Value,
+        now: u64,
+    }
+
+    impl ConsentFixture {
+        fn sign(
+            &self,
+            claims: &Value,
+        ) -> String {
+            let encoding = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+            let header = encoding.encode(br#"{"alg":"EdDSA","typ":"JWT","kid":"key-1"}"#);
+            let body = encoding.encode(serde_json::to_vec(claims).unwrap());
+            let input = format!("{header}.{body}");
+            format!(
+                "{input}.{}",
+                encoding.encode(
+                    self.signing
+                        .sign(input.as_bytes())
+                        .to_bytes()
+                )
+            )
+        }
+
+        async fn verify(
+            &self,
+            claims: &Value,
+        ) -> Result<VerifiedConsentIdentity, ContinuationError> {
+            verify_id_token(
+                &self.verifier,
+                &self.strategy,
+                &self.profile,
+                &self.ticket,
+                "provider-client",
+                &self.sign(claims),
+                self.now,
+            )
+            .await
+        }
+    }
+
+    fn consent_fixture() -> ConsentFixture {
         let signing = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
         let encoding = base64::engine::general_purpose::URL_SAFE_NO_PAD;
         let jwks = json!({"keys": [{"kty": "OKP", "crv": "Ed25519", "alg": "EdDSA", "kid": "key-1", "x": encoding.encode(signing.verifying_key().as_bytes())}]});
@@ -189,20 +234,32 @@ mod tests {
                 "resource": "https://gateway.example/mcp", "provider_id": "provider", "scopes": ["openid"], "method": "tools/call", "arguments_digest": ([2; 32])}
         })).unwrap();
         let claims = json!({"iss": strategy.expected_issuer, "sub": "alice", "aud": "provider-client", "exp": now + 300, "iat": now, "nonce": nonce(&ticket)});
-        let sign = |claims: &Value| {
-            let header = encoding.encode(br#"{"alg":"EdDSA","typ":"JWT","kid":"key-1"}"#);
-            let body = encoding.encode(serde_json::to_vec(claims).unwrap());
-            let input = format!("{header}.{body}");
-            format!(
-                "{input}.{}",
-                encoding.encode(
-                    signing
-                        .sign(input.as_bytes())
-                        .to_bytes()
-                )
-            )
-        };
-        let verified = verify_id_token(&verifier, &strategy, &profile, &ticket, "provider-client", &sign(&claims), now)
+        ConsentFixture {
+            signing,
+            strategy,
+            verifier,
+            profile,
+            ticket,
+            claims,
+            now,
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_id_token_requires_bound_nonce_audience_issuer_and_subject() {
+        let fixture = consent_fixture();
+        let ConsentFixture {
+            strategy,
+            verifier,
+            profile,
+            ticket,
+            claims,
+            now,
+            ..
+        } = &fixture;
+        let now = *now;
+        let sign = |claims: &Value| fixture.sign(claims);
+        let verified = verify_id_token(verifier, strategy, profile, ticket, "provider-client", &sign(claims), now)
             .await
             .unwrap();
         assert!(verified.matches(&ticket.binding.principal, ticket.provider_digest, ticket.identity_strategy_digest));
@@ -222,7 +279,7 @@ mod tests {
             let mut changed = claims.clone();
             changed[field] = value;
             assert!(
-                verify_id_token(&verifier, &strategy, &profile, &ticket, "provider-client", &sign(&changed), now)
+                verify_id_token(verifier, strategy, profile, ticket, "provider-client", &sign(&changed), now)
                     .await
                     .is_err(),
                 "{field}"
@@ -232,18 +289,51 @@ mod tests {
         multiple["aud"] = json!(["provider-client", "another-client"]);
         multiple["azp"] = json!("provider-client");
         assert_eq!(
-            verify_id_token(&verifier, &strategy, &profile, &ticket, "provider-client", &sign(&multiple), now).await,
+            verify_id_token(verifier, strategy, profile, ticket, "provider-client", &sign(&multiple), now).await,
             Ok(verified)
         );
         let forged = format!(
             "{}.bad",
-            sign(&claims)
+            sign(claims)
                 .rsplit_once('.')
                 .unwrap()
                 .0
         );
         assert!(
-            verify_id_token(&verifier, &strategy, &profile, &ticket, "provider-client", &forged, now)
+            verify_id_token(verifier, strategy, profile, ticket, "provider-client", &forged, now)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_metadata_and_scope_claims_do_not_change_consent_identity_checks() {
+        let mut fixture = consent_fixture();
+        let plain = fixture
+            .verify(&fixture.claims)
+            .await
+            .unwrap();
+        fixture
+            .strategy
+            .authorization_server = Some(crate::jwt_bearer::models::AuthorizationServerMetadata {
+            issuer: "https://elsewhere.example/".into(),
+            metadata_url: "https://elsewhere.example/.well-known/oauth-authorization-server".into(),
+            token_endpoint: "https://elsewhere.example/token".into(),
+            jwks_uri: "https://elsewhere.example/jwks.json".into(),
+        });
+        fixture.strategy.scope_claims = Some(vec!["roles".into()]);
+
+        assert_eq!(
+            fixture
+                .verify(&fixture.claims)
+                .await,
+            Ok(plain)
+        );
+        let mut pinned_issuer = fixture.claims.clone();
+        pinned_issuer["iss"] = json!("https://elsewhere.example/");
+        assert!(
+            fixture
+                .verify(&pinned_issuer)
                 .await
                 .is_err()
         );

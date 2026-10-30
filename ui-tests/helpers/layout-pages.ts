@@ -131,12 +131,12 @@ const SIDEBAR_PAGES: LayoutPage[] = [
     {
         id: 'credentials',
         route: '/credentials',
-        testIds: ['page-credentials', `jwt-strategy-row-${FIXTURE_ID.jwtStrategy}`],
+        testIds: ['page-credentials', `strategy-row-${FIXTURE_ID.jwtStrategy}`],
         actions: [
             ...CREDENTIALS,
             'jwt-strategies-add-button',
             `jwt-strategy-edit-button-${FIXTURE_ID.jwtStrategy}`,
-            `jwt-strategy-delete-button-${FIXTURE_ID.jwtStrategy}`,
+            `strategy-delete-button-${FIXTURE_ID.jwtStrategy}`,
         ],
     },
     {
@@ -506,7 +506,7 @@ const CREATE_PAGES: LayoutPage[] = [
         id: 'surface-new',
         route: '/surfaces/new',
         testIds: ['page-add-surface', 'surface-template-row-*'],
-        actions: ['surface-template-use-button-*', 'add-surface-cancel-button'],
+        actions: ['surface-starter-use-*', 'add-surface-cancel-button'],
     },
     {
         id: 'gateway-new',
@@ -642,18 +642,8 @@ const CREATE_PAGES: LayoutPage[] = [
         testIds: ['page-credential-provider-editor'],
         actions: [
             'credential-provider-editor-back-button',
-            'credential-provider-editor-save-button',
+            'provider-save-button',
             'credential-provider-editor-cancel-button',
-        ],
-    },
-    {
-        id: 'oidc-provider-new',
-        route: '/oidc-providers/new',
-        testIds: ['page-oidc-provider-editor'],
-        actions: [
-            'oidc-provider-editor-back-button',
-            'oidc-provider-editor-save-button',
-            'oidc-provider-editor-cancel-button',
         ],
     },
     {
@@ -683,7 +673,7 @@ const CREATE_PAGES: LayoutPage[] = [
         actions: [
             'jwt-strategy-editor-back-button',
             'jwt-strategy-editor-check-jwks-button',
-            'jwt-strategy-editor-save-button',
+            'strategy-save-button',
             'jwt-strategy-editor-cancel-button',
         ],
     },

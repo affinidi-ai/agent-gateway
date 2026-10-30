@@ -23,6 +23,19 @@ There are exactly two policy planes — **Gateway** (appliance-to-appliance) and
 `surface.policy` at boot. Deny reason: `data.surface.policy.deny_reason` /
 `data.gateway.policy.deny_reason`.
 
+### Surface channel context (`input.channel`)
+
+Every inbound request, on the direct Access Point and on Fabric receive alike, carries
+`input.channel` with the surface `config_id` and `name`, and `variant_alias` only when the
+request names an existing, enabled Surface Variant by its alias (`/route$alias/...`, or the
+alias the sending gateway forwards). The field is absent when the request names no alias,
+including when the surface's default variant serves an unmarked URL, so a rule keyed on the
+default variant's alias does not match its unmarked URL. A request whose alias selects no
+enabled variant, including any alias on a surface without variants, is refused at routing
+before policy runs, on the Access Point and on Fabric receive alike. `input.http.path` is the request path
+after the route and any `$alias` are stripped, so a request to the Access Point URL itself
+has the path `/`.
+
 ### MCP request context (`input.mcp`)
 
 On an MCP surface, gateway and surface policies get `input.mcp` on the direct
@@ -253,26 +266,167 @@ triggered it. On the outbound path the record also names the Transit Point.
 
 ## Failed caller authentication
 
-Source auth does not refuse a request whose credential is missing or invalid. The
-request continues with no caller identity, `input.source_auth` is
-`{"method": "failed", "attempted_method": ..., "reason": ...}`. On every forwarding
+On an Access Point that does not declare (see
+[Declaring an Access Point](SOURCE_AUTH.md#declaring-an-access-point)), source auth does not
+refuse a request whose credential is missing or invalid, or whose JWT lacks a required scope.
+The request continues with no caller identity, `input.source_auth` is
+`{"method": "failed", "attempted_method": ..., "kind": ..., "reason": ...}`. `kind` is
+`missing`, `invalid` or `insufficient_scope`; `reason` is fixed text the gateway chooses, for
+example `Invalid credential: Signing key not found` or `Invalid credential: Invalid token: Failed to decode JWT header`, never a value taken from the token, and it is never sent to the caller. On every forwarding
 path (direct inbound, `proxy://` MCP Targets, `a2a-proxy://` Targets, Fabric send and
-Fabric receive, the last for surfaces without protected resource metadata) the stored
-target credential, or the A2A proxy's Direct Line secret, is not attached, because it
-vouches that the gateway vetted the caller. A surface that
-must reject such callers needs a policy that denies `input.source_auth.method == "failed"`.
-Server-side source-auth errors (missing configuration, internal failures) still block
-with `500`. A request to an MCP Access Point that publishes protected resource
-metadata never reaches policy with a failed credential, direct or over Fabric: a direct
-request is refused with a `401` challenge pointing at that metadata, and a Fabric request
-with a `401` without it, see
-[`MCP_METADATA.md`](MCP_METADATA.md#authorization-server-discovery-for-caller-authentication).
+Fabric receive) the surface's Target Authentication credential, or the A2A proxy's Direct
+Line secret, is not attached, because it vouches that the gateway vetted the caller. A
+surface that must reject such callers needs a policy that denies
+`input.source_auth.method == "failed"`. Server-side source-auth errors (missing
+configuration, internal failures) still block with `500`. For a deleted JWT verification
+strategy or mTLS trust certificate the problem `detail` is the fixed text `Caller authentication
+is unavailable`, so its id is never echoed to the caller; only the gateway's own log names it.
+
+A declaring Access Point (MCP, A2A or AP2) never hands a failed caller to its own policy. It
+refuses the caller itself with `401`, or `403` with `error="insufficient_scope"` for a scope
+shortfall, and a `Bearer` challenge that names its protected resource metadata, whatever the
+surface's policy would allow. It does so at source authentication on every protocol, before rate
+limiting and before any policy plane, appliance-wide, gateway or surface, so
+`input.source_auth.method == "failed"` never reaches policy on a declaring Access Point, and a
+gateway deny never hides the challenge from an anonymous caller: no policy can reveal what it
+would allow, and none sees the caller. This holds for a surface saved through the API as for one
+saved from the dashboard. A gateway policy used as a network rule (an IP allow or deny list)
+therefore does not apply to an anonymous caller of a declaring Access Point, who is challenged
+first. The invariant is written once in [`AGENTS.md`](../AGENTS.md#architecture); the statuses and
+headers are in [caller challenge](SOURCE_AUTH.md#caller-challenge). Over Fabric only the
+sending gateway challenges: a receiving gateway's declaring Access Point refuses a failed
+caller before policy with the same status and `realm="agent-gateway"`, without
+`resource_metadata`, and the sending gateway answers its own caller `502`.
 
 Over Fabric, the sending Gateway strips the credential header its own surface consumed
-before forwarding. A receiving surface without protected resource metadata that requires
-source authentication on that same header therefore sees every Fabric caller as failed and
-forwards without its target credential; one with the metadata refuses them with `401`. Require caller authentication on one side of the Fabric hop, or use a
-different credential header on each side.
+before forwarding. A receiving surface that does not declare and requires source
+authentication on that same header therefore sees every Fabric caller as failed and forwards
+without its target credential; one that declares refuses them before policy, and the sending
+gateway's caller gets `502`. Require caller
+authentication on one side of the Fabric hop, or use a different credential header on each
+side.
+
+### Surface save warnings
+
+A surface that admits failed callers is open to anyone who can reach it, so surface writes
+report what each resolved Surface Variant does with them
+([`save_report.rs`](../src/surfaces/save_report.rs)).
+
+`POST /v1/surfaces`, `PUT` and merge `PATCH` on `/v1/surfaces/{id}`, and the variant routes
+(create, update, merge `PATCH`, delete and promote) return their usual body plus two
+top-level fields:
+
+- `declarations`: `[{"variant", "outcome", "reason", "resource", "authorization_servers",
+  "required_scopes", "scopes_supported", "metadata_url"}]`, one entry for the base
+  route (`variant` is `null`) and one for each enabled variant. `outcome` is `declare`,
+  `strip`, `pass_through` or `unservable`, `reason` is the strip or unservable reason code
+  (otherwise `null`), and `resource` is the declared resource, else the resource a stored
+  `protected_resource` names, else the suggested Access Point URL, or `null` when there is none.
+  The other four fields hold what the metadata and challenge publish and are empty (`null` for
+  `metadata_url`) unless the outcome is `declare`
+  ([declaring an Access Point](SOURCE_AUTH.md#declaring-an-access-point)).
+- `warnings`: `[{"code", "message", "path", "variant"}]`. `path` names the field of the
+  resolved surface the warning is about and `variant` is the alias, `null` for the base route.
+
+A request may send both fields back, so a `PUT` of a returned save response succeeds: they are
+dropped before validation, while any other unknown field is still refused. The response is a
+snapshot of the stores at save time. `GET /v1/surfaces/{id}/declarations` returns
+`{"declarations", "warnings"}` recomputed against the current strategies and policies, with
+the permissions and tenancy of `GET /v1/surfaces/{id}`
+([RBAC](RBAC.md#surface-declarations-and-agent-card-preview)).
+
+| Code | When |
+| --- | --- |
+| `fail_open_policy` | The dry run finds a failed caller that every plane admits (`path` is `access_point.inbound_policy`), or, when there is none, a failed caller that only the inbound policy or a gateway policy reading `input.a2a` denies, which Fabric receive admits (`path` is `target.policy`). `message` names the first such kind and method and how many cases were admitted, and advises denying the caller in `target.policy` or in a gateway policy that does not depend on `input.a2a`. |
+| `fail_open_undetermined` | No plane denies some failed caller, and a plane is undefined or fails to evaluate for it: `allow` has no value or is not a boolean, the Rego errors, or a referenced definition is missing, empty or does not compile. The request path denies in those cases. |
+| `payment_before_policy` | The variant takes payment (an enabled x402 or MPP policy) and only a surface-level plane denies failed callers. Payment runs before surface policy, so such a caller can be asked to pay first; deny it in a gateway policy to refuse it before payment. |
+| `dry_run_skipped` | The variant has caller authentication, does not declare, and comes after the first 16 routes with caller authentication, so the dry run did not check it. |
+| `fabric_only_declaration` | The Access Point declares, or its `protected_resource` cannot be served, and its `listen_address` names no listener of this gateway, so callers reach it only over Fabric. Over Fabric the receiving gateway refuses a failed caller without naming metadata, and the sending gateway answers its own caller `502` when it lacks a credential; only the sending gateway challenges its callers. `path` is `access_point.listen_address`. |
+| `authorization_servers_stale` | The Access Point declares and its stored `protected_resource.authorization_servers` differs from the strategy's `expected_issuer`, which the gateway advertises instead. A save that keeps the stored list unchanged is accepted and warned again. A save that sends a different list must send exactly `["<expected_issuer>"]` or no list, or it is refused. To remove the list, send `protected_resource` without `authorization_servers`. `path` is `access_point.caller_authentication.protected_resource.authorization_servers`. |
+| `card_scheme_unavailable` | An A2A or AP2 Access Point declares and its strategy has no pinned authorization server matching its `expected_issuer` and key set, so the agent card names no security scheme. Run Discover on the strategy. `path` is `access_point.caller_authentication.methods[0].jwt_verification_strategy_id`. |
+| `protected_resource_dropped` | A `PUT` or variant `PUT` left out a stored `protected_resource` that no longer fits the edited caller authentication, so it was removed. `path` is `access_point.caller_authentication.protected_resource`. |
+
+**The dry run** ([`failed_caller_dry_run.rs`](../src/policies/failed_caller_dry_run.rs)) runs
+for each resolved variant that has caller authentication, in order from the base route, up to
+16 of them per report; a later one gets `dry_run_skipped`. A variant whose Access Point
+declares refuses every failed caller at source authentication, before any policy
+([caller challenge](SOURCE_AUTH.md#caller-challenge)), so each of its cases counts as denied and it
+reports no `fail_open_policy`, `fail_open_undetermined`, `payment_before_policy` or
+`dry_run_skipped` warning. For
+any other variant it builds the input a `POST` to the variant's Access Point URL gets
+([channel context](#surface-channel-context-inputchannel)): `input.http.path` is `/` and
+`input.channel.variant_alias` is the variant's alias, absent for the base route. Its
+`source_auth` is `failed` with the variant's first method, for every pair of a kind
+(`missing`, `invalid`, and `insufficient_scope` when the `jwt_bearer` method has
+`required_scopes`) and a method:
+
+| Protocol | Methods |
+| --- | --- |
+| A2A and AP2, version 1.0 | `SendMessage`, `SendStreamingMessage`, `GetTask`, `ListTasks`, `CancelTask`, `SubscribeToTask`, `CreateTaskPushNotificationConfig`, `GetTaskPushNotificationConfig`, `ListTaskPushNotificationConfigs`, `DeleteTaskPushNotificationConfig`, `GetExtendedAgentCard` (`input.a2a.method`) |
+| A2A and AP2, version 0.3 | `message/send`, `message/stream`, `tasks/get`, `tasks/list`, `tasks/cancel`, `tasks/resubscribe`, `tasks/pushNotificationConfig/set`, `tasks/pushNotificationConfig/get`, `tasks/pushNotificationConfig/list`, `tasks/pushNotificationConfig/delete`, `agent/getAuthenticatedExtendedCard` |
+| A2A and AP2, either version | One unrecognised method, checked once per view: `input.a2a.method` is set and `input.a2a.method_canonical` is absent |
+| MCP | `initialize`, `tools/list`, `tools/call`, `resources/read`, `prompts/get` (`input.mcp.method`) |
+
+A2A methods are spelled as each version the variant accepts spells them, so a rule that
+matches `SendMessage` alone misses a 0.3 caller sending `message/send`; match
+`input.a2a.method_canonical` to cover both. Each case is evaluated against the appliance-wide
+gateway plane and this gateway's own policy, then the appliance-wide surface plane, the
+variant's `access_point.inbound_policy` and its `target.policy`, each compiled from the current
+definition. Monitor-only appliance-wide members never deny. A case that some plane denies is
+then evaluated as Fabric receive evaluates it: the gateway planes get the input without
+`input.a2a`, and the surface planes are the appliance-wide surface plane and `target.policy`
+only, because Fabric receive runs no `access_point.inbound_policy`. A case passes when some
+plane denies it on both paths.
+
+The A2A set is every method in the gateway's A2A method table, in each accepted spelling, plus one unrecognised method. With JWT Bearer and `required_scopes`, a variant that accepts both versions gives 69 cases (3 kinds times 23); one version gives 36.
+
+The dry run is a heuristic over this fixed set. A policy that branches on anything else (the
+path, headers, tool name or time) can still admit a failed caller unseen. The controls are the
+deny rule and the Target Authentication caller gate; the dry run only warns. The dashboard
+shows the warnings on Surface Detail with a copyable deny rule: a surface policy to attach as
+`target.policy` for the fail-open warnings, and the same rule as a gateway policy for
+`payment_before_policy`.
+
+Create, update, merge `PATCH` and the variant routes run one validation. Besides the checks
+that also run when configuration loads at startup, it reads the stores: references and their
+tenancy, route collisions, payment recipients and MCP resource owners. Startup runs only the
+checks that need no store and computes no warnings.
+
+## JWT bearer caller input
+
+A caller whose token a JWT verification strategy verified has `input.source_auth.method ==
+"jwt_bearer"` and these fields ([`surface_context/mod.rs`](../src/surface_context/mod.rs)):
+
+| Field | Value |
+| --- | --- |
+| `subject`, `claims` | The `sub` claim and every verified claim |
+| `scopes` | Granted scopes, sorted and de-duplicated: the first of the strategy's `scope_claims` (default `scope`, then `scp`) that the token carries, as a space-separated string or an array of strings. Empty when none is granted. |
+| `client_id` | `client_id`, then `azp`, then `appid`; absent when the token has none |
+| `strategy_id`, `strategy_tenant_id` | The strategy that verified the token, and its tenant (absent for an operator strategy) |
+
+A tenant can create a strategy with any `expected_issuer` and key set, so the `iss` claim
+does not say which strategy vouched for a token. A gateway policy that trusts an issuer keys
+on `strategy_id` (and an absent `strategy_tenant_id` for operator strategies), never on
+`claims.iss`:
+
+```rego
+package gateway.policy
+
+default allow := false
+
+allow if {
+    input.source_auth.strategy_id == "corporate-idp"
+    not input.source_auth.strategy_tenant_id
+    "a2a:invoke" in input.source_auth.scopes
+}
+```
+
+Tokens the MCP Resource Server verifies for `mcp_http.authorization` have no strategy: their
+input carries `scopes` from `scope` or `scp` and no `strategy_id`. A method's
+[`required_scopes`](SOURCE_AUTH.md#required-scopes) are checked before policy, so a caller
+short of one reaches the policy of an Access Point that does not declare as a failed caller
+of kind `insufficient_scope`, not as `jwt_bearer`; a declaring Access Point refuses it
+before policy.
 
 ## Caller identity verification in policy input
 
@@ -432,28 +586,46 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   `AG_TEST_MODE=true`, `AG_BDD_EGRESS_ALLOWLIST` can admit an exact loopback
   fixture (never cloud metadata); the MCP conformance runner uses this for its
   REST fixture.
+- `egress::pinned_configured_client` also pins every **credential provider token
+  request** the gateway sends: Client Credentials and JWT bearer grants, the
+  legacy consent flow's code exchange and refresh, and the refresh of a modern
+  delegated credential (`src/delegation_vault/gateway_token.rs`,
+  `src/delegation_vault/oauth.rs`). Redirects are off and the response is read
+  to at most 64 KiB. See
+  [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#gateway-grants).
 - `egress::pinned_forward_client` (cloud-metadata-only) pins the **JWKS** fetch
-  (`src/jwt_bearer/jwks.rs`, fresh client per fetch) and the **x402
-  remote-facilitator** client (`src/x402/remote_facilitator.rs`, re-pinned per
-  construction, resolve/pin on `spawn_blocking` off the async runtime).
+  (`src/jwt_bearer/fetch.rs`) and **authorization server discovery**
+  (`src/authz_metadata/`), each with a fresh client per fetch and a 64 KiB body
+  cap. The management probes that fetch on a caller's behalf (`discover`,
+  `validate-jwks-uri` and a save that discovers) use `egress::pinned_strict_client`
+  instead when the caller is a tenant-scoped PAT, under which discovery and the
+  JWKS URI check accept `https` only. The probes need the edit permission, are
+  limited per user and answer with fixed error codes; see
+  [`SOURCE_AUTH.md`](SOURCE_AUTH.md#authorization-server-discovery).
+- `egress::pinned_forward_client` also pins the **x402 remote-facilitator** client
+  (`src/x402/remote_facilitator.rs`, re-pinned per construction, resolve/pin on
+  `spawn_blocking` off the async runtime).
 - `egress::pinned_forward_client` pins the **event hook** call (`src/event_hook/transport.rs`),
   the operator-configured `AG_EVENT_HOOK_URL` ([`INTEGRATIONS.md`](INTEGRATIONS.md#event-hook)):
   loopback and private receivers are allowed, cloud metadata is blocked, redirects are not followed.
   The mediator directory request (`AG_MEDIATOR_DIRECTORY_URL`, [`INTEGRATIONS.md`](INTEGRATIONS.md#mediator-directory))
   uses the same client and the same rules.
-- `egress::pinned_forward_client` also pins the **agent-card fetch** from an
-  `http(s)` surface target whenever it carries `target.auth`
-  (`src/proxy/handler.rs::fetch_agent_card_from_surface_target`), so the
-  credential cannot follow a 3xx to another host. A 3xx answers `502`
-  "Upstream redirected"; a blocked target answers `403` "Request blocked by
-  egress policy". It shares the `pinned_target_client` helper with the
-  inbound forward step. Without `target.auth` the fetch
-  uses the shared proxy client, which returns a 3xx rather than following it
-  but is not pinned.
+- `egress::pinned_forward_client` also pins every **agent-card fetch** from an
+  `http(s)` surface target, with or without the surface's Target Authentication
+  credential (`src/proxy/handler/agent_card.rs`), so neither the card route nor
+  the [Agent card preview](SOURCE_AUTH.md#agent-card-preview) reads a cloud
+  metadata address, and a credential cannot follow a 3xx to another host. A 3xx
+  answers `502` "Upstream redirected"; a blocked target, or a host that does not
+  resolve, answers `403` "Request blocked by egress policy". On the card route it
+  shares the `pinned_target_client` helper with the inbound forward step and
+  records the refusal as a rejected request; the preview records nothing.
 - Fabric receive's **agent-card hop** to the local Target, made for the GW2
-  policy context, uses the forward's `forward_client_for`
-  (`egress::pinned_forward_client` for an `http(s)` Target), so it is pinned
-  and does not follow redirects. A blocked target or a redirect yields no card.
+  policy context, goes through `fetch_target_card`
+  (`src/proxy/target_card.rs`): each of the surface's agent card URLs in turn,
+  on `egress::pinned_forward_client`, so it is pinned and does not follow
+  redirects, with the surface's Target Authentication attached as the gateway
+  itself. A URL that is blocked or answers a redirect is skipped, and a
+  fallback that refuses to fetch without the credential yields no card.
 - The Transit Point's **agent-card fetch** for target-leg Trust Check and
   agent context (`src/proxy/outbound_handler.rs::fetch_agent_card`) pins each
   well-known URL with `egress::pinned_forward_client`, the forward step's
@@ -582,6 +754,18 @@ documented here so operators can assess exposure.
   to loopback, an unspecified address or cloud metadata after validation is
   refused. It does not refuse a rebind to an RFC 1918 address, because that
   policy allows RFC 1918.
+- **Token endpoints may resolve to RFC 1918 addresses.** Credential provider
+  token requests use the Configured policy, which refuses loopback, unspecified
+  and cloud metadata addresses but allows private ones, so an IdP on a private
+  network keeps working. On a multi-tenant appliance a tenant administrator can
+  therefore point a Client Credentials or JWT bearer provider at an internal
+  service and have the gateway POST a token request to it; JWT bearer endpoints
+  must be https. The response body is never returned, logged or recorded, so the
+  request is blind.
+- **The modern consent callback's code exchange is not pinned.** It checks the
+  token endpoint with `validate_oauth_endpoint_url` and then sends on the shared
+  external client (`src/delegation_vault/modern_consent.rs`), so a host whose DNS
+  answer changes between the check and the connection can be reached.
 - **The process-wide Legacy-SSE session cache** (keyed by `base_url`) can reuse a
   non-discovery session's client for a discovery GET. The POST origin-lock closes
   the metadata vector regardless, but the reused GET leg is not pinned.

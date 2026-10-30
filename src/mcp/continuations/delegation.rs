@@ -46,7 +46,7 @@ pub fn make_binding(
 }
 
 fn verified_principal(identity: &AuthenticatedIdentity) -> Result<String, ContinuationError> {
-    let AuthenticatedIdentity::JwtBearer { subject, claims } = identity else {
+    let AuthenticatedIdentity::JwtBearer { subject, claims, .. } = identity else {
         return Err(ContinuationError::BindingMismatch);
     };
     let issuer = claims
@@ -146,6 +146,35 @@ mod tests {
     use crate::mcp::request_validation::McpMessageKind;
 
     #[test]
+    fn a_strategy_stored_before_discovery_keeps_its_identity_digest() {
+        let stored = json!({
+            "id": "strategy", "name": "IdP", "expected_issuer": "https://idp.example/",
+            "jwks_source": {"type": "remote", "jwks_uri": "https://idp.example/jwks.json"},
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"
+        });
+        let digest_at_consent: [u8; 32] = Sha256::digest(serde_json_canonicalizer::to_vec(&stored).unwrap()).into();
+        let loaded: crate::jwt_bearer::models::JwtVerificationStrategy = serde_json::from_value(stored).unwrap();
+        assert_eq!(identity_strategy_digest(&loaded).unwrap(), digest_at_consent);
+
+        let customised = crate::jwt_bearer::models::JwtVerificationStrategy {
+            authorization_server: Some(crate::jwt_bearer::models::AuthorizationServerMetadata {
+                issuer: "https://idp.example/".into(),
+                metadata_url: "https://idp.example/.well-known/oauth-authorization-server".into(),
+                token_endpoint: "https://idp.example/token".into(),
+                jwks_uri: "https://idp.example/jwks.json".into(),
+            }),
+            ..loaded.clone()
+        };
+        assert_ne!(identity_strategy_digest(&customised).unwrap(), digest_at_consent);
+
+        let scope_claims = crate::jwt_bearer::models::JwtVerificationStrategy {
+            scope_claims: Some(vec!["roles".into()]),
+            ..loaded
+        };
+        assert_ne!(identity_strategy_digest(&scope_claims).unwrap(), digest_at_consent);
+    }
+
+    #[test]
     fn consent_identity_checks_verified_issuer_subject_and_current_authority() {
         let mut surface: AgentSurface = serde_json::from_value(json!({
             "surface_id": "surface", "name": "surface", "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
@@ -157,6 +186,7 @@ mod tests {
         let identity = AuthenticatedIdentity::JwtBearer {
             subject: "user".into(),
             claims: json!({"iss": "https://gateway.example/oauth2/mcp", "sub": "user", "scope": "write read", "act": {"sub": "client"}, "exp": 100}),
+            strategy: None,
         };
         let authorization = McpResourceServerConfig {
             resource: "https://gateway.example/mcp".into(),

@@ -99,12 +99,62 @@ pub struct ProxyState {
     pub active_variant_alias: Option<String>,
     pub active_variant_id: Option<String>,
 
+    /// Whether the Access Point variant this request selected declares itself
+    /// a protected resource, resolved once per request. `None` when the state
+    /// was not built for a routed request, which reads as no declaration.
+    pub access_point_declaration: Option<Arc<crate::source_auth::declaration::DeclarationOutcome>>,
+
     /// Resolved [`AgentSurface`] for this request — the source of
     /// truth for the hot path. Looked up from
     /// [`crate::surfaces::ResolvedSurfaceCache`] by `(surface_id,
     /// active_variant_alias)` so every variant override is already
     /// applied.
     pub surface: Arc<crate::config::agent_surface::AgentSurface>,
+}
+
+impl ProxyState {
+    /// The Target Authentication resolver for this request, sharing the replica's
+    /// gateway token cache.
+    pub fn target_credentials(&self) -> crate::proxy::target_credentials::TargetCredentialResolver {
+        crate::proxy::target_credentials::TargetCredentialResolver::new(
+            self.secrets_store.clone(),
+            self.credential_provider_store
+                .clone(),
+            crate::delegation_vault::gateway_token::target_token_cache(),
+        )
+    }
+
+    /// The policy input for an inbound request on this surface, carrying the alias of
+    /// the Surface Variant the request URL selected. A state whose alias selected no
+    /// variant publishes none.
+    pub fn inbound_policy_input(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &axum::http::HeaderMap,
+    ) -> crate::surface_context::PolicyInput {
+        let mut input = crate::surface_context::PolicyInput::new(
+            method,
+            path,
+            crate::surface_context::filter_sensitive_headers(headers),
+            "inbound",
+            None,
+            None,
+            self.surface
+                .config_id()
+                .map(str::to_string),
+            &self.surface.name,
+        );
+        input.set_variant_alias(
+            self.active_variant_alias
+                .as_deref()
+                .filter(|_| {
+                    self.active_variant_id
+                        .is_some()
+                }),
+        );
+        input
+    }
 }
 
 /// Surface info with routing support (includes rules engines and identity selector)
@@ -129,4 +179,26 @@ pub struct SurfaceInfo {
     pub task_id: String,
     /// Pre-compiled engines for each virtual channel variant (keyed by variant_id)
     pub variant_engines: HashMap<String, VariantEngines>,
+}
+
+impl SurfaceInfo {
+    /// The channel-level engines the base route runs with.
+    pub fn base_engines(&self) -> VariantEngines {
+        VariantEngines {
+            identity_rules_engine: self
+                .identity_rules_engine
+                .clone(),
+            identity_selector: self.identity_selector.clone(),
+            protected_rules_engine: self
+                .protected_rules_engine
+                .clone(),
+            protected_selector: self
+                .protected_selector
+                .clone(),
+            external_rules_engine: self
+                .external_rules_engine
+                .clone(),
+            external_selector: self.external_selector.clone(),
+        }
+    }
 }

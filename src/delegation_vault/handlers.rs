@@ -502,6 +502,7 @@ pub async fn oauth_callback(
         expires_at,
         delegation_vc: delegation_vc_json,
         consent_identity: None,
+        secret_versions: None,
         consent_granted_at: now,
         last_used_at: None,
         created_at: now,

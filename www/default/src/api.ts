@@ -1,3 +1,4 @@
+import type { SurfaceDeclaration, SurfaceWarning } from './utils/surfaceDeclarations';
 import {
   AccessTokenCreated,
   AccessTokenMeta,
@@ -1236,12 +1237,15 @@ export interface McpHttpConfig {
 }
 
 /**
- * RFC 9728 discovery an MCP Access Point publishes for its JWT Bearer caller
- * authentication (`ProtectedResourceConfig` in `src/protocols/protected_resource.rs`).
+ * Authorization server discovery an A2A, AP2 or MCP Access Point publishes for
+ * its JWT Bearer caller authentication (`ProtectedResourceConfig` in
+ * `src/protocols/protected_resource.rs`). The gateway always advertises the
+ * JWT verification strategy's expected issuer; a stored `authorization_servers`
+ * must equal it. Without `scopes` the required scopes are advertised.
  */
 export interface ProtectedResourceConfig {
   resource: string;
-  authorization_servers: string[];
+  authorization_servers?: string[];
   scopes?: string[];
 }
 
@@ -1335,6 +1339,9 @@ export interface AgentSurface {
    */
   default_variant_id?: string;
   last_activity?: string | null;
+  /** Present only on save responses; computed by the gateway and never sent back. */
+  warnings?: SurfaceWarning[];
+  declarations?: SurfaceDeclaration[];
 }
 
 /**
@@ -1399,8 +1406,10 @@ export function templateWithTrustCheckSplit<T>(template: T): T {
   return { ...template, surface: withTrustCheckSplit(surface) };
 }
 
-function toBackendSurface(surface: Partial<AgentSurface>): any {
-  if (!surface || !surface.target) return withTrustCheckSplit(surface);
+function toBackendSurface(input: Partial<AgentSurface>): any {
+  if (!input || typeof input !== 'object') return withTrustCheckSplit(input);
+  const { warnings: _warnings, declarations: _declarations, ...surface } = input;
+  if (!surface.target) return withTrustCheckSplit(surface);
   const target: any = { ...surface.target };
   const ai: any = (target as any).agent_identity;
   // Preserve any operator-set inject_vp toggle (Managed Agent panel); default

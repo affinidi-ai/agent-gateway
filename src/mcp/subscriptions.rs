@@ -1088,7 +1088,7 @@ mod tests {
                         .unwrap();
                 }
                 "reload" => strategies
-                    .reload()
+                    .refresh_from_disk()
                     .await
                     .unwrap(),
                 "delete" => strategies
@@ -1806,6 +1806,7 @@ mod tests {
         let claims = crate::source_auth::AuthenticatedIdentity::JwtBearer {
             subject: "caller".into(),
             claims: json!({"exp": 1}),
+            strategy: None,
         };
         let expired = SubscriptionLifetime::new(std::time::Duration::from_secs(60), Some(&claims));
         assert!(expired.deadline <= tokio::time::Instant::now());

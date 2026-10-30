@@ -208,6 +208,21 @@ pub fn can_reference(
     }
 }
 
+/// [`can_reference`], or, when `same_tenant`, only a resource of the owner's own tenant: a
+/// tenant owner may not use an appliance-wide resource whose value the gateway sends to an
+/// endpoint the owner chose.
+pub fn can_reference_with_rule(
+    owner_tenant_id: Option<&str>,
+    referenced_tenant_id: Option<&str>,
+    same_tenant: bool,
+) -> bool {
+    if same_tenant {
+        owner_tenant_id == referenced_tenant_id
+    } else {
+        can_reference(owner_tenant_id, referenced_tenant_id)
+    }
+}
+
 pub fn scope_allows_resource(
     scope: Option<&PatResourceScope>,
     context: Option<&PatTenantContext>,
@@ -310,6 +325,12 @@ mod tests {
         assert!(!can_reference(Some("tenant-a"), Some("tenant-b")));
         assert!(can_reference(None, None));
         assert!(!can_reference(None, Some("tenant-a")));
+        assert!(can_reference_with_rule(Some("tenant-a"), None, false));
+        assert!(!can_reference_with_rule(Some("tenant-a"), None, true));
+        assert!(can_reference_with_rule(Some("tenant-a"), Some("tenant-a"), true));
+        assert!(!can_reference_with_rule(Some("tenant-a"), Some("tenant-b"), true));
+        assert!(can_reference_with_rule(None, None, true));
+        assert!(!can_reference_with_rule(None, Some("tenant-a"), true));
 
         assert_eq!(tenant_for_create(None, true, Some(&context)).unwrap(), Some("tenant-a".into()));
         assert!(tenant_for_create(Some("tenant-b".into()), true, Some(&context)).is_err());

@@ -132,8 +132,6 @@ const Header: React.FC<HeaderProps> = ({ onLogout }) => {
         return `${TITLE_PREFIX}Credentials`;
       case '/delegation-vault':
         return `${TITLE_PREFIX}Secrets`;
-      case '/oidc-providers':
-        return `${TITLE_PREFIX}OIDC Providers`;
       case '/users':
         return `${TITLE_PREFIX}Users`;
       case '/profile':
@@ -219,9 +217,6 @@ const Header: React.FC<HeaderProps> = ({ onLogout }) => {
         }
         if (location.pathname.startsWith('/credential-providers/')) {
           return `${TITLE_PREFIX}Edit Credential Provider`;
-        }
-        if (location.pathname.startsWith('/oidc-providers/')) {
-          return `${TITLE_PREFIX}Edit OIDC Provider`;
         }
         if (location.pathname.startsWith('/apikeys/')) {
           return `${TITLE_PREFIX}API Key`;

@@ -1,0 +1,18 @@
+[
+  {
+    "target": "card-v1",
+    "sdk": "a2a-python",
+    "version": "0.3.25",
+    "mode": "default",
+    "match": "Field required",
+    "reason": "The 0.3 pydantic AgentCard requires the top-level url, which a pure 1.0 card does not carry (A2AClientJSONError: Failed to validate agent card structure, missing field url)."
+  },
+  {
+    "target": "card-v1",
+    "sdk": "a2a-js",
+    "version": "0.3.13",
+    "mode": "default",
+    "match": "interface urls are missing",
+    "reason": "The 0.3 resolver accepts a pure 1.0 card without an error but reads no url and no security requirements (interfaces is [\"\"], requirements is [])."
+  }
+]

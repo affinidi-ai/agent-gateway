@@ -53,6 +53,7 @@ async fn main() {
 
     SurfaceWorld::cucumber()
         .max_concurrent_scenarios(Some(parallelism))
+        .fail_on_skipped()
         .filter_run_and_exit(&feature_path, move |feature, rule, scenario| {
             should_run_for_tags(
                 feature

@@ -7,8 +7,23 @@ import FieldHelp from '../components/shared/FieldHelp';
 import { Link } from '../components/shared/Link';
 import { usePageTitle } from '../context/PageTitleContext';
 import { useSaveAction } from '../hooks/useSaveAction';
+import { usePermissions } from '../context/PermissionsContext';
 import { deepLinks } from '../utils/deepLinks';
 import { DOCS_URL } from '../config/docs';
+import {
+  EMPTY_PROVIDER_FORM,
+  GOOGLE_TOKEN_ENDPOINT,
+  PROVIDER_TYPES,
+  PROVIDER_TYPE_CAPABILITIES,
+  buildProviderBody,
+  providerFormFromWire,
+  unknownProviderType,
+  deriveProviderId,
+  tokenEndpointForType,
+  validateProviderForm,
+  type CredentialProviderForm,
+  type CredentialProviderType,
+} from '../utils/credentialProviders';
 
 interface Secret {
   id: string;
@@ -16,56 +31,95 @@ interface Secret {
   secret_id: string;
 }
 
-interface CredentialProviderForm {
-  name: string;
-  provider_id: string;
-  provider_type: 'oauth2_authorization_code' | 'oauth2_client_credentials' | 'api_key';
-  authorization_endpoint: string;
-  token_endpoint: string;
-  client_id_secret_ref: string;
-  client_secret_secret_ref: string;
-  api_key_secret_ref: string;
-  default_scopes: string;
-  token_refresh_enabled: boolean;
-  additional_params: string;
-  description: string;
-  callback_host: string;
-}
-
 interface RoutingConfig {
   available_listen_addresses: string[];
   oauth_callback_route: string;
 }
 
-const EMPTY_FORM: CredentialProviderForm = {
-  name: '',
-  provider_id: '',
-  provider_type: 'oauth2_authorization_code',
-  authorization_endpoint: '',
-  token_endpoint: '',
-  client_id_secret_ref: '',
-  client_secret_secret_ref: '',
-  api_key_secret_ref: '',
-  default_scopes: '',
-  token_refresh_enabled: true,
-  additional_params: '',
-  description: '',
-  callback_host: '',
-};
+interface SecretSelectProps {
+  id: string;
+  label: string;
+  value: string;
+  required?: boolean;
+  help: string;
+  helpTestId?: string;
+  linkTestId: string;
+  secrets: Secret[];
+  loading: boolean;
+  onChange: (e: React.ChangeEvent<HTMLSelectElement>) => void;
+}
+
+const SecretSelect: React.FC<SecretSelectProps> = ({
+  id,
+  label,
+  value,
+  required,
+  help,
+  helpTestId,
+  linkTestId,
+  secrets,
+  loading,
+  onChange,
+}) => (
+  <div className="mb-3">
+    <div className="field-label-with-help">
+      <label htmlFor={id} className="mb-0">
+        {label} {required && <span className="text-danger">*</span>}
+      </label>
+      {helpTestId && (
+        <FieldHelp ariaLabel={`About ${label}`} testId={helpTestId}>
+          The value itself is never shown or copied into this form, only a reference to where it's
+          stored.
+        </FieldHelp>
+      )}
+    </div>
+    <select
+      id={id}
+      data-testid={`provider-${id.replace(/_/g, '-')}`}
+      name={id}
+      className="form-control dropdown-styling"
+      value={value}
+      onChange={onChange}
+      required={required}
+      disabled={loading}
+    >
+      <option value="">{loading ? '-- Loading secrets... --' : '-- Select a secret --'}</option>
+      {secrets.map(secret => (
+        <option key={secret.id} value={secret.secret_id}>
+          {secret.name} ({secret.secret_id})
+        </option>
+      ))}
+    </select>
+    <small className="form-text text-muted">{help}</small>
+    {!loading && (
+      <div className="form-text">
+        {secrets.length === 0 ? 'No secrets configured yet. ' : "Don't see the one you need? "}
+        <AddResourceLink to={deepLinks.secret} testid={linkTestId}>
+          Add secret
+        </AddResourceLink>
+      </div>
+    )}
+  </div>
+);
 
 const EditCredentialProviderPage: React.FC = () => {
   const { run, saving, navigate } = useSaveAction();
   const { id } = useParams<{ id: string }>();
   const isNew = !id || id === 'new';
+  const { hasPermission } = usePermissions();
+  const [unknownType, setUnknownType] = useState<string | null>(null);
+  const mayEdit = hasPermission('credential_providers.edit');
+  const canEdit = mayEdit && unknownType === null;
   usePageTitle(isNew ? 'New Credential Provider' : 'Edit Credential Provider');
 
-  const [form, setForm] = useState<CredentialProviderForm>(EMPTY_FORM);
+  const [form, setForm] = useState<CredentialProviderForm>(EMPTY_PROVIDER_FORM);
   const [loading, setLoading] = useState(!isNew);
   const [error, setError] = useState<string | null>(null);
   const [secrets, setSecrets] = useState<Secret[]>([]);
   const [loadingSecrets, setLoadingSecrets] = useState(true);
   const [routingConfig, setRoutingConfig] = useState<RoutingConfig | null>(null);
   const formRef = useRef<HTMLFormElement>(null);
+  const tokenEndpointEdited = useRef(false);
 
   useEffect(() => {
     loadSecrets();
@@ -125,35 +179,14 @@ const EditCredentialProviderPage: React.FC = () => {
         }
       }
 
-      setForm({
-        name: data.name ?? '',
-        provider_id: data.provider_id ?? '',
-        provider_type: data.provider_type ?? 'oauth2_authorization_code',
-        authorization_endpoint: data.authorization_endpoint ?? '',
-        token_endpoint: data.token_endpoint ?? '',
-        client_id_secret_ref: data.client_id_secret_ref ?? '',
-        client_secret_secret_ref: data.client_secret_secret_ref ?? '',
-        api_key_secret_ref: data.api_key_secret_ref ?? '',
-        default_scopes: (data.default_scopes ?? []).join(', '),
-        token_refresh_enabled: data.token_refresh_enabled ?? true,
-        additional_params: data.additional_params
-          ? JSON.stringify(data.additional_params, null, 2)
-          : '',
-        description: data.description ?? '',
-        callback_host: callbackHost,
-      });
+      setUnknownType(unknownProviderType(data));
+      setForm(providerFormFromWire(data, callbackHost));
     } catch (e: any) {
       setError(e.message ?? 'Unknown error');
     } finally {
       setLoading(false);
     }
   };
-
-  const deriveProviderId = (name: string) =>
-    name
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, '-')
-      .replace(/^-|-$/g, '');
 
   const handleChange = (
     e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>
@@ -163,10 +196,18 @@ const EditCredentialProviderPage: React.FC = () => {
       setForm(prev => ({ ...prev, [name]: (e.target as HTMLInputElement).checked }));
     } else if (name === 'name' && isNew) {
       setForm(prev => ({ ...prev, name: value, provider_id: deriveProviderId(value) }));
+    } else if (name === 'provider_type') {
+      const nextType = value as CredentialProviderType;
+      setForm(prev => ({
+        ...prev,
+        provider_type: nextType,
+        token_endpoint: tokenEndpointForType(prev, nextType, isNew && !tokenEndpointEdited.current),
+      }));
     } else if (name === 'provider_id') {
       const sanitized = value.replace(/[^A-Za-z0-9_-]+/g, '-').replace(/^-|-$/g, '');
       setForm(prev => ({ ...prev, provider_id: sanitized }));
     } else {
+      if (name === 'token_endpoint') tokenEndpointEdited.current = true;
       setForm(prev => ({ ...prev, [name]: value }));
     }
   };
@@ -174,93 +215,19 @@ const EditCredentialProviderPage: React.FC = () => {
   const handleSubmit = useCallback(
     async (e?: React.FormEvent) => {
       if (e) e.preventDefault();
-      if (!form.name.trim()) {
-        setError('Name is required.');
+      const validationError = validateProviderForm(form);
+      if (validationError) {
+        setError(validationError);
         return;
-      }
-      if (!form.provider_id.trim()) {
-        setError('Provider ID is required.');
-        return;
-      }
-
-      const isOAuth =
-        form.provider_type === 'oauth2_authorization_code' ||
-        form.provider_type === 'oauth2_client_credentials';
-
-      if (isOAuth) {
-        if (!form.token_endpoint.trim()) {
-          setError('Token endpoint is required for OAuth providers.');
-          return;
-        }
-        if (!form.client_id_secret_ref) {
-          setError('Client ID secret is required for OAuth providers.');
-          return;
-        }
-        if (!form.client_secret_secret_ref) {
-          setError('Client Secret secret is required for OAuth providers.');
-          return;
-        }
-      }
-
-      if (form.provider_type === 'api_key') {
-        if (!form.api_key_secret_ref) {
-          setError('API Key secret is required.');
-          return;
-        }
-      }
-
-      let additionalParams: Record<string, string> = {};
-      if (form.additional_params.trim()) {
-        try {
-          additionalParams = JSON.parse(form.additional_params);
-        } catch {
-          setError('Additional Parameters must be valid JSON.');
-          return;
-        }
       }
 
       setError(null);
 
-      const scopes = form.default_scopes
-        .split(/[,\s]+/)
-        .map(s => s.trim())
-        .filter(Boolean);
-
-      const body: any = {
-        name: form.name.trim(),
-        provider_id: form.provider_id.trim(),
-        provider_type: form.provider_type,
-        default_scopes: scopes,
-        token_refresh_enabled: form.token_refresh_enabled,
-        description: form.description.trim() || undefined,
-      };
-
-      if (isOAuth) {
-        body.token_endpoint = form.token_endpoint.trim();
-        body.client_id_secret_ref = form.client_id_secret_ref;
-        body.client_secret_secret_ref = form.client_secret_secret_ref;
-      }
-
-      if (form.provider_type === 'api_key' && form.api_key_secret_ref) {
-        body.api_key_secret_ref = form.api_key_secret_ref;
-      }
-
-      if (form.authorization_endpoint.trim()) {
-        body.authorization_endpoint = form.authorization_endpoint.trim();
-      }
-      if (Object.keys(additionalParams).length > 0) {
-        body.additional_params = additionalParams;
-      }
-
-      // Build callback_url from host + path for authorization_code providers
-      if (
-        form.provider_type === 'oauth2_authorization_code' &&
-        form.callback_host &&
-        routingConfig
-      ) {
-        const callbackPath = `${routingConfig.oauth_callback_route}/${encodeURIComponent(form.provider_id.trim())}`;
-        body.callback_url = `${form.callback_host}${callbackPath}`;
-      }
+      const body = buildProviderBody(
+        form,
+        routingConfig ? routingConfig.oauth_callback_route : null,
+        isNew
+      );
 
       await run(
         async () => {
@@ -288,7 +255,7 @@ const EditCredentialProviderPage: React.FC = () => {
         }
       );
     },
-    [form, isNew, id, run]
+    [form, isNew, id, run, routingConfig]
   );
 
   // Keyboard shortcut: Ctrl+S / Cmd+S to save
@@ -296,14 +263,18 @@ const EditCredentialProviderPage: React.FC = () => {
     const handleKeyboardSave = (event: KeyboardEvent) => {
       if ((event.ctrlKey || event.metaKey) && event.key === 's') {
         event.preventDefault();
-        if (!saving) {
+        if (!saving && canEdit) {
           handleSubmit();
         }
       }
     };
     document.addEventListener('keydown', handleKeyboardSave);
     return () => document.removeEventListener('keydown', handleKeyboardSave);
-  }, [saving, handleSubmit]);
+  }, [saving, canEdit, handleSubmit]);
+
+  const caps = PROVIDER_TYPE_CAPABILITIES[form.provider_type];
+  const showGoogleEndpointHint =
+    isNew && caps.signingKey && form.token_endpoint.trim() === GOOGLE_TOKEN_ENDPOINT;
 
   if (loading) {
     return (
@@ -328,16 +299,18 @@ const EditCredentialProviderPage: React.FC = () => {
         <div className="card-header py-3 d-flex justify-content-between align-items-center">
           <h6 className="m-0 font-weight-bold text-primary">Provider Configuration</h6>
           <div>
-            <button
-              type="button"
-              className={`btn btn-sm btn-primary me-2 ${saving ? 'disabled' : ''}`}
-              data-testid="credential-provider-editor-save-button"
-              onClick={() => handleSubmit()}
-              disabled={saving}
-            >
-              <i className={`fas ${saving ? 'fa-spinner fa-spin' : 'fa-save'}`}></i>
-              {saving ? ' Saving…' : isNew ? ' Create' : ' Save'}
-            </button>
+            {canEdit && (
+              <button
+                type="button"
+                className={`btn btn-sm btn-primary me-2 ${saving ? 'disabled' : ''}`}
+                data-testid="provider-save-button"
+                onClick={() => handleSubmit()}
+                disabled={saving}
+              >
+                <i className={`fas ${saving ? 'fa-spinner fa-spin' : 'fa-save'}`}></i>
+                {saving ? ' Saving…' : isNew ? ' Create' : ' Save'}
+              </button>
+            )}
             <button
               type="button"
               className="btn btn-sm btn-outline-secondary"
@@ -350,8 +323,21 @@ const EditCredentialProviderPage: React.FC = () => {
           </div>
         </div>
         <div className="card-body">
+          {unknownType && (
+            <div className="alert alert-warning" role="status" data-testid="provider-unknown-type">
+              <i className="fas fa-lock me-2"></i>
+              This provider has type <code>{unknownType}</code>, which this dashboard version cannot
+              edit. It is shown read-only so saving cannot change its type.
+            </div>
+          )}
+          {!mayEdit && unknownType === null && (
+            <div className="alert alert-info" role="status" data-testid="provider-read-only">
+              <i className="fas fa-lock me-2" aria-hidden="true"></i>
+              Your role can view this provider but not change it.
+            </div>
+          )}
           {error && (
-            <div className="alert alert-danger">
+            <div className="alert alert-danger" role="alert" data-testid="provider-error">
               <i className="fas fa-exclamation-triangle me-2"></i>
               {error}
             </div>
@@ -368,454 +354,503 @@ const EditCredentialProviderPage: React.FC = () => {
           </p>
 
           <form ref={formRef} onSubmit={handleSubmit}>
-            {/* Name + ID row */}
-            <div className="row mb-3">
-              <div className={isNew ? 'col-12' : 'col-md-6'}>
-                <label htmlFor="name">
-                  Name <span className="text-danger">*</span>
-                </label>
-                <input
-                  id="name"
-                  name="name"
-                  type="text"
-                  className="form-control"
-                  value={form.name}
-                  onChange={handleChange}
-                  required
-                />
-                <small className="form-text text-muted">
-                  Human-readable name shown in the UI and Transit Credential bindings.
-                </small>
-              </div>
-              {!isNew && id && (
-                <div className="col-md-6">
-                  <label>ID</label>
-                  <input type="text" className="form-control" value={id} readOnly />
-                  <small className="form-text text-muted">Read-only unique identifier.</small>
-                </div>
-              )}
-            </div>
-
-            {/* Description — full width, single line */}
-            <div className="mb-3">
-              <div className="field-label-with-help">
-                <label htmlFor="description" className="mb-0">
-                  Description
-                </label>
-                <FieldHelp ariaLabel="About Description" testId="field-help-provider-description">
-                  Use it to note what this provider is used for (e.g. "GitHub OAuth for the
-                  code-review agent").
-                </FieldHelp>
-              </div>
-              <input
-                id="description"
-                name="description"
-                type="text"
-                className="form-control"
-                value={form.description}
-                onChange={handleChange}
-              />
-              <small className="form-text text-muted">
-                Shown alongside this provider's name in lists.
-              </small>
-            </div>
-
-            {/* Provider Type */}
-            <div className="mb-3">
-              <div className="field-label-with-help">
-                <label htmlFor="provider_type" className="mb-0">
-                  Provider Type
-                </label>
-                <FieldHelp ariaLabel="About Provider Type" testId="field-help-provider-type">
-                  Authorization Code: a person approves access once, in their browser. Client
-                  Credentials: the gateway authenticates on its own, no person involved. API Key: a
-                  single static key, no OAuth flow at all.
-                </FieldHelp>
-              </div>
-              <select
-                id="provider_type"
-                name="provider_type"
-                className="form-control dropdown-styling"
-                value={form.provider_type}
-                onChange={handleChange}
-              >
-                <option value="oauth2_authorization_code">
-                  OAuth 2.0, Authorization Code (3-legged, user consent)
-                </option>
-                <option value="oauth2_client_credentials">
-                  OAuth 2.0, Client Credentials (2-legged, machine-to-machine)
-                </option>
-                <option value="api_key">API Key (static secret)</option>
-              </select>
-              <small className="form-text text-muted">
-                Choose how the gateway obtains credentials for this service.
-              </small>
-            </div>
-
-            {/* Authorization Endpoint + Token Endpoint row */}
-            {form.provider_type !== 'api_key' && (
+            <fieldset disabled={!canEdit} className="border-0 p-0 m-0" style={{ minWidth: 0 }}>
+              {/* Name + ID row */}
               <div className="row mb-3">
-                {form.provider_type === 'oauth2_authorization_code' && (
-                  <div className="col-md-6">
-                    <label htmlFor="authorization_endpoint">Authorization Endpoint</label>
-                    <input
-                      id="authorization_endpoint"
-                      name="authorization_endpoint"
-                      type="url"
-                      className="form-control"
-                      value={form.authorization_endpoint}
-                      onChange={handleChange}
-                    />
-                    <small className="form-text text-muted">
-                      Where to redirect users for consent. Required for Authorization Code flow.
-                    </small>
-                  </div>
-                )}
-                <div
-                  className={
-                    form.provider_type === 'oauth2_authorization_code' ? 'col-md-6' : 'col-12'
-                  }
-                >
-                  <label htmlFor="token_endpoint">
-                    Token Endpoint <span className="text-danger">*</span>
+                <div className={isNew ? 'col-12' : 'col-md-6'}>
+                  <label htmlFor="name">
+                    Name <span className="text-danger">*</span>
                   </label>
                   <input
-                    id="token_endpoint"
-                    name="token_endpoint"
-                    type="url"
+                    id="name"
+                    data-testid="provider-name"
+                    name="name"
+                    type="text"
                     className="form-control"
-                    value={form.token_endpoint}
+                    value={form.name}
                     onChange={handleChange}
                     required
                   />
                   <small className="form-text text-muted">
-                    The URL the gateway calls to trade an authorization code (or its own client
-                    credentials) for an actual access token.
+                    Human-readable name shown in the UI and Transit Credential bindings.
                   </small>
                 </div>
+                {!isNew && id && (
+                  <div className="col-md-6">
+                    <label>ID</label>
+                    <input type="text" className="form-control" value={id} readOnly />
+                    <small className="form-text text-muted">Read-only unique identifier.</small>
+                  </div>
+                )}
               </div>
-            )}
 
-            {/* Callback URL — only for authorization_code flow */}
-            {form.provider_type === 'oauth2_authorization_code' && (
+              {/* Description — full width, single line */}
               <div className="mb-3">
                 <div className="field-label-with-help">
-                  <label htmlFor="callback_host" className="mb-0">
-                    Callback URL Host
+                  <label htmlFor="description" className="mb-0">
+                    Description
                   </label>
-                  <FieldHelp ariaLabel="About Callback URL Host" testId="field-help-callback-host">
-                    Most setups only have one option; if there are several, pick the one your OAuth
-                    provider can actually reach from the outside. Register this exact URL as an
-                    allowed redirect URI with your OAuth provider before saving.
+                  <FieldHelp ariaLabel="About Description" testId="field-help-provider-description">
+                    Use it to note what this provider is used for (e.g. "GitHub OAuth for the
+                    code-review agent").
+                  </FieldHelp>
+                </div>
+                <input
+                  id="description"
+                  name="description"
+                  type="text"
+                  className="form-control"
+                  value={form.description}
+                  onChange={handleChange}
+                />
+                <small className="form-text text-muted">
+                  Shown alongside this provider's name in lists.
+                </small>
+              </div>
+
+              {/* Provider Type */}
+              <div className="mb-3">
+                <div className="field-label-with-help">
+                  <label htmlFor="provider_type" className="mb-0">
+                    Provider Type
+                  </label>
+                  <FieldHelp ariaLabel="About Provider Type" testId="field-help-provider-type">
+                    Authorization Code: a person approves access once, in their browser. Client
+                    Credentials: the gateway authenticates on its own with a client ID and secret.
+                    JWT Bearer: the gateway signs an assertion with its own key and trades it for a
+                    token (RFC 7523). API Key: a single static key, no OAuth flow at all.
                   </FieldHelp>
                 </div>
                 <select
-                  id="callback_host"
-                  name="callback_host"
+                  id="provider_type"
+                  data-testid="provider-type"
+                  name="provider_type"
                   className="form-control dropdown-styling"
-                  value={form.callback_host}
+                  value={form.provider_type}
                   onChange={handleChange}
-                  disabled={!routingConfig || routingConfig.available_listen_addresses.length === 0}
                 >
-                  {!routingConfig ? (
-                    <option value="">Loading…</option>
-                  ) : routingConfig.available_listen_addresses.length === 0 ? (
-                    <option value="">No addresses available</option>
-                  ) : (
-                    <>
-                      <option value="">-- Select listen address --</option>
-                      {routingConfig.available_listen_addresses.map(addr => (
-                        <option key={addr} value={addr}>
-                          {addr}
-                        </option>
-                      ))}
-                    </>
-                  )}
+                  {PROVIDER_TYPES.map(type => (
+                    <option key={type} value={type}>
+                      {PROVIDER_TYPE_CAPABILITIES[type].optionLabel}
+                    </option>
+                  ))}
                 </select>
                 <small className="form-text text-muted">
-                  Which of the gateway's public addresses your identity provider should redirect
-                  back to after a user approves access.
+                  Choose how the gateway obtains credentials for this service.
                 </small>
-
-                <label htmlFor="provider_id" className="mt-3">
-                  Callback URL Route <span className="text-danger">*</span>
-                </label>
-                <div className="input-group">
-                  <span className="input-group-text" style={{ fontSize: '13px' }}>
-                    {routingConfig?.oauth_callback_route ?? '...'}/
-                  </span>
-                  <input
-                    id="provider_id"
-                    name="provider_id"
-                    type="text"
-                    className="form-control"
-                    value={form.provider_id}
-                    onChange={handleChange}
-                    placeholder="e.g. github"
-                    required
-                    disabled={!isNew}
-                  />
-                </div>
-                <small className="form-text text-muted">
-                  Route suffix for the callback URL. Only letters, numbers, dashes, and underscores.
-                  Auto-derived from name. Immutable after creation.
-                </small>
-
-                {form.callback_host && form.provider_id.trim() && routingConfig && (
-                  <div className="alert alert-success mt-2 mb-0" style={{ fontSize: '14px' }}>
-                    <i className="fas fa-info-circle me-2"></i>
-                    <strong>Callback URL:</strong>{' '}
-                    {`${form.callback_host}${routingConfig.oauth_callback_route}/${encodeURIComponent(form.provider_id.trim())}`}
-                    <button
-                      type="button"
-                      className="btn btn-xs ms-2"
-                      style={{ padding: '2px 6px', fontSize: '11px', outline: 'none' }}
-                      onClick={e => {
-                        const url = `${form.callback_host}${routingConfig.oauth_callback_route}/${encodeURIComponent(form.provider_id.trim())}`;
-                        navigator.clipboard.writeText(url);
-                        const btn = e.currentTarget as HTMLButtonElement;
-                        const originalHtml = btn.innerHTML;
-                        btn.innerHTML = '<i class="fas fa-check"></i>';
-                        setTimeout(() => {
-                          btn.innerHTML = originalHtml;
-                        }, 2000);
-                      }}
-                      title="Copy to clipboard"
-                    >
-                      <i className="fas fa-copy"></i>
-                    </button>
-                  </div>
-                )}
               </div>
-            )}
 
-            {/* OAuth Client Credentials (Secret References) */}
-            {form.provider_type !== 'api_key' && (
-              <>
-                <hr />
-                <h6 className="font-weight-bold text-primary mb-3">
-                  <i className="fas fa-key me-2"></i>OAuth Client Credentials (Secret References)
-                </h6>
+              {/* Authorization Endpoint + Token Endpoint row */}
+              {caps.tokenEndpoint && (
+                <div className="row mb-3">
+                  {caps.authorizationEndpoint && (
+                    <div className="col-md-6">
+                      <label htmlFor="authorization_endpoint">Authorization Endpoint</label>
+                      <input
+                        id="authorization_endpoint"
+                        name="authorization_endpoint"
+                        type="url"
+                        className="form-control"
+                        value={form.authorization_endpoint}
+                        onChange={handleChange}
+                      />
+                      <small className="form-text text-muted">
+                        Where to redirect users for consent. Required for Authorization Code flow.
+                      </small>
+                    </div>
+                  )}
+                  <div className={caps.authorizationEndpoint ? 'col-md-6' : 'col-12'}>
+                    <label htmlFor="token_endpoint">
+                      Token Endpoint <span className="text-danger">*</span>
+                    </label>
+                    <input
+                      id="token_endpoint"
+                      data-testid="provider-token-endpoint"
+                      name="token_endpoint"
+                      type="url"
+                      className="form-control"
+                      value={form.token_endpoint}
+                      onChange={handleChange}
+                      required
+                      aria-describedby={
+                        showGoogleEndpointHint ? 'token_endpoint-google-hint' : undefined
+                      }
+                    />
+                    <small className="form-text text-muted">
+                      The URL the gateway calls to trade an authorization code (or its own client
+                      credentials) for an actual access token.
+                    </small>
+                    {showGoogleEndpointHint && (
+                      <small
+                        id="token_endpoint-google-hint"
+                        className="form-text text-muted d-block"
+                        data-testid="provider-token-endpoint-google-hint"
+                      >
+                        This is Google's token endpoint. Other authorization servers use their own;
+                        replace it with yours.
+                      </small>
+                    )}
+                  </div>
+                </div>
+              )}
 
-                {/* Client ID Secret */}
+              {/* Callback URL — only for authorization_code flow */}
+              {caps.callback && (
                 <div className="mb-3">
                   <div className="field-label-with-help">
-                    <label htmlFor="client_id_secret_ref" className="mb-0">
-                      Client ID Secret <span className="text-danger">*</span>
+                    <label htmlFor="callback_host" className="mb-0">
+                      Callback URL Host
                     </label>
                     <FieldHelp
-                      ariaLabel="About Client ID Secret"
-                      testId="field-help-client-id-secret"
+                      ariaLabel="About Callback URL Host"
+                      testId="field-help-callback-host"
                     >
-                      The value itself is never shown or copied into this form, only a reference to
-                      where it's stored.
+                      Most setups only have one option; if there are several, pick the one your
+                      OAuth provider can actually reach from the outside. Register this exact URL as
+                      an allowed redirect URI with your OAuth provider before saving.
                     </FieldHelp>
                   </div>
                   <select
-                    id="client_id_secret_ref"
-                    name="client_id_secret_ref"
+                    id="callback_host"
+                    data-testid="provider-callback-host"
+                    name="callback_host"
                     className="form-control dropdown-styling"
-                    value={form.client_id_secret_ref}
+                    value={form.callback_host}
                     onChange={handleChange}
-                    required
-                    disabled={loadingSecrets}
+                    disabled={
+                      !routingConfig || routingConfig.available_listen_addresses.length === 0
+                    }
                   >
-                    <option value="">
-                      {loadingSecrets ? '-- Loading secrets... --' : '-- Select a secret --'}
-                    </option>
-                    {secrets.map(secret => (
-                      <option key={secret.id} value={secret.secret_id}>
-                        {secret.name} ({secret.secret_id})
-                      </option>
-                    ))}
+                    {!routingConfig ? (
+                      <option value="">Loading…</option>
+                    ) : routingConfig.available_listen_addresses.length === 0 ? (
+                      <option value="">No addresses available</option>
+                    ) : (
+                      <>
+                        <option value="">-- Select listen address --</option>
+                        {routingConfig.available_listen_addresses.map(addr => (
+                          <option key={addr} value={addr}>
+                            {addr}
+                          </option>
+                        ))}
+                      </>
+                    )}
                   </select>
                   <small className="form-text text-muted">
-                    Pick the secret holding your OAuth app's client ID.
+                    Which of the gateway's public addresses your identity provider should redirect
+                    back to after a user approves access.
                   </small>
-                  {!loadingSecrets && (
-                    <div className="form-text">
-                      {secrets.length === 0
-                        ? 'No secrets configured yet. '
-                        : "Don't see the one you need? "}
-                      <AddResourceLink
-                        to={deepLinks.secret}
-                        testid="credential-provider-add-client-id-secret-link"
-                      >
-                        Add secret
-                      </AddResourceLink>
-                    </div>
-                  )}
-                </div>
 
-                {/* Client Secret Secret */}
-                <div className="mb-3">
-                  <div className="field-label-with-help">
-                    <label htmlFor="client_secret_secret_ref" className="mb-0">
-                      Client Secret <span className="text-danger">*</span>
-                    </label>
-                    <FieldHelp
-                      ariaLabel="About Client Secret"
-                      testId="field-help-client-secret-secret"
-                    >
-                      The value itself is never shown or copied into this form, only a reference to
-                      where it's stored.
-                    </FieldHelp>
-                  </div>
-                  <select
-                    id="client_secret_secret_ref"
-                    name="client_secret_secret_ref"
-                    className="form-control dropdown-styling"
-                    value={form.client_secret_secret_ref}
-                    onChange={handleChange}
-                    required
-                    disabled={loadingSecrets}
-                  >
-                    <option value="">
-                      {loadingSecrets ? '-- Loading secrets... --' : '-- Select a secret --'}
-                    </option>
-                    {secrets.map(secret => (
-                      <option key={secret.id} value={secret.secret_id}>
-                        {secret.name} ({secret.secret_id})
-                      </option>
-                    ))}
-                  </select>
-                  <small className="form-text text-muted">
-                    Pick the secret holding your OAuth app's client secret.
-                  </small>
-                  {!loadingSecrets && (
-                    <div className="form-text">
-                      {secrets.length === 0
-                        ? 'No secrets configured yet. '
-                        : "Don't see the one you need? "}
-                      <AddResourceLink
-                        to={deepLinks.secret}
-                        testid="credential-provider-add-client-secret-link"
-                      >
-                        Add secret
-                      </AddResourceLink>
-                    </div>
-                  )}
-                </div>
-              </>
-            )}
-
-            {/* API Key field — only for api_key type */}
-            {form.provider_type === 'api_key' && (
-              <>
-                <hr />
-                <h6 className="font-weight-bold text-primary mb-3">
-                  <i className="fas fa-key me-2"></i>API Key (Secret Reference)
-                </h6>
-
-                <div className="mb-3">
-                  <label htmlFor="api_key_secret_ref">
-                    API Key Secret <span className="text-danger">*</span>
+                  <label htmlFor="provider_id" className="mt-3">
+                    Callback URL Route <span className="text-danger">*</span>
                   </label>
-                  <select
-                    id="api_key_secret_ref"
-                    name="api_key_secret_ref"
-                    className="form-control dropdown-styling"
-                    value={form.api_key_secret_ref}
-                    onChange={handleChange}
-                    required
-                    disabled={loadingSecrets}
-                  >
-                    <option value="">
-                      {loadingSecrets ? '-- Loading secrets... --' : '-- Select a secret --'}
-                    </option>
-                    {secrets.map(secret => (
-                      <option key={secret.id} value={secret.secret_id}>
-                        {secret.name} ({secret.secret_id})
-                      </option>
-                    ))}
-                  </select>
+                  <div className="input-group">
+                    <span className="input-group-text" style={{ fontSize: '13px' }}>
+                      {routingConfig?.oauth_callback_route ?? '...'}/
+                    </span>
+                    <input
+                      id="provider_id"
+                      name="provider_id"
+                      type="text"
+                      className="form-control"
+                      value={form.provider_id}
+                      onChange={handleChange}
+                      placeholder="e.g. github"
+                      required
+                      disabled={!isNew}
+                    />
+                  </div>
                   <small className="form-text text-muted">
-                    Secret containing the API key value. Injected directly into upstream requests.
+                    Route suffix for the callback URL. Only letters, numbers, dashes, and
+                    underscores. Auto-derived from name. Immutable after creation.
                   </small>
-                  {!loadingSecrets && (
-                    <div className="form-text">
-                      {secrets.length === 0
-                        ? 'No secrets configured yet. '
-                        : "Don't see the one you need? "}
-                      <AddResourceLink
-                        to={deepLinks.secret}
-                        testid="credential-provider-add-api-key-secret-link"
+
+                  {form.callback_host && form.provider_id.trim() && routingConfig && (
+                    <div className="alert alert-success mt-2 mb-0" style={{ fontSize: '14px' }}>
+                      <i className="fas fa-info-circle me-2"></i>
+                      <strong>Callback URL:</strong>{' '}
+                      {`${form.callback_host}${routingConfig.oauth_callback_route}/${encodeURIComponent(form.provider_id.trim())}`}
+                      <button
+                        type="button"
+                        className="btn btn-xs ms-2"
+                        style={{ padding: '2px 6px', fontSize: '11px', outline: 'none' }}
+                        onClick={e => {
+                          const url = `${form.callback_host}${routingConfig.oauth_callback_route}/${encodeURIComponent(form.provider_id.trim())}`;
+                          navigator.clipboard.writeText(url);
+                          const btn = e.currentTarget as HTMLButtonElement;
+                          const originalHtml = btn.innerHTML;
+                          btn.innerHTML = '<i class="fas fa-check"></i>';
+                          setTimeout(() => {
+                            btn.innerHTML = originalHtml;
+                          }, 2000);
+                        }}
+                        title="Copy to clipboard"
                       >
-                        Add secret
-                      </AddResourceLink>
+                        <i className="fas fa-copy"></i>
+                      </button>
                     </div>
                   )}
                 </div>
-              </>
-            )}
+              )}
 
-            <hr />
+              {caps.clientRefs !== 'none' && (
+                <>
+                  <hr />
+                  <h6 className="font-weight-bold text-primary mb-3">
+                    <i className="fas fa-key me-2"></i>
+                    {caps.clientRefs === 'required'
+                      ? 'OAuth Client Credentials (Secret References)'
+                      : 'Client Authentication (optional)'}
+                  </h6>
+                  <SecretSelect
+                    id="client_id_secret_ref"
+                    label="Client ID Secret"
+                    value={form.client_id_secret_ref}
+                    required={caps.clientRefs === 'required'}
+                    help={
+                      caps.clientRefs === 'required'
+                        ? "Pick the secret holding your OAuth app's client ID."
+                        : 'Only needed when the token endpoint also authenticates the client. Set both the client ID and the client secret, or neither.'
+                    }
+                    helpTestId="field-help-client-id-secret"
+                    linkTestId="credential-provider-add-client-id-secret-link"
+                    secrets={secrets}
+                    loading={loadingSecrets}
+                    onChange={handleChange}
+                  />
+                  <SecretSelect
+                    id="client_secret_secret_ref"
+                    label="Client Secret"
+                    value={form.client_secret_secret_ref}
+                    required={caps.clientRefs === 'required'}
+                    help="Pick the secret holding your OAuth app's client secret."
+                    helpTestId="field-help-client-secret-secret"
+                    linkTestId="credential-provider-add-client-secret-link"
+                    secrets={secrets}
+                    loading={loadingSecrets}
+                    onChange={handleChange}
+                  />
+                </>
+              )}
 
-            {/* Default Scopes */}
-            <div className="mb-3">
-              <label htmlFor="default_scopes">Default Scopes</label>
-              <input
-                id="default_scopes"
-                name="default_scopes"
-                type="text"
-                className="form-control"
-                value={form.default_scopes}
-                onChange={handleChange}
-              />
-              <small className="form-text text-muted">
-                Comma-separated default scopes for this credential provider (e.g. openid, email,
-                profile). Can be overridden per Transit Credential binding.
-              </small>
-            </div>
+              {caps.signingKey && (
+                <div data-testid="jwt-bearer-section">
+                  <hr />
+                  <h6 className="font-weight-bold text-primary mb-3">
+                    <i className="fas fa-signature me-2"></i>Assertion Signing (RFC 7523)
+                  </h6>
+                  <div
+                    className="alert alert-warning"
+                    role="note"
+                    data-testid="jwt-bearer-encryption-banner"
+                  >
+                    <i className="fas fa-lock me-2"></i>
+                    Encryption at rest is off by default, so a signing key is stored in plain text
+                    under the gateway's storage directory until you turn it on. Enable encryption at
+                    rest, or reference a key in AWS Secrets Manager, before you add a real key. The
+                    key is never returned by the API.
+                  </div>
+                  <SecretSelect
+                    id="signing_key_secret_ref"
+                    label="Signing Key Secret"
+                    value={form.signing_key_secret_ref}
+                    required
+                    help="Secret holding the private key as a PKCS#8 PEM, or a Google service account JSON key. Use the secret type Certificate or General."
+                    helpTestId="field-help-signing-key-secret"
+                    linkTestId="credential-provider-add-signing-key-secret-link"
+                    secrets={secrets}
+                    loading={loadingSecrets}
+                    onChange={handleChange}
+                  />
+                  <div className="row mb-3">
+                    <div className="col-md-4">
+                      <label htmlFor="signing_algorithm">Algorithm</label>
+                      <select
+                        id="signing_algorithm"
+                        data-testid="provider-signing-algorithm"
+                        name="signing_algorithm"
+                        className="form-control dropdown-styling"
+                        value={form.signing_algorithm}
+                        onChange={handleChange}
+                      >
+                        <option value="RS256">RS256</option>
+                        <option value="ES256">ES256</option>
+                      </select>
+                    </div>
+                    <div className="col-md-8">
+                      <label htmlFor="key_id">
+                        Key ID <span className="text-muted">(optional)</span>
+                      </label>
+                      <input
+                        id="key_id"
+                        data-testid="provider-key-id"
+                        name="key_id"
+                        type="text"
+                        className="form-control"
+                        value={form.key_id}
+                        onChange={handleChange}
+                      />
+                      <small className="form-text text-muted">
+                        Sent as the <code>kid</code> header. Leave empty to use the one in a Google
+                        service account key.
+                      </small>
+                    </div>
+                  </div>
+                  <div className="row mb-3">
+                    <div className="col-md-6">
+                      <label htmlFor="assertion_issuer">
+                        Assertion Issuer <span className="text-danger">*</span>
+                      </label>
+                      <input
+                        id="assertion_issuer"
+                        data-testid="provider-assertion-issuer"
+                        name="assertion_issuer"
+                        type="text"
+                        className="form-control"
+                        value={form.assertion_issuer}
+                        onChange={handleChange}
+                        required
+                      />
+                      <small className="form-text text-muted">
+                        The <code>iss</code> claim. The authorization server must trust this issuer.
+                      </small>
+                    </div>
+                    <div className="col-md-6">
+                      <label htmlFor="subject">
+                        Subject <span className="text-muted">(optional)</span>
+                      </label>
+                      <input
+                        id="subject"
+                        data-testid="provider-subject"
+                        name="subject"
+                        type="text"
+                        className="form-control"
+                        value={form.subject}
+                        onChange={handleChange}
+                      />
+                      <small className="form-text text-muted">
+                        The <code>sub</code> claim, sent only when set. Servers that require it,
+                        such as Ory Hydra, need a subject here.
+                      </small>
+                    </div>
+                  </div>
+                  <div className="mb-3">
+                    <label htmlFor="audience">
+                      Audience <span className="text-muted">(optional)</span>
+                    </label>
+                    <input
+                      id="audience"
+                      data-testid="provider-audience"
+                      name="audience"
+                      type="text"
+                      className="form-control"
+                      value={form.audience}
+                      onChange={handleChange}
+                      placeholder={form.token_endpoint.trim()}
+                      aria-describedby="audience-help"
+                    />
+                    <small id="audience-help" className="form-text text-muted">
+                      The <code>aud</code> claim. Defaults to the token endpoint; set it only when
+                      the authorization server expects another audience.
+                    </small>
+                  </div>
+                </div>
+              )}
 
-            {/* Token Refresh */}
-            <div className="mb-3 form-check">
-              <input
-                id="token_refresh_enabled"
-                name="token_refresh_enabled"
-                type="checkbox"
-                className="form-check-input"
-                checked={form.token_refresh_enabled}
-                onChange={handleChange}
-              />
-              <label htmlFor="token_refresh_enabled" className="form-check-label">
-                Enable automatic token refresh
-              </label>
-              <div>
+              {caps.apiKey && (
+                <>
+                  <hr />
+                  <h6 className="font-weight-bold text-primary mb-3">
+                    <i className="fas fa-key me-2"></i>API Key (Secret Reference)
+                  </h6>
+                  <SecretSelect
+                    id="api_key_secret_ref"
+                    label="API Key Secret"
+                    value={form.api_key_secret_ref}
+                    required
+                    help="Secret containing the API key value. Injected directly into upstream requests."
+                    linkTestId="credential-provider-add-api-key-secret-link"
+                    secrets={secrets}
+                    loading={loadingSecrets}
+                    onChange={handleChange}
+                  />
+                </>
+              )}
+
+              <hr />
+
+              {/* Default Scopes */}
+              <div className="mb-3">
+                <label htmlFor="default_scopes">Default Scopes</label>
+                <input
+                  id="default_scopes"
+                  data-testid="provider-default-scopes"
+                  name="default_scopes"
+                  type="text"
+                  className="form-control"
+                  value={form.default_scopes}
+                  onChange={handleChange}
+                />
                 <small className="form-text text-muted">
-                  Access tokens are refreshed automatically using the stored refresh token whenever
-                  one is available, so this connection keeps working without needing to reauthorize.
+                  Comma-separated default scopes for this credential provider (e.g. openid, email,
+                  profile). Can be overridden per Transit Credential binding.
                 </small>
               </div>
-            </div>
 
-            {/* Additional Params */}
-            <div className="mb-3">
-              <div className="field-label-with-help">
-                <label htmlFor="additional_params" className="mb-0">
-                  Additional Parameters <span className="text-muted">(JSON)</span>
-                </label>
-                <FieldHelp
-                  ariaLabel="About Additional Parameters"
-                  testId="field-help-additional-params"
-                >
-                  Use this to force a consent screen every time, or leave blank if your provider
-                  doesn't need any extra parameters.
-                </FieldHelp>
-              </div>
-              <textarea
-                id="additional_params"
-                name="additional_params"
-                className="form-control font-monospace"
-                value={form.additional_params}
-                onChange={handleChange}
-                rows={3}
-              />
-              <small className="form-text text-muted">
-                Extra query parameters to send with the authorization request, as a JSON object
-                (e.g. <code>{'{"prompt": "consent"}'}</code>).
-              </small>
-            </div>
+              {/* Token Refresh */}
+              {caps.tokenRefresh && (
+                <div className="mb-3 form-check">
+                  <input
+                    id="token_refresh_enabled"
+                    name="token_refresh_enabled"
+                    type="checkbox"
+                    className="form-check-input"
+                    checked={form.token_refresh_enabled}
+                    onChange={handleChange}
+                  />
+                  <label htmlFor="token_refresh_enabled" className="form-check-label">
+                    Enable automatic token refresh
+                  </label>
+                  <div>
+                    <small className="form-text text-muted">
+                      Access tokens are refreshed automatically using the stored refresh token
+                      whenever one is available, so this connection keeps working without needing to
+                      reauthorize.
+                    </small>
+                  </div>
+                </div>
+              )}
+
+              {/* Additional Params */}
+              {caps.additionalParams && (
+                <div className="mb-3">
+                  <div className="field-label-with-help">
+                    <label htmlFor="additional_params" className="mb-0">
+                      Additional Parameters <span className="text-muted">(JSON)</span>
+                    </label>
+                    <FieldHelp
+                      ariaLabel="About Additional Parameters"
+                      testId="field-help-additional-params"
+                    >
+                      Use this to force a consent screen every time, or leave blank if your provider
+                      doesn't need any extra parameters.
+                    </FieldHelp>
+                  </div>
+                  <textarea
+                    id="additional_params"
+                    name="additional_params"
+                    className="form-control font-monospace"
+                    value={form.additional_params}
+                    onChange={handleChange}
+                    rows={3}
+                  />
+                  <small className="form-text text-muted">
+                    Extra query parameters to send with the authorization request, as a JSON object
+                    (e.g. <code>{'{"prompt": "consent"}'}</code>).
+                  </small>
+                </div>
+              )}
+            </fieldset>
           </form>
         </div>
       </div>

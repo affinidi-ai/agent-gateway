@@ -98,8 +98,9 @@ fn is_handler_enforced_nested_action(
 ) -> bool {
     matches!(
         (kind, tail),
-        (ResourceKind::Surfaces, ["variants"])
+        (ResourceKind::Surfaces, ["variants" | "declarations" | "agent-card"])
             | (ResourceKind::Surfaces, ["trust-recorder-status"])
+            | (ResourceKind::Surfaces, ["agent-card", "refresh"])
             | (ResourceKind::Surfaces, ["variants", _])
             | (ResourceKind::Surfaces, ["variants", _, "promote-to-default" | "resolved"])
             | (ResourceKind::SurfaceTemplates, ["export"])
@@ -244,6 +245,40 @@ mod tests {
         assert_eq!(classify_resource_path("/v1/surfaces/id/trust-recorder-status/future"), PathScope::DenyScoped);
         assert_eq!(classify_resource_path("/v1/sts/clients/id/future-action"), PathScope::DenyScoped);
         assert_eq!(classify_resource_path("/v1/gateways/id/connection-points/future-action"), PathScope::DenyScoped);
+    }
+
+    #[test]
+    fn surface_declarations_and_agent_card_routes_enforce_the_surface_id() {
+        for path in [
+            "/api/v1/surfaces/s1/declarations",
+            "/api/v1/surfaces/s1/agent-card",
+            "/api/v1/surfaces/s1/agent-card/refresh",
+            "/v1/surfaces/s1/agent-card",
+        ] {
+            assert_eq!(
+                classify_resource_path(path),
+                PathScope::EnforceId {
+                    kind: ResourceKind::Surfaces,
+                    id: "s1".into(),
+                },
+                "{path}"
+            );
+        }
+        assert_eq!(
+            classify_resource_path("/api/v1/surfaces/surface%2Fa/agent-card"),
+            PathScope::EnforceId {
+                kind: ResourceKind::Surfaces,
+                id: "surface/a".into(),
+            }
+        );
+        for path in [
+            "/api/v1/surfaces/s1/declarations/extra",
+            "/api/v1/surfaces/s1/agent-card/extra",
+            "/api/v1/surfaces/s1/agent-card/refresh/extra",
+            "/api/v1/surfaces/s1/refresh",
+        ] {
+            assert_eq!(classify_resource_path(path), PathScope::DenyScoped, "{path}");
+        }
     }
 
     #[test]

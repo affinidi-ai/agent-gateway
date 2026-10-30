@@ -83,13 +83,16 @@ fn mcp_proxy_writable(
         && scope_allows_resource(scope, context, ResourceKind::McpProxies, &proxy.id)
 }
 
+/// A tenant caller sends only its own tenant's secret to the endpoint it discovers, never an
+/// appliance-wide one, as with a surface's `static_secret` Target Authentication.
 fn discovery_secret_allowed(
     tenant_id: Option<&str>,
     secret_id: &str,
     context: Option<&PatTenantContext>,
     scope: Option<&PatResourceScope>,
 ) -> bool {
-    can_access(tenant_id, context) && scope_allows_resource(scope, context, ResourceKind::Secrets, secret_id)
+    context.is_none_or(|context| tenant_id == Some(context.tenant_id.as_str()))
+        && scope_allows_resource(scope, context, ResourceKind::Secrets, secret_id)
 }
 
 // Import rmcp-openapi for MCP Server functionality
@@ -1015,8 +1018,9 @@ fn ensure_jsonrpc_success(response: &str) -> Result<serde_json::Value, (StatusCo
 }
 
 /// The proxy's `mcp_http.authorization.resource` must be its own public URL
-/// (an inbound public origin plus `channel_prefix` + `endpoint_path`), and no
-/// other stored surface or MCP Proxy may serve it
+/// (an inbound public origin plus `channel_prefix` + `endpoint_path`), no
+/// other stored surface or MCP Proxy may serve it, and its path must be one no
+/// surface's Access Point uses for protected resource metadata
 /// (`crate::sts::resource_owners`).
 async fn ensure_proxy_may_declare_resource(
     owners: &crate::sts::resource_owners::ApplianceResourceOwners,
@@ -1026,13 +1030,35 @@ async fn ensure_proxy_may_declare_resource(
     let declarations: Vec<_> = crate::mcp::resource_server::proxy_resource_declaration(proxy, owners.network())
         .into_iter()
         .collect();
-    owners
-        .ensure_endpoint_may_declare(&ResourceEndpoint::McpProxy(proxy.id.clone()), &declarations)
-        .await
-        .map_err(|error| match error {
-            ResourceDeclarationError::Unavailable => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
-            _ => (StatusCode::BAD_REQUEST, error.to_string()),
-        })
+    async {
+        owners
+            .ensure_endpoint_may_declare(&ResourceEndpoint::McpProxy(proxy.id.clone()), &declarations)
+            .await?;
+        owners
+            .ensure_proxy_metadata_path_free(proxy)
+            .await
+    }
+    .await
+    .map_err(|error| match error {
+        ResourceDeclarationError::Unavailable => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+        _ => (StatusCode::BAD_REQUEST, error.to_string()),
+    })
+}
+
+/// Every inbound listener answers every method at and below the protected
+/// resource metadata path itself, so a proxy there could never be reached.
+fn reject_metadata_path_proxy(proxy: &McpProxy) -> Result<(), (StatusCode, String)> {
+    let path = proxy.full_path();
+    if crate::proxy::paths::is_protected_resource_metadata_route(&path) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "MCP Proxy path '{path}' must not be at or under {}",
+                crate::proxy::paths::PROTECTED_RESOURCE_METADATA_PATH
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Create a new MCP Proxy
@@ -1112,6 +1138,7 @@ pub async fn create_mcp_proxy<S: McpProxyStore>(
             .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
     }
     proxy.mcp_http = request.mcp_http;
+    reject_metadata_path_proxy(&proxy)?;
     ensure_proxy_may_declare_resource(&resource_owners, &proxy).await?;
 
     // Try to create the MCP Server first
@@ -1253,6 +1280,7 @@ pub async fn update_mcp_proxy<S: McpProxyStore>(
             .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
         proxy.mcp_http = Some(config);
     }
+    reject_metadata_path_proxy(&proxy)?;
     // Also re-checked when only the path changes: the kept resource must
     // still be this proxy's own URL.
     ensure_proxy_may_declare_resource(&resource_owners, &proxy).await?;
@@ -4814,6 +4842,9 @@ mod tests {
         assert!(discovery_secret_allowed(Some("tenant-a"), "secret-a", Some(&context), Some(&scope)));
         assert!(!discovery_secret_allowed(Some("tenant-b"), "secret-a", Some(&context), Some(&scope)));
         assert!(!discovery_secret_allowed(Some("tenant-a"), "secret-b", Some(&context), Some(&scope)));
+        assert!(!discovery_secret_allowed(None, "secret-a", Some(&context), Some(&scope)));
+        assert!(discovery_secret_allowed(None, "secret-a", None, None));
+        assert!(discovery_secret_allowed(Some("tenant-b"), "secret-a", None, None));
 
         proxy.tenant_id = Some("tenant-b".to_string());
         assert!(!mcp_proxy_allowed(&proxy, Some(&context), Some(&scope)));
@@ -5315,6 +5346,159 @@ mod tests {
         .await
         .expect_err("moved away from its resource");
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn a_proxy_cannot_declare_at_another_tenants_access_point_path() {
+        use crate::sts::resource_owners::tests::{Surfaces, network, surface, with_variants};
+        let mut access_point = with_variants(surface(Some("tenant-a"), "active", "/smoke", "https://gw.example/smoke"));
+        access_point
+            .access_point
+            .protocol = crate::config::agent_surface::SurfaceProtocol::A2a;
+        access_point.mcp_http = None;
+        let owners = Arc::new(crate::sts::resource_owners::ApplianceResourceOwners::new(
+            Some(Arc::new(Surfaces(vec![access_point]))),
+            None,
+            network(),
+        ));
+        let store = store_with(vec![]);
+        let body = |id: &str, path: &str| {
+            let mut body = create_body(Some(id));
+            body["channel_prefix"] = serde_json::json!("");
+            body["endpoint_path"] = serde_json::json!(path);
+            body["mcp_http"] =
+                serde_json::json!({"authorization": {"resource": format!("https://gw.example{path}"), "scopes": []}});
+            body
+        };
+        let create = |body: serde_json::Value| {
+            super::create_mcp_proxy(
+                Extension(store.clone()),
+                Extension(Arc::new(super::McpServerManager::new())),
+                Extension(None),
+                Extension(owners.clone()),
+                None,
+                tenant("tenant-b"),
+                scope(r"\ATENANT:tenant-b:mcp-proxies:.*\z"),
+                Json(serde_json::from_value(body).unwrap()),
+            )
+        };
+
+        for (id, path, message) in [
+            ("on-route", "/smoke", "already used by another endpoint"),
+            ("on-variant", "/smoke$dev", "must not contain '$'"),
+            ("on-encoded-variant", "/smoke%24dev", "must not contain '$'"),
+        ] {
+            let err = create(body(id, path))
+                .await
+                .expect_err(path);
+            assert_eq!(err.0, StatusCode::BAD_REQUEST, "{path}");
+            assert!(err.1.contains(message), "{path}: {}", err.1);
+        }
+        let mut undeclared = body("undeclared", "/smoke$dev");
+        undeclared["mcp_http"] = serde_json::Value::Null;
+        let Json(undeclared) = create(undeclared)
+            .await
+            .expect("a proxy that declares nothing publishes no metadata");
+        assert_eq!(undeclared.proxy.full_path(), "/smoke$dev");
+        let Json(elsewhere) = create(body("elsewhere", "/elsewhere"))
+            .await
+            .expect("a path no Access Point uses");
+        assert_eq!(elsewhere.proxy.full_path(), "/elsewhere");
+
+        let err = super::update_mcp_proxy(
+            Extension(store.clone()),
+            Extension(Arc::new(super::McpServerManager::new())),
+            Extension(None),
+            Extension(owners.clone()),
+            Path("elsewhere".to_string()),
+            tenant("tenant-b"),
+            scope(r"\ATENANT:tenant-b:mcp-proxies:.*\z"),
+            Json(
+                serde_json::from_value(serde_json::json!({
+                    "endpoint_path": "/smoke",
+                    "mcp_http": {"authorization": {"resource": "https://gw.example/smoke", "scopes": []}}
+                }))
+                .unwrap(),
+            ),
+        )
+        .await
+        .expect_err("moved onto the Access Point's path");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            store
+                .get("elsewhere")
+                .await
+                .unwrap()
+                .expect("kept")
+                .endpoint_path,
+            "/elsewhere"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_proxy_at_or_under_the_metadata_path_is_refused() {
+        let store = store_with(vec![]);
+        let at = |id: &str, channel_prefix: &str, endpoint_path: &str| {
+            let mut body = create_body(Some(id));
+            body["channel_prefix"] = serde_json::json!(channel_prefix);
+            body["endpoint_path"] = serde_json::json!(endpoint_path);
+            body
+        };
+        for (id, channel_prefix, endpoint_path) in [
+            ("exact", "", "/.well-known/oauth-protected-resource"),
+            ("below", "/.well-known/oauth-protected-resource", "/tools"),
+        ] {
+            let err = create(&store, at(id, channel_prefix, endpoint_path), None, None)
+                .await
+                .expect_err(id);
+            assert_eq!(err.0, StatusCode::BAD_REQUEST, "{id}");
+            assert!(
+                err.1
+                    .contains("/.well-known/oauth-protected-resource"),
+                "{id}: {}",
+                err.1
+            );
+        }
+        assert!(
+            store
+                .list_all()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let beside = create(&store, at("beside", "/.well-known", "/tools"), None, None)
+            .await
+            .expect("a path beside the metadata path");
+        assert_eq!(beside.full_path(), "/.well-known/tools");
+
+        let err = super::update_mcp_proxy(
+            Extension(store.clone()),
+            Extension(Arc::new(super::McpServerManager::new())),
+            Extension(None),
+            Extension(no_resource_owners()),
+            Path("beside".to_string()),
+            None,
+            None,
+            Json(
+                serde_json::from_value(
+                    serde_json::json!({ "channel_prefix": "/.well-known/oauth-protected-resource" }),
+                )
+                .unwrap(),
+            ),
+        )
+        .await
+        .expect_err("moved under the metadata path");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            store
+                .get("beside")
+                .await
+                .unwrap()
+                .expect("kept")
+                .channel_prefix,
+            "/.well-known"
+        );
     }
 
     fn legacy_incompatible_spec() -> String {

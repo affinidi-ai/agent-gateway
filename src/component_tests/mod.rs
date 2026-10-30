@@ -1,8 +1,11 @@
+mod a2a_card_security_e2e;
 mod a2a_extended_card_e2e;
 mod a2a_flow_e2e;
 mod a2a_proxy_e2e;
 mod a2a_streaming_e2e;
 mod access_tokens_pat;
+mod agent_card_preview;
+mod caller_challenge_e2e;
 mod channel_e2e;
 mod connection_point_integration_events_e2e;
 #[cfg(feature = "didwebvh")]
@@ -20,7 +23,11 @@ mod mcp_policy_e2e;
 mod mcp_record_compat;
 mod mcp_sandbox_e2e;
 mod mcp_subscription_scope;
+mod mock_auth_server_tests;
 mod mtls;
+mod provider_activation_e2e;
+mod surface_save_checks_e2e;
+mod target_auth_provider_e2e;
 mod tr_naming_e2e;
 mod transit_caller_policy_e2e;
 mod transit_point_headers_e2e;

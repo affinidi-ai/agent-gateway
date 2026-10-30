@@ -131,6 +131,7 @@ mod tests {
     use crate::audit::events::Actor;
     use crate::audit::producer::capture;
     use crate::delegation_vault::audit::action_category;
+    use serde_json::json;
 
     fn surface(policy: &str) -> AgentSurface {
         serde_json::from_value(serde_json::json!({
@@ -308,6 +309,100 @@ mod tests {
                 ("policy_detached", second),
                 ("policy_attached", third.to_string()),
             ]
+        );
+    }
+
+    fn surface_json(
+        id: &str,
+        auth: serde_json::Value,
+    ) -> serde_json::Value {
+        json!({
+            "surface_id": id, "name": id,
+            "access_point": {"listen_address": "127.0.0.1:0", "route": format!("/{id}"), "protocol": "a2a"},
+            "target": {"endpoint": "https://agent.example", "auth": auth}
+        })
+    }
+
+    fn unreadable_surfaces() -> u64 {
+        crate::metrics::backends::prometheus::STORAGE_LOAD_ERRORS
+            .with_label_values(&["agent_surface", "unreadable_record"])
+            .get()
+    }
+
+    /// A node of an earlier release does not know a newer Target Authentication method.
+    /// Its loader drops the whole surface, not just the authentication, and counts it.
+    #[tokio::test]
+    async fn a_surface_with_a_target_authentication_method_the_release_does_not_know_is_dropped_whole() {
+        let directory = tempfile::tempdir().unwrap();
+        let known = surface_json("known", json!({"method": {"static_secret": {"secret_id": "S", "header_name": "X"}}}));
+        let unknown = surface_json("unknown", json!({"method": {"a_method_from_a_newer_release": {}}}));
+        std::fs::write(
+            directory
+                .path()
+                .join("known.json"),
+            known.to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            directory
+                .path()
+                .join("unknown.json"),
+            unknown.to_string(),
+        )
+        .unwrap();
+        let before = unreadable_surfaces();
+
+        let store = FileSystemAgentSurfaceStore::new(directory.path().to_path_buf())
+            .await
+            .unwrap();
+        assert_eq!(unreadable_surfaces(), before + 1, "the load counts the one unreadable record");
+
+        let ids: Vec<String> = store
+            .list_all()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|surface| surface.surface_id)
+            .collect();
+        assert_eq!(ids, vec!["known".to_string()]);
+        assert!(
+            store
+                .get("unknown")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_surface_this_release_wrote_loads_without_an_authentication_block() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut bare = surface_json("bare", json!(null));
+        bare["target"]
+            .as_object_mut()
+            .unwrap()
+            .remove("auth");
+        std::fs::write(
+            directory
+                .path()
+                .join("bare.json"),
+            bare.to_string(),
+        )
+        .unwrap();
+
+        let store = FileSystemAgentSurfaceStore::new(directory.path().to_path_buf())
+            .await
+            .unwrap();
+
+        let surface = store
+            .get("bare")
+            .await
+            .unwrap()
+            .expect("loads");
+        assert!(
+            surface
+                .target_auth()
+                .is_none()
         );
     }
 }

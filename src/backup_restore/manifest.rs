@@ -7,6 +7,7 @@ const LEGACY_MANIFEST_PATH: &str = "META-INF/trust-gateway-backup.json"; // Acce
 pub(super) const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 const FORMAT_VERSION: u8 = 2;
 const PRODUCT: &str = "agent-gateway";
+const RUNNING_VERSION: &str = env!("CARGO_PKG_VERSION");
 const LEGACY_PRODUCT: &str = "trust-gateway"; // Accept old backups during migration
 
 pub(super) fn is_manifest_path(name: &str) -> bool {
@@ -21,6 +22,9 @@ pub struct BackupManifest {
     pub created_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub legacy_import: bool,
+    /// The Agent Gateway release that took the backup; absent on older backups.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_version: Option<String>,
 }
 
 impl BackupManifest {
@@ -34,6 +38,7 @@ impl BackupManifest {
             source_domain: canonicalize_domain(source_domain)?,
             created_at: Utc::now(),
             legacy_import,
+            gateway_version: Some(RUNNING_VERSION.to_string()),
         })
     }
 }
@@ -118,8 +123,62 @@ pub fn validate_parsed_backup_manifest(
     if source_domain != target_domain {
         anyhow::bail!("backup source domain does not match this Agent Gateway");
     }
+    refuse_newer_release(
+        manifest
+            .gateway_version
+            .as_deref(),
+        RUNNING_VERSION,
+    )?;
 
     Ok(manifest)
+}
+
+/// The backup was taken by a newer release than the one running.
+#[derive(Debug, thiserror::Error)]
+#[error("backup was taken by a newer Agent Gateway release than this one")]
+pub struct NewerRelease;
+
+/// The audit and API category of a refused manifest: a newer release is told apart
+/// from an invalid manifest because its fix is to upgrade before restoring.
+pub fn manifest_failure_category(error: &anyhow::Error) -> &'static str {
+    if error.is::<NewerRelease>() {
+        "backup_from_newer_release"
+    } else {
+        "manifest_invalid"
+    }
+}
+
+/// A backup from a newer release may hold records this release cannot read, and a
+/// record it cannot read is skipped on load, so the restore would silently drop it.
+fn refuse_newer_release(
+    backup: Option<&str>,
+    running: &str,
+) -> anyhow::Result<()> {
+    let Some(backup) = backup else {
+        return Ok(());
+    };
+    let backup_release = release_triple(backup).ok_or_else(|| anyhow::anyhow!("backup release version is invalid"))?;
+    let running_release =
+        release_triple(running).ok_or_else(|| anyhow::anyhow!("running release version is invalid"))?;
+    if backup_release > running_release {
+        return Err(NewerRelease.into());
+    }
+    Ok(())
+}
+
+/// The numeric `major.minor.patch` of a release, ignoring any pre-release or build suffix.
+fn release_triple(version: &str) -> Option<(u64, u64, u64)> {
+    let numeric = version
+        .split(['-', '+'])
+        .next()?;
+    let mut parts = numeric
+        .split('.')
+        .map(|part| part.parse::<u64>().ok());
+    let triple = (parts.next()??, parts.next()??, parts.next()??);
+    parts
+        .next()
+        .is_none()
+        .then_some(triple)
 }
 
 pub fn validate_optional_backup_manifest(
@@ -254,6 +313,81 @@ mod tests {
         ] {
             assert!(canonicalize_domain(invalid).is_err(), "accepted {invalid}");
         }
+    }
+
+    fn manifest_from(gateway_version: Option<&str>) -> BackupManifest {
+        let mut manifest = BackupManifest::new("gateway.example.com", false).unwrap();
+        manifest.gateway_version = gateway_version.map(str::to_string);
+        manifest
+    }
+
+    #[test]
+    fn a_new_manifest_records_the_release_that_took_the_backup() {
+        let manifest = BackupManifest::new("gateway.example.com", false).unwrap();
+        assert_eq!(
+            manifest
+                .gateway_version
+                .as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        let json = serde_json::to_value(&manifest).unwrap();
+        assert_eq!(json["gateway_version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn a_manifest_without_a_release_still_restores() {
+        let mut json = serde_json::to_value(manifest_from(None)).unwrap();
+        assert!(
+            json.get("gateway_version")
+                .is_none()
+        );
+        json["extra_field_from_a_later_release"] = serde_json::json!(true);
+        let parsed: BackupManifest = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.gateway_version, None);
+        validate_parsed_backup_manifest(parsed, "gateway.example.com").expect("older backups restore");
+    }
+
+    #[test]
+    fn a_backup_from_the_same_or_an_older_release_restores() {
+        for version in [RUNNING_VERSION, "0.0.1", "0.9.9", "1.0.0-rc.1+build.5"] {
+            validate_parsed_backup_manifest(manifest_from(Some(version)), "gateway.example.com")
+                .unwrap_or_else(|error| panic!("{version} was refused: {error}"));
+        }
+    }
+
+    #[test]
+    fn a_backup_from_a_newer_release_is_refused_before_anything_is_restored() {
+        for version in ["999.0.0", "1.999.0", "1.0.999"] {
+            let error = validate_parsed_backup_manifest(manifest_from(Some(version)), "gateway.example.com")
+                .expect_err("a newer backup is refused");
+            assert_eq!(error.to_string(), "backup was taken by a newer Agent Gateway release than this one");
+        }
+        let zip = zip_with_manifest(&manifest_from(Some("999.0.0")));
+        assert!(validate_backup_manifest(&zip, "gateway.example.com").is_err());
+    }
+
+    #[test]
+    fn an_unreadable_release_version_is_refused() {
+        for version in ["", "latest", "1.2", "1.2.3.4", "a.b.c"] {
+            let error = validate_parsed_backup_manifest(manifest_from(Some(version)), "gateway.example.com")
+                .expect_err("an unparseable release is refused");
+            assert_eq!(error.to_string(), "backup release version is invalid", "{version}");
+        }
+    }
+
+    #[test]
+    fn release_comparison_reads_numbers_not_text() {
+        assert!(refuse_newer_release(Some("1.10.0"), "1.9.0").is_err());
+        assert!(refuse_newer_release(Some("1.9.0"), "1.10.0").is_ok());
+        assert!(refuse_newer_release(Some("2.0.0-rc.1"), "1.99.99").is_err());
+    }
+
+    #[test]
+    fn a_newer_release_has_its_own_failure_category() {
+        let newer = refuse_newer_release(Some("2.0.0"), "1.0.0").unwrap_err();
+        assert_eq!(manifest_failure_category(&newer), "backup_from_newer_release");
+        let invalid = refuse_newer_release(Some("latest"), "1.0.0").unwrap_err();
+        assert_eq!(manifest_failure_category(&invalid), "manifest_invalid");
     }
 
     #[test]

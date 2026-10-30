@@ -2,11 +2,14 @@
 
 pub mod agent_card_cache;
 pub mod backend_identity;
+pub(crate) mod caller_denial;
 pub mod caller_identity;
+pub mod card_preview;
 pub mod channel_logging;
 pub mod credential_delegation;
 pub mod fabric_forward;
 pub mod fabric_identity;
+pub(crate) mod fabric_peer_refusal;
 pub(crate) mod fabric_response_waiter;
 pub(crate) mod fabric_stream;
 pub mod handler;
@@ -18,6 +21,8 @@ pub mod route_variant;
 pub mod rules_engine;
 pub mod server;
 pub mod surface_manager;
+pub(crate) mod target_card;
+pub mod target_credentials;
 pub mod trace;
 pub mod transit_token;
 pub(crate) mod upstream_body;

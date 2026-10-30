@@ -13,7 +13,12 @@ jest.mock('../api', () => ({
     post: jest.fn(),
     put: jest.fn(),
     delete: jest.fn(),
+    fetch: jest.fn(),
   },
+}));
+
+jest.mock('../context/PermissionsContext', () => ({
+  usePermissions: () => ({ hasPermission: () => true }),
 }));
 
 jest.mock('../utils/toaster', () => ({ showToast: jest.fn() }));
@@ -262,5 +267,47 @@ describe('EditSecretPage', () => {
     expect(revealed.tagName).toBe('TEXTAREA');
     expect(revealed).toHaveValue('sk-created');
     expect(screen.getByTestId('secret-save-button')).toHaveTextContent('Create Secret');
+  });
+
+  describe('deleting', () => {
+    const json = (body: unknown) => Promise.resolve({ ok: true, json: async () => body });
+
+    const providerRefs = (refs: Record<string, unknown>) =>
+      (apiClient.fetch as jest.Mock).mockImplementation((url: string) =>
+        url === '/api/v1/credential-providers'
+          ? json([{ id: 'p1', name: 'Hop 2 provider' }])
+          : json(refs)
+      );
+
+    const clickDelete = async () => {
+      await screen.findByDisplayValue('OpenAI key');
+      fireEvent.click(screen.getByTitle('Delete this secret'));
+      fireEvent.click(screen.getByTitle('Click again to confirm deletion'));
+    };
+
+    it('warns with the provider names, then deletes and leaves for the list after confirmation', async () => {
+      providerRefs({ client_secret_secret_ref: 'openai_key' });
+      (apiClient.delete as jest.Mock).mockResolvedValue({});
+      renderPage('/secrets/secret-1');
+      await clickDelete();
+
+      const warning = await screen.findByTestId('secret-delete-warning');
+      expect(warning).toHaveTextContent('Hop 2 provider');
+      expect(apiClient.delete).not.toHaveBeenCalled();
+
+      fireEvent.click(screen.getByTestId('secret-delete-warning-confirm-button'));
+      await waitFor(() => expect(apiClient.delete).toHaveBeenCalledWith('/secrets/secret-1'));
+      expect(await screen.findByTestId('secrets-list-page')).toBeInTheDocument();
+    });
+
+    it('deletes without a warning when no provider references the secret', async () => {
+      providerRefs({ client_secret_secret_ref: 'another_secret' });
+      (apiClient.delete as jest.Mock).mockResolvedValue({});
+      renderPage('/secrets/secret-1');
+      await clickDelete();
+
+      await waitFor(() => expect(apiClient.delete).toHaveBeenCalledWith('/secrets/secret-1'));
+      expect(screen.queryByTestId('secret-delete-warning')).not.toBeInTheDocument();
+    });
   });
 });

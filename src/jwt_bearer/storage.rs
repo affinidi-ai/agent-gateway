@@ -63,6 +63,12 @@ pub trait JwtVerificationStrategyStorage: Send + Sync {
         &self,
         id: &str,
     ) -> Result<()>;
+
+    /// Reconcile any in-memory cache with the backing storage, picking up records
+    /// another node wrote. A store without a cache has nothing to reconcile.
+    async fn refresh_from_disk(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 // ── Filesystem implementation ─────────────────────────────────────────────────
@@ -99,18 +105,6 @@ impl FileSystemJwtVerificationStrategyStore {
                 .len()
         );
         Ok(store)
-    }
-
-    /// Re-read all strategy files from disk and reconcile the in-memory cache.
-    /// Safe to call from a hot-reload watcher.
-    #[allow(dead_code)]
-    pub async fn reload(&self) -> Result<()> {
-        let _access_change =
-            crate::mcp::subscriptions::AccessChange::begin(crate::mcp::subscriptions::AccessScope::Appliance);
-        info!("Reloading JWT verification strategy store from disk");
-        self.storage
-            .refresh_from_disk()
-            .await
     }
 }
 
@@ -198,6 +192,15 @@ impl JwtVerificationStrategyStorage for FileSystemJwtVerificationStrategyStore {
         info!("Deleted JWT verification strategy {}", id);
         Ok(())
     }
+
+    async fn refresh_from_disk(&self) -> Result<()> {
+        let _access_change =
+            crate::mcp::subscriptions::AccessChange::begin(crate::mcp::subscriptions::AccessScope::Appliance);
+        info!("Reloading JWT verification strategy store from disk");
+        self.storage
+            .refresh_from_disk()
+            .await
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -218,15 +221,12 @@ mod tests {
 
     fn sample_strategy() -> JwtVerificationStrategy {
         JwtVerificationStrategy {
-            id: String::new(), // populated by create()
-            tenant_id: None,
             name: "Test IdP".to_string(),
             expected_issuer: "https://idp.example.com".to_string(),
             jwks_source: JwksSource::Remote {
                 jwks_uri: "https://idp.example.com/.well-known/jwks.json".to_string(),
             },
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            ..Default::default()
         }
     }
 
@@ -393,7 +393,10 @@ mod tests {
                 .all(|s| s.id != strategy.id)
         );
 
-        store.reload().await.unwrap();
+        store
+            .refresh_from_disk()
+            .await
+            .unwrap();
 
         // After reload the cache is reconciled with disk.
         assert!(
@@ -404,5 +407,51 @@ mod tests {
                 .iter()
                 .any(|s| s.id == strategy.id)
         );
+    }
+
+    struct UncachedStore;
+
+    #[async_trait]
+    impl JwtVerificationStrategyStorage for UncachedStore {
+        async fn create(
+            &self,
+            strategy: JwtVerificationStrategy,
+        ) -> Result<JwtVerificationStrategy> {
+            Ok(strategy)
+        }
+
+        async fn get(
+            &self,
+            _id: &str,
+        ) -> Result<Option<JwtVerificationStrategy>> {
+            Ok(None)
+        }
+
+        async fn list(&self) -> Result<Vec<JwtVerificationStrategy>> {
+            Ok(vec![])
+        }
+
+        async fn update(
+            &self,
+            strategy: JwtVerificationStrategy,
+        ) -> Result<JwtVerificationStrategy> {
+            Ok(strategy)
+        }
+
+        async fn delete(
+            &self,
+            _id: &str,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_store_without_a_cache_has_nothing_to_reconcile() {
+        let store = UncachedStore;
+        store
+            .refresh_from_disk()
+            .await
+            .expect("the default reconcile succeeds");
     }
 }

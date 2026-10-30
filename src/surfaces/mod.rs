@@ -2,6 +2,7 @@
 
 pub mod filesystem;
 pub mod resolved_cache;
+pub mod save_report;
 pub mod store;
 
 pub use filesystem::FileSystemAgentSurfaceStore;

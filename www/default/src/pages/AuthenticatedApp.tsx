@@ -79,8 +79,6 @@ const EditAccessTokenPage = lazy(() => import('./EditAccessTokenPage'));
 const EditPolicyDefinitionPage = lazy(() => import('./SettingsPage/EditPolicyDefinitionPage'));
 const AuditPage = lazy(() => import('./AuditPage'));
 const EditCredentialProviderPage = lazy(() => import('./EditCredentialProviderPage'));
-const OidcProvidersPage = lazy(() => import('./OidcProvidersPage'));
-const EditOidcProviderPage = lazy(() => import('./EditOidcProviderPage'));
 const AddSurfacePage = lazy(() => import('./AddSurfacePage'));
 const SurfaceDetailPage = lazy(() => import('./SurfaceDetailPage'));
 
@@ -676,7 +674,7 @@ const AppContent: React.FC<AuthenticatedAppProps> = ({ onLogout }) => {
                 <Route
                   path="/credential-providers/new"
                   element={
-                    <ProtectedRoute permission="settings.edit">
+                    <ProtectedRoute permission="credential_providers.edit">
                       <EditCredentialProviderPage />
                     </ProtectedRoute>
                   }
@@ -684,38 +682,13 @@ const AppContent: React.FC<AuthenticatedAppProps> = ({ onLogout }) => {
                 <Route
                   path="/credential-providers/:id"
                   element={
-                    <ProtectedRoute permission="settings.edit">
+                    <ProtectedRoute permission="credential_providers.view">
                       <EditCredentialProviderPage />
                     </ProtectedRoute>
                   }
                 />
                 {/* Delegation Vault — now part of Secrets page; redirect for back-compat */}
                 <Route path="/delegation-vault" element={<Navigate to="/secrets" replace />} />
-                {/* OIDC Providers */}
-                <Route
-                  path="/oidc-providers"
-                  element={
-                    <ProtectedRoute permission="settings.edit">
-                      <OidcProvidersPage />
-                    </ProtectedRoute>
-                  }
-                />
-                <Route
-                  path="/oidc-providers/new"
-                  element={
-                    <ProtectedRoute permission="settings.edit">
-                      <EditOidcProviderPage />
-                    </ProtectedRoute>
-                  }
-                />
-                <Route
-                  path="/oidc-providers/:id"
-                  element={
-                    <ProtectedRoute permission="settings.edit">
-                      <EditOidcProviderPage />
-                    </ProtectedRoute>
-                  }
-                />
                 <Route path="/users" element={<Navigate to="/settings?tab=users" replace />} />
                 <Route
                   path="/users/:userId"

@@ -27,6 +27,5 @@ export const deepLinks = {
   credentialProvider: '/credential-providers/new',
   policies: '/policies',
   integration: '/integrations/new',
-  oidcProvider: '/oidc-providers/new',
   a2aProxy: '/proxies/a2a-proxies/new',
 } as const;

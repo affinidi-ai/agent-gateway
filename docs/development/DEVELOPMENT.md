@@ -291,6 +291,12 @@ Other available targets include:
 | `make gw-e2e` | Gateway-to-Gateway BDD suite using managed mediator containers |
 | `make mcp-conformance` | MCP `2026-07-28` conformance harness plus legacy compatibility checks ([`scripts/mcp-conformance/README.md`](../../scripts/mcp-conformance/README.md)) |
 | `make mcp-conformance-legacy` | Only the MCP legacy (`2024-11-05`) compatibility checks on the default build |
+| `make oidc-demo-smoke` | Checks the Ory Hydra demo's authorization servers, mock agent and seed payloads, no gateway ([`OIDC_DEMO.md`](OIDC_DEMO.md)) |
+| `make oidc-demo-run` | The scripted Hydra demo, its hop one walkthrough and hop 2 checks against a native gateway; `oidc-demo-up`, `-seed` and `-down` run the parts |
+| `make oidc-demo-auth0` | The demo with a live Auth0 tenant as the caller's authorization server; needs the gitignored `envs/oidc-demo/auth0.env` |
+| `make oidc-demo-browser` | Leaves the demo running for a look at the dashboard's Agent card tab ([`OIDC_DEMO.md`](OIDC_DEMO.md#showing-the-agent-card-tab)) |
+| `make oidc-sdk-check` | Parses agent cards with the A2A Python and JavaScript SDKs, no gateway or Docker ([`OIDC_DEMO.md`](OIDC_DEMO.md#a2a-sdk-check)) |
+| `make oidc-ui-e2e` | The live OIDC Playwright dashboard tests against the demo's Hydra containers and mock agent ([`TESTING.md`](TESTING.md#live-oidc-dashboard-tests)) |
 
 ### Frontend Tests
 
@@ -373,6 +379,8 @@ Paste the contents of `private.pem` when prompted, followed by an empty line. Th
 ### Full `.agbak` Backup
 
 Full backup and restore are management operations exposed by the running Gateway and dashboard. They require a configured backup encryption key. Retain that key under your organization's key-management and recovery policy; losing it makes the encrypted backup unusable. The legacy `.tgwbak` extension written by earlier builds is still accepted on restore.
+
+A backup's manifest records the Agent Gateway release that took it. A restore refuses a backup from a newer release than the running one, before it changes anything, because a record that release wrote may not be readable here and an unreadable record is skipped on load. A backup from an older release, or one with no recorded release, restores. A backup whose recorded release is not a numeric major.minor.patch version is refused as an invalid manifest. Restore on the same release or a newer one. The check compares released versions only; an unreleased build carries the version of the release before it, so its backups restore onto that earlier release without refusal.
 
 See the dashboard's backup and restore controls for the running instance. Review the storage and encryption settings before relying on backups in an operational environment. Encryption at rest is a separate option and is disabled by default.
 

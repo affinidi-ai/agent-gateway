@@ -3,7 +3,9 @@ use serde_json::{Value, json};
 use super::{ResolvedCredentialInjection, build_injection_headers};
 use crate::config::agent_surface::AgentSurface;
 use crate::config::types::{CredentialInjection, CredentialRequirement, OutboundCredentialBinding};
-use crate::credential_providers::{CredentialProvider, CredentialProviderType, storage::CredentialProviderStorage};
+use crate::credential_providers::{
+    CredentialProvider, CredentialProviderType, ProviderGrant, storage::CredentialProviderStorage,
+};
 use crate::delegation_vault::{DelegationToken, VaultLookupResult, storage::DelegationVaultStorage};
 use crate::jwt_bearer::{JwtVerificationStrategyStorage, models::JwtVerificationStrategy};
 use crate::mcp::continuations::{
@@ -34,7 +36,8 @@ pub struct ModernDelegationContext<'context> {
     pub providers: &'context dyn CredentialProviderStorage,
     pub strategies: &'context dyn JwtVerificationStrategyStorage,
     pub secrets: Option<&'context std::sync::Arc<dyn crate::secrets::SecretsStore>>,
-    pub provider_http: Option<&'context reqwest::Client>,
+    /// How gateway grants reach token endpoints; the environment's settings when `None`.
+    pub grant_egress: Option<&'context crate::delegation_vault::gateway_token::GrantEgress>,
 }
 
 pub enum ModernDelegationResult {
@@ -197,7 +200,7 @@ pub async fn prepare_direct(
             .ok_or(ContinuationError::Unavailable)?,
         strategies: strategies.as_ref(),
         secrets: state.secrets_store.as_ref(),
-        provider_http: None,
+        grant_egress: None,
     }
     .prepare_with_payment(request, now_secs()?, unpaid)
     .await
@@ -264,7 +267,7 @@ pub async fn prepare_transit(
             .as_deref()
             .ok_or(ContinuationError::Unavailable)?,
         secrets: state.secrets_store.as_ref(),
-        provider_http: None,
+        grant_egress: None,
     }
     .prepare(request, now_secs()?)
     .await
@@ -317,6 +320,33 @@ fn validate_injection_destinations<'config>(
 }
 
 impl ModernDelegationContext<'_> {
+    /// The endpoint of the leg this route sends to: the surface's Target, or the Transit
+    /// Point's endpoint.
+    fn leg_endpoint(&self) -> Option<&str> {
+        match &self.route {
+            ContinuationRoute::AccessPoint
+            | ContinuationRoute::Fabric { .. }
+            | ContinuationRoute::FabricSend { .. } => Some(
+                self.surface
+                    .target
+                    .endpoint
+                    .as_str(),
+            ),
+            ContinuationRoute::TransitPoint { alias } => self
+                .surface
+                .transit
+                .as_ref()
+                .and_then(|transit| {
+                    transit
+                        .points
+                        .iter()
+                        .find(|point| &point.alias == alias)
+                })
+                .map(|point| point.target_endpoint.as_str()),
+            ContinuationRoute::StandaloneProxy => None,
+        }
+    }
+
     async fn select<'context>(
         &'context self,
         request: &ValidatedModernMessage,
@@ -350,37 +380,52 @@ impl ModernDelegationContext<'_> {
                 .await
                 .map_err(|_| ContinuationError::Unavailable)?
                 .ok_or(ContinuationError::NotFound)?;
-            let strategy = if provider.provider_type == CredentialProviderType::OAuth2AuthorizationCode {
-                let strategy_id = provider
-                    .consent_identity_strategy_id
-                    .as_deref()
-                    .ok_or(ContinuationError::InvalidRecord)?;
-                Some(
-                    self.strategies
-                        .get(strategy_id)
-                        .await
-                        .map_err(|_| ContinuationError::Unavailable)?
-                        .ok_or(ContinuationError::NotFound)?,
-                )
-            } else {
-                None
+            let grant = provider.provider_type.grant();
+            let strategy = match grant {
+                ProviderGrant::UserConsent => {
+                    let strategy_id = provider
+                        .consent_identity_strategy_id
+                        .as_deref()
+                        .ok_or(ContinuationError::InvalidRecord)?;
+                    Some(
+                        self.strategies
+                            .get(strategy_id)
+                            .await
+                            .map_err(|_| ContinuationError::Unavailable)?
+                            .ok_or(ContinuationError::NotFound)?,
+                    )
+                }
+                ProviderGrant::GatewayToken | ProviderGrant::StaticKey => None,
             };
-            if !crate::tenancy::can_reference(
+            let requires_resource = match grant {
+                ProviderGrant::UserConsent | ProviderGrant::GatewayToken => true,
+                ProviderGrant::StaticKey => false,
+            };
+            if !provider.usable_by(
                 self.surface
                     .tenant_id
                     .as_deref(),
-                provider.tenant_id.as_deref(),
             ) || strategy
                 .as_ref()
                 .is_some_and(|strategy| {
                     !crate::tenancy::can_reference(provider.tenant_id.as_deref(), strategy.tenant_id.as_deref())
                         || crate::sts::mcp_profile::canonical_https_url(&strategy.expected_issuer).is_err()
                 })
-                || (provider.provider_type != CredentialProviderType::ApiKey
+                || (requires_resource
                     && provider
                         .resource
                         .as_deref()
                         .is_none_or(|resource| crate::sts::mcp_profile::canonical_https_url(resource).is_err()))
+                || (provider.provider_type == CredentialProviderType::OAuth2ClientCredentials
+                    && !self
+                        .leg_endpoint()
+                        .is_none_or(crate::proxy::target_credentials::permits_client_credentials_leg))
+                || (provider.provider_type == CredentialProviderType::OAuth2JwtBearer
+                    && !self
+                        .leg_endpoint()
+                        .is_some_and(|endpoint| {
+                            crate::proxy::target_credentials::permits_jwt_bearer_leg(self.surface, endpoint, None)
+                        }))
             {
                 return Err(ContinuationError::BindingMismatch);
             }
@@ -666,16 +711,21 @@ impl ModernDelegationContext<'_> {
         let secrets = self
             .secrets
             .ok_or(ContinuationError::Unavailable)?;
-        if provider.provider_type == CredentialProviderType::ApiKey {
-            let key = crate::delegation_vault::oauth::resolve_api_key(provider, secrets)
-                .await
-                .map_err(|_| ContinuationError::Unavailable)?;
-            if key.is_empty() {
-                return Err(ContinuationError::Unavailable);
+        match provider.provider_type.grant() {
+            ProviderGrant::StaticKey => {
+                let key = crate::delegation_vault::oauth::resolve_api_key(provider, secrets)
+                    .await
+                    .map_err(|_| ContinuationError::Unavailable)?;
+                if key.is_empty() {
+                    return Err(ContinuationError::Unavailable);
+                }
+                return Ok(key);
             }
-            return Ok(key);
+            ProviderGrant::UserConsent => return Err(ContinuationError::InvalidRecord),
+            ProviderGrant::GatewayToken => {}
         }
         let cache_identity = format!("__mcp_client_credentials__:{}", hex::encode(provider_digest(provider)?));
+        let provider_secrets = crate::delegation_vault::gateway_token::ProviderSecrets::new(secrets, provider);
         if let VaultLookupResult::Found(token) = self
             .vault
             .lookup(self.agent_did, &cache_identity, &provider.id)
@@ -696,21 +746,34 @@ impl ModernDelegationContext<'_> {
                 .scopes
                 .iter()
                 .all(|scope| token.scopes.contains(scope))
+            && provider_secrets
+                .still_current(
+                    token
+                        .secret_versions
+                        .as_deref(),
+                )
+                .await
         {
             return Ok(token.access_token);
         }
-        let client = match self.provider_http {
-            Some(client) => client.clone(),
-            None => crate::http_client::external().map_err(|_| ContinuationError::Unavailable)?,
-        };
-        let response = crate::delegation_vault::oauth::fetch_scoped_client_credentials_token(
-            provider,
-            &selected.binding.scopes,
-            secrets,
-            &client,
-        )
-        .await
-        .map_err(|_| ContinuationError::Unavailable)?;
+        let requested_at = chrono::Utc::now();
+        let response = crate::delegation_vault::gateway_token::GATEWAY_GRANT_BACKOFF
+            .request(
+                provider,
+                &selected.binding.scopes,
+                &provider_secrets,
+                &self
+                    .grant_egress
+                    .cloned()
+                    .unwrap_or_else(crate::delegation_vault::gateway_token::GrantEgress::from_environment),
+            )
+            .await
+            .map_err(|error| match error {
+                crate::delegation_vault::gateway_token::GatewayTokenError::Forbidden => {
+                    ContinuationError::BindingMismatch
+                }
+                _ => ContinuationError::Unavailable,
+            })?;
         let scopes = response
             .scope
             .as_deref()
@@ -731,12 +794,7 @@ impl ModernDelegationContext<'_> {
                 .binding
                 .scopes
                 .contains(scope)
-        }) || selected
-            .binding
-            .scopes
-            .iter()
-            .any(|scope| !scopes.contains(scope))
-        {
+        }) {
             return Err(ContinuationError::Denied);
         }
         let current = self
@@ -768,7 +826,8 @@ impl ModernDelegationContext<'_> {
                 expires_at: Some(expires_at),
                 delegation_vc: None,
                 consent_identity: None,
-                consent_granted_at: created,
+                secret_versions: Some(provider_secrets.versions_read()),
+                consent_granted_at: requested_at,
                 last_used_at: None,
                 created_at: created,
                 updated_at: created,
@@ -807,10 +866,6 @@ impl ModernDelegationContext<'_> {
             Err(RefreshError::Uncertain | RefreshError::NotRefreshable) => return Ok(None),
             Err(_) => return Err(ContinuationError::Unavailable),
         };
-        let client = match self.provider_http {
-            Some(client) => client.clone(),
-            None => crate::http_client::external().map_err(|_| ContinuationError::Unavailable)?,
-        };
         let Some(response) = crate::delegation_vault::oauth::refresh_scoped_access_token(
             &provider.provider,
             claim
@@ -821,7 +876,10 @@ impl ModernDelegationContext<'_> {
             &claim.token().scopes,
             self.secrets
                 .ok_or(ContinuationError::Unavailable)?,
-            &client,
+            &self
+                .grant_egress
+                .cloned()
+                .unwrap_or_else(crate::delegation_vault::gateway_token::GrantEgress::from_environment),
         )
         .await
         .map_err(|_| ContinuationError::Unavailable)?
@@ -1216,12 +1274,11 @@ mod tests {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .unwrap();
-            let client = reqwest::Client::builder()
-                .no_proxy()
-                .proxy(reqwest::Proxy::http(format!("http://{}", listener.local_addr().unwrap())).unwrap())
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .unwrap();
+            let grant_endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+            let grant_egress = crate::delegation_vault::gateway_token::GrantEgress {
+                timeout: Duration::from_secs(5),
+                exact_allowlist: Some(grant_endpoint.clone()),
+            };
             let mut tasks = tokio::task::JoinSet::new();
             tasks.spawn(async move {
                 axum::serve(listener, provider_app)
@@ -1285,7 +1342,7 @@ mod tests {
                 .unwrap();
             let provider = providers.create(serde_json::from_value(json!({
                 "id": "provider", "name": "Provider", "provider_id": "provider", "resource": "https://provider.example/api",
-                "token_endpoint": "http://192.0.2.1/token", "client_id_secret_ref": "client-id", "client_secret_secret_ref": "client-secret",
+                "token_endpoint": grant_endpoint, "client_id_secret_ref": "client-id", "client_secret_secret_ref": "client-secret",
                 "consent_identity_strategy_id": strategy.id, "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
             })).unwrap()).await.unwrap();
             let surface: AgentSurface = serde_json::from_value(json!({
@@ -1302,6 +1359,7 @@ mod tests {
             let caller = AuthenticatedIdentity::JwtBearer {
                 subject: "user".into(),
                 claims: json!({"iss": profile.issuer, "sub": "user", "scope": "read"}),
+                strategy: None,
             };
             let now = now_secs().unwrap();
             let service = ContinuationService::new(
@@ -1328,7 +1386,7 @@ mod tests {
                 providers: &providers,
                 strategies: &strategies,
                 secrets: Some(&secrets),
-                provider_http: Some(&client),
+                grant_egress: Some(&grant_egress),
             };
             let other_context = ModernDelegationContext {
                 vault: &other_vault,
@@ -1488,6 +1546,7 @@ mod tests {
 
                 configured.provider_type = CredentialProviderType::OAuth2ClientCredentials;
                 configured.api_key_secret_ref = None;
+                configured.token_endpoint = Some(grant_endpoint.clone());
                 providers
                     .update(configured.clone())
                     .await
@@ -1603,6 +1662,7 @@ mod tests {
         let caller = AuthenticatedIdentity::JwtBearer {
             subject: "user".into(),
             claims: json!({"iss": profile.issuer, "sub": "user", "scope": "read"}),
+            strategy: None,
         };
         let service = ContinuationService::new(
             ContinuationCipher::new(
@@ -1628,7 +1688,7 @@ mod tests {
             providers: &providers,
             strategies: &strategies,
             secrets: None,
-            provider_http: None,
+            grant_egress: None,
         };
         let mut request = ValidatedModernMessage {
             protocol_version: crate::mcp::MCP_MODERN_VERSION.into(),
@@ -1934,6 +1994,45 @@ mod tests {
                 .unwrap(),
             body
         );
+
+        let shared_key: CredentialProvider = serde_json::from_value(json!({
+            "id": "shared-key", "name": "Shared key", "provider_id": "shared-key", "provider_type": "api_key",
+            "api_key_secret_ref": "operator-key", "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+        }))
+        .unwrap();
+        providers
+            .create(CredentialProvider {
+                id: "tenant-key".into(),
+                provider_id: "tenant-key".into(),
+                tenant_id: Some("tenant-a".into()),
+                ..shared_key.clone()
+            })
+            .await
+            .unwrap();
+        providers
+            .create(shared_key)
+            .await
+            .unwrap();
+        let mut tenant_surface = surface.clone();
+        tenant_surface.tenant_id = Some("tenant-a".into());
+        for (provider_id, usable) in [("provider", true), ("shared-key", false), ("tenant-key", true)] {
+            tenant_surface.outbound_credentials[0].credential_provider_id = provider_id.into();
+            let tenant = ModernDelegationContext {
+                surface: &tenant_surface,
+                route: context.route.clone(),
+                variant_id: context.variant_id.clone(),
+                ..context
+            };
+            let selected = tenant.select(&request).await;
+            assert!(
+                match selected {
+                    Ok(selected) => usable && selected.len() == 1,
+                    Err(ContinuationError::BindingMismatch) => !usable,
+                    Err(_) => false,
+                },
+                "{provider_id}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1989,6 +2088,7 @@ mod tests {
             let caller = AuthenticatedIdentity::JwtBearer {
                 subject: "user".into(),
                 claims: json!({"iss": profile.issuer, "sub": "user", "scope": "read"}),
+                strategy: None,
             };
             let now = now_secs().unwrap();
             let service = ContinuationService::new(
@@ -2017,7 +2117,7 @@ mod tests {
                 providers: &providers,
                 strategies: &strategies,
                 secrets: None,
-                provider_http: None,
+                grant_egress: None,
             };
             let request = ValidatedModernMessage {
                 protocol_version: crate::mcp::MCP_MODERN_VERSION.into(),
@@ -2077,5 +2177,413 @@ mod tests {
                 assert_eq!(sent["params"]["_meta"]["io.affinidi.fabric/delegated-credential"], "live-access");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_jwt_bearer_provider_is_selected_only_for_an_https_leg_of_a_surface_that_authenticates_callers() {
+        assert_gateway_token_leg_selection(
+            "oauth2_jwt_bearer",
+            [true, false, false, true, false, false, false, false, false],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_client_credentials_provider_is_selected_for_any_leg_but_plain_http_without_caller_authentication() {
+        assert_gateway_token_leg_selection(
+            "oauth2_client_credentials",
+            [true, false, true, true, false, true, true, true, true],
+        )
+        .await;
+    }
+
+    async fn assert_gateway_token_leg_selection(
+        provider_type: &str,
+        expected: [bool; 9],
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let providers = FileSystemCredentialProviderStore::new(
+            directory
+                .path()
+                .join("providers"),
+        )
+        .await
+        .unwrap();
+        let strategies = FileSystemJwtVerificationStrategyStore::new(
+            directory
+                .path()
+                .join("strategies"),
+        )
+        .await
+        .unwrap();
+        let vault = FileSystemDelegationVaultStore::new(directory.path().join("vault"))
+            .await
+            .unwrap();
+        providers
+            .create(
+                serde_json::from_value(json!({
+                    "id": "jwt", "name": "JWT", "provider_id": "jwt", "provider_type": provider_type,
+                    "resource": "https://provider.example/api",
+                    "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let surface = |target: &str, partner: &str, authenticated: bool| -> AgentSurface {
+            let mut access_point =
+                json!({"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"});
+            if authenticated {
+                access_point["caller_authentication"] = json!({"methods": [{
+                    "type": "jwt_bearer", "jwt_verification_strategy_id": "strategy", "audiences": []
+                }]});
+            }
+            serde_json::from_value(json!({
+                "surface_id": "surface", "name": "Surface", "access_point": access_point,
+                "target": {"endpoint": target},
+                "transit": {"points": [{"name": "Partner", "alias": "partner", "target_endpoint": partner}]},
+                "outbound_credentials": [{"credential_provider_id": "jwt", "scopes": ["read"]}]
+            }))
+            .unwrap()
+        };
+        let authorization = McpResourceServerConfig {
+            resource: "https://gateway.example/mcp".into(),
+            scopes: vec!["read".into()],
+        };
+        let profile = McpIssuerProfile {
+            issuer: "https://gateway.example/oauth2/mcp".into(),
+        };
+        let caller = AuthenticatedIdentity::JwtBearer {
+            subject: "user".into(),
+            claims: json!({"iss": profile.issuer, "sub": "user", "scope": "read"}),
+            strategy: None,
+        };
+        let service = ContinuationService::new(
+            ContinuationCipher::new(
+                "deployment".into(),
+                "key".into(),
+                vec![ContinuationKey::new("key".into(), [7; 32], 1, 1000, 1900).unwrap()],
+            )
+            .unwrap(),
+            Arc::new(EmbeddedContinuations::new(32).unwrap()),
+        );
+        let request = ValidatedModernMessage {
+            protocol_version: crate::mcp::MCP_MODERN_VERSION.into(),
+            client_capabilities: None,
+            client_info: None,
+            method: "tools/call".into(),
+            id: Some(json!(1)),
+            kind: McpMessageKind::Request,
+            params: Some(json!({"name": "read", "arguments": {"value": 1}})),
+        };
+        let access_point = ContinuationRoute::AccessPoint;
+        let partner = ContinuationRoute::TransitPoint { alias: "partner".into() };
+        let unknown_partner = ContinuationRoute::TransitPoint { alias: "unknown".into() };
+        let fabric_send = ContinuationRoute::FabricSend {
+            peer_did: "did:web:peer.example".into(),
+        };
+        let standalone = ContinuationRoute::StandaloneProxy;
+        let https = "https://agent.example/api";
+        let http = "http://agent.example/api";
+        let fabric = "fabric://peer-gateway/peer-surface";
+        for (case, ((route, target, partner_endpoint, authenticated), selected)) in [
+            (&access_point, https, http, true),
+            (&access_point, http, https, true),
+            (&access_point, https, https, false),
+            (&partner, http, https, true),
+            (&partner, https, http, true),
+            (&partner, https, https, false),
+            (&unknown_partner, https, https, true),
+            (&fabric_send, fabric, https, true),
+            (&standalone, https, https, true),
+        ]
+        .into_iter()
+        .zip(expected)
+        .enumerate()
+        {
+            let surface = surface(target, partner_endpoint, authenticated);
+            let context = ModernDelegationContext {
+                service: &service,
+                deployment: "deployment",
+                ttl_secs: 100,
+                surface: &surface,
+                variant_id: None,
+                route: route.clone(),
+                authorization: &authorization,
+                identity: &caller,
+                agent_did: "did:web:agent.example",
+                profile: &profile,
+                vault: &vault,
+                providers: &providers,
+                strategies: &strategies,
+                secrets: None,
+                grant_egress: None,
+            };
+            let outcome = context
+                .select(&request)
+                .await
+                .map(|selected| selected.len());
+            let expected = if selected {
+                Ok(1)
+            } else {
+                Err(ContinuationError::BindingMismatch)
+            };
+            assert_eq!(outcome, expected, "case {case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_service_credential_fails_closed_and_is_regranted_after_its_secret_changes() {
+        use crate::delegation_vault::gateway_token::test_endpoint::{TokenEndpoint, replace_secret};
+
+        let directory = tempfile::tempdir().unwrap();
+        let providers = FileSystemCredentialProviderStore::new(
+            directory
+                .path()
+                .join("providers"),
+        )
+        .await
+        .unwrap();
+        let strategies = FileSystemJwtVerificationStrategyStore::new(
+            directory
+                .path()
+                .join("strategies"),
+        )
+        .await
+        .unwrap();
+        let vault = FileSystemDelegationVaultStore::new(directory.path().join("vault"))
+            .await
+            .unwrap();
+        let secrets: Arc<dyn crate::secrets::SecretsStore> = Arc::new(
+            crate::secrets::FilesystemSecretsStore::new_async(
+                directory
+                    .path()
+                    .join("secrets")
+                    .to_str()
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+        );
+        for (secret_id, value) in
+            [("empty-key", ""), ("client-id", "client"), ("client-secret", "secret"), ("unrelated", "other")]
+        {
+            secrets
+                .create(crate::secrets::CreateSecretRequest {
+                    tenant_id: None,
+                    name: secret_id.into(),
+                    secret_id: secret_id.into(),
+                    description: None,
+                    value: value.into(),
+                    secret_type: "General".into(),
+                    tags: vec![],
+                })
+                .await
+                .unwrap();
+        }
+        let rejecting =
+            TokenEndpoint::start(axum::http::StatusCode::BAD_REQUEST, json!({"error": "invalid_client"}).to_string())
+                .await;
+        let token_with_scope = |scope: &str| {
+            json!({"access_token": "service-token", "token_type": "Bearer", "expires_in": 3600, "scope": scope})
+                .to_string()
+        };
+        let narrowing = TokenEndpoint::start(axum::http::StatusCode::OK, token_with_scope("other")).await;
+        let widening = TokenEndpoint::start(axum::http::StatusCode::OK, token_with_scope("read extra")).await;
+        let granting = TokenEndpoint::start(axum::http::StatusCode::OK, token_with_scope("read")).await;
+        let grant_egress = crate::delegation_vault::gateway_token::GrantEgress {
+            timeout: std::time::Duration::from_secs(5),
+            exact_allowlist: Some(format!("{},{},{},{}", rejecting.url, narrowing.url, widening.url, granting.url)),
+        };
+        let provider = |id: &str, provider_type: &str, extra: serde_json::Value| {
+            let mut provider = json!({
+                "id": id, "name": id, "provider_id": id, "provider_type": provider_type,
+                "resource": "https://provider.example/api",
+                "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+            });
+            provider
+                .as_object_mut()
+                .unwrap()
+                .extend(
+                    extra
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                );
+            serde_json::from_value(provider).unwrap()
+        };
+        let client_credentials = |id: &str, endpoint: &str| {
+            provider(
+                id,
+                "oauth2_client_credentials",
+                json!({"token_endpoint": endpoint, "client_id_secret_ref": "client-id",
+                    "client_secret_secret_ref": "client-secret"}),
+            )
+        };
+        for configured in [
+            provider("empty", "api_key", json!({"api_key_secret_ref": "empty-key"})),
+            client_credentials("rejected", &rejecting.url),
+            client_credentials("blocked", "http://127.0.0.1:9/token"),
+            client_credentials("narrowed", &narrowing.url),
+            client_credentials("widened", &widening.url),
+            client_credentials("granted", &granting.url),
+        ] {
+            providers
+                .create(configured)
+                .await
+                .unwrap();
+        }
+        let surface: AgentSurface = serde_json::from_value(json!({
+            "surface_id": "surface", "name": "Surface",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
+            "target": {"endpoint": "https://provider.example/api"},
+            "outbound_credentials": [
+                {"credential_provider_id": "empty", "scopes": ["read"],
+                    "inject_as": {"type": "custom_header", "name": "X-Empty", "format": "{value}"}},
+                {"credential_provider_id": "rejected", "scopes": ["read"],
+                    "inject_as": {"type": "custom_header", "name": "X-Rejected", "format": "{value}"}},
+                {"credential_provider_id": "blocked", "scopes": ["read"],
+                    "inject_as": {"type": "custom_header", "name": "X-Blocked", "format": "{value}"}},
+                {"credential_provider_id": "narrowed", "scopes": ["read"],
+                    "inject_as": {"type": "custom_header", "name": "X-Narrowed", "format": "{value}"}},
+                {"credential_provider_id": "widened", "scopes": ["read"],
+                    "inject_as": {"type": "custom_header", "name": "X-Widened", "format": "{value}"}},
+                {"credential_provider_id": "granted", "scopes": ["read"],
+                    "inject_as": {"type": "custom_header", "name": "X-Granted", "format": "{value}"}}
+            ]
+        }))
+        .unwrap();
+        let authorization = McpResourceServerConfig {
+            resource: "https://gateway.example/mcp".into(),
+            scopes: vec!["read".into()],
+        };
+        let profile = McpIssuerProfile {
+            issuer: "https://gateway.example/oauth2/mcp".into(),
+        };
+        let caller = AuthenticatedIdentity::JwtBearer {
+            subject: "user".into(),
+            claims: json!({"iss": profile.issuer, "sub": "user", "scope": "read"}),
+            strategy: None,
+        };
+        let service = ContinuationService::new(
+            ContinuationCipher::new(
+                "deployment".into(),
+                "key".into(),
+                vec![ContinuationKey::new("key".into(), [7; 32], 1, 1000, 1900).unwrap()],
+            )
+            .unwrap(),
+            Arc::new(EmbeddedContinuations::new(32).unwrap()),
+        );
+        let request = ValidatedModernMessage {
+            protocol_version: crate::mcp::MCP_MODERN_VERSION.into(),
+            client_capabilities: None,
+            client_info: None,
+            method: "tools/call".into(),
+            id: Some(json!(1)),
+            kind: McpMessageKind::Request,
+            params: Some(json!({"name": "read", "arguments": {"value": 1}})),
+        };
+        macro_rules! context {
+            ($egress:expr) => {
+                ModernDelegationContext {
+                    service: &service,
+                    deployment: "deployment",
+                    ttl_secs: 100,
+                    surface: &surface,
+                    variant_id: None,
+                    route: ContinuationRoute::AccessPoint,
+                    authorization: &authorization,
+                    identity: &caller,
+                    agent_did: "did:web:agent.example",
+                    profile: &profile,
+                    vault: &vault,
+                    providers: &providers,
+                    strategies: &strategies,
+                    secrets: Some(&secrets),
+                    grant_egress: $egress,
+                }
+            };
+        }
+
+        let with_endpoint = context!(Some(&grant_egress));
+        let selected = with_endpoint
+            .select(&request)
+            .await
+            .unwrap();
+        let by_id = |id: &str| {
+            selected
+                .iter()
+                .find(|selected| selected.provider.id == id)
+                .unwrap()
+        };
+        assert_eq!(
+            with_endpoint
+                .service_credential(by_id("empty"), 100)
+                .await,
+            Err(ContinuationError::Unavailable)
+        );
+        assert_eq!(
+            with_endpoint
+                .service_credential(by_id("rejected"), 100)
+                .await,
+            Err(ContinuationError::Unavailable)
+        );
+        assert_eq!(
+            rejecting
+                .calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            with_endpoint
+                .service_credential(by_id("narrowed"), 100)
+                .await,
+            Err(ContinuationError::Unavailable)
+        );
+        assert_eq!(narrowing.grants(), 1);
+        assert_eq!(
+            with_endpoint
+                .service_credential(by_id("widened"), 100)
+                .await,
+            Err(ContinuationError::Denied)
+        );
+        assert_eq!(widening.grants(), 1);
+        assert!(
+            vault
+                .list_all()
+                .await
+                .unwrap()
+                .is_empty(),
+            "a grant missing a requested scope or adding one is never stored"
+        );
+
+        for (expected_grants, change) in [(1, None), (1, Some("unrelated")), (2, Some("client-secret"))] {
+            if let Some(secret_id) = change {
+                replace_secret(&secrets, secret_id, "changed").await;
+            }
+            assert_eq!(
+                with_endpoint
+                    .service_credential(by_id("granted"), 100)
+                    .await,
+                Ok("service-token".to_string())
+            );
+            assert_eq!(granting.grants(), expected_grants, "after a change to {change:?}");
+        }
+
+        let from_environment = context!(None);
+        let selected = from_environment
+            .select(&request)
+            .await
+            .unwrap();
+        let blocked = selected
+            .iter()
+            .find(|selected| selected.provider.id == "blocked")
+            .unwrap();
+        assert_eq!(
+            from_environment
+                .service_credential(blocked, 100)
+                .await,
+            Err(ContinuationError::BindingMismatch)
+        );
     }
 }

@@ -1,0 +1,13 @@
+{
+  "name": "Fixture Agent",
+  "interfaces": ["https://gateway.example.test/a2a/fixture"],
+  "schemes": {
+    "agent_gateway": {
+      "type": "oauth2",
+      "metadataUrl": "https://auth.example.test/.well-known/oauth-authorization-server",
+      "flows": ["clientCredentials"],
+      "scopes": ["agent.invoke"]
+    }
+  },
+  "requirements": [{"agent_gateway": ["agent.invoke"]}]
+}

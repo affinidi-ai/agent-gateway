@@ -9,6 +9,7 @@ pub use crate::audit::events::{RejectionReason, RejectionStage};
 
 use crate::audit::events::{AuthScheme, RateLimitScope};
 use crate::delegation_vault::audit::{DelegationAuditAction, DelegationAuditEvent, audit_event, emit};
+use crate::metrics::backends::prometheus::track_scope_denied;
 use crate::protocols::protected_resource::ResourceTokenError;
 use crate::source_auth::errors::SourceAuthError;
 use crate::source_auth::models::SourceAuthConfig;
@@ -61,6 +62,9 @@ pub fn auth_failed(
     blocking: bool,
     client_ip: Option<IpAddr>,
 ) {
+    if reason == INSUFFICIENT_SCOPE {
+        track_scope_denied(scheme.as_str());
+    }
     emit("auth_failed", || {
         facts.record(DelegationAuditAction::AuthFailed {
             scheme,
@@ -183,6 +187,20 @@ impl RoutingRefusal {
     }
 }
 
+/// Sets the surface variant of a request whose variant can't be resolved:
+/// `_unknown_` for an unknown alias, the disabled variant's alias, or nothing
+/// for a misconfigured default.
+pub fn set_unresolved_request_variant(error: &crate::config::agent_surface_variants::VariantResolveError) {
+    use crate::config::agent_surface_variants::{SurfaceVariant, VariantResolveError};
+    use crate::observability::policy_audit::set_request_variant;
+
+    match error {
+        VariantResolveError::UnknownAlias(_) => set_request_variant(SurfaceVariant::UNKNOWN),
+        VariantResolveError::DisabledVariant(alias) => set_request_variant(alias),
+        VariantResolveError::MisconfiguredDefault(_) => {}
+    }
+}
+
 /// Records a routing refusal for `error` and returns how to answer it. The
 /// request's surface variant is set first: `_unknown_` for an unknown alias,
 /// the disabled variant's alias, or nothing for a misconfigured default. The
@@ -195,14 +213,9 @@ pub fn refuse_routing(
     rpc_error_code: Option<i64>,
 ) -> RoutingRefusal {
     use crate::config::agent_surface_variants::{SurfaceVariant, VariantResolveError};
-    use crate::observability::policy_audit::set_request_variant;
     use axum::http::StatusCode;
 
-    match error {
-        VariantResolveError::UnknownAlias(_) => set_request_variant(SurfaceVariant::UNKNOWN),
-        VariantResolveError::DisabledVariant(alias) => set_request_variant(alias),
-        VariantResolveError::MisconfiguredDefault(_) => {}
-    }
+    set_unresolved_request_variant(error);
     let refusal = match error {
         VariantResolveError::UnknownAlias(alias) => RoutingRefusal {
             reason: RejectionReason::UnknownVariant,
@@ -329,10 +342,13 @@ pub fn source_auth_scheme(config: &SourceAuthConfig) -> AuthScheme {
     }
 }
 
+const INSUFFICIENT_SCOPE: &str = "insufficient_scope";
+
 pub fn source_auth_reason(error: &SourceAuthError) -> &'static str {
     match error {
         SourceAuthError::MissingCredential { .. } => "missing_credential",
         SourceAuthError::InvalidCredential { .. } => "invalid_credential",
+        SourceAuthError::InsufficientScope { .. } => INSUFFICIENT_SCOPE,
         SourceAuthError::ConfigNotFound { .. } => "config_not_found",
         SourceAuthError::Internal { .. } => "internal",
     }
@@ -342,7 +358,7 @@ pub fn resource_token_reason(error: ResourceTokenError) -> &'static str {
     match error {
         ResourceTokenError::Missing => "missing_credential",
         ResourceTokenError::Invalid => "invalid_credential",
-        ResourceTokenError::InsufficientScope => "insufficient_scope",
+        ResourceTokenError::InsufficientScope => INSUFFICIENT_SCOPE,
         ResourceTokenError::Unavailable => "unavailable",
     }
 }
@@ -665,6 +681,74 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_scope_is_counted_even_when_no_sink_selects_the_event() {
+        let counter = |scheme: &str| {
+            crate::metrics::backends::prometheus::SCOPE_DENIED
+                .with_label_values(&[scheme])
+                .get()
+        };
+        let did_auth_before = counter("did_auth");
+        let mtls_before = counter("mtls");
+
+        auth_failed(&facts(), AuthScheme::DidAuth, "insufficient_scope", true, None);
+        auth_failed(&facts(), AuthScheme::Mtls, "invalid_credential", true, None);
+
+        assert_eq!(counter("did_auth"), did_auth_before + 1);
+        assert_eq!(counter("mtls"), mtls_before, "another failure reason is not a scope denial");
+    }
+
+    #[test]
+    fn only_an_insufficient_scope_source_failure_moves_the_scope_denied_counter() {
+        use crate::source_auth::errors::SourceAuthError;
+        let counter = || {
+            crate::metrics::backends::prometheus::SCOPE_DENIED
+                .with_label_values(&["api_key"])
+                .get()
+        };
+        let record = |error: &SourceAuthError| {
+            auth_failed(&facts(), AuthScheme::ApiKey, source_auth_reason(error), true, None);
+        };
+        let missing = SourceAuthError::MissingCredential { reason: "no key".into() };
+        let invalid = SourceAuthError::InvalidCredential { reason: "bad key".into() };
+        let short = SourceAuthError::InsufficientScope {
+            missing: vec!["Task.Run".into()],
+        };
+
+        let before = counter();
+        record(&missing);
+        assert_eq!(counter(), before, "a missing credential is not a scope denial");
+        record(&invalid);
+        assert_eq!(counter(), before, "an invalid credential is not a scope denial");
+        record(&short);
+        assert_eq!(counter(), before + 1);
+        record(&short);
+        assert_eq!(counter(), before + 2);
+
+        let expected = format!("agent_gateway_scope_denied_total{{scheme=\"api_key\"}} {}", before + 2);
+        let exposition = crate::metrics::backends::prometheus::get_metrics();
+        assert!(
+            exposition
+                .lines()
+                .any(|line| line == expected),
+            "missing {expected} in:\n{exposition}"
+        );
+    }
+
+    #[test]
+    fn a_refused_resource_token_scope_is_counted_under_its_scheme() {
+        let counter = || {
+            crate::metrics::backends::prometheus::SCOPE_DENIED
+                .with_label_values(&["mcp_resource_token"])
+                .get()
+        };
+        let before = counter();
+
+        resource_token_failed(&facts(), ResourceTokenError::InsufficientScope, None);
+
+        assert!(counter() > before);
+    }
+
+    #[test]
     fn source_auth_schemes_map_onto_audit_schemes() {
         use crate::source_auth::models::SourceAuthConfig;
         let scheme = |config: &SourceAuthConfig| source_auth_scheme(config);
@@ -691,6 +775,7 @@ mod tests {
             }),
             "invalid_credential"
         );
+        assert_eq!(reason(SourceAuthError::InsufficientScope { missing: Default::default() }), "insufficient_scope");
         assert_eq!(reason(SourceAuthError::ConfigNotFound { id: "s".into() }), "config_not_found");
         assert_eq!(reason(SourceAuthError::Internal { reason: "x".into() }), "internal");
     }

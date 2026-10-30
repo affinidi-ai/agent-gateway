@@ -17,6 +17,7 @@ import type { DerivedEdge, SlotDirection } from './elements/edges/types';
 import { isSyntheticFabricNodeId } from './elements/synthesizeFabric';
 import { syncTrustCheckReviewBadge } from './elements/trust-check/reviewBadge';
 import { fetchRoutingConfig } from './elements/access-point/defaults';
+import { resizeNeedsRebuild } from './canvasResize';
 import {
   POLICY_UNCONFIGURED_DASH,
   policyDefinitionMissing,
@@ -909,6 +910,10 @@ function pinSyntheticFabricChain(
   });
 }
 
+function isSingleSelected(nodeId: string, selectedNodeId: string | null | undefined): boolean {
+  return !!selectedNodeId && selectedNodeId !== '__surface__' && nodeId === selectedNodeId;
+}
+
 // ─── Component ──────────────────────────────────────────────────────────────
 
 const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
@@ -968,6 +973,9 @@ const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
     surfacePolicyIdsRef.current = surfacePolicyIds;
   }, [surfacePolicyIds]);
   const lastSizeRef = useRef<{ w: number; h: number }>({ w: 0, h: 0 });
+  // Set when the rebuild effect found the container hidden, so a structure change made while the
+  // tab was hidden is drawn on the next reveal even when the size equals the last drawn size.
+  const rebuildPendingRef = useRef(false);
   // Captured on every rebuild so the surfaceSize-prop effect (driven by
   // undo/redo, where the parent reverts state.surfaceSize) can re-apply
   // a size change through the same machinery the live drag uses, with
@@ -1376,9 +1384,7 @@ const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
     const ro = new ResizeObserver(() => {
       const w = el.clientWidth;
       const h = el.clientHeight;
-      if (w === 0 || h === 0) return;
-      const last = lastSizeRef.current;
-      if (Math.abs(last.w - w) < 1 && Math.abs(last.h - h) < 1) return;
+      if (!resizeNeedsRebuild(lastSizeRef.current, { w, h }, rebuildPendingRef.current)) return;
       lastSizeRef.current = { w, h };
       // Keep the SVG's intrinsic size and viewBox in sync with the
       // container immediately so the content never gets scaled by the
@@ -1406,8 +1412,10 @@ const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
     // bail out. The ResizeObserver above will bump sizeKey when it gains a
     // size, which will re-run this effect.
     if (measuredW === 0 || measuredH === 0) {
+      rebuildPendingRef.current = true;
       return;
     }
+    rebuildPendingRef.current = false;
     const width = measuredW;
     const height = measuredH;
     const centerY = height / 2;
@@ -2525,6 +2533,7 @@ const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
       .enter()
       .append('line')
       .attr('class', 'link')
+      .attr('data-testid', 'canvas-link')
       .attr('stroke-width', d => (d.type === 'middleware' ? 1.5 : 2))
       .attr('stroke', d => {
         if (d.type === 'middleware') {
@@ -2589,6 +2598,8 @@ const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
       .attr('data-node-id', d => d.id)
       .attr('data-node-type', d => d.type)
       .attr('data-testid', d => `surface-node-${d.type}`)
+      .classed('node-single-selected', d => isSingleSelected(d.id, selectedNodeIdRef.current))
+      .classed('lasso-selected', d => selectedNodesRef.current.has(d.id))
       .style('cursor', d => {
         if (d.type === 'surface') return 'pointer';
         return 'pointer';
@@ -4599,11 +4610,9 @@ const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
   // shouldn't redraw the whole graph.
   useEffect(() => {
     if (!svgRef.current) return;
-    const svg = d3.select(svgRef.current);
-    svg.selectAll('.node').classed('node-single-selected', false);
-    if (selectedNodeId && selectedNodeId !== '__surface__') {
-      svg.select(`[data-node-id="${selectedNodeId}"]`).classed('node-single-selected', true);
-    }
+    d3.select(svgRef.current)
+      .selectAll<SVGGElement, D3Node>('.node')
+      .classed('node-single-selected', d => isSingleSelected(d.id, selectedNodeId));
   }, [selectedNodeId, nodes]);
 
   // ─── Externally-controlled multi-selection sync ─────────────────────
@@ -4994,7 +5003,7 @@ const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
     >
-      <svg ref={svgRef} />
+      <svg ref={svgRef} data-testid="surface-canvas" />
       {variantNode && (
         <div
           style={{

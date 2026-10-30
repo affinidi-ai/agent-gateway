@@ -17,8 +17,7 @@ use tracing::{Instrument, debug, error, info, warn};
 
 use crate::a2a::{
     build_target_url, create_error_response, create_jsonrpc_error_response, inject_custom_metadata_extension,
-    inspect_message_extensions, is_hop_by_hop_header, rewrite_agent_card_urls, should_forward_request_header,
-    validate_jsonrpc_envelope,
+    inspect_message_extensions, is_hop_by_hop_header, should_forward_request_header, validate_jsonrpc_envelope,
 };
 use crate::observability::broadcast_payload_capture_async;
 use crate::observability::loggable;
@@ -28,6 +27,7 @@ use crate::state::{MultiSurfaceProxyState, ProxyState};
 use crate::{channel_debug, channel_error, channel_info, channel_warn};
 
 mod a2a_stream;
+pub(crate) mod agent_card;
 pub(crate) mod surface_payment;
 
 /// Lazy-initialized SSE session manager for MCP proxy:// channels.
@@ -472,7 +472,7 @@ fn extract_jwt_claims_from_headers(headers: &HeaderMap) -> Option<HashMap<String
 /// authenticity is established by source authentication; this only surfaces the
 /// claims for policy input.
 pub(crate) fn decode_bearer_jwt_claims(auth_header: &str) -> Option<HashMap<String, serde_json::Value>> {
-    let token = auth_header.strip_prefix("Bearer ")?;
+    let token = crate::jwt_bearer::validator::extract_bearer_with_scheme(Some(auth_header), "Bearer").ok()?;
 
     // Split JWT into parts (header.payload.signature)
     let parts: Vec<&str> = token.split('.').collect();
@@ -553,67 +553,104 @@ impl CallerAssertion {
         }
     }
 
-    /// A caller request the gateway forwards to its target. A caller whose
-    /// source authentication failed has been vetted by nobody, whatever the
-    /// path; otherwise [`Self::for_request`] decides.
+    /// A caller request the gateway forwards to `surface`'s target, `path` being
+    /// its route tail. A caller whose source authentication failed has been
+    /// vetted by nobody, whatever the path; otherwise only a public discovery
+    /// read of the surface skipped caller authentication.
     pub(crate) fn for_forwarded_request(
+        surface: &crate::config::agent_surface::AgentSurface,
         method: &str,
         path: &str,
         source_auth_failed: bool,
     ) -> Self {
-        if source_auth_failed {
+        if source_auth_failed || crate::proxy::paths::is_public_surface_request(surface, method, path) {
             Self::Unauthenticated
         } else {
-            Self::for_request(method, path)
+            Self::Authenticated
         }
     }
 }
 
-pub(crate) async fn inject_target_auth_header(
-    target_auth: &crate::config::TargetAuthConfig,
-    secrets_store: &Option<Arc<dyn crate::secrets::SecretsStore>>,
-    channel_name: &str,
-    caller: CallerAssertion,
-) -> anyhow::Result<Option<(String, String)>> {
-    use crate::config::TargetAuthMethod;
+/// Whether the surface authenticates its callers: caller authentication with at
+/// least one method, or MCP resource authorization.
+pub(crate) fn surface_authenticates_callers(surface: &crate::config::agent_surface::AgentSurface) -> bool {
+    surface
+        .access_point
+        .caller_authentication
+        .as_ref()
+        .is_some_and(|authentication| {
+            !authentication
+                .methods
+                .is_empty()
+        })
+        || surface
+            .mcp_http
+            .as_ref()
+            .is_some_and(|http| http.authorization.is_some())
+}
 
-    if !caller.permits_target_credential() {
-        warn!(
-            channel = %channel_name,
-            "Refusing to inject target credentials: the caller was not authenticated"
-        );
-        return Ok(None);
+/// Whether the caller's own bearer token is sent on to the Target: a JWT bearer method
+/// with `forward_header`, on an Access Point that is neither an MCP Resource Server nor
+/// declaring. A declaring Access Point is the resource the token was issued for, so the
+/// token never leaves the gateway.
+pub(crate) fn forwards_caller_token(
+    surface: &crate::config::agent_surface::AgentSurface,
+    declaration: Option<&crate::source_auth::declaration::DeclarationOutcome>,
+) -> bool {
+    surface
+        .source_auth()
+        .is_some_and(
+            |auth| matches!(auth, crate::source_auth::SourceAuthConfig::JwtBearer(config) if config.forward_header),
+        )
+        && surface
+            .mcp_http
+            .as_ref()
+            .and_then(|http| http.authorization.as_ref())
+            .is_none()
+        && !matches!(declaration, Some(crate::source_auth::declaration::DeclarationOutcome::Declare(_)))
+}
+
+/// The 503 detail for a request to an Access Point that cannot serve its declaration.
+pub(crate) fn unservable_declaration_detail(protocol: &crate::config::agent_surface::SurfaceProtocol) -> &'static str {
+    match protocol {
+        crate::config::agent_surface::SurfaceProtocol::Mcp => "Invalid MCP protected resource",
+        _ => "Caller authentication unavailable",
     }
+}
 
-    match &target_auth.method {
-        TargetAuthMethod::StaticSecret {
-            secret_id,
-            header_name,
-            header_format,
-        } => {
-            let store = secrets_store
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("Secrets store not available"))?;
-
-            let secret = store
-                .get_by_secret_id(secret_id)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to load secret '{}': {}", secret_id, e))?
-                .ok_or_else(|| anyhow::anyhow!("Secret with secret_id '{}' not found", secret_id))?;
-
-            // Format the header value
-            let header_value = header_format.replace("{value}", &secret.value);
-
-            debug!(channel = channel_name, secret_id = %secret_id, header = %header_name, "Resolved target auth secret");
-
-            Ok(Some((header_name.clone(), header_value)))
-        }
-        TargetAuthMethod::CredentialLookup => {
-            // CredentialLookup method not yet implemented - using Secrets approach instead
-            warn!(channel = channel_name, "CredentialLookup method not implemented, skipping target auth injection");
-            Ok(None)
-        }
-    }
+/// The declaration of the Access Point variant a request selected, resolved once per
+/// request. A strategy store failure reads as a declaration the Access Point cannot
+/// serve, so its callers fail closed rather than pass through.
+pub(crate) async fn resolve_access_point_declaration(
+    surface: &crate::config::agent_surface::AgentSurface,
+    alias: Option<&str>,
+    source_auth_middleware: Option<&crate::source_auth::SourceAuthMiddleware>,
+    network: &crate::config::NetworkConfig,
+) -> crate::source_auth::declaration::DeclarationOutcome {
+    let strategies = source_auth_middleware.map(crate::source_auth::SourceAuthMiddleware::provider_store);
+    let outcome = crate::source_auth::declaration::resolve_surface_declaration(
+        surface,
+        alias,
+        strategies.as_deref(),
+        network,
+    )
+    .await
+    .unwrap_or_else(|error| {
+        warn!(surface = %surface.name, error = %error, "Access Point declaration unavailable: strategy store failed");
+        crate::source_auth::declaration::DeclarationOutcome::Unservable(
+            crate::source_auth::declaration::UnservableDeclaration::new(
+                crate::source_auth::declaration::UnservableReason::StrategyStoreUnavailable,
+                "the JWT verification strategy store is unavailable",
+            ),
+        )
+    });
+    debug!(
+        surface = %surface.name,
+        outcome = outcome.label(),
+        reason = outcome.reason_code(),
+        "Access Point declaration resolved"
+    );
+    outcome
 }
 
 /// Load and prepare DID:webvh identity context for a channel request
@@ -735,29 +772,10 @@ pub async fn handle_agent_card(
             .surface_id
             .as_str();
         let resource_url = "/.well-known/agent-card.json";
-        let empty_body: &[u8] = b""; // Agent card is a GET request
-
-        // A delegated (Model B) x402 policy has no local price/verify config to
-        // check here and is never routed through the delegation relay on this
-        // endpoint — skip it so an agent-card fetch isn't paywalled against an
-        // empty local challenge.
-        let x402_required = state
-            .surface
-            .x402_config()
-            .is_some_and(|p| p.enabled && p.provider != crate::config::types::X402Provider::AgentPay);
-        let mpp_required = state
-            .surface
-            .mpp_config()
-            .is_some_and(|p| {
-                crate::mpp::should_require_payment(
-                    p,
-                    &state
-                        .surface
-                        .channel_protocol(),
-                    empty_body,
-                    None,
-                )
-            });
+        let agent_card::CardPaymentGates {
+            x402: x402_required,
+            mpp: mpp_required,
+        } = agent_card::card_payment_gates(&state.surface);
 
         if x402_required || mpp_required {
             let payment_signature = crate::x402::extract_payment_signature(
@@ -837,284 +855,7 @@ pub async fn handle_agent_card(
         }
     }
 
-    let prepared_a2a_proxy_agent_card = prepare_a2a_proxy_agent_card(&state, &channel_name).await?;
-    let agent_card_was_synthesized = prepared_a2a_proxy_agent_card.is_some();
-
-    // Build target URL, respecting override_agent_card_location if configured
-    let target_url = if prepared_a2a_proxy_agent_card.is_none()
-        && state
-            .surface
-            .override_agent_card_location()
-        && state
-            .surface
-            .agent_card_location_path()
-            .is_some()
-    {
-        let custom_path = state
-            .surface
-            .agent_card_location_path()
-            .unwrap();
-        let endpoint = &state.surface.target.endpoint;
-        let origin = if let Some(scheme_end) = endpoint.find("://") {
-            let after_scheme = &endpoint[scheme_end + 3..];
-            let authority_end = after_scheme
-                .find('/')
-                .unwrap_or(after_scheme.len());
-            &endpoint[..scheme_end + 3 + authority_end]
-        } else {
-            endpoint.as_str()
-        };
-        if custom_path.starts_with('/') {
-            format!("{}{}", origin, custom_path)
-        } else {
-            format!("{}/{}", origin, custom_path)
-        }
-    } else {
-        crate::proxy::protocol_router::join_endpoint_path(
-            &state.surface.target.endpoint,
-            "/.well-known/agent-card.json",
-        )
-    };
-
-    let (mut agent_card, prepared_identity) = if let Some(prepared) = prepared_a2a_proxy_agent_card {
-        (prepared.card, prepared.identity)
-    } else {
-        (fetch_agent_card_from_surface_target(&state, &headers, &source_addr, &channel_name, &target_url).await?, None)
-    };
-
-    let card_bytes = serde_json::to_vec(&agent_card).unwrap_or_default();
-    let resolved_identity = if let Some(identity) = prepared_identity {
-        identity
-    } else {
-        let card_identity_selector = state
-            .protected_selector
-            .as_ref()
-            .or(state
-                .identity_selector
-                .as_ref());
-        let card_identity_rules = state
-            .protected_rules_engine
-            .as_ref()
-            .or(state
-                .identity_rules_engine
-                .as_ref());
-        match crate::proxy::backend_identity::resolve_protected_agent_identity(
-            &card_bytes,
-            &state.surface,
-            card_identity_selector,
-            card_identity_rules,
-            &channel_name,
-            crate::proxy::backend_identity::IdentityResponseKind::PublicAgentCard,
-            None,
-        )
-        .await
-        {
-            Ok(identity) => identity,
-            Err(e) => {
-                warn!(
-                    channel = channel_name,
-                    error = %e,
-                    code = %e.code(),
-                    "Protected agent identity resolution failed for agent card intercept"
-                );
-                return Err(crate::a2a::create_identity_error_response(
-                    e.http_status(),
-                    e.code(),
-                    "protected_identity",
-                    &channel_name,
-                    &e.to_string(),
-                ));
-            }
-        }
-    };
-
-    // External slot resolution (Surface Builder external identity node).
-    // Side-effect: issues DID for the external counterparty via vc_issuer.
-    if state
-        .external_selector
-        .is_some()
-        && let Err(e) = crate::proxy::backend_identity::resolve_external_agent_identity(
-            &card_bytes,
-            &state.surface,
-            state
-                .external_selector
-                .as_ref(),
-            state
-                .external_rules_engine
-                .as_ref(),
-            &channel_name,
-            crate::proxy::backend_identity::IdentityResponseKind::PublicAgentCard,
-            None, // agent-card fetch has no inbound caller token
-        )
-        .await
-    {
-        warn!(
-            channel = channel_name,
-            error = %e,
-            code = %e.code(),
-            "External agent identity resolution failed for agent card intercept"
-        );
-        return Err(crate::a2a::create_identity_error_response(
-            e.http_status(),
-            e.code(),
-            "external_identity",
-            &channel_name,
-            &e.to_string(),
-        ));
-    }
-
-    // Rewrite upstream cards to point back to the proxy; synthesized A2A Proxy
-    // cards already derive their URL from the exposing Access Point.
-    if !agent_card_was_synthesized {
-        let card_bytes = serde_json::to_vec(&agent_card).unwrap_or_default();
-        let rewritten = rewrite_agent_card_urls(
-            &card_bytes,
-            &state.surface,
-            &state.config,
-            &state.network_config,
-            &resolved_identity,
-            crate::a2a::AgentCardKind::Public,
-        )
-        .await
-        .map_err(|e| {
-            warn!(channel = channel_name, error = %e, "Failed to rewrite agent card URLs");
-            create_error_response(StatusCode::BAD_GATEWAY, "Failed to rewrite agent card URLs")
-        })?;
-        agent_card = serde_json::from_slice(rewritten.as_ref()).map_err(|e| {
-            warn!(channel = channel_name, error = %e, "Failed to parse rewritten agent card JSON");
-            create_error_response(StatusCode::BAD_GATEWAY, "Invalid rewritten agent card JSON")
-        })?;
-    }
-
-    // Replace agent-identity/v1 with agent-identity-credential/v1 (signed VP)
-    if let Some(selector) = state
-        .identity_selector
-        .as_ref()
-    {
-        let vc_issuer = selector.get_vc_issuer();
-        if let Err(e) = crate::a2a::inject_credential_into_agent_card(
-            &mut agent_card,
-            &resolved_identity,
-            &vc_issuer,
-            &channel_name,
-        )
-        .await
-        {
-            error!(channel = channel_name, error = %e, "Failed to inject identity credential into agent card");
-            return Err(create_error_response(
-                StatusCode::BAD_GATEWAY,
-                &format!("Agent card identity credential injection failed: {}", e),
-            ));
-        }
-    }
-
-    // Inject Agent DNA + DID from the channel's did:webvh identity into the agent card.
-    // Per the February demo design: DNA is randomly generated at identity creation time
-    // and surfaced here so callers (other agents, UI clients) can observe the UAI / DNA
-    // without needing to resolve the did.jsonl separately.
-    #[cfg(feature = "didwebvh")]
-    if let (Some(did_config), Some(identity_store)) = (
-        state
-            .surface
-            .didwebvh_identity_legacy(),
-        state
-            .didwebvh_identity_store
-            .as_ref(),
-    ) {
-        match identity_store
-            .get(&did_config.identity_id)
-            .await
-        {
-            Ok(Some(identity)) => {
-                if let Some(obj) = agent_card.as_object_mut() {
-                    obj.insert("agentDid".to_string(), JsonValue::String(identity.did.clone()));
-                    if let Some(dna_value) = identity
-                        .metadata
-                        .get("agentDNA")
-                    {
-                        obj.insert("agentDNA".to_string(), dna_value.clone());
-                        info!(
-                            channel = channel_name,
-                            did = %identity.did,
-                            "Injected agentDNA into agent card"
-                        );
-                    }
-                }
-            }
-            Ok(None) => {
-                warn!(
-                    channel = channel_name,
-                    identity_id = %did_config.identity_id,
-                    "Configured did:webvh identity not found — skipping DNA injection"
-                );
-            }
-            Err(e) => {
-                warn!(
-                    channel = channel_name,
-                    identity_id = %did_config.identity_id,
-                    error = %e,
-                    "Failed to load did:webvh identity for agent card — skipping DNA injection"
-                );
-            }
-        }
-    }
-
-    info!(channel = channel_name, "Successfully fetched and parsed agent card");
-
-    // Trust Recorder — writes TrAdmin records to configured TRs on the
-    // discovery (agent-card) fetch, so a fresh surface populates its trust
-    // registry on the first `.well-known/agent-card.json` request instead of
-    // waiting for the first real message. Fire-and-forget; idempotent —
-    // duplicate records log at DEBUG (`apply_trust_recorder`), so firing on
-    // every discovery is safe.
-    if let ProtectedAgentIdentity::Managed { did, .. } = &resolved_identity {
-        crate::trust_registry_verification::spawn_trust_recorder(
-            &state.surface,
-            did,
-            state
-                .trust_registry_listener_manager
-                .clone(),
-        );
-    }
-
-    // Record successful connection in metrics
-    // Only tag as UCP "discovery" when the channel is actually a UCP channel
-    if let Some(ref metrics) = state.metrics_store {
-        let metrics = Arc::clone(metrics);
-        let channel_config_id = state
-            .surface
-            .surface_id
-            .clone();
-        let source = source_addr.clone();
-        let dest = state
-            .surface
-            .target
-            .endpoint
-            .clone();
-        let ucp_operation = if state.surface.is_ucp() {
-            Some("discovery".to_string())
-        } else {
-            None
-        };
-        crate::observability::policy_audit::spawn_in_request(async move {
-            metrics
-                .record_connection_with_ucp(
-                    channel_config_id,
-                    source,
-                    dest,
-                    crate::metrics::ConnectionStatus::Success,
-                    None,
-                    None,
-                    crate::metrics::ConnectionDirection::Request,
-                    uuid::Uuid::new_v4().to_string(),
-                    ucp_operation,
-                    None,
-                    None,
-                    0,
-                )
-                .await;
-        });
-    }
+    let agent_card = agent_card::assemble_public_agent_card(&state, &headers, &source_addr).await?;
 
     // Negotiate the agent-card media type: A2A 1.0.1 prefers
     // `application/a2a+json`, but it is only served to callers that signalled 1.0
@@ -1127,25 +868,39 @@ pub async fn handle_agent_card(
             .surface
             .a2a_settings()
             .accepted_versions,
+        secures_agent_card(&state.surface),
     ))
 }
 
 /// Serialize an agent card with the media type negotiated from the request's
 /// `A2A-Version` / `Accept` headers against the surface's `accepted` versions,
 /// and a `Vary` naming those headers so a shared cache keys each variant
-/// separately.
+/// separately. With `revalidate`, caches must revalidate the card against a
+/// digest of its body on every use, so a changed declaration is never served
+/// stale.
 fn agent_card_response(
     agent_card: JsonValue,
     headers: &HeaderMap,
     accepted: &[&str],
+    revalidate: bool,
 ) -> Response {
     use axum::http::{HeaderValue, header};
 
     let content_type = crate::a2a::version::agent_card_content_type(headers, accepted);
-    let mut response = Json(agent_card).into_response();
+    let body = match serde_json::to_vec(&agent_card) {
+        Ok(body) => axum::body::Bytes::from(body),
+        Err(e) => {
+            warn!(error = %e, "Failed to serialize agent card");
+            return crate::a2a::agent_card_refusal();
+        }
+    };
+    let mut response = body.clone().into_response();
     let response_headers = response.headers_mut();
     response_headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     response_headers.append(header::VARY, HeaderValue::from_static("A2A-Version, Accept"));
+    if revalidate {
+        crate::a2a::set_agent_card_revalidation(response_headers, &body);
+    }
     response
 }
 
@@ -1247,12 +1002,11 @@ fn evaluate_ap2_inbound_decision(
 
 async fn resolve_direct_surface_auth_config(
     auth_config: &crate::source_auth::SourceAuthConfig,
-    protected_resource: Option<&crate::protocols::protected_resource::ProtectedResourceConfig>,
+    declaration: Option<&crate::source_auth::declaration::Declaration>,
     vc_issuer: Option<&crate::identity::VCIssuer>,
     surface_id: &str,
 ) -> crate::source_auth::errors::SourceAuthResult<crate::source_auth::SourceAuthConfig> {
-    crate::source_auth::middleware::resolve_surface_audience(auth_config, protected_resource, vc_issuer, surface_id)
-        .await
+    crate::source_auth::middleware::resolve_surface_audience(auth_config, declaration, vc_issuer, surface_id).await
 }
 
 /// Maps the config-level delegated-rail marker onto the audit `PaymentRail`.
@@ -1580,7 +1334,7 @@ fn sse_session_limit_response(
     (StatusCode::TOO_MANY_REQUESTS, "Too many active SSE sessions").into_response()
 }
 
-async fn proxy_handler_with_mcp_runtime(
+pub(crate) async fn proxy_handler_with_mcp_runtime(
     addr: SocketAddr,
     state: ProxyState,
     req: Request,
@@ -1649,7 +1403,7 @@ async fn proxy_handler_with_mcp_runtime(
     // Public/discovery paths are skipped too (no caller identity, bypass OPA/VP), so
     // a discovery fetch doesn't add a noise bridge record.
     if egress_trace_id != trace_id
-        && !crate::proxy::paths::is_public_request(method.as_str(), uri.path())
+        && !crate::proxy::paths::is_public_surface_request(&state.surface, method.as_str(), uri.path())
         && !state
             .surface
             .target
@@ -1681,7 +1435,10 @@ async fn proxy_handler_with_mcp_runtime(
     }
 
     // Extract UCP operation type from request path and method (if this is a UCP channel).
-    let mut ucp_operation = extract_ucp_operation(uri.path(), &method);
+    let mut ucp_operation = extract_ucp_operation(uri.path(), &method).filter(|operation| {
+        operation != "discovery"
+            || crate::proxy::paths::is_public_surface_request(&state.surface, method.as_str(), uri.path())
+    });
 
     if let Some(ref op) = ucp_operation {
         channel_info!(
@@ -1721,7 +1478,10 @@ async fn proxy_handler_with_mcp_runtime(
 
     channel_info!(config_id, "Proxying request: method={} path={}", method, uri.path());
 
-    if crate::proxy::paths::is_well_known_agent_card_path(uri.path()) {
+    if crate::proxy::paths::is_well_known_agent_card_path(uri.path())
+        && (!secures_agent_card(&state.surface)
+            || crate::proxy::paths::is_public_surface_request(&state.surface, method.as_str(), uri.path()))
+    {
         let response = match handle_agent_card(ConnectInfo(addr), State(state.clone()), headers.clone()).await {
             Ok(response) | Err(response) => response,
         };
@@ -1801,13 +1561,14 @@ async fn proxy_handler_with_mcp_runtime(
     }
 
     // ── Unified source authentication ──────────────────────────────────────
-    // Must run before rate limiting so unauthenticated requests are rejected
-    // before consuming any rate-limit budget.
-    // Public paths (e.g. agent-card) bypass all authentication gates.
-    // Caller-attributable source-auth failures are non-blocking: the outcome is
-    // handed to the policy layer via `source_auth_context` below, which decides
-    // whether to allow or deny. Only server-side failures (setup/config
-    // resolution, internal errors) still block here (now with a 500).
+    // Source authentication runs before rate limiting, before the body is read
+    // and before every policy plane, so a refused caller never consumes
+    // rate-limit budget. Public requests skip it. On a declaring Access Point a
+    // caller-attributable failure (no token, an invalid one, or one short of a
+    // required scope) is answered here with the declaration's challenge, on
+    // every protocol. Elsewhere the failure is handed to policy as
+    // `source_auth.method == "failed"`. Server-side failures block with 500,
+    // and a declaration the Access Point cannot serve with 503.
     let resource_authorization = state
         .surface
         .mcp_http
@@ -1835,18 +1596,13 @@ async fn proxy_handler_with_mcp_runtime(
             .get::<crate::source_auth::client_ip::ClientIp>()
             .map_or(addr.ip(), |client| client.0),
     );
-    let protected_resource = match crate::protocols::protected_resource::access_point_protected_resource(
-        &state.surface,
-        state
-            .active_variant_alias
-            .as_deref(),
-        &state.network_config,
-    )
-    .transpose()
-    {
-        Ok(protected_resource) => protected_resource,
-        Err(e) => {
-            channel_warn!(config_id, "Invalid MCP protected resource (reason={}) — blocking", e);
+    let access_point_declaration = state
+        .access_point_declaration
+        .clone();
+    let declaration = match access_point_declaration.as_deref() {
+        Some(crate::source_auth::declaration::DeclarationOutcome::Declare(declaration)) => Some(declaration),
+        Some(crate::source_auth::declaration::DeclarationOutcome::Unservable(e)) => {
+            channel_warn!(config_id, "Access Point cannot serve its declaration (reason={}) — blocking", e);
             crate::audit::request_events::auth_failed(
                 &audit_facts,
                 crate::audit::events::AuthScheme::Jwt,
@@ -1857,8 +1613,17 @@ async fn proxy_handler_with_mcp_runtime(
             connection_guard
                 .decrement()
                 .await;
-            return Err(create_error_response(StatusCode::SERVICE_UNAVAILABLE, "Invalid MCP protected resource"));
+            return Err(create_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                unservable_declaration_detail(
+                    &state
+                        .surface
+                        .access_point
+                        .protocol,
+                ),
+            ));
         }
+        _ => None,
     };
     let authenticated_identity: Option<crate::source_auth::AuthenticatedIdentity> = if let Some(authorization) =
         &resource_authorization
@@ -1942,7 +1707,7 @@ async fn proxy_handler_with_mcp_runtime(
                 return Ok(authorization.challenge(error));
             }
         }
-    } else if !crate::proxy::paths::is_public_request(method.as_str(), uri.path())
+    } else if !crate::proxy::paths::is_public_surface_request(&state.surface, method.as_str(), uri.path())
         && let (Some(auth_config), installed_middleware) = (state.surface.source_auth(), &state.source_auth_middleware)
     {
         let sa_middleware = match crate::source_auth::middleware::require_installed(installed_middleware.clone()) {
@@ -1964,7 +1729,7 @@ async fn proxy_handler_with_mcp_runtime(
         };
         let resolved_auth_config = match resolve_direct_surface_auth_config(
             auth_config,
-            protected_resource.as_ref(),
+            declaration,
             state.vc_issuer.as_deref(),
             &state.surface.surface_id,
         )
@@ -2003,42 +1768,34 @@ async fn proxy_handler_with_mcp_runtime(
             .await
         {
             Ok(identity) => Some(identity),
-            // Caller-attributable failure (missing/invalid credential). An
-            // Access Point that publishes protected resource metadata answers
-            // it with its challenge, so the caller can fetch a token and
-            // retry. Otherwise record the outcome for the policy layer and
-            // continue with no asserted caller identity — do not block here.
             Err(e) if e.is_caller_attributable() => {
-                let challenged = protected_resource.is_some();
-                channel_warn!(
-                    config_id,
-                    "Source authentication failed (reason={}) — {}",
-                    e,
-                    if challenged {
-                        "sending the discovery challenge"
-                    } else {
-                        "deferring to policy"
-                    }
-                );
+                if let Some(declaration) = declaration {
+                    channel_warn!(
+                        config_id,
+                        "Source authentication failed (reason={}) — sending the caller challenge",
+                        e
+                    );
+                    connection_guard
+                        .decrement()
+                        .await;
+                    return Ok(crate::proxy::caller_denial::challenge_failed_caller(
+                        &audit_facts,
+                        declaration,
+                        crate::audit::request_events::source_auth_scheme(&resolved_auth_config),
+                        &e,
+                        client_ip,
+                    ));
+                }
+                channel_warn!(config_id, "Source authentication failed (reason={}) — deferring to policy", e);
                 crate::audit::request_events::auth_failed(
                     &audit_facts,
                     crate::audit::request_events::source_auth_scheme(&resolved_auth_config),
                     crate::audit::request_events::source_auth_reason(&e),
-                    challenged,
+                    false,
                     client_ip,
                 );
-                if let Some(protected_resource) = &protected_resource {
-                    connection_guard
-                        .decrement()
-                        .await;
-                    return Ok(protected_resource.caller_challenge(&e));
-                }
-                source_auth_failure = Some(crate::surface_context::SourceAuthContext::Failed {
-                    attempted_method: resolved_auth_config
-                        .method_tag()
-                        .to_string(),
-                    reason: e.to_string(),
-                });
+                source_auth_failure =
+                    crate::surface_context::SourceAuthContext::failed(resolved_auth_config.method_tag(), &e);
                 None
             }
             // Server-side failure (config not found, internal) — keep
@@ -2693,7 +2450,7 @@ async fn proxy_handler_with_mcp_runtime(
     // even when surface OPA is absent, because its template resolver reads
     // `input.agent.*` directly. Skipped only for discovery requests.
     let mut agent_context: Option<crate::surface_context::AgentContext> =
-        if !crate::proxy::paths::is_public_request(method.as_str(), uri.path())
+        if !crate::proxy::paths::is_public_surface_request(&state.surface, method.as_str(), uri.path())
             && ucp_operation.as_deref() != Some("discovery")
             && (state.surface.opa_enabled()
                 || !state
@@ -2751,19 +2508,7 @@ async fn proxy_handler_with_mcp_runtime(
     if let Some(global_pm) = crate::gateways::get_appliance_policy_manager()
         && global_pm.has_global(crate::policies::global_policy::PLANE_GATEWAY)
     {
-        let mut g_input = crate::surface_context::PolicyInput::new(
-            method.as_ref(),
-            uri.path(),
-            crate::surface_context::filter_sensitive_headers(&headers),
-            "inbound",
-            None,
-            None,
-            state
-                .surface
-                .config_id()
-                .map(|s| s.to_string()),
-            &state.surface.name,
-        );
+        let mut g_input = state.inbound_policy_input(method.as_ref(), uri.path(), &headers);
         g_input.source_auth = source_auth_context.clone();
         g_input.agent = agent_context.clone();
         g_input.mcp = mcp_context.clone();
@@ -2793,31 +2538,19 @@ async fn proxy_handler_with_mcp_runtime(
             connection_guard
                 .decrement()
                 .await;
-            return Err(create_error_response(StatusCode::FORBIDDEN, "Request blocked by appliance-wide policy"));
+            return Err(crate::proxy::caller_denial::CallerDenial::AppliancePolicy.refusal());
         }
     }
 
     // ── Gateway-level OPA policy enforcement ─────────────────────────────────
     // Evaluated AFTER trust registry fetch so that `input.agent` is available.
     // A gateway deny cannot be overridden by a channel allow (no privilege escalation).
-    if !crate::proxy::paths::is_public_request(method.as_str(), uri.path())
+    if !crate::proxy::paths::is_public_surface_request(&state.surface, method.as_str(), uri.path())
         && let Some(ref gw_policy_manager) = state.gateway_policy_manager
         && let Some(self_gateway_id) = gw_policy_manager.get_self_gateway_id()
         && gw_policy_manager.is_enforced(&self_gateway_id)
     {
-        let mut gw_input = crate::surface_context::PolicyInput::new(
-            method.as_ref(),
-            uri.path(),
-            crate::surface_context::filter_sensitive_headers(&headers),
-            "inbound",
-            None,
-            None,
-            state
-                .surface
-                .config_id()
-                .map(|s| s.to_string()),
-            &state.surface.name,
-        );
+        let mut gw_input = state.inbound_policy_input(method.as_ref(), uri.path(), &headers);
         gw_input.source_auth = source_auth_context.clone();
         gw_input.agent = agent_context.clone();
         gw_input.mcp = mcp_context.clone();
@@ -2875,7 +2608,7 @@ async fn proxy_handler_with_mcp_runtime(
                 connection_guard
                     .decrement()
                     .await;
-                return Err(create_error_response(StatusCode::FORBIDDEN, "Request blocked by gateway policy"));
+                return Err(crate::proxy::caller_denial::CallerDenial::GatewayPolicy.refusal());
             }
             Err(e) => {
                 channel_warn!(config_id, "Gateway policy evaluation error (denying request): {}", e);
@@ -2899,7 +2632,7 @@ async fn proxy_handler_with_mcp_runtime(
                 connection_guard
                     .decrement()
                     .await;
-                return Err(create_error_response(StatusCode::FORBIDDEN, "Request blocked by gateway policy"));
+                return Err(crate::proxy::caller_denial::CallerDenial::GatewayPolicy.refusal());
             }
         }
     }
@@ -4832,7 +4565,7 @@ async fn proxy_handler_with_mcp_runtime(
     // Skipped on public/discovery paths (`is_public_path`): source auth is
     // bypassed there, so no JWT claims exist and there is no caller identity to
     // resolve — mirrors the Trust Check and surface OPA discovery bypasses.
-    if !crate::proxy::paths::is_public_request(method.as_str(), uri.path())
+    if !crate::proxy::paths::is_public_surface_request(&state.surface, method.as_str(), uri.path())
         && identity_result.is_none()
         && let Some(crate::source_auth::ManagedIdentityConfig::FromJwtClaim { claim, namespace_claims }) = state
             .surface
@@ -5245,25 +4978,13 @@ async fn proxy_handler_with_mcp_runtime(
             .access_point
             .trust_check_list;
         if !caller_elements.is_empty()
-            && !crate::proxy::paths::is_public_request(method.as_str(), uri.path())
+            && !crate::proxy::paths::is_public_surface_request(&state.surface, method.as_str(), uri.path())
             && let Some(manager) = state
                 .trust_registry_listener_manager
                 .clone()
         {
             let client = crate::trust_registry_verification::TrqpListenerClient::new(manager);
-            let mut probe_input = crate::surface_context::PolicyInput::new(
-                method.as_ref(),
-                uri.path(),
-                crate::surface_context::filter_sensitive_headers(&headers),
-                "inbound",
-                None,
-                None,
-                state
-                    .surface
-                    .config_id()
-                    .map(|s| s.to_string()),
-                &state.surface.name,
-            );
+            let mut probe_input = state.inbound_policy_input(method.as_ref(), uri.path(), &headers);
             probe_input.source_auth = source_auth_context.clone();
             probe_input.agent = agent_context.clone();
             probe_input.mcp = mcp_context.clone();
@@ -5323,19 +5044,7 @@ async fn proxy_handler_with_mcp_runtime(
                         true,
                     )
                     .await;
-                    let mut probe_input = crate::surface_context::PolicyInput::new(
-                        method.as_ref(),
-                        uri.path(),
-                        crate::surface_context::filter_sensitive_headers(&headers),
-                        "inbound",
-                        None,
-                        None,
-                        state
-                            .surface
-                            .config_id()
-                            .map(|s| s.to_string()),
-                        &state.surface.name,
-                    );
+                    let mut probe_input = state.inbound_policy_input(method.as_ref(), uri.path(), &headers);
                     probe_input.source_auth = source_auth_context.clone();
                     probe_input.agent = Some(agent_ctx);
                     probe_input.mcp = mcp_context.clone();
@@ -5401,25 +5110,13 @@ async fn proxy_handler_with_mcp_runtime(
     // target-side processing. Independent of `state.surface.opa_enabled()`
     // (which gates `target.policy`) — both can fire on the same request.
     // Sees the caller-leg `trust_check_results` populated above.
-    if !crate::proxy::paths::is_public_request(method.as_str(), uri.path())
+    if !crate::proxy::paths::is_public_surface_request(&state.surface, method.as_str(), uri.path())
         && state
             .surface
             .inbound_opa_enabled()
         && let Some(config_id_str) = state.surface.config_id()
     {
-        let mut policy_input = crate::surface_context::PolicyInput::new(
-            method.as_ref(),
-            uri.path(),
-            crate::surface_context::filter_sensitive_headers(&headers),
-            "inbound",
-            None,
-            None,
-            state
-                .surface
-                .config_id()
-                .map(|s| s.to_string()),
-            &state.surface.name,
-        );
+        let mut policy_input = state.inbound_policy_input(method.as_ref(), uri.path(), &headers);
         policy_input.source_auth = source_auth_context.clone();
         policy_input.agent = agent_context.clone();
         policy_input.mcp = mcp_context.clone();
@@ -5455,13 +5152,7 @@ async fn proxy_handler_with_mcp_runtime(
             connection_guard
                 .decrement()
                 .await;
-            return Err(axum::response::Response::builder()
-                .status(axum::http::StatusCode::FORBIDDEN)
-                .header("Content-Type", "application/json")
-                .body(axum::body::Body::from(
-                    r#"{"error":"Forbidden","message":"Agent trust policy denied the request"}"#,
-                ))
-                .unwrap());
+            return Err(crate::proxy::caller_denial::CallerDenial::SurfacePolicy.refusal());
         };
         let (inbound_policy_name, inbound_policy_version, inbound_policy_hash) = policy_manager
             .resolve_policy_decision_evidence(inbound_policy_def_id)
@@ -5520,13 +5211,7 @@ async fn proxy_handler_with_mcp_runtime(
                         decision.reason.as_deref(),
                     ));
                 }
-                return Err(axum::response::Response::builder()
-                    .status(axum::http::StatusCode::FORBIDDEN)
-                    .header("Content-Type", "application/json")
-                    .body(axum::body::Body::from(
-                        r#"{"error":"Forbidden","message":"Agent trust policy denied the request"}"#,
-                    ))
-                    .unwrap());
+                return Err(crate::proxy::caller_denial::CallerDenial::SurfacePolicy.refusal());
             }
             Err(e) => {
                 channel_warn!(
@@ -5560,13 +5245,7 @@ async fn proxy_handler_with_mcp_runtime(
                         Some("policy evaluation error"),
                     ));
                 }
-                return Err(axum::response::Response::builder()
-                    .status(axum::http::StatusCode::FORBIDDEN)
-                    .header("Content-Type", "application/json")
-                    .body(axum::body::Body::from(
-                        r#"{"error":"Forbidden","message":"Agent trust policy denied the request"}"#,
-                    ))
-                    .unwrap());
+                return Err(crate::proxy::caller_denial::CallerDenial::SurfacePolicy.refusal());
             }
         }
     }
@@ -5580,19 +5259,7 @@ async fn proxy_handler_with_mcp_runtime(
     if let Some(global_pm) = crate::gateways::get_appliance_policy_manager()
         && global_pm.has_global(crate::policies::global_policy::PLANE_AGENT_SURFACE)
     {
-        let mut g_input = crate::surface_context::PolicyInput::new(
-            method.as_ref(),
-            uri.path(),
-            crate::surface_context::filter_sensitive_headers(&headers),
-            "inbound",
-            None,
-            None,
-            state
-                .surface
-                .config_id()
-                .map(|s| s.to_string()),
-            &state.surface.name,
-        );
+        let mut g_input = state.inbound_policy_input(method.as_ref(), uri.path(), &headers);
         g_input.source_auth = source_auth_context.clone();
         g_input.agent = agent_context.clone();
         g_input.mcp = mcp_context.clone();
@@ -5629,29 +5296,17 @@ async fn proxy_handler_with_mcp_runtime(
             if crate::mcp::is_tools_call_request(&body_bytes) {
                 return Err(crate::mcp::build_tools_call_policy_denied_response(&body_bytes, gd.reason.as_deref()));
             }
-            return Err(create_error_response(StatusCode::FORBIDDEN, "Request blocked by appliance-wide policy"));
+            return Err(crate::proxy::caller_denial::CallerDenial::AppliancePolicy.refusal());
         }
     }
 
     // Surface-Level OPA Policy check (evaluated against resolved AgentContext)
     // Skip for discovery requests (agent-card, /.well-known/ucp, etc.) — no trust check needed
-    if !crate::proxy::paths::is_public_request(method.as_str(), uri.path())
+    if !crate::proxy::paths::is_public_surface_request(&state.surface, method.as_str(), uri.path())
         && state.surface.opa_enabled()
         && let Some(config_id_str) = state.surface.config_id()
     {
-        let mut policy_input = crate::surface_context::PolicyInput::new(
-            method.as_ref(),
-            uri.path(),
-            crate::surface_context::filter_sensitive_headers(&headers),
-            "inbound",
-            None,
-            None,
-            state
-                .surface
-                .config_id()
-                .map(|s| s.to_string()),
-            &state.surface.name,
-        );
+        let mut policy_input = state.inbound_policy_input(method.as_ref(), uri.path(), &headers);
         policy_input.source_auth = source_auth_context.clone();
         policy_input.agent = agent_context.clone();
         policy_input.mcp = mcp_context.clone();
@@ -5705,13 +5360,7 @@ async fn proxy_handler_with_mcp_runtime(
                     Some("no policy is loaded for this channel"),
                 ));
             }
-            return Err(axum::response::Response::builder()
-                .status(axum::http::StatusCode::FORBIDDEN)
-                .header("Content-Type", "application/json")
-                .body(axum::body::Body::from(
-                    r#"{"error":"Forbidden","message":"OPA policy enforcement is enabled but no policy is loaded for this channel"}"#,
-                ))
-                .unwrap());
+            return Err(crate::proxy::caller_denial::CallerDenial::SurfacePolicyUnloaded.refusal());
         };
         let channel_opa_def_id = state
             .surface
@@ -5773,13 +5422,7 @@ async fn proxy_handler_with_mcp_runtime(
                         decision.reason.as_deref(),
                     ));
                 }
-                return Err(axum::response::Response::builder()
-                    .status(axum::http::StatusCode::FORBIDDEN)
-                    .header("Content-Type", "application/json")
-                    .body(axum::body::Body::from(
-                        r#"{"error":"Forbidden","message":"Agent trust policy denied the request"}"#,
-                    ))
-                    .unwrap());
+                return Err(crate::proxy::caller_denial::CallerDenial::SurfacePolicy.refusal());
             }
             Err(e) => {
                 channel_warn!(config_id_str, "Surface-level OPA policy evaluation error (denying request): {}", e);
@@ -5809,13 +5452,7 @@ async fn proxy_handler_with_mcp_runtime(
                         Some("policy evaluation error"),
                     ));
                 }
-                return Err(axum::response::Response::builder()
-                    .status(axum::http::StatusCode::FORBIDDEN)
-                    .header("Content-Type", "application/json")
-                    .body(axum::body::Body::from(
-                        r#"{"error":"Forbidden","message":"Agent trust policy denied the request"}"#,
-                    ))
-                    .unwrap());
+                return Err(crate::proxy::caller_denial::CallerDenial::SurfacePolicy.refusal());
             }
         }
     }
@@ -5828,7 +5465,7 @@ async fn proxy_handler_with_mcp_runtime(
     // installed. The gate condition is evaluated against the same `PolicyInput`
     // the surface OPA gate and the tools/list filter see, so a gate that hides
     // a tool from the list decides identically here.
-    if !crate::proxy::paths::is_public_request(method.as_str(), uri.path())
+    if !crate::proxy::paths::is_public_surface_request(&state.surface, method.as_str(), uri.path())
         && state
             .surface
             .channel_protocol()
@@ -5877,16 +5514,7 @@ async fn proxy_handler_with_mcp_runtime(
         // Only build + serialize the request context when a gate carries an OPA
         // condition; pure-regex gating decides on the tool name alone.
         let input_value = if gating.has_policy_conditions() {
-            let mut policy_input = crate::surface_context::PolicyInput::new(
-                method.as_ref(),
-                uri.path(),
-                crate::surface_context::filter_sensitive_headers(&headers),
-                "inbound",
-                None,
-                None,
-                Some(config_id_str.to_string()),
-                &state.surface.name,
-            );
+            let mut policy_input = state.inbound_policy_input(method.as_ref(), uri.path(), &headers);
             policy_input.source_auth = source_auth_context.clone();
             policy_input.agent = agent_context.clone();
             policy_input.mcp = mcp_context.clone();
@@ -5952,7 +5580,8 @@ async fn proxy_handler_with_mcp_runtime(
             return Ok(response);
         };
         channel_info!(config_id, "🔌 Routing A2A request through A2A proxy backend proxy_id={}", proxy_id);
-        let caller = CallerAssertion::for_forwarded_request(method.as_str(), uri.path(), source_auth_failed);
+        let caller =
+            CallerAssertion::for_forwarded_request(&state.surface, method.as_str(), uri.path(), source_auth_failed);
         let response = handle_a2a_proxy_target_request(&state, proxy_id, &body_bytes, &channel_name, caller).await;
         let response = record_a2a_proxy_connection_metric(
             &state,
@@ -6135,13 +5764,12 @@ async fn proxy_handler_with_mcp_runtime(
         .surface
         .access_point
         .header_metadata_mapping_if_supported();
-    let forward_source_auth_header = state
-        .surface
-        .source_auth()
-        .is_some_and(
-            |auth| matches!(auth, crate::source_auth::SourceAuthConfig::JwtBearer(config) if config.forward_header),
-        )
-        && resource_authorization.is_none();
+    let forward_source_auth_header = forwards_caller_token(
+        &state.surface,
+        state
+            .access_point_declaration
+            .as_deref(),
+    );
 
     // Build upstream request. The forward send uses the per-request pinned,
     // redirect-disabled client built at the SSRF vetting sink above; only the
@@ -6399,39 +6027,8 @@ async fn proxy_handler_with_mcp_runtime(
         }
     }
 
-    // Inject target authentication credentials (if configured)
-    if let Some(target_auth) = state.surface.target_auth() {
-        let caller_assertion = CallerAssertion::for_forwarded_request(method.as_str(), uri.path(), source_auth_failed);
-        match inject_target_auth_header(target_auth, &state.secrets_store, &channel_name, caller_assertion).await {
-            Ok(Some((header_name, header_value))) => {
-                upstream_req = upstream_req.header(&header_name, &header_value);
-                debug!(channel = channel_name, header = %header_name, "Injected target authentication header");
-            }
-            Ok(None) => {
-                // CredentialLookup method not implemented, skip
-            }
-            Err(e) => {
-                error!(channel = channel_name, error = %e, "Failed to resolve target authentication");
-                // Check fallback behavior
-                match target_auth.fallback {
-                    crate::config::TargetAuthFallback::Reject => {
-                        return Ok(create_error_response(
-                            StatusCode::BAD_GATEWAY,
-                            &format!("Target authentication failed: {}", e),
-                        ));
-                    }
-                    crate::config::TargetAuthFallback::Passthrough => {
-                        warn!(
-                            channel = channel_name,
-                            "Target auth failed but passthrough enabled, continuing without credentials"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
     // ── Credential delegation: inject delegated OAuth tokens or signal consent ──
+    let mut delegated_headers: Vec<axum::http::HeaderName> = Vec::new();
     let mut delegation_actions_for_vp: Option<serde_json::Value> = None;
     let mut outbound_credentials = state
         .surface
@@ -6464,25 +6061,15 @@ async fn proxy_handler_with_mcp_runtime(
                 surface_variant = surface_variant.as_deref(),
                 "Credential delegation requires source authentication — rejecting anonymous request"
             );
+            let refusal = crate::proxy::caller_denial::CallerDenial::IdentityRequired.refusal();
             crate::audit::request_events::request_rejected(
                 &audit_facts,
                 crate::audit::request_events::RejectionStage::Admission,
                 crate::audit::request_events::RejectionReason::ConsentIdentityRequired,
-                403,
+                refusal.status().as_u16(),
                 None,
             );
-            let body = serde_json::json!({
-                "type": "https://affinidi.com/atg/errors/identity-required",
-                "title": "Identity Required for Credential Delegation",
-                "status": 403,
-                "detail": "This channel requires credential delegation which needs authenticated source identity. \
-                           Configure source authentication and agent identity management on this channel.",
-            });
-            return Ok(Response::builder()
-                .status(StatusCode::FORBIDDEN)
-                .header("content-type", "application/problem+json")
-                .body(Body::from(serde_json::to_string(&body).unwrap()))
-                .unwrap());
+            return Ok(refusal);
         }
 
         if let (Some(user_hash), Some(vault_store), Some(provider_store), Some(secrets_store), Some(base_url)) = (
@@ -6556,6 +6143,16 @@ async fn proxy_handler_with_mcp_runtime(
                     false, // via_fabric = false (direct HTTP path)
                     Some(&delegation_audit_ctx),
                     delegation_consent_principal.as_deref(),
+                    state
+                        .surface
+                        .tenant_id
+                        .as_deref(),
+                    crate::proxy::target_credentials::permits_jwt_bearer_leg(
+                        &state.surface,
+                        &state.surface.target.endpoint,
+                        Some(&target_url),
+                    ),
+                    crate::proxy::target_credentials::permits_client_credentials_leg(&state.surface.target.endpoint),
                 ))
                 .await;
 
@@ -6784,7 +6381,19 @@ async fn proxy_handler_with_mcp_runtime(
                                 name,
                                 value,
                             } => {
-                                upstream_req = upstream_req.header(name, value);
+                                let (Ok(header_name), Ok(header_value)) = (
+                                    axum::http::HeaderName::from_bytes(name.as_bytes()),
+                                    axum::http::HeaderValue::from_str(value),
+                                ) else {
+                                    return Err(create_error_response(
+                                        StatusCode::INTERNAL_SERVER_ERROR,
+                                        "Invalid delegated credential header",
+                                    ));
+                                };
+                                let mut delegated = HeaderMap::new();
+                                delegated.insert(header_name.clone(), header_value);
+                                upstream_req = upstream_req.headers(delegated);
+                                delegated_headers.push(header_name);
                                 debug!(
                                     target: "credential_delegation",
                                     surface = %channel_name,
@@ -6837,6 +6446,11 @@ async fn proxy_handler_with_mcp_runtime(
                 }
             }
         }
+        delegated_headers.extend(
+            injection_headers
+                .keys()
+                .cloned(),
+        );
         upstream_req = upstream_req
             .headers(injection_headers)
             .body(body_bytes.clone());
@@ -6847,6 +6461,41 @@ async fn proxy_handler_with_mcp_runtime(
                 .map(|id| serde_json::json!({"providerId": id, "outcome": "token_injected"}))
                 .collect(),
         ));
+    }
+
+    if let Some(target_auth) = state.surface.target_auth() {
+        let resolution = state
+            .target_credentials()
+            .resolve(
+                target_auth,
+                &crate::proxy::target_credentials::TargetAuthContext {
+                    surface: &state.surface,
+                    destination: &target_url,
+                    leg: crate::proxy::target_credentials::TargetLeg::HttpTarget,
+                    caller: CallerAssertion::for_forwarded_request(
+                        &state.surface,
+                        method.as_str(),
+                        uri.path(),
+                        source_auth_failed,
+                    ),
+                    via_fabric: false,
+                    trace_id: Some(&egress_trace_id),
+                    occupied_headers: &delegated_headers,
+                },
+            )
+            .await;
+        match crate::proxy::target_credentials::apply_target_auth_fallback(target_auth, resolution) {
+            crate::proxy::target_credentials::TargetAuthDecision::Inject(credential) => {
+                upstream_req = credential.set_on(upstream_req);
+            }
+            crate::proxy::target_credentials::TargetAuthDecision::Continue => {}
+            crate::proxy::target_credentials::TargetAuthDecision::Reject => {
+                return Ok(create_error_response(
+                    StatusCode::BAD_GATEWAY,
+                    crate::proxy::target_credentials::TARGET_AUTH_FAILED,
+                ));
+            }
+        }
     }
 
     // ── deferred request VP injection ───────────────────────────────────────
@@ -8000,12 +7649,12 @@ async fn proxy_handler_with_mcp_runtime(
 
         // Rewrite agent card URLs if this is an agent card response
         let response_body = if is_agent_card_request {
-            match rewrite_agent_card_urls(
+            let strategies = card_strategy_store(&state);
+            match crate::a2a::process_agent_card(
                 &response_body,
                 &state.surface,
-                &state.config,
+                card_security_context(&state, strategies.as_deref()),
                 &state.network_config,
-                &resolved_identity,
                 agent_card_kind(is_extended_card_response),
             )
             .await
@@ -8017,6 +7666,10 @@ async fn proxy_handler_with_mcp_runtime(
                 Err(e) if is_extended_card_response => {
                     error!(channel = channel_name, error = %e, "Failed to rewrite extended agent card URLs");
                     return Err(extended_agent_card_refusal(extended_card_rpc_id.as_ref()));
+                }
+                Err(e) if secures_agent_card(&state.surface) => {
+                    error!(channel = channel_name, error = %e, "Failed to process agent card");
+                    return Err(crate::a2a::agent_card_refusal());
                 }
                 Err(e) => {
                     warn!(channel = channel_name, error = %e, "Failed to rewrite agent card URLs, returning original");
@@ -8162,19 +7815,7 @@ async fn proxy_handler_with_mcp_runtime(
                         // identity_binding, a2a). `filter_mcp_tools` clones the
                         // template per tool and overrides `mcp` with the
                         // synthesized tools/call probe.
-                        let mut template = crate::surface_context::PolicyInput::new(
-                            method.as_ref(),
-                            uri.path(),
-                            crate::surface_context::filter_sensitive_headers(&headers),
-                            "inbound",
-                            None,
-                            None,
-                            state
-                                .surface
-                                .config_id()
-                                .map(|s| s.to_string()),
-                            &state.surface.name,
-                        );
+                        let mut template = state.inbound_policy_input(method.as_ref(), uri.path(), &headers);
                         template.source_auth = source_auth_context.clone();
                         template.mcp = mcp_classification
                             .as_ref()
@@ -9319,6 +8960,81 @@ async fn refuse_access_point_variant(
     .await
 }
 
+/// The surface the route serves when its URL names no variant: the default
+/// variant's, else the base surface, read from the same places as a served
+/// request. A default variant that cannot be resolved leaves the base surface.
+fn bare_route_surface(
+    state: &MultiSurfaceProxyState,
+    surface: &crate::config::agent_surface::AgentSurface,
+) -> Arc<crate::config::agent_surface::AgentSurface> {
+    surface
+        .config_id()
+        .and_then(|sid| {
+            state
+                .resolved_surface_cache
+                .resolve(sid, None)
+                .ok()
+        })
+        .map(|cached| cached.surface)
+        .unwrap_or_else(|| {
+            let served = surface
+                .serve_variant(None)
+                .unwrap_or_else(|_| surface.serve_selected(None));
+            Arc::new(served.surface)
+        })
+}
+
+/// The challenge for a caller that fails source authentication on an Access Point
+/// whose bare route declares, answered before the request's variant is refused:
+/// `surface` is the one [`bare_route_surface`] returns, and the challenge is the one
+/// that route answers, whichever variant the request names, built by the same
+/// [`crate::proxy::caller_denial::challenge_failed_caller`] as the source-auth step.
+/// Variant aliases are not secret: a known variant answers with its own resource.
+/// `None` lets the routing refusal answer: the bare route does not declare, its
+/// declaration cannot be served, the caller authenticates, or its authentication
+/// cannot be checked here.
+async fn challenge_before_variant_refusal(
+    state: &MultiSurfaceProxyState,
+    surface: &crate::config::agent_surface::AgentSurface,
+    error: &crate::config::agent_surface_variants::VariantResolveError,
+    headers: &axum::http::HeaderMap,
+    peer_cert: Option<&crate::source_auth::models::PeerCertInfo>,
+    client_ip: std::net::IpAddr,
+) -> Option<Response> {
+    let auth_config = surface.source_auth()?;
+    let middleware = state
+        .source_auth_middleware
+        .as_deref()?;
+    let crate::source_auth::declaration::DeclarationOutcome::Declare(declaration) =
+        resolve_access_point_declaration(surface, None, Some(middleware), &state.network_config).await
+    else {
+        return None;
+    };
+    let resolved_auth_config = resolve_direct_surface_auth_config(
+        auth_config,
+        Some(&declaration),
+        state.vc_issuer.as_deref(),
+        &surface.surface_id,
+    )
+    .await
+    .ok()?;
+    let failure = match middleware
+        .authenticate(&resolved_auth_config, headers, &surface.name, &surface.surface_id, peer_cert)
+        .await
+    {
+        Err(failure) if failure.is_caller_attributable() => failure,
+        _ => return None,
+    };
+    crate::audit::request_events::set_unresolved_request_variant(error);
+    Some(crate::proxy::caller_denial::challenge_failed_caller(
+        &routing_facts(surface),
+        &declaration,
+        crate::audit::request_events::source_auth_scheme(&resolved_auth_config),
+        &failure,
+        Some(client_ip),
+    ))
+}
+
 fn normalize_route_for_match(route: &str) -> String {
     let with_leading_slash = if route.starts_with('/') {
         route.to_string()
@@ -9483,6 +9199,27 @@ async fn multi_channel_proxy_handler_in_request_scope(
                     let surface = Arc::clone(&ch.surface);
                     drop(sorted_channels);
                     drop(channels);
+                    let public = crate::proxy::paths::is_public_surface_request(
+                        &surface,
+                        req.method().as_str(),
+                        &route_tail_to_uri_path(&stripped_tail),
+                    );
+                    if !public {
+                        let client_ip = req
+                            .extensions()
+                            .get::<crate::source_auth::client_ip::ClientIp>()
+                            .map_or(addr.ip(), |client| client.0);
+                        let headers = req.headers();
+                        let peer_cert = req
+                            .extensions()
+                            .get::<crate::source_auth::models::PeerCertInfo>();
+                        let bare = bare_route_surface(&state, &surface);
+                        if let Some(challenge) =
+                            challenge_before_variant_refusal(&state, &bare, &error, headers, peer_cert, client_ip).await
+                        {
+                            return challenge;
+                        }
+                    }
                     return refuse_access_point_variant(&surface, &state.network_config, mcp_versions, req, &error)
                         .await;
                 }
@@ -9518,36 +9255,10 @@ async fn multi_channel_proxy_handler_in_request_scope(
             // Select the correct engines. In base-mode (variant_id == None) we
             // use channel-level engines and resolve to the base surface.
             // Otherwise we use the pre-compiled per-variant engines.
-            let (
-                identity_rules_engine,
-                identity_selector,
-                protected_rules_engine,
-                protected_selector,
-                external_rules_engine,
-                external_selector,
-            ) = if let Some(ref vid) = variant_id {
+            let engines = if let Some(ref vid) = variant_id {
                 if let Some(variant_engines) = ch.variant_engines.get(vid) {
                     info!("✓ Using pre-compiled engines for variant '{}' on channel '{}'", vid, ch.surface.name);
-                    (
-                        variant_engines
-                            .identity_rules_engine
-                            .clone(),
-                        variant_engines
-                            .identity_selector
-                            .clone(),
-                        variant_engines
-                            .protected_rules_engine
-                            .clone(),
-                        variant_engines
-                            .protected_selector
-                            .clone(),
-                        variant_engines
-                            .external_rules_engine
-                            .clone(),
-                        variant_engines
-                            .external_selector
-                            .clone(),
-                    )
+                    variant_engines.clone()
                 } else {
                     error!(
                         surface = %ch.surface.name,
@@ -9563,86 +9274,31 @@ async fn multi_channel_proxy_handler_in_request_scope(
                 }
             } else {
                 info!("✓ Using channel-level engines (base-mode) for channel '{}'", ch.surface.name);
-                (
-                    ch.identity_rules_engine
-                        .clone(),
-                    ch.identity_selector.clone(),
-                    ch.protected_rules_engine
-                        .clone(),
-                    ch.protected_selector.clone(),
-                    ch.external_rules_engine
-                        .clone(),
-                    ch.external_selector.clone(),
-                )
+                ch.base_engines()
             };
 
-            // Create single-channel ProxyState for this request with effective channel and variant engines
-            let proxy_state = ProxyState {
-                config: state.config.clone(),
-                network_config: state.network_config.clone(),
-                client: state.client.clone(),
-                metrics_store: state.metrics_store.clone(),
-                identity_rules_engine,
-                identity_selector,
-                protected_rules_engine,
-                protected_selector,
-                external_rules_engine,
-                external_selector,
-                task_monitor: state.task_monitor.clone(),
-                task_id: Some(ch.task_id.clone()),
-                ws_state: state.ws_state.clone(),
-                listener_manager: state.listener_manager.clone(),
-                secrets_store: state.secrets_store.clone(),
-                certificates_store: state
-                    .certificates_store
-                    .clone(),
-                policy_manager: state.policy_manager.clone(),
-                gateway_policy_manager: state
-                    .gateway_policy_manager
-                    .clone(),
-                didauth_session_store: state
-                    .didauth_session_store
-                    .clone(),
-                transaction_store: state
-                    .transaction_store
-                    .clone(),
-                mpp_transaction_store: state
-                    .mpp_transaction_store
-                    .clone(),
-                trust_registry_listener_manager: state
-                    .trust_registry_listener_manager
-                    .clone(),
-                source_auth_middleware: state
+            let access_point_declaration = resolve_access_point_declaration(
+                &resolved_surface,
+                virtual_channel_alias.as_deref(),
+                state
                     .source_auth_middleware
-                    .clone(),
+                    .as_deref(),
+                &state.network_config,
+            )
+            .await;
+            let declares =
+                matches!(access_point_declaration, crate::source_auth::declaration::DeclarationOutcome::Declare(_));
 
-                #[cfg(feature = "didwebvh")]
-                didwebvh_identity_store: state
-                    .didwebvh_identity_store
-                    .clone(),
-
-                #[cfg(feature = "didwebvh")]
-                didwebvh_log_manager: state
-                    .didwebvh_log_manager
-                    .clone(),
-
-                credential_provider_store: state
-                    .credential_provider_store
-                    .clone(),
-                delegation_vault_store: state
-                    .delegation_vault_store
-                    .clone(),
-                gateway_base_url: state.gateway_base_url.clone(),
-                transit_token_issuer: state
-                    .transit_token_issuer
-                    .clone(),
-                mcp_proxy_store: state.mcp_proxy_store.clone(),
-                a2a_proxy_store: state.a2a_proxy_store.clone(),
-                vc_issuer: state.vc_issuer.clone(),
-                active_variant_alias: virtual_channel_alias.clone(),
-                active_variant_id: variant_id,
-                surface: resolved_surface,
-            };
+            let proxy_state = state.proxy_state_for(
+                ch,
+                engines,
+                crate::state::ActiveVariant {
+                    alias: virtual_channel_alias.clone(),
+                    id: variant_id,
+                },
+                resolved_surface,
+                access_point_declaration,
+            );
 
             // The route + optional `$alias` suffix have already been stripped
             // by `parse_route_with_variant` above; `stripped_tail` is the
@@ -9687,12 +9343,33 @@ async fn multi_channel_proxy_handler_in_request_scope(
             let policy_collector = std::sync::Arc::new(std::sync::Mutex::new(Vec::<
                 crate::observability::policy_audit::PolicyDecisionSummary,
             >::new()));
-            let result = crate::observability::policy_audit::POLICY_DECISION_COLLECTOR
+            let drops_upstream_challenges =
+                crate::proxy::caller_denial::drops_upstream_challenges(&proxy_state.surface, declares);
+            let mut result = crate::observability::policy_audit::POLICY_DECISION_COLLECTOR
                 .scope(
                     policy_collector,
                     boxed_proxy_handler(addr, proxy_state, new_req, mcp_versions, mcp_continuations),
                 )
                 .await;
+            if drops_upstream_challenges {
+                let (Ok(response) | Err(response)) = &mut result;
+                let relayed_status = response.status();
+                let stripped = crate::source_auth::challenge::strip_relayed_challenges(response);
+                if !stripped
+                    .dropped_schemes
+                    .is_empty()
+                {
+                    channel_warn!(
+                        channel_config_id,
+                        "Dropped relayed Target challenges (status={}, schemes={}, became_bad_gateway={})",
+                        relayed_status,
+                        stripped
+                            .dropped_schemes
+                            .join(","),
+                        stripped.became_bad_gateway
+                    );
+                }
+            }
             match result {
                 Ok(response) => {
                     channel_info!(
@@ -10095,7 +9772,7 @@ async fn resolve_configured_caller_identity(
     use crate::identity::credential_identity::CredentialIdentity;
     use crate::source_auth::ManagedIdentityConfig;
 
-    if crate::proxy::paths::is_public_request(method, path) {
+    if crate::proxy::paths::is_public_surface_request(&state.surface, method, path) {
         return Ok(None);
     }
     let (mi, from_managed_slot) = match state
@@ -10395,7 +10072,9 @@ async fn handle_fabric_request(
     // paths (agent-card fetch, `.well-known/*`) — those carry no caller identity and
     // bypass OPA/VP injection, so a bridge record for them is only noise (matching
     // the discovery bypass every other stage already applies).
-    if egress_trace_id != trace_id && !crate::proxy::paths::is_public_request(method.as_str(), uri.path()) {
+    if egress_trace_id != trace_id
+        && !crate::proxy::paths::is_public_surface_request(&state.surface, method.as_str(), uri.path())
+    {
         channel_info!(
             config_id,
             "🔀 Trace terminated at egress: own trace {} continues downstream as {}",
@@ -10604,7 +10283,7 @@ async fn handle_fabric_request(
     // Skipped on public/discovery paths (`is_public_path`): source auth is
     // bypassed there, so no JWT claims exist and there is no caller identity to
     // resolve — mirrors the Trust Check and surface OPA discovery bypasses.
-    if !crate::proxy::paths::is_public_request(method.as_str(), uri.path())
+    if !crate::proxy::paths::is_public_surface_request(&state.surface, method.as_str(), uri.path())
         && identity_result.is_none()
         && let Some(crate::source_auth::ManagedIdentityConfig::FromJwtClaim { claim, namespace_claims }) = state
             .surface
@@ -10769,7 +10448,7 @@ async fn handle_fabric_request(
     // Fail-closed: the gate enters purely on `inbound_opa_enabled()` — a
     // missing policy manager or a policy that failed to load/compile
     // returns 403 (matches the direct path).
-    if !crate::proxy::paths::is_public_request(method.as_str(), uri.path())
+    if !crate::proxy::paths::is_public_surface_request(&state.surface, method.as_str(), uri.path())
         && state
             .surface
             .inbound_opa_enabled()
@@ -10834,19 +10513,7 @@ async fn handle_fabric_request(
             None
         };
 
-        let mut policy_input = crate::surface_context::PolicyInput::new(
-            method.as_ref(),
-            uri.path(),
-            crate::surface_context::filter_sensitive_headers(&headers),
-            "inbound",
-            None,
-            None,
-            state
-                .surface
-                .config_id()
-                .map(|s| s.to_string()),
-            &state.surface.name,
-        );
+        let mut policy_input = state.inbound_policy_input(method.as_ref(), uri.path(), &headers);
         policy_input.source_auth = source_auth_context.clone();
         policy_input.agent = agent_ctx;
         policy_input.mcp = mcp_context;
@@ -10885,13 +10552,7 @@ async fn handle_fabric_request(
             connection_guard
                 .decrement()
                 .await;
-            return Err(axum::response::Response::builder()
-                .status(axum::http::StatusCode::FORBIDDEN)
-                .header("Content-Type", "application/json")
-                .body(axum::body::Body::from(
-                    r#"{"error":"Forbidden","message":"Agent trust policy denied the request"}"#,
-                ))
-                .unwrap());
+            return Err(crate::proxy::caller_denial::CallerDenial::SurfacePolicy.refusal());
         };
         let (inbound_policy_name, inbound_policy_version, inbound_policy_hash) = policy_manager
             .resolve_policy_decision_evidence(inbound_policy_def_id)
@@ -10950,13 +10611,7 @@ async fn handle_fabric_request(
                         decision.reason.as_deref(),
                     ));
                 }
-                return Err(axum::response::Response::builder()
-                    .status(axum::http::StatusCode::FORBIDDEN)
-                    .header("Content-Type", "application/json")
-                    .body(axum::body::Body::from(
-                        r#"{"error":"Forbidden","message":"Agent trust policy denied the request"}"#,
-                    ))
-                    .unwrap());
+                return Err(crate::proxy::caller_denial::CallerDenial::SurfacePolicy.refusal());
             }
             Err(e) => {
                 channel_warn!(
@@ -10990,13 +10645,7 @@ async fn handle_fabric_request(
                         Some("policy evaluation error"),
                     ));
                 }
-                return Err(axum::response::Response::builder()
-                    .status(axum::http::StatusCode::FORBIDDEN)
-                    .header("Content-Type", "application/json")
-                    .body(axum::body::Body::from(
-                        r#"{"error":"Forbidden","message":"Agent trust policy denied the request"}"#,
-                    ))
-                    .unwrap());
+                return Err(crate::proxy::caller_denial::CallerDenial::SurfacePolicy.refusal());
             }
         }
     }
@@ -11196,13 +10845,7 @@ async fn handle_fabric_request(
                     connection_guard
                         .decrement()
                         .await;
-                    return Err(axum::response::Response::builder()
-                        .status(axum::http::StatusCode::FORBIDDEN)
-                        .header("Content-Type", "application/json")
-                        .body(axum::body::Body::from(
-                            r#"{"error":"Forbidden","message":"Agent trust policy denied the request"}"#,
-                        ))
-                        .unwrap());
+                    return Err(crate::proxy::caller_denial::CallerDenial::SurfacePolicy.refusal());
                 }
                 Err(e) => {
                     channel_warn!(config_id_str, "Surface-level OPA policy evaluation error (denying request): {}", e);
@@ -11225,13 +10868,7 @@ async fn handle_fabric_request(
                     connection_guard
                         .decrement()
                         .await;
-                    return Err(axum::response::Response::builder()
-                        .status(axum::http::StatusCode::FORBIDDEN)
-                        .header("Content-Type", "application/json")
-                        .body(axum::body::Body::from(
-                            r#"{"error":"Forbidden","message":"Agent trust policy denied the request"}"#,
-                        ))
-                        .unwrap());
+                    return Err(crate::proxy::caller_denial::CallerDenial::SurfacePolicy.refusal());
                 }
             }
         }
@@ -12104,65 +11741,74 @@ async fn handle_fabric_request(
         })
         .collect();
 
+    let modern_credentials = match modern_delegation.as_ref() {
+        Some(prepared) => {
+            body_bytes = prepared
+                .inject_body_credentials(&body_bytes)
+                .map_err(|_| {
+                    create_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Invalid delegated credential metadata")
+                })?;
+            Some(
+                prepared
+                    .credential_headers()
+                    .map_err(|_| {
+                        create_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Invalid delegated credential header")
+                    })?,
+            )
+        }
+        None => None,
+    };
+
     // Inject target authentication credentials into the forwarded headers so
     // GW2 delivers them to the upstream service.
     if let Some(target_auth) = state.surface.target_auth() {
-        match inject_target_auth_header(
-            target_auth,
-            &state.secrets_store,
-            channel_name,
-            CallerAssertion::for_forwarded_request(method.as_str(), uri.path(), source_auth_failed),
-        )
-        .await
-        {
-            Ok(Some((header_name, header_value))) => {
+        let occupied_headers: Vec<axum::http::HeaderName> = modern_credentials
+            .iter()
+            .flat_map(|credentials| credentials.keys().cloned())
+            .collect();
+        let resolution = state
+            .target_credentials()
+            .resolve(
+                target_auth,
+                &crate::proxy::target_credentials::TargetAuthContext {
+                    surface: &state.surface,
+                    destination: &state.surface.target.endpoint,
+                    leg: crate::proxy::target_credentials::TargetLeg::FabricForward,
+                    caller: CallerAssertion::for_forwarded_request(
+                        &state.surface,
+                        method.as_str(),
+                        uri.path(),
+                        source_auth_failed,
+                    ),
+                    via_fabric: true,
+                    trace_id: Some(&trace_id),
+                    occupied_headers: &occupied_headers,
+                },
+            )
+            .await;
+        match crate::proxy::target_credentials::apply_target_auth_fallback(target_auth, resolution) {
+            crate::proxy::target_credentials::TargetAuthDecision::Inject(credential) => {
                 if modern_request.is_some() {
-                    let name = axum::http::HeaderName::from_bytes(header_name.as_bytes()).map_err(|_| {
-                        create_error_response(StatusCode::BAD_GATEWAY, "Invalid Target authentication header")
-                    })?;
-                    let value = axum::http::HeaderValue::from_str(&header_value).map_err(|_| {
-                        create_error_response(StatusCode::BAD_GATEWAY, "Invalid Target authentication value")
-                    })?;
-                    stream_headers.insert(name, value);
+                    stream_headers.insert(credential.name.clone(), credential.value.clone());
                 }
-                headers_map.insert(header_name.to_uppercase(), header_value);
+                let (name, value) = credential.into_pair();
+                headers_map.insert(name.to_uppercase(), value);
                 channel_info!(config_id, "Injected target auth header into fabric ForwardRequest");
             }
-            Ok(None) => {}
-            Err(e) => {
-                error!(channel = channel_name, error = %e, "Failed to resolve target auth for fabric forwarding");
-                match target_auth.fallback {
-                    crate::config::TargetAuthFallback::Reject => {
-                        connection_guard
-                            .decrement()
-                            .await;
-                        return Err(create_error_response(
-                            StatusCode::BAD_GATEWAY,
-                            &format!("Target authentication failed: {}", e),
-                        ));
-                    }
-                    crate::config::TargetAuthFallback::Passthrough => {
-                        warn!(
-                            channel = channel_name,
-                            "Target auth failed but passthrough enabled, continuing without credentials"
-                        );
-                    }
-                }
+            crate::proxy::target_credentials::TargetAuthDecision::Continue => {}
+            crate::proxy::target_credentials::TargetAuthDecision::Reject => {
+                connection_guard
+                    .decrement()
+                    .await;
+                return Err(create_error_response(
+                    StatusCode::BAD_GATEWAY,
+                    crate::proxy::target_credentials::TARGET_AUTH_FAILED,
+                ));
             }
         }
     }
 
-    if let Some(prepared) = modern_delegation.as_ref() {
-        body_bytes = prepared
-            .inject_body_credentials(&body_bytes)
-            .map_err(|_| {
-                create_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Invalid delegated credential metadata")
-            })?;
-        let credentials = prepared
-            .credential_headers()
-            .map_err(|_| {
-                create_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Invalid delegated credential header")
-            })?;
+    if let Some(credentials) = modern_credentials {
         for (name, value) in credentials.iter() {
             stream_headers.insert(name.clone(), value.clone());
         }
@@ -12686,6 +12332,8 @@ async fn handle_fabric_request(
     let response_gateway_id = gateway_id.to_string();
     let response_channel_name = channel_name.to_string();
     let modern_response_peer_did = remote_gateway_did.clone();
+    let modern_refusal_surface_id = config_id.to_string();
+    let modern_refusal_trace_id = trace_id.clone();
     let discovery_support = crate::mcp::modern::ForwardingSupport::for_endpoint(
         true,
         crate::mcp::request_validation::McpPathKind::FabricSend,
@@ -12861,6 +12509,27 @@ async fn handle_fabric_request(
                     response_body.len()
                 );
 
+                let peer_challenges = crate::proxy::fabric_peer_refusal::peer_challenges(
+                    response_msg
+                        .message_body
+                        .get("headers"),
+                );
+                if let Some(refused) = crate::proxy::fabric_peer_refusal::refuse_peer_authorization(
+                    StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                    &peer_challenges,
+                    &crate::audit::request_events::RequestFacts {
+                        surface_id: config_id,
+                        channel_name,
+                        trace_id: Some(trace_id.as_str()),
+                        via_fabric: false,
+                    },
+                ) {
+                    connection_guard
+                        .decrement()
+                        .await;
+                    return Err(refused);
+                }
+
                 // Check if there was an error in the response
                 if let Some(error) = response_msg
                     .message_body
@@ -12874,11 +12543,8 @@ async fn handle_fabric_request(
                         let mut response_builder = Response::builder().status(StatusCode::PAYMENT_REQUIRED);
 
                         for (key, value) in response_headers.iter() {
-                            if let Ok(header_name) = axum::http::HeaderName::try_from(key)
-                                && let Some(value_str) = value.as_str()
-                                && let Ok(header_value) = axum::http::HeaderValue::try_from(value_str)
-                            {
-                                response_builder = response_builder.header(header_name, header_value);
+                            for (name, header_value) in crate::proxy::fabric_forward::fabric_header_pairs(key, value) {
+                                response_builder = response_builder.header(name, header_value);
                             }
                         }
 
@@ -12968,11 +12634,8 @@ async fn handle_fabric_request(
                         let mut response_builder = Response::builder().status(mcp_error_status);
 
                         for (key, value) in response_headers.iter() {
-                            if let Ok(header_name) = axum::http::HeaderName::try_from(key)
-                                && let Some(value_str) = value.as_str()
-                                && let Ok(header_value) = axum::http::HeaderValue::try_from(value_str)
-                            {
-                                response_builder = response_builder.header(header_name, header_value);
+                            for (name, header_value) in crate::proxy::fabric_forward::fabric_header_pairs(key, value) {
+                                response_builder = response_builder.header(name, header_value);
                             }
                         }
 
@@ -13009,11 +12672,8 @@ async fn handle_fabric_request(
                     let mut response_builder = Response::builder().status(StatusCode::PAYMENT_REQUIRED);
 
                     for (key, value) in response_headers.iter() {
-                        if let Ok(header_name) = axum::http::HeaderName::try_from(key)
-                            && let Some(value_str) = value.as_str()
-                            && let Ok(header_value) = axum::http::HeaderValue::try_from(value_str)
-                        {
-                            response_builder = response_builder.header(header_name, header_value);
+                        for (name, header_value) in crate::proxy::fabric_forward::fabric_header_pairs(key, value) {
+                            response_builder = response_builder.header(name, header_value);
                         }
                     }
 
@@ -13180,12 +12840,12 @@ async fn handle_fabric_request(
                 drop(_rewrite_span.enter());
 
                 let response_body = if is_agent_card_request {
-                    match rewrite_agent_card_urls(
+                    let strategies = card_strategy_store(&state);
+                    match crate::a2a::process_agent_card(
                         response_body.as_bytes(),
                         &state.surface,
-                        &state.config,
+                        card_security_context(&state, strategies.as_deref()),
                         &state.network_config,
-                        &resolved_identity,
                         agent_card_kind(is_extended_card_response),
                     )
                     .await
@@ -13200,6 +12860,13 @@ async fn handle_fabric_request(
                                 .decrement()
                                 .await;
                             return Err(extended_agent_card_refusal(extended_card_rpc_id.as_ref()));
+                        }
+                        Err(e) if secures_agent_card(&state.surface) => {
+                            channel_error!(config_id, "Failed to process agent card: {}", e);
+                            connection_guard
+                                .decrement()
+                                .await;
+                            return Err(crate::a2a::agent_card_refusal());
                         }
                         Err(e) => {
                             channel_warn!(
@@ -13886,29 +13553,9 @@ async fn handle_fabric_request(
                         continue;
                     }
 
-                    let values = if is_modern_response {
-                        match value {
-                            serde_json::Value::String(value) => vec![value],
-                            serde_json::Value::Array(values) => values
-                                .into_iter()
-                                .filter_map(|value| {
-                                    value
-                                        .as_str()
-                                        .map(str::to_string)
-                                })
-                                .collect(),
-                            _ => Vec::new(),
-                        }
-                    } else {
-                        value
-                            .as_str()
-                            .map(str::to_string)
-                            .into_iter()
-                            .collect()
-                    };
                     channel_info!(config_id, "  Header: {}", key);
-                    for value_str in values {
-                        response_builder = response_builder.header(key.as_str(), value_str);
+                    for (name, header_value) in crate::proxy::fabric_forward::fabric_header_pairs(&key, &value) {
+                        response_builder = response_builder.header(name, header_value);
                     }
                 }
 
@@ -14133,6 +13780,17 @@ async fn handle_fabric_request(
     };
     if let (Some(upstream), Some(request), Some(complete)) = (modern_upstream, modern_request, modern_completion) {
         let (mut parts, body) = upstream.into_parts();
+        let complete = refuse_modern_fabric_peer(
+            parts.status,
+            &parts.headers,
+            &crate::audit::request_events::RequestFacts {
+                surface_id: &modern_refusal_surface_id,
+                channel_name,
+                trace_id: Some(&modern_refusal_trace_id),
+                via_fabric: false,
+            },
+            complete,
+        )?;
         let completion = parts
             .extensions
             .remove::<crate::mcp::modern_sse::TransportCompletion>();
@@ -14237,6 +13895,28 @@ async fn handle_fabric_request(
     process_response(forward_result)
         .instrument(_process_span)
         .await
+}
+
+/// The start of a modern Fabric stream whose peer refused the gateway's
+/// authorization ends the request with the peer refusal's `502`, after `complete`
+/// records the response as failed and so releases the connection. Any other start
+/// hands `complete` back for the stream.
+fn refuse_modern_fabric_peer<C: FnOnce(crate::mcp::modern_sse::ResponseOutcome)>(
+    status: StatusCode,
+    headers: &HeaderMap,
+    facts: &crate::audit::request_events::RequestFacts<'_>,
+    complete: C,
+) -> Result<C, Response> {
+    match crate::proxy::fabric_peer_refusal::refuse_peer_authorization(status, headers, facts) {
+        Some(refused) => {
+            complete(crate::mcp::modern_sse::ResponseOutcome {
+                failed: true,
+                ..Default::default()
+            });
+            Err(refused)
+        }
+        None => Ok(complete),
+    }
 }
 
 /// Outcome of evaluating the surface's MCP tool-level policies. Carries the
@@ -14461,43 +14141,6 @@ fn agent_card_fabric_forward_path(surface: &crate::config::agent_surface::AgentS
     }
 }
 
-fn record_agent_card_gateway_fault(
-    state: &ProxyState,
-    source_addr: &str,
-) {
-    if let Some(ref metrics) = state.metrics_store {
-        let metrics = Arc::clone(metrics);
-        let channel_config_id = state
-            .surface
-            .surface_id
-            .clone();
-        let source = source_addr.to_string();
-        let dest = state
-            .surface
-            .target
-            .endpoint
-            .clone();
-        let trace_id = uuid::Uuid::new_v4().to_string();
-        crate::observability::policy_audit::spawn_in_request(async move {
-            metrics
-                .record_connection(
-                    channel_config_id,
-                    source,
-                    dest,
-                    crate::metrics::ConnectionStatus::GatewayFault,
-                    None,
-                    Some("Anonymous".to_string()),
-                    crate::metrics::ConnectionDirection::Request,
-                    trace_id,
-                    None,
-                    None,
-                    0,
-                )
-                .await;
-        });
-    }
-}
-
 /// Put the gateway-issued identity credential on an agent card. A public card
 /// keeps a credential an upstream gateway already put there; an extended card
 /// has every credential its sender put there removed and gets the gateway's own.
@@ -14525,188 +14168,6 @@ fn agent_card_kind(is_extended_card_response: bool) -> crate::a2a::AgentCardKind
 
 fn extended_agent_card_refusal(rpc_request_id: Option<&serde_json::Value>) -> Response {
     crate::a2a::url_rewriter::extended_agent_card_refusal(rpc_request_id)
-}
-
-async fn fetch_agent_card_from_surface_target(
-    state: &ProxyState,
-    headers: &HeaderMap,
-    source_addr: &str,
-    channel_name: &str,
-    target_url: &str,
-) -> Result<JsonValue, Response> {
-    debug!(channel = channel_name, target = %loggable::url(target_url), "Fetching agent card from upstream");
-
-    let source_cred_header = state
-        .surface
-        .source_auth()
-        .and_then(|sa| sa.credential_header_name());
-
-    if state
-        .surface
-        .target
-        .endpoint
-        .starts_with("fabric://")
-    {
-        let forwarded_headers = headers
-            .iter()
-            .filter(|(key, _)| should_forward_header(key.as_str(), source_cred_header))
-            .filter_map(|(key, value)| {
-                value
-                    .to_str()
-                    .ok()
-                    .map(|value| (key.as_str().to_string(), value.to_string()))
-            })
-            .collect::<HashMap<_, _>>();
-        let trace_id = uuid::Uuid::new_v4().to_string();
-        let path = agent_card_fabric_forward_path(&state.surface);
-        let response = crate::proxy::fabric_forward::forward_via_fabric(
-            &state.listener_manager,
-            crate::proxy::fabric_forward::FabricForwardRequest {
-                fabric_target: &state.surface.target.endpoint,
-                method: &Method::GET,
-                path: &path,
-                headers: forwarded_headers,
-                body: bytes::Bytes::new(),
-                timeout: std::time::Duration::from_secs(30),
-                trace_id: &trace_id,
-                log_label: channel_name,
-            },
-        )
-        .await
-        .map_err(|e| {
-            error!(channel = channel_name, error = %e, "Failed to fetch agent card from fabric upstream - bad gateway");
-            record_agent_card_gateway_fault(state, source_addr);
-            create_error_response(StatusCode::BAD_GATEWAY, &format!("Failed to fetch from upstream: {}", e))
-        })?;
-
-        let status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::BAD_GATEWAY);
-        if !status.is_success() {
-            error!(channel = channel_name, status = %status, "Fabric upstream returned error for agent card - gateway fault");
-            record_agent_card_gateway_fault(state, source_addr);
-            return Err(create_error_response(status, &format!("Upstream error: {status}")));
-        }
-
-        serde_json::from_slice(&response.body).map_err(|e| {
-            error!(channel = channel_name, error = %e, "Failed to parse fabric agent card JSON");
-            create_error_response(StatusCode::BAD_GATEWAY, "Invalid JSON from upstream")
-        })
-    } else {
-        let credential = agent_card_target_credential(state, source_addr, channel_name).await?;
-        let mut req = match credential {
-            Some(_) => pinned_target_client(
-                state,
-                channel_name,
-                target_url,
-                &crate::audit::request_events::RequestFacts {
-                    surface_id: &state.surface.surface_id,
-                    channel_name,
-                    trace_id: None,
-                    via_fabric: false,
-                },
-            )
-            .await
-            .inspect_err(|_| record_agent_card_gateway_fault(state, source_addr))?
-            .get(target_url),
-            None => state.client.get(target_url),
-        };
-
-        for (key, value) in headers.iter() {
-            let forward = match credential {
-                Some(_) => is_forwarded_on_credentialed_card_fetch(key.as_str()),
-                None => should_forward_header(key.as_str(), source_cred_header),
-            };
-            if forward {
-                req = req.header(key.as_str(), value.as_bytes());
-            }
-        }
-        if let Some((header_name, header_value)) = &credential {
-            req = req.header(header_name.as_str(), header_value.as_str());
-            debug!(channel = channel_name, header = %header_name, "Injected target authentication header on agent card fetch");
-        }
-
-        let response = req
-            .send()
-            .await
-            .map_err(|e| {
-                error!(
-                    channel = channel_name,
-                    error = %e.without_url(),
-                    "Failed to fetch agent card from upstream - bad gateway"
-                );
-                record_agent_card_gateway_fault(state, source_addr);
-                create_error_response(StatusCode::BAD_GATEWAY, "Failed to fetch from upstream")
-            })?;
-
-        if response
-            .status()
-            .is_redirection()
-        {
-            error!(channel = channel_name, status = %response.status(), "Upstream redirected the agent card fetch - gateway fault");
-            record_agent_card_gateway_fault(state, source_addr);
-            return Err(create_error_response(StatusCode::BAD_GATEWAY, "Upstream redirected"));
-        }
-        if !response.status().is_success() {
-            error!(channel = channel_name, status = %response.status(), "Upstream returned error for agent card - gateway fault");
-            record_agent_card_gateway_fault(state, source_addr);
-            return Err(create_error_response(response.status(), &format!("Upstream error: {}", response.status())));
-        }
-
-        let limits = crate::proxy::upstream_body::UpstreamBodyLimits::new(
-            state.config.a2a.max_body_size,
-            state.surface.timeout(),
-            state
-                .config
-                .a2a
-                .timeout_seconds,
-        );
-        let body = crate::proxy::upstream_body::read_bounded(response, limits)
-            .await
-            .map_err(|e| {
-                error!(channel = channel_name, error = %e, "Failed to read agent card from upstream - gateway fault");
-                record_agent_card_gateway_fault(state, source_addr);
-                let (status, message) = e.status_and_message();
-                create_error_response(status, message)
-            })?;
-        serde_json::from_slice(&body).map_err(|e| {
-            error!(channel = channel_name, error = %e, "Failed to parse agent card JSON");
-            create_error_response(StatusCode::BAD_GATEWAY, "Invalid JSON from upstream")
-        })
-    }
-}
-
-/// The surface's target credential for the gateway's own agent-card fetch, or
-/// `None` when the surface has none. Honours `target.auth.fallback` exactly as
-/// the forwarded path does: `reject` fails the card with 502 rather than asking
-/// the target without the credential it requires.
-async fn agent_card_target_credential(
-    state: &ProxyState,
-    source_addr: &str,
-    channel_name: &str,
-) -> Result<Option<(String, String)>, Response> {
-    let Some(target_auth) = state.surface.target_auth() else {
-        return Ok(None);
-    };
-    match inject_target_auth_header(target_auth, &state.secrets_store, channel_name, CallerAssertion::GatewayOriginated)
-        .await
-    {
-        Ok(credential) => Ok(credential),
-        Err(e) => {
-            error!(channel = channel_name, error = %e, "Failed to resolve target authentication for agent card fetch");
-            match target_auth.fallback {
-                crate::config::TargetAuthFallback::Reject => {
-                    record_agent_card_gateway_fault(state, source_addr);
-                    Err(create_error_response(StatusCode::BAD_GATEWAY, "Target authentication failed"))
-                }
-                crate::config::TargetAuthFallback::Passthrough => {
-                    warn!(
-                        channel = channel_name,
-                        "Target auth failed but passthrough enabled, fetching agent card without credentials"
-                    );
-                    Ok(None)
-                }
-            }
-        }
-    }
 }
 
 /// A redirect-disabled client pinned to the vetted address of `target_url`, or
@@ -14756,10 +14217,58 @@ async fn pinned_target_client(
 /// credential. The caller is anonymous, so only content negotiation passes;
 /// nothing the caller sends can override the credential or ride along on a
 /// request the gateway has authenticated.
-fn is_forwarded_on_credentialed_card_fetch(name: &str) -> bool {
+pub(crate) fn is_forwarded_on_credentialed_card_fetch(name: &str) -> bool {
     ["accept", "accept-language", "user-agent"]
         .iter()
         .any(|allowed| name.eq_ignore_ascii_case(allowed))
+}
+
+/// What a card served for this request needs to resolve its declaration.
+fn card_security_context<'a>(
+    state: &'a ProxyState,
+    strategies: Option<&'a dyn crate::jwt_bearer::JwtVerificationStrategyStorage>,
+) -> crate::a2a::CardSecurityContext<'a> {
+    crate::a2a::CardSecurityContext {
+        variant_alias: card_variant_alias(state),
+        strategies,
+    }
+}
+
+/// The alias a card served for this request names. It counts only when it selected
+/// a Surface Variant, so path text never reaches a card URL.
+fn card_variant_alias(state: &ProxyState) -> Option<&str> {
+    selected_variant_alias(
+        state
+            .active_variant_alias
+            .as_deref(),
+        state
+            .active_variant_id
+            .as_deref(),
+    )
+}
+
+fn selected_variant_alias<'a>(
+    alias: Option<&'a str>,
+    variant_id: Option<&str>,
+) -> Option<&'a str> {
+    variant_id.and(alias)
+}
+
+/// The JWT verification strategy store a card's declaration reads.
+fn card_strategy_store(state: &ProxyState) -> Option<Arc<dyn crate::jwt_bearer::JwtVerificationStrategyStorage>> {
+    state
+        .source_auth_middleware
+        .as_ref()
+        .map(|middleware| middleware.provider_store())
+}
+
+/// Whether the Access Point asks to declare on the route called: its caller
+/// authentication sets `protected_resource`. Such a card is refused when it
+/// cannot be rewritten or secured, and caches must revalidate it on every use.
+/// Any other card is served without revalidation headers, and on a proxied
+/// response a card that cannot be rewritten is served as the agent sent it.
+fn secures_agent_card(surface: &crate::config::agent_surface::AgentSurface) -> bool {
+    crate::source_auth::declaration::requests_declaration(surface)
 }
 
 async fn prepare_a2a_proxy_agent_card(
@@ -14921,19 +14430,7 @@ async fn evaluate_mcp_proxy_opa_policies(
         }
     }
 
-    let mut policy_input = crate::surface_context::PolicyInput::new(
-        method,
-        uri.path(),
-        crate::surface_context::filter_sensitive_headers(headers),
-        "inbound",
-        None,
-        None,
-        state
-            .surface
-            .config_id()
-            .map(|s| s.to_string()),
-        &state.surface.name,
-    );
+    let mut policy_input = state.inbound_policy_input(method, uri.path(), headers);
     policy_input.source_auth = source_auth_context.cloned();
     policy_input.mcp = mcp_context.cloned();
     policy_input.payment = payment_context.cloned();
@@ -14972,7 +14469,7 @@ async fn evaluate_mcp_proxy_opa_policies(
             .access_point
             .trust_check_list;
         if !caller_elements.is_empty()
-            && !crate::proxy::paths::is_public_request(method, uri.path())
+            && !crate::proxy::paths::is_public_surface_request(&state.surface, method, uri.path())
             && let Some(manager) = state
                 .trust_registry_listener_manager
                 .clone()
@@ -15457,37 +14954,42 @@ async fn handle_mcp_proxy_request(
     }
 
     // Resolve target auth header if configured on the channel
-    let target_auth_header = if let Some(target_auth) = state.surface.target_auth() {
-        match inject_target_auth_header(
-            target_auth,
-            &state.secrets_store,
-            channel_name,
-            CallerAssertion::for_forwarded_request(method.as_str(), uri.path(), source_auth_failed),
-        )
-        .await
-        {
-            Ok(header) => header,
-            Err(e) => {
-                error!(channel = channel_name, error = %e, "Failed to resolve target auth for MCP proxy");
-                match target_auth.fallback {
-                    crate::config::TargetAuthFallback::Reject => {
-                        return Err(create_error_response(
-                            StatusCode::BAD_GATEWAY,
-                            "Target authentication configuration error",
-                        ));
-                    }
-                    crate::config::TargetAuthFallback::Passthrough => {
-                        warn!(
-                            channel = channel_name,
-                            "Target auth failed but passthrough enabled, continuing without credentials"
-                        );
-                        None
-                    }
+    let target_auth_header = match state.surface.target_auth() {
+        Some(target_auth) => {
+            let resolution = state
+                .target_credentials()
+                .resolve(
+                    target_auth,
+                    &crate::proxy::target_credentials::TargetAuthContext {
+                        surface: &state.surface,
+                        destination: &state.surface.target.endpoint,
+                        leg: crate::proxy::target_credentials::TargetLeg::McpProxy,
+                        caller: CallerAssertion::for_forwarded_request(
+                            &state.surface,
+                            method.as_str(),
+                            uri.path(),
+                            source_auth_failed,
+                        ),
+                        via_fabric: false,
+                        trace_id: Some(&trace_id),
+                        occupied_headers: &[],
+                    },
+                )
+                .await;
+            match crate::proxy::target_credentials::apply_target_auth_fallback(target_auth, resolution) {
+                crate::proxy::target_credentials::TargetAuthDecision::Inject(credential) => {
+                    Some(credential.into_pair())
+                }
+                crate::proxy::target_credentials::TargetAuthDecision::Continue => None,
+                crate::proxy::target_credentials::TargetAuthDecision::Reject => {
+                    return Err(create_error_response(
+                        StatusCode::BAD_GATEWAY,
+                        crate::proxy::target_credentials::TARGET_AUTH_FAILED,
+                    ));
                 }
             }
         }
-    } else {
-        None
+        None => None,
     };
 
     // Use the MCP proxy request handler with full policy support (timeout, retry, circuit breaker, mirroring)
@@ -16344,6 +15846,9 @@ fn compute_transit_token_caller_context(
 mod variant_routing_tests;
 
 #[cfg(test)]
+mod source_auth_order_tests;
+
+#[cfg(test)]
 mod forward_response_log_tests {
     #[test]
     fn forward_response_log_summary_keeps_header_values_and_body_out() {
@@ -16415,22 +15920,115 @@ mod caller_assertion_tests {
 
     #[test]
     fn a_failed_source_authentication_never_carries_the_target_credential() {
+        let surface = plain_surface();
         for (method, path) in [("POST", "/surface/mcp"), ("GET", "/payments/garlic/station")] {
-            let assertion = CallerAssertion::for_forwarded_request(method, path, true);
+            let assertion = CallerAssertion::for_forwarded_request(&surface, method, path, true);
             assert_eq!(assertion, CallerAssertion::Unauthenticated, "{method} {path}");
             assert!(!assertion.permits_target_credential(), "{method} {path}");
         }
     }
 
+    fn plain_surface() -> crate::config::agent_surface::AgentSurface {
+        use crate::protocols::protected_resource::fixtures::{discovery_surface, jwt_bearer_method};
+        discovery_surface(jwt_bearer_method(), None)
+    }
+
+    fn declaring_surface() -> crate::config::agent_surface::AgentSurface {
+        use crate::protocols::protected_resource::fixtures::{discovery_surface, jwt_bearer_method};
+        discovery_surface(
+            jwt_bearer_method(),
+            Some(serde_json::json!({"resource": "https://gateway.example/mcp/alpha", "scopes": ["tools"]})),
+        )
+    }
+
     #[test]
     fn a_forwarded_request_without_a_failure_keeps_the_path_rule() {
+        let surface = plain_surface();
         for (method, path, expected) in [
             ("POST", "/surface/mcp", CallerAssertion::Authenticated),
             ("GET", "/surface/.well-known/agent-card.json", CallerAssertion::Unauthenticated),
             ("HEAD", "/surface/agent.json", CallerAssertion::Unauthenticated),
         ] {
-            assert_eq!(CallerAssertion::for_forwarded_request(method, path, false), expected, "{method} {path}");
+            assert_eq!(
+                CallerAssertion::for_forwarded_request(&surface, method, path, false),
+                expected,
+                "{method} {path}"
+            );
         }
+    }
+
+    #[test]
+    fn a_forwarded_discovery_suffix_on_a_declaring_access_point_is_an_asserted_caller() {
+        let surface = declaring_surface();
+        for (method, path, expected) in [
+            ("GET", "/.well-known/agent-card.json", CallerAssertion::Unauthenticated),
+            ("GET", "/tasks/discovery", CallerAssertion::Authenticated),
+            ("HEAD", "/agent.json", CallerAssertion::Authenticated),
+        ] {
+            assert_eq!(
+                CallerAssertion::for_forwarded_request(&surface, method, path, false),
+                expected,
+                "{method} {path}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod caller_token_tests {
+    use serde_json::json;
+
+    use super::forwards_caller_token;
+    use crate::config::agent_surface::AgentSurface;
+    use crate::protocols::protected_resource::fixtures::{
+        FixtureStrategies, STRATEGY_ID, discovery_network, discovery_surface,
+    };
+    use crate::source_auth::declaration::{DeclarationOutcome, StripReason, resolve_surface_declaration};
+
+    fn method(forward_header: bool) -> serde_json::Value {
+        json!({"type": "jwt_bearer", "jwt_verification_strategy_id": STRATEGY_ID, "audiences": [], "forward_header": forward_header})
+    }
+
+    async fn declare() -> DeclarationOutcome {
+        let surface = discovery_surface(method(false), Some(json!({"resource": "https://gateway.example/mcp/alpha"})));
+        let outcome =
+            resolve_surface_declaration(&surface, None, Some(&FixtureStrategies::Pinned), &discovery_network())
+                .await
+                .expect("the fixture strategy store answers");
+        assert!(matches!(outcome, DeclarationOutcome::Declare(_)), "{outcome:?}");
+        outcome
+    }
+
+    #[test]
+    fn a_forwarding_method_on_an_access_point_that_does_not_declare_forwards_the_callers_token() {
+        let surface = discovery_surface(method(true), None);
+        let stripped = DeclarationOutcome::Strip(StripReason::NotDeclared);
+        for outcome in [None, Some(&DeclarationOutcome::PassThrough), Some(&stripped)] {
+            assert!(forwards_caller_token(&surface, outcome), "{outcome:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_declaring_access_point_never_forwards_the_callers_token() {
+        let declare = declare().await;
+        assert!(!forwards_caller_token(&discovery_surface(method(true), None), Some(&declare)));
+        assert!(!forwards_caller_token(&discovery_surface(method(false), None), Some(&declare)));
+    }
+
+    #[test]
+    fn the_callers_token_stays_without_a_forwarding_jwt_bearer_method_or_on_a_resource_server() {
+        assert!(!forwards_caller_token(&discovery_surface(method(false), None), None));
+        let api_key = json!({"type": "api_key", "extraction": {"source": "http_header", "field": "authorization"}, "secret_id": "key"});
+        assert!(!forwards_caller_token(&discovery_surface(api_key, None), None));
+        let resource_server: AgentSurface = serde_json::from_value(json!({
+            "surface_id": "rs", "name": "rs",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp",
+                "caller_authentication": {"methods": [method(true)]}},
+            "target": {"endpoint": "https://tools.example/mcp"},
+            "mcp_http": {"authorization": {"resource": "https://gateway.example/mcp", "scopes": ["read"]}}
+        }))
+        .unwrap();
+        assert!(!forwards_caller_token(&resource_server, None));
     }
 }
 
@@ -16441,12 +16039,15 @@ mod tests {
         agent_card_response, ap2_experimental_enabled_from_flags, decode_bearer_jwt_claims,
         delegates_credentials_over_fabric, evaluate_ap2_inbound_decision, fabric_mcp_gate_input,
         is_forwarded_on_credentialed_card_fetch, modern_fabric_failure_response, normalize_route_for_match,
-        resolve_direct_surface_auth_config, resolve_legacy_mcp_session, route_tail_to_uri_path,
-        should_forward_ap_request_header_with_mapping,
+        resolve_access_point_declaration, resolve_direct_surface_auth_config, resolve_legacy_mcp_session,
+        route_tail_to_uri_path, secures_agent_card, selected_variant_alias,
+        should_forward_ap_request_header_with_mapping, unservable_declaration_detail,
     };
+    use crate::component_tests::helpers::direct_router_state;
     use axum::http::{HeaderMap, HeaderValue};
     use base64::Engine;
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     const READER_CONDITION: &str = r#"
 package surface.policy
@@ -16515,6 +16116,10 @@ allow if {
         crate::surface_context::SourceAuthContext::JwtBearer {
             subject: "alice".to_string(),
             claims: serde_json::json!({ "role": role }),
+            scopes: Vec::new(),
+            client_id: None,
+            strategy_id: None,
+            strategy_tenant_id: None,
         }
     }
 
@@ -16726,8 +16331,12 @@ allow if {
         for (name, value) in request_headers {
             headers.insert(*name, HeaderValue::from_static(value));
         }
-        let response =
-            agent_card_response(serde_json::json!({"name": "card"}), &headers, crate::a2a::version::SUPPORTED_VERSIONS);
+        let response = agent_card_response(
+            serde_json::json!({"name": "card"}),
+            &headers,
+            crate::a2a::version::SUPPORTED_VERSIONS,
+            false,
+        );
         let content_type = response.headers()[axum::http::header::CONTENT_TYPE]
             .to_str()
             .unwrap()
@@ -16763,77 +16372,157 @@ allow if {
         }
     }
 
-    fn direct_router_state(
-        state: &crate::state::ProxyState,
-        surface: crate::config::agent_surface::AgentSurface,
-    ) -> crate::state::MultiSurfaceProxyState {
-        use std::sync::Arc;
+    fn header_text(
+        response: &axum::response::Response,
+        name: axum::http::header::HeaderName,
+    ) -> Option<String> {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+    }
 
-        crate::state::MultiSurfaceProxyState {
-            config: state.config.clone(),
-            network_config: state.network_config.clone(),
-            client: state.client.clone(),
-            channels: Arc::new(tokio::sync::RwLock::new(vec![crate::state::SurfaceInfo {
-                surface: Arc::new(surface),
-                identity_rules_engine: None,
-                identity_selector: None,
-                protected_rules_engine: None,
-                protected_selector: None,
-                external_rules_engine: None,
-                external_selector: None,
-                task_id: "router-fixture".into(),
-                variant_engines: HashMap::new(),
-            }])),
-            metrics_store: state.metrics_store.clone(),
-            task_monitor: state.task_monitor.clone(),
-            ws_state: state.ws_state.clone(),
-            listener_manager: state.listener_manager.clone(),
-            secrets_store: state.secrets_store.clone(),
-            certificates_store: state
-                .certificates_store
-                .clone(),
-            vc_issuer: state.vc_issuer.clone(),
-            policy_manager: state.policy_manager.clone(),
-            gateway_policy_manager: state
-                .gateway_policy_manager
-                .clone(),
-            didauth_session_store: state
-                .didauth_session_store
-                .clone(),
-            transaction_store: state
-                .transaction_store
-                .clone(),
-            mpp_transaction_store: state
-                .mpp_transaction_store
-                .clone(),
-            trust_registry_listener_manager: state
-                .trust_registry_listener_manager
-                .clone(),
-            source_auth_middleware: state
-                .source_auth_middleware
-                .clone(),
-            #[cfg(feature = "didwebvh")]
-            didwebvh_identity_store: state
-                .didwebvh_identity_store
-                .clone(),
-            #[cfg(feature = "didwebvh")]
-            didwebvh_log_manager: state
-                .didwebvh_log_manager
-                .clone(),
-            credential_provider_store: state
-                .credential_provider_store
-                .clone(),
-            delegation_vault_store: state
-                .delegation_vault_store
-                .clone(),
-            gateway_base_url: state.gateway_base_url.clone(),
-            transit_token_issuer: state
-                .transit_token_issuer
-                .clone(),
-            mcp_proxy_store: state.mcp_proxy_store.clone(),
-            a2a_proxy_store: state.a2a_proxy_store.clone(),
-            resolved_surface_cache: Arc::new(crate::surfaces::ResolvedSurfaceCache::new()),
+    #[test]
+    fn agent_card_response_must_be_revalidated_against_a_digest_of_the_card() {
+        let card = serde_json::json!({"name": "card"});
+        let response =
+            agent_card_response(card.clone(), &HeaderMap::new(), crate::a2a::version::SUPPORTED_VERSIONS, true);
+        assert_eq!(header_text(&response, axum::http::header::CACHE_CONTROL).as_deref(), Some("no-cache"));
+        let digest = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(serde_json::to_vec(&card).unwrap()));
+        assert_eq!(header_text(&response, axum::http::header::ETAG), Some(format!("W/\"{digest}\"")));
+
+        let other = agent_card_response(
+            serde_json::json!({"name": "other"}),
+            &HeaderMap::new(),
+            crate::a2a::version::SUPPORTED_VERSIONS,
+            true,
+        );
+        assert_ne!(
+            header_text(&other, axum::http::header::ETAG),
+            header_text(&response, axum::http::header::ETAG),
+            "a changed card gets a new validator"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_card_response_without_revalidation_serves_the_card_with_no_validator() {
+        let card = serde_json::json!({"name": "card"});
+        let response =
+            agent_card_response(card.clone(), &HeaderMap::new(), crate::a2a::version::SUPPORTED_VERSIONS, false);
+        assert_eq!(header_text(&response, axum::http::header::CACHE_CONTROL), None);
+        assert_eq!(header_text(&response, axum::http::header::ETAG), None);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap(), card);
+    }
+
+    #[test]
+    fn a_card_names_the_request_alias_only_when_it_selected_a_variant() {
+        assert_eq!(selected_variant_alias(Some("dev"), Some("vc-dev")), Some("dev"));
+        assert_eq!(selected_variant_alias(None, Some("vc-default")), None, "the default variant serves the base route");
+        assert_eq!(selected_variant_alias(Some("injected"), None), None, "an alias that selected nothing is ignored");
+        assert_eq!(selected_variant_alias(None, None), None);
+    }
+
+    /// A strategy store failure leaves an Access Point that sets `protected_resource`
+    /// unservable, so its callers fail closed, while one that sets none never reads
+    /// the store and does not declare.
+    #[tokio::test]
+    async fn a_strategy_store_failure_leaves_a_declaring_access_point_unservable() {
+        use crate::protocols::protected_resource::fixtures::{FixtureStrategies, STRATEGY_ID, discovery_network};
+        use crate::source_auth::declaration::{
+            DeclarationOutcome, StripReason, UnservableDeclaration, UnservableReason,
+        };
+
+        let middleware = crate::source_auth::SourceAuthMiddleware::new(
+            Arc::new(crate::didauth::DidAuthSessionStore::new()),
+            Arc::new(FixtureStrategies::Failing),
+            Arc::new(crate::jwt_bearer::JwksClient::new()),
+            None,
+            Arc::new(dashmap::DashMap::new()),
+            None,
+            None,
+        );
+        let surface = |protected_resource: Option<serde_json::Value>| -> crate::config::agent_surface::AgentSurface {
+            let mut caller_authentication = serde_json::json!({"methods": [{"type": "jwt_bearer",
+                "jwt_verification_strategy_id": STRATEGY_ID, "audiences": [], "required_scopes": ["agent.invoke"]}]});
+            if let Some(protected_resource) = protected_resource {
+                caller_authentication["protected_resource"] = protected_resource;
+            }
+            serde_json::from_value(serde_json::json!({
+                "name": "card",
+                "access_point": {"listen_address": "https://gateway.example", "route": "/card", "protocol": "a2a",
+                    "caller_authentication": caller_authentication},
+                "target": {"endpoint": "https://agent.internal"}
+            }))
+            .expect("surface")
+        };
+        let network = discovery_network();
+
+        assert_eq!(
+            resolve_access_point_declaration(
+                &surface(Some(serde_json::json!({"resource": "https://gateway.example/card"}))),
+                None,
+                Some(&middleware),
+                &network
+            )
+            .await,
+            DeclarationOutcome::Unservable(UnservableDeclaration::new(
+                UnservableReason::StrategyStoreUnavailable,
+                "the JWT verification strategy store is unavailable"
+            ))
+        );
+        assert_eq!(
+            resolve_access_point_declaration(&surface(None), None, Some(&middleware), &network).await,
+            DeclarationOutcome::Strip(StripReason::NotDeclared),
+            "required_scopes alone does not declare"
+        );
+    }
+
+    #[test]
+    fn an_unservable_declaration_names_the_protocol_it_fails() {
+        use crate::config::agent_surface::SurfaceProtocol;
+        assert_eq!(unservable_declaration_detail(&SurfaceProtocol::Mcp), "Invalid MCP protected resource");
+        for protocol in [SurfaceProtocol::A2a, SurfaceProtocol::Ap2, SurfaceProtocol::DIDComm] {
+            assert_eq!(unservable_declaration_detail(&protocol), "Caller authentication unavailable", "{protocol:?}");
         }
+    }
+
+    #[test]
+    fn only_a_card_of_an_access_point_with_protected_resource_is_secured() {
+        let a2a_surface = |route: &str, methods: serde_json::Value, protected_resource: Option<&str>| {
+            let mut caller_authentication = serde_json::json!({"methods": methods});
+            if let Some(resource) = protected_resource {
+                caller_authentication["protected_resource"] = serde_json::json!({"resource": resource});
+            }
+            serde_json::from_value::<crate::config::agent_surface::AgentSurface>(serde_json::json!({
+                "name": "buyer",
+                "access_point": {"listen_address": "0.0.0.0:8443", "route": route, "protocol": "a2a",
+                    "caller_authentication": caller_authentication},
+                "target": {"endpoint": "https://agent.internal"},
+                "variants": [{"id": "dev", "alias": "dev", "name": "Dev", "enabled": true, "overrides": {}}]
+            }))
+            .unwrap()
+        };
+        let jwt = serde_json::json!([{"type": "jwt_bearer", "jwt_verification_strategy_id": "strategy-1",
+            "audiences": [], "required_scopes": ["agent.invoke"]}]);
+
+        let declaring = a2a_surface("/a2a/buyer", jwt.clone(), Some("https://gw.example/a2a/buyer"));
+        assert!(secures_agent_card(&declaring));
+        let dev = declaring
+            .serve_variant(Some("dev"))
+            .expect("the dev variant resolves")
+            .surface;
+        assert!(secures_agent_card(&dev), "a variant keeps the base route's protected_resource");
+        assert!(secures_agent_card(&a2a_surface("/", jwt.clone(), Some("https://gw.example/"))));
+
+        assert!(!secures_agent_card(&a2a_surface("/a2a/buyer", jwt, None)), "required_scopes alone does not declare");
+        assert!(!secures_agent_card(&a2a_surface("/a2a/buyer", serde_json::json!([]), None)));
+        let api_key = serde_json::json!([{"type": "api_key", "secret_id": "keys",
+            "extraction": {"source": "http_header", "field": "X-API-Key"}}]);
+        assert!(!secures_agent_card(&a2a_surface("/a2a/buyer", api_key, None)));
     }
 
     async fn access_point_router_refuses_a_variant_it_cannot_resolve(state: &crate::state::ProxyState) {
@@ -18283,6 +17972,39 @@ allow if {
         );
     }
 
+    fn inbound_policy_input_publishes_only_a_selected_variant_alias(state: &crate::state::ProxyState) {
+        let headers =
+            HeaderMap::from_iter([(axum::http::header::CONTENT_TYPE, HeaderValue::from_static("application/json"))]);
+        let input = |alias: Option<&str>, id: Option<&str>| {
+            let state = crate::state::ProxyState {
+                active_variant_alias: alias.map(str::to_string),
+                active_variant_id: id.map(str::to_string),
+                ..state.clone()
+            };
+            serde_json::to_value(state.inbound_policy_input("POST", "/mcp", &headers)).unwrap()
+        };
+
+        let selected = input(Some("beta"), Some("beta-id"));
+        assert_eq!(selected["channel"]["variant_alias"], "beta");
+        assert_eq!(selected["channel"]["config_id"], "consent-surface");
+        assert_eq!(selected["channel"]["name"], "Consent Surface");
+        assert_eq!(selected["gateway"]["direction"], "inbound");
+        assert_eq!(selected["http"]["method"], "POST");
+        assert_eq!(selected["http"]["path"], "/mcp");
+        assert_eq!(selected["http"]["headers"]["content-type"], "application/json");
+
+        for (alias, id) in [(Some("beta"), None), (None, None), (None, Some("default-id"))] {
+            let input = input(alias, id);
+            assert!(
+                input["channel"]
+                    .get("variant_alias")
+                    .is_none(),
+                "{alias:?} {id:?}: {input}"
+            );
+            assert_eq!(input["channel"]["config_id"], "consent-surface");
+        }
+    }
+
     async fn direct_access_point_blocks_when_source_auth_is_unavailable(state: &crate::state::ProxyState) {
         use serde_json::json;
         use std::sync::atomic::Ordering;
@@ -19158,6 +18880,7 @@ allow if {
             a2a_proxy_store: None,
             active_variant_alias: None,
             active_variant_id: None,
+            access_point_declaration: None,
             surface: Arc::new(surface),
         };
         access_point_router_refuses_a_variant_it_cannot_resolve(&state).await;
@@ -19169,6 +18892,7 @@ allow if {
         access_point_refuses_methods_and_bodies_outside_post(&state).await;
         access_point_rejects_a_spoofed_identity_credential(&state).await;
         direct_access_point_blocks_when_source_auth_is_unavailable(&state).await;
+        inbound_policy_input_publishes_only_a_selected_variant_alias(&state);
         direct_access_point_preserves_every_result_field(&state).await;
         direct_access_point_caller_disconnect_cancels_quiet_upstream(&state).await;
         streamed_responses_hold_the_connection_until_the_body_ends(&state).await;
@@ -19719,6 +19443,7 @@ allow if {
         let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
             subject: "user".into(),
             claims: json!({"iss": "https://gateway.example/api/oauth2/mcp", "sub": "user", "scope": "read"}),
+            strategy: None,
         };
         let binding = crate::mcp::continuations::delegation::make_binding(
             "deployment",
@@ -20695,6 +20420,33 @@ allow if {
     }
 
     #[test]
+    fn decode_bearer_jwt_claims_accepts_the_scheme_in_any_case() {
+        let header = bearer_with_payload(serde_json::json!({ "sub": "agent@example.com", "tier": "free" }));
+        let token = header
+            .strip_prefix("Bearer ")
+            .unwrap();
+        for scheme in ["bearer", "BEARER", "BeArEr"] {
+            let claims = decode_bearer_jwt_claims(&format!("{scheme} {token}")).expect("claims should decode");
+            assert_eq!(
+                claims
+                    .get("tier")
+                    .and_then(|v| v.as_str()),
+                Some("free"),
+                "{scheme}"
+            );
+            assert_eq!(
+                claims
+                    .get("sub")
+                    .and_then(|v| v.as_str()),
+                Some("agent@example.com"),
+                "{scheme}"
+            );
+        }
+        assert!(decode_bearer_jwt_claims(&format!("Bearer{token}")).is_none());
+        assert!(decode_bearer_jwt_claims("bearer ").is_none());
+    }
+
+    #[test]
     fn ap2_experimental_enabled_defaults_false() {
         let empty_flags = HashMap::new();
         assert!(!ap2_experimental_enabled_from_flags(None));
@@ -20888,6 +20640,7 @@ allow if {
             a2a_proxy_store: None,
             active_variant_alias: None,
             active_variant_id: None,
+            access_point_declaration: None,
             surface: std::sync::Arc::new(surface),
         }
     }
@@ -21152,6 +20905,7 @@ mod fabric_extended_card_tests {
     struct FabricPeer {
         state: crate::state::ProxyState,
         peer_did: String,
+        forwarded: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
         _root: tempfile::TempDir,
         _issuer_dir: tempfile::TempDir,
     }
@@ -21167,6 +20921,35 @@ mod fabric_extended_card_tests {
     async fn fabric_peer_answering(
         status: u16,
         body: serde_json::Value,
+    ) -> FabricPeer {
+        fabric_peer_answering_with_headers(status, json!({"content-type": "application/json"}), body).await
+    }
+
+    /// [`fabric_peer_answering`] with the ForwardResponse `headers` given.
+    async fn fabric_peer_answering_with_headers(
+        status: u16,
+        headers: serde_json::Value,
+        body: serde_json::Value,
+    ) -> FabricPeer {
+        fabric_peer_on("a2a", status, headers, body).await
+    }
+
+    /// A gateway whose `protocol` surface, `fabric-<protocol>` on the route
+    /// `/<protocol>`, targets a Fabric peer that answers every ForwardRequest
+    /// with `status`, `headers` and `body`.
+    async fn fabric_peer_on(
+        protocol: &str,
+        status: u16,
+        headers: serde_json::Value,
+        body: serde_json::Value,
+    ) -> FabricPeer {
+        fabric_peer_replying(protocol, json!({"status": status, "headers": headers, "body": body.to_string()})).await
+    }
+
+    /// [`fabric_peer_on`] whose peer answers with the ForwardResponse body `reply`.
+    async fn fabric_peer_replying(
+        protocol: &str,
+        reply: serde_json::Value,
     ) -> FabricPeer {
         let root = tempfile::tempdir().unwrap();
         let peer_did = format!("did:example:peer-{}", uuid::Uuid::new_v4());
@@ -21196,8 +20979,13 @@ mod fabric_extended_card_tests {
             .await;
 
         let responder_did = peer_did.clone();
-        let reply_body = body.to_string();
+        let forwarded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = forwarded.clone();
         crate::comm::didcomm::client::test_send_hook::install(&peer_did, move |request| {
+            recorded
+                .lock()
+                .unwrap()
+                .push(request.body.clone());
             let reply = crate::gateways::connection_points::messages::ReceivedMessage::new(
                 "cp-1".into(),
                 "peer".into(),
@@ -21210,7 +20998,7 @@ mod fabric_extended_card_tests {
                 vec!["did:example:connection-point".into()],
                 None,
                 None,
-                json!({"status": status, "headers": {"content-type": "application/json"}, "body": reply_body}),
+                reply.clone(),
                 crate::gateways::connection_points::messages::MessageMetadata {
                     encrypted: true,
                     authenticated: true,
@@ -21222,8 +21010,8 @@ mod fabric_extended_card_tests {
         });
 
         let surface = serde_json::from_value(json!({
-            "surface_id": "fabric-a2a", "name": "Fabric A2A",
-            "access_point": {"listen_address": "https://gateway.example", "route": "/a2a", "protocol": "a2a"},
+            "surface_id": format!("fabric-{protocol}"), "name": format!("Fabric {}", protocol.to_uppercase()),
+            "access_point": {"listen_address": "https://gateway.example", "route": format!("/{protocol}"), "protocol": protocol},
             "target": {"endpoint": format!("fabric://{}/remote-surface", peer.id)}
         }))
         .unwrap();
@@ -21278,11 +21066,13 @@ mod fabric_extended_card_tests {
             a2a_proxy_store: None,
             active_variant_alias: None,
             active_variant_id: None,
+            access_point_declaration: None,
             surface: Arc::new(surface),
         };
         FabricPeer {
             state,
             peer_did,
+            forwarded,
             _root: root,
             _issuer_dir: issuer_dir,
         }
@@ -21322,6 +21112,672 @@ mod fabric_extended_card_tests {
         let body =
             serde_json::from_slice(&bytes).unwrap_or_else(|_| panic!("{status}: {}", String::from_utf8_lossy(&bytes)));
         (status, body)
+    }
+
+    async fn send_through_router(peer: &FabricPeer) -> axum::response::Response {
+        send_message_through_router(peer, None).await
+    }
+
+    /// Sends an A2A `message/send` to `/a2a`, presenting `authorization` when given.
+    async fn send_message_through_router(
+        peer: &FabricPeer,
+        authorization: Option<&str>,
+    ) -> axum::response::Response {
+        let mut request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/a2a")
+            .header("content-type", "application/json");
+        if let Some(authorization) = authorization {
+            request = request.header("authorization", authorization);
+        }
+        let request = request
+            .body(axum::body::Body::from(
+                json!({"jsonrpc": "2.0", "id": "m-1", "method": "message/send", "params": {"message": {
+                    "role": "user", "messageId": "m-1", "parts": [{"kind": "text", "text": "hi"}]
+                }}})
+                .to_string(),
+            ))
+            .unwrap();
+        route_through_router(peer, request).await
+    }
+
+    /// Sends a legacy MCP `tools/list` to `/mcp`.
+    async fn send_tools_list_through_router(peer: &FabricPeer) -> axum::response::Response {
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-protocol-version", crate::mcp::MCP_LEGACY_VERSION)
+            .body(axum::body::Body::from(json!({"jsonrpc": "2.0", "id": "m-1", "method": "tools/list"}).to_string()))
+            .unwrap();
+        route_through_router(peer, request).await
+    }
+
+    async fn route_through_router(
+        peer: &FabricPeer,
+        request: axum::http::Request<axum::body::Body>,
+    ) -> axum::response::Response {
+        let router = crate::component_tests::helpers::direct_router_state(&peer.state, (*peer.state.surface).clone());
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            Box::pin(super::multi_channel_proxy_handler_with_mcp_runtime(
+                "127.0.0.1:12345"
+                    .parse()
+                    .unwrap(),
+                router,
+                request,
+                crate::mcp::request_validation::McpVersionPolicy::new(
+                    &[crate::mcp::MCP_MODERN_VERSION],
+                    &[crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION],
+                ),
+                None,
+            )),
+        )
+        .await
+        .expect("the Fabric leg answers")
+    }
+
+    #[test]
+    fn a_fabric_route_relays_only_payment_challenges_from_the_peer() {
+        run_on_large_stack(async {
+            const BEARER: &str =
+                "Bearer resource_metadata=\"https://gw2.example/.well-known/oauth-protected-resource/a\"";
+            const PAYMENT: &str = "Payment id=\"p1\", realm=\"gw2\", method=\"tempo\"";
+            let both = format!("{BEARER}, {PAYMENT}");
+            for (status, relayed, expected_status, expected_challenges) in [
+                (402, PAYMENT, 402, vec![PAYMENT]),
+                (402, both.as_str(), 402, vec![PAYMENT]),
+                (401, both.as_str(), 401, vec![PAYMENT]),
+                (401, BEARER, 502, vec![]),
+                (403, PEER_INSUFFICIENT_SCOPE, 502, vec![]),
+                (401, "", 502, vec![]),
+            ] {
+                let mut headers = json!({"content-type": "application/json"});
+                if !relayed.is_empty() {
+                    headers["www-authenticate"] = json!(relayed);
+                }
+                let peer = fabric_peer_answering_with_headers(
+                    status,
+                    headers,
+                    json!({"jsonrpc": "2.0", "id": "m-1", "error": {"code": -32000, "message": "refused"}}),
+                )
+                .await;
+
+                let response = send_through_router(&peer).await;
+
+                let challenges: Vec<String> = response
+                    .headers()
+                    .get_all(axum::http::header::WWW_AUTHENTICATE)
+                    .iter()
+                    .map(|value| {
+                        value
+                            .to_str()
+                            .unwrap()
+                            .to_string()
+                    })
+                    .collect();
+                assert_eq!(
+                    (response.status().as_u16(), challenges),
+                    (
+                        expected_status,
+                        expected_challenges
+                            .iter()
+                            .map(|c| c.to_string())
+                            .collect()
+                    ),
+                    "peer status {status} with {relayed}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn a_fabric_relay_skips_a_peer_header_http_cannot_carry_and_keeps_the_rest() {
+        run_on_large_stack(async {
+            let reply = json!({"jsonrpc": "2.0", "id": "m-1", "result": {"ok": true}});
+            let peer = fabric_peer_on(
+                "a2a",
+                202,
+                json!({"content-type": "application/json", "x-ok": "1", "x-bad": "v\r\nInjected: 1"}),
+                reply.clone(),
+            )
+            .await;
+
+            let response = send_through_router(&peer).await;
+
+            assert_eq!(response.status(), axum::http::StatusCode::ACCEPTED);
+            assert_eq!(response.headers()["x-ok"], "1");
+            assert!(
+                response
+                    .headers()
+                    .get("x-bad")
+                    .is_none()
+            );
+            assert!(
+                response
+                    .headers()
+                    .get("injected")
+                    .is_none()
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body, reply);
+        });
+    }
+
+    const PEER_INVALID_TOKEN: &str = "Bearer realm=\"agent-gateway\", error=\"invalid_token\"";
+    const PEER_INSUFFICIENT_SCOPE: &str = "Bearer realm=\"agent-gateway\", error=\"insufficient_scope\"";
+
+    /// The refusals a receiving gateway answers a forwarded request with: its
+    /// status, its challenge and its problem body, and the reason the sending
+    /// gateway records.
+    fn peer_refusals() -> [(u16, &'static str, serde_json::Value, crate::audit::request_events::RejectionReason); 2] {
+        [
+            (
+                401,
+                PEER_INVALID_TOKEN,
+                json!({"type": "about:blank", "title": "Unauthorized", "status": 401,
+                    "detail": "A bearer token issued for this resource is required"}),
+                crate::audit::request_events::RejectionReason::PeerTokenRefused,
+            ),
+            (
+                403,
+                PEER_INSUFFICIENT_SCOPE,
+                json!({"type": "about:blank", "title": "Forbidden", "status": 403,
+                    "detail": "A bearer token granting the scopes this resource requires is required"}),
+                crate::audit::request_events::RejectionReason::PeerScopeRefused,
+            ),
+        ]
+    }
+
+    fn peer_refusal_headers(challenge: &str) -> serde_json::Value {
+        json!({"content-type": "application/problem+json", "cache-control": "no-store", "www-authenticate": challenge})
+    }
+
+    type Rejection = (
+        crate::audit::request_events::RejectionStage,
+        crate::audit::request_events::RejectionReason,
+        Option<u16>,
+        bool,
+    );
+
+    /// Every `request_rejected` record: its stage, reason, HTTP status and
+    /// whether it was recorded for a Fabric receive.
+    fn rejections(events: &[crate::delegation_vault::audit::DelegationAuditEvent]) -> Vec<Rejection> {
+        events
+            .iter()
+            .filter_map(|event| match &event.event {
+                crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                    stage,
+                    reason,
+                    http_status,
+                    ..
+                } => Some((*stage, *reason, *http_status, event.via_fabric)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn forward_rejection(reason: crate::audit::request_events::RejectionReason) -> Vec<Rejection> {
+        vec![(crate::audit::request_events::RejectionStage::Forward, reason, Some(502), false)]
+    }
+
+    /// The status, headers and body of `response`, with the audit records sent
+    /// while `send` ran.
+    async fn answered(
+        send: impl std::future::Future<Output = axum::response::Response>
+    ) -> (
+        axum::http::StatusCode,
+        axum::http::HeaderMap,
+        serde_json::Value,
+        Vec<crate::delegation_vault::audit::DelegationAuditEvent>,
+    ) {
+        let (response, events) = crate::audit::producer::capture(send).await;
+        let (parts, body) = response.into_parts();
+        let bytes = axum::body::to_bytes(body, 65536)
+            .await
+            .unwrap();
+        let body = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| panic!("{}: {}", parts.status, String::from_utf8_lossy(&bytes)));
+        (parts.status, parts.headers, body, events)
+    }
+
+    /// Asserts the sending gateway's answer to a peer authorization refusal: a
+    /// `502` problem with the fixed detail, no challenge, nothing of the peer's
+    /// refusal, and one forward rejection with `reason`.
+    fn assert_peer_refusal_answer(
+        case: &str,
+        (status, headers, body, events): (
+            axum::http::StatusCode,
+            axum::http::HeaderMap,
+            serde_json::Value,
+            Vec<crate::delegation_vault::audit::DelegationAuditEvent>,
+        ),
+        reason: crate::audit::request_events::RejectionReason,
+    ) {
+        assert_eq!(status, axum::http::StatusCode::BAD_GATEWAY, "{case}: {body}");
+        assert_eq!(
+            headers
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/problem+json"),
+            "{case}"
+        );
+        assert!(
+            headers
+                .get(axum::http::header::WWW_AUTHENTICATE)
+                .is_none(),
+            "{case}: {headers:?}"
+        );
+        assert_eq!(body["status"], 502, "{case}: {body}");
+        assert_eq!(body["detail"], crate::proxy::fabric_peer_refusal::PEER_REFUSED_DETAIL, "{case}: {body}");
+        let text = body.to_string();
+        for leaked in ["realm", "scope", "invalid_token", "resource_metadata", "this resource"] {
+            assert!(!text.contains(leaked), "{case}: the answer names the peer's {leaked}: {body}");
+        }
+        assert_eq!(rejections(&events), forward_rejection(reason), "{case}");
+    }
+
+    #[test]
+    fn a_fabric_peer_authorization_refusal_reaches_an_a2a_caller_as_a_502() {
+        run_on_large_stack(async {
+            for (status, challenge, body, reason) in peer_refusals() {
+                let peer = fabric_peer_on("a2a", status, peer_refusal_headers(challenge), body).await;
+
+                let answer = answered(send_through_router(&peer)).await;
+
+                assert_peer_refusal_answer(&format!("peer {status}"), answer, reason);
+            }
+        });
+    }
+
+    #[test]
+    fn a_fabric_peer_authorization_refusal_reaches_a_legacy_mcp_caller_as_a_502() {
+        run_on_large_stack(async {
+            for (status, challenge, body, reason) in peer_refusals() {
+                let peer = fabric_peer_on("mcp", status, peer_refusal_headers(challenge), body).await;
+
+                let answer = answered(send_tools_list_through_router(&peer)).await;
+
+                assert!(
+                    answer
+                        .2
+                        .get("jsonrpc")
+                        .is_none(),
+                    "peer {status}: a problem, not a JSON-RPC envelope"
+                );
+                assert_peer_refusal_answer(&format!("peer {status}"), answer, reason);
+            }
+        });
+    }
+
+    /// A peer's policy `403` carries no Bearer `insufficient_scope` challenge, so
+    /// the caller keeps the stage's answer and no forward rejection is recorded.
+    #[test]
+    fn a_fabric_peer_policy_403_keeps_the_stage_answer() {
+        run_on_large_stack(async {
+            let reply = || {
+                json!({
+                    "status": 403,
+                    "headers": {"content-type": "application/problem+json"},
+                    "body": json!({"type": "about:blank", "title": "Forbidden", "status": 403,
+                        "detail": "Request blocked by gateway policy"}).to_string(),
+                    "error": "Request blocked by gateway policy"
+                })
+            };
+
+            let peer = fabric_peer_replying("a2a", reply()).await;
+            let (status, headers, body, events) = answered(send_through_router(&peer)).await;
+            assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{body}");
+            assert_eq!(body["detail"], "Request blocked by gateway policy", "{body}");
+            assert!(
+                headers
+                    .get(axum::http::header::WWW_AUTHENTICATE)
+                    .is_none()
+            );
+            assert!(rejections(&events).is_empty(), "{events:?}");
+
+            let peer = fabric_peer_replying("mcp", reply()).await;
+            let (status, headers, body, events) = answered(send_tools_list_through_router(&peer)).await;
+            assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{body}");
+            assert_eq!(body["jsonrpc"], "2.0", "{body}");
+            assert_eq!(body["error"]["code"], -32001, "{body}");
+            assert_eq!(body["error"]["message"], "Request blocked by gateway policy", "{body}");
+            assert!(
+                headers
+                    .get(axum::http::header::WWW_AUTHENTICATE)
+                    .is_none()
+            );
+            assert!(rejections(&events).is_empty(), "{events:?}");
+        });
+    }
+
+    /// A peer's challenge decides its answer however large the peer's other
+    /// headers are.
+    #[test]
+    fn a_fabric_peer_challenge_is_read_beside_large_headers() {
+        run_on_large_stack(async {
+            const PAYMENT: &str = "Payment id=\"p1\", realm=\"gw2\", method=\"tempo\"";
+            let with_large = |challenge: Option<serde_json::Value>| {
+                let mut headers =
+                    json!({"content-type": "application/json", "content-security-policy": "a".repeat(17 * 1024)});
+                if let Some(challenge) = challenge {
+                    headers["www-authenticate"] = challenge;
+                }
+                headers
+            };
+
+            for (status, challenge, body, reason) in peer_refusals() {
+                for challenge in [json!(challenge), json!(["Basic realm=\"peer\"", challenge])] {
+                    let peer = fabric_peer_on("a2a", status, with_large(Some(challenge.clone())), body.clone()).await;
+
+                    let answer = answered(send_through_router(&peer)).await;
+
+                    assert_peer_refusal_answer(&format!("peer {status} with {challenge}"), answer, reason);
+                }
+            }
+
+            const OTHER_PAYMENT: &str = "Payment id=\"p2\", realm=\"gw2\", method=\"card\"";
+            let refused = json!({"jsonrpc": "2.0", "id": "m-1", "error": {"code": -32000, "message": "refused"}});
+            for (status, challenge, expected_challenges) in [
+                (402, Some(json!(PAYMENT)), vec![PAYMENT.to_string()]),
+                (401, Some(json!(PAYMENT)), vec![PAYMENT.to_string()]),
+                (401, Some(json!([PAYMENT, PEER_INVALID_TOKEN])), vec![PAYMENT.to_string()]),
+                (402, Some(json!([PAYMENT, OTHER_PAYMENT])), vec![PAYMENT.to_string(), OTHER_PAYMENT.to_string()]),
+                (403, None, vec![]),
+                (403, Some(json!(["Basic realm=\"peer\""])), vec![]),
+            ] {
+                let peer = fabric_peer_on("a2a", status, with_large(challenge.clone()), refused.clone()).await;
+
+                let (response, events) = crate::audit::producer::capture(send_through_router(&peer)).await;
+
+                let challenges: Vec<String> = response
+                    .headers()
+                    .get_all(axum::http::header::WWW_AUTHENTICATE)
+                    .iter()
+                    .map(|value| {
+                        value
+                            .to_str()
+                            .unwrap()
+                            .to_string()
+                    })
+                    .collect();
+                assert_eq!(
+                    (response.status().as_u16(), challenges),
+                    (status, expected_challenges),
+                    "peer {status} with {challenge:?}"
+                );
+                assert!(rejections(&events).is_empty(), "peer {status} with {challenge:?}: {events:?}");
+            }
+        });
+    }
+
+    #[test]
+    fn a_header_the_fabric_peer_repeats_reaches_the_caller_with_every_value() {
+        run_on_large_stack(async {
+            let peer = fabric_peer_on(
+                "a2a",
+                200,
+                json!({"content-type": "application/json", "link": ["<https://a.example>", "<https://b.example>"]}),
+                json!({"jsonrpc": "2.0", "id": "m-1", "result": {}}),
+            )
+            .await;
+
+            let response = send_through_router(&peer).await;
+
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            let links: Vec<&str> = response
+                .headers()
+                .get_all(axum::http::header::LINK)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .collect();
+            assert_eq!(links, ["<https://a.example>", "<https://b.example>"]);
+        });
+    }
+
+    /// The answer the card route gives, or the failure a preview reports, for a
+    /// Fabric peer's answer to the gateway's card fetch.
+    async fn card_fetch_answer(
+        mode: super::agent_card::CardMode,
+        status: u16,
+        challenge: Option<&str>,
+    ) -> (
+        Result<serde_json::Value, super::agent_card::CardFailure>,
+        Vec<crate::delegation_vault::audit::DelegationAuditEvent>,
+    ) {
+        let peer = fabric_peer_on("a2a", 200, json!({}), json!({})).await;
+        let mut headers = std::collections::HashMap::from([(
+            "content-type".to_string(),
+            vec!["application/problem+json".to_string()],
+        )]);
+        if let Some(challenge) = challenge {
+            headers.insert("www-authenticate".to_string(), vec![challenge.to_string()]);
+        }
+        let response = crate::proxy::fabric_forward::FabricForwardResponse {
+            status,
+            headers,
+            body: json!({"type": "about:blank", "status": status})
+                .to_string()
+                .into_bytes(),
+        };
+        let fetch = super::agent_card::TargetCardFetch {
+            state: &peer.state,
+            source_addr: "127.0.0.1",
+            mode,
+        };
+        crate::audit::producer::capture(async { fetch.read_fabric_answer(&response, "trace-card") }).await
+    }
+
+    async fn served_failure(
+        failure: Result<serde_json::Value, super::agent_card::CardFailure>
+    ) -> (axum::http::StatusCode, axum::http::HeaderMap, serde_json::Value) {
+        let response = axum::response::IntoResponse::into_response(super::agent_card::CardRefusal::Failed(
+            failure.expect_err("the card fetch failed"),
+        ));
+        let (parts, body) = response.into_parts();
+        let bytes = axum::body::to_bytes(body, 65536)
+            .await
+            .unwrap();
+        (parts.status, parts.headers, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[test]
+    fn a_fabric_peer_refusal_of_the_card_fetch_is_a_502() {
+        run_on_large_stack(async {
+            for (status, challenge, _, reason) in peer_refusals() {
+                let (failure, events) =
+                    card_fetch_answer(super::agent_card::CardMode::Serve, status, Some(challenge)).await;
+
+                let (answered_status, headers, body) = served_failure(failure).await;
+
+                assert_peer_refusal_answer(
+                    &format!("card fetch, peer {status}"),
+                    (answered_status, headers, body, events),
+                    reason,
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn a_fabric_peer_policy_403_or_404_on_the_card_fetch_keeps_its_status() {
+        run_on_large_stack(async {
+            for status in [403, 404] {
+                let (failure, events) = card_fetch_answer(super::agent_card::CardMode::Serve, status, None).await;
+
+                let (answered_status, headers, body) = served_failure(failure).await;
+
+                assert_eq!(answered_status.as_u16(), status, "{body}");
+                assert!(
+                    body["detail"]
+                        .as_str()
+                        .is_some_and(|detail| detail.starts_with("Upstream error")),
+                    "{body}"
+                );
+                assert!(
+                    headers
+                        .get(axum::http::header::WWW_AUTHENTICATE)
+                        .is_none()
+                );
+                assert!(rejections(&events).is_empty(), "peer {status}: {events:?}");
+            }
+        });
+    }
+
+    #[test]
+    fn a_preview_reports_a_fabric_peer_refusal_without_recording_it() {
+        run_on_large_stack(async {
+            for (status, challenge, _, _) in peer_refusals() {
+                let (failure, events) =
+                    card_fetch_answer(super::agent_card::CardMode::Preview, status, Some(challenge)).await;
+
+                let failure = failure.expect_err("the card fetch failed");
+                assert_eq!(failure.cause, crate::proxy::card_preview::CardFetchCause::AuthFailed, "peer {status}");
+                assert_eq!(failure.http_status, Some(status), "peer {status}");
+                assert!(events.is_empty(), "peer {status}: {events:?}");
+                let (answered_status, _, body) = served_failure(Err(failure)).await;
+                assert_eq!(answered_status, axum::http::StatusCode::BAD_GATEWAY, "{body}");
+                assert_eq!(body["detail"], crate::proxy::fabric_peer_refusal::PEER_REFUSED_DETAIL, "{body}");
+            }
+            let (failure, _) = card_fetch_answer(super::agent_card::CardMode::Preview, 401, None).await;
+            let failure = failure.expect_err("the card fetch failed");
+            assert_eq!(
+                (failure.cause, failure.http_status),
+                (crate::proxy::card_preview::CardFetchCause::AuthFailed, Some(401)),
+                "a peer 401 with no challenge is a refusal too"
+            );
+            let peer = fabric_peer_on("a2a", 200, json!({}), json!({})).await;
+            assert_eq!(
+                crate::proxy::card_preview::CardAuthReport::for_surface(&peer.state.surface).kind,
+                crate::proxy::card_preview::CardAuthKind::RemoteGateway
+            );
+        });
+    }
+
+    /// The start of a modern Fabric stream that refuses the gateway's authorization
+    /// ends the request with the peer refusal's `502`, and its completion records a
+    /// failed response; any other start keeps the completion for the stream.
+    #[tokio::test]
+    async fn a_modern_fabric_peer_authorization_refusal_is_a_502_with_the_peer_detail() {
+        let facts = crate::audit::request_events::RequestFacts {
+            surface_id: "fabric-mcp",
+            channel_name: "Fabric MCP",
+            trace_id: Some("trace-1"),
+            via_fabric: false,
+        };
+        for (status, challenge, _, reason) in peer_refusals() {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(axum::http::header::WWW_AUTHENTICATE, axum::http::HeaderValue::from_static(challenge));
+            let outcome = std::cell::Cell::new(None);
+
+            let (refused, events) = crate::audit::producer::capture(async {
+                super::refuse_modern_fabric_peer(
+                    axum::http::StatusCode::from_u16(status).unwrap(),
+                    &headers,
+                    &facts,
+                    |completed: crate::mcp::modern_sse::ResponseOutcome| outcome.set(Some(completed.failed)),
+                )
+                .err()
+                .expect("the stream start is refused")
+            })
+            .await;
+
+            assert_eq!(outcome.get(), Some(true), "peer {status}: the completion records a failed response");
+            let (parts, body) = refused.into_parts();
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(body, 65536)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_peer_refusal_answer(
+                &format!("modern peer {status}"),
+                (parts.status, parts.headers, body, events),
+                reason,
+            );
+        }
+
+        let outcome = std::cell::Cell::new(None);
+        let (kept, events) = crate::audit::producer::capture(async {
+            super::refuse_modern_fabric_peer(
+                axum::http::StatusCode::OK,
+                &axum::http::HeaderMap::new(),
+                &facts,
+                |completed: crate::mcp::modern_sse::ResponseOutcome| outcome.set(Some(completed.failed)),
+            )
+            .is_ok()
+        })
+        .await;
+        assert!(kept, "a 200 stream start keeps its completion");
+        assert_eq!(outcome.get(), None, "the completion is left for the stream");
+        assert!(events.is_empty(), "{events:?}");
+    }
+
+    /// The caller's `Authorization` header never reaches the Fabric peer, on a
+    /// JWT Bearer Access Point whose caller authenticates with it.
+    #[test]
+    fn the_caller_token_never_reaches_the_fabric_peer() {
+        run_on_large_stack(async {
+            let fixture = crate::component_tests::helpers::jwt::JwksFixture::start().await;
+            let mut peer = fabric_peer_on(
+                "a2a",
+                200,
+                json!({"content-type": "application/json"}),
+                json!({"jsonrpc": "2.0", "id": "m-1", "result": {}}),
+            )
+            .await;
+            peer.state
+                .source_auth_middleware = Some(
+                super::variant_routing_tests::idp_middleware(
+                    peer._root.path(),
+                    Some(&fixture),
+                    Arc::clone(
+                        &peer
+                            .state
+                            .didauth_session_store,
+                    ),
+                )
+                .await,
+            );
+            let mut surface = (*peer.state.surface).clone();
+            surface
+                .access_point
+                .caller_authentication = Some(
+                serde_json::from_value(json!({"methods": [{"type": "jwt_bearer",
+                    "jwt_verification_strategy_id": "idp", "audiences": ["https://gateway.example/a2a"]}]}))
+                .unwrap(),
+            );
+            peer.state.surface = Arc::new(surface);
+            let token = super::variant_routing_tests::idp_token(&fixture, "https://gateway.example/a2a");
+
+            let response = send_message_through_router(&peer, Some(&format!("Bearer {token}"))).await;
+
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            let forwarded = peer
+                .forwarded
+                .lock()
+                .unwrap()
+                .clone();
+            assert_eq!(forwarded.len(), 1, "{forwarded:?}");
+            let sent = forwarded[0]["headers"]
+                .as_object()
+                .expect("the ForwardRequest carries headers");
+            assert!(
+                sent.keys()
+                    .all(|name| !name.eq_ignore_ascii_case("authorization")),
+                "{sent:?}"
+            );
+            assert!(
+                !forwarded[0]
+                    .to_string()
+                    .contains(&token),
+                "the caller's token crossed Fabric"
+            );
+        });
     }
 
     #[test]
@@ -21386,6 +21842,124 @@ mod fabric_extended_card_tests {
         });
     }
 
+    async fn peer_with_target_secret(secret: Option<&str>) -> FabricPeer {
+        let mut peer = fabric_peer_answering(200, json!({"jsonrpc": "2.0", "id": "m-1", "result": {}})).await;
+        let secrets: Arc<dyn crate::secrets::SecretsStore> = Arc::new(
+            crate::secrets::FilesystemSecretsStore::new_async(
+                peer._root
+                    .path()
+                    .join("secrets")
+                    .to_str()
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+        );
+        if let Some(value) = secret {
+            secrets
+                .create(crate::secrets::CreateSecretRequest {
+                    tenant_id: None,
+                    name: "PEER_KEY".into(),
+                    secret_id: "PEER_KEY".into(),
+                    description: None,
+                    value: value.into(),
+                    secret_type: "General".into(),
+                    tags: vec![],
+                })
+                .await
+                .unwrap();
+        }
+        peer.state.secrets_store = Some(secrets);
+        let mut surface = (*peer.state.surface).clone();
+        surface.target.auth = Some(
+            serde_json::from_value(json!({
+                "method": {"static_secret": {"secret_id": "PEER_KEY", "header_name": "X-Api-Key"}},
+                "fallback": "reject"
+            }))
+            .unwrap(),
+        );
+        peer.state.surface = Arc::new(surface);
+        peer
+    }
+
+    async fn forward_message_send(peer: &FabricPeer) -> (axum::http::StatusCode, String) {
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("https://gateway.example/a2a")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                json!({"jsonrpc": "2.0", "id": "m-1", "method": "message/send", "params": {"message": {
+                    "role": "user", "parts": [{"kind": "text", "text": "hi"}], "messageId": "m-1"}}})
+                .to_string(),
+            ))
+            .unwrap();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            Box::pin(super::proxy_handler_with_mcp_runtime(
+                "127.0.0.1:12345"
+                    .parse()
+                    .unwrap(),
+                peer.state.clone(),
+                request,
+                crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+                None,
+            )),
+        )
+        .await
+        .expect("the Fabric leg answers")
+        .unwrap_or_else(|response| response);
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    #[test]
+    fn fabric_forward_carries_the_target_secret_to_the_peer_in_a_header() {
+        run_on_large_stack(async {
+            let peer = peer_with_target_secret(Some("peer-secret")).await;
+
+            let (status, body) = forward_message_send(&peer).await;
+
+            assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+            let forwarded = peer
+                .forwarded
+                .lock()
+                .unwrap()
+                .clone();
+            assert_eq!(forwarded.len(), 1, "{forwarded:?}");
+            assert_eq!(forwarded[0]["headers"]["X-API-KEY"], "peer-secret", "{forwarded:?}");
+            assert!(!body.contains("peer-secret"), "the secret never reaches the caller: {body}");
+        });
+    }
+
+    #[test]
+    fn fabric_forward_without_its_target_secret_is_refused_before_anything_is_sent() {
+        run_on_large_stack(async {
+            let peer = peer_with_target_secret(None).await;
+
+            let (status, body) = forward_message_send(&peer).await;
+
+            assert_eq!(status, axum::http::StatusCode::BAD_GATEWAY, "{body}");
+            let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(body["detail"], crate::proxy::target_credentials::TARGET_AUTH_FAILED);
+            assert!(
+                !body
+                    .to_string()
+                    .contains("PEER_KEY"),
+                "{body}"
+            );
+            assert!(
+                peer.forwarded
+                    .lock()
+                    .unwrap()
+                    .is_empty(),
+                "the peer gateway never received the request"
+            );
+        });
+    }
+
     #[tokio::test]
     async fn the_fabric_forward_vp_injection_record_names_the_authenticated_caller() {
         let mut peer = fabric_peer_answering(200, json!({"jsonrpc": "2.0", "id": "m-1", "result": {}})).await;
@@ -21423,6 +21997,7 @@ mod fabric_extended_card_tests {
         let caller = crate::source_auth::AuthenticatedIdentity::JwtBearer {
             subject: "user-123".to_string(),
             claims: json!({"iss": "https://idp.example.com", "email": "ada@example.com"}),
+            strategy: None,
         };
 
         let (result, events) = crate::audit::producer::capture(Box::pin(super::handle_fabric_request(

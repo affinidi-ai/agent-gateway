@@ -25,6 +25,22 @@ Feature: Surface creation through the admin API
     And the admin API error response mentions "target.endpoint is required"
     And the admin API response does not include a surface id
 
+  Scenario Outline: A surface on the protected resource metadata path is refused
+    When the operator attempts to create an otherwise valid surface for route "<route>"
+    Then the admin API response status is 400
+    And the admin API error response mentions "protected resource metadata path"
+    And the admin API response does not include a surface id
+
+    Examples:
+      | route                                       |
+      | /.well-known/oauth-protected-resource       |
+      | /.well-known/oauth-protected-resource/agent |
+
+  Scenario: A surface beside the protected resource metadata path is created
+    When the operator creates a valid surface for route "/.well-known/oauth-protected-resources"
+    Then the admin API response status is 201
+    And the admin API response includes a surface id
+
   Scenario: A rejected surface creation does not activate routing
     Given the operator has attempted to create a surface for route "/example" with invalid configuration
     When the caller sends a request to the surface path "/example/foo"

@@ -88,17 +88,12 @@ impl DynamoDbConfigStore {
             .await
             .context("Failed to query channels from DynamoDB")?;
 
-        let mut channels = Vec::new();
-
-        if let Some(items) = result.items {
-            for item in items {
-                let surface = self.parse_channel_item(item)?;
-                // Only include channels that are not marked as deleted
-                if surface.status != crate::config::agent_surface::SurfaceStatus::Deleted {
-                    channels.push(surface);
-                }
-            }
-        }
+        let channels = Self::readable_channels(
+            result
+                .items
+                .unwrap_or_default(),
+            |item| self.parse_channel_item(item),
+        );
 
         if channels.is_empty() {
             warn!("No active channels found in DynamoDB table");
@@ -148,6 +143,51 @@ impl DynamoDbConfigStore {
                     .with_context(|| format!("Invalid protocol value: {}", protocol))
             }
         }
+    }
+
+    /// The channels that parse and are not marked deleted; an item that does not parse is skipped.
+    fn readable_channels(
+        items: Vec<HashMap<String, aws_sdk_dynamodb::types::AttributeValue>>,
+        mut parse: impl FnMut(
+            HashMap<String, aws_sdk_dynamodb::types::AttributeValue>,
+        ) -> Result<crate::config::agent_surface::AgentSurface>,
+    ) -> Vec<crate::config::agent_surface::AgentSurface> {
+        items
+            .into_iter()
+            .filter_map(|item| Self::skip_unreadable(parse(item)))
+            .filter(|surface| surface.status != crate::config::agent_surface::SurfaceStatus::Deleted)
+            .collect()
+    }
+
+    /// An item that cannot be read is logged and counted, and the other channels still load.
+    fn skip_unreadable(
+        parsed: Result<crate::config::agent_surface::AgentSurface>
+    ) -> Option<crate::config::agent_surface::AgentSurface> {
+        match parsed {
+            Ok(surface) => Some(surface),
+            Err(error) => {
+                warn!("Skipping an unreadable DynamoDB channel: {error:#}");
+                crate::metrics::backends::prometheus::track_storage_load_error("dynamodb_channel", "unreadable_record");
+                None
+            }
+        }
+    }
+
+    /// An unreadable `target_auth` fails the item instead of reading as none: a method
+    /// from a newer release must not leave the surface forwarding without its credential.
+    fn parse_target_auth(
+        item: &HashMap<String, aws_sdk_dynamodb::types::AttributeValue>,
+        config_id: &str,
+    ) -> Result<Option<crate::config::types::TargetAuthConfig>> {
+        let Some(raw) = item
+            .get("target_auth")
+            .and_then(|value| value.as_s().ok())
+        else {
+            return Ok(None);
+        };
+        serde_json::from_str(raw)
+            .map(Some)
+            .map_err(|_| anyhow!("Unreadable target_auth on channel '{config_id}'; it may come from a newer release"))
     }
 
     /// Parse a DynamoDB item into an AgentSurface
@@ -209,10 +249,12 @@ impl DynamoDbConfigStore {
             .and_then(|v| v.as_s().ok())
             .and_then(|s| serde_json::from_str(s).ok());
 
-        let target_auth: Option<crate::config::types::TargetAuthConfig> = item
-            .get("target_auth")
-            .and_then(|v| v.as_s().ok())
-            .and_then(|s| serde_json::from_str(s).ok());
+        let target_auth = Self::parse_target_auth(
+            &item,
+            config_id
+                .as_deref()
+                .unwrap_or_default(),
+        )?;
 
         use crate::config::agent_surface::{
             AccessPoint, AgentSurface, CallerAuthentication, SurfaceIdentitySlots, SurfaceProtocol, SurfaceStatus,
@@ -344,5 +386,108 @@ mod tests {
 
         let protocol = DynamoDbConfigStore::parse_channel_protocol(&item);
         assert!(protocol.is_err());
+    }
+}
+
+#[cfg(test)]
+mod target_auth_tests {
+    use super::*;
+    use aws_sdk_dynamodb::types::AttributeValue;
+
+    fn unreadable_channels() -> u64 {
+        crate::metrics::backends::prometheus::STORAGE_LOAD_ERRORS
+            .with_label_values(&["dynamodb_channel", "unreadable_record"])
+            .get()
+    }
+
+    #[test]
+    fn an_unreadable_channel_is_skipped_and_counted_while_a_readable_one_is_kept() {
+        let before = unreadable_channels();
+        let kept = DynamoDbConfigStore::skip_unreadable(Ok(crate::config::agent_surface::AgentSurface::default()));
+        assert!(kept.is_some());
+
+        let dropped = DynamoDbConfigStore::skip_unreadable(Err(anyhow!("unreadable")));
+        assert!(dropped.is_none());
+        assert!(unreadable_channels() > before, "the counter is shared with parallel tests, so it only rises");
+    }
+
+    #[test]
+    fn one_unreadable_item_among_readable_ones_is_skipped_and_counted_while_the_rest_load() {
+        use crate::config::agent_surface::{AgentSurface, SurfaceStatus};
+        let named = |name: &str| {
+            let mut item = HashMap::new();
+            item.insert("name".to_string(), AttributeValue::S(name.to_string()));
+            item
+        };
+        let before = unreadable_channels();
+        let channels = DynamoDbConfigStore::readable_channels(
+            vec![named("first"), named("broken"), named("gone"), named("last")],
+            |item| {
+                let name = item["name"]
+                    .as_s()
+                    .unwrap()
+                    .clone();
+                match name.as_str() {
+                    "broken" => Err(anyhow!("unreadable")),
+                    "gone" => Ok(AgentSurface {
+                        name,
+                        status: SurfaceStatus::Deleted,
+                        ..AgentSurface::default()
+                    }),
+                    _ => Ok(AgentSurface {
+                        name,
+                        ..AgentSurface::default()
+                    }),
+                }
+            },
+        );
+        let names: Vec<_> = channels
+            .iter()
+            .map(|surface| surface.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["first", "last"]);
+        assert!(unreadable_channels() > before, "the counter is shared with parallel tests, so it only rises");
+    }
+
+    fn item_with(target_auth: Option<&str>) -> HashMap<String, AttributeValue> {
+        let mut item = HashMap::new();
+        if let Some(target_auth) = target_auth {
+            item.insert("target_auth".to_string(), AttributeValue::S(target_auth.to_string()));
+        }
+        item
+    }
+
+    fn parsed(target_auth: Option<&str>) -> Result<Option<crate::config::types::TargetAuthConfig>> {
+        DynamoDbConfigStore::parse_target_auth(&item_with(target_auth), "channel-1")
+    }
+
+    #[test]
+    fn a_missing_target_auth_is_none() {
+        assert_eq!(parsed(None).unwrap(), None);
+    }
+
+    #[test]
+    fn a_readable_target_auth_is_returned() {
+        let auth = parsed(Some(r#"{"method":{"static_secret":{"secret_id":"S","header_name":"X"}}}"#))
+            .unwrap()
+            .expect("target auth is read");
+        assert!(matches!(auth.method, crate::config::types::TargetAuthMethod::StaticSecret { .. }));
+    }
+
+    #[test]
+    fn a_target_auth_method_from_a_newer_release_fails_the_item() {
+        let error = parsed(Some(r#"{"method":{"a_method_from_a_newer_release":{}}}"#)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("channel-1"),
+            "{error}"
+        );
+        assert!(
+            !error
+                .to_string()
+                .contains("a_method_from_a_newer_release"),
+            "the stored text is not echoed"
+        );
     }
 }

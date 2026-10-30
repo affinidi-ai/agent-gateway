@@ -1289,6 +1289,119 @@ async fn inbound_a2a_tampered_jwt_forwarded_reaches_target() {
     assert_mock_received_request(&h.mock, &request_str);
 }
 
+// ── Auth: required scopes ────────────────────────────────────────────────────
+
+const SCOPE_POLICY_ID: &str = "e2e-scope-policy";
+
+/// Admits a caller whose token grants `a2a:invoke` to the expected client through the
+/// expected strategy, and a failed caller only when its token was short of a scope, so
+/// an admission shows the exact failure kind reached OPA.
+const SCOPE_POLICY_REGO: &str = r#"package surface.policy
+
+default allow := false
+
+allow if {
+    input.source_auth.method == "jwt_bearer"
+    "a2a:invoke" in input.source_auth.scopes
+    input.source_auth.strategy_id == "e2e-jwt-strategy"
+    input.source_auth.client_id == "billing-client"
+}
+
+allow if {
+    input.source_auth.method == "failed"
+    input.source_auth.kind == "insufficient_scope"
+}
+"#;
+
+/// An Access Point with `required_scopes` that does not declare an authorization
+/// server publishes the granted scopes, the client id and the verifying strategy to
+/// policy, and publishes a token short of a required scope as a failed caller of kind
+/// `insufficient_scope` instead of refusing it.
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_a2a_required_scopes_are_published_to_policy() {
+    let fixture = JwksFixture::start().await;
+    let h = GatewayHarness::start(|temp_dir, gw_config, _bootstrap| {
+        setup_jwt_bearer_auth_rejects_missing_then_accepts_valid(&fixture, temp_dir, gw_config);
+        let dir = temp_dir.join("policy_definitions");
+        std::fs::create_dir_all(&dir).expect("create policy_definitions dir");
+        std::fs::write(
+            dir.join(format!("{SCOPE_POLICY_ID}.json")),
+            json!({
+                "id": SCOPE_POLICY_ID, "name": "Scopes", "description": "Requires a2a:invoke.",
+                "policy_type": "agent_surface", "policy": SCOPE_POLICY_REGO, "enabled": true,
+                "created_at": "2026-01-01T00:00:00Z"
+            })
+            .to_string(),
+        )
+        .expect("write policy definition");
+        let mut surface = serde_json::to_value(&gw_config.surfaces[0]).expect("serialize surface");
+        surface["access_point"]["caller_authentication"]["methods"][0]["required_scopes"] = json!(["a2a:invoke"]);
+        surface["access_point"]["inbound_policy"] = json!({ "policy_definition_id": SCOPE_POLICY_ID });
+        gw_config.surfaces = vec![serde_json::from_value(surface).expect("scoped surface")];
+    })
+    .await;
+
+    let request_str = serde_json::to_string(&a2a_request_body()).unwrap();
+    let send = |token: Option<String>| {
+        let mut request = reqwest::Client::new()
+            .post(&h.gateway_url)
+            .header("content-type", "application/json")
+            .body(request_str.clone());
+        if let Some(token) = token {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        async move {
+            request
+                .send()
+                .await
+                .expect("request")
+        }
+    };
+    let token = |client_id: &str, scope: &str| {
+        sign_jwt(
+            json!({
+                "iss": fixture.issuer,
+                "sub": client_id,
+                "client_id": client_id,
+                "scope": scope,
+                "exp": now_secs() + 300,
+                "iat": now_secs(),
+            }),
+            &fixture.kid,
+        )
+    };
+    let target_requests = || {
+        h.mock
+            .request_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+    };
+
+    let admitted = send(Some(token("billing-client", "read a2a:invoke"))).await;
+    assert_eq!(admitted.status(), 200, "a token with the required scope is admitted");
+    assert_mock_received_request(&h.mock, &request_str);
+    assert_eq!(target_requests(), 1);
+
+    let other_client = send(Some(token("other-client", "a2a:invoke"))).await;
+    assert_eq!(other_client.status(), 403, "policy reads the client id");
+    assert_eq!(target_requests(), 1);
+
+    let short = send(Some(token("billing-client", "read"))).await;
+    assert_eq!(short.status(), 200, "a scope shortfall reaches policy as kind insufficient_scope");
+    assert_eq!(target_requests(), 2);
+
+    for (label, credential) in [("missing", None), ("invalid", Some("not-a-jwt".to_string()))] {
+        let refused = send(credential).await;
+        assert_eq!(refused.status(), 403, "{label}: only a scope shortfall is admitted");
+        assert!(
+            !refused
+                .headers()
+                .contains_key("www-authenticate"),
+            "{label}: an Access Point that does not declare never challenges"
+        );
+    }
+    assert_eq!(target_requests(), 2);
+}
+
 // ── Strict request-shape validation (opt-in) ─────────────────────────────────
 
 /// A2A marks `messageId` required, so a message without one is refused at the
@@ -2348,78 +2461,6 @@ const ELEMENTS_IDENTITY_URI: &str = "https://fabric.affinidi.io/extensions/agent
 
 // ── A2A validation off is for appliance-wide callers only ──────────────────
 
-/// Seed an administrator and an access token they own into the gateway's stores
-/// before it boots: with `resource_pattern`, a token scoped to tenant
-/// `tenant-a`'s surfaces; without one, a token scoped by its required
-/// `x-external-account` header alone. Returns a client that sends the token and
-/// the header.
-pub(super) fn seed_scoped_access_token(
-    bootstrap: &crate::config::BootstrapConfig,
-    resource_pattern: Option<&str>,
-) -> reqwest::Client {
-    let now = chrono::Utc::now();
-    let owner = "tenant-token-owner";
-    let user: crate::auth::storage::UserData = serde_json::from_value(serde_json::json!({
-        "user_id": owner, "username": owner, "passkeys": [], "role": "administrator", "status": "approved",
-        "created_at": now, "updated_at": now
-    }))
-    .unwrap();
-    let passkeys = std::path::Path::new(
-        &bootstrap
-            .storage_paths
-            .passkeys,
-    );
-    std::fs::create_dir_all(passkeys).unwrap();
-    std::fs::write(passkeys.join(format!("{owner}.json")), serde_json::to_vec(&user).unwrap()).unwrap();
-
-    let (id, secret) = crate::access_tokens::generate_token();
-    let token = crate::access_tokens::AccessToken {
-        id: id.clone(),
-        name: "tenant token".to_string(),
-        description: String::new(),
-        token_hash: crate::access_tokens::store::hash_secret(&secret),
-        user_id: owner.to_string(),
-        scopes: Vec::new(),
-        resource_pattern: resource_pattern.map(str::to_string),
-        required_headers: vec![crate::auth_manager::resource_scope::RequiredHeader {
-            name: "x-external-account".to_string(),
-            pattern: "tenant-a".to_string(),
-        }],
-        created_by: owner.to_string(),
-        parent_token_id: None,
-        delegation_depth: 0,
-        created_at: now,
-        last_used_at: None,
-        expires_at: None,
-        revoked_at: None,
-        rotation_generation: 0,
-        rotated_at: None,
-        rotated_by: None,
-    };
-    let tokens = std::path::Path::new(
-        &bootstrap
-            .storage_paths
-            .secrets,
-    )
-    .parent()
-    .unwrap()
-    .join("access_tokens");
-    std::fs::create_dir_all(&tokens).unwrap();
-    std::fs::write(tokens.join(format!("{id}.json")), serde_json::to_vec(&token).unwrap()).unwrap();
-
-    let mut headers = reqwest::header::HeaderMap::new();
-    let mut authorization = reqwest::header::HeaderValue::from_str(&format!("Bearer {secret}")).unwrap();
-    authorization.set_sensitive(true);
-    headers.insert(reqwest::header::AUTHORIZATION, authorization);
-    headers.insert("x-external-account", reqwest::header::HeaderValue::from_static("tenant-a"));
-    reqwest::Client::builder()
-        .no_proxy()
-        .default_headers(headers)
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .unwrap()
-}
-
 /// A tenant access token cannot set an A2A surface's validation to `off`
 /// through the admin API, on create, PUT or merge PATCH, and neither can a token
 /// scoped by required headers alone, while both can choose another level; an
@@ -2429,8 +2470,8 @@ async fn a_tenant_access_token_cannot_turn_a2a_validation_off_through_the_admin_
     let mut clients = None;
     let h = GatewayHarness::start(|_, _, bootstrap| {
         let admin = helpers::configure_admin_api(bootstrap);
-        let tenant = seed_scoped_access_token(bootstrap, Some("TENANT:${x-external-account}:surfaces:.*"));
-        let header_scoped = seed_scoped_access_token(bootstrap, None);
+        let tenant = helpers::seed_scoped_access_token(bootstrap, Some("TENANT:${x-external-account}:surfaces:.*"));
+        let header_scoped = helpers::seed_scoped_access_token(bootstrap, None);
         clients = Some((admin, tenant, header_scoped));
     })
     .await;

@@ -229,6 +229,9 @@ pub async fn update_secret(
             if let Some(cache) = secrets_cache {
                 crate::a2a::clear_secret_cache(&secret.secret_id, &cache);
             }
+            let tokens = crate::delegation_vault::gateway_token::target_token_cache();
+            tokens.invalidate_secret(&old_secret.secret_id);
+            tokens.invalidate_secret(&secret.secret_id);
 
             (StatusCode::OK, Json(SecretListItem::from(secret))).into_response()
         }
@@ -317,6 +320,7 @@ pub async fn delete_secret(
             if let Some(cache) = secrets_cache {
                 crate::a2a::clear_secret_cache(&secret.secret_id, &cache);
             }
+            crate::delegation_vault::gateway_token::target_token_cache().invalidate_secret(&secret.secret_id);
 
             (StatusCode::NO_CONTENT, "").into_response()
         }

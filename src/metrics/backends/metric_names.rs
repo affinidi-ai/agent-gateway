@@ -39,6 +39,17 @@ pub mod prom {
     pub const STS_TOKEN_EXCHANGE_TOTAL: &str = "agent_gateway_sts_token_exchange_total";
     pub const STS_TOKEN_EXCHANGE_DURATION_SECONDS: &str = "agent_gateway_sts_token_exchange_duration_seconds";
 
+    // Gateway token requests to an authorization server's token endpoint.
+    pub const TOKEN_FETCH_TOTAL: &str = "agent_gateway_token_fetch_total";
+    // JWKS fetches that fill the signing key cache.
+    pub const JWKS_FETCH_TOTAL: &str = "agent_gateway_jwks_fetch_total";
+    // Authorization server metadata discovery attempts.
+    pub const DISCOVERY_TOTAL: &str = "agent_gateway_discovery_total";
+    // Requests whose caller token lacked a required scope, whether refused or left to surface policy.
+    pub const SCOPE_DENIED_TOTAL: &str = "agent_gateway_scope_denied_total";
+    // Agent cards served, by the Access Point's declaration outcome.
+    pub const CARD_SECURITY_TOTAL: &str = "agent_gateway_card_security_total";
+
     // AWS KMS per-value envelope operations (GenerateDataKey / Decrypt)
     pub const KMS_OPERATION_TOTAL: &str = "agent_gateway_kms_operation_total";
     pub const KMS_OPERATION_DURATION_SECONDS: &str = "agent_gateway_kms_operation_duration_seconds";

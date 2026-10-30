@@ -1,20 +1,33 @@
 import type { AgentSurface } from '../../../../../api';
 import {
+  advertisedScopes,
   authorizationServerProblem,
+  declarationForVariant,
+  declaredAudience,
+  declaresOn,
+  derivedAuthorizationServer,
   discoveryProblems,
   discoverySaveError,
+  discoverySaveErrorField,
   protectedResourcePayload,
   protectedResourceRemovals,
   readProtectedResource,
   resourceMissesRoute,
   resourceProblem,
+  rootVariantProblem,
   scopeProblem,
+  storedDiscoveryOn,
+  strategyPin,
   suggestedResource,
   variantResource,
   withDroppedProtectedResourcesRemoved,
+  withoutStoredAuthorizationServers,
+  withoutStoredScopes,
 } from '../protectedResource';
 
-const SETTING = {
+const SETTING = { resource: 'https://gateway.example/mcp/alpha' };
+
+const STORED_SETTING = {
   resource: 'https://gateway.example/mcp/alpha',
   authorization_servers: ['https://idp.example/realms/agents'],
   scopes: ['tools'],
@@ -57,23 +70,46 @@ function surface(
 }
 
 describe('readProtectedResource and protectedResourcePayload', () => {
-  it('reads a stored setting and writes it back unchanged', () => {
+  it('keeps absent lists absent and writes only the resource', () => {
     const setting = readProtectedResource(SETTING);
-    expect(setting).toEqual(SETTING);
-    expect(protectedResourcePayload(setting!)).toEqual(SETTING);
+    expect(setting).toEqual({ resource: SETTING.resource });
+    expect(setting).not.toHaveProperty('authorization_servers');
+    expect(setting).not.toHaveProperty('scopes');
+    expect(protectedResourcePayload(setting!)).toStrictEqual({ resource: SETTING.resource });
   });
 
-  it('defaults missing lists and leaves empty scopes out of the payload', () => {
-    const setting = readProtectedResource({ resource: 'https://gateway.example/mcp' });
-    expect(setting).toEqual({
-      resource: 'https://gateway.example/mcp',
+  it('keeps stored authorization servers and scopes and writes them back unchanged', () => {
+    const setting = readProtectedResource(STORED_SETTING);
+    expect(setting).toEqual(STORED_SETTING);
+    expect(protectedResourcePayload(setting!)).toEqual(STORED_SETTING);
+  });
+
+  it('keeps a stored empty list present and leaves empty scopes out of the payload', () => {
+    const setting = readProtectedResource({
+      resource: SETTING.resource,
       authorization_servers: [],
       scopes: [],
     });
-    expect(protectedResourcePayload(setting!)).toEqual({
-      resource: 'https://gateway.example/mcp',
+    expect(setting).toEqual({ resource: SETTING.resource, authorization_servers: [], scopes: [] });
+    expect(protectedResourcePayload(setting!)).toStrictEqual({
+      resource: SETTING.resource,
       authorization_servers: [],
     });
+  });
+
+  it('drops a stored authorization server list or extra scopes on request', () => {
+    expect(withoutStoredAuthorizationServers(STORED_SETTING)).toStrictEqual({
+      resource: STORED_SETTING.resource,
+      scopes: ['tools'],
+    });
+    expect(withoutStoredScopes(STORED_SETTING)).toStrictEqual({
+      resource: STORED_SETTING.resource,
+      authorization_servers: STORED_SETTING.authorization_servers,
+    });
+    expect(withoutStoredScopes(withoutStoredAuthorizationServers(STORED_SETTING))).toStrictEqual(
+      SETTING
+    );
+    expect(STORED_SETTING.authorization_servers).toEqual(['https://idp.example/realms/agents']);
   });
 
   it('reads nothing from null or a non-object', () => {
@@ -108,6 +144,13 @@ describe('field checks', () => {
     ]) {
       expect(authorizationServerProblem(issuer)).not.toBeNull();
     }
+  });
+
+  it('accepts an http issuer only when asked to', () => {
+    expect(authorizationServerProblem('http://idp.example', true)).toBeNull();
+    expect(authorizationServerProblem('http://idp.example')).toMatch(/https issuer URL/);
+    expect(authorizationServerProblem('ftp://idp.example', true)).toMatch(/https issuer URL/);
+    expect(authorizationServerProblem('http://user@idp.example', true)).toMatch(/https issuer URL/);
   });
 
   it('accepts OAuth scope tokens only', () => {
@@ -149,7 +192,7 @@ describe('discoveryProblems', () => {
     expect(fields({ jwt_token_scheme: 'bearer' })).toHaveLength(1);
   });
 
-  it('flags a missing, over-long or repeated authorization server list', () => {
+  it('flags an empty, over-long or repeated stored authorization server list and nothing when it is absent', () => {
     const problems = (servers: string[]) =>
       discoveryProblems(
         jwtConfig({ protected_resource: { ...SETTING, authorization_servers: servers } })
@@ -169,6 +212,11 @@ describe('discoveryProblems', () => {
         message: 'List each authorization server once',
       },
     ]);
+    expect(problems(['https://idp.example'])).toEqual([]);
+    expect(discoveryProblems(jwtConfig({ protected_resource: SETTING }))).toEqual([]);
+    expect(
+      discoveryProblems(jwtConfig({ protected_resource: SETTING }), 'https://idp.example')
+    ).toEqual([]);
   });
 
   it('flags the resource and scopes under their own fields', () => {
@@ -181,7 +229,7 @@ describe('discoveryProblems', () => {
 });
 
 describe('the strategy issuer rule', () => {
-  it('flags authorization servers other than exactly the strategy issuer', () => {
+  it('flags a stored authorization server that is not the strategy issuer, with the remedy', () => {
     const issuer = 'https://idp.example/realms/agents';
     const servers = (authorization_servers: string[]) =>
       discoveryProblems(
@@ -191,12 +239,16 @@ describe('the strategy issuer rule', () => {
         .filter(p => p.field === 'protected_resource.authorization_servers')
         .map(p => p.message);
     expect(servers([issuer])).toEqual([]);
+    expect(servers(['https://other.example'])).toEqual([
+      `The stored authorization server https://other.example is not the issuer the JWT verification strategy trusts (${issuer}), so the gateway advertises the strategy's issuer and keeps this stored list only while it is unchanged. Use the strategy's issuer or clear the list.`,
+    ]);
     for (const listed of [
-      ['https://other.example'],
       ['https://other.example', issuer],
       [issuer, 'https://other.example'],
     ]) {
-      expect(servers(listed)).toEqual([expect.stringContaining(`List only ${issuer}`)]);
+      expect(servers(listed)).toEqual([
+        expect.stringContaining('is not the issuer the JWT verification strategy trusts'),
+      ]);
     }
     expect(
       discoveryProblems(
@@ -205,6 +257,76 @@ describe('the strategy issuer rule', () => {
         })
       )
     ).toEqual([]);
+  });
+});
+
+describe('a stored http authorization server', () => {
+  const httpIssuer = 'http://idp.local:8080/realms/a';
+  const serverProblems = (authorization_servers: string[], strategyIssuer?: string) =>
+    discoveryProblems(
+      jwtConfig({ protected_resource: { ...SETTING, authorization_servers } }),
+      strategyIssuer
+    )
+      .filter(p => p.field === 'protected_resource.authorization_servers')
+      .map(p => p.message);
+
+  it('accepts a sole http entry that is the strategy issuer, or with the issuer unknown', () => {
+    expect(serverProblems([httpIssuer])).toEqual([]);
+    expect(serverProblems([httpIssuer], httpIssuer)).toEqual([]);
+  });
+
+  it('keeps the https rule for a longer list or an entry that is not the strategy issuer', () => {
+    expect(serverProblems(['http://a.example', 'https://b.example'])).toEqual([
+      expect.stringContaining('must be an https issuer URL'),
+    ]);
+    expect(serverProblems(['http://other.example'], 'http://idp.example')).toEqual([
+      expect.stringContaining('must be an https issuer URL'),
+    ]);
+  });
+});
+
+describe('what the gateway advertises', () => {
+  const ISSUER = 'https://idp.example/realms/agents';
+
+  it('lists the required scopes first, then each stored extra scope once', () => {
+    expect(advertisedScopes(['agent.invoke', 'read'])).toEqual(['agent.invoke', 'read']);
+    expect(advertisedScopes(['agent.invoke'], ['tools', 'agent.invoke', 'tools'])).toEqual([
+      'agent.invoke',
+      'tools',
+    ]);
+    expect(advertisedScopes([], ['tools'])).toEqual(['tools']);
+    expect(advertisedScopes([], [])).toEqual([]);
+  });
+
+  it('names the strategy issuer, or nothing without a strategy', () => {
+    expect(derivedAuthorizationServer({ id: 'idp', expected_issuer: ISSUER })).toEqual({
+      value: ISSUER,
+      source: 'strategy',
+    });
+    expect(derivedAuthorizationServer({ id: 'idp' })).toEqual({ value: null, source: 'none' });
+    expect(derivedAuthorizationServer({ id: 'idp', expected_issuer: '' })).toEqual({
+      value: null,
+      source: 'none',
+    });
+    expect(derivedAuthorizationServer(undefined)).toEqual({ value: null, source: 'none' });
+  });
+
+  it('declares the plain resource on the base and resource$alias on a variant', () => {
+    expect(declaredAudience(SETTING.resource)).toBe(SETTING.resource);
+    expect(declaredAudience(SETTING.resource, 'beta')).toBe(`${SETTING.resource}$beta`);
+    expect(declaredAudience('', undefined)).toBe('');
+  });
+
+  it('refuses discovery on a variant of an Access Point at /', () => {
+    const message =
+      'A variant of an Access Point at / has no resource of its own. Move the Access Point off /, or turn authorization server discovery off for this variant.';
+    expect(rootVariantProblem('/', 'beta')).toBe(message);
+    expect(rootVariantProblem('', 'beta')).toBe(message);
+    expect(rootVariantProblem('/a', 'beta')).toBeNull();
+    expect(rootVariantProblem('/', undefined)).toBeNull();
+    expect(rootVariantProblem('', undefined)).toBeNull();
+    expect(rootVariantProblem('/a', undefined)).toBeNull();
+    expect(rootVariantProblem(undefined, 'beta')).toBeNull();
   });
 });
 
@@ -241,19 +363,57 @@ describe('resource helpers', () => {
     const rule =
       'access_point.caller_authentication.protected_resource: requires empty JWT Bearer audiences (400)';
     expect(discoverySaveError(rule, SETTING.resource)).toBe(rule);
-    expect(discoverySaveError(`variant 'beta': ${rule}`, undefined)).toBe(
+    expect(discoverySaveError(`variant 'beta': ${rule}`, SETTING.resource, 'beta')).toBe(
       `variant 'beta': ${rule}`
     );
+    expect(discoverySaveError(rule, SETTING.resource, 'beta')).toBeNull();
     const owned = `MCP resource '${SETTING.resource}$beta' is already served by another endpoint (400)`;
     expect(discoverySaveError(owned, SETTING.resource)).toBe(owned);
+    const generic = `Resource '${SETTING.resource}' is already served by another endpoint (400)`;
+    expect(discoverySaveError(generic, SETTING.resource)).toBe(generic);
+    const variant = `resource '${SETTING.resource}$beta' is already served (400)`;
+    expect(discoverySaveError(variant, SETTING.resource)).toBe(variant);
     expect(
       discoverySaveError(
         "MCP resource 'https://other.example/x' is already served",
         SETTING.resource
       )
     ).toBeNull();
+    const othersResource = "Resource 'https://other.example/x' is already served";
+    expect(discoverySaveError(othersResource, SETTING.resource)).toBeNull();
     expect(discoverySaveError('target.endpoint: invalid (400)', SETTING.resource)).toBeNull();
     expect(discoverySaveError(null, SETTING.resource)).toBeNull();
+  });
+
+  it('leaves a refusal about another route to that route', () => {
+    const rule =
+      'access_point.caller_authentication.protected_resource: a variant of an Access Point at / has no resource';
+    expect(discoverySaveError(`variant 'beta': ${rule}`, SETTING.resource)).toBeNull();
+    expect(discoverySaveError(`variant 'beta': ${rule}`, SETTING.resource, 'gamma')).toBeNull();
+  });
+
+  it('routes a refused save to the field it names', () => {
+    const prefix = 'access_point.caller_authentication.protected_resource: ';
+    const resourceMismatch = `${prefix}MCP resource must match the configured public origin and endpoint path`;
+    const servers = `${prefix}authorization_servers must be exactly ["https://as/"], the issuer the JWT verification strategy trusts, or be omitted: the gateway advertises that issuer`;
+    const scopes = `${prefix}MCP authorization scopes must be bounded OAuth scope tokens`;
+    const audiences = `${prefix}requires empty JWT Bearer audiences: tokens must name the protected resource of the route they call as their audience`;
+    const header = `${prefix}requires a first caller authentication method of JWT Bearer reading the Authorization header with the Bearer scheme`;
+    const rootVariant = `variant 'beta': ${prefix}a variant of an Access Point at / is not reachable at a resource of its own`;
+    const owned = `MCP resource '${SETTING.resource}' is already served (400)`;
+    const issuer = `${prefix}the JWT verification strategy's expected_issuer "did:web:as.example" is not an issuer URL protected resource metadata can name: an https URL, or an http one for a strategy no tenant owns`;
+    const protocol = `${prefix}requires an MCP, A2A or AP2 Access Point`;
+
+    expect(discoverySaveErrorField(resourceMismatch)).toBe('resource');
+    expect(discoverySaveErrorField(servers)).toBe('authorizationServers');
+    expect(discoverySaveErrorField(scopes)).toBe('scopes');
+    expect(discoverySaveErrorField(audiences)).toBe('rules');
+    expect(discoverySaveErrorField(header)).toBe('rules');
+    expect(discoverySaveErrorField(rootVariant)).toBe('resource');
+    expect(discoverySaveErrorField(owned)).toBe('resource');
+    expect(discoverySaveErrorField(issuer)).toBeNull();
+    expect(discoverySaveErrorField(protocol)).toBeNull();
+    expect(discoverySaveErrorField('JWT verification strategy not found')).toBeNull();
   });
 });
 
@@ -320,5 +480,88 @@ describe('removing a stored setting', () => {
     expect(withDroppedProtectedResourcesRemoved(stored, withoutCallerAuthentication)).toEqual(
       withoutCallerAuthentication
     );
+  });
+});
+
+describe('declaring protocols and strategy pins', () => {
+  const ISSUER = 'https://idp.example/realms/agents';
+  const JWKS = 'https://idp.example/realms/agents/certs';
+  const strategy = (extra: Record<string, unknown> = {}) => ({
+    id: 'idp',
+    expected_issuer: ISSUER,
+    jwks_source: { type: 'remote', jwks_uri: JWKS },
+    authorization_server: { issuer: ISSUER, metadata_url: 'm', jwks_uri: JWKS },
+    ...extra,
+  });
+
+  it('declares on A2A, AP2 and MCP only', () => {
+    expect(declaresOn('a2a')).toBe(true);
+    expect(declaresOn('ap2')).toBe(true);
+    expect(declaresOn('mcp')).toBe(true);
+    expect(declaresOn('didcomm')).toBe(false);
+    expect(declaresOn(undefined)).toBe(false);
+  });
+
+  it('names the pinned issuer while the pin matches the strategy', () => {
+    expect(strategyPin(strategy())).toEqual({ state: 'pinned', issuer: ISSUER });
+  });
+
+  it('flags an unpinned, moved or static-key strategy', () => {
+    expect(strategyPin(strategy({ authorization_server: undefined }))).toEqual({
+      state: 'not_pinned',
+    });
+    expect(strategyPin(strategy({ authorization_server: { metadata_url: 'm' } }))).toEqual({
+      state: 'not_pinned',
+    });
+    expect(strategyPin(strategy({ expected_issuer: 'https://other.example' }))).toEqual({
+      state: 'mismatch',
+      issuer: ISSUER,
+    });
+    expect(
+      strategyPin(
+        strategy({ jwks_source: { type: 'remote', jwks_uri: 'https://idp.example/new' } })
+      )
+    ).toEqual({ state: 'mismatch', issuer: ISSUER });
+    expect(
+      strategyPin(
+        strategy({ jwks_source: { type: 'static', jwks: [] }, authorization_server: undefined })
+      )
+    ).toEqual({ state: 'static_jwks' });
+  });
+
+  it('pins a static key set whose pinned issuer is the expected issuer', () => {
+    const source = { jwks_source: { type: 'static', jwks: [] } };
+    expect(strategyPin(strategy(source))).toEqual({ state: 'pinned', issuer: ISSUER });
+    expect(strategyPin(strategy({ ...source, expected_issuer: 'https://other.example' }))).toEqual({
+      state: 'mismatch',
+      issuer: ISSUER,
+    });
+  });
+
+  it('reads whether the saved surface stores discovery on the route edited', () => {
+    const on = { caller_authentication: { protected_resource: SETTING } };
+    const saved = {
+      access_point: on,
+      variants: [
+        { id: 'v-1', alias: 'beta', overrides: { access_point: on } },
+        { id: 'v-2', alias: 'gamma', overrides: {} },
+      ],
+    } as unknown as Partial<AgentSurface>;
+    expect(storedDiscoveryOn(saved)).toBe(true);
+    expect(storedDiscoveryOn(saved, 'v-1')).toBe(true);
+    expect(storedDiscoveryOn(saved, 'v-2')).toBe(false);
+    expect(storedDiscoveryOn(saved, 'missing')).toBe(false);
+    expect(storedDiscoveryOn({ access_point: {} } as Partial<AgentSurface>)).toBe(false);
+    expect(storedDiscoveryOn(null)).toBe(false);
+  });
+
+  it('picks the entry of the route edited', () => {
+    const entries = [
+      { variant: null, outcome: 'declare' },
+      { variant: 'beta', outcome: 'strip' },
+    ];
+    expect(declarationForVariant(entries, undefined)).toBe(entries[0]);
+    expect(declarationForVariant(entries, 'beta')).toBe(entries[1]);
+    expect(declarationForVariant(entries, 'gamma')).toBeUndefined();
   });
 });

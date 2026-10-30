@@ -35,15 +35,18 @@ A JWT bearer token is accepted only when it is signed with an RS256, RS384, RS51
 ES384 or EdDSA key from the strategy's key set, its `iss` equals the strategy's expected
 issuer, it has an `exp` that has not passed and, when it has an `nbf`, that time has come,
 each with 60 seconds of leeway. `aud` must name one of the method's `audiences`; an empty
-list skips that check, except on an MCP Access Point that publishes protected resource
-metadata, where `aud` must name the resource of the route called.
+list skips that check, except on a declaring Access Point, where the declared resource of the
+route called must be one of the token's `aud` values and the method's `audiences` are not used.
+A method that lists `required_scopes` also needs a token that grants each of them; see [Required scopes](#required-scopes).
 
-An MCP Access Point whose first method is JWT bearer can also publish RFC 9728 protected
-resource metadata naming the authorization server that issues its tokens, with
-`caller_authentication.protected_resource`. See
+An Access Point whose first method is JWT bearer can also publish RFC 9728 protected
+resource metadata naming the authorization server that issues its tokens, and then refuses
+callers with a challenge that points at it. An MCP, A2A or AP2 Access Point declares by setting
+`caller_authentication.protected_resource`; see [Declaring an Access Point](#declaring-an-access-point).
+See also
 [`MCP_METADATA.md`](MCP_METADATA.md#authorization-server-discovery-for-caller-authentication),
 and [Choosing How an MCP Access Point Checks Tokens](MCP_METADATA.md#choosing-how-an-mcp-access-point-checks-tokens)
-for when to use it instead of the gateway STS Resource Server path.
+for when to use the explicit setting instead of the gateway STS Resource Server path.
 
 The gateway builds one source authentication middleware at startup. If its JWT
 verification strategy store (`jwt_verification_strategies/`, next to the secrets storage
@@ -52,17 +55,19 @@ than serving surfaces whose caller authentication would be skipped. A request, d
 over Fabric, that reaches a surface with caller authentication configured while no middleware
 is installed is refused with `500` rather than forwarded unauthenticated.
 
-A missing or invalid credential does not refuse the request. That includes an mTLS
-certificate that lacks the configured binding field. The request continues with no caller
-identity, and policy sees `input.source_auth` as
-`{"method": "failed", "attempted_method": ..., "reason": ...}`. Only server-side errors,
+On an Access Point that does not declare, a missing or invalid credential, or a JWT short of
+a required scope, does not refuse the request. That includes an mTLS certificate that lacks
+the configured binding field. The request continues with no caller identity, and policy sees
+`input.source_auth` as
+`{"method": "failed", "attempted_method": ..., "kind": ..., "reason": ...}`, where `kind` is
+`missing`, `invalid` or `insufficient_scope`. Only server-side errors,
 such as missing configuration or an internal failure, block the request with `500`
 ([`errors.rs`](../src/source_auth/errors.rs)). Such a request is forwarded without the
-surface's stored target credential, or the A2A proxy's Direct Line secret, on each inbound
+surface's Target Authentication credential, or the A2A proxy's Direct Line secret, on each inbound
 and Fabric forwarding path: direct inbound, `proxy://` MCP Targets, `a2a-proxy://` Targets,
 Fabric send and Fabric receive. Transit Point listeners do not authenticate callers, so this
-does not cover them. A surface that must reject unauthenticated callers therefore
-needs a policy that denies them:
+does not cover them. A surface that does not declare and must reject unauthenticated callers
+therefore needs a policy that denies them:
 
 ```rego
 package surface.policy
@@ -76,10 +81,496 @@ deny if input.source_auth.method == "failed"
 
 See [`POLICY.md`](POLICY.md#failed-caller-authentication).
 
-A request to an MCP Access Point that publishes protected resource metadata, direct or over
-Fabric, is the exception: a missing or invalid JWT is refused with a `401` (the discovery
-challenge on a direct request), see
+A declaring Access Point (MCP, A2A or AP2) is the exception: it refuses a failed caller itself, at
+source authentication, before rate limiting, the request body and any policy, with `401` for a
+missing or invalid JWT and `403` for one short of a required scope, and the caller never reaches
+the surface's policy or its Target. The refusal carries the discovery challenge on
+a direct request and the realm-only refusal on the receiving gateway of a Fabric route, which the
+sending gateway answers to its own caller with `502`. The
+invariant is written once in [`AGENTS.md`](../AGENTS.md#architecture); see
+[Caller challenge](#caller-challenge) and
 [`MCP_METADATA.md`](MCP_METADATA.md#authorization-server-discovery-for-caller-authentication).
+
+A surface whose JWT verification strategy no longer exists, for example because it was deleted
+while the surface still references it, cannot authenticate any caller. The strategy is looked
+up only after a token is found, so a request with no token is still a missing credential,
+handled as above, while a request that presents one is refused with `500`. The problem `detail`
+of that `500` is the fixed text `Caller authentication is unavailable` and names no strategy or
+certificate id, so a caller learns nothing about the surface's configuration; only the
+gateway's own log names the id, and the audit event records the reason `config_not_found`.
+Deleting a strategy is not refused while a surface uses it; the dashboard asks for confirmation first and lists the
+surfaces whose Access Point or Surface Variants reference it. The confirmation also lists the credential providers that use the strategy as their consent identity, and the surfaces whose Transit Points or outbound credential bindings use those providers. If the provider list cannot be read, it says so and still allows the delete. A surface that advertises an authorization server through a deleted strategy can no longer be served and refuses every caller until the strategy is restored.
+
+### JWT bearer signing keys
+
+A strategy with a remote `jwks_uri` has its JSON Web Key Set fetched and cached by
+[`JwksClient`](../src/jwt_bearer/jwks.rs). Each node keeps its own cache.
+
+| Behaviour | Rule |
+| --- | --- |
+| Cache key | One key set per strategy, used only while the strategy's `jwks_uri` and `updated_at` match the ones it was fetched for. A strategy edited on any node, through the API or on disk, is a cache miss once the node reads the edited record. |
+| Eviction | Updating or deleting a strategy through the API evicts its key set. A standby that becomes Active drops every cached key set (see [Server mode](CONFIGURATION_RELOAD.md#server-mode)). |
+| Lifetime | `Cache-Control: max-age` (directive names matched in any case), clamped to between 60 seconds and 6 hours. `no-store` or `no-cache` gives 60 seconds. With no usable `max-age` the lifetime is 1 hour. After a failed refresh the last good set keeps serving for up to 1 hour past its expiry (see Fetch failure). |
+| Unknown `kid` | A token whose `kid` is not in a fresh key set triggers at most one refetch per strategy every 60 seconds. Inside that window it fails as `Signing key not found`, an invalid credential like any other. The `kid` is never echoed. |
+| Concurrency | Concurrent requests for one strategy share one fetch. |
+| Fetch failure | The next fetch waits 10 seconds. When a refresh of an expired key set fails, the last good set keeps serving for up to one hour past its expiry; after that, or with no good set, the request is refused with `500`. |
+| Limits | A response body over 64 KiB, more than 64 keys, a repeated `kid`, or a key without a `kid` in a set of several keys is a failed fetch. `POST /v1/jwt-verification-strategies/validate-jwks-uri` applies the same limits. |
+
+The fetch is pinned to the vetted address under the cloud-metadata-only posture, with no
+redirects ([`fetch.rs`](../src/jwt_bearer/fetch.rs); see
+[`POLICY.md`](POLICY.md#other-pinned-egress-sinks)). A strategy with a static key set is never
+fetched or cached. Each network fetch of a strategy's key set, successful or failed, is counted
+by result in `agent_gateway_jwks_fetch_total`
+([`OBSERVABILITY.md`](OBSERVABILITY.md#trust-plane-metrics)); a cache hit and the
+`validate-jwks-uri` probe are not counted. A host that does not resolve fails as `blocked`, and
+resolving it times out after 10 seconds as `unreachable`.
+
+### Authorization server discovery
+
+A strategy can pin its authorization server's metadata. Discovery runs through the shared
+[authorization server metadata module](#authorization-server-metadata-module-developer-reference)
+with `expected_issuer` as the issuer, so the document's `issuer` must equal it byte for byte,
+trailing slash included, and name a `token_endpoint` and a `jwks_uri` that do not use a weaker
+scheme than the issuer. The pin, `authorization_server`, holds `issuer`, `metadata_url` (the
+document that answered), `token_endpoint` and `jwks_uri`. It does not change `jwks_source`,
+and token verification does not read it.
+
+| Request | Behaviour |
+| --- | --- |
+| `POST /v1/jwt-verification-strategies/discover` with `{"issuer": ...}` | Returns the metadata a save would pin, and stores nothing |
+| Save with `discover_metadata: true` | Discovers and pins. If discovery fails, the save is refused with `422` and nothing is stored |
+| Save with `discover_metadata: false` | Clears the pin |
+| Save without `discover_metadata` | Keeps the pin, if any. When a pinned strategy's issuer or remote `jwks_uri` changed, discovers again. If that fails, or the caller is past the probe limit, the save still answers `200` and logs a warning; the old pin is kept only when its issuer still equals the expected issuer (only the remote `jwks_uri` changed) and is cleared otherwise. A tenant-scoped caller that moves the issuer to an `http` URL always has its pin cleared: the strict posture refuses the issuer as `invalid_url` before any request |
+
+`POST /v1/jwt-verification-strategies/validate-jwks-uri` stays for strategies whose
+`jwks_uri` is entered by hand; `discover` returns the discovered `jwks_uri` as well.
+
+Both endpoints, and a save that discovers, make an outbound request on the caller's behalf, so
+they share one set of rules ([`handlers.rs`](../src/jwt_bearer/handlers.rs)):
+
+| Rule | Detail |
+| --- | --- |
+| Permission | `jwt_verification_strategies.edit` |
+| Egress posture | The cloud-metadata-only posture (cloud metadata blocked; http, loopback and RFC 1918 allowed), and the strict posture for a tenant-scoped PAT, which also blocks loopback, RFC 1918, link-local and unique-local addresses. Under the strict posture discovery and `validate-jwks-uri` accept `https` only: an `http` issuer or JWKS URI fails with `invalid_url` before any lookup, and an `http` endpoint in the document makes it invalid. Each request is pinned to the vetted address unless a proxy is configured (see the module's [DNS limit](#authorization-server-metadata-module-developer-reference)), does not follow redirects, and reads at most 64 KiB. A discovery fetch has 10 seconds to resolve the host and 10 more for the request, and discovery makes up to three fetches for an issuer with a path and two for one without, so it takes at most 60 or 40 seconds. |
+| Limit | Up to 10 probes per user at once, replenished at one every 6 seconds; past that, `429` with code `rate_limited`. A save that cannot re-discover because of the limit keeps its pin only when the issuer is unchanged, and clears it otherwise. |
+| Errors | A fixed `code` and message, never the resolved address or the transport error. Discovery uses the [module's codes](#authorization-server-metadata-module-developer-reference): `invalid_url`, `blocked` (also a host name that does not resolve), `unreachable`, `http_status`, `too_large`, `invalid_document`, `issuer_mismatch`. `validate-jwks-uri` uses `invalid_url`, `blocked` (also a host name that does not resolve), `unreachable`, `http_status`, `too_large`, `invalid_document`. `discover` and saves answer `422`; `validate-jwks-uri` answers `400` with `valid: false`. |
+| Audit | Each probe logs an `audit` event `jwt_verification_strategy.probe` with the probe kind (`discover`, `jwks_uri` or `save`), the caller, the tenant, the posture, the host and the result: `ok` or the failure code, which a failed probe also logs in a warning. Every probe records a server that answers outside 2xx as `http_status`. |
+
+Every discovery is also counted in `agent_gateway_discovery_total`
+([trust plane metrics](OBSERVABILITY.md#trust-plane-metrics)), and each strategy create, update
+or delete records a `verification_strategy_changed` configuration event that says whether the
+pin changed ([governance audit forwarding](OBSERVABILITY.md#governance-audit-forwarding)).
+
+**Microsoft Entra.** Only tenant-specific authorities work. A declaring Access Point that
+accepts Entra v1.0 tokens needs `expected_issuer` `https://sts.windows.net/<tenant id>/` with
+the App ID URI equal to the resource, and `scp` holds the short scope names. The
+`https://login.microsoftonline.com/<tenant id>/v2.0` issuer belongs to v2.0 tokens. The multi-tenant authorities (`common`,
+`organizations`) advertise `{tenantid}` in their issuer, which fails the exact match, and a
+strategy whose `expected_issuer` contains `{` or `}` is refused with `400`: the gateway never
+matches issuer templates.
+
+Today an Entra token is accepted only when its `aud` is the declared resource URL. That works
+for v1.0 tokens whose App ID URI equals the resource. v2.0 tokens (issuer
+`https://login.microsoftonline.com/<tenant id>/v2.0`) carry the API's client ID in
+`aud` and are refused until per-Access-Point audience aliases, and a split between the scope
+the metadata advertises and the scope the gateway checks, are added. Both are planned as a
+follow-up change.
+
+**Other consumers of a strategy.** STS subject and ID-JAG verification ([`STS.md`](STS.md))
+selects a strategy by `expected_issuer` and checks no audience; modern consent verifies the
+provider's ID token against `consent_identity_strategy_id` with the client id as audience
+([`MCP_METADATA.md`](MCP_METADATA.md)); credential providers reference a strategy only through
+that field. None of them reads `authorization_server`, so a pin never changes which tokens
+they accept. The field is left out of the stored record when unset, so a strategy saved before
+the field existed keeps the digest that a consent record bound to it.
+
+### Required scopes
+
+A `jwt_bearer` method can list `required_scopes`. After the token verifies (signature, issuer,
+expiry and audience), the Access Point reads the scopes it grants
+([`access_token.rs`](../src/jwt_bearer/access_token.rs)) and checks them in
+[`middleware.rs`](../src/source_auth/middleware.rs). The check is not part of token
+validation, so STS, modern consent and credential providers are unaffected.
+
+| Rule | Detail |
+| --- | --- |
+| Granted scopes | The first claim in the strategy's `scope_claims` (default `scope`, then `scp`) that the token carries decides. A string is split on spaces, an array of strings is used as is, and any other shape grants nothing. |
+| Shortfall | A token that lacks any required scope is a failed caller of kind `insufficient_scope`, handed to policy like a missing or invalid token, except on a declaring Access Point, which refuses it with `403` (see [Caller challenge](#caller-challenge)). The `auth_failed` audit reason is `insufficient_scope`, and each shortfall is counted in `agent_gateway_scope_denied_total` ([`OBSERVABILITY.md`](OBSERVABILITY.md#trust-plane-metrics)). |
+| Access tokens only | A token fails as `invalid` when it carries `nonce`, `at_hash`, `c_hash` or `s_hash`, when its payload `typ` claim is `ID` (any case), or when its JOSE `typ` header is present and is not `at+jwt`, `application/at+jwt` or `JWT` (case-insensitive). The check runs when `required_scopes` is set and on every declaring Access Point. It is best-effort: an ID token without these markers, such as a Google service-account ID token, passes it. A method that neither sets `required_scopes` nor declares keeps accepting such tokens. |
+| Saving | Each entry must be an RFC 6749 scope token (`%x21 / %x23-5B / %x5D-7E`) of 1 to 128 characters, with at most 32 entries and no duplicates, on the base Access Point and on every Surface Variant. Only the first caller authentication method may list `required_scopes`: a save that sets them on a later method, on the base Access Point or on a variant, is refused with `400` (`required_scopes is enforced only on the first caller authentication method`). Otherwise the save is refused with `400`, and a configuration file is refused at startup. |
+
+A strategy's `scope_claims` lists the claims read for granted scopes, in order: 1 to 8 names,
+each 1 to 256 printable ASCII characters without spaces, none repeated, or the save is refused
+with `400`. Microsoft Entra app-only tokens, for example, carry their permissions in `roles`.
+A save that omits the field keeps the stored list, and one that sends `["scope", "scp"]`
+stores the default as absent, so a strategy that never customises it keeps its stored record,
+and the digest a consent record binds to it, unchanged. Only Access Points read it.
+
+An ID token is signed by the same issuer as an access token, and its audience can be the
+Access Point URL: any Google service account can mint a Google ID token for an audience it
+chooses. Such a token carries no scope, so requiring a scope refuses it. An Access Point that
+trusts a Google issuer, or any issuer that mints ID tokens for arbitrary audiences, needs
+`required_scopes` or a policy on `client_id` or `subject`. A declaring Access Point refuses
+ID-shaped tokens even without `required_scopes`, but a Google service-account ID token has none
+of the ID-token markers, so with a Google-style issuer you still need `required_scopes` or such
+a policy.
+
+A verified caller's policy input carries `scopes` and `client_id` normalised across
+providers, and the id and tenant of the strategy that verified the token; see
+[`POLICY.md`](POLICY.md#jwt-bearer-caller-input).
+
+Releases before this one ignore a method's `required_scopes` and a strategy's
+`scope_claims` on every `jwt_bearer` Access Point, and drop them when they save the record.
+After a rollback those Access Points accept tokens without the scope, ID tokens included,
+with no warning, and the metadata keeps listing the scopes as supported. Before rolling back,
+disable each Access Point that relies on `required_scopes`, or protect it with a surface
+policy those releases can evaluate: one that checks the raw `scope` or `scp` claim in
+`input.source_auth.claims`, since they publish neither `input.source_auth.scopes` nor the
+`insufficient_scope` kind. Set `required_scopes` again after upgrading.
+
+Those releases also drop a strategy's pinned `authorization_server` when they save it. A
+strategy an older node saved during a rollback comes back unpinned, so a declaring A2A or AP2
+agent card names no security scheme (the `card_scheme_unavailable` warning), and a
+strategy that read scopes from `roles` falls back to `scope` and `scp`. After re-upgrading,
+run discovery on each such strategy (`discover_metadata: true`) and set its `scope_claims`
+again, as well as `required_scopes`.
+
+### Declaring an Access Point
+
+An Access Point declares when it tells callers which authorization server to use: it publishes
+protected resource metadata for the route called, binds the token audience to that route and
+refuses a failed caller with a challenge that names the metadata. The request path resolves
+the declaration once per request ([`declaration.rs`](../src/source_auth/declaration.rs)), and
+the metadata, the audience binding, the caller challenge and a declaring A2A or AP2 agent card
+([`PROTOCOLS.md`](PROTOCOLS.md#agent-card-security)) are all projections of it.
+
+There is one source: `caller_authentication.protected_resource` on an MCP, A2A or AP2 Access
+Point (the dashboard's **Authorization server discovery** switch). An Access Point without it
+never declares, never reads the strategy store and handles a failed caller as an Access Point
+that does not declare, whatever its methods say. `required_scopes` alone enforces scopes and
+hands a failure to policy. Removing the setting (`PATCH` it to `null`) switches declaring off.
+
+| Field | Meaning |
+| --- | --- |
+| `resource` | Required. The resource a token is issued for: a canonical `https` URL on one of the `external_urls` of the Access Point's listener, with the Access Point's route as its path. It is checked on save, and one endpoint owns it ([`MCP_METADATA.md`](MCP_METADATA.md#authorization-server-discovery-for-caller-authentication)) |
+| `authorization_servers` | Optional. The gateway advertises the strategy's `expected_issuer` whether or not this is sent. When a save sends or changes it, it must be exactly `["<expected_issuer>"]`, or the save is refused with `400`; to remove it, send `protected_resource` without the field. A stored list that the save leaves unchanged is kept and reported as `authorization_servers_stale` |
+| `scopes` | Optional. Scopes advertised in addition to `required_scopes` |
+
+The authorization server and the scopes are not stored with the declaration. The gateway reads
+the JWT verification strategy of the first method on every request, so an issuer change shows
+in the metadata and the challenge at once, and takes `required_scopes` from that method.
+With `protected_resource`, `forward_header`, non-empty `audiences`, a token header other than
+`Authorization` and a scheme other than `Bearer` are refused with `400` on save and answer `503`
+at request time. A presented `Bearer` scheme is matched in any case (RFC 9110 section 11.1), so
+`bearer <token>` and `BEARER <token>` are accepted.
+
+A declaring Access Point whose Target is `fabric://` declares too: it challenges its own callers,
+and the receiving gateway refuses with the realm-only answer described under
+[Caller challenge](#caller-challenge).
+
+A declaration has one of four outcomes. An Access Point without `protected_resource` strips:
+it publishes no metadata, sends no challenge and adds no scheme to its card, and the reason code
+([`StripReason`](../src/source_auth/declaration.rs)) is one of:
+
+| Reason code | Strips when |
+| --- | --- |
+| `fabric_target` | The Access Point has no caller authentication and its Target is `fabric://` |
+| `not_declared` | The Access Point has caller authentication and no `protected_resource` |
+
+`agent_gateway_card_security_total` also counts a `strip` with the reason `transit_point`: a
+Transit Point card whose partner security and signatures the gateway removed because its
+Access Point's cards are secured ([`PROTOCOLS.md`](PROTOCOLS.md#agent-card-security)). It is
+never the outcome of a request.
+
+An Access Point with neither caller authentication nor a `fabric://` Target passes through.
+An Access Point is `unservable` when its settings ask for a declaration it cannot serve. Its
+callers get `503` before policy, and the reason code
+([`UnservableReason`](../src/source_auth/declaration.rs)) says why. The code does not change
+the refusal: callers get `503` with `Invalid MCP protected resource` on an MCP Access Point and
+`Caller authentication unavailable` on any other, on the direct path and over Fabric, and the
+gateway warning names the cause's detail.
+
+| Reason code | Unservable when |
+| --- | --- |
+| `unsupported_protocol` | `protected_resource` is set on an Access Point that is not MCP, A2A or AP2 |
+| `invalid_protected_resource` | The `protected_resource` fields fail their checks: the resource, the scopes, or 1 to 8 distinct `authorization_servers` |
+| `incompatible_caller_authentication` | With `protected_resource`, the first method is not `jwt_bearer` reading the `Authorization` header with the `Bearer` scheme, lists `audiences`, or has `forward_header` on |
+| `root_variant_resource` | With `protected_resource`, the route called is a Surface Variant of an Access Point at `/`, which has no resource of its own |
+| `resource_mismatch` | The `protected_resource` resource is not on a public origin of the Access Point's listener with the Access Point's own path |
+| `strategy_unavailable` | The strategy the method names is missing, or the surface's tenant may not reference it |
+| `issuer_not_advertisable` | The strategy's `expected_issuer` is not an `https` issuer URL (or an `http` one too for a strategy no tenant owns) that protected resource metadata can name |
+| `strategy_store_unavailable` | The strategy could not be read because the strategy store failed |
+| `network_unavailable` | Over Fabric, the receiving gateway has no network configuration to name the resource of an Access Point that declares |
+
+The resource of a Surface Variant is the declared resource with `$alias` appended (`%24` is read
+as `$`); the base route and the default variant use the declared resource itself. A surface at `/`
+has no variants that declare. Each variant is resolved on its own, against its own resource. An
+alias that selects no enabled variant, including any alias on a surface without
+variants, is refused at routing (`404` `unknown_variant` or `variant_disabled`; see
+[`request_rejected`](OBSERVABILITY.md#governance-audit-forwarding)). On an Access Point whose bare
+route declares (the route without an alias, served by the default variant, else the base
+surface), a caller that fails source authentication on such a URL first gets the bare route's
+challenge, whichever alias it named, and never reaches policy, payment or the Target; an
+authenticated caller gets the refusal, and so does every caller when the bare route does not
+declare or cannot serve its declaration. Variant aliases are not secret: each variant publishes
+its own metadata at `<route>$alias`, and its challenge names that resource. Over Fabric the alias is the one the
+sending route's `fabric://` Target pins, so the receiving gateway refuses an unresolvable one
+before source authentication.
+
+On a declaring route a token is accepted when the resource of the route called is one of its
+`aud` values, whether `aud` is a string or an array: a token issued for the base route does not
+open a variant, and the method's `audiences` must be empty. The resource is the stored one, so it
+does not depend on the order of the listener's `external_urls`; if the listener stops serving it,
+requests fail closed with `503`, audited. Direct requests and Fabric receive resolve it through the
+same code. A route that holds `$` or `%24` is refused with `400` on save, because it would claim
+another surface's variant URL.
+
+`GET /v1/surfaces/{id}/declarations` reports the outcome of the base route and of each enabled
+Surface Variant as `{"declarations", "warnings"}`, and every surface save returns the same two
+fields next to the surface; see [Surface save warnings](POLICY.md#surface-save-warnings). Each
+declaration's `reason` is the strip reason code for `strip`, the unservable reason code above
+for `unservable`, and `null` otherwise. `resource` is the declared resource; for any other outcome
+it is the resource the route's `protected_resource` names, else the Access Point URL the dashboard
+suggests, else `null`. `authorization_servers`, `required_scopes`, `scopes_supported` and
+`metadata_url` hold what the metadata and challenge publish and are empty (`metadata_url`
+`null`) unless the outcome is `declare`.
+
+A declaring Access Point never sends the caller's token on, to the Target or over Fabric: it is
+the resource the token was issued for, so a Target would receive a token not meant for it. A strategy store failure while
+resolving a declaration that would otherwise declare answers `503` and never lets the caller
+through.
+
+### Protected resource metadata
+
+A declaring Access Point publishes its declaration as RFC 9728 protected resource metadata, so
+a client can find the authorization server from the Access Point URL alone. Every inbound
+listener serves it at `/.well-known/oauth-protected-resource<path>`, where `<path>` is the
+route, or `<route>$alias` for a Surface Variant, whether or not `sts.mcp_issuer` is set:
+
+```json
+{
+  "resource": "https://gw.example/smoke",
+  "authorization_servers": ["https://as.example/"],
+  "bearer_methods_supported": ["header"],
+  "scopes_supported": ["agent.invoke"]
+}
+```
+
+| Field | Value |
+| --- | --- |
+| `resource` | The resource of the route called, which `aud` must name |
+| `authorization_servers` | The strategy's `expected_issuer`, read on every request; a stored list is never advertised |
+| `scopes_supported` | `required_scopes`, then each extra `protected_resource.scopes` once; omitted when both are empty |
+
+| Request | Answer |
+| --- | --- |
+| The path of a declaring Access Point or enabled Surface Variant | `200` with `Cache-Control: no-store` |
+| Any other path, including one that strips | `404` |
+| A path that two endpoints claim, a setting the Access Point cannot serve, or a strategy store failure | `503` |
+
+The surface and its strategy are read on every request, so an edit to either, an issuer change
+included, changes the document on the next request. The route, its CORS rule, the collision checks and the reserved
+prefix are in
+[`MCP_METADATA.md`](MCP_METADATA.md#authorization-server-discovery-for-caller-authentication).
+
+### Caller challenge
+
+On a declaring Access Point the gateway is the resource server, so a caller whose source
+authentication failed is refused by the gateway, whatever policy would say. The refusal names
+the protected resource metadata, so a client finds the authorization server from the refusal
+alone (RFC 6750 and RFC 9728):
+
+| Failure kind | Answer |
+| --- | --- |
+| `missing` | `401`, `WWW-Authenticate: Bearer resource_metadata="<metadata URL>"`, plus `scope="<required_scopes>"` when the method lists any |
+| `invalid` | `401`, the same challenge with `error="invalid_token"` after `resource_metadata` |
+| `insufficient_scope` | `403`, the same challenge with `error="insufficient_scope"` after `resource_metadata` |
+
+`scope` lists `required_scopes` only, never the other scopes the metadata advertises. A
+server-side error is never challenged: it answers `500`, or `503` when the Access Point can no
+longer serve its declaration.
+
+The refusal comes from one place, `challenge_failed_caller`
+([`caller_denial.rs`](../src/proxy/caller_denial.rs)). The invariant, that no stage after
+source authentication sees a failed caller of a declaring Access Point, is written once in
+[`AGENTS.md`](../AGENTS.md#architecture). In request order:
+
+| Stage | A failed caller on a declaring Access Point |
+| --- | --- |
+| Routing, when the request's Surface Variant cannot be resolved | The bare route's challenge, before any policy, on every protocol |
+| Source authentication | The challenge, on every protocol, before rate limit, the body and every policy plane, AP2 and payment; one blocking `auth_failed` record and no `policy_decision` record |
+| Receiving gateway of a Fabric route | `401` or `403` with `realm="agent-gateway"` and no `resource_metadata`, before policy |
+
+Public paths, the agent card and the protected resource metadata, are never challenged. On an
+Access Point that declares a protected resource, only a `GET` or `HEAD` of exactly
+`{route}/.well-known/agent-card.json`, `{route}/.well-known/agent.json`,
+`{route}/.well-known/agent-card` or `{route}/.well-known/ucp` (also under a `$alias`) skips
+caller authentication. Any other path, including one that only ends like a discovery document,
+such as `{route}/tasks/discovery` or `{route}/agent.json`, is challenged like any other request;
+once authenticated it runs Trust Check, gateway and surface policy and tool gating, and carries
+the Target credential. The same rule applies on a Fabric receive and, through a Transit Point, to
+the transit token, identity and policy steps: a path that only ends like a discovery document
+needs a transit token like any other request. A policy
+stage refuses with its own `403` and never a challenge. On every protocol the body is a problem
+(`application/problem+json`, `Cache-Control: no-store`) whose detail is fixed and never says why
+a token failed. Every challenge the gateway builds carries the `GatewayChallenge` marker
+([`protected_resource.rs`](../src/protocols/protected_resource.rs)), so the filter below keeps
+it.
+
+Only the sending gateway of a Fabric route declares and sends the challenge that names the
+metadata. The receiving gateway has no use for `resource_metadata`: the sending gateway strips the caller's own token, so sending
+the remote client to fetch one would only loop. It refuses a failed caller with the realm-only
+answer, which the sending gateway answers to its own caller with `502` and the detail `The Fabric
+peer refused the gateway's authorization`, recorded as `request_rejected` (stage `forward`, reason
+`peer_token_refused` or `peer_scope_refused`). See [Relayed challenges](#relayed-challenges) and
+[`FABRIC.md`](FABRIC.md#resource-server-across-the-fabric).
+
+| Not a caller challenge | Answer |
+| --- | --- |
+| Rate limit | `429`; a failed caller of a declaring Access Point is challenged before the limit and uses none of it |
+| Payment | `402` with its `Payment` challenges; a `Bearer` challenge is never added to it |
+| A `tools/call` that a policy refuses, and MCP tool gating | The JSON-RPC denial (HTTP `200`, code `-32001`) |
+| Response policy, egress policy, server-side source authentication errors | Their own answers |
+
+### Relayed challenges
+
+When the Access Point declares, or the Target is a `fabric://` route, every
+`WWW-Authenticate` challenge in the Target's response except `Payment` is removed before the
+caller sees it ([`strip_relayed_challenges`](../src/source_auth/challenge.rs)). The gateway is
+then the resource server, or the Target is another gateway answering the sending gateway's
+credential, so `Bearer`, `DPoP`, `Basic` and the rest name an authorization the caller cannot
+use through the gateway.
+
+From a Target:
+
+| Target response | Caller gets |
+| --- | --- |
+| A challenge the gateway built itself | Unchanged |
+| A header value listing several challenges | Only its `Payment` challenges |
+| A header the Target repeats, one challenge per value | The `Payment` challenges among all values, on the legacy and the modern relay |
+| A `401` left with no challenge | `502` with the detail `The target refused the gateway's authorization`: the Target refused the gateway's own credential, which the caller cannot fix, and a `401` without a challenge would send an OAuth or MCP client back to its own authorization server |
+| Any other status | The same status, without the dropped challenges |
+| A `401` that carried no challenge at all | Unchanged |
+
+Each response that loses a challenge logs a warning naming the surface, the status, the
+dropped schemes and whether it became `502`. Every other Access Point passes the Target's
+challenges and status through unchanged, including one whose `jwt_bearer` method forwards the
+caller's own token.
+
+From a Fabric peer: the peer is another gateway, and the caller's own token never crosses Fabric, so a
+peer's refusal of the gateway's authorization is not the caller's to fix. The sending gateway
+answers `502` with the detail `The Fabric peer refused the gateway's authorization` and no
+`WWW-Authenticate`, on every `fabric://` Access Point whether or not it declares, and records
+`request_rejected` with stage `forward` and `http_status` `502`
+([`peer_refusal`](../src/source_auth/challenge.rs),
+[`fabric_peer_refusal.rs`](../src/proxy/fabric_peer_refusal.rs)). The receiving gateway's own
+`auth_failed` record holds the reason. A challenge the peer repeats in its own
+`WWW-Authenticate` header counts the same as one listed in a single value. The public agent
+card route of a `fabric://` surface answers a peer refusal the same way (a `502` with the fixed
+detail and no challenge, recorded as a forward rejection). An agent card preview reports it as
+`auth_failed` with the peer's status and records nothing.
+
+| Fabric peer response | Caller gets | Audit reason |
+| --- | --- | --- |
+| `401` without a `Payment` challenge, a `401` with no challenge at all included | `502` | `peer_token_refused` |
+| `403` with a `Bearer` challenge whose `error` is `insufficient_scope` | `502` | `peer_scope_refused` |
+| `401` or `402` with a `Payment` challenge | The status, with its `Payment` challenges only | None |
+| Any other answer, a policy `403` included | The same status, without the dropped challenges | None |
+
+### Agent card preview
+
+When the card fetch fails, a caller gets no card and only a `502` or the agent's status. The
+Agent card preview shows an operator why, and what the gateway changes in a card it serves. It
+is the Agent Cards tab of the Surface Builder. It runs the base route's card assembly
+([`src/proxy/handler/agent_card.rs`](../src/proxy/handler/agent_card.rs)) as the card route does
+for an anonymous caller, so its `after` is the served card, but as an operator read: it reads
+the Target card with policy-context semantics only. It records no `RequestRejected` or
+`auth_failed` audit event, does not count as a caller request in any metric (including
+`agent_gateway_card_security_total`), writes no Trust Recorder entry and skips the x402 and MPP
+payment gate. An egress refusal is not recorded as a rejected request either. Target
+Authentication delegation events other than a rejected request are still written, because the
+gateway really used its credential.
+
+| Method | Path | Permission |
+| --- | --- | --- |
+| `GET` | `/api/v1/surfaces/{surface_id}/agent-card` | `surfaces.view` |
+| `POST` | `/api/v1/surfaces/{surface_id}/agent-card/refresh` | `surfaces.edit` |
+
+Both routes load the stored surface for the caller's tenant first: `404` when it is unknown or
+belongs to another tenant, so another tenant's card is never returned. A PAT with a resource
+pattern reaches only its own surface ids ([RBAC](RBAC.md#surface-declarations-and-agent-card-preview),
+[Access tokens](ACCESS_TOKENS.md#what-tenancy-does-not-partition)). They then preview the surface
+running on this replica. A failed fetch is data and answers `200`. `POST` takes no body and always
+fetches. `GET` answers from a snapshot under a minute old while the running surface is unchanged
+(a SHA-256 digest of the running surface, so a save or reload is never shown stale), otherwise it
+fetches. Concurrent requests for one surface share one fetch. Each fetch that a read or refresh
+runs logs an `agent_card.preview_fetch` event on the audit target, with `request` (`read` or
+`refresh`), `caller_user_id`, `tenant_id`, `surface_id`, `auth_kind`, `auth_result`,
+`fetch_status` and `cause`. A snapshot answer, a request that waited for another's fetch and a
+rate-limited request log none, and no credential, provider name, token expiry or URL is logged.
+
+Response fields:
+
+| Field | Value |
+| --- | --- |
+| `surface_id` | The surface id |
+| `supported`, `unsupported_reason` | `false` with `not_a2a` for a surface that is not A2A or AP2, or `operator_only` for a tenant token that reads the card preview of an appliance-wide surface (nothing is fetched and no snapshot is returned, because the fetch would use the appliance's Target credential), or `not_running` when no listener on this replica runs it, or its base route serves no card because the default Surface Variant is missing or disabled; nothing is fetched and the fields below are `null`, `false` or `0`. Otherwise `true` |
+| `generated` | `true` for an `a2a-proxy://` Target; `before` and `source_url` are then `null` |
+| `served_url` | The public card URL of the base route (the Access Point origin and path with `/.well-known/agent-card.json`), `null` when no listener matches |
+| `source_url`, `source_url_query_hidden` | The card URL the gateway fetches, with user info, query and fragment removed; the flag is `true` when a query or user info was removed |
+| `fetched_at`, `cached` | When the snapshot was taken (RFC 3339); `cached` is `true` when no fetch ran for this request |
+| `fetch` | `{status, cause, http_status, duration_ms}`: `status` is `ok`, `failed` (no card obtained) or `not_served` (obtained, but the gateway will not serve it); `cause` is `null` exactly when `ok`; `http_status` is the agent's status for a status-derived cause |
+| `auth` | `{kind, result, provider_name, token_expires_at, failure}`: `kind` is `none`, `static_secret`, `credential_provider`, `credential_lookup` or `remote_gateway` (`fabric://`); `result` is `not_configured`, `sent`, `not_sent` or `failed`; `provider_name` and, for a gateway token, `token_expires_at` only when a provider credential was sent; `failure` is the Target Authentication category when `failed` |
+| `payment_required` | `true` when callers must pay before the card route answers |
+| `outcome` | The [declaration](PROTOCOLS.md#agent-card-security) the rewrite applied, in the shape `GET /declarations` reports; the base route's resolved declaration when the card was not processed |
+| `before`, `after` | The agent's card as parsed, and the card the route serves. A card over `display_limit_bytes` (256 KiB) is `null` |
+| `before_bytes`, `after_bytes` | Serialized sizes, set whenever the card exists |
+| `last_caller_fetch` | `{status, cause, http_status, at}` of the last card request a caller made on this replica since it started, on the URL without `$alias`; `null` when there is none |
+
+| `cause` | `status` | Raised when |
+| --- | --- | --- |
+| `needs_token` | `failed` | The agent answered `401` and no credential was sent |
+| `auth_failed` | `failed` | The `reject` fallback refused the fetch, the agent answered `401` to the credential, or a Fabric peer refused the gateway's authorization (`http_status` is the peer's `401` or `403`) |
+| `forbidden` | `failed` | The agent answered `403` |
+| `not_found` | `failed` | The agent answered `404` or `410` |
+| `redirected` | `failed` | The agent answered `3xx` (the fetch never follows redirects) |
+| `upstream_error` | `failed` | Any other non-success status |
+| `unreachable` | `failed` | Connect, TLS or body read error, or a fabric forward error |
+| `timeout` | `failed` | The fetch or body read timed out, or the preview deadline passed |
+| `too_large` | `failed` | The body is over `[a2a] max_body_size` |
+| `invalid_card` | `failed` | The body is not a JSON object |
+| `blocked_by_egress` | `failed` | Egress policy refused the agent's address: its host does not resolve, or resolves to a cloud metadata address |
+| `proxy_unavailable` | `failed` | The A2A proxy is missing or disabled, or its store is unavailable |
+| `identity_failed` | `not_served` | Protected or external identity resolution, or identity credential injection, failed |
+| `rewrite_failed` | `not_served` | The endpoint or security rewrite failed |
+
+When the fetch fails, `after` still holds the last card the gateway served for the same
+running surface: the last card the base route served a caller, or the last successful preview,
+as the card route processed it. A card served before the surface last changed is never shown.
+`after` is `null` when no such card is kept, and `fetch` still reports the failure. The agent's
+own card (`before`) is `null` after a failed fetch.
+
+The preview never returns the upstream body of a failed fetch, any header sent or received, a
+token, an API key, a static secret, a secret id, a client id, a provider id, a resolved address
+or an error string: only the fixed values above and, when it parsed as a JSON object, the
+agent's card. The fetch carries only `Accept: application/json` and, when Target Authentication
+sends one, the Target credential; the management request's cookie and `Authorization` never
+reach the agent. The preview's own log line holds only the surface id, the cause and the
+duration; the fetch itself logs as the card route does, including the target URL at debug level
+and the transport error on a failed send or read.
+
+The fetch is the card route's own: pinned to the address the egress policy vetted, with or
+without a Target credential, never following redirects and bounded by `[a2a] max_body_size`,
+inside an overall deadline of `a2a.timeout_seconds + 5` seconds, at most
+60. It uses the shared gateway token cache like a caller, so a refresh never forces a new
+token ([Target Authentication](CREDENTIAL_DELEGATION.md#target-authentication-through-a-provider)).
+A user may start 10 fetches a minute across all surfaces on a replica (a `GET` counts only when
+it fetches). Past that, `GET` answers from a snapshot of the running surface with `cached: true`
+and otherwise, like `POST`, answers `429` `{"error": "Too many card refreshes; try again in a
+minute", "code": "rate_limited"}` with `Retry-After: 60`. Everything the preview keeps is per
+replica and in memory: snapshots and the last served card for 10 minutes, `last_caller_fetch`
+until the gateway restarts, each for up to 512 surfaces, and the limit. A served card over
+`display_limit_bytes` is kept by its size only.
 
 ### mTLS
 
@@ -188,9 +679,11 @@ applies to the metadata URL at fetch time. It also applies to the discovered
 `localhost` name in a blocked range makes the document invalid. A name that only resolves to
 a private address cannot be known without DNS, so it passes parsing. The caller must therefore
 fetch these URLs with `get_bounded`, or another pinned client, under the same posture, which
-blocks such a name at fetch time. The JWT Bearer `JwksFetcher` always uses the
-cloud-metadata-only pinned client, so a `jwks_uri` discovered under `Strict` must not be
-handed to it; fetch it with `get_bounded` under `Strict`.
+blocks such a name at fetch time. The JWT Bearer `JwksClient` fetches a strategy's key set
+for verification (`get_key`) only under the cloud-metadata-only posture; only `fetch_jwks`,
+used by `validate-jwks-uri`, takes the caller's posture. So a `jwks_uri` discovered under
+`Strict` must not be handed to the verification cache; fetch it with `get_bounded` under
+`Strict`.
 
 A failure is a `DiscoveryError`. `failure()` returns the `DiscoveryFailure`, `code()` a
 stable string, `message()` fixed text that is safe in an API response (it never carries a

@@ -1,5 +1,6 @@
 pub mod agent_context;
 pub mod circuit_breaker;
+pub mod failed_caller_dry_run;
 pub mod gateway_manager;
 pub mod global_policy;
 pub mod mcp_tool_gating;
@@ -8,6 +9,7 @@ pub mod policy_definitions;
 pub mod rate_limiter;
 pub mod slots;
 pub mod surface_manager;
+pub mod verdict;
 
 use std::borrow::Cow;
 
@@ -88,6 +90,7 @@ pub use opa::PolicyDecision;
 pub use policy_definitions::{FileSystemPolicyDefinitionStore, PolicyAttestation};
 pub use rate_limiter::{RateLimitConfig, RateLimitError, RateLimiter};
 pub use surface_manager::SurfacePolicyManager;
+pub use verdict::PlaneVerdict;
 
 #[cfg(test)]
 mod tests {

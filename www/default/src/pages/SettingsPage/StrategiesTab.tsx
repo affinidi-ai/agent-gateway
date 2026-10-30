@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { apiClient } from '../../api';
 import { usePermissions } from '../../context/PermissionsContext';
@@ -7,6 +7,13 @@ import { formatDateTime, topAndTail } from '../../utils/stringUtils';
 import { AppButton } from '../../components/shared/AppButton';
 import { EmptyState } from '../../components/shared/EmptyState';
 import { DOCS_URL } from '../../config/docs';
+import {
+  providersUsingStrategy,
+  surfacesUsingStrategy,
+  type ProviderRef,
+  type SurfaceRef,
+} from '../../utils/strategyUsage';
+import { useInPageConfirm } from '../../hooks/useInPageConfirm';
 
 export interface JwksSource {
   type: 'remote' | 'static';
@@ -19,8 +26,20 @@ export interface JwtVerificationStrategy {
   name: string;
   expected_issuer: string;
   jwks_source: JwksSource;
+  authorization_server?: { issuer: string } | null;
   created_at: string;
   updated_at: string;
+}
+
+interface StrategyUsage {
+  surfaces: SurfaceRef[] | 'unknown';
+  providers: ProviderRef[] | 'unknown';
+}
+
+async function readList(url: string): Promise<unknown> {
+  const response = await apiClient.fetch(url);
+  if (!response.ok) throw new Error(response.statusText);
+  return response.json();
 }
 
 interface StrategiesTabProps {
@@ -42,6 +61,14 @@ const StrategiesTab: React.FC<StrategiesTabProps> = ({
   const searchTerm = externalProvided ? externalSearchTerm! : internalSearchTerm;
   const setSearchTerm = setInternalSearchTerm;
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [confirming, setConfirming] = useState<JwtVerificationStrategy | null>(null);
+  const [usedBy, setUsedBy] = useState<StrategyUsage | 'loading'>('loading');
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const checkingId = useRef<string | null>(null);
+  const headingRef = useRef<HTMLHeadingElement>(null);
+  const { dialogRef, rememberTrigger, returnFocus, cancelOnEscape } = useInPageConfirm(
+    confirming?.id ?? null
+  );
 
   const canEdit = hasPermission('jwt_verification_strategies.edit');
   const canDelete = hasPermission('jwt_verification_strategies.delete');
@@ -67,15 +94,40 @@ const StrategiesTab: React.FC<StrategiesTabProps> = ({
     }
   };
 
+  const askDelete = async (strategy: JwtVerificationStrategy) => {
+    rememberTrigger();
+    checkingId.current = strategy.id;
+    setConfirming(strategy);
+    setDeleteError(null);
+    setUsedBy('loading');
+    const [surfaceList, providerList] = await Promise.allSettled([
+      readList('/api/v1/surfaces'),
+      readList('/api/v1/credential-providers'),
+    ]);
+    const providers =
+      providerList.status === 'fulfilled'
+        ? providersUsingStrategy(providerList.value, strategy.id)
+        : 'unknown';
+    const surfaces =
+      surfaceList.status === 'fulfilled'
+        ? surfacesUsingStrategy(
+            surfaceList.value,
+            strategy.id,
+            providers === 'unknown' ? [] : providers.map(p => p.id)
+          )
+        : 'unknown';
+    if (checkingId.current === strategy.id) setUsedBy({ surfaces, providers });
+  };
+
+  const cancelDelete = () => {
+    checkingId.current = null;
+    returnFocus();
+    setConfirming(null);
+  };
+
   const handleDelete = async (strategy: JwtVerificationStrategy) => {
-    if (
-      !window.confirm(
-        `Delete JWT verification strategy "${strategy.name}"?\n\nWarning: any channel still referencing this strategy will return 403.`
-      )
-    ) {
-      return;
-    }
     setDeletingId(strategy.id);
+    setDeleteError(null);
     try {
       const response = await apiClient.fetch(
         `/api/v1/jwt-verification-strategies/${encodeURIComponent(strategy.id)}`,
@@ -85,8 +137,11 @@ const StrategiesTab: React.FC<StrategiesTabProps> = ({
         throw new Error(`Delete failed: ${response.statusText}`);
       }
       setStrategies(prev => prev.filter(s => s.id !== strategy.id));
+      checkingId.current = null;
+      headingRef.current?.focus();
+      setConfirming(null);
     } catch (e: any) {
-      alert(`Failed to delete strategy: ${e.message}`);
+      setDeleteError(e.message ?? 'Delete failed');
     } finally {
       setDeletingId(null);
     }
@@ -107,7 +162,7 @@ const StrategiesTab: React.FC<StrategiesTabProps> = ({
       {/* Search + Add */}
       <div className="card shadow mb-4">
         <div className="card-header py-3 d-flex justify-content-between align-items-center">
-          <h6 className="m-0 font-weight-bold text-primary">
+          <h6 className="m-0 font-weight-bold text-primary" ref={headingRef} tabIndex={-1}>
             <i className="fas fa-id-badge"></i> JWT Verification Strategies
             <Badge
               value={filtered.length}
@@ -148,6 +203,81 @@ const StrategiesTab: React.FC<StrategiesTabProps> = ({
                   iconStart={<i className="fas fa-search fa-sm" aria-hidden="true" />}
                 />
               </div>
+            </div>
+          )}
+
+          {confirming && (
+            <div
+              ref={dialogRef}
+              tabIndex={-1}
+              className="alert alert-warning"
+              role="alertdialog"
+              aria-labelledby="strategy-delete-title"
+              data-testid="strategy-delete-confirm"
+              onKeyDown={cancelOnEscape(cancelDelete, deletingId === confirming.id)}
+            >
+              <strong id="strategy-delete-title">
+                Delete JWT verification strategy &quot;{confirming.name}&quot;?
+              </strong>
+              <p className="mb-1 mt-2">
+                A surface that still references it cannot verify tokens. Without authorization
+                server discovery, a caller that presents a token is refused with 500 and a caller
+                without one is left to the surface&apos;s policy. A surface that advertises an
+                authorization server can no longer be served and refuses every caller until the
+                strategy is restored. A credential provider that uses it for consent identity can no
+                longer obtain credentials that need the user&apos;s consent.
+              </p>
+              <div aria-live="polite">
+                {usedBy === 'loading' && <p className="mb-1">Checking which surfaces use it…</p>}
+                {usedBy !== 'loading' && usedBy.surfaces === 'unknown' && (
+                  <p className="mb-1">Could not check which surfaces use it.</p>
+                )}
+                {usedBy !== 'loading' && usedBy.providers === 'unknown' && (
+                  <p className="mb-1">Could not check which credential providers use it.</p>
+                )}
+                {usedBy !== 'loading' && Array.isArray(usedBy.surfaces) && (
+                  <UsageList
+                    items={usedBy.surfaces}
+                    none="No surface uses it."
+                    heading={n => `Used by ${n} ${n === 1 ? 'surface' : 'surfaces'}:`}
+                  />
+                )}
+                {usedBy !== 'loading' &&
+                  Array.isArray(usedBy.providers) &&
+                  usedBy.providers.length > 0 && (
+                    <UsageList
+                      items={usedBy.providers}
+                      heading={n =>
+                        `Used by ${n} ${n === 1 ? 'credential provider' : 'credential providers'} for consent identity:`
+                      }
+                    />
+                  )}
+              </div>
+              {deleteError && (
+                <div className="text-danger mb-2" role="alert" data-testid="strategy-delete-error">
+                  {deleteError}
+                </div>
+              )}
+              <AppButton
+                variant="danger"
+                size="sm"
+                className="me-2"
+                data-testid="strategy-delete-confirm-button"
+                onClick={() => handleDelete(confirming)}
+                loading={deletingId === confirming.id}
+                loadingLabel="Deleting"
+              >
+                Delete strategy
+              </AppButton>
+              <AppButton
+                variant="secondary"
+                size="sm"
+                data-testid="strategy-delete-cancel-button"
+                onClick={cancelDelete}
+                disabled={deletingId === confirming.id}
+              >
+                Cancel
+              </AppButton>
             </div>
           )}
 
@@ -202,13 +332,22 @@ const StrategiesTab: React.FC<StrategiesTabProps> = ({
                 <tbody>
                   {filtered.map(strategy => (
                     <tr
-                      data-testid={`jwt-strategy-row-${strategy.id}`}
                       key={strategy.id}
+                      data-testid={`strategy-row-${strategy.id}`}
                       onClick={() => navigate(`/jwt-verification-strategies/${strategy.id}`)}
                       style={{ cursor: 'pointer' }}
                     >
                       <td>
                         <strong>{strategy.name}</strong>
+                        {strategy.authorization_server && (
+                          <span
+                            className="badge text-bg-success ms-2"
+                            data-testid="strategy-discovered-badge"
+                            title="An authorization server is pinned from discovery"
+                          >
+                            Discovered
+                          </span>
+                        )}
                         <div>
                           <small className="text-muted">
                             {topAndTail(strategy.expected_issuer, 30, 20)}
@@ -267,11 +406,14 @@ const StrategiesTab: React.FC<StrategiesTabProps> = ({
                           <AppButton
                             variant="outline-danger"
                             size="sm"
-                            data-testid={`jwt-strategy-delete-button-${strategy.id}`}
-                            onClick={() => handleDelete(strategy)}
+                            onClick={e => {
+                              e.stopPropagation();
+                              askDelete(strategy);
+                            }}
                             disabled={deletingId === strategy.id}
                             title="Delete"
                             aria-label={`Delete strategy ${strategy.name}`}
+                            data-testid={`strategy-delete-button-${strategy.id}`}
                             loading={deletingId === strategy.id}
                             loadingLabel="Deleting"
                           >
@@ -287,6 +429,24 @@ const StrategiesTab: React.FC<StrategiesTabProps> = ({
           )}
         </div>
       </div>
+    </>
+  );
+};
+
+const UsageList: React.FC<{
+  items: SurfaceRef[];
+  none?: string;
+  heading: (count: number) => string;
+}> = ({ items, none, heading }) => {
+  if (items.length === 0) return none ? <p className="mb-1">{none}</p> : null;
+  return (
+    <>
+      <p className="mb-1">{heading(items.length)}</p>
+      <ul className="mb-2">
+        {items.map(item => (
+          <li key={item.id}>{item.name}</li>
+        ))}
+      </ul>
     </>
   );
 };

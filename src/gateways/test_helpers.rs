@@ -8,6 +8,32 @@ use crate::gateways::did_cache::DIDCacheConfig;
 use crate::gateways::types::Gateway;
 use crate::gateways::{ConnectionPointListenerManager, FileSystemGatewayStore, GatewayStore};
 
+/// Re-runs the calling test alone in a child process, where the receiver's
+/// process-wide stores start empty, and asserts that it passed. Returns `true`
+/// in the parent, which then returns; `false` in the child, which runs the body.
+pub(crate) fn rerun_in_isolated_process() -> bool {
+    if std::env::var_os("AG_RECEIVE_TEST_CHILD").is_some() {
+        return false;
+    }
+    let test_name = std::thread::current()
+        .name()
+        .expect("test thread name")
+        .to_string();
+    let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args(["--exact", &test_name, "--nocapture"])
+        .env("AG_RECEIVE_TEST_CHILD", "1")
+        .output()
+        .expect("run receiver regression with isolated globals");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("test result: ok. 1 passed"),
+        "isolated receiver regression did not run and pass exactly one test:\n{}\n{}",
+        stdout,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
+}
+
 /// The fabric-receive path only attributes requests to paired peers whose
 /// issuers are known, so install a listener manager whose gateway store holds
 /// `peers`. Returns the VC issuer's temp dir, which the caller keeps alive for

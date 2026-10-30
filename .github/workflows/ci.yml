@@ -302,6 +302,9 @@ jobs:
       - name: Run surface BDD scenarios
         run: cargo test --test surface_bdd
 
+      - name: Run startup refusal tests
+        run: cargo test --test startup_refusal
+
   g2g-bdd:
     name: BDD - gateway-to-gateway suite
     # arm64 because the mediator image is published for linux/arm64 only, with no

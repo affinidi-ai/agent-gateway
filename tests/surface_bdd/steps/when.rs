@@ -260,6 +260,9 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
     ) {
         let jwks_server = JwksServer::start().await;
         let issuer = jwks_server.base_url.clone();
+        let strategy_issuer = world
+            .surface_config
+            .jwt_strategy_issuer(&issuer);
 
         if let Some(SurfaceSourceAuthConfig::JwtBearer(JwtSourceAuthConfig {
             jwks_url, issuer: auth_issuer, ..
@@ -268,7 +271,7 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
             .source_auth
         {
             *jwks_url = format!("{}/.well-known/jwks.json", issuer);
-            *auth_issuer = issuer.clone();
+            *auth_issuer = strategy_issuer;
         }
 
         (Some(jwks_server), Some(JwksFiles { issuer }))
@@ -335,6 +338,17 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
     if let Some(reservation) = &mut outbound_port_reservation {
         reservation.release_listener();
     }
+    if let Some(token_auth) = &world
+        .surface_config
+        .target_token_auth
+    {
+        oauth_endpoint_allowlist.push(
+            token_auth
+                .provider
+                .token_endpoint
+                .clone(),
+        );
+    }
     let mut gateway_env = if oauth_endpoint_allowlist.is_empty() {
         std::collections::HashMap::new()
     } else {
@@ -343,6 +357,13 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
             oauth_endpoint_allowlist.join(","),
         )])
     };
+    if world
+        .surface_config
+        .target_token_auth
+        .is_some()
+    {
+        gateway_env.insert("AG_BDD_EGRESS_ALLOWLIST".to_string(), mock.url());
+    }
     if world.terms_enabled {
         gateway_env.insert("AFFINIDI_TERMS_REFRESH_INTERVAL_SECONDS".to_string(), "1".to_string());
     }
@@ -498,7 +519,7 @@ fn record_caller_response(
     });
 }
 
-fn record_admin_response(
+pub(crate) fn record_admin_response(
     world: &mut SurfaceWorld,
     response: crate::world::RecordedResponse,
 ) {
@@ -1397,7 +1418,7 @@ pub(crate) async fn read_surface_through_admin_api(world: &mut SurfaceWorld) {
     fetch_created_surface(world, "reading the surface through the admin API").await;
 }
 
-#[when(expr = "the operator creates a valid surface for route {string}")]
+#[when(regex = r#"^the operator (?:creates a|attempts to create an otherwise) valid surface for route "([^"]+)"$"#)]
 async fn valid_surface_create_request_submitted(
     world: &mut SurfaceWorld,
     route: String,
@@ -1662,20 +1683,115 @@ fn get_jwt_source_auth_issuer(world: &SurfaceWorld) -> String {
 }
 
 /// The audience a caller's token names: the resource of the surface's route
-/// when it publishes protected resource metadata, so a test token fails only
-/// for the flaw it was made with, and none otherwise.
+/// when it publishes protected resource metadata or declares the authorization
+/// server of its source authentication, so a test token fails only for the flaw
+/// it was made with, and none otherwise. A declaring surface's resource names
+/// the running gateway's port.
 fn caller_token_audience(world: &SurfaceWorld) -> serde_json::Value {
-    match world
+    if world
         .surface_config
         .protected_resource
+        .is_some()
     {
-        Some(_) => serde_json::json!(format!(
+        return serde_json::json!(format!(
             "{}{}",
             crate::bdd_support::config::single_surface_fixture::PROTECTED_RESOURCE_PUBLIC_ORIGIN,
             world.surface_config.route
-        )),
-        None => serde_json::json!([]),
+        ));
     }
+    match &world
+        .surface_config
+        .source_auth
+    {
+        Some(SurfaceSourceAuthConfig::JwtBearer(JwtSourceAuthConfig {
+            declares_authorization_server: true,
+            ..
+        })) => {
+            let gateway_port = world
+                .infra
+                .as_ref()
+                .expect("the gateway must be running before a token names the declared resource")
+                .gateway_port;
+            serde_json::json!(config::gateway_bootstrap::declared_access_point_url(
+                gateway_port,
+                &world.surface_config.route
+            ))
+        }
+        _ => serde_json::json!([]),
+    }
+}
+
+/// The scopes a declaring surface requires, as one space-separated value.
+fn surface_required_scopes(world: &SurfaceWorld) -> String {
+    match &world
+        .surface_config
+        .source_auth
+    {
+        Some(SurfaceSourceAuthConfig::JwtBearer(config)) => config
+            .required_scopes
+            .join(" "),
+        _ => panic!("JWT Bearer source authentication must be configured"),
+    }
+}
+
+async fn send_request_with_token_claims(
+    world: &mut SurfaceWorld,
+    mut claims: serde_json::Value,
+) {
+    ensure_gateway_running(world).await;
+    if claims.get("aud").is_none() {
+        claims["aud"] = caller_token_audience(world);
+    }
+    let token = create_valid_jwt_for_subject(get_jwt_source_auth_issuer(world), "test-user", claims);
+    send_request_with_bearer_token(world, token).await;
+}
+
+#[when(
+    expr = "the caller sends a request to the surface with a token issued for the surface granting scopes {string} in its {string} claim"
+)]
+async fn request_with_token_granting_scopes(
+    world: &mut SurfaceWorld,
+    scopes: String,
+    claim: String,
+) {
+    let mut claims = serde_json::json!({});
+    claims[claim.as_str()] = serde_json::json!(scopes);
+    send_request_with_token_claims(world, claims).await;
+}
+
+#[when(
+    expr = "the caller sends a request to the surface with a token whose audiences are the surface resource and {string} granting scopes {string}"
+)]
+async fn request_with_token_naming_resource_among_audiences(
+    world: &mut SurfaceWorld,
+    extra_audience: String,
+    scopes: String,
+) {
+    ensure_gateway_running(world).await;
+    let resource = caller_token_audience(world);
+    let claims = serde_json::json!({ "aud": [resource, extra_audience], "scope": scopes });
+    send_request_with_token_claims(world, claims).await;
+}
+
+#[when("the caller sends a request to the surface without a token and with a body that is not JSON")]
+async fn request_without_token_with_body_that_is_not_json(world: &mut SurfaceWorld) {
+    send_raw_string_request_and_record(world, "{not json", "application/json").await;
+}
+
+#[when(
+    expr = "the caller sends a request to the surface with an identity token issued for the surface granting scopes {string}"
+)]
+async fn request_with_identity_token_granting_scopes(
+    world: &mut SurfaceWorld,
+    scopes: String,
+) {
+    send_request_with_token_claims(world, serde_json::json!({ "scope": scopes, "nonce": "bdd-nonce" })).await;
+}
+
+#[when("the caller sends a request to the surface with a token issued for another resource")]
+async fn request_with_token_for_another_resource(world: &mut SurfaceWorld) {
+    let claims = serde_json::json!({ "aud": "https://other.example/agent", "scope": surface_required_scopes(world) });
+    send_request_with_token_claims(world, claims).await;
 }
 
 fn create_expired_jwt_for_issuer(
@@ -1846,7 +1962,7 @@ async fn request_with_invalid_api_key(world: &mut SurfaceWorld) {
 }
 
 #[when("the caller sends a request to the surface with a valid API key")]
-async fn request_with_valid_api_key(world: &mut SurfaceWorld) {
+pub(crate) async fn request_with_valid_api_key(world: &mut SurfaceWorld) {
     let header = build_valid_api_key_source_auth_header(world);
     send_request_and_record(world, vec![header]).await;
 }
@@ -1869,13 +1985,29 @@ async fn request_to_path_with_alternate_variant_api_key(
 
 #[when("the caller fetches the protected resource metadata of the surface")]
 async fn fetch_protected_resource_metadata(world: &mut SurfaceWorld) {
+    let route = world
+        .surface_config
+        .route
+        .clone();
+    fetch_protected_resource_metadata_for_route(world, &route).await;
+}
+
+#[when(expr = "the caller fetches the protected resource metadata for route {string}")]
+async fn fetch_protected_resource_metadata_for_unconfigured_route(
+    world: &mut SurfaceWorld,
+    route: String,
+) {
+    fetch_protected_resource_metadata_for_route(world, &route).await;
+}
+
+async fn fetch_protected_resource_metadata_for_route(
+    world: &mut SurfaceWorld,
+    route: &str,
+) {
     ensure_gateway_running(world).await;
 
     let infra = world.infra.as_ref().unwrap();
-    let url = format!(
-        "http://127.0.0.1:{}/.well-known/oauth-protected-resource{}",
-        infra.gateway_port, world.surface_config.route
-    );
+    let url = format!("http://127.0.0.1:{}/.well-known/oauth-protected-resource{route}", infra.gateway_port);
     let resp = reqwest::Client::new()
         .get(&url)
         .send()
@@ -1889,10 +2021,11 @@ async fn fetch_protected_resource_metadata(world: &mut SurfaceWorld) {
         .await
         .unwrap_or(serde_json::Value::Null);
     world.caller_response = Some(RecordedResponse { status, headers, body });
+    record_mock_observation(world).await;
 }
 
 #[when("the caller fetches the agent card")]
-async fn fetch_agent_card(world: &mut SurfaceWorld) {
+pub(crate) async fn fetch_agent_card(world: &mut SurfaceWorld) {
     fetch_agent_card_with_headers(world, vec![]).await;
 }
 
@@ -1921,15 +2054,30 @@ async fn fetch_agent_card_with_extra_headers(
     fetch_agent_card_with_headers(world, headers).await;
 }
 
+#[when(expr = "the caller reads public path {string} of the surface")]
+async fn caller_reads_public_path(
+    world: &mut SurfaceWorld,
+    path: String,
+) {
+    read_surface_path(world, &path, vec![]).await;
+}
+
 async fn fetch_agent_card_with_headers(
     world: &mut SurfaceWorld,
+    headers: Vec<(String, String)>,
+) {
+    read_surface_path(world, "/.well-known/agent-card.json", headers).await;
+}
+
+async fn read_surface_path(
+    world: &mut SurfaceWorld,
+    path: &str,
     headers: Vec<(String, String)>,
 ) {
     ensure_gateway_running(world).await;
 
     let infra = world.infra.as_ref().unwrap();
-    let url =
-        format!("http://127.0.0.1:{}{}/.well-known/agent-card.json", infra.gateway_port, world.surface_config.route);
+    let url = format!("http://127.0.0.1:{}{}{path}", infra.gateway_port, world.surface_config.route);
 
     let mut req = reqwest::Client::new().get(&url);
     for (name, value) in &headers {
@@ -1938,7 +2086,7 @@ async fn fetch_agent_card_with_headers(
     let resp = req
         .send()
         .await
-        .expect("agent card request failed");
+        .expect("surface read request failed");
 
     let status = resp.status().as_u16();
     let headers = collect_headers(resp.headers());
@@ -2186,6 +2334,53 @@ async fn send_mcp_request_through_transit_point(
     send_mcp_request_through_transit_point_path(world, agent_name, &path, body).await;
 }
 
+/// The URL of `path` on the outbound listener, once that listener accepts connections.
+async fn outbound_listener_url(
+    world: &mut SurfaceWorld,
+    path: &str,
+) -> String {
+    let infra = world
+        .infra
+        .as_mut()
+        .expect("scenario infra must exist");
+    let outbound_port = infra.outbound_port;
+    infra
+        .gateway
+        .wait_for_secondary_port(outbound_port, std::time::Duration::from_secs(15))
+        .await
+        .unwrap_or_else(|error| panic!("outbound listener did not become ready on port {outbound_port}: {error}"));
+    format!("http://127.0.0.1:{outbound_port}{path}")
+}
+
+#[when(expr = "managed agent {string} fetches the agent card through Transit Point {string}")]
+async fn managed_agent_fetches_agent_card_through_transit_point(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    transit_point: String,
+) {
+    world
+        .actors
+        .expect_target_kind(&agent_name, TargetActorKind::ManagedAgent);
+    ensure_gateway_running(world).await;
+    let url = outbound_listener_url(world, &format!("/transit/{transit_point}/.well-known/agent-card.json")).await;
+    let response = reqwest::Client::new()
+        .get(&url)
+        .send()
+        .await
+        .expect("fetch the agent card through Transit Point");
+
+    let status = response.status().as_u16();
+    let headers = collect_headers(response.headers());
+    let body = response
+        .json()
+        .await
+        .unwrap_or(serde_json::Value::Null);
+    world.caller_response = Some(RecordedResponse { status, headers, body });
+
+    record_mock_observation(world).await;
+    record_replacement_mock_observation(world).await;
+}
+
 async fn send_mcp_request_through_transit_point_path(
     world: &mut SurfaceWorld,
     agent_name: &str,
@@ -2360,17 +2555,7 @@ async fn send_mcp_request_through_transit_point_path_with_headers(
         .expect_target_kind(agent_name, TargetActorKind::ManagedAgent);
     ensure_gateway_running(world).await;
 
-    let infra = world
-        .infra
-        .as_mut()
-        .expect("scenario infra must exist");
-    let outbound_port = infra.outbound_port;
-    infra
-        .gateway
-        .wait_for_secondary_port(outbound_port, std::time::Duration::from_secs(15))
-        .await
-        .unwrap_or_else(|error| panic!("outbound listener did not become ready on port {outbound_port}: {error}"));
-    let url = format!("http://127.0.0.1:{}{}", outbound_port, path);
+    let url = outbound_listener_url(world, path).await;
 
     world.sent_body = Some(body.clone());
     let mut request = reqwest::Client::new()
@@ -2408,17 +2593,7 @@ async fn send_a2a_request_through_transit_point(
         .expect_target_kind(agent_name, TargetActorKind::ManagedAgent);
     ensure_gateway_running(world).await;
 
-    let infra = world
-        .infra
-        .as_mut()
-        .expect("scenario infra must exist");
-    let outbound_port = infra.outbound_port;
-    infra
-        .gateway
-        .wait_for_secondary_port(outbound_port, std::time::Duration::from_secs(15))
-        .await
-        .unwrap_or_else(|error| panic!("outbound listener did not become ready on port {outbound_port}: {error}"));
-    let url = format!("http://127.0.0.1:{}/transit/{}", outbound_port, transit_point);
+    let url = outbound_listener_url(world, &format!("/transit/{transit_point}")).await;
 
     let body = build_a2a_message_send_body("hello");
     world.sent_body = Some(body.clone());
@@ -2623,6 +2798,7 @@ async fn caller_asks_mcp_surface_for_available_tools_with_valid_token(world: &mu
 
 #[when("the caller asks the MCP surface for available tools with a token issued for the surface")]
 async fn caller_asks_mcp_surface_for_available_tools_with_token_for_surface(world: &mut SurfaceWorld) {
+    ensure_gateway_running(world).await;
     let audience = caller_token_audience(world);
     ask_mcp_surface_for_available_tools_with_audience(world, audience).await;
 }
@@ -2641,6 +2817,25 @@ async fn caller_asks_mcp_surface_for_available_tools_with_token_for_surface_cont
         &caller,
         serde_json::json!({ "aud": caller_token_audience(world), "groups": [group] }),
     );
+    ask_mcp_surface_for_available_tools_with_headers(
+        world,
+        vec![("authorization".to_string(), format!("Bearer {}", token))],
+    )
+    .await;
+}
+
+#[when(
+    expr = "the caller asks the MCP surface for available tools with a token issued for the surface granting scopes {string} in its {string} claim"
+)]
+async fn caller_asks_mcp_surface_for_available_tools_with_token_granting_scopes(
+    world: &mut SurfaceWorld,
+    scopes: String,
+    claim: String,
+) {
+    ensure_gateway_running(world).await;
+    let mut claims = serde_json::json!({ "aud": caller_token_audience(world) });
+    claims[claim.as_str()] = serde_json::json!(scopes);
+    let token = create_valid_jwt_for_subject(get_jwt_source_auth_issuer(world), "test-user", claims);
     ask_mcp_surface_for_available_tools_with_headers(
         world,
         vec![("authorization".to_string(), format!("Bearer {}", token))],

@@ -66,6 +66,25 @@ describe('authorization server discovery round-trip', () => {
     );
   });
 
+  it('saves required scopes next to a stored setting, each unchanged', () => {
+    const method = { ...METHOD, required_scopes: ['tools.call'] };
+    const surface = stored({ methods: [method], protected_resource: SETTING });
+    const { nodes, payload } = rebuild(surface);
+
+    expect(callerAuthNode(nodes)?.config.required_scopes).toEqual(['tools.call']);
+    expect(payload.access_point.caller_authentication).toEqual({
+      methods: [method],
+      protected_resource: SETTING,
+    });
+  });
+
+  it('adds no required scopes to a surface stored without them', () => {
+    const { payload } = rebuild(stored({ methods: [METHOD], protected_resource: SETTING }));
+    expect(payload.access_point.caller_authentication.methods[0]).not.toHaveProperty(
+      'required_scopes'
+    );
+  });
+
   it('saves a setting without scopes without inventing any', () => {
     const setting = {
       resource: SETTING.resource,
@@ -73,6 +92,35 @@ describe('authorization server discovery round-trip', () => {
     };
     const { payload } = rebuild(stored({ methods: [METHOD], protected_resource: setting }));
     expect(payload.access_point.caller_authentication.protected_resource).toEqual(setting);
+  });
+
+  it('saves a setting that holds only a resource without inventing authorization servers or scopes', () => {
+    const setting = { resource: SETTING.resource };
+    const { nodes, payload } = rebuild(stored({ methods: [METHOD], protected_resource: setting }));
+
+    expect(callerAuthNode(nodes)?.config.protected_resource).toStrictEqual(setting);
+    expect(payload.access_point.caller_authentication.protected_resource).toStrictEqual(setting);
+    expect(
+      rebuild(payload).payload.access_point.caller_authentication.protected_resource
+    ).toStrictEqual(setting);
+  });
+
+  it('keeps a stored authorization server list through a save that does not touch it', () => {
+    const setting = {
+      resource: SETTING.resource,
+      authorization_servers: SETTING.authorization_servers,
+    };
+    const method = { ...METHOD, required_scopes: ['tools.call'] };
+    const { nodes, payload } = rebuild(stored({ methods: [method], protected_resource: setting }));
+    const edited = { ...callerAuthNode(nodes)!.config, required_scopes: ['tools.call', 'read'] };
+    const editedNodes = nodes.map(n => (n.type === 'caller-auth' ? { ...n, config: edited } : n));
+    const saved = registry.buildPayload(context(editedNodes));
+
+    expect(payload.access_point.caller_authentication.protected_resource).toStrictEqual(setting);
+    expect(saved.access_point.caller_authentication).toEqual({
+      methods: [{ ...METHOD, required_scopes: ['tools.call', 'read'] }],
+      protected_resource: setting,
+    });
   });
 
   it('does not bring back a setting from a stale canvas copy once the surface has none', () => {

@@ -40,7 +40,7 @@ pub async fn build_authorization_url(
         .client_id_secret_ref
         .as_deref()
         .ok_or_else(|| anyhow!("Provider '{}' has no client_id_secret_ref", provider.provider_id))?;
-    let client_id = resolve_secret(secrets_store, client_id_ref)
+    let client_id = resolve_secret(secrets_store, provider, client_id_ref)
         .await
         .context("Failed to resolve client_id secret")?;
 
@@ -102,6 +102,17 @@ pub async fn build_authorization_url(
     Ok(url)
 }
 
+fn ensure_https_token_endpoint(
+    provider: &CredentialProvider,
+    token_endpoint: &str,
+    egress: &super::gateway_token::GrantEgress,
+) -> Result<()> {
+    if egress.permits_token_endpoint(token_endpoint) {
+        return Ok(());
+    }
+    Err(anyhow!("Blocked token_endpoint for provider '{}': token_endpoint must be https", provider.provider_id))
+}
+
 /// Exchange an OAuth authorization code for tokens
 pub async fn exchange_code_for_tokens(
     provider: &CredentialProvider,
@@ -118,10 +129,19 @@ pub async fn exchange_code_for_tokens(
         .client_secret_secret_ref
         .as_deref()
         .ok_or_else(|| anyhow!("Provider '{}' has no client_secret_secret_ref", provider.provider_id))?;
-    let client_id = resolve_secret(secrets_store, client_id_ref)
+    let egress = super::gateway_token::GrantEgress::from_environment();
+    let token_endpoint = provider
+        .token_endpoint
+        .as_deref()
+        .ok_or_else(|| anyhow!("Provider '{}' has no token_endpoint", provider.provider_id))?;
+    crate::url_validation::validate_oauth_endpoint_url(token_endpoint)
+        .map_err(|e| anyhow!("Blocked token_endpoint for provider '{}': {}", provider.provider_id, e))?;
+    ensure_https_token_endpoint(provider, token_endpoint, &egress)?;
+
+    let client_id = resolve_secret(secrets_store, provider, client_id_ref)
         .await
         .context("Failed to resolve client_id")?;
-    let client_secret = resolve_secret(secrets_store, client_secret_ref)
+    let client_secret = resolve_secret(secrets_store, provider, client_secret_ref)
         .await
         .context("Failed to resolve client_secret")?;
 
@@ -130,16 +150,8 @@ pub async fn exchange_code_for_tokens(
         .as_deref()
         .map(|s| s.to_string())
         .unwrap_or_else(|| format!("{}{}", gateway_base_url, provider.callback_path));
-    let token_endpoint = provider
-        .token_endpoint
-        .as_deref()
-        .ok_or_else(|| anyhow!("Provider '{}' has no token_endpoint", provider.provider_id))?;
-    crate::url_validation::validate_oauth_endpoint_url(token_endpoint)
-        .map_err(|e| anyhow!("Blocked token_endpoint for provider '{}': {}", provider.provider_id, e))?;
     crate::url_validation::validate_oauth_endpoint_url(&callback_url)
         .map_err(|e| anyhow!("Blocked callback_url for provider '{}': {}", provider.provider_id, e))?;
-
-    let http_client = crate::http_client::external()?;
 
     let mut params = vec![
         ("grant_type", "authorization_code".to_string()),
@@ -161,55 +173,8 @@ pub async fn exchange_code_for_tokens(
         "Exchanging authorization code for tokens"
     );
 
-    let response = http_client
-        .post(token_endpoint)
-        .header("Accept", "application/json")
-        .form(&params)
-        .send()
-        .await
-        .context("Failed to send token exchange request")?;
-
-    let status = response.status();
-    let body = response
-        .text()
-        .await
-        .context("Failed to read token response body")?;
-
-    if !status.is_success() {
-        let reason = token_error_reason(&body);
-        warn!(
-            target: "credential_delegation",
-            provider_id = %provider.provider_id,
-            status = %status,
-            reason = %reason,
-            "Token exchange failed"
-        );
-        return Err(anyhow!("Token exchange failed (HTTP {}): {}", status, reason));
-    }
-
-    // Try JSON first; fall back to application/x-www-form-urlencoded (e.g. GitHub without Accept header)
-    let token_response: OAuthTokenResponse = serde_json::from_str(&body)
-        .or_else(|_| {
-            let pairs: std::collections::HashMap<String, String> = serde_urlencoded::from_str(&body)?;
-            Ok::<OAuthTokenResponse, serde_urlencoded::de::Error>(OAuthTokenResponse {
-                access_token: pairs
-                    .get("access_token")
-                    .cloned()
-                    .unwrap_or_default(),
-                refresh_token: pairs
-                    .get("refresh_token")
-                    .cloned(),
-                token_type: pairs
-                    .get("token_type")
-                    .cloned()
-                    .unwrap_or_else(|| "bearer".to_string()),
-                expires_in: pairs
-                    .get("expires_in")
-                    .and_then(|v| v.parse().ok()),
-                scope: pairs.get("scope").cloned(),
-            })
-        })
-        .map_err(|e| anyhow!("Failed to parse token response as JSON or form-urlencoded: {e}"))?;
+    let token_response =
+        post_consent_token_request(provider, token_endpoint, &params, "Token exchange", &egress).await?;
 
     info!(
         target: "credential_delegation",
@@ -261,19 +226,21 @@ pub async fn refresh_access_token(
         .client_secret_secret_ref
         .as_deref()
         .ok_or_else(|| anyhow!("Provider '{}' has no client_secret_secret_ref", provider.provider_id))?;
-    let client_id = resolve_secret(secrets_store, client_id_ref)
-        .await
-        .context("Failed to resolve client_id for refresh")?;
-    let client_secret = resolve_secret(secrets_store, client_secret_ref)
-        .await
-        .context("Failed to resolve client_secret for refresh")?;
-
+    let egress = super::gateway_token::GrantEgress::from_environment();
     let token_endpoint = provider
         .token_endpoint
         .as_deref()
         .ok_or_else(|| anyhow!("Provider '{}' has no token_endpoint", provider.provider_id))?;
     crate::url_validation::validate_oauth_endpoint_url(token_endpoint)
         .map_err(|e| anyhow!("Blocked token_endpoint for provider '{}': {}", provider.provider_id, e))?;
+    ensure_https_token_endpoint(provider, token_endpoint, &egress)?;
+
+    let client_id = resolve_secret(secrets_store, provider, client_id_ref)
+        .await
+        .context("Failed to resolve client_id for refresh")?;
+    let client_secret = resolve_secret(secrets_store, provider, client_secret_ref)
+        .await
+        .context("Failed to resolve client_secret for refresh")?;
 
     let params = [
         ("grant_type", "refresh_token"),
@@ -289,35 +256,58 @@ pub async fn refresh_access_token(
         "Refreshing access token"
     );
 
-    let http_client = crate::http_client::external()?;
+    let token_response =
+        post_consent_token_request(provider, token_endpoint, &params, "Token refresh", &egress).await?;
 
-    let response = http_client
-        .post(token_endpoint)
+    info!(
+        target: "credential_delegation",
+        provider_id = %provider.provider_id,
+        has_new_refresh_token = %token_response.refresh_token.is_some(),
+        expires_in = ?token_response.expires_in,
+        "Token refresh successful"
+    );
+
+    Ok(token_response)
+}
+
+/// Posts a consent-flow token request on a client pinned to the token endpoint's vetted
+/// addresses, with redirects off, and reads at most 64 KiB of the response. A failure
+/// names only the HTTP status; the response body is never logged or returned.
+async fn post_consent_token_request<P: serde::Serialize + ?Sized>(
+    provider: &CredentialProvider,
+    token_endpoint: &str,
+    params: &P,
+    operation: &'static str,
+    egress: &super::gateway_token::GrantEgress,
+) -> Result<OAuthTokenResponse> {
+    let (client, target) = pinned_token_client(token_endpoint, egress)
+        .await
+        .map_err(|_| anyhow!("{operation} failed: token endpoint is not reachable"))?;
+    let response = client
+        .post(target.url)
         .header("Accept", "application/json")
-        .form(&params)
+        .form(params)
         .send()
         .await
-        .context("Failed to send token refresh request")?;
-
+        .map_err(|_| anyhow!("{operation} request failed"))?;
     let status = response.status();
-    let body = response
-        .text()
+    let body = read_token_response(response)
         .await
-        .context("Failed to read refresh response body")?;
-
+        .map_err(|error| anyhow!("{operation} response rejected: {}", error.category()))?;
     if !status.is_success() {
         warn!(
             target: "credential_delegation",
             provider_id = %provider.provider_id,
-            status = %status,
-            "Token refresh failed — user may need to re-consent"
+            status = status.as_u16(),
+            error_code = super::gateway_token::oauth_error_code(&body).unwrap_or("none"),
+            "{operation} failed"
         );
-        return Err(anyhow!("Token refresh failed (HTTP {}): {}", status, token_error_reason(&body)));
+        return Err(anyhow!("{operation} failed (HTTP {})", status.as_u16()));
     }
-
-    let token_response: OAuthTokenResponse = serde_json::from_str(&body)
+    // JSON first; application/x-www-form-urlencoded for providers such as GitHub without an Accept header.
+    serde_json::from_slice::<OAuthTokenResponse>(&body)
         .or_else(|_| {
-            let pairs: std::collections::HashMap<String, String> = serde_urlencoded::from_str(&body)?;
+            let pairs: std::collections::HashMap<String, String> = serde_urlencoded::from_bytes(&body)?;
             Ok::<OAuthTokenResponse, serde_urlencoded::de::Error>(OAuthTokenResponse {
                 access_token: pairs
                     .get("access_token")
@@ -336,53 +326,43 @@ pub async fn refresh_access_token(
                 scope: pairs.get("scope").cloned(),
             })
         })
-        .map_err(|e| anyhow!("Failed to parse refresh response as JSON or form-urlencoded: {e}"))?;
-
-    info!(
-        target: "credential_delegation",
-        provider_id = %provider.provider_id,
-        has_new_refresh_token = %token_response.refresh_token.is_some(),
-        expires_in = ?token_response.expires_in,
-        "Token refresh successful"
-    );
-
-    Ok(token_response)
+        .map_err(|_| anyhow!("{operation} response is neither JSON nor form-urlencoded"))
 }
 
+/// Vets a token endpoint and returns a redirect-off client pinned to the addresses it
+/// resolved to, with the target URL to post to.
+async fn pinned_token_client(
+    token_endpoint: &str,
+    egress: &super::gateway_token::GrantEgress,
+) -> Result<(reqwest::Client, crate::egress::PinnedTarget)> {
+    let raw = token_endpoint.to_string();
+    let timeout = egress.timeout;
+    let allowlist = egress.exact_allowlist.clone();
+    tokio::task::spawn_blocking(move || crate::egress::pinned_configured_client(&raw, timeout, allowlist.as_deref()))
+        .await
+        .context("Token endpoint check failed")?
+        .map_err(|_| anyhow!("Token endpoint is not reachable"))
+}
+
+/// Refreshes a modern delegated credential on a client pinned to the token endpoint's
+/// vetted addresses, with redirects off. `Ok(None)` means the provider answered
+/// `invalid_grant`.
 pub async fn refresh_scoped_access_token(
     provider: &CredentialProvider,
     refresh_token: &str,
     scopes: &[String],
     secrets: &Arc<dyn SecretsStore>,
-    client: &reqwest::Client,
+    egress: &super::gateway_token::GrantEgress,
 ) -> Result<Option<OAuthTokenResponse>> {
     anyhow::ensure!(!refresh_token.is_empty() && refresh_token.len() <= 32 * 1024, "Invalid refresh credential");
-    scoped_token_grant(provider, Some(refresh_token), scopes, secrets, client).await
-}
-
-pub async fn fetch_scoped_client_credentials_token(
-    provider: &CredentialProvider,
-    scopes: &[String],
-    secrets: &Arc<dyn SecretsStore>,
-    client: &reqwest::Client,
-) -> Result<OAuthTokenResponse> {
-    scoped_token_grant(provider, None, scopes, secrets, client)
-        .await?
-        .ok_or_else(|| anyhow!("Provider credential grant rejected"))
-}
-
-async fn scoped_token_grant(
-    provider: &CredentialProvider,
-    refresh_token: Option<&str>,
-    scopes: &[String],
-    secrets: &Arc<dyn SecretsStore>,
-    client: &reqwest::Client,
-) -> Result<Option<OAuthTokenResponse>> {
     let endpoint = provider
         .token_endpoint
         .as_deref()
         .ok_or_else(|| anyhow!("Missing refresh endpoint"))?;
-    crate::url_validation::validate_oauth_endpoint_url(endpoint).map_err(|_| anyhow!("Invalid refresh endpoint"))?;
+    anyhow::ensure!(egress.permits_token_endpoint(endpoint), "Invalid refresh endpoint");
+    let (client, target) = pinned_token_client(endpoint, egress)
+        .await
+        .map_err(|_| anyhow!("Invalid refresh endpoint"))?;
     let resource = provider
         .resource
         .as_deref()
@@ -390,6 +370,7 @@ async fn scoped_token_grant(
     crate::sts::mcp_profile::canonical_https_url(resource).map_err(|_| anyhow!("Invalid refresh resource"))?;
     let client_id = resolve_secret(
         secrets,
+        provider,
         provider
             .client_id_secret_ref
             .as_deref()
@@ -399,6 +380,7 @@ async fn scoped_token_grant(
     let client_secret = zeroize::Zeroizing::new(
         resolve_secret(
             secrets,
+            provider,
             provider
                 .client_secret_secret_ref
                 .as_deref()
@@ -408,49 +390,27 @@ async fn scoped_token_grant(
     );
     let operation = async {
         let scope = scopes.join(" ");
-        let mut params = vec![
-            (
-                "grant_type",
-                if refresh_token.is_some() {
-                    "refresh_token"
-                } else {
-                    "client_credentials"
-                },
-            ),
+        let params = [
+            ("grant_type", "refresh_token"),
             ("client_id", client_id.as_str()),
             ("client_secret", client_secret.as_str()),
             ("resource", resource),
             ("scope", scope.as_str()),
+            ("refresh_token", refresh_token),
         ];
-        if let Some(refresh_token) = refresh_token {
-            params.push(("refresh_token", refresh_token));
-        }
-        let mut response = client
-            .post(endpoint)
+        let response = client
+            .post(target.url)
             .header("accept", "application/json")
             .form(&params)
             .send()
             .await
             .context("Provider refresh request failed")?;
         let status = response.status();
-        let mut bytes = zeroize::Zeroizing::new(Vec::new());
-        while let Some(chunk) = response
-            .chunk()
+        let bytes = read_token_response(response)
             .await
-            .context("Provider refresh response failed")?
-        {
-            anyhow::ensure!(
-                bytes
-                    .len()
-                    .saturating_add(chunk.len())
-                    <= 64 * 1024,
-                "Provider refresh response too large"
-            );
-            bytes.extend_from_slice(&chunk);
-        }
+            .map_err(|error| anyhow!("Provider refresh response failed: {}", error.category()))?;
         let value: serde_json::Value = serde_json::from_slice(&bytes).context("Invalid provider refresh response")?;
-        if refresh_token.is_some()
-            && status == reqwest::StatusCode::BAD_REQUEST
+        if status == reqwest::StatusCode::BAD_REQUEST
             && value
                 .get("error")
                 .and_then(serde_json::Value::as_str)
@@ -482,6 +442,40 @@ async fn scoped_token_grant(
     tokio::time::timeout(std::time::Duration::from_secs(30), operation)
         .await
         .context("Provider refresh timed out")?
+}
+
+/// Largest token endpoint response read into memory.
+pub(crate) const MAX_TOKEN_RESPONSE_BYTES: usize = 64 * 1024;
+
+/// Reads a token endpoint response into zeroizing memory. A declared Content-Length
+/// over [`MAX_TOKEN_RESPONSE_BYTES`] is refused unread; an undeclared body is refused
+/// once it grows past it.
+pub(crate) async fn read_token_response(
+    mut response: reqwest::Response
+) -> std::result::Result<zeroize::Zeroizing<Vec<u8>>, super::gateway_token::GatewayTokenError> {
+    use super::gateway_token::GatewayTokenError;
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_TOKEN_RESPONSE_BYTES as u64)
+    {
+        return Err(GatewayTokenError::InvalidResponse);
+    }
+    let mut bytes = zeroize::Zeroizing::new(Vec::new());
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| GatewayTokenError::Unavailable)?
+    {
+        if bytes
+            .len()
+            .saturating_add(chunk.len())
+            > MAX_TOKEN_RESPONSE_BYTES
+        {
+            return Err(GatewayTokenError::InvalidResponse);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 /// Build a consent-required payload for protocol-aware signaling
@@ -556,95 +550,6 @@ pub async fn build_delegation_vc(
     }
 }
 
-/// Fetch a token using the OAuth 2.0 Client Credentials flow (M2M, no user consent)
-pub async fn fetch_client_credentials_token(
-    provider: &CredentialProvider,
-    scopes: &[String],
-    secrets_store: &Arc<dyn SecretsStore>,
-) -> Result<OAuthTokenResponse> {
-    let client_id_ref = provider
-        .client_id_secret_ref
-        .as_deref()
-        .ok_or_else(|| anyhow!("Provider '{}' has no client_id_secret_ref", provider.provider_id))?;
-    let client_secret_ref = provider
-        .client_secret_secret_ref
-        .as_deref()
-        .ok_or_else(|| anyhow!("Provider '{}' has no client_secret_secret_ref", provider.provider_id))?;
-    let token_endpoint = provider
-        .token_endpoint
-        .as_deref()
-        .ok_or_else(|| anyhow!("Provider '{}' has no token_endpoint", provider.provider_id))?;
-    let client_id = resolve_secret(secrets_store, client_id_ref)
-        .await
-        .context("Failed to resolve client_id for client_credentials")?;
-    let client_secret = resolve_secret(secrets_store, client_secret_ref)
-        .await
-        .context("Failed to resolve client_secret for client_credentials")?;
-
-    crate::url_validation::validate_oauth_endpoint_url(token_endpoint)
-        .map_err(|e| anyhow!("Blocked token_endpoint for provider '{}': {}", provider.provider_id, e))?;
-
-    let scope_string = scopes.join(" ");
-
-    let http_client = crate::http_client::external()?;
-
-    let mut params = vec![
-        ("grant_type", "client_credentials".to_string()),
-        ("client_id", client_id),
-        ("client_secret", client_secret),
-    ];
-
-    if !scope_string.is_empty() {
-        params.push(("scope", scope_string));
-    }
-
-    info!(
-        target: "credential_delegation",
-        provider_id = %provider.provider_id,
-        token_endpoint = %token_endpoint,
-        scopes = ?scopes,
-        "Fetching client_credentials token (M2M)"
-    );
-
-    let response = http_client
-        .post(token_endpoint)
-        .form(&params)
-        .send()
-        .await
-        .context("Failed to send client_credentials token request")?;
-
-    let status = response.status();
-    let body = response
-        .text()
-        .await
-        .context("Failed to read client_credentials response body")?;
-
-    if !status.is_success() {
-        let reason = token_error_reason(&body);
-        warn!(
-            target: "credential_delegation",
-            provider_id = %provider.provider_id,
-            status = %status,
-            reason = %reason,
-            "Client credentials token fetch failed"
-        );
-        return Err(anyhow!("Client credentials token fetch failed (HTTP {}): {}", status, reason));
-    }
-
-    let token_response: OAuthTokenResponse =
-        serde_json::from_str(&body).context("Failed to parse client_credentials token response")?;
-
-    info!(
-        target: "credential_delegation",
-        provider_id = %provider.provider_id,
-        token_type = %token_response.token_type,
-        expires_in = ?token_response.expires_in,
-        "Client credentials token fetch successful"
-    );
-
-    Ok(token_response)
-}
-
 /// Resolve an API key directly from the secrets store (no OAuth flow)
 pub async fn resolve_api_key(
     provider: &CredentialProvider,
@@ -654,7 +559,7 @@ pub async fn resolve_api_key(
         .api_key_secret_ref
         .as_deref()
         .ok_or_else(|| anyhow!("API key provider '{}' has no api_key_secret_ref", provider.provider_id))?;
-    resolve_secret(secrets_store, secret_ref)
+    resolve_secret(secrets_store, provider, secret_ref)
         .await
         .context("Failed to resolve API key secret")
 }
@@ -782,25 +687,20 @@ pub async fn claim_oauth_state(state: &OAuthState) -> bool {
         .is_fresh()
 }
 
-/// Resolve a secret value from the secrets store by secret_id
+/// Resolve one of `provider`'s secret references, only when the secret belongs to
+/// the provider's own tenant (an appliance-wide provider uses appliance-wide secrets).
 pub(super) async fn resolve_secret(
     secrets_store: &Arc<dyn SecretsStore>,
+    provider: &CredentialProvider,
     secret_ref: &str,
 ) -> Result<String> {
-    let secrets = secrets_store
-        .list_all()
+    super::gateway_token::ProviderSecrets::new(secrets_store, provider)
+        .resolve(secret_ref)
         .await
-        .context("Failed to list secrets")?;
-    let secret = secrets
-        .iter()
-        .find(|s| s.secret_id == secret_ref)
-        .ok_or_else(|| anyhow!("Secret with secret_id '{}' not found", secret_ref))?;
-    let full_secret = secrets_store
-        .get(&secret.id)
-        .await
-        .context("Failed to get secret by id")?
-        .ok_or_else(|| anyhow!("Secret '{}' disappeared during resolution", secret_ref))?;
-    Ok(full_secret.value)
+        .map(|value| value.as_str().to_owned())
+        .map_err(|error| {
+            anyhow!("Secret '{}' is not available to provider '{}': {}", secret_ref, provider.provider_id, error)
+        })
 }
 
 fn base64_url_encode(data: &str) -> String {
@@ -822,6 +722,8 @@ fn base64_url_decode(encoded: &str) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::component_tests::helpers::formatted_logs::FormattedLogs;
+    use crate::component_tests::helpers::test_mode::TestModeEnv;
     use chrono::Duration;
 
     fn init_test_encryption() {
@@ -1024,6 +926,7 @@ mod tests {
             token_refresh_enabled: true,
             additional_params: std::collections::HashMap::new(),
             api_key_secret_ref: None,
+            jwt_bearer: None,
             description: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -1066,6 +969,7 @@ mod tests {
             token_refresh_enabled: true,
             additional_params: std::collections::HashMap::new(),
             api_key_secret_ref: None,
+            jwt_bearer: None,
             description: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -1232,6 +1136,7 @@ mod tests {
             token_refresh_enabled: true,
             additional_params: std::collections::HashMap::new(),
             api_key_secret_ref: None,
+            jwt_bearer: None,
             description: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -1267,5 +1172,528 @@ mod tests {
         assert_eq!(vc["issuer"], "did:web:gateway.example.com");
         assert_eq!(vc["credentialSubject"]["id"], "did:web:agent.example.com");
         assert_eq!(vc["credentialSubject"]["delegationType"], "oauth2_on_behalf_of");
+    }
+
+    async fn token_endpoint(
+        status: u16,
+        body: &'static str,
+        content_type: &'static str,
+    ) -> String {
+        let app = axum::Router::new().route(
+            "/token",
+            axum::routing::post(move || async move {
+                (axum::http::StatusCode::from_u16(status).expect("status"), [("content-type", content_type)], body)
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener binds");
+        let address = listener
+            .local_addr()
+            .expect("address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{address}/token")
+    }
+
+    fn consent_provider() -> CredentialProvider {
+        serde_json::from_value(serde_json::json!({
+            "id": "provider", "name": "Provider", "provider_id": "provider",
+            "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+        }))
+        .expect("provider deserializes")
+    }
+
+    fn egress_for(endpoint: &str) -> super::super::gateway_token::GrantEgress {
+        super::super::gateway_token::GrantEgress {
+            timeout: std::time::Duration::from_secs(5),
+            exact_allowlist: Some(endpoint.to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_consent_token_request_parses_json_and_form_responses() {
+        let json = token_endpoint(
+            200,
+            r#"{"access_token":"user-token","refresh_token":"r","token_type":"Bearer","expires_in":60}"#,
+            "application/json",
+        )
+        .await;
+        let response = post_consent_token_request(
+            &consent_provider(),
+            &json,
+            &[("grant_type", "authorization_code")],
+            "Token exchange",
+            &egress_for(&json),
+        )
+        .await
+        .expect("JSON response parses");
+        assert_eq!(response.access_token, "user-token");
+        assert_eq!(
+            response
+                .refresh_token
+                .as_deref(),
+            Some("r")
+        );
+
+        let form = token_endpoint(
+            200,
+            "access_token=form-token&token_type=bearer&scope=repo",
+            "application/x-www-form-urlencoded",
+        )
+        .await;
+        let response = post_consent_token_request(
+            &consent_provider(),
+            &form,
+            &[("grant_type", "authorization_code")],
+            "Token exchange",
+            &egress_for(&form),
+        )
+        .await
+        .expect("form response parses");
+        assert_eq!(response.access_token, "form-token");
+        assert_eq!(response.scope.as_deref(), Some("repo"));
+    }
+
+    #[tokio::test]
+    async fn test_consent_token_request_error_names_only_the_status() {
+        let endpoint = token_endpoint(
+            400,
+            r#"{"error":"invalid_grant","error_description":"provider-detail-91c2"}"#,
+            "application/json",
+        )
+        .await;
+        let error = post_consent_token_request(
+            &consent_provider(),
+            &endpoint,
+            &[("grant_type", "authorization_code")],
+            "Token exchange",
+            &egress_for(&endpoint),
+        )
+        .await
+        .expect_err("a 400 fails");
+        assert_eq!(error.to_string(), "Token exchange failed (HTTP 400)");
+    }
+
+    #[tokio::test]
+    async fn test_consent_token_request_never_reaches_an_unlisted_loopback_endpoint() {
+        let endpoint = token_endpoint(200, r#"{"access_token":"t"}"#, "application/json").await;
+        let unlisted = super::super::gateway_token::GrantEgress {
+            timeout: std::time::Duration::from_secs(5),
+            exact_allowlist: None,
+        };
+        let error = post_consent_token_request(
+            &consent_provider(),
+            &endpoint,
+            &[("grant_type", "refresh_token")],
+            "Token refresh",
+            &unlisted,
+        )
+        .await
+        .expect_err("loopback is blocked");
+        assert_eq!(error.to_string(), "Token refresh failed: token endpoint is not reachable");
+    }
+
+    async fn refresh_fixture(
+        directory: &tempfile::TempDir,
+        token_endpoint: &str,
+    ) -> (CredentialProvider, Arc<dyn SecretsStore>) {
+        let secrets = crate::secrets::FilesystemSecretsStore::new_async(
+            directory
+                .path()
+                .to_str()
+                .expect("utf-8 path"),
+        )
+        .await
+        .expect("secrets store opens");
+        for secret_id in ["client-id", "client-secret"] {
+            secrets
+                .create(crate::secrets::CreateSecretRequest {
+                    tenant_id: None,
+                    name: secret_id.into(),
+                    secret_id: secret_id.into(),
+                    description: None,
+                    value: format!("{secret_id}-value"),
+                    secret_type: "General".into(),
+                    tags: vec![],
+                })
+                .await
+                .expect("secret is created");
+        }
+        let mut provider = consent_provider();
+        provider.token_endpoint = Some(token_endpoint.into());
+        provider.resource = Some("https://provider.example/api".into());
+        provider.client_id_secret_ref = Some("client-id".into());
+        provider.client_secret_secret_ref = Some("client-secret".into());
+        (provider, Arc::new(secrets))
+    }
+
+    #[tokio::test]
+    async fn test_provider_secrets_resolve_only_within_the_provider_tenant() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (mut provider, secrets) = refresh_fixture(&directory, "https://provider.example/token").await;
+        provider.api_key_secret_ref = Some("client-id".into());
+        assert_eq!(
+            resolve_api_key(&provider, &secrets)
+                .await
+                .expect("an appliance-wide provider reads appliance-wide secrets"),
+            "client-id-value"
+        );
+
+        provider.tenant_id = Some("tenant-a".into());
+        let error = resolve_api_key(&provider, &secrets)
+            .await
+            .expect_err("a tenant provider never reads an appliance-wide secret");
+        let chain = format!("{error:#}");
+        assert!(chain.contains("forbidden"), "{chain}");
+        assert!(!chain.contains("client-id-value"), "{chain}");
+        assert!(
+            resolve_secret(&secrets, &provider, "client-secret")
+                .await
+                .is_err()
+        );
+        assert!(
+            resolve_secret(&secrets, &provider, "missing")
+                .await
+                .is_err_and(|error| error
+                    .to_string()
+                    .contains("secret_unavailable"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scoped_refresh_uses_the_pinned_endpoint_and_never_reaches_an_unlisted_one() {
+        let endpoint = token_endpoint(
+            200,
+            r#"{"access_token":"renewed","token_type":"Bearer","expires_in":60}"#,
+            "application/json",
+        )
+        .await;
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (provider, secrets) = refresh_fixture(&directory, &endpoint).await;
+        let scopes = vec!["read".to_string()];
+
+        let renewed = refresh_scoped_access_token(&provider, "refresh", &scopes, &secrets, &egress_for(&endpoint))
+            .await
+            .expect("an allowlisted endpoint is reached")
+            .expect("the provider returned a credential");
+        assert_eq!(renewed.access_token, "renewed");
+
+        let unlisted = super::super::gateway_token::GrantEgress {
+            timeout: std::time::Duration::from_secs(5),
+            exact_allowlist: None,
+        };
+        let error = refresh_scoped_access_token(&provider, "refresh", &scopes, &secrets, &unlisted)
+            .await
+            .expect_err("loopback is blocked");
+        assert_eq!(error.to_string(), "Invalid refresh endpoint");
+    }
+
+    #[tokio::test]
+    async fn test_scoped_refresh_refuses_an_http_endpoint_before_reading_secrets() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (mut provider, secrets) = refresh_fixture(&directory, "http://192.0.2.1/token").await;
+        provider.client_id_secret_ref = None;
+        provider.client_secret_secret_ref = None;
+        let unlisted = super::super::gateway_token::GrantEgress {
+            timeout: std::time::Duration::from_secs(5),
+            exact_allowlist: None,
+        };
+
+        let error = refresh_scoped_access_token(&provider, "refresh", &["read".to_string()], &secrets, &unlisted)
+            .await
+            .expect_err("a plain http refresh endpoint is refused");
+        assert_eq!(error.to_string(), "Invalid refresh endpoint");
+    }
+
+    const CONSENT_TOKENS: &str =
+        r#"{"access_token":"user-token","refresh_token":"next-refresh","token_type":"Bearer","expires_in":60}"#;
+
+    type CapturedForm = Arc<std::sync::Mutex<Option<std::collections::HashMap<String, String>>>>;
+
+    async fn capturing_token_endpoint() -> (String, CapturedForm) {
+        let captured: CapturedForm = Arc::new(std::sync::Mutex::new(None));
+        let sink = captured.clone();
+        let app = axum::Router::new().route(
+            "/token",
+            axum::routing::post(
+                move |axum::extract::Form(form): axum::extract::Form<std::collections::HashMap<String, String>>| {
+                    let sink = sink.clone();
+                    async move {
+                        *sink.lock().expect("lock") = Some(form);
+                        ([("content-type", "application/json")], CONSENT_TOKENS)
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener binds");
+        let address = listener
+            .local_addr()
+            .expect("address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{address}/token"), captured)
+    }
+
+    #[tokio::test]
+    async fn test_authorization_code_exchange_posts_the_client_and_returns_the_tokens() {
+        let (endpoint, captured) = capturing_token_endpoint().await;
+        let _env = TestModeEnv::enabled(&endpoint, &endpoint);
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (mut provider, secrets) = refresh_fixture(&directory, &endpoint).await;
+        provider.callback_url = Some(endpoint.clone());
+        let logs = FormattedLogs::capture();
+
+        let tokens = exchange_code_for_tokens(&provider, "auth-code", "https://gateway.example", &secrets, Some("v"))
+            .await
+            .expect("an allowlisted endpoint is reached");
+
+        assert_eq!(tokens.access_token, "user-token");
+        assert_eq!(
+            tokens
+                .refresh_token
+                .as_deref(),
+            Some("next-refresh")
+        );
+        assert_eq!(tokens.expires_in, Some(60));
+        let form = captured
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("the endpoint received a request");
+        assert_eq!(form["grant_type"], "authorization_code");
+        assert_eq!(form["code"], "auth-code");
+        assert_eq!(form["redirect_uri"], endpoint);
+        assert_eq!(form["client_id"], "client-id-value");
+        assert_eq!(form["client_secret"], "client-secret-value");
+        assert_eq!(form["code_verifier"], "v");
+        let logged = logs.text();
+        assert!(logged.contains("Exchanging authorization code for tokens"), "{logged}");
+        assert!(logged.contains("Token exchange successful"), "{logged}");
+        assert!(!logged.contains("user-token"), "{logged}");
+        assert!(!logged.contains("client-secret-value"), "{logged}");
+    }
+
+    #[tokio::test]
+    async fn test_authorization_code_exchange_to_an_unlisted_endpoint_is_refused() {
+        let endpoint = token_endpoint(200, CONSENT_TOKENS, "application/json").await;
+        let _env = TestModeEnv::with(None, None, None);
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (mut provider, secrets) = refresh_fixture(&directory, &endpoint).await;
+        provider.callback_url = Some("https://gateway.example/callback".into());
+
+        let error = exchange_code_for_tokens(&provider, "auth-code", "https://gateway.example", &secrets, None)
+            .await
+            .expect_err("loopback http is blocked");
+        assert!(
+            error
+                .to_string()
+                .starts_with("Blocked token_endpoint for provider 'provider'"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_authorization_code_exchange_refuses_an_unlisted_http_token_endpoint() {
+        let _env = TestModeEnv::with(None, None, None);
+        let directory = tempfile::tempdir().expect("tempdir");
+        let endpoint = "http://192.0.2.1/token";
+        let (mut provider, secrets) = refresh_fixture(&directory, endpoint).await;
+        provider.callback_url = Some("https://gateway.example/callback".into());
+
+        let error = exchange_code_for_tokens(&provider, "auth-code", "https://gateway.example", &secrets, None)
+            .await
+            .expect_err("a plain http token endpoint is refused");
+
+        assert_eq!(error.to_string(), "Blocked token_endpoint for provider 'provider': token_endpoint must be https");
+    }
+
+    #[tokio::test]
+    async fn test_refresh_access_token_refuses_an_unlisted_http_token_endpoint() {
+        let _env = TestModeEnv::with(None, None, None);
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (provider, secrets) = refresh_fixture(&directory, "http://192.0.2.1/token").await;
+
+        let error = refresh_access_token(&provider, "old-refresh", &secrets)
+            .await
+            .expect_err("a plain http token endpoint is refused");
+
+        assert_eq!(error.to_string(), "Blocked token_endpoint for provider 'provider': token_endpoint must be https");
+    }
+
+    #[tokio::test]
+    async fn test_authorization_code_exchange_refuses_http_endpoint_before_reading_secrets() {
+        let _env = TestModeEnv::with(None, None, None);
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (mut provider, secrets) = refresh_fixture(&directory, "http://192.0.2.1/token").await;
+        provider.client_id_secret_ref = Some("unstored-client-id".into());
+        provider.client_secret_secret_ref = Some("unstored-client-secret".into());
+        provider.callback_url = Some("https://gateway.example/callback".into());
+
+        let error = exchange_code_for_tokens(&provider, "auth-code", "https://gateway.example", &secrets, None)
+            .await
+            .expect_err("a plain http token endpoint is refused before any secret is read");
+
+        assert_eq!(error.to_string(), "Blocked token_endpoint for provider 'provider': token_endpoint must be https");
+    }
+
+    #[tokio::test]
+    async fn test_refresh_access_token_refuses_http_endpoint_before_reading_secrets() {
+        let _env = TestModeEnv::with(None, None, None);
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (mut provider, secrets) = refresh_fixture(&directory, "http://192.0.2.1/token").await;
+        provider.client_id_secret_ref = Some("unstored-client-id".into());
+        provider.client_secret_secret_ref = Some("unstored-client-secret".into());
+
+        let error = refresh_access_token(&provider, "old-refresh", &secrets)
+            .await
+            .expect_err("a plain http token endpoint is refused before any secret is read");
+
+        assert_eq!(error.to_string(), "Blocked token_endpoint for provider 'provider': token_endpoint must be https");
+    }
+
+    #[tokio::test]
+    async fn test_refresh_access_token_posts_the_refresh_token_and_returns_the_new_tokens() {
+        let (endpoint, captured) = capturing_token_endpoint().await;
+        let _env = TestModeEnv::enabled(&endpoint, &endpoint);
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (provider, secrets) = refresh_fixture(&directory, &endpoint).await;
+        let logs = FormattedLogs::capture();
+
+        let tokens = refresh_access_token(&provider, "old-refresh", &secrets)
+            .await
+            .expect("an allowlisted endpoint is reached");
+
+        assert_eq!(tokens.access_token, "user-token");
+        assert_eq!(
+            tokens
+                .refresh_token
+                .as_deref(),
+            Some("next-refresh")
+        );
+        let form = captured
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("the endpoint received a request");
+        assert_eq!(form["grant_type"], "refresh_token");
+        assert_eq!(form["refresh_token"], "old-refresh");
+        assert_eq!(form["client_id"], "client-id-value");
+        let logged = logs.text();
+        assert!(logged.contains("Token refresh successful"), "{logged}");
+        assert!(logged.contains("has_new_refresh_token"), "{logged}");
+        assert!(!logged.contains("user-token"), "{logged}");
+        assert!(!logged.contains("next-refresh"), "{logged}");
+    }
+
+    #[tokio::test]
+    async fn test_refresh_access_token_failure_names_only_the_status() {
+        let endpoint = token_endpoint(
+            400,
+            r#"{"error":"invalid_grant","error_description":"provider-detail-5e1a"}"#,
+            "application/json",
+        )
+        .await;
+        let _env = TestModeEnv::enabled(&endpoint, &endpoint);
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (provider, secrets) = refresh_fixture(&directory, &endpoint).await;
+        let logs = FormattedLogs::capture();
+
+        let error = refresh_access_token(&provider, "old-refresh", &secrets)
+            .await
+            .expect_err("a 400 fails");
+
+        assert_eq!(error.to_string(), "Token refresh failed (HTTP 400)");
+        let logged = logs.text();
+        assert!(logged.contains("Token refresh failed"), "{logged}");
+        assert!(logged.contains("status=400"), "{logged}");
+        assert!(logged.contains("error_code=\"invalid_grant\""), "{logged}");
+        assert!(!logged.contains("provider-detail-5e1a"), "{logged}");
+    }
+
+    #[tokio::test]
+    async fn test_consent_exchange_and_refresh_fail_when_a_client_secret_cannot_be_resolved() {
+        let endpoint = token_endpoint(200, CONSENT_TOKENS, "application/json").await;
+        let _env = TestModeEnv::enabled(&endpoint, &endpoint);
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (provider, secrets) = refresh_fixture(&directory, &endpoint).await;
+        let mut missing_id = provider.clone();
+        missing_id.client_id_secret_ref = Some("missing".into());
+        let mut missing_secret = provider.clone();
+        missing_secret.client_secret_secret_ref = Some("missing".into());
+
+        let chain = |error: anyhow::Error| format!("{error:#}");
+        assert_eq!(
+            chain(
+                exchange_code_for_tokens(&missing_id, "code", "https://gateway.example", &secrets, None)
+                    .await
+                    .expect_err("a missing client id fails")
+            ),
+            "Failed to resolve client_id: Secret 'missing' is not available to provider 'provider': secret_unavailable"
+        );
+        assert_eq!(
+            chain(
+                exchange_code_for_tokens(&missing_secret, "code", "https://gateway.example", &secrets, None)
+                    .await
+                    .expect_err("a missing client secret fails")
+            ),
+            "Failed to resolve client_secret: Secret 'missing' is not available to provider 'provider': secret_unavailable"
+        );
+        assert_eq!(
+            chain(
+                refresh_access_token(&missing_id, "refresh", &secrets)
+                    .await
+                    .expect_err("a missing client id fails")
+            ),
+            "Failed to resolve client_id for refresh: Secret 'missing' is not available to provider 'provider': secret_unavailable"
+        );
+        assert_eq!(
+            chain(
+                refresh_access_token(&missing_secret, "refresh", &secrets)
+                    .await
+                    .expect_err("a missing client secret fails")
+            ),
+            "Failed to resolve client_secret for refresh: Secret 'missing' is not available to provider 'provider': secret_unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_streamed_token_response_over_the_size_cap_is_rejected() {
+        let app = axum::Router::new().route(
+            "/token",
+            axum::routing::post(|| async {
+                let chunk = bytes::Bytes::from(vec![b'a'; MAX_TOKEN_RESPONSE_BYTES / 2 + 1]);
+                let chunks = vec![Ok::<_, std::convert::Infallible>(chunk.clone()), Ok(chunk)];
+                axum::body::Body::from_stream(futures::stream::iter(chunks))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener binds");
+        let endpoint = format!(
+            "http://{}/token",
+            listener
+                .local_addr()
+                .expect("address")
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let error = post_consent_token_request(
+            &consent_provider(),
+            &endpoint,
+            &[("grant_type", "refresh_token")],
+            "Token refresh",
+            &egress_for(&endpoint),
+        )
+        .await
+        .expect_err("an oversized body is refused");
+
+        assert_eq!(error.to_string(), "Token refresh response rejected: invalid_response");
     }
 }

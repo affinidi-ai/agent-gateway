@@ -35,6 +35,8 @@ pub struct SurfaceSpec {
     /// Credential provider whose delegated credentials the Access Point
     /// obtains with modern consent. Callers then present MCP access tokens.
     pub delegated_credentials: Option<String>,
+    /// Credential provider whose gateway token the surface sends to its Target.
+    pub target_token_provider: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -105,6 +107,7 @@ impl SurfaceSpec {
             external_target: false,
             transit_points: Vec::new(),
             delegated_credentials: None,
+            target_token_provider: None,
         }
     }
 }

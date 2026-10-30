@@ -7,10 +7,14 @@
 //! - [`models`]    — data types: `JwtVerificationStrategy`, `JwtBearerAuthConfig`, etc.
 //! - [`errors`]    — `JwtBearerError` / `JwtBearerResult`
 //! - [`storage`]   — `JwtVerificationStrategyStorage` trait + `FileSystemJwtVerificationStrategyStore`
+//! - [`fetch`]     — bounded, pinned GETs for the JWKS client, and the egress posture of a caller
 //! - [`jwks`]      — JWKS fetching and in-memory caching
 //! - [`validator`] — JWT signature + claims verification (`JwtBearerVerifier`)
+//! - [`access_token`] — Access Point scope, client id and ID-token rules
 
+pub mod access_token;
 pub mod errors;
+pub mod fetch;
 pub mod handlers;
 pub mod jwks;
 pub mod models;

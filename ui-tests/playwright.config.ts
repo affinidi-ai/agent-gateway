@@ -13,10 +13,15 @@ import fs from 'fs';
  *   - results.json - JSON results
  *   - junit.xml - JUnit XML report
  * - test_results/latest/ - Symlink to most recent run
+ *
+ * Screenshots and traces are kept only for failed tests. Set AG_UI_ARTIFACTS=all
+ * to keep them for passing tests too; videos are still kept only on failure.
  */
 
 // Base URL for the gateway dashboard
 const BASE_URL = process.env.AG_BASE_URL || 'http://localhost:8080';
+
+const KEEP_ALL_ARTIFACTS = process.env.AG_UI_ARTIFACTS === 'all';
 
 // Generate timestamp for this test run.
 //
@@ -86,6 +91,9 @@ export default defineConfig({
     // Test directory
     testDir: './specs',
 
+    // The live OIDC suite has its own config (playwright.oidc-live.config.ts)
+    testIgnore: ['**/oidc-live/**'],
+
     // Output directory for test artifacts
     outputDir: path.join(RESULT_DIR, 'test-output'),
 
@@ -137,14 +145,14 @@ export default defineConfig({
         // Base URL for navigation
         baseURL: BASE_URL,
 
-        // Capture screenshot on failure
+        // Capture screenshot on failure, or for every test with AG_UI_ARTIFACTS=all
         screenshot: {
-            mode: 'only-on-failure',
+            mode: KEEP_ALL_ARTIFACTS ? 'on' : 'only-on-failure',
             fullPage: true,
         },
 
-        // Record trace on failure for debugging
-        trace: 'retain-on-failure',
+        // Record trace on failure for debugging, or for every test with AG_UI_ARTIFACTS=all
+        trace: KEEP_ALL_ARTIFACTS ? 'on' : 'retain-on-failure',
 
         // Record video on failure
         video: 'retain-on-failure',
@@ -202,6 +210,7 @@ export default defineConfig({
             name: 'setup',
             testDir: '.',
             testMatch: /.*\.setup\.ts/,
+            testIgnore: ['**/oidc-live/**'],
             use: {
                 // Don't use saved storage state for setup
                 storageState: undefined,

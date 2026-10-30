@@ -14,6 +14,7 @@ import FabricDelegatedCredentialsSection, {
 import { AgentCardLocationHelp } from '../_shared/AgentCardLocationHelp';
 import { newTransitPointId, deriveTransitPointAlias } from './factory';
 import { filterSelectableGateways } from '../../../../utils/gateways';
+import { PRESERVED_AUTH_PICK, hasPreservedTargetAuth } from '../../../../utils/targetAuth';
 
 interface Gateway {
   id: string;
@@ -106,6 +107,7 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
   );
 
   const tpProtocol = transitPointProtocol(node?.type);
+  const preserved = hasPreservedTargetAuth(config);
 
   // Only A2A/AP2 destinations serve an agent card, so the location override
   // is shown for those protocols only. Protocol is encoded in the TP node
@@ -370,14 +372,18 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
         <label>Target Authentication</label>
         <Form.Select
           size="sm"
-          value={config.auth_type || 'none'}
+          value={preserved ? PRESERVED_AUTH_PICK : config.auth_type || 'none'}
           onChange={e => updateField('auth_type', e.target.value)}
         >
+          {preserved && (
+            <option value={PRESERVED_AUTH_PICK} disabled>
+              Unsupported method (kept as saved)
+            </option>
+          )}
           <option value="none">None</option>
           <option value="bearer">Bearer Token</option>
           <option value="api_key">API Key Header</option>
           <option value="custom_header">Custom Header</option>
-          <option value="oauth_client_credentials">OAuth Client Credentials</option>
         </Form.Select>
         {config.auth_type && config.auth_type !== 'none' && (
           <Form.Group className="mt-2">
@@ -431,9 +437,11 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
             </Form.Select>
           </Form.Group>
         )}
-        {config.auth_type === 'oauth_client_credentials' && (
-          <Form.Text className="text-warning" style={{ fontSize: '10px' }}>
-            Not yet wired through the proxy runtime — this selection will not be persisted on save.
+        {preserved && (
+          <Form.Text className="text-warning" data-testid="tp-target-auth-preserved" role="status">
+            This Transit Point has a Target Authentication method this editor cannot change. It is
+            saved unchanged. Pick another option to replace it, or None to remove it. A credential
+            provider is configured on the Managed Agent.
           </Form.Text>
         )}
       </div>

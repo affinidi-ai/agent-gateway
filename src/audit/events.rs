@@ -13,6 +13,18 @@ pub enum AuthScheme {
     McpResourceToken,
 }
 
+impl AuthScheme {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Jwt => "jwt",
+            Self::ApiKey => "api_key",
+            Self::DidAuth => "did_auth",
+            Self::Mtls => "mtls",
+            Self::McpResourceToken => "mcp_resource_token",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RateLimitScope {
@@ -46,6 +58,13 @@ pub enum RejectionReason {
     ExtensionRejected,
     SsrfBlocked,
     ConsentIdentityRequired,
+    TargetAuthUnavailable,
+    /// The receiving gateway of a Fabric route answered `401`: it refused the
+    /// credential the sending gateway forwarded, or got none it accepts.
+    PeerTokenRefused,
+    /// The receiving gateway of a Fabric route answered `403` with a Bearer
+    /// `insufficient_scope` challenge.
+    PeerScopeRefused,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +88,8 @@ pub enum DelegationFailureReason {
     CredentialsUnavailable,
     AnonymousCaller,
     ContinuationError,
+    AssertionFailed,
+    TokenEndpointFailed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -227,4 +248,57 @@ pub enum RefusalReason {
     Invalid,
     /// 409: the change conflicts with what is stored.
     Conflict,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigChange {
+    Created,
+    Updated,
+    Deleted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetAuthKind {
+    CredentialLookup,
+    StaticSecret,
+    CredentialProvider,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AuthScheme, RejectionReason};
+
+    const SCHEMES: [AuthScheme; 5] =
+        [AuthScheme::Jwt, AuthScheme::ApiKey, AuthScheme::DidAuth, AuthScheme::Mtls, AuthScheme::McpResourceToken];
+
+    #[test]
+    fn auth_scheme_labels_are_fixed() {
+        let labels: Vec<&str> = SCHEMES
+            .iter()
+            .map(|scheme| scheme.as_str())
+            .collect();
+        assert_eq!(labels, ["jwt", "api_key", "did_auth", "mtls", "mcp_resource_token"]);
+    }
+
+    #[test]
+    fn auth_scheme_labels_match_the_audit_record_names() {
+        for scheme in SCHEMES {
+            assert_eq!(serde_json::to_value(scheme).unwrap(), serde_json::json!(scheme.as_str()));
+        }
+        assert_ne!(AuthScheme::Jwt.as_str(), AuthScheme::McpResourceToken.as_str());
+    }
+
+    #[test]
+    fn peer_refusal_reasons_serialize_as_snake_case() {
+        for (reason, label) in [
+            (RejectionReason::PeerTokenRefused, "peer_token_refused"),
+            (RejectionReason::PeerScopeRefused, "peer_scope_refused"),
+        ] {
+            let value = serde_json::to_value(reason).unwrap();
+            assert_eq!(value, serde_json::json!(label));
+            assert_eq!(serde_json::from_value::<RejectionReason>(value).unwrap(), reason);
+        }
+    }
 }

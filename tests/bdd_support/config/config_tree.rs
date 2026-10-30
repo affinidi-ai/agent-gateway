@@ -69,6 +69,7 @@ pub struct JwtVerificationStrategyFixture {
     pub name: String,
     pub expected_issuer: String,
     pub jwks_uri: String,
+    pub authorization_server: Option<serde_json::Value>,
 }
 
 impl JwtVerificationStrategyFixture {
@@ -83,7 +84,33 @@ impl JwtVerificationStrategyFixture {
             name: name.into(),
             expected_issuer: expected_issuer.into(),
             jwks_uri: jwks_uri.into(),
+            authorization_server: None,
         }
+    }
+
+    /// Store the strategy pinned to this authorization server metadata.
+    pub fn with_authorization_server(
+        mut self,
+        authorization_server: Option<serde_json::Value>,
+    ) -> Self {
+        self.authorization_server = authorization_server;
+        self
+    }
+
+    /// Store the strategy pinned to an authorization server whose issuer and key set are the
+    /// strategy's own.
+    pub fn pinned_to_authorization_server(
+        self,
+        metadata_url: impl Into<String>,
+        token_endpoint: impl Into<String>,
+    ) -> Self {
+        let pin = serde_json::json!({
+            "issuer": self.expected_issuer,
+            "metadata_url": metadata_url.into(),
+            "token_endpoint": token_endpoint.into(),
+            "jwks_uri": self.jwks_uri,
+        });
+        self.with_authorization_server(Some(pin))
     }
 }
 
@@ -187,7 +214,7 @@ impl GatewayBootstrapFixture {
         }
     }
 
-    pub async fn start_gateway(&self) -> GatewayProcess {
+    pub fn write_config_files(&self) -> PathBuf {
         let base_dir = self
             .root_dir
             .as_ref()
@@ -196,7 +223,16 @@ impl GatewayBootstrapFixture {
         write_gateway_config_tree(base_dir, self, false);
         write_config_toml_from_fixture(self);
         self.write_self_record();
-        let config_toml_path = base_dir.join("config.toml");
+        base_dir.join("config.toml")
+    }
+
+    pub async fn start_gateway(&self) -> GatewayProcess {
+        let base_dir = self
+            .root_dir
+            .as_ref()
+            .expect("root dir must be set")
+            .as_path();
+        let config_toml_path = self.write_config_files();
         let inbound_port = self.gateway_port;
         let mut gateway = GatewayProcess::start(&config_toml_path, base_dir, TEST_AUTH_TOKEN, OutputMode::Piped);
         gateway = gateway.with_port(inbound_port);
@@ -207,11 +243,20 @@ impl GatewayBootstrapFixture {
     }
 
     pub fn write_self_record(&self) {
-        let base_dir = self
-            .root_dir
-            .as_ref()
-            .expect("root dir must be set")
-            .as_path();
+        self.write_self_record_in(
+            self.root_dir
+                .as_ref()
+                .expect("root dir must be set")
+                .as_path(),
+        );
+    }
+
+    /// Writes this gateway's own record, with its gateway-level policy when one is set,
+    /// under `base_dir`.
+    fn write_self_record_in(
+        &self,
+        base_dir: &Path,
+    ) {
         let gateway_record_dir = base_dir.join("_storage/gateways");
         let record_path = gateway_record_dir.join(format!("{}.json", self.key));
         let now = Utc::now().to_rfc3339();
@@ -289,6 +334,13 @@ pub fn write_gateway_config_tree(
         write_gateway_bootstrap_json(base_dir, fixture.gateway_port, &bootstrap_surfaces, &fixture.identity_route_key);
     }
 
+    if fixture
+        .policy_opa_entry
+        .is_some()
+    {
+        fixture.write_self_record_in(base_dir);
+    }
+
     let surfaces_dir = storage_dir.join("agent_surfaces");
     for surface in fixture
         .agent_surfaces
@@ -318,6 +370,9 @@ pub fn write_gateway_config_tree(
             &strategy.name,
             &strategy.expected_issuer,
             &strategy.jwks_uri,
+            strategy
+                .authorization_server
+                .as_ref(),
         );
     }
 
