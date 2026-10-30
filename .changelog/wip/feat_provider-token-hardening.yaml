@@ -8,18 +8,18 @@ changes:
         provider may now hold the whole service account key file, up to 16 KiB. The gateway
         signs with its private_key and sends its private_key_id as the kid header unless
         Key ID is set, so the downloaded file no longer needs to be taken apart.
-    - timestamp: '2026-10-30T23:30:00Z'
+    - timestamp: '2026-10-30T23:00:04Z'
       title: ⭐ Show the managed agent's card next to the served card in Surface Builder
       description: >-
         A2A and AP2 surfaces get an Agent Cards view that compares the managed agent's own
         card with the card the gateway serves, marks what the gateway changed, shows the
         fetch result and the Target Authentication used, and refreshes the card on demand.
-    - timestamp: '2026-10-30T23:31:00Z'
+    - timestamp: '2026-10-30T23:00:04Z'
       title: Show the agent card fetch status on the Managed Agent panel
       description: >-
         The Managed Agent panel shows whether the gateway can fetch the agent's card and why
         not, with a link to the Agent Cards view.
-    - timestamp: '2026-10-31T02:00:00Z'
+    - timestamp: '2026-10-30T23:00:04Z'
       title: Add agent card preview and refresh endpoints to the surface management API
       description: >-
         GET /api/v1/surfaces/{id}/agent-card (surfaces.view) and POST
@@ -63,7 +63,7 @@ changes:
         credential provider or surface whose stored configuration breaks the https token
         endpoint or tenant credential isolation rule, with its id, tenant and the rule, so
         operators can fix them before the rules are enforced.
-    - timestamp: '2026-10-30T23:15:00Z'
+    - timestamp: '2026-10-30T23:00:04Z'
       title: Offer tenant surfaces only their own providers and secrets in the dashboard
       description: >-
         The Surface Builder and the credential provider editor list only the credential
@@ -72,7 +72,7 @@ changes:
         is enforced. The Token Endpoint field shows an inline error for an http URL and
         points to the bootstrap credential_policy.insecure_token_endpoints list.
   fixed:
-    - timestamp: '2026-10-31T00:00:00Z'
+    - timestamp: '2026-10-30T23:00:04Z'
       title: Stop reusing a service token after its provider or a referenced secret changes
       description: >-
         Service tokens for client credentials, JWT bearer and private_key_jwt providers are
@@ -85,14 +85,14 @@ changes:
         cached token at once. Expired service tokens of the same provider are removed from
         the vault when a new one is stored. Upgrade note: each binding and target
         authentication requests one new token after the upgrade.
-    - timestamp: '2026-10-31T00:30:00Z'
+    - timestamp: '2026-10-30T23:00:04Z'
       title: Send one token request per credential at a time
       description: >-
         Requests that need the same service token, for the same surface, provider, scopes
         and secret versions, now wait for one token request on each replica and reuse its
         token from the vault, instead of each sending its own request to the credential
         provider when the cache is empty or expired.
-    - timestamp: '2026-10-31T01:00:00Z'
+    - timestamp: '2026-10-30T23:00:04Z'
       title: Back off token requests to a failing credential provider for up to 60 s
       description: >-
         After a service token request fails or returns other scopes than requested, the next
@@ -101,7 +101,7 @@ changes:
         clears the wait. Missing secrets, store errors and refused token endpoints never start
         one, and a secret that cannot be read is now reported as unavailable rather than as a
         failed token request.
-    - timestamp: '2026-10-31T01:30:00Z'
+    - timestamp: '2026-10-30T23:00:04Z'
       title: Keep using a valid service token when its renewal fails
       description: >-
         A cached service token is now renewed half its lifetime before it expires, at most
@@ -114,7 +114,7 @@ changes:
         value <grant>_stale, for example client_credentials_stale.
   removed: []
   security:
-    - timestamp: '2026-10-31T02:00:00Z'
+    - timestamp: '2026-10-30T23:00:04Z'
       title: Refuse tenant card previews that would use appliance-wide credentials
       description: >-
         A tenant token that reads the agent card preview of an appliance-wide surface gets
