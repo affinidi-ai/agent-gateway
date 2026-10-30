@@ -784,6 +784,75 @@ identities: an integration receives every event of its event set, from every res
   event set holding audit events receives them independently of the log, at least once, so
   receivers deduplicate on `event_id`.
 
+## Laptop layouts
+
+Pages must stay usable at the common laptop viewports, 1280x720 to 1920x1080 with the
+sidebar expanded; `ui-tests/specs/laptop-layout.spec.ts` checks each page at five of them.
+
+### Audit Log
+
+The Audit Log is a list of entries and a detail panel (`pages/AuditPage/`, rules under
+_Viewport-filling master/detail_ in `dashboard.css`).
+
+- **Side by side** from 1440px wide: the page fills the viewport between the topbar and
+  the footer, so the document does not scroll, and the list and the evidence body scroll
+  inside their panels. The card body is a two-column grid (`.audit-shell` is
+  `display: contents`): the "About the Audit Log" banner sits above the list in the left
+  column and the detail panel takes the full height of the right one, so at 1536x864 the
+  list and the evidence body are each still at least 300px tall.
+- **Stacked** below 1440px wide (`@media (max-width: 1439.98px)`): there the two panels
+  are too narrow to read (about 510px each at 1366px, each entry over 230px tall). The
+  list sits above the detail and the page scrolls as one: no scroll box inside the page
+  and no overlay drawer.
+- **Pinned filters** while stacked: `.audit-filters` (search and filters) and
+  `.audit-card-header` (title, Forward records, Refresh) are `position: sticky` under the
+  70px topbar. `AuditPage` publishes their heights as `--audit-filters-height` and
+  `--audit-header-height` with a `ResizeObserver`, since the filters wrap; the header's
+  `top` and the scroll margins below use them. Sticky needs every ancestor up to the
+  document to leave overflow visible or `clip`: `#content-wrapper` hides its sideways
+  overflow on every page, so the stacked rule switches it to `overflow-x: clip` on the
+  Audit Log, and `.audit-card` clips instead of hiding.
+- **Scroll on select**: while stacked, selecting an entry smooth-scrolls the page so the
+  detail panel starts just below the pinned filters and header (`scroll-margin-top`). `AuditPage`
+  decides "stacked" from the computed `flex-direction` of `.audit-shell` at click time,
+  so the breakpoint lives only in CSS. The default selection on load, a page change and a
+  filter change do not scroll, and side by side selecting never scrolls. Clicking the
+  detail title scrolls back to the entry, which lands fully below the pinned area.
+
+### List tables
+
+List pages show their rows in a `.table-responsive` table (Surfaces, MCP Proxies, Secrets,
+Certificates). No list table scrolls sideways at a laptop viewport, so every column keeps
+room for its text.
+
+- Badges in table cells wrap. Bootstrap sets `white-space: nowrap` on `.badge`, so one long
+  tag or owner name fixes a column at its full length and squeezes or pushes out the
+  others. Add `text-wrap text-break` to a badge that shows a user-supplied value (tags,
+  owner names) so it wraps inside its cell and the full value stays readable. Short badges
+  still sit on one line.
+- Do not truncate such a value to make it fit; wrap it.
+
+### Page headers and charts
+
+- **Tasks header**: the shared `.card-header.py-3` is a centred flex row, which would put the
+  tag filter row beside the title. The Tasks header adds `flex-column align-items-stretch`,
+  so the filter row sits under the title row and Refresh stays at the header's right end.
+  The shared rule is unchanged.
+- **Metrics flow chart labels**: node labels are at most 25 characters. A source, identity
+  or target label longer than that is cut to 22 characters plus `...` by `cutLabel` in
+  `MetricsFlowVisualization.tsx`, so a long DID cannot run across its neighbours or past the
+  chart edge; `Anonymous` is unchanged and the hover tooltip shows the full value.
+- **Identities table**: ten columns, so `.identities-table` (`dashboard.css`) keeps
+  Bootstrap's `table-sm` horizontal cell padding (0.25rem) instead of the 0.75rem of the
+  shared `.table-sm` rules. The table fits its box at 1280px wide with every row action
+  inside it; the DID keeps its title and copy button.
+- **Connection Points actions**: the row actions sit in a 6rem wide wrapping block (two
+  buttons per line) with no left margins, so the Actions column stays near 120px and the
+  Name and Mediator columns keep their room. Add a new row action inside that block.
+- **Credential Audit columns**: only Time, Event and the chevron column keep a fixed width.
+  Intent takes what its content needs, and its badge wraps (`text-wrap text-break`), so
+  Downstream Provider and Agent Surface keep room for their linked names.
+
 ## Validation
 
 After frontend edits, prefer these checks when relevant:

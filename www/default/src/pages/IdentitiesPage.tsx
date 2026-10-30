@@ -395,12 +395,13 @@ const IdentitiesPage: React.FC = () => {
   };
 
   return (
-    <div className="container-fluid">
+    <div className="container-fluid" data-testid="page-identities">
       <div className="d-sm-flex align-items-center justify-content-between mb-4">
         <div className="d-flex align-items-center">
           <SearchInput
             value={searchTerm}
             onChange={setSearchTerm}
+            data-testid="identities-search-input"
             placeholder="Filter Agent Identities, Issuers, Authorities..."
             width="384px"
           />
@@ -449,6 +450,7 @@ const IdentitiesPage: React.FC = () => {
         <Tabs activeKey={activeTab} onSelect={handleTabSelect} className="mb-3 custom-channel-tabs">
           <Tab
             eventKey="identities"
+            tabAttrs={{ 'data-testid': 'identities-identities-tab-trigger' }}
             title={
               <>
                 <i className="fas fa-fingerprint"></i> Agent Identities{' '}
@@ -495,7 +497,7 @@ const IdentitiesPage: React.FC = () => {
                       </div>
                     ) : (
                       <div className="table-responsive">
-                        <table className="table table-hover table-sm">
+                        <table className="table table-hover table-sm identities-table">
                           <thead>
                             <tr>
                               <th>{hasNamingMetadata ? 'Identity' : 'DID'}</th>
@@ -729,6 +731,7 @@ const IdentitiesPage: React.FC = () => {
                                         {identity.trust_score !== undefined && (
                                           <button
                                             className="btn btn-outline-primary"
+                                            data-testid={`identities-trust-score-button-${identity.did}`}
                                             onClick={e => openTrustScoreModal(identity, e)}
                                             title="View Trust Score"
                                           >
@@ -738,6 +741,7 @@ const IdentitiesPage: React.FC = () => {
                                         {identity.uuid && (
                                           <button
                                             className="btn btn-outline-secondary"
+                                            data-testid={`identities-history-button-${identity.did}`}
                                             onClick={e => openVersionHistoryModal(identity, e)}
                                             title="View version history"
                                           >
@@ -746,6 +750,7 @@ const IdentitiesPage: React.FC = () => {
                                         )}
                                         <button
                                           className="btn btn-outline-info"
+                                          data-testid={`identities-policy-button-${identity.did}`}
                                           onClick={e => openPolicyConfigModal(identity, e)}
                                           title="Configure Policy"
                                         >
@@ -753,6 +758,7 @@ const IdentitiesPage: React.FC = () => {
                                         </button>
                                         <button
                                           className="btn btn-outline-secondary"
+                                          data-testid={`identities-copy-link-button-${identity.did}`}
                                           onClick={e => copyDeepLink(identity.did, e)}
                                           title="Copy link"
                                         >
@@ -1411,6 +1417,7 @@ const IdentitiesPage: React.FC = () => {
           {canViewIssuers && (
             <Tab
               eventKey="issuers"
+              tabAttrs={{ 'data-testid': 'identities-issuers-tab-trigger' }}
               title={
                 <>
                   <i className="fas fa-sitemap"></i> Issuers {tabBadge(issuersCount)}
@@ -1431,6 +1438,7 @@ const IdentitiesPage: React.FC = () => {
           {canViewAuthorities && (
             <Tab
               eventKey="authorities"
+              tabAttrs={{ 'data-testid': 'identities-authorities-tab-trigger' }}
               title={
                 <>
                   <i className="fas fa-landmark"></i> Authorities {tabBadge(authoritiesCount)}

@@ -136,10 +136,15 @@ const EnterOobUrlStep: React.FC<EnterOobUrlStepProps> = ({ onNext, onCancel }) =
           </div>
 
           <div className="d-flex justify-content-between">
-            <button type="button" className="btn btn-secondary" onClick={onCancel}>
+            <button
+              type="button"
+              data-testid="wizard-cancel"
+              className="btn btn-secondary"
+              onClick={onCancel}
+            >
               <i className="fas fa-times me-1"></i> Cancel
             </button>
-            <button type="submit" className="btn btn-primary">
+            <button type="submit" data-testid="wizard-next" className="btn btn-primary">
               Connect <i className="fas fa-arrow-right ms-1"></i>
             </button>
           </div>

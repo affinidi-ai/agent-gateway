@@ -32,6 +32,14 @@ interface ChannelDetails {
   totalCount: number;
 }
 
+/** Longest node label drawn in full; a longer one is cut to 22 characters plus "...". */
+const MAX_NODE_LABEL_LENGTH = 25;
+
+const cutLabel = (label: string): string =>
+  label.length > MAX_NODE_LABEL_LENGTH
+    ? label.substring(0, MAX_NODE_LABEL_LENGTH - 3) + '...'
+    : label;
+
 interface MetricsFlowVisualizationProps {
   data: FlowData;
 }
@@ -175,7 +183,7 @@ const MetricsFlowVisualization: React.FC<MetricsFlowVisualizationProps> = ({ dat
       if (!nodeMap.has(sourceId)) {
         nodeMap.set(sourceId, {
           id: sourceId,
-          label: conn.source.length > 25 ? conn.source.substring(0, 22) + '...' : conn.source,
+          label: cutLabel(conn.source),
           value: 0,
           type: 'source' as const,
           status: 'neutral' as const,
@@ -194,7 +202,7 @@ const MetricsFlowVisualization: React.FC<MetricsFlowVisualizationProps> = ({ dat
 
       // Add or update identity node
       if (!nodeMap.has(identityId)) {
-        const identityLabel = conn.identity === 'anonymous' ? 'Anonymous' : conn.identity;
+        const identityLabel = conn.identity === 'anonymous' ? 'Anonymous' : cutLabel(conn.identity);
         nodeMap.set(identityId, {
           id: identityId,
           label: identityLabel,
@@ -256,7 +264,7 @@ const MetricsFlowVisualization: React.FC<MetricsFlowVisualizationProps> = ({ dat
       if (!nodeMap.has(targetId)) {
         nodeMap.set(targetId, {
           id: targetId,
-          label: targetLabel.length > 25 ? targetLabel.substring(0, 22) + '...' : targetLabel,
+          label: cutLabel(targetLabel),
           value: 0,
           type: isFabricGateway ? ('fabric-gateway' as const) : ('target' as const),
           status:

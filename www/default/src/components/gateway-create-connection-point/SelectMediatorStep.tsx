@@ -99,6 +99,7 @@ const SelectMediatorStep: React.FC<SelectMediatorStepProps> = ({
             <AppButton
               variant="secondary"
               size="md"
+              data-testid="wizard-cancel"
               onClick={onCancel}
               iconStart={<i className="fas fa-arrow-left"></i>}
             >
@@ -203,6 +204,7 @@ const SelectMediatorStep: React.FC<SelectMediatorStepProps> = ({
           <AppButton
             variant="secondary"
             size="md"
+            data-testid="wizard-cancel"
             onClick={onCancel}
             iconStart={<i className="fas fa-times"></i>}
           >
@@ -211,6 +213,7 @@ const SelectMediatorStep: React.FC<SelectMediatorStepProps> = ({
           <AppButton
             variant="primary"
             size="md"
+            data-testid="wizard-next"
             onClick={handleNext}
             disabled={!selectedMediator}
             iconEnd={<i className="fas fa-arrow-right"></i>}

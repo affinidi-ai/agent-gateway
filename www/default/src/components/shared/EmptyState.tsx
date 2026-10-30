@@ -11,6 +11,7 @@ interface EmptyStateProps {
   ctaLabel?: string;
   ctaIcon?: string;
   onCtaClick?: () => void;
+  ctaTestId?: string;
   docsHref?: string;
   docsLabel?: string;
   variant?: EmptyStateVariant;
@@ -23,6 +24,7 @@ export const EmptyState: React.FC<EmptyStateProps> = ({
   ctaLabel,
   ctaIcon,
   onCtaClick,
+  ctaTestId,
   docsHref,
   docsLabel = 'View Docs',
   variant = 'inline',
@@ -46,7 +48,13 @@ export const EmptyState: React.FC<EmptyStateProps> = ({
           {body} {docsLink}
         </p>
         {hasCta && (
-          <AppButton variant="primary" size="md" onClick={onCtaClick} iconStart={ctaIconStart}>
+          <AppButton
+            data-testid={ctaTestId}
+            variant="primary"
+            size="md"
+            onClick={onCtaClick}
+            iconStart={ctaIconStart}
+          >
             {ctaLabel}
           </AppButton>
         )}
@@ -62,7 +70,13 @@ export const EmptyState: React.FC<EmptyStateProps> = ({
         {body} {docsLink}
       </p>
       {hasCta && (
-        <AppButton variant="primary" size="md" onClick={onCtaClick} iconStart={ctaIconStart}>
+        <AppButton
+          data-testid={ctaTestId}
+          variant="primary"
+          size="md"
+          onClick={onCtaClick}
+          iconStart={ctaIconStart}
+        >
           {ctaLabel}
         </AppButton>
       )}

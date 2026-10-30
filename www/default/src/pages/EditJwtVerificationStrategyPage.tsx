@@ -228,10 +228,11 @@ const EditJwtVerificationStrategyPage: React.FC = () => {
   }
 
   return (
-    <div className="container-fluid">
+    <div className="container-fluid" data-testid="page-jwt-strategy-editor">
       <div className="mb-3">
         <button
           className="btn btn-secondary btn-sm"
+          data-testid="jwt-strategy-editor-back-button"
           onClick={() => navigate('/settings?tab=strategies')}
         >
           <i className="fas fa-arrow-left"></i>
@@ -380,6 +381,7 @@ const EditJwtVerificationStrategyPage: React.FC = () => {
                     <button
                       type="button"
                       className="btn btn-outline-secondary"
+                      data-testid="jwt-strategy-editor-check-jwks-button"
                       onClick={() => checkJwksUri()}
                       disabled={
                         jwksUriCheckState === 'checking' || !form.jwks_source.jwks_uri.trim()
@@ -445,7 +447,12 @@ const EditJwtVerificationStrategyPage: React.FC = () => {
             <hr />
 
             <div className="d-flex">
-              <button type="submit" className="btn btn-primary me-2" disabled={saving}>
+              <button
+                type="submit"
+                data-testid="jwt-strategy-editor-save-button"
+                className="btn btn-primary me-2"
+                disabled={saving}
+              >
                 {saving ? (
                   <>
                     <span className="spinner-border spinner-border-sm me-1" /> Saving…
@@ -460,6 +467,7 @@ const EditJwtVerificationStrategyPage: React.FC = () => {
               <button
                 type="button"
                 className="btn btn-secondary"
+                data-testid="jwt-strategy-editor-cancel-button"
                 onClick={() => navigate('/settings?tab=strategies')}
                 disabled={saving}
               >

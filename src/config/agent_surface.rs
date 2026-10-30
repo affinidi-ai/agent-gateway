@@ -1100,6 +1100,14 @@ pub struct SharedTransitConfig {
     #[serde(default)]
     pub transit_token_mode: TransitTokenMode,
 
+    /// How long, in seconds, the transit tokens the Access Point issues live,
+    /// from [`MIN_TRANSIT_TOKEN_LIFETIME_SECS`] to the appliance's
+    /// `transit_token_max_lifetime_secs` (300 unless `gateway.json` sets it);
+    /// unset means [`DEFAULT_TRANSIT_TOKEN_LIFETIME_SECS`]. A variant cannot
+    /// override it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transit_token_lifetime_secs: Option<u64>,
+
     /// Global transit OPA policy (all outbound calls).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transit_policy: Option<PolicyRef>,
@@ -1132,6 +1140,58 @@ pub struct SharedTransitConfig {
     /// stored with it has every Transit Point request refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_auth: Option<SourceAuthConfig>,
+}
+
+/// How long a transit token lives when its surface sets no lifetime, in seconds.
+pub const DEFAULT_TRANSIT_TOKEN_LIFETIME_SECS: u64 = 300;
+
+/// The shortest transit token lifetime a surface may set, in seconds.
+pub const MIN_TRANSIT_TOKEN_LIFETIME_SECS: u64 = 30;
+
+/// The longest transit token lifetime a surface may set, in seconds, when
+/// `gateway.json` does not set `transit_token_max_lifetime_secs`.
+pub const DEFAULT_TRANSIT_TOKEN_MAX_LIFETIME_SECS: u64 = 300;
+
+/// The highest value `transit_token_max_lifetime_secs` may take, and so the
+/// longest any transit token lives, in seconds. Whoever holds a transit token
+/// can use it on its surface's Transit Points for its whole lifetime.
+pub const MAX_TRANSIT_TOKEN_LIFETIME_SECS: u64 = 900;
+
+/// Reads an appliance-wide `transit_token_max_lifetime_secs` as `gateway.json`
+/// holds it: [`DEFAULT_TRANSIT_TOKEN_MAX_LIFETIME_SECS`] when unset, and
+/// refused unless a whole number from [`MIN_TRANSIT_TOKEN_LIFETIME_SECS`] to
+/// [`MAX_TRANSIT_TOKEN_LIFETIME_SECS`].
+pub fn transit_token_max_lifetime_from(value: Option<&serde_json::Value>) -> Result<u64, String> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_TRANSIT_TOKEN_MAX_LIFETIME_SECS);
+    };
+    value
+        .as_u64()
+        .filter(|max_secs| (MIN_TRANSIT_TOKEN_LIFETIME_SECS..=MAX_TRANSIT_TOKEN_LIFETIME_SECS).contains(max_secs))
+        .ok_or_else(|| {
+            format!(
+                "transit_token_max_lifetime_secs in gateway.json must be from {MIN_TRANSIT_TOKEN_LIFETIME_SECS} \
+                 to {MAX_TRANSIT_TOKEN_LIFETIME_SECS} seconds, not {value}"
+            )
+        })
+}
+
+impl SharedTransitConfig {
+    /// Refuses a [`Self::transit_token_lifetime_secs`] below
+    /// [`MIN_TRANSIT_TOKEN_LIFETIME_SECS`] or above `max_secs`, the appliance's
+    /// `transit_token_max_lifetime_secs`.
+    pub fn validate_transit_token_lifetime(
+        &self,
+        max_secs: u64,
+    ) -> Result<(), String> {
+        match self.transit_token_lifetime_secs {
+            Some(secs) if !(MIN_TRANSIT_TOKEN_LIFETIME_SECS..=max_secs).contains(&secs) => Err(format!(
+                "transit.transit_token_lifetime_secs must be from {MIN_TRANSIT_TOKEN_LIFETIME_SECS} to {max_secs} \
+                 seconds, not {secs} ({max_secs} is transit_token_max_lifetime_secs in gateway.json)"
+            )),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// Why a surface that sets [`SharedTransitConfig::source_auth`] is refused by the
@@ -2644,6 +2704,65 @@ impl AgentSurface {
                         .endpoint
                         .starts_with(A2A_PROXY_ENDPOINT_PREFIX)
                 })
+    }
+
+    /// The longest a transit token for this surface may live, in seconds: its
+    /// `transit.transit_token_lifetime_secs`, or the default when it sets none,
+    /// held to [`MIN_TRANSIT_TOKEN_LIFETIME_SECS`] to
+    /// [`MAX_TRANSIT_TOKEN_LIFETIME_SECS`]. A Transit Point refuses a token that
+    /// lives longer. It depends on the surface alone, never on an instance's
+    /// `gateway.json`, so every instance accepts the tokens any other issued.
+    pub fn transit_token_lifetime_secs(&self) -> u64 {
+        self.transit
+            .as_ref()
+            .and_then(|transit| {
+                transit
+                    .shared
+                    .transit_token_lifetime_secs
+            })
+            .unwrap_or(DEFAULT_TRANSIT_TOKEN_LIFETIME_SECS)
+            .clamp(MIN_TRANSIT_TOKEN_LIFETIME_SECS, MAX_TRANSIT_TOKEN_LIFETIME_SECS)
+    }
+
+    /// How long the transit tokens the Access Point issues for this surface
+    /// live, in seconds: [`Self::transit_token_lifetime_secs`], held to
+    /// `max_secs`, the appliance's `transit_token_max_lifetime_secs`.
+    pub fn issued_transit_token_lifetime_secs(
+        &self,
+        max_secs: u64,
+    ) -> u64 {
+        self.transit_token_lifetime_secs()
+            .min(max_secs)
+            .max(MIN_TRANSIT_TOKEN_LIFETIME_SECS)
+    }
+
+    /// What an operator is told when this surface's stored transit token
+    /// lifetime is outside the bounds and its tokens are issued for another:
+    /// below [`MIN_TRANSIT_TOKEN_LIFETIME_SECS`], or above `max_secs`, the
+    /// appliance's `transit_token_max_lifetime_secs`.
+    pub fn transit_token_lifetime_adjustment(
+        &self,
+        max_secs: u64,
+    ) -> Option<String> {
+        let secs = self
+            .transit
+            .as_ref()?
+            .shared
+            .transit_token_lifetime_secs?;
+        let reason = if secs < MIN_TRANSIT_TOKEN_LIFETIME_SECS {
+            format!("below the shortest, {MIN_TRANSIT_TOKEN_LIFETIME_SECS} seconds")
+        } else if secs > max_secs {
+            format!("above transit_token_max_lifetime_secs in gateway.json ({max_secs})")
+        } else {
+            return None;
+        };
+        Some(format!(
+            "Surface '{}' ({}): transit.transit_token_lifetime_secs is {secs}, {reason}; its transit tokens live \
+             {} seconds",
+            self.name,
+            self.surface_id,
+            self.issued_transit_token_lifetime_secs(max_secs)
+        ))
     }
 
     /// Validate `access_point.a2a`: it belongs to A2A and AP2 Access Points only,
@@ -6517,5 +6636,212 @@ mod a2a_settings_tests {
         assert_eq!(resolved.a2a_settings(), effective(SUPPORTED_VERSIONS, A2aValidation::Envelope));
         assert_eq!(surface.a2a_settings(), effective(SUPPORTED_VERSIONS, A2aValidation::Full));
         assert_eq!(surface.validate_a2a_settings(), Ok(()));
+    }
+}
+
+#[cfg(test)]
+mod transit_token_lifetime_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn surface_with_lifetime(lifetime_secs: Option<u64>) -> AgentSurface {
+        let mut transit = json!({
+            "outbound_listen_address": "http://localhost:9111",
+            "points": [{ "alias": "partner", "target_endpoint": "https://partner.example" }]
+        });
+        if let Some(secs) = lifetime_secs {
+            transit["transit_token_lifetime_secs"] = json!(secs);
+        }
+        serde_json::from_value(json!({
+            "name": "lifetime",
+            "access_point": { "listen_address": "0.0.0.0:8443", "route": "/lifetime", "protocol": "a2a" },
+            "target": { "endpoint": "https://agent.internal" },
+            "transit": transit
+        }))
+        .unwrap()
+    }
+
+    fn refusal(
+        max_secs: u64,
+        secs: u64,
+    ) -> String {
+        format!(
+            "transit.transit_token_lifetime_secs must be from 30 to {max_secs} seconds, not {secs} ({max_secs} is \
+             transit_token_max_lifetime_secs in gateway.json)"
+        )
+    }
+
+    fn shared(surface: &AgentSurface) -> &SharedTransitConfig {
+        &surface
+            .transit
+            .as_ref()
+            .unwrap()
+            .shared
+    }
+
+    #[test]
+    fn transit_tokens_live_300_seconds_unless_the_surface_sets_a_lifetime() {
+        let mut without_transit = surface_with_lifetime(None);
+        without_transit.transit = None;
+
+        assert_eq!(without_transit.transit_token_lifetime_secs(), 300);
+        assert_eq!(surface_with_lifetime(None).transit_token_lifetime_secs(), 300);
+        for secs in [30, 600, 900] {
+            assert_eq!(surface_with_lifetime(Some(secs)).transit_token_lifetime_secs(), secs);
+        }
+    }
+
+    /// The lifetime a Transit Point checks depends on the surface alone, held
+    /// to the fixed 30 to 900 seconds, so instances with different ceilings
+    /// accept each other's tokens; the Access Point issues it held to the
+    /// appliance's ceiling.
+    #[test]
+    fn the_access_point_issues_tokens_held_to_the_appliance_ceiling() {
+        for (stored, checked) in [(Some(0), 30), (Some(29), 30), (Some(901), 900), (Some(u64::MAX), 900), (None, 300)] {
+            assert_eq!(surface_with_lifetime(stored).transit_token_lifetime_secs(), checked, "{stored:?}");
+        }
+        for (stored, max_secs, issued) in [
+            (Some(600), 300, 300),
+            (Some(600), 900, 600),
+            (Some(60), 300, 60),
+            (None, 300, 300),
+            (None, 120, 120),
+            (Some(10), 300, 30),
+            (Some(1200), 900, 900),
+            (Some(600), 0, 30),
+        ] {
+            assert_eq!(
+                surface_with_lifetime(stored).issued_transit_token_lifetime_secs(max_secs),
+                issued,
+                "{stored:?} {max_secs}"
+            );
+        }
+    }
+
+    /// The warning for a stored lifetime the Access Point issues for another
+    /// names the surface, the stored value, the bound and where it comes from.
+    #[test]
+    fn a_stored_lifetime_outside_the_bounds_is_reported_with_the_lifetime_its_tokens_get() {
+        let named = |secs: Option<u64>| {
+            let mut surface = surface_with_lifetime(secs);
+            surface.surface_id = "orders".to_string();
+            surface
+        };
+        assert_eq!(
+            named(Some(10)).transit_token_lifetime_adjustment(300),
+            Some(
+                "Surface 'lifetime' (orders): transit.transit_token_lifetime_secs is 10, below the shortest, 30 \
+                 seconds; its transit tokens live 30 seconds"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            named(Some(600)).transit_token_lifetime_adjustment(300),
+            Some(
+                "Surface 'lifetime' (orders): transit.transit_token_lifetime_secs is 600, above \
+                 transit_token_max_lifetime_secs in gateway.json (300); its transit tokens live 300 seconds"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            named(Some(1200)).transit_token_lifetime_adjustment(900),
+            Some(
+                "Surface 'lifetime' (orders): transit.transit_token_lifetime_secs is 1200, above \
+                 transit_token_max_lifetime_secs in gateway.json (900); its transit tokens live 900 seconds"
+                    .to_string()
+            )
+        );
+        for (secs, max_secs) in [(None, 30), (Some(30), 300), (Some(300), 300), (Some(900), 900)] {
+            assert_eq!(named(secs).transit_token_lifetime_adjustment(max_secs), None, "{secs:?} {max_secs}");
+        }
+    }
+
+    #[test]
+    fn the_appliance_ceiling_must_be_a_whole_number_from_30_to_900_seconds() {
+        assert_eq!(transit_token_max_lifetime_from(None), Ok(300));
+        for max_secs in [30, 300, 600, 900] {
+            assert_eq!(transit_token_max_lifetime_from(Some(&json!(max_secs))), Ok(max_secs), "{max_secs}");
+        }
+        for (max_secs, shown) in [
+            (json!(0), "0"),
+            (json!(29), "29"),
+            (json!(901), "901"),
+            (json!(u64::MAX), "18446744073709551615"),
+            (json!(-1), "-1"),
+            (json!(60.5), "60.5"),
+            (json!("600"), "\"600\""),
+            (serde_json::Value::Null, "null"),
+        ] {
+            assert_eq!(
+                transit_token_max_lifetime_from(Some(&max_secs)),
+                Err(format!(
+                    "transit_token_max_lifetime_secs in gateway.json must be from 30 to 900 seconds, not {shown}"
+                )),
+                "{max_secs}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_transit_token_lifetime_outside_30_seconds_to_the_appliance_ceiling_is_refused() {
+        for (lifetime, max_secs) in [(None, 300), (Some(30), 300), (Some(300), 300), (Some(900), 900), (Some(120), 120)]
+        {
+            assert_eq!(
+                shared(&surface_with_lifetime(lifetime)).validate_transit_token_lifetime(max_secs),
+                Ok(()),
+                "{lifetime:?} {max_secs}"
+            );
+        }
+        for (secs, max_secs) in [(0, 300), (29, 300), (301, 300), (600, 300), (121, 120), (901, 900), (u64::MAX, 900)] {
+            assert_eq!(
+                shared(&surface_with_lifetime(Some(secs))).validate_transit_token_lifetime(max_secs),
+                Err(refusal(max_secs, secs)),
+                "{secs} {max_secs}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_transit_token_lifetime_is_stored_only_when_set() {
+        let unset = serde_json::to_value(surface_with_lifetime(None)).unwrap();
+        assert!(
+            unset["transit"]
+                .get("transit_token_lifetime_secs")
+                .is_none(),
+            "{unset}"
+        );
+
+        let set = serde_json::to_value(surface_with_lifetime(Some(600))).unwrap();
+        assert_eq!(set["transit"]["transit_token_lifetime_secs"], json!(600));
+        let reloaded: AgentSurface = serde_json::from_value(set).unwrap();
+        assert_eq!(reloaded.transit_token_lifetime_secs(), 600);
+    }
+
+    #[test]
+    fn a_variant_takes_its_surfaces_transit_token_lifetime_and_cannot_set_its_own() {
+        let refused = serde_json::from_value::<crate::config::agent_surface_variants::SharedTransitOverrides>(
+            json!({ "transit_token_lifetime_secs": 900 }),
+        )
+        .unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("unknown field `transit_token_lifetime_secs`"),
+            "{refused}"
+        );
+
+        let mut surface = surface_with_lifetime(Some(600));
+        surface.variants = serde_json::from_value(json!([{
+            "id": "candidate", "alias": "candidate", "name": "Candidate",
+            "overrides": { "transit": { "shared": { "sign_requests": false } } }
+        }]))
+        .unwrap();
+        assert_eq!(
+            surface
+                .resolve_variant(Some("candidate"))
+                .unwrap()
+                .transit_token_lifetime_secs(),
+            600
+        );
     }
 }

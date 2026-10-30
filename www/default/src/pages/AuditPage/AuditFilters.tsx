@@ -200,7 +200,7 @@ const AuditFilters: React.FC<AuditFiltersProps> = ({
   }));
 
   return (
-    <div className="mb-3" style={{ marginBottom: '2rem' }}>
+    <div className="audit-filters mb-3" style={{ marginBottom: '2rem' }}>
       <form
         className="d-sm-flex align-items-center mb-3"
         onSubmit={e => {

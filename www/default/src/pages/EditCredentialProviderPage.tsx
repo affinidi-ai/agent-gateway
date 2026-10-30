@@ -300,10 +300,11 @@ const EditCredentialProviderPage: React.FC = () => {
   }
 
   return (
-    <div className="container-fluid">
+    <div className="container-fluid" data-testid="page-credential-provider-editor">
       <div className="mb-3">
         <button
           className="btn btn-secondary btn-sm"
+          data-testid="credential-provider-editor-back-button"
           onClick={() => navigate('/settings?tab=credential-providers')}
         >
           <i className="fas fa-arrow-left"></i>
@@ -316,6 +317,7 @@ const EditCredentialProviderPage: React.FC = () => {
             <button
               type="button"
               className={`btn btn-sm btn-primary me-2 ${saving ? 'disabled' : ''}`}
+              data-testid="credential-provider-editor-save-button"
               onClick={() => handleSubmit()}
               disabled={saving}
             >
@@ -325,6 +327,7 @@ const EditCredentialProviderPage: React.FC = () => {
             <button
               type="button"
               className="btn btn-sm btn-outline-secondary"
+              data-testid="credential-provider-editor-cancel-button"
               onClick={() => navigate('/settings?tab=credential-providers')}
               disabled={saving}
             >

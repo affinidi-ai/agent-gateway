@@ -500,8 +500,16 @@ async fn mark_ready_and_drain_surface_events(
 /// Start the Axum-based proxy server
 pub async fn run_axum_proxy(
     config: GatewayConfig,
-    bootstrap_config: crate::config::BootstrapConfig,
+    mut bootstrap_config: crate::config::BootstrapConfig,
 ) -> anyhow::Result<()> {
+    // The longest transit token lifetime is read once, here: every later load
+    // of gateway.json, a reload's included, keeps this value.
+    let transit_token_max_lifetime_secs = bootstrap_config
+        .pin_transit_token_max_lifetime()
+        .context("Configuration validation failed")?;
+    for adjustment in config.transit_token_lifetime_adjustments(transit_token_max_lifetime_secs) {
+        warn!("{adjustment}");
+    }
     let config = Arc::new(config);
     let bootstrap_config = Arc::new(bootstrap_config);
 
