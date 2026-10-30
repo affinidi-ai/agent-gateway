@@ -60,6 +60,10 @@ fn modern_delegation_decision(
     PaymentDelegationDecision::Challenge { status, headers, body }
 }
 
+/// The caller's headers a delegated payment sends the payment gateway: those
+/// the Access Point forwards to its own Target, and `Authorization` only when
+/// it carries a `Payment` credential that neither the surface's `source_auth`
+/// nor its Resource Server reads.
 fn delegation_headers(
     surface: &crate::config::agent_surface::AgentSurface,
     headers: &HeaderMap,
@@ -71,20 +75,26 @@ fn delegation_headers(
         .mcp_http
         .as_ref()
         .is_some_and(|http| http.authorization.is_some());
+    let header_metadata_mapping = surface
+        .access_point
+        .header_metadata_mapping_if_supported();
     headers
         .iter()
         .filter_map(|(name, value)| {
-            if source_credential.is_some_and(|credential| {
-                name.as_str()
-                    .eq_ignore_ascii_case(credential)
-            }) || resource_authorization && name == axum::http::header::AUTHORIZATION
-            {
-                return None;
-            }
-            value
-                .to_str()
-                .ok()
-                .map(|value| (name.as_str().to_uppercase(), value.to_string()))
+            let value = value.to_str().ok()?;
+            let forwarded = if name == axum::http::header::AUTHORIZATION {
+                !resource_authorization
+                    && !source_credential.is_some_and(|credential| credential.eq_ignore_ascii_case(name.as_str()))
+                    && value.starts_with("Payment ")
+            } else {
+                super::should_forward_ap_request_header_with_mapping(
+                    name.as_str(),
+                    source_credential,
+                    header_metadata_mapping,
+                    false,
+                )
+            };
+            forwarded.then(|| (name.as_str().to_uppercase(), value.to_string()))
         })
         .collect()
 }
@@ -769,18 +779,81 @@ mod tests {
                 .map(String::as_str),
             Some("payment-proof")
         );
-        surface.mcp_http = None;
         headers.insert(
             "authorization",
             "Payment legacy-credential"
                 .parse()
                 .unwrap(),
         );
+        assert!(
+            !delegation_headers(&surface, &headers).contains_key("AUTHORIZATION"),
+            "a Payment credential does not cross when the Resource Server reads Authorization"
+        );
+        surface.mcp_http = None;
         assert_eq!(
             delegation_headers(&surface, &headers)
                 .get("AUTHORIZATION")
                 .map(String::as_str),
             Some("Payment legacy-credential")
+        );
+    }
+
+    #[test]
+    fn a_delegated_payment_sends_only_the_headers_the_access_point_forwards_and_a_payment_credential() {
+        let surface = |key_header: &str| -> crate::config::agent_surface::AgentSurface {
+            serde_json::from_value(json!({
+                "surface_id": "paid", "name": "Paid", "access_point": {
+                    "listen_address": "https://gateway.example", "route": "/a2a", "protocol": "a2a",
+                    "header_metadata_mapping": {"headers": [{"header": "x-user-email", "field": "email"}]},
+                    "caller_authentication": {"methods": [{
+                        "type": "api_key", "extraction": {"source": "http_header", "field": key_header},
+                        "secret_id": "caller-key"
+                    }]}
+                }, "target": {"endpoint": "https://target.example/a2a"}
+            }))
+            .unwrap()
+        };
+        let request = |authorization: &str| {
+            let mut headers = HeaderMap::new();
+            for (name, value) in [
+                ("authorization", authorization),
+                ("proxy-authorization", "Basic cHJveHk6c2VjcmV0"),
+                ("x-transit-token", "caller-transit-token"),
+                ("x-caller-did", "did:web:caller.example"),
+                ("x-caller-identity-source", "verified-presentation"),
+                ("x-gateway-did", "did:web:gateway.example"),
+                ("x-user-email", "ada@example.com"),
+                ("x-api-key", "caller-key"),
+                ("host", "gateway.example"),
+                ("connection", "keep-alive"),
+                ("payment-signature", "payment-proof"),
+                ("x-request-note", "kept"),
+            ] {
+                headers.insert(name, value.parse().unwrap());
+            }
+            headers
+        };
+        let names = |delegated: std::collections::HashMap<String, String>| {
+            let mut names: Vec<_> = delegated
+                .into_iter()
+                .map(|(name, value)| format!("{}={value}", name.to_lowercase()))
+                .collect();
+            names.sort();
+            names
+        };
+
+        assert_eq!(
+            names(delegation_headers(&surface("X-API-Key"), &request("Bearer caller-access-token"))),
+            ["payment-signature=payment-proof", "x-request-note=kept"]
+        );
+        assert_eq!(
+            names(delegation_headers(&surface("X-API-Key"), &request("Payment caller-credential"))),
+            ["authorization=Payment caller-credential", "payment-signature=payment-proof", "x-request-note=kept"]
+        );
+        assert!(
+            !delegation_headers(&surface("Authorization"), &request("Payment caller-credential"))
+                .contains_key("AUTHORIZATION"),
+            "the header source_auth reads never crosses"
         );
     }
 

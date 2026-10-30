@@ -67,6 +67,36 @@ Feature: MCP Transit Point forwarding
     Then the response status is 503
     And MCP server "bravo" was not called
 
+  Scenario: A Transit Point admits a caller that presents its API key
+    Given Transit Point "alpha" authenticates its callers with API key "caller-key-1"
+    When managed agent "example-agent" asks for available tools through Transit Point "alpha" with header "x-api-key" set to "caller-key-1"
+    Then the response status is 200
+    And MCP server "bravo" received MCP method "tools/list"
+    And MCP server "bravo" did not receive header "x-api-key"
+
+  Scenario: A Transit Point refuses a caller without its API key
+    Given Transit Point "alpha" authenticates its callers with API key "caller-key-1"
+    When managed agent "example-agent" asks for available tools through Transit Point "alpha"
+    Then the response status is 401
+    And MCP server "bravo" was not called
+
+  Scenario: A Transit Point refuses a caller with the wrong API key
+    Given Transit Point "alpha" authenticates its callers with API key "caller-key-1"
+    When managed agent "example-agent" asks for available tools through Transit Point "alpha" with header "x-api-key" set to "guessed-key"
+    Then the response status is 401
+    And MCP server "bravo" was not called
+
+  Scenario: A Transit Point that authenticates no caller refuses every request unless it is open to them
+    Given Transit Point "alpha" is not open to callers it does not authenticate
+    When managed agent "example-agent" asks for available tools through Transit Point "alpha"
+    Then the response status is 503
+    And MCP server "bravo" was not called
+
+  Scenario: A Transit Point that authenticates no caller cannot be saved
+    When the operator saves Transit Point "alpha" with no way to authenticate its callers
+    Then the admin API response status is 400
+    And the admin API error response mentions "Transit Point 'alpha' authenticates no caller"
+
   Scenario: A Transit Point policy can allow only a named caller
     Given Transit Point "alpha" requires a transit token
     And Transit Point "alpha" has a policy that allows only caller "alice"

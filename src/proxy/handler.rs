@@ -109,7 +109,8 @@ fn should_forward_ap_request_header_with_mapping(
     header_metadata_mapping: Option<&crate::config::header_metadata_mapping::HeaderMetadataMappingConfig>,
     forward_source_auth_header: bool,
 ) -> bool {
-    if !should_forward_request_header(name) {
+    if !should_forward_request_header(name) || crate::proxy::caller_identity::CallerHeaders::is_caller_info_header(name)
+    {
         return false;
     }
 
@@ -802,17 +803,16 @@ fn inject_did_headers(
     headers: &mut Vec<(&str, String)>,
 ) {
     use crate::config::DidInjectionMode;
+    use crate::proxy::caller_identity::CallerHeaders;
 
     match context.injection_mode() {
         DidInjectionMode::Header => {
-            // Simple DID in X-DID-Identity header
-            headers.push(("X-DID-Identity", context.did().to_string()));
+            headers.push((CallerHeaders::DID_IDENTITY, context.did().to_string()));
             debug!(did = %context.did(), "Injected DID identity in header");
         }
         DidInjectionMode::SignedHeader => {
-            // DID document in X-DID-Signed-Identity header
             headers.push((
-                "X-DID-Signed-Identity",
+                CallerHeaders::DID_SIGNED_IDENTITY,
                 context
                     .did_document()
                     .to_string(),

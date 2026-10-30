@@ -102,6 +102,7 @@ flowchart LR
     Internet([Callers, remote gateways and administrators]) -->|HTTPS| LB[Load balancer]
     LB --> In["Inbound listeners<br/>8443 HTTPS · 8080 HTTP"]
     Agents([Your managed agents]) -->|agents' network only| Out["Outbound listener<br/>9000"]
+    Hosted([Hosted agents with caller authentication]) -.->|source_auth Transit Points only| Out
     In --> GW[agent-gateway]
     Out --> GW
     GW --> Up([Your agents and external services])
@@ -111,7 +112,7 @@ flowchart LR
 | --- | --- | --- |
 | `8443` (HTTPS) | Agent traffic, the dashboard and the management API | The load balancer |
 | `8080` (HTTP) | The same, without TLS | Only a load balancer that terminates TLS |
-| `9000` (HTTP) | Calls your managed agents make to Transit Points | Only your managed agents' network; never the internet |
+| `9000` (HTTP) | Calls your managed agents make to Transit Points | Only your managed agents' network. The internet only for a listener whose Transit Points all authenticate their callers with `source_auth`, and failed attempts are not throttled (see below) |
 
 Each listener in `gateway.json` sets its own port, so open only the ones you use. Before
 you open any listener:
@@ -124,13 +125,23 @@ you open any listener:
   cannot be deleted or demoted. Allow only your own address to reach 8443 and 8080,
   register at the public URL (passkeys require the browser origin to match
   `webauthn.external_origin`), then open the ports to everyone else.
-- **Keep port 9000 private.** It adds your Transit Points' credentials to the calls it
-  forwards, so only your managed agents should reach it. Set its `bind_address` to an
-  internal address, and remove the `localhost` entries from `external_urls` in
-  production. An inbound listener whose `external_urls` share a host name with the
-  outbound listener's also forwards `/outbound/*` to it, so its Transit Points are then
-  reachable wherever that inbound listener is; give the outbound listener a host name of
-  its own to keep them private.
+- **Keep port 9000 private, unless every Transit Point on it authenticates its callers.** It
+  adds your Transit Points' credentials to the calls it forwards, so only callers you trust
+  should reach it. Set its `bind_address` to an internal address, and remove the `localhost`
+  entries from `external_urls` in production. An inbound listener whose `external_urls`
+  share a host name with the outbound listener's also forwards `/outbound/*` to it, so its
+  Transit Points are then reachable wherever that inbound listener is; give the outbound
+  listener a host name of its own to keep them private.
+- **A Transit Point may face callers outside your network only when it authenticates them
+  with `source_auth`.** A hosted agent, such as Copilot Studio, cannot send the transit
+  token, so give its Transit Point `source_auth` with `mtls` or a strong key per caller, and
+  never leave it open (`allow_unauthenticated_callers`) or protected only by a transit
+  token. The listener is the unit of exposure: every Transit Point on an outbound listener
+  is reachable wherever the listener is, so serve the ones that face the internet from a
+  listener of their own (the Transit Point's `listen_address`) and keep the rest on a
+  private one. Failed attempts are not throttled, so protect such a listener with your load
+  balancer or firewall too. See
+  [Reachable from other hosts](SOURCE_AUTH.md#reachable-from-other-hosts).
 
 You also need:
 

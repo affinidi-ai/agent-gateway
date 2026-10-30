@@ -719,7 +719,9 @@ fn validate_source_auth(surface: &AgentSurface) -> Result<(), SurfaceApiError> {
 /// `transit.source_auth`, which the gateway does not enforce, is refused, and
 /// so is a transit token lifetime outside its bounds, unless it is the stored
 /// one (`stored`): a save that keeps it, such as a dashboard round trip, is
-/// accepted, and the gateway holds it to the nearer bound.
+/// accepted, and the gateway holds it to the nearer bound. So is a Transit
+/// Point, on the surface or in a variant's overrides, whose caller
+/// authentication cannot be enforced.
 fn validate_transit_points(
     surface: &mut AgentSurface,
     max_lifetime_secs: u64,
@@ -755,6 +757,7 @@ fn validate_transit_points(
     if surface_sets_source_auth || variant_sets_source_auth {
         return Err(SurfaceApiError::BadRequest(crate::config::agent_surface::TRANSIT_SOURCE_AUTH_REFUSED.to_string()));
     }
+    validate_transit_point_caller_authentication(surface, stored)?;
     let Some(transit) = surface.transit.as_mut() else {
         return Ok(());
     };
@@ -788,6 +791,328 @@ fn validate_transit_points(
         }
     }
     Ok(())
+}
+
+/// Refuse a Transit Point, on the surface or in a variant's overrides, whose
+/// caller authentication cannot be enforced or whose `source_auth` is invalid.
+/// A Transit Point the save leaves exactly as `stored` has it is not refused
+/// for authenticating no caller, so a surface stored before that was refused
+/// can still be saved; the gateway keeps answering `503` for it until it is
+/// given caller authentication or marked open.
+fn validate_transit_point_caller_authentication(
+    surface: &AgentSurface,
+    stored: Option<&AgentSurface>,
+) -> Result<(), SurfaceApiError> {
+    let unchanged = |point: &crate::config::agent_surface::TransitPoint,
+                     stored_points: Option<&[crate::config::agent_surface::TransitPoint]>| {
+        !point.id.is_empty()
+            && stored_points
+                .into_iter()
+                .flatten()
+                .any(|previous| {
+                    previous.id == point.id && serde_json::to_value(previous).ok() == serde_json::to_value(point).ok()
+                })
+    };
+    let surface_points = surface
+        .transit
+        .iter()
+        .flat_map(|transit| {
+            let stored_points = stored
+                .and_then(|stored| stored.transit.as_ref())
+                .map(|transit| transit.points.as_slice());
+            transit
+                .points
+                .iter()
+                .enumerate()
+                .map(move |(idx, tp)| (format!("transit.points[{idx}]"), tp, stored_points))
+        });
+    let variant_points = surface
+        .variants
+        .iter()
+        .flat_map(|variant| {
+            let stored_points = stored.and_then(|stored| variant_stored_points(stored, &variant.id));
+            variant
+                .overrides
+                .transit
+                .iter()
+                .filter_map(|transit| transit.points.as_ref())
+                .flatten()
+                .enumerate()
+                .map(move |(idx, tp)| (format!("variant '{}' transit.points[{idx}]", variant.alias), tp, stored_points))
+        });
+    for (path, tp, stored_points) in surface_points.chain(variant_points) {
+        if !unchanged(tp, stored_points) {
+            tp.validate_caller_authentication()
+                .map_err(|error| SurfaceApiError::BadRequest(format!("{path}: {error}")))?;
+        }
+        if let Some(source_auth) = &tp.source_auth {
+            crate::config::validate_source_auth_method(source_auth, &surface.name)
+                .map_err(|error| SurfaceApiError::BadRequest(format!("{path}: {error}")))?;
+        }
+    }
+    Ok(())
+}
+
+/// A saved surface, with the [`transit_point_warnings`] it calls for.
+type SavedSurface = (axum::http::HeaderMap, Json<AgentSurface>);
+
+/// `Warning` headers (code 299) naming each Transit Point of `surface` that
+/// serves callers it does not authenticate where other hosts reach it, each
+/// that accepts the Access Point's own tokens ([`shared_audience_warnings`]),
+/// and each whose JWT verification strategy names an issuer the surface also
+/// accepts through another ([`shared_issuer_warnings`]).
+async fn transit_point_warnings(
+    state: &IdentityApiState,
+    surface: &AgentSurface,
+) -> axum::http::HeaderMap {
+    let issuers = jwt_strategy_issuers(state, surface).await;
+    let mut headers = axum::http::HeaderMap::new();
+    for warning in crate::proxy::server::open_transit_points(&state.network_config, surface)
+        .iter()
+        .filter_map(crate::proxy::server::OpenTransitPoint::exposure)
+        .chain(shared_audience_warnings(surface))
+        .chain(shared_issuer_warnings(surface, &issuers))
+        .chain(modern_delegation_warnings(surface))
+    {
+        let quoted = warning
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"");
+        if let Ok(value) = axum::http::HeaderValue::from_str(&format!("299 - \"{quoted}\"")) {
+            headers.append(axum::http::header::WARNING, value);
+        }
+    }
+    headers
+}
+
+/// Each MCP Transit Point, on the surface or in a variant, that authenticates
+/// its callers with `source_auth` on a surface whose outbound credentials apply
+/// to every request. A `2026-07-28` MCP request keys a delegated grant only
+/// through `mcp_http.authorization`, which such a Transit Point cannot set, so
+/// every such request to it is refused with `403`.
+fn modern_delegation_warnings(surface: &AgentSurface) -> Vec<String> {
+    if !crate::proxy::credential_delegation::modern::transit_point_bindings_apply(surface) {
+        return Vec::new();
+    }
+    let mut warnings = Vec::new();
+    for (_, view) in surface_views(surface) {
+        for point in view
+            .transit
+            .iter()
+            .flat_map(|transit| transit.points.iter())
+            .filter(|point| {
+                point.protocol == crate::config::agent_surface::TransitProtocol::Mcp && point.source_auth.is_some()
+            })
+        {
+            let warning = format!(
+                "Transit Point '{}' authenticates its callers with source_auth on a surface whose outbound \
+                 credentials apply to every request: every 2026-07-28 MCP request to it is refused with 403, \
+                 because only mcp_http.authorization can key a delegated grant there",
+                point.alias
+            );
+            if !warnings.contains(&warning) {
+                warnings.push(warning);
+            }
+        }
+    }
+    warnings
+}
+
+/// `surface` and each of its enabled variants as it resolves, with the
+/// variant's alias.
+fn surface_views(surface: &AgentSurface) -> Vec<(Option<String>, AgentSurface)> {
+    std::iter::once((None, surface.clone()))
+        .chain(
+            surface
+                .variants
+                .iter()
+                .filter_map(|variant| {
+                    surface
+                        .resolve_variant(Some(&variant.alias))
+                        .ok()
+                        .map(|view| (Some(variant.alias.clone()), view))
+                }),
+        )
+        .collect()
+}
+
+/// The `jwt_bearer` configurations a view's Access Point accepts, and those of
+/// its Transit Points with each Transit Point's alias. An Access Point that
+/// publishes protected resource metadata accepts only the resource of the
+/// route called (`alias`) as the audience, as at runtime.
+fn jwt_bearer_methods(
+    view: &AgentSurface,
+    alias: Option<&str>,
+) -> (Vec<crate::jwt_bearer::models::JwtBearerAuthConfig>, Vec<(String, crate::jwt_bearer::models::JwtBearerAuthConfig)>)
+{
+    use crate::source_auth::SourceAuthConfig;
+    let jwt = |config: &SourceAuthConfig| match config {
+        SourceAuthConfig::JwtBearer(config) => Some(config.clone()),
+        _ => None,
+    };
+    let protected_resource = view
+        .protected_resource()
+        .and_then(|protected| {
+            protected
+                .for_variant(alias)
+                .ok()
+        });
+    let access_point = view
+        .access_point
+        .caller_authentication
+        .iter()
+        .flat_map(|authentication| authentication.methods.iter())
+        .map(|method| match &protected_resource {
+            Some(protected) => protected.bind_audience(method.clone()),
+            None => method.clone(),
+        })
+        .filter_map(|method| jwt(&method))
+        .collect();
+    let transit_points = view
+        .transit_points()
+        .iter()
+        .filter_map(|point| {
+            point
+                .source_auth
+                .as_ref()
+                .and_then(jwt)
+                .map(|config| (point.alias.clone(), config))
+        })
+        .collect();
+    (access_point, transit_points)
+}
+
+/// The `expected_issuer` of each JWT verification strategy `surface` names, on
+/// an Access Point or a Transit Point, by strategy id. A strategy that cannot
+/// be read is left out.
+async fn jwt_strategy_issuers(
+    state: &IdentityApiState,
+    surface: &AgentSurface,
+) -> std::collections::HashMap<String, String> {
+    let mut issuers = std::collections::HashMap::new();
+    let Some(store) = state
+        .jwt_verification_strategy_store
+        .as_ref()
+    else {
+        return issuers;
+    };
+    for (alias, view) in surface_views(surface) {
+        let (access_point, transit_points) = jwt_bearer_methods(&view, alias.as_deref());
+        for config in access_point.iter().chain(
+            transit_points
+                .iter()
+                .map(|(_, config)| config),
+        ) {
+            let id = &config.jwt_verification_strategy_id;
+            if issuers.contains_key(id) {
+                continue;
+            }
+            if let Ok(Some(strategy)) = store.get(id).await {
+                issuers.insert(id.clone(), strategy.expected_issuer);
+            }
+        }
+    }
+    issuers
+}
+
+/// Each Transit Point, on the surface or in an enabled variant, whose
+/// `jwt_bearer` strategy names the same issuer, in `issuers`, as another
+/// strategy the same view accepts, on its Access Point or another Transit
+/// Point. The identity hash keys a JWT caller by its issuer and subject, so
+/// callers verified through either strategy are one caller, with the same
+/// delegated credentials.
+fn shared_issuer_warnings(
+    surface: &AgentSurface,
+    issuers: &std::collections::HashMap<String, String>,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for (alias, view) in surface_views(surface) {
+        let (access_point, transit_points) = jwt_bearer_methods(&view, alias.as_deref());
+        let accepted: Vec<&str> = access_point
+            .iter()
+            .chain(
+                transit_points
+                    .iter()
+                    .map(|(_, config)| config),
+            )
+            .map(|config| {
+                config
+                    .jwt_verification_strategy_id
+                    .as_str()
+            })
+            .collect();
+        for (alias, config) in &transit_points {
+            let strategy = config
+                .jwt_verification_strategy_id
+                .as_str();
+            let Some(issuer) = issuers.get(strategy) else {
+                continue;
+            };
+            for other in accepted
+                .iter()
+                .filter(|other| **other != strategy && issuers.get(**other) == Some(issuer))
+            {
+                let warning = format!(
+                    "Transit Point '{alias}' accepts tokens from issuer '{issuer}' through JWT verification \
+                     strategy '{strategy}', and this surface accepts that issuer through '{other}' too: a caller \
+                     with the same subject through either is one caller, with the same delegated credentials; use \
+                     one strategy per issuer"
+                );
+                if !warnings.contains(&warning) {
+                    warnings.push(warning);
+                }
+            }
+        }
+    }
+    warnings
+}
+
+/// Each Transit Point, on the surface or in an enabled variant, whose
+/// `jwt_bearer` accepts tokens issued for the Access Point, base or enabled
+/// variant: the same JWT verification strategy and an audience both name. An
+/// Access Point that publishes protected resource metadata accepts the resource
+/// of each route, so a Transit Point that names any of them is one. A caller of
+/// the Access Point could then call that Transit Point directly, with its
+/// credentials.
+fn shared_audience_warnings(surface: &AgentSurface) -> Vec<String> {
+    let views: Vec<_> = surface_views(surface)
+        .into_iter()
+        .map(|(alias, view)| jwt_bearer_methods(&view, alias.as_deref()))
+        .collect();
+    let access_point: Vec<_> = views
+        .iter()
+        .flat_map(|(access_point, _)| access_point.iter())
+        .collect();
+    let mut warnings = Vec::new();
+    for (_, transit_points) in &views {
+        for (alias, transit_point) in transit_points {
+            for accepted in access_point
+                .iter()
+                .filter(|accepted| accepted.jwt_verification_strategy_id == transit_point.jwt_verification_strategy_id)
+            {
+                let Some(audience) = transit_point
+                    .audiences
+                    .iter()
+                    .find(|audience| {
+                        accepted
+                            .audiences
+                            .contains(audience)
+                    })
+                else {
+                    continue;
+                };
+                let warning = format!(
+                    "Transit Point '{}' accepts the Access Point's own tokens (JWT verification strategy '{}', \
+                     audience '{audience}'), so a caller of the Access Point can call it directly; give it an \
+                     audience of its own",
+                    alias, transit_point.jwt_verification_strategy_id
+                );
+                if !warnings.contains(&warning) {
+                    warnings.push(warning);
+                }
+            }
+        }
+    }
+    warnings
 }
 
 /// Identity of the listener a surface route is served on.
@@ -1359,7 +1684,7 @@ pub async fn create_surface(
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
     Json(mut surface): Json<AgentSurface>,
-) -> Result<(StatusCode, Json<AgentSurface>), SurfaceApiError> {
+) -> Result<(StatusCode, axum::http::HeaderMap, Json<AgentSurface>), SurfaceApiError> {
     let store = state
         .agent_surface_store
         .as_ref()
@@ -1494,6 +1819,7 @@ pub async fn create_surface(
         .map_err(|e| SurfaceApiError::Forbidden(e.message()))?;
 
     surface.trust_check_split = surface.has_trust_check_lists();
+    surface.transit_point_source_auth = surface.has_transit_point_source_auth();
     store
         .save(&surface)
         .await
@@ -1503,7 +1829,7 @@ pub async fn create_surface(
 
     apply_surface_change(&state, SurfaceChange::Upsert(&surface)).await;
 
-    Ok((StatusCode::CREATED, Json(surface)))
+    Ok((StatusCode::CREATED, transit_point_warnings(&state, &surface).await, Json(surface)))
 }
 
 /// Whether `access_point` in a PUT body removes its discovery setting.
@@ -1552,7 +1878,7 @@ pub async fn update_surface(
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
     JsonWithSent(mut surface, sent): JsonWithSent<AgentSurface>,
-) -> Result<Json<AgentSurface>, SurfaceApiError> {
+) -> Result<SavedSurface, SurfaceApiError> {
     let store = state
         .agent_surface_store
         .as_ref()
@@ -1587,6 +1913,7 @@ pub async fn update_surface(
     retain_mcp_settings(&mut surface, &existing, &state.network_config, &ProtectedResourceRemovals::of(&sent))?;
     retain_a2a_settings(&mut surface, &existing);
     retain_transit_token_lifetime(&mut surface, &existing);
+    retain_transit_caller_authentication(&mut surface, &existing, &sent);
 
     let saved = validate_and_save_surface(
         &state,
@@ -1598,7 +1925,7 @@ pub async fn update_surface(
         resource_scoped(&delegation),
     )
     .await?;
-    Ok(Json(saved))
+    Ok((transit_point_warnings(&state, &saved).await, Json(saved)))
 }
 
 /// PUT carries the whole record, so an omitted
@@ -1906,6 +2233,112 @@ fn retain_mcp_settings(
     settle_retained_protected_resources(surface, base_retained, &retained_aliases, network)
 }
 
+/// PUT carries the whole record, or a variant PUT its whole overrides, but the
+/// Surface Builder shows neither a Transit Point's `source_auth` nor its
+/// `allow_unauthenticated_callers`, so a save from it omits both. An omitted
+/// `source_auth` means unchanged, as an omitted `mcp_http.authorization` does;
+/// removal is explicit: a `null` `source_auth` in the PUT, or a merge PATCH
+/// whose Transit Points leave it out. The save rules then refuse a Transit
+/// Point left authenticating no caller. An omitted
+/// `allow_unauthenticated_callers` is kept while the Transit Point still
+/// authenticates no caller, and dropped once it does.
+fn retain_transit_caller_authentication(
+    surface: &mut AgentSurface,
+    existing: &AgentSurface,
+    sent: &serde_json::Value,
+) {
+    fn sent_points(transit: Option<&serde_json::Value>) -> Option<&serde_json::Value> {
+        transit.and_then(|transit| transit.get("points"))
+    }
+    if let (Some(transit), Some(stored)) = (&mut surface.transit, &existing.transit) {
+        retain_transit_points_caller_authentication(
+            &mut transit.points,
+            &stored.points,
+            sent_points(sent.get("transit")),
+        );
+    }
+    for (index, variant) in surface
+        .variants
+        .iter_mut()
+        .enumerate()
+    {
+        let stored_points = variant_stored_points(existing, &variant.id);
+        let points = variant
+            .overrides
+            .transit
+            .as_mut()
+            .and_then(|transit| transit.points.as_mut());
+        if let (Some(points), Some(stored_points)) = (points, stored_points) {
+            let sent_transit = sent
+                .get("variants")
+                .and_then(|variants| variants.get(index))
+                .and_then(|variant| variant.get("overrides"))
+                .and_then(|overrides| overrides.get("transit"));
+            retain_transit_points_caller_authentication(points, stored_points, sent_points(sent_transit));
+        }
+    }
+}
+
+/// The Transit Points a stored variant's own overrides define, else the stored
+/// surface's: a variant without its own list, or one added in this save,
+/// inherits them, and the Surface Builder sends it a copy of the surface's list
+/// that leaves out each Transit Point's caller authentication.
+fn variant_stored_points<'a>(
+    existing: &'a AgentSurface,
+    variant_id: &str,
+) -> Option<&'a [crate::config::agent_surface::TransitPoint]> {
+    existing
+        .variants
+        .iter()
+        .find(|previous| previous.id == variant_id)
+        .and_then(|previous| {
+            previous
+                .overrides
+                .transit
+                .as_ref()
+        })
+        .and_then(|transit| transit.points.as_deref())
+        .or_else(|| {
+            existing
+                .transit
+                .as_ref()
+                .map(|transit| transit.points.as_slice())
+        })
+}
+
+/// Keeps each Transit Point's stored `source_auth` and
+/// `allow_unauthenticated_callers` that `sent_points`, the JSON the request
+/// sent for `points`, leaves out; see `retain_transit_caller_authentication`.
+fn retain_transit_points_caller_authentication(
+    points: &mut [crate::config::agent_surface::TransitPoint],
+    stored: &[crate::config::agent_surface::TransitPoint],
+    sent_points: Option<&serde_json::Value>,
+) {
+    for (index, point) in points.iter_mut().enumerate() {
+        let Some(previous) = stored
+            .iter()
+            .find(|previous| previous.id == point.id)
+        else {
+            continue;
+        };
+        let sent_point = sent_points.and_then(|points| points.get(index));
+        let removes_source_auth = sent_point
+            .and_then(|point| point.get("source_auth"))
+            .is_some_and(serde_json::Value::is_null);
+        if point.source_auth.is_none() && !removes_source_auth {
+            point.source_auth = previous.source_auth.clone();
+        }
+        let sends_open_flag = sent_point.is_some_and(|point| {
+            point
+                .get("allow_unauthenticated_callers")
+                .is_some()
+        });
+        if !sends_open_flag && previous.allow_unauthenticated_callers && !point.authenticates_callers() {
+            point.allow_unauthenticated_callers = true;
+        }
+    }
+}
+
 /// PUT carries the whole record, so an omitted `mcp_http` — or an `mcp_http`
 /// that omits `authorization` — means "unchanged", never "remove". Resource
 /// Server authorization is enforced for every MCP revision, so dropping it on
@@ -2191,6 +2624,7 @@ async fn validate_and_save_surface(
     validate_mcp_resource_declarations(state, &surface).await?;
 
     surface.trust_check_split = surface.has_trust_check_lists();
+    surface.transit_point_source_auth = surface.has_transit_point_source_auth();
     store
         .save(&surface)
         .await
@@ -2271,7 +2705,7 @@ pub async fn patch_surface(
     delegation: Option<Extension<PatDelegationContext>>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
-) -> Result<Json<AgentSurface>, SurfaceApiError> {
+) -> Result<SavedSurface, SurfaceApiError> {
     require_merge_patch_content_type(&headers)?;
 
     if body.is_empty() {
@@ -2320,7 +2754,7 @@ pub async fn patch_surface(
         resource_scoped(&delegation),
     )
     .await?;
-    Ok(Json(saved))
+    Ok((transit_point_warnings(&state, &saved).await, Json(saved)))
 }
 
 /// `PATCH /v1/surfaces/{id}/variants/{variant_id}`
@@ -2340,7 +2774,7 @@ pub async fn patch_variant(
     delegation: Option<Extension<PatDelegationContext>>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
-) -> Result<Json<AgentSurface>, SurfaceApiError> {
+) -> Result<SavedSurface, SurfaceApiError> {
     require_merge_patch_content_type(&headers)?;
 
     if body.is_empty() {
@@ -2399,7 +2833,7 @@ pub async fn patch_variant(
         resource_scoped(&delegation),
     )
     .await?;
-    Ok(Json(saved))
+    Ok((transit_point_warnings(&state, &saved).await, Json(saved)))
 }
 
 /// Delete an agent surface (hard delete: removes from cache + filesystem).
@@ -2880,7 +3314,7 @@ pub async fn create_variant(
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
     Json(body): Json<CreateVariantRequest>,
-) -> Result<(StatusCode, Json<SurfaceVariant>), SurfaceApiError> {
+) -> Result<(StatusCode, axum::http::HeaderMap, Json<SurfaceVariant>), SurfaceApiError> {
     let (store, mut surface) = load_surface_or_404(
         &state,
         &surface_id,
@@ -2965,7 +3399,7 @@ pub async fn create_variant(
 
     info!("Created variant '{}' (id={}) on surface '{}'", new_variant.alias, new_variant.id, surface_id);
 
-    Ok((StatusCode::CREATED, Json(new_variant)))
+    Ok((StatusCode::CREATED, transit_point_warnings(&state, &saved).await, Json(new_variant)))
 }
 
 /// `PUT /v1/surfaces/{id}/variants/{variant_id}`
@@ -2981,7 +3415,7 @@ pub async fn update_variant(
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
     JsonWithSent(body, sent): JsonWithSent<UpdateVariantRequest>,
-) -> Result<Json<SurfaceVariant>, SurfaceApiError> {
+) -> Result<(axum::http::HeaderMap, Json<SurfaceVariant>), SurfaceApiError> {
     let (store, mut surface) = load_surface_or_404(
         &state,
         &surface_id,
@@ -3058,9 +3492,23 @@ pub async fn update_variant(
         reject_undeclared_trust_check_edit(touches_trust_checks, &existing)?;
     }
     // New overrides replace the stored ones, but keep the stored discovery
-    // setting unless they remove it, as a PUT of the whole surface does.
+    // setting unless they remove it, and the Transit Points' caller
+    // authentication they leave out, as a PUT of the whole surface does.
     let mut retained = Vec::new();
     if let Some(mut overrides) = body.overrides {
+        if let (Some(points), Some(stored_points)) = (
+            overrides
+                .transit
+                .as_mut()
+                .and_then(|transit| transit.points.as_mut()),
+            variant_stored_points(&existing, &variant_id),
+        ) {
+            retain_transit_points_caller_authentication(
+                points,
+                stored_points,
+                sent.pointer("/overrides/transit/points"),
+            );
+        }
         if !removes_protected_resource(sent.pointer("/overrides/access_point"))
             && retain_protected_resource(
                 overrides
@@ -3113,7 +3561,7 @@ pub async fn update_variant(
 
     info!("Updated variant '{}' (id={}) on surface '{}'", updated.alias, updated.id, surface_id);
 
-    Ok(Json(updated))
+    Ok((transit_point_warnings(&state, &saved).await, Json(updated)))
 }
 
 /// `DELETE /v1/surfaces/{id}/variants/{variant_id}`
@@ -3197,7 +3645,7 @@ pub async fn promote_variant_to_default(
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
-) -> Result<Json<AgentSurface>, SurfaceApiError> {
+) -> Result<SavedSurface, SurfaceApiError> {
     let (store, mut surface) = load_surface_or_404(
         &state,
         &surface_id,
@@ -3239,7 +3687,7 @@ pub async fn promote_variant_to_default(
 
     info!("Promoted variant '{}' (id={}) to default on surface '{}'", variant_alias, variant_id, surface_id);
 
-    Ok(Json(saved))
+    Ok((transit_point_warnings(&state, &saved).await, Json(saved)))
 }
 
 /// `GET /v1/surfaces/{id}/variants/{alias}/resolved`
@@ -3606,6 +4054,465 @@ mod validation_tests {
         let mut put: AgentSurface = serde_json::from_value(body).unwrap();
         retain_mcp_settings(&mut put, &existing, &discovery_network(), &removals).unwrap();
         assert_eq!(resources(&put), (true, vec![true, true]));
+    }
+
+    fn surface_with_transit_points(
+        points: serde_json::Value,
+        variant_points: serde_json::Value,
+    ) -> AgentSurface {
+        serde_json::from_value(serde_json::json!({
+            "name": "callers",
+            "access_point": { "listen_address": "0.0.0.0:8443", "route": "/callers", "protocol": "a2a" },
+            "target": { "endpoint": "https://agent.internal" },
+            "transit": { "outbound_listen_address": "http://localhost:9111", "points": points },
+            "variants": [{ "id": "candidate", "alias": "candidate", "name": "Candidate", "overrides": {
+                "transit": { "points": variant_points }
+            }}]
+        }))
+        .unwrap()
+    }
+
+    fn caller_key() -> serde_json::Value {
+        serde_json::json!({
+            "type": "api_key", "extraction": { "source": "http_header", "field": "X-API-Key" },
+            "secret_id": "partner-callers"
+        })
+    }
+
+    /// A save warns of a Transit Point whose `jwt_bearer` accepts tokens issued
+    /// for the Access Point: the same strategy and an audience both name.
+    #[test]
+    fn a_save_warns_of_a_transit_point_that_accepts_the_access_points_own_tokens() {
+        let jwt = |strategy: &str, audiences: serde_json::Value| serde_json::json!({ "type": "jwt_bearer", "jwt_verification_strategy_id": strategy, "audiences": audiences });
+        let surface_with = |transit_point_auth: serde_json::Value| {
+            let mut surface = surface_with_transit_points(
+                serde_json::json!([{ "alias": "crm", "target_endpoint": "https://crm.example",
+                    "require_transit_token": false, "source_auth": transit_point_auth }]),
+                serde_json::json!(null),
+            );
+            surface.variants.clear();
+            surface
+                .access_point
+                .caller_authentication = Some(
+                serde_json::from_value(serde_json::json!({
+                    "methods": [jwt("entra", serde_json::json!(["{{ surface.agent_did }}", "api://agent"]))]
+                }))
+                .unwrap(),
+            );
+            surface
+        };
+
+        assert_eq!(
+            shared_audience_warnings(&surface_with(jwt("entra", serde_json::json!(["{{ surface.agent_did }}"])))),
+            vec![
+                "Transit Point 'crm' accepts the Access Point's own tokens (JWT verification strategy 'entra', \
+                 audience '{{ surface.agent_did }}'), so a caller of the Access Point can call it directly; give it \
+                 an audience of its own"
+                    .to_string()
+            ]
+        );
+        for (case, transit_point_auth) in [
+            ("an audience of its own", jwt("entra", serde_json::json!(["api://crm-transit"]))),
+            ("another strategy", jwt("partner", serde_json::json!(["{{ surface.agent_did }}"]))),
+            ("an API key", caller_key()),
+        ] {
+            assert!(shared_audience_warnings(&surface_with(transit_point_auth)).is_empty(), "{case}");
+        }
+    }
+
+    /// An MCP Access Point that publishes protected resource metadata accepts
+    /// a token whose audience is the resource of the route called, the base
+    /// resource or a variant's own, and lists no audiences itself. A save warns
+    /// of a Transit Point whose `jwt_bearer`, with the same strategy, names
+    /// either resource.
+    #[test]
+    fn a_save_warns_of_a_transit_point_that_accepts_the_tokens_of_an_access_points_protected_resource() {
+        let jwt = |audiences: serde_json::Value| serde_json::json!({ "type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": audiences });
+        let surface_with = |variant_enabled: bool, transit_point_auth: serde_json::Value| -> AgentSurface {
+            serde_json::from_value(serde_json::json!({
+                "name": "tools",
+                "access_point": { "listen_address": "0.0.0.0:8443", "route": "/mcp", "protocol": "mcp",
+                    "caller_authentication": {
+                        "methods": [jwt(serde_json::json!([]))],
+                        "protected_resource": { "resource": "https://gateway.example/mcp",
+                            "authorization_servers": ["https://idp.example"] }
+                    } },
+                "target": { "endpoint": "https://tools.internal/mcp" },
+                "transit": { "outbound_listen_address": "http://localhost:9111", "points": [
+                    { "alias": "crm", "target_endpoint": "https://crm.example", "protocol": "mcp",
+                        "require_transit_token": false, "source_auth": transit_point_auth }
+                ] },
+                "variants": [{ "id": "beta", "alias": "beta", "name": "Beta", "enabled": variant_enabled }]
+            }))
+            .unwrap()
+        };
+        let warning = |audience: &str| {
+            format!(
+                "Transit Point 'crm' accepts the Access Point's own tokens (JWT verification strategy 'idp', \
+                 audience '{audience}'), so a caller of the Access Point can call it directly; give it an audience \
+                 of its own"
+            )
+        };
+
+        assert_eq!(
+            shared_audience_warnings(&surface_with(true, jwt(serde_json::json!(["https://gateway.example/mcp"])))),
+            vec![warning("https://gateway.example/mcp")]
+        );
+        assert_eq!(
+            shared_audience_warnings(&surface_with(true, jwt(serde_json::json!(["https://gateway.example/mcp$beta"])))),
+            vec![warning("https://gateway.example/mcp$beta")]
+        );
+        // A Transit Point only the variant defines, naming the base resource.
+        let mut variant_only = surface_with(true, jwt(serde_json::json!(["api://crm-transit"])));
+        variant_only.variants[0]
+            .overrides
+            .transit = Some(
+            serde_json::from_value(serde_json::json!({ "points": [
+                { "alias": "crm", "target_endpoint": "https://crm.example", "protocol": "mcp",
+                    "require_transit_token": false, "source_auth": jwt(serde_json::json!(["https://gateway.example/mcp"])) }
+            ] }))
+            .unwrap(),
+        );
+        assert_eq!(shared_audience_warnings(&variant_only), vec![warning("https://gateway.example/mcp")]);
+        for (case, surface) in [
+            ("an audience of its own", surface_with(true, jwt(serde_json::json!(["api://crm-transit"])))),
+            (
+                "a disabled variant's resource",
+                surface_with(false, jwt(serde_json::json!(["https://gateway.example/mcp$beta"]))),
+            ),
+        ] {
+            assert!(shared_audience_warnings(&surface).is_empty(), "{case}");
+        }
+    }
+
+    /// The Surface Builder sends every variant a copy of the surface's Transit
+    /// Points, without their `source_auth`. A variant that stored no list of its
+    /// own, or one added in the same save, keeps the caller authentication of
+    /// the surface's Transit Point with the same id, unless the save removes it.
+    /// A surface stored before a Transit Point had to authenticate its callers can
+    /// still be saved while that Transit Point is left as stored. Changing it, or
+    /// adding another like it, is refused as for any save.
+    #[test]
+    fn a_save_accepts_a_stored_transit_point_that_authenticates_no_caller_only_while_unchanged() {
+        let legacy = serde_json::json!([{ "id": "legacy", "alias": "legacy", "target_endpoint": "https://legacy.example",
+            "require_transit_token": false }]);
+        let stored = surface_with_transit_points(legacy.clone(), legacy.clone());
+
+        let mut unchanged = stored.clone();
+        assert!(validate_transit_points(&mut unchanged, 30, Some(&stored)).is_ok(), "left as stored");
+        assert!(validate_transit_points(&mut stored.clone(), 30, None).is_err(), "new, it is refused");
+
+        let mut edited = stored.clone();
+        edited
+            .transit
+            .as_mut()
+            .unwrap()
+            .points[0]
+            .target_endpoint = "https://elsewhere.example".to_string();
+        match validate_transit_points(&mut edited, 30, Some(&stored)) {
+            Err(SurfaceApiError::BadRequest(message)) => {
+                assert!(message.contains("authenticates no caller"), "{message}")
+            }
+            other => panic!("a changed Transit Point is refused with a 400, got {other:?}"),
+        }
+
+        let mut variant_edited = stored.clone();
+        variant_edited.variants[0]
+            .overrides
+            .transit
+            .as_mut()
+            .unwrap()
+            .points
+            .as_mut()
+            .unwrap()[0]
+            .target_endpoint = "https://elsewhere.example".to_string();
+        assert!(validate_transit_points(&mut variant_edited, 30, Some(&stored)).is_err(), "a changed variant copy");
+
+        let mut added = stored.clone();
+        let mut another = added
+            .transit
+            .as_ref()
+            .unwrap()
+            .points[0]
+            .clone();
+        another.id = "another".to_string();
+        another.alias = "another".to_string();
+        added
+            .transit
+            .as_mut()
+            .unwrap()
+            .points
+            .push(another);
+        assert!(validate_transit_points(&mut added, 30, Some(&stored)).is_err(), "a new Transit Point");
+
+        let mut closed = stored.clone();
+        closed
+            .transit
+            .as_mut()
+            .unwrap()
+            .points[0]
+            .allow_unauthenticated_callers = true;
+        closed.variants[0]
+            .overrides
+            .transit
+            .as_mut()
+            .unwrap()
+            .points
+            .as_mut()
+            .unwrap()[0]
+            .allow_unauthenticated_callers = true;
+        assert!(validate_transit_points(&mut closed, 30, Some(&stored)).is_ok(), "marking it open is accepted");
+    }
+
+    #[test]
+    fn a_save_warns_of_a_source_auth_mcp_transit_point_on_a_surface_with_credentials_for_every_request() {
+        let point = |protocol: &str| {
+            serde_json::json!([{ "id": "crm", "alias": "crm", "protocol": protocol,
+                "target_endpoint": "https://crm.example", "require_transit_token": false,
+                "source_auth": caller_key() }])
+        };
+        let surface = |protocol: &str, required_for: serde_json::Value| {
+            let mut surface = surface_with_transit_points(point(protocol), serde_json::json!(null));
+            surface.outbound_credentials = vec![
+                serde_json::from_value(
+                    serde_json::json!({ "credential_provider_id": "provider", "required_for": required_for }),
+                )
+                .unwrap(),
+            ];
+            surface
+        };
+
+        let warnings = modern_delegation_warnings(&surface("mcp", serde_json::json!("all")));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].starts_with("Transit Point 'crm' authenticates its callers with source_auth"));
+        assert!(warnings[0].contains("refused with 403"));
+
+        assert!(
+            modern_delegation_warnings(&surface("mcp", serde_json::json!({ "tools": ["lookup"] }))).is_empty(),
+            "tool-scoped bindings never apply on a Transit Point"
+        );
+        assert!(modern_delegation_warnings(&surface("a2a", serde_json::json!("all"))).is_empty(), "not MCP");
+        let mut no_auth = surface("mcp", serde_json::json!("all"));
+        no_auth
+            .transit
+            .as_mut()
+            .unwrap()
+            .points[0]
+            .source_auth = None;
+        assert!(modern_delegation_warnings(&no_auth).is_empty(), "no source_auth");
+    }
+
+    #[test]
+    fn a_variant_that_inherits_the_surfaces_transit_points_keeps_their_caller_authentication() {
+        let stored_points = serde_json::json!([
+            { "id": "keyed", "alias": "keyed", "target_endpoint": "https://keyed.example",
+                "require_transit_token": false, "source_auth": caller_key() },
+            { "id": "dropped", "alias": "dropped", "target_endpoint": "https://dropped.example",
+                "require_transit_token": true, "source_auth": caller_key() },
+            { "id": "bare", "alias": "bare", "target_endpoint": "https://bare.example",
+                "require_transit_token": true }
+        ]);
+        let mut existing = surface_with_transit_points(stored_points, serde_json::json!(null));
+        assert!(
+            existing.variants[0]
+                .overrides
+                .transit
+                .as_ref()
+                .unwrap()
+                .points
+                .is_none()
+        );
+
+        let frozen = serde_json::json!([
+            { "id": "keyed", "alias": "keyed", "target_endpoint": "https://keyed.example",
+                "require_transit_token": false },
+            { "id": "dropped", "alias": "dropped", "target_endpoint": "https://dropped.example",
+                "require_transit_token": true, "source_auth": null },
+            { "id": "bare", "alias": "bare", "target_endpoint": "https://bare.example",
+                "require_transit_token": true },
+            { "id": "variant-only", "alias": "variant-only", "target_endpoint": "https://only.example",
+                "require_transit_token": true }
+        ]);
+        let mut surface = surface_with_transit_points(frozen.clone(), frozen.clone());
+        let mut added = surface.variants[0].clone();
+        added.id = "added".to_string();
+        added.alias = "added".to_string();
+        surface.variants.push(added);
+        let sent = serde_json::json!({
+            "transit": { "points": frozen },
+            "variants": [
+                { "id": "candidate", "overrides": { "transit": { "points": frozen } } },
+                { "id": "added", "overrides": { "transit": { "points": frozen } } }
+            ]
+        });
+
+        retain_transit_caller_authentication(&mut surface, &existing, &sent);
+
+        for variant in &surface.variants {
+            let points = variant
+                .overrides
+                .transit
+                .as_ref()
+                .and_then(|transit| transit.points.as_ref())
+                .unwrap();
+            assert_eq!(
+                points[0].source_auth,
+                Some(serde_json::from_value(caller_key()).unwrap()),
+                "{}: kept from the surface's Transit Point with the same id",
+                variant.alias
+            );
+            assert!(
+                points[1]
+                    .source_auth
+                    .is_none(),
+                "{}: a null in the save removes it",
+                variant.alias
+            );
+            assert!(
+                points[2]
+                    .source_auth
+                    .is_none(),
+                "{}: nothing stored, nothing invented",
+                variant.alias
+            );
+            assert!(
+                points[3]
+                    .source_auth
+                    .is_none(),
+                "{}: a Transit Point the surface does not have keeps none",
+                variant.alias
+            );
+        }
+
+        existing.variants[0]
+            .overrides
+            .transit
+            .as_mut()
+            .unwrap()
+            .points = Some(Vec::new());
+        let mut surface = surface_with_transit_points(frozen.clone(), frozen.clone());
+        let sent = serde_json::json!({ "variants": [{ "id": "candidate", "overrides": { "transit": { "points": frozen } } }] });
+        retain_transit_caller_authentication(&mut surface, &existing, &sent);
+        assert!(
+            surface.variants[0]
+                .overrides
+                .transit
+                .as_ref()
+                .and_then(|transit| transit.points.as_ref())
+                .unwrap()[0]
+                .source_auth
+                .is_none(),
+            "a variant that stores a list of its own is matched against that list, not the surface's"
+        );
+    }
+
+    #[test]
+    fn a_put_that_omits_a_transit_points_caller_authentication_keeps_it_while_it_applies() {
+        let stored_points = serde_json::json!([
+            { "id": "keyed", "alias": "keyed", "target_endpoint": "https://keyed.example",
+                "require_transit_token": false, "source_auth": caller_key() },
+            { "id": "open", "alias": "open", "target_endpoint": "https://open.example",
+                "require_transit_token": false, "allow_unauthenticated_callers": true },
+            { "id": "reopened", "alias": "reopened", "target_endpoint": "https://reopened.example",
+                "require_transit_token": false, "allow_unauthenticated_callers": true },
+            { "id": "closed", "alias": "closed", "target_endpoint": "https://closed.example",
+                "require_transit_token": false, "allow_unauthenticated_callers": true },
+            { "id": "removed", "alias": "removed", "target_endpoint": "https://removed.example",
+                "require_transit_token": true, "source_auth": caller_key() }
+        ]);
+        let existing = surface_with_transit_points(stored_points.clone(), stored_points);
+        let sent_points = serde_json::json!([
+            { "id": "keyed", "alias": "keyed", "target_endpoint": "https://keyed.example",
+                "require_transit_token": false },
+            { "id": "open", "alias": "open", "target_endpoint": "https://open.example",
+                "require_transit_token": false },
+            { "id": "reopened", "alias": "reopened", "target_endpoint": "https://reopened.example",
+                "require_transit_token": true },
+            { "id": "closed", "alias": "closed", "target_endpoint": "https://closed.example",
+                "require_transit_token": false, "allow_unauthenticated_callers": false },
+            { "id": "removed", "alias": "removed", "target_endpoint": "https://removed.example",
+                "require_transit_token": true, "source_auth": null }
+        ]);
+        let sent = serde_json::json!({
+            "transit": { "points": sent_points },
+            "variants": [{ "id": "candidate", "overrides": { "transit": { "points": sent_points } } }]
+        });
+        let mut surface = surface_with_transit_points(sent_points.clone(), sent_points);
+
+        retain_transit_caller_authentication(&mut surface, &existing, &sent);
+
+        let variant_points = surface.variants[0]
+            .overrides
+            .transit
+            .as_ref()
+            .and_then(|transit| transit.points.clone())
+            .unwrap();
+        for points in [
+            &surface
+                .transit
+                .as_ref()
+                .unwrap()
+                .points,
+            &variant_points,
+        ] {
+            assert_eq!(points[0].source_auth, Some(serde_json::from_value(caller_key()).unwrap()), "kept");
+            assert!(points[1].allow_unauthenticated_callers, "kept while it still authenticates no caller");
+            assert!(!points[2].allow_unauthenticated_callers, "dropped once it authenticates its callers");
+            assert!(!points[3].allow_unauthenticated_callers, "a false the caller sent is honoured");
+            assert_eq!(points[4].source_auth, None, "a null the caller sent removes it");
+            for point in points {
+                assert_eq!(
+                    point
+                        .validate_caller_authentication()
+                        .is_ok(),
+                    point.alias != "closed",
+                    "{}",
+                    point.alias
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_transit_point_that_cannot_authenticate_its_callers_is_refused_on_the_surface_and_in_a_variant() {
+        let valid = serde_json::json!([{ "alias": "partner", "target_endpoint": "https://partner.example" }]);
+        let unauthenticated = serde_json::json!([{ "alias": "partner", "target_endpoint": "https://partner.example",
+                "require_transit_token": false }]);
+        let refusal = "Transit Point 'partner' authenticates no caller";
+        for (case, points, variant_points, expected) in [
+            ("on the surface", unauthenticated.clone(), valid.clone(), format!("transit.points[0]: {refusal}")),
+            (
+                "in a variant",
+                valid.clone(),
+                unauthenticated.clone(),
+                format!("variant 'candidate' transit.points[0]: {refusal}"),
+            ),
+            (
+                "an mTLS source_auth that trusts no certificate",
+                serde_json::json!([{ "alias": "partner", "target_endpoint": "https://partner.example",
+                    "source_auth": { "type": "mtls", "trust": { "type": "pinned", "certificate_ids": [] },
+                        "identity_binding": { "type": "fingerprint" } } }]),
+                valid.clone(),
+                "transit.points[0]: Channel 'callers': mTLS pinned trust requires at least one certificate_id"
+                    .to_string(),
+            ),
+        ] {
+            let mut surface = surface_with_transit_points(points, variant_points);
+            match validate_transit_points(&mut surface, 30, None) {
+                Err(SurfaceApiError::BadRequest(message)) => {
+                    assert!(message.starts_with(&expected), "{case}: {message}")
+                }
+                other => panic!("{case}: expected a 400, got {other:?}"),
+            }
+        }
+
+        let mut open = surface_with_transit_points(
+            serde_json::json!([{ "alias": "partner", "target_endpoint": "https://partner.example",
+                "require_transit_token": false, "allow_unauthenticated_callers": true }]),
+            serde_json::json!([{ "alias": "partner", "target_endpoint": "https://partner.example",
+                "require_transit_token": false, "source_auth": caller_key() }]),
+        );
+        assert!(validate_transit_points(&mut open, 30, None).is_ok());
     }
 
     fn a2a_block(
@@ -4240,6 +5147,7 @@ mod validation_tests {
             _retired_protocol_mode: Default::default(),
             mcp_http: None,
             trust_check_split: false,
+            transit_point_source_auth: false,
         }
     }
 

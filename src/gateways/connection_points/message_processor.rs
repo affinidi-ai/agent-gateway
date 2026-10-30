@@ -5296,6 +5296,10 @@ async fn process_forward_request_in_request_scope(
                     );
                     continue;
                 }
+            if crate::proxy::caller_identity::CallerHeaders::is_caller_info_header(key) {
+                channel_info!(config_id, "    Skipping caller-info header: {}", key);
+                continue;
+            }
             if header_metadata_mapping.is_some_and(|mapping| {
                 mapping.strip_mapped_headers
                     && mapping
@@ -11248,6 +11252,102 @@ mod tests {
             }
             other => panic!("expected ForwardResponse, got {other:?}"),
         }
+    }
+
+    /// The caller-info and DID identity headers a peer gateway sends, in any
+    /// case, never reach the agent behind the receiving surface; the peer's
+    /// other headers do.
+    #[tokio::test]
+    async fn fabric_receive_drops_the_caller_info_headers_a_peer_sends() {
+        use crate::surfaces::AgentSurfaceStore;
+        // Surface lookup prefers the process-global surface store, which other
+        // tests in this binary can initialise; run in a child process where it
+        // is unset, so the lookup reads this test's storage root.
+        if std::env::var_os("ATG_FABRIC_CALLER_HEADERS_CHILD").is_none() {
+            let test_name = std::thread::current()
+                .name()
+                .unwrap()
+                .to_string();
+            let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test_name, "--nocapture"])
+                .env("ATG_FABRIC_CALLER_HEADERS_CHILD", "1")
+                .env("RUST_MIN_STACK", "8388608")
+                .kill_on_drop(true)
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated fabric caller-header check failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let target = crate::component_tests::helpers::RecordingTarget::start(axum::http::StatusCode::OK, &[]).await;
+        let temp = tempfile::tempdir().unwrap();
+        let surfaces = crate::surfaces::FileSystemAgentSurfaceStore::new(
+            temp.path()
+                .join("agent_surfaces"),
+        )
+        .await
+        .unwrap();
+        let mut surface = crate::component_tests::helpers::build_minimal_channel();
+        surface.surface_id = "caller-headers".to_string();
+        surface.target.endpoint = target.url.clone();
+        surfaces
+            .save(&surface)
+            .await
+            .unwrap();
+        let mut peer = crate::gateways::types::Gateway::new(
+            "Peer".to_string(),
+            String::new(),
+            "did:web:peer.example".to_string(),
+            crate::gateways::types::GatewayType::Remote,
+        );
+        peer.status = crate::gateways::types::GatewayStatus::Active;
+        peer.exposure_mode = Some(crate::gateways::types::ExposureMode::All);
+        peer.issuer_did = Some("did:web:peer-gateway.example".to_string());
+        let _issuer_dir =
+            crate::gateways::test_helpers::install_listener_manager_with_peers(temp.path(), &[peer]).await;
+
+        let mut message = make_forward_request_msg(temp.path(), Some("did:web:peer.example"), "caller-headers");
+        message.message_body = serde_json::json!({
+            "channel_id": "caller-headers", "method": "POST", "path": "/rpc",
+            "headers": {
+                "content-type": "application/json",
+                "X-Caller-DID": "did:web:peer-sent.example",
+                "x-caller-identity-source": "verified-presentation",
+                "X-Caller-Dna-Uai": "uai:peer-sent",
+                "x-gateway-did": "did:web:peer-sent-gateway.example",
+                "X-DID-Identity": "did:web:peer-sent-surface.example",
+                "X-Did-Signed-Identity": "{\"id\":\"did:web:peer-sent-surface.example\"}",
+                "x-peer-context": "kept"
+            },
+            "body": {"jsonrpc": "2.0", "method": "test", "id": 1}
+        });
+        let response = forward_response(&message).await;
+        assert_eq!(response["status"], 200, "{response}");
+
+        let received = target.received();
+        assert_eq!(received.len(), 1, "{response}");
+        for name in [
+            "x-caller-did",
+            "x-caller-identity-source",
+            "x-caller-dna-uai",
+            "x-gateway-did",
+            "x-did-identity",
+            "x-did-signed-identity",
+        ] {
+            assert!(
+                received[0]
+                    .get(name)
+                    .is_none(),
+                "{name} reached the agent: {:?}",
+                received[0]
+            );
+        }
+        assert_eq!(received[0]["x-peer-context"], "kept");
     }
 
     #[tokio::test]

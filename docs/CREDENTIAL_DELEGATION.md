@@ -137,6 +137,38 @@ way. So the managed agent can neither supply nor replace a credential, and a del
 credential under the same name as `target_auth` replaces it; give them different names to
 send both.
 
+### The caller on a Transit Point
+
+A Transit Point looks a grant up by the caller's identity hash and the managed agent's DID.
+The caller is the transit token's when the request carries a valid transit token, and it has
+no caller when that token carries no `user_identity_hash`: the request is refused with `403`,
+and the client the Transit Point authenticated is not used instead. When the request carries
+no valid transit token and the Transit Point's own `source_auth` verified the caller (see
+[`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-point-source-authentication)), it is that caller's
+[identity hash](#the-callers-identity-hash), the value the Access Point computes for a caller
+it authenticated the same way. So:
+
+- an agent that calls the Transit Point with a JWT from the same issuer, for the same `sub`,
+  as a user who consented through the Access Point is given that user's grant; a JWT from
+  another issuer, or the same name verified another way, is another caller;
+- an API-key caller is one identity: every request with a key from the same `api_key`
+  secret, or with the same `api_key_provider` key, shares one set of grants;
+- a JWT without a `sub` names no caller and is given no grant.
+
+A caller verified by a resource access token (`mcp_http.authorization`) keys a grant only on
+a `2026-07-28` MCP request, and a `2026-07-28` MCP request keys a grant only that way. A
+Transit Point cannot have both a resource access token and `source_auth`, so when the
+surface has an outbound credential binding for every request (`required_for: all`), every
+`2026-07-28` MCP request to a Transit Point whose caller `source_auth` verified, or that a
+transit token alone names, is refused with `403` and JSON-RPC error `-32001`, whatever its
+method, `tools/list` included, and never reaches the target; a save of such a Transit Point
+answers with a `Warning` header. Bindings scoped to tools never apply on a Transit Point, so a
+surface with only those sends the request on without delegated credentials. Such a caller
+uses delegated credentials on legacy MCP, A2A and HTTP requests. The agent half of the key is the Transit Point's
+[managed identity](SOURCE_AUTH.md#managed-identity), else the caller DID the transit token
+carries, so a `source_auth` caller without a transit token needs a managed identity for the
+Transit Point.
+
 ## Target authentication from a credential provider
 
 A Target's `target.auth` or a Transit Point's `target_auth` can take its credential from a
@@ -221,11 +253,13 @@ credentials unavailable`) carrying the request's id, otherwise an `application/p
 body. The delegation audit records the binding's outcome, and `provider_unavailable` names a
 provider that cannot be used.
 
-A Transit Point refuses such a request with `503`, and also refuses with `403` one whose
-transit token carries no caller identity, including every request to a Transit Point that sets
-`require_transit_token: false` (a valid transit token sent there names the caller to policy
-only, not to delegation), or for which neither its managed identity nor the transit
-token's caller DID gives the agent half of the vault key. It also refuses when its delegation
+A Transit Point refuses such a request with `503`, and also refuses with `403` one that names
+no caller, because neither a transit token with a caller identity nor the Transit Point's
+`source_auth` identifies one. That includes every request to a Transit Point that serves callers it
+does not authenticate and every request to one that sets `require_transit_token: false` without
+`source_auth` (a valid transit token sent there names the caller to policy only, not to
+delegation), or for which neither its managed identity nor the transit token's caller DID gives
+the agent half of the vault key. It also refuses when its delegation
 stores are not available. An MCP Transit Point answers with a JSON-RPC error (`-32603` for
 `503`, `-32001` for `403`) carrying the request's id, and any other Transit Point with an
 `application/problem+json` body. A missing token still gets the consent answer above. A
@@ -331,13 +365,14 @@ certificate identity therefore shares one set of delegated tokens.
 | `api_key` | `api_key` | `""` | The `secret_id` |
 | `api_key_provider` | `api_key_provider` | The API Key Provider agent id | The key's id |
 | `did_auth` | `did_auth` | `""` | The DID |
-| `mtls` | `mtls` | The lowercase hex SHA-256 of the certificate the client certificate was verified against: the configured CA certificate its chain ends at, or with pinned trust the pinned certificate | The principal the `identity_binding` derives |
+| `mtls` | `mtls` | The lowercase hex SHA-256 of the subject and public key of the CA certificate its chain ends at, or with pinned trust of the pinned certificate | The principal the `identity_binding` derives |
 
 `tenant` is the surface's `tenant_id`, or `null` on a surface with none. The same subject named
 by another method, issuer, API Key Provider agent or tenant is therefore another caller, with
-grants of its own. An mTLS caller is keyed by the certificate the gateway trusted, not by the
-issuer name its certificate states, so replacing a trusted CA certificate, or a pinned
-certificate, gives its callers new identity hashes. A JWT without a non-empty `sub`, or without an `iss`, names no caller: it has
+grants of its own. An mTLS caller is keyed by the subject and key of the CA the gateway trusted, not by the
+issuer name its certificate states, so renewing a CA with the same subject and key keeps its callers' identity
+hashes, and a CA with another key gives them new ones. With pinned trust, replacing a pinned
+certificate gives its caller a new hash. A JWT without a non-empty `sub`, or without an `iss`, names no caller: it has
 no identity hash, so it is given no delegated credential: an Access Point answers `403`
 `identity-required`, and a Transit Point `403`.
 
@@ -349,6 +384,14 @@ puts it in `user_hash`. To compute it for a JWT subject `alice` from
 ```sh
 printf '%s' '["jwt_bearer","https://login.example.com",null,"alice"]' | shasum -a 256
 ```
+
+Delegated credentials stored by a release that keyed them by an earlier form of the identity
+hash are never looked up again, but their access and refresh tokens stay in the vault until
+they are removed. After upgrading, list the vault (`GET /api/v1/delegation-vault`, or the
+Credential Tokens tab on the dashboard's Credentials page) and revoke each entry created before
+the upgrade (`DELETE /api/v1/delegation-vault/{id}`, or its delete button), except service tokens (those under
+`__client_credentials__`, `__mcp_client_credentials__:` or `__target_auth__:`), which are unchanged. Users connect their accounts again the next time
+a credential is needed.
 
 Service tokens have no user, so a legacy binding caches them under the fixed user hash
 `__client_credentials__`, a `2026-07-28` binding under `__mcp_client_credentials__:<provider

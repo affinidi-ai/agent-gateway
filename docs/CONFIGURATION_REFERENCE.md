@@ -200,6 +200,17 @@ storage unencrypted.
 One listener can serve several Access Points, and one transit listener several Transit
 Points. A request is matched to its surface by route.
 
+An outbound listener's `bind_address` and `external_urls` also decide whether its Transit
+Points are reachable from other hosts: a bind address other than loopback, or an external URL
+whose host is not `localhost` or a loopback or unspecified address (private addresses
+included), makes them so, and so does the same on an inbound listener that shares a host name
+with it, because that inbound listener passes `/outbound/...` requests on to it. A Transit
+Point that serves callers it does not authenticate and is reachable that way is reported in
+the admin API's answer and the log. A Transit Point that authenticates callers by
+client certificate takes the certificate from the outbound listener's own TLS handshake or
+from a proxy in `tls.client_auth.trusted_proxies`, never through an inbound listener. See
+[`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-point-callers).
+
 ![An inbound listener route-matching to two Access Points, and an outbound listener route-matching to two Transit Points](assets/diagrams/listeners-route-matching.png)
 
 The type is [`NetworkConfig`](../src/config/network.rs). Surfaces themselves are stored

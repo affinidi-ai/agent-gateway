@@ -203,6 +203,18 @@ pub async fn prepare_direct(
     .await
 }
 
+/// Whether any of the surface's outbound credential bindings applies to a
+/// request through a Transit Point. A binding scoped to tools never does: a
+/// partner upstream names its own tools. A request that none applies to is
+/// sent without delegated credentials, with no caller or authorization to
+/// check.
+pub fn transit_point_bindings_apply(surface: &crate::config::agent_surface::AgentSurface) -> bool {
+    surface
+        .outbound_credentials
+        .iter()
+        .any(|config| matches!(config.required_for, CredentialRequirement::All))
+}
+
 pub async fn prepare_transit(
     state: &crate::state::OutboundProxyState,
     runtime: &crate::mcp::continuations::config::ContinuationRuntime,

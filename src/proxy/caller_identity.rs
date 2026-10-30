@@ -164,6 +164,34 @@ impl CallerHeaders {
     /// The Agent Gateway's own DID (omitted when not configured).
     pub const GATEWAY_DID: &'static str = "x-gateway-did";
 
+    /// The surface's DID:webvh identity, in the `header` DID injection mode.
+    pub const DID_IDENTITY: &'static str = "x-did-identity";
+
+    /// The surface's DID:webvh document, in the `signed_header` DID injection mode.
+    pub const DID_SIGNED_IDENTITY: &'static str = "x-did-signed-identity";
+
+    /// Every header the gateway sets about the caller or itself on a request to
+    /// a managed agent: the caller-info headers [`Self::build`] makes and the
+    /// DID identity headers. Only the gateway sets these.
+    pub const NAMES: [&'static str; 6] = [
+        Self::CALLER_DID,
+        Self::CALLER_IDENTITY_SOURCE,
+        Self::CALLER_DNA_UAI,
+        Self::GATEWAY_DID,
+        Self::DID_IDENTITY,
+        Self::DID_SIGNED_IDENTITY,
+    ];
+
+    /// Whether `name` is one of [`Self::NAMES`], in any case. The Access Point,
+    /// Fabric receive and Transit Point request filters drop these from what a
+    /// caller or a peer gateway sent, so an agent or a Transit Point's target
+    /// sees only the values the gateway sets.
+    pub fn is_caller_info_header(name: &str) -> bool {
+        Self::NAMES
+            .iter()
+            .any(|reserved| name.eq_ignore_ascii_case(reserved))
+    }
+
     /// Build the caller-info header set from a [`CallerIdentity`].
     ///
     /// Returns a `Vec<(name, value)>` suitable for appending to an outgoing
@@ -530,5 +558,24 @@ mod tests {
         assert_eq!(CallerHeaders::CALLER_IDENTITY_SOURCE, "x-caller-identity-source");
         assert_eq!(CallerHeaders::CALLER_DNA_UAI, "x-caller-dna-uai");
         assert_eq!(CallerHeaders::GATEWAY_DID, "x-gateway-did");
+    }
+
+    /// Every header the gateway builds, and each DID identity header it sets,
+    /// is a caller-info header, in any case, and no other header is.
+    #[test]
+    fn every_header_the_gateway_builds_is_a_caller_info_header() {
+        let identity = make_identity(IdentitySource::SelfPresented);
+        let built = CallerHeaders::build(&identity, Some("did:web:gateway.example"));
+        for name in built
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .chain([CallerHeaders::CALLER_DNA_UAI, "X-DID-Identity", "X-DID-Signed-Identity"])
+        {
+            assert!(CallerHeaders::is_caller_info_header(name), "{name}");
+            assert!(CallerHeaders::is_caller_info_header(&name.to_uppercase()), "{name}");
+        }
+        for other in ["x-caller-context", "x-caller", "x-gateway-trace-id", "authorization"] {
+            assert!(!CallerHeaders::is_caller_info_header(other), "{other}");
+        }
     }
 }

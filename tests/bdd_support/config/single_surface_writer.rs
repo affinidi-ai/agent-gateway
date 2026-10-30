@@ -102,6 +102,11 @@ fn transit_point_json(
         "listen_path": format!("/transit/{}", transit_point.alias),
         "require_transit_token": transit_point.require_transit_token
     });
+    if let Some(source_auth) = &transit_point.source_auth {
+        transit_point_json["source_auth"] = source_auth.clone();
+    } else if !transit_point.require_transit_token && transit_point.allow_unauthenticated_callers {
+        transit_point_json["allow_unauthenticated_callers"] = serde_json::json!(true);
+    }
     if let Some(binding) = delegation_binding
         && transit_point.delegated_credentials
     {

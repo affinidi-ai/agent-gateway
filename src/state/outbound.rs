@@ -58,6 +58,8 @@ pub struct OutboundProxyState {
     /// Credential provider store — resolves provider metadata for OAuth flows.
     pub credential_provider_store: Option<Arc<dyn crate::credential_providers::storage::CredentialProviderStorage>>,
     pub consent_identity_strategies: Option<Arc<dyn crate::jwt_bearer::JwtVerificationStrategyStorage>>,
+    /// Authenticates a Transit Point's callers with its `source_auth`.
+    pub source_auth_middleware: Option<Arc<crate::source_auth::SourceAuthMiddleware>>,
     pub mcp_continuations: Option<Arc<crate::mcp::continuations::config::ContinuationRuntime>>,
     /// Gateway base URL — for building OAuth authorization URLs.
     pub gateway_base_url: Option<String>,

@@ -126,6 +126,15 @@ pub struct AgentSurface {
     /// and without it is converted on load.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub trust_check_split: bool,
+
+    /// Whether a Transit Point of this surface, on the base or in a variant,
+    /// authenticates its callers with its own `source_auth`. Stored while one
+    /// does, so a release that predates Transit Point `source_auth`, which
+    /// would serve that Transit Point without it, refuses to load the surface.
+    /// The gateway sets it on every save and on load; a value a write sends is
+    /// ignored.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub transit_point_source_auth: bool,
 }
 
 /// Three independent identity slots covering the proxy pipeline edges.
@@ -1136,8 +1145,9 @@ pub struct SharedTransitConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opa_policy_definition_id: Option<String>,
 
-    /// Not enforced. The admin API refuses a surface that sets it, and one
-    /// stored with it has every Transit Point request refused.
+    /// Not enforced: a Transit Point authenticates its callers with its own
+    /// [`TransitPoint::source_auth`]. The admin API refuses a surface that sets
+    /// it, and one stored with it has every Transit Point request refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_auth: Option<SourceAuthConfig>,
 }
@@ -1197,8 +1207,7 @@ impl SharedTransitConfig {
 /// Why a surface that sets [`SharedTransitConfig::source_auth`] is refused by the
 /// admin API, and has every Transit Point request refused when it is loaded.
 pub const TRANSIT_SOURCE_AUTH_REFUSED: &str = "transit.source_auth is not enforced, so a surface that sets it has \
-     every Transit Point request refused; remove it, and authenticate Transit Point callers with \
-     require_transit_token and, on an MCP Transit Point, mcp_http.authorization";
+     every Transit Point request refused; remove it, and set source_auth on each Transit Point instead";
 
 /// How the transit token carries caller context.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -1362,6 +1371,20 @@ pub struct TransitPoint {
     #[serde(default = "default_true")]
     pub require_transit_token: bool,
 
+    /// Authenticates the caller of every request to this Transit Point, as
+    /// source authentication does on an Access Point, before anything else
+    /// runs. [`Self::unenforceable_caller_authentication`] lists the methods a
+    /// Transit Point supports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_auth: Option<SourceAuthConfig>,
+
+    /// Serves callers this Transit Point does not authenticate. A Transit
+    /// Point that neither requires a transit token nor sets
+    /// `mcp_http.authorization` or `source_auth` refuses every request unless
+    /// this is set, and only such a Transit Point may set it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_unauthenticated_callers: bool,
+
     /// Extension inspection for A2A requests from the managed agent to
     /// transit point. When `enabled = true` (the default), the
     /// outbound pipeline rejects any A2A call that does not carry all
@@ -1396,6 +1419,80 @@ impl TransitPoint {
         self.target_endpoint
             .starts_with("fabric://")
             && !self.fabric_delegated_credentials
+    }
+
+    /// Whether this Transit Point authenticates its callers: with a transit
+    /// token, `mcp_http.authorization` or `source_auth`.
+    pub fn authenticates_callers(&self) -> bool {
+        self.require_transit_token
+            || self
+                .mcp_http
+                .as_ref()
+                .is_some_and(|http| http.authorization.is_some())
+            || self.source_auth.is_some()
+    }
+
+    /// Why every request to this Transit Point is refused, when how it
+    /// authenticates its callers cannot be enforced: it authenticates none
+    /// and does not allow unauthenticated callers, it sets both `source_auth`
+    /// and `mcp_http.authorization`, or its `source_auth` is not one a Transit
+    /// Point supports. A Transit Point supports `api_key` and
+    /// `api_key_provider` read from an HTTP header, `jwt_bearer` that does not
+    /// forward the caller's token, and `mtls`.
+    pub fn unenforceable_caller_authentication(&self) -> Option<String> {
+        let alias = &self.alias;
+        let Some(source_auth) = &self.source_auth else {
+            return (!self.authenticates_callers() && !self.allow_unauthenticated_callers).then(|| {
+                format!(
+                    "Transit Point '{alias}' authenticates no caller: require a transit token, set source_auth \
+                     or mcp_http.authorization, or set allow_unauthenticated_callers to serve callers it does not \
+                     authenticate"
+                )
+            });
+        };
+        if self
+            .mcp_http
+            .as_ref()
+            .is_some_and(|http| http.authorization.is_some())
+        {
+            return Some(format!("Transit Point '{alias}' sets both source_auth and mcp_http.authorization; keep one"));
+        }
+        if !transit_point_supports_source_auth(source_auth) {
+            return Some(format!(
+                "Transit Point '{alias}' source_auth must be api_key or api_key_provider read from an HTTP header, \
+                 jwt_bearer without forward_header, or mtls"
+            ));
+        }
+        match source_auth {
+            SourceAuthConfig::JwtBearer(config)
+                if config
+                    .audiences
+                    .iter()
+                    .all(|audience| audience.trim().is_empty()) =>
+            {
+                Some(format!(
+                    "Transit Point '{alias}' source_auth jwt_bearer must name the audiences it accepts, so a token \
+                     issued for another service, such as the Access Point, is refused"
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// Refuses a Transit Point whose caller authentication cannot be enforced
+    /// ([`Self::unenforceable_caller_authentication`]), or that sets
+    /// `allow_unauthenticated_callers` while it authenticates its callers.
+    pub fn validate_caller_authentication(&self) -> Result<(), String> {
+        if let Some(reason) = self.unenforceable_caller_authentication() {
+            return Err(reason);
+        }
+        if self.allow_unauthenticated_callers && self.authenticates_callers() {
+            return Err(format!(
+                "Transit Point '{}' sets allow_unauthenticated_callers but authenticates its callers; remove it",
+                self.alias
+            ));
+        }
+        Ok(())
     }
 
     fn new_id() -> String {
@@ -1447,6 +1544,21 @@ impl TransitPoint {
                 .as_ref(),
             matches!(self.protocol, TransitProtocol::A2a | TransitProtocol::Ap2),
         )
+    }
+}
+
+/// A Transit Point reads a caller's credential from a header and never forwards
+/// it, and it serves no DID Auth challenge.
+fn transit_point_supports_source_auth(source_auth: &SourceAuthConfig) -> bool {
+    use crate::source_auth::models::CredentialExtraction;
+    match source_auth {
+        SourceAuthConfig::ApiKey(config) => matches!(config.extraction, CredentialExtraction::HttpHeader { .. }),
+        SourceAuthConfig::ApiKeyProvider(config) => {
+            matches!(config.extraction, CredentialExtraction::HttpHeader { .. })
+        }
+        SourceAuthConfig::JwtBearer(config) => !config.forward_header,
+        SourceAuthConfig::Mtls(_) => true,
+        SourceAuthConfig::DidAuth(_) => false,
     }
 }
 
@@ -1680,7 +1792,50 @@ impl StorableEntity for AgentSurface {
         let stripped = strip_legacy_trust_registry_fields(value);
         let split = split_target_trust_checks_per_transit_point(value);
         warn_target_lists_that_cannot_run(value);
-        Ok(stripped || split)
+        let marked = mark_transit_point_source_auth(value);
+        Ok(stripped || split || marked)
+    }
+}
+
+/// Keep a stored surface's `transit_point_source_auth` in step with its
+/// Transit Points (see [`AgentSurface::has_transit_point_source_auth`]), so a
+/// surface file written outside the API is marked when it is first loaded and
+/// re-persisted. A Surface Template's surface snapshot is marked the same way.
+/// Returns whether the record changed.
+pub(crate) fn mark_transit_point_source_auth(value: &mut serde_json::Value) -> bool {
+    let any_source_auth = |points: Option<&serde_json::Value>| {
+        points
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|points| {
+                points.iter().any(|point| {
+                    point
+                        .get("source_auth")
+                        .is_some_and(|source_auth| !source_auth.is_null())
+                })
+            })
+    };
+    let uses_source_auth = any_source_auth(value.pointer("/transit/points"))
+        || value
+            .get("variants")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|variants| {
+                variants
+                    .iter()
+                    .any(|variant| any_source_auth(variant.pointer("/overrides/transit/points")))
+            });
+    let Some(obj) = value.as_object_mut() else {
+        return false;
+    };
+    let marked = obj.get("transit_point_source_auth") == Some(&serde_json::Value::Bool(true));
+    match (uses_source_auth, marked) {
+        (true, false) => {
+            obj.insert("transit_point_source_auth".to_string(), serde_json::Value::Bool(true));
+            true
+        }
+        (false, true) => obj
+            .remove("transit_point_source_auth")
+            .is_some(),
+        _ => false,
     }
 }
 
@@ -2655,6 +2810,31 @@ impl AgentSurface {
     /// instead of loading it with no checks.
     pub fn has_trust_check_lists(&self) -> bool {
         self.has_target_trust_checks() || self.has_transit_point_trust_checks()
+    }
+
+    /// Whether any Transit Point, on the base or in a variant override,
+    /// authenticates its callers with its own `source_auth`. Such a surface is
+    /// stored with `transit_point_source_auth: true`.
+    pub fn has_transit_point_source_auth(&self) -> bool {
+        let any_source_auth = |points: &[TransitPoint]| {
+            points
+                .iter()
+                .any(|point| point.source_auth.is_some())
+        };
+        self.transit
+            .as_ref()
+            .is_some_and(|transit| any_source_auth(&transit.points))
+            || self
+                .variants
+                .iter()
+                .any(|variant| {
+                    variant
+                        .overrides
+                        .transit
+                        .as_ref()
+                        .and_then(|transit| transit.points.as_deref())
+                        .is_some_and(any_source_auth)
+                })
     }
 
     /// True when the Target is an A2A proxy (`a2a-proxy://`).
@@ -4709,6 +4889,7 @@ mod tests {
             _retired_protocol_mode: Default::default(),
             mcp_http: None,
             trust_check_split: false,
+            transit_point_source_auth: false,
         };
 
         assert_eq!(surface.base_url("gw.example.com"), "https://gw.example.com:8443/agents/sales");
@@ -4801,6 +4982,8 @@ mod tests {
                         listen_address: None,
                         listen_path: None,
                         require_transit_token: true,
+                        source_auth: None,
+                        allow_unauthenticated_callers: false,
                         extension_inspection: crate::config::types::ExtensionInspectionConfig::default(),
                         fabric_delegated_credentials: false,
                         trust_check_list: Vec::new(),
@@ -4830,6 +5013,8 @@ mod tests {
                         listen_address: None,
                         listen_path: None,
                         require_transit_token: true,
+                        source_auth: None,
+                        allow_unauthenticated_callers: false,
                         extension_inspection: crate::config::types::ExtensionInspectionConfig::default(),
                         fabric_delegated_credentials: false,
                         trust_check_list: Vec::new(),
@@ -4848,6 +5033,7 @@ mod tests {
             _retired_protocol_mode: Default::default(),
             mcp_http: None,
             trust_check_split: false,
+            transit_point_source_auth: false,
         };
 
         assert!(
@@ -6336,6 +6522,7 @@ mod tests {
             _retired_protocol_mode: Default::default(),
             mcp_http: None,
             trust_check_split: false,
+            transit_point_source_auth: false,
         };
         let value = serde_json::to_value(&surface).expect("surface must serialize");
         assert_eq!(value["issuer_id"], serde_json::json!("issuer-42"));
@@ -6842,6 +7029,291 @@ mod transit_token_lifetime_tests {
                 .unwrap()
                 .transit_token_lifetime_secs(),
             600
+        );
+    }
+}
+
+#[cfg(test)]
+mod transit_point_caller_authentication_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn point(fields: serde_json::Value) -> TransitPoint {
+        let mut point = json!({ "alias": "partner", "target_endpoint": "https://partner.example/mcp" });
+        point
+            .as_object_mut()
+            .unwrap()
+            .extend(
+                fields
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            );
+        serde_json::from_value(point).unwrap()
+    }
+
+    fn api_key() -> serde_json::Value {
+        json!({
+            "type": "api_key", "extraction": { "source": "http_header", "field": "X-API-Key" },
+            "secret_id": "partner-callers"
+        })
+    }
+
+    fn resource_token() -> serde_json::Value {
+        json!({ "authorization": { "resource": "https://outbound.example/outbound/route/partner" } })
+    }
+
+    const NO_CALLER: &str = "Transit Point 'partner' authenticates no caller: require a transit token, set \
+        source_auth or mcp_http.authorization, or set allow_unauthenticated_callers to serve callers it does not \
+        authenticate";
+
+    #[test]
+    fn a_transit_point_authenticates_its_callers_with_any_one_mechanism() {
+        for (case, fields) in [
+            ("transit token by default", json!({})),
+            ("transit token", json!({ "require_transit_token": true })),
+            (
+                "resource token",
+                json!({ "require_transit_token": false, "protocol": "mcp", "mcp_http": resource_token() }),
+            ),
+            ("API key", json!({ "require_transit_token": false, "source_auth": api_key() })),
+            (
+                "API Key Provider",
+                json!({ "require_transit_token": false, "source_auth": {
+                    "type": "api_key_provider", "extraction": { "source": "http_header", "field": "X-API-Key" },
+                    "agent_id": "partner-agent"
+                }}),
+            ),
+            (
+                "JWT bearer",
+                json!({ "require_transit_token": false, "source_auth": {
+                    "type": "jwt_bearer", "jwt_verification_strategy_id": "entra", "audiences": ["api://partner"]
+                }}),
+            ),
+            (
+                "mTLS",
+                json!({ "require_transit_token": false, "source_auth": {
+                    "type": "mtls", "trust": { "type": "ca", "ca_certificate_ids": ["partner-ca"] },
+                    "identity_binding": { "type": "subject_cn" }
+                }}),
+            ),
+            ("transit token and API key", json!({ "source_auth": api_key() })),
+        ] {
+            let point = point(fields);
+            assert!(point.authenticates_callers(), "{case}");
+            assert_eq!(point.unenforceable_caller_authentication(), None, "{case}");
+            assert_eq!(point.validate_caller_authentication(), Ok(()), "{case}");
+        }
+    }
+
+    #[test]
+    fn a_transit_point_that_authenticates_no_caller_must_be_marked_open() {
+        let closed = point(json!({ "require_transit_token": false }));
+        assert!(!closed.authenticates_callers());
+        assert_eq!(closed.unenforceable_caller_authentication(), Some(NO_CALLER.to_string()));
+        assert_eq!(closed.validate_caller_authentication(), Err(NO_CALLER.to_string()));
+
+        let open = point(json!({ "require_transit_token": false, "allow_unauthenticated_callers": true }));
+        assert_eq!(open.unenforceable_caller_authentication(), None);
+        assert_eq!(open.validate_caller_authentication(), Ok(()));
+    }
+
+    #[test]
+    fn marking_open_a_transit_point_that_authenticates_its_callers_is_refused() {
+        for fields in [
+            json!({ "allow_unauthenticated_callers": true }),
+            json!({ "require_transit_token": false, "allow_unauthenticated_callers": true, "source_auth": api_key() }),
+        ] {
+            let point = point(fields);
+            assert_eq!(point.unenforceable_caller_authentication(), None, "it still authenticates its callers");
+            assert_eq!(
+                point.validate_caller_authentication(),
+                Err("Transit Point 'partner' sets allow_unauthenticated_callers but authenticates its callers; \
+                     remove it"
+                    .to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn source_auth_a_transit_point_cannot_enforce_is_refused() {
+        let unsupported = "Transit Point 'partner' source_auth must be api_key or api_key_provider read from an HTTP \
+                           header, jwt_bearer without forward_header, or mtls";
+        for (case, source_auth, expected) in [
+            (
+                "DID Auth",
+                json!({ "type": "did_auth", "extraction": { "source": "http_header", "field": "X-Session" } }),
+                unsupported,
+            ),
+            (
+                "a forwarded JWT",
+                json!({ "type": "jwt_bearer", "jwt_verification_strategy_id": "entra", "audiences": [],
+                    "forward_header": true }),
+                unsupported,
+            ),
+            (
+                "an API key read from MCP _meta",
+                json!({ "type": "api_key", "extraction": { "source": "mcp_meta" }, "secret_id": "partner-callers" }),
+                unsupported,
+            ),
+        ] {
+            let point = point(json!({ "require_transit_token": false, "source_auth": source_auth }));
+            assert_eq!(point.unenforceable_caller_authentication(), Some(expected.to_string()), "{case}");
+            assert_eq!(point.validate_caller_authentication(), Err(expected.to_string()), "{case}");
+        }
+
+        let both = point(json!({
+            "require_transit_token": false, "protocol": "mcp", "mcp_http": resource_token(), "source_auth": api_key()
+        }));
+        let refusal = "Transit Point 'partner' sets both source_auth and mcp_http.authorization; keep one";
+        assert_eq!(both.unenforceable_caller_authentication(), Some(refusal.to_string()));
+        assert_eq!(both.validate_caller_authentication(), Err(refusal.to_string()));
+
+        let no_audience = "Transit Point 'partner' source_auth jwt_bearer must name the audiences it accepts, so a \
+                           token issued for another service, such as the Access Point, is refused";
+        for audiences in [json!([]), json!(["", "  "])] {
+            let point = point(json!({ "require_transit_token": false, "source_auth": {
+                "type": "jwt_bearer", "jwt_verification_strategy_id": "entra", "audiences": audiences
+            }}));
+            assert_eq!(point.unenforceable_caller_authentication(), Some(no_audience.to_string()), "{audiences}");
+        }
+        let named = point(json!({ "require_transit_token": false, "source_auth": {
+            "type": "jwt_bearer", "jwt_verification_strategy_id": "entra", "audiences": ["api://crm-transit"]
+        }}));
+        assert_eq!(named.unenforceable_caller_authentication(), None);
+    }
+
+    #[test]
+    fn source_auth_and_the_open_flag_are_stored_only_when_set() {
+        let stored = serde_json::to_value(point(json!({}))).unwrap();
+        assert!(
+            stored
+                .get("source_auth")
+                .is_none(),
+            "{stored}"
+        );
+        assert!(
+            stored
+                .get("allow_unauthenticated_callers")
+                .is_none(),
+            "{stored}"
+        );
+
+        let stored = serde_json::to_value(point(json!({
+            "require_transit_token": false, "allow_unauthenticated_callers": true
+        })))
+        .unwrap();
+        assert_eq!(stored["allow_unauthenticated_callers"], true);
+    }
+
+    /// A stored surface whose Transit Point uses `source_auth`, on the base or
+    /// only in a variant, is marked when loaded so an older release refuses it,
+    /// and the mark is removed once no Transit Point uses `source_auth`.
+    #[test]
+    fn a_loaded_surface_is_marked_while_a_transit_point_uses_source_auth() {
+        let stored = |base: serde_json::Value, variant: Option<serde_json::Value>, marked: bool| {
+            let mut surface = json!({
+                "name": "callers",
+                "access_point": { "listen_address": "0.0.0.0:8443", "route": "/callers", "protocol": "a2a" },
+                "target": { "endpoint": "https://agent.internal" },
+                "transit": { "points": [base] }
+            });
+            if let Some(point) = variant {
+                surface["variants"] = json!([{ "id": "v", "alias": "dev", "name": "dev",
+                    "overrides": { "transit": { "points": [point] } } }]);
+            }
+            if marked {
+                surface["transit_point_source_auth"] = json!(true);
+            }
+            surface
+        };
+        let keyed =
+            json!({ "alias": "partner", "target_endpoint": "https://partner.example", "source_auth": api_key() });
+        let tokened = json!({ "alias": "partner", "target_endpoint": "https://partner.example" });
+
+        for (case, mut record) in [
+            ("base", stored(keyed.clone(), None, false)),
+            ("variant only", stored(tokened.clone(), Some(keyed.clone()), false)),
+        ] {
+            assert!(AgentSurface::migrate_raw_json(&mut record).unwrap(), "{case}: re-persisted");
+            assert_eq!(record["transit_point_source_auth"], true, "{case}");
+            let loaded: AgentSurface = serde_json::from_value(record.clone()).unwrap();
+            assert!(loaded.transit_point_source_auth && loaded.has_transit_point_source_auth(), "{case}");
+            let mut again = record.clone();
+            assert!(!AgentSurface::migrate_raw_json(&mut again).unwrap(), "{case}: already marked");
+            assert_eq!(
+                serde_json::to_value(&loaded).unwrap()["transit_point_source_auth"],
+                true,
+                "{case}: a save keeps the mark"
+            );
+        }
+
+        let mut unused = stored(tokened.clone(), None, true);
+        assert!(AgentSurface::migrate_raw_json(&mut unused).unwrap());
+        assert!(
+            unused
+                .get("transit_point_source_auth")
+                .is_none(),
+            "{unused}"
+        );
+        let mut plain = stored(tokened, None, false);
+        assert!(!AgentSurface::migrate_raw_json(&mut plain).unwrap());
+        assert!(
+            plain
+                .get("transit_point_source_auth")
+                .is_none()
+        );
+
+        let mut renamed = stored(keyed, None, true);
+        let marker = renamed
+            .as_object_mut()
+            .unwrap()
+            .remove("transit_point_source_auth")
+            .unwrap();
+        renamed["a_field_this_release_does_not_know"] = marker;
+        assert!(
+            serde_json::from_value::<AgentSurface>(renamed).is_err(),
+            "a surface is refused for a top-level field its release does not know, which is what makes an older \
+             release refuse the mark"
+        );
+    }
+
+    #[test]
+    fn a_loaded_surface_warns_of_each_transit_point_whose_caller_authentication_cannot_be_enforced() {
+        let surface: AgentSurface = serde_json::from_value(json!({
+            "name": "callers",
+            "access_point": { "listen_address": "0.0.0.0:8443", "route": "/callers", "protocol": "a2a" },
+            "target": { "endpoint": "https://agent.internal" },
+            "transit": {
+                "outbound_listen_address": "http://localhost:9111",
+                "points": [
+                    { "alias": "partner", "target_endpoint": "https://partner.example", "require_transit_token": false },
+                    { "alias": "open", "target_endpoint": "https://open.example", "require_transit_token": false,
+                        "allow_unauthenticated_callers": true },
+                    { "alias": "both", "target_endpoint": "https://both.example",
+                        "allow_unauthenticated_callers": true },
+                    { "alias": "keyed", "target_endpoint": "https://keyed.example", "require_transit_token": false,
+                        "source_auth": api_key() }
+                ]
+            },
+            "variants": [{ "id": "candidate", "alias": "candidate", "name": "Candidate", "overrides": {
+                "transit": { "points": [
+                    { "alias": "partner", "target_endpoint": "https://partner.example", "require_transit_token": false },
+                    { "alias": "keyed", "target_endpoint": "https://keyed.example", "require_transit_token": false,
+                        "source_auth": api_key() }
+                ] }
+            }}]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            surface.validate_outbound(),
+            vec![
+                format!("{NO_CALLER}; every request to it is refused"),
+                "Transit Point 'both' sets allow_unauthenticated_callers but authenticates its callers; remove it"
+                    .to_string(),
+                format!("variant 'candidate': {NO_CALLER}; every request to it is refused"),
+            ]
         );
     }
 }

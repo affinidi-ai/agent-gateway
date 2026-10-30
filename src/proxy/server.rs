@@ -242,6 +242,187 @@ pub(crate) fn find_shared_outbound_listener(
         })
 }
 
+/// Whether the inbound listener's `/outbound` proxy passes `header` to the
+/// outbound listener: every header but hop-by-hop ones, `host`, and the
+/// forwarded client certificate header. The outbound listener sees this
+/// gateway as the peer, so it would take a certificate in that header, which
+/// this hop never verified, as one a trusted proxy forwarded. Unlike
+/// `should_forward_request_header` it keeps `x-transit-token`, which the
+/// Transit Point checks.
+fn shared_domain_proxy_forwards(
+    header: &str,
+    forwarded_cert_header: &str,
+) -> bool {
+    let header = header.to_ascii_lowercase();
+    !crate::a2a::is_hop_by_hop_header(&header)
+        && header != "host"
+        && !header.eq_ignore_ascii_case(forwarded_cert_header)
+}
+
+/// Whether callers on other hosts can use `url`: its host is not `localhost`
+/// or a loopback or unspecified address. A private or link-local address
+/// counts, as every workload on that network reaches it; so does any other
+/// host name, and a URL that does not parse.
+fn reachable_from_other_hosts(url: &str) -> bool {
+    let Some(host) = url::Url::parse(url)
+        .ok()
+        .and_then(|url| {
+            url.host()
+                .map(|host| host.to_owned())
+        })
+    else {
+        return true;
+    };
+    let this_host = |ip: std::net::IpAddr| {
+        let ip = ip.to_canonical();
+        ip.is_loopback() || ip.is_unspecified()
+    };
+    match host {
+        url::Host::Domain(name) => name != "localhost" && !name.ends_with(".localhost"),
+        url::Host::Ipv4(ip) => !this_host(ip.into()),
+        url::Host::Ipv6(ip) => !this_host(ip.into()),
+    }
+}
+
+/// The listener itself as `address:port` when it binds an address other hosts
+/// reach, which is any but loopback; a `bind_address` that does not parse
+/// counts too.
+fn exposed_bind_address(listener: &crate::config::network::Listener) -> Option<String> {
+    match listener
+        .bind_address
+        .parse::<std::net::IpAddr>()
+    {
+        Ok(ip)
+            if ip
+                .to_canonical()
+                .is_loopback() =>
+        {
+            None
+        }
+        Ok(ip) => Some(std::net::SocketAddr::new(ip, listener.port).to_string()),
+        Err(_) => Some(format!("{}:{}", listener.bind_address, listener.port)),
+    }
+}
+
+/// Where callers on other hosts reach the outbound listener on `port`: its own
+/// external URLs and those of every inbound listener that passes `/outbound`
+/// requests to it because the two share a host name, when such a URL is
+/// [`reachable_from_other_hosts`], and the bind address of each of those
+/// listeners that binds beyond loopback.
+pub(crate) fn exposed_outbound_addresses(
+    network_config: &crate::config::NetworkConfig,
+    port: u16,
+) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    network_config
+        .listeners
+        .iter()
+        .filter(|listener| {
+            (listener.listener_type == "outbound" && listener.port == port)
+                || (listener.listener_type == "inbound"
+                    && find_shared_outbound_listener(network_config, listener.port)
+                        .is_some_and(|outbound| outbound.port == port))
+        })
+        .flat_map(|listener| {
+            listener
+                .external_urls
+                .iter()
+                .filter(|url| reachable_from_other_hosts(url))
+                .cloned()
+                .chain(exposed_bind_address(listener))
+        })
+        .filter(|address| seen.insert(address.clone()))
+        .collect()
+}
+
+/// A Transit Point that serves callers it does not authenticate
+/// (`allow_unauthenticated_callers`).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct OpenTransitPoint {
+    pub alias: String,
+    /// The variant whose overrides define this Transit Point; `None` for the
+    /// surface's own.
+    pub variant: Option<String>,
+    /// The outbound listener it is served on, when its address resolves to one.
+    pub port: Option<u16>,
+    /// Where callers on other hosts reach it ([`exposed_outbound_addresses`]).
+    pub exposed_at: Vec<String>,
+}
+
+impl OpenTransitPoint {
+    /// What an operator is told about it when other hosts can reach it.
+    pub fn exposure(&self) -> Option<String> {
+        if self.exposed_at.is_empty() {
+            return None;
+        }
+        let variant = self
+            .variant
+            .as_deref()
+            .map(|variant| format!(" in variant '{variant}'"))
+            .unwrap_or_default();
+        Some(format!(
+            "Transit Point '{}'{variant} serves callers it does not authenticate and is reachable from other \
+             hosts: {}",
+            self.alias,
+            self.exposed_at.join(", ")
+        ))
+    }
+}
+
+/// The Transit Points of `surface`, and those its variants define, that serve
+/// callers they do not authenticate.
+pub(crate) fn open_transit_points(
+    network_config: &crate::config::NetworkConfig,
+    surface: &crate::config::agent_surface::AgentSurface,
+) -> Vec<OpenTransitPoint> {
+    let Some(transit) = surface.transit.as_ref() else {
+        return Vec::new();
+    };
+    let port_of = |address: Option<&str>| {
+        address.and_then(|address| network_config.map_url_to_port_for_type(address, Some("outbound")))
+    };
+    let surface_port = port_of(
+        transit
+            .outbound_listen_address
+            .as_deref(),
+    );
+    let variant_points = surface
+        .variants
+        .iter()
+        .flat_map(|variant| {
+            variant
+                .overrides
+                .transit
+                .iter()
+                .filter_map(|transit| transit.points.as_ref())
+                .flatten()
+                .map(move |point| (Some(variant.alias.clone()), point))
+        });
+    transit
+        .points
+        .iter()
+        .map(|point| (None, point))
+        .chain(variant_points)
+        .filter(|(_, point)| point.allow_unauthenticated_callers && !point.authenticates_callers())
+        .map(|(variant, point)| {
+            let port = port_of(
+                point
+                    .listen_address
+                    .as_deref(),
+            )
+            .or(surface_port);
+            OpenTransitPoint {
+                alias: point.alias.clone(),
+                variant,
+                port,
+                exposed_at: port
+                    .map(|port| exposed_outbound_addresses(network_config, port))
+                    .unwrap_or_default(),
+            }
+        })
+        .collect()
+}
+
 pub async fn run_port_server(
     port: u16,
     surfaces: Vec<crate::config::agent_surface::AgentSurface>,
@@ -1017,9 +1198,18 @@ pub async fn run_port_server(
             );
 
             let outbound_target_arc = std::sync::Arc::new(outbound_target);
+            let forwarded_cert_header = std::sync::Arc::new(
+                config
+                    .tls
+                    .client_auth
+                    .forwarded_header
+                    .header_name
+                    .clone(),
+            );
             let proxy_handler = move |req: axum::extract::Request| {
                 let target = outbound_target_arc.clone();
                 let http_client = proxy_client.clone();
+                let forwarded_cert_header = forwarded_cert_header.clone();
                 async move {
                     let path_and_query = req
                         .uri()
@@ -1036,15 +1226,7 @@ pub async fn run_port_server(
                     .unwrap_or(reqwest::Method::POST);
                     let mut builder = http_client.request(method, &url);
                     for (key, value) in req.headers() {
-                        // Transparent tunnel: forward everything except hop-by-hop headers and
-                        // `host` (set automatically by reqwest). Do NOT use
-                        // `should_forward_request_header` here — that strips `x-transit-token`,
-                        // which the outbound pipeline needs for transit-token validation.
-                        let lower = key
-                            .as_str()
-                            .to_ascii_lowercase();
-                        if !crate::a2a::is_hop_by_hop_header(&lower)
-                            && lower != "host"
+                        if shared_domain_proxy_forwards(key.as_str(), &forwarded_cert_header)
                             && let Ok(v) = value.to_str()
                         {
                             builder = builder.header(key.as_str(), v);
@@ -1454,7 +1636,7 @@ pub async fn run_outbound_port_server(
     >,
     direct_client_auth: Option<Arc<crate::server::DirectClientAuth>>,
     listener_manager: Arc<tokio::sync::RwLock<Option<Arc<crate::gateways::ConnectionPointListenerManager>>>>,
-    consent_identity_strategies: Option<Arc<dyn crate::jwt_bearer::JwtVerificationStrategyStorage>>,
+    source_auth_middleware: Option<Arc<crate::source_auth::SourceAuthMiddleware>>,
 ) -> anyhow::Result<()> {
     use axum::{Router, routing::any};
 
@@ -1491,6 +1673,20 @@ pub async fn run_outbound_port_server(
             .unwrap_or_else(|_| surface.clone());
         for e in outbound_surface.validate_outbound() {
             tracing::warn!(channel = %outbound_surface.name, "Outbound validation warning: {}", e);
+        }
+        for open in open_transit_points(&network_config, surface)
+            .into_iter()
+            .filter(|open| open.port == Some(port))
+        {
+            match open.exposure() {
+                Some(exposure) => tracing::warn!(channel = %outbound_surface.name, "{exposure}"),
+                None => tracing::warn!(
+                    channel = %outbound_surface.name,
+                    transit_point = %open.alias,
+                    variant = ?open.variant,
+                    "Transit Point serves callers it does not authenticate"
+                ),
+            }
         }
         let route_prefix = outbound_surface
             .route()
@@ -1555,7 +1751,10 @@ pub async fn run_outbound_port_server(
                 transit_token_issuer: get_transit_token_issuer(),
                 delegation_vault_store: get_delegation_vault_store(),
                 credential_provider_store: get_credential_provider_store(),
-                consent_identity_strategies: consent_identity_strategies.clone(),
+                consent_identity_strategies: source_auth_middleware
+                    .as_ref()
+                    .map(|middleware| middleware.provider_store()),
+                source_auth_middleware: source_auth_middleware.clone(),
                 mcp_continuations: crate::mcp::continuations::config::global().map(|runtime| Arc::new(runtime.clone())),
                 gateway_base_url: get_gateway_base_url(),
                 task_monitor: task_monitor.clone(),
@@ -2032,6 +2231,8 @@ mod tests {
                     listen_address: None,
                     listen_path: tp_listen_path.map(str::to_string),
                     require_transit_token: true,
+                    source_auth: None,
+                    allow_unauthenticated_callers: false,
                     extension_inspection: crate::config::types::ExtensionInspectionConfig::default(),
                     fabric_delegated_credentials: false,
                     trust_check_list: Vec::new(),
@@ -2281,6 +2482,17 @@ mod tests {
         inbound_urls: Vec<&str>,
         outbound_urls: Vec<&str>,
     ) -> crate::config::NetworkConfig {
+        network_config_binding("0.0.0.0", inbound_urls, "0.0.0.0", outbound_urls)
+    }
+
+    /// An inbound listener on port 8080 and an outbound one on 9000, bound to
+    /// the given addresses.
+    fn network_config_binding(
+        inbound_bind: &str,
+        inbound_urls: Vec<&str>,
+        outbound_bind: &str,
+        outbound_urls: Vec<&str>,
+    ) -> crate::config::NetworkConfig {
         serde_json::from_value(serde_json::json!({
             "did": { "domain": "test.example.com" },
             "webauthn": { "rp_id": "test", "external_origin": "https://test.example.com" },
@@ -2289,7 +2501,7 @@ mod tests {
                 {
                     "id": "inbound-http",
                     "name": "Inbound",
-                    "bind_address": "0.0.0.0",
+                    "bind_address": inbound_bind,
                     "port": 8080,
                     "protocol": "http",
                     "external_urls": inbound_urls,
@@ -2298,7 +2510,7 @@ mod tests {
                 {
                     "id": "outbound-http",
                     "name": "Outbound",
-                    "bind_address": "0.0.0.0",
+                    "bind_address": outbound_bind,
                     "port": 9000,
                     "protocol": "http",
                     "external_urls": outbound_urls,
@@ -2544,6 +2756,203 @@ mod tests {
         let config =
             make_network_config_with_listeners(vec!["https://Shared.Example.COM"], vec!["https://shared.example.com"]);
         assert!(find_shared_outbound_listener(&config, 8080).is_some());
+    }
+
+    #[test]
+    fn the_outbound_proxy_on_an_inbound_listener_never_passes_a_forwarded_client_certificate() {
+        for header in ["X-Forwarded-Client-Cert", "x-forwarded-client-cert"] {
+            assert!(!shared_domain_proxy_forwards(header, "x-forwarded-client-cert"), "{header}");
+        }
+        assert!(!shared_domain_proxy_forwards("x-client-cert", "X-Client-Cert"));
+        for header in ["host", "connection", "transfer-encoding"] {
+            assert!(!shared_domain_proxy_forwards(header, "x-forwarded-client-cert"), "{header}");
+        }
+        for header in ["x-transit-token", "x-api-key", "authorization", "content-type"] {
+            assert!(shared_domain_proxy_forwards(header, "x-forwarded-client-cert"), "{header}");
+        }
+    }
+
+    #[test]
+    fn only_this_hosts_own_addresses_are_out_of_reach_of_other_hosts() {
+        for url in [
+            "https://gateway.example.com",
+            "https://gateway.internal:9000/outbound",
+            "http://203.0.113.7:9000",
+            "http://[2001:db8::1]:9000",
+            "http://10.1.2.3",
+            "http://172.16.0.1",
+            "http://192.168.1.10",
+            "http://169.254.169.254",
+            "http://[fd00::1]",
+            "http://[fe80::1]",
+            "http://[::ffff:10.0.0.1]",
+            "not a url",
+        ] {
+            assert!(reachable_from_other_hosts(url), "{url}");
+        }
+        for url in [
+            "http://localhost:9000",
+            "http://LOCALHOST:9000",
+            "http://gateway.localhost",
+            "http://127.0.0.1:9000",
+            "http://127.8.0.1",
+            "http://0.0.0.0:9000",
+            "http://[::1]:9000",
+            "http://[::ffff:127.0.0.1]",
+        ] {
+            assert!(!reachable_from_other_hosts(url), "{url}");
+        }
+    }
+
+    #[test]
+    fn an_outbound_listener_is_exposed_on_its_urls_its_bind_address_and_an_inbound_listener_sharing_its_host() {
+        let loopback =
+            |inbound_urls, outbound_urls| network_config_binding("127.0.0.1", inbound_urls, "127.0.0.1", outbound_urls);
+        let addresses = |addresses: &[&str]| -> Vec<String> {
+            addresses
+                .iter()
+                .map(|address| address.to_string())
+                .collect()
+        };
+        let separate = loopback(vec!["https://inbound.example.com"], vec!["http://localhost:9000"]);
+        assert_eq!(exposed_outbound_addresses(&separate, 9000), addresses(&[]));
+
+        let own = loopback(
+            vec!["https://inbound.example.com"],
+            vec!["https://outbound.example.com", "http://localhost:9000"],
+        );
+        assert_eq!(exposed_outbound_addresses(&own, 9000), addresses(&["https://outbound.example.com"]));
+
+        let private = loopback(vec!["https://inbound.example.com"], vec!["http://10.0.0.5:9000"]);
+        assert_eq!(
+            exposed_outbound_addresses(&private, 9000),
+            addresses(&["http://10.0.0.5:9000"]),
+            "every workload on that network reaches a private address"
+        );
+
+        let shared =
+            loopback(vec!["https://gateway.example.com", "http://localhost:8080"], vec!["http://localhost:9000"]);
+        assert_eq!(
+            exposed_outbound_addresses(&shared, 9000),
+            addresses(&["https://gateway.example.com"]),
+            "the inbound listener passes /outbound to the outbound listener it shares localhost with"
+        );
+        assert_eq!(exposed_outbound_addresses(&shared, 9001), addresses(&[]));
+
+        let bound = network_config_binding(
+            "127.0.0.1",
+            vec!["https://inbound.example.com"],
+            "0.0.0.0",
+            vec!["http://localhost:9000"],
+        );
+        assert_eq!(
+            exposed_outbound_addresses(&bound, 9000),
+            addresses(&["0.0.0.0:9000"]),
+            "a listener bound beyond loopback is reachable whatever its URLs say"
+        );
+        let bound_v6 = network_config_binding(
+            "127.0.0.1",
+            vec!["https://inbound.example.com"],
+            "::",
+            vec!["http://localhost:9000"],
+        );
+        assert_eq!(exposed_outbound_addresses(&bound_v6, 9000), addresses(&["[::]:9000"]));
+
+        let shared_bound = network_config_binding(
+            "0.0.0.0",
+            vec!["http://localhost:8080"],
+            "127.0.0.1",
+            vec!["http://localhost:9000"],
+        );
+        assert_eq!(exposed_outbound_addresses(&shared_bound, 9000), addresses(&["0.0.0.0:8080"]));
+        let separate_bound = network_config_binding(
+            "0.0.0.0",
+            vec!["https://inbound.example.com"],
+            "127.0.0.1",
+            vec!["http://localhost:9000"],
+        );
+        assert_eq!(
+            exposed_outbound_addresses(&separate_bound, 9000),
+            addresses(&[]),
+            "an inbound listener that does not pass /outbound on does not expose it"
+        );
+    }
+
+    #[test]
+    fn open_transit_points_name_the_addresses_other_hosts_reach_them_on() {
+        let network = network_config_binding(
+            "127.0.0.1",
+            vec!["https://gateway.example.com", "http://localhost:8080"],
+            "127.0.0.1",
+            vec!["http://localhost:9000"],
+        );
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(serde_json::json!({
+            "name": "exposure",
+            "access_point": { "listen_address": "http://localhost:8080", "route": "/exposure", "protocol": "a2a" },
+            "target": { "endpoint": "https://agent.internal" },
+            "transit": {
+                "outbound_listen_address": "http://localhost:9000",
+                "points": [
+                    { "alias": "open", "target_endpoint": "https://open.example", "require_transit_token": false,
+                        "allow_unauthenticated_callers": true },
+                    { "alias": "tokened", "target_endpoint": "https://tokened.example" },
+                    { "alias": "elsewhere", "target_endpoint": "https://elsewhere.example",
+                        "listen_address": "http://unknown:1", "require_transit_token": false,
+                        "allow_unauthenticated_callers": true }
+                ]
+            },
+            "variants": [{ "id": "candidate", "alias": "candidate", "name": "Candidate", "overrides": {
+                "transit": { "points": [{ "alias": "tokened", "target_endpoint": "https://tokened.example",
+                    "require_transit_token": false, "allow_unauthenticated_callers": true }] }
+            }}]
+        }))
+        .unwrap();
+        let exposed = vec!["https://gateway.example.com".to_string()];
+
+        let open = open_transit_points(&network, &surface);
+
+        assert_eq!(
+            open,
+            vec![
+                OpenTransitPoint {
+                    alias: "open".to_string(),
+                    variant: None,
+                    port: Some(9000),
+                    exposed_at: exposed.clone(),
+                },
+                OpenTransitPoint {
+                    alias: "elsewhere".to_string(),
+                    variant: None,
+                    port: Some(9000),
+                    exposed_at: exposed.clone(),
+                },
+                OpenTransitPoint {
+                    alias: "tokened".to_string(),
+                    variant: Some("candidate".to_string()),
+                    port: Some(9000),
+                    exposed_at: exposed,
+                },
+            ]
+        );
+        assert_eq!(
+            open[2].exposure().unwrap(),
+            "Transit Point 'tokened' in variant 'candidate' serves callers it does not authenticate and is \
+             reachable from other hosts: https://gateway.example.com"
+        );
+
+        let local = network_config_binding(
+            "127.0.0.1",
+            vec!["http://localhost:8080"],
+            "127.0.0.1",
+            vec!["http://localhost:9000"],
+        );
+        let open = open_transit_points(&local, &surface);
+        assert_eq!(open.len(), 3);
+        assert!(
+            open.iter()
+                .all(|point| point.exposure().is_none()),
+            "{open:?}"
+        );
     }
 
     #[test]

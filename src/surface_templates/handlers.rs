@@ -179,7 +179,7 @@ pub async fn create_template(
     let id = format!("user-{}", uuid::Uuid::new_v4());
     let now = chrono::Utc::now().to_rfc3339();
     let mut tpl = req.into_template(id, now);
-    tpl.settle_trust_check_shape();
+    tpl.settle_surface_markers();
     if !template_writable(&tpl, &context, &scope) {
         return Err(TemplateApiError::Forbidden("Surface template is outside this token's permitted scope".into()));
     }
@@ -232,7 +232,7 @@ async fn update_stored_template(
     if tpl.name.trim().is_empty() {
         return Err(TemplateApiError::BadRequest("name must not be empty".to_string()));
     }
-    tpl.settle_trust_check_shape();
+    tpl.settle_surface_markers();
     s.save(&tpl)
         .await
         .map_err(|e| TemplateApiError::InternalError(format!("save: {}", e)))?;
@@ -319,7 +319,7 @@ pub async fn import_template(
     let now = chrono::Utc::now().to_rfc3339();
     tpl.created_at = Some(now.clone());
     tpl.updated_at = Some(now);
-    tpl.settle_trust_check_shape();
+    tpl.settle_surface_markers();
     if !template_writable(&tpl, &context, &scope) {
         return Err(TemplateApiError::Forbidden("Surface template is outside this token's permitted scope".into()));
     }
@@ -553,6 +553,42 @@ mod tests {
         assert_eq!(reloaded, saved);
     }
 
+    /// A template saved with a Transit Point that uses `source_auth` is marked
+    /// `transit_point_source_auth` in its surface, whatever the update sent, as
+    /// a saved surface is; one whose Transit Points do not use it is not.
+    #[tokio::test]
+    async fn an_update_marks_a_template_whose_transit_point_uses_source_auth() {
+        let surface = |source_auth: bool, marker: bool| {
+            let mut point = serde_json::json!({"alias": "partner", "target_endpoint": "https://partner.example/a2a",
+                "require_transit_token": false, "allow_unauthenticated_callers": true});
+            if source_auth {
+                point = serde_json::json!({"alias": "partner", "target_endpoint": "https://partner.example/a2a",
+                    "require_transit_token": false, "source_auth": {"type": "api_key",
+                        "extraction": {"source": "http_header", "field": "X-API-Key"}, "secret_id": "partner-callers"}});
+            }
+            serde_json::json!({
+                "name": "$NAME",
+                "access_point": {"listen_address": "$HOST", "route": "$ROUTE", "protocol": "a2a"},
+                "target": {"endpoint": "$TARGET_ENDPOINT"},
+                "transit": {"points": [point]},
+                "transit_point_source_auth": marker
+            })
+        };
+
+        let (saved, reloaded) = update_and_reload(surface(true, false)).await;
+        assert_eq!(saved["transit_point_source_auth"], serde_json::json!(true), "{saved}");
+        assert_eq!(reloaded, saved);
+
+        let (saved, reloaded) = update_and_reload(surface(false, true)).await;
+        assert!(
+            saved
+                .get("transit_point_source_auth")
+                .is_none(),
+            "{saved}"
+        );
+        assert_eq!(reloaded, saved);
+    }
+
     #[test]
     fn a_created_template_follows_the_declared_shape() {
         let create = |surface: serde_json::Value| {
@@ -561,7 +597,7 @@ mod tests {
             )
             .unwrap()
             .into_template("template-f".into(), "2026-01-01T00:00:00Z".into());
-            template.settle_trust_check_shape();
+            template.settle_surface_markers();
             template
                 .surface
                 .expect("surface")
@@ -595,7 +631,7 @@ mod tests {
         )
         .unwrap()
         .into_template("template-p".into(), "2026-01-01T00:00:00Z".into());
-        template.settle_trust_check_shape();
+        template.settle_surface_markers();
         assert!(template.surface.is_none());
     }
 }

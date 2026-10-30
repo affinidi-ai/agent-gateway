@@ -165,6 +165,9 @@ pub enum TransitClientVerification {
     /// The Transit Point verified the client's resource-server token
     /// (`mcp_http.authorization`) on this request.
     ResourceToken,
+    /// The Transit Point's own `source_auth` verified the client's credential
+    /// on this request.
+    SourceAuth,
 }
 
 /// `input.transit.client`: the principal the Transit Point authenticated

@@ -139,12 +139,18 @@ pub(crate) enum OutboundPipelineError {
     #[error("Transit token missing or invalid")]
     TransitTokenInvalid(String),
 
-    /// The surface sets `transit.source_auth`, which the gateway does not
-    /// enforce, so every request is refused. The reason is logged, never shown
-    /// to the caller. `mcp_request_id` is set, to the id the JSON-RPC error
-    /// answers, when the Transit Point speaks MCP.
+    /// How the Transit Point authenticates its callers cannot be enforced, or
+    /// its caller authentication is unavailable, so the request is refused.
+    /// The reason is logged, never shown to the caller. `mcp_request_id` is
+    /// set, to the id the JSON-RPC error answers, when the Transit Point speaks
+    /// MCP.
     #[error("This Transit Point is unavailable")]
-    TransitSourceAuthUnsupported { mcp_request_id: Option<serde_json::Value> },
+    TransitPointUnavailable { mcp_request_id: Option<serde_json::Value> },
+
+    /// The Transit Point's `source_auth` refused the caller's credential. Why
+    /// is logged, never shown to the caller.
+    #[error("Caller credential missing or invalid")]
+    TransitCallerUnauthenticated,
 
     #[error("Credential delegation consent required")]
     ConsentRequired(String),
@@ -194,7 +200,7 @@ pub(crate) enum OutboundPipelineError {
 /// not resolve.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum DelegationRefusal {
-    #[error("Delegated credentials need the caller's identity, and this request's transit token carries none")]
+    #[error("Delegated credentials need the caller's identity, and this request does not establish one")]
     CallerIdentityMissing,
     #[error(
         "Delegated credentials need the managed agent's identity, and neither this Transit Point's managed \
@@ -249,9 +255,11 @@ impl OutboundPipelineError {
 
             Self::RateLimitExceeded | Self::UpstreamCapacityReached(_) => StatusCode::TOO_MANY_REQUESTS,
 
-            Self::TransitTokenInvalid(_) | Self::ConsentRequired(_) => StatusCode::UNAUTHORIZED,
+            Self::TransitTokenInvalid(_) | Self::TransitCallerUnauthenticated | Self::ConsentRequired(_) => {
+                StatusCode::UNAUTHORIZED
+            }
 
-            Self::TransitSourceAuthUnsupported { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            Self::TransitPointUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::DelegationRefused { refusal, .. } => refusal.status_code(),
             Self::McpResourceAuthorization { error, .. } => error.status_code(),
 
@@ -319,7 +327,7 @@ impl IntoResponse for OutboundPipelineError {
             }
             .into_response();
         }
-        if let Self::TransitSourceAuthUnsupported { mcp_request_id: Some(id) } = &self {
+        if let Self::TransitPointUnavailable { mcp_request_id: Some(id) } = &self {
             return crate::mcp::request_validation::McpRequestValidationError {
                 status: self.status_code(),
                 id: Some(id.clone()),
@@ -394,6 +402,8 @@ pub struct OutboundPipelineContext {
     pub protocol: Option<ChannelProtocol>,
     pub mcp_metadata_context: crate::mcp::meta::McpMetadataContext,
     pub mcp_classification: Option<crate::mcp::request_validation::McpRequestClassification>,
+    /// The caller this Transit Point authenticated itself, with
+    /// `mcp_http.authorization` or `source_auth`.
     pub authenticated_identity: Option<crate::source_auth::AuthenticatedIdentity>,
     /// What authenticated `authenticated_identity`, set with it. An identity
     /// without one is not reported as `input.transit.client`.
@@ -1124,14 +1134,7 @@ async fn validate_transit_token(
         ctx.transit_token_claims = None;
     }
     let Some(ref issuer) = state.transit_token_issuer else {
-        if modern {
-            return Err(OutboundPipelineError::TransitTokenInvalid("Transit token validation is unavailable".into()));
-        }
-        // Transit token issuer not configured — skip validation.
-        // This allows the outbound pipeline to degrade gracefully when the
-        // gateway is not configured for transit token enforcement.
-        debug!(request_id = %ctx.request_id, "Transit token issuer not configured, skipping validation");
-        return Ok(());
+        return Err(OutboundPipelineError::TransitTokenInvalid("Transit token validation is unavailable".into()));
     };
 
     if modern
@@ -1225,29 +1228,43 @@ fn adopt_transit_token(
     ctx.transit_token_claims = Some(claims);
 }
 
-/// Caller authentication. A surface that sets `transit.source_auth`, which the
-/// gateway does not enforce, has every Transit Point request refused. An MCP
-/// Transit Point with `mcp_http.authorization` requires its resource access token.
+/// Caller authentication, before anything else reads or forwards the request.
+/// A Transit Point whose caller authentication cannot be enforced
+/// ([`TransitPoint::unenforceable_caller_authentication`]), or whose surface
+/// sets `transit.source_auth`, which the gateway does not enforce, has every
+/// request refused. An MCP Transit Point with `mcp_http.authorization` requires
+/// its resource access token, and one with `source_auth` the credential it
+/// names, which is never forwarded. The transit token is checked next.
 async fn step_source_auth(
     state: &OutboundProxyState,
     ctx: &mut OutboundPipelineContext,
 ) -> Result<(), OutboundPipelineError> {
-    if ctx
+    let unenforceable = if ctx
         .outbound_shared
         .source_auth
         .is_some()
     {
+        Some(crate::config::agent_surface::TRANSIT_SOURCE_AUTH_REFUSED.to_string())
+    } else {
+        ctx.virtual_channel
+            .unenforceable_caller_authentication()
+    };
+    if let Some(reason) = unenforceable {
         warn!(
             request_id = %ctx.request_id,
             surface_id = %ctx.surface.surface_id,
             transit_point = %ctx.virtual_channel.alias,
-            "{}",
-            crate::config::agent_surface::TRANSIT_SOURCE_AUTH_REFUSED
+            reason = %reason,
+            "Transit Point request refused: its caller authentication cannot be enforced"
         );
-        return Err(OutboundPipelineError::TransitSourceAuthUnsupported {
-            mcp_request_id: (ctx.virtual_channel.protocol == crate::config::agent_surface::TransitProtocol::Mcp)
-                .then_some(serde_json::Value::Null),
-        });
+        return Err(transit_point_unavailable(ctx));
+    }
+    if let Some(source_auth) = ctx
+        .virtual_channel
+        .source_auth
+        .clone()
+    {
+        return authenticate_transit_caller(state, ctx, &source_auth).await;
     }
     if let Some(authorization) = ctx
         .virtual_channel
@@ -1344,6 +1361,107 @@ async fn step_source_auth(
         ctx.mcp_resource_authorization = Some(authorization);
     }
     Ok(())
+}
+
+/// Authenticates the caller with the Transit Point's `source_auth`, as the
+/// Access Point does. A missing or refused credential is refused with `401`,
+/// and a check the gateway cannot run with `503`; why is logged. The
+/// credential's header is removed, so it never reaches the target.
+async fn authenticate_transit_caller(
+    state: &OutboundProxyState,
+    ctx: &mut OutboundPipelineContext,
+    source_auth: &crate::source_auth::SourceAuthConfig,
+) -> Result<(), OutboundPipelineError> {
+    let middleware = crate::source_auth::middleware::require_installed(
+        state
+            .source_auth_middleware
+            .clone(),
+    )
+    .map_err(|error| caller_authentication_unavailable(ctx, &error))?;
+    // A Transit Point publishes no protected resource metadata, so its
+    // `source_auth` keeps the audiences it names.
+    let config = crate::source_auth::middleware::resolve_surface_audience(
+        source_auth,
+        None,
+        state.vc_issuer.as_deref(),
+        &ctx.surface.surface_id,
+    )
+    .await
+    .map_err(|error| caller_authentication_unavailable(ctx, &error))?;
+    let peer_cert = ctx
+        .request
+        .as_ref()
+        .and_then(|request| {
+            request
+                .extensions()
+                .get::<crate::source_auth::models::PeerCertInfo>()
+        });
+    let authenticated = middleware
+        .authenticate(&config, &ctx.original_headers, &ctx.surface.name, &ctx.surface.surface_id, peer_cert)
+        .await;
+    match authenticated {
+        Ok(identity) => {
+            if let Some(header) = config.credential_header_name() {
+                ctx.original_headers
+                    .remove(header);
+                if let Some(request) = ctx.request.as_mut() {
+                    request
+                        .headers_mut()
+                        .remove(header);
+                }
+            }
+            ctx.authenticated_identity = Some(identity);
+            ctx.authenticated_by = Some(crate::surface_context::TransitClientVerification::SourceAuth);
+            Ok(())
+        }
+        Err(error) if error.is_caller_attributable() => {
+            warn!(
+                request_id = %ctx.request_id,
+                surface_id = %ctx.surface.surface_id,
+                transit_point = %ctx.virtual_channel.alias,
+                method = config.method_tag(),
+                error = ?error,
+                "Transit Point caller authentication failed"
+            );
+            crate::audit::request_events::auth_failed(
+                &crate::audit::request_events::RequestFacts {
+                    surface_id: &ctx.surface.surface_id,
+                    channel_name: &ctx.surface.name,
+                    trace_id: Some(&ctx.request_id),
+                    via_fabric: false,
+                },
+                crate::audit::request_events::source_auth_scheme(&config),
+                crate::audit::request_events::source_auth_reason(&error),
+                true,
+                Some(ctx.remote_addr.ip()),
+            );
+            Err(OutboundPipelineError::TransitCallerUnauthenticated)
+        }
+        Err(error) => Err(caller_authentication_unavailable(ctx, &error)),
+    }
+}
+
+fn caller_authentication_unavailable(
+    ctx: &OutboundPipelineContext,
+    error: &crate::source_auth::errors::SourceAuthError,
+) -> OutboundPipelineError {
+    warn!(
+        request_id = %ctx.request_id,
+        surface_id = %ctx.surface.surface_id,
+        transit_point = %ctx.virtual_channel.alias,
+        error = ?error,
+        "Transit Point caller authentication is unavailable"
+    );
+    transit_point_unavailable(ctx)
+}
+
+/// Refuses a request the Transit Point cannot serve; on an MCP Transit Point
+/// as a JSON-RPC error, sent before the request id is read.
+fn transit_point_unavailable(ctx: &OutboundPipelineContext) -> OutboundPipelineError {
+    OutboundPipelineError::TransitPointUnavailable {
+        mcp_request_id: (ctx.virtual_channel.protocol == crate::config::agent_surface::TransitProtocol::Mcp)
+            .then_some(serde_json::Value::Null),
+    }
 }
 
 /// [4] Agent Identity Resolution — extracts, validates, and resolves the
@@ -2218,9 +2336,10 @@ async fn step_map_transit_point_header_metadata(
     }
 }
 
-/// Whether a managed agent's request header goes on to a Transit Point's target,
-/// over HTTP or Fabric. The agent's `Authorization` and cookies never do; its other
-/// headers, such as its own API key header for the target, do.
+/// Whether a Transit Point caller's request header goes on to its target, over
+/// HTTP or Fabric. The caller's `Authorization`, cookies, and caller-info and DID
+/// identity headers ([`crate::proxy::caller_identity::CallerHeaders::NAMES`])
+/// never do; its other headers, such as its own API key header for the target, do.
 fn should_forward_outbound_request_header(
     name: &str,
     header_metadata_mapping: Option<&crate::config::header_metadata_mapping::HeaderMetadataMappingConfig>,
@@ -2229,7 +2348,10 @@ fn should_forward_outbound_request_header(
         return false;
     }
 
-    if name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("cookie") {
+    if name.eq_ignore_ascii_case("authorization")
+        || name.eq_ignore_ascii_case("cookie")
+        || crate::proxy::caller_identity::CallerHeaders::is_caller_info_header(name)
+    {
         return false;
     }
 
@@ -3097,11 +3219,19 @@ fn outbound_actor_did(ctx: &OutboundPipelineContext) -> Option<&str> {
     }
 }
 
-/// The inbound caller a transit token carries, for attributing outbound decisions.
+/// The caller of a Transit Point call, for attributing outbound decisions: the
+/// inbound caller a transit token carries, else the caller the Transit Point
+/// verified itself, by its resource token or `source_auth`.
 fn outbound_caller(ctx: &OutboundPipelineContext) -> Option<crate::delegation_vault::audit::AuditCallerContext> {
     ctx.transit_token_claims
         .as_ref()
         .and_then(crate::delegation_vault::audit::transit_caller_context)
+        .or_else(|| {
+            ctx.authenticated_identity
+                .as_ref()
+                .filter(|_| ctx.authenticated_by.is_some())
+                .map(crate::delegation_vault::audit::build_caller_context)
+        })
 }
 
 /// Shared audit context for an outbound OPA evaluation so each site records a
@@ -3998,6 +4128,48 @@ fn build_outbound_policy_input(ctx: &OutboundPipelineContext) -> crate::surface_
     }
 }
 
+/// The caller context a Transit Point's Workload Binding binds into the signed
+/// presentation. A JWT caller is read from the claims the Transit Point's own
+/// authentication verified, never from an `Authorization` header it did not
+/// verify; the raw header is read only when the Transit Point authenticated no
+/// caller itself.
+fn capture_workload_binding_caller(
+    ctx: &OutboundPipelineContext,
+    cfg: &crate::config::types::WorkloadBindingConfig,
+) -> Option<crate::proxy::workload_binding::CapturedCallerContext> {
+    match cfg.caller_source {
+        crate::config::types::CallerContextSource::TransitToken => ctx
+            .transit_token_claims
+            .as_ref()
+            .and_then(|claims| {
+                crate::proxy::workload_binding::capture_from_transit_token(claims, &cfg.caller_context_fields).ok()
+            }),
+        crate::config::types::CallerContextSource::AuthorizationBearerJwt => match ctx
+            .authenticated_identity
+            .as_ref()
+        {
+            Some(crate::source_auth::AuthenticatedIdentity::JwtBearer { claims, .. }) => {
+                crate::proxy::workload_binding::capture_from_verified_claims(claims, &cfg.caller_context_fields).ok()
+            }
+            Some(_) => None,
+            None => ctx
+                .original_headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|auth| {
+                    crate::proxy::workload_binding::capture_from_bearer_jwt(auth, &cfg.caller_context_fields).ok()
+                }),
+        },
+        // Transit Point calls are made by the managed agent, not the original
+        // DID-authenticated caller — the raw DID is not available on this hop.
+        // Use `TransitToken` here so the AP-hop's `SHA256(did)` user_hash flows
+        // through the transit token, then set `caller_source: did` on the
+        // target-leg workload binding where the AP-inbound authenticated
+        // identity is still in scope.
+        crate::config::types::CallerContextSource::Did => None,
+    }
+}
+
 /// [5] Trusted Identity Injection — removes the raw `agent-identity/v1` extension
 /// from the request body and inserts a signed `agent-identity-credential/v1`
 /// containing a VP (Verifiable Presentation) JWT issued by the gateway's
@@ -4064,30 +4236,7 @@ async fn step_inject_trusted_identity(
             .as_ref();
         let captured = wb_config
             .filter(|c| c.enabled)
-            .and_then(|cfg| match cfg.caller_source {
-                crate::config::types::CallerContextSource::TransitToken => ctx
-                    .transit_token_claims
-                    .as_ref()
-                    .and_then(|claims| {
-                        crate::proxy::workload_binding::capture_from_transit_token(claims, &cfg.caller_context_fields)
-                            .ok()
-                    }),
-                crate::config::types::CallerContextSource::AuthorizationBearerJwt => ctx
-                    .original_headers
-                    .get(axum::http::header::AUTHORIZATION)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|auth| {
-                        crate::proxy::workload_binding::capture_from_bearer_jwt(auth, &cfg.caller_context_fields).ok()
-                    }),
-                // Transit Point calls are made by the managed agent, not the
-                // original DID-authenticated caller — the raw DID is not
-                // available on this hop. Use `TransitToken` here so the
-                // AP-hop's `SHA256(did)` user_hash flows through the transit
-                // token, then set `caller_source: did` on the target-leg
-                // workload binding where the AP-inbound authenticated
-                // identity is still in scope.
-                crate::config::types::CallerContextSource::Did => None,
-            });
+            .and_then(|cfg| capture_workload_binding_caller(ctx, cfg));
         let mut wb = crate::proxy::workload_binding::maybe_build_workload_binding_subject(
             wb_config,
             crate::proxy::workload_binding::WorkloadBindingInputs {
@@ -4234,11 +4383,7 @@ async fn step_prepare_modern_credentials(
     else {
         return Ok(None);
     };
-    if ctx
-        .surface
-        .outbound_credentials
-        .is_empty()
-    {
+    if !crate::proxy::credential_delegation::modern::transit_point_bindings_apply(&ctx.surface) {
         return Ok(None);
     }
     if ctx
@@ -4314,6 +4459,32 @@ fn mcp_refusal_id(ctx: &OutboundPipelineContext) -> Option<serde_json::Value> {
     })
 }
 
+/// The caller half of the vault key for a Transit Point's delegated
+/// credentials: the transit token's `user_identity_hash`, else the identity
+/// hash of a caller the Transit Point's `source_auth` verified, which is the
+/// value the Access Point puts in a transit token for a caller it identified
+/// the same way. A credential that names no subject identifies no caller.
+fn delegation_caller_hash(ctx: &OutboundPipelineContext) -> Option<String> {
+    if let Some(claims) = ctx
+        .transit_token_claims
+        .as_ref()
+    {
+        return claims
+            .user_identity_hash
+            .clone();
+    }
+    ctx.authenticated_identity
+        .as_ref()
+        .filter(|_| ctx.authenticated_by == Some(crate::surface_context::TransitClientVerification::SourceAuth))
+        .and_then(|identity| {
+            identity.principal_hash(
+                ctx.surface
+                    .tenant_id
+                    .as_deref(),
+            )
+        })
+}
+
 /// Refuse a request whose delegated credentials cannot be resolved.
 fn refuse_delegation(
     ctx: &OutboundPipelineContext,
@@ -4329,8 +4500,7 @@ fn refuse_delegation(
 /// vault and inject them into the outbound request, or return a consent_required
 /// signal if the user has not yet authorized.
 ///
-/// The user identity hash is extracted from the transit token claims (which encodes
-/// the original caller's authenticated identity). The channel's `outbound_credentials`
+/// The caller is the one [`delegation_caller_hash`] names. The channel's `outbound_credentials`
 /// bindings determine which credential providers to look up. A binding that applies
 /// but cannot be resolved refuses the request; it is never forwarded without the
 /// credential. A public discovery read carries no caller, so, as with target
@@ -4390,24 +4560,14 @@ async fn step_inject_credentials(
         }
     };
 
-    // Extract user_identity_hash from the transit token (carries the original caller context)
-    let user_hash = match ctx
-        .transit_token_claims
-        .as_ref()
-        .and_then(|c| {
-            c.user_identity_hash
-                .as_deref()
-        }) {
-        Some(h) => h.to_string(),
-        None => {
-            warn!(
-                target: "credential_delegation",
-                request_id = %ctx.request_id,
-                surface_variant = surface_variant.as_deref(),
-                "Transit token does not carry user_identity_hash - refusing the request"
-            );
-            return Err(refuse_delegation(ctx, DelegationRefusal::CallerIdentityMissing));
-        }
+    let Some(user_hash) = delegation_caller_hash(ctx) else {
+        warn!(
+            target: "credential_delegation",
+            request_id = %ctx.request_id,
+            surface_variant = surface_variant.as_deref(),
+            "Neither the transit token nor the Transit Point's source_auth identifies the caller - refusing the request"
+        );
+        return Err(refuse_delegation(ctx, DelegationRefusal::CallerIdentityMissing));
     };
 
     // The agent half of the vault key: the Transit Point's managed identity, else the
@@ -4425,6 +4585,7 @@ async fn step_inject_credentials(
         warn!(
             target: "credential_delegation",
             request_id = %ctx.request_id,
+            surface_variant = surface_variant.as_deref(),
             "No managed agent identity for delegated credentials - refusing the request"
         );
         return Err(refuse_delegation(ctx, DelegationRefusal::AgentIdentityMissing));
@@ -4442,7 +4603,7 @@ async fn step_inject_credentials(
         .and_then(crate::mcp::tool_analyzer::called_tool_name);
 
     let audit_ctx = crate::proxy::credential_delegation::DelegationAuditContext {
-        caller: None,
+        caller: outbound_caller(ctx),
         channel_name: Some(ctx.surface.name.clone()),
         target_endpoint: Some(
             ctx.virtual_channel
@@ -6116,6 +6277,7 @@ mod tests {
             delegation_vault_store: None,
             credential_provider_store: None,
             consent_identity_strategies: None,
+            source_auth_middleware: None,
             mcp_continuations: None,
             gateway_base_url: None,
             task_monitor: None,
@@ -7997,7 +8159,8 @@ mod tests {
             "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "a2a"},
             "target": {"endpoint": "http://127.0.0.1:1"},
             "transit": {"points": [{"alias": "partner-a", "protocol": "mcp",
-                "require_transit_token": false, "target_endpoint": format!("http://{}", target.addr),
+                "require_transit_token": false, "allow_unauthenticated_callers": true,
+                "target_endpoint": format!("http://{}", target.addr),
                 "mcp_tool_gating": {"gates": [{"id": "g1", "name": "no admin",
                     "action": {"effect": "deny", "patterns": ["^admin_"]}}]}}]},
             "outbound_credentials": [{"credential_provider_id": "provider", "required_for": {"tools": ["scoped_tool"]}}]
@@ -8088,7 +8251,8 @@ mod tests {
             "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "a2a"},
             "target": {"endpoint": "http://127.0.0.1:1"},
             "transit": {"points": [{"alias": "partner-a", "protocol": "mcp",
-                "require_transit_token": false, "target_endpoint": format!("http://{}", target.addr)}]}
+                "require_transit_token": false, "allow_unauthenticated_callers": true,
+                "target_endpoint": format!("http://{}", target.addr)}]}
         }))
         .unwrap();
         let state = test_outbound_state();
@@ -8166,7 +8330,8 @@ mod tests {
             "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "a2a"},
             "target": {"endpoint": "http://127.0.0.1:1"},
             "transit": {"opa_policy_definition_id": "def-1", "points": [{"alias": "partner-a", "protocol": "mcp",
-                "require_transit_token": false, "target_endpoint": "http://127.0.0.1:9"}]}
+                "require_transit_token": false, "allow_unauthenticated_callers": true,
+                "target_endpoint": "http://127.0.0.1:9"}]}
         }))
         .unwrap();
         let state = test_outbound_state();
@@ -8572,7 +8737,8 @@ mod tests {
                 "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "a2a"},
                 "target": {"endpoint": "http://127.0.0.1:1"},
                 "transit": {"points": [{"alias": "partner-a", "protocol": "mcp",
-                    "require_transit_token": false, "target_endpoint": format!("http://{}", target.addr)}]},
+                    "require_transit_token": false, "allow_unauthenticated_callers": true,
+                    "target_endpoint": format!("http://{}", target.addr)}]},
                 "variants": [{"id": "candidate", "alias": "candidate", "name": "Candidate", "enabled": false}]
             }))
             .unwrap();
@@ -8750,7 +8916,8 @@ mod tests {
                 "transit": {
                     "shared": {"opa_policy_definition_id": "unavailable"},
                     "points": [{"alias": "partner-a", "protocol": "mcp",
-                        "require_transit_token": false, "target_endpoint": "http://127.0.0.1:1"}]
+                        "require_transit_token": false, "allow_unauthenticated_callers": true,
+                        "target_endpoint": "http://127.0.0.1:1"}]
                 },
                 "variants": variants
             }))
@@ -8957,7 +9124,7 @@ mod tests {
                 .await
                 .unwrap_err();
 
-            assert!(matches!(error, OutboundPipelineError::TransitSourceAuthUnsupported { .. }), "{case}: {error:?}");
+            assert!(matches!(error, OutboundPipelineError::TransitPointUnavailable { .. }), "{case}: {error:?}");
             assert!(
                 ctx.authenticated_identity
                     .is_none(),
@@ -8989,6 +9156,312 @@ mod tests {
                     .contains("source_auth"),
                 "{case}: the caller is not told why: {body}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_transit_point_whose_caller_authentication_cannot_be_enforced_refuses_every_request() {
+        let state = test_outbound_state();
+        let point = |fields: serde_json::Value| -> TransitPoint {
+            let mut point = serde_json::to_value(test_virtual_channel()).unwrap();
+            point
+                .as_object_mut()
+                .unwrap()
+                .extend(
+                    fields
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                );
+            serde_json::from_value(point).unwrap()
+        };
+        let cases = [
+            ("no caller authentication", point(json!({ "require_transit_token": false }))),
+            (
+                "DID Auth",
+                point(json!({ "source_auth": {
+                    "type": "did_auth", "extraction": { "source": "http_header", "field": "X-Session" }
+                }})),
+            ),
+            (
+                "a forwarded JWT",
+                point(json!({ "source_auth": {
+                    "type": "jwt_bearer", "jwt_verification_strategy_id": "strategy", "audiences": [],
+                    "forward_header": true
+                }})),
+            ),
+            (
+                "source_auth beside mcp_http.authorization",
+                point(json!({
+                    "protocol": "mcp",
+                    "mcp_http": { "authorization": {
+                        "resource": "https://outbound.example/outbound/surfaces/order/partner-a"
+                    }},
+                    "source_auth": {
+                        "type": "api_key", "extraction": { "source": "http_header", "field": "X-API-Key" },
+                        "secret_id": "transit-caller-key"
+                    }
+                })),
+            ),
+        ];
+        for (case, transit_point) in cases {
+            for method in [Method::POST, Method::GET] {
+                let mut ctx = test_pipeline_context();
+                ctx.original_method = method.clone();
+                ctx.request_path = "/outbound/surfaces/order/partner-a/.well-known/agent-card.json".to_string();
+                ctx.virtual_channel = transit_point.clone();
+                ctx.original_headers
+                    .insert("x-api-key", HeaderValue::from_static("any-key"));
+
+                let error = step_source_auth(&state, &mut ctx)
+                    .await
+                    .unwrap_err();
+
+                assert!(matches!(error, OutboundPipelineError::TransitPointUnavailable { .. }), "{case} {method}");
+                assert!(
+                    ctx.authenticated_identity
+                        .is_none(),
+                    "{case}"
+                );
+                let response = error.into_response();
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{case} {method}");
+                let body = String::from_utf8(
+                    axum::body::to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .unwrap()
+                        .to_vec(),
+                )
+                .unwrap();
+                assert!(body.contains("This Transit Point is unavailable"), "{case}: {body}");
+                for detail in ["source_auth", "authenticat", "did_auth", "mcp_http"] {
+                    assert!(!body.contains(detail), "{case}: the caller is not told why: {body}");
+                }
+            }
+        }
+
+        let mut open = test_pipeline_context();
+        open.virtual_channel
+            .require_transit_token = false;
+        open.virtual_channel
+            .allow_unauthenticated_callers = true;
+        step_source_auth(&state, &mut open)
+            .await
+            .unwrap();
+        assert!(
+            open.authenticated_identity
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transit_point_refuses_its_source_auth_when_the_gateway_cannot_run_it() {
+        let state = test_outbound_state();
+        let mut ctx = test_pipeline_context();
+        ctx.virtual_channel
+            .require_transit_token = false;
+        ctx.virtual_channel
+            .source_auth = Some(
+            serde_json::from_value(json!({
+                "type": "api_key", "extraction": { "source": "http_header", "field": "X-API-Key" },
+                "secret_id": "transit-caller-key"
+            }))
+            .unwrap(),
+        );
+        ctx.original_headers
+            .insert("x-api-key", HeaderValue::from_static("caller-key"));
+
+        let error = step_source_auth(&state, &mut ctx)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, OutboundPipelineError::TransitPointUnavailable { .. }), "{error:?}");
+        assert_eq!(error.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            ctx.authenticated_identity
+                .is_none()
+        );
+    }
+
+    /// An outbound state whose `source_auth` middleware knows the API key
+    /// secret `transit-caller-key`, whose value is `right-key`.
+    async fn transit_caller_key_state(directory: &std::path::Path) -> OutboundProxyState {
+        use crate::secrets::SecretsStore;
+
+        let secrets = Arc::new(
+            crate::secrets::FilesystemSecretsStore::new_async(
+                directory
+                    .join("secrets")
+                    .to_str()
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+        );
+        secrets
+            .create(crate::secrets::CreateSecretRequest {
+                tenant_id: None,
+                name: "Transit Point callers".to_string(),
+                secret_id: "transit-caller-key".to_string(),
+                description: None,
+                value: "right-key".to_string(),
+                secret_type: "ApiKey".to_string(),
+                tags: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let strategies =
+            crate::jwt_bearer::storage::FileSystemJwtVerificationStrategyStore::new(directory.join("strategies"))
+                .await
+                .unwrap();
+        let mut state = test_outbound_state();
+        state.source_auth_middleware = Some(Arc::new(crate::source_auth::SourceAuthMiddleware::new(
+            Arc::new(crate::didauth::sessions::DidAuthSessionStore::new()),
+            Arc::new(strategies),
+            Arc::new(crate::jwt_bearer::JwksClient::new()),
+            Some(secrets),
+            Arc::new(dashmap::DashMap::new()),
+            None,
+            None,
+        )));
+        state
+    }
+
+    /// A Transit Point records every caller its `source_auth` refuses as an
+    /// `auth_failed` event, and names the caller it admitted on its policy and
+    /// delegation audit records.
+    #[tokio::test]
+    async fn a_transit_point_audits_the_callers_its_source_auth_refuses_and_names_the_one_it_admits() {
+        use crate::delegation_vault::audit::DelegationAuditAction;
+
+        let directory = tempfile::tempdir().unwrap();
+        let state = transit_caller_key_state(directory.path()).await;
+        let context = |key: Option<&'static str>| {
+            let mut ctx = test_pipeline_context();
+            ctx.virtual_channel
+                .require_transit_token = false;
+            ctx.virtual_channel
+                .source_auth = Some(
+                serde_json::from_value(json!({
+                    "type": "api_key", "extraction": { "source": "http_header", "field": "X-API-Key" },
+                    "secret_id": "transit-caller-key"
+                }))
+                .unwrap(),
+            );
+            if let Some(key) = key {
+                ctx.original_headers
+                    .insert("x-api-key", HeaderValue::from_static(key));
+            }
+            ctx
+        };
+
+        for (key, reason) in [(Some("wrong-key"), "invalid_credential"), (None, "missing_credential")] {
+            let mut ctx = context(key);
+            let (result, events) = crate::audit::producer::capture(step_source_auth(&state, &mut ctx)).await;
+            assert!(matches!(result, Err(OutboundPipelineError::TransitCallerUnauthenticated)), "{result:?}");
+            assert_eq!(events.len(), 1, "{reason}: {events:?}");
+            assert!(
+                matches!(
+                    &events[0].event,
+                    DelegationAuditAction::AuthFailed {
+                        scheme: crate::audit::events::AuthScheme::ApiKey,
+                        reason: recorded,
+                        blocking: true,
+                        client_ip: Some(ip),
+                    } if recorded == reason && ip == "127.0.0.1"
+                ),
+                "{reason}: {events:?}"
+            );
+            assert_eq!(
+                events[0]
+                    .surface_id
+                    .as_deref(),
+                Some(
+                    ctx.surface
+                        .surface_id
+                        .as_str()
+                )
+            );
+            assert_eq!(events[0].trace_id.as_deref(), Some("test-request-id"));
+        }
+
+        let mut admitted = context(Some("right-key"));
+        let (result, events) = crate::audit::producer::capture(step_source_auth(&state, &mut admitted)).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(events.is_empty(), "{events:?}");
+        let caller = outbound_caller(&admitted).expect("the admitted caller is named");
+        assert_eq!(caller.auth_method, "api_key");
+        assert_eq!(caller.sub.as_deref(), Some("transit-caller-key"));
+
+        admitted.authenticated_by = None;
+        assert!(outbound_caller(&admitted).is_none(), "an identity nothing verified names no caller");
+    }
+
+    /// The `auth_failed` record a Transit Point's `source_auth` writes names
+    /// the surface variant that served the request, as every other Transit
+    /// Point record does.
+    #[tokio::test]
+    async fn a_transit_point_source_auth_refusal_names_the_variant_that_served_it() {
+        use crate::delegation_vault::audit::DelegationAuditAction;
+
+        for (variants, path, expected) in [
+            (json!([{"id": "v-beta", "alias": "beta", "name": "Beta"}]), "/outbound/mcp$beta/partner-a", "beta"),
+            (json!([]), "/outbound/mcp/partner-a", "_base_"),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+                "surface_id": "variant-surface", "name": "Variant surface",
+                "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "a2a"},
+                "target": {"endpoint": "http://127.0.0.1:1"},
+                "transit": {"points": [{"alias": "partner-a", "protocol": "mcp",
+                    "require_transit_token": false, "target_endpoint": "http://127.0.0.1:1",
+                    "source_auth": {
+                        "type": "api_key", "extraction": { "source": "http_header", "field": "X-API-Key" },
+                        "secret_id": "transit-caller-key"
+                    }}]},
+                "variants": variants
+            }))
+            .unwrap();
+            let state = transit_caller_key_state(directory.path()).await;
+            state
+                .channel_state
+                .write()
+                .unwrap()
+                .surface = Arc::new(surface);
+            let request = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json")
+                .header("x-api-key", "wrong-key")
+                .body(axum::body::Body::from(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).to_string()))
+                .unwrap();
+            let (response, events) =
+                crate::audit::producer::capture(Box::pin(outbound_proxy_handler_with_mcp_versions(
+                    "127.0.0.1:12345"
+                        .parse()
+                        .unwrap(),
+                    state,
+                    request,
+                    crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+                )))
+                .await;
+            assert!(
+                matches!(response, Err(OutboundPipelineError::TransitCallerUnauthenticated)),
+                "{path}: {response:?}"
+            );
+            let refusals = events
+                .iter()
+                .filter(|event| matches!(event.event, DelegationAuditAction::AuthFailed { .. }))
+                .count();
+            assert_eq!(refusals, 1, "{path}: {events:?}");
+            for event in &events {
+                assert_eq!(
+                    event
+                        .surface_variant
+                        .as_deref(),
+                    Some(expected),
+                    "{path}: {event:?}"
+                );
+            }
         }
     }
 
@@ -9669,10 +10142,23 @@ mod tests {
 
     #[test]
     fn a_managed_agents_cookies_and_authorization_never_reach_a_transit_point_target() {
-        for withheld in ["cookie", "Cookie", "authorization", "x-transit-token"] {
+        for withheld in [
+            "cookie",
+            "Cookie",
+            "authorization",
+            "x-transit-token",
+            "X-Caller-DID",
+            "x-caller-identity-source",
+            "x-caller-dna-uai",
+            "x-gateway-did",
+            "X-DID-Identity",
+            "x-did-signed-identity",
+        ] {
             assert!(!should_forward_outbound_request_header(withheld, None), "{withheld}");
         }
-        for forwarded in ["x-api-key", "accept", "content-type", "x-forwarded-for", "mcp-protocol-version"] {
+        for forwarded in
+            ["x-api-key", "accept", "content-type", "x-forwarded-for", "mcp-protocol-version", "x-caller-context"]
+        {
             assert!(should_forward_outbound_request_header(forwarded, None), "{forwarded}");
         }
     }
@@ -10998,7 +11484,7 @@ mod tests {
                 .unwrap()
                 .surface = Arc::new(transit_surface(
                 json!([{"alias": "partner", "protocol": "http", "require_transit_token": false,
-                    "target_endpoint": target.url}]),
+                    "allow_unauthenticated_callers": true, "target_endpoint": target.url}]),
                 json!([]),
             ));
             let request = Request::builder()
@@ -11336,6 +11822,253 @@ mod tests {
         ctx.authenticated_by = Some(crate::surface_context::TransitClientVerification::ResourceToken);
     }
 
+    /// A transit token that names no verified end user is not replaced by the
+    /// client the Transit Point authenticated: that client's grant belongs to
+    /// the client, not to an end user the Access Point could not identify.
+    #[test]
+    fn delegation_keys_on_the_transit_point_client_only_when_no_token_names_the_caller() {
+        let mut ctx = test_pipeline_context();
+        ctx.authenticated_identity = Some(crate::source_auth::AuthenticatedIdentity::ApiKey {
+            key_name: "copilot-studio".to_string(),
+            provider_agent_id: None,
+        });
+        ctx.authenticated_by = Some(crate::surface_context::TransitClientVerification::SourceAuth);
+        let client_hash = delegation_caller_hash(&ctx).expect("a client the Transit Point verified keys its grant");
+
+        ctx.transit_token_claims = Some(caller_claims(None, Some("gateway-computed"), None, json!({})));
+        assert_eq!(delegation_caller_hash(&ctx), None, "a token with no verified end user refuses, not falls back");
+
+        ctx.transit_token_claims = Some(caller_claims(None, Some("gateway-computed"), Some("abc123"), json!({})));
+        assert_eq!(delegation_caller_hash(&ctx).as_deref(), Some("abc123"));
+        assert_ne!(Some("abc123"), Some(client_hash.as_str()));
+    }
+
+    /// Delegated credentials on a `2026-07-28` MCP request are keyed through the
+    /// Transit Point's resource-server authorization. A Transit Point cannot have
+    /// both that and `source_auth`, so a caller its `source_auth` verified, or one
+    /// only a transit token names, is refused there, while the legacy path keys a
+    /// `source_auth` caller by its identity hash.
+    #[tokio::test]
+    async fn a_modern_mcp_request_from_a_source_auth_caller_cannot_use_delegated_credentials() {
+        use crate::mcp::continuations::ContinuationError;
+        use crate::mcp::continuations::negative_cases::continuation_runtime;
+        use crate::mcp::request_validation::{McpMessageKind, ValidatedModernMessage};
+        use crate::proxy::credential_delegation::modern::{ModernDelegationError, prepare_transit};
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let runtime = continuation_runtime(now, 60);
+        let request = ValidatedModernMessage {
+            protocol_version: crate::mcp::MCP_MODERN_VERSION.into(),
+            client_capabilities: None,
+            client_info: None,
+            method: "tools/call".into(),
+            params: None,
+            id: Some(json!(1)),
+            kind: McpMessageKind::Request,
+        };
+        let state = test_outbound_state();
+        let mut ctx = test_pipeline_context();
+        ctx.authenticated_identity = Some(crate::source_auth::AuthenticatedIdentity::ApiKey {
+            key_name: "copilot-studio".to_string(),
+            provider_agent_id: None,
+        });
+        ctx.authenticated_by = Some(crate::surface_context::TransitClientVerification::SourceAuth);
+        assert!(
+            delegation_caller_hash(&ctx).is_some(),
+            "the legacy path keys this caller by its identity hash when no transit token names one"
+        );
+        ctx.transit_token_claims = Some(caller_claims(Some("did:example:agent"), None, None, json!({})));
+        assert!(
+            ctx.mcp_resource_authorization
+                .is_none()
+        );
+
+        let refused = prepare_transit(&state, &runtime, &mut ctx, &request)
+            .await
+            .err()
+            .expect("the modern path refuses without a resource-server authorization");
+        assert!(matches!(refused, ModernDelegationError::Continuation(ContinuationError::BindingMismatch)));
+
+        ctx.authenticated_identity = None;
+        ctx.authenticated_by = None;
+        ctx.transit_token_claims =
+            Some(caller_claims(Some("did:example:agent"), Some("gateway-computed"), Some("abc123"), json!({})));
+        let refused = prepare_transit(&state, &runtime, &mut ctx, &request)
+            .await
+            .err()
+            .expect("a caller only a transit token names is refused on the modern path too");
+        assert!(matches!(refused, ModernDelegationError::Continuation(ContinuationError::BindingMismatch)));
+    }
+
+    /// On a `2026-07-28` MCP request a Transit Point whose caller `source_auth`
+    /// verified has no resource-server authorization to key a grant by. A
+    /// request that no binding applies to, such as `tools/list` with tool-scoped
+    /// bindings, is sent on without delegated credentials; one an `all` binding
+    /// applies to is answered `403` with `-32001` and its own id, and never
+    /// reaches the target.
+    #[tokio::test]
+    async fn a_modern_mcp_request_through_a_source_auth_transit_point_is_refused_only_where_a_binding_applies() {
+        use crate::mcp::continuations::negative_cases::continuation_runtime;
+        use crate::mcp::request_validation::{McpMessageKind, McpRequestClassification, ValidatedModernMessage};
+
+        let now = crate::proxy::credential_delegation::modern::now_secs().unwrap();
+        let mut state = test_outbound_state();
+        state.mcp_continuations = Some(continuation_runtime(now, 60));
+        let tool_scoped = {
+            let mut surface = test_surface();
+            surface.outbound_credentials = vec![
+                serde_json::from_value(json!({
+                    "credential_provider_id": "provider",
+                    "required_for": {"tools": ["get_current_date_time"]}
+                }))
+                .unwrap(),
+            ];
+            surface
+        };
+        let mut all = tool_scoped.clone();
+        all.outbound_credentials[0].required_for = crate::config::types::CredentialRequirement::All;
+
+        for (surface, refused) in [(tool_scoped, false), (all, true)] {
+            let mut ctx = test_pipeline_context();
+            ctx.surface = Arc::new(surface);
+            ctx.mcp_classification = Some(McpRequestClassification::Modern(Box::new(ValidatedModernMessage {
+                protocol_version: crate::mcp::MCP_MODERN_VERSION.into(),
+                client_capabilities: None,
+                client_info: None,
+                method: "tools/list".into(),
+                params: None,
+                id: Some(json!(7)),
+                kind: McpMessageKind::Request,
+            })));
+            ctx.authenticated_identity = Some(crate::source_auth::AuthenticatedIdentity::ApiKey {
+                key_name: "copilot-studio".to_string(),
+                provider_agent_id: None,
+            });
+            ctx.authenticated_by = Some(crate::surface_context::TransitClientVerification::SourceAuth);
+            ctx.transit_token_claims = Some(caller_claims(Some("did:example:agent"), None, None, json!({})));
+
+            let answer = step_prepare_modern_credentials(&state, &mut ctx)
+                .await
+                .unwrap();
+            match (answer, refused) {
+                (None, false) => {}
+                (Some(response), true) => {
+                    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+                    let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+                        .await
+                        .unwrap();
+                    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(body["error"]["code"], -32001, "{body}");
+                    assert_eq!(body["id"], 7, "the refusal answers the request's own id: {body}");
+                }
+                (answer, refused) => {
+                    panic!("refused: {refused}, but the step answered {:?}", answer.map(|r| r.status()))
+                }
+            }
+        }
+    }
+
+    fn bearer_workload_binding() -> crate::config::types::WorkloadBindingConfig {
+        serde_json::from_value(json!({
+            "enabled": true,
+            "caller_source": "authorization_bearer_jwt",
+            "caller_context_fields": ["tid"]
+        }))
+        .unwrap()
+    }
+
+    fn unverified_bearer(claims: serde_json::Value) -> axum::http::HeaderValue {
+        use base64::Engine as _;
+        let b64 = |value: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value);
+        axum::http::HeaderValue::from_str(&format!(
+            "Bearer {}.{}.sig",
+            b64(br#"{"alg":"none"}"#),
+            b64(claims.to_string().as_bytes())
+        ))
+        .unwrap()
+    }
+
+    /// A Workload Binding that reads the caller's bearer JWT binds the claims the
+    /// Transit Point's own authentication verified, whichever header or method
+    /// carried them, and never those of an `Authorization` header nothing verified.
+    #[test]
+    fn a_bearer_workload_binding_reads_the_claims_the_transit_point_verified() {
+        let config = bearer_workload_binding();
+        let mut ctx = test_pipeline_context();
+        ctx.original_headers
+            .insert(axum::http::header::AUTHORIZATION, unverified_bearer(json!({ "tid": "forged" })));
+
+        ctx.authenticated_identity = Some(crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            subject: "alice".to_string(),
+            claims: json!({ "iss": "https://idp.example", "sub": "alice", "tid": "contoso" }),
+        });
+        ctx.authenticated_by = Some(crate::surface_context::TransitClientVerification::SourceAuth);
+        let captured = capture_workload_binding_caller(&ctx, &config).expect("a verified JWT caller is captured");
+        assert_eq!(captured.fields.get("tid"), Some(&json!("contoso")), "the verified claims win over the header");
+        assert_eq!(captured.fields.len(), 1, "only the allowlisted claim is bound");
+
+        ctx.authenticated_identity = Some(crate::source_auth::AuthenticatedIdentity::ApiKey {
+            key_name: "copilot-studio".to_string(),
+            provider_agent_id: None,
+        });
+        assert!(
+            capture_workload_binding_caller(&ctx, &config).is_none(),
+            "a caller verified another way binds nothing from a header the gateway did not verify"
+        );
+    }
+
+    #[test]
+    fn a_bearer_workload_binding_reads_the_header_when_the_transit_point_authenticates_no_caller() {
+        let config = bearer_workload_binding();
+        let mut ctx = test_pipeline_context();
+        assert!(capture_workload_binding_caller(&ctx, &config).is_none(), "no credential, nothing to bind");
+        ctx.original_headers
+            .insert(axum::http::header::AUTHORIZATION, unverified_bearer(json!({ "tid": "contoso" })));
+        let captured = capture_workload_binding_caller(&ctx, &config).expect("the header is read");
+        assert_eq!(captured.fields.get("tid"), Some(&json!("contoso")));
+    }
+
+    #[test]
+    fn outbound_policy_input_carries_a_client_the_transit_points_source_auth_verified() {
+        let mut ctx = test_pipeline_context();
+        ctx.authenticated_identity = Some(crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            subject: "alice".to_string(),
+            claims: json!({ "iss": "https://idp.example", "sub": "alice", "tid": "tenant-1" }),
+        });
+        ctx.authenticated_by = Some(crate::surface_context::TransitClientVerification::SourceAuth);
+        Arc::make_mut(&mut ctx.surface).tenant_id = Some("tenant-a".to_string());
+        assert_eq!(
+            transit_client_json(&ctx),
+            json!({
+                "verification": "source_auth",
+                "method": "jwt_bearer",
+                "user_identity_hash": hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+                    br#"["jwt_bearer","https://idp.example","tenant-a","alice"]"#
+                )),
+                "subject": "alice"
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(build_outbound_policy_input(&ctx).source_auth).unwrap()["claims"]["tid"],
+            "tenant-1",
+            "the verified token's claims stay in input.source_auth"
+        );
+        assert_eq!(transit_caller_json(&ctx)["verification"], "anonymous", "the client is not the caller");
+
+        ctx.authenticated_identity = Some(crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            subject: "<none>".to_string(),
+            claims: json!({ "iss": "https://idp.example", "client_id": "no-subject" }),
+        });
+        assert_eq!(
+            transit_client_json(&ctx),
+            json!({ "verification": "source_auth", "method": "jwt_bearer" }),
+            "a token that names no subject has neither a hash nor a subject"
+        );
+    }
+
     #[test]
     fn outbound_policy_input_carries_the_client_the_transit_point_authenticated() {
         let mut ctx = test_pipeline_context();
@@ -11620,14 +12353,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_transit_token_validation_skipped_when_no_issuer() {
+    async fn test_transit_token_validation_refuses_when_no_issuer() {
         let state = test_outbound_state(); // transit_token_issuer = None
         let mut ctx = test_pipeline_context();
         let result = step_validate_transit_token(&state, &mut ctx).await;
-        assert!(result.is_ok());
+        assert!(
+            matches!(result, Err(OutboundPipelineError::TransitTokenInvalid(ref reason)) if reason.contains("unavailable")),
+            "a Transit Point that requires the token refuses when it cannot check it: {result:?}"
+        );
         assert!(
             ctx.transit_token_claims
                 .is_none()
+        );
+
+        ctx.virtual_channel
+            .require_transit_token = false;
+        assert!(
+            step_validate_transit_token(&state, &mut ctx)
+                .await
+                .is_ok(),
+            "a Transit Point that does not require the token is unaffected"
         );
     }
 
@@ -13316,6 +14061,250 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_caller_the_transit_points_source_auth_verified_keys_delegated_credentials_by_its_identity_hash() {
+        use crate::surface_context::TransitClientVerification::{ResourceToken, SourceAuth};
+
+        let directory = tempfile::tempdir().unwrap();
+        let state = delegation_state(directory.path(), &[("provider", "token-caller-access")]).await;
+        let jwt_caller = |subject: &str| crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            subject: subject.to_string(),
+            claims: json!({ "iss": "https://idp.example", "sub": subject }),
+        };
+        state
+            .delegation_vault_store
+            .as_ref()
+            .unwrap()
+            .store(
+                serde_json::from_value(json!({
+                    "id": "alice-token", "agent_did": "did:web:agent.example",
+                    "user_identity_hash": jwt_caller("alice").principal_hash(None), "credential_provider_id": "provider",
+                    "provider_id": "provider", "access_token": "alice-access",
+                    "refresh_token": "alice-refresh", "scopes": ["read"],
+                    "expires_at": chrono::Utc::now() + chrono::Duration::hours(1),
+                    "consent_granted_at": "2026-09-01T00:00:00Z",
+                    "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let surface = transit_surface(
+            json!([meta_transit_point("partner", "https://partner.example/mcp", false, Some("provider"))]),
+            json!([]),
+        );
+        let (resolved, point) = resolved_transit_point(&surface, None, "partner");
+        let context = |identity, verified_by, with_transit_token: bool| {
+            let mut ctx = legacy_delegation_context(resolved.clone(), point.clone());
+            if !with_transit_token {
+                ctx.transit_token_claims = None;
+            }
+            ctx.authenticated_identity = Some(identity);
+            ctx.authenticated_by = Some(verified_by);
+            ctx
+        };
+
+        assert_eq!(injected_credential(&state, context(jwt_caller("alice"), SourceAuth, false)).await, "alice-access");
+        assert_eq!(
+            injected_credential(&state, context(jwt_caller("alice"), SourceAuth, true)).await,
+            "token-caller-access",
+            "the transit token's caller keys the grant when there is one"
+        );
+
+        let mut bob = context(jwt_caller("bob"), SourceAuth, false);
+        assert!(
+            step_inject_credentials(&state, &mut bob)
+                .await
+                .is_err(),
+            "a caller without a grant of its own is not given another caller's"
+        );
+
+        let mut resource_token_caller = context(jwt_caller("alice"), ResourceToken, false);
+        let refused = step_inject_credentials(&state, &mut resource_token_caller)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                OutboundPipelineError::DelegationRefused {
+                    refusal: DelegationRefusal::CallerIdentityMissing,
+                    ..
+                }
+            ),
+            "{refused:?}"
+        );
+    }
+
+    /// A caller the Transit Point's `source_auth` verified reaches only the
+    /// grant consented under how it was identified: the same subject from
+    /// another issuer, the same name from another method, the same caller on
+    /// another tenant's surface, and a token that names no subject get none.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delegated_grants_are_keyed_by_how_the_caller_was_identified() {
+        use crate::source_auth::AuthenticatedIdentity;
+        use crate::surface_context::TransitClientVerification::SourceAuth;
+
+        let directory = tempfile::tempdir().unwrap();
+        let state = delegation_state(directory.path(), &[("provider", "token-caller-access")]).await;
+        let jwt = |claims: serde_json::Value| AuthenticatedIdentity::JwtBearer {
+            subject: claims["sub"]
+                .as_str()
+                .unwrap_or("<none>")
+                .to_string(),
+            claims,
+        };
+        let alice = jwt(json!({ "iss": "https://idp.example", "sub": "alice" }));
+        let store_grant = |id: &'static str, user_identity_hash: String, access_token: &'static str| {
+            let vault = state
+                .delegation_vault_store
+                .clone()
+                .unwrap();
+            async move {
+                vault
+                    .store(
+                        serde_json::from_value(json!({
+                            "id": id, "agent_did": "did:web:agent.example",
+                            "user_identity_hash": user_identity_hash, "credential_provider_id": "provider",
+                            "provider_id": "provider", "access_token": access_token,
+                            "refresh_token": format!("{id}-refresh"), "scopes": ["read"],
+                            "expires_at": chrono::Utc::now() + chrono::Duration::hours(1),
+                            "consent_granted_at": "2026-09-01T00:00:00Z",
+                            "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+                        }))
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        };
+        store_grant(
+            "alice-token",
+            alice
+                .principal_hash(None)
+                .unwrap(),
+            "alice-access",
+        )
+        .await;
+        // A grant under the hash of the `<none>` subject placeholder, which no
+        // caller's identity hash is.
+        store_grant(
+            "no-subject-token",
+            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(b"<none>")),
+            "no-subject-access",
+        )
+        .await;
+        let surface = transit_surface(
+            json!([meta_transit_point("partner", "https://partner.example/mcp", false, Some("provider"))]),
+            json!([]),
+        );
+        let (resolved, point) = resolved_transit_point(&surface, None, "partner");
+        let context = |identity: AuthenticatedIdentity, tenant: Option<&str>| {
+            let mut ctx = legacy_delegation_context(resolved.clone(), point.clone());
+            ctx.transit_token_claims = None;
+            Arc::make_mut(&mut ctx.surface).tenant_id = tenant.map(str::to_string);
+            ctx.authenticated_identity = Some(identity);
+            ctx.authenticated_by = Some(SourceAuth);
+            ctx
+        };
+
+        assert_eq!(injected_credential(&state, context(alice.clone(), None)).await, "alice-access");
+
+        let refused = async |identity: AuthenticatedIdentity, tenant: Option<&str>| {
+            step_inject_credentials(&state, &mut context(identity, tenant))
+                .await
+                .err()
+        };
+        for (case, identity, tenant) in [
+            (
+                "the same subject from another issuer",
+                jwt(json!({ "iss": "https://partner.example", "sub": "alice" })),
+                None,
+            ),
+            (
+                "an API key secret of the same name",
+                AuthenticatedIdentity::ApiKey {
+                    key_name: "alice".into(),
+                    provider_agent_id: None,
+                },
+                None,
+            ),
+            ("the same caller on another tenant's surface", alice.clone(), Some("tenant-b")),
+        ] {
+            assert!(
+                refused(identity, tenant)
+                    .await
+                    .is_some(),
+                "{case} must not get alice's grant"
+            );
+        }
+        let second_without_subject = jwt(json!({ "iss": "https://idp.example", "client_id": "second" }));
+        assert!(
+            matches!(
+                refused(second_without_subject, None).await,
+                Some(OutboundPipelineError::DelegationRefused {
+                    refusal: DelegationRefusal::CallerIdentityMissing,
+                    ..
+                })
+            ),
+            "a token that names no subject identifies no caller, so it gets no grant"
+        );
+    }
+
+    /// The `credential_delegation` lines that refuse a Transit Point call for
+    /// want of a caller or an agent to key its delegated credentials by name
+    /// the surface variant that served it; a `source_auth` caller with no
+    /// managed agent identity takes the second.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_delegation_refusal_line_names_the_request_variant() {
+        use crate::observability::policy_audit::{RequestScope, in_request, set_request_variant};
+        use crate::surface_context::TransitClientVerification::SourceAuth;
+
+        let directory = tempfile::tempdir().unwrap();
+        let state = delegation_state(directory.path(), &[("provider", "transit-access")]).await;
+        let surface = transit_surface(
+            json!([meta_transit_point("partner", "https://partner.example/mcp", false, Some("provider"))]),
+            json!([]),
+        );
+        let (resolved, point) = resolved_transit_point(&surface, None, "partner");
+        let no_caller = || {
+            let mut ctx = legacy_delegation_context(resolved.clone(), point.clone());
+            ctx.transit_token_claims = None;
+            ctx
+        };
+        let mut no_agent = no_caller();
+        no_agent.authenticated_identity = Some(crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            subject: "alice".to_string(),
+            claims: json!({ "iss": "https://idp.example", "sub": "alice" }),
+        });
+        no_agent.authenticated_by = Some(SourceAuth);
+        no_agent.resolved_identity = ProtectedAgentIdentity::Anonymous;
+
+        for (mut ctx, expected, line) in [
+            (no_caller(), DelegationRefusal::CallerIdentityMissing, "identifies the caller - refusing the request"),
+            (no_agent, DelegationRefusal::AgentIdentityMissing, "No managed agent identity for delegated credentials"),
+        ] {
+            let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+            let refused = in_request(RequestScope::fresh(), async {
+                set_request_variant("beta");
+                step_inject_credentials(&state, &mut ctx).await
+            })
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(refused, OutboundPipelineError::DelegationRefused { refusal, .. } if refusal == expected),
+                "{line}: {refused:?}"
+            );
+            let lines: Vec<String> = logs
+                .text()
+                .lines()
+                .filter(|text| text.contains(line))
+                .map(str::to_string)
+                .collect();
+            assert_eq!(lines.len(), 1, "{line}: {lines:?}");
+            assert!(lines[0].contains("surface_variant=\"beta\""), "{}", lines[0]);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fabric_transit_point_with_only_transit_credentials_follows_its_switch() {
         let directory = tempfile::tempdir().unwrap();
         let state = delegation_state(directory.path(), &[("provider", "transit-access")]).await;
@@ -13873,6 +14862,7 @@ mod tests {
                 .points
             {
                 point.require_transit_token = point.alias != "untokened";
+                point.allow_unauthenticated_callers = point.alias == "untokened";
             }
             channel_state.surface = Arc::new(surface);
         }

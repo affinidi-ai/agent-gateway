@@ -159,6 +159,7 @@ impl GatewayConfig {
                 _retired_protocol_mode: Default::default(),
                 mcp_http: None,
                 trust_check_split: false,
+                transit_point_source_auth: false,
             }],
             tls: TlsConfig {
                 cert_path: PathBuf::from("cert.pem"),
@@ -338,17 +339,25 @@ fn validate_source_auth_surface(surface: &crate::config::agent_surface::AgentSur
 /// dashboard save cannot persist values that would otherwise be rejected on
 /// the next process restart.
 pub fn validate_source_auth_config(surface: &crate::config::agent_surface::AgentSurface) -> anyhow::Result<()> {
-    use crate::source_auth::models::{MtlsTrust, SourceAuthConfig};
+    match surface.source_auth() {
+        Some(src) => validate_source_auth_method(src, &surface.name),
+        None => Ok(()),
+    }
+}
 
-    let Some(src) = surface.source_auth() else {
-        return Ok(());
-    };
+/// Validate one source authentication method, set on the Access Point or a
+/// Transit Point of the surface named `surface_name`.
+pub(crate) fn validate_source_auth_method(
+    src: &crate::source_auth::SourceAuthConfig,
+    surface_name: &str,
+) -> anyhow::Result<()> {
+    use crate::source_auth::models::{MtlsTrust, SourceAuthConfig};
 
     match src {
         SourceAuthConfig::Mtls(cfg) => match &cfg.trust {
             MtlsTrust::Pinned { certificate_ids } => {
                 if certificate_ids.is_empty() {
-                    anyhow::bail!("Channel '{}': mTLS pinned trust requires at least one certificate_id", surface.name);
+                    anyhow::bail!("Channel '{}': mTLS pinned trust requires at least one certificate_id", surface_name);
                 }
             }
             MtlsTrust::Ca {
@@ -358,24 +367,24 @@ pub fn validate_source_auth_config(surface: &crate::config::agent_surface::Agent
                 ..
             } => {
                 if ca_certificate_ids.is_empty() {
-                    anyhow::bail!("Channel '{}': mTLS CA trust requires at least one ca_certificate_id", surface.name);
+                    anyhow::bail!("Channel '{}': mTLS CA trust requires at least one ca_certificate_id", surface_name);
                 }
                 if *check_crl {
                     anyhow::bail!(
                         "Channel '{}': mTLS CA trust has check_crl=true but CRL checking is not yet implemented; set check_crl=false",
-                        surface.name
+                        surface_name
                     );
                 }
                 if *require_ocsp {
                     anyhow::bail!(
                         "Channel '{}': mTLS CA trust has require_ocsp=true but OCSP stapling is not yet implemented; set require_ocsp=false",
-                        surface.name
+                        surface_name
                     );
                 }
             }
         },
         SourceAuthConfig::JwtBearer(_) | SourceAuthConfig::ApiKey(_) | SourceAuthConfig::ApiKeyProvider(_) => {}
-        SourceAuthConfig::DidAuth(cfg) => validate_did_auth_config(cfg, &surface.name)?,
+        SourceAuthConfig::DidAuth(cfg) => validate_did_auth_config(cfg, surface_name)?,
     }
     Ok(())
 }

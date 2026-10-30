@@ -1165,7 +1165,8 @@ pub fn build_minimal_outbound_channel() -> AgentSurface {
                 "alias": "target",
                 "target_endpoint": "outbound_target_placeholder",
                 "gateway_url": "outbound_gateway_url_placeholder",
-                "require_transit_token": false
+                "require_transit_token": false,
+                "allow_unauthenticated_callers": true
             }]
         }
     }))
@@ -1195,6 +1196,7 @@ pub fn build_identity_channel() -> AgentSurface {
                 "target_endpoint": "outbound_target_placeholder",
                 "gateway_url": "outbound_gateway_url_placeholder",
                 "require_transit_token": false,
+                "allow_unauthenticated_callers": true,
                 "identity_injection": { "inject_vp": true }
             }]
         },
@@ -1251,7 +1253,8 @@ pub fn build_api_key_identity_channel(api_key_id: &str) -> AgentSurface {
                 "alias": "target",
                 "target_endpoint": "outbound_target_placeholder",
                 "gateway_url": "outbound_gateway_url_placeholder",
-                "require_transit_token": false
+                "require_transit_token": false,
+                "allow_unauthenticated_callers": true
             }]
         },
         "identity_slots": {
@@ -1287,6 +1290,7 @@ pub fn build_per_tp_identity_channel() -> AgentSurface {
                 "target_endpoint": "outbound_target_placeholder",
                 "gateway_url": "outbound_gateway_url_placeholder",
                 "require_transit_token": false,
+                "allow_unauthenticated_callers": true,
                 "managed_identity": {
                     "type": "payload_extraction",
                     "meta_field": "agentIdentity",

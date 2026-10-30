@@ -341,6 +341,59 @@ async fn source_auth_credential_header_not_forwarded_upstream() {
     );
 }
 
+/// The managed agent learns who is calling only from the caller-info and DID
+/// identity headers the gateway sets: a caller's own copies, in any case, are
+/// dropped, so the agent gets the gateway's one value of each it sets and none
+/// of the others.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_agent_receives_the_caller_info_headers_only_as_the_gateway_sets_them() {
+    let target = helpers::RecordingTarget::start(axum::http::StatusCode::OK, &[]).await;
+    let target_url = target.url.clone();
+    let h = GatewayHarness::start(move |_, gw_config, _| {
+        let mut surface = helpers::build_minimal_channel();
+        surface.target.endpoint = target_url;
+        gw_config.surfaces = vec![surface];
+    })
+    .await;
+
+    let response = reqwest::Client::new()
+        .post(&h.gateway_url)
+        .header("content-type", "application/json")
+        .header("x-caller-did", "did:web:caller-sent.example")
+        .header("X-Caller-Identity-Source", "verified-presentation")
+        .header("x-caller-dna-uai", "uai:caller-sent")
+        .header("X-Gateway-DID", "did:web:caller-sent-gateway.example")
+        .header("X-DID-Identity", "did:web:caller-sent-surface.example")
+        .header("x-did-signed-identity", r#"{"id":"did:web:caller-sent-surface.example"}"#)
+        .header("x-caller-context", "kept")
+        .body(r#"{"jsonrpc":"2.0","method":"test","id":1}"#)
+        .send()
+        .await
+        .expect("request failed");
+    assert_eq!(response.status(), 200);
+
+    let received = target.received();
+    assert_eq!(received.len(), 1);
+    let values = |name: &str| -> Vec<String> {
+        received[0]
+            .get_all(name)
+            .iter()
+            .map(|value| {
+                value
+                    .to_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    };
+    assert_eq!(values("x-caller-did"), ["anonymous"]);
+    assert_eq!(values("x-caller-identity-source"), ["gateway-computed"]);
+    for unset in ["x-caller-dna-uai", "x-gateway-did", "x-did-identity", "x-did-signed-identity"] {
+        assert!(values(unset).is_empty(), "{unset}: {:?}", values(unset));
+    }
+    assert_eq!(values("x-caller-context"), ["kept"], "headers that are not caller-info headers still pass");
+}
+
 // ── Surface variant URL routing (plan §2.3) ─────────────────────────────────
 
 /// Plan §2.3: a request whose URL matches `/route$alias[/rest]` selects the
