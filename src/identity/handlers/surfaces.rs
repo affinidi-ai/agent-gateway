@@ -888,9 +888,11 @@ type SavedSurface = (axum::http::HeaderMap, Json<AgentSurface>);
 /// serves callers it does not authenticate where other hosts reach it, each
 /// that accepts the Access Point's own tokens ([`shared_audience_warnings`]),
 /// each whose JWT verification strategy names an issuer the surface also
-/// accepts through another ([`shared_issuer_warnings`]), and each that opts
+/// accepts through another ([`shared_issuer_warnings`]), each that opts
 /// Fabric callers in to delegated credentials without a managed identity
-/// ([`fabric_delegation_identity_warnings`]).
+/// ([`fabric_delegation_identity_warnings`]), and each with external consent
+/// that a variant keeps under its own settings
+/// ([`inherited_external_point_warnings`]).
 async fn transit_point_warnings(
     state: &IdentityApiState,
     surface: &AgentSurface,
@@ -903,6 +905,7 @@ async fn transit_point_warnings(
         .chain(shared_audience_warnings(surface))
         .chain(shared_issuer_warnings(surface, &issuers))
         .chain(fabric_delegation_identity_warnings(surface))
+        .chain(inherited_external_point_warnings(surface))
     {
         let quoted = warning
             .replace('\\', "\\\\")
@@ -1086,6 +1089,56 @@ fn fabric_delegation_identity_warnings(surface: &AgentSurface) -> Vec<String> {
             if !warnings.contains(&warning) {
                 warnings.push(warning);
             }
+        }
+    }
+    warnings
+}
+
+/// Each Transit Point with `consent_mode: external` that an enabled variant
+/// keeps from the surface, rather than listing its own points, while it
+/// overrides the shared transit settings or the Access Point. A grant by
+/// binding is kept under the Transit Point's id, so calls through the variant
+/// use the surface's grants under the variant's own transit policy, rate limit
+/// and Access Point.
+fn inherited_external_point_warnings(surface: &AgentSurface) -> Vec<String> {
+    let external: Vec<&str> = surface
+        .transit_points()
+        .iter()
+        .filter(|point| {
+            point
+                .transit_credentials
+                .as_ref()
+                .is_some_and(|binding| binding.is_external())
+        })
+        .map(|point| point.alias.as_str())
+        .collect();
+    let mut warnings = Vec::new();
+    for variant in surface
+        .variants
+        .iter()
+        .filter(|variant| variant.enabled)
+    {
+        let transit = variant
+            .overrides
+            .transit
+            .as_ref();
+        let keeps_the_points = transit.is_none_or(|transit| transit.disabled != Some(true) && transit.points.is_none());
+        let overrides_access = transit.is_some_and(|transit| transit.shared.is_some())
+            || variant
+                .overrides
+                .access_point
+                .is_some();
+        if !keeps_the_points || !overrides_access {
+            continue;
+        }
+        for alias in &external {
+            warnings.push(format!(
+                "Variant '{}' keeps Transit Point '{alias}', which has consent_mode external, and overrides its \
+                 transit settings or its Access Point: calls through the variant use the Transit Point's grants under \
+                 the variant's own transit policy, rate limit and Access Point; to keep them apart, give the variant \
+                 its own Transit Points in overrides.transit.points, with new ids",
+                variant.alias
+            ));
         }
     }
     warnings
@@ -4443,6 +4496,80 @@ mod validation_tests {
             ("the switch off", surface_with(point(false, serde_json::json!({})), false)),
         ] {
             assert!(fabric_delegation_identity_warnings(&surface).is_empty(), "{case}");
+        }
+    }
+
+    /// A variant that keeps the surface's Transit Points uses their grants by
+    /// binding under its own transit settings and Access Point: a save says so
+    /// when the variant overrides either.
+    #[test]
+    fn a_save_warns_of_a_variant_that_uses_inherited_grants_under_its_own_settings() {
+        let surface_with = |enabled: bool, overrides: serde_json::Value| -> AgentSurface {
+            serde_json::from_value(serde_json::json!({
+                "name": "tools",
+                "access_point": { "listen_address": "0.0.0.0:8443", "route": "/mcp", "protocol": "mcp" },
+                "target": { "endpoint": "https://tools.internal/mcp" },
+                "transit": { "points": [
+                    { "id": "crm-id", "alias": "crm", "target_endpoint": "https://crm.example/mcp",
+                        "require_transit_token": true, "transit_credentials": {
+                            "credential_provider_id": "vendor", "consent_mode": "external", "subject": "owner" } },
+                    { "id": "docs-id", "alias": "docs", "target_endpoint": "https://docs.example/mcp",
+                        "require_transit_token": true }
+                ] },
+                "variants": [{ "id": "dev", "alias": "dev", "name": "Dev", "enabled": enabled,
+                    "overrides": overrides }]
+            }))
+            .unwrap()
+        };
+        let warning = vec![
+            "Variant 'dev' keeps Transit Point 'crm', which has consent_mode external, and overrides its transit \
+             settings or its Access Point: calls through the variant use the Transit Point's grants under the \
+             variant's own transit policy, rate limit and Access Point; to keep them apart, give the variant its own \
+             Transit Points in overrides.transit.points, with new ids"
+                .to_string(),
+        ];
+        for (case, overrides) in [
+            (
+                "its own transit policy",
+                serde_json::json!({ "transit": { "shared": { "opa_policy_definition_id": "dev" } } }),
+            ),
+            (
+                "its own Access Point",
+                serde_json::json!({ "access_point": { "caller_authentication": { "methods": [caller_key()] } } }),
+            ),
+        ] {
+            assert_eq!(inherited_external_point_warnings(&surface_with(true, overrides)), warning, "{case}");
+        }
+        for (case, surface) in [
+            ("no overrides", surface_with(true, serde_json::json!({}))),
+            (
+                "its own target",
+                surface_with(true, serde_json::json!({ "target": { "endpoint": "https://dev.internal" } })),
+            ),
+            (
+                "its own Transit Points",
+                surface_with(
+                    true,
+                    serde_json::json!({ "transit": { "points": [], "shared": { "opa_policy_definition_id": "dev" } } }),
+                ),
+            ),
+            (
+                "transit turned off",
+                surface_with(
+                    true,
+                    serde_json::json!({ "transit": { "disabled": true }, "access_point": { "caller_authentication": {
+                        "methods": [caller_key()] } } }),
+                ),
+            ),
+            (
+                "a disabled variant",
+                surface_with(
+                    false,
+                    serde_json::json!({ "transit": { "shared": { "opa_policy_definition_id": "dev" } } }),
+                ),
+            ),
+        ] {
+            assert!(inherited_external_point_warnings(&surface).is_empty(), "{case}");
         }
     }
 
