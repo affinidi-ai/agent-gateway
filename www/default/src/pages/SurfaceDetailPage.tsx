@@ -3,7 +3,6 @@ import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { AgentSurface, apiClient } from '../api';
 import { showToast } from '../utils/toaster';
 import SaveWarningsBanner from '../components/surface-builder/SaveWarningsBanner';
-import { joinWarnings } from '../utils/warningHeader';
 import { usePermissions } from '../context/PermissionsContext';
 import { usePageTitle } from '../context/PageTitleContext';
 import { useApp } from '../context/AppContext';
@@ -13,6 +12,7 @@ import {
   validateSurfacePayload,
   buildCanvasBlob,
 } from '../components/surface-builder/elements';
+import { showSurfaceSaveToast } from '../components/surface-builder/elements/saveWarnings';
 import type { Protocol } from '../components/surface-builder/elements/types';
 import { useSurfaceBuilder } from '../components/surface-builder/hooks/useSurfaceBuilder';
 import { useSurfaceHistory } from '../components/surface-builder/hooks/useSurfaceHistory';
@@ -1359,23 +1359,8 @@ const SurfaceDetailPage: React.FC = () => {
       if (hydration.didAutoLayout) bumpResetView();
       // Surface non-blocking structural warnings AFTER save so the
       // user notices issues like empty target endpoints / unrouted
-      // transit points without being prevented from saving. The toast
-      // helper only knows success/error/loading, so warnings reuse the
-      // error styling — they are real shape problems the user should
-      // see, just not severe enough to block the save itself.
-      const warnings = validateSurfacePayload(updated).filter(i => i.severity === 'warning');
-      // One toast: a later one replaces an earlier one, so the saved message
-      // and every warning go into this one.
-      const allWarnings = [...headerWarnings, ...warnings.map(w => w.message)];
-      if (allWarnings.length === 0) {
-        showToast('success', `Agent Surface "${updated.name}" saved`);
-      } else {
-        showToast(
-          'error',
-          `Agent Surface "${updated.name}" saved, with warnings:\n${joinWarnings(allWarnings)}`,
-          { autoRemove: true, duration: 10000 }
-        );
-      }
+      // transit points without being prevented from saving.
+      showSurfaceSaveToast(`Agent Surface "${updated.name}" saved`, updated, { headerWarnings });
     } catch (err: any) {
       setError(err.message || 'Failed to save surface');
     } finally {

@@ -153,7 +153,7 @@ describe('SurfaceDetailPage save warnings', () => {
     expect(screen.getByTestId('surface-save-warnings')).toHaveTextContent(updateWarning);
     expect(showToast).toHaveBeenCalledTimes(1);
     expect(showToast).toHaveBeenCalledWith(
-      'error',
+      'warning',
       expect.stringContaining(updateWarning),
       expect.objectContaining({ autoRemove: true })
     );

@@ -8,6 +8,7 @@ import type { Protocol } from '../components/surface-builder/elements/types';
 import { ALL_PROTOCOLS } from '../components/surface-builder/protocols';
 import { defaultSurfaceName } from '../components/surface-builder/surfaceNaming';
 import { registry, validateSurfacePayload } from '../components/surface-builder/elements';
+import { showSurfaceSaveToast } from '../components/surface-builder/elements/saveWarnings';
 import { useSurfaceBuilder } from '../components/surface-builder/hooks/useSurfaceBuilder';
 import { useSaveShortcut } from '../components/surface-builder/hooks/useSaveShortcut';
 import { useDiscardWithUndo } from '../components/surface-builder/hooks/useDiscardWithUndo';
@@ -33,7 +34,6 @@ import {
   getTemplateProtocolBadge,
 } from '../components/surface-builder/templates/templateSort';
 import { showToast } from '../utils/toaster';
-import { joinWarnings } from '../utils/warningHeader';
 import './SurfaceBuilder.css';
 
 const WELCOME_DISMISSED_KEY = 'surface-builder-welcome-dismissed';
@@ -412,7 +412,7 @@ const AddSurfacePage: React.FC = () => {
     // surface after a successful POST.
     try {
       const draft = buildSurfacePayload();
-      const issues = validateSurfacePayload(draft);
+      const issues = validateSurfacePayload(draft, { isNew: true });
       const firstError = issues.find(i => i.severity === 'error');
       if (firstError) {
         return { message: firstError.message, nodeId: firstError.nodeId };
@@ -459,18 +459,10 @@ const AddSurfacePage: React.FC = () => {
       justCreatedRef.current = true;
       // Surface non-blocking structural warnings AFTER create. See
       // SurfaceDetailPage for full rationale.
-      const warnings = validateSurfacePayload(payload).filter(i => i.severity === 'warning');
-      // One toast: a later one replaces an earlier one.
-      const allWarnings = [...headerWarnings, ...warnings.map(w => w.message)];
-      if (allWarnings.length === 0) {
-        showToast('success', `Agent Surface "${name}" created`);
-      } else {
-        showToast(
-          'error',
-          `Agent Surface "${name}" created, with warnings:\n${joinWarnings(allWarnings)}`,
-          { autoRemove: true, duration: 10000 }
-        );
-      }
+      showSurfaceSaveToast(`Agent Surface "${name}" created`, payload, {
+        isNew: true,
+        headerWarnings,
+      });
       // Warnings from the gateway go with the operator to the new surface's
       // page, which lists them, since the toast goes after a few seconds.
       if (headerWarnings.length > 0 && created?.surface_id) {
