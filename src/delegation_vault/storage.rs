@@ -53,6 +53,19 @@ pub trait DelegationVaultStorage: Send + Sync {
         user_identity_hash: &str,
     ) -> Result<usize>;
 
+    /// Delete the expired tokens of one agent and provider whose user hash starts with
+    /// `user_hash_prefix`, except `keep_id`. Unlike a revoke, it leaves pending consents
+    /// alone: it removes only records that can no longer be used.
+    async fn prune_expired(
+        &self,
+        _agent_did: &str,
+        _provider_id: &str,
+        _user_hash_prefix: &str,
+        _keep_id: &str,
+    ) -> Result<usize> {
+        Ok(0)
+    }
+
     /// Update a token (e.g. after refresh)
     async fn update(
         &self,
@@ -472,6 +485,59 @@ impl DelegationVaultStorage for FileSystemDelegationVaultStore {
         .await
     }
 
+    async fn prune_expired(
+        &self,
+        agent_did: &str,
+        provider_id: &str,
+        user_hash_prefix: &str,
+        keep_id: &str,
+    ) -> Result<usize> {
+        let (agent_did, provider_id, user_hash_prefix, keep_id) =
+            (agent_did.to_string(), provider_id.to_string(), user_hash_prefix.to_string(), keep_id.to_string());
+        self.mutate(move |store| async move {
+            let now = Utc::now();
+            let expired: Vec<String> = store
+                .storage
+                .list_all()
+                .await?
+                .into_iter()
+                .filter(|token| {
+                    token.id != keep_id
+                        && token.agent_did == agent_did
+                        && token.credential_provider_id == provider_id
+                        && token
+                            .user_identity_hash
+                            .starts_with(&user_hash_prefix)
+                        && token
+                            .expires_at
+                            .is_some_and(|expires_at| expires_at <= now)
+                })
+                .map(|token| token.id)
+                .collect();
+            for id in &expired {
+                store
+                    .refreshes
+                    .delete(id)
+                    .await?;
+                store
+                    .storage
+                    .delete(id)
+                    .await?;
+            }
+            if !expired.is_empty() {
+                info!(
+                    target: "credential_delegation",
+                    agent_did = %agent_did,
+                    provider_id = %provider_id,
+                    count = expired.len(),
+                    "Removed expired service tokens"
+                );
+            }
+            Ok(expired.len())
+        })
+        .await
+    }
+
     async fn update(
         &self,
         mut token: DelegationToken,
@@ -678,6 +744,103 @@ fn newest_first(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pruning_removes_only_expired_rows_of_one_agent_provider_and_purpose() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FileSystemDelegationVaultStore::new(directory.path().into())
+            .await
+            .unwrap();
+        let row = |id: &str, agent_did: &str, provider: &str, user_hash: &str, expires_in: i64| {
+            let mut token = super::super::tests::make_token(Some(expires_in), true);
+            token.id = id.into();
+            token.agent_did = agent_did.into();
+            token.credential_provider_id = provider.into();
+            token.user_identity_hash = user_hash.into();
+            token
+        };
+        let rows = [
+            row("expired-old-settings", "surface:a", "cp-1", "__target_auth__:old", -10),
+            row("live-other-scopes", "surface:a", "cp-1", "__target_auth__:other", 3600),
+            row("expired-other-provider", "surface:a", "cp-2", "__target_auth__:old", -10),
+            row("expired-other-agent", "surface:b", "cp-1", "__target_auth__:old", -10),
+            row("expired-user-consent", "surface:a", "cp-1", "sha256:user", -10),
+            row("kept-new-token", "surface:a", "cp-1", "__target_auth__:new", -10),
+        ];
+        let mut stored = Vec::new();
+        for token in rows {
+            stored.push(
+                store
+                    .store(token)
+                    .await
+                    .unwrap(),
+            );
+        }
+        let now = Utc::now().timestamp() as u64;
+        store
+            .claim_refresh(&stored[4], now)
+            .await
+            .unwrap();
+        let pending = super::super::tests::make_token(Some(3600), true);
+        let consent = StagedConsent {
+            id: uuid::Uuid::new_v4().to_string(),
+            binding_digest: [1; 32],
+            issued_at: now,
+            expires_at: now + 300,
+            snapshot: store
+                .consent_snapshot(&pending.agent_did, &pending.user_identity_hash, &pending.credential_provider_id)
+                .await
+                .unwrap(),
+            credential: pending,
+        };
+        let consent_id = uuid::Uuid::parse_str(&consent.id).unwrap();
+        store
+            .stage_consent(consent, now)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .prune_expired("surface:a", "cp-1", "__target_auth__:", "kept-new-token")
+                .await
+                .unwrap(),
+            1
+        );
+
+        let mut left: Vec<String> = store
+            .list_all()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|token| token.id)
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                "expired-other-agent",
+                "expired-other-provider",
+                "expired-user-consent",
+                "kept-new-token",
+                "live-other-scopes"
+            ]
+        );
+        assert!(
+            store
+                .refreshes
+                .get("expired-user-consent")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .staged_consent(consent_id, [1; 32], now)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_vault_updates_hold_the_lock_until_their_write_finishes() {

@@ -504,7 +504,7 @@ pub async fn resolve_delegation_credentials(
                 };
                 let key = ServiceTokenKey {
                     agent_did,
-                    identity: m2m_user_hash,
+                    purpose: m2m_user_hash,
                 };
                 let acquired = service_token::acquire(&provider, effective_scopes, &context, key, Utc::now())
                     .await
@@ -1596,14 +1596,31 @@ mod tests {
         ) -> Result<Option<DelegationToken>> {
             Ok(None)
         }
+        /// A found service token stored under its purpose alone answers every key of that
+        /// purpose, so a test need not compute the hashed identity.
         async fn lookup(
             &self,
             _agent_did: &str,
-            _user_identity_hash: &str,
+            user_identity_hash: &str,
             _provider_id: &str,
         ) -> Result<VaultLookupResult> {
-            let guard = self.result.lock().await;
-            Ok(guard.clone())
+            let mut result = self
+                .result
+                .lock()
+                .await
+                .clone();
+            if let VaultLookupResult::Found(token) = &mut result
+                && user_identity_hash
+                    .strip_prefix(
+                        token
+                            .user_identity_hash
+                            .as_str(),
+                    )
+                    .is_some_and(|rest| rest.starts_with(':'))
+            {
+                token.user_identity_hash = user_identity_hash.to_string();
+            }
+            Ok(result)
         }
         async fn list_all(&self) -> Result<Vec<DelegationToken>> {
             Ok(vec![])
@@ -1711,7 +1728,12 @@ mod tests {
 
     // ── Mock secrets store ────────────────────────────────────────────────
 
-    struct MockSecretsStore;
+    /// Lists the `CLIENT_ID` and `CLIENT_SECRET` references of `make_credential_provider`
+    /// in `tenant_id`, and holds no values.
+    #[derive(Default)]
+    struct MockSecretsStore {
+        tenant_id: Option<String>,
+    }
 
     #[async_trait]
     impl crate::secrets::store::SecretsStore for MockSecretsStore {
@@ -1728,7 +1750,21 @@ mod tests {
             Ok(None)
         }
         async fn list_all(&self) -> Result<Vec<SecretListItem>> {
-            Ok(vec![])
+            let at = chrono::DateTime::<Utc>::UNIX_EPOCH;
+            Ok(["CLIENT_ID", "CLIENT_SECRET"]
+                .into_iter()
+                .map(|secret_id| SecretListItem {
+                    id: secret_id.to_lowercase(),
+                    tenant_id: self.tenant_id.clone(),
+                    name: secret_id.into(),
+                    secret_id: secret_id.into(),
+                    description: None,
+                    secret_type: "General".into(),
+                    tags: vec![],
+                    created_at: at,
+                    updated_at: at,
+                })
+                .collect())
         }
         async fn update(
             &self,
@@ -1987,7 +2023,7 @@ mod tests {
             .claim_refresh(&token, modern::now_secs().unwrap())
             .await
             .unwrap();
-        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
         let providers: Arc<dyn CredentialProviderStorage> = MockProviderStore::with_oauth_provider("cp-1");
         let store: Arc<dyn DelegationVaultStorage> = vault.clone();
         let results = resolve_delegation_credentials(
@@ -2040,7 +2076,7 @@ mod tests {
         });
         let vault = MockVaultStore::new(VaultLookupResult::Found(token));
         let providers = MockProviderStore::with_oauth_provider("cp-1");
-        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
         resolve_delegation_credentials(
             &[make_binding("cp-1")],
             "sha256:user1",
@@ -2098,7 +2134,7 @@ mod tests {
         let token = make_token(false, false);
         let vault = MockVaultStore::new(VaultLookupResult::Found(token));
         let providers = MockProviderStore::with_oauth_provider("cp-1");
-        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
         let bindings = vec![make_binding("cp-1")];
 
         let results = resolve_delegation_credentials(
@@ -2164,7 +2200,7 @@ mod tests {
     async fn a_binding_whose_provider_is_gone_is_unavailable() {
         let vault = MockVaultStore::new(VaultLookupResult::NotFound);
         let providers = MockProviderStore::empty();
-        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
         let bindings = vec![make_binding("cp-1")];
 
         let results = resolve_delegation_credentials(
@@ -2203,7 +2239,7 @@ mod tests {
         token.access_token = "cached-service-token".to_string();
         let vault = MockVaultStore::new(VaultLookupResult::Found(token));
         let providers = MockProviderStore::with_provider("cp-1", CredentialProviderType::OAuth2ClientCredentials);
-        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
 
         let results = resolve_delegation_credentials(
             &[make_binding("cp-1")],
@@ -2254,7 +2290,7 @@ mod tests {
         let providers = Arc::new(MockProviderStore {
             providers: HashMap::from([("cp-1".to_string(), provider)]),
         });
-        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
 
         let results = resolve_delegation_credentials(
             &[make_binding("cp-1")],
@@ -2298,7 +2334,7 @@ mod tests {
         ] {
             let vault = MockVaultStore::new(VaultLookupResult::NotFound);
             let providers = MockProviderStore::with_provider("cp-1", provider_type.clone());
-            let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+            let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
 
             let results = resolve_delegation_credentials(
                 &[make_binding("cp-1")],
@@ -2416,7 +2452,9 @@ mod tests {
         let mut provider = make_credential_provider("cp-1", provider_type);
         provider.tenant_id = provider_tenant.map(String::from);
         let providers = MockProviderStore::with_stored(provider);
-        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore {
+            tenant_id: provider_tenant.map(String::from),
+        });
         resolve_delegation_credentials(
             &[make_binding("cp-1")],
             "sha256:user1",
@@ -2524,7 +2562,7 @@ mod tests {
         let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
         let vault: Arc<dyn DelegationVaultStorage> = MockVaultStore::new(VaultLookupResult::NotFound);
         let providers: Arc<dyn CredentialProviderStorage> = MockProviderStore::empty();
-        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
         let bindings = vec![make_binding("cp-1")];
 
         in_request(RequestScope::new("0123456789abcdef".to_string()), async {
@@ -2562,7 +2600,7 @@ mod tests {
         let token = make_token(false, false);
         let vault = MockVaultStore::new(VaultLookupResult::Found(token));
         let providers = MockProviderStore::empty();
-        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
         let bindings = vec![make_tool_binding("cp-1", vec!["list_repos".to_string()])];
 
         // Call with a different tool name
@@ -2603,7 +2641,7 @@ mod tests {
         let token = make_token(false, false);
         let vault = MockVaultStore::new(VaultLookupResult::Found(token));
         let providers = MockProviderStore::with_oauth_provider("cp-1");
-        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
         let bindings = vec![make_tool_binding("cp-1", vec!["list_repos".to_string()])];
 
         let results = resolve_delegation_credentials(
@@ -2632,7 +2670,7 @@ mod tests {
     async fn test_tool_binding_skips_when_no_tool_name() {
         let vault = MockVaultStore::new(VaultLookupResult::NotFound);
         let providers = MockProviderStore::empty();
-        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
         let bindings = vec![make_tool_binding("cp-1", vec!["list_repos".to_string()])];
 
         // No tool name (non-MCP request)
@@ -2671,7 +2709,7 @@ mod tests {
     async fn test_empty_bindings_returns_empty() {
         let vault = MockVaultStore::new(VaultLookupResult::NotFound);
         let providers = MockProviderStore::empty();
-        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
 
         let results = resolve_delegation_credentials(
             &[],
@@ -2698,7 +2736,7 @@ mod tests {
         let token = make_token(false, false);
         let vault = MockVaultStore::new(VaultLookupResult::Found(token));
         let providers = MockProviderStore::with_oauth_provider("cp-1");
-        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
         let bindings = vec![OutboundCredentialBinding {
             credential_provider_id: "cp-1".to_string(),
             scopes: vec![],
@@ -2803,7 +2841,7 @@ mod tests {
         // Use a real provider so we reach the vault lookup (instead of
         // short-circuiting on provider_not_found).
         let providers = MockProviderStore::with_oauth_provider("cp-1");
-        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
         let bindings = vec![make_binding("cp-1")];
 
         let results = resolve_delegation_credentials(
@@ -2834,7 +2872,7 @@ mod tests {
         // Since MockProviderStore is empty, the binding is unavailable.
         let vault = MockVaultStore::new(VaultLookupResult::ExpiredNoRefresh(make_token(true, false)));
         let providers = MockProviderStore::empty();
-        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
         let bindings = vec![make_binding("cp-1")];
 
         let results = resolve_delegation_credentials(
@@ -2863,7 +2901,7 @@ mod tests {
         let token = make_token(false, false);
         let vault = MockVaultStore::new(VaultLookupResult::Found(token));
         let providers = MockProviderStore::with_oauth_provider("cp-1");
-        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
 
         let bindings = vec![make_binding("cp-1"), make_tool_binding("cp-2", vec!["special_tool".to_string()])];
 
@@ -2926,7 +2964,7 @@ mod tests {
         // authorization URL can be built and the binding is unavailable.
         let vault = MockVaultStore::new(VaultLookupResult::NotFound);
         let providers = MockProviderStore::with_oauth_provider("cp-1");
-        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
         let bindings = vec![elicit_binding("cp-1", crate::config::types::ElicitFallback::OnDemand)];
 
         let results = resolve_delegation_credentials(
@@ -2956,7 +2994,7 @@ mod tests {
         // elicitation capability + fallback = Fail → NotApplicable + audit.
         let vault = MockVaultStore::new(VaultLookupResult::NotFound);
         let providers = MockProviderStore::with_oauth_provider("cp-1");
-        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
         let bindings = vec![elicit_binding("cp-1", crate::config::types::ElicitFallback::Fail)];
 
         let ctx = DelegationAuditContext {
@@ -2999,7 +3037,7 @@ mod tests {
         // OnDemand → falls through to consent_required.
         let vault = MockVaultStore::new(VaultLookupResult::NotFound);
         let providers = MockProviderStore::with_oauth_provider("cp-1");
-        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
         let bindings = vec![elicit_binding("cp-1", crate::config::types::ElicitFallback::OnDemand)];
 
         let ctx = DelegationAuditContext {
@@ -3050,7 +3088,7 @@ mod tests {
 
         let vault = MockVaultStore::new(VaultLookupResult::NotFound);
         let providers = MockProviderStore::with_oauth_provider("cp-1");
-        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
         let bindings = vec![elicit_binding("cp-1", crate::config::types::ElicitFallback::Fail)];
 
         let ctx = DelegationAuditContext {

@@ -60,7 +60,20 @@ changes:
         outside that tenant stays visible, labelled as stopping to work once tenant isolation
         is enforced. The Token Endpoint field shows an inline error for an http URL and
         points to the bootstrap credential_policy.insecure_token_endpoints list.
-  fixed: []
+  fixed:
+    - timestamp: '2026-10-31T00:00:00Z'
+      title: Stop reusing a service token after its provider or a referenced secret changes
+      description: >-
+        Service tokens for client credentials, JWT bearer and private_key_jwt providers are
+        now cached under a key that covers the provider's settings, the sorted scopes and
+        the version and tenant of every secret the provider references, read from the
+        secrets' metadata without decrypting them. Editing a provider, rotating one of its
+        secrets or moving a secret to another tenant requests a new token instead of reusing
+        the old one, including on legacy bindings, which reused one token per provider
+        before. A deleted secret, a secrets store error or an enforced tenant rule stops a
+        cached token at once. Expired service tokens of the same provider are removed from
+        the vault when a new one is stored. Upgrade note: each binding and target
+        authentication requests one new token after the upgrade.
   removed: []
   security:
     - timestamp: '2026-10-30T20:30:00Z'

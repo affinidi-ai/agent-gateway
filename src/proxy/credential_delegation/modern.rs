@@ -698,7 +698,6 @@ impl ModernDelegationContext<'_> {
             .ok()
             .and_then(|now| chrono::DateTime::from_timestamp(now, 0))
             .ok_or(ContinuationError::InvalidRecord)?;
-        let cache_identity = format!("__mcp_client_credentials__:{}", hex::encode(provider_digest(provider)?));
         let context = ServiceTokenContext {
             secrets: self
                 .secrets
@@ -709,7 +708,7 @@ impl ModernDelegationContext<'_> {
         };
         let key = ServiceTokenKey {
             agent_did: self.agent_did,
-            identity: &cache_identity,
+            purpose: "__mcp_client_credentials__",
         };
         service_token::acquire(provider, &selected.binding.scopes, &context, key, now)
             .await
@@ -1675,15 +1674,18 @@ mod tests {
             Some("first-access".to_string())
         );
         assert_eq!(calls(), 1);
-        let cache_identity =
-            format!("__mcp_client_credentials__:{}", hex::encode(provider_digest(&selected[0].provider).unwrap()));
-        let VaultLookupResult::Found(cached) = vault
-            .lookup("did:web:agent.example", &cache_identity, "provider")
+        let mut cached = vault
+            .list_all()
             .await
-            .unwrap()
-        else {
-            panic!("the service token must be cached under its digest identity");
-        };
+            .unwrap();
+        assert_eq!(cached.len(), 1);
+        let cached = cached.remove(0);
+        assert_eq!(cached.agent_did, "did:web:agent.example");
+        assert!(
+            cached
+                .user_identity_hash
+                .starts_with("__mcp_client_credentials__:")
+        );
         assert_eq!(cached.scopes, vec!["read"]);
         assert!(cached.refresh_token.is_none());
 

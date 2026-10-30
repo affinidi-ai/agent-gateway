@@ -76,9 +76,10 @@ sets how the rule is applied (see [Credential policy](CONFIGURATION_RELOAD.md#cr
 | Authorization URL, code exchange, refresh, service token grant or API key read | The secret is read, with a warning log naming the provider and secret id | Refused before the secret is read |
 
 In `enforce` mode a service token or API key whose secret is outside the provider's tenant
-reports `SecretUnavailable`, and no token request is sent. A cached service token is served
-without reading the provider's secrets, so it stays valid until it expires. Move such secrets
-into the provider's tenant before switching to `enforce`.
+reports `SecretUnavailable`, and no token request is sent. A cached service token is checked
+against the same rule on every use, from the secrets' metadata, so it stops being served as soon
+as the rule is enforced. Move such secrets into the provider's tenant before switching to
+`enforce`.
 
 ### Providers that sign a JWT
 
@@ -131,7 +132,19 @@ that needs one: legacy and `2026-07-28` delegation bindings, and target authenti
   `AG_TEST_MODE=true`, `AG_BDD_OAUTH_ENDPOINT_ALLOWLIST` admits listed loopback test endpoints
   (never cloud metadata).
 - An issued token is cached in the delegation vault until 60 seconds before its `expires_at`,
-  then a new one is requested. A token response without `expires_in`, with an empty token, or
+  then a new one is requested. Its key is `<purpose>:<hash>`, where the hash is the hex SHA-256
+  of the provider's digest, the sorted, deduplicated scopes, and the id, tenant and `updated_at`
+  of every secret the provider references (client ID, client secret, signing key,
+  certificate). Editing the provider, rotating one of its secrets or moving a secret to another
+  tenant therefore requests a new token instead of reusing one issued under the old settings.
+  Each use reads the secrets' metadata listing, never their values, so a cached token is served
+  without decrypting a secret. A referenced secret that no longer exists reports
+  `SecretUnavailable` and a secrets store error `StoreUnavailable`; neither serves the cached
+  token nor sends a request.
+- After a new token is stored, the expired tokens of the same agent, provider and purpose
+  (those left by earlier settings, scopes or secret versions) are removed from the vault.
+  Unexpired tokens, user grants, pending consents and refresh claims are kept. A failure to
+  remove them is logged as a warning only. A token response without `expires_in`, with an empty token, or
   with a `token_type` other than `Bearer` is refused, as is a response over 64 KiB or slower
   than 30 seconds; only the response's OAuth `error` fields are logged.
 - When scopes were requested, the issued `scope` must name the same set, or the token is
@@ -248,11 +261,10 @@ method, which still loads from storage. The provider is a reference of the surfa
 cannot be deleted while a surface uses it.
 
 The token is a service token (see above), cached in the vault under the agent half
-`surface:<surface_id>` and the user half `__target_auth__:<provider digest>:<scope hash>`, where
-the scope hash is the SHA-256 (hex) of the sorted, deduplicated scopes joined by spaces.
-Changing the provider changes the digest, so a token issued under the old settings is never
-reused; a Target and a Transit Point that use one provider with different scopes each keep
-their own token. The token shows in the Credential Tokens tab like any other. The credential is sent only on a
+`surface:<surface_id>` and the user half `__target_auth__:<hash>` of the provider, its scopes
+and its secret versions. Changing the provider or one of its secrets changes the hash, so a
+token issued under the old settings is never reused; a Target and a Transit Point that use one
+provider with different scopes each keep their own token. The token shows in the Credential Tokens tab like any other. The credential is sent only on a
 request the gateway vetted (`CallerAssertion`), so a provider token is never spent on an
 unauthenticated discovery request, except on the gateway's own agent card fetch. A token that
 cannot be obtained follows `fallback`: `reject` answers 502 "Target authentication failed",
@@ -477,13 +489,17 @@ hash are never looked up again, but their access and refresh tokens stay in the 
 they are removed. After upgrading, list the vault (`GET /api/v1/delegation-vault`, or the
 Credential Tokens tab on the dashboard's Credentials page) and revoke each entry created before
 the upgrade (`DELETE /api/v1/delegation-vault/{id}`, or its delete button), except service tokens (those under
-`__client_credentials__`, `__mcp_client_credentials__:` or `__target_auth__:`), which are unchanged. Users connect their accounts again the next time
+`__client_credentials__:`, `__mcp_client_credentials__:` or `__target_auth__:`), which are unchanged. Users connect their accounts again the next time
 a credential is needed.
 
-Service tokens have no user, so a legacy binding caches them under the fixed user hash
-`__client_credentials__`, a `2026-07-28` binding under `__mcp_client_credentials__:<provider
-digest>`, and target authentication under `__target_auth__:<provider digest>:<scope hash>` with
-the agent half `surface:<surface_id>`.
+Service tokens have no user, so a legacy binding caches them under the user hash
+`__client_credentials__:<hash>`, a `2026-07-28` binding under `__mcp_client_credentials__:<hash>`,
+and target authentication under `__target_auth__:<hash>` with the agent half
+`surface:<surface_id>`, where the hash covers the provider, the scopes and the secret versions
+(see [Service tokens](#service-tokens)). Service tokens cached by an earlier release, under
+`__client_credentials__` alone or an identity without secret versions, are not looked up again:
+each binding requests one new token after the upgrade, and the old entries are removed once they
+have expired and a new token for the same provider is stored.
 
 A lookup has four outcomes.
 
@@ -524,7 +540,7 @@ Before the [identity hash](#the-callers-identity-hash) took the method, issuer a
 was the lowercase hex SHA-256 of the subject alone. A grant stored under that hash is never
 found again: the user connects the account again, and the old entry stays in the vault, with
 its refresh token, until it is revoked. Both hashes are 64 hex characters, so the vault list
-does not show which entries are old. Entries under `__client_credentials__` are not affected.
+does not show which entries are old. Service token entries (under `__client_credentials__`) are not affected.
 
 For each user who connected an account before the upgrade, compute the old hash from the
 subject (the JWT `sub`, the API key `secret_id` or key id, the DID, or the mTLS principal) and
@@ -536,7 +552,7 @@ curl -X DELETE "$GATEWAY/api/v1/delegation-vault/by-user/$OLD_HASH" -H "Authoriz
 ```
 
 When the subjects are not known, list the vault and revoke by `id` every entry, other than
-`__client_credentials__`, whose `created_at` is before the upgrade. Do this after every
+service tokens (under `__client_credentials__`), whose `created_at` is before the upgrade. Do this after every
 instance runs the new release, as an instance still on the old one writes the old hash.
 
 Credential providers have their own management routes in

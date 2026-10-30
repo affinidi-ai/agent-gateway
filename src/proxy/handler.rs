@@ -712,16 +712,15 @@ pub(crate) async fn inject_target_auth_header(
 }
 
 /// The service token of `provider_id` for target authentication, cached in the vault
-/// under the surface (`surface:<id>`) and `__target_auth__:<provider digest>:<scope hash>`,
-/// so a changed provider never reuses a token issued under its old settings and two
-/// sets of scopes on one surface keep a token each.
+/// under the surface (`surface:<id>`) and the purpose `__target_auth__`, so two sets of
+/// scopes on one surface keep a token each.
 async fn target_provider_token(
     context: &TargetAuthContext<'_>,
     provider_id: &str,
     scopes: &[String],
 ) -> Result<String, TargetAuthError> {
     use crate::credential_providers::CredentialProviderType;
-    use crate::delegation_vault::service_token::{self, ServiceTokenContext, ServiceTokenError, ServiceTokenKey};
+    use crate::delegation_vault::service_token::{self, ServiceTokenContext, ServiceTokenKey};
 
     let (Some(secrets), Some(providers), Some(vault)) = (context.secrets, context.providers, context.vault) else {
         return Err(TargetAuthError::StoreUnavailable);
@@ -765,11 +764,7 @@ async fn target_provider_token(
     };
     scopes.sort_unstable();
     scopes.dedup();
-    let digest = crate::mcp::continuations::delegation::provider_digest(&provider)
-        .map_err(|_| ServiceTokenError::ProviderChanged)?;
     let agent_did = format!("surface:{}", context.surface.surface_id);
-    let scope_hash = <sha2::Sha256 as sha2::Digest>::digest(scopes.join(" ").as_bytes());
-    let identity = format!("__target_auth__:{}:{}", hex::encode(digest), hex::encode(scope_hash));
     let service = ServiceTokenContext {
         secrets,
         providers,
@@ -778,7 +773,7 @@ async fn target_provider_token(
     };
     let key = ServiceTokenKey {
         agent_did: &agent_did,
-        identity: &identity,
+        purpose: "__target_auth__",
     };
     let token = service_token::acquire(&provider, &scopes, &service, key, chrono::Utc::now()).await?;
     Ok(token.value().to_string())
