@@ -228,7 +228,9 @@ Ownership changes are administrator-only: `GET
 `PUT /v1/tenant-ownership/{kind}/{id}` changes `tenant_id`, returning `409` if any
 reference would become incompatible. The self Gateway and built-in Surface
 Templates are immovable, and so is a mediator provided by the mediator directory (`409`);
-child API keys and Connection Points move with their parent.
+child API keys and Connection Points move with their parent. A credential provider that any
+surface binds, of any tenant, cannot move to another tenant (`409`); remove the bindings first
+([`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#deleting-a-provider)).
 
 ## Dashboard
 
