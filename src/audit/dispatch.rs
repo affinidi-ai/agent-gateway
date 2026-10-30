@@ -714,7 +714,7 @@ mod tests {
             }
             if self
                 .failures_left
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
                 .is_ok()
             {
                 anyhow::bail!("destination unreachable");
@@ -730,7 +730,7 @@ mod tests {
                 .fetch_add(1, Ordering::SeqCst);
             if self
                 .commit_failures_left
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
                 .is_ok()
             {
                 anyhow::bail!("disk full");

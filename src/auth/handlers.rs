@@ -88,10 +88,22 @@ pub struct LoginFinishRequest {
 }
 
 /// Response from successful login
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 pub struct LoginFinishResponse {
     pub session_token: String,
     pub consent_required: bool,
+}
+
+impl std::fmt::Debug for LoginFinishResponse {
+    fn fmt(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        f.debug_struct("LoginFinishResponse")
+            .field("session_token", &crate::observability::loggable::secret(&self.session_token))
+            .field("consent_required", &self.consent_required)
+            .finish()
+    }
 }
 
 /// Response for auth check
@@ -107,15 +119,14 @@ pub async fn register_start(
     State(auth_state): State<Arc<AuthState>>,
     Json(req): Json<RegisterStartRequest>,
 ) -> Result<Json<RegisterStartResponse>, (StatusCode, String)> {
-    let user_exists = auth_state
+    let existing_user = auth_state
         .storage
         .load_user(&req.username)
         .await
         .map_err(|e| {
             error!("Failed to check whether user exists: {}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, "Failed to start registration".to_string())
-        })?
-        .is_some();
+        })?;
 
     // Enforce the appliance user limit before starting a new registration.
     if let Ok(users) = auth_state
@@ -128,8 +139,8 @@ pub async fn register_start(
         return Err((StatusCode::FORBIDDEN, e.message()));
     }
 
-    if user_exists {
-        error!("Registration requested for an existing username: {}", req.username);
+    if let Some(existing_user) = &existing_user {
+        error!("Registration requested for the username of existing user_id: {}", existing_user.user_id);
     }
 
     // Generate registration challenge
@@ -155,7 +166,9 @@ pub async fn register_start(
     // Store challenge state
     let challenge_id = uuid::Uuid::new_v4().to_string();
     let challenge_state = ChallengeState {
-        registration_state: (!user_exists).then_some(reg_state),
+        registration_state: existing_user
+            .is_none()
+            .then_some(reg_state),
         authentication_state: None,
         username: req.username.clone(),
         created_at: chrono::Utc::now(),
@@ -247,13 +260,13 @@ pub async fn register_finish(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
     if user.is_primary {
-        info!("First user '{}' registered as Primary Administrator (cannot be deleted or demoted)", username);
+        info!("First user_id '{}' registered as Primary Administrator (cannot be deleted or demoted)", user.user_id);
     } else {
-        info!("New user '{}' registered with status 'new' - requires approval", username);
+        info!("New user_id '{}' registered with status 'new' - requires approval", user.user_id);
     }
     drop(user_write_guard);
 
-    info!("Successfully registered passkey for user: {}", username);
+    info!("Successfully registered passkey for user_id: {}", user.user_id);
 
     info!("User registration complete - role: {:?}, status: {:?}, user_id: {}", user.role, user.status, user.user_id);
 
@@ -367,10 +380,10 @@ pub async fn login_start(
         })?;
 
     let passkeys = if !is_approved {
-        error!("User '{}' is not approved to sign in", req.username);
+        error!("Sign-in requested for a user that is not approved");
         Vec::new()
     } else if passkeys.is_empty() {
-        error!("No passkeys found for user: {}", req.username);
+        error!("Sign-in requested for a user without passkeys");
         Vec::new()
     } else {
         passkeys
@@ -456,7 +469,7 @@ pub async fn login_finish(
             StatusCode::INTERNAL_SERVER_ERROR
         })?
         .ok_or_else(|| {
-            error!("User not found after authentication: {}", username);
+            error!("User not found after authentication");
             StatusCode::UNAUTHORIZED
         })?;
 
@@ -467,7 +480,7 @@ pub async fn login_finish(
         .save_user(&user)
         .await
     {
-        error!("Failed to update last_logged_in for user {}: {}", username, e);
+        error!("Failed to update last_logged_in for user_id {}: {}", user.user_id, e);
     }
 
     let finalized_session = SessionManagerFinalizer::new(
@@ -498,7 +511,7 @@ pub async fn login_finish(
     }
     drop(notif_store_guard);
 
-    info!("Successfully authenticated user: {}", username);
+    info!("Successfully authenticated user_id: {}", user.user_id);
 
     Ok((
         finalized_session.headers,
@@ -532,7 +545,7 @@ pub async fn check_auth(
         } else {
             false
         };
-        info!("Authentication successful for user: {}", session.username);
+        info!("Authentication successful for user_id: {}", session.user_id);
         return Ok(Json(AuthCheckResponse {
             authenticated: true,
             username: Some(session.username),
@@ -577,7 +590,7 @@ pub async fn logout(
 
 #[cfg(test)]
 mod tests {
-    use super::{LoginStartRequest, RegisterStartRequest, login_start, register_start};
+    use super::{LoginFinishResponse, LoginStartRequest, RegisterStartRequest, login_start, register_start};
     use crate::auth::{
         AuthState,
         storage::UserData,
@@ -778,5 +791,20 @@ mod tests {
                     .registration_state
                     .is_some())
         );
+    }
+
+    #[test]
+    fn login_finish_response_debug_shows_only_a_token_prefix() {
+        let token = "0f2c9d7e-1b3a-4c5d-8e9f-a0b1c2d3e4f5";
+        let rendered = format!(
+            "{:?}",
+            LoginFinishResponse {
+                session_token: token.to_string(),
+                consent_required: false,
+            }
+        );
+
+        assert!(rendered.contains(r#"session_token: "0f2c9d7e...""#), "{rendered}");
+        assert!(!rendered.contains(token), "{rendered}");
     }
 }

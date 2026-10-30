@@ -231,6 +231,7 @@ sdk_inbound_cache_bytes = 104857600  # 100 MiB
 level = "info"  # trace, debug, info, warn, error
 json = false    # Set to true for JSON-formatted logs
 log_directory = "../_storage/logs"  # Directory to write log files (logs to stdout only if not set)
+# Log redaction is set in gateway.json `logging.redaction`, not here. It is on by default.
 
 # Extension Inspection Configuration (optional)
 [extension_inspection]

@@ -1965,7 +1965,7 @@ mod tests {
     }
 
     /// Outbound state must hold the raw surface: resolving a variant clears the
-    /// catalog, and an empty catalog silently routes `$alias` to the base Target.
+    /// catalog, and an empty catalog refuses every `$alias`.
     #[test]
     fn outbound_state_keeps_the_variant_catalog_that_resolution_drops() {
         let surface = surface_with_variant();
@@ -1990,11 +1990,9 @@ mod tests {
         assert_eq!(
             compiled_from
                 .resolve_variant(Some("prod"))
-                .expect("an empty catalog does not reject the alias")
-                .target
-                .endpoint,
-            "https://tools.example.com/mcp",
-            "storing the resolved surface silently sent $prod to the base Target"
+                .map(|_| ()),
+            Err(crate::config::agent_surface_variants::VariantResolveError::UnknownAlias("prod".to_string())),
+            "storing the resolved surface would refuse every $prod request"
         );
     }
 }

@@ -191,23 +191,38 @@
         },
         {
           "name": "Authorization header values",
-          "pattern": "(?i)((?:Authorization|Proxy-Authorization)[\"']?\\s*[:=]\\s*(?:Bearer|Basic|Digest|Token|ApiKey)\\s+)\\S+",
+          "pattern": "(?i)((?:Authorization|Proxy-Authorization)\\\\?[\"']?\\s*[:=]\\s*\\\\?[\"']?(?:Bearer|Basic|Digest|Token|ApiKey)\\s+)[^\\s\"'\\\\,]+",
           "replacement": "${1}[REDACTED]"
         },
         {
           "name": "Password fields",
-          "pattern": "(?i)(password|passwd|pwd)[\"']?\\s*[:=]\\s*[\"']?\\S+",
-          "replacement": "${1}=[REDACTED]"
+          "pattern": "(?i)((?:password|passwd|pwd)\\\\?[\"']?\\s*[:=]\\s*\\\\?[\"']?)[^\\s\"'\\\\,;&}\\]]+",
+          "replacement": "${1}[REDACTED]"
         },
         {
           "name": "Access and refresh tokens",
-          "pattern": "(?i)(access_token|refresh_token|token)[\"']?\\s*[:=]\\s*[\"']?[^\\s\"']+",
-          "replacement": "${1}=[REDACTED]"
+          "pattern": "(?i)((?:access_token|refresh_token|token)\\\\?[\"']?\\s*[:=]\\s*\\\\?[\"']?)[^\\s\"'\\\\,;&}\\]]+",
+          "replacement": "${1}[REDACTED]"
         },
         {
           "name": "Session identifiers",
-          "pattern": "(?i)(session_id|sessionid|sid|jsessionid|connect\\.sid)[\"']?\\s*[:=]\\s*[\"']?[A-Za-z0-9_\\-\\.]+",
-          "replacement": "${1}=[REDACTED-SESSION]"
+          "pattern": "(?i)((?:session_id|sessionid|sid|jsessionid|connect\\.sid)\\\\?[\"']?\\s*[:=]\\s*\\\\?[\"']?)[A-Za-z0-9_\\-\\.]+",
+          "replacement": "${1}[REDACTED-SESSION]"
+        },
+        {
+          "name": "API key and secret assignments",
+          "pattern": "(?i)((?:api[_-]?key|secret)\\\\?[\"']?\\s*[:=]\\s*\\\\?[\"']?)[^\\s\"'\\\\,;&}\\]]+",
+          "replacement": "${1}[REDACTED]"
+        },
+        {
+          "name": "Quoted credential fields",
+          "pattern": "(?i)(\"[A-Za-z0-9_.-]*(?:authorization|cookie|api[_-]?key|secret(?:[_-]?key)?|private[_-]?key|token|passw(?:or)?d|session[_-]?id|credentials?)\\\\?\"\\s*:\\s*\\\\?\")[^\"\\\\]*",
+          "replacement": "${1}[REDACTED]"
+        },
+        {
+          "name": "Personal access tokens",
+          "pattern": "agpat_[A-Za-z0-9_-]+",
+          "replacement": "[REDACTED-PAT]"
         },
         {
           "name": "Private key material (PEM)",
@@ -231,8 +246,8 @@
         },
         {
           "name": "Device identifiers",
-          "pattern": "(?i)(device_id|device-id|udid|idfa|gaid|android_id)[\"']?\\s*[:=]\\s*[\"']?[0-9a-f\\-]{32,36}",
-          "replacement": "${1}=[REDACTED-DEVICE-ID]"
+          "pattern": "(?i)((?:device_id|device-id|udid|idfa|gaid|android_id)\\\\?[\\\"']?\\s*[:=]\\s*\\\\?[\\\"']?)[0-9a-f\\-]{32,36}",
+          "replacement": "${1}[REDACTED-DEVICE-ID]"
         },
         {
           "name": "DID identifiers",
@@ -246,13 +261,8 @@
         },
         {
           "name": "Public key values",
-          "pattern": "(?i)(public_key|publicKey|pub_key|pubkey)[\"']?\\s*[:=]\\s*[\"']?[A-Za-z0-9+/=_\\-]{43,}",
-          "replacement": "${1}=[REDACTED-PUBKEY]"
-        },
-        {
-          "name": "API key assignments",
-          "pattern": "(?i)(api[_-]?key|secret)[=:\\s]+\\S+",
-          "replacement": "${1}=[REDACTED]"
+          "pattern": "(?i)((?:public_key|publicKey|pub_key|pubkey)\\\\?[\\\"']?\\s*[:=]\\s*\\\\?[\\\"']?)[A-Za-z0-9+/=_\\-]{43,}",
+          "replacement": "${1}[REDACTED-PUBKEY]"
         },
         {
           "name": "CREDIT / DEBIT CARD NO (structural)",

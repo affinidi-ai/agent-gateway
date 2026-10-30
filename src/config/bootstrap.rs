@@ -660,7 +660,7 @@ key_path = "key.pem"
         .unwrap();
 
         let config = BootstrapConfig::from_file(&path).expect("unknown top-level keys are ignored");
-        assert_eq!(config.backup_encryption_key, "unused");
+        assert_eq!(&*config.backup_encryption_key, "unused");
     }
 
     /// The storage paths of `config.toml` written to `<tempdir>/config` with `storage_paths`.

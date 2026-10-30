@@ -183,10 +183,8 @@ async fn forward_stream_with_runtime(
         return Err(FabricForwardError::StreamingUnavailable);
     }
     let (gateway_id, target) = parse_fabric_target(request.fabric_target)?;
-    let (channel_id, variant_alias) = match target.split_once('$') {
-        Some((channel, alias)) => (channel, Some(alias.to_string())),
-        None => (target, None),
-    };
+    let (channel_id, variant_alias) = pinned_alias(target);
+    let variant_alias = variant_alias.map(str::to_string);
     if channel_id.contains(['/', '?', '#']) {
         return Err(FabricForwardError::InvalidUrl(
             request
@@ -480,6 +478,60 @@ fn parse_fabric_target(fabric_target: &str) -> Result<(&str, &str), FabricForwar
     Ok((gateway_id, channel_id))
 }
 
+/// Splits the part of a `fabric://` Target after the gateway id into the peer
+/// surface it names and the variant alias it pins (`orders$v`: `orders`, `v`).
+/// The pinned alias is the only one a request sends the peer: a caller's own
+/// `$alias` names a variant of the sending surface, and with no alias the peer
+/// serves its own default variant or base surface.
+pub(crate) fn pinned_alias(channel: &str) -> (&str, Option<&str>) {
+    match channel.split_once('$') {
+        Some((surface, alias)) => (surface, Some(alias)),
+        None => (channel, None),
+    }
+}
+
+/// The `ForwardRequest` body `fields` with its alias fields set to the alias
+/// the Target pins, under both names the receiving gateway reads, or `null`
+/// when it pins none. Every `ForwardRequest` along a `fabric://` Target sets
+/// them here, so a retry asks the peer for the same variant as the first send.
+pub(crate) fn with_pinned_alias(
+    fields: serde_json::Value,
+    variant_alias: Option<&str>,
+) -> serde_json::Value {
+    match fields {
+        serde_json::Value::Object(mut body) => {
+            for field in ["virtual_channel_alias", "active_variant_alias"] {
+                body.insert(field.to_string(), serde_json::json!(variant_alias));
+            }
+            serde_json::Value::Object(body)
+        }
+        other => other,
+    }
+}
+
+/// The body of the `ForwardRequest` sending `req` to `channel`, the part of
+/// the `fabric://` Target after the gateway id, with the alias it pins.
+fn forward_request_body(
+    channel: &str,
+    req: &FabricForwardRequest<'_>,
+    body: serde_json::Value,
+    deadline_ms: u64,
+) -> serde_json::Value {
+    let (channel_id, variant_alias) = pinned_alias(channel);
+    with_pinned_alias(
+        serde_json::json!({
+            "channel_id": channel_id,
+            "method": req.method.as_str(),
+            "path": req.path,
+            "headers": req.headers,
+            "body": body,
+            "trace_id": req.trace_id,
+            "deadline_ms": deadline_ms,
+        }),
+        variant_alias,
+    )
+}
+
 /// Forward a prepared request to a remote gateway channel over `fabric://`
 /// and synchronously await its `ForwardResponse`.
 pub(crate) async fn forward_via_fabric(
@@ -544,15 +596,7 @@ pub(crate) async fn forward_via_fabric(
         MessageType::ForwardRequest
             .as_str()
             .to_string(),
-        serde_json::json!({
-            "channel_id": channel_id,
-            "method": req.method.as_str(),
-            "path": req.path,
-            "headers": req.headers,
-            "body": body_value,
-            "trace_id": req.trace_id,
-            "deadline_ms": deadline_ms,
-        }),
+        forward_request_body(channel_id, &req, body_value, deadline_ms),
     )
     .from(
         gateway_listener
@@ -666,6 +710,28 @@ pub(crate) async fn forward_via_fabric(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_forward_request_names_the_peer_surface_and_only_the_alias_its_target_pins() {
+        let method = Method::POST;
+        let request = FabricForwardRequest {
+            fabric_target: "",
+            method: &method,
+            path: "/rpc",
+            headers: HashMap::new(),
+            body: Bytes::new(),
+            timeout: Duration::from_secs(1),
+            trace_id: "trace",
+            log_label: "Orders",
+        };
+        for (channel, surface, alias) in [("orders", "orders", None), ("orders$v", "orders", Some("v"))] {
+            let body = forward_request_body(channel, &request, serde_json::Value::Null, 0);
+
+            assert_eq!(body["channel_id"], surface, "{channel}");
+            assert_eq!(body["virtual_channel_alias"], serde_json::json!(alias), "{channel}: {body}");
+            assert_eq!(body["active_variant_alias"], serde_json::json!(alias), "{channel}: {body}");
+        }
+    }
 
     #[test]
     fn an_outbound_stream_registered_while_a_revocation_ran_is_refused() {

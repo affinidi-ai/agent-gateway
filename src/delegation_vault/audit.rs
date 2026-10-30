@@ -161,6 +161,12 @@ pub struct DelegationAuditEvent {
     /// each have their own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    /// The variant of the surface `surface_id` names that served the request:
+    /// the variant's alias, `_base_` when the base surface served it, or
+    /// `_unknown_` when the URL named a variant the surface doesn't have.
+    /// Absent outside surface requests and on a misconfigured default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface_variant: Option<String>,
     /// Additional context
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
@@ -292,8 +298,11 @@ pub struct PolicyChangeDetails {
     pub scope: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slot: Option<PolicySlot>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub variant: Option<String>,
+    /// On a surface slot: the variant whose slot was written, or `_base_` for
+    /// a base slot, which also applies to every variant inheriting it. Records
+    /// written before the rename stored it as `variant`.
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "variant")]
+    pub surface_variant: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transit_point: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -341,7 +350,7 @@ impl PolicyChangeDetails {
             target: None,
             scope: None,
             slot: None,
-            variant: None,
+            surface_variant: None,
             transit_point: None,
             mcp_tool_name: None,
             gate: None,
@@ -480,12 +489,19 @@ pub enum DelegationAuditAction {
     RequestRejected {
         stage: RejectionStage,
         reason: RejectionReason,
-        /// The HTTP status the caller received. Legacy MCP refuses a malformed
-        /// request with 200 and a JSON-RPC error, so read it with `rpc_error_code`.
-        http_status: u16,
+        /// The HTTP status the caller received, on HTTP paths only; absent on
+        /// Fabric, where no HTTP response is involved. Legacy MCP refuses a
+        /// malformed request with 200 and a JSON-RPC error, so read it with
+        /// `rpc_error_code`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        http_status: Option<u16>,
         /// The JSON-RPC error code the caller received, when the refusal was one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rpc_error_code: Option<i64>,
+        /// On `unknown_variant` only: the alias the URL named, cut to the
+        /// longest alias a variant can have. Caller-chosen text.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        requested_variant: Option<String>,
     },
     IdentityBindingFailed {
         outcome: IdentityBindingFailure,
@@ -525,8 +541,6 @@ pub enum DelegationAuditAction {
         response_bytes: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ucp_op: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        variant_alias: Option<String>,
     },
     /// A policy definition was created.
     PolicyCreated(Box<PolicyChangeDetails>),
@@ -952,6 +966,7 @@ pub fn audit_event(
         vp_fingerprint: None,
         trace_id: None,
         request_id: None,
+        surface_variant: None,
         detail: None,
     }
 }
@@ -1538,6 +1553,7 @@ pub fn audit_policy_decision(
         vp_fingerprint: None,
         trace_id: trace_id.map(str::to_string),
         request_id: None,
+        surface_variant: None,
         detail: None,
     });
 }
@@ -1589,6 +1605,7 @@ pub fn audit_trust_check(
         vp_fingerprint: None,
         trace_id: trace_id.map(str::to_string),
         request_id: None,
+        surface_variant: None,
         detail: None,
     });
 }
@@ -1633,6 +1650,7 @@ pub fn audit_trace_terminated(
         vp_fingerprint: None,
         trace_id: Some(own_trace_id.to_string()),
         request_id: None,
+        surface_variant: None,
         detail: Some(format!("downstream_trace_id={downstream_trace_id}")),
     });
 }
@@ -1762,6 +1780,34 @@ mod tests {
     }
 
     #[test]
+    fn a_stored_policy_change_that_names_its_variant_variant_reads_back_as_surface_variant() {
+        let stored = serde_json::json!({
+            "policy_definition_id": "deny-pii",
+            "slot": "inbound",
+            "variant": "beta",
+            "actor": {"kind": "user", "id": "u-123"},
+            "source": "api",
+        });
+
+        let change: PolicyChangeDetails = serde_json::from_value(stored).unwrap();
+
+        assert_eq!(
+            change
+                .surface_variant
+                .as_deref(),
+            Some("beta")
+        );
+        let written = serde_json::to_value(&change).unwrap();
+        assert_eq!(written["surface_variant"], "beta");
+        assert!(
+            written
+                .get("variant")
+                .is_none(),
+            "{written}"
+        );
+    }
+
+    #[test]
     fn a_policy_change_event_is_categorised_by_its_name_and_kept_in_the_vp_audit_log() {
         let change = || Box::new(PolicyChangeDetails::new(Actor::system(), PolicyChangeSource::DefinitionDeleted));
         let actions = [
@@ -1820,6 +1866,7 @@ mod tests {
             vp_fingerprint: None,
             trace_id: Some("own-123".to_string()),
             request_id: None,
+            surface_variant: None,
             detail: Some("downstream_trace_id=down-456".to_string()),
         };
         let json = serde_json::to_string(&event).unwrap();
@@ -2027,8 +2074,9 @@ mod tests {
                 DelegationAuditAction::RequestRejected {
                     stage: RejectionStage::Admission,
                     reason: RejectionReason::BodyTooLarge,
-                    http_status: 413,
+                    http_status: Some(413),
                     rpc_error_code: Some(-32600),
+                    requested_variant: None,
                 },
                 "request_rejected",
             ),
@@ -2073,7 +2121,6 @@ mod tests {
                     request_bytes: 128,
                     response_bytes: 2048,
                     ucp_op: None,
-                    variant_alias: Some("beta".to_string()),
                 },
                 "request_completed",
             ),
@@ -2102,8 +2149,9 @@ mod tests {
         let stored = serde_json::to_value(DelegationAuditAction::RequestRejected {
             stage: RejectionStage::Admission,
             reason: RejectionReason::ConsentIdentityRequired,
-            http_status: 403,
+            http_status: Some(403),
             rpc_error_code: None,
+            requested_variant: None,
         })
         .unwrap();
         assert_eq!(stored["request_rejected"]["stage"], "admission");
@@ -2271,6 +2319,7 @@ mod tests {
                 vp_fingerprint: None,
                 trace_id: Some("trace-1".to_string()),
                 request_id: None,
+                surface_variant: None,
                 detail: None,
             },
             DelegationAuditEvent {
@@ -2311,6 +2360,7 @@ mod tests {
                 vp_fingerprint: None,
                 trace_id: Some("trace-1".to_string()),
                 request_id: None,
+                surface_variant: None,
                 detail: None,
             },
         ];

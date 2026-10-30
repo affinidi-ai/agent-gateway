@@ -178,13 +178,11 @@ const EditCertificatePage: React.FC = () => {
 
   const generateIdentity = async () => {
     try {
-      console.log('[EditCertificatePage] Generating new identity...');
       const response = await apiClient.post('/vault/identity/generate', {
         purpose: `Certificate: ${formData.name || 'Unnamed'}`,
         item_type: 'cert',
       });
       const { did } = response.data;
-      console.log('[EditCertificatePage] Generated DID:', did);
       setFormData({ ...formData, identity_did: did, useIdentity: true });
       setIsModified(true);
       showToast('success', 'Identity generated successfully');

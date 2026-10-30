@@ -26,6 +26,7 @@ pub mod user_integration_triggers;
 pub mod webhook_signing;
 pub mod x402_integration_triggers;
 
+pub use connection_point_integration_triggers::*;
 pub use filesystem::FileSystemNotificationStore;
 pub use gateway_integration_triggers::*;
 pub use store::NotificationStore;
@@ -33,7 +34,6 @@ pub use types::Notification;
 
 pub use user_integration_triggers::*;
 
-pub use async_triggers::*;
 pub use secrets_integration_triggers::*;
 pub use trust_registry_integration_triggers::*;
 pub use x402_integration_triggers::*;
