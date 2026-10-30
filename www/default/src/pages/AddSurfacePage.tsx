@@ -11,7 +11,9 @@ import { registry, validateSurfacePayload } from '../components/surface-builder/
 import { useSurfaceBuilder } from '../components/surface-builder/hooks/useSurfaceBuilder';
 import { useSaveShortcut } from '../components/surface-builder/hooks/useSaveShortcut';
 import { useDiscardWithUndo } from '../components/surface-builder/hooks/useDiscardWithUndo';
-import SurfaceFormShell from '../components/surface-builder/SurfaceFormShell';
+import SurfaceFormShell, {
+  type SurfaceFormView,
+} from '../components/surface-builder/SurfaceFormShell';
 import { useSurfacePolicyDefinitions } from '../components/surface-builder/hooks/useSurfacePolicyDefinitions';
 import { surfacePolicyBlockingReason } from '../components/surface-builder/elements/policy/status';
 import { freezeEmptyVariantOverrides } from '../components/surface-builder/variants/resolve';
@@ -124,9 +126,7 @@ const AddSurfacePage: React.FC = () => {
   const surfacePolicyIds =
     surfacePolicyLoadState.status === 'loaded' ? surfacePolicyLoadState.ids : null;
 
-  const [activeTab, setActiveTab] = useState<
-    'surface' | 'elements' | 'monitoring' | 'config' | 'editor'
-  >('surface');
+  const [activeTab, setActiveTab] = useState<SurfaceFormView>('surface');
 
   const [editorTabNodeId, setEditorTabNodeId] = useState<string | null>(null);
   const [jsonOverride, setJsonOverride] = useState<string | null>(null);

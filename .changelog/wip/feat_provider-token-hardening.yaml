@@ -8,6 +8,17 @@ changes:
         provider may now hold the whole service account key file, up to 16 KiB. The gateway
         signs with its private_key and sends its private_key_id as the kid header unless
         Key ID is set, so the downloaded file no longer needs to be taken apart.
+    - timestamp: '2026-10-30T23:30:00Z'
+      title: ⭐ Show the managed agent's card next to the served card in Surface Builder
+      description: >-
+        A2A and AP2 surfaces get an Agent Cards view that compares the managed agent's own
+        card with the card the gateway serves, marks what the gateway changed, shows the
+        fetch result and the Target Authentication used, and refreshes the card on demand.
+    - timestamp: '2026-10-30T23:31:00Z'
+      title: Show the agent card fetch status on the Managed Agent panel
+      description: >-
+        The Managed Agent panel shows whether the gateway can fetch the agent's card and why
+        not, with a link to the Agent Cards view.
   changed:
     - timestamp: '2026-10-30T21:30:00Z'
       title: Refuse new http token endpoints and cross-tenant credential references on save

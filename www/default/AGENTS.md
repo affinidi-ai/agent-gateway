@@ -225,6 +225,12 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
 | Variant resource, default variant note, rules explainer toggle | `caller-auth-discovery-variant-resource`, `caller-auth-discovery-default-variant-note`, `caller-auth-discovery-context-toggle`                                                                     |
 | Errors                                                         | `caller-auth-discovery-save-error`, `caller-auth-discovery-rules-error`, `caller-auth-discovery-resource-error`, `caller-auth-discovery-<list>s-error`, `caller-auth-discovery-<list>-input-error` |
 | Sidebar status and error                                       | `caller-auth-panel-discovery-status`, `caller-auth-panel-discovery-save-error`                                                                                                                     |
+- **Switching views from content.** The Surface Builder views are Surface, Templates, Elements,
+  Agent Cards, Monitoring and Config (see _Agent Cards tab_). A switch started from content (**View
+  agent cards**, **Open the Surface view**) goes through `openViewFromContent` in
+  `SurfaceFormShell`, which then moves focus to the destination's sidebar view button (or the Agent
+  Cards heading when the sidebar is collapsed); a click on a sidebar view button leaves focus where
+  it is.
 
 ## Trust Check
 
@@ -344,6 +350,119 @@ being created, and without an id. States: a quiet **Loading…**, **No attempt y
 the counts summed across entries, and **Status unavailable** when the fetch fails; a failed
 fetch never breaks the panel. Test ids: `trust-recorder-last-outcome` with `-state`,
 `-reason`, `-time`, `-counts`, `-loading`, `-empty`, and `-unavailable`.
+
+## Agent Cards tab
+
+The **Agent Cards** view (`components/surface-builder/agent-card/`, view key `agent-card`, button
+`surface-view-agent-card`) is a first-class Surface Builder view placed directly after **Elements**
+and before **Monitoring** in `SIDEBAR_VIEWS` of `SurfaceFormShell.tsx` (Surface, Templates,
+Elements, Agent Cards, Monitoring, Config). `visibleSidebarViews(mode, protocol)` offers it for
+A2A and AP2 surfaces (`AGENT_CARD_PROTOCOLS`) and never for MCP or DIDComm; when the protocol
+changes away while it is open, the shell returns to the Surface view. Every view button has the
+test id `surface-view-<key>` and `aria-current="page"` while active. The view shows the saved
+surface, never the unsaved form.
+
+- `AgentCardTab` orchestrates and calls `useAgentCardPreview` (`GET /api/v1/surfaces/{id}/agent-card`;
+  Refresh is `POST .../agent-card/refresh`). A Refresh answer that arrives after the surface, the
+  refresh key or the tab changed comes back as `{ kind: 'stale' }` and changes nothing, with no
+  toast. The parts are `AgentCardHeader` (facts),
+  `AgentCardCompare` (summary, legend, side by side cards) and `AgentCardRawJson`. The wire types,
+  `parseAgentCardPreview` (rejects unknown enum values), the cause and sign-in copy,
+  `describeFetchFailure` and `safeHttpUrl` live in `utils/agentCardPreview.ts`; the pure comparison
+  lives in `utils/agentCardDiff.ts` (`diffAgentCards` with `addedCount`, `modifiedCount` and
+  `removedCount`, and `cardEra`). Tests build bodies with `utils/agentCardTestFixtures.ts`. A
+  gateway without these endpoints, a thrown request or a body that does not parse shows the
+  read-failed state, and the rest of the page keeps working.
+- The **Managed Agent Card** (the agent's own card, `agent-card-before`) and the **Gateway-Served
+  Agent Card** (what callers see, `agent-card-after`) sit side by side. Rows are
+  `agent-card-row-signin|scope|signature|endpoint|other`, each with
+  `data-status="same|changed|removed|absent"`. Each item carries a tag with a distinct colour and
+  always an icon with a text label, never colour alone: **Added** on the served side
+  (`agent-card-item-added`), **Modified** on both sides (`agent-card-item-changed`), **Removed** on
+  the managed side (`agent-card-item-removed`) and **Unchanged**. The summary strip
+  (`agent-card-summary`, `agent-card-change-count`) reads "N added, N modified, N removed", and the
+  legend is a list named **Legend** (`agent-card-legend`, `agent-card-legend-added|changed|removed|same`).
+  **Show raw JSON** (`agent-card-raw-toggle`) shows the full content of each card side by side, each
+  in a focusable `pre` region named by its heading (`agent-card-raw-before|after`, sections
+  `agent-card-raw-<side>-section`), with copy buttons named "Copy the <card title> JSON"
+  (`agent-card-copy-before-button`, `agent-card-copy-after-button`). The colours are local tokens on
+  `.agent-card-tab` in `SurfaceBuilder.css`, redefined under `body.dark-theme`; the light tokens
+  (added `#065f46`, modified `#92400e`, removed `#b91c1c`) keep the tag text at 4.5:1 or more on
+  its 8% tint. The tab sizes itself
+  with a container query (`container-type: inline-size` on `.agent-card-tab`), not a viewport query,
+  because the app nav and the Surface sidebar take part of the width: below 640px of tab width the
+  cards and raw panels stack and the facts become one column.
+- The Surface Entry point URL stays in the Surface view. The Agent Cards view links back to it:
+  "The Entry point URL and the rest of the surface settings are in the Surface view." with an
+  **Open the Surface view** button (`agent-card-surface-link`, `agent-card-open-surface-button`),
+  through `SurfaceMetaContext.onOpenSurfaceView`; outside a surface editor the link is absent.
+- The header is a definition list: **Served card discovery URL** (the gateway-served card
+  discovery URL, `agent-card-served-url`, **Copy** named "Copy the served card discovery URL"
+  `agent-card-url-copy-button`, **Open** `agent-card-open-button`, **Refresh**
+  `agent-card-refresh-button`), **Fetched from** (`agent-card-source-url`, with "(query hidden)"),
+  **Fetch** (`agent-card-fetch`, holding the `agent-card-fetch-status` badge and
+  `agent-card-fetch-cause` with `data-cause`, not a live region), **Target Authentication** (`agent-card-auth`: the provider and token expiry, **Static
+  secret**, **Looked-up credential**, **No Target Authentication**, **The remote gateway signs in**,
+  **Credential not obtained** or **No credential sent**), **Last fetched** (`agent-card-fetched-at`,
+  a `time` element with the absolute time as its title). A failed fetch names the cause with the HTTP status (`describeFetchFailure`), for
+  example "Sign-in failed — HTTP 401". The longer cause text (`CARD_FETCH_CAUSE_TEXT`) says what
+  happened and what to do, for example "Check that the agent is running, then Refresh."
+  **Refresh** needs `surfaces.edit`; without it the button is disabled with the reason as its title
+  and description. A successful Refresh replaces the failed state with the new cards and puts
+  "Card refreshed." with the fetch result (OK, failing or not served, never the cause, which the
+  alert gives) in a visually hidden status region (`agent-card-refresh-status`), cleared when the
+  next Refresh starts; a 429 shows a warning toast and keeps the cards on screen; a refused or
+  failed Refresh shows an error toast. The tab heading (`agent-card-heading`, `tabIndex=-1`) takes
+  focus when **Retry** replaces itself with the loading status.
+- A failed or not-served fetch shows a danger alert with the cause text (`agent-card-failed`,
+  `agent-card-failed-cause`) and opens both raw panels. The managed panel reads "Not available:
+  <cause — HTTP n>." (`agent-card-raw-before-missing`), or shows the managed card when the gateway
+  fetched it but will not serve it. The served panel shows, in this order: the card the gateway
+  returns in `after` whatever the fetch status, with "The card the gateway last served for this
+  surface, before the latest fetch failed. Callers do not get it until this is fixed." (or "before
+  the gateway refused to serve the card it fetched.") as `agent-card-raw-after-note`, never in the
+  present tense, because the card route keeps no stale card for callers; when `after` is
+  `null` because the card is over the display limit, "The card the gateway last served is N KB, more
+  than the N KB the dashboard shows. Open the card URL to read it."; on a gateway that returns no
+  served card, the last Gateway-Served Agent Card the dashboard saw for this surface
+  (`useAgentCardPreview` `lastServed`, never carried to another surface) with "The last card the
+  gateway served, fetched <time>."; otherwise "The gateway serves no card while the fetch fails."
+  (`agent-card-raw-after-missing`). A failed or not-served fetch shows no comparison, summary or
+  **Added** marks, because there is no managed card from the same fetch to compare against.
+- Other states, each with its own test id and fixed copy: create mode or no id
+  (`agent-card-unsaved`, "Save the surface to see its agent cards."), unsaved edits
+  (`agent-card-unsaved-changes`, a banner above the content; moving or zooming the canvas does not
+  count, see `utils/surfaceDirtySignature.ts`), loading (`agent-card-loading`), read failed with
+  **Retry** (`agent-card-error`, `agent-card-retry-button`), `not_a2a` ("Only A2A and AP2 surfaces
+  have agent cards.") and `not_running` (`agent-card-unsupported`; `operator_only` reads "Only an
+  appliance operator can preview the card of an appliance-wide surface."; an `auth_failed` cause on
+  a `remote_gateway` sign-in reads "The remote gateway refused this gateway's authorization (HTTP
+  {status}). Check the sign-in settings of the remote surface."), a card over the display limit
+  (`agent-card-too-large`), a gateway-generated A2A proxy card (`agent-card-generated`, served column
+  only), callers paying first (`agent-card-payment`) and Surface Variants existing
+  (`agent-card-variant-note`, because the view shows the base route). `hasVariants` comes from the
+  saved surface's enabled variants.
+- Card content comes from the agent, so it
+  is untrusted: every value renders as React text, there is no `dangerouslySetInnerHTML`, and no
+  card URL (`iconUrl`, `documentationUrl`, `provider.url`) becomes a link or an image. The only link
+  is the served card URL, and only when `safeHttpUrl` passes (http or https, no user info), opened
+  with `rel="noopener noreferrer"`. The parser keeps no token, secret, secret id or upstream error
+  body, so the view has nothing of that kind to show.
+- The Managed Agent panel shows one line, **Card fetch: OK**, **Card fetch: failing (<cause — HTTP
+  n>)** or **Card: generated by the gateway**, with an icon, and a **View agent cards** link button
+  (`managed-agent-card-fetch`, `managed-agent-card-fetch-status`, `managed-agent-card-fetch-icon`,
+  `managed-agent-card-fetch-link`), through `agent-card/AgentCardFetchLine.tsx`. The status text
+  uses `agent-card-fetch-ok` and `agent-card-fetch-failing` (AA colours in both themes, scoped to
+  `.agent-card-fetch-line`), not `text-success` or `text-danger`. `AgentCardFetchLine` reads the
+  preview with its own `useAgentCardPreview` call and never calls Refresh; it reads again when
+  `SurfaceMetaContext.agentCardFetchRevision` changes, which the shell bumps on a save and on each
+  successful Refresh in the Agent Cards view (`AgentCardTab` `onRefreshed`), so the line does not
+  keep a stale status. It shows `Card fetch: checking…` while loading and `Card fetch: status
+unavailable` when the read fails. Like the chip's
+  link, it reaches the view through `SurfaceMetaContext.onOpenAgentCard`, which `SurfaceFormShell`
+  sets only while the view is offered, and it shows only for a saved surface. `SurfaceDetailPage`
+  passes `isDirty` (ignoring canvas layout), its save counter as `agentCardRefreshKey` (so a save reads
+  the cards again) and `hasVariants`.
 
 ## Access Tokens page
 

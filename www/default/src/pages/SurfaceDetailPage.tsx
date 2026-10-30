@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback, useRef, useReducer } from 'react';
+import React, { useEffect, useState, useCallback, useRef, useReducer, useMemo } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { AgentSurface, apiClient } from '../api';
 import { showToast } from '../utils/toaster';
@@ -18,7 +18,9 @@ import { useSurfaceBuilder } from '../components/surface-builder/hooks/useSurfac
 import { useSurfaceHistory } from '../components/surface-builder/hooks/useSurfaceHistory';
 import { useSaveShortcut } from '../components/surface-builder/hooks/useSaveShortcut';
 import { useDiscardWithUndo } from '../components/surface-builder/hooks/useDiscardWithUndo';
-import SurfaceFormShell from '../components/surface-builder/SurfaceFormShell';
+import SurfaceFormShell, {
+  type SurfaceFormView,
+} from '../components/surface-builder/SurfaceFormShell';
 import { dependencyErrorBlocker } from '../components/surface-builder/dependencyBlocker';
 import { useSurfacePolicyDefinitions } from '../components/surface-builder/hooks/useSurfacePolicyDefinitions';
 import { surfacePolicyBlockingReason } from '../components/surface-builder/elements/policy/status';
@@ -38,6 +40,7 @@ import {
   nodesFromSurface,
 } from '../components/surface-builder/nodesFromSurface';
 import { findDuplicateListenerRoutes } from '../components/surface-builder/templates/scrubVolatile';
+import { withoutCanvasLayout } from '../utils/surfaceDirtySignature';
 import './SurfaceBuilder.css';
 
 interface DetailBuilderState {
@@ -106,6 +109,8 @@ const SurfaceDetailPage: React.FC = () => {
   const { getCurrentStats } = useApp();
 
   const [surface, setSurface] = useState<AgentSurface | null>(null);
+  const [saveCount, setSaveCount] = useState(0);
+  const savedHasVariants = (surface?.variants ?? []).some(v => v.enabled !== false);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
@@ -138,9 +143,7 @@ const SurfaceDetailPage: React.FC = () => {
   const surfacePolicyLoadState = useSurfacePolicyDefinitions();
   const surfacePolicyIds =
     surfacePolicyLoadState.status === 'loaded' ? surfacePolicyLoadState.ids : null;
-  const [activeTab, setActiveTab] = useState<
-    'surface' | 'elements' | 'monitoring' | 'config' | 'editor'
-  >('surface');
+  const [activeTab, setActiveTab] = useState<SurfaceFormView>('surface');
   const [editorTabNodeId, setEditorTabNodeId] = useState<string | null>(null);
 
   const handleOpenFullscreenEditor = useCallback((nodeId: string) => {
@@ -1272,6 +1275,7 @@ const SurfaceDetailPage: React.FC = () => {
       });
       setSavedWarnings({ surfaceId, warnings: headerWarnings });
       setSurface(updated);
+      setSaveCount(count => count + 1);
       setJsonOverride(null);
       setJsonError(null);
       // Re-hydrate the variant snapshot manager from the saved
@@ -1475,6 +1479,13 @@ const SurfaceDetailPage: React.FC = () => {
     !deleting &&
     baselineRef.current !== null &&
     baselineRef.current !== currentSignature;
+  const hasUnsavedConfig = useMemo(
+    () =>
+      isDirty &&
+      baselineRef.current !== null &&
+      withoutCanvasLayout(baselineRef.current) !== withoutCanvasLayout(currentSignature),
+    [isDirty, currentSignature]
+  );
   const { discard, popPendingRestore } = useDiscardWithUndo({
     dirty: isDirty,
     navigateTo: '/surfaces',
@@ -1696,6 +1707,9 @@ const SurfaceDetailPage: React.FC = () => {
         hasAttemptedSave={hasAttemptedSave}
         saveError={error}
         saveWarnings={saveWarnings}
+        isDirty={hasUnsavedConfig}
+        agentCardRefreshKey={saveCount}
+        hasVariants={savedHasVariants}
         surfaceId={surface?.surface_id}
         tenantId={surface ? (surface.tenant_id ?? null) : undefined}
         lastActivity={
