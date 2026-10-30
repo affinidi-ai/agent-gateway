@@ -11,7 +11,9 @@
 //! ever read, echoed or logged. Revocation is best effort: its outcome is
 //! returned, logged and audited with the actor that caused it, and a failed
 //! revocation never keeps a grant that is being removed. [`remove_grants`]
-//! revokes and deletes many grants at most [`REVOCATION_CONCURRENCY`] at a time.
+//! revokes and deletes many grants at most [`REVOCATION_CONCURRENCY`] at a time;
+//! [`delete_then_revoke`] deletes them first and revokes them on a task of its
+//! own, so the change that removed them never waits on a vendor.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -44,6 +46,9 @@ pub enum RevocationOutcome {
     NotSupported,
     /// The client's secret could not be resolved in the provider's tenant.
     ClientUnavailable,
+    /// Revocation was not tried: the grant was removed without it, for the
+    /// [`GrantRevocation::reason`] given.
+    Skipped,
 }
 
 impl RevocationOutcome {
@@ -55,9 +60,18 @@ impl RevocationOutcome {
             Self::Unreachable => "unreachable",
             Self::NotSupported => "not_supported",
             Self::ClientUnavailable => "client_unavailable",
+            Self::Skipped => "skipped",
         }
     }
 }
+
+/// Why a removed grant was not revoked: no secrets store is configured, so a
+/// confidential client cannot authenticate.
+pub const SKIPPED_NO_SECRETS_STORE: &str = "no_secrets_store";
+/// Why a removed grant was not revoked: its provider no longer exists.
+pub const SKIPPED_PROVIDER_MISSING: &str = "provider_missing";
+/// Why a removed grant was not revoked: an operator purged it without reading it.
+pub const SKIPPED_PURGED: &str = "purged";
 
 /// What revoking one grant came to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,35 +82,66 @@ pub struct GrantRevocation {
     /// The access token's outcome, for a grant whose refresh token was revoked
     /// first.
     pub access_token: Option<RevocationOutcome>,
+    /// Why revocation was skipped, for [`RevocationOutcome::Skipped`].
+    pub reason: Option<&'static str>,
 }
 
 impl GrantRevocation {
     fn failed(outcome: RevocationOutcome) -> Self {
-        Self { outcome, access_token: None }
+        Self {
+            outcome,
+            access_token: None,
+            reason: None,
+        }
+    }
+
+    fn skipped(reason: &'static str) -> Self {
+        Self {
+            outcome: RevocationOutcome::Skipped,
+            access_token: None,
+            reason: Some(reason),
+        }
     }
 
     /// The audit record's `detail`: `vendor_revocation:<outcome>`, then
-    /// `,access_token:<outcome>` when the access token was revoked as well.
-    fn detail(self) -> String {
-        match self.access_token {
-            Some(access_token) => {
-                format!("vendor_revocation:{},access_token:{}", self.outcome.as_str(), access_token.as_str())
-            }
-            None => format!("vendor_revocation:{}", self.outcome.as_str()),
+    /// `,access_token:<outcome>` when the access token was revoked as well, or
+    /// `,reason:<reason>` when revocation was skipped.
+    pub fn detail(self) -> String {
+        let mut detail = format!("vendor_revocation:{}", self.outcome.as_str());
+        if let Some(access_token) = self.access_token {
+            detail.push_str(&format!(",access_token:{}", access_token.as_str()));
         }
+        if let Some(reason) = self.reason {
+            detail.push_str(&format!(",reason:{reason}"));
+        }
+        detail
     }
 }
 
 /// Revoke `grant` at `provider`'s revocation endpoint, then log and audit the
 /// outcome, naming `actor`, the management caller whose change removed it.
+/// Without a secrets store, a client that authenticates with a secret is not
+/// revoked: the outcome is `skipped`, with the reason `no_secrets_store`.
 pub async fn revoke_grant(
     provider: &CredentialProvider,
     grant: &DelegatedGrant,
-    secrets: &Arc<dyn SecretsStore>,
+    secrets: Option<&Arc<dyn SecretsStore>>,
     exact_allowlist: Option<&str>,
     actor: Option<&AuditCallerContext>,
 ) -> GrantRevocation {
     let revocation = revoke(provider, grant, secrets, exact_allowlist).await;
+    record_revocation(&provider.id, Some(&provider.name), grant, revocation, actor);
+    revocation
+}
+
+/// Log and audit what became of `grant`'s revocation.
+fn record_revocation(
+    credential_provider_id: &str,
+    provider_name: Option<&str>,
+    grant: &DelegatedGrant,
+    revocation: GrantRevocation,
+    actor: Option<&AuditCallerContext>,
+) {
     let outcome = revocation.outcome.as_str();
     let access_token = revocation
         .access_token
@@ -105,7 +150,7 @@ pub async fn revoke_grant(
         RevocationOutcome::Revoked => tracing::info!(
             target: "credential_delegation",
             grant_id = %grant.id,
-            credential_provider_id = %provider.id,
+            credential_provider_id = %credential_provider_id,
             outcome,
             access_token,
             "Revoked a delegated grant at its authorization server"
@@ -113,15 +158,23 @@ pub async fn revoke_grant(
         RevocationOutcome::NotSupported => tracing::info!(
             target: "credential_delegation",
             grant_id = %grant.id,
-            credential_provider_id = %provider.id,
+            credential_provider_id = %credential_provider_id,
             outcome,
             "A delegated grant's provider names no revocation endpoint, so the grant is removed without revoking it"
+        ),
+        RevocationOutcome::Skipped => tracing::warn!(
+            target: "credential_delegation",
+            grant_id = %grant.id,
+            credential_provider_id = %credential_provider_id,
+            outcome,
+            reason = revocation.reason,
+            "A delegated grant is removed without revoking it at its authorization server"
         ),
         RevocationOutcome::Refused | RevocationOutcome::Unreachable | RevocationOutcome::ClientUnavailable => {
             tracing::warn!(
                 target: "credential_delegation",
                 grant_id = %grant.id,
-                credential_provider_id = %provider.id,
+                credential_provider_id = %credential_provider_id,
                 outcome,
                 "A delegated grant could not be revoked at its authorization server; it is removed all the same"
             )
@@ -132,16 +185,15 @@ pub async fn revoke_grant(
             super::audit::DelegationAuditAction::TokenRevoked,
             None,
             None,
-            Some(&provider.id),
+            Some(credential_provider_id),
             Some(&grant.surface_id),
         );
         event.token_id = Some(grant.id.clone());
-        event.provider_name = Some(provider.name.clone());
+        event.provider_name = provider_name.map(str::to_string);
         event.detail = Some(revocation.detail());
         event.caller = actor.cloned();
         event
     });
-    revocation
 }
 
 /// Revoke at its authorization server, then delete, each of `grants`, at most
@@ -161,12 +213,14 @@ pub async fn remove_grants(
         .map(|grant| async move {
             match providers.get(&grant.credential_provider_id) {
                 Some(provider) => {
-                    revoke_grant(provider, &grant, secrets, exact_allowlist, actor).await;
+                    revoke_grant(provider, &grant, Some(secrets), exact_allowlist, actor).await;
                 }
-                None => tracing::warn!(
-                    target: "credential_delegation",
-                    grant_id = %grant.id,
-                    "A delegated grant's provider no longer exists, so the grant is removed without revoking it"
+                None => record_revocation(
+                    &grant.credential_provider_id,
+                    None,
+                    &grant,
+                    GrantRevocation::skipped(SKIPPED_PROVIDER_MISSING),
+                    actor,
                 ),
             }
             vault
@@ -184,15 +238,116 @@ pub async fn remove_grants(
     }
 }
 
+/// What revoking removed grants on a task of their own needs: each grant's
+/// provider by its record id, the secrets store, the test allow-list of
+/// fixtures (`None` in production), and the management caller whose change
+/// removed them.
+#[derive(Clone)]
+pub struct Revoker {
+    pub providers: HashMap<String, CredentialProvider>,
+    pub secrets: Option<Arc<dyn SecretsStore>>,
+    pub exact_allowlist: Option<String>,
+    pub actor: Option<AuditCallerContext>,
+}
+
+/// Delete each of `grants` from the vault, which ends its release at once,
+/// then revoke the deleted ones at their authorization servers on a task of
+/// their own, at most [`REVOCATION_CONCURRENCY`] at a time, auditing each
+/// outcome, so the caller never waits on a vendor. Every grant is tried; the
+/// call fails if any could not be deleted, and the ones that were are revoked
+/// all the same. The returned task ends when every revocation has.
+pub async fn delete_then_revoke(
+    vault: &Arc<dyn DelegationVaultStorage>,
+    grants: Vec<DelegatedGrant>,
+    revoker: Revoker,
+) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+    let mut deleted = Vec::with_capacity(grants.len());
+    let mut failure = None;
+    for grant in grants {
+        match vault
+            .purge_grant(&grant.id, grant.tenant_id.as_deref())
+            .await
+        {
+            Ok(_) => deleted.push(grant),
+            Err(error) => {
+                failure.get_or_insert(error);
+            }
+        }
+    }
+    let revocations = tokio::spawn(revoke_removed(deleted, revoker));
+    match failure {
+        Some(error) => Err(error.context("Failed to delete a delegated grant")),
+        None => Ok(revocations),
+    }
+}
+
+/// Revoke grants already removed from the vault, at most
+/// [`REVOCATION_CONCURRENCY`] at a time, logging and auditing each outcome.
+pub async fn revoke_removed(
+    grants: Vec<DelegatedGrant>,
+    revoker: Revoker,
+) {
+    let revoker = &revoker;
+    futures::stream::iter(grants)
+        .for_each_concurrent(REVOCATION_CONCURRENCY, |grant| async move {
+            match revoker
+                .providers
+                .get(&grant.credential_provider_id)
+            {
+                Some(provider) => {
+                    revoke_grant(
+                        provider,
+                        &grant,
+                        revoker.secrets.as_ref(),
+                        revoker
+                            .exact_allowlist
+                            .as_deref(),
+                        revoker.actor.as_ref(),
+                    )
+                    .await;
+                }
+                None => record_revocation(
+                    &grant.credential_provider_id,
+                    None,
+                    &grant,
+                    GrantRevocation::skipped(SKIPPED_PROVIDER_MISSING),
+                    revoker.actor.as_ref(),
+                ),
+            }
+        })
+        .await;
+}
+
+/// Audit that an operator purged the grant with this record id without
+/// reading it, so it was not revoked at its authorization server.
+pub fn record_purge(
+    grant_id: &str,
+    actor: Option<&AuditCallerContext>,
+) {
+    tracing::warn!(
+        target: "credential_delegation",
+        grant_id = %grant_id,
+        "A delegated grant was purged without reading it, so it is not revoked at its authorization server"
+    );
+    super::audit::emit("token_revoked", || {
+        let mut event =
+            super::audit::audit_event(super::audit::DelegationAuditAction::TokenRevoked, None, None, None, None);
+        event.token_id = Some(grant_id.to_string());
+        event.detail = Some(GrantRevocation::skipped(SKIPPED_PURGED).detail());
+        event.caller = actor.cloned();
+        event
+    });
+}
+
 async fn revoke(
     provider: &CredentialProvider,
     grant: &DelegatedGrant,
-    secrets: &Arc<dyn SecretsStore>,
+    secrets: Option<&Arc<dyn SecretsStore>>,
     exact_allowlist: Option<&str>,
 ) -> GrantRevocation {
     let client = match RevocationClient::new(provider, secrets, exact_allowlist).await {
         Ok(client) => client,
-        Err(outcome) => return GrantRevocation::failed(outcome),
+        Err(revocation) => return revocation,
     };
     match grant.refresh_token.as_deref() {
         Some(refresh_token) => GrantRevocation {
@@ -204,6 +359,7 @@ async fn revoke(
                     .revoke(&grant.access_token, "access_token")
                     .await,
             ),
+            reason: None,
         },
         None => GrantRevocation::failed(
             client
@@ -226,22 +382,25 @@ struct RevocationClient<'a> {
 impl<'a> RevocationClient<'a> {
     async fn new(
         provider: &'a CredentialProvider,
-        secrets: &Arc<dyn SecretsStore>,
+        secrets: Option<&Arc<dyn SecretsStore>>,
         exact_allowlist: Option<&str>,
-    ) -> Result<Self, RevocationOutcome> {
+    ) -> Result<Self, GrantRevocation> {
         let endpoint = provider
             .revocation_endpoint
             .as_deref()
-            .ok_or(RevocationOutcome::NotSupported)?;
+            .ok_or(GrantRevocation::failed(RevocationOutcome::NotSupported))?;
         let (Some(client_id), Some(method)) = (provider.client_id.as_deref(), provider.token_endpoint_auth_method)
         else {
-            return Err(RevocationOutcome::ClientUnavailable);
+            return Err(GrantRevocation::failed(RevocationOutcome::ClientUnavailable));
         };
         let secret = if method.uses_secret() {
+            let Some(secrets) = secrets else {
+                return Err(GrantRevocation::skipped(SKIPPED_NO_SECRETS_STORE));
+            };
             Some(
                 client_secret(provider, secrets)
                     .await
-                    .ok_or(RevocationOutcome::ClientUnavailable)?,
+                    .ok_or(GrantRevocation::failed(RevocationOutcome::ClientUnavailable))?,
             )
         } else {
             None
@@ -254,7 +413,7 @@ impl<'a> RevocationClient<'a> {
                     error = ?error.to_string(),
                     "Revocation endpoint refused by egress policy"
                 );
-                RevocationOutcome::Unreachable
+                GrantRevocation::failed(RevocationOutcome::Unreachable)
             })?;
         Ok(Self {
             endpoint,
@@ -507,12 +666,14 @@ pub(crate) mod tests {
         let secrets = secrets_with(&directory, Some("tenant-a")).await;
         let server = RecordingServer::start(200).await;
         let revocation =
-            revoke(&provider(Some(&server.url), "none", None), &grant(true), &secrets, Some(&server.origin())).await;
+            revoke(&provider(Some(&server.url), "none", None), &grant(true), Some(&secrets), Some(&server.origin()))
+                .await;
         assert_eq!(
             revocation,
             GrantRevocation {
                 outcome: RevocationOutcome::Revoked,
                 access_token: Some(RevocationOutcome::Revoked),
+                reason: None,
             }
         );
         let requests = server.requests();
@@ -551,14 +712,14 @@ pub(crate) mod tests {
         let server = RecordingServer::start(200).await;
         let basic = provider(Some(&server.url), "client_secret_basic", Some("client-secret"));
         assert_eq!(
-            revoke(&basic, &grant(false), &secrets, Some(&server.origin()))
+            revoke(&basic, &grant(false), Some(&secrets), Some(&server.origin()))
                 .await
                 .outcome,
             RevocationOutcome::Revoked
         );
         let post = provider(Some(&server.url), "client_secret_post", Some("client-secret"));
         assert_eq!(
-            revoke(&post, &grant(false), &secrets, Some(&server.origin()))
+            revoke(&post, &grant(false), Some(&secrets), Some(&server.origin()))
                 .await
                 .outcome,
             RevocationOutcome::Revoked
@@ -602,7 +763,8 @@ pub(crate) mod tests {
         let secrets = secrets_with(&directory, Some("tenant-a")).await;
         let server = RecordingServer::start(200).await;
         let revocation =
-            revoke(&provider(Some(&server.url), "none", None), &grant(false), &secrets, Some(&server.origin())).await;
+            revoke(&provider(Some(&server.url), "none", None), &grant(false), Some(&secrets), Some(&server.origin()))
+                .await;
         assert_eq!(revocation, GrantRevocation::failed(RevocationOutcome::Revoked));
         assert_eq!(server.requests().len(), 1);
         let fields = form(&server.requests()[0].1);
@@ -616,15 +778,21 @@ pub(crate) mod tests {
         let secrets = secrets_with(&directory, Some("tenant-b")).await;
         let refusing = RecordingServer::start(400).await;
         assert_eq!(
-            revoke(&provider(Some(&refusing.url), "none", None), &grant(true), &secrets, Some(&refusing.origin()))
-                .await,
+            revoke(
+                &provider(Some(&refusing.url), "none", None),
+                &grant(true),
+                Some(&secrets),
+                Some(&refusing.origin())
+            )
+            .await,
             GrantRevocation {
                 outcome: RevocationOutcome::Refused,
                 access_token: Some(RevocationOutcome::Refused),
+                reason: None,
             }
         );
         assert_eq!(
-            revoke(&provider(None, "none", None), &grant(true), &secrets, None).await,
+            revoke(&provider(None, "none", None), &grant(true), Some(&secrets), None).await,
             GrantRevocation::failed(RevocationOutcome::NotSupported)
         );
         let before = refusing.requests().len();
@@ -632,7 +800,7 @@ pub(crate) mod tests {
             revoke(
                 &provider(Some(&refusing.url), "client_secret_post", Some("client-secret")),
                 &grant(true),
-                &secrets,
+                Some(&secrets),
                 Some(&refusing.origin())
             )
             .await
@@ -641,7 +809,7 @@ pub(crate) mod tests {
             "another tenant's secret is never sent"
         );
         assert_eq!(
-            revoke(&provider(Some(&refusing.url), "none", None), &grant(true), &secrets, None)
+            revoke(&provider(Some(&refusing.url), "none", None), &grant(true), Some(&secrets), None)
                 .await
                 .outcome,
             RevocationOutcome::Unreachable,
@@ -652,7 +820,7 @@ pub(crate) mod tests {
             revoke(
                 &provider(Some("http://127.0.0.1:1/revoke"), "none", None),
                 &grant(true),
-                &secrets,
+                Some(&secrets),
                 Some("http://127.0.0.1:1")
             )
             .await
@@ -670,7 +838,7 @@ pub(crate) mod tests {
         let grant = grant(true);
         let actor = actor();
         let (revocation, events) = crate::audit::producer::capture(async {
-            revoke_grant(&provider, &grant, &secrets, Some(&server.origin()), Some(&actor)).await
+            revoke_grant(&provider, &grant, Some(&secrets), Some(&server.origin()), Some(&actor)).await
         })
         .await;
         assert_eq!(revocation.outcome, RevocationOutcome::Revoked);
@@ -699,7 +867,7 @@ pub(crate) mod tests {
         revoke_grant(
             &provider(Some(&refusing.url), "none", None),
             &grant(true),
-            &secrets,
+            Some(&secrets),
             Some(&refusing.origin()),
             None,
         )
@@ -713,7 +881,7 @@ pub(crate) mod tests {
         revoke_grant(
             &provider(Some(&accepting.url), "none", None),
             &grant(true),
-            &secrets,
+            Some(&secrets),
             Some(&accepting.origin()),
             None,
         )
@@ -776,11 +944,95 @@ pub(crate) mod tests {
         assert_eq!(server.revoked_tokens().len(), 2 * REVOCATION_CONCURRENCY);
         assert!(
             vault
-                .all_grants()
+                .provider_grants("provider")
                 .await
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// Removing grants deletes them first, which ends their release at once,
+    /// and revokes them on a task of their own: the caller never waits on a
+    /// vendor, however slow.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn removed_grants_are_deleted_at_once_and_revoked_in_the_background() {
+        let directory = tempfile::tempdir().unwrap();
+        let secrets = secrets_with(&directory, Some("tenant-a")).await;
+        let delay = Duration::from_secs(2);
+        let server = RecordingServer::start_with_delay(200, delay).await;
+        let (vault, grants) = vault_with(&directory, 3).await;
+        let revoker = Revoker {
+            providers: HashMap::from([("provider".to_string(), provider(Some(&server.url), "none", None))]),
+            secrets: Some(secrets),
+            exact_allowlist: Some(server.origin()),
+            actor: Some(actor()),
+        };
+
+        let started = std::time::Instant::now();
+        let revocations = delete_then_revoke(&vault, grants, revoker)
+            .await
+            .unwrap();
+        assert!(started.elapsed() < delay / 2, "the removal waited on the vendor: {:?}", started.elapsed());
+        assert!(
+            vault
+                .provider_grants("provider")
+                .await
+                .unwrap()
+                .is_empty(),
+            "the grants are deleted before any revocation ends"
+        );
+        tokio::time::timeout(delay * 4, revocations)
+            .await
+            .expect("the revocations end")
+            .unwrap();
+        assert_eq!(server.revoked_tokens().len(), 6);
+    }
+
+    /// Without a secrets store a client that authenticates with a secret cannot
+    /// revoke, so the grant is removed unrevoked and the audit says why; a
+    /// public client still revokes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn without_a_secrets_store_a_confidential_clients_revocation_is_skipped_and_audited() {
+        let server = RecordingServer::start(200).await;
+        let confidential = provider(Some(&server.url), "client_secret_post", Some("client-secret"));
+        let grant = grant(true);
+        let (revocation, events) = crate::audit::producer::capture(async {
+            revoke_grant(&confidential, &grant, None, Some(&server.origin()), Some(&actor())).await
+        })
+        .await;
+        assert_eq!(revocation.outcome, RevocationOutcome::Skipped);
+        assert!(server.requests().is_empty());
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].detail.as_deref(), Some("vendor_revocation:skipped,reason:no_secrets_store"));
+        assert_eq!(
+            events[0]
+                .caller
+                .as_ref()
+                .and_then(|caller| caller.sub.as_deref()),
+            Some("operator")
+        );
+
+        let public = provider(Some(&server.url), "none", None);
+        assert_eq!(
+            revoke_grant(&public, &grant, None, Some(&server.origin()), None)
+                .await
+                .outcome,
+            RevocationOutcome::Revoked
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_removed_grant_whose_provider_is_gone_is_audited_as_skipped() {
+        let revoker = Revoker {
+            providers: HashMap::new(),
+            secrets: None,
+            exact_allowlist: None,
+            actor: None,
+        };
+        let ((), events) = crate::audit::producer::capture(revoke_removed(vec![grant(true)], revoker)).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].detail.as_deref(), Some("vendor_revocation:skipped,reason:provider_missing"));
+        assert_eq!(events[0].token_id.as_deref(), Some(grant(true).id.as_str()));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -795,7 +1047,7 @@ pub(crate) mod tests {
         assert!(server.requests().is_empty());
         assert!(
             vault
-                .all_grants()
+                .provider_grants("provider")
                 .await
                 .unwrap()
                 .is_empty()

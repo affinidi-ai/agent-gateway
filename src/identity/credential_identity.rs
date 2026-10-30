@@ -71,6 +71,7 @@ static IDENTITY_HASH_PEPPER: OnceLock<Pepper> = OnceLock::new();
 #[cfg(test)]
 thread_local! {
     static TEST_PEPPER_CONFIGURED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static TEST_PEPPER_BYTES: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
 }
 
 pub async fn initialize_pepper() {
@@ -128,6 +129,13 @@ pub fn pepper_is_configured() -> bool {
 #[cfg(test)]
 pub(crate) fn configure_pepper_for_tests(configured: bool) {
     TEST_PEPPER_CONFIGURED.with(|cell| cell.set(Some(configured)));
+}
+
+/// Make [`derived_key`] derive from `pepper` on this test thread, as a gateway
+/// run with another `AG_IDENTITY_HASH_PEPPER` would.
+#[cfg(test)]
+pub(crate) fn configure_pepper_bytes_for_tests(pepper: &[u8]) {
+    TEST_PEPPER_BYTES.with(|cell| *cell.borrow_mut() = Some(pepper.to_vec()));
 }
 
 // ── Error type ────────────────────────────────────────────────────────────
@@ -611,6 +619,15 @@ fn validate_did(did: &str) -> Result<(), String> {
 pub(crate) fn derived_key(label: &[u8]) -> [u8; 32] {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
+    #[cfg(test)]
+    if let Some(pepper) = TEST_PEPPER_BYTES.with(|cell| cell.borrow().clone()) {
+        let mut mac = Hmac::<Sha256>::new_from_slice(&pepper).expect("HMAC key");
+        mac.update(label);
+        return mac
+            .finalize()
+            .into_bytes()
+            .into();
+    }
     let mut mac = Hmac::<Sha256>::new_from_slice(pepper()).expect("HMAC key");
     mac.update(label);
     mac.finalize()

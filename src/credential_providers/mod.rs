@@ -467,6 +467,10 @@ pub struct CredentialProviderListItem {
     pub callback_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource: Option<String>,
+    /// The origin of `resource`, for a provider with an issuer: the only origin
+    /// its grants are sent to, so a connect page can show the person where.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_origin: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub consent_identity_strategy_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -510,6 +514,10 @@ impl From<&CredentialProvider> for CredentialProviderListItem {
             description: p.description.clone(),
             callback_url: p.callback_url.clone(),
             resource: p.resource.clone(),
+            resource_origin: p
+                .is_external_consent()
+                .then(|| external::resource_origin(p))
+                .flatten(),
             consent_identity_strategy_id: p
                 .consent_identity_strategy_id
                 .clone(),

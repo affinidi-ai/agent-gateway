@@ -238,6 +238,136 @@ pub async fn revoke_user_tokens(
     }
 }
 
+/// The authenticated operator of a grant purge: refused without a caller, and
+/// for a tenant's token, since a purge reads no grant and so cannot tell whose
+/// it is.
+fn purging_operator(
+    caller: Option<&Extension<AuthGuardOk>>,
+    delegation: Option<&Extension<PatDelegationContext>>,
+    tenant: Option<&Extension<crate::tenancy::PatTenantContext>>,
+) -> Result<super::audit::AuditCallerContext, (StatusCode, &'static str)> {
+    let Some(operator) = management_caller_context(caller, delegation) else {
+        return Err((StatusCode::UNAUTHORIZED, "no authenticated caller"));
+    };
+    if tenant.is_some() {
+        return Err((StatusCode::FORBIDDEN, "Purging delegated grants is an operator action; a tenant's token cannot"));
+    }
+    Ok(operator)
+}
+
+/// DELETE /api/v1/delegation-vault/grants/{grant_id}
+///
+/// Deletes one grant by binding by its record id without reading it, so a grant
+/// that cannot be decrypted or parsed, and so blocks the removal of its binding
+/// or provider, can be removed. It is not revoked at its authorization server:
+/// the audit says so.
+pub async fn purge_grant(
+    State(state): State<DelegationVaultState>,
+    caller: Option<Extension<AuthGuardOk>>,
+    delegation: Option<Extension<PatDelegationContext>>,
+    tenant: Option<Extension<crate::tenancy::PatTenantContext>>,
+    Path(grant_id): Path<String>,
+) -> impl IntoResponse {
+    let operator = match purging_operator(caller.as_ref(), delegation.as_ref(), tenant.as_ref()) {
+        Ok(operator) => operator,
+        Err((status, error)) => return (status, Json(serde_json::json!({ "error": error }))).into_response(),
+    };
+    if !super::grants::is_record_id(&grant_id) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Not the id of a delegated grant"})))
+            .into_response();
+    }
+    match state
+        .vault_store
+        .purge_grant(&grant_id, None)
+        .await
+    {
+        Ok(true) => {
+            super::revocation::record_purge(&grant_id, Some(&operator));
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(false) => {
+            (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Delegated grant not found"}))).into_response()
+        }
+        Err(error) => {
+            error!(target: "credential_delegation", error = ?error.to_string(), "Failed to purge a delegated grant");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Failed to purge the grant"})))
+                .into_response()
+        }
+    }
+}
+
+/// The binding whose grants `DELETE /api/v1/delegation-vault/grants` purges.
+#[derive(Debug, Deserialize)]
+pub struct PurgeBindingQuery {
+    /// The surface's tenant; left out for an untenanted surface.
+    pub tenant_id: Option<String>,
+    pub surface_id: String,
+    pub transit_point_id: String,
+    pub credential_provider_id: String,
+}
+
+/// DELETE /api/v1/delegation-vault/grants?surface_id=&transit_point_id=&credential_provider_id=&tenant_id=
+///
+/// Deletes every grant of one binding, the owner's and each caller's, without
+/// reading them, and answers with their record ids. None is revoked at its
+/// authorization server: the audit records each as purged.
+pub async fn purge_binding_grants(
+    State(state): State<DelegationVaultState>,
+    caller: Option<Extension<AuthGuardOk>>,
+    delegation: Option<Extension<PatDelegationContext>>,
+    tenant: Option<Extension<crate::tenancy::PatTenantContext>>,
+    Query(query): Query<PurgeBindingQuery>,
+) -> impl IntoResponse {
+    let operator = match purging_operator(caller.as_ref(), delegation.as_ref(), tenant.as_ref()) {
+        Ok(operator) => operator,
+        Err((status, error)) => return (status, Json(serde_json::json!({ "error": error }))).into_response(),
+    };
+    let tenant_id = query
+        .tenant_id
+        .as_deref()
+        .filter(|tenant| !tenant.is_empty());
+    let binding = super::grants::GrantBinding::new(
+        tenant_id,
+        &query.surface_id,
+        &query.transit_point_id,
+        &query.credential_provider_id,
+    );
+    let failed = || {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Failed to purge the binding's grants"})))
+            .into_response()
+    };
+    let ids = match state
+        .vault_store
+        .binding_grant_ids(&binding)
+        .await
+    {
+        Ok(ids) => ids,
+        Err(error) => {
+            error!(target: "credential_delegation", error = ?error.to_string(), "Failed to list a binding's grants");
+            return failed();
+        }
+    };
+    let mut purged = Vec::with_capacity(ids.len());
+    for id in ids {
+        match state
+            .vault_store
+            .purge_grant(&id, tenant_id)
+            .await
+        {
+            Ok(true) => {
+                super::revocation::record_purge(&id, Some(&operator));
+                purged.push(id);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                error!(target: "credential_delegation", error = ?error.to_string(), "Failed to purge a delegated grant");
+                return failed();
+            }
+        }
+    }
+    (StatusCode::OK, Json(serde_json::json!({"purged": purged.len(), "grant_ids": purged}))).into_response()
+}
+
 /// Query parameters for OAuth callback
 #[derive(Debug, Deserialize)]
 pub struct OAuthCallbackQuery {

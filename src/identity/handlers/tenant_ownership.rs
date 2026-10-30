@@ -824,7 +824,6 @@ async fn persist_tenant_id(
                 .await
                 .map_err(internal)?
                 .ok_or_else(|| missing(kind, id))?;
-            let stored = resource.clone();
             resource.tenant_id = tenant_id;
             super::surface_tenancy::validate_surface_references(state, &resource, None, None)
                 .await
@@ -838,20 +837,24 @@ async fn persist_tenant_id(
                     other => OwnershipApiError::Internal(format!("External consent validation failed: {other:?}")),
                 })?;
             let allowlist = crate::egress::bdd_egress_allowlist();
-            super::surface_grants::remove_changed_binding_grants(
+            super::surface_grants::write_surface(
                 &super::surface_grants::GrantRemoval::of(state, allowlist.as_deref(), actor),
-                Some(&stored),
+                &**store,
+                id,
+                super::surface_grants::Stored::Any,
                 Some(&resource),
+                || async {
+                    store
+                        .save(&resource)
+                        .await
+                        .map_err(|error| super::surfaces::SurfaceApiError::InternalError(error.to_string()))
+                },
             )
             .await
             .map_err(|error| match error {
                 super::surfaces::SurfaceApiError::Unavailable(message) => OwnershipApiError::Refused(message),
-                other => OwnershipApiError::Internal(format!("Removing the surface's grants failed: {other:?}")),
+                other => OwnershipApiError::Internal(format!("Saving the surface failed: {other:?}")),
             })?;
-            store
-                .save(&resource)
-                .await
-                .map_err(internal)?;
             super::surfaces::apply_surface_from_storage(state, id).await;
         }
         ResourceKind::Issuers => {
@@ -986,6 +989,16 @@ async fn persist_tenant_id(
                 .await
                 .map_err(internal)?
                 .ok_or_else(|| missing(kind, id))?;
+            if resource.tenant_id != tenant_id {
+                let surfaces = state
+                    .agent_surface_store
+                    .as_ref()
+                    .ok_or_else(|| unavailable(ResourceKind::Surfaces))?
+                    .list_all()
+                    .await
+                    .map_err(internal)?;
+                refuse_moving_a_bound_provider(&surfaces, &resource.id)?;
+            }
             resource.tenant_id = tenant_id;
             resource.updated_at = chrono::Utc::now();
             store
@@ -1150,6 +1163,28 @@ fn appliance_wide(kind: ResourceKind) -> OwnershipApiError {
 
 /// A mediator the directory provides belongs to the whole appliance: its record is found
 /// by its owner, so a new owner would make the directory entry unusable.
+/// A credential provider that any surface binds, of any tenant, in its base or
+/// a variant, through `outbound_credentials` or a Transit Point's
+/// `transit_credentials`, cannot move to another tenant: its bindings would
+/// name another tenant's provider, and moving it back would serve the grants
+/// kept for them again. Remove the bindings first.
+fn refuse_moving_a_bound_provider(
+    surfaces: &[crate::config::agent_surface::AgentSurface],
+    credential_provider_id: &str,
+) -> Result<(), OwnershipApiError> {
+    if surfaces
+        .iter()
+        .any(|surface| super::surface_tenancy::bound_credential_provider_ids(surface).contains(credential_provider_id))
+    {
+        return Err(OwnershipApiError::Refused(
+            "The credential provider is bound by an agent surface, so it cannot move to another tenant; remove the \
+             binding first"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn refuse_provided_mediator(mediator: &crate::mediators::types::Mediator) -> Result<(), OwnershipApiError> {
     if mediator.provided {
         return Err(OwnershipApiError::Refused(
@@ -1230,6 +1265,38 @@ mod tests {
                 .status(),
             StatusCode::CONFLICT
         );
+    }
+
+    #[test]
+    fn a_provider_that_any_surface_binds_cannot_move_to_another_tenant() {
+        let surface = |tenant: &str, binding: serde_json::Value| -> crate::config::agent_surface::AgentSurface {
+            serde_json::from_value(serde_json::json!({
+                "surface_id": format!("surface-{tenant}"), "name": "surface", "tenant_id": tenant,
+                "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
+                "target": {"endpoint": "https://managed.example/agent"},
+                "transit": {"points": [{"id": "tp-1", "alias": "vendor", "target_endpoint": "https://203.0.113.30/mcp",
+                    "require_transit_token": true, "transit_credentials": binding}]}
+            }))
+            .unwrap()
+        };
+        let external =
+            serde_json::json!({"credential_provider_id": "provider", "consent_mode": "external", "subject": "owner"});
+        let other = serde_json::json!({"credential_provider_id": "other-provider"});
+        for surfaces in [
+            vec![surface("tenant-a", external.clone())],
+            vec![surface("tenant-b", other.clone()), surface("tenant-c", external)],
+        ] {
+            let refused = refuse_moving_a_bound_provider(&surfaces, "provider").unwrap_err();
+            assert!(matches!(&refused, OwnershipApiError::Refused(message) if message.contains("bound")));
+            assert_eq!(
+                refused
+                    .into_response()
+                    .status(),
+                StatusCode::CONFLICT
+            );
+        }
+        assert!(refuse_moving_a_bound_provider(&[surface("tenant-a", other)], "provider").is_ok());
+        assert!(refuse_moving_a_bound_provider(&[], "provider").is_ok());
     }
 
     #[test]
