@@ -515,11 +515,25 @@ pub fn resource_origin(provider: &CredentialProvider) -> Option<String> {
 
 /// An origin an operator wrote in `external_consent_resource_origins`, as its
 /// ASCII serialization: an `https` URL with a host and nothing after it but an
-/// optional `/`. `None` for anything else, which then permits nothing.
+/// optional `/`, whose host is an IP address or a plain DNS name, labels of
+/// letters, digits and `-` with none empty. Entries are exact origins, so a
+/// host such as `*.example.com`, which the URL parser takes literally, is not
+/// one. `None` for anything else, which then permits nothing.
 fn configured_origin(value: &str) -> Option<String> {
     let url = url::Url::parse(value.trim()).ok()?;
+    let plain_host = match url.host()? {
+        url::Host::Domain(domain) => domain
+            .split('.')
+            .all(|label| {
+                !label.is_empty()
+                    && label
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            }),
+        url::Host::Ipv4(_) | url::Host::Ipv6(_) => true,
+    };
     let bare = url.scheme() == "https"
-        && url.host().is_some()
+        && plain_host
         && url.username().is_empty()
         && url.password().is_none()
         && url.path() == "/"
@@ -532,8 +546,9 @@ fn configured_origin(value: &str) -> Option<String> {
 }
 
 /// The entries of gateway.json's `external_consent_resource_origins` that are
-/// not `https` origins, issuers and resources alike: they permit nothing, and
-/// the gateway names them at startup.
+/// not plain `https` origins, issuers and resources alike, wildcard-looking
+/// hosts among them: they permit nothing, and the gateway names them at
+/// startup.
 pub fn invalid_resource_origin_entries(permitted: &std::collections::HashMap<String, Vec<String>>) -> Vec<String> {
     let mut invalid: Vec<String> = permitted
         .iter()
@@ -787,6 +802,65 @@ pub(crate) mod tests {
             assert!(!resource_permitted(&issued_for(google, resource), &permitted), "{resource}");
         }
         assert_eq!(invalid_resource_origin_entries(&permitted), ["https://collector.example/path", "not an origin"]);
+    }
+
+    /// Entries are exact origins. One that is not a plain `https` origin, such
+    /// as one that looks like a wildcard, is named at startup and permits
+    /// nothing, not even the literal origin it spells.
+    #[test]
+    fn an_entry_that_is_not_a_plain_https_origin_is_named_and_permits_nothing() {
+        let google = "https://accounts.google.com";
+        let entries = [
+            "https://*.googleapis.com",
+            "https://*",
+            "https://www_googleapis.com",
+            "https://www.googleapis.com.",
+            "https://www..googleapis.com",
+            "https://user@www.googleapis.com",
+            "https://www.googleapis.com/calendar",
+            "https://www.googleapis.com?x=1",
+            "https://www.googleapis.com#x",
+            "http://www.googleapis.com",
+            "www.googleapis.com",
+        ];
+        let permitted = std::collections::HashMap::from([(
+            google.to_string(),
+            entries
+                .iter()
+                .map(|entry| entry.to_string())
+                .collect(),
+        )]);
+        let mut named = entries.to_vec();
+        named.sort();
+        assert_eq!(invalid_resource_origin_entries(&permitted), named);
+        for resource in [
+            "https://*.googleapis.com/calendar",
+            "https://storage.googleapis.com/calendar",
+            "https://www_googleapis.com/calendar",
+            "https://www.googleapis.com./calendar",
+        ] {
+            assert!(!resource_permitted(&issued_for(google, resource), &permitted), "{resource}");
+        }
+
+        let wildcard_issuer = std::collections::HashMap::from([(
+            "https://*.google.com".to_string(),
+            vec!["https://www.googleapis.com".to_string()],
+        )]);
+        assert_eq!(invalid_resource_origin_entries(&wildcard_issuer), ["https://*.google.com"]);
+        assert!(!resource_permitted(
+            &issued_for("https://*.google.com", "https://www.googleapis.com/calendar"),
+            &wildcard_issuer
+        ));
+        let plain = std::collections::HashMap::from([(
+            "https://login.microsoftonline.com".to_string(),
+            vec![
+                "https://graph.microsoft.com".to_string(),
+                "https://xn--bcher-kva.example:8443/".to_string(),
+                "https://203.0.113.20".to_string(),
+                "https://[2001:db8::1]".to_string(),
+            ],
+        )]);
+        assert!(invalid_resource_origin_entries(&plain).is_empty(), "plain origins, ports and IPs are valid");
     }
 
     pub(crate) fn external_provider() -> CredentialProvider {

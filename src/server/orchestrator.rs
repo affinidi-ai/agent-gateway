@@ -1708,8 +1708,8 @@ pub async fn run_axum_proxy(
             error!(
                 target: "credential_delegation",
                 entries = ?invalid_resource_origins,
-                "external_consent_resource_origins in gateway.json names entries that are not https origins; they \
-                 permit nothing"
+                "external_consent_resource_origins in gateway.json names entries that are not plain https origins \
+                 (each must be an exact origin, with no wildcard, path or userinfo); they permit nothing"
             );
         }
 
