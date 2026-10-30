@@ -712,7 +712,7 @@ dependencies = [
  "opentelemetry-appender-tracing",
  "opentelemetry-otlp 0.31.1",
  "opentelemetry_sdk 0.31.0",
- "p256 0.13.2",
+ "p256 0.14.0",
  "parking_lot",
  "pem 3.0.6",
  "prometheus",
