@@ -17,7 +17,7 @@ use tracing::{debug, error, info, warn};
 
 use super::communication::{TrustRegistryConnection, connection};
 use super::store::TrustRegistryStore;
-use super::types::TrustRegistryConnectionStatus;
+use super::types::{TrustRegistry, TrustRegistryConnectionStatus};
 use crate::comm::didcomm::trust_registry::PollResult;
 use crate::server::websocket::WsState;
 
@@ -181,28 +181,17 @@ async fn update_status(
     };
     let tr_id = &connection.trust_registry_id;
 
-    let mut tr = match store.get(tr_id).await {
-        Ok(Some(tr)) => tr,
-        Ok(None) => {
-            warn!("TR reader: trust registry '{}' not found in store", tr_id);
-            return;
-        }
-        Err(e) => {
-            error!("TR reader: failed to get trust registry '{}': {}", tr_id, e);
-            return;
-        }
-    };
-
     let status_label = format!("{:?}", new_status);
-    tr.connection_status = new_status;
-    tr.updated_at = chrono::Utc::now();
-
+    let change = Box::new(move |tr: &mut TrustRegistry| {
+        tr.connection_status = new_status;
+        tr.updated_at = chrono::Utc::now();
+    });
     match store
-        .update_if_exists(&tr)
+        .modify(tr_id, change)
         .await
     {
-        Ok(true) => {}
-        Ok(false) => {
+        Ok(Some(_)) => {}
+        Ok(None) => {
             debug!("TR reader: trust registry '{}' was deleted; its status was not written", tr_id);
             return;
         }

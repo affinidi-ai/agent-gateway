@@ -264,6 +264,39 @@ impl TimedOutQueries {
     }
 }
 
+/// A query thread that `send_and_await` is waiting on. Unless a response was
+/// delivered to it, dropping it records the thread as timed out and only then
+/// removes its waiter, so a late reply is never taken for the registry rejecting
+/// the gateway, however the query was abandoned: by its own deadline, by a
+/// caller's outer timeout dropping the future, or by the reader closing.
+struct PendingQuery {
+    waiters: ResponseWaiters,
+    timed_out_queries: TimedOutQueries,
+    thid: String,
+    answered: bool,
+}
+
+impl Drop for PendingQuery {
+    fn drop(&mut self) {
+        if self.answered {
+            return;
+        }
+        self.timed_out_queries
+            .record(&self.thid);
+        if let Ok(mut waiters) = self.waiters.try_lock() {
+            waiters.remove(&self.thid);
+        } else if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let (waiters, thid) = (self.waiters.clone(), std::mem::take(&mut self.thid));
+            runtime.spawn(async move {
+                waiters
+                    .lock()
+                    .await
+                    .remove(&thid);
+            });
+        }
+    }
+}
+
 /// Register a waiter for `thid`, returning the receiver the caller awaits.
 async fn register_waiter_in(
     waiters: &ResponseWaiters,
@@ -301,17 +334,6 @@ impl TrustRegistryConnection {
         thid: String,
     ) -> oneshot::Receiver<PollResult> {
         register_waiter_in(&self.response_waiters, thid).await
-    }
-
-    /// Remove a still-pending waiter for `thid` (on timeout / send failure).
-    async fn remove_waiter(
-        &self,
-        thid: &str,
-    ) {
-        self.response_waiters
-            .lock()
-            .await
-            .remove(thid);
     }
 
     /// Deliver a response to the waiter registered for `thid`. Returns `true`
@@ -2430,6 +2452,16 @@ impl TrustRegistryListenerManager {
         let rx = connection
             .register_waiter(thread_id.clone())
             .await;
+        let mut pending = PendingQuery {
+            waiters: connection
+                .response_waiters
+                .clone(),
+            timed_out_queries: connection
+                .timed_out_queries
+                .clone(),
+            thid: thread_id.clone(),
+            answered: false,
+        };
 
         if let Err(e) = crate::comm::didcomm::trust_registry::pack_and_forward(
             &connection.client,
@@ -2440,9 +2472,6 @@ impl TrustRegistryListenerManager {
         )
         .await
         {
-            connection
-                .remove_waiter(&thread_id)
-                .await;
             return Err(TrustRegistryError::SendError(e));
         }
 
@@ -2453,6 +2482,7 @@ impl TrustRegistryListenerManager {
 
         match tokio::time::timeout_at(deadline, rx).await {
             Ok(Ok(result)) => {
+                pending.answered = true;
                 if result.msg_type == MSG_TYPE_PROBLEM_REPORT {
                     return Err(problem_report_error(result.body));
                 }
@@ -2462,18 +2492,9 @@ impl TrustRegistryListenerManager {
             Ok(Err(_recv_err)) => {
                 // Sender dropped: the reader exited (disconnect) and failed all
                 // waiters. Treat as stale so `send_with_reconnect` reconnects.
-                connection
-                    .remove_waiter(&thread_id)
-                    .await;
                 Err(TrustRegistryError::StaleConnection("stream reader closed before a response arrived".to_string()))
             }
             Err(_elapsed) => {
-                connection
-                    .remove_waiter(&thread_id)
-                    .await;
-                connection
-                    .timed_out_queries
-                    .record(&thread_id);
                 Err(TrustRegistryError::Timeout(format!("No response within {:?} for thread {}", remaining, thread_id)))
             }
         }
@@ -3513,6 +3534,13 @@ mod tests {
         ) -> anyhow::Result<bool> {
             Err(anyhow::anyhow!("the disk is unreadable"))
         }
+        async fn modify(
+            &self,
+            _id: &str,
+            _change: super::super::store::RegistryChange,
+        ) -> anyhow::Result<Option<super::super::types::TrustRegistry>> {
+            Err(anyhow::anyhow!("the disk is unreadable"))
+        }
     }
 
     #[tokio::test]
@@ -4227,6 +4255,101 @@ mod tests {
         assert!(threads.contains("thid-1"));
         assert!(threads.contains(&format!("thid-{TIMED_OUT_QUERIES_KEPT}")));
         assert!(!threads.contains("thid-unknown"));
+    }
+
+    fn pending_query(
+        waiters: &ResponseWaiters,
+        threads: &TimedOutQueries,
+        thid: &str,
+    ) -> PendingQuery {
+        PendingQuery {
+            waiters: waiters.clone(),
+            timed_out_queries: threads.clone(),
+            thid: thid.to_string(),
+            answered: false,
+        }
+    }
+
+    fn problem_report() -> PollResult {
+        PollResult {
+            msg_type: MSG_TYPE_PROBLEM_REPORT.to_string(),
+            body: json!({ "code": "e.p.req.time" }),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_query_dropped_by_an_outer_timeout_is_recorded_and_its_waiter_removed() {
+        let (waiters, threads) = (empty_waiters(), TimedOutQueries::default());
+        let rx = register_waiter_in(&waiters, "thid-dropped".to_string()).await;
+        let pending = pending_query(&waiters, &threads, "thid-dropped");
+
+        let outer = tokio::time::timeout(std::time::Duration::from_millis(20), async move {
+            let _pending = pending;
+            rx.await
+        })
+        .await;
+
+        assert!(outer.is_err(), "the outer timeout dropped the query");
+        assert!(threads.contains("thid-dropped"), "the late reply is recognised");
+        assert!(
+            waiters
+                .lock()
+                .await
+                .is_empty(),
+            "the waiter is removed"
+        );
+        assert!(!deliver_response_in(&waiters, "thid-dropped", problem_report()).await);
+    }
+
+    #[tokio::test]
+    async fn a_query_whose_reader_closed_is_recorded() {
+        let (waiters, threads) = (empty_waiters(), TimedOutQueries::default());
+        let rx = register_waiter_in(&waiters, "thid-closed".to_string()).await;
+        let pending = pending_query(&waiters, &threads, "thid-closed");
+
+        waiters.lock().await.clear();
+        assert!(rx.await.is_err());
+        drop(pending);
+
+        assert!(threads.contains("thid-closed"), "a reply after the socket reconnects is recognised");
+    }
+
+    #[tokio::test]
+    async fn an_answered_query_is_not_recorded() {
+        let (waiters, threads) = (empty_waiters(), TimedOutQueries::default());
+        let rx = register_waiter_in(&waiters, "thid-answered".to_string()).await;
+        let mut pending = pending_query(&waiters, &threads, "thid-answered");
+
+        assert!(deliver_response_in(&waiters, "thid-answered", problem_report()).await);
+        assert!(rx.await.is_ok());
+        pending.answered = true;
+        drop(pending);
+
+        assert!(!threads.contains("thid-answered"));
+    }
+
+    #[tokio::test]
+    async fn a_dropped_query_is_recorded_before_its_waiter_is_removed_while_the_waiters_are_locked() {
+        let (waiters, threads) = (empty_waiters(), TimedOutQueries::default());
+        let _rx = register_waiter_in(&waiters, "thid-busy".to_string()).await;
+        let pending = pending_query(&waiters, &threads, "thid-busy");
+
+        let held = waiters.lock().await;
+        drop(pending);
+        assert!(threads.contains("thid-busy"), "recorded while the waiter is still registered");
+        drop(held);
+
+        for _ in 0..100 {
+            if waiters
+                .lock()
+                .await
+                .is_empty()
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("the waiter was never removed");
     }
 
     #[tokio::test]
