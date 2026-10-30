@@ -152,6 +152,7 @@ const StrategiesTab: React.FC<StrategiesTabProps> = ({
               variant="primary"
               size="md"
               className="shadow-sm"
+              data-testid="jwt-strategies-add-button"
               onClick={() => navigate('/jwt-verification-strategies/new')}
               iconStart={<i className="fas fa-plus fa-sm me-1" aria-hidden="true" />}
             >
@@ -363,6 +364,7 @@ const StrategiesTab: React.FC<StrategiesTabProps> = ({
                             variant="outline-primary"
                             size="sm"
                             className="me-1"
+                            data-testid={`jwt-strategy-edit-button-${strategy.id}`}
                             onClick={() => navigate(`/jwt-verification-strategies/${strategy.id}`)}
                             title="Edit"
                             aria-label={`Edit strategy ${strategy.name}`}

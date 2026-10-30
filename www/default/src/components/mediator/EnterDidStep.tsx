@@ -81,6 +81,7 @@ const EnterDidStep: React.FC<EnterDidStepProps> = ({ onNext, onCancel }) => {
             <input
               type="text"
               className={`form-control ${error ? 'is-invalid' : ''}`}
+              data-testid="wizard-mediator-did-input"
               id="did"
               value={did}
               onChange={e => setDid(e.target.value)}
@@ -103,12 +104,14 @@ const EnterDidStep: React.FC<EnterDidStepProps> = ({ onNext, onCancel }) => {
               type="button"
               variant="secondary"
               size="md"
+              data-testid="wizard-cancel"
               onClick={onCancel}
               iconStart={<i className="fas fa-times"></i>}
             >
               Cancel
             </AppButton>
             <AppButton
+              data-testid="wizard-next"
               type="submit"
               variant="primary"
               size="md"

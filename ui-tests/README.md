@@ -161,11 +161,16 @@ ui-tests/
 │   ├── surface-builder-save.spec.ts # Surface Builder save path: target, caller auth, warnings
 │   ├── agent-card-layout.spec.ts    # Agent Cards tab: placement, compare, URLs, failed fetch, layout
 │   ├── accessibility.spec.ts # WCAG accessibility tests
+│   ├── laptop-layout.spec.ts # Every page at every laptop viewport (layout)
 │   └── oidc-live/            # Live Ory Hydra suite, run by make oidc-ui-e2e
 ├── helpers/                  # Test utilities
 │   ├── test-auth.ts          # Authentication helpers
 │   ├── gateway-api.ts        # Authenticated gateway API client for seeding and read-back
 │   ├── ticket.ts             # Ticket annotations and acceptance screenshots
+│   ├── fixtures.ts           # Shared `test`/`expect` with the session bridge
+│   ├── layout-pages.ts       # Page inventory for the laptop layout spec
+│   ├── layout-fixtures.ts    # Long-identifier list fixtures (page.route)
+│   ├── layout-assertions.ts  # Sideways-scroll and action reachability checks
 │   ├── screenshots.ts        # Screenshot utilities
 │   ├── wait.ts               # Custom wait functions
 │   ├── index.ts              # Helper exports
@@ -183,6 +188,52 @@ ui-tests/
 ├── playwright.oidc-live.config.ts # Live OIDC suite configuration
 ├── package.json              # Dependencies
 └── tsconfig.json             # TypeScript config
+```
+
+## Laptop Layout Spec
+
+`specs/laptop-layout.spec.ts` opens every page of the inventory in
+`helpers/layout-pages.ts` at 1280x720, 1366x768, 1536x864, 1440x900 and 1920x1080, with
+the sidebar expanded, and runs one test per page and viewport. The inventory covers every
+sidebar destination and each of its tabs, `/profile`, every create or wizard route without
+a record id, and `audit-selected` (the Audit Log with its first entry selected). Each entry
+names its page root, the test ids that mark its data, and its primary actions: header
+actions, save, cancel and back, wizard navigation, search and filter controls, tab
+triggers, and the action buttons of the first row.
+
+A test fails when:
+
+- a listed test id is not attached;
+- the page scrolls sideways (`document.documentElement.scrollWidth` above `clientWidth`);
+- a list table scrolls sideways inside its box (a `.table-responsive` whose `scrollWidth` is more than 1px above its `clientWidth`; the message names the table's nearest test id);
+- a primary action is not visible, lies outside the viewport once scrolled into view, is
+  cut by an ancestor whose overflow is not `visible`, or is not the topmost element at its
+  centre;
+- on Tasks the tag filter row starts above the bottom of the title row, or `tasks-refresh-button`
+  ends more than 32px from the header's right edge (`helpers/layout-page-checks.ts`);
+- on Metrics a `text.node-label` of the request flow chart has more than 25 characters or lies
+  horizontally outside the chart's `svg`.
+
+The spec also runs an Audit Log layout test at each viewport, measured from the DOM with
+`helpers/layout-audit.ts`. Where the Audit Log stacks (below 1440px wide: 1280x720 and 1366x768) it
+checks that `.audit-shell` is a column with the list above the detail, that nothing in
+the page scrolls by itself, that selecting `audit-item-3` brings the detail panel to just
+below the pinned filters and card header while the search, the filters and Refresh stay on
+screen under the topbar, and that clicking the detail title shows the entry fully below
+the pinned area. Side by side it checks that the document does not scroll, that the list and the
+evidence body are each at least 300px tall, and that selecting does not scroll the page.
+
+A fresh test-mode gateway has empty lists, so `helpers/layout-fixtures.ts` answers the list
+requests of those pages through `page.route` with rows whose DIDs, URLs and names run past
+80 characters, and the Audit Log with a full page of 50 entries and pagination. Every
+other request reaches the real gateway; nothing is written through the API.
+
+Set `AG_LAYOUT_SCREENSHOT_DIR` to save a viewport-sized screenshot of every test,
+`<page>__<width>x<height>.png`, before any assertion runs, plus a full-page
+`<page>__<width>x<height>__full.png` for `audit` and `audit-selected`:
+
+```bash
+AG_LAYOUT_SCREENSHOT_DIR="$PWD/ui-tests/test_results/layout-screens" make ui-test
 ```
 
 ## Test Authentication

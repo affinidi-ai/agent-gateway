@@ -279,6 +279,7 @@ const MediatorsPage: React.FC<MediatorsPageProps> = ({ externalSearchTerm, onCou
         variant="primary"
         size="md"
         className="shadow-sm"
+        data-testid="mediators-add-button"
         onClick={e => guard('connections.mediators', () => navigate('/mediators/wizard'), e)}
         iconStart={<i className="fas fa-plus fa-sm me-1" aria-hidden="true" />}
       >
@@ -402,6 +403,7 @@ const MediatorsPage: React.FC<MediatorsPageProps> = ({ externalSearchTerm, onCou
                         <React.Fragment key={mediator.id}>
                           <tr
                             ref={el => (mediatorRefs.current[mediator.id] = el)}
+                            data-testid={`mediators-row-${mediator.id}`}
                             onClick={() => toggleMediatorDetails(mediator.id, mediator)}
                             style={{
                               cursor: isUnstoredDirectoryMediator(mediator) ? 'default' : 'pointer',
@@ -441,6 +443,7 @@ const MediatorsPage: React.FC<MediatorsPageProps> = ({ externalSearchTerm, onCou
                                 }
                                 size="sm"
                                 title="Trust Ping: sends a test message to confirm this mediator is reachable, and reports the round-trip time"
+                                data-testid={`mediators-trust-ping-button-${mediator.id}`}
                                 aria-label={`Trust ping ${mediator.name}`}
                                 onClick={e => handleTrustPing(mediator.id, mediator.name, e)}
                                 disabled={
@@ -467,6 +470,7 @@ const MediatorsPage: React.FC<MediatorsPageProps> = ({ externalSearchTerm, onCou
                                   variant="outline-primary"
                                   size="sm"
                                   title="Edit Mediator"
+                                  data-testid={`mediators-edit-button-${mediator.id}`}
                                   aria-label={`Edit mediator ${mediator.name}`}
                                   onClick={() => navigate(`/mediators/${mediator.id}`)}
                                 >
@@ -477,6 +481,7 @@ const MediatorsPage: React.FC<MediatorsPageProps> = ({ externalSearchTerm, onCou
                                 canDeleteProvidedMediator(mediator)) &&
                                 hasPermission('mediators.delete') && (
                                   <DeleteButton
+                                    data-testid={`mediators-delete-button-${mediator.id}`}
                                     onDelete={() => handleDelete(mediator.id)}
                                     size="sm"
                                     title="Delete Mediator"
