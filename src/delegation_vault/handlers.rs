@@ -282,7 +282,7 @@ pub async fn purge_grant(
         .await
     {
         Ok(true) => {
-            super::revocation::record_purge(&grant_id, Some(&operator));
+            super::revocation::record_purge(&grant_id, None, Some(&operator));
             StatusCode::NO_CONTENT.into_response()
         }
         Ok(false) => {
@@ -310,7 +310,10 @@ pub struct PurgeBindingQuery {
 ///
 /// Deletes every grant of one binding, the owner's and each caller's, without
 /// reading them, and answers with their record ids. None is revoked at its
-/// authorization server: the audit records each as purged.
+/// authorization server: the audit records each as purged, with the binding.
+/// While the grants stored were written under another identity hash pepper,
+/// their ids cannot be derived from the binding: it answers `409`, naming the
+/// cause and where the ids are, and purges nothing.
 pub async fn purge_binding_grants(
     State(state): State<DelegationVaultState>,
     caller: Option<Extension<AuthGuardOk>>,
@@ -342,6 +345,20 @@ pub async fn purge_binding_grants(
         .await
     {
         Ok(ids) => ids,
+        Err(error) if error.is::<super::grants::PepperMismatch>() => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "code": "identity_hash_pepper_mismatch",
+                    "error": "The delegated grants stored were written under another identity hash pepper than \
+                              AG_IDENTITY_HASH_PEPPER now sets, so this binding's grant ids cannot be derived and \
+                              nothing was purged. Restore the pepper they were written under, or purge each grant \
+                              by its id with DELETE /api/v1/delegation-vault/grants/{grant_id}: the ids are the \
+                              file names in the vault's delegated_grants directory, without .json.enc"
+                })),
+            )
+                .into_response();
+        }
         Err(error) => {
             error!(target: "credential_delegation", error = ?error.to_string(), "Failed to list a binding's grants");
             return failed();
@@ -355,7 +372,7 @@ pub async fn purge_binding_grants(
             .await
         {
             Ok(true) => {
-                super::revocation::record_purge(&id, Some(&operator));
+                super::revocation::record_purge(&id, Some(&binding), Some(&operator));
                 purged.push(id);
             }
             Ok(false) => {}

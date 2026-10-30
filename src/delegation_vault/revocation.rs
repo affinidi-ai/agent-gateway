@@ -25,7 +25,7 @@ use base64::Engine as _;
 use futures::StreamExt as _;
 
 use super::audit::AuditCallerContext;
-use super::grants::DelegatedGrant;
+use super::grants::{DelegatedGrant, GrantBinding};
 use super::storage::DelegationVaultStorage;
 use crate::credential_providers::{CredentialProvider, TokenEndpointAuthMethod};
 use crate::secrets::SecretsStore;
@@ -337,21 +337,46 @@ pub async fn revoke_removed(
 }
 
 /// Audit that an operator purged the grant with this record id without
-/// reading it, so it was not revoked at its authorization server.
+/// reading it, so it was not revoked at its authorization server. `binding`
+/// is the binding the purge named, when it named one: the record then carries
+/// its surface and provider, and its `detail` its tenant and Transit Point,
+/// each a JSON string, after the reason.
 pub fn record_purge(
     grant_id: &str,
+    binding: Option<&GrantBinding>,
     actor: Option<&AuditCallerContext>,
 ) {
     tracing::warn!(
         target: "credential_delegation",
         grant_id = %grant_id,
+        surface_id = ?binding.map(|binding| binding.surface_id.as_str()),
+        transit_point_id = ?binding.map(|binding| binding.hop.as_str()),
+        credential_provider_id = ?binding.map(|binding| binding.credential_provider_id.as_str()),
+        tenant_id = ?binding.and_then(|binding| binding.tenant_id.as_deref()),
         "A delegated grant was purged without reading it, so it is not revoked at its authorization server"
     );
     super::audit::emit("token_revoked", || {
-        let mut event =
-            super::audit::audit_event(super::audit::DelegationAuditAction::TokenRevoked, None, None, None, None);
+        let mut event = super::audit::audit_event(
+            super::audit::DelegationAuditAction::TokenRevoked,
+            None,
+            None,
+            binding.map(|binding| {
+                binding
+                    .credential_provider_id
+                    .as_str()
+            }),
+            binding.map(|binding| binding.surface_id.as_str()),
+        );
         event.token_id = Some(grant_id.to_string());
-        event.detail = Some(GrantRevocation::skipped(SKIPPED_PURGED).detail());
+        let mut detail = GrantRevocation::skipped(SKIPPED_PURGED).detail();
+        if let Some(binding) = binding {
+            let quoted = |value: &str| serde_json::Value::String(value.to_string()).to_string();
+            if let Some(tenant_id) = binding.tenant_id.as_deref() {
+                detail.push_str(&format!(",tenant:{}", quoted(tenant_id)));
+            }
+            detail.push_str(&format!(",transit_point:{}", quoted(&binding.hop)));
+        }
+        event.detail = Some(detail);
         event.caller = actor.cloned();
         event
     });
