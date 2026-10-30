@@ -42,9 +42,17 @@ pub struct CredentialProviderState {
     pub oauth_callback_route: String,
 }
 
-/// Why a provider's consent strategy or secret reference was rejected.
+/// Why a provider's settings, secret references or consent strategy were rejected.
 #[derive(Debug, thiserror::Error)]
-enum ProviderReferenceError {
+enum ProviderValidationError {
+    #[error("{0} is required for this provider type")]
+    Missing(&'static str),
+    #[error("client_secret_secret_ref is not allowed: this provider authenticates with a signed JWT")]
+    ClientSecretNotAllowed,
+    #[error("jwt_signing_algorithm is not supported for this provider type")]
+    UnsupportedAlgorithm,
+    #[error("jwt_audience: {0}")]
+    InvalidAudience(String),
     #[error("Consent identity strategy is invalid or not accessible")]
     InvalidConsentStrategy,
     #[error("Identity verification configuration unavailable")]
@@ -59,10 +67,14 @@ enum ProviderReferenceError {
     InvalidCertificate,
 }
 
-impl IntoResponse for ProviderReferenceError {
+impl IntoResponse for ProviderValidationError {
     fn into_response(self) -> Response {
         match self {
-            Self::InvalidConsentStrategy
+            Self::Missing(_)
+            | Self::ClientSecretNotAllowed
+            | Self::UnsupportedAlgorithm
+            | Self::InvalidAudience(_)
+            | Self::InvalidConsentStrategy
             | Self::SecretNotAccessible
             | Self::InvalidSigningKey
             | Self::InvalidCertificate => {
@@ -84,7 +96,7 @@ async fn validate_consent_strategy(
     provider: &CredentialProvider,
     context: &Option<Extension<PatTenantContext>>,
     scope: &Option<Extension<PatResourceScope>>,
-) -> Result<(), ProviderReferenceError> {
+) -> Result<(), ProviderValidationError> {
     let Some(id) = provider
         .consent_identity_strategy_id
         .as_deref()
@@ -99,16 +111,16 @@ async fn validate_consent_strategy(
             .as_deref()
             .is_none_or(|resource| crate::sts::mcp_profile::canonical_https_url(resource).is_err())
     {
-        return Err(ProviderReferenceError::InvalidConsentStrategy);
+        return Err(ProviderValidationError::InvalidConsentStrategy);
     }
     let strategy = state
         .identity_strategies
         .as_ref()
-        .ok_or(ProviderReferenceError::InvalidConsentStrategy)?
+        .ok_or(ProviderValidationError::InvalidConsentStrategy)?
         .get(id)
         .await
-        .map_err(|_| ProviderReferenceError::IdentityConfigurationUnavailable)?
-        .ok_or(ProviderReferenceError::InvalidConsentStrategy)?;
+        .map_err(|_| ProviderValidationError::IdentityConfigurationUnavailable)?
+        .ok_or(ProviderValidationError::InvalidConsentStrategy)?;
     if !can_reference(provider.tenant_id.as_deref(), strategy.tenant_id.as_deref())
         || !scope_allows_resource(
             resource_scope(scope),
@@ -118,7 +130,7 @@ async fn validate_consent_strategy(
         )
         || crate::sts::mcp_profile::canonical_https_url(&strategy.expected_issuer).is_err()
     {
-        return Err(ProviderReferenceError::InvalidConsentStrategy);
+        return Err(ProviderValidationError::InvalidConsentStrategy);
     }
     Ok(())
 }
@@ -129,7 +141,7 @@ async fn validate_secret_references(
     references: impl IntoIterator<Item = Option<&str>>,
     context: &Option<Extension<PatTenantContext>>,
     scope: &Option<Extension<PatResourceScope>>,
-) -> Result<(), ProviderReferenceError> {
+) -> Result<(), ProviderValidationError> {
     for secret_id in references
         .into_iter()
         .flatten()
@@ -140,9 +152,9 @@ async fn validate_secret_references(
             .await
             .map_err(|error| {
                 warn!(%error, "Failed to validate credential provider secret reference");
-                ProviderReferenceError::SecretLookupFailed
+                ProviderValidationError::SecretLookupFailed
             })?
-            .ok_or(ProviderReferenceError::SecretNotAccessible)?;
+            .ok_or(ProviderValidationError::SecretNotAccessible)?;
         if !can_reference(tenant_id, secret.tenant_id.as_deref())
             || !scope_allows_resource(
                 resource_scope(scope),
@@ -151,34 +163,15 @@ async fn validate_secret_references(
                 &secret.secret_id,
             )
         {
-            return Err(ProviderReferenceError::SecretNotAccessible);
+            return Err(ProviderValidationError::SecretNotAccessible);
         }
     }
     Ok(())
 }
 
-/// Why the fields of a provider that signs a JWT were rejected.
-#[derive(Debug, thiserror::Error)]
-enum JwtProviderFieldError {
-    #[error("{0} is required for this provider type")]
-    Missing(&'static str),
-    #[error("client_secret_secret_ref is not allowed: this provider authenticates with a signed JWT")]
-    ClientSecretNotAllowed,
-    #[error("jwt_signing_algorithm is not supported for this provider type")]
-    UnsupportedAlgorithm,
-    #[error("jwt_audience: {0}")]
-    InvalidAudience(String),
-}
-
-impl IntoResponse for JwtProviderFieldError {
-    fn into_response(self) -> Response {
-        (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": self.to_string() }))).into_response()
-    }
-}
-
 /// The required fields, algorithm and audience of an `oauth2_jwt_bearer` or
 /// `oauth2_client_credentials_jwt_auth` provider; other types pass unchecked.
-fn validate_jwt_provider(provider: &CredentialProvider) -> Result<(), JwtProviderFieldError> {
+fn validate_jwt_provider(provider: &CredentialProvider) -> Result<(), ProviderValidationError> {
     let required = match provider.provider_type {
         CredentialProviderType::OAuth2JwtBearer => vec![
             (
@@ -238,14 +231,14 @@ fn validate_jwt_provider(provider: &CredentialProvider) -> Result<(), JwtProvide
         .into_iter()
         .find(|(_, value)| value.is_none_or(|value| value.trim().is_empty()))
     {
-        return Err(JwtProviderFieldError::Missing(field));
+        return Err(ProviderValidationError::Missing(field));
     }
     if provider.provider_type == CredentialProviderType::OAuth2ClientCredentialsJwtAuth
         && provider
             .client_secret_secret_ref
             .is_some()
     {
-        return Err(JwtProviderFieldError::ClientSecretNotAllowed);
+        return Err(ProviderValidationError::ClientSecretNotAllowed);
     }
     if let Some(algorithm) = provider
         .jwt
@@ -254,7 +247,7 @@ fn validate_jwt_provider(provider: &CredentialProvider) -> Result<(), JwtProvide
             .provider_type
             .allows_jwt_algorithm(algorithm)
     {
-        return Err(JwtProviderFieldError::UnsupportedAlgorithm);
+        return Err(ProviderValidationError::UnsupportedAlgorithm);
     }
     if let Some(audience) = provider
         .jwt
@@ -262,7 +255,7 @@ fn validate_jwt_provider(provider: &CredentialProvider) -> Result<(), JwtProvide
         .as_deref()
     {
         crate::url_validation::validate_oauth_endpoint_url(audience)
-            .map_err(|error| JwtProviderFieldError::InvalidAudience(error.to_string()))?;
+            .map_err(|error| ProviderValidationError::InvalidAudience(error.to_string()))?;
     }
     Ok(())
 }
@@ -275,7 +268,7 @@ async fn validate_jwt_key_material(
     state: &CredentialProviderState,
     algorithm: Option<JwtSigningAlgorithm>,
     jwt: &JwtAssertionSettings,
-) -> Result<(), ProviderReferenceError> {
+) -> Result<(), ProviderValidationError> {
     use crate::delegation_vault::jwt_assertion;
 
     let Some(algorithm) = algorithm else {
@@ -291,10 +284,10 @@ async fn validate_jwt_key_material(
             .await
             .map_err(|error| {
                 warn!(%error, "Failed to resolve credential provider key material");
-                ProviderReferenceError::SecretLookupFailed
+                ProviderValidationError::SecretLookupFailed
             })?
             .map(|secret| Some(zeroize::Zeroizing::new(secret.value)))
-            .ok_or(ProviderReferenceError::SecretNotAccessible)
+            .ok_or(ProviderValidationError::SecretNotAccessible)
     };
     if let Some(key) = resolve(
         jwt.jwt_signing_key_secret_ref
@@ -302,7 +295,7 @@ async fn validate_jwt_key_material(
     )
     .await?
     {
-        jwt_assertion::check_signing_key(&key, algorithm).map_err(|_| ProviderReferenceError::InvalidSigningKey)?;
+        jwt_assertion::check_signing_key(&key, algorithm).map_err(|_| ProviderValidationError::InvalidSigningKey)?;
     }
     if let Some(certificate) = resolve(
         jwt.jwt_certificate_secret_ref
@@ -310,9 +303,50 @@ async fn validate_jwt_key_material(
     )
     .await?
     {
-        jwt_assertion::certificate_thumbprint(&certificate).map_err(|_| ProviderReferenceError::InvalidCertificate)?;
+        jwt_assertion::certificate_thumbprint(&certificate).map_err(|_| ProviderValidationError::InvalidCertificate)?;
     }
     Ok(())
+}
+
+/// The checks a provider passes before it is stored. Tenancy and token scope are checked
+/// on every secret reference before the key material is read.
+async fn validate_provider_settings(
+    state: &CredentialProviderState,
+    provider: &CredentialProvider,
+    context: &Option<Extension<PatTenantContext>>,
+    scope: &Option<Extension<PatResourceScope>>,
+) -> Result<(), ProviderValidationError> {
+    validate_jwt_provider(provider)?;
+    validate_secret_references(
+        state,
+        provider
+            .tenant_id
+            .as_deref(),
+        [
+            provider
+                .client_id_secret_ref
+                .as_deref(),
+            provider
+                .client_secret_secret_ref
+                .as_deref(),
+            provider
+                .api_key_secret_ref
+                .as_deref(),
+            provider
+                .jwt
+                .jwt_signing_key_secret_ref
+                .as_deref(),
+            provider
+                .jwt
+                .jwt_certificate_secret_ref
+                .as_deref(),
+        ],
+        context,
+        scope,
+    )
+    .await?;
+    validate_jwt_key_material(state, provider.jwt_signing_algorithm(), &provider.jwt).await?;
+    validate_consent_strategy(state, provider, context, scope).await
 }
 
 /// A blank secret reference is no reference: the dashboard sends unused fields empty.
@@ -435,31 +469,6 @@ pub async fn create_provider(
         return resp;
     }
 
-    if let Err(error) = validate_secret_references(
-        &state,
-        req.tenant_id.as_deref(),
-        [
-            req.client_id_secret_ref
-                .as_deref(),
-            req.client_secret_secret_ref
-                .as_deref(),
-            req.api_key_secret_ref
-                .as_deref(),
-            req.jwt
-                .jwt_signing_key_secret_ref
-                .as_deref(),
-            req.jwt
-                .jwt_certificate_secret_ref
-                .as_deref(),
-        ],
-        &context,
-        &scope,
-    )
-    .await
-    {
-        return error.into_response();
-    }
-
     // Check for duplicate provider_id
     match state
         .store
@@ -534,13 +543,7 @@ pub async fn create_provider(
         updated_at: now,
     };
 
-    if let Err(error) = validate_jwt_provider(&provider) {
-        return error.into_response();
-    }
-    if let Err(error) = validate_jwt_key_material(&state, provider.jwt_signing_algorithm(), &provider.jwt).await {
-        return error.into_response();
-    }
-    if let Err(error) = validate_consent_strategy(&state, &provider, &context, &scope).await {
+    if let Err(error) = validate_provider_settings(&state, &provider, &context, &scope).await {
         return error.into_response();
     }
 
@@ -739,43 +742,7 @@ pub async fn update_provider(
         updated_at: Utc::now(),
     };
 
-    if let Err(error) = validate_jwt_provider(&updated) {
-        return error.into_response();
-    }
-    if let Err(error) = validate_secret_references(
-        &state,
-        updated.tenant_id.as_deref(),
-        [
-            updated
-                .client_id_secret_ref
-                .as_deref(),
-            updated
-                .client_secret_secret_ref
-                .as_deref(),
-            updated
-                .api_key_secret_ref
-                .as_deref(),
-            updated
-                .jwt
-                .jwt_signing_key_secret_ref
-                .as_deref(),
-            updated
-                .jwt
-                .jwt_certificate_secret_ref
-                .as_deref(),
-        ],
-        &context,
-        &scope,
-    )
-    .await
-    {
-        return error.into_response();
-    }
-    if let Err(error) = validate_jwt_key_material(&state, updated.jwt_signing_algorithm(), &updated.jwt).await {
-        return error.into_response();
-    }
-
-    if let Err(error) = validate_consent_strategy(&state, &updated, &context, &scope).await {
+    if let Err(error) = validate_provider_settings(&state, &updated, &context, &scope).await {
         return error.into_response();
     }
 
@@ -861,6 +828,45 @@ pub async fn validate_provider(
     validate_provider_with(&state, &client, pat.is_some(), &context, &scope, req).await
 }
 
+/// The algorithm the requested provider would sign with, once its key material checks
+/// out; `None` for a type that signs nothing.
+async fn validate_key_material_request(
+    state: &CredentialProviderState,
+    tenant_id: Option<&str>,
+    req: &ValidateCredentialProviderRequest,
+    context: &Option<Extension<PatTenantContext>>,
+    scope: &Option<Extension<PatResourceScope>>,
+) -> Result<Option<JwtSigningAlgorithm>, ProviderValidationError> {
+    let jwt = req
+        .jwt
+        .clone()
+        .normalized();
+    let algorithm = req
+        .provider_type
+        .as_ref()
+        .and_then(|provider_type| provider_type.jwt_signing_algorithm(jwt.jwt_signing_algorithm));
+    if let (Some(provider_type), Some(algorithm)) = (&req.provider_type, algorithm)
+        && !provider_type.allows_jwt_algorithm(algorithm)
+    {
+        return Err(ProviderValidationError::UnsupportedAlgorithm);
+    }
+    validate_secret_references(
+        state,
+        tenant_id,
+        [
+            jwt.jwt_signing_key_secret_ref
+                .as_deref(),
+            jwt.jwt_certificate_secret_ref
+                .as_deref(),
+        ],
+        context,
+        scope,
+    )
+    .await?;
+    validate_jwt_key_material(state, algorithm, &jwt).await?;
+    Ok(algorithm)
+}
+
 async fn validate_provider_with(
     state: &CredentialProviderState,
     client: &reqwest::Client,
@@ -873,7 +879,10 @@ async fn validate_provider_with(
         Ok(tenant_id) => tenant_id,
         Err(message) => return (StatusCode::FORBIDDEN, Json(serde_json::json!({ "error": message }))).into_response(),
     };
-    let Some(token_endpoint) = req.token_endpoint else {
+    let Some(token_endpoint) = req
+        .token_endpoint
+        .take()
+    else {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "token_endpoint is required"})))
             .into_response();
     };
@@ -884,35 +893,10 @@ async fn validate_provider_with(
     }
 
     // Local checks first, so a request that fails them sends nothing to the endpoint.
-    let jwt = req.jwt.normalized();
-    let algorithm = req
-        .provider_type
-        .as_ref()
-        .and_then(|provider_type| provider_type.jwt_signing_algorithm(jwt.jwt_signing_algorithm));
-    if let (Some(provider_type), Some(algorithm)) = (&req.provider_type, algorithm)
-        && !provider_type.allows_jwt_algorithm(algorithm)
-    {
-        return JwtProviderFieldError::UnsupportedAlgorithm.into_response();
-    }
-    if let Err(error) = validate_secret_references(
-        state,
-        tenant_id.as_deref(),
-        [
-            jwt.jwt_signing_key_secret_ref
-                .as_deref(),
-            jwt.jwt_certificate_secret_ref
-                .as_deref(),
-        ],
-        context,
-        scope,
-    )
-    .await
-    {
-        return error.into_response();
-    }
-    if let Err(error) = validate_jwt_key_material(state, algorithm, &jwt).await {
-        return error.into_response();
-    }
+    let algorithm = match validate_key_material_request(state, tenant_id.as_deref(), &req, context, scope).await {
+        Ok(algorithm) => algorithm,
+        Err(error) => return error.into_response(),
+    };
 
     match client
         .get(&token_endpoint)
@@ -1505,8 +1489,8 @@ mod consent_strategy_tests {
         let denied = Some(Extension(PatResourceScope(Arc::new(
             regex::Regex::new(r"\ATENANT:tenant-a:credential-providers:provider\z").unwrap(),
         ))));
-        let invalid = |result: Result<(), ProviderReferenceError>| {
-            matches!(result, Err(ProviderReferenceError::InvalidConsentStrategy))
+        let invalid = |result: Result<(), ProviderValidationError>| {
+            matches!(result, Err(ProviderValidationError::InvalidConsentStrategy))
         };
         assert!(
             validate_consent_strategy(&state, &provider, &context, &allowed)
@@ -1561,22 +1545,22 @@ mod consent_strategy_tests {
     async fn reference_errors_render_generic_responses() {
         for (error, status, body) in [
             (
-                ProviderReferenceError::InvalidConsentStrategy,
+                ProviderValidationError::InvalidConsentStrategy,
                 StatusCode::BAD_REQUEST,
                 r#"{"error":"Consent identity strategy is invalid or not accessible"}"#,
             ),
             (
-                ProviderReferenceError::IdentityConfigurationUnavailable,
+                ProviderValidationError::IdentityConfigurationUnavailable,
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Identity verification configuration unavailable",
             ),
             (
-                ProviderReferenceError::SecretNotAccessible,
+                ProviderValidationError::SecretNotAccessible,
                 StatusCode::BAD_REQUEST,
                 r#"{"error":"Secret reference is not accessible"}"#,
             ),
             (
-                ProviderReferenceError::SecretLookupFailed,
+                ProviderValidationError::SecretLookupFailed,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 r#"{"error":"Internal server error"}"#,
             ),
