@@ -897,7 +897,12 @@ async fn validate_provider_with(
     if let Err(error) = validate_secret_references(
         state,
         tenant_id.as_deref(),
-        [jwt.jwt_signing_key_secret_ref.as_deref(), jwt.jwt_certificate_secret_ref.as_deref()],
+        [
+            jwt.jwt_signing_key_secret_ref
+                .as_deref(),
+            jwt.jwt_certificate_secret_ref
+                .as_deref(),
+        ],
         context,
         scope,
     )
@@ -1110,10 +1115,7 @@ mod jwt_provider_tests {
             "jwt_key_id": "", "jwt_issuer": "", "jwt_subject": ""
         });
         for (mut body, provider_id) in [(jwt_bearer("vertex"), "vertex"), (jwt_auth("foundry"), "foundry")] {
-            for (field, value) in blanks
-                .as_object()
-                .unwrap()
-            {
+            for (field, value) in blanks.as_object().unwrap() {
                 body.as_object_mut()
                     .unwrap()
                     .entry(field.as_str())
@@ -1334,9 +1336,15 @@ mod jwt_provider_tests {
         context: Option<Extension<PatTenantContext>>,
         body: Value,
     ) -> (StatusCode, Value) {
-        let response =
-            validate_provider_with(state, http, context.is_some(), &context, &None, serde_json::from_value(body).unwrap())
-                .await;
+        let response = validate_provider_with(
+            state,
+            http,
+            context.is_some(),
+            &context,
+            &None,
+            serde_json::from_value(body).unwrap(),
+        )
+        .await;
         body_of(response).await
     }
 

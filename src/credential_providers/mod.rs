@@ -261,10 +261,7 @@ impl CredentialProvider {
     /// type's default. `None` for types that sign nothing.
     pub fn jwt_signing_algorithm(&self) -> Option<JwtSigningAlgorithm> {
         self.provider_type
-            .jwt_signing_algorithm(
-                self.jwt
-                    .jwt_signing_algorithm,
-            )
+            .jwt_signing_algorithm(self.jwt.jwt_signing_algorithm)
     }
 }
 
