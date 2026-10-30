@@ -4517,6 +4517,7 @@ async fn step_inject_credentials(
         warn!(
             target: "credential_delegation",
             request_id = %ctx.request_id,
+            surface_variant = surface_variant.as_deref(),
             "No managed agent identity for delegated credentials - refusing the request"
         );
         return Err(refuse_delegation(ctx, DelegationRefusal::AgentIdentityMissing));
@@ -9214,19 +9215,14 @@ mod tests {
         );
     }
 
-    /// A Transit Point records every caller its `source_auth` refuses as an
-    /// `auth_failed` event, and names the caller it admitted on its policy and
-    /// delegation audit records.
-    #[tokio::test]
-    async fn a_transit_point_audits_the_callers_its_source_auth_refuses_and_names_the_one_it_admits() {
-        use crate::delegation_vault::audit::DelegationAuditAction;
+    /// An outbound state whose `source_auth` middleware knows the API key
+    /// secret `transit-caller-key`, whose value is `right-key`.
+    async fn transit_caller_key_state(directory: &std::path::Path) -> OutboundProxyState {
         use crate::secrets::SecretsStore;
 
-        let directory = tempfile::tempdir().unwrap();
         let secrets = Arc::new(
             crate::secrets::FilesystemSecretsStore::new_async(
                 directory
-                    .path()
                     .join("secrets")
                     .to_str()
                     .unwrap(),
@@ -9246,13 +9242,10 @@ mod tests {
             })
             .await
             .unwrap();
-        let strategies = crate::jwt_bearer::storage::FileSystemJwtVerificationStrategyStore::new(
-            directory
-                .path()
-                .join("strategies"),
-        )
-        .await
-        .unwrap();
+        let strategies =
+            crate::jwt_bearer::storage::FileSystemJwtVerificationStrategyStore::new(directory.join("strategies"))
+                .await
+                .unwrap();
         let mut state = test_outbound_state();
         state.source_auth_middleware = Some(Arc::new(crate::source_auth::SourceAuthMiddleware::new(
             Arc::new(crate::didauth::sessions::DidAuthSessionStore::new()),
@@ -9263,6 +9256,18 @@ mod tests {
             None,
             None,
         )));
+        state
+    }
+
+    /// A Transit Point records every caller its `source_auth` refuses as an
+    /// `auth_failed` event, and names the caller it admitted on its policy and
+    /// delegation audit records.
+    #[tokio::test]
+    async fn a_transit_point_audits_the_callers_its_source_auth_refuses_and_names_the_one_it_admits() {
+        use crate::delegation_vault::audit::DelegationAuditAction;
+
+        let directory = tempfile::tempdir().unwrap();
+        let state = transit_caller_key_state(directory.path()).await;
         let context = |key: Option<&'static str>| {
             let mut ctx = test_pipeline_context();
             ctx.virtual_channel
@@ -9322,6 +9327,75 @@ mod tests {
 
         admitted.authenticated_by = None;
         assert!(outbound_caller(&admitted).is_none(), "an identity nothing verified names no caller");
+    }
+
+    /// The `auth_failed` record a Transit Point's `source_auth` writes names
+    /// the surface variant that served the request, as every other Transit
+    /// Point record does.
+    #[tokio::test]
+    async fn a_transit_point_source_auth_refusal_names_the_variant_that_served_it() {
+        use crate::delegation_vault::audit::DelegationAuditAction;
+
+        for (variants, path, expected) in [
+            (json!([{"id": "v-beta", "alias": "beta", "name": "Beta"}]), "/outbound/mcp$beta/partner-a", "beta"),
+            (json!([]), "/outbound/mcp/partner-a", "_base_"),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+                "surface_id": "variant-surface", "name": "Variant surface",
+                "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "a2a"},
+                "target": {"endpoint": "http://127.0.0.1:1"},
+                "transit": {"points": [{"alias": "partner-a", "protocol": "mcp",
+                    "require_transit_token": false, "target_endpoint": "http://127.0.0.1:1",
+                    "source_auth": {
+                        "type": "api_key", "extraction": { "source": "http_header", "field": "X-API-Key" },
+                        "secret_id": "transit-caller-key"
+                    }}]},
+                "variants": variants
+            }))
+            .unwrap();
+            let state = transit_caller_key_state(directory.path()).await;
+            state
+                .channel_state
+                .write()
+                .unwrap()
+                .surface = Arc::new(surface);
+            let request = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json")
+                .header("x-api-key", "wrong-key")
+                .body(axum::body::Body::from(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).to_string()))
+                .unwrap();
+            let (response, events) =
+                crate::audit::producer::capture(Box::pin(outbound_proxy_handler_with_mcp_versions(
+                    "127.0.0.1:12345"
+                        .parse()
+                        .unwrap(),
+                    state,
+                    request,
+                    crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+                )))
+                .await;
+            assert!(
+                matches!(response, Err(OutboundPipelineError::TransitCallerUnauthenticated)),
+                "{path}: {response:?}"
+            );
+            let refusals = events
+                .iter()
+                .filter(|event| matches!(event.event, DelegationAuditAction::AuthFailed { .. }))
+                .count();
+            assert_eq!(refusals, 1, "{path}: {events:?}");
+            for event in &events {
+                assert_eq!(
+                    event
+                        .surface_variant
+                        .as_deref(),
+                    Some(expected),
+                    "{path}: {event:?}"
+                );
+            }
+        }
     }
 
     // ── step_rate_limit ────────────────────────────────────────────────────
@@ -13744,6 +13818,61 @@ mod tests {
             ),
             "a token that names no subject identifies no caller, so it gets no grant"
         );
+    }
+
+    /// The `credential_delegation` lines that refuse a Transit Point call for
+    /// want of a caller or an agent to key its delegated credentials by name
+    /// the surface variant that served it; a `source_auth` caller with no
+    /// managed agent identity takes the second.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_delegation_refusal_line_names_the_request_variant() {
+        use crate::observability::policy_audit::{RequestScope, in_request, set_request_variant};
+        use crate::surface_context::TransitCallerVerification::SourceAuth;
+
+        let directory = tempfile::tempdir().unwrap();
+        let state = delegation_state(directory.path(), &[("provider", "transit-access")]).await;
+        let surface = transit_surface(
+            json!([meta_transit_point("partner", "https://partner.example/mcp", false, Some("provider"))]),
+            json!([]),
+        );
+        let (resolved, point) = resolved_transit_point(&surface, None, "partner");
+        let no_caller = || {
+            let mut ctx = legacy_delegation_context(resolved.clone(), point.clone());
+            ctx.transit_token_claims = None;
+            ctx
+        };
+        let mut no_agent = no_caller();
+        no_agent.authenticated_identity = Some(crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            subject: "alice".to_string(),
+            claims: json!({ "iss": "https://idp.example", "sub": "alice" }),
+        });
+        no_agent.authenticated_by = Some(SourceAuth);
+        no_agent.resolved_identity = ProtectedAgentIdentity::Anonymous;
+
+        for (mut ctx, expected, line) in [
+            (no_caller(), DelegationRefusal::CallerIdentityMissing, "identifies the caller - refusing the request"),
+            (no_agent, DelegationRefusal::AgentIdentityMissing, "No managed agent identity for delegated credentials"),
+        ] {
+            let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+            let refused = in_request(RequestScope::fresh(), async {
+                set_request_variant("beta");
+                step_inject_credentials(&state, &mut ctx).await
+            })
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(refused, OutboundPipelineError::DelegationRefused { refusal, .. } if refusal == expected),
+                "{line}: {refused:?}"
+            );
+            let lines: Vec<String> = logs
+                .text()
+                .lines()
+                .filter(|text| text.contains(line))
+                .map(str::to_string)
+                .collect();
+            assert_eq!(lines.len(), 1, "{line}: {lines:?}");
+            assert!(lines[0].contains("surface_variant=\"beta\""), "{}", lines[0]);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
