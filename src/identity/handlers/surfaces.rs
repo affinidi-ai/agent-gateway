@@ -4579,9 +4579,14 @@ mod validation_tests {
             actor: None,
         };
         assert!(
-            super::super::surface_grants::remove_changed_binding_grants(&no_vault, Some(&existing), Some(&surface))
-                .await
-                .is_ok(),
+            super::super::surface_grants::remove_changed_binding_grants(
+                &no_vault,
+                Some(&existing),
+                Some(&surface),
+                None
+            )
+            .await
+            .is_ok(),
             "no binding changed, so no grant is revoked"
         );
 
