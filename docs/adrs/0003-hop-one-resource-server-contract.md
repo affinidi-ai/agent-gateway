@@ -7,11 +7,12 @@
 | Is Global    | false                                                                   |
 | Categories   | authentication, authorization, oauth, a2a, mcp, agent-card, policy, fabric |
 | Date         | 2026-10-21                                                              |
-| Last Updated | 2026-10-29                                                              |
+| Last Updated | 2026-10-30                                                              |
 
 ## Status
 
-Proposed.
+Proposed. Decisions D1 to D5 are aligned with the owner's recommendation,
+pending recorded agreement.
 
 Extends [1. Adopt OpenID Connect and OAuth 2.0 as a provider-neutral trust plane in Agent Gateway](0001-openid-oauth-agent-gateway.md).
 
@@ -21,18 +22,21 @@ the matching `Extended by` link. [ADR 0002](0002-hop-two-target-authentication.m
 requirement for `credential_provider` on every Surface Variant and on a receiving gateway; this
 ADR leaves it unchanged.
 
-Five of the decisions below (D1 to D5) need the agreement of Anton Iskryzhytskyi, who owns the
-MCP protected resource module (`src/protocols/protected_resource.rs`). The gateway is built with
-the default recorded for each, and the code keeps each choice in the functions named under
+Anton Iskryzhytskyi, who owns the MCP protected resource module
+(`src/protocols/protected_resource.rs`), recommended an outcome for each of D1 to D5: agree with
+D4 and D5, change D1 and D2, adjust D3, and have the sending gateway of a Fabric route answer a
+peer's authorization refusal itself. The gateway is built to those recommendations. The defaults
+recorded earlier are kept under [Alternatives](#alternatives) as rejected options, with his
+reasons, and the code keeps each choice in the functions named under
 [Isolation points](#11-isolation-points), so a different outcome changes only those.
 
-| Decision | Default built | Section |
+| Decision | Decision taken | Section |
 | --- | --- | --- |
-| D1. When a failed caller of a declaring Access Point is refused | Always, by the gateway: an MCP Access Point at the source authentication stage, any other after gateway policy and before AP2 and payment | [Decision 2](#2-failure-kind-one-deny-mapping-and-the-built-in-refusal) |
-| D2. How an Access Point declares | Derived from one pinned `jwt_bearer` method with `required_scopes`; an MCP `protected_resource` stays as an explicit source | [Decision 3](#3-declaration-sources-and-outcomes) |
-| D3. Resource and audience | The listener's first external URL, the route and `$alias`; a declaring route's tokens must name it | [Decision 4](#4-access-point-url-and-audience) |
-| D4. Fabric | Only the sending gateway declares and challenges | [Decision 9](#9-fabric-only-the-sending-gateway-challenges) |
-| D5. Surfaces saved through the API | Protected by the D1 refusal exactly as dashboard saves | [Decision 2](#2-failure-kind-one-deny-mapping-and-the-built-in-refusal) |
+| D1. When a failed caller of a declaring Access Point is refused | At source authentication on every protocol, in the order MCP already used: token check and `401`, scope check and `403`, before rate limiting, before the request body is read and before every policy plane, the AP2 gate and payment. Public paths are exempt. | [Decision 2](#2-failure-kind-and-the-source-auth-refusal) |
+| D2. How an Access Point declares | One explicit opt-in, `caller_authentication.protected_resource`, on MCP, A2A and AP2 Access Points. `resource` is explicit. The advertised authorization server is the strategy's `expected_issuer` and the advertised scopes start with `required_scopes`; the stored `authorization_servers` and `scopes` are optional. | [Decision 3](#3-the-declaration-and-its-outcomes) |
+| D3. Resource and audience | The stored, declared resource, validated at save against the listener's external URLs and the route; `<resource>$<alias>` per variant; a token is accepted when the resource is one of its `aud` values; one resolver for direct and Fabric requests | [Decision 4](#4-declared-resource-and-audience) |
+| D4. Fabric | Only the sending gateway declares and challenges. The receiving gateway refuses without a metadata URL. The sending gateway answers a peer `401`, and a peer `403` with `error="insufficient_scope"`, with `502` and a fixed detail, relays no `WWW-Authenticate` and audits the refusal, on MCP and A2A alike. | [Decision 9](#9-fabric-only-the-sending-gateway-challenges) |
+| D5. Surfaces saved through the API | Protected by the D1 refusal exactly as dashboard saves; no generated deny rule | [Decision 2](#2-failure-kind-and-the-source-auth-refusal) |
 
 ## Context
 
@@ -59,20 +63,24 @@ one contract, A2A would grow a second metadata builder, a second challenge and a
 rule beside the MCP ones, and the card, the metadata and the validator could drift apart, which is what
 ADR 0001 exists to prevent.
 
+The owner of the MCP protected resource module then reviewed the defaults first built for D1 to
+D5. His recommendation is recorded as the decision; the earlier defaults are recorded as rejected
+alternatives.
+
 ### Glossary
 
 | Term | Meaning |
 | --- | --- |
 | Hop 1, AS, PRM | As in [ADR 0001](0001-openid-oauth-agent-gateway.md#glossary). |
 | Declaring Access Point | An Access Point, for one Surface Variant, whose declaration outcome is `declare`: the gateway is the resource server, publishes its metadata and challenges its failed callers. |
-| Declaration | The resource server facts a declaring Access Point publishes: resource, authorization servers, the pinned authorization server metadata when derived, required scopes and advertised scopes. The card, the metadata, the audience check and the challenge are projections of it. |
+| Declaration | The resource server facts a declaring Access Point publishes: the declared resource, the authorization server (the strategy's `expected_issuer`), the strategy's pinned authorization server metadata when it matches, required scopes and advertised scopes. The card, the metadata, the audience check and the challenge are projections of it. |
 | Declaration outcome | `declare`, `strip` (with a reason code), `pass_through` or `unservable`, for one Surface Variant. |
-| Explicit declaration | An MCP Access Point's `protected_resource` setting. |
-| Derived declaration | A declaration built from one pinned `jwt_bearer` method with `required_scopes`. |
-| Access Point URL | The canonical HTTPS URL of an Access Point for one Surface Variant. The dashboard labels it **Entry point URL** ([`CONTEXT.md`](../../CONTEXT.md)). |
+| Declared resource | The `protected_resource.resource` an Access Point stores, or `<resource>$<alias>` for a named Surface Variant. It is the metadata `resource`, the URL in the challenge and the audience a token must carry. |
+| Access Point URL | The first external URL of an Access Point's listener, with its route. The dashboard labels it **Entry point URL** ([`CONTEXT.md`](../../CONTEXT.md)). It is the resource the save report suggests and the card URL of an Access Point that does not declare; it is never an audience. |
 | Failure kind | Why source authentication failed: `missing`, `invalid` or `insufficient_scope`. |
 | Gateway challenge | A `WWW-Authenticate` header the gateway wrote, marked with `GatewayChallenge`. |
 | Relayed challenge | A `WWW-Authenticate` header that came back from the Target. |
+| Peer authorization refusal | A receiving gateway's `401`, or its `403` with a Bearer `error="insufficient_scope"` challenge, answered over Fabric to the sending gateway. |
 | GW1, GW2 | On a Fabric route, the gateway that owns the Access Point the caller reaches (GW1) and the gateway that owns the Target (GW2). |
 
 ## Requirements
@@ -81,35 +89,41 @@ ADR 0001 exists to prevent.
 
 1. **One scope check.** `required_scopes` is checked in exactly one place, and a shortfall
    reaches every consumer as a failure kind, like a missing or invalid token.
-2. **One deny mapping.** Every stage that refuses a caller answers through one mapping, which
-   chooses the status and the challenge from the declaration outcome and the failure kind.
+2. **One refusal point.** A caller whose source authentication failed on a declaring Access
+   Point is answered in one place, by one builder, on every protocol. Every policy stage answers
+   with its own 403 and never with a challenge.
 3. **Fail closed where the gateway is the resource server.** A declaring Access Point refuses a
    failed caller with no policy attached, before any payment is taken or the Target is reached,
-   whether the surface was saved from the dashboard or through the API.
+   whether the surface was saved from the dashboard or through the API. It does so in the same
+   place for MCP, A2A and AP2, without depending on a policy rule or on the order of the
+   listener's `external_urls`.
 4. **Compatibility.** A surface that sets none of the new settings answers as before, except
    for the changes listed under [Consequences](#negative-with-mitigations): a `fabric://`
-   Target's relayed 401 becomes 502, `input.channel.variant_alias` is published on direct
-   requests, and a route holding `$` or `%24` can no longer be saved.
-   `tests/features/surface/source_authentication_http.feature` passes unchanged. An MCP Access
-   Point with `protected_resource` answers as before this decision except for the responses listed under
-   [Consequences](#negative-with-mitigations).
+   Target's relayed 401 becomes 502, a Fabric peer's 403 `insufficient_scope` becomes 502,
+   `input.channel.variant_alias` is published on direct requests, and a route holding `$` or
+   `%24` can no longer be saved. `tests/features/surface/source_authentication_http.feature`
+   passes unchanged. An MCP Access Point with `protected_resource` answers as before this
+   decision except for the responses listed under [Consequences](#negative-with-mitigations).
 5. **One URL.** The card's endpoint, the metadata `resource`, the metadata URL in the challenge
-   and the audience a declaring route accepts come from one resolver and agree byte for byte.
-6. **Metadata for every declaring Access Point,** A2A and MCP, with an absolute
+   and the audience a declaring route accepts come from one declared resource and agree byte for
+   byte.
+6. **Metadata for every declaring Access Point,** A2A, AP2 and MCP, with an absolute
    `resource_metadata` URL in every challenge.
-7. **Only usable challenges reach the caller.** Where the gateway is the resource server, a
+7. **Discovery without required scopes.** An Access Point can publish metadata and challenge
+   its failed callers without requiring any scope.
+8. **Only usable challenges reach the caller.** Where the gateway is the resource server, a
    Target challenge the caller cannot answer through the gateway never reaches it.
-8. **Fabric.** A caller is never sent to fetch a token it cannot use.
-9. **Isolation.** Each of D1 to D5 is isolated in the functions named under
-   [Isolation points](#11-isolation-points).
+9. **Fabric.** A caller is never sent to fetch a token it cannot use.
+10. **Isolation.** Each of D1 to D5 is isolated in the functions named under
+    [Isolation points](#11-isolation-points).
 
 ### Non-functional
 
 | Area | Requirement |
 | --- | --- |
-| Security | No hop 1 response carries the internal failure reason, a strategy id, a JWKS host or a key id. Challenge parameters are built only from validated values, by one module. Card bodies are never logged. |
-| Performance | The declaration is resolved once per request from in-memory stores, with no network call on the card, metadata or refusal path. A surface without `required_scopes` and without `protected_resource` never reads the strategy store. |
-| Availability | A strategy store failure on a declaring candidate answers 503 and never passes the caller through. A card the gateway cannot process on a declaring Access Point answers 502, never the unrewritten upstream card. |
+| Security | No hop 1 response carries the internal failure reason, a strategy id, a JWKS host, a key id, or a receiving gateway's realm, error or scopes. Challenge parameters are built only from validated values, by one module. Card bodies are never logged. No anonymous request body is read, parsed or evaluated by policy on a declaring Access Point. |
+| Performance | The declaration is resolved once per request from in-memory stores, with no network call on the card, metadata or refusal path. A surface without `protected_resource` never reads the strategy store for a declaration. |
+| Availability | A strategy store failure on a declaring Access Point answers 503 and never passes the caller through. A card the gateway cannot process on a declaring Access Point answers 502, never the unrewritten upstream card. |
 | Compatibility | Stored surface and strategy JSON written before this change still loads, and no field is added to a record older releases parse with `deny_unknown_fields`. `make mcp-conformance` output differs from the previous release only in the listed responses. |
 | Maintainability | `src/protocols/protected_resource.rs` stays the only builder of RFC 6750 and RFC 9728 strings. Existing types (`SourceAuthError`, `SourceAuthContext`, `ProtectedResourceConfig`) are extended rather than duplicated. |
 
@@ -118,7 +132,7 @@ ADR 0001 exists to prevent.
 | Team | Impact | Contact |
 | --- | --- | --- |
 | Agent Gateway backend | All of the above | Kajal Sinha; Anton Iskryzhytskyi for the MCP protected resource module and D1 to D5 |
-| Dashboard | Caller authentication form, scope input, card view | See open question 1 |
+| Dashboard | Caller authentication form, authorization server discovery switch, scope input, card view | See open question 1 |
 | Product | Response changes on declaring Access Points | Cosmin Mogos |
 | Hosted documentation | Source authentication and policy pages | See open question 1 |
 
@@ -130,14 +144,14 @@ Each needs its own ADR if it is taken up.
   unchanged. ADR 0001 open question 6 stays open.
 - **Declarations for Transit Points, DID Auth Access Points**, and `apiKey`, `mutualTLS` and
   `http` schemes.
-- **Declaring with more than one source authentication method,** a Static JWKS, a custom token
-  header or scheme, or more than one authorization server per derived declaration.
-- **A policy override of the built-in refusal** (alternative D1-D). A policy cannot admit a
+- **Declaring with a first method other than JWT Bearer,** a custom token header or scheme, or
+  more than one authorization server per declaration.
+- **A policy override of the source-auth refusal** (alternative D1-D). A policy cannot admit a
   failed caller on a declaring Access Point.
+- **A network rule (IP allow or deny) that answers before source authentication.** Gateway
+  policy runs after it ([open question 7](#open-questions)).
 - **Challenges on refusals that are not caller refusals:** 402, 413, 429, 501 (AP2 gate), 500,
   and MCP tool-policy denials returned as JSON-RPC errors keep their responses.
-- **A save-time report** of each Surface Variant's declaration outcome and of policies that admit
-  failed callers, and a read endpoint for it (see [Future work](#future-work)).
 - **A receiving gateway accepting the sending gateway's caller authentication** in place of its
   own. ADR 0002's Fabric caller rule is unchanged.
 - **Re-signing cards and filtering extended-card content** (ADR 0001 future work and open
@@ -147,9 +161,10 @@ Each needs its own ADR if it is taken up.
 
 ADR 0001 chose where configuration lives (A1) and that a declaring Access Point's card replaces
 the upstream security (C1). This ADR chooses among options for eight points: three settled with the owner of
-the existing MCP module (S, R, M) and the five open decisions (D1 to D5). No option adds infrastructure, so
+the existing MCP module (S, R, M) and the five reviewed decisions (D1 to D5). No option adds infrastructure, so
 infrastructure cost is nil throughout. Scores are 1 to 5, where 5 is best; for effort, 5 means
-least effort. Effort is in engineer-days.
+least effort. Effort is in engineer-days. For D1 to D4 the option first built is kept as
+"earlier default, rejected"; the option chosen is the one the review recommended.
 
 ### S. Where `required_scopes` is enforced
 
@@ -171,69 +186,77 @@ least effort. Effort is in engineer-days.
 
 | Option | Description | Pros | Cons | Effort |
 | --- | --- | --- | --- | --- |
-| **D1-A (Chosen)** | A built-in refusal. An MCP Access Point refuses at the source authentication stage, as before this decision. Any other refuses after gateway policy and before the AP2 gate, payment and forwarding. Every refusing stage shares one mapping, so a gateway policy denial gets the same challenge. | Fails closed with no policy. Nothing is paid and the Target is never reached. Appliance and gateway policy, and their audit, still see the failed caller. | No policy can admit a failed caller on a declaring Access Point | 4 |
+| D1-A (earlier default, rejected) | A built-in refusal. An MCP Access Point refuses at the source authentication stage. Any other refuses after gateway policy and before the AP2 gate, payment and forwarding, and every refusing stage maps its denial to the same challenge. | Fails closed with no policy. Nothing is paid and the Target is never reached. Appliance and gateway policy, and their audit, still see the failed caller. | Anonymous requests are read, parsed as A2A and evaluated by gateway policy. A 403 versus 401 split tells an anonymous caller what gateway policy allows. A gateway rule denying unverified callers answers 403 before the 401, so the client never receives `resource_metadata` (RFC 9728 §5). A second challenge point in the pipeline. | 4 |
 | D1-B | Policy decides: the challenge is sent only when a policy denies, at that policy's stage | Keeps "OPA decides" everywhere | A surface without a deny policy forwards failed callers. A surface-plane deny runs after payment, so a failed caller can pay before it is refused. For MCP it needs a policy-deny mapping at the 14 MCP `tools/call` denial sites. | 6 |
-| D1-C | Refuse at the source authentication stage on every protocol, the existing MCP model | Simplest ordering | Gateway policy and its audit never see a failed caller on a declaring Access Point, so a gateway deny with its own reason cannot apply | 3 |
-| D1-D | D1-A plus a policy rule that can admit failed callers, read by the refusal predicate | Fails closed by default and keeps an escape hatch | A new policy contract and a second reading of every plane on the refusal path | 8 |
+| **D1-C (Chosen)** | Refuse at the source authentication step on every protocol, in the order MCP already used: token check and 401, scope check and 403, then rate limit, body read, every policy plane, the AP2 gate, payment and forwarding | Fails closed with no policy. No anonymous body is read or parsed and no policy runs on anonymous input. No 401/403 policy oracle. A gateway deny never hides `resource_metadata`. One challenge point. | Gateway policy and its audit never see a failed caller on a declaring Access Point (the blocking `auth_failed` record still does). A network rule (IP allow or deny) in gateway policy answers 401 to an anonymous caller instead of 403. | 3 |
+| D1-D | D1-A plus a policy rule that can admit failed callers, read by the refusal predicate | Fails closed by default and keeps an escape hatch | A new policy contract and a second reading of every plane on the refusal path, on top of D1-A's cons | 8 |
 
 | Aspect | Weight | D1-A | D1-B | D1-C | D1-D | Info |
 | --- | --- | --- | --- | --- | --- | --- |
 | Fails closed with no policy, for API and dashboard saves | 3 | 5 | 1 | 5 | 4 | D1-D can be reopened by a rule |
-| Refused before payment and the Target | 2.5 | 5 | 2 | 5 | 5 | |
-| Gateway policy and audit still see the failed caller | 1.5 | 5 | 5 | 2 | 5 | |
-| Policy can admit some failed callers | 1 | 1 | 5 | 1 | 4 | |
+| No anonymous body read, parse or policy evaluation; no policy oracle | 2.5 | 2 | 1 | 5 | 2 | |
+| Discovery survives a gateway rule denying unverified callers (RFC 9728 §5) | 2 | 2 | 1 | 5 | 2 | |
+| One challenge point for MCP and A2A | 1.5 | 2 | 2 | 5 | 2 | |
+| Gateway policy and its audit see the failed caller | 1 | 5 | 5 | 1 | 5 | |
 | Development effort | 1 | 4 | 3 | 4 | 2 | |
-| **Summary** | | **40.0** | **23.5** | **35.5** | **38.0** | |
+| **Summary** | | **36.0** | **18.5** | **50.0** | **31.0** | |
 
 ### D2. How an Access Point declares
 
 | Option | Description | Pros | Cons | Effort |
 | --- | --- | --- | --- | --- |
-| **D2-A (Chosen)** | The derived declaration is the source of truth. The existing `protected_resource` stays as written, as an explicit source for MCP that takes precedence when present. There is no new "off" field: removing `required_scopes` switches a derived declaration off. | One configuration (strategy and method) drives the validator, card, metadata and challenge, as ADR 0001 requires. Existing MCP records load and answer as before. Older releases still load every surface. | Two sources for MCP; switching a declaration off means removing the scopes or the pin | 5 |
-| D2-B | Explicit only: allow `protected_resource` on A2A, and keep `required_scopes` for enforcement only | One mechanism | The operator types the resource and authorization servers a second time beside the strategy, so the card and the validator can disagree | 4 |
-| D2-C | Add an on/off field inside `protected_resource` that defaults to the derived value | An explicit switch | `ProtectedResourceConfig` and `CallerAuthentication` refuse unknown fields, so an older release skips the whole surface after a downgrade | 4 |
+| D2-A (earlier default, rejected) | A declaration derived from one pinned `jwt_bearer` method with `required_scopes` whose `audiences` contain the Access Point URL; an MCP `protected_resource` takes precedence as an explicit source | No setting beyond the method. Older releases load every surface. | Removing `required_scopes` silently turns the refusal and the `aud` binding off, and an API-saved surface without a deny rule then forwards failed tokens. A second trigger needs every save-time check of the explicit setting again. A `required_scopes` trigger cannot express discovery without scopes. | 5 |
+| D2-B | Explicit only, every field typed: `protected_resource` allowed on A2A with the `authorization_servers` the operator types | One mechanism | Typed issuers drift from the strategy: a strategy edit re-checks no surface, so the metadata can name an issuer the validator no longer trusts | 4 |
+| D2-C | An on/off field inside `protected_resource` that defaults to the derived value | An explicit switch | `ProtectedResourceConfig` and `CallerAuthentication` refuse unknown fields, so an older release skips the whole surface after a downgrade | 4 |
+| **D2-D (Chosen)** | One explicit opt-in, `protected_resource`, on MCP, A2A and AP2. `resource` is explicit. `authorization_servers` is optional and, when sent, must equal the strategy's `expected_issuer`; the gateway always advertises that issuer. `scopes` is optional; the advertised scopes are `required_scopes`, then each extra stored scope. | Removing scopes cannot switch discovery off. One set of save-time checks. The advertised issuer and scopes cannot drift from what is enforced. Discovery works without required scopes. Existing MCP records load. | A `protected_resource` stored without `authorization_servers`, or on an A2A or AP2 Access Point, cannot be served by an older release | 4 |
 
-| Aspect | Weight | D2-A | D2-B | D2-C | Info |
-| --- | --- | --- | --- | --- | --- |
-| One configuration drives validator, card, metadata and challenge | 3 | 5 | 3 | 5 | |
-| Older releases still load the surface | 2.5 | 5 | 5 | 1 | |
-| An existing MCP `protected_resource` answers as before | 2 | 5 | 5 | 5 | |
-| Switch off without removing scopes | 1 | 2 | 5 | 5 | |
-| Development effort | 1 | 4 | 3 | 3 | |
-| **Summary** | | **43.5** | **39.5** | **35.5** | |
+| Aspect | Weight | D2-A | D2-B | D2-C | D2-D | Info |
+| --- | --- | --- | --- | --- | --- | --- |
+| Removing scopes cannot silently switch the refusal and `aud` binding off | 3 | 1 | 5 | 4 | 5 | |
+| One set of save-time checks | 2 | 2 | 5 | 3 | 5 | |
+| Advertised issuer and scopes cannot drift from what is enforced | 2 | 5 | 2 | 4 | 5 | |
+| Discovery without required scopes | 1 | 1 | 5 | 5 | 5 | |
+| Existing MCP records stay valid | 1.5 | 5 | 5 | 5 | 5 | |
+| An older release still loads the surface | 1 | 5 | 4 | 1 | 3 | |
+| Development effort | 1 | 5 | 4 | 3 | 3 | |
+| **Summary** | | **35.5** | **49.5** | **42.5** | **53.5** | |
 
 ### D3. Resource and audience
 
 | Option | Description | Pros | Cons | Effort |
 | --- | --- | --- | --- | --- |
-| **D3-A (Chosen)** | The resource is the first external URL of the Access Point's listener, plus the route, plus `$alias` for a variant. A derived declaration needs it in `audiences`; on a declaring route the method's audiences are replaced by exactly that resource through the existing `bind_audience`. | A token minted for a sibling resource or another variant is refused. One URL for card, metadata, challenge and audience. | A listener with several public hosts declares only its first. Providers that put an application GUID in `aud`, such as Entra v2, need an identifier URI equal to the Access Point URL. | 3 |
+| D3-A (earlier default, rejected) | The resource is the first external URL of the Access Point's listener, plus the route, plus `$alias` for a variant. On a declaring route `bind_audience` replaces the method's audiences with exactly that resource. | A token minted for a sibling resource or another variant is refused. One URL for card, metadata, challenge and audience. | Reordering or adding an external URL changes every audience without a save or a check. A listener with several public hosts declares only its first, and the operator cannot pick the host. | 3 |
 | D3-B | Accept any of the listener's external URLs as the resource | Works for multi-host listeners | The metadata, the card and the challenge would name one host while tokens for another pass | 4 |
-| D3-C | Keep the method's other audiences on a declaring route, as any-of matching | Entra v2 GUID audiences keep working | A token minted for any other listed audience passes the declaring Access Point | 2 |
+| D3-C | Keep the method's other audiences on a declaring route, as any-of matching | Audiences such as Entra v2 GUIDs keep working | A token minted for any other listed audience passes the declaring Access Point | 2 |
+| **D3-D (Chosen)** | The stored, declared resource, validated at save against the listener's external URLs (any of them) with the route as path; `<resource>$<alias>` per variant; `audiences` must be empty; a token is accepted when the resource is one of its `aud` values | A token for a sibling resource or variant is refused. Audiences do not depend on the order of `external_urls`. One value in the metadata, the card, the dashboard and the authorization server's registration. The operator picks the host. | Providers that put an application GUID in `aud`, such as Entra v2, need an identifier URI equal to the resource | 3 |
 
-| Aspect | Weight | D3-A | D3-B | D3-C | Info |
-| --- | --- | --- | --- | --- | --- |
-| Token for a sibling resource or variant refused | 3 | 5 | 4 | 2 | |
-| Card, metadata, challenge and audience agree | 2.5 | 5 | 3 | 5 | |
-| Listeners with several public hosts | 1.5 | 2 | 5 | 2 | |
-| GUID audiences such as Entra v2 | 1 | 1 | 1 | 5 | |
-| Development effort | 1 | 4 | 3 | 4 | |
-| **Summary** | | **35.5** | **31.0** | **30.5** | |
+| Aspect | Weight | D3-A | D3-B | D3-C | D3-D | Info |
+| --- | --- | --- | --- | --- | --- | --- |
+| Token for a sibling resource or variant refused | 3 | 5 | 4 | 2 | 5 | |
+| Audiences independent of the order of `external_urls` | 2.5 | 1 | 4 | 3 | 5 | |
+| One value in metadata, card, dashboard and AS registration | 2 | 5 | 2 | 3 | 5 | |
+| Providers that add their own `aud` (Auth0 `/userinfo`) | 1.5 | 5 | 5 | 5 | 5 | Every option matches `aud` as any-of |
+| Operator picks the host on a multi-host listener | 1 | 1 | 3 | 3 | 5 | |
+| Development effort | 1 | 5 | 3 | 4 | 4 | |
+| **Summary** | | **41.0** | **39.5** | **34.0** | **54.0** | |
 
 ### D4. Fabric
 
 | Option | Description | Pros | Cons | Effort |
 | --- | --- | --- | --- | --- |
-| **D4-A (Chosen)** | Only GW1 declares and challenges a caller. A declaring surface on GW2 refuses a failed Fabric caller before policy with the existing realm-only answer (401, or 403 with `error="insufficient_scope"`) and no `resource_metadata`. GW1 drops that challenge as a relayed one, so its caller sees 502. | A caller is never sent to fetch a token for GW2's resource, which GW1 would strip. GW2 still fails closed. Same shape as the existing MCP Fabric refusal. | A declaring GW2 surface admits only a credential GW1 injects for GW2's resource | 2 |
-| D4-B | GW2 challenges with its own `resource_metadata` | GW2 looks like a direct Access Point | The caller fetches a token for GW2 that GW1 never relays, and loops | 2 |
+| D4-A (earlier default, rejected) | Only GW1 declares and challenges a caller. A declaring surface on GW2 refuses a failed Fabric caller before policy with the realm-only answer (401, or 403 with `error="insufficient_scope"`) and no `resource_metadata`. GW1's relayed-challenge filter drops that challenge: a 401 becomes 502, a 403 reaches the caller without its challenge, and nothing is audited. | A caller is never sent to fetch a token for GW2's resource. GW2 still fails closed. Same shape as the existing MCP Fabric refusal. | Two statuses for one kind of failure the caller cannot fix; GW1 records nothing about where the request failed | 2 |
+| D4-B | GW2 challenges with its own `resource_metadata` | GW2 looks like a direct Access Point | The caller fetches a token for GW2 that GW1 never relays, and loops; GW2's setup reaches the caller | 2 |
 | D4-C | GW2 never refuses before policy and hands the failure to its policy | Policy decides on GW2 | A GW2 surface without a deny policy forwards a caller that failed its source authentication | 1 |
+| **D4-D (Chosen)** | D4-A, plus GW1 answers a peer 401, and a peer 403 with a Bearer `error="insufficient_scope"` challenge, with 502 and a fixed detail, relays no `WWW-Authenticate`, and records the refusal; on MCP and A2A, on every `fabric://` route | One status for every peer authorization refusal. Nothing of GW2's realm, error or scopes reaches the caller. GW1 records where the request failed. | A GW2 403 `insufficient_scope` that reached the caller as 403 now reaches it as 502 | 3 |
 
-| Aspect | Weight | D4-A | D4-B | D4-C | Info |
-| --- | --- | --- | --- | --- | --- |
-| Caller never sent to fetch a token it cannot use | 3 | 5 | 1 | 5 | |
-| GW2 still fails closed | 2 | 5 | 5 | 2 | |
-| Same shape as the existing MCP Fabric refusal | 1.5 | 5 | 2 | 2 | |
-| Development effort | 1 | 4 | 4 | 4 | |
-| **Summary** | | **36.5** | **20.0** | **26.0** | |
+| Aspect | Weight | D4-A | D4-B | D4-C | D4-D | Info |
+| --- | --- | --- | --- | --- | --- | --- |
+| Caller never sent to fetch a token it cannot use | 3 | 5 | 1 | 5 | 5 | |
+| Receiving gateway fails closed | 2 | 5 | 5 | 2 | 5 | |
+| One status for every peer authorization refusal; nothing of the receiver's setup leaks | 2 | 3 | 1 | 3 | 5 | |
+| The sending gateway records where it failed | 1.5 | 2 | 2 | 2 | 5 | |
+| Development effort | 1 | 5 | 4 | 4 | 4 | |
+| **Summary** | | **39.0** | **22.0** | **32.0** | **46.5** | |
 
 ### D5. Protection for surfaces saved through the API
 
@@ -251,6 +274,9 @@ least effort. Effort is in engineer-days.
 | Development effort | 1 | 5 | 3 | 2 | |
 | **Summary** | | **33.0** | **24.5** | **27.0** | |
 
+The review checked that the dashboard adds no rule: the Caller Context editor advises one for an
+Access Point that does not declare, and Surface Detail offers a copyable deny rule.
+
 ### R. Which Target challenges reach the caller
 
 | Option | Description | Pros | Cons | Effort |
@@ -266,6 +292,9 @@ least effort. Effort is in engineer-days.
 | Payment challenges reach the caller | 1.5 | 5 | 5 | 5 | |
 | Development effort | 1 | 4 | 5 | 4 | |
 | **Summary** | | **34.5** | **25.5** | **28.5** | |
+
+On a `fabric://` Target the peer's 401 and 403 `insufficient_scope` are answered by D4 before
+this filter runs.
 
 ### M. How the metadata route meets other routes
 
@@ -285,32 +314,41 @@ least effort. Effort is in engineer-days.
 ## Argument
 
 - **S1** keeps one failure path: the middleware turns a shortfall into a failure kind, and the
-  same mapping that answers a missing token answers it. S2 would enforce scopes on Access Points
+  same refusal that answers a missing token answers it. S2 would enforce scopes on Access Points
   that do not declare, where policy owns the decision today. S3 would let the card declare scopes
   nothing checks.
-- **D1-A** is the only option that meets requirement 3 without losing gateway policy. A
-  dashboard deny rule would not meet it: that rule is a surface policy, which runs after payment,
-  and an API save never gets it. Placing the refusal
-  after gateway policy keeps "a gateway deny is final" and lets appliance and gateway policy, and
-  their audit, see the failed caller first; placing it before AP2 and payment means nothing is
-  settled. MCP keeps its existing refusal at source authentication, which already met the requirement. D1-C would hide
-  the failed caller from gateway policy; D1-D adds a policy contract that no one has asked for yet
-  and that the predicate can read later.
-- **D2-A** meets ADR 0001 requirement 1: the strategy and the method are the only inputs, so the
-  card, the metadata and the validator cannot disagree. It keeps every existing MCP record as it is.
-  D2-C would make a downgrade drop whole surfaces, because older releases refuse unknown fields in
-  `protected_resource`. D2-B scores close, but it reintroduces hand-typed authorization servers,
-  which is the drift ADR 0001 exists to prevent.
-- **D3-A** makes requirement 5 true by construction: one function names the URL, and the existing
-  `bind_audience` already enforces it for MCP. D3-C keeps Entra v2 GUID audiences working but lets
-  a token for a sibling resource through, which RFC 8707 audience restriction exists to stop; an
-  operator who needs a GUID audience keeps a non-declaring Access Point and a policy.
-- **D4-A** meets requirement 8. GW1 never relays the caller's `Authorization` header, so a GW2
-  challenge with metadata (D4-B) sends the caller after a token it can never deliver. D4-C would
-  make GW2 fail open on its own declaring surface.
-- **D5-A** follows from D1-A at no cost. D5-B leaves API saves unprotected and protects dashboard
+- **D1-C** meets requirements 2 and 3 with the fewest moving parts: the source authentication
+  step is the one place that refuses a failed caller, on every declaring protocol, as it already
+  did for MCP. The earlier default, D1-A, kept gateway policy and its audit in front of the
+  refusal, and that is its only advantage; the blocking `auth_failed` record keeps the audit. Its
+  costs were the ones the review gave: an anonymous body was read, parsed and evaluated by policy;
+  the 403 or 401 answer told an anonymous caller what gateway policy allows; a gateway rule
+  denying unverified callers answered 403 before the 401, so an RFC 9728 client never learned
+  where to get a token; and a second challenge point sat in the pipeline. D1-B fails open without
+  a deny policy, and D1-D adds a policy contract no one has asked for.
+- **D2-D** meets ADR 0001 requirement 1 and requirement 7 here. The opt-in is one setting that
+  only a save can change, so removing `required_scopes` cannot quietly switch off the refusal and
+  the `aud` binding (D2-A's flaw), and every save-time check of the setting applies once. The
+  advertised issuer is read from the strategy on every request rather than typed beside it, so it
+  cannot drift (D2-B's flaw), and a stored list must equal it. D2-C keeps the downgrade hazard of
+  an unknown field. D2-D's downgrade cost is smaller and has a rollback step: a record that omits
+  `authorization_servers` is unreadable by an older release, so the operator adds it first.
+- **D3-D** makes requirement 5 true by construction: the stored resource is the one value, checked
+  at save against the listener's external URLs in any order and the route, and the existing
+  `bind_audience` enforces it on direct and Fabric requests through one resolver. D3-A is
+  rejected for availability (reordering or adding an external URL changes every audience without
+  a save or a check) and for operator choice. Matching `aud` as any-of is not new: the validator
+  already accepted an array `aud` with one matching entry. D3-C lets a token for a sibling
+  resource through, which RFC 8707 audience restriction exists to stop; an operator who needs a
+  GUID audience keeps a non-declaring Access Point and a policy.
+- **D4-D** meets requirement 9 and closes the gaps D4-A left. GW1 never relays the caller's
+  `Authorization` header, so no peer authorization refusal is the caller's to fix: one `502`
+  answers all of them, nothing of GW2's realm, error or scopes reaches the caller, and GW1 records
+  the refusal. D4-B sends the caller after a token it can never deliver; D4-C makes GW2 fail open
+  on its own declaring surface.
+- **D5-A** follows from D1-C at no cost. D5-B leaves API saves unprotected and protects dashboard
   saves only after payment; D5-C adds a concept for one rule.
-- **R1** meets requirement 7 with the narrowest change: only Access Points where the gateway is
+- **R1** meets requirement 8 with the narrowest change: only Access Points where the gateway is
   the resource server, and Fabric routes where the Target is another gateway answering the sending
   gateway's credential. R3 changes surfaces that may legitimately pass the Target's challenge on.
 - **M1** removes a silent failure (M2) at the price of a startup error the operator can fix by
@@ -320,8 +358,9 @@ least effort. Effort is in engineer-days.
   - The A2A 1.0 JSON names for the oauth2 scheme (`oauth2SecurityScheme`, `clientCredentials`,
     `oauth2MetadataUrl`, `securityRequirements` with `schemes`) match the a2a-python and a2a-js
     parsers.
-  - An authorization server can mint a token whose `aud` is the Access Point URL: Hydra and
+  - An authorization server can mint a token whose `aud` is the declared resource: Hydra and
     Auth0 through the requested audience, Entra through an `https` identifier URI equal to it.
+  - Auth0 adds its `/userinfo` audience when `openid` is requested, so `aud` matching is any-of.
 
 ## Decision
 
@@ -344,91 +383,122 @@ least effort. Effort is in engineer-days.
 - Policy input for an authenticated `jwt_bearer` caller carries `scopes` (sorted,
   de-duplicated), `client_id` (`client_id`, then `azp`, then `appid`), `strategy_id` and
   `strategy_tenant_id`.
-- The challenge's `scope` names `required_scopes` only. The metadata's `scopes_supported` lists
-  `required_scopes`, then any `protected_resource.scopes` not already among them.
+- The challenge's `scope` names `required_scopes` only, and is left out when there are none. The
+  metadata's `scopes_supported` lists `required_scopes`, then any `protected_resource.scopes` not
+  already among them, and is left out when that list is empty.
 
-### 2. Failure kind, one deny mapping and the built-in refusal
+### 2. Failure kind and the source-auth refusal
 
 - A failed caller's policy input carries `kind`: `missing`, `invalid` or `insufficient_scope`.
   `reason` stays for policy authors and logs and is never sent to the caller.
-- Every stage that refuses a caller answers through `caller_deny_response`
-  (`src/source_auth/challenge.rs`), reached through `deny_caller` (`src/proxy/caller_denial.rs`)
-  with the declaration resolved once for the request: appliance, gateway and surface policy, an
-  unloaded surface policy, the identity-required refusal and the built-in refusal, on the direct
-  path, the Fabric send path and the proxy paths.
+- **The source-auth refusal (D1, D5).** A declaring Access Point refuses a caller whose source
+  authentication failed itself, whatever policy says, at the source authentication step, on
+  every protocol: before rate limiting, before the request body is read and before every policy
+  plane, the AP2 gate, payment and forwarding, directly or over Fabric. No policy ever sees such
+  a caller, and a gateway deny never hides the challenge. The one builder is
+  `challenge_failed_caller` (`src/proxy/caller_denial.rs`); it records one blocking `auth_failed`
+  event and returns the declaration's challenge. This is the rule stated once in
+  [`AGENTS.md`](../../AGENTS.md); the other documents link to it.
 
   | Declaration outcome | Source authentication | Response |
   | --- | --- | --- |
   | `declare` | Failed, kind `missing` | 401, `WWW-Authenticate: Bearer resource_metadata="<url>"`, with `scope="<required>"` when `required_scopes` is set |
   | `declare` | Failed, kind `invalid` | 401, the same challenge with `error="invalid_token"` |
   | `declare` | Failed, kind `insufficient_scope` | 403, the same challenge with `error="insufficient_scope"` |
-  | `declare` | Authenticated, or none | The stage's 403, unchanged |
-  | `strip` or `pass_through` | Any | The stage's 403, unchanged; a failed caller reaches policy as before |
-  | `unservable` | Any | 503 before policy, no challenge |
+  | `declare` | Authenticated, or none | The request goes on; a refusing policy stage answers with its own 403 |
+  | `strip` or `pass_through` | Failed | Handed to policy as `input.source_auth.method == "failed"`, as before |
+  | `unservable` | Any | 503 before source authentication, no challenge |
 
-  - On an MCP Access Point the challenged response is the existing MCP problem document with a fixed
-    detail. On any other it is the refusing stage's body with the challenge's status and
-    `Cache-Control: no-store`. Neither carries `error_description`.
-- **The built-in refusal (D1, D5).** A declaring Access Point refuses a failed caller whatever
-  policy says. An MCP Access Point does it at the source authentication stage, before policy, as
-  before this decision. Any other does it right after gateway policy and before the AP2 gate, payment and
-  forwarding, directly or over Fabric, so appliance and gateway policy still see the caller and
-  nothing is settled. This is the rule stated once in
-  [`AGENTS.md`](../../AGENTS.md); the other documents link to it.
+  - The request order on a declaring Access Point is: routing; the public paths (the agent card,
+    DID Auth, onboarding; the metadata route is its own route), which are never challenged;
+    declaration resolution; source authentication, token check then scope check; rate limit;
+    body read and protocol admission; appliance-wide and gateway policy; the AP2 gate; A2A
+    version and validation; payment; forwarding; surface policy.
+  - On every protocol the challenged response is a problem (`application/problem+json`,
+    `type: about:blank`, `Cache-Control: no-store`) with a fixed detail that never says why a
+    token failed, and no `error_description`.
+  - A request whose Surface Variant cannot be resolved gets the bare route's challenge from the
+    same builder ([decision 10](#10-surface-variants)).
+- **Policy refusals.** Each policy stage, the unloaded surface policy and the identity-required
+  refusal answer with their own 403 body (`CallerDenial::refusal`) and never a challenge. Only an
+  Access Point that does not declare can still bring a failed caller to them.
 - **Payment.** Because the refusal comes before payment, a failed caller of a declaring Access
   Point is never charged. A non-declaring Access Point keeps today's order, and an operator who
   must refuse its failed callers before payment puts the rule in the gateway plane, as
   [`POLICY.md`](../POLICY.md#failed-caller-authentication) says.
 
-### 3. Declaration sources and outcomes
+### 3. The declaration and its outcomes
 
 - One resolver, `resolve_surface_declaration` (`src/source_auth/declaration.rs`), returns the
-  outcome for the resolved Surface Variant. The request path, Fabric receive, the metadata route
-  and the card all call it, and the request path stores it once per request.
-- `declaration_source` chooses the source (D2):
-  - **Explicit:** the Access Point has `protected_resource` (MCP only). Its fields and checks
-    stay. The outcome is `declare` or `unservable`, never `strip`.
-  - **Derived:** no `protected_resource`, exactly one `jwt_bearer` method with non-empty
-    `required_scopes`, and not a variant of an Access Point at `/`.
-  - **None:** anything else. The resolver reads no strategy and never declares.
-- A derived candidate reads its strategy from the in-memory store. A store failure answers 503
-  (`unservable`); it never passes the caller through. The first failed condition below strips:
+  outcome for the resolved Surface Variant. The request path, Fabric receive, the metadata route,
+  the card and the save report all call it, and the request path stores it once per request.
+- An Access Point declares from one source, `caller_authentication.protected_resource` (D2), on
+  an MCP, A2A or AP2 Access Point (`supports_protected_resource`,
+  `src/protocols/protected_resource.rs`).
 
-  | # | Condition | Outcome | Reason code |
-  | --- | --- | --- | --- |
-  | 1 | No caller authentication, and the Target is `fabric://` | `strip` | `fabric_target` |
-  | 2 | No caller authentication | `pass_through` | – |
-  | 3 | More than one method | `strip` | `multiple_methods` |
-  | 4 | The method is not `jwt_bearer` | `strip` | `method_not_declarable` |
-  | 5 | `required_scopes` is empty | `strip` | `no_required_scopes` |
-  | 6 | A variant of an Access Point at `/` | `strip` | `root_variant` |
-  | 7 | The strategy is missing or not referenceable by the surface's tenant | `strip` | `strategy_unavailable` |
-  | 8 | The strategy has a Static JWKS | `strip` | `static_jwks` |
-  | 9 | No pinned `authorization_server` | `strip` | `not_pinned` |
-  | 10 | The pinned issuer differs from `expected_issuer`, or the pinned JWKS URI from the strategy's | `strip` | `pin_mismatch` |
-  | 11 | `token_header` is not `Authorization`, or `token_scheme` is not `Bearer` (case-insensitive) | `strip` | `custom_token_header` |
-  | 12 | `forward_header` is on | `strip` | `forwards_caller_token` |
-  | 13 | No Access Point URL ([decision 4](#4-access-point-url-and-audience)) | `strip` | `no_access_point_url` |
-  | 14 | The Access Point URL is not in `audiences` | `strip` | `audience_missing` |
-  | 15 | Otherwise | `declare` | – |
+  | Field | Required | Meaning |
+  | --- | --- | --- |
+  | `resource` | Yes | The declared resource ([decision 4](#4-declared-resource-and-audience)) |
+  | `authorization_servers` | No | When sent, exactly `["<expected_issuer>"]` of the method's strategy. It is never advertised. |
+  | `scopes` | No | Extra scopes the metadata advertises after `required_scopes` |
 
-  A Transit Point card uses the reason `transit_point` when its Access Point's cards are
-  secured.
-- `strip` and `pass_through` leave the Access Point as it was before this decision: no metadata,
+- **Without `protected_resource`** the resolver reads no strategy and never declares: `strip`
+  with `not_declared` when the Access Point has caller authentication, `strip` with
+  `fabric_target` when it has none and its Target is `fabric://`, `pass_through` otherwise. A
+  Transit Point card uses the reason `transit_point` when its Access Point's cards are secured.
+  `strip` and `pass_through` leave the Access Point as it was before this decision: no metadata,
   no challenge, the upstream card, and failed callers handed to policy.
+- **With `protected_resource`** the first failed condition makes the outcome `unservable`, which
+  answers 503 and never passes the caller through; otherwise it is `declare`:
 
-### 4. Access Point URL and audience
+  | # | Condition | Reason code |
+  | --- | --- | --- |
+  | 1 | A variant of an Access Point at `/` | `root_variant_resource` |
+  | 2 | The protocol is not MCP, A2A or AP2 | `unsupported_protocol` |
+  | 3 | A field is invalid | `invalid_protected_resource` |
+  | 4 | The first method is not `jwt_bearer` reading `Authorization` with the `Bearer` scheme, it sets `forward_header`, or its `audiences` is not empty | `incompatible_caller_authentication` |
+  | 5 | The resource is not on one of the listener's external URLs with the route as path | `resource_mismatch` |
+  | 6 | No strategy store, or the store fails | `strategy_store_unavailable` |
+  | 7 | The strategy is missing or not referenceable by the surface's tenant | `strategy_unavailable` |
+  | 8 | The strategy's `expected_issuer` is not an issuer metadata can name: `https`, or also `http` for a strategy no tenant owns | `issuer_not_advertisable` |
+  | 9 | Fabric receive without the network configuration | `network_unavailable` |
 
-- The origin is the first `external_urls` entry of the listener matched by the Access Point's
-  `listen_address`, with trailing slashes trimmed (`access_point_origin`,
-  `src/protocols/protected_resource.rs`). Without a match there is no Access Point URL.
-- The path is the route, with `/` for an empty route. A named Surface Variant appends `$alias`.
-- The result must be a canonical HTTPS URL (`canonical_https_url`, `src/sts/mcp_profile.rs`).
-- A derived declaration needs that URL in `audiences`. On a declaring route `bind_audience`
-  replaces the method's audiences with exactly that URL, so a token for any other audience or
-  variant fails as `invalid`.
-- The metadata URL is the origin, then `/.well-known/oauth-protected-resource`, then the resource
-  path, as the existing builder does (RFC 9728 §3.1). `%24` in a metadata path is decoded to `$`.
+- A declaration carries the declared resource, `authorization_servers` = `[expected_issuer]`,
+  the strategy's pinned authorization server metadata when its issuer equals `expected_issuer`
+  and, for a remote key set, its `jwks_uri` equals the strategy's, `required_scopes`, and the
+  advertised scopes. A strategy edit changes the advertised issuer on the next request without a
+  surface save.
+- **Save.** `validate_protected_resource_strategy` (`src/identity/handlers/surfaces.rs`) refuses
+  with 400 a strategy that does not exist, an issuer metadata cannot name, and a stored
+  `authorization_servers` other than `["<expected_issuer>"]`. The other save checks apply on
+  every declaring protocol: the resource on a listener origin and the route, owned by one
+  endpoint, empty `audiences`, no `forward_header`, the `Bearer` scheme, and a route or listen
+  address change refused unless `protected_resource` is sent with a new resource or `null`. A PUT
+  that rebuilds caller authentication keeps a `protected_resource` the Access Point still
+  supports and reports `protected_resource_dropped` otherwise.
+- **Report.** A save response and `GET /v1/surfaces/{id}/declarations` list each Surface
+  Variant's outcome, reason, resource and, when it declares, the advertised authorization
+  servers, scopes and metadata URL, with warnings. Two warnings belong to this decision:
+  `authorization_servers_stale` when a stored list no longer names the strategy's issuer, and
+  `card_scheme_unavailable` when a declaring A2A or AP2 Access Point's strategy has no matching
+  pin, so its card names no scheme.
+
+### 4. Declared resource and audience
+
+- The resource is the stored `protected_resource.resource`: a canonical HTTPS URL
+  (`canonical_https_url`, `src/sts/mcp_profile.rs`) on one of the external URLs of the listener
+  the Access Point is served on, whatever their order, with the route as path (`/` for an empty
+  route). A bind address such as `0.0.0.0:8443` names the listener on that port. The check runs
+  at save and again on every resolution (`ProtectedResourceConfig::validate_endpoint`).
+- A named Surface Variant's resource is `<resource>$<alias>`.
+- On a declaring route `Declaration::bind_audience` replaces the method's audiences, which must
+  be empty, with exactly the declared resource. A token is accepted when that resource is one of
+  its `aud` values, so a token for any other resource or variant fails as `invalid`.
+  `resolve_surface_audience` (`src/source_auth/middleware.rs`) is the one resolver for direct
+  and Fabric requests.
+- The metadata URL is the resource's origin, then `/.well-known/oauth-protected-resource`, then
+  the resource path, as the existing builder does (RFC 9728 §3.1). `%24` in a metadata path is
+  decoded to `$`.
 - A route holding `$` or `%24` is refused at save with 400, because those characters separate a
   variant alias and such a route could never be reached as written.
 - The card served for a declaring Access Point names the declared resource as its URL.
@@ -437,19 +507,17 @@ least effort. Effort is in engineer-days.
 
 - A declaring Access Point never sends the caller's token to the Target or over Fabric
   (`forwards_caller_token`, `src/proxy/handler.rs`); the token was issued for the gateway.
-- A derived candidate with `forward_header` does not declare: it strips with
-  `forwards_caller_token` and keeps forwarding the token, as before.
-- An explicit `protected_resource` keeps the existing rules: `forward_header` is refused at save with
-  400 and a stored record that combines them fails closed with 503.
+- `protected_resource` with `forward_header` is refused at save with 400, and a stored record
+  that combines them is `unservable` and answers 503.
 
 ### 6. Protected resource metadata
 
 - `/.well-known/oauth-protected-resource` and `/{*path}` are mounted on every inbound listener,
   with the existing CORS choice for the path. Each request resolves the surface for the path, so hot
   reload applies.
-  - A declaring Access Point answers 200 with `resource`, `authorization_servers`,
-    `scopes_supported` when non-empty, and `bearer_methods_supported: ["header"]`, with
-    `Cache-Control: no-store`.
+  - A declaring Access Point answers 200 with `resource`, `authorization_servers` (the
+    strategy's `expected_issuer`), `scopes_supported` when non-empty, and
+    `bearer_methods_supported: ["header"]`, with `Cache-Control: no-store`.
   - A path two endpoints claim, or an unservable declaration, answers 503.
   - Any other path answers 404. A method other than GET and HEAD answers 405.
 - Nothing else may sit at or under the path. A gateway.json prefix there stops startup with exit
@@ -476,36 +544,46 @@ least effort. Effort is in engineer-days.
   generates, and the declaring Access Point's Transit Point cards.
   - `declare` removes `security`, `securitySchemes`, `securityRequirements`,
     `security_schemes` and `security_requirements` from the card and from every `skills[]`
-    entry and removes `signatures`. A derived declaration then adds one `agent_gateway` oauth2 scheme with
-    `oauth2MetadataUrl` set to the pinned metadata URL and a `clientCredentials` flow whose
-    `tokenUrl` is the pinned token endpoint and whose scopes are the advertised scopes. The
-    requirement lists `required_scopes`. The shape follows the card's era: the 0.3 `type` shape
-    with `security`, the 1.0 `oauth2SecurityScheme` with `securityRequirements`, or the flat shape
-    with both for a card of both eras. An explicit declaration has no pinned authorization
-    server to name, so it adds no scheme.
+    entry and removes `signatures`. When the declaration carries a pin it then adds one
+    `agent_gateway` oauth2 scheme with `oauth2MetadataUrl` set to the pinned metadata URL and a
+    `clientCredentials` flow whose `tokenUrl` is the pinned token endpoint and whose scopes are
+    the advertised scopes. The requirement lists `required_scopes`. The shape follows the card's
+    era: the 0.3 `type` shape with `security`, the 1.0 `oauth2SecurityScheme` with
+    `securityRequirements`, or the flat shape with both for a card of both eras. Without a pin
+    there is no token endpoint to name, so the card declares no scheme and the save report warns
+    `card_scheme_unavailable`; the metadata and the challenge still work.
   - `unservable` removes the security and signatures and adds no scheme.
   - A Transit Point card of a declaring Access Point loses the partner's security and signatures
     and declares nothing.
   - Every other card keeps the upstream security and signatures.
-- The public card of an Access Point with a declaration source (`declaration_source` is not
-  `None`), including one whose derived declaration strips, carries `Cache-Control: no-cache` and
-  a weak ETag over its body, so a changed declaration is never served stale: an edit to the
-  strategy can make it declare without the card changing. Such a card the gateway cannot process
-  answers 502; it is never served unrewritten. Every other card keeps its cache headers.
+- The public card of an Access Point with `protected_resource` (`secures_agent_card`,
+  `src/proxy/handler.rs`) carries `Cache-Control: no-cache` and a weak ETag over its body, so a
+  changed declaration is never served stale: an edit to the strategy can change the scheme
+  without the card changing. Such a card the gateway cannot process answers 502; it is never
+  served unrewritten. Every other card keeps its cache headers.
 - Card bodies are never logged. A served card is logged with its surface, outcome, reason, size
   and SHA-256 digest, and `agent_gateway_card_security_total{outcome,reason}` counts it.
 
 ### 9. Fabric: only the sending gateway challenges
 
 - GW1, which owns the Access Point the caller reaches, is the only resource server for the
-  caller. Its declaration, metadata and challenge describe GW1's Access Point URL, and its
-  built-in refusal runs before the Fabric send.
+  caller. Its declaration, metadata and challenge describe GW1's declared resource, and its
+  source-auth refusal runs before the Fabric send, so a failed caller never costs a Fabric round
+  trip.
 - A declaring surface on GW2 refuses a caller-attributable source authentication failure on a
   Fabric request before policy with `fabric_refusal`: 401 with `Bearer realm="agent-gateway"`
   (with `error="invalid_token"` for an invalid token), or 403 with
   `error="insufficient_scope"`. It names no metadata. Since GW1 never relays the caller's
   `Authorization` header, only a credential GW1 injects for GW2's resource can pass.
-- GW1 drops that challenge ([decision 7](#7-relayed-challenges)), so its caller sees 502.
+- GW1 answers a peer 401 that carries no `Payment` challenge, and a peer 403 with a Bearer
+  `error="insufficient_scope"` challenge, with 502, `application/problem+json` and the fixed
+  detail "The Fabric peer refused the gateway's authorization"
+  (`refuse_peer_authorization`, `src/proxy/fabric_peer_refusal.rs`; `peer_refusal`,
+  `src/source_auth/challenge.rs`). It relays no `WWW-Authenticate` and records
+  `request_rejected` at stage `forward` with reason `peer_token_refused` or
+  `peer_scope_refused`. This applies on every `fabric://` route, declaring or not, MCP and A2A
+  alike, on legacy responses and on modern MCP streams. A policy 403 and a 402 are passed on
+  unchanged.
 - A non-declaring GW2 surface hands the failure to its policy, as before. ADR 0002's caller
   requirement for `credential_provider` on GW2 is unchanged.
 
@@ -513,7 +591,7 @@ least effort. Effort is in engineer-days.
 
 - The declaration, the metadata, the audience binding, the refusal and the card are resolved for
   the Surface Variant the request selects, through its `$alias` URL. Each variant has its own
-  resource, `<route>$alias`.
+  resource, `<resource>$alias`.
 - Policy input for a request that selects an enabled variant carries
   `input.channel.variant_alias`, on the direct path as over Fabric. An alias that selects no
   enabled variant, including any alias on a surface without variants, is refused at routing and
@@ -532,41 +610,51 @@ least effort. Effort is in engineer-days.
 
 | Decision | Where it lives | What a different choice changes |
 | --- | --- | --- |
-| D1 | `refuses_failed_callers_by_default` (`src/source_auth/declaration.rs`), read by `default_refusal` in `src/proxy/caller_denial.rs` (reached from `refuse_failed_caller_by_default`, called right after gateway policy) and by the source authentication stage in `src/proxy/handler.rs` for its log and audit record; the MCP refusal at that stage, which checks the declaration and protocol directly | D1-B: the predicate returns false for A2A, and `deny_caller` already sends the challenge at each policy denial; for MCP, the source authentication branch defers and the MCP `tools/call` denial sites gain the mapping. D1-D: the predicate reads the admit rule, and the MCP refusal at the source authentication stage is changed to read the predicate too. |
-| D2 | `declaration_source` (`src/source_auth/declaration.rs`) | D2-B: it returns the explicit source only, and `supports_protected_resource` admits A2A. |
-| D3 | `Declaration::bind_audience`, `access_point_resource_url` (`src/source_auth/declaration.rs`) and `access_point_origin` (`src/protocols/protected_resource.rs`) | D3-B: `access_point_origin` accepts any listener origin. D3-C: `bind_audience` keeps the method's audiences. |
-| D4 | The Fabric receive source authentication branch in `src/gateways/connection_points/message_processor.rs`, and `Declaration::fabric_refusal` | D4-C: the branch defers to policy. D4-B: it answers with `caller_challenge`. |
-| D5 | The same predicate as D1 | D5-B: the predicate returns false for A2A and the dashboard attaches a deny-rule policy. |
+| D1 | `challenge_failed_caller` (`src/proxy/caller_denial.rs`), called by the `if let Some(declaration)` branch of the source authentication step and by `challenge_before_variant_refusal` in `src/proxy/handler.rs`; `refuses_failed_callers_by_default` (`src/source_auth/declaration.rs`) for the dry run and the save report | D1-A: that branch refuses only on MCP and a refusal after gateway policy returns. D1-B: the branch always hands the failure to policy and each policy denial maps to the challenge. D1-D: the branch reads an admit rule first. |
+| D2 | `resolve_surface_declaration` (its branch for an Access Point without `protected_resource`) and `matching_pin` (`src/source_auth/declaration.rs`); `supports_protected_resource` (`src/protocols/protected_resource.rs`); `validate_protected_resource_strategy` (`src/identity/handlers/surfaces.rs`) | D2-A: that branch derives a declaration from `required_scopes`. D2-B: the resolver advertises the stored `authorization_servers` and the save check stops comparing it with the strategy. |
+| D3 | `access_point_protected_resource` and `ProtectedResourceConfig::validate_endpoint` (`src/protocols/protected_resource.rs`); `Declaration::bind_audience`; `resolve_surface_audience` (`src/source_auth/middleware.rs`) | D3-A: `access_point_protected_resource` requires the listener's first external URL. D3-B: it accepts any listener origin. D3-C: `bind_audience` keeps the method's audiences. |
+| D4 | `Declaration::fabric_refusal` (receiving gateway); `peer_refusal` (`src/source_auth/challenge.rs`) and `refuse_peer_authorization` (`src/proxy/fabric_peer_refusal.rs`), called from `handle_fabric_request` (sending gateway) | D4-A: the two call sites are removed and the relayed-challenge filter answers alone. D4-B: the receiving gateway answers with `caller_challenge`. D4-C: the receiving branch defers to policy. |
+| D5 | The same refusal as D1 | D5-B: the D1 branch hands A2A failures to policy and the dashboard attaches a deny-rule policy. |
 
 ## Consequences
 
 ### Positive
 
-- One failure path: every source authentication failure, scope shortfalls included, carries a
-  structured kind, and one mapping turns any refusal into the right status and challenge.
-- A declaring Access Point fails closed before payment with no policy, so an operator who saves a
-  surface through the API is protected exactly as one who uses the dashboard.
-- On a declaring Access Point the card, the metadata, the challenge and the audience use one URL
-  and one scope list, so they cannot drift apart. A2A and MCP clients discover the gateway's
-  authorization server the same way.
+- One refusal point: every source authentication failure, scope shortfalls included, carries a
+  structured kind, and a declaring Access Point answers it once, at source authentication, with
+  the same problem body on every protocol.
+- A declaring Access Point fails closed before rate limiting, the body, every policy plane and
+  payment, with no policy, so an operator who saves a surface through the API is protected
+  exactly as one who uses the dashboard, and an anonymous caller learns nothing about policy.
+- Discovery is one setting the operator turns on or off with a save. It works without required
+  scopes, and its issuer follows the strategy without a surface save.
+- On a declaring Access Point the card, the metadata, the challenge and the audience use one
+  declared resource and one scope list, so they cannot drift apart, and the resource does not
+  change when the listener's external URLs are reordered. A2A, AP2 and MCP clients discover the
+  gateway's authorization server the same way.
+- Over Fabric, every peer authorization refusal reaches the caller as one 502 that leaks nothing
+  of the receiving gateway, and the sending gateway records it.
 - Surfaces that set none of the new settings answer as before, except for the changes listed
   below, and existing MCP records keep their metadata and challenge.
-- Each open decision changes only the functions named under Isolation points if it is decided
+- Each decision changes only the functions named under Isolation points if it is decided
   differently.
 
 ### Negative, with mitigations
 
 | Consequence | Mitigation |
 | --- | --- |
-| No policy can admit a failed caller on a declaring Access Point | Only Access Points the operator made declare; removing `required_scopes` or the pin returns to "OPA decides". D1-D is the isolated follow-up if an admit rule is needed. |
-| MCP responses that differ from the previous release: `InsufficientScope` is 403 instead of 503; the challenge's `scope` names `required_scopes` only; a metadata-path prefix stops startup instead of disabling the listener's metadata; relayed challenges are dropped on a declaring MCP Access Point; an MCP Access Point without `protected_resource` can declare from `required_scopes` | Each is a changelog entry and is documented in [`MCP_METADATA.md`](../MCP_METADATA.md); `make mcp-conformance` differs only in these |
-| Every `fabric://` surface's relayed Target 401 becomes 502 | Changelog breaking entry; the 502 detail names the gateway's credential, which the operator fixes; [open question 3](#open-questions) |
-| A declaring GW2 surface admits only a credential GW1 injects for GW2's resource, and its refusal reaches GW1's caller as 502 | Documented in [`FABRIC.md`](../FABRIC.md); a save warning for a declaration on a surface reached only over Fabric is future work |
-| Declaring needs non-empty `required_scopes` and a pinned authorization server, so some `jwt_bearer` Access Points strip | The reason code is logged on every card and resolution; a save-time report is future work |
-| A listener with several public hosts declares only its first | Documented; D3-B is the isolated alternative |
+| No policy can admit a failed caller on a declaring Access Point | Only Access Points the operator made declare; removing `protected_resource` (PATCH it to `null`) returns to "OPA decides". D1-D is the isolated follow-up if an admit rule is needed. |
+| Gateway policy and its audit no longer see failed callers on a declaring A2A or AP2 Access Point, and a gateway rule used as an IP deny list answers such a caller 401 with `resource_metadata` instead of 403 | The blocking `auth_failed` record names every refused caller; the caller is still refused and nothing is forwarded or paid. A pre-sign-in network rule is [open question 7](#open-questions). |
+| A failed caller of a declaring Access Point does not count against the surface rate limit | Each refusal costs a JWT parse and a signature check against cached keys, with no network call; the same holds for MCP before this decision. A per-address throttle is [open question 8](#open-questions). |
+| MCP responses that differ from the previous release: `InsufficientScope` is 403 instead of 503; the challenge's `scope` names `required_scopes` only; a metadata-path prefix stops startup instead of disabling the listener's metadata; relayed challenges are dropped on a declaring MCP Access Point; the advertised `authorization_servers` is the strategy's `expected_issuer`, not the stored list; a declaring MCP Access Point whose strategy is missing or names an issuer metadata cannot name answers 503 | Each is a changelog entry and is documented in [`MCP_METADATA.md`](../MCP_METADATA.md); the save report warns `authorization_servers_stale`; `make mcp-conformance` differs only in these |
+| Every `fabric://` surface's relayed Target 401 becomes 502 | Changelog breaking entry; the 502 detail names the gateway's credential, which the operator fixes |
+| A receiving gateway's 403 `insufficient_scope` reaches the sending gateway's caller as 502 | The `request_rejected` record (`peer_scope_refused`) on the sending gateway says which; the caller cannot fix it in either case |
+| A sending gateway older than this release still relays the receiving gateway's 401 and its challenge | Upgrade sending gateways before receiving ones ([`FABRIC.md`](../FABRIC.md)) |
+| A declaring GW2 surface admits only a credential GW1 injects for GW2's resource | Documented in [`FABRIC.md`](../FABRIC.md); the save report warns `fabric_only_declaration` for a declaration on a surface reached only over Fabric |
+| A `protected_resource` without `authorization_servers`, or on an A2A or AP2 Access Point, cannot be served by an older release | Rollback steps under [Migration](#migration-and-change-management) |
+| A strategy edit to an issuer metadata cannot name turns its declaring Access Points 503 (`issuer_not_advertisable`), and the strategy save does not warn | The save report and the card metric name the reason; a strategy-save check is [open question 9](#open-questions) |
 | A policy keyed on `variant_alias` may now match direct requests | Changelog `changed` entry |
 | A surface whose route holds `$` or `%24` can no longer be saved | Such a route was unreachable as written; changelog `fixed` entry |
-| An older release does not declare from `required_scopes`, so after a downgrade its failed callers reach policy, and it does not enforce `required_scopes` | ADR 0001 rollback rules; the changelog tells operators to attach a deny policy before rolling back |
 
 ## Security considerations
 
@@ -576,31 +664,37 @@ least effort. Effort is in engineer-days.
 
 | Threat (STRIDE) | Control |
 | --- | --- |
-| Spoofing: an ID token, or a token for a sibling resource or variant, accepted as an access token | `bind_audience` narrows a declaring route to exactly its URL; with `required_scopes` set, `nonce`, `at_hash` and a non-access-token `typ` fail as invalid |
+| Spoofing: an ID token, or a token for a sibling resource or variant, accepted as an access token | `bind_audience` narrows a declaring route to exactly its declared resource; with `required_scopes` set, `nonce`, `at_hash` and a non-access-token `typ` fail as invalid |
 | Spoofing: a gateway policy trusts an `iss` claim a tenant strategy can also produce | Policy input carries `strategy_id` and `strategy_tenant_id`; [`POLICY.md`](../POLICY.md) tells authors to key on them |
 | Spoofing: a Target challenge sends the caller to an authorization server of the Target's choosing | Relayed challenges other than `Payment` are dropped on declaring Access Points and `fabric://` Targets |
+| Spoofing: metadata names an issuer the validator does not trust | The advertised issuer is the strategy's `expected_issuer`, read on every request; a stored list must equal it at save |
 | Tampering: header injection through `scope` in `WWW-Authenticate` | Scope tokens validated on save and at startup; one module builds the header from validated values |
 | Information disclosure: failure reason, key id or JWKS host in a response; full cards in logs | Fixed `detail`, no `error_description`; card bodies replaced by a digest in logs |
+| Information disclosure: a 401 or 403 split reveals what gateway policy allows an anonymous caller | No policy runs before the challenge on a declaring Access Point |
+| Information disclosure: the receiving gateway's realm, error and scopes reach the caller | The sending gateway answers a peer authorization refusal with 502 and a fixed detail, and relays no challenge |
 | Information disclosure: the upstream card names the Target's authorization server | Replaced on a declaring Access Point's cards and its Transit Point cards; other cards are open question 2 of ADR 0001 |
-| Elevation of privilege: a failed caller reaches a paid or forwarded stage | The built-in refusal before AP2, payment and forwarding on every declaring Access Point; a store failure answers 503 |
-| Elevation of privilege: the caller's gateway-audience token forwarded to the Target | A declaring Access Point never forwards it; a derived candidate with `forward_header` does not declare |
+| Elevation of privilege: a failed caller reaches a paid or forwarded stage | Refused at source authentication, before rate limiting, the body, every policy plane, AP2, payment and forwarding, on every declaring Access Point; a store failure answers 503 |
+| Elevation of privilege: the caller's gateway-audience token forwarded to the Target | A declaring Access Point never forwards it; `protected_resource` with `forward_header` is refused at save and unservable when stored |
 | Elevation of privilege: a GW2 Target reached with a caller GW2 never authenticated | GW2's declaring surface refuses before policy; ADR 0002's caller requirement for `credential_provider` |
 | Denial of service: a colliding route takes a listener down on reload | Collisions are refused before the listener is swapped |
-| Denial of service: unauthenticated metadata or refusal traffic | No network call on the card, metadata or refusal path |
-| Repudiation | `auth_failed` audit events with the failure kind and whether the gateway refused; the card outcome and reason in logs and metrics |
+| Denial of service: anonymous bodies read and parsed | Refused before the body is read on a declaring Access Point |
+| Denial of service: unauthenticated metadata or refusal traffic | No network call on the card, metadata or refusal path; the refusal is not rate limited ([open question 8](#open-questions)) |
+| Repudiation | `auth_failed` audit events with the failure kind and whether the gateway refused; `request_rejected` with `peer_token_refused` or `peer_scope_refused` on the sending gateway; the card outcome and reason in logs and metrics |
 
 - **Least privilege and tenancy:** a surface declares only from a strategy its tenant may
-  reference (row 7); no new permission is granted.
+  reference (`strategy_unavailable` otherwise); no new permission is granted.
 - **Tokens:** algorithm, expiry and issuer checks are ADR 0001's. Hop 1 access tokens stay bearer
   tokens: a replayed token is accepted until its `exp`, with no `jti` cache, and
   sender-constrained tokens ([RFC 9449](https://www.rfc-editor.org/rfc/rfc9449)) are not in
-  scope.
+  scope. The caller's token never crosses Fabric.
 
 ## Performance, scalability and cost
 
 - The declaration is resolved once per request from the in-memory surface and strategy stores
-  and kept on the request state. A surface without `required_scopes` and without
-  `protected_resource` never reads the strategy store.
+  and kept on the request state. A surface without `protected_resource` never reads the strategy
+  store for a declaration. A declaring one reads the same in-memory strategy store the JWT
+  verifier already reads.
+- A refused failed caller costs no body read, no rate-limit accounting and no policy evaluation.
 - The card, the metadata route and the refusal add no network call and no I/O.
 - The target is under 1 ms of added p95 latency per card, metadata or refusal response. It has
   not been measured; the component tests exercise each path.
@@ -613,38 +707,56 @@ No new store and no new stored field beyond ADR 0001's `required_scopes` and `sc
 
 | Record | Change | Type | Default | Purpose |
 | --- | --- | --- | --- | --- |
-| `JwtBearerAuthConfig` | `required_scopes` (ADR 0001) | String list, validated | Empty | Scope enforcement and the derived declaration |
+| `JwtBearerAuthConfig` | `required_scopes` (ADR 0001) | String list, validated | Empty | Scope enforcement and the advertised scopes |
 | `JwtVerificationStrategy` | `scope_claims` | String list | Absent, read as `scope` then `scp` | Claims read for granted scopes |
+| `ProtectedResourceConfig` | `authorization_servers` becomes optional; the setting is accepted on A2A and AP2 Access Points | `Option<Vec<String>>`, equal to `["<expected_issuer>"]` when present | Absent | Kept for records that list it; never advertised |
+| `ProtectedResourceConfig` | `scopes` | String list | Empty | Extra advertised scopes |
 | Policy input, failed caller (not stored) | `kind` | `missing`, `invalid`, `insufficient_scope` | n/a | Status and challenge choice |
 | Policy input, `jwt_bearer` caller (not stored) | `scopes`, `client_id`, `strategy_id`, `strategy_tenant_id` | Strings | n/a | Provider-neutral policy input |
 | Request state (not stored) | The declaration outcome | Enum | n/a | Read by every consumer for the request |
+| Audit (not stored by the gateway) | `request_rejected` reasons `peer_token_refused`, `peer_scope_refused` | Strings | n/a | Where a Fabric request failed |
 
 - **Access patterns, TTL, delete, encryption and locality:** unchanged from ADR 0001.
-- **Data minimisation:** the declaration is derived on each request and never stored.
+- **Data minimisation:** the declaration is resolved on each request and never stored.
 
 ## Migration and change management
 
 The contract ships in one release. What it changes and what gates it:
 
 - **Existing MCP `protected_resource` records** keep their metadata and challenge, except for the
-  MCP responses listed under [Consequences](#negative-with-mitigations).
-- **Surfaces that set neither `required_scopes` nor `protected_resource`** keep their
-  responses, except for the other changes listed there.
+  MCP responses listed under [Consequences](#negative-with-mitigations). A record whose stored
+  `authorization_servers` differs from its strategy's issuer loads and advertises the issuer;
+  the save report warns `authorization_servers_stale`, and the next save must send the issuer
+  or omit the list.
+- **Surfaces that set no `protected_resource`** keep their responses, except for the other
+  changes listed there. D2-A was never released, so no released record declares through
+  `required_scopes` alone, and operators of the previous release see no change in which MCP
+  surfaces declare.
+- **Upgrade order:** sending gateways of Fabric routes before receiving ones, so a receiving
+  gateway's refusal is never relayed to a caller.
 - **Conformance:** `make mcp-conformance` differs from the previous release only in the listed
   MCP responses, and the existing MCP discovery tests pass.
-- **Gating tests:** component tests for every declaration outcome and both card eras; BDD
-  features for the A2A challenge, card security, metadata and an Access Point that does not
-  declare; `source_authentication_http.feature` unchanged.
+- **Gating tests:** unit tests for the refusal order, every declaration outcome and the peer
+  refusal mapping; component tests for every declaration outcome, both card eras and the request
+  order; BDD features for the A2A challenge, card security, metadata, the opt-in, and an Access
+  Point that does not declare; `source_authentication_http.feature` unchanged.
 
-- **Rollback:** as in ADR 0001. Per Access Point, removing `required_scopes` or clearing the
-  strategy's pin returns it to `strip`: no metadata, no challenge, the upstream card and failed
-  callers handed to policy. A release rollback stops the derived declaration and the built-in
-  refusal, so attach a deny policy to each declaring Access Point first.
+- **Rollback:** as in ADR 0001, plus:
+  1. A `protected_resource` stored without `authorization_servers` cannot be read by an older
+     release, which skips the surface (404, fail closed). Before rolling back, PATCH it with
+     `"authorization_servers": ["<strategy expected_issuer>"]`.
+  2. An A2A or AP2 surface with `protected_resource` answers 503 on an older release and cannot
+     be saved there. Before rolling back, attach a gateway policy denying
+     `input.source_auth.method == "failed"` and PATCH `"protected_resource": null`.
+  3. `peer_token_refused` and `peer_scope_refused` records stay in audit sinks; an older sending
+     gateway writes none and relays the receiving gateway's 401.
+  - Per Access Point, PATCH `protected_resource` to `null`: no metadata, no challenge, the
+    upstream card and failed callers handed to policy.
 - **Backward compatibility:** surfaces that do not declare keep their responses; existing MCP
   `protected_resource` records keep theirs except the listed responses; no new stored field.
-- **Communication:** changelog entries for the declaring Access Point, the A2A challenge, the
-  card, the variant alias and each MCP difference, with upgrade notes on breaking entries; the
-  hosted source authentication and policy pages.
+- **Communication:** changelog entries for the opt-in on A2A and AP2, the refusal at source
+  authentication, the card, the Fabric peer refusal, the variant alias and each MCP difference,
+  with upgrade and rollback notes; the hosted source authentication and policy pages.
 
 ## Diagrams
 
@@ -657,19 +769,15 @@ sequenceDiagram
     end
     box "GW1 trust zone"
     participant SA as Source authentication
-    participant GP as Appliance and gateway policy
-    participant R as Built-in refusal
-    participant PAY as AP2 and payment
+    participant PAY as Rate limit, policy, AP2 and payment
     participant PRM as Metadata route
     end
     C->>SA: SendMessage, token without required scope
     SA->>SA: validate, then scope check
-    SA->>GP: source_auth = failed, kind = insufficient_scope
-    GP-->>R: allow
-    R-->>C: "403, WWW-Authenticate: Bearer resource_metadata, error=insufficient_scope"
-    Note over PAY: never reached
+    SA-->>C: "403, WWW-Authenticate: Bearer resource_metadata, error=insufficient_scope"
+    Note over PAY: never reached, body never read
     C->>PRM: "GET /.well-known/oauth-protected-resource/route"
-    PRM-->>C: "resource = Access Point URL, authorization_servers = [issuer]"
+    PRM-->>C: "resource = declared resource, authorization_servers = [expected_issuer]"
 ```
 
 ### Declaration outcome
@@ -677,20 +785,14 @@ sequenceDiagram
 ```mermaid
 flowchart TD
     S["Request, card or metadata for a Surface Variant"] --> E{"protected_resource?"}
-    E -- yes --> ES{"Servable?"}
+    E -- yes --> ES{"Servable: protocol, fields, JWT Bearer method, resource on the listener and route, strategy and issuer?"}
     ES -- yes --> D["declare"]
     ES -- no --> U["unservable: 503"]
     E -- no --> N{"Caller authentication?"}
+    N -- yes --> X["strip: not_declared"]
     N -- no --> F{"fabric:// Target?"}
-    F -- yes --> X["strip"]
+    F -- yes --> XF["strip: fabric_target"]
     F -- no --> P["pass_through"]
-    N -- yes --> J{"One jwt_bearer with required_scopes, not a root variant?"}
-    J -- no --> X
-    J -- yes --> K{"Strategy readable?"}
-    K -- no --> U
-    K -- yes --> V{"Pinned, Remote JWKS, Authorization Bearer, no forward_header, URL in audiences?"}
-    V -- no --> X
-    V -- yes --> D
 ```
 
 ### Fabric
@@ -702,8 +804,9 @@ flowchart LR
     end
     subgraph GW1 zone
       AP["Access Point (resource server)"]
-      RF["Built-in refusal"]
+      RF["Source-auth refusal"]
       PRM["Metadata"]
+      PR["Peer refusal: 502, audited"]
     end
     subgraph GW2 zone
       RX["Fabric receive"]
@@ -716,7 +819,8 @@ flowchart LR
     RF -- "authcrypt envelope; Authorization not relayed" --> RX
     RX -- "declaring surface, failed caller" --> FR
     RX --> T
-    FR -- "challenge dropped at GW1, caller sees 502" --> AP
+    FR -- "401 or 403 insufficient_scope" --> PR
+    PR -- "challenge never relayed" --> AP
 ```
 
 ## References
@@ -730,14 +834,16 @@ flowchart LR
 - [`PROTOCOLS.md`](../PROTOCOLS.md)
 - [`MCP_METADATA.md`](../MCP_METADATA.md)
 - [`FABRIC.md`](../FABRIC.md)
+- [`OBSERVABILITY.md`](../OBSERVABILITY.md)
 - [`CONTEXT.md`](../../CONTEXT.md)
 
 **Standards and specifications:**
 - [RFC 6749 §3.3, scope](https://www.rfc-editor.org/rfc/rfc6749#section-3.3)
 - [RFC 6750 §3, the WWW-Authenticate response header](https://www.rfc-editor.org/rfc/rfc6750#section-3)
+- [RFC 7519 §4.1.3, the `aud` claim](https://www.rfc-editor.org/rfc/rfc7519#section-4.1.3)
 - [RFC 8707](https://www.rfc-editor.org/rfc/rfc8707)
 - [RFC 9068, JWT profile for OAuth 2.0 access tokens](https://www.rfc-editor.org/rfc/rfc9068)
-- [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728)
+- [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728), and [§5, use of WWW-Authenticate](https://www.rfc-editor.org/rfc/rfc9728#section-5)
 - [A2A specification](https://a2a-protocol.org/latest/specification/)
 - [Microsoft identity platform access token claims](https://learn.microsoft.com/en-us/entra/identity-platform/access-token-claims-reference)
 
@@ -746,21 +852,26 @@ flowchart LR
 | # | Question | Owner | Resolves by |
 | --- | --- | --- | --- |
 | 1 | Which team owns this ADR (the Team field)? Same question as ADR 0001 open question 1. | Kajal Sinha | Before the ADR is accepted |
-| 2 | Are the defaults for D1 to D5 accepted? Each alternative is isolated as listed under [Isolation points](#11-isolation-points). | Anton Iskryzhytskyi | Before the ADR is accepted |
-| 3 | Should relayed-challenge stripping exclude `fabric://` surfaces whose Access Point forwards the caller's token, so their relayed 401 is kept? Default: every `fabric://` Target strips. | Kajal Sinha | Before the ADR is accepted |
-| 4 | Should a stored surface at the metadata path stop startup rather than be logged and skipped? Default: logged and skipped. | Kajal Sinha | Before the ADR is accepted |
-| 5 | Should a deleted strategy (`ConfigNotFound`) answer 403 rather than the existing 500? Default: 500, as before this decision. | Kajal Sinha | Before the ADR is accepted |
+| 2 | Is the alignment of D1 to D5 with the owner's recommendation recorded as agreed? Each alternative is isolated as listed under [Isolation points](#11-isolation-points). | Anton Iskryzhytskyi | Before the ADR is accepted |
+| 3 | Does an AP2 Access Point declare with `protected_resource`? Built: yes, as an A2A Access Point. | Anton Iskryzhytskyi | Before the ADR is accepted |
+| 4 | Is `scopes_supported` the union of `required_scopes` and the extra stored `scopes`, or `required_scopes` only? Built: the union, required first. | Anton Iskryzhytskyi | Before the ADR is accepted |
+| 5 | Does a declaring A2A Access Point whose strategy has no matching pin declare without a card scheme, or is the save refused? Built: it declares and the save report warns `card_scheme_unavailable`. | Anton Iskryzhytskyi | Before the ADR is accepted |
+| 6 | Should a stored surface at the metadata path stop startup rather than be logged and skipped? Default: logged and skipped. | Kajal Sinha | Before the ADR is accepted |
+| 7 | Should a network rule (IP allow or deny) run before source authentication, so an anonymous caller a gateway rule denies gets 403 rather than the challenge? Default: no; gateway policy runs after the refusal. | Kajal Sinha, Anton Iskryzhytskyi | Follow-up ADR if needed |
+| 8 | Should anonymous refusals on a declaring Access Point be throttled per address? Default: not throttled, as for MCP before this decision. | Kajal Sinha | Follow-up |
+| 9 | Should a strategy save refuse or warn when its new issuer would leave declaring Access Points unservable? Default: no check; the save report names `issuer_not_advertisable`. | Kajal Sinha | Follow-up |
+| 10 | Should a Transit Point's Fabric forward, and the gateway STS as a receiving resource server, take part in the peer refusal and the declaration? Default: out of scope. | Anton Iskryzhytskyi | Follow-up ADR if needed |
+| 11 | Should a deleted strategy (`ConfigNotFound`) on an Access Point that does not declare answer 403 rather than the existing 500? Default: 500, as before this decision. A declaring one answers 503 (`strategy_unavailable`). | Kajal Sinha | Before the ADR is accepted |
 
 ## Future work
 
-- A save-time report of each Surface Variant's declaration outcome and reason, and of policies
-  that admit failed callers on Access Points that do not declare, with a read endpoint that
-  recomputes it; a save warning for a declaration on a surface reached only over Fabric.
-- The dashboard's caller authentication controls for the derived declaration, and an agent card
-  preview.
+- A sign-in-required switch for JWT Bearer Access Points that do not publish discovery.
+- A pre-sign-in network rule stage (IP allow or deny), if [open question 7](#open-questions)
+  needs it.
 - A policy rule that admits failed callers on a declaring Access Point (D1-D), if one is needed.
 - Gateway-signed cards, and `apiKey`, `mutualTLS` and `http` declarations (ADR 0001 future work).
 - Declarations for Transit Points and for the gateway's own STS.
-- Carrying the sending gateway's caller authentication outcome over Fabric.
+- Carrying the sending gateway's caller authentication outcome over Fabric, and a two-gateway
+  test harness that configures a declaring receiving gateway.
 
 Each item gets its own ADR when it changes a contract.

@@ -175,7 +175,7 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   that isn't a comma-separated list of HTTP status codes (100 to 599) blocks Save. Test
   ids: `networking-retry-status-codes-input` and
   `networking-retry-connection-errors-only-switch`.
-- **Caller Context** (JWT bearer) on an A2A, AP2 or MCP surface carries the declaration controls in
+- **Caller Context** (JWT bearer) on an A2A, AP2 or MCP surface carries the authorization server discovery controls in
   one section, `caller-auth/CallerAuthDiscoverySection.tsx` (`caller-auth-discovery`), for all three
   protocols; DIDComm has none of them. It mounts `ScopesInput.tsx`, the **Required Scopes** chip
   input (test ids `caller-auth-scopes`, `caller-auth-scope-input`, `caller-auth-scope-add` and
@@ -186,45 +186,72 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   scope input. The field round-trips through
   `definition.ts` as `required_scopes` on the `jwt_bearer` method, is left out when empty, and
   `validate` reports scopes the gateway would refuse.
-- Without an explicit discovery setting, the section shows what the derived declaration publishes
-  (`caller-auth-discovery-derived`, headed "What the agent card declares" on A2A and AP2 and "What
-  the protected resource metadata declares" on MCP). With no required scope it says it declares
-  nothing (`-derived-off`). Otherwise it lists the selected strategy's pinned authorization server
-  (`-derived-authorization-server`; when the strategy is not pinned or its pin no longer matches,
-  `-strategy-link` opens `/jwt-verification-strategies/<id>` to run Discover), the required scopes
-  (`-derived-scopes`) and the Access Point URL the gateway reports in
-  `GET /api/v1/surfaces/{id}/declarations` (`-derived-audience`). **Add to Accepted Audiences**
-  (`-add-audience-button`) appends that URL while it is not listed; the confirmation "Listed in
-  Accepted Audiences." (`-audience-listed`) appears in a persistent status region
-  (`-audience-status`) and takes focus after the button adds it. Advice notes from
-  `derivedDeclarationNotes` (`protectedResource.ts`: `custom_token_header`, `forwards_caller_token`,
-  `audience_missing`) sit in a status region (`-derived-notes`, `-derived-note-<code>`). The
-  section shows what the served card or metadata will carry and never a token or a secret.
-- The Caller Context editor's intro (`caller-auth-jwt-intro`) says that while the Access Point
-  declares its authorization server, a missing or invalid token gets `401` with a challenge and a
-  token short of a required scope gets `403` `insufficient_scope` before policy and payment run;
-  otherwise a failed caller reaches policy as `source_auth.method == "failed"`. While the route
-  declares, `caller-auth-audiences-declared-note` says only tokens for the Access Point URL are
-  accepted. The strategy select is `caller-auth-jwt-strategy` and the audience input
-  `caller-auth-audience-input`, each with a `htmlFor` label; audience chips are named
-  `Remove audience <audience>`.
+- **Authorization server discovery** is the one switch of that section
+  (`caller-auth-discovery-explicit`, switch `caller-auth-discovery-switch`, described by
+  `caller-auth-discovery-switch-help`, with `field-help-caller-auth-discovery`). It is the single
+  opt-in by which an A2A, AP2 or MCP Access Point with a JWT Bearer method declares, and it edits
+  `caller_authentication.protected_resource`. Required scopes alone never declare. While it is off,
+  `caller-auth-discovery-off-summary` (a status region) says that no protected resource metadata is
+  published (on A2A and AP2 the card keeps the managed agent's own security) and that a caller whose
+  token is missing, invalid or short of a scope reaches policy as `source_auth.method == "failed"`,
+  so a policy has to deny it. Turning it off on a saved surface whose stored setting is on shows
+  `caller-auth-discovery-off-warning`, because the gateway then stops refusing failed callers itself.
+- Turning discovery on prefills the resource with the Access Point's https listener URL plus its
+  route (left empty otherwise, and then `caller-auth-discovery-resource-hint` says there is nothing
+  to suggest), moves focus to the resource input, empties Accepted Audiences, turns token
+  forwarding off and sets the `Authorization` header with the `Bearer` scheme; each of those
+  controls stays locked while discovery is on, once it holds that value, and
+  `caller-auth-discovery-cleared` says what was removed. The resource input
+  (`caller-auth-discovery-resource-input`) is `aria-invalid` and described by its hint and error
+  while it has a problem. The banner says what changes: protected resource metadata is published on
+  the Access Point's listener, a caller without a valid token gets `401` with a challenge and a token
+  short of a required scope gets `403` `insufficient_scope`, both before rate limiting, any policy,
+  the AP2 gate and payment, a token is accepted when the resource URL is one of its audiences, and
+  the token is never forwarded to the managed agent.
+- Below the resource, a read-only definition list (`caller-auth-discovery-derived`, headed "What
+  callers are told") shows what the gateway publishes, never a token or a secret. The authorization
+  server is the selected strategy's `expected_issuer` (`-derived-authorization-server`, with its
+  source line `-derived-authorization-server-source`, "From the JWT verification strategy <name>";
+  "Select a JWT verification strategy." when none is selected). The scopes are the Required Scopes
+  plus any stored extra scopes (`-derived-scopes`, `-derived-scopes-source`; "None required" when
+  empty, and callers without a valid token are still refused). The audience is the resource, or
+  `<resource>$<alias>` on a variant (`-derived-audience`, `-derived-audience-source`). On A2A and
+  AP2, `-card-pin` shows the strategy's pinned authorization server that the card's security scheme
+  names; when the strategy is not pinned or its pin no longer matches, `-strategy-link` opens
+  `/jwt-verification-strategies/<id>` to run Discover.
+- A surface that stores more than a resource shows `caller-auth-discovery-stored-overrides`: a stored
+  `authorization_servers` list with **Use the strategy's issuer**
+  (`-clear-authorization-servers-button`) and stored extra `scopes` with **Advertise required
+  scopes only** (`-clear-scopes-button`). The gateway advertises the strategy's issuer, so a stored
+  list that is not exactly `[expected_issuer]` blocks the save and shows
+  `caller-auth-discovery-authorization-servers-error`. The editor has no input to add an
+  authorization server or an advertised scope.
+- The Caller Context editor's intro (`caller-auth-jwt-intro`) says that while Authorization server
+  discovery is on, a missing or invalid token gets `401` with a challenge and a token short of a
+  required scope gets `403` `insufficient_scope` before rate limiting, any policy, the AP2 gate and
+  payment; otherwise a failed caller reaches policy as `source_auth.method == "failed"`. While
+  discovery is on, `caller-auth-audiences-discovery-note` says Accepted Audiences stay empty because
+  the resource URL is the audience. The strategy select is `caller-auth-jwt-strategy` and the
+  audience input `caller-auth-audience-input`, each with a `htmlFor` label; audience chips are
+  named `Remove audience <audience>`.
 - The **declaration outcome chip** (`DeclarationOutcomeChip.tsx`, `caller-auth-outcome`,
   `caller-auth-outcome-chip`, `caller-auth-outcome-icon`, `caller-auth-outcome-detail`) shows the
   outcome for the variant being edited (`activeVariantAlias`, the base when none) from
   `GET /api/v1/surfaces/{id}/declarations`, labelled **Agent card:** on A2A and AP2 and **Protected
-  resource metadata:** on MCP. The outcomes are **Declares OAuth**, **Security removed from card**
-  (**Not declared** on MCP, with the reason text from `STRIP_REASON_TEXT`, which uses the editor's
-  terms **Access Point URL** and **Accepted Audiences**), **Upstream card unchanged** (**No
-  metadata published** on MCP) and **Cannot be served** (`unservable`, with the action for its
-  reason code from `UNSERVABLE_REASON_TEXT`, or a general sentence when the reason is missing or
-  unknown). The chip is the shared
+  resource metadata:** on MCP. The outcomes are **Declares OAuth**, **Not declared** (on every
+  protocol, with the reason text from `STRIP_REASON_TEXT`: `not_declared` reads "Authorization
+  server discovery is off for this route."; on A2A and AP2 the detail adds that the card keeps the
+  managed agent's own security), **Upstream card unchanged** (**No metadata published** on MCP)
+  and **Cannot be served** (`unservable`, with the action for the reason code from
+  `UNSERVABLE_REASON_TEXT`, which has exactly the gateway's nine codes, or a general sentence when
+  the reason is missing or unknown). The chip is the shared
   `Badge` (tinted `app-badge`, tones success, warning, danger and secondary, with the class
   `caller-auth-outcome-chip`; `SurfaceBuilder.css` darkens the light warning text of this chip and
   of the Agent Cards badges to `#92400e` to keep 4.5:1 contrast), never a solid `badge text-bg-*`. Each badge carries an icon and a text label, never
   colour alone. It reflects the saved surface, so a new
   surface shows "Outcome shown after the first save", and a failed read, or a gateway without that
   endpoint, shows "<noun> outcome unavailable" without breaking the page. It appears in the Caller
-  Context sidebar (`caller-auth-panel-outcome`, beside the MCP discovery status line) and in the
+  Context sidebar (`caller-auth-panel-outcome`, beside the discovery status line) and in the
   editor under the intro, with a **See the card** link button (`caller-auth-outcome-card-link`)
   that opens the Agent Cards view, shown only on A2A and AP2 for a saved surface. A view switch
   started from content (**See the card**, **View agent cards**, **Open the Surface view**) goes
@@ -245,39 +272,41 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   (`surface-warnings-copy-gateway-rule`), which copies `GATEWAY_DENY_FAILED_CALLERS_REGO`, the
   same rule under `package gateway.policy`, with the matching hint
   (`surface-warnings-copy-gateway-rule-hint`) for the gateway policy; a surface policy cannot fix
-  that warning because payment runs before it. The dashboard never creates or attaches either
-  policy itself. Surface Detail reads `GET /api/v1/surfaces/{id}/declarations` (the
+  that warning because payment runs before it. When the surface has a JWT Bearer first method on
+  a protocol that can declare and no `protected_resource`, the fail-open block also shows
+  `surface-warnings-discovery-hint` (the `offersDiscovery` prop, set by Surface Detail), pointing
+  at the **Authorization server discovery** switch as the other way to refuse failed callers. The
+  dashboard never creates or attaches either policy itself. Surface Detail reads `GET /api/v1/surfaces/{id}/declarations` (the
   `useSurfaceDeclarations` hook, refreshed after each save), so it shows the current result, not
   the snapshot from the last save, and falls back to the save response when that read is
   unavailable. After creating a surface whose response carries warnings, the dashboard opens
   Surface Detail instead of the list so they stay visible (`surfacePathAfterCreate`).
   `toBackendSurface` never sends `warnings` or `declarations` back.
-- **Authorization server discovery**, the explicit block of the same section
-  (`caller-auth-discovery-explicit`), edits `caller_authentication.protected_resource` in the
-  Caller Context editor of an MCP surface whose method is JWT Bearer. Turning it on prefills the
-  resource with the Access Point's https listener URL plus its route (left empty otherwise),
-  empties Accepted Audiences, turns token forwarding off and sets the `Authorization` header with
-  the `Bearer` scheme; each of those controls stays locked while discovery is on, once it holds
-  that value. Authorization servers (1 to 8) and **Advertised Scopes** are lists checked as each
-  value is added; the banner says required scopes are enforced and listed first in
-  `scopes_supported`, followed by the advertised ones, which are not. `protectedResource.ts`
-  mirrors the gateway's save rules, which block Save. Leaving JWT Bearer drops the setting. A
-  variant shows the resource it advertises, `<resource>$<alias>`, and keeps its own setting. A
-  failed save whose message names the setting shows in the section and in the sidebar, which also
-  shows whether discovery is on.
+- `protectedResource.ts` mirrors the gateway's save rules, which block Save: the resource must be a
+  public https URL of the Access Point's listener followed by its route, a variant of an Access
+  Point on `/` has no resource of its own (`rootVariantProblem`, also a feature dependency of the
+  editor), and a stored list must match the strategy's issuer. Leaving JWT Bearer drops the setting.
+  A variant shows the resource it advertises, `<resource>$<alias>`, and keeps its own setting. A
+  failed save whose message names the setting shows in the section (the resource message under the
+  resource input, the issuer messages under the stored overrides, others in
+  `caller-auth-discovery-save-error`) and in the sidebar, which also shows whether Authorization
+  server discovery is on or off.
 - A PUT that leaves out a stored `protected_resource` keeps it, so Save sends a setting the
   operator switched off as `protected_resource: null` in the same PUT
   (`withDroppedProtectedResourcesRemoved`), for the surface and each variant. A save that fails
   leaves it in place. The default variant's note says it also answers on the surface's route
   with the resource as written.
 
-| Element                                                        | Test id                                                                                                                                                                                            |
-| -------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Discovery switch, resource, use listener URL                   | `caller-auth-discovery-switch`, `caller-auth-discovery-resource-input`, `caller-auth-discovery-use-listener-url-button`                                                                            |
-| List, where `<list>` is `authorization-server` or `scope`      | `caller-auth-discovery-<list>-input`, `caller-auth-discovery-add-<list>-button`, `caller-auth-discovery-<list>-<index>`, `caller-auth-discovery-remove-<list>-<index>-button`                      |
-| Variant resource, default variant note, rules explainer toggle | `caller-auth-discovery-variant-resource`, `caller-auth-discovery-default-variant-note`, `caller-auth-discovery-context-toggle`                                                                     |
-| Errors                                                         | `caller-auth-discovery-save-error`, `caller-auth-discovery-rules-error`, `caller-auth-discovery-resource-error`, `caller-auth-discovery-<list>s-error`, `caller-auth-discovery-<list>-input-error` |
-| Sidebar status and error                                       | `caller-auth-panel-discovery-status`, `caller-auth-panel-discovery-save-error`                                                                                                                     |
+| Element                                                        | Test id                                                                                                                                                                                                                                                                                                                                                                                                       |
+| -------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Discovery switch, its help and the off summary                 | `caller-auth-discovery-switch`, `caller-auth-discovery-switch-help`, `caller-auth-discovery-off-summary`, `caller-auth-discovery-off-warning`, `caller-auth-discovery-cleared`                                                                                                                                                                                                                                |
+| Resource, hint, use listener URL                               | `caller-auth-discovery-resource-input`, `caller-auth-discovery-resource-hint`, `caller-auth-discovery-use-listener-url-button`                                                                                                                                                                                                                                                                                |
+| What callers are told                                          | `caller-auth-discovery-derived`, `caller-auth-discovery-derived-authorization-server`, `caller-auth-discovery-derived-authorization-server-source`, `caller-auth-discovery-derived-scopes`, `caller-auth-discovery-derived-scopes-source`, `caller-auth-discovery-derived-audience`, `caller-auth-discovery-derived-audience-source`, `caller-auth-discovery-card-pin`, `caller-auth-discovery-strategy-link` |
+| Stored overrides                                               | `caller-auth-discovery-stored-overrides`, `caller-auth-discovery-clear-authorization-servers-button`, `caller-auth-discovery-clear-scopes-button`                                                                                                                                                                                                                                                             |
+| Variant resource, default variant note, rules explainer toggle | `caller-auth-discovery-variant-resource`, `caller-auth-discovery-default-variant-note`, `caller-auth-discovery-context-toggle`                                                                                                                                                                                                                                                                                |
+| Errors                                                         | `caller-auth-discovery-save-error`, `caller-auth-discovery-rules-error`, `caller-auth-discovery-resource-error`, `caller-auth-discovery-authorization-servers-error`, `caller-auth-discovery-scopes-error`                                                                                                                                                                                                    |
+| Sidebar status and error                                       | `caller-auth-panel-discovery-status`, `caller-auth-panel-discovery-save-error`                                                                                                                                                                                                                                                                                                                                |
+| Surface Detail hint                                            | `surface-warnings-discovery-hint`                                                                                                                                                                                                                                                                                                                                                                             |
 
 ## Agent Cards tab
 
@@ -369,8 +398,9 @@ surface, never the unsaved form.
   only), callers paying first (`agent-card-payment`) and Surface Variants existing
   (`agent-card-variant-note`, because the view shows the base route). `hasVariants` comes from the
   saved surface's enabled variants.
-- Authorization server, scopes and audience are set in the A2A surface's Caller Context editor (see
-  _Surface Builder_ above) and appear in the served card. Card content comes from the agent, so it
+- The required scopes and the Authorization server discovery resource are set in the A2A surface's
+  Caller Context editor (see _Surface Builder_ above); the authorization server comes from the
+  strategy and appears with the scopes in the served card. Card content comes from the agent, so it
   is untrusted: every value renders as React text, there is no `dangerouslySetInnerHTML`, and no
   card URL (`iconUrl`, `documentationUrl`, `provider.url`) becomes a link or an image. The only link
   is the served card URL, and only when `safeHttpUrl` passes (http or https, no user info), opened

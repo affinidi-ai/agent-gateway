@@ -98,8 +98,8 @@ none carries a URL, host, issuer, token or provider name.
 | `agent_gateway_token_fetch_total` | `grant`: `client_credentials`, `jwt_bearer`, `unsupported` (a provider type the gateway never grants for). `result`: `ok`, `unsupported`, `secret_unavailable`, `forbidden`, `unavailable`, `invalid_response`, `assertion_failed` | Each gateway token request that was not answered from cache or held back by the retry backoff. `unavailable` covers an unreachable endpoint, a refused grant and a timeout; `assertion_failed` is a JWT bearer assertion that could not be signed |
 | `agent_gateway_jwks_fetch_total` | `result`: `ok`, `invalid_url`, `blocked`, `unreachable`, `http_status`, `too_large`, `invalid_document` | Each network fetch of a remote strategy's key set, successful or failed. A host that does not resolve counts as `blocked`. A cache hit, a static key set and the validate-jwks-uri probe are not counted |
 | `agent_gateway_discovery_total` | `result`: `ok`, `invalid_url`, `blocked`, `unreachable`, `http_status`, `too_large`, `invalid_document`, `issuer_mismatch` | Each authorization server metadata discovery, whether from a probe, a save or a re-discovery after an issuer change |
-| `agent_gateway_scope_denied_total` | `scheme`: the `auth_failed` scheme, `jwt` for a `jwt_bearer` method's [`required_scopes`](SOURCE_AUTH.md#required-scopes) (an MCP Access Point with `protected_resource` included) and `mcp_resource_token` for `mcp_http.authorization` | Each request whose caller token lacked a required scope, whether the gateway refused it or left the decision to policy. Counted whether or not a sink selects `auth_failed`. An operator's card preview is not a caller request and is not counted |
-| `agent_gateway_card_security_total` | `outcome`: `declare`, `strip`, `pass_through`, `unservable`. `reason`: the [strip reason code](SOURCE_AUTH.md#declaring-an-access-point) for `strip` (`transit_point` for a Transit Point card), the unservable reason code for `unservable`, otherwise `none` | Each agent card an Access Point serves after rewriting it, and each Transit Point card whose security the gateway removes because its Access Point's cards are secured ([Agent card security](PROTOCOLS.md#agent-card-security)). An operator's [Agent card preview](SOURCE_AUTH.md#agent-card-preview) is not counted |
+| `agent_gateway_scope_denied_total` | `scheme`: the `auth_failed` scheme, `jwt` for a `jwt_bearer` method's [`required_scopes`](SOURCE_AUTH.md#required-scopes) (an Access Point with `protected_resource` included) and `mcp_resource_token` for `mcp_http.authorization` | Each request whose caller token lacked a required scope, whether the gateway refused it or left the decision to policy. Counted whether or not a sink selects `auth_failed`. An operator's card preview is not a caller request and is not counted |
+| `agent_gateway_card_security_total` | `outcome`: `declare`, `strip`, `pass_through`, `unservable`. `reason`: the [strip reason code](SOURCE_AUTH.md#declaring-an-access-point) for `strip` (`not_declared`, `fabric_target`, or `transit_point` for a Transit Point card), one of the nine unservable reason codes for `unservable`, otherwise `none` | Each agent card an Access Point serves after rewriting it, and each Transit Point card whose security the gateway removes because its Access Point's cards are secured ([Agent card security](PROTOCOLS.md#agent-card-security)). An operator's [Agent card preview](SOURCE_AUTH.md#agent-card-preview) is not counted |
 
 Alert on `agent_gateway_token_fetch_total{result!="ok"}` and
 `agent_gateway_jwks_fetch_total{result!="ok"}` as a rate against their `ok` series: a gateway
@@ -299,7 +299,10 @@ it is over the preview's 256 KiB display limit.
   resource authorization context). `blocking` is false when the failure was handed to policy
   (`input.source_auth.method == "failed"`) instead of refusing the request. `client_ip` is the
   resolved client address (forwarded headers only from `client_ip.trusted_proxies`); absent on
-  the fabric path, where the caller connected to the sending gateway.
+  the fabric path, where the caller connected to the sending gateway. On a declaring Access
+  Point the refusal is recorded at source authentication, before rate limiting, so a refused
+  caller is not counted against the surface's rate limit; it writes one blocking `auth_failed`
+  record and no `policy_decision` record, on every protocol.
 - `rate_limited`: the request was refused with 429. `scope` is `surface` (the Access Point's
   rate limit), `sse_sessions` (the legacy SSE session cap) or `fabric_capacity` (a full Fabric
   stream cap on the way to a fabric target). `retry_after_ms` is the wait the caller is given,
@@ -365,7 +368,11 @@ it is over the preview's 256 KiB display limit.
     the Target base path, an unsupported provider type, leg or injection, a provider or secret
     the surface's tenant may not use, or a Target endpoint a credential provider may not be sent
     to; `http_status` is 502, the status the gateway answers with, including on the agent card
-    route's fetch). The receiving gateway's card read for its policy context answers no caller
+    route's fetch), `peer_token_refused` and `peer_scope_refused` (the receiving gateway of a
+    Fabric route answered `401`, or `403` with a Bearer `insufficient_scope` challenge, so the
+    sending gateway answers its caller `502` with the detail `The Fabric peer refused the
+    gateway's authorization` and no challenge; `http_status` is 502, the status the sending
+    gateway answers with, and the receiving gateway's own `auth_failed` record holds the reason). The receiving gateway's card read for its policy context answers no caller
     and is not recorded. A credential deliberately withheld, and a failure under
     `fallback: passthrough` that the fallback covers, is not recorded.
 

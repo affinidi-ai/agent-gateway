@@ -215,6 +215,22 @@ change its route.
 The type is [`NetworkConfig`](../src/config/network.rs). Surfaces themselves are stored
 records rather than file content; see [`src/config/agent_surface.rs`](../src/config/agent_surface.rs).
 
+An MCP, A2A or AP2 Access Point declares its OAuth protection with
+`access_point.caller_authentication.protected_resource`, next to a JWT Bearer method:
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `resource` | Yes | The canonical HTTPS URL of the Access Point on a public origin of its listener, with the route as its path. It is the one audience a token must name and the resource the metadata and challenge publish. |
+| `authorization_servers` | No | Absent, the document names the JWT verification strategy's `expected_issuer`. Sent, it must be exactly `["<expected_issuer>"]`; a save refuses anything else. |
+| `scopes` | No | Extra scopes advertised as `scopes_supported` after the method's `required_scopes`; never enforced. |
+
+The setting makes the Access Point refuse a failed caller at source authentication; see
+[Authorization server discovery](MCP_METADATA.md#authorization-server-discovery-for-caller-authentication)
+and [`SOURCE_AUTH.md`](SOURCE_AUTH.md#declaring-an-access-point). Before rolling back to a release
+up to v1.0.3, read the downgrade notes there: a setting stored without
+`authorization_servers` cannot be read by those releases, and an A2A or AP2 surface with the
+setting answers `503` on them.
+
 `webauthn.external_origin` is the value a browser must be visiting for passkey
 registration to succeed. A mismatch is the most common local-setup failure, and
 [`development/GETTING_STARTED.md`](development/GETTING_STARTED.md) treats the generated

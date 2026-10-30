@@ -188,10 +188,11 @@ A missing or invalid caller credential, or a JWT short of a scope the Access Poi
 does not by itself refuse the request. The request continues with no caller identity and the
 failure is passed to policy, so a surface that must reject unauthenticated callers needs a
 policy that denies them. A declaring Access Point, one that publishes protected resource
-metadata, instead refuses such a caller with a challenge before payment, whatever policy would
-allow. Over a Fabric route only the sending gateway's challenge names the metadata; a declaring
-receiving gateway still refuses a failed caller before policy, with a challenge that carries a
-realm and no `resource_metadata`; see the
+metadata, instead refuses such a caller with a challenge at source authentication, before any policy
+and payment, whatever policy would allow. Over a Fabric route only the sending gateway's
+challenge names the metadata; a declaring receiving gateway still refuses a failed caller
+before policy, with a challenge that carries a realm and no `resource_metadata`, and the
+sending gateway answers its caller `502`; see the
 [invariant in `AGENTS.md`](../AGENTS.md#architecture) and
 [`POLICY.md`](POLICY.md#failed-caller-authentication).
 

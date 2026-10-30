@@ -146,8 +146,10 @@ Access Point of an A2A surface (**A2A Protocol**):
 ```
 
 An A2A Access Point that [declares](SOURCE_AUTH.md#declaring-an-access-point) refuses a caller
-that failed source authentication with the [challenge](SOURCE_AUTH.md#caller-challenge) before
-version negotiation and validation, so neither setting applies to that request.
+that failed source authentication with the [challenge](SOURCE_AUTH.md#caller-challenge) at source
+authentication, before the body is read, so version negotiation, validation and every policy plane
+never see that request. A2A Access Points declare with `caller_authentication.protected_resource`,
+like MCP ones (see [Authorization server discovery](MCP_METADATA.md#authorization-server-discovery-for-caller-authentication)).
 
 The dashboard shows `validation` as **Message validation**: **Off**, **JSON-RPC envelope** (the
 default) or **Envelope + A2A fields**.
@@ -482,8 +484,7 @@ the HTTP+JSON binding it is a problem response. A non-success response that carr
 A public card that cannot be rewritten is answered with `502` and the generic detail
 "Failed to process agent card" on the card route, whatever the Access Point. On a proxied
 response, a Fabric response and a Transit Point response it is answered the same way when the
-Access Point has a declaration source (an explicit `protected_resource`, or one `jwt_bearer`
-method with `required_scopes`; a Transit Point card is secured when the Access Point declares,
+Access Point sets `protected_resource` (a Transit Point card is secured when the Access Point declares,
 asks for a declaration it cannot serve, or its declaration cannot be resolved because the
 strategy store failed), and forwarded as received otherwise.
 
@@ -516,12 +517,12 @@ A surface's agent card (the synthesized A2A-proxy card or a Managed Agent's rewr
 served as `application/a2a+json` only when the caller's `A2A-Version` resolves to `1.0` and the
 surface accepts `1.0`, or the caller lists that type in `Accept`; every other caller receives `application/json`. The response carries
 `Vary: A2A-Version, Accept`, so a shared cache stores each variant separately. The public card the card
-route serves for an Access Point that has a declaration source, and a Transit Point's public card
+route serves for an Access Point that sets `protected_resource`, and a Transit Point's public card
 when its Access Point declares, also carries `Cache-Control: no-cache` and a weak `ETag` holding the SHA-256 digest of the card
 served, replacing any the Target sent, so a cache revalidates it on every use and a changed
-security declaration is never served stale. A declaration source is enough: the card of a
-derived declaration that strips keeps the upstream security but still carries these headers,
-since an edit to the strategy can make it declare without the card changing. Any other card carries no revalidation headers. The onboarding
+security declaration is never served stale. An Access Point with `protected_resource` carries
+them whatever its outcome, since a strategy edit changes the declared issuer without the card
+changing. Any other card carries no revalidation headers. The onboarding
 card served by the identity API (`/onboard/{uuid}/.well-known/agent-card.json`) is always served as
 `application/json`.
 
@@ -539,7 +540,7 @@ fabric paths, and the cards of the Access Point's Transit Points.
 
 | Outcome | Card effect |
 | --- | --- |
-| `declare` | Removes `security`, `securitySchemes`, `securityRequirements`, `security_schemes` and `security_requirements` from the card and from every `skills[]` entry and removes `signatures`. A derived declaration, which pins its authorization server, then adds one scheme named `agent_gateway`: an `oauth2` scheme whose `oauth2MetadataUrl` is the pinned `metadata_url`, with a `clientCredentials` flow whose `tokenUrl` is the pinned `token_endpoint` and whose scopes are every advertised scope, and a card-level requirement that lists only `required_scopes`. A declaration from an explicit `protected_resource` has no pinned authorization server to name, so its card gets the removal with no scheme and no requirement, as for an unservable declaration |
+| `declare` | Removes `security`, `securitySchemes`, `securityRequirements`, `security_schemes` and `security_requirements` from the card and from every `skills[]` entry and removes `signatures`. The declaration then adds one scheme named `agent_gateway`, built from the same declaration: an `oauth2` scheme whose `oauth2MetadataUrl` is the `metadata_url` of the strategy's pinned authorization server, with a `clientCredentials` flow whose `tokenUrl` is the pinned `token_endpoint` and whose scopes are every advertised scope, and a card-level requirement that lists only `required_scopes`. A strategy without pinned metadata that matches its `expected_issuer` and key set gets the removal with no scheme and no requirement, as for an unservable declaration, and the save report warns (`card_scheme_unavailable`) |
 | Unservable (a declaration the Access Point cannot serve) | The same removal, with no scheme, so the card fails closed |
 | `strip` or `pass_through` | The card keeps the upstream security and signatures. A Transit Point card whose security is removed is counted as `strip` with the reason `transit_point` |
 

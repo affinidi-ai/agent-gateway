@@ -129,9 +129,10 @@ The JWT verification strategy editor discovers and pins an authorization server 
 scope claims, and the strategy list marks a strategy with a pinned server **Discovered**; see _JWT verification strategies_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#jwt-verification-strategies).
 
-The Caller Context editor of an MCP surface with JWT Bearer edits authorization server
-discovery (`caller_authentication.protected_resource`), and Save removes a setting the
-operator switched off in the same PUT; see _Authorization server discovery_ in
+The Caller Context editor of an A2A, AP2 or MCP surface with JWT Bearer edits authorization server
+discovery (`caller_authentication.protected_resource`), the one opt-in by which an Access Point
+declares; the authorization server and scopes are shown as derived from the strategy and the
+required scopes, and Save removes a setting the operator switched off in the same PUT; see _Authorization server discovery_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
 The Surface Detail **Agent Cards** view, for A2A and AP2 surfaces only, sits after Elements and
@@ -140,9 +141,10 @@ difference marked by colour and an icon with a text label, the raw JSON of both,
 status with its cause and HTTP status, a Refresh action, the served card discovery URL with a copy
 action and a link back to the Surface view. When the fetch fails, it shows the card the gateway
 last served, marked as possibly from earlier, and no comparison. `CallerAuthDiscoverySection` is the one caller-auth
-declaration section for A2A, AP2 and MCP: it sets the required scopes, shows the authorization
-server, scopes and audience the served card or metadata carries, and keeps the explicit MCP
-discovery setting; the declaration outcome chip shows the result. Surface Detail shows surface save
+declaration section for A2A, AP2 and MCP: it sets the required scopes and the authorization server
+discovery resource, and shows the authorization server, scopes and audience the served card or
+metadata carries, derived from the strategy and the required scopes; the declaration outcome
+chip shows the result. Surface Detail shows surface save
 warnings, with a copyable deny rule for the fail-open ones. See _Agent Cards tab_ and _Surface
 Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#agent-cards-tab).
 
@@ -179,29 +181,36 @@ are `data.gateway.policy.deny_reason` and `data.surface.policy.deny_reason`.
 let OPA decide instead: Trust Check, and caller source authentication. A surface that must
 reject unauthenticated callers needs a policy denying `input.source_auth.method == "failed"`.
 A declaring Access Point, one that publishes protected resource metadata, is the only
-exception, and this paragraph is where the rule is stated; other documents link here. It
-refuses a caller whose source authentication failed (no token, an invalid one, or a JWT short
-of a method's `required_scopes`) with its `WWW-Authenticate` challenge, a `401` or a `403`
-with `error="insufficient_scope"`, and no surface policy can admit that caller. An MCP
-Access Point refuses at the source authentication stage, before policy. Any other declaring
-Access Point refuses after gateway policy and before the AP2 gate and payment, so nothing is
-settled and the Target is never reached. When the request's Surface Variant cannot be
-resolved, a failed caller on an Access Point whose bare route (served by the default variant,
-else the base surface) declares gets that route's challenge at routing, before any policy, on
-every protocol. Every other stage that refuses such a caller answers
-with the same challenge, through one mapping. Only the sending gateway's challenge names the
-metadata: the receiving gateway of a Fabric route answers with a `realm` and no
-`resource_metadata`. An
-Access Point declares through an explicit `protected_resource` (MCP only) or, without it,
-through one pinned `jwt_bearer` method that sets `required_scopes`. It never forwards the
-caller's token, and every challenge the gateway builds goes through `mark_gateway_challenge`
+exception, and this paragraph is where the rule is stated; other documents link here. An
+Access Point declares only through `access_point.caller_authentication.protected_resource`, on
+MCP, A2A and AP2 (`supports_protected_resource`); the dashboard calls the switch Authorization
+server discovery. `resource` is explicit, validated at save and the audience a token must carry
+among its `aud` values; the advertised authorization server is the JWT verification
+strategy's `expected_issuer` and the advertised scopes are its `required_scopes`. A declaring
+Access Point refuses a caller whose source authentication failed (no token, an invalid one, or a
+JWT short of a method's `required_scopes`) with its `WWW-Authenticate` challenge, a `401` or a
+`403` with `error="insufficient_scope"`, and no policy can admit that caller. It refuses at
+source authentication, on every protocol: before rate limiting, before the request body is
+read and before every policy plane, the AP2 gate and payment, so no policy sees that caller,
+nothing is settled and the Target is never reached. Public paths (the agent card, protected
+resource metadata) are exempt. When the request's Surface Variant cannot be resolved, a failed
+caller on an Access Point whose bare route (served by the default variant, else the base
+surface) declares gets that route's challenge at routing, before any policy, on every
+protocol. Only the sending gateway's challenge names the metadata: the receiving gateway of a
+Fabric route answers with a `realm` and no `resource_metadata`, and the sending gateway
+answers its own caller `502` with a fixed detail for that peer's `401`, or `403` with a Bearer
+`insufficient_scope` challenge, never relays the challenge, and records `request_rejected`
+(`forward`, `peer_token_refused` or `peer_scope_refused`); see
+[`src/proxy/fabric_peer_refusal.rs`](src/proxy/fabric_peer_refusal.rs). A declaring Access
+Point never forwards the caller's token, and every challenge the gateway builds goes through
+`mark_gateway_challenge`
 ([`src/protocols/protected_resource.rs`](src/protocols/protected_resource.rs)); relayed Target
 challenges other than `Payment` are dropped on such an Access Point and on a `fabric://`
-Target. The choice lives in `refuses_failed_callers_by_default`
-([`src/source_auth/declaration.rs`](src/source_auth/declaration.rs)), read by
-`refuse_failed_caller_by_default` ([`src/proxy/caller_denial.rs`](src/proxy/caller_denial.rs))
-for the refusal and by the source authentication stage in `src/proxy/handler.rs` for its log
-and audit record; the MCP refusal at that stage checks the declaration and protocol directly.
+Target. The refusal is `challenge_failed_caller`
+([`src/proxy/caller_denial.rs`](src/proxy/caller_denial.rs)), called from the source
+authentication stage and from routing in `src/proxy/handler.rs`; the dry run and the save
+report read `refuses_failed_callers_by_default`
+([`src/source_auth/declaration.rs`](src/source_auth/declaration.rs)).
 See [`docs/POLICY.md`](docs/POLICY.md#failed-caller-authentication).
 
 **MCP revisions are admitted per transport path.** Every MCP endpoint admits `2026-07-28`

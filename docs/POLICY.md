@@ -282,25 +282,27 @@ configuration, internal failures) still block with `500`. For a deleted JWT veri
 strategy or mTLS trust certificate the problem `detail` is the fixed text `Caller authentication
 is unavailable`, so its id is never echoed to the caller; only the gateway's own log names it.
 
-A declaring Access Point, MCP or A2A, never hands a failed caller to its own policy. It
+A declaring Access Point (MCP, A2A or AP2) never hands a failed caller to its own policy. It
 refuses the caller itself with `401`, or `403` with `error="insufficient_scope"` for a scope
 shortfall, and a `Bearer` challenge that names its protected resource metadata, whatever the
-surface's policy would allow. MCP does it at the source authentication stage, before any
-policy; every other protocol does it right after the appliance-wide and gateway policy, before
-AP2, payment and any Target or Fabric forwarding, so a gateway policy still sees the caller
-first. A caller that the appliance-wide or gateway policy refuses gets the same challenge in
-place of that stage's `403`. This holds for a surface saved through the API as for one saved
-from the dashboard, and no policy can admit a failed caller on such an Access Point. The
-invariant is written once in [`AGENTS.md`](../AGENTS.md#architecture); the statuses and
+surface's policy would allow. It does so at source authentication on every protocol, before rate
+limiting and before any policy plane, appliance-wide, gateway or surface, so
+`input.source_auth.method == "failed"` never reaches policy on a declaring Access Point, and a
+gateway deny never hides the challenge from an anonymous caller: no policy can reveal what it
+would allow, and none sees the caller. This holds for a surface saved through the API as for one
+saved from the dashboard. A gateway policy used as a network rule (an IP allow or deny list)
+therefore does not apply to an anonymous caller of a declaring Access Point, who is challenged
+first. The invariant is written once in [`AGENTS.md`](../AGENTS.md#architecture); the statuses and
 headers are in [caller challenge](SOURCE_AUTH.md#caller-challenge). Over Fabric only the
 sending gateway challenges: a receiving gateway's declaring Access Point refuses a failed
 caller before policy with the same status and `realm="agent-gateway"`, without
-`resource_metadata`.
+`resource_metadata`, and the sending gateway answers its own caller `502`.
 
 Over Fabric, the sending Gateway strips the credential header its own surface consumed
 before forwarding. A receiving surface that does not declare and requires source
 authentication on that same header therefore sees every Fabric caller as failed and forwards
-without its target credential; one that declares refuses them with `401`. Require caller
+without its target credential; one that declares refuses them before policy, and the sending
+gateway's caller gets `502`. Require caller
 authentication on one side of the Fabric hop, or use a different credential header on each
 side.
 
@@ -314,10 +316,14 @@ report what each resolved Surface Variant does with them
 (create, update, merge `PATCH`, delete and promote) return their usual body plus two
 top-level fields:
 
-- `declarations`: `[{"variant", "outcome", "reason", "resource"}]`, one entry for the base
+- `declarations`: `[{"variant", "outcome", "reason", "resource", "authorization_servers",
+  "required_scopes", "scopes_supported", "metadata_url"}]`, one entry for the base
   route (`variant` is `null`) and one for each enabled variant. `outcome` is `declare`,
   `strip`, `pass_through` or `unservable`, `reason` is the strip or unservable reason code
-  (otherwise `null`), and `resource` is the Access Point URL, or `null` when the Access Point has none
+  (otherwise `null`), and `resource` is the declared resource, else the resource a stored
+  `protected_resource` names, else the suggested Access Point URL, or `null` when there is none.
+  The other four fields hold what the metadata and challenge publish and are empty (`null` for
+  `metadata_url`) unless the outcome is `declare`
   ([declaring an Access Point](SOURCE_AUTH.md#declaring-an-access-point)).
 - `warnings`: `[{"code", "message", "path", "variant"}]`. `path` names the field of the
   resolved surface the warning is about and `variant` is the alias, `null` for the base route.
@@ -331,20 +337,20 @@ the permissions and tenancy of `GET /v1/surfaces/{id}`
 
 | Code | When |
 | --- | --- |
-| `fail_open_policy` | The dry run finds a failed caller that every plane admits (`path` is `access_point.inbound_policy`), or, when there is none, a failed caller that only the inbound policy or a gateway policy reading `input.a2a` denies, which Fabric receive admits (`path` is `target.policy`). `message` names the first such kind and method and how many cases were admitted, and advises denying the caller in `target.policy` or in a gateway policy that does not depend on `input.a2a`. |
+| `fail_open_policy` | The dry run finds a failed caller that every plane admits (`path` is `access_point.inbound_policy`), or, when there is none, a failed caller that only the inbound policy or a gateway policy reading `input.a2a` denies, which Fabric receive admits (`path` is `target.policy`). `message` names the first such kind and method and how many cases were admitted, and advises denying the caller in `target.policy` or in a gateway policy that does not depend on `input.a2a`, or setting `protected_resource` (Authorization server discovery) so the gateway refuses failed callers itself. |
 | `fail_open_undetermined` | No plane denies some failed caller, and a plane is undefined or fails to evaluate for it: `allow` has no value or is not a boolean, the Rego errors, or a referenced definition is missing, empty or does not compile. The request path denies in those cases. |
 | `payment_before_policy` | The variant takes payment (an enabled x402 or MPP policy) and only a surface-level plane denies failed callers. Payment runs before surface policy, so such a caller can be asked to pay first; deny it in a gateway policy to refuse it before payment. |
-| `declaration_stripped` | The Access Point uses `jwt_bearer` and the declaration outcome is `strip`; `message` ends with the reason code. |
-| `additional_audiences` | The Access Point declares and `audiences` lists values besides the Access Point URL. A declaring route binds the token audience to the Access Point URL, so the other values are ignored there. |
 | `dry_run_skipped` | The variant has caller authentication, does not declare, and comes after the first 16 routes with caller authentication, so the dry run did not check it. |
-| `fabric_only_declaration` | The Access Point declares, or its `protected_resource` cannot be served, and its `listen_address` names no listener of this gateway, so callers reach it only over Fabric. Over Fabric the receiving gateway refuses a failed caller without naming metadata; only the sending gateway challenges its callers. `path` is `access_point.listen_address`. |
+| `fabric_only_declaration` | The Access Point declares, or its `protected_resource` cannot be served, and its `listen_address` names no listener of this gateway, so callers reach it only over Fabric. Over Fabric the receiving gateway refuses a failed caller without naming metadata, and the sending gateway answers its own caller `502` when it lacks a credential; only the sending gateway challenges its callers. `path` is `access_point.listen_address`. |
+| `authorization_servers_stale` | The Access Point declares and its stored `protected_resource.authorization_servers` differs from the strategy's `expected_issuer`, which the gateway advertises instead. The next save that sends the list is refused until it is `["<expected_issuer>"]` or omitted. `path` is `access_point.caller_authentication.protected_resource.authorization_servers`. |
+| `card_scheme_unavailable` | An A2A or AP2 Access Point declares and its strategy has no pinned authorization server matching its `expected_issuer` and key set, so the agent card names no security scheme. Run Discover on the strategy. `path` is `access_point.caller_authentication.methods[0].jwt_verification_strategy_id`. |
 | `protected_resource_dropped` | A `PUT` or variant `PUT` left out a stored `protected_resource` that no longer fits the edited caller authentication, so it was removed. `path` is `access_point.caller_authentication.protected_resource`. |
 
 **The dry run** ([`failed_caller_dry_run.rs`](../src/policies/failed_caller_dry_run.rs)) runs
 for each resolved variant that has caller authentication, in order from the base route, up to
 16 of them per report; a later one gets `dry_run_skipped`. A variant whose Access Point
-declares refuses every failed caller before policy ([built-in
-default](SOURCE_AUTH.md#caller-challenge)), so each of its cases counts as denied and it
+declares refuses every failed caller at source authentication, before any policy
+([caller challenge](SOURCE_AUTH.md#caller-challenge)), so each of its cases counts as denied and it
 reports no `fail_open_policy`, `fail_open_undetermined`, `payment_before_policy` or
 `dry_run_skipped` warning. For
 any other variant it builds the input a `POST` to the variant's Access Point URL gets

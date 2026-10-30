@@ -7,7 +7,7 @@
 | Is Global    | false                                                                  |
 | Categories   | authentication, authorization, oauth, oidc, a2a, credential-delegation |
 | Date         | 2026-10-20                                                             |
-| Last Updated | 2026-10-29                                                             |
+| Last Updated | 2026-10-30                                                             |
 
 ## Status
 
@@ -79,7 +79,7 @@ Access Point, Target, Transit Point, and Fabric are defined in [`CONTEXT.md`](..
 
 1. **One configuration per hop.**
    - **Hop 1:**
-     - The JWT verification strategy and the Access Point's `jwt_bearer` settings are the only inputs. An MCP Access Point may instead name its metadata explicitly with `protected_resource`, as it could before this decision.
+     - The JWT verification strategy, the Access Point's `jwt_bearer` settings and its `protected_resource` (the resource explicit, the authorization server and scopes taken from the strategy and the method) are the only inputs, on MCP, A2A and AP2 Access Points.
      - They drive token validation, the agent card's security declaration, RFC 9728 metadata, and the `WWW-Authenticate` challenge.
      - Changing them changes all four on the next request, with no restart.
    - **Hop 2:**
@@ -91,7 +91,7 @@ Access Point, Target, Transit Point, and Fabric are defined in [`CONTEXT.md`](..
    - The authorization server's metadata comes from RFC 8414, with OIDC Discovery as a fallback.
    - The issuer must match exactly.
 4. **Scopes.** The Access Point can require scopes. Granted scopes are normalised (`scope` and `scp`) and published to OPA.
-5. **RFC 9728 for A2A.** A declaring A2A Access Point publishes protected-resource metadata. A caller whose token is missing, invalid or short of a required scope receives an RFC 6750 challenge pointing at that metadata, before the gateway takes a payment or reaches the Target ([ADR 0003 decision 2](0003-hop-one-resource-server-contract.md#2-failure-kind-one-deny-mapping-and-the-built-in-refusal)).
+5. **RFC 9728 for A2A.** A declaring A2A Access Point publishes protected-resource metadata. A caller whose token is missing, invalid or short of a required scope receives an RFC 6750 challenge pointing at that metadata, at source authentication, before any policy, payment or the Target ([ADR 0003 decision 2](0003-hop-one-resource-server-contract.md#2-failure-kind-and-the-source-auth-refusal)).
 6. **JWT bearer provider type (RFC 7523 §2.1).**
    - Fields: token endpoint, issuer (the JWT `iss`), subject (the JWT `sub`, defaulting to the issuer), signing key as a secret reference, signing algorithm (RS256 or ES256), key id (the `kid` header), and scopes. The assertion `aud` is always the token endpoint.
    - Fetch, caching, refresh and Bearer injection behave exactly as for Client Credentials.
@@ -111,7 +111,7 @@ Access Point, Target, Transit Point, and Fabric are defined in [`CONTEXT.md`](..
 | Security | Discovery and token endpoints must be https and are fetched through pinned egress with redirects off. Response bodies are capped (64 KiB for metadata). Error text is generic. Signing keys and tokens never appear in API responses or logs. JWT bearer assertions have `exp` no more than 3600 s after `iat` and carry a random `jti`. |
 | Performance | No new network call on the request path, except a JWKS refetch on an unknown `kid`, limited to one per strategy per 60-second cooldown. Card security is resolved from in-memory stores. Hop 2 tokens are reused until 300 seconds before they expire. |
 | Availability | If a hop 2 token cannot be obtained, the existing `TargetAuthFallback` applies (reject by default). A card whose declaration cannot be resolved has the upstream security removed, rather than a wrong or stale declaration served. If a JWKS refresh fails, the last good key set keeps serving for up to one hour past its expiry. |
-| Compatibility | Stored strategy, surface and provider JSON written before this change still loads. A surface that sets none of the new settings answers as before, except for the changes ADR 0003 lists under Consequences (a `fabric://` Target's relayed 401 becomes 502, `variant_alias` reaches policy on direct requests, and a route holding `$` or `%24` can no longer be saved), and `tests/features/surface/source_authentication_http.feature` passes unchanged. An MCP Access Point with `protected_resource` keeps its metadata, its 401 before policy and its save checks; ADR 0003 lists the few MCP responses that change. The only new surface field, `required_scopes`, sits in the `jwt_bearer` method, which older releases parse without `deny_unknown_fields`; nothing is added to `caller_authentication` itself or to `protected_resource`, which they parse with it, so an older release still loads the surface. |
+| Compatibility | Stored strategy, surface and provider JSON written before this change still loads. A surface that sets none of the new settings answers as before, except for the changes ADR 0003 lists under Consequences (a `fabric://` Target's relayed 401 becomes 502, a Fabric peer's 403 `insufficient_scope` becomes 502, `variant_alias` reaches policy on direct requests, and a route holding `$` or `%24` can no longer be saved), and `tests/features/surface/source_authentication_http.feature` passes unchanged. An MCP Access Point with `protected_resource` keeps its metadata, its 401 before policy and its save checks; ADR 0003 lists the few MCP responses that change. The only new surface field, `required_scopes`, sits in the `jwt_bearer` method, which older releases parse without `deny_unknown_fields`; nothing is added to `caller_authentication` itself or to `protected_resource`, which they parse with it. `protected_resource.authorization_servers` becomes optional, so a setting saved without it is the one surface shape an older release cannot load; the rollback steps in ADR 0003 add it back first. |
 | Interoperability | The rewritten card parses with a2a-python 1.x and 0.3.x and with a2a-js 1.x and 0.3.x. |
 | Maintainability | Extend existing records and functions rather than adding parallel entities (AGENTS.md rules 6 and 13). |
 
@@ -237,19 +237,19 @@ Agent Gateway treats OAuth 2.0 and OpenID Connect as a first-class, provider-neu
 
   | Outcome | When | Card effect |
   | --- | --- | --- |
-  | Declare | An MCP Access Point's explicit `protected_resource`, or one pinned `jwt_bearer` method with `required_scopes` whose `audiences` contain the Access Point URL ([ADR 0003 decision 3](0003-hop-one-resource-server-contract.md#3-declaration-sources-and-outcomes)) | Drops the upstream security and signatures. A derived declaration also emits the gateway's `oauth2` scheme with `oauth2MetadataUrl`, a `clientCredentials` flow offering the advertised scopes, and a requirement listing `required_scopes`; an explicit one has no pinned server to name and emits no scheme |
-  | Strip | Caller authentication that does not declare, with a reason code such as `no_required_scopes`, `not_pinned` or `method_not_declarable` | Upstream card kept |
+  | Declare | An MCP, A2A or AP2 Access Point with a servable `protected_resource` ([ADR 0003 decision 3](0003-hop-one-resource-server-contract.md#3-the-declaration-and-its-outcomes)) | Drops the upstream security and signatures. When the strategy's pinned metadata matches its issuer and key set, also emits the gateway's `oauth2` scheme with `oauth2MetadataUrl`, a `clientCredentials` flow offering the advertised scopes, and a requirement listing `required_scopes`; without such a pin it emits no scheme |
+  | Strip | Caller authentication without `protected_resource` (`not_declared`), or none on a `fabric://` Target (`fabric_target`) | Upstream card kept |
   | Pass through | No caller authentication | Upstream card kept |
-  | Unservable | The declaration cannot be served, such as a strategy store failure | Upstream security and signatures removed, no scheme |
+  | Unservable | `protected_resource` that cannot be served, such as a missing strategy or a strategy store failure | Upstream security and signatures removed, no scheme |
 
   - Emission follows the card's era: the v1.0 oneof wrapper with `securityRequirements`, or the v0.3 `type` shape with `security`. A card carrying both eras gets the flat shape and both arrays.
-- A declaring Access Point, A2A or MCP, serves `/.well-known/oauth-protected-resource<route>`.
-  - `resource` is the Access Point URL. On a declaring route a token's `aud` must name it.
-  - `authorization_servers` holds the pinned strategy issuer, or the configured servers of an explicit `protected_resource`.
-- A declaring Access Point refuses a caller whose source authentication failed with 401 (403 for insufficient scope) and `WWW-Authenticate: Bearer resource_metadata=...`, whatever its surface policy says: an MCP Access Point at the source authentication stage, any other after gateway policy and before AP2 and payment. It never forwards the caller's token.
+- A declaring Access Point, A2A, AP2 or MCP, serves `/.well-known/oauth-protected-resource<route>`.
+  - `resource` is the stored, declared resource, validated at save against the listener's external URLs and the route. On a declaring route a token's `aud` values must include it.
+  - `authorization_servers` is the strategy's `expected_issuer`, read on every request.
+- A declaring Access Point refuses a caller whose source authentication failed with 401 (403 for insufficient scope) and `WWW-Authenticate: Bearer resource_metadata=...`, whatever its policy says, at source authentication on every protocol, before rate limiting, any policy, AP2 and payment. It never forwards the caller's token.
 - **Fail-open invariant.**
   - Unchanged on an Access Point that does not declare: source authentication publishes, OPA decides.
-  - A declaring Access Point fails closed for failed callers with no policy attached, whether it was saved from the dashboard or through the API ([ADR 0003 decision 2](0003-hop-one-resource-server-contract.md#2-failure-kind-one-deny-mapping-and-the-built-in-refusal)).
+  - A declaring Access Point fails closed for failed callers with no policy attached, whether it was saved from the dashboard or through the API ([ADR 0003 decision 2](0003-hop-one-resource-server-contract.md#2-failure-kind-and-the-source-auth-refusal)).
 
 ### Hop 2: the gateway as OAuth client
 
@@ -309,9 +309,9 @@ before each increment starts.
 | The cards of a declaring Access Point change: the upstream schemes and signatures disappear | They change only when the operator makes the Access Point declare; the changelog, release notes and hosted documentation describe it. A future increment re-signs cards with the gateway key. |
 | A non-declaring Access Point's card still names the upstream's authorization server and carries a signature the URL rewrite invalidated | Unchanged from before this decision; declaring removes both. Whether to strip them everywhere is [open question 2](#open-questions). |
 | The dual-era card shape relies on SDK compatibility code | A conformance run against a2a-python and a2a-js gates the card change. Java and Go are tracked as open questions. |
-| A strategy edit can break the declaration of surfaces that reference it | The resolver strips and logs a warning. A later increment refuses to delete strategies that are still referenced. |
+| A strategy edit changes the declaration of surfaces that reference it | The advertised issuer follows the strategy on the next request, with no surface save. A missing strategy, or an issuer metadata cannot name, leaves the declaration unservable (503) and the save report names the reason. A later increment refuses to delete strategies that are still referenced. |
 | Older releases cannot load the new enum variants (`oauth2_jwt_bearer`, `TargetAuthMethod::CredentialProvider`) and drop the whole surface or provider; they also stop enforcing `required_scopes` | Rollback procedure in Migration, no mixed releases on shared storage, a release version in the backup manifest, and a load-error counter. A downgrade test covers the whole-record drop. |
-| A declaring Access Point refuses failed callers whatever its surface policy says, so a policy that admitted some failed callers stops doing so once the Access Point declares | Only an Access Point the operator made declare is affected; removing `required_scopes`, or the strategy's pin, returns it to "OPA decides". The trade-off and its isolation point are recorded in [ADR 0003 decision 2](0003-hop-one-resource-server-contract.md#2-failure-kind-one-deny-mapping-and-the-built-in-refusal). |
+| A declaring Access Point refuses failed callers whatever its surface policy says, so a policy that admitted some failed callers stops doing so once the Access Point declares | Only an Access Point the operator made declare is affected; removing `protected_resource` returns it to "OPA decides". The trade-off and its isolation point are recorded in [ADR 0003 decision 2](0003-hop-one-resource-server-contract.md#2-failure-kind-and-the-source-auth-refusal). |
 | Discovery fetches operator-supplied URLs, including private hosts | Discovery uses the JWKS fetch posture: pinned resolution, cloud-metadata addresses blocked, embedded credentials and non-http(s) schemes refused, a body size cap and fixed error codes. Like JWKS fetches it admits http, loopback and RFC 1918 hosts, because operators legitimately run authorization servers on the same machine or VPC. Documented as a residual risk. The probes that fetch on a caller's behalf (`discover`, `validate-jwks-uri` and a save that discovers) need the edit permission, are limited to 10 per user per minute and are audited, and a tenant-scoped caller probes under the strict posture, which also blocks loopback and private ranges. |
 
 ## Security considerations
@@ -324,13 +324,13 @@ before each increment starts.
 
 | Threat | Control |
 | --- | --- |
-| Audience confusion; ID tokens accepted as access tokens | On a declaring route the token's `aud` must name the Access Point URL, and the method's other audiences are not accepted there. With `required_scopes` set, a token carrying `nonce` or `at_hash`, or with a `typ` other than an access token type, fails. |
+| Audience confusion; ID tokens accepted as access tokens | On a declaring route the token's `aud` values must include the declared resource, and the method's `audiences` must be empty there. With `required_scopes` set, a token carrying `nonce` or `at_hash`, or with a `typ` other than an access token type, fails. |
 | Algorithm confusion | Fixed allow-list (RS*, ES256/384, EdDSA) today. A per-strategy allow-list, `kty`/`crv`/`use` checks and RFC 8725 follow in the envelope-strictness increment. |
 | Issuer mix-up | Exact issuer match at discovery and on every token. Strategies are tenant-owned, and surfaces may reference only strategies they are allowed to (`src/identity/handlers/surface_tenancy.rs`). |
 | JWKS refetch amplification by unauthenticated callers sending unknown `kid`s | Per-strategy cooldown and a single in-flight fetch. JWKS bodies and key counts are capped. The JWKS cache is evicted on strategy update and delete, and a cached key set is used only for the `jwks_uri` and `updated_at` it was fetched for. |
 | SSRF through discovery or token endpoints | Cloud-metadata block, pinned DNS, redirects off, size cap, fixed error codes that never carry a resolved address; probes need the edit permission, are rate-limited per user and audited, and run under the strict posture for tenant-scoped callers |
 | Card spoofing or leakage | On a declaring Access Point the upstream security and signatures are replaced on its own and its Transit Point cards, and card bodies are never logged. Re-signing with the gateway key is a later increment. |
-| Fail-open surfaces | A declaring Access Point refuses failed callers before AP2, payment and the Target with no policy attached; a non-declaring one keeps "OPA decides" |
+| Fail-open surfaces | A declaring Access Point refuses failed callers at source authentication, before any policy, AP2, payment and the Target, with no policy attached; a non-declaring one keeps "OPA decides" |
 | Signing key exposure (hop 2) | The key is a secrets-store entry referenced by `secret_id`: a PKCS#8 PEM key or a service account JSON key of at most 16 KiB. It is never returned by the API or logged, and is held in zeroizing memory only while one assertion is signed. Encryption at rest is off by default ([`DEPLOYMENT_REQUIREMENTS.md`](../DEPLOYMENT_REQUIREMENTS.md)), so the docs tell operators to enable it on any appliance that holds a signing key. The AWS Secrets Manager backend is not implemented and cannot hold the key. |
 | Assertion replay (hop 2) | `exp` no more than 3600 s, a random `jti`, and `aud` bound to the token endpoint. Assertions are never cached or logged. |
 | Token leakage (hop 2) | Tokens a delegation binding obtains are stored in the delegation vault, exactly like Client Credentials tokens, so the encryption-at-rest guidance above applies to them too. Target Authentication tokens are held only in the per-replica gateway token cache in memory ([ADR 0002](0002-hop-two-target-authentication.md)). They are never logged, and only the target receives them. |
@@ -358,7 +358,7 @@ The change modifies existing records only. It adds no new store.
 | Record | Change | Type | Default | Purpose |
 | --- | --- | --- | --- | --- |
 | `JwtVerificationStrategy` | `authorization_server` | Optional object: `issuer`, `metadata_url`, `token_endpoint`, `jwks_uri` | Absent | Pinned discovery result, used by the card, PRM and challenge |
-| `JwtBearerAuthConfig` (Access Point) | `required_scopes` | String list | Empty | Scope enforcement, the declared scopes and the derived declaration |
+| `JwtBearerAuthConfig` (Access Point) | `required_scopes` | String list | Empty | Scope enforcement and the advertised scopes |
 | `JwtVerificationStrategy` | `scope_claims` | String list | Absent, read as `scope` then `scp` | Claims read for granted scopes |
 | `CredentialProvider` | Type `oauth2_jwt_bearer`. New object `jwt_bearer`: `assertion_issuer`, `assertion_subject`, `signing_key_secret_ref`, `signing_algorithm`, `key_id`. Reused fields: `token_endpoint` (also the assertion `aud`), `default_scopes`. | Strings | Subject defaults to the issuer; algorithm to RS256 | Hop 2 token acquisition |
 | `TargetAuthConfig` | `method: credential_provider { credential_provider_id, scopes, inject_as }` | Enum variant | n/a | Hop 2 authentication for calls and the card fetch |
@@ -384,7 +384,7 @@ The change modifies existing records only. It adds no new store.
 | Hop 2 tokens | `oauth2_jwt_bearer` provider type; Target Authentication through a credential provider | The Vertex lab and the Foundry card fetch succeed. The Hydra JWT bearer leg passes in CI. |
 | Discovery and scopes | Strategy discovery and pinning; `required_scopes`; normalised policy input | Auth0 and Hydra discovery tests, including the trailing-slash case |
 | Metadata and challenge | One declaration resolver on the shared RFC 9728 builders; metadata for every declaring Access Point; scope enforcement with 403 `insufficient_scope`; relayed-challenge stripping | `make mcp-conformance` differs from the previous release only in the responses ADR 0003 lists. MCP and A2A metadata tests pass. |
-| Card declaration and A2A challenge | The derived declaration; the A2A refusal before payment; card replacement and signature removal on declaring Access Points | Component tests for both card eras and every declaration outcome; the SDK conformance run passes |
+| Card declaration and A2A challenge | The A2A and AP2 `protected_resource`; the A2A refusal at source authentication; card replacement and signature removal on declaring Access Points | Component tests for both card eras and every declaration outcome; the SDK conformance run passes |
 | Demo | Compose demo with two Hydra instances, a mock agent and a client | The scripted walkthrough passes end to end |
 
 **Test plan:**
@@ -396,20 +396,20 @@ The change modifies existing records only. It adds no new store.
 - **Test seam:** with `AG_TEST_MODE=true`, the exact-URL allow-lists let CI and the demo reach a loopback token endpoint; discovery and JWKS need no allow-list. Cloud metadata stays blocked, and a negative test proves the seam is inert without `AG_TEST_MODE`. A run that uses it proves the protocol flow, not production egress; see [Reaching loopback in a test](../development/TESTING.md#reaching-loopback-in-a-test).
 
 **Rollback:**
-- **Optional fields:** older releases ignore the new optional fields. One of them is a security control: `required_scopes` on a `jwt_bearer` Access Point is read by no older release, so after a downgrade the Access Point accepts tokens without the scope, and only a surface policy on the raw `scope` or `scp` claim in `input.source_auth.claims` still enforces it, since older releases do not publish `input.source_auth.scopes`. Treat a downgrade as removing scope enforcement. An older node that re-saves a strategy also drops its pinned `authorization_server` and its `scope_claims`, so after re-upgrading its Access Points strip with `not_pinned` until discovery runs again and `scope_claims` is set again ([`SOURCE_AUTH.md`](../SOURCE_AUTH.md#required-scopes)).
+- **Optional fields:** older releases ignore the new optional fields. One of them is a security control: `required_scopes` on a `jwt_bearer` Access Point is read by no older release, so after a downgrade the Access Point accepts tokens without the scope, and only a surface policy on the raw `scope` or `scp` claim in `input.source_auth.claims` still enforces it, since older releases do not publish `input.source_auth.scopes`. Treat a downgrade as removing scope enforcement. An older node that re-saves a strategy also drops its pinned `authorization_server` and its `scope_claims`, so after re-upgrading its declaring A2A Access Points publish no card scheme (`card_scheme_unavailable`) until discovery runs again, and `scope_claims` must be set again ([`SOURCE_AUTH.md`](../SOURCE_AUTH.md#required-scopes)).
 - **New enum values:** an older release cannot read `oauth2_jwt_bearer` providers or `credential_provider` Target Authentication. Its filesystem loader skips the whole record it cannot parse, not the field. A surface with such Target Authentication disappears from the older node and its route stops answering; a provider disappears and every binding to it refuses with 503. On DynamoDB the older release reads such Target Authentication as none and forwards without the credential (see the DynamoDB bullet below). Before downgrading, remove those providers and settings, or restore a pre-upgrade backup ([Downgrading](../CREDENTIAL_DELEGATION.md#downgrading)).
 - **Detection:** from this release on, a record the loader cannot read is counted in `agent_gateway_storage_load_errors_total{reason="unreadable_record"}` or `invalid_json`. A release that predates this change counts nothing, so check the surface and provider counts in the dashboard after a downgrade. Tests cover the whole-record drop for surfaces and providers.
 - **Shared storage:** do not run mixed releases against one storage directory or one DynamoDB table, including an Active and a Standby node. An older node that loads or re-saves a record can drop it, and a Standby promoted on an older release serves less than the Active node did. Upgrade and downgrade every node together, Standby last on upgrade and first on downgrade.
 - **DynamoDB:** an older release read an unreadable `target_auth` attribute as no Target Authentication, so a channel forwarded without its credential. This release skips the item and counts it in `agent_gateway_storage_load_errors_total{entity="dynamodb_channel"}` while the other channels still load, so it is never served with a credential silently missing. A downgrade of a DynamoDB-backed appliance carries the older behaviour.
 - **Backups:** the manifest of a `.agbak` backup and of a portable archive records the release that took it. A restore refuses a backup from a newer release than the running one, before it changes anything; an older release's backup, and one without a version, restores. The guard compares released versions only: an unreleased build carries the version of the release before it, so its backups restore onto that earlier release without refusal. An older node reading a newer manifest ignores the field, so the guard only protects a node that has this change. A redacted `.atgx` export is not a backup and cannot restore an appliance.
 - **`credential_lookup` as a two-way door:** not adopted. An older release resolves `credential_lookup` to no credential and forwards, so a downgrade would send requests to the Target unauthenticated. Dropping the surface is the safer failure.
-- **Declaring Access Points:** an older release does not declare from `required_scopes`, so it publishes no metadata for such an Access Point, serves its upstream card and leaves its failed callers to policy. Before downgrading, attach a policy denying `input.source_auth.method == "failed"` to each declaring Access Point that has none.
-- **Per-surface rollback of a declaration:** remove `required_scopes`, or clear the strategy's pinned metadata. The Access Point then strips: its card, metadata and failed-caller responses return to what they were before it declared.
+- **Declaring Access Points:** an older release cannot read a `protected_resource` stored without `authorization_servers` and skips that surface; before downgrading, PATCH it with `"authorization_servers": ["<strategy expected_issuer>"]`. An older release refuses `protected_resource` on an A2A or AP2 Access Point and answers 503; before downgrading, attach a policy denying `input.source_auth.method == "failed"` to each such Access Point and PATCH `"protected_resource": null` ([ADR 0003 migration](0003-hop-one-resource-server-contract.md#migration-and-change-management)).
+- **Per-surface rollback of a declaration:** PATCH `"protected_resource": null`. The Access Point then strips: its card, metadata and failed-caller responses return to what they were before it declared.
 
 **Backward compatibility:**
 - Serde defaults keep old JSON loading.
 - `source_authentication_http.feature` runs unchanged.
-- An MCP Access Point with `protected_resource` keeps its metadata, its challenge before policy and its save checks, except for the responses ADR 0003 lists. An MCP Access Point without it can declare from `required_scopes` like an A2A one.
+- An MCP Access Point with `protected_resource` keeps its metadata, its challenge before policy and its save checks, except for the responses ADR 0003 lists. An A2A or AP2 Access Point declares with the same setting.
 
 **Communication:**
 - Changelog fragments per change, with upgrade notes on breaking entries and rollback notes where an older release drops a control.
@@ -437,7 +437,7 @@ sequenceDiagram
     A-->>G: card naming Google, with signatures
     Note over G: Replace security with Hydra's scheme, drop signatures
     G-->>C: card naming Hydra, scopes = required_scopes
-    C->>H: client_credentials (audience = Access Point URL)
+    C->>H: client_credentials (audience = declared resource)
     H-->>C: JWT
     C->>G: SendMessage + Bearer (hop 1)
     Note over G: Validate iss, aud and scopes from the same configuration
@@ -455,13 +455,8 @@ flowchart TD
     Q1 -- no --> F{"fabric:// Target?"}
     F -- yes --> X["Strip with a reason: upstream card kept"]
     F -- no --> P["Pass through: upstream card kept"]
-    Q1 -- yes --> J{"One jwt_bearer with required_scopes, not a root variant?"}
-    J -- no --> X
-    J -- yes --> Q0{"Strategy store readable?"}
-    Q0 -- no --> U
-    Q0 -- yes --> Q2{"A valid pinned AS and the Access Point URL in audiences?"}
-    Q2 -- yes --> D["Declare: upstream security and signatures removed, and a derived declaration adds the gateway scheme and required scopes"]
-    Q2 -- no --> X
+    Q1 -- yes --> X
+    D["Declare: upstream security and signatures removed, and the gateway scheme and required scopes added when the strategy is pinned"]
 ```
 
 ### One configuration per hop

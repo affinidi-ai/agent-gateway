@@ -156,8 +156,9 @@ text in any file and prints only counts, the way the secret scan of the Hydra de
 Discover from issuer does: `POST /api/v1/jwt-verification-strategies/discover` for the issuer
 `https://<domain>/` (trailing slash included, pinned exactly), then a save with
 `discover_metadata: true`. The surface keeps the same route and Target Authentication as the Hydra
-demo, and its `jwt_bearer` method requires the Access Point URL, which is the API identifier, as audience
-and the scope `agent:invoke`. Auth0's public https endpoints need no egress allowance.
+demo, and its `jwt_bearer` method requires the scope `agent:invoke`. Its authorization server discovery
+(`protected_resource`) names the Access Point URL, which is the API identifier, as the resource, and
+the Auth0 issuer comes from the strategy. Auth0's public https endpoints need no egress allowance.
 
 | Step | Asserts |
 | --- | --- |
@@ -206,15 +207,15 @@ management API.
 | --- | --- |
 | Secrets | The hop 2 signing key (PKCS#8 PEM), client id and client secret. Created through the secrets API, read from `envs/oidc-demo-run/`. |
 | Verification strategies | One per Hydra instance, with the authorization server metadata already pinned. Written into the gateway's storage by `gateway.sh start`, not through the API (see below). |
-| Policy | `oidc-demo-deny-failed-callers`: denies callers whose authentication failed. Source authentication publishes and policy decides, so without it a missing or bad token is not refused. |
+| Policy | `oidc-demo-deny-failed-callers`: denies callers whose authentication failed. The surface declares, so the gateway refuses a missing or bad token itself, before policy; the policy keeps that refusal in place if authorization server discovery is switched off. |
 | Credential provider | `oauth2_jwt_bearer` pointing at hydra-b, client authentication by HTTP Basic. Skipped with hop 2 off. |
-| Surface | An A2A Access Point at `/mock-agent`: `jwt_bearer` from hydra-a with audience equal to the Access Point URL and required scope `agent.read`, target the mock agent, Target Authentication through the provider. |
+| Surface | An A2A Access Point at `/mock-agent`: `jwt_bearer` from hydra-a with required scope `agent.read` and authorization server discovery whose resource is the Access Point URL (the authorization server comes from the strategy); no accepted audiences, because the resource is the audience. Target the mock agent, Target Authentication through the provider. |
 
 `gateway.sh start` also registers the `/mock-agent` route in `gateway.json`. Routes are read at
 startup, so a surface seeded into a gateway that was not started this way has no listener route.
 
-The Access Point is on the gateway's HTTPS listener, because an Access Point declares its
-authorization server on its card and in protected resource metadata only at a canonical `https` URL
+The Access Point is on the gateway's HTTPS listener, because an Access Point publishes
+authorization server discovery on its card and in protected resource metadata only at a canonical `https` URL
 (see [`../SOURCE_AUTH.md`](../SOURCE_AUTH.md#declaring-an-access-point)). `gateway.sh start` sets that
 listener's external URL to `https://localhost:9171`, and the surface's `listen_address` is the same
 origin; the gateway matches them, and a `127.0.0.1` address matches no listener. The listener serves the
@@ -289,8 +290,9 @@ transcript (tokens redacted), asserts, and exits non-zero on failure.
 | 6. No token | 401 with a `Bearer` challenge whose `resource_metadata` is the metadata URL. |
 | 7. Wrong audience | A token for another audience gets 401. |
 | 8. Missing scope | A token without `agent.read` gets 403 with `insufficient_scope`. |
-| 9. Swap | Patching the surface to the hydra-b strategy changes the card and the metadata, refuses the old token, accepts a hydra-b token, and the gateway process is the same. |
-| 10. Hop 2 | After a fresh card fetch and call, the agent's log shows an authenticated card fetch and an authenticated call, both as `gateway-hop2`. |
+| 9. Scope removed | Removing the required scope still answers a caller without a token with 401, a `resource_metadata` challenge and no `scope=`, and the metadata lists no scopes; the scope is then restored. |
+| 10. Swap | Patching the surface to the hydra-b strategy changes the card and the metadata, refuses the old token, accepts a hydra-b token, and the gateway process is the same. |
+| 11. Hop 2 | After a fresh card fetch and call, the agent's log shows an authenticated card fetch and an authenticated call, both as `gateway-hop2`. |
 
 ## The hop 2 checks
 
@@ -308,6 +310,9 @@ exits non-zero on failure.
 | 6. Gateway log | The gateway log of the granted run and of the refused run holds no private key, JWT, Hydra access token or Hydra error description, and the refused run logs the Target authentication failure. |
 
 It revokes the grant, so run `up.sh`, `gateway.sh start --fresh` and `seed.sh` again before repeating it.
+
+Storage seeded before surfaces declared through `protected_resource` holds a surface that no longer
+declares, so re-seed it (`gateway.sh start --fresh`, then `seed.sh`) before running the walkthrough.
 
 ## Coverage
 
