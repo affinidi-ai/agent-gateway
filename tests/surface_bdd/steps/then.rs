@@ -4022,6 +4022,41 @@ async fn target_credential_provider_received_token_requests(
     );
 }
 
+#[then(expr = "the target's credential provider received a client credentials grant from client {string} for scope {string}")]
+async fn target_credential_provider_received_client_credentials_grant(
+    world: &mut SurfaceWorld,
+    client_id: String,
+    scope: String,
+) {
+    let requests = target_token_requests(world).await;
+    let grant = requests
+        .first()
+        .expect("the token endpoint received a grant");
+    let field = |name: &str| grant.get(name).map(String::as_str);
+    assert_eq!(
+        field("grant_type"),
+        Some("client_credentials"),
+        "the target's credential provider received grant_type {:?}, expected client_credentials",
+        field("grant_type")
+    );
+    assert_eq!(
+        field("client_id"),
+        Some(client_id.as_str()),
+        "the target's credential provider received client_id {:?}, expected {client_id}",
+        field("client_id")
+    );
+    assert_eq!(
+        field("scope"),
+        Some(scope.as_str()),
+        "the target's credential provider received scope {:?}, expected {scope}",
+        field("scope")
+    );
+    assert!(
+        !grant.contains_key("assertion"),
+        "a client credentials grant carries no assertion, but the target's credential provider received one"
+    );
+}
+
 #[then("the target's credential provider received a JWT Bearer grant signed with the provider key")]
 async fn target_credential_provider_received_signed_jwt_bearer_grant(world: &mut SurfaceWorld) {
     use crate::bdd_support::config::target_auth::{

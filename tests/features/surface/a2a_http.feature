@@ -110,6 +110,7 @@ Feature: A2A HTTP surface forwarding and identity
     Then the response status is 200
     And managed agent "bravo" received header "authorization" with value "Bearer bdd-target-provider-token"
     And the target's credential provider received 1 token request
+    And the target's credential provider received a client credentials grant from client "bdd-target-client" for scope "https://www.googleapis.com/auth/cloud-platform"
 
   Scenario: A second agent card fetch reuses the cached provider token
     Given the surface authenticates its target with a client credentials provider
