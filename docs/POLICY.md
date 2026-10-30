@@ -253,13 +253,16 @@ triggered it. On the outbound path the record also names the Transit Point.
 
 ## Failed caller authentication
 
-Source auth does not refuse a request whose credential is missing or invalid. The
-request continues with no caller identity, `input.source_auth` is
+A closed Access Point (`caller_authentication.on_failure: reject`, which the admin API sets on
+every surface it creates unless it is public) refuses a missing or invalid credential with
+`401` before policy, see
+[`SOURCE_AUTH.md`](SOURCE_AUTH.md#closed-and-public-access-points). Otherwise source auth
+does not refuse a request whose credential is missing or invalid. The request continues with no caller identity, `input.source_auth` is
 `{"method": "failed", "attempted_method": ..., "reason": ...}`. On every forwarding
 path (direct inbound, `proxy://` MCP Targets, `a2a-proxy://` Targets, Fabric send and
 Fabric receive, the last for surfaces without protected resource metadata) the stored
 target credential, or the A2A proxy's Direct Line secret, is not attached, because it
-vouches that the gateway vetted the caller. A surface that
+vouches that the gateway vetted the caller. A legacy surface that
 must reject such callers needs a policy that denies `input.source_auth.method == "failed"`.
 Server-side source-auth errors (missing configuration, internal failures) still block
 with `500`. A request to an MCP Access Point that publishes protected resource
@@ -271,7 +274,7 @@ with a `401` without it, see
 Over Fabric, the sending Gateway strips the credential header its own surface consumed
 before forwarding. A receiving surface without protected resource metadata that requires
 source authentication on that same header therefore sees every Fabric caller as failed and
-forwards without its target credential; one with the metadata refuses them with `401`. Require caller authentication on one side of the Fabric hop, or use a
+forwards without its target credential; one with the metadata, or a closed one, refuses them with `401`. Require caller authentication on one side of the Fabric hop, or use a
 different credential header on each side.
 
 ## Caller identity verification in policy input

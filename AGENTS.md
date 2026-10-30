@@ -121,6 +121,11 @@ discovery (`caller_authentication.protected_resource`), and Save removes a setti
 operator switched off in the same PUT; see _Authorization server discovery_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md).
 
+The Access Point panel's **Public access** switch writes `access_point.public`; creating a
+surface with no Caller Context and the switch off is blocked, and saving a public surface, or
+a surface without `public` and without a Caller Context, warns after the save; see
+_Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
+
 Keep `AGENTS.md` and any local `AGENTS.md` in sync in the same change when UI patterns evolve. Instruction drift is a blocker.
 
 ## Architecture
@@ -151,12 +156,15 @@ Legacy `package channel.policy` is migrated to `surface.policy` at boot. Deny re
 are `data.gateway.policy.deny_reason` and `data.surface.policy.deny_reason`.
 
 **Policy planes and identity attribution fail closed.** Two stages publish results and
-let OPA decide instead: Trust Check, and caller source authentication. A surface that must
-reject unauthenticated callers needs a policy denying `input.source_auth.method == "failed"`.
-An MCP Access Point that publishes protected resource metadata is the exception: a request to
-it, direct or over Fabric, is refused before policy with a `401` (direct requests get the
-discovery challenge).
-See [`docs/POLICY.md`](docs/POLICY.md#failed-caller-authentication).
+let OPA decide instead: Trust Check, and caller source authentication. Two exceptions refuse
+a failed caller before policy with a `401`, direct or over Fabric: a closed Access Point
+(`caller_authentication.on_failure: reject`), and an MCP Access Point that publishes protected
+resource metadata (direct requests get the discovery challenge). The admin API creates every
+surface closed unless `access_point.public` is `true`, and refuses a closed surface without
+caller authentication; surfaces without `public` keep forwarding failed callers to policy,
+which must deny `input.source_auth.method == "failed"` to reject them.
+See [`docs/SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#closed-and-public-access-points) and
+[`docs/POLICY.md`](docs/POLICY.md#failed-caller-authentication).
 
 **MCP revisions are admitted per transport path.** Every MCP endpoint admits `2026-07-28`
 alongside the session revisions listed in [`docs/MCP_METADATA.md`](docs/MCP_METADATA.md#modern-mcp-admission).
