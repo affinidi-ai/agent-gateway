@@ -69,7 +69,7 @@ async fn creating_changing_and_deleting_a_connection_point_raises_its_events() {
             "/surfaces",
             &json!({
                 "name": "exposed", "status": "disabled",
-                "access_point": {"listen_address": api.harness.gateway_base, "route": "/exposed", "protocol": "a2a"},
+                "access_point": {"listen_address": api.harness.gateway_base, "route": "/exposed", "protocol": "a2a", "public": true},
                 "target": {"endpoint": "http://127.0.0.1:9"}
             }),
         )

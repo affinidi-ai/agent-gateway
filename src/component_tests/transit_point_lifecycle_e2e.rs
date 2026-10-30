@@ -170,7 +170,7 @@ async fn create_surface(
         .post(format!("{}/api/v1/surfaces", h.gateway_base))
         .json(&json!({
             "name": route.trim_start_matches('/'),
-            "access_point": { "listen_address": h.gateway_base, "route": route, "protocol": "a2a" },
+            "access_point": { "listen_address": h.gateway_base, "route": route, "protocol": "a2a", "public": true },
             "target": { "endpoint": h.mock.url() },
             "transit": {
                 "outbound_listen_address": format!("{outbound_scheme}://localhost:{}", outbound_port(h)),

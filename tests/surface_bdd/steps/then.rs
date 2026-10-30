@@ -914,14 +914,48 @@ fn admin_api_error_response_mentions(
     assert_json_body_mentions(&get_admin_response(world).body, &expected, "admin API error response");
 }
 
+#[then(expr = "the admin API response warns {string}")]
+fn admin_api_response_warns(
+    world: &mut SurfaceWorld,
+    expected: String,
+) {
+    let body = &get_admin_response(world).body;
+    let warned = body
+        .get("warnings")
+        .and_then(|warnings| warnings.as_array())
+        .is_some_and(|warnings| {
+            warnings
+                .iter()
+                .filter_map(|warning| warning.as_str())
+                .any(|warning| warning.contains(&expected))
+        });
+    assert!(warned, "expected the admin API response to warn {expected:?}; body was {body}");
+}
+
+#[then("the response says only that the caller credential is missing or invalid")]
+fn response_says_only_caller_credential_missing_or_invalid(world: &mut SurfaceWorld) {
+    let expected = serde_json::json!({
+        "type": "https://a2a-protocol.org/errors/proxy-error",
+        "title": "Unauthorized",
+        "status": 401,
+        "detail": "Caller credential missing or invalid"
+    });
+    assert_json_bodies_equal(get_response_body_value(world), &expected, "caller credential refusal");
+}
+
 #[then("the operator can still read the stored surface through the admin API")]
 fn fetching_surface_by_id_returns_stored_configuration(world: &mut SurfaceWorld) {
     let lookup = get_surface_lookup_response(world);
     assert_status_with_body(lookup.status, 200, &lookup.body, "surface lookup");
 
     let fetched = &lookup.body;
-    let stored = &get_admin_response(world).body;
-    assert_json_bodies_equal(fetched, stored, "fetched surface should match the stored disabled configuration");
+    let mut stored = get_admin_response(world)
+        .body
+        .clone();
+    if let Some(saved) = stored.as_object_mut() {
+        saved.remove("warnings");
+    }
+    assert_json_bodies_equal(fetched, &stored, "fetched surface should match the stored disabled configuration");
 }
 
 #[then("the stored surface keeps the existing surface id")]

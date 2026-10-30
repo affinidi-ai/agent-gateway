@@ -380,17 +380,30 @@ where
         state: &S,
     ) -> Result<Self, Self::Rejection> {
         let headers = request.headers().clone();
-        let bytes = axum::body::Bytes::from_request(request, state)
+        let mut bytes = axum::body::Bytes::from_request(request, state)
             .await
             .map_err(IntoResponse::into_response)?;
-        let mut typed = axum::extract::Request::new(axum::body::Body::from(bytes.clone()));
+        let mut sent = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        if drop_save_warnings(&mut sent) {
+            bytes = serde_json::to_vec(&sent)
+                .map_err(|error| SurfaceApiError::InternalError(error.to_string()).into_response())?
+                .into();
+        }
+        let mut typed = axum::extract::Request::new(axum::body::Body::from(bytes));
         *typed.headers_mut() = headers;
         let Json(value) = Json::<T>::from_request(typed, state)
             .await
             .map_err(IntoResponse::into_response)?;
-        let sent = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
         Ok(Self(value, sent))
     }
+}
+
+/// Removes the `warnings` of a [`SurfaceWriteResponse`] from a write body, so a
+/// client can send back what a save returned. Whether one was removed.
+fn drop_save_warnings(body: &mut serde_json::Value) -> bool {
+    body.as_object_mut()
+        .and_then(|body| body.remove("warnings"))
+        .is_some()
 }
 
 const PER_TRANSIT_POINT_REQUIRED: &str = "this surface uses the per-Transit-Point Trust Check shape; send \
@@ -1358,8 +1371,8 @@ pub async fn create_surface(
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
-    Json(mut surface): Json<AgentSurface>,
-) -> Result<(StatusCode, Json<AgentSurface>), SurfaceApiError> {
+    JsonWithSent(mut surface, _): JsonWithSent<AgentSurface>,
+) -> Result<(StatusCode, Json<SurfaceWriteResponse<AgentSurface>>), SurfaceApiError> {
     let store = state
         .agent_surface_store
         .as_ref()
@@ -1400,6 +1413,15 @@ pub async fn create_surface(
     validate_required_fields(&surface, "")?;
     validate_identity_extraction(&surface, "")?;
     reject_public_predicate_route(&surface)?;
+    surface.access_point.public = Some(
+        surface
+            .access_point
+            .public
+            .unwrap_or(false),
+    );
+    surface
+        .close_access_point()
+        .map_err(SurfaceApiError::BadRequest)?;
 
     // Block cloud-metadata URLs on target endpoint (SSRF protection)
     if (surface
@@ -1503,7 +1525,7 @@ pub async fn create_surface(
 
     apply_surface_change(&state, SurfaceChange::Upsert(&surface)).await;
 
-    Ok((StatusCode::CREATED, Json(surface)))
+    Ok((StatusCode::CREATED, Json(surface.into())))
 }
 
 /// Whether `access_point` in a PUT body removes its discovery setting.
@@ -1552,7 +1574,7 @@ pub async fn update_surface(
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
     JsonWithSent(mut surface, sent): JsonWithSent<AgentSurface>,
-) -> Result<Json<AgentSurface>, SurfaceApiError> {
+) -> Result<Json<SurfaceWriteResponse<AgentSurface>>, SurfaceApiError> {
     let store = state
         .agent_surface_store
         .as_ref()
@@ -1598,7 +1620,7 @@ pub async fn update_surface(
         resource_scoped(&delegation),
     )
     .await?;
-    Ok(Json(saved))
+    Ok(Json(saved.into()))
 }
 
 /// PUT carries the whole record, so an omitted
@@ -2142,6 +2164,16 @@ async fn validate_and_save_surface(
     validate_required_fields(&surface, "")?;
     validate_identity_extraction(&surface, "")?;
     reject_public_predicate_route(&surface)?;
+    if surface
+        .access_point
+        .public
+        .is_none()
+    {
+        surface.access_point.public = existing.and_then(|existing| existing.access_point.public);
+    }
+    surface
+        .close_access_point()
+        .map_err(SurfaceApiError::BadRequest)?;
 
     if (surface
         .target
@@ -2271,14 +2303,15 @@ pub async fn patch_surface(
     delegation: Option<Extension<PatDelegationContext>>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
-) -> Result<Json<AgentSurface>, SurfaceApiError> {
+) -> Result<Json<SurfaceWriteResponse<AgentSurface>>, SurfaceApiError> {
     require_merge_patch_content_type(&headers)?;
 
     if body.is_empty() {
         return Err(SurfaceApiError::BadRequest("PATCH body must not be empty".to_string()));
     }
-    let patch: serde_json::Value = serde_json::from_slice(&body)
+    let mut patch: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| SurfaceApiError::BadRequest(format!("PATCH body is not valid JSON: {}", e)))?;
+    drop_save_warnings(&mut patch);
     if !patch.is_object() {
         return Err(SurfaceApiError::BadRequest("PATCH body must be a JSON object at the top level".to_string()));
     }
@@ -2320,7 +2353,7 @@ pub async fn patch_surface(
         resource_scoped(&delegation),
     )
     .await?;
-    Ok(Json(saved))
+    Ok(Json(saved.into()))
 }
 
 /// `PATCH /v1/surfaces/{id}/variants/{variant_id}`
@@ -2340,7 +2373,7 @@ pub async fn patch_variant(
     delegation: Option<Extension<PatDelegationContext>>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
-) -> Result<Json<AgentSurface>, SurfaceApiError> {
+) -> Result<Json<SurfaceWriteResponse<AgentSurface>>, SurfaceApiError> {
     require_merge_patch_content_type(&headers)?;
 
     if body.is_empty() {
@@ -2348,6 +2381,7 @@ pub async fn patch_variant(
     }
     let mut patch: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| SurfaceApiError::BadRequest(format!("PATCH body is not valid JSON: {}", e)))?;
+    drop_save_warnings(&mut patch);
     let Some(patch_obj) = patch.as_object_mut() else {
         return Err(SurfaceApiError::BadRequest("PATCH body must be a JSON object at the top level".to_string()));
     };
@@ -2399,7 +2433,7 @@ pub async fn patch_variant(
         resource_scoped(&delegation),
     )
     .await?;
-    Ok(Json(saved))
+    Ok(Json(saved.into()))
 }
 
 /// Delete an agent surface (hard delete: removes from cache + filesystem).
@@ -2458,6 +2492,36 @@ pub async fn delete_surface(
             Err(SurfaceApiError::Forbidden("surface is outside this token's permitted scope".to_string()))
         }
         _ => Err(SurfaceApiError::NotFound(format!("Surface '{}' not found", surface_id))),
+    }
+}
+
+/// A saved surface, or the variant a variant write saved, with the warnings
+/// about the saved surface.
+#[derive(Debug, Serialize)]
+pub struct SurfaceWriteResponse<T> {
+    #[serde(flatten)]
+    pub saved: T,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+impl<T> SurfaceWriteResponse<T> {
+    fn new(
+        saved: T,
+        surface: &AgentSurface,
+    ) -> Self {
+        let warnings = (surface.access_point.public == Some(true))
+            .then(|| crate::config::agent_surface::PUBLIC_ACCESS_POINT_WARNING.to_string())
+            .into_iter()
+            .collect();
+        Self { saved, warnings }
+    }
+}
+
+impl From<AgentSurface> for SurfaceWriteResponse<AgentSurface> {
+    fn from(surface: AgentSurface) -> Self {
+        let warnings = SurfaceWriteResponse::new((), &surface).warnings;
+        Self { saved: surface, warnings }
     }
 }
 
@@ -2880,7 +2944,7 @@ pub async fn create_variant(
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
     Json(body): Json<CreateVariantRequest>,
-) -> Result<(StatusCode, Json<SurfaceVariant>), SurfaceApiError> {
+) -> Result<(StatusCode, Json<SurfaceWriteResponse<SurfaceVariant>>), SurfaceApiError> {
     let (store, mut surface) = load_surface_or_404(
         &state,
         &surface_id,
@@ -2965,7 +3029,7 @@ pub async fn create_variant(
 
     info!("Created variant '{}' (id={}) on surface '{}'", new_variant.alias, new_variant.id, surface_id);
 
-    Ok((StatusCode::CREATED, Json(new_variant)))
+    Ok((StatusCode::CREATED, Json(SurfaceWriteResponse::new(new_variant, &saved))))
 }
 
 /// `PUT /v1/surfaces/{id}/variants/{variant_id}`
@@ -2981,7 +3045,7 @@ pub async fn update_variant(
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
     JsonWithSent(body, sent): JsonWithSent<UpdateVariantRequest>,
-) -> Result<Json<SurfaceVariant>, SurfaceApiError> {
+) -> Result<Json<SurfaceWriteResponse<SurfaceVariant>>, SurfaceApiError> {
     let (store, mut surface) = load_surface_or_404(
         &state,
         &surface_id,
@@ -3113,7 +3177,7 @@ pub async fn update_variant(
 
     info!("Updated variant '{}' (id={}) on surface '{}'", updated.alias, updated.id, surface_id);
 
-    Ok(Json(updated))
+    Ok(Json(SurfaceWriteResponse::new(updated, &saved)))
 }
 
 /// `DELETE /v1/surfaces/{id}/variants/{variant_id}`
@@ -3197,7 +3261,7 @@ pub async fn promote_variant_to_default(
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
-) -> Result<Json<AgentSurface>, SurfaceApiError> {
+) -> Result<Json<SurfaceWriteResponse<AgentSurface>>, SurfaceApiError> {
     let (store, mut surface) = load_surface_or_404(
         &state,
         &surface_id,
@@ -3239,7 +3303,7 @@ pub async fn promote_variant_to_default(
 
     info!("Promoted variant '{}' (id={}) to default on surface '{}'", variant_alias, variant_id, surface_id);
 
-    Ok(Json(saved))
+    Ok(Json(saved.into()))
 }
 
 /// `GET /v1/surfaces/{id}/variants/{alias}/resolved`
@@ -4206,6 +4270,7 @@ mod validation_tests {
                 didwebvh_identity: None,
                 terminate_trace_id: false,
                 a2a: None,
+                public: None,
             },
             target: Target {
                 endpoint: "https://prod.example.com".to_string(),
@@ -4819,6 +4884,7 @@ mod validation_tests {
         s.access_point
             .caller_authentication = Some(CallerAuthentication {
             protected_resource: None,
+            on_failure: crate::config::agent_surface::OnFailure::Continue,
             methods: vec![SourceAuthConfig::DidAuth(cfg)],
         });
         s
@@ -4929,6 +4995,7 @@ mod validation_tests {
         use crate::source_auth::models::SourceAuthConfig;
         CallerAuthentication {
             protected_resource: None,
+            on_failure: crate::config::agent_surface::OnFailure::Continue,
             methods: vec![SourceAuthConfig::JwtBearer(JwtBearerAuthConfig {
                 token_header: token_header.to_string(),
                 ..Default::default()
@@ -5814,6 +5881,49 @@ mod tenancy_tests {
 mod tests {
     use super::*;
     use crate::config::types::{TrustRecorderConfig, TrustRecorderEntry};
+
+    #[test]
+    fn a_save_of_a_public_access_point_warns_and_others_do_not() {
+        let mut surface = AgentSurface {
+            surface_id: "saved".into(),
+            name: "saved".into(),
+            ..Default::default()
+        };
+        for public in [None, Some(false)] {
+            surface.access_point.public = public;
+            let response = serde_json::to_value(SurfaceWriteResponse::from(surface.clone())).unwrap();
+            assert!(
+                response
+                    .get("warnings")
+                    .is_none(),
+                "{response}"
+            );
+            assert_eq!(response["surface_id"], "saved");
+        }
+        surface.access_point.public = Some(true);
+        let response = serde_json::to_value(SurfaceWriteResponse::from(surface.clone())).unwrap();
+        assert_eq!(
+            response["warnings"],
+            serde_json::json!([crate::config::agent_surface::PUBLIC_ACCESS_POINT_WARNING])
+        );
+        assert_eq!(response["access_point"]["public"], true);
+        let variant =
+            serde_json::to_value(SurfaceWriteResponse::new(serde_json::json!({"id": "beta"}), &surface)).unwrap();
+        assert_eq!(
+            variant,
+            serde_json::json!({"id": "beta", "warnings": [crate::config::agent_surface::PUBLIC_ACCESS_POINT_WARNING]})
+        );
+    }
+
+    #[test]
+    fn a_write_body_sent_back_from_a_save_response_loses_only_its_warnings() {
+        let mut sent = serde_json::json!({"name": "saved", "warnings": ["anything"]});
+        assert!(drop_save_warnings(&mut sent));
+        assert_eq!(sent, serde_json::json!({"name": "saved"}));
+        assert!(!drop_save_warnings(&mut sent));
+        let mut not_an_object = serde_json::json!(["warnings"]);
+        assert!(!drop_save_warnings(&mut not_an_object));
+    }
 
     fn entry(registry: &str) -> TrustRecorderEntry {
         TrustRecorderEntry {

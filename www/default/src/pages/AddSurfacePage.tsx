@@ -8,6 +8,7 @@ import type { Protocol } from '../components/surface-builder/elements/types';
 import { ALL_PROTOCOLS } from '../components/surface-builder/protocols';
 import { defaultSurfaceName } from '../components/surface-builder/surfaceNaming';
 import { registry, validateSurfacePayload } from '../components/surface-builder/elements';
+import { showSurfaceSaveWarnings } from '../components/surface-builder/elements/saveWarnings';
 import { useSurfaceBuilder } from '../components/surface-builder/hooks/useSurfaceBuilder';
 import { useSaveShortcut } from '../components/surface-builder/hooks/useSaveShortcut';
 import { useDiscardWithUndo } from '../components/surface-builder/hooks/useDiscardWithUndo';
@@ -411,7 +412,7 @@ const AddSurfacePage: React.FC = () => {
     // surface after a successful POST.
     try {
       const draft = buildSurfacePayload();
-      const issues = validateSurfacePayload(draft);
+      const issues = validateSurfacePayload(draft, { isNew: true });
       const firstError = issues.find(i => i.severity === 'error');
       if (firstError) {
         return { message: firstError.message, nodeId: firstError.nodeId };
@@ -454,10 +455,7 @@ const AddSurfacePage: React.FC = () => {
       showToast('success', `Agent Surface "${name}" created`);
       // Surface non-blocking structural warnings AFTER create. See
       // SurfaceDetailPage for full rationale.
-      const warnings = validateSurfacePayload(payload).filter(i => i.severity === 'warning');
-      for (const w of warnings.slice(0, 3)) {
-        showToast('error', `Warning: ${w.message}`, { autoRemove: true, duration: 8000 });
-      }
+      showSurfaceSaveWarnings(payload, { isNew: true });
       navigate('/surfaces');
     } catch (err: any) {
       setError(err.message || 'Failed to create surface');

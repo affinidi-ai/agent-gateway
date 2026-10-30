@@ -257,6 +257,7 @@ impl DynamoDbConfigStore {
                     .map(|sa| CallerAuthentication {
                         methods: vec![sa.clone()],
                         protected_resource: None,
+                        on_failure: crate::config::agent_surface::OnFailure::Continue,
                     }),
                 ..Default::default()
             },

@@ -1249,6 +1249,8 @@ export interface CallerAuthentication {
   methods: unknown[];
   /** `null` on a PUT removes the stored setting; leaving it out keeps it. */
   protected_resource?: ProtectedResourceConfig | null;
+  /** `reject` refuses a missing or invalid credential with 401; `continue` forwards it to policy as `failed`. */
+  on_failure?: 'reject' | 'continue';
 }
 
 export interface AgentSurface {
@@ -1267,6 +1269,8 @@ export interface AgentSurface {
     route: string;
     protocol: 'a2a' | 'ap2' | 'mcp';
     caller_authentication?: CallerAuthentication;
+    /** `true` admits callers without credentials. Absent on surfaces created before it existed. */
+    public?: boolean;
     caller_context?: { mode: 'required' | 'optional' | 'anonymous' };
     identity_resolution?: any;
     inbound_policy?: { policy_definition_id: string };

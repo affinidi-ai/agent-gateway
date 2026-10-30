@@ -1032,7 +1032,7 @@ async fn surface_api_settles_a2a_settings_on_a2a_proxy_surfaces() {
     let create = |route: &str, target: &str, variant_target: Option<&str>| {
         let mut body = json!({
             "name": route.trim_start_matches('/'), "status": "disabled",
-            "access_point": {"listen_address": h.gateway_base, "route": route, "protocol": "a2a"},
+            "access_point": {"listen_address": h.gateway_base, "route": route, "protocol": "a2a", "public": true},
             "target": {"endpoint": target}
         });
         if target.starts_with("a2a-proxy://") {
@@ -1221,6 +1221,7 @@ async fn start_a2a_proxy_harness_requiring_caller_auth(fake_direct_line: &FakeDi
             .access_point
             .caller_authentication = Some(crate::config::agent_surface::CallerAuthentication {
             protected_resource: None,
+            on_failure: crate::config::agent_surface::OnFailure::Continue,
             methods: vec![crate::source_auth::SourceAuthConfig::ApiKey(crate::source_auth::models::ApiKeyAuthConfig {
                 extraction: crate::source_auth::models::CredentialExtraction::HttpHeader {
                     field: "x-api-key".to_string(),
@@ -1338,7 +1339,7 @@ async fn an_undeclared_a2a_proxy_create_with_a_target_list_keeps_its_fixed_versi
         .post(format!("{}/api/v1/surfaces", h.gateway_base))
         .json(&json!({
             "name": "proxy-with-checks", "status": "disabled",
-            "access_point": {"listen_address": h.gateway_base, "route": "/proxy-with-checks", "protocol": "a2a",
+            "access_point": {"listen_address": h.gateway_base, "route": "/proxy-with-checks", "protocol": "a2a", "public": true,
                              "a2a": {"validation": "envelope"}},
             "target": {"endpoint": format!("a2a-proxy://{PROXY_ID}"), "a2a_proxy_id": PROXY_ID,
                        "trust_check_list": [super::trust_check_e2e::api_trust_check("proxy-target")]},

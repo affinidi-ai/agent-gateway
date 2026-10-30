@@ -480,11 +480,41 @@ pub(crate) fn build_surface_payload(
             "listen_address": format!("http://localhost:{}", infra.gateway_port),
             "route": route,
             "protocol": world.surface_config.protocol,
+            "public": true,
         },
         "target": {
             "endpoint": target_url,
         }
     })
+}
+
+/// The payload that creates a new surface for `route`, with the scenario's
+/// caller authentication. It sets `access_point.public` only when the operator
+/// marks the Access Point public, so the gateway closes it otherwise.
+pub(crate) async fn build_new_surface_payload(
+    world: &mut SurfaceWorld,
+    route: &str,
+    public: bool,
+) -> serde_json::Value {
+    configure_unseeded_route(world, route);
+    let mut payload = build_primary_target_surface_payload(world, route).await;
+    let access_point = payload["access_point"]
+        .as_object_mut()
+        .expect("surface payload must have an access_point object");
+    access_point.remove("public");
+    if public {
+        access_point.insert("public".to_string(), serde_json::json!(true));
+    }
+    if let Some(auth) = &world
+        .surface_config
+        .source_auth
+    {
+        access_point.insert(
+            "caller_authentication".to_string(),
+            serde_json::json!({ "methods": [config::source_auth::caller_authentication_method_json(auth)] }),
+        );
+    }
+    payload
 }
 
 fn record_caller_response(
@@ -574,6 +604,19 @@ fn get_current_admin_surface_body(
         .unwrap_or_else(|| panic!("admin_response must contain the existing surface before {}", action))
         .body
         .clone()
+}
+
+/// The surface from the last admin save, without the save's `warnings`.
+fn get_saved_surface_without_warnings(
+    world: &SurfaceWorld,
+    action: &str,
+) -> serde_json::Value {
+    let mut surface = get_current_admin_surface_body(world, action);
+    surface
+        .as_object_mut()
+        .expect("surface body must be an object")
+        .remove("warnings");
+    surface
 }
 
 async fn update_created_surface(
@@ -1405,6 +1448,65 @@ async fn valid_surface_create_request_submitted(
     create_valid_surface_for_route(world, &route).await;
 }
 
+#[when(expr = "the operator attempts to create a surface for route {string} without source authentication")]
+async fn surface_without_source_authentication_create_request_submitted(
+    world: &mut SurfaceWorld,
+    route: String,
+) {
+    let payload = build_new_surface_payload(world, &route, false).await;
+    create_surface(world, payload).await;
+}
+
+#[when(expr = "the operator creates a public surface for route {string}")]
+async fn public_surface_create_request_submitted(
+    world: &mut SurfaceWorld,
+    route: String,
+) {
+    let payload = build_new_surface_payload(world, &route, true).await;
+    create_surface(world, payload).await;
+}
+
+#[when("the operator saves the surface again")]
+async fn operator_saves_the_surface_again(world: &mut SurfaceWorld) {
+    // The save response goes back as it came, `warnings` included, as a client
+    // that edits the response would send it.
+    let payload = get_current_admin_surface_body(world, "saving the surface again");
+    update_created_surface(world, payload, "saving the surface again").await;
+}
+
+#[when("the operator removes source authentication from the surface")]
+async fn operator_removes_source_authentication(world: &mut SurfaceWorld) {
+    let mut payload = get_saved_surface_without_warnings(world, "removing source authentication");
+    payload["access_point"]
+        .as_object_mut()
+        .expect("surface body must have an access_point object")
+        .remove("caller_authentication");
+
+    update_created_surface(world, payload, "removing source authentication").await;
+}
+
+#[when(expr = "the operator adds a complete-mode variant {string} without source authentication to the surface")]
+async fn operator_adds_complete_variant_without_source_authentication(
+    world: &mut SurfaceWorld,
+    alias: String,
+) {
+    let mut payload = get_saved_surface_without_warnings(world, "adding a variant");
+    let target_endpoint = payload["target"]["endpoint"].clone();
+    payload["variants"] = serde_json::json!([{
+        "id": format!("variant-{alias}"),
+        "alias": alias,
+        "name": alias,
+        "enabled": true,
+        "overrides": {
+            "complete": true,
+            "access_point": {},
+            "target": { "endpoint": target_endpoint }
+        }
+    }]);
+
+    update_created_surface(world, payload, "adding a variant").await;
+}
+
 #[when(expr = "the operator attempts to create an A2A surface for route {string} that accepts no A2A versions")]
 async fn surface_without_a2a_versions_create_request_submitted(
     world: &mut SurfaceWorld,
@@ -1921,15 +2023,31 @@ async fn fetch_agent_card_with_extra_headers(
     fetch_agent_card_with_headers(world, headers).await;
 }
 
+#[when(expr = "the caller reads the surface path {string}")]
+async fn caller_reads_surface_path(
+    world: &mut SurfaceWorld,
+    path: String,
+) {
+    get_path_and_record(world, &path, vec![]).await;
+}
+
 async fn fetch_agent_card_with_headers(
     world: &mut SurfaceWorld,
+    headers: Vec<(String, String)>,
+) {
+    let path = format!("{}/.well-known/agent-card.json", world.surface_config.route);
+    get_path_and_record(world, &path, headers).await;
+}
+
+async fn get_path_and_record(
+    world: &mut SurfaceWorld,
+    path: &str,
     headers: Vec<(String, String)>,
 ) {
     ensure_gateway_running(world).await;
 
     let infra = world.infra.as_ref().unwrap();
-    let url =
-        format!("http://127.0.0.1:{}{}/.well-known/agent-card.json", infra.gateway_port, world.surface_config.route);
+    let url = format!("http://127.0.0.1:{}{}", infra.gateway_port, path);
 
     let mut req = reqwest::Client::new().get(&url);
     for (name, value) in &headers {

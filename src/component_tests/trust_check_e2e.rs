@@ -273,7 +273,7 @@ async fn surface_api_writes_per_transit_point_trust_checks() {
             "surface_id": id,
             "name": id,
             "status": "disabled",
-            "access_point": {"listen_address": h.gateway_base, "route": format!("/{id}"), "protocol": "a2a"},
+            "access_point": {"listen_address": h.gateway_base, "route": format!("/{id}"), "protocol": "a2a", "public": true},
             "target": {"endpoint": h.mock.url(), "trust_check_list": target_list},
             "transit": {"points": [{
                 "id": "tp-partner",
@@ -440,7 +440,7 @@ async fn surface_api_variant_writes_follow_the_declared_shape() {
             "name": id,
             "status": "disabled",
             "trust_check_split": true,
-            "access_point": {"listen_address": h.gateway_base, "route": format!("/{id}"), "protocol": "a2a"},
+            "access_point": {"listen_address": h.gateway_base, "route": format!("/{id}"), "protocol": "a2a", "public": true},
             "target": {"endpoint": h.mock.url()},
             "variants": [{
                 "id": "variant-dev", "alias": "dev", "name": "dev", "enabled": true,
@@ -577,7 +577,7 @@ async fn surface_api_accepts_trust_check_lists_on_mcp_transit_points() {
                 "name": "tc-api-mcp",
                 "status": "disabled",
                 "trust_check_split": true,
-                "access_point": {"listen_address": h.gateway_base, "route": "/tc-api-mcp", "protocol": "a2a"},
+                "access_point": {"listen_address": h.gateway_base, "route": "/tc-api-mcp", "protocol": "a2a", "public": true},
                 "target": {"endpoint": h.mock.url()},
                 "transit": {"points": [{
                     "alias": "tools", "target_endpoint": "https://tools.example/mcp", "protocol": "mcp",
@@ -618,7 +618,7 @@ async fn a_tenant_token_references_only_its_own_trust_registries_from_transit_po
             "name": id,
             "status": "disabled",
             "trust_check_split": true,
-            "access_point": {"listen_address": h.gateway_base, "route": format!("/{id}"), "protocol": "a2a"},
+            "access_point": {"listen_address": h.gateway_base, "route": format!("/{id}"), "protocol": "a2a", "public": true},
             "target": {"endpoint": h.mock.url()},
             "transit": {"points": [point("base-partner", base_registry)]},
             "variants": [{"id": "variant-dev", "alias": "dev", "name": "dev", "enabled": true,

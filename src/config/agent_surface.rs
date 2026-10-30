@@ -276,6 +276,17 @@ pub struct AccessPoint {
     /// read it through [`AgentSurface::a2a_settings`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub a2a: Option<A2aAccessPointSettings>,
+
+    /// Whether callers without credentials may use the Access Point. The admin
+    /// API sets it on every surface it creates: `false` (the default) requires
+    /// `caller_authentication` and refuses a caller whose credential is missing
+    /// or invalid; `true` opens the Access Point to anyone who can reach it.
+    /// Absent on surfaces created before it existed, and on surfaces the admin
+    /// API did not create, which keep the behaviour their stored
+    /// `caller_authentication` describes. Surface-level, not overridable per
+    /// variant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public: Option<bool>,
 }
 
 /// How much of an inbound A2A request the gateway validates before forwarding it.
@@ -449,17 +460,48 @@ pub enum SurfaceProtocol {
 }
 
 /// Caller authentication configuration.
-/// Multiple methods can be configured; the Gateway tries them in order.
+/// Only the first method is enforced; see [`AgentSurface::source_auth`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CallerAuthentication {
-    /// Ordered list of authentication methods. First success wins.
+    /// Authentication methods. Only the first is enforced.
     pub methods: Vec<SourceAuthConfig>,
     /// RFC 9728 discovery for an MCP Access Point whose JWT Bearer method
     /// accepts tokens from an external authorization server.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protected_resource: Option<crate::protocols::protected_resource::ProtectedResourceConfig>,
+    /// What happens to a caller whose credential is missing or invalid.
+    #[serde(default, skip_serializing_if = "OnFailure::is_continue")]
+    pub on_failure: OnFailure,
 }
+
+/// What the Access Point does with a caller whose credential is missing or
+/// invalid.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OnFailure {
+    /// The request goes on to policy with `input.source_auth.method` set to
+    /// `failed` and no caller identity.
+    #[default]
+    Continue,
+    /// The request is refused with `401` before policy and the Target.
+    Reject,
+}
+
+impl OnFailure {
+    pub fn is_continue(&self) -> bool {
+        *self == Self::Continue
+    }
+}
+
+/// Why the admin API refuses to save a closed Access Point (`public: false`)
+/// without caller authentication.
+pub const CALLER_AUTHENTICATION_REQUIRED: &str = "access_point.caller_authentication is required for a new surface. \
+     Add a caller authentication method, or set access_point.public to true to allow callers without credentials.";
+
+/// The warning on every admin API save of a surface whose Access Point is public.
+pub const PUBLIC_ACCESS_POINT_WARNING: &str =
+    "This Access Point is public. Anyone who can reach it can call your agent without credentials.";
 
 /// What the Gateway needs to know about the caller.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -2827,6 +2869,65 @@ impl AgentSurface {
         }
     }
 
+    /// Applies a closed Access Point (`access_point.public` is `false`): its
+    /// caller authentication, and every variant override of it, rejects a
+    /// caller whose credential is missing or invalid, and the surface and each
+    /// variant it can serve authenticate callers, with a caller authentication
+    /// method or MCP resource authorization, which refuses failed callers
+    /// itself. Any other surface is left as it is.
+    pub fn close_access_point(&mut self) -> Result<(), String> {
+        if self.access_point.public != Some(false) {
+            return Ok(());
+        }
+        let variant_overrides = self
+            .variants
+            .iter_mut()
+            .filter_map(|variant| {
+                variant
+                    .overrides
+                    .access_point
+                    .as_mut()?
+                    .caller_authentication
+                    .as_mut()
+            });
+        for caller_authentication in self
+            .access_point
+            .caller_authentication
+            .iter_mut()
+            .chain(variant_overrides)
+        {
+            caller_authentication.on_failure = OnFailure::Reject;
+        }
+        if !self.authenticates_callers() {
+            return Err(CALLER_AUTHENTICATION_REQUIRED.to_string());
+        }
+        for variant in &self.variants {
+            if let Ok(resolved) = self.resolve_variant(Some(&variant.alias))
+                && !resolved.authenticates_callers()
+            {
+                return Err(format!("variant '{}': {CALLER_AUTHENTICATION_REQUIRED}", variant.alias));
+            }
+        }
+        Ok(())
+    }
+
+    fn authenticates_callers(&self) -> bool {
+        self.source_auth().is_some()
+            || self
+                .mcp_http
+                .as_ref()
+                .is_some_and(|http| http.authorization.is_some())
+    }
+
+    /// Whether a caller whose credential is missing or invalid is refused
+    /// before policy and the Target.
+    pub fn rejects_failed_caller_authentication(&self) -> bool {
+        self.access_point
+            .caller_authentication
+            .as_ref()
+            .is_some_and(|caller_authentication| caller_authentication.on_failure == OnFailure::Reject)
+    }
+
     pub fn validate_mcp_metadata(&self) -> Result<(), String> {
         self.validate_mcp_metadata_base()?;
         for variant in &self.variants {
@@ -3242,6 +3343,163 @@ mod tests {
                 .unwrap_err()
                 .contains("Transit Point")
         );
+    }
+
+    fn api_key_caller_authentication() -> serde_json::Value {
+        serde_json::json!({"methods": [
+            {"type": "api_key", "extraction": {"source": "http_header", "field": "x-api-key"}, "secret_id": "key"}
+        ]})
+    }
+
+    fn surface_with_access_point(access_point: serde_json::Value) -> serde_json::Value {
+        let mut stored = serde_json::json!({
+            "surface_id": "closed", "name": "closed",
+            "access_point": {"listen_address": "http://localhost:8080", "route": "/agent", "protocol": "a2a"},
+            "target": {"endpoint": "http://localhost:8081"}
+        });
+        stored["access_point"]
+            .as_object_mut()
+            .unwrap()
+            .extend(
+                access_point
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            );
+        stored
+    }
+
+    #[test]
+    fn a_stored_access_point_without_the_new_fields_loads_as_before() {
+        let stored =
+            surface_with_access_point(serde_json::json!({"caller_authentication": api_key_caller_authentication()}));
+        let surface: super::AgentSurface = serde_json::from_value(stored).unwrap();
+
+        assert_eq!(surface.access_point.public, None);
+        assert_eq!(
+            surface
+                .access_point
+                .caller_authentication
+                .as_ref()
+                .unwrap()
+                .on_failure,
+            super::OnFailure::Continue
+        );
+        assert!(!surface.rejects_failed_caller_authentication());
+        let saved = serde_json::to_value(&surface).unwrap();
+        assert!(
+            saved["access_point"]
+                .get("public")
+                .is_none()
+        );
+        assert!(
+            saved["access_point"]["caller_authentication"]
+                .get("on_failure")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_closed_access_point_round_trips_public_and_on_failure() {
+        let mut caller_authentication = api_key_caller_authentication();
+        caller_authentication["on_failure"] = serde_json::json!("reject");
+        let stored = surface_with_access_point(
+            serde_json::json!({"caller_authentication": caller_authentication, "public": false}),
+        );
+        let surface: super::AgentSurface = serde_json::from_value(stored).unwrap();
+
+        assert_eq!(surface.access_point.public, Some(false));
+        assert!(surface.rejects_failed_caller_authentication());
+        let saved = serde_json::to_value(&surface).unwrap();
+        assert_eq!(saved["access_point"]["public"], false);
+        assert_eq!(saved["access_point"]["caller_authentication"]["on_failure"], "reject");
+        assert!(
+            serde_json::from_value::<super::AgentSurface>(surface_with_access_point(serde_json::json!({
+                "caller_authentication": {"methods": [], "on_failure": "drop"}
+            })))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn closing_an_access_point_requires_caller_authentication_and_rejects_failures() {
+        let close = |stored: serde_json::Value| {
+            let mut surface: super::AgentSurface = serde_json::from_value(stored).unwrap();
+            surface
+                .close_access_point()
+                .map(|()| surface)
+        };
+
+        for open in [
+            serde_json::json!({"public": false}),
+            serde_json::json!({"public": false, "caller_authentication": {"methods": []}}),
+        ] {
+            assert_eq!(
+                close(surface_with_access_point(open))
+                    .err()
+                    .as_deref(),
+                Some(super::CALLER_AUTHENTICATION_REQUIRED)
+            );
+        }
+
+        let mut continuing = api_key_caller_authentication();
+        continuing["on_failure"] = serde_json::json!("continue");
+        let closed =
+            close(surface_with_access_point(serde_json::json!({"public": false, "caller_authentication": continuing})))
+                .unwrap();
+        assert!(closed.rejects_failed_caller_authentication());
+
+        for unchanged in [serde_json::json!({"public": true}), serde_json::json!({})] {
+            let surface = close(surface_with_access_point(unchanged.clone())).unwrap();
+            assert_eq!(surface.access_point.public, unchanged["public"].as_bool());
+            assert!(!surface.rejects_failed_caller_authentication());
+        }
+        let mut resource_authorized =
+            surface_with_access_point(serde_json::json!({"public": false, "protocol": "mcp"}));
+        resource_authorized["mcp_http"] =
+            serde_json::json!({"authorization": {"resource": "https://gateway.example/agent", "scopes": []}});
+        assert!(close(resource_authorized).is_ok(), "MCP resource authorization authenticates callers");
+
+        let legacy = close(surface_with_access_point(
+            serde_json::json!({"caller_authentication": api_key_caller_authentication()}),
+        ))
+        .unwrap();
+        assert!(!legacy.rejects_failed_caller_authentication());
+    }
+
+    #[test]
+    fn closing_an_access_point_applies_to_every_variant_it_can_serve() {
+        let variant = |enabled: bool, overrides: serde_json::Value| serde_json::json!({"id": "beta", "alias": "beta", "name": "Beta", "enabled": enabled, "overrides": overrides});
+        let closed_with = |variant: serde_json::Value| {
+            let mut stored = surface_with_access_point(
+                serde_json::json!({"public": false, "caller_authentication": api_key_caller_authentication()}),
+            );
+            stored["variants"] = serde_json::json!([variant]);
+            let mut surface: super::AgentSurface = serde_json::from_value(stored).unwrap();
+            surface
+                .close_access_point()
+                .map(|()| surface)
+        };
+        let cleared = serde_json::json!({"complete": true, "access_point": {}});
+
+        assert_eq!(
+            closed_with(variant(true, cleared.clone()))
+                .err()
+                .as_deref(),
+            Some(format!("variant 'beta': {}", super::CALLER_AUTHENTICATION_REQUIRED).as_str())
+        );
+        assert!(closed_with(variant(false, cleared)).is_ok());
+
+        let surface = closed_with(variant(
+            true,
+            serde_json::json!({"access_point": {"caller_authentication": api_key_caller_authentication()}}),
+        ))
+        .unwrap();
+        let resolved = surface
+            .resolve_variant(Some("beta"))
+            .unwrap();
+        assert!(resolved.rejects_failed_caller_authentication());
+        assert!(surface.rejects_failed_caller_authentication());
     }
 
     #[test]
@@ -4675,6 +4933,7 @@ mod tests {
                 didwebvh_identity: None,
                 terminate_trace_id: false,
                 a2a: None,
+                public: None,
             },
             target: Target {
                 endpoint: "https://sales.internal:3000/a2a".to_string(),
@@ -4751,6 +5010,7 @@ mod tests {
                 didwebvh_identity: None,
                 terminate_trace_id: false,
                 a2a: None,
+                public: None,
             },
             target: Target {
                 endpoint: "https://test.internal/mcp".to_string(),

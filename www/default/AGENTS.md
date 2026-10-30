@@ -121,6 +121,23 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   repeat the URL. Test ids: `access-point-entry-point-url` and `surface-entry-point-url`,
   each with `-help` and `-copy-button`; the Transit Point's **Listener URL** banner is
   `transit-point-listener-url`.
+- **Public access** is a switch in the Access Point panel (`access-point-public-switch`, with an
+  always-visible `access-point-public-warning` while on). It writes `access_point.public`, which
+  is surface-level (an `ACCESS_POINT_IDENTIFIER_FIELDS` entry, never a variant override). A
+  surface stored without the field sends none until the operator flips the switch, so saving it
+  keeps its rules. The Access Point and Caller Context elements carry `public` and
+  `caller_authentication.on_failure` through a load and save unchanged. `validateSurfacePayload`
+  owns the save prompts, listed before its other warnings:
+  - No Caller Context and Public access off, on a new surface or one stored with
+    `public: false`: a blocking error toast, "This Access Point is closed to all callers. Add a
+    Caller Context, or turn on Public access.", whose **Show me** selects the Access Point. No API
+    call is made.
+  - Public access on: a `warning` toast after every successful save, "Warning: This Access Point
+    is public. …".
+  - Stored without `public` and no Caller Context: the save goes ahead, then a `warning` toast,
+    "Warning: This Access Point has no Caller Context. …".
+  Post-save warnings go through `showSurfaceSaveWarnings` (`elements/saveWarnings.ts`) as
+  `warning` toasts, at most three.
 - **Transit Settings** has no listener authentication control: the gateway does not support
   `transit.source_auth` and refuses a save that sets it. The **Transit Token Mode** option
   says the embedded token is signed and readable by the agent, not encrypted.

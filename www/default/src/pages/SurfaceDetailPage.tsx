@@ -11,6 +11,7 @@ import {
   validateSurfacePayload,
   buildCanvasBlob,
 } from '../components/surface-builder/elements';
+import { showSurfaceSaveWarnings } from '../components/surface-builder/elements/saveWarnings';
 import type { Protocol } from '../components/surface-builder/elements/types';
 import { useSurfaceBuilder } from '../components/surface-builder/hooks/useSurfaceBuilder';
 import { useSurfaceHistory } from '../components/surface-builder/hooks/useSurfaceHistory';
@@ -1328,14 +1329,8 @@ const SurfaceDetailPage: React.FC = () => {
       showToast('success', `Agent Surface "${updated.name}" saved`);
       // Surface non-blocking structural warnings AFTER save so the
       // user notices issues like empty target endpoints / unrouted
-      // transit points without being prevented from saving. The toast
-      // helper only knows success/error/loading, so warnings reuse the
-      // error styling — they are real shape problems the user should
-      // see, just not severe enough to block the save itself.
-      const warnings = validateSurfacePayload(updated).filter(i => i.severity === 'warning');
-      for (const w of warnings.slice(0, 3)) {
-        showToast('error', `Warning: ${w.message}`, { autoRemove: true, duration: 8000 });
-      }
+      // transit points without being prevented from saving.
+      showSurfaceSaveWarnings(updated);
     } catch (err: any) {
       setError(err.message || 'Failed to save surface');
     } finally {

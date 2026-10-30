@@ -13,6 +13,8 @@ import {
 const usesDiscovery = (c: Record<string, unknown>): boolean =>
   c.method_type === 'jwt_bearer' && readProtectedResource(c.protected_resource) !== null;
 
+const isOnFailure = (v: unknown): v is 'reject' | 'continue' => v === 'reject' || v === 'continue';
+
 /**
  * Caller Context Extraction — promotes the AP-side `caller_authentication`
  * sub-editor to a first-class canvas element so it shows up next to the
@@ -55,10 +57,12 @@ export const callerAuthDefinition: NodeDefinition = {
       <p>Extracts caller authentication context from inbound call <em>before</em> any policy or
       payment gate runs. Drops on the caller → access-point arrow.
       Singleton: one auth method per Surface.</p>
-      <p>Without this element every caller is treated as anonymous. The
-      element does not refuse a request on its own: a missing or invalid
-      credential reaches policy as <code>source_auth.method == "failed"</code>.
-      Add a policy that denies unverified callers to require credentials.</p>
+      <p>A new surface needs this element unless its Access Point has
+      <strong>Public access</strong> on, and it refuses a caller whose
+      credential is missing or invalid with <code>401</code>. A surface
+      created before this check keeps forwarding such callers to policy as
+      <code>source_auth.method == "failed"</code>; add a policy that denies
+      unverified callers to require credentials there.</p>
       <p><strong>Methods:</strong></p>
       <ul>
         <li><strong>JWT bearer</strong>: verify a signed JWT against a
@@ -204,6 +208,7 @@ export const callerAuthDefinition: NodeDefinition = {
         value: {
           methods: [method],
           ...(discovery ? { protected_resource: protectedResourcePayload(discovery) } : {}),
+          ...(isOnFailure(c.on_failure) ? { on_failure: c.on_failure } : {}),
         },
       },
     ];
@@ -233,6 +238,7 @@ export const callerAuthDefinition: NodeDefinition = {
     }
     out.protected_resource =
       m.type === 'jwt_bearer' ? readProtectedResource(slice.protected_resource) : null;
+    out.on_failure = isOnFailure(slice.on_failure) ? slice.on_failure : undefined;
     if (m.type === 'api_key' && m.secret_id) out.api_key_secret_id = m.secret_id;
     if (m.type === 'mtls') {
       // New shape: pinned trust carrying certificate_ids[0].
