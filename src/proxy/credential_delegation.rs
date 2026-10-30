@@ -2323,13 +2323,26 @@ mod tests {
 
     #[tokio::test]
     async fn api_key_and_client_credentials_failures_are_unavailable() {
-        for (provider_type, outcome) in [
-            (CredentialProviderType::ApiKey, DelegationActionOutcome::ApiKeyResolutionFailed),
-            (CredentialProviderType::OAuth2ClientCredentials, DelegationActionOutcome::ClientCredentialsFailed),
-            (CredentialProviderType::OAuth2JwtBearer, DelegationActionOutcome::JwtBearerFailed),
+        for (provider_type, outcome, error) in [
+            (
+                CredentialProviderType::ApiKey,
+                DelegationActionOutcome::ApiKeyResolutionFailed,
+                ServiceTokenError::SecretUnavailable,
+            ),
+            (
+                CredentialProviderType::OAuth2ClientCredentials,
+                DelegationActionOutcome::ClientCredentialsFailed,
+                ServiceTokenError::SecretUnavailable,
+            ),
+            (
+                CredentialProviderType::OAuth2JwtBearer,
+                DelegationActionOutcome::JwtBearerFailed,
+                ServiceTokenError::TokenRequestFailed,
+            ),
             (
                 CredentialProviderType::OAuth2ClientCredentialsJwtAuth,
                 DelegationActionOutcome::ClientCredentialsJwtAuthFailed,
+                ServiceTokenError::SecretUnavailable,
             ),
         ] {
             let vault = MockVaultStore::new(VaultLookupResult::NotFound);
@@ -2363,11 +2376,7 @@ mod tests {
                         .action
                         .detail
                         .as_deref(),
-                    Some(
-                        ServiceTokenError::TokenRequestFailed
-                            .to_string()
-                            .as_str()
-                    ),
+                    Some(error.to_string().as_str()),
                     "{provider_type:?}"
                 );
             }
@@ -2405,39 +2414,43 @@ mod tests {
         let providers = Arc::new(MockProviderStore {
             providers: HashMap::from([("cp-1".to_string(), provider)]),
         });
-        let vault = MockVaultStore::new(VaultLookupResult::NotFound);
+        let vault: Arc<dyn DelegationVaultStorage> = MockVaultStore::new(VaultLookupResult::NotFound);
+        let providers: Arc<dyn CredentialProviderStorage> = providers;
 
-        let results = resolve_delegation_credentials(
-            &[make_binding("cp-1")],
-            "sha256:user1",
-            "did:web:agent.example",
-            "ch-1",
-            crate::tenancy::SurfaceTenancy::configured(None),
-            None,
-            &(vault as Arc<dyn DelegationVaultStorage>),
-            &(providers as Arc<dyn CredentialProviderStorage>),
-            &secrets,
-            "https://gw.example.com",
-            false,
-            None,
-            None,
-        )
-        .await;
-
-        assert_eq!(results.len(), 1);
-        assert_eq!(result_tag(&results[0].result), "Unavailable");
-        assert_eq!(results[0].action.outcome, DelegationActionOutcome::ClientCredentialsFailed);
-        assert_eq!(
-            results[0]
-                .action
-                .detail
-                .as_deref(),
-            Some(
-                ServiceTokenError::TokenEndpointRefused
-                    .to_string()
-                    .as_str()
+        // A refusal starts no backoff, so the second resolve is refused again rather than held back.
+        for _ in 0..2 {
+            let results = resolve_delegation_credentials(
+                &[make_binding("cp-1")],
+                "sha256:user1",
+                "did:web:agent.example",
+                "ch-1",
+                crate::tenancy::SurfaceTenancy::configured(None),
+                None,
+                &vault,
+                &providers,
+                &secrets,
+                "https://gw.example.com",
+                false,
+                None,
+                None,
             )
-        );
+            .await;
+
+            assert_eq!(results.len(), 1);
+            assert_eq!(result_tag(&results[0].result), "Unavailable");
+            assert_eq!(results[0].action.outcome, DelegationActionOutcome::ClientCredentialsFailed);
+            assert_eq!(
+                results[0]
+                    .action
+                    .detail
+                    .as_deref(),
+                Some(
+                    ServiceTokenError::TokenEndpointRefused
+                        .to_string()
+                        .as_str()
+                )
+            );
+        }
     }
 
     async fn resolve_for_tenant(

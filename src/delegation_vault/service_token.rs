@@ -8,7 +8,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use tracing::{debug, warn};
 
-use super::{DelegationToken, VaultLookupResult, oauth, storage::DelegationVaultStorage};
+use super::{DelegationToken, OAuthTokenResponse, VaultLookupResult, oauth, storage::DelegationVaultStorage};
 use crate::config::credential_policy::RuleMode;
 use crate::credential_providers::{CredentialProvider, CredentialProviderType, storage::CredentialProviderStorage};
 use crate::mcp::continuations::delegation::provider_digest;
@@ -89,6 +89,14 @@ pub enum ServiceTokenError {
     StoreUnavailable,
 }
 
+impl ServiceTokenError {
+    /// Whether the token endpoint's answer caused it, so the next request for the same key
+    /// waits for the retry backoff. Local failures never do.
+    fn backs_off(self) -> bool {
+        matches!(self, Self::TokenRequestFailed | Self::ScopeMismatch)
+    }
+}
+
 /// A cached token is not injected within this many seconds of its expiry, so it does not
 /// reach the target just as the issuer stops accepting it.
 pub const EXPIRY_MARGIN_SECS: i64 = 60;
@@ -96,8 +104,10 @@ pub const EXPIRY_MARGIN_SECS: i64 = 60;
 /// The provider's service token for `scopes`: its API key, or a cached token that grants
 /// them, or a new token from the provider's grant, stored under `key`. On this replica one
 /// token request per key is in flight at a time; a caller that missed the cache waits for it
-/// and reads the vault again before requesting. Issued scopes must equal requested ones; when
-/// none were requested the issuer's scopes are kept.
+/// and reads the vault again before requesting. After a failed request the next one for the
+/// key waits for the retry backoff, and a caller arriving before then fails without a request.
+/// Issued scopes must equal requested ones; when none were requested the issuer's scopes are
+/// kept.
 pub async fn acquire(
     provider: &CredentialProvider,
     scopes: &[String],
@@ -155,57 +165,15 @@ pub async fn acquire(
         return Ok(cached(token));
     }
     let slot = grant_slot(key.agent_did, &identity, &provider.id).await;
-    let _grant = slot.lock().await;
+    let mut backoff = slot.lock().await;
     if let Some(token) = cached_token(provider, scopes, context, key.agent_did, &identity, now).await? {
         return Ok(cached(token));
     }
-    let response = match provider.provider_type {
-        CredentialProviderType::OAuth2ClientCredentials => {
-            oauth::fetch_scoped_client_credentials_token(provider, scopes, context.secrets, &egress).await
-        }
-        CredentialProviderType::OAuth2JwtBearer => {
-            oauth::fetch_jwt_bearer_token(provider, scopes, context.secrets, &egress).await
-        }
-        CredentialProviderType::OAuth2ClientCredentialsJwtAuth => {
-            oauth::fetch_client_credentials_jwt_auth_token(provider, scopes, context.secrets, &egress).await
-        }
-        CredentialProviderType::OAuth2AuthorizationCode | CredentialProviderType::ApiKey => {
-            return Err(ServiceTokenError::Unsupported);
-        }
+    if backoff.holds_back(now) {
+        debug!(target: "credential_delegation", provider_id = %provider.provider_id, "Service token request held back by the retry backoff");
+        return Err(ServiceTokenError::TokenRequestFailed);
     }
-    .map_err(|error| {
-        warn!(target: "credential_delegation", provider_id = %provider.provider_id, error = %format!("{error:#}"), "Service token request failed");
-        if error
-            .downcast_ref::<oauth::TokenEndpointRefused>()
-            .is_some()
-        {
-            ServiceTokenError::TokenEndpointRefused
-        } else if error.downcast_ref::<oauth::ProviderSecretError>() == Some(&oauth::ProviderSecretError::OutsideTenant) {
-            ServiceTokenError::SecretUnavailable
-        } else {
-            ServiceTokenError::TokenRequestFailed
-        }
-    })?;
-    let granted = response
-        .scope
-        .as_deref()
-        .map(|scope| {
-            scope
-                .split_whitespace()
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_else(|| scopes.to_vec());
-    if (!scopes.is_empty()
-        && granted
-            .iter()
-            .any(|scope| !scopes.contains(scope)))
-        || scopes
-            .iter()
-            .any(|scope| !granted.contains(scope))
-    {
-        return Err(ServiceTokenError::ScopeMismatch);
-    }
+    let (response, granted) = backoff.record(token_grant(provider, scopes, context.secrets, &egress).await, now)?;
     let current = context
         .providers
         .get(&provider.id)
@@ -258,15 +226,81 @@ pub async fn acquire(
     Ok(ServiceToken::issued(token, false, insecure_endpoint))
 }
 
+/// Requests a token with the provider's grant, checking the issued scopes against `scopes`.
+async fn token_grant(
+    provider: &CredentialProvider,
+    scopes: &[String],
+    secrets: &Arc<dyn SecretsStore>,
+    egress: &oauth::TokenEgress,
+) -> Result<(OAuthTokenResponse, Vec<String>), ServiceTokenError> {
+    let response = match provider.provider_type {
+        CredentialProviderType::OAuth2ClientCredentials => {
+            oauth::fetch_scoped_client_credentials_token(provider, scopes, secrets, egress).await
+        }
+        CredentialProviderType::OAuth2JwtBearer => {
+            oauth::fetch_jwt_bearer_token(provider, scopes, secrets, egress).await
+        }
+        CredentialProviderType::OAuth2ClientCredentialsJwtAuth => {
+            oauth::fetch_client_credentials_jwt_auth_token(provider, scopes, secrets, egress).await
+        }
+        CredentialProviderType::OAuth2AuthorizationCode | CredentialProviderType::ApiKey => {
+            return Err(ServiceTokenError::Unsupported);
+        }
+    }
+    .map_err(|error| {
+        warn!(target: "credential_delegation", provider_id = %provider.provider_id, error = %format!("{error:#}"), "Service token request failed");
+        if error
+            .downcast_ref::<oauth::TokenEndpointRefused>()
+            .is_some()
+        {
+            ServiceTokenError::TokenEndpointRefused
+        } else if let Some(error) = error.downcast_ref::<oauth::ProviderSecretError>() {
+            match error {
+                oauth::ProviderSecretError::NotFound | oauth::ProviderSecretError::OutsideTenant => {
+                    ServiceTokenError::SecretUnavailable
+                }
+                oauth::ProviderSecretError::Store => ServiceTokenError::StoreUnavailable,
+            }
+        } else {
+            ServiceTokenError::TokenRequestFailed
+        }
+    })?;
+    let granted = response
+        .scope
+        .as_deref()
+        .map(|scope| {
+            scope
+                .split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| scopes.to_vec());
+    if (!scopes.is_empty()
+        && granted
+            .iter()
+            .any(|scope| !scopes.contains(scope)))
+        || scopes
+            .iter()
+            .any(|scope| !granted.contains(scope))
+    {
+        return Err(ServiceTokenError::ScopeMismatch);
+    }
+    Ok((response, granted))
+}
+
 const GRANT_SLOT_ENTRIES: u64 = 16_384;
 const GRANT_SLOT_IDLE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
+const BACKOFF_INITIAL_SECS: i64 = 1;
+const BACKOFF_MAX_SECS: i64 = 60;
+
 type GrantSlotKey = (String, String, String);
+type GrantSlot = Arc<tokio::sync::Mutex<Backoff>>;
 
 /// One lock per vault row key on this replica, held while its token is requested and
 /// stored, so concurrent misses send one token request and the others then read its token
-/// from the vault. Holds no token values.
-static GRANT_SLOTS: std::sync::LazyLock<moka::future::Cache<GrantSlotKey, Arc<tokio::sync::Mutex<()>>>> =
+/// from the vault. It guards the key's retry backoff and holds no token values.
+static GRANT_SLOTS: std::sync::LazyLock<moka::future::Cache<GrantSlotKey, GrantSlot>> =
     std::sync::LazyLock::new(|| {
         moka::future::Cache::builder()
             .max_capacity(GRANT_SLOT_ENTRIES)
@@ -278,10 +312,57 @@ async fn grant_slot(
     agent_did: &str,
     identity: &str,
     credential_provider_id: &str,
-) -> Arc<tokio::sync::Mutex<()>> {
+) -> GrantSlot {
     GRANT_SLOTS
         .get_with((agent_did.into(), identity.into(), credential_provider_id.into()), async { Arc::default() })
         .await
+}
+
+/// The token requests to one key that failed in a row, and the time before which the next
+/// one is not sent: 1 s after the first failure, doubling up to 60 s. A success clears it.
+#[derive(Debug, Default)]
+struct Backoff {
+    failures: u32,
+    retry_at: Option<DateTime<Utc>>,
+}
+
+impl Backoff {
+    fn holds_back(
+        &self,
+        now: DateTime<Utc>,
+    ) -> bool {
+        self.retry_at
+            .is_some_and(|retry_at| now < retry_at)
+    }
+
+    fn record<T>(
+        &mut self,
+        outcome: Result<T, ServiceTokenError>,
+        now: DateTime<Utc>,
+    ) -> Result<T, ServiceTokenError> {
+        match &outcome {
+            Ok(_) => *self = Self::default(),
+            Err(error) if error.backs_off() => {
+                self.failures = self
+                    .failures
+                    .saturating_add(1);
+                self.retry_at = Some(now + backoff_delay(self.failures));
+            }
+            Err(_) => {}
+        }
+        outcome
+    }
+}
+
+fn backoff_delay(failures: u32) -> chrono::Duration {
+    let factor = 2_i64
+        .checked_pow(failures.saturating_sub(1))
+        .unwrap_or(i64::MAX);
+    chrono::Duration::seconds(
+        BACKOFF_INITIAL_SECS
+            .saturating_mul(factor)
+            .min(BACKOFF_MAX_SECS),
+    )
 }
 
 /// The vault user identity of the provider's token for `scopes`: `<purpose>:` and the hex
@@ -379,11 +460,13 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    /// The fixture's secrets store, counting value reads and able to fail its listing.
+    /// The fixture's secrets store, counting value reads and able to fail its listing or
+    /// lose its values.
     struct ObservedSecrets {
         inner: crate::secrets::FilesystemSecretsStore,
         value_reads: AtomicUsize,
         listing_fails: AtomicBool,
+        values_missing: AtomicBool,
     }
 
     #[async_trait::async_trait]
@@ -402,6 +485,12 @@ mod tests {
         ) -> anyhow::Result<Option<crate::secrets::Secret>> {
             self.value_reads
                 .fetch_add(1, Ordering::SeqCst);
+            if self
+                .values_missing
+                .load(Ordering::SeqCst)
+            {
+                return Ok(None);
+            }
             self.inner.get(id).await
         }
         async fn list_all(&self) -> anyhow::Result<Vec<crate::secrets::SecretListItem>> {
@@ -450,6 +539,7 @@ mod tests {
     #[derive(Default)]
     struct Endpoint {
         response: Mutex<Value>,
+        failing: AtomicBool,
         forms: Mutex<Vec<HashMap<String, String>>>,
     }
 
@@ -485,12 +575,23 @@ mod tests {
                             .lock()
                             .unwrap()
                             .push(form);
-                        axum::Json(
-                            endpoint
-                                .response
-                                .lock()
-                                .unwrap()
-                                .clone(),
+                        let status = if endpoint
+                            .failing
+                            .load(Ordering::SeqCst)
+                        {
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                        } else {
+                            axum::http::StatusCode::OK
+                        };
+                        (
+                            status,
+                            axum::Json(
+                                endpoint
+                                    .response
+                                    .lock()
+                                    .unwrap()
+                                    .clone(),
+                            ),
                         )
                     },
                 ))
@@ -517,6 +618,7 @@ mod tests {
                 .unwrap(),
                 value_reads: AtomicUsize::new(0),
                 listing_fails: AtomicBool::new(false),
+                values_missing: AtomicBool::new(false),
             });
             let secrets: Arc<dyn SecretsStore> = observed.clone();
             for (secret_id, value) in [
@@ -638,7 +740,7 @@ mod tests {
             &self,
             provider: &CredentialProvider,
             scopes: &[&str],
-        ) -> (String, Arc<tokio::sync::Mutex<()>>) {
+        ) -> (String, GrantSlot) {
             let scopes: Vec<String> = scopes
                 .iter()
                 .map(|scope| scope.to_string())
@@ -667,6 +769,15 @@ mod tests {
                 .lock()
                 .unwrap()
                 .clone()
+        }
+
+        fn fail(
+            &self,
+            failing: bool,
+        ) {
+            self.endpoint
+                .failing
+                .store(failing, Ordering::SeqCst);
         }
 
         fn respond(
@@ -1494,7 +1605,7 @@ mod tests {
     /// `slot`, that is, have missed the cache and are queued for its lock. The slot cache's
     /// pending tasks run before `holders` is counted, so it holds one copy only.
     async fn until_waiting(
-        slot: &Arc<tokio::sync::Mutex<()>>,
+        slot: &GrantSlot,
         holders: usize,
         waiters: usize,
     ) {
@@ -1614,6 +1725,213 @@ mod tests {
                     .await
             ),
             ("read".into(), false)
+        );
+        assert_eq!(fixture.requests().len(), 2);
+    }
+
+    fn after(
+        now: DateTime<Utc>,
+        millis: i64,
+    ) -> DateTime<Utc> {
+        now + chrono::Duration::milliseconds(millis)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_grant_holds_back_the_next_request_until_the_backoff_passes() {
+        for (failure, error) in [
+            (None, ServiceTokenError::TokenRequestFailed),
+            (
+                Some(
+                    json!({"access_token": "wide", "token_type": "Bearer", "expires_in": 3600, "scope": "read write"}),
+                ),
+                ServiceTokenError::ScopeMismatch,
+            ),
+        ] {
+            let fixture = Fixture::new().await;
+            let provider = fixture
+                .provider(client_credentials())
+                .await;
+            match failure {
+                Some(response) => fixture.respond(response),
+                None => fixture.fail(true),
+            }
+            let now = Utc::now();
+            assert_eq!(
+                fixture
+                    .acquire(&provider, &["read"], now)
+                    .await
+                    .err(),
+                Some(error)
+            );
+            assert_eq!(
+                fixture
+                    .acquire(&provider, &["read"], after(now, 500))
+                    .await
+                    .err(),
+                Some(ServiceTokenError::TokenRequestFailed),
+                "{error}"
+            );
+            assert_eq!(fixture.requests().len(), 1, "{error}");
+            assert_eq!(
+                fixture
+                    .acquire(&provider, &["read"], after(now, 1_100))
+                    .await
+                    .err(),
+                Some(error)
+            );
+            assert_eq!(fixture.requests().len(), 2, "{error}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_backoff_doubles_after_each_failure_and_a_success_clears_it() {
+        let fixture = Fixture::new().await;
+        let provider = fixture
+            .provider(client_credentials())
+            .await;
+        fixture.fail(true);
+        let now = Utc::now();
+        let attempt = |millis| fixture.acquire(&provider, &["read"], after(now, millis));
+        for (millis, requests) in [(0, 1), (900, 1), (1_000, 2), (2_900, 2), (3_000, 3), (6_900, 3), (7_000, 4)] {
+            assert_eq!(attempt(millis).await.err(), Some(ServiceTokenError::TokenRequestFailed), "{millis}");
+            assert_eq!(fixture.requests().len(), requests, "{millis}");
+        }
+        fixture.fail(false);
+        assert_eq!(issued(attempt(15_000).await), ("issued".into(), false));
+
+        fixture.fail(true);
+        let expired = 15_000 + 3_600_000;
+        for (millis, requests) in [(expired, 6), (expired + 900, 6), (expired + 1_000, 7)] {
+            assert_eq!(attempt(millis).await.err(), Some(ServiceTokenError::TokenRequestFailed), "{millis}");
+            assert_eq!(fixture.requests().len(), requests, "{millis}");
+        }
+    }
+
+    #[test]
+    fn the_backoff_delay_doubles_from_one_second_and_stops_at_sixty() {
+        let delays: Vec<i64> = [1, 2, 3, 4, 5, 6, 7, 8, 64, u32::MAX]
+            .into_iter()
+            .map(|failures| backoff_delay(failures).num_seconds())
+            .collect();
+        assert_eq!(delays, [1, 2, 4, 8, 16, 32, 60, 60, 60, 60]);
+
+        let now = Utc::now();
+        let mut backoff = Backoff::default();
+        for _ in 0..10 {
+            assert!(
+                backoff
+                    .record::<()>(Err(ServiceTokenError::TokenRequestFailed), now)
+                    .is_err()
+            );
+        }
+        assert!(backoff.holds_back(after(now, 59_900)));
+        assert!(!backoff.holds_back(after(now, 60_000)));
+        assert_eq!(backoff.record(Ok(()), now), Ok(()));
+        assert!(!backoff.holds_back(now));
+        assert_eq!(backoff.failures, 0);
+    }
+
+    #[test]
+    fn local_errors_never_start_a_backoff() {
+        let now = Utc::now();
+        for error in [
+            ServiceTokenError::Unsupported,
+            ServiceTokenError::SecretUnavailable,
+            ServiceTokenError::TokenEndpointRefused,
+            ServiceTokenError::TokenEndpointNotHttps,
+            ServiceTokenError::ProviderChanged,
+            ServiceTokenError::StoreUnavailable,
+        ] {
+            let mut backoff = Backoff::default();
+            assert_eq!(backoff.record::<()>(Err(error), now), Err(error));
+            assert!(!backoff.holds_back(now), "{error}");
+            assert_eq!(backoff.failures, 0, "{error}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_missing_secret_or_refused_endpoint_never_holds_back_the_next_request() {
+        let mut fixture = Fixture::new().await;
+        let provider = fixture
+            .provider(client_credentials())
+            .await;
+        let now = Utc::now();
+        fixture
+            .observed
+            .values_missing
+            .store(true, Ordering::SeqCst);
+        for _ in 0..2 {
+            assert_eq!(
+                fixture
+                    .acquire(&provider, &["read"], now)
+                    .await
+                    .err(),
+                Some(ServiceTokenError::SecretUnavailable)
+            );
+        }
+        fixture
+            .observed
+            .values_missing
+            .store(false, Ordering::SeqCst);
+        let allowlist = fixture
+            .egress
+            .exact_allowlist
+            .take();
+        for _ in 0..2 {
+            assert_eq!(
+                fixture
+                    .acquire(&provider, &["read"], now)
+                    .await
+                    .err(),
+                Some(ServiceTokenError::TokenEndpointRefused)
+            );
+        }
+        assert!(fixture.requests().is_empty());
+        fixture.egress.exact_allowlist = allowlist;
+        assert_eq!(
+            issued(
+                fixture
+                    .acquire(&provider, &["read"], now)
+                    .await
+            ),
+            ("issued".into(), false)
+        );
+        assert_eq!(fixture.requests().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn editing_the_provider_during_a_backoff_requests_a_token_at_once() {
+        let fixture = Fixture::new().await;
+        let provider = fixture
+            .provider(client_credentials())
+            .await;
+        fixture.fail(true);
+        let now = Utc::now();
+        for _ in 0..2 {
+            assert_eq!(
+                fixture
+                    .acquire(&provider, &["read"], now)
+                    .await
+                    .err(),
+                Some(ServiceTokenError::TokenRequestFailed)
+            );
+        }
+        assert_eq!(fixture.requests().len(), 1);
+        fixture.fail(false);
+        let mut edited = provider.clone();
+        edited.default_scopes = vec!["other".into()];
+        let edited = fixture
+            .providers
+            .update(edited)
+            .await
+            .unwrap();
+        assert_eq!(
+            issued(
+                fixture
+                    .acquire(&edited, &["read"], now)
+                    .await
+            ),
+            ("issued".into(), false)
         );
         assert_eq!(fixture.requests().len(), 2);
     }

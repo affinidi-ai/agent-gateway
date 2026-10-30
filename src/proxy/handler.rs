@@ -16895,18 +16895,21 @@ mod target_auth_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_refused_token_request_fails_without_detail() {
+    async fn a_refused_token_request_fails_without_detail_and_holds_back_the_next() {
         let fixture = Fixture::new(401).await;
-        let error = inject_target_auth_header(
-            &provider_auth("machine"),
-            &fixture.context(),
-            "surface",
-            CallerAssertion::GatewayOriginated,
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(error, TargetAuthError::ServiceToken(ServiceTokenError::TokenRequestFailed));
-        assert_eq!(error.to_string(), "credential provider token request failed");
+        for _ in 0..2 {
+            let error = inject_target_auth_header(
+                &provider_auth("machine"),
+                &fixture.context(),
+                "surface",
+                CallerAssertion::GatewayOriginated,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error, TargetAuthError::ServiceToken(ServiceTokenError::TokenRequestFailed));
+            assert_eq!(error.to_string(), "credential provider token request failed");
+        }
+        assert_eq!(fixture.requests(), 1);
         assert!(
             fixture
                 .vault

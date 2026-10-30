@@ -161,6 +161,17 @@ meanwhile wait for it, then read the vault again, so they reuse the token it sto
 another replica stored, instead of requesting their own. Requests for other scopes, providers or
 surfaces do not wait. Replicas do not coordinate, so each may request one token for the same key.
 
+After a token request fails, or its issued scopes do not match (`TokenRequestFailed`,
+`ScopeMismatch`), the next request for the same cache key (surface, provider, scopes and secret
+versions) waits 1 second, doubling after each further failure up to 60 seconds. A request
+arriving before then fails at once with `TokenRequestFailed`, without contacting the provider. A
+successful request clears the wait, and editing the provider or rotating a referenced secret
+starts a new key with no wait. Failures found before any request is sent never start a wait: a
+missing or refused secret (`SecretUnavailable`), a secrets store or vault error
+(`StoreUnavailable`), a token endpoint the egress or https rule refuses (`TokenEndpointRefused`,
+`TokenEndpointNotHttps`), a provider changed during the request (`ProviderChanged`) or an
+unsupported provider type. The wait is kept in memory on each replica and resets on restart.
+
 ## Binding a provider to a surface
 
 Each entry in `AgentSurface.outbound_credentials`
