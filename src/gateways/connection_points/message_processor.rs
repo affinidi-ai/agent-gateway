@@ -5348,7 +5348,15 @@ async fn process_forward_request_in_request_scope(
         } else {
             crate::proxy::handler::CallerAssertion::for_forwarded_request(method, path, source_auth_failed)
         };
-        match crate::proxy::handler::inject_target_auth_header(target_auth, &secrets_store, &surface.name, caller)
+        let providers = get_credential_provider_store();
+        let vault = get_delegation_vault_store();
+        let context = crate::proxy::handler::TargetAuthContext::of_surface(
+            &surface,
+            secrets_store.as_ref(),
+            providers.as_ref(),
+            vault.as_ref(),
+        );
+        match crate::proxy::handler::inject_target_auth_header(target_auth, &context, &surface.name, caller)
         .await
         {
             Ok(Some((header_name, header_value))) => {
@@ -8038,9 +8046,17 @@ async fn handle_mcp_proxy_forward(
             }
         };
 
+        let providers = get_credential_provider_store();
+        let vault = get_delegation_vault_store();
+        let context = crate::proxy::handler::TargetAuthContext::of_surface(
+            surface,
+            secrets_store.as_ref(),
+            providers.as_ref(),
+            vault.as_ref(),
+        );
         match crate::proxy::handler::inject_target_auth_header(
             target_auth,
-            &secrets_store,
+            &context,
             &surface.name,
             crate::proxy::handler::CallerAssertion::for_forwarded_request(method, path, source_auth_failed),
         )

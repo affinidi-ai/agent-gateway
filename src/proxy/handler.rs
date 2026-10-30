@@ -569,12 +569,69 @@ impl CallerAssertion {
     }
 }
 
+/// The stores target authentication resolves a credential from, and the surface it is
+/// resolved for. A provider token is cached in the vault for this surface.
+pub(crate) struct TargetAuthContext<'a> {
+    pub secrets: Option<&'a Arc<dyn crate::secrets::SecretsStore>>,
+    pub providers: Option<&'a dyn crate::credential_providers::storage::CredentialProviderStorage>,
+    pub vault: Option<&'a dyn crate::delegation_vault::storage::DelegationVaultStorage>,
+    /// The client for token requests; the external client when `None`.
+    pub http: Option<&'a reqwest::Client>,
+    pub surface: &'a crate::config::agent_surface::AgentSurface,
+}
+
+impl<'a> TargetAuthContext<'a> {
+    pub(crate) fn of_surface(
+        surface: &'a crate::config::agent_surface::AgentSurface,
+        secrets: Option<&'a Arc<dyn crate::secrets::SecretsStore>>,
+        providers: Option<&'a Arc<dyn crate::credential_providers::storage::CredentialProviderStorage>>,
+        vault: Option<&'a Arc<dyn crate::delegation_vault::storage::DelegationVaultStorage>>,
+    ) -> Self {
+        Self {
+            secrets,
+            providers: providers.map(|providers| providers.as_ref()),
+            vault: vault.map(|vault| vault.as_ref()),
+            http: None,
+            surface,
+        }
+    }
+
+    pub(crate) fn of_proxy(state: &'a ProxyState) -> Self {
+        Self::of_surface(
+            &state.surface,
+            state.secrets_store.as_ref(),
+            state
+                .credential_provider_store
+                .as_ref(),
+            state
+                .delegation_vault_store
+                .as_ref(),
+        )
+    }
+}
+
+/// Why a target credential could not be resolved. Rendered to the caller only as a
+/// generic failure; the variant is logged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum TargetAuthError {
+    #[error("target authentication store unavailable")]
+    StoreUnavailable,
+    #[error("target authentication secret not found")]
+    SecretNotFound,
+    #[error("target authentication credential provider not found")]
+    ProviderNotFound,
+    #[error("credential provider needs a user's consent and cannot authenticate a target")]
+    ProviderNeedsConsent,
+    #[error(transparent)]
+    ServiceToken(#[from] crate::delegation_vault::service_token::ServiceTokenError),
+}
+
 pub(crate) async fn inject_target_auth_header(
     target_auth: &crate::config::TargetAuthConfig,
-    secrets_store: &Option<Arc<dyn crate::secrets::SecretsStore>>,
+    context: &TargetAuthContext<'_>,
     channel_name: &str,
     caller: CallerAssertion,
-) -> anyhow::Result<Option<(String, String)>> {
+) -> Result<Option<(String, String)>, TargetAuthError> {
     use crate::config::TargetAuthMethod;
 
     if !caller.permits_target_credential() {
@@ -591,15 +648,18 @@ pub(crate) async fn inject_target_auth_header(
             header_name,
             header_format,
         } => {
-            let store = secrets_store
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("Secrets store not available"))?;
+            let store = context
+                .secrets
+                .ok_or(TargetAuthError::StoreUnavailable)?;
 
             let secret = store
                 .get_by_secret_id(secret_id)
                 .await
-                .map_err(|e| anyhow::anyhow!("Failed to load secret '{}': {}", secret_id, e))?
-                .ok_or_else(|| anyhow::anyhow!("Secret with secret_id '{}' not found", secret_id))?;
+                .map_err(|e| {
+                    warn!(channel = channel_name, secret_id = %secret_id, error = %e, "Failed to load target auth secret");
+                    TargetAuthError::StoreUnavailable
+                })?
+                .ok_or(TargetAuthError::SecretNotFound)?;
 
             // Format the header value
             let header_value = header_format.replace("{value}", &secret.value);
@@ -608,12 +668,82 @@ pub(crate) async fn inject_target_auth_header(
 
             Ok(Some((header_name.clone(), header_value)))
         }
+        TargetAuthMethod::CredentialProvider {
+            provider_id,
+            header_name,
+            header_format,
+            scopes,
+        } => {
+            let token = target_provider_token(context, provider_id, scopes).await?;
+            debug!(channel = channel_name, provider_id = %provider_id, header = %header_name, "Resolved target auth provider token");
+            Ok(Some((header_name.clone(), header_format.replace("{value}", &token))))
+        }
         TargetAuthMethod::CredentialLookup => {
             // CredentialLookup method not yet implemented - using Secrets approach instead
             warn!(channel = channel_name, "CredentialLookup method not implemented, skipping target auth injection");
             Ok(None)
         }
     }
+}
+
+/// The service token of `provider_id` for target authentication, cached in the vault
+/// under the surface (`surface:<id>`) and `__target_auth__:<provider digest>:<scope hash>`,
+/// so a changed provider never reuses a token issued under its old settings and two
+/// sets of scopes on one surface keep a token each.
+async fn target_provider_token(
+    context: &TargetAuthContext<'_>,
+    provider_id: &str,
+    scopes: &[String],
+) -> Result<String, TargetAuthError> {
+    use crate::credential_providers::CredentialProviderType;
+    use crate::delegation_vault::service_token::{self, ServiceTokenContext, ServiceTokenError, ServiceTokenKey};
+
+    let (Some(secrets), Some(providers), Some(vault)) = (context.secrets, context.providers, context.vault) else {
+        return Err(TargetAuthError::StoreUnavailable);
+    };
+    let provider = providers
+        .get(provider_id)
+        .await
+        .map_err(|_| TargetAuthError::StoreUnavailable)?
+        .filter(|provider| {
+            crate::tenancy::can_reference(
+                context
+                    .surface
+                    .tenant_id
+                    .as_deref(),
+                provider.tenant_id.as_deref(),
+            )
+        })
+        .ok_or(TargetAuthError::ProviderNotFound)?;
+    if provider.provider_type == CredentialProviderType::OAuth2AuthorizationCode {
+        return Err(TargetAuthError::ProviderNeedsConsent);
+    }
+    let mut scopes = if scopes.is_empty() {
+        provider
+            .default_scopes
+            .clone()
+    } else {
+        scopes.to_vec()
+    };
+    scopes.sort_unstable();
+    scopes.dedup();
+    let digest = crate::mcp::continuations::delegation::provider_digest(&provider)
+        .map_err(|_| ServiceTokenError::ProviderChanged)?;
+    let agent_did = format!("surface:{}", context.surface.surface_id);
+    let scope_hash = <sha2::Sha256 as sha2::Digest>::digest(scopes.join(" ").as_bytes());
+    let identity = format!("__target_auth__:{}:{}", hex::encode(digest), hex::encode(scope_hash));
+    let service = ServiceTokenContext {
+        secrets,
+        providers,
+        vault,
+        http: context.http,
+    };
+    let key = ServiceTokenKey {
+        agent_did: &agent_did,
+        identity: &identity,
+    };
+    let token = service_token::acquire(&provider, &scopes, &service, key, chrono::Utc::now()).await?;
+    Ok(token.value().to_string())
 }
 
 /// Load and prepare DID:webvh identity context for a channel request
@@ -6402,7 +6532,14 @@ async fn proxy_handler_with_mcp_runtime(
     // Inject target authentication credentials (if configured)
     if let Some(target_auth) = state.surface.target_auth() {
         let caller_assertion = CallerAssertion::for_forwarded_request(method.as_str(), uri.path(), source_auth_failed);
-        match inject_target_auth_header(target_auth, &state.secrets_store, &channel_name, caller_assertion).await {
+        match inject_target_auth_header(
+            target_auth,
+            &TargetAuthContext::of_proxy(&state),
+            &channel_name,
+            caller_assertion,
+        )
+        .await
+        {
             Ok(Some((header_name, header_value))) => {
                 upstream_req = upstream_req.header(&header_name, &header_value);
                 debug!(channel = channel_name, header = %header_name, "Injected target authentication header");
@@ -6415,10 +6552,7 @@ async fn proxy_handler_with_mcp_runtime(
                 // Check fallback behavior
                 match target_auth.fallback {
                     crate::config::TargetAuthFallback::Reject => {
-                        return Ok(create_error_response(
-                            StatusCode::BAD_GATEWAY,
-                            &format!("Target authentication failed: {}", e),
-                        ));
+                        return Ok(create_error_response(StatusCode::BAD_GATEWAY, "Target authentication failed"));
                     }
                     crate::config::TargetAuthFallback::Passthrough => {
                         warn!(
@@ -12109,7 +12243,7 @@ async fn handle_fabric_request(
     if let Some(target_auth) = state.surface.target_auth() {
         match inject_target_auth_header(
             target_auth,
-            &state.secrets_store,
+            &TargetAuthContext::of_proxy(&state),
             channel_name,
             CallerAssertion::for_forwarded_request(method.as_str(), uri.path(), source_auth_failed),
         )
@@ -12136,10 +12270,7 @@ async fn handle_fabric_request(
                         connection_guard
                             .decrement()
                             .await;
-                        return Err(create_error_response(
-                            StatusCode::BAD_GATEWAY,
-                            &format!("Target authentication failed: {}", e),
-                        ));
+                        return Err(create_error_response(StatusCode::BAD_GATEWAY, "Target authentication failed"));
                     }
                     crate::config::TargetAuthFallback::Passthrough => {
                         warn!(
@@ -14686,8 +14817,13 @@ async fn agent_card_target_credential(
     let Some(target_auth) = state.surface.target_auth() else {
         return Ok(None);
     };
-    match inject_target_auth_header(target_auth, &state.secrets_store, channel_name, CallerAssertion::GatewayOriginated)
-        .await
+    match inject_target_auth_header(
+        target_auth,
+        &TargetAuthContext::of_proxy(state),
+        channel_name,
+        CallerAssertion::GatewayOriginated,
+    )
+    .await
     {
         Ok(credential) => Ok(credential),
         Err(e) => {
@@ -15460,7 +15596,7 @@ async fn handle_mcp_proxy_request(
     let target_auth_header = if let Some(target_auth) = state.surface.target_auth() {
         match inject_target_auth_header(
             target_auth,
-            &state.secrets_store,
+            &TargetAuthContext::of_proxy(state),
             channel_name,
             CallerAssertion::for_forwarded_request(method.as_str(), uri.path(), source_auth_failed),
         )
@@ -16431,6 +16567,326 @@ mod caller_assertion_tests {
         ] {
             assert_eq!(CallerAssertion::for_forwarded_request(method, path, false), expected, "{method} {path}");
         }
+    }
+}
+
+#[cfg(test)]
+mod target_auth_tests {
+    use super::{CallerAssertion, TargetAuthContext, TargetAuthError, inject_target_auth_header};
+    use crate::config::TargetAuthConfig;
+    use crate::credential_providers::storage::{CredentialProviderStorage, FileSystemCredentialProviderStore};
+    use crate::delegation_vault::service_token::ServiceTokenError;
+    use crate::delegation_vault::storage::{DelegationVaultStorage, FileSystemDelegationVaultStore};
+    use crate::secrets::SecretsStore;
+    use serde_json::{Value, json};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Fixture {
+        surface: crate::config::agent_surface::AgentSurface,
+        secrets: Arc<dyn SecretsStore>,
+        providers: FileSystemCredentialProviderStore,
+        vault: FileSystemDelegationVaultStore,
+        client: reqwest::Client,
+        token_requests: Arc<AtomicUsize>,
+        _server: tokio::task::JoinSet<()>,
+        _directory: tempfile::TempDir,
+    }
+
+    impl Fixture {
+        async fn new(token_status: u16) -> Self {
+            let token_requests = Arc::new(AtomicUsize::new(0));
+            let counter = token_requests.clone();
+            let app = axum::Router::new().fallback(axum::routing::post(move || {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    (
+                        axum::http::StatusCode::from_u16(token_status).unwrap(),
+                        axum::Json(
+                            json!({"access_token": "provider-token", "token_type": "Bearer", "expires_in": 3600}),
+                        ),
+                    )
+                }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .unwrap();
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .proxy(reqwest::Proxy::http(format!("http://{}", listener.local_addr().unwrap())).unwrap())
+                .build()
+                .unwrap();
+            let mut server = tokio::task::JoinSet::new();
+            server.spawn(async move {
+                axum::serve(listener, app)
+                    .await
+                    .unwrap();
+            });
+            let directory = tempfile::tempdir().unwrap();
+            let secrets: Arc<dyn SecretsStore> = Arc::new(
+                crate::secrets::FilesystemSecretsStore::new(
+                    directory
+                        .path()
+                        .join("secrets")
+                        .to_str()
+                        .unwrap(),
+                )
+                .unwrap(),
+            );
+            for (secret_id, value) in [("CLIENT_ID", "client"), ("CLIENT_SECRET", "secret")] {
+                secrets
+                    .create(crate::secrets::CreateSecretRequest {
+                        tenant_id: None,
+                        name: secret_id.into(),
+                        secret_id: secret_id.into(),
+                        description: None,
+                        value: value.into(),
+                        secret_type: "General".into(),
+                        tags: vec![],
+                    })
+                    .await
+                    .unwrap();
+            }
+            let providers = FileSystemCredentialProviderStore::new(
+                directory
+                    .path()
+                    .join("providers"),
+            )
+            .await
+            .unwrap();
+            for (id, provider_type, tenant) in [
+                ("machine", "oauth2_client_credentials", Value::Null),
+                ("consent", "oauth2_authorization_code", Value::Null),
+                ("other-tenant", "oauth2_client_credentials", json!("tenant-b")),
+            ] {
+                providers
+                    .create(
+                        serde_json::from_value(json!({
+                            "id": id, "name": id, "provider_id": id, "provider_type": provider_type, "tenant_id": tenant,
+                            "token_endpoint": "http://192.0.2.1/token", "client_id_secret_ref": "CLIENT_ID",
+                            "client_secret_secret_ref": "CLIENT_SECRET", "default_scopes": ["read"],
+                            "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+                        }))
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            Self {
+                surface: serde_json::from_value(json!({
+                    "surface_id": "surface-1", "name": "Surface", "tenant_id": "tenant-a",
+                    "access_point": {"listen_address": "https://gateway.example", "route": "/a2a", "protocol": "a2a"},
+                    "target": {"endpoint": "https://agent.example/a2a"}
+                }))
+                .unwrap(),
+                secrets,
+                providers,
+                vault: FileSystemDelegationVaultStore::new(directory.path().join("vault"))
+                    .await
+                    .unwrap(),
+                client,
+                token_requests,
+                _server: server,
+                _directory: directory,
+            }
+        }
+
+        fn context(&self) -> TargetAuthContext<'_> {
+            TargetAuthContext {
+                secrets: Some(&self.secrets),
+                providers: Some(&self.providers),
+                vault: Some(&self.vault),
+                http: Some(&self.client),
+                surface: &self.surface,
+            }
+        }
+
+        fn requests(&self) -> usize {
+            self.token_requests
+                .load(Ordering::SeqCst)
+        }
+    }
+
+    fn provider_auth(provider_id: &str) -> TargetAuthConfig {
+        serde_json::from_value(json!({"method": {"credential_provider": {"provider_id": provider_id}}})).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_provider_token_is_injected_and_cached_for_the_surface() {
+        let fixture = Fixture::new(200).await;
+        for _ in 0..2 {
+            let header = inject_target_auth_header(
+                &provider_auth("machine"),
+                &fixture.context(),
+                "surface",
+                CallerAssertion::GatewayOriginated,
+            )
+            .await
+            .unwrap();
+            assert_eq!(header, Some(("Authorization".to_string(), "Bearer provider-token".to_string())));
+        }
+        assert_eq!(fixture.requests(), 1);
+        let stored = fixture
+            .vault
+            .list_all()
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].agent_did, "surface:surface-1");
+        assert!(
+            stored[0]
+                .user_identity_hash
+                .starts_with("__target_auth__:")
+        );
+        assert_eq!(stored[0].credential_provider_id, "machine");
+        assert_eq!(stored[0].scopes, vec!["read"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_custom_header_and_scopes_shape_the_injected_credential() {
+        let fixture = Fixture::new(200).await;
+        let auth: TargetAuthConfig = serde_json::from_value(json!({"method": {"credential_provider": {
+            "provider_id": "machine", "header_name": "x-agent-token", "header_format": "Token {value}", "scopes": ["write", "read", "write"]
+        }}}))
+        .unwrap();
+        let header = inject_target_auth_header(&auth, &fixture.context(), "surface", CallerAssertion::Authenticated)
+            .await
+            .unwrap();
+        assert_eq!(header, Some(("x-agent-token".to_string(), "Token provider-token".to_string())));
+        assert_eq!(
+            fixture
+                .vault
+                .list_all()
+                .await
+                .unwrap()[0]
+                .scopes,
+            vec!["read", "write"]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tokens_for_different_scopes_of_one_provider_are_cached_side_by_side() {
+        let fixture = Fixture::new(200).await;
+        let scoped = |scope: &str| -> TargetAuthConfig {
+            serde_json::from_value(json!({"method": {"credential_provider": {
+                "provider_id": "machine", "scopes": [scope]
+            }}}))
+            .unwrap()
+        };
+        for _ in 0..2 {
+            for scope in ["read", "write"] {
+                inject_target_auth_header(
+                    &scoped(scope),
+                    &fixture.context(),
+                    "surface",
+                    CallerAssertion::Authenticated,
+                )
+                .await
+                .unwrap();
+            }
+        }
+        assert_eq!(fixture.requests(), 2, "the token endpoint received one request per scope set");
+        let mut stored: Vec<Vec<String>> = fixture
+            .vault
+            .list_all()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|record| record.scopes)
+            .collect();
+        stored.sort();
+        assert_eq!(stored, vec![vec!["read".to_string()], vec!["write".to_string()]]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unauthenticated_caller_never_spends_a_provider_token() {
+        let fixture = Fixture::new(200).await;
+        let header = inject_target_auth_header(
+            &provider_auth("machine"),
+            &fixture.context(),
+            "surface",
+            CallerAssertion::Unauthenticated,
+        )
+        .await
+        .unwrap();
+        assert_eq!(header, None);
+        assert_eq!(fixture.requests(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unusable_provider_is_a_typed_error() {
+        let fixture = Fixture::new(200).await;
+        for (provider_id, expected) in [
+            ("consent", TargetAuthError::ProviderNeedsConsent),
+            ("other-tenant", TargetAuthError::ProviderNotFound),
+            ("missing", TargetAuthError::ProviderNotFound),
+        ] {
+            let error = inject_target_auth_header(
+                &provider_auth(provider_id),
+                &fixture.context(),
+                "surface",
+                CallerAssertion::GatewayOriginated,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error, expected, "{provider_id}");
+        }
+        let mut without_vault = fixture.context();
+        without_vault.vault = None;
+        assert_eq!(
+            inject_target_auth_header(
+                &provider_auth("machine"),
+                &without_vault,
+                "surface",
+                CallerAssertion::GatewayOriginated
+            )
+            .await
+            .unwrap_err(),
+            TargetAuthError::StoreUnavailable
+        );
+        assert_eq!(fixture.requests(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_token_request_fails_without_detail() {
+        let fixture = Fixture::new(401).await;
+        let error = inject_target_auth_header(
+            &provider_auth("machine"),
+            &fixture.context(),
+            "surface",
+            CallerAssertion::GatewayOriginated,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, TargetAuthError::ServiceToken(ServiceTokenError::TokenRequestFailed));
+        assert_eq!(error.to_string(), "credential provider token request failed");
+        assert!(
+            fixture
+                .vault
+                .list_all()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_missing_static_secret_is_a_typed_error_that_does_not_name_it() {
+        let fixture = Fixture::new(200).await;
+        let auth: TargetAuthConfig = serde_json::from_value(json!({"method": {"static_secret": {
+            "secret_id": "secret-name-marker", "header_name": "x-key"
+        }}}))
+        .unwrap();
+        let error = inject_target_auth_header(&auth, &fixture.context(), "surface", CallerAssertion::Authenticated)
+            .await
+            .unwrap_err();
+        assert_eq!(error, TargetAuthError::SecretNotFound);
+        assert!(
+            !error
+                .to_string()
+                .contains("secret-name-marker")
+        );
     }
 }
 

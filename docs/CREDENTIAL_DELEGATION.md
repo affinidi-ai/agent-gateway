@@ -22,17 +22,76 @@ for the operator procedure. This page documents the implementation in
 ## Credential providers
 
 `CredentialProvider` ([`src/credential_providers/mod.rs`](../src/credential_providers/mod.rs))
-has three types, set by `provider_type`.
+has five types, set by `provider_type`.
 
 | Type | Flow | Consent |
 | --- | --- | --- |
 | `oauth2_authorization_code` | Three-legged OAuth. The user signs in to the provider and approves the scopes. | Required, per user |
-| `oauth2_client_credentials` | Two-legged, machine to machine. The gateway authenticates as the client. | None |
+| `oauth2_client_credentials` | Two-legged, machine to machine. The gateway authenticates as the client with a client secret. | None |
+| `oauth2_jwt_bearer` | JWT Bearer grant (RFC 7523 section 2.1). The gateway signs a JWT with the provider's private key and posts it as the `assertion`; no client ID or secret. A Google service account for Vertex AI Agent Engine works this way. | None |
+| `oauth2_client_credentials_jwt_auth` | Client Credentials grant whose client authenticates with a signed JWT (`private_key_jwt`, RFC 7523 section 2.2) instead of a client secret. An Entra certificate credential (key named by certificate thumbprint) and an Ory `private_key_jwt` client (key named by `kid`) work this way. | None |
 | `api_key` | A static key resolved from the secrets store. No OAuth. | None |
 
 A provider carries its authorization and token endpoints and its default scopes. Its
-client ID and client secret are **references** into the secrets store, such as
-`GOOGLE_CLIENT_SECRET`, and are never stored in the provider record itself.
+client ID, client secret, signing key and certificate are **references** into the secrets
+store, such as `GOOGLE_CLIENT_SECRET`, and are never stored in the provider record itself.
+
+### Providers that sign a JWT
+
+The two JWT types share the settings in `JwtAssertionSettings`; create and update refuse a
+record that misses a required one.
+
+| Field | `oauth2_jwt_bearer` | `oauth2_client_credentials_jwt_auth` |
+| --- | --- | --- |
+| `jwt_signing_key_secret_ref` | Required: a PEM private key (PKCS#1 or PKCS#8 for RSA, PKCS#8 for EC) | Required |
+| `jwt_signing_algorithm` | `RS256` (default) or `ES256` | `PS256` (default) or `RS256` |
+| `jwt_issuer` | Required: the `iss` claim, a service account's `client_email` | Not used: `iss` and `sub` are the client ID |
+| `jwt_subject` | Optional `sub` (domain-wide delegation) | Not used |
+| `jwt_certificate_secret_ref` | Not used | Optional: the PEM certificate, whose SHA-256 thumbprint goes in the `x5t#S256` header. Entra needs it; issuers that find the key by `kid`, such as Ory, do not |
+| `client_id_secret_ref` | Not used | Required, sent as `client_id` |
+| `client_secret_secret_ref` | Not used | Refused, so a misconfiguration cannot fall back to a client secret |
+| `jwt_audience` | Optional `aud`; the token endpoint when unset | The same |
+| `jwt_key_id` | Optional `kid` header, a Google key's `private_key_id` | Optional `kid` header, such as the `kid` of the key in an Ory client's JWKS. The dashboard warns when neither it nor a certificate is set, since the server may then not find the key |
+
+Create and update resolve the referenced key and certificate after checking the caller may
+use them, and refuse with 400 a key that cannot sign with the algorithm or a certificate that
+is not PEM, so a wrong format fails the save rather than the first token request.
+`POST /api/v1/credential-providers/validate` runs the same check before a save: it needs the
+credential provider edit permission, applies the caller's tenant to the secrets it names, and
+answers `"key_material": "ok"` beside the token endpoint's reachability. JWK keys are not
+accepted. The provider API never returns the key or certificate; the list leaves out
+their references too.
+
+Every token request signs a fresh assertion that lives 5 minutes (`iat`, `exp`, and for a
+client assertion `nbf` and a random `jti`); only the issued access token is cached. A JWT
+Bearer grant sends the scopes in the `scope` claim, a client assertion in the `scope` form
+field (Entra: `<audience>/.default`). Entra needs the tenant-specific v2.0 token endpoint, not
+`common`. An update that sends a reference or JWT field as an empty string clears it, which
+is how a client-credentials provider switches to `oauth2_client_credentials_jwt_auth`; a create
+reads an empty reference as none.
+
+### Service tokens
+
+`oauth2_client_credentials`, `oauth2_jwt_bearer`, `oauth2_client_credentials_jwt_auth` and
+`api_key` give the gateway a credential of its own, with no user.
+[`service_token::acquire`](../src/delegation_vault/service_token.rs) obtains it for every path
+that needs one: legacy and `2026-07-28` delegation bindings, and target authentication.
+
+- An API key is read from the secrets store on every use and never cached.
+- An issued token is cached in the delegation vault until 60 seconds before its `expires_at`,
+  then a new one is requested. A token response without `expires_in`, with an empty token, or
+  with a `token_type` other than `Bearer` is refused, as is a response over 64 KiB or slower
+  than 30 seconds; only the response's OAuth `error` fields are logged.
+- When scopes were requested, the issued `scope` must name the same set, or the token is
+  refused; when none were requested, the issued scopes are kept.
+- The provider is read again after the token request, and a provider changed meanwhile
+  refuses the token.
+- `resource` is sent only when the provider sets it, on every path including legacy bindings.
+  The Microsoft identity platform v2.0 token endpoint rejects it (AADSTS901002): put the audience
+  in the scopes as `<resource>/.default` instead. The dashboard warns on the provider form and
+  list when an Entra v2.0 provider sets `resource`.
+
+Concurrent requests that all miss the cache each request a token; the last one stored wins.
 
 ## Binding a provider to a surface
 
@@ -78,6 +137,48 @@ way. So the managed agent can neither supply nor replace a credential, and a del
 credential under the same name as `target_auth` replaces it; give them different names to
 send both.
 
+## Target authentication from a credential provider
+
+A Target's `target.auth` or a Transit Point's `target_auth` can take its credential from a
+credential provider instead of a static secret:
+
+```json
+{
+  "method": {
+    "credential_provider": {
+      "provider_id": "<credential provider id>",
+      "header_name": "Authorization",
+      "header_format": "Bearer {value}",
+      "scopes": ["https://www.googleapis.com/auth/cloud-platform"]
+    }
+  },
+  "fallback": "reject"
+}
+```
+
+`header_name` defaults to `Authorization`, `header_format` to `Bearer {value}`, and `scopes`
+to the provider's default scopes. The provider can be any type but
+`oauth2_authorization_code`, which needs a user's consent; a surface save refuses that type, a
+provider the surface's tenant cannot reference, and the never-implemented `credential_lookup`
+method, which still loads from storage. The provider is a reference of the surface, so it
+cannot be deleted while a surface uses it.
+
+The token is a service token (see above), cached in the vault under the agent half
+`surface:<surface_id>` and the user half `__target_auth__:<provider digest>:<scope hash>`, where
+the scope hash is the SHA-256 (hex) of the sorted, deduplicated scopes joined by spaces.
+Changing the provider changes the digest, so a token issued under the old settings is never
+reused; a Target and a Transit Point that use one provider with different scopes each keep
+their own token. The token shows in the Credential Tokens tab like any other. The credential is sent only on a
+request the gateway vetted (`CallerAssertion`), so a provider token is never spent on an
+unauthenticated discovery request, except on the gateway's own agent card fetch. A token that
+cannot be obtained follows `fallback`: `reject` answers 502 "Target authentication failed",
+`passthrough` forwards without the credential, and the cause is logged only. A `401` from the
+target does not evict the cached token.
+
+`POST /v1/mcp-proxies/discover`, the Surface Builder's design-time tool listing, still accepts
+only `static_secret` target authentication, so listing the tools of an MCP server behind an
+OAuth-protected endpoint needs a static secret for now.
+
 ## When a token is missing
 
 Delegation needs a user to key the token by, so a surface with delegation but no
@@ -112,7 +213,9 @@ A binding that applies but whose credential cannot be resolved refuses the reque
 than forwarding it without the credential. That covers a deleted or unreadable provider, an
 API key whose secret cannot be read, a failed client-credentials token request, a vault read
 error, and consent that is needed but cannot be asked for because no authorization URL can be
-built, for example when the provider has no `authorization_endpoint`. An Access Point and
+built, for example when the provider has no `authorization_endpoint`. A failed token request
+records `client_credentials_failed`, `jwt_bearer_failed` or `client_credentials_jwt_auth_failed`
+by provider type. An Access Point and
 Fabric receive answer `503`: on an MCP surface a JSON-RPC error (`-32603`, `Delegated
 credentials unavailable`) carrying the request's id, otherwise an `application/problem+json`
 body. The delegation audit records the binding's outcome, and `provider_unavailable` names a
@@ -247,8 +350,10 @@ puts it in `user_hash`. To compute it for a JWT subject `alice` from
 printf '%s' '["jwt_bearer","https://login.example.com",null,"alice"]' | shasum -a 256
 ```
 
-Client-credentials tokens have no user, so they are cached under the fixed user hash
-`__client_credentials__`.
+Service tokens have no user, so a legacy binding caches them under the fixed user hash
+`__client_credentials__`, a `2026-07-28` binding under `__mcp_client_credentials__:<provider
+digest>`, and target authentication under `__target_auth__:<provider digest>:<scope hash>` with
+the agent half `surface:<surface_id>`.
 
 A lookup has four outcomes.
 
@@ -259,8 +364,8 @@ A lookup has four outcomes.
 | Expired, no refresh token | Treats it as missing and applies the consent mode |
 | Not found | Applies the consent mode |
 
-For client-credentials providers an expired token is deleted and a fresh one fetched,
-since no user is involved.
+For a service token, one within 60 seconds of expiry counts as expired and is replaced by a
+fresh one, since no user is involved.
 
 ### Storage
 

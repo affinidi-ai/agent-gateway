@@ -9,13 +9,20 @@ import { DeleteButton } from '../../components/shared/DeleteButton';
 import { EmptyState } from '../../components/shared/EmptyState';
 import { DOCS_URL } from '../../config/docs';
 import { formatDateTime } from '../../utils/stringUtils';
+import {
+  CredentialProviderType,
+  PROVIDER_TYPE_LABELS,
+  entraRejectsResource,
+  entraResourceMessage,
+} from '../EditCredentialProviderPage/credentialProviderForm';
 
 interface CredentialProviderListItem {
   id: string;
   name: string;
   provider_id: string;
-  provider_type: 'oauth2_authorization_code' | 'oauth2_client_credentials' | 'api_key';
+  provider_type: CredentialProviderType;
   token_endpoint?: string;
+  resource?: string | null;
   default_scopes: string[];
   token_refresh_enabled: boolean;
   description?: string;
@@ -23,15 +30,11 @@ interface CredentialProviderListItem {
   updated_at: string;
 }
 
-const PROVIDER_TYPE_LABELS: Record<string, string> = {
-  oauth2_authorization_code: 'Authorization Code',
-  oauth2_client_credentials: 'Client Credentials',
-  api_key: 'API Key',
-};
-
-const PROVIDER_TYPE_COLORS: Record<string, string> = {
+const PROVIDER_TYPE_COLORS: Record<CredentialProviderType, string> = {
   oauth2_authorization_code: 'text-bg-info',
   oauth2_client_credentials: 'text-bg-primary',
+  oauth2_jwt_bearer: 'text-bg-primary',
+  oauth2_client_credentials_jwt_auth: 'text-bg-primary',
   api_key: 'text-bg-warning',
 };
 
@@ -202,6 +205,16 @@ const CredentialProvidersTab: React.FC<CredentialProvidersTabProps> = ({
                   >
                     <td>
                       <strong>{provider.name}</strong>
+                      {provider.resource &&
+                        entraRejectsResource(provider.token_endpoint ?? '', provider.resource) && (
+                          <i
+                            className="fas fa-exclamation-triangle text-warning ms-2"
+                            role="img"
+                            aria-label={entraResourceMessage(provider.resource)}
+                            title={entraResourceMessage(provider.resource)}
+                            data-testid="credential-provider-entra-resource-badge"
+                          />
+                        )}
                       {provider.description && (
                         <div>
                           <small className="text-muted">{provider.description}</small>

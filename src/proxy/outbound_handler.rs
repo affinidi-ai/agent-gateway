@@ -2264,9 +2264,10 @@ async fn transit_request_headers(
         .virtual_channel
         .target_auth
         .as_ref()
-        .and_then(|target_auth| match &target_auth.method {
-            crate::config::TargetAuthMethod::StaticSecret { header_name, .. } => Some(header_name.as_str()),
-            crate::config::TargetAuthMethod::CredentialLookup => None,
+        .and_then(|target_auth| {
+            target_auth
+                .method
+                .header_name()
         });
     let mut headers = HeaderMap::new();
     for (name, value) in &ctx.original_headers {
@@ -2305,7 +2306,16 @@ async fn transit_target_auth_header(
     };
     match crate::proxy::handler::inject_target_auth_header(
         target_auth,
-        &state.secrets_store,
+        &crate::proxy::handler::TargetAuthContext::of_surface(
+            &ctx.surface,
+            state.secrets_store.as_ref(),
+            state
+                .credential_provider_store
+                .as_ref(),
+            state
+                .delegation_vault_store
+                .as_ref(),
+        ),
         &ctx.surface.name,
         crate::proxy::handler::CallerAssertion::for_request(ctx.original_method.as_str(), &ctx.request_path),
     )

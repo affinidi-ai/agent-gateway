@@ -32,6 +32,135 @@ pub enum CredentialProviderType {
     /// Static API key — resolved directly from the secrets store, no OAuth
     #[serde(rename = "api_key")]
     ApiKey,
+    /// JWT Bearer grant (RFC 7523 section 2.1): a signed JWT is the grant, no client
+    /// credentials. Google service accounts use it.
+    #[serde(rename = "oauth2_jwt_bearer")]
+    OAuth2JwtBearer,
+    /// Client Credentials grant with `private_key_jwt` client authentication (RFC 7523
+    /// section 2.2). Entra certificate credentials use it.
+    #[serde(rename = "oauth2_client_credentials_jwt_auth")]
+    OAuth2ClientCredentialsJwtAuth,
+}
+
+impl CredentialProviderType {
+    /// The signing algorithm used when the provider names none; `None` for types
+    /// that sign nothing.
+    pub fn default_jwt_algorithm(&self) -> Option<JwtSigningAlgorithm> {
+        match self {
+            Self::OAuth2JwtBearer => Some(JwtSigningAlgorithm::RS256),
+            Self::OAuth2ClientCredentialsJwtAuth => Some(JwtSigningAlgorithm::PS256),
+            Self::OAuth2AuthorizationCode | Self::OAuth2ClientCredentials | Self::ApiKey => None,
+        }
+    }
+
+    /// The algorithm a provider of this type signs with: `configured`, else the default.
+    pub fn jwt_signing_algorithm(
+        &self,
+        configured: Option<JwtSigningAlgorithm>,
+    ) -> Option<JwtSigningAlgorithm> {
+        self.default_jwt_algorithm()
+            .map(|default| configured.unwrap_or(default))
+    }
+
+    pub fn allows_jwt_algorithm(
+        &self,
+        algorithm: JwtSigningAlgorithm,
+    ) -> bool {
+        match self {
+            Self::OAuth2JwtBearer => matches!(algorithm, JwtSigningAlgorithm::RS256 | JwtSigningAlgorithm::ES256),
+            Self::OAuth2ClientCredentialsJwtAuth => {
+                matches!(algorithm, JwtSigningAlgorithm::PS256 | JwtSigningAlgorithm::RS256)
+            }
+            Self::OAuth2AuthorizationCode | Self::OAuth2ClientCredentials | Self::ApiKey => false,
+        }
+    }
+}
+
+/// Algorithm of the JWT a provider signs with its private key.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum JwtSigningAlgorithm {
+    RS256,
+    PS256,
+    ES256,
+}
+
+/// The signed-JWT settings of the `oauth2_jwt_bearer` and
+/// `oauth2_client_credentials_jwt_auth` types. Key and certificate are secret
+/// references; the PEM values never leave the secrets store except to sign.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JwtAssertionSettings {
+    /// Secret holding the PEM private key (PKCS#1 or PKCS#8 for RSA, PKCS#8 for EC)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwt_signing_key_secret_ref: Option<String>,
+    /// Secret holding the PEM certificate whose SHA-256 thumbprint goes in `x5t#S256`;
+    /// optional, for issuers such as Entra that identify the key by certificate
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwt_certificate_secret_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwt_signing_algorithm: Option<JwtSigningAlgorithm>,
+    /// `aud` claim; the token endpoint when unset
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwt_audience: Option<String>,
+    /// `kid` header
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwt_key_id: Option<String>,
+    /// `iss` claim of a JWT Bearer grant (a Google service account's `client_email`)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwt_issuer: Option<String>,
+    /// `sub` claim of a JWT Bearer grant (domain-wide delegation)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwt_subject: Option<String>,
+}
+
+impl JwtAssertionSettings {
+    /// These settings with every field that `self` leaves unset taken from `existing`.
+    pub fn or(
+        self,
+        existing: Self,
+    ) -> Self {
+        Self {
+            jwt_signing_key_secret_ref: self
+                .jwt_signing_key_secret_ref
+                .or(existing.jwt_signing_key_secret_ref),
+            jwt_certificate_secret_ref: self
+                .jwt_certificate_secret_ref
+                .or(existing.jwt_certificate_secret_ref),
+            jwt_signing_algorithm: self
+                .jwt_signing_algorithm
+                .or(existing.jwt_signing_algorithm),
+            jwt_audience: self
+                .jwt_audience
+                .or(existing.jwt_audience),
+            jwt_key_id: self
+                .jwt_key_id
+                .or(existing.jwt_key_id),
+            jwt_issuer: self
+                .jwt_issuer
+                .or(existing.jwt_issuer),
+            jwt_subject: self
+                .jwt_subject
+                .or(existing.jwt_subject),
+        }
+    }
+
+    /// The same settings with blank values removed and the rest trimmed, so a field
+    /// sent empty clears it.
+    pub fn normalized(self) -> Self {
+        fn clean(value: Option<String>) -> Option<String> {
+            value
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        }
+        Self {
+            jwt_signing_key_secret_ref: clean(self.jwt_signing_key_secret_ref),
+            jwt_certificate_secret_ref: clean(self.jwt_certificate_secret_ref),
+            jwt_signing_algorithm: self.jwt_signing_algorithm,
+            jwt_audience: clean(self.jwt_audience),
+            jwt_key_id: clean(self.jwt_key_id),
+            jwt_issuer: clean(self.jwt_issuer),
+            jwt_subject: clean(self.jwt_subject),
+        }
+    }
 }
 
 /// A configured OAuth 2.0 credential provider
@@ -107,6 +236,9 @@ pub struct CredentialProvider {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_secret_ref: Option<String>,
 
+    #[serde(flatten)]
+    pub jwt: JwtAssertionSettings,
+
     /// Optional description
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -122,6 +254,15 @@ fn default_true() -> bool {
 impl StorableEntity for CredentialProvider {
     fn id(&self) -> &str {
         &self.id
+    }
+}
+
+impl CredentialProvider {
+    /// The algorithm this provider signs its JWT with: the configured one, or its
+    /// type's default. `None` for types that sign nothing.
+    pub fn jwt_signing_algorithm(&self) -> Option<JwtSigningAlgorithm> {
+        self.provider_type
+            .jwt_signing_algorithm(self.jwt.jwt_signing_algorithm)
     }
 }
 
@@ -150,6 +291,8 @@ pub struct CreateCredentialProviderRequest {
     pub additional_params: HashMap<String, String>,
     #[serde(default)]
     pub api_key_secret_ref: Option<String>,
+    #[serde(flatten)]
+    pub jwt: JwtAssertionSettings,
     #[serde(default)]
     pub description: Option<String>,
     /// Full callback URL (host + path) — overrides auto-generated callback URL
@@ -184,6 +327,8 @@ pub struct UpdateCredentialProviderRequest {
     pub additional_params: Option<HashMap<String, String>>,
     #[serde(default)]
     pub api_key_secret_ref: Option<String>,
+    #[serde(flatten)]
+    pub jwt: JwtAssertionSettings,
     #[serde(default)]
     pub description: Option<String>,
     /// Full callback URL (host + path) — overrides auto-generated callback URL
@@ -193,6 +338,20 @@ pub struct UpdateCredentialProviderRequest {
     pub resource: Option<String>,
     #[serde(default)]
     pub consent_identity_strategy_id: Option<String>,
+}
+
+/// Request to check a provider before it is saved: the token endpoint's reachability and,
+/// for a type that signs a JWT, the key material its secret references hold
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidateCredentialProviderRequest {
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    #[serde(default)]
+    pub provider_type: Option<CredentialProviderType>,
+    #[serde(default)]
+    pub token_endpoint: Option<String>,
+    #[serde(flatten)]
+    pub jwt: JwtAssertionSettings,
 }
 
 /// List response item (no sensitive data)
@@ -217,6 +376,16 @@ pub struct CredentialProviderListItem {
     pub resource: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub consent_identity_strategy_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwt_signing_algorithm: Option<JwtSigningAlgorithm>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwt_audience: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwt_key_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwt_issuer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwt_subject: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -241,6 +410,11 @@ impl From<&CredentialProvider> for CredentialProviderListItem {
             consent_identity_strategy_id: p
                 .consent_identity_strategy_id
                 .clone(),
+            jwt_signing_algorithm: p.jwt.jwt_signing_algorithm,
+            jwt_audience: p.jwt.jwt_audience.clone(),
+            jwt_key_id: p.jwt.jwt_key_id.clone(),
+            jwt_issuer: p.jwt.jwt_issuer.clone(),
+            jwt_subject: p.jwt.jwt_subject.clone(),
             created_at: p.created_at,
             updated_at: p.updated_at,
         }
@@ -271,6 +445,7 @@ mod tests {
             token_refresh_enabled: true,
             additional_params: HashMap::new(),
             api_key_secret_ref: None,
+            jwt: Default::default(),
             description: Some("Test provider".to_string()),
             created_at: now,
             updated_at: now,
@@ -398,6 +573,7 @@ mod tests {
             token_refresh_enabled: false,
             additional_params: HashMap::new(),
             api_key_secret_ref: Some("MY_API_KEY".to_string()),
+            jwt: Default::default(),
             description: None,
             created_at: now,
             updated_at: now,
@@ -413,6 +589,162 @@ mod tests {
     #[test]
     fn test_provider_type_default_is_authorization_code() {
         assert_eq!(CredentialProviderType::default(), CredentialProviderType::OAuth2AuthorizationCode);
+    }
+
+    #[test]
+    fn jwt_bearer_provider_round_trips_its_signed_jwt_settings() {
+        let json = r#"{
+            "id": "cp-vertex", "name": "Vertex", "provider_id": "vertex",
+            "provider_type": "oauth2_jwt_bearer",
+            "token_endpoint": "https://oauth2.googleapis.com/token",
+            "jwt_signing_key_secret_ref": "VERTEX_SA_KEY",
+            "jwt_signing_algorithm": "ES256",
+            "jwt_audience": "https://oauth2.googleapis.com/token",
+            "jwt_key_id": "key-1",
+            "jwt_issuer": "agent@project.iam.gserviceaccount.com",
+            "jwt_subject": "user@example.com",
+            "default_scopes": ["https://www.googleapis.com/auth/cloud-platform"],
+            "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+        }"#;
+        let provider: CredentialProvider = serde_json::from_str(json).unwrap();
+        assert_eq!(provider.provider_type, CredentialProviderType::OAuth2JwtBearer);
+        assert_eq!(
+            provider.jwt,
+            JwtAssertionSettings {
+                jwt_signing_key_secret_ref: Some("VERTEX_SA_KEY".into()),
+                jwt_certificate_secret_ref: None,
+                jwt_signing_algorithm: Some(JwtSigningAlgorithm::ES256),
+                jwt_audience: Some("https://oauth2.googleapis.com/token".into()),
+                jwt_key_id: Some("key-1".into()),
+                jwt_issuer: Some("agent@project.iam.gserviceaccount.com".into()),
+                jwt_subject: Some("user@example.com".into()),
+            }
+        );
+        let value = serde_json::to_value(&provider).unwrap();
+        assert_eq!(value["provider_type"], "oauth2_jwt_bearer");
+        assert_eq!(value["jwt_signing_key_secret_ref"], "VERTEX_SA_KEY");
+        assert_eq!(value["jwt_signing_algorithm"], "ES256");
+        assert!(value.get("jwt").is_none());
+        assert!(
+            value
+                .get("jwt_certificate_secret_ref")
+                .is_none()
+        );
+        let again: CredentialProvider = serde_json::from_value(value).unwrap();
+        assert_eq!(again.jwt, provider.jwt);
+    }
+
+    #[test]
+    fn client_credentials_jwt_auth_request_reads_its_certificate_reference() {
+        let json = r#"{
+            "name": "Foundry", "provider_id": "foundry",
+            "provider_type": "oauth2_client_credentials_jwt_auth",
+            "token_endpoint": "https://login.microsoftonline.com/tenant/oauth2/v2.0/token",
+            "client_id_secret_ref": "FOUNDRY_CLIENT_ID",
+            "jwt_signing_key_secret_ref": "FOUNDRY_KEY",
+            "jwt_certificate_secret_ref": "FOUNDRY_CERT",
+            "jwt_signing_algorithm": "PS256"
+        }"#;
+        let request: CreateCredentialProviderRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.provider_type, CredentialProviderType::OAuth2ClientCredentialsJwtAuth);
+        assert_eq!(
+            request
+                .jwt
+                .jwt_certificate_secret_ref
+                .as_deref(),
+            Some("FOUNDRY_CERT")
+        );
+        assert_eq!(
+            request
+                .jwt
+                .jwt_signing_algorithm,
+            Some(JwtSigningAlgorithm::PS256)
+        );
+        let update: UpdateCredentialProviderRequest =
+            serde_json::from_str(r#"{"jwt_key_id": "thumb", "jwt_signing_algorithm": "RS256"}"#).unwrap();
+        assert_eq!(
+            update
+                .jwt
+                .jwt_key_id
+                .as_deref(),
+            Some("thumb")
+        );
+        assert_eq!(
+            update
+                .jwt
+                .jwt_signing_algorithm,
+            Some(JwtSigningAlgorithm::RS256)
+        );
+        assert!(
+            serde_json::from_str::<UpdateCredentialProviderRequest>(r#"{"jwt_signing_algorithm": "HS256"}"#).is_err()
+        );
+    }
+
+    #[test]
+    fn list_item_shows_jwt_settings_but_never_the_key_or_certificate_reference() {
+        let mut provider = make_provider("Vertex", "vertex");
+        provider.provider_type = CredentialProviderType::OAuth2JwtBearer;
+        provider.jwt = JwtAssertionSettings {
+            jwt_signing_key_secret_ref: Some("KEY_REF_MARKER".into()),
+            jwt_certificate_secret_ref: Some("CERT_REF_MARKER".into()),
+            jwt_signing_algorithm: Some(JwtSigningAlgorithm::RS256),
+            jwt_audience: Some("https://aud.example".into()),
+            jwt_key_id: Some("kid-1".into()),
+            jwt_issuer: Some("sa@example.iam".into()),
+            jwt_subject: Some("user@example.com".into()),
+        };
+        let item = serde_json::to_value(CredentialProviderListItem::from(&provider)).unwrap();
+        assert_eq!(item["provider_type"], "oauth2_jwt_bearer");
+        assert_eq!(item["jwt_signing_algorithm"], "RS256");
+        assert_eq!(item["jwt_audience"], "https://aud.example");
+        assert_eq!(item["jwt_key_id"], "kid-1");
+        assert_eq!(item["jwt_issuer"], "sa@example.iam");
+        assert_eq!(item["jwt_subject"], "user@example.com");
+        let text = item.to_string();
+        assert!(!text.contains("KEY_REF_MARKER"));
+        assert!(!text.contains("CERT_REF_MARKER"));
+    }
+
+    #[test]
+    fn jwt_settings_merge_onto_existing_and_blank_values_clear_them() {
+        let existing = JwtAssertionSettings {
+            jwt_signing_key_secret_ref: Some("OLD_KEY".into()),
+            jwt_issuer: Some("old@example".into()),
+            jwt_key_id: Some("old-kid".into()),
+            ..Default::default()
+        };
+        let update = JwtAssertionSettings {
+            jwt_issuer: Some(" new@example ".into()),
+            jwt_key_id: Some("  ".into()),
+            ..Default::default()
+        };
+        let merged = update
+            .or(existing)
+            .normalized();
+        assert_eq!(
+            merged
+                .jwt_signing_key_secret_ref
+                .as_deref(),
+            Some("OLD_KEY")
+        );
+        assert_eq!(merged.jwt_issuer.as_deref(), Some("new@example"));
+        assert_eq!(merged.jwt_key_id, None);
+    }
+
+    #[test]
+    fn jwt_algorithms_follow_the_provider_type() {
+        use CredentialProviderType::*;
+        use JwtSigningAlgorithm::*;
+        assert_eq!(OAuth2JwtBearer.default_jwt_algorithm(), Some(RS256));
+        assert_eq!(OAuth2ClientCredentialsJwtAuth.default_jwt_algorithm(), Some(PS256));
+        assert_eq!(OAuth2ClientCredentials.default_jwt_algorithm(), None);
+        assert!(OAuth2JwtBearer.allows_jwt_algorithm(RS256));
+        assert!(OAuth2JwtBearer.allows_jwt_algorithm(ES256));
+        assert!(!OAuth2JwtBearer.allows_jwt_algorithm(PS256));
+        assert!(OAuth2ClientCredentialsJwtAuth.allows_jwt_algorithm(PS256));
+        assert!(OAuth2ClientCredentialsJwtAuth.allows_jwt_algorithm(RS256));
+        assert!(!OAuth2ClientCredentialsJwtAuth.allows_jwt_algorithm(ES256));
+        assert!(!ApiKey.allows_jwt_algorithm(RS256));
     }
 
     #[test]

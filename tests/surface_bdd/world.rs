@@ -487,6 +487,8 @@ pub struct ScenarioInfra {
     pub gateway: GatewayProcess,
     pub mock: MockServer,
     pub replacement_mock: Option<MockServer>,
+    /// The token endpoint of the Target's credential provider.
+    pub target_token_endpoint: Option<MockServer>,
     /// Destinations of the second and later Transit Points, by collaborator key.
     pub transit_point_mocks: HashMap<String, MockServer>,
     pub affinidi_well: Option<MockServer>,

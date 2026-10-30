@@ -5,6 +5,7 @@ import ManagedAgentPanel from './ManagedAgentPanel';
 import ManagedAgentAuthFullscreen from './ManagedAgentAuthFullscreen';
 import { DOCS_URL } from '../../../../config/docs';
 import { a2aProxyIdFromEndpoint, isA2aProxyEndpoint } from '../_shared/a2aProxyEndpoint';
+import { providerTargetAuthFromApi, providerTargetAuthToApi } from '../_shared/providerTargetAuth';
 
 export const managedAgentDefinition: NodeDefinition = {
   type: 'target',
@@ -174,11 +175,19 @@ export const managedAgentDefinition: NodeDefinition = {
       // and sibling fields, so handle both.
       const ss =
         (typeof m === 'object' ? m?.static_secret : null) || (m === 'static_secret' ? ta : null);
+      const provider = providerTargetAuthFromApi(ta);
       if (ss) {
+        c.target_auth_source = 'secret';
         c.target_auth_secret_id = ss.secret_id || '';
         c.target_auth_header_name = ss.header_name || 'Authorization';
         c.target_auth_header_format = ss.header_format || '{value}';
-
+      } else if (provider) {
+        c.target_auth_source = 'provider';
+        c.target_auth_provider_id = provider.providerId;
+        c.target_auth_header_name = provider.headerName;
+        c.target_auth_header_format = provider.headerFormat;
+      }
+      if (ss || provider) {
         if (typeof ta.auth_type === 'string') {
           c.target_auth_type = ta.auth_type;
         } else {
@@ -200,7 +209,15 @@ export const managedAgentDefinition: NodeDefinition = {
     if (isA2aProxyEndpoint(c.endpoint)) {
       tgt.a2a_proxy_id = c.a2a_proxy_id || a2aProxyIdFromEndpoint(c.endpoint);
     }
-    if (c.target_auth_enabled && c.target_auth_secret_id) {
+    if (c.target_auth_enabled && c.target_auth_source === 'provider') {
+      const auth = providerTargetAuthToApi({
+        providerId: c.target_auth_provider_id || '',
+        headerName: c.target_auth_header_name || '',
+        headerFormat: c.target_auth_header_format || '',
+        fallback: c.target_auth_fallback,
+      });
+      if (auth) tgt.auth = { ...auth, auth_type: c.target_auth_type || 'bearer' };
+    } else if (c.target_auth_enabled && c.target_auth_secret_id) {
       tgt.auth = {
         method: {
           static_secret: {

@@ -95,6 +95,11 @@ The CLI consent page (`/cli-consent`) is shown outside the dashboard shell and r
 The secret editor has one save button and never shows a stored secret value; see
 _Secret editor_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#secret-editor).
 
+The credential provider editor shows the inputs of the chosen type, picks the JWT signing key
+and certificate from the secrets store, and target authentication on a Managed Agent or Transit
+Point can take its credential from a credential provider; see _Credential provider editor_ and
+_Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#credential-provider-editor).
+
 A Trust Check on a Managed Agent → Transit Point arrow belongs to that Transit Point and saves
 to `transit.points[i].trust_check_list` (new ones on A2A and AP2 Transit Points only); the
 Managed Agent's own Trust Check is offered only for `a2a-proxy://` and `fabric://` targets (on

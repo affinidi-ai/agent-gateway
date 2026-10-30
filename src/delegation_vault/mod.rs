@@ -11,10 +11,12 @@
 
 pub mod audit;
 pub mod handlers;
+pub mod jwt_assertion;
 pub mod modern_consent;
 pub mod notifier;
 pub mod oauth;
 pub mod router;
+pub mod service_token;
 pub mod storage;
 
 use chrono::{DateTime, Utc};

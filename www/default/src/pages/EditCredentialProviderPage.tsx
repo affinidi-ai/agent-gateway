@@ -9,17 +9,24 @@ import { usePageTitle } from '../context/PageTitleContext';
 import { useSaveAction } from '../hooks/useSaveAction';
 import { deepLinks } from '../utils/deepLinks';
 import { DOCS_URL } from '../config/docs';
+import JwtAssertionSection from './EditCredentialProviderPage/JwtAssertionSection';
+import { SecretOption as Secret } from './EditCredentialProviderPage/SecretSelect';
+import {
+  CredentialProviderType,
+  EMPTY_JWT_FIELDS,
+  JwtFormFields,
+  entraRejectsResource,
+  entraResourceMessage,
+  jwtFieldsOf,
+  missingProviderField,
+  providerCredentialFields,
+  providerTypeFields,
+} from './EditCredentialProviderPage/credentialProviderForm';
 
-interface Secret {
-  id: string;
-  name: string;
-  secret_id: string;
-}
-
-interface CredentialProviderForm {
+interface CredentialProviderForm extends JwtFormFields {
   name: string;
   provider_id: string;
-  provider_type: 'oauth2_authorization_code' | 'oauth2_client_credentials' | 'api_key';
+  provider_type: CredentialProviderType;
   authorization_endpoint: string;
   token_endpoint: string;
   client_id_secret_ref: string;
@@ -30,6 +37,8 @@ interface CredentialProviderForm {
   additional_params: string;
   description: string;
   callback_host: string;
+  /** The stored resource, shown only through the Entra warning; never sent on save. */
+  resource: string;
 }
 
 interface RoutingConfig {
@@ -51,6 +60,8 @@ const EMPTY_FORM: CredentialProviderForm = {
   additional_params: '',
   description: '',
   callback_host: '',
+  resource: '',
+  ...EMPTY_JWT_FIELDS,
 };
 
 const EditCredentialProviderPage: React.FC = () => {
@@ -141,6 +152,8 @@ const EditCredentialProviderPage: React.FC = () => {
           : '',
         description: data.description ?? '',
         callback_host: callbackHost,
+        resource: data.resource ?? '',
+        ...jwtFieldsOf(data),
       });
     } catch (e: any) {
       setError(e.message ?? 'Unknown error');
@@ -183,30 +196,10 @@ const EditCredentialProviderPage: React.FC = () => {
         return;
       }
 
-      const isOAuth =
-        form.provider_type === 'oauth2_authorization_code' ||
-        form.provider_type === 'oauth2_client_credentials';
-
-      if (isOAuth) {
-        if (!form.token_endpoint.trim()) {
-          setError('Token endpoint is required for OAuth providers.');
-          return;
-        }
-        if (!form.client_id_secret_ref) {
-          setError('Client ID secret is required for OAuth providers.');
-          return;
-        }
-        if (!form.client_secret_secret_ref) {
-          setError('Client Secret secret is required for OAuth providers.');
-          return;
-        }
-      }
-
-      if (form.provider_type === 'api_key') {
-        if (!form.api_key_secret_ref) {
-          setError('API Key secret is required.');
-          return;
-        }
+      const missing = missingProviderField(form);
+      if (missing) {
+        setError(missing);
+        return;
       }
 
       let additionalParams: Record<string, string> = {};
@@ -233,17 +226,8 @@ const EditCredentialProviderPage: React.FC = () => {
         default_scopes: scopes,
         token_refresh_enabled: form.token_refresh_enabled,
         description: form.description.trim() || undefined,
+        ...providerCredentialFields(form),
       };
-
-      if (isOAuth) {
-        body.token_endpoint = form.token_endpoint.trim();
-        body.client_id_secret_ref = form.client_id_secret_ref;
-        body.client_secret_secret_ref = form.client_secret_secret_ref;
-      }
-
-      if (form.provider_type === 'api_key' && form.api_key_secret_ref) {
-        body.api_key_secret_ref = form.api_key_secret_ref;
-      }
 
       if (form.authorization_endpoint.trim()) {
         body.authorization_endpoint = form.authorization_endpoint.trim();
@@ -304,6 +288,8 @@ const EditCredentialProviderPage: React.FC = () => {
     document.addEventListener('keydown', handleKeyboardSave);
     return () => document.removeEventListener('keydown', handleKeyboardSave);
   }, [saving, handleSubmit]);
+
+  const typeFields = providerTypeFields(form.provider_type);
 
   if (loading) {
     return (
@@ -428,13 +414,17 @@ const EditCredentialProviderPage: React.FC = () => {
                 </label>
                 <FieldHelp ariaLabel="About Provider Type" testId="field-help-provider-type">
                   Authorization Code: a person approves access once, in their browser. Client
-                  Credentials: the gateway authenticates on its own, no person involved. API Key: a
+                  Credentials: the gateway authenticates on its own, no person involved. JWT Bearer:
+                  the gateway signs a JWT as the grant, as a Google service account does. Client
+                  Credentials JWT: the gateway authenticates with a signed JWT and certificate
+                  instead of a client secret, as an Entra certificate credential does. API Key: a
                   single static key, no OAuth flow at all.
                 </FieldHelp>
               </div>
               <select
                 id="provider_type"
                 name="provider_type"
+                data-testid="credential-provider-type-select"
                 className="form-control dropdown-styling"
                 value={form.provider_type}
                 onChange={handleChange}
@@ -444,6 +434,10 @@ const EditCredentialProviderPage: React.FC = () => {
                 </option>
                 <option value="oauth2_client_credentials">
                   OAuth 2.0, Client Credentials (2-legged, machine-to-machine)
+                </option>
+                <option value="oauth2_jwt_bearer">OAuth 2.0, JWT Bearer (signed JWT grant)</option>
+                <option value="oauth2_client_credentials_jwt_auth">
+                  OAuth 2.0, Client Credentials JWT (certificate, no client secret)
                 </option>
                 <option value="api_key">API Key (static secret)</option>
               </select>
@@ -489,9 +483,20 @@ const EditCredentialProviderPage: React.FC = () => {
                     required
                   />
                   <small className="form-text text-muted">
-                    The URL the gateway calls to trade an authorization code (or its own client
-                    credentials) for an actual access token.
+                    {form.provider_type === 'oauth2_client_credentials_jwt_auth'
+                      ? 'The tenant-specific token URL (login.microsoftonline.com/<tenant>/oauth2/v2.0/token), not the common one.'
+                      : 'The URL the gateway calls to trade an authorization code (or its own client credentials) for an actual access token.'}
                   </small>
+                  {entraRejectsResource(form.token_endpoint, form.resource) && (
+                    <div
+                      className="alert alert-warning py-2 mt-2"
+                      role="status"
+                      data-testid="credential-provider-entra-resource-warning"
+                    >
+                      <i className="fas fa-exclamation-triangle me-2" aria-hidden="true" />
+                      {entraResourceMessage(form.resource)}
+                    </div>
+                  )}
                 </div>
               </div>
             )}
@@ -590,7 +595,7 @@ const EditCredentialProviderPage: React.FC = () => {
             )}
 
             {/* OAuth Client Credentials (Secret References) */}
-            {form.provider_type !== 'api_key' && (
+            {typeFields.clientId && (
               <>
                 <hr />
                 <h6 className="font-weight-bold text-primary mb-3">
@@ -648,56 +653,66 @@ const EditCredentialProviderPage: React.FC = () => {
                 </div>
 
                 {/* Client Secret Secret */}
-                <div className="mb-3">
-                  <div className="field-label-with-help">
-                    <label htmlFor="client_secret_secret_ref" className="mb-0">
-                      Client Secret <span className="text-danger">*</span>
-                    </label>
-                    <FieldHelp
-                      ariaLabel="About Client Secret"
-                      testId="field-help-client-secret-secret"
-                    >
-                      The value itself is never shown or copied into this form, only a reference to
-                      where it's stored.
-                    </FieldHelp>
-                  </div>
-                  <select
-                    id="client_secret_secret_ref"
-                    name="client_secret_secret_ref"
-                    className="form-control dropdown-styling"
-                    value={form.client_secret_secret_ref}
-                    onChange={handleChange}
-                    required
-                    disabled={loadingSecrets}
-                  >
-                    <option value="">
-                      {loadingSecrets ? '-- Loading secrets... --' : '-- Select a secret --'}
-                    </option>
-                    {secrets.map(secret => (
-                      <option key={secret.id} value={secret.secret_id}>
-                        {secret.name} ({secret.secret_id})
-                      </option>
-                    ))}
-                  </select>
-                  <small className="form-text text-muted">
-                    Pick the secret holding your OAuth app's client secret.
-                  </small>
-                  {!loadingSecrets && (
-                    <div className="form-text">
-                      {secrets.length === 0
-                        ? 'No secrets configured yet. '
-                        : "Don't see the one you need? "}
-                      <AddResourceLink
-                        to={deepLinks.secret}
-                        testid="credential-provider-add-client-secret-link"
+                {typeFields.clientSecret && (
+                  <div className="mb-3">
+                    <div className="field-label-with-help">
+                      <label htmlFor="client_secret_secret_ref" className="mb-0">
+                        Client Secret <span className="text-danger">*</span>
+                      </label>
+                      <FieldHelp
+                        ariaLabel="About Client Secret"
+                        testId="field-help-client-secret-secret"
                       >
-                        Add secret
-                      </AddResourceLink>
+                        The value itself is never shown or copied into this form, only a reference
+                        to where it's stored.
+                      </FieldHelp>
                     </div>
-                  )}
-                </div>
+                    <select
+                      id="client_secret_secret_ref"
+                      name="client_secret_secret_ref"
+                      className="form-control dropdown-styling"
+                      value={form.client_secret_secret_ref}
+                      onChange={handleChange}
+                      required
+                      disabled={loadingSecrets}
+                    >
+                      <option value="">
+                        {loadingSecrets ? '-- Loading secrets... --' : '-- Select a secret --'}
+                      </option>
+                      {secrets.map(secret => (
+                        <option key={secret.id} value={secret.secret_id}>
+                          {secret.name} ({secret.secret_id})
+                        </option>
+                      ))}
+                    </select>
+                    <small className="form-text text-muted">
+                      Pick the secret holding your OAuth app's client secret.
+                    </small>
+                    {!loadingSecrets && (
+                      <div className="form-text">
+                        {secrets.length === 0
+                          ? 'No secrets configured yet. '
+                          : "Don't see the one you need? "}
+                        <AddResourceLink
+                          to={deepLinks.secret}
+                          testid="credential-provider-add-client-secret-link"
+                        >
+                          Add secret
+                        </AddResourceLink>
+                      </div>
+                    )}
+                  </div>
+                )}
               </>
             )}
+
+            <JwtAssertionSection
+              providerType={form.provider_type}
+              form={form}
+              secrets={secrets}
+              loadingSecrets={loadingSecrets}
+              onChange={handleChange}
+            />
 
             {/* API Key field — only for api_key type */}
             {form.provider_type === 'api_key' && (

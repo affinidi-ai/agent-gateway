@@ -3991,3 +3991,118 @@ async fn mcp_server_stops_processing_cancelled_call(
 fn mcp_response_stream_is_closed(world: &mut SurfaceWorld) {
     assert!(world.mcp_stream.is_none(), "the caller's MCP response stream is closed");
 }
+
+async fn target_token_requests(world: &SurfaceWorld) -> Vec<HashMap<String, String>> {
+    world
+        .infra
+        .as_ref()
+        .and_then(|infra| {
+            infra
+                .target_token_endpoint
+                .as_ref()
+        })
+        .expect("the target's credential provider must serve a token endpoint")
+        .requests()
+        .await
+        .iter()
+        .map(|request| serde_urlencoded::from_str(&request.raw_body).expect("a token request is form encoded"))
+        .collect()
+}
+
+#[then(expr = "the target's credential provider received {int} token request(s)")]
+async fn target_credential_provider_received_token_requests(
+    world: &mut SurfaceWorld,
+    expected: usize,
+) {
+    let observed = target_token_requests(world)
+        .await
+        .len();
+    assert_eq!(
+        observed, expected,
+        "the target's credential provider received {observed} token requests, expected {expected}"
+    );
+}
+
+#[then(
+    expr = "the target's credential provider received a client credentials grant from client {string} for scope {string}"
+)]
+async fn target_credential_provider_received_client_credentials_grant(
+    world: &mut SurfaceWorld,
+    client_id: String,
+    scope: String,
+) {
+    let requests = target_token_requests(world).await;
+    let grant = requests
+        .first()
+        .expect("the token endpoint received a grant");
+    let field = |name: &str| {
+        grant
+            .get(name)
+            .map(String::as_str)
+    };
+    assert_eq!(
+        field("grant_type"),
+        Some("client_credentials"),
+        "the target's credential provider received grant_type {:?}, expected client_credentials",
+        field("grant_type")
+    );
+    assert_eq!(
+        field("client_id"),
+        Some(client_id.as_str()),
+        "the target's credential provider received client_id {:?}, expected {client_id}",
+        field("client_id")
+    );
+    assert_eq!(
+        field("scope"),
+        Some(scope.as_str()),
+        "the target's credential provider received scope {:?}, expected {scope}",
+        field("scope")
+    );
+    assert!(
+        !grant.contains_key("assertion"),
+        "a client credentials grant carries no assertion, but the target's credential provider received one"
+    );
+}
+
+#[then("the target's credential provider received a JWT Bearer grant signed with the provider key")]
+async fn target_credential_provider_received_signed_jwt_bearer_grant(world: &mut SurfaceWorld) {
+    use crate::bdd_support::config::target_auth::{
+        TARGET_AUTH_JWT_ISSUER, TARGET_AUTH_PROVIDER_SCOPE, target_auth_signing_key,
+    };
+
+    let requests = target_token_requests(world).await;
+    let grant = requests
+        .first()
+        .expect("the token endpoint received a grant");
+    assert_eq!(grant["grant_type"], "urn:ietf:params:oauth:grant-type:jwt-bearer");
+    assert!(!grant.contains_key("client_secret"), "a JWT Bearer grant sends no client secret");
+    let token_endpoint = world
+        .surface_config
+        .target_auth_provider
+        .as_ref()
+        .and_then(|provider| {
+            provider
+                .token_endpoint
+                .clone()
+        })
+        .expect("the token endpoint was configured");
+    let header = jsonwebtoken::decode_header(&grant["assertion"]).expect("the assertion is a JWT");
+    assert_eq!(header.alg, jsonwebtoken::Algorithm::RS256);
+    assert_eq!(header.kid.as_deref(), Some("bdd-target-key-id"));
+    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
+    validation.set_audience(&[token_endpoint]);
+    validation.set_issuer(&[TARGET_AUTH_JWT_ISSUER]);
+    let claims = jsonwebtoken::decode::<serde_json::Value>(
+        &grant["assertion"],
+        &jsonwebtoken::DecodingKey::from_rsa_pem(
+            target_auth_signing_key()
+                .public_pem
+                .as_bytes(),
+        )
+        .unwrap(),
+        &validation,
+    )
+    .expect("the grant is signed with the provider key")
+    .claims;
+    assert_eq!(claims["scope"], TARGET_AUTH_PROVIDER_SCOPE);
+}
