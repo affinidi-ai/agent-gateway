@@ -74,6 +74,61 @@ target must not return credential-only content on its card path. A2A's authentic
 extended card lives on a separate endpoint that the gateway does not fetch. This may later
 become a per-surface opt-in.
 
+### Agent card preview
+
+The management API shows an operator the card the base route serves beside the agent's own
+card, and how the gateway's fetch went:
+
+- `GET /api/v1/surfaces/{id}/agent-card` (`surfaces.view`) fetches and reports.
+- `POST /api/v1/surfaces/{id}/agent-card/refresh` (`surfaces.edit`) fetches again. Its body is
+  ignored.
+
+The preview builds the card exactly as the card route does for an anonymous caller, with the
+same Target Authentication, identity, endpoint rewrite and identity credential. It skips the
+x402 and MPP payment gate and reports only `payment_required`. It records no gateway fault,
+rejected request, Trust Recorder write or connection metric. It fetches from an `http(s)` Target
+over a client pinned to the vetted address, credential or not, without following redirects; a
+`fabric://` Target is asked through the remote gateway as the card route asks it. The request to the agent carries only
+`Accept: application/json` and the Target credential, never the management request's headers.
+The preview is built from the surface as it runs on the replica that answers, within the A2A
+timeout plus 5 seconds, at most 60 seconds.
+
+Every fetch result is a `200` with these fields, each always present:
+
+| Field | Meaning |
+| --- | --- |
+| `supported`, `unsupported_reason` | `false` with `not_a2a` (not an A2A or AP2 surface), `not_running` (not running here, or a Standby replica) or `operator_only` (a tenant token on an appliance-wide surface, whose fetch would use the appliance's credential); every field below is then `null`, `false` or `0`. |
+| `generated` | The A2A proxy generated the card; `before` and `source_url` are then `null`. |
+| `served_url` | The card URL callers use: the first external URL of the Access Point's listener, the route and `/.well-known/agent-card.json`. |
+| `source_url`, `source_url_query_hidden` | The card URL fetched from the Target, without user info, query or fragment; the flag says a query or user info was removed. |
+| `fetched_at`, `cached` | When the fetch started; `cached` is `true` when the answer is the last preview instead of a new fetch. |
+| `fetch` | `status` (`ok`, `failed`, `not_served`), `cause`, `http_status`, `duration_ms`. |
+| `auth` | `kind` (`none`, `static_secret`, `credential_provider`, `credential_lookup`, `remote_gateway`), `result` (`not_configured`, `sent`, `not_sent`, `failed`) and `failure`; `provider_name` and `token_expires_at` are `null`. |
+| `payment_required` | Callers must pay before the card route serves the card. |
+| `before`, `before_bytes` | The agent's own card as fetched, and its size. |
+| `after`, `after_bytes` | The card the gateway serves, and its size. |
+| `display_limit_bytes` | 262144. A card larger than this is reported by size only, with the card `null`. |
+| `variant`, `outcome`, `last_caller_fetch` | Always `null`. |
+
+The causes are fixed strings, never upstream text: `needs_token` (401 without a credential),
+`auth_failed` (401 with a credential, a remote gateway's 401 or 403, or a credential the gateway
+could not obtain), `forbidden` (403), `not_found` (404 or 410), `redirected` (3xx),
+`upstream_error`, `unreachable`, `timeout`, `too_large`, `invalid_card`, `blocked_by_egress`,
+`proxy_unavailable`, and, with status `not_served` and the agent's card in `before`,
+`identity_failed` and `rewrite_failed`. An `auth.failure` is `secret_unavailable`,
+`provider_not_found` (a secret or provider of another tenant reports as missing too),
+`token_unavailable` or `unsupported`; `forbidden`, `invalid_header`, `outside_target_base` and
+`header_conflict` are never sent and keep the spellings the dashboard accepts.
+
+When a fetch fails, `after` is the last good card the preview built for the same running surface
+on this replica, for up to 10 minutes after that fetch, and `null` once the surface changed.
+The gateway does not serve that card to callers while the fetch fails.
+
+Each user, and each surface, may start 10 fetches a minute on a replica. Past either limit a
+`GET` answers with the last preview of the same running surface, marked `cached`; a refresh, or
+a `GET` without one, is `429` with `Retry-After: 60` and
+`{"error": "Too many card fetches; try again in a minute", "code": "rate_limited"}`.
+
 For payload-derived managed identity, the Gateway reads configured fields from the identity
 extension metadata, sorts them by field path, joins them as `key=value` pairs with `|`, and hashes
 the canonical string with SHA-256. This hash is deterministic and unkeyed. Credential-derived modes

@@ -1933,7 +1933,6 @@ impl SurfaceTaskManager {
 impl SurfaceTaskManager {
     /// The base-route state of the surface `surface_id` as a request on its Access
     /// Point gets it on this replica. `None` when no listener here runs the surface.
-    #[cfg_attr(not(test), expect(dead_code))]
     pub async fn card_preview_state(
         &self,
         surface_id: &str,

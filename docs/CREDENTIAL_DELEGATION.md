@@ -293,6 +293,9 @@ unauthenticated discovery request, except on the gateway's own agent card fetch.
 cannot be obtained follows `fallback`: `reject` answers 502 "Target authentication failed",
 `passthrough` forwards without the credential, and the cause is logged only. A `401` from the
 target does not evict the cached token.
+The [agent card preview](PROTOCOLS.md#agent-card-preview) fetches the card with the same Target
+Authentication and reports whether the credential was sent or why it could not be obtained, never
+the token.
 
 `POST /v1/mcp-proxies/discover`, the Surface Builder's design-time tool listing, still accepts
 only `static_secret` target authentication, so listing the tools of an MCP server behind an

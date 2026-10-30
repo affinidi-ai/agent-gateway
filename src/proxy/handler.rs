@@ -859,6 +859,33 @@ fn inject_did_headers(
     }
 }
 
+/// The payments the card route asks a caller for before it serves the card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CardPaymentGates {
+    pub x402: bool,
+    pub mpp: bool,
+}
+
+impl CardPaymentGates {
+    pub(crate) fn any(self) -> bool {
+        self.x402 || self.mpp
+    }
+}
+
+/// The payment gates of the card route. A delegated (Model B) x402 policy has no
+/// local price/verify config to check there and is never routed through the
+/// delegation relay on that endpoint, so it does not paywall the card.
+pub(crate) fn card_payment_gates(surface: &crate::config::agent_surface::AgentSurface) -> CardPaymentGates {
+    CardPaymentGates {
+        x402: surface
+            .x402_config()
+            .is_some_and(|p| p.enabled && p.provider != crate::config::types::X402Provider::AgentPay),
+        mpp: surface
+            .mpp_config()
+            .is_some_and(|p| crate::mpp::should_require_payment(p, &surface.channel_protocol(), b"", None)),
+    }
+}
+
 /// Handle agent card requests - intercept and potentially modify
 #[allow(dead_code)]
 pub async fn handle_agent_card(
@@ -898,29 +925,10 @@ pub async fn handle_agent_card(
             .surface_id
             .as_str();
         let resource_url = "/.well-known/agent-card.json";
-        let empty_body: &[u8] = b""; // Agent card is a GET request
-
-        // A delegated (Model B) x402 policy has no local price/verify config to
-        // check here and is never routed through the delegation relay on this
-        // endpoint — skip it so an agent-card fetch isn't paywalled against an
-        // empty local challenge.
-        let x402_required = state
-            .surface
-            .x402_config()
-            .is_some_and(|p| p.enabled && p.provider != crate::config::types::X402Provider::AgentPay);
-        let mpp_required = state
-            .surface
-            .mpp_config()
-            .is_some_and(|p| {
-                crate::mpp::should_require_payment(
-                    p,
-                    &state
-                        .surface
-                        .channel_protocol(),
-                    empty_body,
-                    None,
-                )
-            });
+        let CardPaymentGates {
+            x402: x402_required,
+            mpp: mpp_required,
+        } = card_payment_gates(&state.surface);
 
         if x402_required || mpp_required {
             let payment_signature = crate::x402::extract_payment_signature(
@@ -15892,7 +15900,7 @@ fn compute_transit_token_caller_context(
 }
 
 #[cfg(test)]
-mod variant_routing_tests;
+pub(crate) mod variant_routing_tests;
 
 #[cfg(test)]
 mod forward_response_log_tests {

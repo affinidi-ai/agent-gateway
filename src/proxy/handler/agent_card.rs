@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::Response;
@@ -24,7 +25,6 @@ use crate::state::ProxyState;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CardMode {
     Serve,
-    #[cfg_attr(not(test), expect(dead_code))]
     Preview,
 }
 
@@ -38,21 +38,25 @@ impl CardMode {
 #[derive(Debug)]
 pub(crate) struct BuiltCard {
     /// The agent's own card as fetched, before any change. `None` for a generated card.
-    #[cfg_attr(not(test), expect(dead_code))]
     pub upstream: Option<JsonValue>,
     /// The card the route serves.
     pub served: JsonValue,
     /// Whether an A2A proxy generated the card instead of fetching it.
     #[cfg_attr(not(test), expect(dead_code))]
     pub generated: bool,
+    /// Whether the fetch carried the Target credential.
+    pub credential_sent: bool,
 }
 
 /// Why the card was not built, and exactly what the card route answers.
 #[derive(Debug)]
 pub(crate) struct CardFailure {
-    #[cfg_attr(not(test), expect(dead_code))]
     pub fault: FetchFault,
     pub response: Response,
+    /// The agent's own card when it was fetched but the gateway will not serve it.
+    pub upstream: Option<JsonValue>,
+    /// Whether the fetch carried the Target credential.
+    pub credential_sent: bool,
 }
 
 impl CardFailure {
@@ -60,7 +64,12 @@ impl CardFailure {
         fault: FetchFault,
         response: Response,
     ) -> Self {
-        Self { fault, response }
+        Self {
+            fault,
+            response,
+            upstream: None,
+            credential_sent: false,
+        }
     }
 }
 
@@ -140,17 +149,54 @@ pub(crate) async fn build_public_card(
         .map_err(|response| CardFailure::new(FetchFault::ProxyUnavailable, response))?;
     let generated = prepared.is_some();
 
-    let (mut agent_card, prepared_identity, upstream) = match prepared {
-        Some(prepared) => (prepared.card, prepared.identity, None),
+    let (agent_card, prepared_identity, upstream, credential_sent) = match prepared {
+        Some(prepared) => (prepared.card, prepared.identity, None, false),
         None => {
-            let fetch = TargetCardFetch { state, source_addr, mode };
-            let card = fetch
+            let fetch = TargetCardFetch {
+                state,
+                source_addr,
+                mode,
+                credential_sent: AtomicBool::new(false),
+            };
+            let fetched = fetch
                 .fetch(headers, &card_target_url(&state.surface))
-                .await?;
-            (card.clone(), None, Some(card))
+                .await;
+            let credential_sent = fetch
+                .credential_sent
+                .load(Ordering::Relaxed);
+            let card = fetched.map_err(|failure| CardFailure { credential_sent, ..failure })?;
+            (card.clone(), None, Some(card), credential_sent)
         }
     };
 
+    let (agent_card, resolved_identity) = finish_card(state, agent_card, prepared_identity, generated)
+        .await
+        .map_err(|failure| CardFailure {
+            upstream: upstream.clone(),
+            credential_sent,
+            ..failure
+        })?;
+
+    info!(channel = channel_name, "Successfully fetched and parsed agent card");
+    if mode.serves() {
+        record_served_effects(state, source_addr, &resolved_identity);
+    }
+    Ok(BuiltCard {
+        upstream,
+        served: agent_card,
+        generated,
+        credential_sent,
+    })
+}
+
+/// Resolve the identity of the obtained card, rewrite its endpoints to the Access
+/// Point and add the gateway's identity credential and did:webvh identity.
+async fn finish_card(
+    state: &ProxyState,
+    mut agent_card: JsonValue,
+    prepared_identity: Option<ProtectedAgentIdentity>,
+    generated: bool,
+) -> Result<(JsonValue, ProtectedAgentIdentity), CardFailure> {
     let card_bytes = serde_json::to_vec(&agent_card).unwrap_or_default();
     let resolved_identity = match prepared_identity {
         Some(identity) => identity,
@@ -164,16 +210,7 @@ pub(crate) async fn build_public_card(
     inject_identity_credential(state, &mut agent_card, &resolved_identity).await?;
     #[cfg(feature = "didwebvh")]
     inject_agent_dna(state, &mut agent_card).await;
-
-    info!(channel = channel_name, "Successfully fetched and parsed agent card");
-    if mode.serves() {
-        record_served_effects(state, source_addr, &resolved_identity);
-    }
-    Ok(BuiltCard {
-        upstream,
-        served: agent_card,
-        generated,
-    })
+    Ok((agent_card, resolved_identity))
 }
 
 async fn resolve_card_identity(
@@ -453,6 +490,7 @@ struct TargetCardFetch<'a> {
     state: &'a ProxyState,
     source_addr: &'a str,
     mode: CardMode,
+    credential_sent: AtomicBool,
 }
 
 impl TargetCardFetch<'_> {
@@ -670,6 +708,8 @@ impl TargetCardFetch<'_> {
         }
         if let Some((header_name, header_value)) = &credential {
             req = req.header(header_name.as_str(), header_value.as_str());
+            self.credential_sent
+                .store(true, Ordering::Relaxed);
             debug!(channel = channel_name, header = %header_name, "Injected target authentication header on agent card fetch");
         }
 

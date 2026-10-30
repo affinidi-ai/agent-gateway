@@ -161,6 +161,12 @@ secrets stay usable for caller authentication, and an appliance-wide
 `oauth2_authorization_code` provider stays usable. See
 [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#tenant-isolation-on-a-surfaces-upstream-legs).
 
+The agent card preview follows the same rule (see
+[`PROTOCOLS.md`](PROTOCOLS.md#agent-card-preview)). A tenant PAT reads and refreshes its own
+tenant's cards; another tenant's surface is `404` to both. On an appliance-wide surface its read is
+`200` with `unsupported_reason: "operator_only"` and nothing fetched, because the fetch would use the
+appliance's Target credential, and its refresh is `403`.
+
 Peers that arrive through the inbound Fabric handshake are always appliance-wide, so a tenant
 PAT cannot approve, rename or reconfigure them. Approving one needs an appliance-wide
 credential, because an active appliance-wide peer reaches every tenant's Fabric surfaces.
@@ -215,7 +221,9 @@ PAT's feature scopes both apply. A scoped PAT may create or update tokens only w
 non-empty subset of its own scopes.
 
 Resource-scoped PAT routing is fail-closed for unknown nested tenant-resource
-paths: only an audited allowlist of handler-enforced actions may proceed. Mediator
+paths: only an audited allowlist of handler-enforced actions may proceed. The surface
+`agent-card` and `agent-card/refresh` actions are on it and check the surface id against the PAT
+pattern. Mediator
 trust-ping, Issuer Trust Registry retry, and Trust Registry record-list/reconnect
 enforce owning-record tenancy plus canonical scope; Trust Registry
 list/get/action routes also carry explicit feature guards. Tenant-ownership

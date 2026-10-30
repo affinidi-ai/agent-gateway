@@ -79,6 +79,16 @@ For a session login, `token_id` and `scopes` are `null` and the caller holds its
 personal access token, `token_id` is the token record ID and `scopes` is the list of feature scopes it
 was issued, or `null` when it is not scope-restricted. It never returns the token secret or hash.
 
+## Agent card preview
+
+`GET /v1/surfaces/{id}/agent-card` needs `surfaces.view` and `POST
+/v1/surfaces/{id}/agent-card/refresh` needs `surfaces.edit`, as the refresh changes nothing but
+always fetches. Both make the gateway fetch the agent's card with the surface's Target
+Authentication, so a `surfaces.view` holder can cause a credentialed fetch; each fetch is audited
+(`agent_card.preview_fetch`) and limited to 10 a minute per user and per surface. A tenant token
+gets `operator_only` instead of a fetch on an appliance-wide surface. See
+[`PROTOCOLS.md`](PROTOCOLS.md#agent-card-preview).
+
 ## Payments admin API
 
 The x402 (`/api/admin/x402/...`) and MPP (`/api/admin/mpp/...`) admin routers require

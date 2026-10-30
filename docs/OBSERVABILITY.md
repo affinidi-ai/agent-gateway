@@ -221,6 +221,20 @@ missing or invalid credential, the `403` it returns to a PAT with a `resource_pa
 access-token routes are not a resource-scoped path family, a required header that does not
 match, or Terms the token owner has not accepted.
 
+## Agent card preview events
+
+Every card fetch an [agent card preview](PROTOCOLS.md#agent-card-preview) starts emits one
+`INFO` event on the `audit` target, a log event only like the rotation events above. An answer
+from the last preview, or a refused request, emits none.
+
+| Event | Fields |
+| --- | --- |
+| `agent_card.preview_fetch` | `request` (`read` or `refresh`), `caller_user_id`, `tenant_id` (the tenant token's tenant, empty otherwise), `surface_id`, `auth_kind`, `auth_result`, `auth_failure`, `fetch_status`, `cause` |
+
+The values are the preview's wire spellings, empty when absent. The event never carries a URL,
+a credential, a secret or provider id, or card content. A preview records no connection, gateway
+fault, rejected request or Trust Recorder write, so it leaves the dashboard metrics as they were.
+
 ## Credential policy report
 
 At startup and on every configuration reload (including the reload that follows a surface

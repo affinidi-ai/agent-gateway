@@ -19,6 +19,17 @@ changes:
       description: >-
         The Managed Agent panel shows whether the gateway can fetch the agent's card and why
         not, with a link to the Agent Cards view.
+    - timestamp: '2026-10-31T02:00:00Z'
+      title: Add agent card preview and refresh endpoints to the surface management API
+      description: >-
+        GET /api/v1/surfaces/{id}/agent-card (surfaces.view) and POST
+        .../agent-card/refresh (surfaces.edit) report the card the base route serves beside
+        the managed agent's own card, how the gateway's fetch went and whether Target
+        Authentication was sent, as a 200 for every fetch result. The fetch is pinned,
+        records no metric, is audited as agent_card.preview_fetch without URL, secret or
+        card, and is limited to 10 a minute per user and per surface; past the limit a read
+        answers with the last preview and a refresh gets 429. A failed fetch keeps showing
+        the last good card of the same running surface for up to 10 minutes.
   changed:
     - timestamp: '2026-10-30T21:30:00Z'
       title: Refuse new http token endpoints and cross-tenant credential references on save
@@ -103,6 +114,13 @@ changes:
         value <grant>_stale, for example client_credentials_stale.
   removed: []
   security:
+    - timestamp: '2026-10-31T02:00:00Z'
+      title: Refuse tenant card previews that would use appliance-wide credentials
+      description: >-
+        A tenant token that reads the agent card preview of an appliance-wide surface gets
+        unsupported_reason operator_only with nothing fetched, and its refresh is 403,
+        because the fetch would use the appliance's Target credential. Another tenant's
+        surface is 404 to both.
     - timestamp: '2026-10-30T20:30:00Z'
       title: Pin credential provider token requests to the vetted address
       description: >-

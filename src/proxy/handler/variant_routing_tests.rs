@@ -36,7 +36,7 @@ pub(super) fn catalog() -> Value {
     ])
 }
 
-pub(super) fn router(surface: AgentSurface) -> crate::state::MultiSurfaceProxyState {
+pub(crate) fn router(surface: AgentSurface) -> crate::state::MultiSurfaceProxyState {
     let config = serde_json::from_value(json!({
         "tls": {"cert_path": "unused.pem", "key_path": "unused-key.pem"},
         "integration": {"variable_pattern": "\\$\\{([^}]+)\\}", "custom_variable_prefix": "_", "types": [], "categories": []},

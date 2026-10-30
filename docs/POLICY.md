@@ -463,6 +463,10 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   inbound forward step. Without `target.auth` the fetch
   uses the shared proxy client, which returns a 3xx rather than following it
   but is not pinned.
+- The [agent card preview](PROTOCOLS.md#agent-card-preview) builds the same card
+  but always fetches an `http(s)` Target over `egress::pinned_forward_client`, with
+  or without `target.auth`, and records nothing; a blocked target reports
+  `blocked_by_egress`.
 - Fabric receive's **agent-card hop** to the local Target, made for the GW2
   policy context, uses the forward's `forward_client_for`
   (`egress::pinned_forward_client` for an `http(s)` Target), so it is pinned
