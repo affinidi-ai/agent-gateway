@@ -622,8 +622,9 @@ changes:
       title: Keep legacy gateway tokens apart for bindings with different scopes
       description: >-
         Two routes that bound one provider with different scopes could receive each other's gateway
-        token. Each scope set now has its own vault record, so after the upgrade every binding sends
-        one new grant.
+        token. Each scope set now has its own vault record, and the record is also keyed by a digest
+        of the provider, so a token granted with other provider settings is never found. After the
+        upgrade every binding sends one new grant.
     - timestamp: '2026-10-30T09:00:00Z'
       title: Never send a gateway token that expired while its refresh failed
       description: >-
@@ -666,6 +667,17 @@ changes:
       description: >-
         The token validator matched the Bearer scheme case-sensitively while the declaration
         accepted any case. It now matches in any case, as RFC 9110 section 11.1 requires.
+    - timestamp: '2026-10-30T15:30:00Z'
+      title: Pay MPP challenges a peer sends in repeated WWW-Authenticate headers
+      description: >-
+        MPP auto-pay read only a WWW-Authenticate value sent as one string, so a peer gateway that
+        sent several challenges in an array was not paid and the 402 reached the caller. Auto-pay
+        now reads every value, as the Fabric relay does.
+    - timestamp: '2026-10-30T15:30:00Z'
+      title: Skip a peer header the gateway cannot carry instead of answering 500
+      description: >-
+        One peer header with an invalid name or value made the buffered Fabric relay answer 500.
+        The relay now drops that header and returns the rest of the peer's answer.
   removed:
     - timestamp: '2026-10-21T15:00:00Z'
       title: Remove the OIDC Providers dashboard pages
@@ -851,6 +863,19 @@ changes:
         and policy steps. Any other path that only ends like a discovery document, such as
         /tasks/discovery, now needs a transit token and runs the full pipeline. A surface that does
         not declare keeps the current behaviour.
+    - timestamp: '2026-10-30T15:30:00Z'
+      title: Read MCP tool policy claims for any Bearer scheme case
+      description: >-
+        Source authentication accepts the Bearer scheme in any case, but the claims that MCP tool
+        policies read as input.jwt were decoded only from the exact scheme Bearer, so a policy that
+        denied on a claim let a lowercase bearer request through. Both now use the same parser.
+    - timestamp: '2026-10-30T15:30:00Z'
+      title: Challenge card-like requests that are not the public card on declaring surfaces
+      description: >-
+        On an Access Point that declares a protected resource, the agent card was served before
+        source authentication for any method and any path ending in the well-known card name. Now
+        only a GET or HEAD of exactly the well-known card URL is public, and every other request is
+        challenged like any other.
   breaking:
     - timestamp: '2026-10-30T13:30:00Z'
       title: Refuse client credentials tokens on plain http legs

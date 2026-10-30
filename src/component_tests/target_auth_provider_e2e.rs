@@ -1237,6 +1237,72 @@ fn a_tenant_surface_never_sends_appliance_wide_gateway_credentials() {
 }
 
 #[test]
+fn a_client_credentials_binding_is_refused_on_a_plain_http_target_and_sent_on_an_allowlisted_one() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let auth_server = runtime.block_on(MockAuthServer::start());
+    auth_server.register_client("gateway-client", "gateway-secret");
+    let allowlisted =
+        runtime.block_on(MockServer::start_with_response(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#.to_string()));
+    let plain =
+        runtime.block_on(MockServer::start_with_response(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#.to_string()));
+    let _test_mode = TestModeEnv::enabled(
+        &format!("{},{}", allowlisted.url(), auth_server.egress_allowlist()),
+        &auth_server.oauth_endpoint_allowlist(),
+    );
+    let handle = runtime.handle().clone();
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            handle.block_on(crate::delegation_vault::gateway_token::with_own_target_token_cache(async {
+                let bound = |endpoint: &str| {
+                    let mut value = surface("https://gateway.example", ROUTE, endpoint, "cp-hop-two", true);
+                    value["target"]
+                        .as_object_mut()
+                        .expect("target")
+                        .remove("auth");
+                    value["outbound_credentials"] = json!([{"credential_provider_id": "cp-hop-two"}]);
+                    value
+                };
+
+                let refused = HopTwo::start(&auth_server, bound(&format!("{}/api", plain.url()))).await;
+                let (status, body) = refused
+                    .call_with_body(Some(CALLER_KEY))
+                    .await;
+                assert_eq!(status, 503, "{body}");
+                assert!(body.contains("Delegated credentials unavailable"), "{body}");
+                assert_eq!(
+                    plain
+                        .request_count
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    0,
+                    "the refused leg never reaches the Target"
+                );
+                assert_eq!(last_authorization(&plain), None);
+                assert_eq!(auth_server.token_request_count(), 0, "no gateway token is requested for a forbidden leg");
+
+                let permitted = HopTwo::start(&auth_server, bound(&format!("{}/api", allowlisted.url()))).await;
+                assert_eq!(
+                    permitted
+                        .call(Some(CALLER_KEY))
+                        .await,
+                    200
+                );
+                assert!(
+                    last_authorization(&allowlisted).is_some_and(|value| value.starts_with("Bearer ")),
+                    "the same binding on an allowlisted target sends the gateway token"
+                );
+                assert_eq!(auth_server.token_request_count(), 1);
+            }));
+        })
+        .expect("test thread")
+        .join()
+        .expect("client credentials leg checks pass");
+}
+
+#[test]
 fn a_delegated_credential_and_the_target_credential_never_share_a_header() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

@@ -109,12 +109,12 @@ fn extract_challenges_from_map(headers: &HashMap<String, serde_json::Value>) -> 
     let mut header_map = reqwest::header::HeaderMap::new();
 
     for (key, value) in headers {
-        let key_upper = key.to_uppercase();
-        if key_upper == "WWW-AUTHENTICATE"
-            && let Some(val_str) = value.as_str()
-            && let Ok(hv) = reqwest::header::HeaderValue::from_str(val_str)
-        {
-            header_map.append(reqwest::header::WWW_AUTHENTICATE, hv);
+        if key.to_uppercase() == "WWW-AUTHENTICATE" {
+            for val_str in crate::proxy::fabric_forward::fabric_header_values(value) {
+                if let Ok(hv) = reqwest::header::HeaderValue::from_str(val_str) {
+                    header_map.append(reqwest::header::WWW_AUTHENTICATE, hv);
+                }
+            }
         }
     }
 
@@ -327,6 +327,26 @@ mod tests {
         assert_eq!(challenges.len(), 1);
         assert_eq!(challenges[0].method, "tempo");
         assert_eq!(challenges[0].realm, "test.com");
+    }
+
+    #[test]
+    fn test_extract_challenges_from_map_array_of_payment_headers() {
+        let request = r#"eyJhbW91bnQiOiIwLjAxIiwiY3VycmVuY3kiOiJ1c2QiLCJyZWNpcGllbnQiOiIweGFiYyJ9"#;
+        let mut headers = HashMap::new();
+        headers.insert(
+            "WWW-AUTHENTICATE".to_string(),
+            serde_json::json!([
+                format!(r#"Payment id="a", realm="test.com", method="tempo", intent="charge", request="{request}""#),
+                format!(r#"Payment id="b", realm="test.com", method="stripe", intent="charge", request="{request}""#),
+            ]),
+        );
+
+        let challenges = extract_challenges_from_map(&headers).unwrap();
+        let summary: Vec<(&str, &str)> = challenges
+            .iter()
+            .map(|c| (c.id.as_str(), c.method.as_str()))
+            .collect();
+        assert_eq!(summary, vec![("a", "tempo"), ("b", "stripe")]);
     }
 
     #[test]

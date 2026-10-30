@@ -159,7 +159,7 @@ described in [`CREDENTIAL_DELEGATION.md`](../CREDENTIAL_DELEGATION.md).
   A2A proxy targets (`a2a-proxy://`) and on the sending gateway of a Fabric route. Each is rejected
   at save. Transit Points keep `transit_credentials` for provider tokens.
 - Changing the shape of the legacy delegation vault key for Client Credentials bindings. It is
-  `(agent_did, "__client_credentials__:<scope-set hash>", provider id)`, so scope sets no longer
+  `(agent_did, "__client_credentials__:<provider and scope-set hash>", provider id)`, so scope sets no longer
   share a token; the original bare key is in the option table below.
 - `static_secret` Target Authentication across Fabric. Its behaviour is kept, except for the
   receiving gateway's header rule under [Precedence](#precedence).
@@ -1059,7 +1059,7 @@ sequenceDiagram
 ## Known limitations
 
 - Legacy Client Credentials and JWT bearer delegation bindings use the vault key
-  `(agent_did, "__client_credentials__:<scope-set hash>", provider id)`, so scope sets no longer
+  `(agent_did, "__client_credentials__:<provider and scope-set hash>", provider id)`, so scope sets no longer
   share a token. Records under the old bare key are no longer read and stay listed until they
   expire or are revoked.
 - A stored authorization code provider with an http token endpoint fails each authorization code

@@ -13290,6 +13290,17 @@ mod tests {
             })
             .await
             .unwrap();
+        let stored_provider = state
+            .credential_provider_store
+            .as_ref()
+            .unwrap()
+            .get("jwt")
+            .await
+            .unwrap()
+            .unwrap();
+        let user_hash =
+            crate::proxy::credential_delegation::gateway_grant_user_hash(&stored_provider, &["read".to_string()])
+                .unwrap();
         state
             .delegation_vault_store
             .as_ref()
@@ -13297,7 +13308,7 @@ mod tests {
             .store(
                 serde_json::from_value(json!({
                     "id": "jwt-token", "agent_did": "did:web:agent.example",
-                    "user_identity_hash": crate::proxy::credential_delegation::gateway_grant_user_hash(&["read".to_string()]),
+                    "user_identity_hash": user_hash,
                     "credential_provider_id": "jwt", "provider_id": "jwt", "access_token": "gateway-jwt-token",
                     "scopes": ["read"], "expires_at": chrono::Utc::now() + chrono::Duration::hours(1),
                     "secret_versions": [{"secret_id": signing_key.secret_id, "updated_at": signing_key.updated_at}],

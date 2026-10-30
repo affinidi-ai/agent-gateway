@@ -304,6 +304,17 @@ async fn only_the_well_known_card_of_a_declaring_access_point_is_never_challenge
     let asked = target
         .request_count
         .load(std::sync::atomic::Ordering::SeqCst);
+    for (method, path) in [
+        ("POST", "/a2a/.well-known/agent-card.json"),
+        ("PUT", "/a2a/.well-known/agent.json"),
+        ("GET", "/a2a/x/.well-known/agent-card.json"),
+    ] {
+        let (router, _strategies) = authenticating_router(a2a_surface_declaring_on_its_base(&target.url())).await;
+
+        let challenged = answer(router, request(Protocol::A2a, method, path, None, axum::body::Body::empty())).await;
+
+        assert_missing_token_challenge(&format!("{method} {path}"), Protocol::A2a, &challenged);
+    }
     for path in ["/a2a/agent.json", "/a2a/tasks/discovery", "/a2a/x/.well-known/ucp"] {
         let (router, _strategies) = authenticating_router(a2a_surface_declaring_on_its_base(&target.url())).await;
 
@@ -384,52 +395,56 @@ async fn an_authenticated_discovery_suffix_path_of_a_declaring_access_point_meet
 }
 
 /// A declaring Access Point without required scopes refuses an ID-shaped token
-/// with the invalid-token challenge, before surface policy, while an access token
-/// for the same resource is served.
+/// with the invalid-token challenge, on MCP and A2A alike, before surface policy,
+/// while an access token for the same resource is served.
 #[tokio::test]
 async fn a_declaring_access_point_without_scopes_challenges_an_id_token_as_invalid() {
     let fixture = JwksFixture::start().await;
-    let resource = "https://gateway.example/a2a";
-    let id_token = crate::component_tests::helpers::jwt::sign_jwt(
-        json!({
-            "iss": "https://idp.example", "sub": "client", "aud": resource, "nonce": "n-1",
-            "exp": crate::component_tests::helpers::jwt::now_secs() + 300,
-            "iat": crate::component_tests::helpers::jwt::now_secs(),
-        }),
-        &fixture.kid,
-    );
-    let (router, _strategies) = authenticating_router_trusting(Protocol::A2a.declaring_surface(), Some(&fixture)).await;
+    for protocol in [Protocol::Mcp, Protocol::A2a] {
+        let case = format!("{protocol:?}");
+        let resource = format!("https://gateway.example{}", protocol.route());
+        let id_token = crate::component_tests::helpers::jwt::sign_jwt(
+            json!({
+                "iss": "https://idp.example", "sub": "client", "aud": resource, "nonce": "n-1",
+                "exp": crate::component_tests::helpers::jwt::now_secs() + 300,
+                "iat": crate::component_tests::helpers::jwt::now_secs(),
+            }),
+            &fixture.kid,
+        );
+        let (router, _strategies) = authenticating_router_trusting(protocol.declaring_surface(), Some(&fixture)).await;
 
-    let refused = answer(
-        router,
-        request(Protocol::A2a, "POST", "/a2a", Some(&id_token), axum::body::Body::from(message(Protocol::A2a))),
-    )
-    .await;
+        let refused = answer(
+            router,
+            request(protocol, "POST", protocol.route(), Some(&id_token), axum::body::Body::from(message(protocol))),
+        )
+        .await;
 
-    assert_eq!(refused.status, StatusCode::UNAUTHORIZED, "{}", String::from_utf8_lossy(&refused.body));
-    let challenge = refused
-        .header("www-authenticate")
-        .unwrap_or_default();
-    assert!(challenge.contains("error=\"invalid_token\""), "{challenge}");
-    assert_eq!(
-        auth_failure_records(&refused.events),
-        vec![(Some("prod".to_string()), AuthScheme::Jwt, "invalid_credential".to_string(), true)]
-    );
-    assert!(refusals(&refused.events).is_empty(), "{:?}", refused.events);
+        assert_eq!(refused.status, StatusCode::UNAUTHORIZED, "{case}: {}", String::from_utf8_lossy(&refused.body));
+        let challenge = refused
+            .header("www-authenticate")
+            .unwrap_or_default();
+        assert!(challenge.contains("error=\"invalid_token\""), "{case}: {challenge}");
+        assert_eq!(
+            auth_failure_records(&refused.events),
+            vec![(Some("prod".to_string()), AuthScheme::Jwt, "invalid_credential".to_string(), true)],
+            "{case}"
+        );
+        assert!(refusals(&refused.events).is_empty(), "{case}: {:?}", refused.events);
 
-    let (router, _strategies) = authenticating_router_trusting(Protocol::A2a.declaring_surface(), Some(&fixture)).await;
-    let served = answer(
-        router,
-        request(
-            Protocol::A2a,
-            "POST",
-            "/a2a",
-            Some(&idp_token(&fixture, resource)),
-            axum::body::Body::from(message(Protocol::A2a)),
-        ),
-    )
-    .await;
-    assert!(auth_failure_records(&served.events).is_empty(), "{:?}", served.events);
+        let (router, _strategies) = authenticating_router_trusting(protocol.declaring_surface(), Some(&fixture)).await;
+        let served = answer(
+            router,
+            request(
+                protocol,
+                "POST",
+                protocol.route(),
+                Some(&idp_token(&fixture, &resource)),
+                axum::body::Body::from(message(protocol)),
+            ),
+        )
+        .await;
+        assert!(auth_failure_records(&served.events).is_empty(), "{case}: {:?}", served.events);
+    }
 }
 
 /// On a declaring Access Point that terminates traces, an authenticated GET of a

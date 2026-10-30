@@ -296,7 +296,8 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   list with an `authorization_servers_stale` warning; the editor does not block either.
   Stored authorization server entries must be https URLs, except a single entry that is the
   strategy's http issuer (or any single http entry while the strategy issuer is unknown); the
-  gateway accepts that only for a strategy no tenant owns and refuses the save otherwise.
+  gateway accepts that only for a strategy no tenant owns, and otherwise refuses a list the
+  save sends or changes (an unchanged stored list is kept, as above).
   Leaving JWT Bearer drops the setting.
   A variant shows the resource it advertises, `<resource>$<alias>`, and keeps its own setting. A
   failed save whose message names the setting of the route edited (a `variant '<alias>': ` message

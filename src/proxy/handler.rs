@@ -472,7 +472,7 @@ fn extract_jwt_claims_from_headers(headers: &HeaderMap) -> Option<HashMap<String
 /// authenticity is established by source authentication; this only surfaces the
 /// claims for policy input.
 pub(crate) fn decode_bearer_jwt_claims(auth_header: &str) -> Option<HashMap<String, serde_json::Value>> {
-    let token = auth_header.strip_prefix("Bearer ")?;
+    let token = crate::jwt_bearer::validator::extract_bearer_with_scheme(Some(auth_header), "Bearer").ok()?;
 
     // Split JWT into parts (header.payload.signature)
     let parts: Vec<&str> = token.split('.').collect();
@@ -1478,7 +1478,10 @@ pub(crate) async fn proxy_handler_with_mcp_runtime(
 
     channel_info!(config_id, "Proxying request: method={} path={}", method, uri.path());
 
-    if crate::proxy::paths::is_well_known_agent_card_path(uri.path()) {
+    if crate::proxy::paths::is_well_known_agent_card_path(uri.path())
+        && (!secures_agent_card(&state.surface)
+            || crate::proxy::paths::is_public_surface_request(&state.surface, method.as_str(), uri.path()))
+    {
         let response = match handle_agent_card(ConnectInfo(addr), State(state.clone()), headers.clone()).await {
             Ok(response) | Err(response) => response,
         };
@@ -12554,13 +12557,8 @@ async fn handle_fabric_request(
                         let mut response_builder = Response::builder().status(StatusCode::PAYMENT_REQUIRED);
 
                         for (key, value) in response_headers.iter() {
-                            let Ok(header_name) = axum::http::HeaderName::try_from(key) else {
-                                continue;
-                            };
-                            for value_str in crate::proxy::fabric_forward::fabric_header_values(value) {
-                                if let Ok(header_value) = axum::http::HeaderValue::try_from(value_str) {
-                                    response_builder = response_builder.header(&header_name, header_value);
-                                }
+                            for (name, header_value) in crate::proxy::fabric_forward::fabric_header_pairs(key, value) {
+                                response_builder = response_builder.header(name, header_value);
                             }
                         }
 
@@ -12650,13 +12648,8 @@ async fn handle_fabric_request(
                         let mut response_builder = Response::builder().status(mcp_error_status);
 
                         for (key, value) in response_headers.iter() {
-                            let Ok(header_name) = axum::http::HeaderName::try_from(key) else {
-                                continue;
-                            };
-                            for value_str in crate::proxy::fabric_forward::fabric_header_values(value) {
-                                if let Ok(header_value) = axum::http::HeaderValue::try_from(value_str) {
-                                    response_builder = response_builder.header(&header_name, header_value);
-                                }
+                            for (name, header_value) in crate::proxy::fabric_forward::fabric_header_pairs(key, value) {
+                                response_builder = response_builder.header(name, header_value);
                             }
                         }
 
@@ -12693,13 +12686,8 @@ async fn handle_fabric_request(
                     let mut response_builder = Response::builder().status(StatusCode::PAYMENT_REQUIRED);
 
                     for (key, value) in response_headers.iter() {
-                        let Ok(header_name) = axum::http::HeaderName::try_from(key) else {
-                            continue;
-                        };
-                        for value_str in crate::proxy::fabric_forward::fabric_header_values(value) {
-                            if let Ok(header_value) = axum::http::HeaderValue::try_from(value_str) {
-                                response_builder = response_builder.header(&header_name, header_value);
-                            }
+                        for (name, header_value) in crate::proxy::fabric_forward::fabric_header_pairs(key, value) {
+                            response_builder = response_builder.header(name, header_value);
                         }
                     }
 
@@ -13580,8 +13568,8 @@ async fn handle_fabric_request(
                     }
 
                     channel_info!(config_id, "  Header: {}", key);
-                    for value_str in crate::proxy::fabric_forward::fabric_header_values(&value) {
-                        response_builder = response_builder.header(key.as_str(), value_str);
+                    for (name, header_value) in crate::proxy::fabric_forward::fabric_header_pairs(&key, &value) {
+                        response_builder = response_builder.header(name, header_value);
                     }
                 }
 
@@ -20441,6 +20429,33 @@ allow if {
     }
 
     #[test]
+    fn decode_bearer_jwt_claims_accepts_the_scheme_in_any_case() {
+        let header = bearer_with_payload(serde_json::json!({ "sub": "agent@example.com", "tier": "free" }));
+        let token = header
+            .strip_prefix("Bearer ")
+            .unwrap();
+        for scheme in ["bearer", "BEARER", "BeArEr"] {
+            let claims = decode_bearer_jwt_claims(&format!("{scheme} {token}")).expect("claims should decode");
+            assert_eq!(
+                claims
+                    .get("tier")
+                    .and_then(|v| v.as_str()),
+                Some("free"),
+                "{scheme}"
+            );
+            assert_eq!(
+                claims
+                    .get("sub")
+                    .and_then(|v| v.as_str()),
+                Some("agent@example.com"),
+                "{scheme}"
+            );
+        }
+        assert!(decode_bearer_jwt_claims(&format!("Bearer{token}")).is_none());
+        assert!(decode_bearer_jwt_claims("bearer ").is_none());
+    }
+
+    #[test]
     fn ap2_experimental_enabled_defaults_false() {
         let empty_flags = HashMap::new();
         assert!(!ap2_experimental_enabled_from_flags(None));
@@ -21223,6 +21238,42 @@ mod fabric_extended_card_tests {
                     "peer status {status} with {relayed}"
                 );
             }
+        });
+    }
+
+    #[test]
+    fn a_fabric_relay_skips_a_peer_header_http_cannot_carry_and_keeps_the_rest() {
+        run_on_large_stack(async {
+            let reply = json!({"jsonrpc": "2.0", "id": "m-1", "result": {"ok": true}});
+            let peer = fabric_peer_on(
+                "a2a",
+                202,
+                json!({"content-type": "application/json", "x-ok": "1", "x-bad": "v\r\nInjected: 1"}),
+                reply.clone(),
+            )
+            .await;
+
+            let response = send_through_router(&peer).await;
+
+            assert_eq!(response.status(), axum::http::StatusCode::ACCEPTED);
+            assert_eq!(response.headers()["x-ok"], "1");
+            assert!(
+                response
+                    .headers()
+                    .get("x-bad")
+                    .is_none()
+            );
+            assert!(
+                response
+                    .headers()
+                    .get("injected")
+                    .is_none()
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body, reply);
         });
     }
 

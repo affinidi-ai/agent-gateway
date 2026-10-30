@@ -602,11 +602,14 @@ With API-key or mTLS source authentication, every caller presenting the same key
 certificate identity therefore shares one set of delegated tokens.
 
 Gateway tokens (client credentials and JWT bearer) have no user. Legacy delegation caches them
-under the user hash `__client_credentials__:<hex SHA-256 of the sorted, deduplicated scope set
-joined by spaces>`, so bindings with different scopes on one provider never share a token.
-After an upgrade each binding sends one new grant; records under the old bare
-`__client_credentials__` key are no longer read and stay listed until they expire or are
-revoked. Modern MCP delegation caches them under
+under the user hash `__client_credentials__:<hex SHA-256 of the provider digest and the sorted,
+deduplicated scope set joined by spaces>`, so bindings with different scopes on one provider, or a
+token granted before the provider was edited, never share a token.
+After an upgrade each binding sends one new grant. Records under the old bare
+`__client_credentials__` key are no longer read. Nothing removes expired vault records, so
+they stay on disk and in the Credential Tokens list until an operator deletes them with
+`DELETE /api/v1/delegation-vault/by-user/__client_credentials__`, which touches only the
+records stored under that exact key. Modern MCP delegation caches them under
 `__mcp_client_credentials__:<hex provider digest>`.
 
 A lookup has four outcomes.

@@ -2597,7 +2597,12 @@ async fn fabric_discovery_flow() {
                 "protected_resource": {"resource": "https://gateway.example/mcp"}
             }},
         "target": {"endpoint": format!("http://{}", target.addr)},
-        "variants": [{"id": "beta", "alias": "beta", "name": "Beta", "enabled": true, "overrides": {}}]
+        "variants": [{"id": "beta", "alias": "beta", "name": "Beta", "enabled": true, "overrides": {
+            "access_point": {"caller_authentication": {
+                "methods": [{"type": "jwt_bearer", "jwt_verification_strategy_id": strategy.id, "audiences": []}],
+                "protected_resource": {"resource": "https://gateway.example/mcp"}
+            }}
+        }}]
     }))
     .unwrap();
     FileSystemAgentSurfaceStore::new(storage_path.clone())
@@ -2618,22 +2623,25 @@ async fn fabric_discovery_flow() {
     )))
     .await;
 
-    let token_with = |audience: &str, scope: Option<&str>| {
+    let token_with = |audience: &str, scope: Option<&str>, id_token: bool| {
         let mut claims = json!({"iss": crate::protocols::protected_resource::fixtures::ISSUER, "sub": "user-123", "aud": audience,
             "exp": now_secs() + 300});
         if let Some(scope) = scope {
             claims["scope"] = json!(scope);
         }
+        if id_token {
+            claims["nonce"] = json!("n-1");
+        }
         sign_jwt(claims, &fixture.kid)
     };
-    let token_for = |audience: &str| token_with(audience, Some("mcp:tools"));
+    let token_for = |audience: &str| token_with(audience, Some("mcp:tools"), false);
     let now = super::super::envelope_replay::now_secs();
-    let send = |alias: Option<&str>, token: Option<String>| {
+    let send_request = |method: &str, path: &str, alias: Option<&str>, token: Option<String>| {
         let mut headers = json!({"MCP-Protocol-Version": MCP_LEGACY_VERSION});
         if let Some(token) = token {
             headers["authorization"] = json!(format!("Bearer {token}"));
         }
-        let mut body = json!({"channel_id": surface.surface_id, "method": "POST", "path": "/mcp", "headers": headers,
+        let mut body = json!({"channel_id": surface.surface_id, "method": method, "path": path, "headers": headers,
             "body": {"jsonrpc": "2.0", "id": "call", "method": "tools/list"}});
         if let Some(alias) = alias {
             body["virtual_channel_alias"] = json!(alias);
@@ -2667,6 +2675,7 @@ async fn fabric_discovery_flow() {
             response_body
         }
     };
+    let send = |alias: Option<&str>, token: Option<String>| send_request("POST", "/mcp", alias, token);
     let reached = || {
         target
             .request_count
@@ -2678,6 +2687,8 @@ async fn fabric_discovery_flow() {
         (None, Some(token_for("https://gateway.example/other")), true),
         (None, Some(token_for("https://gateway.example/mcp$beta")), true),
         (Some("beta"), Some(token_for("https://gateway.example/mcp")), true),
+        (None, Some(token_with("https://gateway.example/mcp", Some("mcp:tools"), true)), true),
+        (Some("beta"), Some(token_with("https://gateway.example/mcp$beta", None, true)), true),
     ] {
         let response = send(alias, token).await;
         assert_eq!(response["status"], 401, "{response}");
@@ -2691,7 +2702,7 @@ async fn fabric_discovery_flow() {
     }
 
     for scope in [None, Some("mcp:read")] {
-        let response = send(None, Some(token_with("https://gateway.example/mcp", scope))).await;
+        let response = send(None, Some(token_with("https://gateway.example/mcp", scope, false))).await;
         assert_eq!(response["status"], 403, "{response}");
         assert_eq!(
             response["headers"]["www-authenticate"], "Bearer realm=\"agent-gateway\", error=\"insufficient_scope\"",
@@ -2720,6 +2731,15 @@ async fn fabric_discovery_flow() {
         );
     }
 
+    let before = reached();
+    let response = send(Some("beta"), Some(token_with("https://gateway.example/mcp$beta", None, false))).await;
+    assert_eq!(response["status"], 200, "{response}");
+    assert_eq!(
+        reached(),
+        before + 1,
+        "a scope-less access token for a variant that requires no scope reaches the Target"
+    );
+
     // A named alias that does not resolve is refused, with or without a token
     // and whatever it names, and never reaches the Target.
     for token in
@@ -2729,6 +2749,34 @@ async fn fabric_discovery_flow() {
         let response = send(Some("ghost"), token).await;
         assert_eq!(response["status"], 404, "{response}");
         assert_eq!(reached(), before, "an unresolved alias never reaches the Target");
+    }
+
+    // On a declaring Access Point only an exact GET or HEAD of a well-known card
+    // is public; a discovery-suffix path is challenged with no token, and never
+    // reaches the Target.
+    let before = reached();
+    for (method, path) in [
+        ("GET", "/agent.json"),
+        ("GET", "/agent-card.json"),
+        ("GET", "/discovery"),
+        ("GET", "/tasks/discovery"),
+        ("GET", "/x/.well-known/ucp"),
+        ("POST", "/.well-known/agent-card.json"),
+    ] {
+        let response = send_request(method, path, None, None).await;
+        assert_eq!(response["status"], 401, "{method} {path}: {response}");
+        let challenge = response["headers"]["www-authenticate"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(challenge.starts_with("Bearer realm=\"agent-gateway\""), "{method} {path}: {response}");
+        assert!(!challenge.contains("resource_metadata"), "{method} {path}: {response}");
+    }
+    assert_eq!(reached(), before, "a challenged discovery-suffix path never reaches the Target");
+
+    for (method, path) in [("GET", "/.well-known/agent-card.json"), ("HEAD", "/.well-known/agent.json")] {
+        let response = send_request(method, path, None, None).await;
+        assert_ne!(response["status"], 401, "{method} {path}: {response}");
+        assert!(response["headers"]["www-authenticate"].is_null(), "{method} {path}: {response}");
     }
 }
 

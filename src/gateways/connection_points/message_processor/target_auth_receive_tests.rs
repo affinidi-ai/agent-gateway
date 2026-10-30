@@ -904,6 +904,93 @@ async fn fabric_delegated_credentials_reach_the_target_and_a_jwt_bearer_binding_
 }
 
 #[tokio::test]
+async fn fabric_client_credentials_binding_is_refused_on_a_plain_http_leg_and_sent_on_an_allowlisted_one() {
+    if rerun_in_isolated_process() {
+        return;
+    }
+    let receiver = Receiver::start(json!({"jsonrpc": "2.0", "id": 1, "result": {}})).await;
+    let vault = Arc::new(
+        crate::delegation_vault::storage::FileSystemDelegationVaultStore::new(
+            receiver
+                ._directory
+                .path()
+                .join("vault"),
+        )
+        .await
+        .expect("vault store"),
+    );
+    super::init_delegation_vault_store(vault).await;
+    super::init_secrets_store(receiver.secrets.clone()).await;
+    super::init_credential_provider_store(receiver.providers.clone()).await;
+    super::init_gateway_base_url("https://gateway.example".to_string()).await;
+    let plain = MockServer::start_with_response(json!({"jsonrpc": "2.0", "id": 1, "result": {}}).to_string()).await;
+
+    let bound = |surface_id: &str, endpoint: String| {
+        json!({
+            "surface_id": surface_id, "name": surface_id,
+            "access_point": {"listen_address": "127.0.0.1:0", "route": "/route", "protocol": "a2a",
+                "caller_authentication": {"methods": [{
+                    "type": "api_key", "extraction": {"source": "http_header", "field": "X-Caller-Key"},
+                    "secret_id": "CALLER_KEYS"
+                }]}},
+            "target": {"endpoint": endpoint},
+            "outbound_credentials": [{"credential_provider_id": "cp-receiver"}]
+        })
+    };
+    receiver
+        .save(bound("client-credentials-plain-http", format!("{}/api", plain.url())))
+        .await;
+    receiver
+        .save(bound("client-credentials-allowlisted", format!("{}/api", receiver.target.url())))
+        .await;
+    let call = json!({"jsonrpc": "2.0", "id": 1, "method": "message/send"});
+    let caller = json!({"x-caller-key": CALLER_KEY});
+
+    assert_eq!(
+        receiver
+            .send("client-credentials-plain-http", "POST", "/", caller.clone(), call.clone())
+            .await,
+        503,
+        "a Client Credentials binding is refused on a plain http leg"
+    );
+    assert_eq!(
+        plain
+            .request_count
+            .load(Ordering::SeqCst),
+        0,
+        "the refused leg never reaches the Target"
+    );
+    assert_eq!(
+        receiver
+            .auth_server
+            .token_request_count(),
+        0,
+        "no gateway token is requested for a forbidden leg"
+    );
+
+    assert_eq!(
+        receiver
+            .send("client-credentials-allowlisted", "POST", "/", caller, call)
+            .await,
+        200
+    );
+    assert!(
+        receiver
+            .last_request()
+            .headers
+            .get("authorization")
+            .is_some_and(|value| value.starts_with("Bearer ")),
+        "the same binding on an allowlisted leg sends the gateway token"
+    );
+    assert_eq!(
+        receiver
+            .auth_server
+            .token_request_count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn fabric_mcp_proxy_calls_carry_the_target_credential_and_refuse_a_missing_or_disabled_proxy() {
     use crate::mcp_proxies::filesystem::McpProxyStore;
     if rerun_in_isolated_process() {
