@@ -1321,7 +1321,10 @@ mod tests {
             assert_eq!(header.alg, Algorithm::RS256);
             assert_eq!(header.kid.as_deref(), Some("key1"));
             assert_eq!(header.x5t_s256, None);
-            assert_eq!(claims(&form["client_assertion"], &fixture.key.public_pem, Algorithm::RS256)["iss"], "client-123");
+            assert_eq!(
+                claims(&form["client_assertion"], &fixture.key.public_pem, Algorithm::RS256)["iss"],
+                "client-123"
+            );
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
