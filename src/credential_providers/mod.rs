@@ -53,6 +53,15 @@ impl CredentialProviderType {
         }
     }
 
+    /// The algorithm a provider of this type signs with: `configured`, else the default.
+    pub fn jwt_signing_algorithm(
+        &self,
+        configured: Option<JwtSigningAlgorithm>,
+    ) -> Option<JwtSigningAlgorithm> {
+        self.default_jwt_algorithm()
+            .map(|default| configured.unwrap_or(default))
+    }
+
     pub fn allows_jwt_algorithm(
         &self,
         algorithm: JwtSigningAlgorithm,
@@ -252,12 +261,10 @@ impl CredentialProvider {
     /// type's default. `None` for types that sign nothing.
     pub fn jwt_signing_algorithm(&self) -> Option<JwtSigningAlgorithm> {
         self.provider_type
-            .default_jwt_algorithm()
-            .map(|default| {
+            .jwt_signing_algorithm(
                 self.jwt
-                    .jwt_signing_algorithm
-                    .unwrap_or(default)
-            })
+                    .jwt_signing_algorithm,
+            )
     }
 }
 
@@ -333,6 +340,20 @@ pub struct UpdateCredentialProviderRequest {
     pub resource: Option<String>,
     #[serde(default)]
     pub consent_identity_strategy_id: Option<String>,
+}
+
+/// Request to check a provider before it is saved: the token endpoint's reachability and,
+/// for a type that signs a JWT, the key material its secret references hold
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidateCredentialProviderRequest {
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    #[serde(default)]
+    pub provider_type: Option<CredentialProviderType>,
+    #[serde(default)]
+    pub token_endpoint: Option<String>,
+    #[serde(flatten)]
+    pub jwt: JwtAssertionSettings,
 }
 
 /// List response item (no sensitive data)

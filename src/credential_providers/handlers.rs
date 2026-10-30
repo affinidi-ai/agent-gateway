@@ -2,7 +2,8 @@
 
 use super::{
     CreateCredentialProviderRequest, CredentialProvider, CredentialProviderListItem, CredentialProviderType,
-    UpdateCredentialProviderRequest, storage::CredentialProviderStorage,
+    JwtAssertionSettings, JwtSigningAlgorithm, UpdateCredentialProviderRequest, ValidateCredentialProviderRequest,
+    storage::CredentialProviderStorage,
 };
 use axum::{
     Extension, Json,
@@ -268,14 +269,16 @@ fn validate_jwt_provider(provider: &CredentialProvider) -> Result<(), JwtProvide
 
 /// Resolve the signing key and certificate a JWT-signing provider references and check
 /// they parse, so a wrong format fails the save rather than the first token request.
-/// Runs after [`validate_secret_references`] has checked the caller may use them.
+/// `algorithm` is `None` for a type that signs nothing. Runs after
+/// [`validate_secret_references`] has checked the caller may use them.
 async fn validate_jwt_key_material(
     state: &CredentialProviderState,
-    provider: &CredentialProvider,
+    algorithm: Option<JwtSigningAlgorithm>,
+    jwt: &JwtAssertionSettings,
 ) -> Result<(), ProviderReferenceError> {
     use crate::delegation_vault::jwt_assertion;
 
-    let Some(algorithm) = provider.jwt_signing_algorithm() else {
+    let Some(algorithm) = algorithm else {
         return Ok(());
     };
     let resolve = |secret_id: Option<String>| async move {
@@ -294,9 +297,7 @@ async fn validate_jwt_key_material(
             .ok_or(ProviderReferenceError::SecretNotAccessible)
     };
     if let Some(key) = resolve(
-        provider
-            .jwt
-            .jwt_signing_key_secret_ref
+        jwt.jwt_signing_key_secret_ref
             .clone(),
     )
     .await?
@@ -304,9 +305,7 @@ async fn validate_jwt_key_material(
         jwt_assertion::check_signing_key(&key, algorithm).map_err(|_| ProviderReferenceError::InvalidSigningKey)?;
     }
     if let Some(certificate) = resolve(
-        provider
-            .jwt
-            .jwt_certificate_secret_ref
+        jwt.jwt_certificate_secret_ref
             .clone(),
     )
     .await?
@@ -538,7 +537,7 @@ pub async fn create_provider(
     if let Err(error) = validate_jwt_provider(&provider) {
         return error.into_response();
     }
-    if let Err(error) = validate_jwt_key_material(&state, &provider).await {
+    if let Err(error) = validate_jwt_key_material(&state, provider.jwt_signing_algorithm(), &provider.jwt).await {
         return error.into_response();
     }
     if let Err(error) = validate_consent_strategy(&state, &provider, &context, &scope).await {
@@ -772,7 +771,7 @@ pub async fn update_provider(
     {
         return error.into_response();
     }
-    if let Err(error) = validate_jwt_key_material(&state, &updated).await {
+    if let Err(error) = validate_jwt_key_material(&state, updated.jwt_signing_algorithm(), &updated.jwt).await {
         return error.into_response();
     }
 
@@ -849,17 +848,34 @@ pub async fn delete_provider(
 }
 
 /// POST /api/v1/credential-providers/validate
-/// Tests that the token endpoint is reachable
-pub async fn validate_provider(Json(req): Json<serde_json::Value>) -> impl IntoResponse {
-    let token_endpoint = match req
-        .get("token_endpoint")
-        .and_then(|v| v.as_str())
-    {
-        Some(url) => url.to_string(),
-        None => {
-            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "token_endpoint is required"})))
-                .into_response();
-        }
+/// Checks the key material a JWT-signing provider references, with the same tenancy rules
+/// as a save, then that the token endpoint is reachable
+pub async fn validate_provider(
+    State(state): State<CredentialProviderState>,
+    pat: Option<Extension<PatContext>>,
+    context: Option<Extension<PatTenantContext>>,
+    scope: Option<Extension<PatResourceScope>>,
+    Json(req): Json<ValidateCredentialProviderRequest>,
+) -> impl IntoResponse {
+    let client = crate::http_client::with_short_timeout().unwrap_or_else(|_| reqwest::Client::new());
+    validate_provider_with(&state, &client, pat.is_some(), &context, &scope, req).await
+}
+
+async fn validate_provider_with(
+    state: &CredentialProviderState,
+    client: &reqwest::Client,
+    pat_authenticated: bool,
+    context: &Option<Extension<PatTenantContext>>,
+    scope: &Option<Extension<PatResourceScope>>,
+    mut req: ValidateCredentialProviderRequest,
+) -> Response {
+    let tenant_id = match tenant_for_create(req.tenant_id.take(), pat_authenticated, tenant_context(context)) {
+        Ok(tenant_id) => tenant_id,
+        Err(message) => return (StatusCode::FORBIDDEN, Json(serde_json::json!({ "error": message }))).into_response(),
+    };
+    let Some(token_endpoint) = req.token_endpoint else {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "token_endpoint is required"})))
+            .into_response();
     };
 
     if let Err(e) = crate::url_validation::validate_oauth_endpoint_url(&token_endpoint) {
@@ -867,7 +883,31 @@ pub async fn validate_provider(Json(req): Json<serde_json::Value>) -> impl IntoR
             .into_response();
     }
 
-    let client = crate::http_client::with_short_timeout().unwrap_or_else(|_| reqwest::Client::new());
+    // Local checks first, so a request that fails them sends nothing to the endpoint.
+    let jwt = req.jwt.normalized();
+    let algorithm = req
+        .provider_type
+        .as_ref()
+        .and_then(|provider_type| provider_type.jwt_signing_algorithm(jwt.jwt_signing_algorithm));
+    if let (Some(provider_type), Some(algorithm)) = (&req.provider_type, algorithm)
+        && !provider_type.allows_jwt_algorithm(algorithm)
+    {
+        return JwtProviderFieldError::UnsupportedAlgorithm.into_response();
+    }
+    if let Err(error) = validate_secret_references(
+        state,
+        tenant_id.as_deref(),
+        [jwt.jwt_signing_key_secret_ref.as_deref(), jwt.jwt_certificate_secret_ref.as_deref()],
+        context,
+        scope,
+    )
+    .await
+    {
+        return error.into_response();
+    }
+    if let Err(error) = validate_jwt_key_material(state, algorithm, &jwt).await {
+        return error.into_response();
+    }
 
     match client
         .get(&token_endpoint)
@@ -884,15 +924,15 @@ pub async fn validate_provider(Json(req): Json<serde_json::Value>) -> impl IntoR
                 http_status = %status,
                 "Token endpoint validation check"
             );
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "reachable": true,
-                    "http_status": status,
-                    "token_endpoint": token_endpoint,
-                })),
-            )
-                .into_response()
+            let mut body = serde_json::json!({
+                "reachable": true,
+                "http_status": status,
+                "token_endpoint": token_endpoint,
+            });
+            if algorithm.is_some() {
+                body["key_material"] = serde_json::json!("ok");
+            }
+            (StatusCode::OK, Json(body)).into_response()
         }
         Err(e) => {
             warn!(
@@ -1265,6 +1305,126 @@ mod jwt_provider_tests {
         let (status, response) = update(&state, id, json!({"name": "Renamed"})).await;
         assert_eq!(status, StatusCode::OK, "{response}");
         assert_eq!(response["jwt_certificate_secret_ref"], "CERT");
+    }
+
+    /// A client whose every request reaches a local server that answers GET with 405, as a
+    /// token endpoint does.
+    async fn token_endpoint_answering_get() -> (reqwest::Client, tokio::task::JoinSet<()>) {
+        let app = axum::Router::new().fallback(axum::routing::get(|| async { StatusCode::METHOD_NOT_ALLOWED }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .proxy(reqwest::Proxy::http(format!("http://{}", listener.local_addr().unwrap())).unwrap())
+            .build()
+            .unwrap();
+        let mut server = tokio::task::JoinSet::new();
+        server.spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .unwrap();
+        });
+        (client, server)
+    }
+
+    async fn validate(
+        state: &CredentialProviderState,
+        http: &reqwest::Client,
+        context: Option<Extension<PatTenantContext>>,
+        body: Value,
+    ) -> (StatusCode, Value) {
+        let response =
+            validate_provider_with(state, http, context.is_some(), &context, &None, serde_json::from_value(body).unwrap())
+                .await;
+        body_of(response).await
+    }
+
+    fn validate_jwt_bearer(signing_key: &str) -> Value {
+        json!({
+            "provider_type": "oauth2_jwt_bearer", "token_endpoint": "http://192.0.2.1/token",
+            "jwt_signing_key_secret_ref": signing_key
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn validate_checks_reachability_and_the_key_material_of_a_jwt_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let (http, _server) = token_endpoint_answering_get().await;
+        let (status, response) = validate(&state, &http, None, validate_jwt_bearer("SA_KEY")).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["reachable"], true);
+        assert_eq!(response["http_status"], 405);
+        assert_eq!(response["token_endpoint"], "http://192.0.2.1/token");
+        assert_eq!(response["key_material"], "ok");
+
+        let (status, response) = validate(
+            &state,
+            &http,
+            None,
+            json!({"provider_type": "oauth2_client_credentials", "token_endpoint": "http://192.0.2.1/token"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["reachable"], true);
+        assert!(
+            response
+                .get("key_material")
+                .is_none(),
+            "{response}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn validate_refuses_key_material_in_the_wrong_format_without_echoing_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let (http, _server) = token_endpoint_answering_get().await;
+        let (status, response) = validate(&state, &http, None, validate_jwt_bearer("NOT_A_KEY")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response["error"],
+            "jwt_signing_key_secret_ref must reference a PEM private key matching jwt_signing_algorithm"
+        );
+        assert!(
+            !response
+                .to_string()
+                .contains("key-secret-marker")
+        );
+        let mut pss_bearer = validate_jwt_bearer("SA_KEY");
+        pss_bearer["jwt_signing_algorithm"] = json!("PS256");
+        let (status, response) = validate(&state, &http, None, pss_bearer).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(response["error"], "jwt_signing_algorithm is not supported for this provider type");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn validate_refuses_another_tenants_secret_before_reading_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        // Not a key: reading it would answer "must reference a PEM private key" instead.
+        state
+            .secrets_store
+            .create(crate::secrets::CreateSecretRequest {
+                tenant_id: Some("tenant-b".into()),
+                name: "B_KEY".into(),
+                secret_id: "B_KEY".into(),
+                description: None,
+                value: "key-secret-marker".into(),
+                secret_type: "general".into(),
+                tags: vec![],
+            })
+            .await
+            .unwrap();
+        let (http, _server) = token_endpoint_answering_get().await;
+        let tenant_a = Some(Extension(PatTenantContext {
+            token_id: "token-a".into(),
+            tenant_id: "tenant-a".into(),
+        }));
+        let (status, response) = validate(&state, &http, tenant_a, validate_jwt_bearer("B_KEY")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(response["error"], "Secret reference is not accessible");
     }
 }
 

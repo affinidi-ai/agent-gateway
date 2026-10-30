@@ -18,7 +18,14 @@ changes:
         Authorization Bearer by default. Issued tokens are cached in the delegation vault per
         surface and renewed before they expire. The dashboard offers it on the Managed Agent
         and Transit Point, and a surface save refuses an authorization-code provider.
-  changed: []
+  changed:
+    - timestamp: '2026-10-30T09:30:00Z'
+      title: Check JWT key material on the credential provider validate endpoint
+      description: >-
+        POST /api/v1/credential-providers/validate now requires the credential provider edit
+        permission, applies the caller's tenant to the secrets it names, and for a JWT Bearer
+        or Client Credentials JWT provider checks that the signing key and certificate secrets
+        hold PEM key material before it tests the token endpoint.
   fixed:
     - timestamp: '2026-10-29T23:30:00Z'
       title: Fetch an agent card protected by an expiring OAuth token
