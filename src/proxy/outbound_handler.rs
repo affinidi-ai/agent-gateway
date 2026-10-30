@@ -11847,6 +11847,66 @@ mod tests {
         assert_ne!(Some("abc123"), Some(client_hash.as_str()));
     }
 
+    /// Delegated credentials on a `2026-07-28` MCP request are keyed through the
+    /// Transit Point's resource-server authorization. A Transit Point cannot have
+    /// both that and `source_auth`, so a caller its `source_auth` verified, or one
+    /// only a transit token names, is refused there, while the legacy path keys a
+    /// `source_auth` caller by its identity hash.
+    #[tokio::test]
+    async fn a_modern_mcp_request_from_a_source_auth_caller_cannot_use_delegated_credentials() {
+        use crate::mcp::continuations::ContinuationError;
+        use crate::mcp::continuations::negative_cases::continuation_runtime;
+        use crate::mcp::request_validation::{McpMessageKind, ValidatedModernMessage};
+        use crate::proxy::credential_delegation::modern::{ModernDelegationError, prepare_transit};
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let runtime = continuation_runtime(now, 60);
+        let request = ValidatedModernMessage {
+            protocol_version: crate::mcp::MCP_MODERN_VERSION.into(),
+            client_capabilities: None,
+            client_info: None,
+            method: "tools/call".into(),
+            params: None,
+            id: Some(json!(1)),
+            kind: McpMessageKind::Request,
+        };
+        let state = test_outbound_state();
+        let mut ctx = test_pipeline_context();
+        ctx.authenticated_identity = Some(crate::source_auth::AuthenticatedIdentity::ApiKey {
+            key_name: "copilot-studio".to_string(),
+            provider_agent_id: None,
+        });
+        ctx.authenticated_by = Some(crate::surface_context::TransitClientVerification::SourceAuth);
+        assert!(
+            delegation_caller_hash(&ctx).is_some(),
+            "the legacy path keys this caller by its identity hash when no transit token names one"
+        );
+        ctx.transit_token_claims = Some(caller_claims(Some("did:example:agent"), None, None, json!({})));
+        assert!(
+            ctx.mcp_resource_authorization
+                .is_none()
+        );
+
+        let refused = prepare_transit(&state, &runtime, &mut ctx, &request)
+            .await
+            .err()
+            .expect("the modern path refuses without a resource-server authorization");
+        assert!(matches!(refused, ModernDelegationError::Continuation(ContinuationError::BindingMismatch)));
+
+        ctx.authenticated_identity = None;
+        ctx.authenticated_by = None;
+        ctx.transit_token_claims =
+            Some(caller_claims(Some("did:example:agent"), Some("gateway-computed"), Some("abc123"), json!({})));
+        let refused = prepare_transit(&state, &runtime, &mut ctx, &request)
+            .await
+            .err()
+            .expect("a caller only a transit token names is refused on the modern path too");
+        assert!(matches!(refused, ModernDelegationError::Continuation(ContinuationError::BindingMismatch)));
+    }
+
     fn bearer_workload_binding() -> crate::config::types::WorkloadBindingConfig {
         serde_json::from_value(json!({
             "enabled": true,

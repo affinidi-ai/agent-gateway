@@ -156,7 +156,10 @@ it authenticated the same way. So:
 - a JWT without a `sub` names no caller and is given no grant.
 
 A caller verified by a resource access token (`mcp_http.authorization`) keys a grant only on
-a `2026-07-28` MCP request. The agent half of the key is the Transit Point's
+a `2026-07-28` MCP request, and a `2026-07-28` MCP request keys a grant only that way: a
+Transit Point cannot have both a resource access token and `source_auth`, so a caller its
+`source_auth` verified, or one named only by a transit token, is refused there and uses
+delegated credentials on legacy MCP, A2A and HTTP requests. The agent half of the key is the Transit Point's
 [managed identity](SOURCE_AUTH.md#managed-identity), else the caller DID the transit token
 carries, so a `source_auth` caller without a transit token needs a managed identity for the
 Transit Point.
