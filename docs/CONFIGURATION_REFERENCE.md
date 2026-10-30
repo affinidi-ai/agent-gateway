@@ -159,7 +159,7 @@ The bootstrap file. Startup only; changes need a restart.
 | `[reconnect_policy]` | Backoff for DIDComm connection points |
 | `[oob_connection]` | How long an out-of-band pairing invitation stays pending |
 | `[a2a]` | Default A2A revision, body size, timeouts, fabric timeouts and envelope lifetime, inbound cache sizing |
-| `[logging]` | Level, JSON output, log directory |
+| `[logging]` | Level, JSON output, log directory. Log redaction is not read here; see [Log redaction](#log-redaction). |
 | `[extension_inspection]` | Whether to parse A2A extensions, and which URIs to watch |
 
 Fields and defaults are defined in [`src/config/bootstrap.rs`](../src/config/bootstrap.rs).
@@ -200,7 +200,7 @@ Network topology and the surfaces served. The largest configuration file; the ex
 | `facilitator_mode` | x402 facilitator behaviour |
 | `cors` | Permitted dashboard origins |
 | `terms`, `affinidi_terms_url` | Whether Terms acceptance is enforced, and where metadata is fetched |
-| `logging` | Log redaction rules. Only `redaction` is read here; level, JSON output, and directory come from `config.toml`. |
+| `logging` | Log redaction, for every configuration source. Only `redaction` is read here; level, JSON output, and directory come from `config.toml`. See [Log redaction](#log-redaction). |
 | `oauth_callback_route` | Where OAuth redirects land |
 | `external_consent_resource_origins` | Resource origins permitted for the credential providers of external consent of each issuer, beyond the issuer's own host and its subdomains: an issuer origin maps to a list of resource origins, all `https`, for example `{"https://accounts.google.com": ["https://www.googleapis.com"]}`. Entries are exact origins, with no wildcard (`https://*.googleapis.com` is not one), path or userinfo; an entry that is not one permits nothing and is named in an `ERROR` at startup. Read at startup; no API changes it. See [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#external-consent-providers). |
 
@@ -233,6 +233,60 @@ records rather than file content; see [`src/config/agent_surface.rs`](../src/con
 registration to succeed. A mismatch is the most common local-setup failure, and
 [`development/GETTING_STARTED.md`](development/GETTING_STARTED.md) treats the generated
 value as the source of truth.
+
+### Log redaction
+
+`logging.redaction` masks values before they leave the gateway: in stderr, in the log
+file, in exported OTLP spans (span names, string attributes and events) and in exported
+OTLP log records (body and string attributes). It is read from `gateway.json` with every
+configuration source, `local` and `dynamodb`. A `[logging.redaction]` table in
+`config.toml` is ignored, and startup logs a warning about it. To keep rules set there, move
+them to `rules` in `gateway.json` `logging.redaction`; they replace the built-in rules, so
+also copy any built-in rules you still want from
+[`config/examples/gateway.example.json`](../config/examples/gateway.example.json).
+
+| Setting | Effect |
+| --- | --- |
+| No `logging.redaction` block, or no `enabled` | Redaction is on. |
+| `"enabled": false` | Redaction is off for every destination. |
+| No `rules` | The built-in rules below apply. |
+| `rules` | Your rules replace the built-in rules and run in order. An empty list applies no pattern. |
+
+A rule whose pattern does not compile is skipped with a warning on stderr. At startup
+stderr reports the number of rules in use, or a warning when redaction is off, and the
+`Startup configuration` log line shows `log_redaction=on` or `off`.
+
+The built-in rules, applied in this order:
+
+| Rule | Masks |
+| --- | --- |
+| JWT tokens | Three-part `eyJ…` tokens |
+| Authorization header values | The credential after `Authorization:` or `Proxy-Authorization:` and a `Bearer`, `Basic`, `Digest`, `Token` or `ApiKey` scheme |
+| Password fields | The value of a `password`, `passwd` or `pwd` assignment |
+| Access and refresh tokens | The value of an `access_token`, `refresh_token` or `token` assignment |
+| Session identifiers | The value of a `session_id`, `sessionid`, `sid`, `jsessionid` or `connect.sid` assignment |
+| API key and secret assignments | The value after `api_key`, `api-key`, `apikey` or `secret` and an `=` or `:` |
+| Quoted credential fields | The JSON-quoted value of a key naming a credential, such as `"authorization": "Bearer …"`, `"x-api-key": "…"` or `"cookie": "…"`, also with escaped quotes |
+| Personal access tokens | `agpat_…` tokens |
+| Private key material (PEM) | PEM private key blocks |
+| Email addresses | Email addresses |
+
+The patterns are `BUILT_IN_RULES` in
+[`src/observability/log_redact.rs`](../src/observability/log_redact.rs).
+`config/examples/gateway.example.json` lists a broader set that adds IP addresses, phone
+numbers, DIDs, wallet addresses, card and national ID numbers. The built-in set leaves
+those out because they also match ordinary log text, such as listen addresses,
+timestamps and module paths, and the access log keeps client IP addresses by design.
+
+In OTLP exports, an attribute whose name is a credential name is replaced with
+`<redacted>` whatever its value, because a rule pattern cannot match a structured
+attribute by its name. The names, ignoring case, are `authorization`, `cookie`, `token`,
+`session_id`, `sessionid`, `jsessionid`, `password`, `passwd`, `secret`, `secret_key`,
+`api_key`, `apikey`, `private_key`, `credential` and `credentials`, alone or after a `.`,
+`_` or `-`: `http.request.header.authorization`, `x-api-key` and `mcp_session_id` match,
+`token_count` and `secret_id` do not. Fields named like a credential lose the
+8-character prefix the gateway logs for correlation, in local logs as well as in OTLP
+exports.
 
 ## `rbac.json`
 
@@ -364,6 +418,12 @@ Telemetry export. Three independent sinks, each with its own `enabled` flag.
 | Remaining keys | Local metric collection and retention |
 
 `opentelemetry.traces.sample_rate` is a fraction, so `0.1` records one span in ten.
+`opentelemetry.logs.targets` lists the log targets exported over OTLP: an exact target,
+such as `policy_audit`, or a module path, such as `agent_gateway`, which also covers
+`agent_gateway::proxy::handler`. `"*"`, the default, exports every target. Exported log
+records carry the level set by `[logging] level` in `config.toml` and the same
+[redaction](#log-redaction) as local logs. The list is applied at startup and again
+whenever the OpenTelemetry settings are saved from the dashboard.
 `opentelemetry.traces.record_caller_identity` adds `caller.auth_method`,
 `caller.principal`, and `caller.did` to the root HTTP span. It is off by default because
 those values identify the caller; turning it on puts caller identity into your tracing

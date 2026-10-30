@@ -17,6 +17,7 @@ use tracing::{info, warn};
 
 use crate::config::EncryptionConfig;
 use crate::encryption::{EncryptionService, global};
+use crate::observability::loggable;
 
 /// Decrypt residual field-level `ENC[...]` values under `storage_root` to
 /// plaintext, in place. No-op when encryption is disabled or no service is
@@ -83,7 +84,7 @@ fn migrate_file(
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) => {
-            warn!("Encryption migration: cannot read {}: {}", path.display(), e);
+            warn!("Encryption migration: cannot read {}: {}", loggable::record_path(path).display(), e);
             return false;
         }
     };
@@ -99,14 +100,14 @@ fn migrate_file(
     let serialized = match serde_json::to_vec_pretty(&value) {
         Ok(serialized) => serialized,
         Err(e) => {
-            warn!("Encryption migration: cannot re-serialize {}: {}", path.display(), e);
+            warn!("Encryption migration: cannot re-serialize {}: {}", loggable::record_path(path).display(), e);
             return false;
         }
     };
     match std::fs::write(path, serialized) {
         Ok(()) => true,
         Err(e) => {
-            warn!("Encryption migration: cannot write {}: {}", path.display(), e);
+            warn!("Encryption migration: cannot write {}: {}", loggable::record_path(path).display(), e);
             false
         }
     }
@@ -191,5 +192,29 @@ mod tests {
         migrate_field_encrypted_values(dir.path(), &config);
 
         assert_eq!(std::fs::read(&file).unwrap(), original, "a file with no ENC[...] must be untouched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_file_is_logged_by_its_directory_only() {
+        let service = EncryptionService::new(KeySource::Raw { key: [9u8; 32] }).unwrap();
+        let config = EncryptionConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        global::set_test_encryption(config.clone(), service);
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let token = "0f2c9d7e-1b3a-4c5d-8e9f-a0b1c2d3e4f5";
+        std::os::unix::fs::symlink(dir.path().join("missing"), sessions.join(format!("{token}.json"))).unwrap();
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        migrate_field_encrypted_values(dir.path(), &config);
+
+        let text = logs.text();
+        let logged_path = sessions.join("<redacted>");
+        assert!(text.contains(&format!("Encryption migration: cannot read {}", logged_path.display())), "{text}");
+        assert!(!text.contains(token), "{text}");
     }
 }

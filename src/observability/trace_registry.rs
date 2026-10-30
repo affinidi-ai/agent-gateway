@@ -57,15 +57,6 @@ impl TraceRegistry {
             .insert(prefix, name);
     }
 
-    /// Check if a path should be traced based on registered prefixes
-    pub fn should_trace(
-        &self,
-        path: &str,
-    ) -> bool {
-        self.get_trace_info(path)
-            .is_some()
-    }
-
     /// Get trace information (name and type) for a path
     /// Returns (name, type) where type is "channel", "mcp", or "well-known"
     ///
@@ -110,19 +101,6 @@ impl TraceRegistry {
 
         None
     }
-
-    /// Clear all registered prefixes (useful for testing)
-    #[allow(dead_code)]
-    pub fn clear(&mut self) {
-        self.channel_prefixes.clear();
-        self.mcp_prefixes.clear();
-    }
-}
-
-/// Get the global trace registry
-#[allow(dead_code)]
-pub fn get_trace_registry() -> Arc<RwLock<TraceRegistry>> {
-    TRACE_REGISTRY.clone()
 }
 
 /// Register a channel prefix for tracing
@@ -141,13 +119,6 @@ pub fn register_mcp_prefix(
 ) {
     let mut registry = TRACE_REGISTRY.write();
     registry.register_mcp_prefix(prefix.into(), name.into());
-}
-
-/// Check if a path should be traced
-#[allow(dead_code)]
-pub fn should_trace_path(path: &str) -> bool {
-    let registry = TRACE_REGISTRY.read();
-    registry.should_trace(path)
 }
 
 /// Get trace information for a path (name and type)

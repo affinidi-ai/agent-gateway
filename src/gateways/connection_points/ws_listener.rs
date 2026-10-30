@@ -3169,7 +3169,7 @@ async fn process_messages<CS: super::ConnectionPointStore + 'static>(
                     }
                 }
 
-                debug!("Message body: {}", serde_json::to_string_pretty(&message.body).unwrap_or_default());
+                debug!("Message {} ({}): {} body bytes", message.id, message.typ, message.body.to_string().len());
             }
             Ok(None) => {
                 debug!("No message received within timeout for connection point '{}'", connection_point.name);

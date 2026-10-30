@@ -149,7 +149,7 @@ impl PasskeyStorage {
             .await?
             .is_some()
         {
-            anyhow::bail!("User already exists: {}", username);
+            anyhow::bail!("User already exists");
         }
 
         if !is_first_user && let Err(e) = crate::config::global_limits().check_can_add("users", users.len()) {
@@ -197,7 +197,7 @@ impl PasskeyStorage {
         let mut user_data = self
             .load_user(username)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("User not found: {}", username))?;
+            .ok_or_else(|| anyhow::anyhow!("User not found"))?;
 
         if let Some(new_role) = role {
             user_data.role = new_role;
@@ -295,13 +295,13 @@ impl PasskeyStorage {
         let user_data = self
             .load_user(username)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("User not found: {}", username))?;
+            .ok_or_else(|| anyhow::anyhow!("User not found"))?;
 
         self.storage
             .delete(&user_data.user_id)
             .await?;
 
-        tracing::info!("Permanently deleted user: {} (user_id: {})", username, user_data.user_id);
+        tracing::info!("Permanently deleted user_id: {}", user_data.user_id);
 
         Ok(())
     }
@@ -323,7 +323,7 @@ impl PasskeyStorage {
 
 #[cfg(test)]
 mod tests {
-    use super::PasskeyStorage;
+    use super::{PasskeyStorage, UserData, UserRole, UserStatus};
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -350,5 +350,63 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn deleting_a_user_logs_its_user_id_but_not_its_username() {
+        const USERNAME: &str = "alice.marker@example.com";
+        let temp_dir = tempdir().unwrap();
+        let storage = PasskeyStorage::new(
+            temp_dir
+                .path()
+                .join("users")
+                .to_string_lossy()
+                .into_owned(),
+            temp_dir
+                .path()
+                .join("avatars")
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .await
+        .unwrap();
+        let now = chrono::Utc::now();
+        let user = UserData {
+            user_id: uuid::Uuid::new_v4().to_string(),
+            username: USERNAME.to_string(),
+            passkeys: vec![],
+            role: UserRole::User,
+            status: UserStatus::Approved,
+            is_primary: false,
+            first_name: None,
+            last_name: None,
+            email: Some(USERNAME.to_string()),
+            department: None,
+            job_title: None,
+            avatar_path: None,
+            created_at: now,
+            updated_at: now,
+            last_logged_in: None,
+            saml_id: None,
+        };
+        storage
+            .save_user(&user)
+            .await
+            .unwrap();
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        storage
+            .delete_user(USERNAME)
+            .await
+            .unwrap();
+        let missing = storage
+            .delete_user(USERNAME)
+            .await
+            .unwrap_err();
+
+        let text = logs.text();
+        assert!(text.contains(&format!("Permanently deleted user_id: {}", user.user_id)), "{text}");
+        assert!(!text.contains(USERNAME), "{text}");
+        assert_eq!(missing.to_string(), "User not found");
     }
 }

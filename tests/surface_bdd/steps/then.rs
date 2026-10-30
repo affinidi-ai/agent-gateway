@@ -1357,25 +1357,6 @@ fn oauth_callback_response_shows_authorization_failure_page(world: &mut SurfaceW
     );
 }
 
-#[then(expr = "the response reports that variant {string} is disabled")]
-fn response_reports_variant_disabled(
-    world: &mut SurfaceWorld,
-    alias: String,
-) {
-    let body = get_response_body_value(world);
-    let raw_body = body.to_string();
-
-    assert!(
-        raw_body.contains(&alias)
-            && raw_body
-                .to_lowercase()
-                .contains("disabled"),
-        "expected response body to report variant '{}' is disabled, got {}",
-        alias,
-        body
-    );
-}
-
 fn get_did_document_service_uris(body: &serde_json::Value) -> Vec<String> {
     body.get("service")
         .and_then(|value| value.as_array())

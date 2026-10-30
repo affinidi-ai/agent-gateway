@@ -5507,6 +5507,31 @@ mod validation_tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_default_variant_on_a_surface_with_no_variants_is_saved_as_a_bad_request() {
+        let mut s = base_surface();
+        s.default_variant_id = Some("x".to_string());
+
+        let response = validate_variant_aliases(&s)
+            .expect_err("a default naming no variant must fail")
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["error"], "Bad Request");
+        assert!(
+            body["details"]
+                .as_str()
+                .is_some_and(|details| details.contains("'x'")),
+            "{body}"
+        );
+    }
+
     #[test]
     fn resolved_variants_accept_when_base_already_valid() {
         let mut s = base_surface();

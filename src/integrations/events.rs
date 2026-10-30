@@ -68,11 +68,12 @@ const VARIABLES: &[VariableSpec] = &[
     var("USER_EMAIL", "User Email", "Email of the user, when known"),
     var("USER_ROLE", "User Role", "Role of the user"),
     var("USER_STATUS", "User Status", "Status of the user"),
-    var("CP_ID", "Connection Point ID", "ID of the connection point that received the message"),
+    var("CP_ID", "Connection Point ID", "ID of the connection point"),
     var("CP_NAME", "Connection Point Name", "Name of the connection point"),
     var("CP_DESCRIPTION", "Connection Point Description", "Description of the connection point"),
+    var("CP_DID", "Connection Point DID", "DID of the connection point"),
     var("GATEWAY", "Gateway", "ID of the connection point's gateway"),
-    var("MEDIATOR_ID", "Mediator ID", "ID of the mediator the message arrived through"),
+    var("MEDIATOR_ID", "Mediator ID", "ID of the connection point's mediator"),
     var("MESSAGE_ID", "Message ID", "ID of the connection-setup message"),
     var("MESSAGE_TYPE", "Message Type", "DIDComm type of the connection-setup message"),
     var("FROM_DID", "Connecting DID", "DID of whoever connected"),
@@ -112,6 +113,11 @@ const VARIABLES: &[VariableSpec] = &[
     ),
     var("AUDIT_SURFACE_ID", "Surface ID", "ID of the Agent Surface the record belongs to"),
     var("AUDIT_SURFACE_NAME", "Surface Name", "Name of the Agent Surface the record belongs to"),
+    var(
+        "AUDIT_SURFACE_VARIANT",
+        "Surface Variant",
+        "The variant the request resolved to: the variant's alias, _base_ when the base surface served it, _unknown_ when the URL named a variant the surface doesn't have, or the disabled variant's alias when it was refused as disabled. Empty outside surface requests and when the surface's default variant is misconfigured.",
+    ),
     var("AUDIT_PROTOCOL", "Protocol", "Protocol of the surface (a2a, mcp, …)"),
     var("AUDIT_AGENT_DID", "Agent DID", "DID of the agent the record was written for"),
     var(
@@ -180,6 +186,8 @@ const GATEWAY_VARIABLES: &[&str] = &[
 ];
 const USER_VARIABLES: &[&str] =
     &["OLD_STATE", "NEW_STATE", "USER_ID", "USERNAME", "USER_EMAIL", "USER_ROLE", "USER_STATUS"];
+const CONNECTION_POINT_VARIABLES: &[&str] =
+    &["OLD_STATE", "NEW_STATE", "CP_ID", "CP_NAME", "CP_DESCRIPTION", "CP_DID", "GATEWAY_ID", "MEDIATOR_ID"];
 const MESSAGE_VARIABLES: &[&str] = &[
     "CP_ID",
     "CP_NAME",
@@ -202,6 +210,7 @@ const AUDIT_VARIABLES: &[&str] = &[
     "AUDIT_TRACE_ID",
     "AUDIT_SURFACE_ID",
     "AUDIT_SURFACE_NAME",
+    "AUDIT_SURFACE_VARIANT",
     "AUDIT_PROTOCOL",
     "AUDIT_AGENT_DID",
     "AUDIT_VIA_FABRIC",
@@ -289,9 +298,30 @@ const EVENTS: &[EventSpec] = &[
     spec(USER, "user.accessed", "User Profile Accessed", "A user's profile was viewed", &[USER_VARIABLES]),
     spec(
         CONNECTION_POINT,
+        "connection_point.created",
+        "Connection Point Created",
+        "A connection point was created",
+        &[CONNECTION_POINT_VARIABLES],
+    ),
+    spec(
+        CONNECTION_POINT,
+        "connection_point.updated",
+        "Connection Point Updated",
+        "A connection point's name, description, enabled state or exposed surfaces were changed",
+        &[CONNECTION_POINT_VARIABLES],
+    ),
+    spec(
+        CONNECTION_POINT,
+        "connection_point.deleted",
+        "Connection Point Deleted",
+        "A connection point was deleted",
+        &[CONNECTION_POINT_VARIABLES],
+    ),
+    spec(
+        CONNECTION_POINT,
         "connection_point.connected",
         "Connection Point Connected",
-        "Someone connected through a connection point with its secret",
+        "A gateway paired through a connection point's invitation, using its secret",
         &[MESSAGE_VARIABLES],
     ),
     spec(
@@ -427,6 +457,9 @@ mod tests {
             "user.deleted",
             "user.login",
             "user.accessed",
+            "connection_point.created",
+            "connection_point.updated",
+            "connection_point.deleted",
             "connection_point.connected",
             "x402.verification.failed",
             "x402.settlement.failed",
@@ -577,6 +610,33 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn connection_point_changes_offer_the_connection_point_but_no_message() {
+        for id in ["connection_point.created", "connection_point.updated", "connection_point.deleted"] {
+            let event = find_event(id).unwrap_or_else(|| panic!("{id}"));
+            assert_eq!((event.family, event.family_label), ("connection_point", "Connection Point"), "{id}");
+            for name in
+                ["OLD_STATE", "NEW_STATE", "CP_ID", "CP_NAME", "CP_DESCRIPTION", "CP_DID", "GATEWAY_ID", "MEDIATOR_ID"]
+            {
+                assert!(
+                    event
+                        .variables
+                        .contains(&name),
+                    "{id} lacks {name}"
+                );
+            }
+            for name in ["FROM_DID", "MESSAGE_BODY", "MESSAGE_ID"] {
+                assert!(
+                    !event
+                        .variables
+                        .contains(&name),
+                    "{id} offers {name}"
+                );
+            }
+        }
+        assert_eq!(find_event("connection_point.error"), None);
     }
 
     #[test]

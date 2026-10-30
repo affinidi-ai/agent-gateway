@@ -222,10 +222,10 @@ impl EncryptionService {
         self.decrypt_value(None, encrypted)
     }
 
-    /// Encrypt the content of the storage file at `path` (whole-file encryption).
+    /// Encrypt the content of a storage file (whole-file encryption).
     ///
-    /// Identical to [`Self::encrypt_string`] except that the tracing backend can
-    /// name the file in its log line.
+    /// Identical to [`Self::encrypt_string`] except that the tracing backend names
+    /// the file as `path` in its log line, so `path` must be safe to log.
     pub fn encrypt_file(
         &self,
         path: &Path,
@@ -234,10 +234,10 @@ impl EncryptionService {
         self.encrypt_value(Some(path), plaintext)
     }
 
-    /// Decrypt the content read from the storage file at `path`.
+    /// Decrypt the content read from a storage file.
     ///
-    /// Identical to [`Self::decrypt_string`] except that the tracing backend can
-    /// name the file in its log line.
+    /// Identical to [`Self::decrypt_string`] except that the tracing backend names
+    /// the file as `path` in its log line, so `path` must be safe to log.
     pub fn decrypt_file(
         &self,
         path: &Path,

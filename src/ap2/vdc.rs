@@ -417,18 +417,12 @@ pub fn extract_vdc_from_message(message: &Value) -> Result<Option<VDC>> {
         && let Some(vdc_value) = payment.get("vdc")
     {
         debug!("Found W3C VC in extensions.payment.vdc (legacy)");
-        if let Ok(raw_json) = serde_json::to_string_pretty(vdc_value) {
-            info!("📦 Raw VDC data from extensions.payment.vdc:\n{}", raw_json);
-        }
         return VDC::from_value(vdc_value).map(Some);
     }
 
     // Fallback: Check for W3C VC in top-level mandate field (legacy)
     if let Some(mandate) = message.get("mandate") {
         debug!("Found W3C VC in top-level mandate field (legacy)");
-        if let Ok(raw_json) = serde_json::to_string_pretty(mandate) {
-            info!("📦 Raw VDC data from top-level mandate:\n{}", raw_json);
-        }
         return VDC::from_value(mandate).map(Some);
     }
 

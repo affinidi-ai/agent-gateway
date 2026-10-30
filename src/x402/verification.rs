@@ -7,6 +7,7 @@ use tracing::info;
 use super::{PaymentPayload, PaymentResponse, TransactionStore};
 use crate::config::types::{X402Config, X402PaymentRequirement, X402VerificationMode};
 use crate::gateways::ConnectionPointListenerManager;
+use crate::observability::loggable;
 use crate::{channel_debug, channel_error, channel_info, channel_warn};
 use std::sync::Arc;
 
@@ -523,14 +524,20 @@ async fn verify_local_payment(
             .ok_or_else(|| format!("No RPC endpoint configured for network: {}", network))?
     };
 
-    channel_debug!(channel_id, "Verifying payment on-chain network={} rpc_url={}", network, rpc_url);
+    channel_debug!(channel_id, "Verifying payment on-chain network={} rpc={}", network, loggable::origin(&rpc_url));
 
     // Get transaction hash
     let tx_hash = payload
         .tx_hash()
         .ok_or_else(|| "Transaction hash required for local verification".to_string())?;
 
-    channel_info!(channel_id, "Verifying payment on-chain network={} rpc_url={} tx_hash={}", network, rpc_url, tx_hash);
+    channel_info!(
+        channel_id,
+        "Verifying payment on-chain network={} rpc={} tx_hash={}",
+        network,
+        loggable::origin(&rpc_url),
+        tx_hash
+    );
 
     // Verify based on network type (CAIP-2 format: namespace:reference)
     // EVM chains use eip155 namespace, Solana uses solana namespace
@@ -573,7 +580,7 @@ async fn verify_evm_transaction(
         .try_into()
         .map_err(|_| "Transaction hash must be 32 bytes".to_string())?;
 
-    channel_debug!(channel_id, "Fetching transaction receipt tx_hash={} rpc_url={}", tx_hash, rpc_url);
+    channel_debug!(channel_id, "Fetching transaction receipt tx_hash={} rpc={}", tx_hash, loggable::origin(rpc_url));
 
     // Retry logic for transaction lookup (RPC endpoints may be out of sync)
     // Client should verify transaction is on-chain before submitting, so minimal retries needed
@@ -612,7 +619,7 @@ async fn verify_evm_transaction(
                 let tx = provider
                     .get_transaction_by_hash(tx_hash_bytes.into())
                     .await
-                    .map_err(|e| format!("Failed to get transaction: {}", e))?
+                    .map_err(|e| format!("Failed to get transaction: {}", loggable::error_without_url(&e, rpc_url)))?
                     .ok_or_else(|| "Transaction not found".to_string())?;
 
                 return verify_evm_transaction_details(
@@ -624,7 +631,8 @@ async fn verify_evm_transaction(
                     config,
                     channel_id,
                 )
-                .await;
+                .await
+                .map_err(|error| loggable::error_without_url(&error, rpc_url));
             }
             Ok(Ok(None)) => {
                 last_error = format!("Transaction not found on blockchain (attempt {}/{})", attempt, max_retries);
@@ -641,7 +649,8 @@ async fn verify_evm_transaction(
                 }
             }
             Ok(Err(e)) => {
-                last_error = format!("RPC error: {}", e);
+                let error = loggable::error_without_url(&e, rpc_url);
+                last_error = format!("RPC error: {}", error);
                 if attempt < max_retries {
                     channel_warn!(
                         channel_id,
@@ -649,7 +658,7 @@ async fn verify_evm_transaction(
                         retry_delay,
                         attempt,
                         max_retries,
-                        e
+                        error
                     );
                     tokio::time::sleep(retry_delay).await;
                 } else {
@@ -670,9 +679,9 @@ async fn verify_evm_transaction(
                 } else {
                     channel_error!(
                         channel_id,
-                        "RPC timeout - all retries exhausted. tx_hash={} rpc_url={} timeout={:?}",
+                        "RPC timeout - all retries exhausted. tx_hash={} rpc={} timeout={:?}",
                         tx_hash,
-                        rpc_url,
+                        loggable::origin(rpc_url),
                         rpc_timeout
                     );
                     return Err(last_error);
@@ -684,10 +693,10 @@ async fn verify_evm_transaction(
     // All retries exhausted
     channel_error!(
         channel_id,
-        "Transaction not found after {} attempts tx_hash={} rpc_url={}",
+        "Transaction not found after {} attempts tx_hash={} rpc={}",
         max_retries,
         tx_hash,
-        rpc_url
+        loggable::origin(rpc_url)
     );
     Err(last_error)
 }
@@ -952,7 +961,7 @@ async fn verify_solana_transaction(
     // Get transaction using JSON encoding
     let tx = client
         .get_transaction(&signature, UiTransactionEncoding::Json)
-        .map_err(|e| format!("Failed to get Solana transaction: {}", e))?;
+        .map_err(|e| format!("Failed to get Solana transaction: {}", loggable::error_without_url(&e, rpc_url)))?;
 
     // Verify transaction succeeded
     if tx
@@ -1174,19 +1183,6 @@ async fn verify_eip3009_signature(
         .eip3009_authorization()
         .ok_or_else(|| "Missing EIP-3009 authorization in payload".to_string())?;
 
-    // Debug: Log raw authorization values before any parsing
-    channel_info!(
-        channel_id,
-        "EIP3009 Raw Authorization - from={} to={} value={} validAfter={} validBefore={} nonce={} nonce_len={}",
-        authorization.from,
-        authorization.to,
-        authorization.value,
-        authorization.valid_after,
-        authorization.valid_before,
-        authorization.nonce,
-        authorization.nonce.len()
-    );
-
     // Parse signature (r, s, v format - 65 bytes)
     let sig_bytes =
         hex::decode(signature_hex.trim_start_matches("0x")).map_err(|e| format!("Invalid signature hex: {}", e))?;
@@ -1212,15 +1208,6 @@ async fn verify_eip3009_signature(
     };
 
     let signature = AlloySignature::new(r, s, v_parity);
-
-    channel_info!(
-        channel_id,
-        "EIP3009 Parsed signature - r={} s={} v_byte={} v_parity={}",
-        hex::encode(r.to_be_bytes::<32>()),
-        hex::encode(s.to_be_bytes::<32>()),
-        v_byte,
-        v_parity
-    );
 
     // Parse addresses and values
     let from_addr: Address = authorization
@@ -1376,18 +1363,6 @@ async fn verify_eip3009_signature(
     struct_data.extend_from_slice(&valid_before.to_be_bytes::<32>());
     struct_data.extend_from_slice(nonce.as_slice());
 
-    channel_info!(
-        channel_id,
-        "EIP3009 Encoding - typeHash={} from_addr={} to_addr={} value={} validAfter={} validBefore={} nonce={}",
-        hex::encode(type_hash.as_slice()),
-        hex::encode(from_addr.as_slice()),
-        hex::encode(to_addr.as_slice()),
-        hex::encode(value.to_be_bytes::<32>()),
-        hex::encode(valid_after.to_be_bytes::<32>()),
-        hex::encode(valid_before.to_be_bytes::<32>()),
-        hex::encode(nonce.as_slice())
-    );
-
     let struct_hash = keccak256(&struct_data);
 
     // Construct the EIP-712 message hash: "\x19\x01" || domainSeparator || structHash
@@ -1402,32 +1377,13 @@ async fn verify_eip3009_signature(
         token_addr
     );
 
-    channel_info!(
-        channel_id,
-        "EIP3009 Debug - Message: from={} to={} value={} validAfter={} validBefore={} nonce={}",
-        authorization.from,
-        authorization.to,
-        authorization.value,
-        authorization.valid_after,
-        authorization.valid_before,
-        authorization.nonce // This is the original hex string from payload
-    );
-
-    channel_info!(
-        channel_id,
-        "EIP3009 Debug - Hashes: domainSep={} structHash={} signature={}",
-        hex::encode(domain_separator.as_slice()),
-        hex::encode(struct_hash.as_slice()),
-        hex::encode(&sig_bytes)
-    );
-
     let mut message = Vec::new();
     message.extend_from_slice(b"\x19\x01");
     message.extend_from_slice(domain_separator.as_slice());
     message.extend_from_slice(struct_hash.as_slice());
     let message_hash = keccak256(&message);
 
-    channel_info!(channel_id, "EIP3009 Debug - Final messageHash={}", hex::encode(message_hash.as_slice()));
+    channel_debug!(channel_id, "EIP3009 final messageHash={}", hex::encode(message_hash.as_slice()));
 
     // Recover signer from signature
     channel_info!(
@@ -2226,6 +2182,68 @@ mod tests {
                 .pay_to,
             MERCHANT.to_lowercase()
         );
+    }
+
+    #[tokio::test]
+    async fn signature_mode_logs_neither_signature_nor_authorization() {
+        let signer = alloy_signer_local::PrivateKeySigner::random();
+        let header = signed_eip3009_header(&signer, &configured(), "USDC", "1000000");
+        let decoded: serde_json::Value = serde_json::from_slice(
+            &base64::engine::general_purpose::STANDARD
+                .decode(&header)
+                .unwrap(),
+        )
+        .unwrap();
+        let signature = decoded["payload"]["signature"]
+            .as_str()
+            .unwrap()
+            .trim_start_matches("0x")
+            .to_string();
+        let nonce = decoded["payload"]["authorization"]["nonce"]
+            .as_str()
+            .unwrap()
+            .trim_start_matches("0x")
+            .to_string();
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        let result = verify_in_signature_mode(&header).await;
+
+        let text = logs.text();
+        assert!(result.is_ok(), "{result:?}");
+        assert!(text.contains("EIP-3009 signature verified successfully"), "{text}");
+        assert!(!text.contains(&signature[..64]), "signature r logged: {text}");
+        assert!(!text.contains(&signature[64..128]), "signature s logged: {text}");
+        assert!(!text.contains(&nonce), "authorization nonce logged: {text}");
+        assert!(!text.contains(&header), "payment header logged: {text}");
+    }
+
+    #[tokio::test]
+    async fn external_facilitator_exchange_is_not_logged() {
+        let nonce_marker = format!("0x{}", hex::encode(rand::random::<[u8; 32]>()));
+        let (url, _requests) = mock_facilitator().await;
+        let config = X402Config {
+            facilitator_url: Some(url),
+            ..config(X402VerificationMode::ExternalFacilitator)
+        };
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        let result = verify_payment(
+            &payment_header_for(&configured(), &nonce_marker),
+            &config,
+            "Test Channel",
+            "channel-1",
+            "/test",
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        let text = logs.text();
+        assert!(result.is_ok(), "{result:?}");
+        assert!(text.contains("Payment verified successfully"), "{text}");
+        assert!(!text.contains(&nonce_marker), "{text}");
+        assert!(!text.contains("\"isValid\""), "facilitator response body logged: {text}");
     }
 
     #[tokio::test]

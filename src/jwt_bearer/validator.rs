@@ -152,7 +152,6 @@ impl JwtBearerVerifier {
         info!(
             strategy_id = %strategy.id,
             iss = %claims.get("iss").and_then(|v| v.as_str()).unwrap_or("<none>"),
-            sub = %claims.get("sub").and_then(|v| v.as_str()).unwrap_or("<none>"),
             "JWT validation successful"
         );
 
