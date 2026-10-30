@@ -10,7 +10,7 @@ use serde::Serialize;
 use tracing::{debug, error, info, warn};
 
 use crate::auth_manager::pat::{PatContext, PatDelegationContext, PatResourceScope};
-use crate::config::agent_surface::AgentSurface;
+use crate::config::agent_surface::{AgentSurface, SharedTransitConfig, TransitConfig};
 use crate::identity::state::IdentityApiState;
 use crate::surfaces::AgentSurfaceStore;
 use crate::tenancy::{
@@ -1605,24 +1605,41 @@ pub async fn update_surface(
 /// `transit.transit_token_lifetime_secs` means "unchanged", never "back to
 /// 300". The Surface Builder does not show the field, so a save from it omits
 /// it, and resetting it would silently widen a tightened lifetime or cut short
-/// a lengthened one. Removal is explicit, via PATCH with a `null`.
+/// a lengthened one. Removal is explicit, via PATCH with a `null`. A stored
+/// base `transit` block with no Transit Points, which carries the lifetime of
+/// a surface whose Transit Points exist only in a variant, is kept with only
+/// its lifetime when the PUT has no `transit`, as a dashboard save sends.
 fn retain_transit_token_lifetime(
     surface: &mut AgentSurface,
     existing: &AgentSurface,
 ) {
-    let (Some(incoming), Some(stored)) = (&mut surface.transit, &existing.transit) else {
+    let Some(stored) = &existing.transit else {
         return;
     };
-    if incoming
+    let Some(stored_secs) = stored
         .shared
         .transit_token_lifetime_secs
-        .is_none()
-    {
-        incoming
-            .shared
-            .transit_token_lifetime_secs = stored
-            .shared
-            .transit_token_lifetime_secs;
+    else {
+        return;
+    };
+    match &mut surface.transit {
+        Some(incoming) => {
+            incoming
+                .shared
+                .transit_token_lifetime_secs
+                .get_or_insert(stored_secs);
+        }
+        None if stored.points.is_empty() => {
+            surface.transit = Some(TransitConfig {
+                points: Vec::new(),
+                outbound_listen_address: None,
+                shared: SharedTransitConfig {
+                    transit_token_lifetime_secs: Some(stored_secs),
+                    ..Default::default()
+                },
+            });
+        }
+        None => {}
     }
 }
 
@@ -3777,6 +3794,48 @@ mod validation_tests {
         let mut fresh = surface_with_transit_lifetime(None);
         retain_transit_token_lifetime(&mut fresh, &surface_with_transit_lifetime(None));
         assert_eq!(stored_lifetime(&fresh), None);
+    }
+
+    /// A PUT without `transit` keeps the lifetime a stored base block with no
+    /// Transit Points carries, and removes a block that has Transit Points.
+    #[test]
+    fn a_put_without_transit_keeps_the_lifetime_of_a_base_block_with_no_transit_points() {
+        let existing = surface_with_transit_lifetime(Some(600));
+        let mut omitted = base_surface();
+        retain_transit_token_lifetime(&mut omitted, &existing);
+        assert_eq!(stored_lifetime(&omitted), Some(600));
+        assert!(
+            omitted
+                .transit
+                .as_ref()
+                .is_some_and(|transit| transit.points.is_empty())
+        );
+
+        let mut without_lifetime = base_surface();
+        retain_transit_token_lifetime(&mut without_lifetime, &surface_with_transit_lifetime(None));
+        assert!(
+            without_lifetime
+                .transit
+                .is_none()
+        );
+
+        let mut with_points = surface_with_transit_lifetime(Some(600));
+        with_points
+            .transit
+            .as_mut()
+            .expect("transit")
+            .points
+            .push(
+                serde_json::from_value(serde_json::json!({
+                    "name": "partner",
+                    "target_endpoint": "https://partner.example/a2a",
+                    "protocol": "a2a"
+                }))
+                .expect("transit point"),
+            );
+        let mut removed = base_surface();
+        retain_transit_token_lifetime(&mut removed, &with_points);
+        assert!(removed.transit.is_none());
     }
 
     /// A merge PATCH with a `null` is the way to reset the lifetime to its

@@ -1156,18 +1156,25 @@ pub const LOWEST_TRANSIT_TOKEN_MIN_LIFETIME_SECS: u64 = 1;
 /// whole lifetime.
 pub const MAX_TRANSIT_TOKEN_LIFETIME_SECS: u64 = 900;
 
-/// Refuses an appliance-wide `transit_token_min_lifetime_secs` below
-/// [`LOWEST_TRANSIT_TOKEN_MIN_LIFETIME_SECS`] or above
-/// [`MAX_TRANSIT_TOKEN_LIFETIME_SECS`].
-pub fn validate_transit_token_min_lifetime(min_secs: u64) -> Result<(), String> {
-    if (LOWEST_TRANSIT_TOKEN_MIN_LIFETIME_SECS..=MAX_TRANSIT_TOKEN_LIFETIME_SECS).contains(&min_secs) {
-        Ok(())
-    } else {
-        Err(format!(
-            "transit_token_min_lifetime_secs in gateway.json must be from {LOWEST_TRANSIT_TOKEN_MIN_LIFETIME_SECS} \
-             to {MAX_TRANSIT_TOKEN_LIFETIME_SECS} seconds, not {min_secs}"
-        ))
-    }
+/// Reads an appliance-wide `transit_token_min_lifetime_secs` as `gateway.json`
+/// holds it: [`DEFAULT_TRANSIT_TOKEN_MIN_LIFETIME_SECS`] when unset, and
+/// refused unless a whole number from [`LOWEST_TRANSIT_TOKEN_MIN_LIFETIME_SECS`]
+/// to [`MAX_TRANSIT_TOKEN_LIFETIME_SECS`].
+pub fn transit_token_min_lifetime_from(value: Option<&serde_json::Value>) -> Result<u64, String> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_TRANSIT_TOKEN_MIN_LIFETIME_SECS);
+    };
+    value
+        .as_u64()
+        .filter(|min_secs| {
+            (LOWEST_TRANSIT_TOKEN_MIN_LIFETIME_SECS..=MAX_TRANSIT_TOKEN_LIFETIME_SECS).contains(min_secs)
+        })
+        .ok_or_else(|| {
+            format!(
+                "transit_token_min_lifetime_secs in gateway.json must be from {LOWEST_TRANSIT_TOKEN_MIN_LIFETIME_SECS} \
+                 to {MAX_TRANSIT_TOKEN_LIFETIME_SECS} seconds, not {value}"
+            )
+        })
 }
 
 impl SharedTransitConfig {
@@ -6738,15 +6745,24 @@ mod transit_token_lifetime_tests {
     }
 
     #[test]
-    fn the_appliance_minimum_must_be_from_1_to_900_seconds() {
+    fn the_appliance_minimum_must_be_a_whole_number_from_1_to_900_seconds() {
+        assert_eq!(transit_token_min_lifetime_from(None), Ok(30));
         for min_secs in [1, 10, 30, 900] {
-            assert_eq!(validate_transit_token_min_lifetime(min_secs), Ok(()), "{min_secs}");
+            assert_eq!(transit_token_min_lifetime_from(Some(&serde_json::json!(min_secs))), Ok(min_secs), "{min_secs}");
         }
-        for min_secs in [0, 901, u64::MAX] {
+        for (min_secs, shown) in [
+            (serde_json::json!(0), "0"),
+            (serde_json::json!(901), "901"),
+            (serde_json::json!(u64::MAX), "18446744073709551615"),
+            (serde_json::json!(-1), "-1"),
+            (serde_json::json!(60.5), "60.5"),
+            (serde_json::json!("60"), "\"60\""),
+            (serde_json::Value::Null, "null"),
+        ] {
             assert_eq!(
-                validate_transit_token_min_lifetime(min_secs),
+                transit_token_min_lifetime_from(Some(&min_secs)),
                 Err(format!(
-                    "transit_token_min_lifetime_secs in gateway.json must be from 1 to 900 seconds, not {min_secs}"
+                    "transit_token_min_lifetime_secs in gateway.json must be from 1 to 900 seconds, not {shown}"
                 )),
                 "{min_secs}"
             );

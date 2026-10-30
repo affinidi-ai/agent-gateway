@@ -170,7 +170,10 @@ a Transit Point configured with MCP tool gating whose gating was evicted meanwhi
 
 A reload keeps the `transit_token_min_lifetime_secs` the gateway started with. A change to it
 in `gateway.json` takes a restart, and a reload never fails on it, even when the file holds a
-value startup would refuse by then.
+value startup would refuse by then, such as `0`, `901` or `"60"`. While the file holds a value
+other than the one in force, every load of `gateway.json`, a reload's included, logs a `WARN`
+naming both values, saying a restart is needed, and, for a value startup would refuse, saying
+so.
 
 On every full or single-surface reload, a stored `transit.transit_token_lifetime_secs` below
 that shortest lifetime is raised to it, and one above 900 seconds is lowered to 900, with one

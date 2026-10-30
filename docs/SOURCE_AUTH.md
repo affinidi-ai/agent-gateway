@@ -329,10 +329,11 @@ issuer itself also refuses a lifetime outside the bounds.
 
 The shortest lifetime is a setting of the appliance, `transit_token_min_lifetime_secs` in
 `gateway.json` (see [`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md)): 30 seconds
-unless set, from 1 to 900. The gateway reads it once, when it starts: a value outside 1 to 900
-stops it from starting, and a change takes a restart. A reload, including the one a surface
-save triggers, keeps the value the gateway started with, whatever `gateway.json` says by then,
-so the admin API, the Access Point and the Transit Point always agree. Raise it to make every
+unless set, from 1 to 900. The gateway reads it once, when it starts: anything but a whole
+number from 1 to 900 stops it from starting, and a change takes a restart. A reload, including
+the one a surface save triggers, keeps the value the gateway started with, whatever
+`gateway.json` says by then, and logs a `WARN` while the file says otherwise, so the admin API,
+the Access Point and the Transit Point always agree. Raise it to make every
 surface's tokens live at least that long; surfaces stored with a shorter lifetime are raised
 with it, as above. Lower it, for example to 10, when a deployment needs tokens that expire
 sooner. Near the floor, a Transit Point accepts a token on a legacy request until 5 seconds
@@ -354,7 +355,9 @@ Shortening the lifetime is therefore not revocation. To revoke the tokens alread
 rotate the transit token key as described above.
 
 The Surface Builder does not show the lifetime. A `PUT` that omits
-`transit.transit_token_lifetime_secs`, as a dashboard save does, keeps the stored value;
+`transit.transit_token_lifetime_secs`, as a dashboard save does, keeps the stored value. A
+`PUT` with no `transit` at all, as a dashboard save of a surface whose base has no Transit
+Points sends, keeps a stored base block with empty `points` holding only its lifetime;
 a merge `PATCH` with `"transit_token_lifetime_secs": null` removes it, which sets it back
 to 300 seconds.
 

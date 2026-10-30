@@ -673,21 +673,29 @@ async fn assert_a_stored_lifetime_is_held_and_still_saves(
         .await
         .unwrap();
     assert_eq!(stored["transit"]["transit_token_lifetime_secs"], stored_secs, "{stored}");
-    let round_trip = admin
-        .put(&surface_url)
-        .json(&stored)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        round_trip.status(),
-        200,
-        "{}",
-        round_trip
-            .text()
+    let mut omitted = stored.clone();
+    omitted["transit"]
+        .as_object_mut()
+        .unwrap()
+        .remove("transit_token_lifetime_secs");
+    for (case, body) in [("round trip", &stored), ("lifetime omitted", &omitted)] {
+        let saved = admin
+            .put(&surface_url)
+            .json(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(saved.status(), 200, "{case}: {}", saved.text().await.unwrap());
+        let kept: serde_json::Value = admin
+            .get(&surface_url)
+            .send()
             .await
             .unwrap()
-    );
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(kept["transit"]["transit_token_lifetime_secs"], stored_secs, "{case}: {kept}");
+    }
 
     let patch = |secs: u64| {
         admin
@@ -717,6 +725,72 @@ async fn assert_a_stored_lifetime_is_held_and_still_saves(
         "the stored value is kept as it is"
     );
     assert_eq!(lifetime_of(&transit_token_from_access_point(&h, "/lifetime").await), issued_secs);
+}
+
+/// A surface whose Transit Points exist only in a variant carries its lifetime
+/// in a base `transit` block with no Transit Points; a `PUT` with no `transit`,
+/// as a dashboard save of its base sends, keeps that lifetime.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_put_without_transit_keeps_the_lifetime_of_a_base_block_with_no_transit_points() {
+    let mut admin = None;
+    let h = GatewayHarness::start_with_outbound(|_, _, bootstrap| {
+        admin = Some(helpers::configure_admin_api(bootstrap));
+        helpers::configure_gateway_route_prefixes(bootstrap, &[("lifetime", "lifetime", "/lifetime")]);
+    })
+    .await;
+    let admin = admin.unwrap();
+    let mut surface = lifetime_surface(
+        &h.gateway_base,
+        h.outbound_url
+            .as_deref()
+            .unwrap(),
+        &h.mock.url(),
+        Some(600),
+    );
+    let points = surface["transit"]["points"].take();
+    surface["transit"]["points"] = json!([]);
+    surface["variants"] = json!([{
+        "id": "with-points", "alias": "candidate", "name": "Candidate", "enabled": true,
+        "overrides": { "transit": { "points": points } }
+    }]);
+    let created = admin
+        .post(format!("{}/api/v1/surfaces", h.gateway_base))
+        .json(&surface)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201, "{}", created.text().await.unwrap());
+
+    let surface_url = format!("{}/api/v1/surfaces/lifetime", h.gateway_base);
+    let mut without_transit: serde_json::Value = admin
+        .get(&surface_url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    without_transit
+        .as_object_mut()
+        .unwrap()
+        .remove("transit");
+    let saved = admin
+        .put(&surface_url)
+        .json(&without_transit)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(saved.status(), 200, "{}", saved.text().await.unwrap());
+
+    let kept: serde_json::Value = admin
+        .get(&surface_url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(kept["transit"]["transit_token_lifetime_secs"], 600, "{kept}");
 }
 
 /// The shortest lifetime is the one the gateway started with: a save that

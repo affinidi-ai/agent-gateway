@@ -282,18 +282,22 @@ impl TransitTokenIssuer {
         encode(&header, claims, &key).context("failed to encode transit token")
     }
 
-    /// Validate a transit token and return the claims. A token whose `kid` does not name this
-    /// issuer's key, or that has none, is refused before its signature is checked. A token is
-    /// accepted any number of times until it expires; one issued in the future, living longer
-    /// than `allowed_lifetime_secs`, or without a token ID is refused.
-    ///
-    /// `allowed_lifetime_secs` is the lifetime the token's surface sets when the token is
-    /// presented, so shortening it refuses the tokens already issued for longer, and lengthening
-    /// it keeps the shorter ones only until their own expiry.
+    /// [`Self::validate_for_transit_point`] without the surface and Transit Point checks.
+    #[cfg(test)]
     pub fn validate(
         &self,
         token: &str,
         allowed_lifetime_secs: u64,
+    ) -> Result<TransitTokenClaims> {
+        let claims = self.decode_claims(token)?;
+        check_lifetime(&claims, allowed_lifetime_secs)?;
+        Ok(claims)
+    }
+
+    /// Every check of [`Self::validate_for_transit_point`] that needs only the token.
+    fn decode_claims(
+        &self,
+        token: &str,
     ) -> Result<TransitTokenClaims> {
         let header = decode_header(token).context("transit token validation failed")?;
         if header.kid.as_deref() != Some(self.key.kid.as_str()) {
@@ -319,9 +323,6 @@ impl TransitTokenIssuer {
         if claims.exp <= claims.iat {
             anyhow::bail!("transit token lifetime is not one this gateway issues");
         }
-        if claims.exp - claims.iat > allowed_lifetime_secs {
-            anyhow::bail!("transit token lives longer than its surface allows");
-        }
         if claims.jti.is_empty() {
             anyhow::bail!("transit token has no token ID");
         }
@@ -329,9 +330,16 @@ impl TransitTokenIssuer {
         Ok(claims)
     }
 
-    /// Validate a transit token against the lifetime its surface allows, see
-    /// [`Self::validate`], and check it was issued for `surface_id` and opens the Transit Point
-    /// named `transit_point_name`.
+    /// Validate a transit token and return the claims. A token whose `kid` does not name this
+    /// issuer's key, or that has none, is refused before its signature is checked. A token is
+    /// accepted any number of times until it expires; one issued in the future, without a token
+    /// ID, issued for another surface than `surface_id`, not opening the Transit Point named
+    /// `transit_point_name`, or living longer than `allowed_lifetime_secs` is refused, in that
+    /// order, so a token for another surface is refused as such whatever its lifetime.
+    ///
+    /// `allowed_lifetime_secs` is the lifetime `surface_id` sets when the token is presented, so
+    /// shortening it refuses the tokens already issued for longer, and lengthening it keeps the
+    /// shorter ones only until their own expiry.
     pub fn validate_for_transit_point(
         &self,
         token: &str,
@@ -339,7 +347,7 @@ impl TransitTokenIssuer {
         transit_point_name: &str,
         allowed_lifetime_secs: u64,
     ) -> Result<TransitTokenClaims> {
-        let claims = self.validate(token, allowed_lifetime_secs)?;
+        let claims = self.decode_claims(token)?;
 
         if claims.surface_id.is_empty() || claims.surface_id != surface_id {
             anyhow::bail!("transit token was issued for another surface");
@@ -355,9 +363,20 @@ impl TransitTokenIssuer {
         {
             anyhow::bail!("transit token not authorized for transit point '{}'", transit_point_name);
         }
+        check_lifetime(&claims, allowed_lifetime_secs)?;
 
         Ok(claims)
     }
+}
+
+fn check_lifetime(
+    claims: &TransitTokenClaims,
+    allowed_lifetime_secs: u64,
+) -> Result<()> {
+    if claims.exp - claims.iat > allowed_lifetime_secs {
+        anyhow::bail!("transit token lives longer than its surface allows");
+    }
+    Ok(())
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -766,6 +785,24 @@ mod tests {
             issuer
                 .validate_for_transit_point(&token, "surface-a", "partner", LIFETIME)
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn refuses_a_longer_lived_token_for_another_surface_as_issued_for_another_surface() {
+        let issuer = test_issuer();
+        let now = now();
+        let token = issuer
+            .sign(&claims_for("surface-b", now, now + 900))
+            .unwrap();
+
+        assert_eq!(
+            refusal(issuer.validate_for_transit_point(&token, "surface-a", "partner", LIFETIME)),
+            "transit token was issued for another surface"
+        );
+        assert_eq!(
+            refusal(issuer.validate_for_transit_point(&token, "surface-b", "partner", LIFETIME)),
+            "transit token lives longer than its surface allows"
         );
     }
 

@@ -77,13 +77,26 @@ pub struct NetworkConfig {
     /// tokens (`transit.transit_token_lifetime_secs`), from 1 to 900; 30 when
     /// unset. The longest, 900, is fixed. Read and checked once, when the
     /// gateway starts (`BootstrapConfig::pin_transit_token_min_lifetime`); a
-    /// reload keeps that value.
-    #[serde(default = "default_transit_token_min_lifetime_secs")]
+    /// reload keeps that value, so a load reads a value that is not a whole
+    /// number as 30 rather than failing.
+    #[serde(
+        default = "default_transit_token_min_lifetime_secs",
+        deserialize_with = "deserialize_transit_token_min_lifetime_secs"
+    )]
     pub transit_token_min_lifetime_secs: u64,
 }
 
 fn default_transit_token_min_lifetime_secs() -> u64 {
     crate::config::agent_surface::DEFAULT_TRANSIT_TOKEN_MIN_LIFETIME_SECS
+}
+
+fn deserialize_transit_token_min_lifetime_secs<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(serde_json::Value::deserialize(deserializer)?
+        .as_u64()
+        .unwrap_or_else(default_transit_token_min_lifetime_secs))
 }
 
 /// DID configuration
@@ -194,6 +207,15 @@ pub struct RouteCategory {
 
 impl NetworkConfig {
     /// Load network configuration from a JSON file
+    /// `transit_token_min_lifetime_secs` exactly as the file at `path` holds
+    /// it, whatever its type, or `None` when the file does not set it.
+    pub fn transit_token_min_lifetime_in_file(path: &str) -> anyhow::Result<Option<serde_json::Value>> {
+        let mut file: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+        Ok(file
+            .get_mut("transit_token_min_lifetime_secs")
+            .map(serde_json::Value::take))
+    }
+
     pub fn load_from_file(path: &str) -> anyhow::Result<Self> {
         let contents = std::fs::read_to_string(path)?;
         let config: NetworkConfig = serde_json::from_str(&contents)?;
@@ -801,9 +823,9 @@ mod url_mapping_tests {
 
     /// A load does not judge the shortest lifetime: only the startup pin does
     /// (`BootstrapConfig::pin_transit_token_min_lifetime`), so a reload never
-    /// fails on it.
+    /// fails on it, and reads a value that is not a whole number as 30.
     #[test]
-    fn a_load_reads_any_shortest_transit_token_lifetime_and_refuses_only_a_non_number() {
+    fn a_load_never_fails_on_the_shortest_transit_token_lifetime() {
         for min_secs in [0, 901] {
             assert_eq!(
                 load_with_min_lifetime(Some(serde_json::json!(min_secs)))
@@ -812,7 +834,16 @@ mod url_mapping_tests {
                 min_secs
             );
         }
-        assert!(load_with_min_lifetime(Some(serde_json::json!("ten"))).is_err());
-        assert!(load_with_min_lifetime(Some(serde_json::json!(-1))).is_err());
+        for not_whole in
+            [serde_json::json!("ten"), serde_json::json!(-1), serde_json::json!(60.5), serde_json::Value::Null]
+        {
+            assert_eq!(
+                load_with_min_lifetime(Some(not_whole.clone()))
+                    .unwrap()
+                    .transit_token_min_lifetime_secs,
+                30,
+                "{not_whole}"
+            );
+        }
     }
 }

@@ -8,27 +8,33 @@ use tracing::{info, warn};
 #[allow(dead_code)]
 impl BootstrapConfig {
     /// Reads `transit_token_min_lifetime_secs` from `gateway.json` when the
-    /// gateway starts, refusing a value outside 1 to 900 seconds, and pins it:
-    /// every later [`Self::load_network_config`], such as a reload's, takes the
-    /// pinned value instead of the file's. A change takes a restart, and an
-    /// edit, valid or not, never reaches a running gateway.
+    /// gateway starts, refusing anything but a whole number from 1 to 900
+    /// seconds, and pins it: every later [`Self::load_network_config`], such as
+    /// a reload's, takes the pinned value instead of the file's. A change takes
+    /// a restart, and an edit, valid or not, never reaches a running gateway.
     pub fn pin_transit_token_min_lifetime(&mut self) -> anyhow::Result<u64> {
         let network_path = &self.config_files.gateway;
-        let min_secs = NetworkConfig::load_from_file(network_path)?.transit_token_min_lifetime_secs;
-        crate::config::agent_surface::validate_transit_token_min_lifetime(min_secs)
+        let in_file = NetworkConfig::transit_token_min_lifetime_in_file(network_path)?;
+        let min_secs = crate::config::agent_surface::transit_token_min_lifetime_from(in_file.as_ref())
             .map_err(|error| anyhow::anyhow!("{network_path}: {error}"))?;
         self.pinned_transit_token_min_lifetime_secs = Some(min_secs);
         Ok(min_secs)
     }
 
     /// Load network configuration from the configured path, with the
-    /// `transit_token_min_lifetime_secs` pinned at startup, once pinned.
+    /// `transit_token_min_lifetime_secs` pinned at startup, once pinned. A
+    /// `WARN` says when the file holds a different value, which takes a
+    /// restart.
     pub fn load_network_config(&self) -> anyhow::Result<NetworkConfig> {
         let network_path = &self.config_files.gateway;
         info!("Loading network configuration from: {}", network_path);
         let mut network_config = NetworkConfig::load_from_file(network_path)?;
         if let Some(min_secs) = self.pinned_transit_token_min_lifetime_secs {
             network_config.transit_token_min_lifetime_secs = min_secs;
+            let in_file = NetworkConfig::transit_token_min_lifetime_in_file(network_path)?;
+            if let Some(ignored) = ignored_transit_token_min_lifetime(in_file.as_ref(), min_secs) {
+                warn!("{network_path}: {ignored}");
+            }
         }
 
         if let Some((old_domain, new_domain)) = network_config.normalize_localhost_did_domain() {
@@ -459,9 +465,60 @@ fn validate_allowed_algorithms(
     Ok(())
 }
 
+/// Why the `transit_token_min_lifetime_secs` `gateway.json` holds is not in
+/// force, while the gateway keeps `pinned_secs`, the value it started with;
+/// `None` when the file holds that value.
+fn ignored_transit_token_min_lifetime(
+    in_file: Option<&serde_json::Value>,
+    pinned_secs: u64,
+) -> Option<String> {
+    match crate::config::agent_surface::transit_token_min_lifetime_from(in_file) {
+        Ok(file_secs) if file_secs == pinned_secs => None,
+        Ok(file_secs) => Some(format!(
+            "transit_token_min_lifetime_secs is {file_secs} in gateway.json, but the gateway keeps {pinned_secs}, \
+             the value it started with, until it restarts"
+        )),
+        Err(error) => Some(format!(
+            "{error}; the gateway keeps {pinned_secs}, the value it started with, and will refuse to start with \
+             this value"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reload_names_a_shortest_transit_token_lifetime_it_does_not_apply() {
+        assert_eq!(ignored_transit_token_min_lifetime(Some(&serde_json::json!(10)), 10), None);
+        assert_eq!(ignored_transit_token_min_lifetime(None, 30), None);
+        assert_eq!(
+            ignored_transit_token_min_lifetime(Some(&serde_json::json!(120)), 30).as_deref(),
+            Some(
+                "transit_token_min_lifetime_secs is 120 in gateway.json, but the gateway keeps 30, the value it \
+                 started with, until it restarts"
+            )
+        );
+        assert_eq!(
+            ignored_transit_token_min_lifetime(None, 10).as_deref(),
+            Some(
+                "transit_token_min_lifetime_secs is 30 in gateway.json, but the gateway keeps 10, the value it \
+                 started with, until it restarts"
+            )
+        );
+        for (refused, shown) in
+            [(serde_json::json!(0), "0"), (serde_json::json!(901), "901"), (serde_json::json!("ten"), "\"ten\"")]
+        {
+            assert_eq!(
+                ignored_transit_token_min_lifetime(Some(&refused), 30),
+                Some(format!(
+                    "transit_token_min_lifetime_secs in gateway.json must be from 1 to 900 seconds, not {shown}; the \
+                     gateway keeps 30, the value it started with, and will refuse to start with this value"
+                ))
+            );
+        }
+    }
 
     /// At startup a stored lifetime below the appliance's shortest is held to it
     /// and one above 900 seconds to 900, each named in one line, disabled
@@ -543,8 +600,8 @@ mod tests {
             .to_string_lossy()
             .into_owned();
 
-        for refused in [0, 901] {
-            write(serde_json::json!(refused));
+        for refused in ["0", "901", "\"ten\"", "-1", "60.5"] {
+            write(serde_json::from_str(refused).unwrap());
             let error = bootstrap
                 .pin_transit_token_min_lifetime()
                 .unwrap_err()
@@ -564,8 +621,8 @@ mod tests {
                 .unwrap(),
             10
         );
-        for on_disk in [30, 0, 901] {
-            write(serde_json::json!(on_disk));
+        for on_disk in [serde_json::json!(30), serde_json::json!(0), serde_json::json!(901), serde_json::json!("ten")] {
+            write(on_disk.clone());
             assert_eq!(
                 bootstrap
                     .load_network_config()

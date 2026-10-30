@@ -10,15 +10,17 @@ changes:
         issues live, from the appliance's shortest lifetime to 900 seconds; unset means 300,
         or the shortest lifetime when that is above 300. The shortest lifetime is
         `transit_token_min_lifetime_secs` in `gateway.json`: 30 seconds unless set, from 1 to
-        900. It is read once, when the gateway starts: a value outside 1 to 900 stops it from
-        starting, a change takes a restart, and a reload keeps the startup value. A stored
+        900. It is read once, when the gateway starts: anything but a whole number from 1 to 900
+        stops it from starting, a change takes a restart, and a reload keeps the startup value,
+        never fails on it, and logs a warning while `gateway.json` holds another value. A stored
         lifetime below it is raised to it, and one above 900 is lowered to 900, at startup and
         on reload, with a warning per surface; neither stops the gateway. A Transit
         Point checks a token against the lifetime its surface sets when the token is
-        presented, so shortening the lifetime refuses the tokens already issued for longer
-        while it is in force, and lengthening it never extends a token already issued.
+        presented, after checking the token was issued for that surface, so shortening the
+        lifetime refuses the tokens already issued for longer while it is in force, and lengthening it never extends a token already issued.
         Shortening is not revocation: rotate the transit token key to revoke issued tokens. A
-        `PUT` that omits the lifetime, as a dashboard save does, keeps the stored value, and a
+        `PUT` that omits the lifetime, as a dashboard save does, keeps the stored value, also
+        when it omits a stored base `transit` block with no Transit Points, and a
         merge `PATCH` with `null` resets it. The admin API refuses a new lifetime outside the
         bounds, naming the setting, or one set in a variant, but accepts a save that keeps the
         stored value. A longer lifetime lets whoever holds a token use the surface's Transit
