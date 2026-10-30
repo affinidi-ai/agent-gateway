@@ -208,6 +208,44 @@ pub fn can_reference(
     }
 }
 
+/// The tenant of a surface and how strictly it is held to tenant isolation.
+#[derive(Debug, Clone, Copy)]
+pub struct SurfaceTenancy<'a> {
+    pub tenant_id: Option<&'a str>,
+    pub mode: crate::config::credential_policy::RuleMode,
+}
+
+impl<'a> SurfaceTenancy<'a> {
+    /// The tenancy of a surface under the configured `tenant_credential_isolation` mode.
+    pub fn configured(tenant_id: Option<&'a str>) -> Self {
+        Self {
+            tenant_id,
+            mode: crate::config::credential_policy::credential_policy().tenant_credential_isolation,
+        }
+    }
+}
+
+/// May a resource owned by `owner_tenant_id` send the credential held by a resource of
+/// `referenced_tenant_id`? A tenant resource may always send its own tenant's credential.
+/// Sending an appliance-wide credential is allowed only when `mode` is `Warn`; use
+/// [`breaks_tenant_isolation`] to report it.
+pub fn can_reference_with_rule(
+    owner_tenant_id: Option<&str>,
+    referenced_tenant_id: Option<&str>,
+    mode: crate::config::credential_policy::RuleMode,
+) -> bool {
+    can_reference(owner_tenant_id, referenced_tenant_id)
+        && (!breaks_tenant_isolation(owner_tenant_id, referenced_tenant_id) || !mode.is_enforced())
+}
+
+/// Does a tenant resource reference an appliance-wide one?
+pub fn breaks_tenant_isolation(
+    owner_tenant_id: Option<&str>,
+    referenced_tenant_id: Option<&str>,
+) -> bool {
+    owner_tenant_id.is_some() && referenced_tenant_id.is_none()
+}
+
 pub fn scope_allows_resource(
     scope: Option<&PatResourceScope>,
     context: Option<&PatTenantContext>,
@@ -315,6 +353,24 @@ mod tests {
         assert!(tenant_for_create(Some("tenant-b".into()), true, Some(&context)).is_err());
         assert!(tenant_for_create(Some("tenant-a".into()), true, None).is_err());
         assert_eq!(tenant_for_create(Some("tenant-a".into()), false, None).unwrap(), Some("tenant-a".into()));
+    }
+
+    #[test]
+    fn a_tenant_resource_sends_an_appliance_wide_credential_only_in_warn_mode() {
+        use crate::config::credential_policy::RuleMode::{Enforce, Warn};
+
+        for mode in [Warn, Enforce] {
+            assert!(can_reference_with_rule(Some("tenant-a"), Some("tenant-a"), mode));
+            assert!(can_reference_with_rule(None, None, mode));
+            assert!(!can_reference_with_rule(Some("tenant-a"), Some("tenant-b"), mode));
+            assert!(!can_reference_with_rule(None, Some("tenant-a"), mode));
+        }
+        assert!(can_reference_with_rule(Some("tenant-a"), None, Warn));
+        assert!(!can_reference_with_rule(Some("tenant-a"), None, Enforce));
+        assert!(breaks_tenant_isolation(Some("tenant-a"), None));
+        assert!(!breaks_tenant_isolation(Some("tenant-a"), Some("tenant-a")));
+        assert!(!breaks_tenant_isolation(None, None));
+        assert!(!breaks_tenant_isolation(None, Some("tenant-a")));
     }
 
     fn selector(

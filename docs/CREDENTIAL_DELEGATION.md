@@ -263,6 +263,32 @@ target does not evict the cached token.
 only `static_secret` target authentication, so listing the tools of an MCP server behind an
 OAuth-protected endpoint needs a static secret for now.
 
+## Tenant isolation on a surface's upstream legs
+
+A surface owned by a tenant sends only credentials of its own tenant. The check covers
+`static_secret` and `credential_provider` Target authentication on a Target, a Transit Point,
+Fabric receive and the agent card fetch, and `outbound_credentials` and `transit_credentials`
+bindings on the legacy and modern delegation paths.
+
+- A secret or provider of another tenant is always refused.
+- An appliance-wide secret or provider is refused according to the bootstrap
+  `tenant_credential_isolation` rule (see
+  [Credential policy](CONFIGURATION_RELOAD.md#credential-policy)). With `"warn"` (default) it
+  keeps working and logs a warning, and a delegation audit detail gains the note
+  `(appliance_wide_credential)`. With `"enforce"` it is refused.
+- For delegation, only providers that send the gateway's own credential are held to the rule:
+  `api_key`, `oauth2_client_credentials`, `oauth2_client_credentials_jwt_auth` and
+  `oauth2_jwt_bearer`. An appliance-wide `oauth2_authorization_code` provider sends the end
+  user's token and stays usable on a tenant surface.
+- Appliance-wide surfaces are unaffected.
+
+A refused Target authentication follows the usual 502 "Target authentication failed" (or
+`fallback`), and the cause is logged only. A refused legacy binding records
+`provider_unavailable` with detail `provider_forbidden`, raised before any cached token is read
+or grant is requested, and answers as in
+[When a credential cannot be resolved](#when-a-credential-cannot-be-resolved). On a modern MCP
+request the binding is refused as a binding mismatch.
+
 ## When a token is missing
 
 Delegation needs a user to key the token by, so a surface with delegation but no

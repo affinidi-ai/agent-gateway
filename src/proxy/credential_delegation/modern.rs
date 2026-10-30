@@ -35,6 +35,7 @@ pub struct ModernDelegationContext<'context> {
     pub strategies: &'context dyn JwtVerificationStrategyStorage,
     pub secrets: Option<&'context std::sync::Arc<dyn crate::secrets::SecretsStore>>,
     pub provider_egress: Option<&'context crate::delegation_vault::oauth::TokenEgress>,
+    pub isolation: crate::config::credential_policy::RuleMode,
 }
 
 pub enum ModernDelegationResult {
@@ -198,6 +199,7 @@ pub async fn prepare_direct(
         strategies: strategies.as_ref(),
         secrets: state.secrets_store.as_ref(),
         provider_egress: None,
+        isolation: crate::config::credential_policy::credential_policy().tenant_credential_isolation,
     }
     .prepare_with_payment(request, now_secs()?, unpaid)
     .await
@@ -277,6 +279,7 @@ pub async fn prepare_transit(
             .ok_or(ContinuationError::Unavailable)?,
         secrets: state.secrets_store.as_ref(),
         provider_egress: None,
+        isolation: crate::config::credential_policy::credential_policy().tenant_credential_isolation,
     }
     .prepare(request, now_secs()?)
     .await
@@ -377,12 +380,13 @@ impl ModernDelegationContext<'_> {
             } else {
                 None
             };
-            if !crate::tenancy::can_reference(
-                self.surface
+            if !provider.usable_by(crate::tenancy::SurfaceTenancy {
+                tenant_id: self
+                    .surface
                     .tenant_id
                     .as_deref(),
-                provider.tenant_id.as_deref(),
-            ) || strategy
+                mode: self.isolation,
+            }) || strategy
                 .as_ref()
                 .is_some_and(|strategy| {
                     !crate::tenancy::can_reference(provider.tenant_id.as_deref(), strategy.tenant_id.as_deref())
@@ -395,6 +399,19 @@ impl ModernDelegationContext<'_> {
                         .is_none_or(|resource| crate::sts::mcp_profile::canonical_https_url(resource).is_err()))
             {
                 return Err(ContinuationError::BindingMismatch);
+            }
+            if provider.breaks_tenant_isolation_for(
+                self.surface
+                    .tenant_id
+                    .as_deref(),
+            ) {
+                tracing::warn!(
+                    target: "credential_delegation",
+                    surface_id = %self.surface.surface_id,
+                    provider_id = %config.credential_provider_id,
+                    tenant_id = ?self.surface.tenant_id,
+                    "Credential provider is appliance-wide on a tenant surface; refused once tenant_credential_isolation is enforce"
+                );
             }
             let mut scopes = if config.scopes.is_empty() {
                 provider
@@ -1260,6 +1277,7 @@ mod tests {
                 strategies: &strategies,
                 secrets: Some(&secrets),
                 provider_egress: Some(&egress),
+                isolation: crate::config::credential_policy::RuleMode::Warn,
             };
             let other_context = ModernDelegationContext {
                 vault: &other_vault,
@@ -1619,6 +1637,7 @@ mod tests {
             strategies: &strategies,
             secrets: Some(&secrets),
             provider_egress: Some(&egress),
+            isolation: crate::config::credential_policy::RuleMode::Warn,
         };
         let request = ValidatedModernMessage {
             protocol_version: crate::mcp::MCP_MODERN_VERSION.into(),
@@ -1725,6 +1744,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_tenant_surface_selects_an_appliance_wide_service_provider_only_when_not_enforced() {
+        use crate::config::credential_policy::RuleMode::{Enforce, Warn};
+
+        let directory = tempfile::tempdir().unwrap();
+        let providers = FileSystemCredentialProviderStore::new(
+            directory
+                .path()
+                .join("providers"),
+        )
+        .await
+        .unwrap();
+        let strategies = FileSystemJwtVerificationStrategyStore::new(
+            directory
+                .path()
+                .join("strategies"),
+        )
+        .await
+        .unwrap();
+        let vault = FileSystemDelegationVaultStore::new(directory.path().join("vault"))
+            .await
+            .unwrap();
+        for (id, tenant) in [("wide", Value::Null), ("own", json!("tenant-a")), ("foreign", json!("tenant-b"))] {
+            providers.create(serde_json::from_value(json!({
+                "id": id, "name": id, "provider_id": id, "provider_type": "oauth2_client_credentials", "tenant_id": tenant,
+                "resource": "https://provider.example/api", "token_endpoint": "https://provider.example/token",
+                "client_id_secret_ref": "client-id", "client_secret_secret_ref": "client-secret",
+                "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+            })).unwrap()).await.unwrap();
+        }
+        let authorization = McpResourceServerConfig {
+            resource: "https://gateway.example/mcp".into(),
+            scopes: vec!["read".into()],
+        };
+        let profile = McpIssuerProfile {
+            issuer: "https://gateway.example/oauth2/mcp".into(),
+        };
+        let caller = AuthenticatedIdentity::JwtBearer {
+            subject: "user".into(),
+            claims: json!({"iss": profile.issuer, "sub": "user", "scope": "read"}),
+        };
+        let service = ContinuationService::new(
+            ContinuationCipher::new(
+                "deployment".into(),
+                "key".into(),
+                vec![ContinuationKey::new("key".into(), [7; 32], 1, 1000, 1900).unwrap()],
+            )
+            .unwrap(),
+            Arc::new(EmbeddedContinuations::new(32).unwrap()),
+        );
+        let request = ValidatedModernMessage {
+            protocol_version: crate::mcp::MCP_MODERN_VERSION.into(),
+            client_capabilities: None,
+            client_info: None,
+            method: "tools/call".into(),
+            id: Some(json!(1)),
+            kind: McpMessageKind::Request,
+            params: Some(json!({"name": "read", "arguments": {"value": 1}})),
+        };
+        for (provider_id, mode, selectable) in [
+            ("wide", Warn, true),
+            ("wide", Enforce, false),
+            ("own", Warn, true),
+            ("own", Enforce, true),
+            ("foreign", Warn, false),
+            ("foreign", Enforce, false),
+        ] {
+            let surface: AgentSurface = serde_json::from_value(json!({
+                "surface_id": "surface", "name": "Surface", "tenant_id": "tenant-a",
+                "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
+                "target": {"endpoint": "https://provider.example/api"},
+                "outbound_credentials": [{"credential_provider_id": provider_id, "scopes": ["read"]}]
+            }))
+            .unwrap();
+            let context = ModernDelegationContext {
+                service: &service,
+                deployment: "deployment",
+                ttl_secs: 100,
+                surface: &surface,
+                variant_id: None,
+                route: ContinuationRoute::AccessPoint,
+                authorization: &authorization,
+                identity: &caller,
+                agent_did: "did:web:agent.example",
+                profile: &profile,
+                vault: &vault,
+                providers: &providers,
+                strategies: &strategies,
+                secrets: None,
+                provider_egress: None,
+                isolation: mode,
+            };
+            let selected = context.select(&request).await;
+            if selectable {
+                assert_eq!(selected.unwrap().len(), 1, "{provider_id} {mode:?}");
+            } else {
+                assert!(matches!(selected, Err(ContinuationError::BindingMismatch)), "{provider_id} {mode:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn preparation_requires_request_capability_and_rejects_unverified_credentials_and_replays() {
         let directory = tempfile::tempdir().unwrap();
         let providers = FileSystemCredentialProviderStore::new(
@@ -1799,6 +1919,7 @@ mod tests {
             strategies: &strategies,
             secrets: None,
             provider_egress: None,
+            isolation: crate::config::credential_policy::RuleMode::Warn,
         };
         let mut request = ValidatedModernMessage {
             protocol_version: crate::mcp::MCP_MODERN_VERSION.into(),
@@ -2188,6 +2309,7 @@ mod tests {
                 strategies: &strategies,
                 secrets: None,
                 provider_egress: None,
+                isolation: crate::config::credential_policy::RuleMode::Warn,
             };
             let request = ValidatedModernMessage {
                 protocol_version: crate::mcp::MCP_MODERN_VERSION.into(),

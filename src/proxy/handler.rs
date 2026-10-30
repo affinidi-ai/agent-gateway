@@ -579,6 +579,7 @@ pub(crate) struct TargetAuthContext<'a> {
     /// How token requests reach the provider; the environment's egress when `None`.
     pub egress: Option<&'a crate::delegation_vault::oauth::TokenEgress>,
     pub surface: &'a crate::config::agent_surface::AgentSurface,
+    pub isolation: crate::config::credential_policy::RuleMode,
 }
 
 impl<'a> TargetAuthContext<'a> {
@@ -594,6 +595,7 @@ impl<'a> TargetAuthContext<'a> {
             vault: vault.map(|vault| vault.as_ref()),
             egress: None,
             surface,
+            isolation: crate::config::credential_policy::credential_policy().tenant_credential_isolation,
         }
     }
 
@@ -662,6 +664,28 @@ pub(crate) async fn inject_target_auth_header(
                 })?
                 .ok_or(TargetAuthError::SecretNotFound)?;
 
+            let surface_tenant = context
+                .surface
+                .tenant_id
+                .as_deref();
+            if !crate::tenancy::can_reference_with_rule(surface_tenant, secret.tenant_id.as_deref(), context.isolation)
+            {
+                warn!(
+                    channel = channel_name,
+                    secret_id = %secret_id,
+                    "Refusing target auth secret outside the surface's tenant"
+                );
+                return Err(TargetAuthError::SecretNotFound);
+            }
+            if crate::tenancy::breaks_tenant_isolation(surface_tenant, secret.tenant_id.as_deref()) {
+                warn!(
+                    channel = channel_name,
+                    secret_id = %secret_id,
+                    tenant_id = ?surface_tenant,
+                    "Target auth secret is appliance-wide on a tenant surface; refused once tenant_credential_isolation is enforce"
+                );
+            }
+
             // Format the header value
             let header_value = header_format.replace("{value}", &secret.value);
 
@@ -707,15 +731,28 @@ async fn target_provider_token(
         .await
         .map_err(|_| TargetAuthError::StoreUnavailable)?
         .filter(|provider| {
-            crate::tenancy::can_reference(
-                context
+            provider.usable_by(crate::tenancy::SurfaceTenancy {
+                tenant_id: context
                     .surface
                     .tenant_id
                     .as_deref(),
-                provider.tenant_id.as_deref(),
-            )
+                mode: context.isolation,
+            })
         })
         .ok_or(TargetAuthError::ProviderNotFound)?;
+    if provider.breaks_tenant_isolation_for(
+        context
+            .surface
+            .tenant_id
+            .as_deref(),
+    ) {
+        warn!(
+            surface_id = %context.surface.surface_id,
+            provider_id = %provider_id,
+            tenant_id = ?context.surface.tenant_id,
+            "Target auth provider is appliance-wide on a tenant surface; refused once tenant_credential_isolation is enforce"
+        );
+    }
     if provider.provider_type == CredentialProviderType::OAuth2AuthorizationCode {
         return Err(TargetAuthError::ProviderNeedsConsent);
     }
@@ -6682,6 +6719,12 @@ async fn proxy_handler_with_mcp_runtime(
                     user_hash,
                     agent_did_for_vault,
                     config_id,
+                    crate::tenancy::SurfaceTenancy::configured(
+                        state
+                            .surface
+                            .tenant_id
+                            .as_deref(),
+                    ),
                     mcp_tool,
                     vault_store,
                     provider_store,
@@ -16630,10 +16673,16 @@ mod target_auth_tests {
                 )
                 .unwrap(),
             );
-            for (secret_id, value) in [("CLIENT_ID", "client"), ("CLIENT_SECRET", "secret")] {
+            for (secret_id, value, tenant) in [
+                ("CLIENT_ID", "client", None),
+                ("CLIENT_SECRET", "secret", None),
+                ("WIDE_KEY", "wide-value", None),
+                ("OWN_KEY", "own-value", Some("tenant-a")),
+                ("OTHER_KEY", "other-value", Some("tenant-b")),
+            ] {
                 secrets
                     .create(crate::secrets::CreateSecretRequest {
-                        tenant_id: None,
+                        tenant_id: tenant.map(String::from),
                         name: secret_id.into(),
                         secret_id: secret_id.into(),
                         description: None,
@@ -16655,6 +16704,7 @@ mod target_auth_tests {
                 ("machine", "oauth2_client_credentials", Value::Null),
                 ("consent", "oauth2_authorization_code", Value::Null),
                 ("other-tenant", "oauth2_client_credentials", json!("tenant-b")),
+                ("own", "oauth2_client_credentials", json!("tenant-a")),
             ] {
                 providers
                     .create(
@@ -16699,6 +16749,7 @@ mod target_auth_tests {
                 vault: Some(&self.vault),
                 egress: Some(&self.egress),
                 surface: &self.surface,
+                isolation: crate::config::credential_policy::RuleMode::Warn,
             }
         }
 
@@ -16869,6 +16920,80 @@ mod target_auth_tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    fn secret_auth(secret_id: &str) -> TargetAuthConfig {
+        serde_json::from_value(json!({"method": {"static_secret": {"secret_id": secret_id, "header_name": "x-key"}}}))
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_appliance_wide_provider_is_refused_on_a_tenant_surface_only_when_enforced() {
+        let fixture = Fixture::new(200).await;
+        let mut enforced = fixture.context();
+        enforced.isolation = crate::config::credential_policy::RuleMode::Enforce;
+        let error = inject_target_auth_header(
+            &provider_auth("machine"),
+            &enforced,
+            "surface",
+            CallerAssertion::GatewayOriginated,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, TargetAuthError::ProviderNotFound);
+        assert_eq!(fixture.requests(), 0);
+
+        let header =
+            inject_target_auth_header(&provider_auth("own"), &enforced, "surface", CallerAssertion::GatewayOriginated)
+                .await
+                .unwrap();
+        assert_eq!(header, Some(("Authorization".to_string(), "Bearer provider-token".to_string())));
+        assert_eq!(fixture.requests(), 1);
+
+        let header = inject_target_auth_header(
+            &provider_auth("machine"),
+            &fixture.context(),
+            "surface",
+            CallerAssertion::GatewayOriginated,
+        )
+        .await
+        .unwrap();
+        assert_eq!(header, Some(("Authorization".to_string(), "Bearer provider-token".to_string())));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_static_secret_must_belong_to_the_surface_tenant() {
+        let fixture = Fixture::new(200).await;
+        let mut enforced = fixture.context();
+        enforced.isolation = crate::config::credential_policy::RuleMode::Enforce;
+        for (context, secret_id, expected) in [
+            (&enforced, "OWN_KEY", Ok(Some(("x-key".to_string(), "own-value".to_string())))),
+            (&enforced, "WIDE_KEY", Err(TargetAuthError::SecretNotFound)),
+            (&enforced, "OTHER_KEY", Err(TargetAuthError::SecretNotFound)),
+            (&fixture.context(), "WIDE_KEY", Ok(Some(("x-key".to_string(), "wide-value".to_string())))),
+            (&fixture.context(), "OTHER_KEY", Err(TargetAuthError::SecretNotFound)),
+        ] {
+            let result =
+                inject_target_auth_header(&secret_auth(secret_id), context, "surface", CallerAssertion::Authenticated)
+                    .await;
+            assert_eq!(result, expected, "{secret_id}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_appliance_wide_surface_may_use_an_appliance_wide_secret() {
+        let mut fixture = Fixture::new(200).await;
+        fixture.surface.tenant_id = None;
+        let mut enforced = fixture.context();
+        enforced.isolation = crate::config::credential_policy::RuleMode::Enforce;
+        let result =
+            inject_target_auth_header(&secret_auth("WIDE_KEY"), &enforced, "surface", CallerAssertion::Authenticated)
+                .await;
+        assert_eq!(result, Ok(Some(("x-key".to_string(), "wide-value".to_string()))));
+        let result =
+            inject_target_auth_header(&secret_auth("OWN_KEY"), &enforced, "surface", CallerAssertion::Authenticated)
+                .await;
+        assert_eq!(result, Err(TargetAuthError::SecretNotFound));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

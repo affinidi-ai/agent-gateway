@@ -245,7 +245,10 @@ needs a restart.
 | `insecure_token_endpoints` | `[]` | Exact token endpoint URLs that may use http deliberately, for example an internal identity provider. Honoured in both modes. |
 
 `"warn"` keeps stored configurations that break a rule working and logs a warning; new or changed
-configurations that break a rule are refused on save. `"enforce"` also refuses them at runtime. An
+configurations that break a rule are refused on save. `"enforce"` also refuses them at runtime. For
+`tenant_credential_isolation` that means a tenant surface sending an appliance-wide secret or
+credential provider; a reference to another tenant's is refused in both modes (see
+[Tenant isolation on a surface's upstream legs](CREDENTIAL_DELEGATION.md#tenant-isolation-on-a-surfaces-upstream-legs)). An
 unknown value fails startup, and an absent section means both rules are `"warn"`.
 
 ## Fabric envelope lifetime

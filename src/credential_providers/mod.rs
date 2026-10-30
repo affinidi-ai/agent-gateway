@@ -53,6 +53,19 @@ impl CredentialProviderType {
         }
     }
 
+    /// Does a request authenticated by a provider of this type carry the gateway's own
+    /// credential (an API key, or a token granted to the gateway's own client)? An
+    /// authorization code provider sends the end user's token instead.
+    pub fn sends_gateway_credential(&self) -> bool {
+        match self {
+            Self::OAuth2ClientCredentials
+            | Self::ApiKey
+            | Self::OAuth2JwtBearer
+            | Self::OAuth2ClientCredentialsJwtAuth => true,
+            Self::OAuth2AuthorizationCode => false,
+        }
+    }
+
     /// The algorithm a provider of this type signs with: `configured`, else the default.
     pub fn jwt_signing_algorithm(
         &self,
@@ -280,6 +293,38 @@ impl CredentialProvider {
         .collect()
     }
 
+    /// Does the provider send the gateway's own credential on a tenant surface from an
+    /// appliance-wide provider? Only that credential is held to tenant isolation.
+    pub fn breaks_tenant_isolation_for(
+        &self,
+        surface_tenant_id: Option<&str>,
+    ) -> bool {
+        self.provider_type
+            .sends_gateway_credential()
+            && crate::tenancy::breaks_tenant_isolation(surface_tenant_id, self.tenant_id.as_deref())
+    }
+
+    /// May a surface use this provider? A provider of another tenant never; an
+    /// appliance-wide one that sends the gateway's own credential only while the surface's
+    /// mode is `Warn`.
+    pub fn usable_by(
+        &self,
+        surface_tenancy: crate::tenancy::SurfaceTenancy<'_>,
+    ) -> bool {
+        if self
+            .provider_type
+            .sends_gateway_credential()
+        {
+            crate::tenancy::can_reference_with_rule(
+                surface_tenancy.tenant_id,
+                self.tenant_id.as_deref(),
+                surface_tenancy.mode,
+            )
+        } else {
+            crate::tenancy::can_reference(surface_tenancy.tenant_id, self.tenant_id.as_deref())
+        }
+    }
+
     /// The algorithm this provider signs its JWT with: the configured one, or its
     /// type's default. `None` for types that sign nothing.
     pub fn jwt_signing_algorithm(&self) -> Option<JwtSigningAlgorithm> {
@@ -446,6 +491,51 @@ impl From<&CredentialProvider> for CredentialProviderListItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_provider_is_usable_by_a_surface_according_to_type_tenant_and_mode() {
+        use crate::config::credential_policy::RuleMode::{Enforce, Warn};
+        use crate::tenancy::SurfaceTenancy;
+
+        let types = [
+            (CredentialProviderType::OAuth2AuthorizationCode, false),
+            (CredentialProviderType::OAuth2ClientCredentials, true),
+            (CredentialProviderType::OAuth2ClientCredentialsJwtAuth, true),
+            (CredentialProviderType::OAuth2JwtBearer, true),
+            (CredentialProviderType::ApiKey, true),
+        ];
+        for (provider_type, sends_gateway_credential) in types {
+            assert_eq!(provider_type.sends_gateway_credential(), sends_gateway_credential, "{provider_type:?}");
+            let provider = |tenant: Option<&str>| {
+                let mut provider = make_provider("p", "p");
+                provider.provider_type = provider_type.clone();
+                provider.tenant_id = tenant.map(String::from);
+                provider
+            };
+            for mode in [Warn, Enforce] {
+                let surface = |tenant: Option<&'static str>| SurfaceTenancy { tenant_id: tenant, mode };
+                assert!(provider(Some("a")).usable_by(surface(Some("a"))));
+                assert!(!provider(Some("b")).usable_by(surface(Some("a"))));
+                assert!(!provider(Some("a")).usable_by(surface(None)));
+                assert!(provider(None).usable_by(surface(None)));
+            }
+            let wide = provider(None);
+            assert!(wide.usable_by(SurfaceTenancy {
+                tenant_id: Some("a"),
+                mode: Warn
+            }));
+            assert_eq!(
+                wide.usable_by(SurfaceTenancy {
+                    tenant_id: Some("a"),
+                    mode: Enforce
+                }),
+                !sends_gateway_credential,
+                "{provider_type:?}"
+            );
+            assert_eq!(wide.breaks_tenant_isolation_for(Some("a")), sends_gateway_credential);
+            assert!(!wide.breaks_tenant_isolation_for(None));
+        }
+    }
 
     fn make_provider(
         name: &str,

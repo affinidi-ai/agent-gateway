@@ -4931,6 +4931,7 @@ async fn process_forward_request_in_request_scope(
                 profile: network.sts.mcp_issuer.as_ref().ok_or(ContinuationError::Unavailable)?,
                 vault: vault.as_ref(), providers: providers.as_ref(), strategies: strategies.as_ref(),
                 secrets: secrets.as_ref(), provider_egress: None,
+                isolation: crate::config::credential_policy::credential_policy().tenant_credential_isolation,
             }.prepare_with_payment(request, crate::proxy::credential_delegation::modern::now_secs()?,
                 modern_payment.as_ref().is_some_and(|(headers, config)| {
                     crate::proxy::handler::surface_payment::LocalPayment::inspect(
@@ -5462,6 +5463,11 @@ async fn process_forward_request_in_request_scope(
                     user_hash,
                     surface.target_endpoint(),
                     config_id,
+                    crate::tenancy::SurfaceTenancy::configured(
+                        surface
+                            .tenant_id
+                            .as_deref(),
+                    ),
                     // Admission refused batches and ambiguous keys above, so this is
                     // the tool the Target reads. The Target is this gateway's own, so a
                     // tool-scoped binding may apply here, unlike on a Transit Point.

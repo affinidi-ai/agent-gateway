@@ -290,6 +290,9 @@ fn enrich_audit_event(
 /// * `user_identity_hash` — SHA-256 hash of the caller's identity claim
 /// * `agent_did` — the DID of the agent this channel proxies to
 /// * `channel_id` — for logging
+/// * `surface_tenancy` — the tenant of the surface the bindings belong to; a provider of
+///   another tenant, or an appliance-wide one that sends the gateway's own credential once
+///   `tenant_credential_isolation` is `enforce`, is refused with `provider_forbidden`
 /// * `mcp_tool_name` — if this is an MCP tool call, the tool name (for `Tools` requirement filter)
 /// * `vault_store` — delegation vault storage
 /// * `provider_store` — credential provider storage
@@ -305,6 +308,7 @@ pub async fn resolve_delegation_credentials(
     user_identity_hash: &str,
     agent_did: &str,
     channel_id: &str,
+    surface_tenancy: crate::tenancy::SurfaceTenancy<'_>,
     mcp_tool_name: Option<&str>,
     vault_store: &Arc<dyn DelegationVaultStorage>,
     provider_store: &Arc<dyn CredentialProviderStorage>,
@@ -392,6 +396,42 @@ pub async fn resolve_delegation_credentials(
             }
         };
 
+        if !provider.usable_by(surface_tenancy) {
+            warn!(
+                target: "credential_delegation",
+                surface_variant,
+                surface_id = %channel_id,
+                provider_id = %binding.credential_provider_id,
+                "Credential provider is outside the surface's tenant - refusing the request"
+            );
+            results.push(DelegationResolution::new(
+                binding,
+                Some(&provider.name),
+                DelegationActionOutcome::ProviderUnavailable,
+                Some("provider_forbidden".to_string()),
+                DelegationLookupResult::Unavailable,
+            ));
+            continue;
+        }
+        let appliance_wide = provider.breaks_tenant_isolation_for(surface_tenancy.tenant_id);
+        if appliance_wide {
+            warn!(
+                target: "credential_delegation",
+                surface_variant,
+                surface_id = %channel_id,
+                provider_id = %binding.credential_provider_id,
+                tenant_id = ?surface_tenancy.tenant_id,
+                "Credential provider is appliance-wide on a tenant surface; refused once tenant_credential_isolation is enforce"
+            );
+        }
+        let with_note = |detail: String| {
+            if appliance_wide {
+                format!("{detail} (appliance_wide_credential)")
+            } else {
+                detail
+            }
+        };
+
         // Route by provider type
         match &provider.provider_type {
             CredentialProviderType::ApiKey => {
@@ -414,7 +454,7 @@ pub async fn resolve_delegation_credentials(
                                 Some(channel_id),
                             );
                             evt.via_fabric = via_fabric;
-                            evt.detail = Some("api_key".to_string());
+                            evt.detail = Some(with_note("api_key".to_string()));
                             enrich_audit_event(&mut evt, audit_ctx, binding, Some(&provider.name));
                             evt
                         });
@@ -423,7 +463,7 @@ pub async fn resolve_delegation_credentials(
                             binding,
                             Some(&provider.name),
                             DelegationActionOutcome::TokenInjected,
-                            Some("api_key".to_string()),
+                            Some(with_note("api_key".to_string())),
                             DelegationLookupResult::Inject(headers),
                         ));
                     }
@@ -477,7 +517,7 @@ pub async fn resolve_delegation_credentials(
                     });
                 match acquired {
                     Ok((token_id, cached, insecure_endpoint, token)) => {
-                        let detail = format!(
+                        let detail = with_note(format!(
                             "{grant}_{}{}",
                             if cached {
                                 "cached"
@@ -489,7 +529,7 @@ pub async fn resolve_delegation_credentials(
                             } else {
                                 ""
                             }
-                        );
+                        ));
                         debug!(
                             target: "credential_delegation",
                             surface_variant,
@@ -1617,6 +1657,12 @@ mod tests {
             providers.insert(id.to_string(), make_credential_provider(id, provider_type));
             Arc::new(Self { providers })
         }
+
+        fn with_stored(provider: CredentialProvider) -> Arc<Self> {
+            let mut providers = HashMap::new();
+            providers.insert(provider.id.clone(), provider);
+            Arc::new(Self { providers })
+        }
     }
 
     #[async_trait]
@@ -1949,6 +1995,7 @@ mod tests {
             "sha256:user1",
             "did:web:agent.example",
             "ch-1",
+            crate::tenancy::SurfaceTenancy::configured(None),
             None,
             &store,
             &providers,
@@ -1999,6 +2046,7 @@ mod tests {
             "sha256:user1",
             "did:web:agent.example",
             "ch-1",
+            crate::tenancy::SurfaceTenancy::configured(None),
             None,
             &(vault as Arc<dyn DelegationVaultStorage>),
             &(providers as Arc<dyn CredentialProviderStorage>),
@@ -2058,6 +2106,7 @@ mod tests {
             "sha256:user1",
             "did:web:agent.example",
             "ch-1",
+            crate::tenancy::SurfaceTenancy::configured(None),
             None,
             &(vault as Arc<dyn DelegationVaultStorage>),
             &(providers as Arc<dyn CredentialProviderStorage>),
@@ -2123,6 +2172,7 @@ mod tests {
             "sha256:user1",
             "did:web:agent.example",
             "ch-1",
+            crate::tenancy::SurfaceTenancy::configured(None),
             None,
             &(vault as Arc<dyn DelegationVaultStorage>),
             &(providers as Arc<dyn CredentialProviderStorage>),
@@ -2160,6 +2210,7 @@ mod tests {
             "sha256:user1",
             "did:web:agent.example",
             "ch-1",
+            crate::tenancy::SurfaceTenancy::configured(None),
             None,
             &(vault as Arc<dyn DelegationVaultStorage>),
             &(providers as Arc<dyn CredentialProviderStorage>),
@@ -2210,6 +2261,7 @@ mod tests {
             "sha256:user1",
             "did:web:agent.example",
             "ch-1",
+            crate::tenancy::SurfaceTenancy::configured(None),
             None,
             &(vault as Arc<dyn DelegationVaultStorage>),
             &(providers as Arc<dyn CredentialProviderStorage>),
@@ -2253,6 +2305,7 @@ mod tests {
                 "sha256:user1",
                 "did:web:agent.example",
                 "ch-1",
+                crate::tenancy::SurfaceTenancy::configured(None),
                 None,
                 &(vault as Arc<dyn DelegationVaultStorage>),
                 &(providers as Arc<dyn CredentialProviderStorage>),
@@ -2323,6 +2376,7 @@ mod tests {
             "sha256:user1",
             "did:web:agent.example",
             "ch-1",
+            crate::tenancy::SurfaceTenancy::configured(None),
             None,
             &(vault as Arc<dyn DelegationVaultStorage>),
             &(providers as Arc<dyn CredentialProviderStorage>),
@@ -2350,6 +2404,120 @@ mod tests {
         );
     }
 
+    async fn resolve_for_tenant(
+        provider_type: CredentialProviderType,
+        provider_tenant: Option<&str>,
+        mode: crate::config::credential_policy::RuleMode,
+    ) -> DelegationResolution {
+        let mut token = make_token(false, false);
+        token.user_identity_hash = "__client_credentials__".to_string();
+        token.access_token = "cached-service-token".to_string();
+        let vault = MockVaultStore::new(VaultLookupResult::Found(token));
+        let mut provider = make_credential_provider("cp-1", provider_type);
+        provider.tenant_id = provider_tenant.map(String::from);
+        let providers = MockProviderStore::with_stored(provider);
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+        resolve_delegation_credentials(
+            &[make_binding("cp-1")],
+            "sha256:user1",
+            "did:web:agent.example",
+            "ch-1",
+            crate::tenancy::SurfaceTenancy {
+                tenant_id: Some("tenant-a"),
+                mode,
+            },
+            None,
+            &(vault as Arc<dyn DelegationVaultStorage>),
+            &(providers as Arc<dyn CredentialProviderStorage>),
+            &secrets,
+            "https://gw.example.com",
+            false,
+            None,
+            None,
+        )
+        .await
+        .remove(0)
+    }
+
+    #[tokio::test]
+    async fn a_tenant_surface_never_sends_another_tenants_gateway_credential() {
+        use crate::config::credential_policy::RuleMode::{Enforce, Warn};
+        for mode in [Warn, Enforce] {
+            for provider_type in [
+                CredentialProviderType::ApiKey,
+                CredentialProviderType::OAuth2ClientCredentials,
+                CredentialProviderType::OAuth2JwtBearer,
+                CredentialProviderType::OAuth2ClientCredentialsJwtAuth,
+            ] {
+                let resolution = resolve_for_tenant(provider_type.clone(), Some("tenant-b"), mode).await;
+                assert_eq!(result_tag(&resolution.result), "Unavailable", "{provider_type:?}");
+                assert_eq!(resolution.action.outcome, DelegationActionOutcome::ProviderUnavailable);
+                assert_eq!(
+                    resolution
+                        .action
+                        .detail
+                        .as_deref(),
+                    Some("provider_forbidden")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_appliance_wide_gateway_credential_is_refused_on_a_tenant_surface_only_when_enforced() {
+        use crate::config::credential_policy::RuleMode::{Enforce, Warn};
+        for provider_type in [
+            CredentialProviderType::ApiKey,
+            CredentialProviderType::OAuth2ClientCredentials,
+            CredentialProviderType::OAuth2JwtBearer,
+            CredentialProviderType::OAuth2ClientCredentialsJwtAuth,
+        ] {
+            let refused = resolve_for_tenant(provider_type.clone(), None, Enforce).await;
+            assert_eq!(result_tag(&refused.result), "Unavailable", "{provider_type:?}");
+            assert_eq!(refused.action.outcome, DelegationActionOutcome::ProviderUnavailable);
+            assert_eq!(
+                refused
+                    .action
+                    .detail
+                    .as_deref(),
+                Some("provider_forbidden")
+            );
+        }
+
+        let warned = resolve_for_tenant(CredentialProviderType::OAuth2ClientCredentials, None, Warn).await;
+        assert_eq!(result_tag(&warned.result), "Inject");
+        assert_eq!(warned.action.outcome, DelegationActionOutcome::TokenInjected);
+        assert_eq!(
+            warned
+                .action
+                .detail
+                .as_deref(),
+            Some("client_credentials_cached (appliance_wide_credential)")
+        );
+
+        let own = resolve_for_tenant(CredentialProviderType::OAuth2ClientCredentials, Some("tenant-a"), Enforce).await;
+        assert_eq!(result_tag(&own.result), "Inject");
+        assert_eq!(own.action.detail.as_deref(), Some("client_credentials_cached"));
+    }
+
+    #[tokio::test]
+    async fn an_appliance_wide_authorization_code_provider_stays_usable_on_a_tenant_surface() {
+        let resolution = resolve_for_tenant(
+            CredentialProviderType::OAuth2AuthorizationCode,
+            None,
+            crate::config::credential_policy::RuleMode::Enforce,
+        )
+        .await;
+        assert_ne!(
+            resolution
+                .action
+                .detail
+                .as_deref(),
+            Some("provider_forbidden")
+        );
+        assert_ne!(resolution.action.outcome, DelegationActionOutcome::ProviderUnavailable);
+    }
+
     #[tokio::test]
     async fn a_delegation_line_names_the_request_variant() {
         use crate::observability::policy_audit::{RequestScope, in_request, set_request_variant};
@@ -2366,6 +2534,7 @@ mod tests {
                 "sha256:user1",
                 "did:web:agent.example",
                 "ch-1",
+                crate::tenancy::SurfaceTenancy::configured(None),
                 None,
                 &vault,
                 &providers,
@@ -2402,6 +2571,7 @@ mod tests {
             "sha256:user1",
             "did:web:agent.example",
             "ch-1",
+            crate::tenancy::SurfaceTenancy::configured(None),
             Some("create_issue"),
             &(vault as Arc<dyn DelegationVaultStorage>),
             &(providers as Arc<dyn CredentialProviderStorage>),
@@ -2441,6 +2611,7 @@ mod tests {
             "sha256:user1",
             "did:web:agent.example",
             "ch-1",
+            crate::tenancy::SurfaceTenancy::configured(None),
             Some("list_repos"),
             &(vault as Arc<dyn DelegationVaultStorage>),
             &(providers as Arc<dyn CredentialProviderStorage>),
@@ -2470,6 +2641,7 @@ mod tests {
             "sha256:user1",
             "did:web:agent.example",
             "ch-1",
+            crate::tenancy::SurfaceTenancy::configured(None),
             None,
             &(vault as Arc<dyn DelegationVaultStorage>),
             &(providers as Arc<dyn CredentialProviderStorage>),
@@ -2506,6 +2678,7 @@ mod tests {
             "sha256:user1",
             "did:web:agent.example",
             "ch-1",
+            crate::tenancy::SurfaceTenancy::configured(None),
             None,
             &(vault as Arc<dyn DelegationVaultStorage>),
             &(providers as Arc<dyn CredentialProviderStorage>),
@@ -2544,6 +2717,7 @@ mod tests {
             "sha256:user1",
             "did:web:agent.example",
             "ch-1",
+            crate::tenancy::SurfaceTenancy::configured(None),
             None,
             &(vault as Arc<dyn DelegationVaultStorage>),
             &(providers as Arc<dyn CredentialProviderStorage>),
@@ -2637,6 +2811,7 @@ mod tests {
             "sha256:user1",
             "did:web:agent.example",
             "ch-1",
+            crate::tenancy::SurfaceTenancy::configured(None),
             None,
             &vault,
             &(providers as Arc<dyn CredentialProviderStorage>),
@@ -2667,6 +2842,7 @@ mod tests {
             "sha256:user1",
             "did:web:agent.example",
             "ch-1",
+            crate::tenancy::SurfaceTenancy::configured(None),
             None,
             &(vault as Arc<dyn DelegationVaultStorage>),
             &(providers as Arc<dyn CredentialProviderStorage>),
@@ -2697,6 +2873,7 @@ mod tests {
             "sha256:user1",
             "did:web:agent.example",
             "ch-1",
+            crate::tenancy::SurfaceTenancy::configured(None),
             None,
             &(vault as Arc<dyn DelegationVaultStorage>),
             &(providers as Arc<dyn CredentialProviderStorage>),
@@ -2757,6 +2934,7 @@ mod tests {
             "sha256:user1",
             "did:web:agent.example",
             "ch-1",
+            crate::tenancy::SurfaceTenancy::configured(None),
             None,
             &(vault as Arc<dyn DelegationVaultStorage>),
             &(providers as Arc<dyn CredentialProviderStorage>),
@@ -2791,6 +2969,7 @@ mod tests {
             "sha256:user1",
             "did:web:agent.example",
             "ch-1",
+            crate::tenancy::SurfaceTenancy::configured(None),
             None,
             &(vault as Arc<dyn DelegationVaultStorage>),
             &(providers as Arc<dyn CredentialProviderStorage>),
@@ -2833,6 +3012,7 @@ mod tests {
             "sha256:user1",
             "did:web:agent.example",
             "ch-1",
+            crate::tenancy::SurfaceTenancy::configured(None),
             None,
             &(vault as Arc<dyn DelegationVaultStorage>),
             &(providers as Arc<dyn CredentialProviderStorage>),
@@ -2883,6 +3063,7 @@ mod tests {
             "sha256:user1",
             "did:web:agent.example",
             "ch-1",
+            crate::tenancy::SurfaceTenancy::configured(None),
             None,
             &(vault as Arc<dyn DelegationVaultStorage>),
             &(providers as Arc<dyn CredentialProviderStorage>),

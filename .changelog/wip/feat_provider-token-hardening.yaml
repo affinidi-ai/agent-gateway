@@ -53,6 +53,10 @@ changes:
         A credential provider that reads a secret outside its own tenant keeps working in
         this release, but every read logs a warning. Setting credential_policy
         tenant_credential_isolation to enforce refuses the read before the secret is
-        loaded, so no token request is sent. Upgrade note: move the secrets into the
-        provider's tenant before the default becomes enforce.
+        loaded, so no token request is sent. A tenant surface that sends an appliance-wide
+        secret or credential provider on its Target, Transit Point, Fabric receive or
+        delegation legs also logs a warning and notes appliance_wide_credential in the
+        delegation audit, and enforce refuses it; another tenant's secret or provider is
+        always refused. Upgrade note: move the secrets and providers into the tenant before
+        the default becomes enforce.
   breaking: []

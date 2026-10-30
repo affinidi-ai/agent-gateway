@@ -4628,6 +4628,11 @@ async fn step_inject_credentials(
         &user_hash,
         agent_did,
         channel_id,
+        crate::tenancy::SurfaceTenancy::configured(
+            ctx.surface
+                .tenant_id
+                .as_deref(),
+        ),
         mcp_tool.as_deref(),
         vault_store,
         provider_store,
@@ -14904,6 +14909,54 @@ mod tests {
         let received = target.received();
         assert_eq!(received.len(), 1);
         assert_eq!(header_values(&received[0], "authorization"), ["Bearer vendor-access"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tenant_transit_point_refuses_a_delegated_credential_of_another_tenant() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = crate::component_tests::helpers::RecordingTarget::start(StatusCode::OK, &[]).await;
+        let bearer = json!({"type": "bearer_header"});
+        let (state, issuer) = delegation_pipeline(
+            directory.path(),
+            &target.url,
+            &[("shared", "mcp", binding("provider", bearer.clone())), ("foreign", "mcp", binding("foreign", bearer))],
+        )
+        .await;
+        state
+            .credential_provider_store
+            .as_ref()
+            .unwrap()
+            .create(
+                serde_json::from_value(json!({
+                    "id": "foreign", "name": "foreign", "provider_id": "foreign", "tenant_id": "tenant-b",
+                    "resource": "https://provider.example/api",
+                    "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        {
+            let mut channel_state = state
+                .channel_state
+                .write()
+                .unwrap();
+            let mut surface = (*channel_state.surface).clone();
+            surface.tenant_id = Some("tenant-a".into());
+            channel_state.surface = Arc::new(surface);
+        }
+        let token = issuer
+            .issue("transit-fabric", Some("did:web:agent.example"), None, None, Some("sha256:user"), None, vec![])
+            .unwrap();
+
+        let (status, body) = through_the_pipeline(&state, "foreign", &token).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["error"]["code"], -32603, "{body}");
+        assert!(target.received().is_empty());
+
+        let (status, body) = through_the_pipeline(&state, "shared", &token).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(target.received().len(), 1);
     }
 
     /// A public discovery read needs no transit token and names no caller, so
