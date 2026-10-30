@@ -900,6 +900,33 @@ fn appliance_lets_transit_tokens_live_up_to(
         .transit_token_max_lifetime_secs = Some(max_secs);
 }
 
+#[given(expr = "Transit Point {string} has a policy that allows only caller {string}")]
+fn transit_point_has_a_policy_allowing_only_a_caller(
+    world: &mut SurfaceWorld,
+    transit_point: String,
+    caller: String,
+) {
+    use sha2::Digest as _;
+
+    let rego = format!(
+        r#"package surface.policy
+
+default allow := false
+
+allow if {{
+    input.transit.caller.verified
+    input.transit.caller.user_identity_hash == "{:x}"
+}}
+"#,
+        sha2::Sha256::digest(caller.as_bytes())
+    );
+    transit_point_config_mut(world, &transit_point).policy = Some(PolicyDefinitionFixture::new(
+        format!("bdd-transit-caller-{}", uuid::Uuid::new_v4()),
+        "BDD Transit Point policy: allow only one caller",
+        &rego,
+    ));
+}
+
 #[given(expr = "the surface's transit tokens live {int} seconds")]
 fn surface_transit_tokens_live(
     world: &mut SurfaceWorld,

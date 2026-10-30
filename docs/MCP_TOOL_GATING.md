@@ -160,7 +160,16 @@ surface's Transit Point instead.
   `tools/call` toward the TP (→ `TransitMcpToolGated`, 403) and
   `filter_transit_mcp_tools_list` hides denied tools from the TP's `tools/list`
   response — both guarded on `virtual_channel.protocol == Mcp`, so a tool the
-  managed agent can't see through a TP it also can't call. The per-TP
+  managed agent can't see through a TP it also can't call. Their condition
+  input is the TP's own policy input (`build_outbound_policy_input`), so a
+  condition can read `input.transit.caller` (the end user the transit token
+  names) and `input.transit.client` (the principal the TP authenticated); see
+  [Caller in Transit Point policy input](POLICY.md#caller-in-transit-point-policy-input).
+  Without a transit token the caller is `anonymous`, so gate on
+  `input.transit.caller.verified` rather than its negation, as in a gate that
+  hides `admin_*` unless the caller is verified (condition `default allow :=
+  true`, `allow := false if input.transit.caller.verified`). A surface-wide
+  `target.mcp_tool_gating` condition has no `input.transit`. The per-TP
   `tools/list` filter handles the same SSE framing: when a TP answers
   `tools/list` as `text/event-stream`, `filter_transit_mcp_tools_list` extracts
   the last JSON-RPC frame (`mcp::sse_transport::extract_last_json_rpc_from_sse_bytes`),

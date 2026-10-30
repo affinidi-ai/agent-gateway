@@ -370,7 +370,7 @@ impl PolicyFlow {
 fn caller_fields(identity: &AuthenticatedIdentity) -> (&'static str, String, Option<String>) {
     match identity {
         AuthenticatedIdentity::JwtBearer { subject, .. } => ("jwt_bearer", subject.clone(), None),
-        AuthenticatedIdentity::ApiKey { key_name } => ("api_key", key_name.clone(), None),
+        AuthenticatedIdentity::ApiKey { key_name, .. } => ("api_key", key_name.clone(), None),
         AuthenticatedIdentity::DidAuth { did } => ("did_auth", did.clone(), Some(did.clone())),
         AuthenticatedIdentity::Mtls { principal, .. } => ("mtls", principal.clone(), None),
     }
@@ -944,7 +944,10 @@ mod tests {
         assert_eq!(principal, "sub-123");
         assert_eq!(did, None);
 
-        let api = AuthenticatedIdentity::ApiKey { key_name: "key-a".to_string() };
+        let api = AuthenticatedIdentity::ApiKey {
+            key_name: "key-a".to_string(),
+            provider_agent_id: None,
+        };
         let (method, principal, did) = caller_fields(&api);
         assert_eq!(method, "api_key");
         assert_eq!(principal, "key-a");
@@ -1157,6 +1160,7 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             let identity = AuthenticatedIdentity::ApiKey {
                 key_name: "alpha-key".to_string(),
+                provider_agent_id: None,
             };
             with_request_variant("beta", || {
                 record_policy_decision(PolicyDecisionEvent {

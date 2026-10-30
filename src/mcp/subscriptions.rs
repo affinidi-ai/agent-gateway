@@ -1663,7 +1663,10 @@ mod tests {
 
     #[test]
     fn unauthenticated_listens_are_counted_by_peer_and_never_collide_with_principals() {
-        let identity = crate::source_auth::AuthenticatedIdentity::ApiKey { key_name: "10.0.0.1".into() };
+        let identity = crate::source_auth::AuthenticatedIdentity::ApiKey {
+            key_name: "10.0.0.1".into(),
+            provider_agent_id: None,
+        };
         assert_ne!(listen_caller(Some(&identity), "10.0.0.1"), listen_caller(None, "10.0.0.1"));
         assert_eq!(listen_caller(None, "10.0.0.1"), listen_caller(None, "10.0.0.1"));
     }
