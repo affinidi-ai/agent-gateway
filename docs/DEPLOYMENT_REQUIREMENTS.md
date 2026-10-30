@@ -112,7 +112,7 @@ flowchart LR
 | --- | --- | --- |
 | `8443` (HTTPS) | Agent traffic, the dashboard and the management API | The load balancer |
 | `8080` (HTTP) | The same, without TLS | Only a load balancer that terminates TLS |
-| `9000` (HTTP) | Calls your managed agents make to Transit Points | Only your managed agents' network. The internet only for a listener whose Transit Points all authenticate their callers with `source_auth` (see below) |
+| `9000` (HTTP) | Calls your managed agents make to Transit Points | Only your managed agents' network. The internet only for a listener whose Transit Points all authenticate their callers with `source_auth`, and failed attempts are not throttled (see below) |
 
 Each listener in `gateway.json` sets its own port, so open only the ones you use. Before
 you open any listener:
