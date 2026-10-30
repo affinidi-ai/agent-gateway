@@ -140,7 +140,8 @@ from dashboard sessions. At startup the gateway moves any DID Auth session files
 finds in `sessions` itself into that subdirectory.
 
 Workload Binding supports `caller_source: did`, which tags the Workload Binding
-presentation with `user_hash = SHA256(did)`.
+presentation with the caller's identity hash as `user_hash` (see
+[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-callers-identity-hash)).
 
 ### Authorization server metadata module (developer reference)
 
@@ -278,6 +279,10 @@ The refusal says only that the transit token is missing or invalid; which check 
 logged. A `GET` of a public discovery path, such as an agent card, is forwarded without a
 transit token check, and so without any credential (see
 [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#when-a-credential-cannot-be-resolved)).
+
+Transit Point policies see the caller the token carries in `input.transit.caller`, and a
+client the Transit Point verified itself apart from it, in `input.transit.client`; see
+[`POLICY.md`](POLICY.md#caller-in-transit-point-policy-input).
 
 The signing key is 32 random bytes the gateway creates on its first start, in
 `transit_token_key.json` under `[storage_paths] vc_keys`, readable by the owner only and

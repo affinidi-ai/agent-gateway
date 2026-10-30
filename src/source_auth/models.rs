@@ -294,8 +294,12 @@ pub enum AuthenticatedIdentity {
 
     /// API Key authentication succeeded.
     ApiKey {
-        /// The human-readable name of the validated key.
+        /// The human-readable name of the validated key: the `secret_id` for
+        /// `api_key`, the key's id for `api_key_provider`.
         key_name: String,
+        /// The API Key Provider agent that issued the key; `None` for a key
+        /// held in a secret (`api_key`).
+        provider_agent_id: Option<String>,
     },
 
     /// DID Auth session authentication succeeded.
@@ -316,7 +320,13 @@ pub enum AuthenticatedIdentity {
         /// Subject DN as an RFC 4514 string.
         subject_dn: String,
         /// Issuer DN. Empty for [`MtlsTrust::Pinned`] (no chain verified).
+        /// For display and audit only: it is a name the certificate states.
         issuer_dn: String,
+        /// Lowercase hex SHA-256 of the certificate the trust check verified
+        /// the leaf against: the configured CA certificate its verified chain
+        /// ends at, or for [`MtlsTrust::Pinned`] the pinned certificate, which
+        /// is the leaf itself.
+        trust_anchor_fingerprint: String,
         /// SANs captured from the leaf, for audit / OPA visibility even
         /// when they are not used as the principal.
         sans: MtlsSans,
@@ -338,16 +348,99 @@ impl AuthenticatedIdentity {
         }
     }
 
+    /// The caller's name as the credential states it: the JWT `sub`, the API
+    /// key name, the DID, or the mTLS principal.
+    pub fn principal(&self) -> &str {
+        match self {
+            AuthenticatedIdentity::JwtBearer { subject, .. } => subject,
+            AuthenticatedIdentity::ApiKey { key_name, .. } => key_name,
+            AuthenticatedIdentity::DidAuth { did } => did,
+            AuthenticatedIdentity::Mtls { principal, .. } => principal,
+        }
+    }
+
+    /// This caller's `user_identity_hash` on a surface of `tenant_id`: the
+    /// [`caller_identity_hash`] of the method, the issuer (the JWT `iss`, the
+    /// API Key Provider agent, the fingerprint of the certificate an mTLS
+    /// client certificate was verified against) and the principal. The
+    /// transit token, policy input and delegated credentials
+    /// key callers by it. `None` when the credential names no subject, such as
+    /// a JWT without a `sub`: such a caller has no delegated credentials.
+    pub fn principal_hash(
+        &self,
+        tenant_id: Option<&str>,
+    ) -> Option<String> {
+        let (method, issuer, subject) = match self {
+            AuthenticatedIdentity::JwtBearer { subject, claims } => {
+                let issuer = claims
+                    .get("iss")
+                    .and_then(Value::as_str)
+                    .filter(|issuer| !issuer.is_empty())?;
+                let named = claims
+                    .get("sub")
+                    .and_then(Value::as_str)?;
+                if named != subject {
+                    return None;
+                }
+                ("jwt_bearer", issuer, subject.as_str())
+            }
+            AuthenticatedIdentity::ApiKey {
+                key_name,
+                provider_agent_id: None,
+            } => ("api_key", "", key_name.as_str()),
+            AuthenticatedIdentity::ApiKey {
+                key_name,
+                provider_agent_id: Some(agent_id),
+            } => ("api_key_provider", agent_id.as_str(), key_name.as_str()),
+            AuthenticatedIdentity::DidAuth { did } => ("did_auth", "", did.as_str()),
+            AuthenticatedIdentity::Mtls {
+                principal,
+                trust_anchor_fingerprint,
+                ..
+            } => ("mtls", trust_anchor_fingerprint.as_str(), principal.as_str()),
+        };
+        if subject.is_empty() {
+            return None;
+        }
+        caller_identity_hash(method, issuer, tenant_id, subject)
+    }
+
+    /// The source-auth method that produced this identity, as policy input
+    /// names it (`input.source_auth.method`).
+    pub fn method(&self) -> &'static str {
+        match self {
+            AuthenticatedIdentity::JwtBearer { .. } => "jwt_bearer",
+            AuthenticatedIdentity::ApiKey { .. } => "api_key",
+            AuthenticatedIdentity::DidAuth { .. } => "did_auth",
+            AuthenticatedIdentity::Mtls { .. } => "mtls",
+        }
+    }
+
     /// A stable key for the authenticated caller, distinct across auth modes,
     /// for per-caller limits.
     pub fn principal_key(&self) -> String {
         match self {
             AuthenticatedIdentity::JwtBearer { subject, .. } => format!("jwt:{subject}"),
-            AuthenticatedIdentity::ApiKey { key_name } => format!("api-key:{key_name}"),
+            AuthenticatedIdentity::ApiKey { key_name, .. } => format!("api-key:{key_name}"),
             AuthenticatedIdentity::DidAuth { did } => format!("did-auth:{did}"),
             AuthenticatedIdentity::Mtls { principal, .. } => format!("mtls:{principal}"),
         }
     }
+}
+
+/// The identity hash of a caller: lowercase hex SHA-256 of the canonical JSON
+/// array `[method, issuer, tenant, subject]` (RFC 8785; a surface with no tenant
+/// gives `null`). The same subject named by another method, issuer, key
+/// provider or tenant is another caller.
+pub fn caller_identity_hash(
+    method: &str,
+    issuer: &str,
+    tenant_id: Option<&str>,
+    subject: &str,
+) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let encoded = serde_json_canonicalizer::to_vec(&(method, issuer, tenant_id, subject)).ok()?;
+    Some(hex::encode(Sha256::digest(encoded)))
 }
 
 /// SubjectAltName values lifted off a verified leaf certificate.
@@ -701,8 +794,78 @@ mod tests {
             Some("abc")
         );
 
-        let other = AuthenticatedIdentity::ApiKey { key_name: "k".to_string() };
+        let other = AuthenticatedIdentity::ApiKey {
+            key_name: "k".to_string(),
+            provider_agent_id: None,
+        };
         assert!(other.jwt_claims().is_none());
+    }
+
+    /// The identity hash is the SHA-256 of `[method, issuer, tenant, subject]`,
+    /// so a caller is told apart by each, and a JWT that names no subject has no
+    /// hash at all.
+    #[test]
+    fn the_identity_hash_tells_callers_apart_by_method_issuer_and_tenant() {
+        use sha2::{Digest, Sha256};
+        let jwt = |claims: serde_json::Value| AuthenticatedIdentity::JwtBearer {
+            subject: claims["sub"]
+                .as_str()
+                .unwrap_or("<none>")
+                .to_string(),
+            claims,
+        };
+        let api_key = |name: &str, provider: Option<&str>| AuthenticatedIdentity::ApiKey {
+            key_name: name.to_string(),
+            provider_agent_id: provider.map(str::to_string),
+        };
+        let alice = jwt(serde_json::json!({"iss": "https://idp.example", "sub": "alice"}));
+
+        assert_eq!(
+            alice.principal_hash(Some("tenant-a")),
+            Some(hex::encode(Sha256::digest(br#"["jwt_bearer","https://idp.example","tenant-a","alice"]"#)))
+        );
+        assert_eq!(
+            alice.principal_hash(None),
+            Some(hex::encode(Sha256::digest(br#"["jwt_bearer","https://idp.example",null,"alice"]"#)))
+        );
+        let hashes = [
+            alice.principal_hash(None),
+            alice.principal_hash(Some("tenant-a")),
+            jwt(serde_json::json!({"iss": "https://partner.example", "sub": "alice"})).principal_hash(None),
+            api_key("alice", None).principal_hash(None),
+            api_key("alice", Some("agent-1")).principal_hash(None),
+            api_key("alice", Some("agent-2")).principal_hash(None),
+            AuthenticatedIdentity::DidAuth { did: "alice".into() }.principal_hash(None),
+        ];
+        let distinct: std::collections::HashSet<_> = hashes
+            .iter()
+            .map(|hash| {
+                hash.clone()
+                    .expect("each names a subject")
+            })
+            .collect();
+        assert_eq!(distinct.len(), hashes.len(), "{hashes:?}");
+        assert_ne!(
+            alice.principal_hash(None),
+            Some(hex::encode(Sha256::digest(b"alice"))),
+            "the subject alone is no longer the hash"
+        );
+
+        for (case, identity) in [
+            ("no sub", jwt(serde_json::json!({"iss": "https://idp.example"}))),
+            ("empty sub", jwt(serde_json::json!({"iss": "https://idp.example", "sub": ""}))),
+            ("no iss", jwt(serde_json::json!({"sub": "alice"}))),
+            (
+                "a subject the claims do not carry",
+                AuthenticatedIdentity::JwtBearer {
+                    subject: "alice".into(),
+                    claims: serde_json::json!({"iss": "https://idp.example", "sub": "bob"}),
+                },
+            ),
+            ("an empty key name", api_key("", None)),
+        ] {
+            assert_eq!(identity.principal_hash(None), None, "{case}");
+        }
     }
 
     #[test]

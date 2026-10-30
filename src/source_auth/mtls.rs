@@ -87,10 +87,10 @@ pub fn verify_peer_cert(
     let fingerprint = hex::encode(leaf_fp_raw);
 
     // Trust check ----------------------------------------------------------
-    let issuer_dn = match &config.trust {
+    let (issuer_dn, trust_anchor_fingerprint) = match &config.trust {
         MtlsTrust::Pinned { certificate_ids } => {
             verify_pinned(&leaf_fp_raw, certificate_ids, trust.pinned)?;
-            String::new()
+            (String::new(), fingerprint.clone())
         }
         MtlsTrust::Ca {
             ca_certificate_ids,
@@ -110,13 +110,16 @@ pub fn verify_peer_cert(
                         .to_string(),
                 });
             }
-            verify_ca_chain(peer, &leaf, ca_certificate_ids, trust.ca, now)?;
+            let anchor = verify_ca_chain(peer, &leaf, ca_certificate_ids, trust.ca, now)?;
             if *require_client_auth_eku {
                 require_eku(&leaf, OID_EKU_CLIENT_AUTH)?;
             }
-            leaf.tbs_certificate
-                .issuer
-                .to_string()
+            (
+                leaf.tbs_certificate
+                    .issuer
+                    .to_string(),
+                hex::encode(anchor),
+            )
         }
     };
 
@@ -148,6 +151,7 @@ pub fn verify_peer_cert(
         fingerprint,
         subject_dn,
         issuer_dn,
+        trust_anchor_fingerprint,
         sans,
         source: peer.source,
     })
@@ -216,13 +220,15 @@ fn verify_pinned(
 
 // ── Trust: CA chain ────────────────────────────────────────────────────────
 
+/// Verifies the client certificate's chain against the configured CAs and
+/// returns the SHA-256 of the CA certificate the verified chain ends at.
 fn verify_ca_chain(
     peer: &PeerCertInfo,
     leaf: &X509Certificate<'_>,
     ca_certificate_ids: &[String],
     ca: &[TrustEntry],
     now: SystemTime,
-) -> SourceAuthResult<()> {
+) -> SourceAuthResult<[u8; 32]> {
     let _ = leaf; // x509-parser leaf retained for symmetry; webpki re-parses internally.
     if ca_certificate_ids.is_empty() {
         return Err(SourceAuthError::Internal {
@@ -277,7 +283,7 @@ fn verify_ca_chain(
     );
 
     // Verify with the client-auth EKU when present in supported algorithms.
-    leaf_cert
+    let path = leaf_cert
         .verify_for_usage(
             webpki::ALL_VERIFICATION_ALGS,
             &anchors,
@@ -291,7 +297,14 @@ fn verify_ca_chain(
             reason: format!("Client certificate chain verification failed: {e}"),
         })?;
 
-    Ok(())
+    let anchor = path.anchor();
+    anchors
+        .iter()
+        .position(|candidate| candidate == anchor)
+        .map(|index| ca[index].fingerprint)
+        .ok_or_else(|| SourceAuthError::Internal {
+            reason: "Verified client certificate chain ends at no configured CA".to_string(),
+        })
 }
 
 fn require_eku(
@@ -950,5 +963,126 @@ mod tests {
             }
             _ => panic!("expected Mtls identity"),
         }
+    }
+
+    /// A CA certificate whose subject is `CN=<name>`, self-signed or signed by
+    /// `signer`: its PEM, its DER and the issuer that signs with it.
+    fn ca_named(
+        name: &str,
+        signer: Option<&rcgen::Issuer<'static, KeyPair>>,
+    ) -> (Vec<u8>, Vec<u8>, rcgen::Issuer<'static, KeyPair>) {
+        let mut params = CertificateParams::default();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.distinguished_name = DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(DnType::CommonName, name);
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let key = KeyPair::generate().expect("ca keypair");
+        let cert = match signer {
+            Some(signer) => params
+                .clone()
+                .signed_by(&key, signer),
+            None => params
+                .clone()
+                .self_signed(&key),
+        }
+        .expect("ca certificate");
+        (cert.pem().into_bytes(), cert.der().to_vec(), rcgen::Issuer::new(params, key))
+    }
+
+    /// A client certificate for `CN=<cn>` signed by `signer`.
+    fn client_named(
+        cn: &str,
+        signer: &rcgen::Issuer<'static, KeyPair>,
+    ) -> Vec<u8> {
+        let mut params = CertificateParams::default();
+        params.distinguished_name = DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(DnType::CommonName, cn);
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let now = ::time::OffsetDateTime::now_utc();
+        params.not_before = now - ::time::Duration::seconds(60);
+        params.not_after = now + ::time::Duration::seconds(3600);
+        let key = KeyPair::generate().expect("client keypair");
+        params
+            .signed_by(&key, signer)
+            .expect("client certificate")
+            .der()
+            .to_vec()
+    }
+
+    /// The identity hash keys an mTLS caller by the certificate its trust was
+    /// verified against: the configured CA that ends its chain, or the pinned
+    /// certificate. A leaf whose chain ends at another CA, through an
+    /// intermediate named like the first CA, is another caller although its
+    /// subject and issuer name are the same; so is a pinned certificate with
+    /// the same subject as another.
+    #[test]
+    fn the_identity_hash_keys_an_mtls_caller_by_the_certificate_that_verified_it() {
+        let ca_trust = |cas: &[&[u8]]| MtlsAuthConfig {
+            trust: MtlsTrust::Ca {
+                ca_certificate_ids: (0..cas.len())
+                    .map(|i| format!("ca{i}"))
+                    .collect(),
+                require_client_auth_eku: true,
+                check_crl: false,
+                require_ocsp: false,
+            },
+            identity_binding: MtlsIdentityBinding::SubjectCn,
+            allowed_subjects: vec![],
+            allow_forwarded: true,
+        };
+        let verify = |peer: &PeerCertInfo, cas: &[&[u8]]| {
+            let ca = to_entries(cas);
+            let trust = ResolvedTrustMaterial { pinned: &[], ca: &ca };
+            verify_peer_cert(peer, &ca_trust(cas), trust, SystemTime::now()).expect("the chain verifies")
+        };
+        let issuer_dn = |identity: &AuthenticatedIdentity| match identity {
+            AuthenticatedIdentity::Mtls { issuer_dn, .. } => issuer_dn.clone(),
+            other => panic!("expected an mTLS identity: {other:?}"),
+        };
+        let (org_pem, _, org) = ca_named("Org CA", None);
+        let (partner_pem, _, partner) = ca_named("Partner CA", None);
+        let (_, named_like_org_der, named_like_org) = ca_named("Org CA", Some(&partner));
+        let org_alice = peer_from_der(client_named("alice", &org));
+        let partner_alice =
+            peer_with_intermediates(client_named("alice", &named_like_org), vec![named_like_org_der.clone()]);
+
+        let by_org = verify(&org_alice, &[&org_pem]);
+        let by_partner = verify(&partner_alice, &[&partner_pem]);
+        assert_eq!((by_org.principal(), by_partner.principal()), ("alice", "alice"));
+        assert_eq!(issuer_dn(&by_org), issuer_dn(&by_partner), "the leaves name the same issuer");
+        assert_ne!(by_org.principal_hash(None), by_partner.principal_hash(None));
+        assert_ne!(by_org.principal_hash(None), None);
+
+        let both = [partner_pem.as_slice(), org_pem.as_slice()];
+        assert_eq!(
+            verify(&org_alice, &both).principal_hash(None),
+            by_org.principal_hash(None),
+            "a surface trusting both CAs keys each caller by the CA its chain ends at"
+        );
+        assert_eq!(verify(&partner_alice, &both).principal_hash(None), by_partner.principal_hash(None));
+
+        let pinned_trust = MtlsAuthConfig {
+            trust: MtlsTrust::Pinned {
+                certificate_ids: vec!["c1".into()],
+            },
+            identity_binding: MtlsIdentityBinding::SubjectCn,
+            allowed_subjects: vec![],
+            allow_forwarded: true,
+        };
+        let pinned = |pki: &TestPki| {
+            let pinned = to_entries(&[&pki.client_pem]);
+            let trust = ResolvedTrustMaterial { pinned: &pinned, ca: &[] };
+            verify_peer_cert(&peer_from_der(pki.client_der.clone()), &pinned_trust, trust, SystemTime::now())
+                .expect("the pinned certificate verifies")
+                .principal_hash(None)
+        };
+        let first = build_pki("alice", vec![], false, 3600);
+        let second = build_pki("alice", vec![], false, 3600);
+        assert_eq!(pinned(&first), pinned(&first));
+        assert_ne!(pinned(&first), pinned(&second), "two pinned certificates for CN=alice are two callers");
     }
 }

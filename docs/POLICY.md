@@ -303,6 +303,82 @@ The same rule denies every request on the direct A2A path, which never produces
 `vp`; a rule for that path accepts `vp_unanchored` together with a check on
 `input.agent.identity_issuer_did`.
 
+## Caller in Transit Point policy input
+
+Every outbound evaluation (gateway, surface, per-Transit-Point and response policies, and
+MCP tool gating conditions on a Transit Point) gets `input.transit`. It is never on an
+inbound evaluation, where `input.source_auth` and `input.extension_identity` carry the
+caller. It names two principals, each in its own field, because one call can carry both:
+
+- `input.transit.caller` is the end user the transit token names, as the Access Point
+  authenticated them. Without a transit token it is `anonymous`.
+- `input.transit.client` is the principal the Transit Point authenticated itself on this
+  request, such as the managed agent's resource-server token. It is absent when the Transit
+  Point authenticated none.
+
+A rule about the end user reads `caller`, and a rule about the client reads `client`;
+neither stands in for the other. A policy that reads `caller` must test `verified` first: a
+caller named only by an unverified DID is reported, and never as verified.
+
+A Transit Point's response policy gets `input.transit`, and `input.source_auth` when the
+Transit Point authenticated a client, beside its `input.response`, `input.caller` and
+`input.surface`. Its `input.caller.did` is the managed agent's DID, not the Transit Point's
+caller, so a rule about who receives a response reads `input.transit.caller`.
+
+Only a Transit Point's response policy has `input.transit`. A gateway or surface response
+policy also runs on the inbound legs, where `input.transit` is undefined, and there
+`not input.transit.caller.verified` is true. A rule shared by both legs that denies on
+`not input.transit.caller.verified` therefore also denies every inbound response, and one that
+allows on it allows every inbound response. Do not negate `input.transit` in a response policy
+that can run inbound. Test that it is present instead (`input.transit.caller.verification`), or
+keep the rule in the Transit Point's own `response_policy`.
+
+| Field | Values | Meaning |
+| --- | --- | --- |
+| `input.transit.caller.verified` | `true` / `false` | `true` when `verification` is `transit_token`. |
+| `input.transit.caller.verification` | `transit_token` | The call carries a valid transit token whose `user_identity_hash` came from source authentication on the Access Point. |
+| | `unverified` | A valid transit token names a caller DID but carries no verified principal: the DID was asserted or derived from request fields on the Access Point. |
+| | `anonymous` | The call carries no valid transit token: none on a Transit Point that does not require one, one there that does not verify, or a public discovery `GET`. A Transit Point that does not require a token still verifies one the agent sends, so a valid token is reported as above. There it names the caller to policy only: delegated credentials, Workload Binding and stream expiry still treat the call as carrying no token. A client the Transit Point authenticated does not change this. |
+| `input.transit.caller.identity_source` | `gateway-computed`, `self-presented`, `verified-presentation` | How the Access Point established the caller DID. Absent when the token has none. |
+| `input.transit.caller.user_identity_hash` | lowercase hex SHA-256 | The caller's [identity hash](CREDENTIAL_DELEGATION.md#the-callers-identity-hash) the Access Point computed: the source-auth method, its issuer, the surface's tenant and the principal (the JWT `sub`, API key name, DID or mTLS principal). The same subject verified by another method, issuer or tenant has another hash. Present only when `verified`, and absent for a JWT that names no `sub`. |
+| `input.transit.caller.did` | DID | The caller DID the transit token carries. Always asserted, even when `verified` is `true`: `verified` is about the principal behind `user_identity_hash`, not this DID. Absent when the token has none. |
+| `input.transit.caller.fields` | object | The caller claims this Transit Point allowlists, verbatim: its enabled `workload_binding.caller_context_fields` with `caller_source: transit_token`, taken from the caller's verified JWT claims on the Access Point. The token carries the claims every Transit Point of the surface allowlists, but each Transit Point's policy sees only its own. Absent unless the caller is `verified` and the Transit Point allowlists a claim the token carries. |
+| `input.transit.client.verification` | `resource_token` | The Transit Point verified the client's resource-server token (`mcp_http.authorization`) on this request. `input.source_auth` carries the same identity with its claims. |
+| `input.transit.client.method` | `jwt_bearer`, `api_key`, `did_auth`, `mtls` | The source-auth method that verified the client (`api_key` also for `api_key_provider`). |
+| `input.transit.client.user_identity_hash` | lowercase hex SHA-256 | The client's identity hash, computed as for the caller. It equals a caller's hash only when both were verified the same way. Absent for a JWT that names no `sub`. |
+| `input.transit.client.subject` | string | The verified principal itself. Absent with the hash. |
+
+On an MCP Transit Point that requires a resource token and also receives a transit token,
+`caller` is the end user, and `client` is the client the resource token names. A rule that
+admits one end user checks `caller`; one that admits only some clients checks `client` as well.
+
+An anonymous call looks like this, and a policy that must refuse it denies on
+`not input.transit.caller.verified`:
+
+```json
+{ "verified": false, "verification": "anonymous" }
+```
+
+`input.transit.caller` has no `did_verified` and no Agent DNA UAI. Nothing on the Access Point
+verifies a DID presentation yet, so either would be a value the caller asserted. Match a caller
+by `user_identity_hash`, never by `did`.
+
+To allow only one caller, compare the hash. For the JWT subject `alice` from
+`https://login.example.com` on a surface with no tenant, it is
+`printf '%s' '["jwt_bearer","https://login.example.com",null,"alice"]' | shasum -a 256`. An API
+key named `alice`, or `alice` at another issuer, has another hash and is not admitted:
+
+```rego
+package surface.policy
+
+default allow := false
+
+allow if {
+    input.transit.caller.verified
+    input.transit.caller.user_identity_hash == "42628a381c35947c51d560b24315c5590c6f3c217701fcabd95f9fd9697bcd3f"
+}
+```
+
 ## Egress and SSRF controls
 
 ### Forward-leg SSRF guard
