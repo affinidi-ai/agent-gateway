@@ -488,7 +488,8 @@ impl PreviewMemory {
         }
     }
 
-    /// Whether `user_id` and `surface_id` may each start another fetch.
+    /// Whether `user_id` and `surface_id` may each start another fetch. The user is
+    /// checked first, so a user past their own limit takes nothing from the surface.
     fn admit(
         &self,
         user_id: &str,
@@ -498,12 +499,12 @@ impl PreviewMemory {
             .retain_recent();
         self.surface_fetches
             .retain_recent();
-        self.surface_fetches
-            .check_key(&surface_id.to_string())
+        self.user_fetches
+            .check_key(&user_id.to_string())
             .is_ok()
             && self
-                .user_fetches
-                .check_key(&user_id.to_string())
+                .surface_fetches
+                .check_key(&surface_id.to_string())
                 .is_ok()
     }
 
@@ -1269,6 +1270,42 @@ mod tests {
             .await
             .unwrap();
         assert!(!other.cached, "another surface has its own limit");
+    }
+
+    #[tokio::test]
+    async fn a_user_past_their_limit_takes_nothing_from_the_surface_limit() {
+        let target = MockServer::start_with_response(agent_card().to_string()).await;
+        let orders = state(json!({"endpoint": target.url()})).await;
+        let billing = running(surface_with("billing", json!({"endpoint": target.url()}))).await;
+        let memory = PreviewMemory::new(FETCHES_PER_MINUTE);
+        for _ in 0..FETCHES_PER_MINUTE.get() {
+            memory
+                .preview(&billing, &caller("u-busy"), PreviewRequest::Refresh)
+                .await
+                .unwrap();
+        }
+        for _ in 0..FETCHES_PER_MINUTE.get() {
+            assert_eq!(
+                memory
+                    .preview(&orders, &caller("u-busy"), PreviewRequest::Refresh)
+                    .await,
+                Err(RateLimited)
+            );
+        }
+        for user in 0..FETCHES_PER_MINUTE.get() {
+            let preview = memory
+                .preview(&orders, &caller(&format!("u-{user}")), PreviewRequest::Refresh)
+                .await
+                .unwrap();
+            assert!(!preview.cached, "refused requests left the surface's whole quota to others");
+        }
+        assert_eq!(
+            memory
+                .preview(&orders, &caller("u-new"), PreviewRequest::Refresh)
+                .await,
+            Err(RateLimited),
+            "the surface limit still applies once its own quota is used"
+        );
     }
 
     #[tokio::test]
