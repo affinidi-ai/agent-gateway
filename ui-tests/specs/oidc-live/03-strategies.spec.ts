@@ -15,7 +15,7 @@ import {asHttpsLooking, bridgeLoopbackScheme} from '../../helpers/oidc-live/brid
 import {env, issuerWithoutSlash} from '../../helpers/oidc-live/env';
 import {Entity, listEntities, seedStrategy, strategyRecord} from '../../helpers/oidc-live/gateway-state';
 import {names, PREFIX} from '../../helpers/oidc-live/names';
-import {ticket} from '../../helpers/ticket';
+import {feature} from '../../helpers/feature';
 
 const DISCOVER = '**/api/v1/jwt-verification-strategies/discover';
 const STRATEGIES = '**/api/v1/jwt-verification-strategies';
@@ -56,7 +56,7 @@ test.describe('JWT verification strategies', () => {
     });
 
     test('Discover from issuer fills the JWKS URI and pins the metadata Hydra publishes', async ({page}) => {
-        ticket('FTL-30890');
+        feature('strategy-discovery');
         await bridgeLoopbackScheme(page, DISCOVER);
         await page.goto('/jwt-verification-strategies/new');
         await page.getByTestId('strategy-name').fill(names.strategies.hydraA.name);
@@ -96,7 +96,7 @@ test.describe('JWT verification strategies', () => {
     });
 
     test('an issuer that differs only by a trailing slash fails discovery, pins nothing and cannot be saved as advertised', async ({page}) => {
-        ticket('FTL-30890');
+        feature('strategy-discovery');
         await bridgeLoopbackScheme(page, DISCOVER);
         await page.goto('/jwt-verification-strategies/new');
         await page.getByTestId('strategy-issuer').fill(issuerWithoutSlash(issuerA));
@@ -182,7 +182,7 @@ test.describe('JWT verification strategies', () => {
     });
 
     test('the strategy that advertises hydra-a is listed as Discovered and opens with Hydra metadata pinned', async ({page}) => {
-        ticket('FTL-30890');
+        feature('strategy-discovery');
         await seedStrategy(api, strategyRecord('a'));
         await seedStrategy(api, strategyRecord('b'));
 

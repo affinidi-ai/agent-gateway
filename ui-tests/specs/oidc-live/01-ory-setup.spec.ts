@@ -22,7 +22,7 @@ import {
 } from '../../helpers/oidc-live/hydra';
 import {names} from '../../helpers/oidc-live/names';
 import {loadWorld, World} from '../../helpers/oidc-live/world';
-import {ticket} from '../../helpers/ticket';
+import {feature} from '../../helpers/feature';
 
 test.describe('Ory side', () => {
     let hydra: APIRequestContext;
@@ -38,7 +38,7 @@ test.describe('Ory side', () => {
     });
 
     test('hydra-a advertises the issuer string the gateway must compare exactly', async () => {
-        ticket('FTL-30889', 'FTL-30890');
+        feature('signin-demo-and-live-tests', 'strategy-discovery');
         const metadata = await hydra.get(`${env.hydraA.issuer}.well-known/openid-configuration`);
         expect(metadata.status()).toBe(200);
         const body = (await metadata.json()) as {issuer: string; token_endpoint: string; jwks_uri: string};
@@ -49,7 +49,7 @@ test.describe('Ory side', () => {
     });
 
     test('demo-good gets a JWT with the entry point as audience, the scope as a list and hydra-a as issuer', async () => {
-        ticket('FTL-30892');
+        feature('required-scopes');
         const response = await clientCredentialsToken(hydra, env.hydraA, world.good, {
             audience: env.entryPointUrl,
             scope: names.scopes.caller,
@@ -62,7 +62,7 @@ test.describe('Ory side', () => {
     });
 
     test('demo-noscope gets a token without the scope', async () => {
-        ticket('FTL-30892');
+        feature('required-scopes');
         const response = await clientCredentialsToken(hydra, env.hydraA, world.noScope, {audience: env.entryPointUrl});
         const claims = jwtClaims(accessToken(response));
         expect(claims.aud).toEqual([env.entryPointUrl]);
@@ -70,7 +70,7 @@ test.describe('Ory side', () => {
     });
 
     test('demo-noscope is refused the scope it was never registered for', async () => {
-        ticket('FTL-30892');
+        feature('required-scopes');
         const response = await clientCredentialsToken(hydra, env.hydraA, world.noScope, {
             audience: env.entryPointUrl,
             scope: names.scopes.caller,
@@ -80,7 +80,7 @@ test.describe('Ory side', () => {
     });
 
     test('demo-otheraud gets a token for another audience and cannot ask for the entry point', async () => {
-        ticket('FTL-30893');
+        feature('signin-challenges-and-metadata');
         const other = await clientCredentialsToken(hydra, env.hydraA, world.otherAudience, {
             audience: names.otherAudience,
             scope: names.scopes.caller,
@@ -95,7 +95,7 @@ test.describe('Ory side', () => {
     });
 
     test('hydra-b accepts an assertion signed by the trusted key, refuses a replay and an unknown key', async () => {
-        ticket('FTL-30885');
+        feature('jwt-bearer-provider');
         expect(await trustGrantExists(hydra, env.hydraB, world.grantId)).toBe(true);
         expect(publicKeyMatches(world.key)).toBe(true);
         const claims = {

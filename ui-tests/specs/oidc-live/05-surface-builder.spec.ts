@@ -36,7 +36,7 @@ import {ensureDenyRule, ensureProviders, ensureSecrets, ensureStrategy, listEnti
 import {names} from '../../helpers/oidc-live/names';
 import {newContext} from '../../helpers/oidc-live/hydra';
 import {loadWorld} from '../../helpers/oidc-live/world';
-import {ticket} from '../../helpers/ticket';
+import {feature} from '../../helpers/feature';
 
 const SURFACES = '**/api/v1/surfaces**';
 
@@ -68,7 +68,7 @@ test.describe('Surface builder', () => {
     });
 
     test('creates the surface with caller authentication, a required scope and Target Authentication, and only warns', async ({page}) => {
-        ticket('FTL-30885', 'FTL-30888', 'FTL-30891');
+        feature('jwt-bearer-provider', 'target-authentication-dashboard', 'a2a-signin-design');
         await bridgeLoopbackScheme(page, SURFACES);
         await startA2aSurface(page);
         await nameSurface(page, names.surface);
@@ -115,7 +115,7 @@ test.describe('Surface builder', () => {
     });
 
     test('attaching the deny rule to the Target policy through the API clears the fail-open warning', async ({page}) => {
-        ticket('FTL-30891');
+        feature('a2a-signin-design');
         const surface = (await surfaceByName(api)) as SavedSurface;
         denyRuleId = await ensureDenyRule(api);
         const patched = await api.patch(`/api/v1/surfaces/${surface.surface_id}`, {
@@ -130,7 +130,7 @@ test.describe('Surface builder', () => {
     });
 
     test('turning on Authorization server discovery in the Caller Context editor makes the Access Point declare hydra-a', async ({page}) => {
-        ticket('FTL-30891', 'FTL-30893', 'FTL-30894', 'FTL-30895');
+        feature('a2a-signin-design', 'signin-challenges-and-metadata', 'agent-card-signin-declaration', 'agent-card-tab-and-signin-settings');
         await bridgeLoopbackScheme(page, SURFACES);
         const surface = (await surfaceByName(api)) as SavedSurface;
         await openSurface(page, surface.surface_id);
@@ -165,7 +165,7 @@ test.describe('Surface builder', () => {
     });
 
     test('shows the entry point URL and the Declares OAuth outcome for the saved surface', async ({page}) => {
-        ticket('FTL-30894', 'FTL-30895');
+        feature('agent-card-signin-declaration', 'agent-card-tab-and-signin-settings');
         const surface = (await surfaceByName(api)) as SavedSurface;
         await openSurface(page, surface.surface_id);
         await expect(page.getByTestId('surface-entry-point-url')).toContainText(env.entryPointUrl);
@@ -178,7 +178,7 @@ test.describe('Surface builder', () => {
     });
 
     test('removing the required scope keeps the gateway refusing a caller without a token', async ({page}) => {
-        ticket('FTL-30891', 'FTL-30892');
+        feature('a2a-signin-design', 'required-scopes');
         await bridgeLoopbackScheme(page, SURFACES);
         const surface = (await surfaceByName(api)) as SavedSurface;
         await openSurface(page, surface.surface_id);

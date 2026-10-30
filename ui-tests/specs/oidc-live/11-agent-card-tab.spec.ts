@@ -32,9 +32,9 @@ import {newContext} from '../../helpers/oidc-live/hydra';
 import {names, PREFIX} from '../../helpers/oidc-live/names';
 import {loadWorld, World} from '../../helpers/oidc-live/world';
 import {testUserStorageState, TestUserStorageState} from '../../helpers/test-auth';
-import {attachCriterion, ticket} from '../../helpers/ticket';
+import {attachCriterion, feature} from '../../helpers/feature';
 
-const TICKET = 'FTL-30895';
+const FEATURE = 'agent-card-tab-and-signin-settings';
 const NO_AUTH_SURFACE = `${names.surface}-card-no-auth`;
 const NO_AUTH_ROUTE = `${env.routePrefix}/card-no-auth`;
 const CARD_OPERATOR = `${PREFIX}-card-operator`;
@@ -142,7 +142,7 @@ test.describe('Agent Cards tab', () => {
     test('the Agent Cards tab sits directly after Elements and before Monitoring and loads the cards the gateway fetched', async ({
         page,
     }) => {
-        ticket(TICKET, 'FTL-30887');
+        feature(FEATURE, 'protected-agent-card-fetch');
         await openSurface(page, surfaceIdOf(surface));
         const view = page.getByTestId('surface-view-agent-card');
         await expect(view).toHaveText('Agent Cards');
@@ -186,13 +186,13 @@ test.describe('Agent Cards tab', () => {
 
         const views = page.locator('.surface-form-sidebar-section').filter({has: view});
         await expectNoSecretIn(views, world);
-        await attachCriterion(TICKET, 1, 'Agent Cards tab placement', views);
+        await attachCriterion(FEATURE, 1, 'Agent Cards tab placement', views);
     });
 
     test('the Managed Agent Card and the Gateway-Served Agent Card sit side by side, each change marked by colour, icon and label', async ({
         page,
     }) => {
-        ticket(TICKET);
+        feature(FEATURE);
         await openSurface(page, surfaceIdOf(surface));
         const body = await openTab(page, world);
         expect(body.fetch.status).toBe('ok');
@@ -268,13 +268,13 @@ test.describe('Agent Cards tab', () => {
 
         const tab = page.getByTestId('agent-card-tab');
         await expectNoSecretIn(tab, world);
-        await attachCriterion(TICKET, 2, 'Managed and served cards side by side', tab);
+        await attachCriterion(FEATURE, 2, 'Managed and served cards side by side', tab);
     });
 
     test('the Surface view keeps the Entry point URL, and the tab links to it and copies the served card discovery URL', async ({
         page,
     }) => {
-        ticket(TICKET);
+        feature(FEATURE);
         await page.context().grantPermissions(['clipboard-read', 'clipboard-write'], {origin: new URL(env.gatewayUrl).origin});
         await openSurface(page, surfaceIdOf(surface));
         const entryPoint = page.getByTestId('surface-entry-point-url');
@@ -300,7 +300,7 @@ test.describe('Agent Cards tab', () => {
         expect((await http.get(CARD_URL)).status(), 'the copied URL serves the card').toBe(200);
 
         await expectNoSecretIn(tab, world);
-        await attachCriterion(TICKET, 3, 'Served card URL and link to the Surface', tab);
+        await attachCriterion(FEATURE, 3, 'Served card URL and link to the Surface', tab);
 
         await tab.getByTestId('agent-card-open-surface-button').click();
         await expect(page.getByTestId('surface-view-surface')).toHaveAttribute('aria-current', 'page');
@@ -310,7 +310,7 @@ test.describe('Agent Cards tab', () => {
     test('the authorization server, required scope and resource set in the Caller Context editor are what the served card declares', async ({
         page,
     }) => {
-        ticket(TICKET, 'FTL-30894');
+        feature(FEATURE, 'agent-card-signin-declaration');
         await openSurface(page, surfaceIdOf(surface));
         await openCallerAuth(page);
         await expect(page.getByTestId('caller-auth-jwt-strategy')).toHaveValue(names.strategies.hydraA.id);
@@ -322,7 +322,7 @@ test.describe('Agent Cards tab', () => {
         await expect(page.getByTestId('caller-auth-discovery-resource-input')).toHaveValue(env.entryPointUrl);
         await expect(page.getByTestId('caller-auth-outcome-chip').first()).toContainText('Declares OAuth');
         await attachCriterion(
-            TICKET,
+            FEATURE,
             5,
             'Authorization server discovery, scopes and resource in the Caller Context editor',
             page.getByTestId('caller-auth-discovery')
@@ -349,11 +349,11 @@ test.describe('Agent Cards tab', () => {
         expect(servedCard.url).toBe(env.entryPointUrl);
 
         await expectNoSecretIn(tab, world);
-        await attachCriterion(TICKET, 5, 'Caller declaration reflected in the served card', tab);
+        await attachCriterion(FEATURE, 5, 'Caller declaration reflected in the served card', tab);
     });
 
     test('the Managed Agent panel shows the card fetch status and links to the tab', async ({page}) => {
-        ticket('FTL-30895');
+        feature('agent-card-tab-and-signin-settings');
         await openSurface(page, surfaceIdOf(surface));
         await selectNode(page, 'target');
         await expect(page.getByTestId('managed-agent-card-fetch-status')).toHaveText('Card fetch: OK');
@@ -363,7 +363,7 @@ test.describe('Agent Cards tab', () => {
     });
 
     test('Refresh asks the agent again with the gateway token and moves the fetch time', async ({page}) => {
-        ticket(TICKET, 'FTL-30887');
+        feature(FEATURE, 'protected-agent-card-fetch');
         await openSurface(page, surfaceIdOf(surface));
         await openTab(page, world);
         await expect(page.getByTestId('agent-card-fetch-status')).toHaveText('OK');
@@ -394,7 +394,7 @@ test.describe('Agent Cards tab', () => {
     test('a failed managed card fetch shows its cause and HTTP status, keeps the served card visible, and Refresh recovers once the agent is fixed', async ({
         page,
     }) => {
-        ticket(TICKET, 'FTL-30887');
+        feature(FEATURE, 'protected-agent-card-fetch');
         await openSurface(page, surfaceIdOf(surface));
         await openTab(page, world);
         await expect(page.getByTestId('agent-card-fetch-status')).toHaveText('OK');
@@ -430,7 +430,7 @@ test.describe('Agent Cards tab', () => {
             expect(gatewayScheme(await rawCard(servedDuringFailure)).oauth2MetadataUrl).toBe(METADATA_URL);
 
             await expectNoSecretIn(tab, world);
-            await attachCriterion(TICKET, 4, 'Failed card fetch with its cause and the served card', tab);
+            await attachCriterion(FEATURE, 4, 'Failed card fetch with its cause and the served card', tab);
         } finally {
             await setAgentRefusing(http, false);
         }
@@ -448,7 +448,7 @@ test.describe('Agent Cards tab', () => {
     });
 
     test('a surface on the same agent with no Target Authentication shows that the agent needs a token', async ({page}) => {
-        ticket('FTL-30895');
+        feature('agent-card-tab-and-signin-settings');
         await resetAgentLog(http);
         const created = await api.post<Entity>('/api/v1/surfaces', {
             name: NO_AUTH_SURFACE,
@@ -489,7 +489,7 @@ test.describe('Agent Cards tab', () => {
     });
 
     test('no token, client secret or Authorization value reaches the tab, its raw JSON or the preview responses', async ({page}) => {
-        ticket('FTL-30895', 'FTL-30888', 'FTL-30889');
+        feature('agent-card-tab-and-signin-settings', 'target-authentication-dashboard', 'signin-demo-and-live-tests');
         await openSurface(page, surfaceIdOf(surface));
         const body = await openTab(page, world);
         expect(body.auth.kind).toBe('credential_provider');
@@ -502,6 +502,6 @@ test.describe('Agent Cards tab', () => {
         await expectNoSecretIn(tab, world);
         await expect(tab).not.toContainText('Authorization');
         await expect(tab).not.toContainText(/Bearer\s+\S/);
-        await attachCriterion(TICKET, 6, 'No secret in the Agent Cards tab', tab);
+        await attachCriterion(FEATURE, 6, 'No secret in the Agent Cards tab', tab);
     });
 });

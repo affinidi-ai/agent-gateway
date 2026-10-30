@@ -17,7 +17,7 @@ import {ensureSurface} from '../../helpers/oidc-live/gateway-state';
 import {accessToken, clientCredentialsToken, newContext} from '../../helpers/oidc-live/hydra';
 import {names} from '../../helpers/oidc-live/names';
 import {loadWorld, World} from '../../helpers/oidc-live/world';
-import {ticket} from '../../helpers/ticket';
+import {feature} from '../../helpers/feature';
 
 function decisionField(panel: Locator): Locator {
     return panel.locator('.audit-kv-row').filter({has: panel.page().locator('dt', {hasText: /^Decision$/})}).locator('dd');
@@ -66,7 +66,7 @@ test.describe('Dashboard evidence', () => {
     });
 
     test('three callers use the surface: one is allowed, two are refused before the surface policy', async ({page}) => {
-        ticket('FTL-30892', 'FTL-30893');
+        feature('required-scopes', 'signin-challenges-and-metadata');
         await page.goto('/audit');
         await expect(page.getByTestId('audit-refresh')).toBeVisible();
         await expect(page.getByTestId('audit-list').or(page.getByTestId('audit-empty'))).toBeVisible();
@@ -87,7 +87,7 @@ test.describe('Dashboard evidence', () => {
     });
 
     test('the audit page lists the allowed call with its caller and the two failed authentications, with no policy denial', async ({page}) => {
-        ticket('FTL-30892', 'FTL-30893');
+        feature('required-scopes', 'signin-challenges-and-metadata');
         await page.goto('/audit');
         await expect(async () => {
             await page.getByTestId('audit-refresh').click();
@@ -123,7 +123,7 @@ test.describe('Dashboard evidence', () => {
     });
 
     test('the gateway log shows the same three requests with their status', async ({page}) => {
-        ticket('FTL-30892');
+        feature('required-scopes');
         await page.goto('/logs');
         const route = env.route;
         for (const status of ['200', '403', '401']) {

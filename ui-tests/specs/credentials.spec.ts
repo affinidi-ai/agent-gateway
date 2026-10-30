@@ -11,7 +11,7 @@
  */
 
 import {expect, test} from '../helpers/fixtures';
-import {ticket} from '../helpers/ticket';
+import {feature} from '../helpers/feature';
 
 const BASE_URL = process.env.AG_BASE_URL || 'http://localhost:8080';
 
@@ -286,7 +286,7 @@ test.describe('Secret Value Masking', () => {
     });
 
     test('should never display credential values in plain text', async ({page}) => {
-        ticket('FTL-30888');
+        feature('target-authentication-dashboard');
         // Get all text content on the page
         const pageText = await page.textContent('body');
 

@@ -169,7 +169,7 @@ ui-tests/
 ├── helpers/                  # Test utilities
 │   ├── test-auth.ts          # Authentication helpers
 │   ├── gateway-api.ts        # Authenticated gateway API client for seeding and read-back
-│   ├── ticket.ts             # Ticket annotations and acceptance screenshots
+│   ├── feature.ts            # Feature annotations and acceptance screenshots
 │   ├── fixtures.ts           # Shared `test`/`expect` with the session bridge
 │   ├── layout-pages.ts       # Page inventory for the laptop layout spec
 │   ├── layout-fixtures.ts    # Long-identifier list fixtures (page.route)
@@ -337,12 +337,12 @@ test.describe('Channels', () => {
 });
 ```
 
-### Ticket annotations and acceptance screenshots
+### Feature annotations and acceptance screenshots
 
-Call `ticket(...ids)` from `helpers/ticket.ts` at the start of a test, or in a `beforeEach`,
-to add one `ticket` annotation per id; the HTML and JSON reports list them with the test.
-`attachCriterion(id, criterion, title, target)` attaches a screenshot named
-`<id> criterion <n>: <title>` to the report, of a locator or of a PNG the spec took. Take it
+Call `feature(...tags)` from `helpers/feature.ts` at the start of a test, or in a `beforeEach`,
+to add one `feature` annotation per tag; the HTML and JSON reports list them with the test.
+`attachCriterion(tag, criterion, title, target)` attaches a screenshot named
+`<tag> criterion <n>: <title>` to the report, of a locator or of a PNG the spec took. Take it
 of the area under test only, and in the live OIDC suite only after asserting the area shows
 no secret.
 

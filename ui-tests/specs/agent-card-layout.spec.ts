@@ -17,7 +17,7 @@
 import type {Page} from '@playwright/test';
 import {expect, test} from '../helpers/fixtures';
 import {GatewayApi} from '../helpers/gateway-api';
-import {attachCriterion, ticket} from '../helpers/ticket';
+import {attachCriterion, feature} from '../helpers/feature';
 
 const BASE_URL = process.env.AG_BASE_URL || 'http://localhost:8080';
 const RUN_ID = `${Date.now()}`;
@@ -25,7 +25,7 @@ const ROUTE = `/e2e-card-layout-${RUN_ID}`;
 const LISTEN_ADDRESS = 'http://localhost:8711';
 const MIN_CELL_WIDTH = 200;
 const TAB_PADDING = 64;
-const TICKET = 'FTL-30895';
+const FEATURE = 'agent-card-tab-and-signin-settings';
 
 const MANAGED_CARD = {
     protocolVersion: '0.3.0',
@@ -144,7 +144,7 @@ test.describe('Agent Cards tab', () => {
         await api.dispose();
     });
 
-    test.beforeEach(() => ticket(TICKET));
+    test.beforeEach(() => feature(FEATURE));
 
     async function stubPreview(page: Page, preview: object = PREVIEW): Promise<void> {
         await page.route(`**/api/v1/surfaces/${surfaceId}/agent-card`, route =>
@@ -186,7 +186,7 @@ test.describe('Agent Cards tab', () => {
         const views = await page.screenshot({
             clip: {x: first.x, y: first.y, width: Math.max(first.width, last.width), height: last.y + last.height - first.y},
         });
-        await attachCriterion(TICKET, 1, 'Agent Cards tab placement', views);
+        await attachCriterion(FEATURE, 1, 'Agent Cards tab placement', views);
     });
 
     test('shows both cards side by side with colour, icon and text change markers, and their raw JSON', async ({
@@ -223,7 +223,7 @@ test.describe('Agent Cards tab', () => {
         }
         expect(new Set(colours).size).toBe(CHANGE_KINDS.length);
         await expect(page.getByTestId('agent-card-summary')).toContainText('added');
-        await attachCriterion(TICKET, 2, 'Managed and served cards side by side', page.getByTestId('agent-card-tab'));
+        await attachCriterion(FEATURE, 2, 'Managed and served cards side by side', page.getByTestId('agent-card-tab'));
 
         const toggle = page.getByTestId('agent-card-raw-toggle');
         await toggle.click();
@@ -251,7 +251,7 @@ test.describe('Agent Cards tab', () => {
         await copy.click();
         await expect(copy).toHaveText('Copied');
         expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(PREVIEW.served_url);
-        await attachCriterion(TICKET, 3, 'Served card URL and link to the Surface', tab);
+        await attachCriterion(FEATURE, 3, 'Served card URL and link to the Surface', tab);
 
         await tab.getByTestId('agent-card-open-surface-button').click();
         const surfaceView = page.getByTestId('surface-view-surface');

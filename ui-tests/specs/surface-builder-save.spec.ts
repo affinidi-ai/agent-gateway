@@ -25,7 +25,7 @@ import type {Page} from '@playwright/test';
 import {generateKeyPairSync} from 'crypto';
 import {expect, test} from '../helpers/fixtures';
 import {GatewayApi} from '../helpers/gateway-api';
-import {ticket} from '../helpers/ticket';
+import {feature} from '../helpers/feature';
 
 const BASE_URL = process.env.AG_BASE_URL || 'http://localhost:8080';
 const RUN_ID = `${Date.now()}`;
@@ -164,7 +164,7 @@ test.describe('Surface builder save', () => {
     });
 
     test('saves JWT caller authentication with required scopes and authorization server discovery off', async ({page}) => {
-        ticket('FTL-30892', 'FTL-30895');
+        feature('required-scopes', 'agent-card-tab-and-signin-settings');
         await startFromA2aStarter(page);
         await addJwtCallerAuth(page, STRATEGY_NAME, REQUIRED_SCOPE);
         await fillTargetUrl(page, TARGET_URL);
@@ -191,7 +191,7 @@ test.describe('Surface builder save', () => {
     });
 
     test('turning on authorization server discovery from the keyboard moves focus to the Resource URL field', async ({page}) => {
-        ticket('FTL-30895');
+        feature('agent-card-tab-and-signin-settings');
         await startFromA2aStarter(page);
         await addJwtCallerAuth(page, STRATEGY_NAME, REQUIRED_SCOPE, {keepOpen: true});
 
@@ -207,7 +207,7 @@ test.describe('Surface builder save', () => {
     test('refuses to save authorization server discovery whose resource the listener does not serve, with the reason at the Resource URL field', async ({
         page,
     }) => {
-        ticket('FTL-30893', 'FTL-30895');
+        feature('signin-challenges-and-metadata', 'agent-card-tab-and-signin-settings');
         const existing = await api.get<Array<{surface_id: string}>>('/api/v1/surfaces');
         const before = new Set(existing.body.map(surface => surface.surface_id));
         await startFromA2aStarter(page);
@@ -238,7 +238,7 @@ test.describe('Surface builder save', () => {
     });
 
     test('opens the new surface with its save warnings when failed callers are not denied', async ({page}) => {
-        ticket('FTL-30891');
+        feature('a2a-signin-design');
         await page.context().grantPermissions(['clipboard-read', 'clipboard-write'], {origin: new URL(BASE_URL).origin});
         await startFromA2aStarter(page);
         await addJwtCallerAuth(page, STRATEGY_NAME);
@@ -282,7 +282,7 @@ test.describe('Surface builder save', () => {
     });
 
     test('saves a credential provider as the Target Authentication', async ({page}) => {
-        ticket('FTL-30886', 'FTL-30888');
+        feature('target-authentication-provider', 'target-authentication-dashboard');
         const providerName = `E2E target auth ${RUN_ID}`;
         const secret = await api.post<{id: string}>('/api/v1/secrets/new', {
             name: `E2E target key ${RUN_ID}`,
@@ -324,7 +324,7 @@ test.describe('Surface builder save', () => {
     });
 
     test('refuses to save credential provider Target Authentication without a provider or with header Host', async ({page}) => {
-        ticket('FTL-30888');
+        feature('target-authentication-dashboard');
         const providerName = `E2E refused ${RUN_ID}`;
         const secret = await api.post<{id: string}>('/api/v1/secrets/new', {
             name: `E2E refused key ${RUN_ID}`,

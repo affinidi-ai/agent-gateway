@@ -26,7 +26,7 @@ import {accessToken, clientCredentialsToken, newContext} from '../../helpers/oid
 import {StaticKey, generateStaticKey, signStaticJwt} from '../../helpers/oidc-live/static-jwt';
 import {names} from '../../helpers/oidc-live/names';
 import {loadWorld, World} from '../../helpers/oidc-live/world';
-import {ticket} from '../../helpers/ticket';
+import {feature} from '../../helpers/feature';
 
 const STATIC_NAME = `${names.surface} static strategy`;
 const SECOND_SURFACE = `${names.surface}-static`;
@@ -72,7 +72,7 @@ test.describe('Edit and delete', () => {
     });
 
     test('deleting a strategy that no surface uses asks first and removes it', async ({page}) => {
-        ticket('FTL-30890');
+        feature('strategy-discovery');
         await page.goto('/credentials?tab=jwt-verification');
         await page.getByTestId(`strategy-delete-button-${names.strategies.hydraB.id}`).click();
         const confirm = page.getByTestId('strategy-delete-confirm');
@@ -86,7 +86,7 @@ test.describe('Edit and delete', () => {
     });
 
     test('the delete dialog for the strategy the surface uses names the surface, and cancelling keeps it', async ({page}) => {
-        ticket('FTL-30890');
+        feature('strategy-discovery');
         await ensureStrategy(api, 'a');
         await page.goto('/credentials?tab=jwt-verification');
         await page.getByTestId(`strategy-delete-button-${names.strategies.hydraA.id}`).click();
@@ -102,7 +102,7 @@ test.describe('Edit and delete', () => {
     });
 
     test('a static-key strategy and a second surface that uses it', async () => {
-        ticket('FTL-30890');
+        feature('strategy-discovery');
         staticStrategy = await createStaticStrategy(api, {name: STATIC_NAME, issuer: OLD_ISSUER, jwk: staticKey.publicJwk});
         const {jwtBearer} = await ensureProviders(api);
         secondSurface = await createSecondSurface(api, {
@@ -116,7 +116,7 @@ test.describe('Edit and delete', () => {
     });
 
     test('changing the issuer of that strategy in the dashboard takes effect without a restart', async ({page}) => {
-        ticket('FTL-30890');
+        feature('strategy-discovery');
         await page.goto(`/jwt-verification-strategies/${staticStrategy.id}`);
         await expect(page.getByTestId('strategy-issuer')).toHaveValue(OLD_ISSUER);
         await page.getByTestId('strategy-issuer').fill(NEW_ISSUER);
@@ -135,7 +135,7 @@ test.describe('Edit and delete', () => {
     });
 
     test('changing the issuer of the pinned hydra-a strategy marks the pin stale, and the gateway refuses the save', async ({page}) => {
-        ticket('FTL-30890');
+        feature('strategy-discovery');
         await page.goto(`/jwt-verification-strategies/${names.strategies.hydraA.id}`);
         await expect(page.getByTestId('strategy-pinned-server')).toBeVisible();
         await page.getByTestId('strategy-issuer').fill(`${env.hydraA.issuer}changed`);
@@ -157,7 +157,7 @@ test.describe('Edit and delete', () => {
     });
 
     test('deleting the strategy the second surface uses lists that surface and removes the strategy', async ({page}) => {
-        ticket('FTL-30890');
+        feature('strategy-discovery');
         await page.goto('/credentials?tab=jwt-verification');
         await page.getByTestId(`strategy-delete-button-${staticStrategy.id}`).click();
         const confirm = page.getByTestId('strategy-delete-confirm');
@@ -170,7 +170,7 @@ test.describe('Edit and delete', () => {
     });
 
     test('callers of a surface whose strategy was deleted get 500 with a generic text and no strategy id, as the dialog says', async () => {
-        ticket('FTL-30890');
+        feature('strategy-discovery');
         const refused = await callAgent2(http, staticToken(NEW_ISSUER));
         expect(refused.status).toBe(500);
         expect(refused.headers['www-authenticate']).toBeUndefined();
@@ -180,7 +180,7 @@ test.describe('Edit and delete', () => {
     });
 
     test('a provider that a surface uses cannot be deleted, and the dashboard says why', async ({page}) => {
-        ticket('FTL-30886', 'FTL-30888');
+        feature('target-authentication-provider', 'target-authentication-dashboard');
         await page.goto('/credentials?tab=credential-providers');
         await twoStepDelete(page, `Delete "${names.providers.jwtBearer}"`);
 
@@ -192,7 +192,7 @@ test.describe('Edit and delete', () => {
     });
 
     test('deleting a secret that a provider references warns first, then deletes it, and the provider keeps its reference', async ({page}) => {
-        ticket('FTL-30888');
+        feature('target-authentication-dashboard');
         const secret = (await listEntities(api, '/api/v1/secrets/')).find(item => item.secret_id === names.secrets.ccClientSecret);
         expect(secret).toBeDefined();
         const provider = (await listEntities(api, '/api/v1/credential-providers')).find(
@@ -238,7 +238,7 @@ test.describe('Edit and delete', () => {
     });
 
     test('deleting the main surface removes its card and frees the provider and the strategy', async ({page}) => {
-        ticket('FTL-30885', 'FTL-30886', 'FTL-30888', 'FTL-30890');
+        feature('jwt-bearer-provider', 'target-authentication-provider', 'target-authentication-dashboard', 'strategy-discovery');
         await page.goto(`/surfaces/${mainSurface.surface_id ?? mainSurface.id}`);
         await expect(page.getByTestId('surface-node-access-point')).toBeVisible();
         await twoStepDelete(page, 'Delete this surface');
