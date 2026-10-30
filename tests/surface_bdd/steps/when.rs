@@ -209,7 +209,11 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
         response.status = provider.token_status;
         let mock = MockServer::start(response).await;
         let token_endpoint = format!("{}/token", mock.url());
-        oauth_endpoint_allowlist.push(token_endpoint.clone());
+        oauth_endpoint_allowlist.push(if provider.insecure_token_endpoint {
+            mock.url()
+        } else {
+            token_endpoint.clone()
+        });
         provider.token_endpoint = Some(token_endpoint);
         Some(mock)
     } else {

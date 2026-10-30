@@ -2471,6 +2471,34 @@ fn target_credential_provider_token_lifetime(
     target_auth_provider(world).expires_in = expires_in;
 }
 
+#[given("the target's credential provider has a plain http token endpoint")]
+fn target_credential_provider_has_http_token_endpoint(world: &mut SurfaceWorld) {
+    target_auth_provider(world).insecure_token_endpoint = true;
+}
+
+#[given(expr = "the surface belongs to tenant {string}")]
+fn surface_belongs_to_tenant(
+    world: &mut SurfaceWorld,
+    tenant_id: String,
+) {
+    world.surface_config.tenant_id = Some(tenant_id);
+}
+
+#[given(expr = "the gateway enforces the credential rule {string}")]
+fn gateway_enforces_credential_rule(
+    world: &mut SurfaceWorld,
+    rule: String,
+) {
+    assert!(
+        matches!(rule.as_str(), "token_endpoint_https" | "tenant_credential_isolation"),
+        "unknown credential rule {rule:?}"
+    );
+    world
+        .surface_config
+        .enforced_credential_rules
+        .push(rule);
+}
+
 /// Fetches the card once and checks it succeeded, then clears only managed agent "bravo"'s
 /// recorded requests: a later header assertion is about the next fetch, while the token
 /// endpoint's request count stays cumulative across both.

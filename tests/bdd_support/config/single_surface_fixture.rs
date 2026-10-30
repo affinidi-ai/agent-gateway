@@ -67,6 +67,10 @@ pub struct SurfaceConfigBuilder {
     pub rate_limit_per_minute: Option<u32>,
     /// The gateway starts with the VP Audit Log keeping every audit event.
     pub audit_log_keeps_every_event: bool,
+    /// The tenant that owns the surface; appliance-wide when absent.
+    pub tenant_id: Option<String>,
+    /// The `[credential_policy]` rules the gateway starts with set to `enforce`.
+    pub enforced_credential_rules: Vec<String>,
 }
 
 impl Default for SurfaceConfigBuilder {
@@ -119,6 +123,8 @@ impl Default for SurfaceConfigBuilder {
             a2a_settings: None,
             rate_limit_per_minute: None,
             audit_log_keeps_every_event: false,
+            tenant_id: None,
+            enforced_credential_rules: Vec::new(),
         }
     }
 }
@@ -331,6 +337,9 @@ pub struct SurfaceTargetAuthProviderConfig {
     pub token_status: u16,
     pub expires_in: u64,
     pub token_endpoint: Option<String>,
+    /// The test allowlist admits the http token endpoint's origin for egress only, so the
+    /// gateway holds it to the https rule as it would any http token endpoint.
+    pub insecure_token_endpoint: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -347,6 +356,7 @@ impl SurfaceTargetAuthProviderConfig {
             token_status: 200,
             expires_in: 3600,
             token_endpoint: None,
+            insecure_token_endpoint: false,
         }
     }
 }

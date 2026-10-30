@@ -235,6 +235,9 @@ fn write_single_surface_config_inner(
     if let Some(proxy) = &surface_config.a2a_proxy_target {
         surface_fixture = surface_fixture.with_a2a_proxy_id(&proxy.proxy_id);
     }
+    surface_fixture.tenant_id = surface_config
+        .tenant_id
+        .clone();
     if let Some(requests) = surface_config.rate_limit_per_minute {
         surface_fixture = surface_fixture.with_rate_limit(requests, 60);
     }
@@ -524,6 +527,24 @@ fn write_single_surface_config_inner(
     if let Some(max_secs) = surface_config.transit_token_max_lifetime_secs {
         set_transit_token_max_lifetime(base_dir, max_secs);
     }
+    enforce_credential_rules(base_dir, &surface_config.enforced_credential_rules);
+}
+
+/// Appends a `[credential_policy]` table setting each of `rules` to `enforce`.
+fn enforce_credential_rules(
+    base_dir: &Path,
+    rules: &[String],
+) {
+    if rules.is_empty() {
+        return;
+    }
+    let path = base_dir.join("config.toml");
+    let mut config = std::fs::read_to_string(&path).unwrap();
+    config.push_str("\n[credential_policy]\n");
+    for rule in rules {
+        config.push_str(&format!("{rule} = \"enforce\"\n"));
+    }
+    std::fs::write(&path, config).unwrap();
 }
 
 fn set_transit_token_max_lifetime(
