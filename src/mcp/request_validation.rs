@@ -317,22 +317,100 @@ impl McpRequestValidationError {
         Self::unsupported(id, super::MCP_MODERN_VERSION, LEGACY_ONLY_POLICY)
     }
 
+    /// The answer to a modern MCP request refused at routing because its
+    /// surface variant can't be resolved: `-32603` with the refusal's status
+    /// and message, carrying the request's `id` when one could be read.
+    pub fn for_routing_refusal(
+        refusal: &crate::audit::request_events::RoutingRefusal,
+        id: Option<JsonValue>,
+    ) -> Box<Self> {
+        Box::new(Self {
+            status: refusal.status(),
+            id,
+            code: error_codes::INTERNAL_ERROR,
+            message: refusal.message().to_string(),
+            data: None,
+        })
+    }
+
     pub fn into_response(self) -> axum::response::Response {
         super::errors::create_mcp_error_response_with_status(self.status, self.id, self.code, &self.message, self.data)
     }
+}
+
+/// The JSON-RPC `id` of a request body, when the body is one JSON object
+/// carrying a valid id.
+pub(crate) fn request_id_from_bytes(body: &[u8]) -> Option<JsonValue> {
+    serde_json::from_slice::<JsonValue>(body)
+        .ok()
+        .and_then(|body| {
+            body.as_object()
+                .and_then(recover_request_id)
+        })
+}
+
+/// How much of a refused request's body is read for its JSON-RPC `id`. The
+/// read runs at routing, before source auth and rate limiting, so the bytes a
+/// caller can make the gateway buffer for a request it has already refused are
+/// bounded here, independently of the endpoint's `max_request_bytes`. The `id`
+/// of any real envelope sits well inside 16 KiB; a larger body is answered
+/// without one, as a body that can't be read is.
+pub const ROUTING_REFUSAL_ID_READ_LIMIT: usize = 16 * 1024;
+
+/// How long a refused request's body is read for its JSON-RPC `id`. The read
+/// runs before source auth and rate limiting, so a caller that names a variant
+/// the surface can't serve and then trickles or stalls its body would otherwise
+/// keep the refusal, and its connection, pending for as long as it likes. A
+/// real client sends its envelope at once; a body not read by then is answered
+/// without an `id`, as one that is too large is.
+pub const ROUTING_REFUSAL_ID_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Answers a modern MCP request refused at routing with
+/// [`McpRequestValidationError::for_routing_refusal`]. `body`, when given, is
+/// read only for the request's `id`, within the endpoint's MCP body limit (from
+/// `mcp_http`, `public_endpoints` and `versions`, as the endpoint builds its
+/// [`super::modern_http::EndpointHttpPolicy`]) and
+/// [`ROUTING_REFUSAL_ID_READ_TIMEOUT`]. An endpoint policy that can't be built,
+/// or a body that can't be read in time, is answered without an `id`.
+pub(crate) async fn answer_routing_refusal(
+    refusal: &crate::audit::request_events::RoutingRefusal,
+    mcp_http: Option<&crate::config::McpHttpConfig>,
+    public_endpoints: &[String],
+    versions: McpVersionPolicy<'static>,
+    body: Option<axum::body::Body>,
+) -> axum::response::Response {
+    let limit = super::modern_http::EndpointHttpPolicy::with_versions(mcp_http, public_endpoints, versions)
+        .map(|policy| policy.body_limit());
+    let id = match (body, limit) {
+        (Some(body), Ok(limit)) => read_request_id(body, limit).await,
+        _ => None,
+    };
+    (*McpRequestValidationError::for_routing_refusal(refusal, id)).into_response()
+}
+
+/// Reads a refused request's body, within `limit`,
+/// [`ROUTING_REFUSAL_ID_READ_LIMIT`] and [`ROUTING_REFUSAL_ID_READ_TIMEOUT`],
+/// for its JSON-RPC `id`; `None` when the body is larger, isn't read in time,
+/// can't be read or carries no id.
+async fn read_request_id(
+    body: axum::body::Body,
+    limit: usize,
+) -> Option<JsonValue> {
+    let body = tokio::time::timeout(
+        ROUTING_REFUSAL_ID_READ_TIMEOUT,
+        axum::body::to_bytes(body, limit.min(ROUTING_REFUSAL_ID_READ_LIMIT)),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    request_id_from_bytes(&body)
 }
 
 pub fn malformed_transport_header(
     body_bytes: &[u8],
     message: impl Into<String>,
 ) -> Box<McpRequestValidationError> {
-    let id = serde_json::from_slice::<JsonValue>(body_bytes)
-        .ok()
-        .and_then(|body| {
-            body.as_object()
-                .and_then(recover_request_id)
-        });
-    header_mismatch(id, message)
+    header_mismatch(request_id_from_bytes(body_bytes), message)
 }
 
 pub fn validate_mcp_post(
@@ -649,7 +727,7 @@ fn validate_modern_message(
     })))
 }
 
-pub(super) fn recover_request_id(object: &Map<String, JsonValue>) -> Option<JsonValue> {
+fn recover_request_id(object: &Map<String, JsonValue>) -> Option<JsonValue> {
     object
         .get("id")
         .filter(|value| is_valid_request_id(value))
@@ -674,7 +752,7 @@ fn has_session_header(
         && versions.next().is_none()
 }
 
-fn has_modern_header(
+pub(crate) fn has_modern_header(
     headers: &HeaderMap,
     policy: McpVersionPolicy<'_>,
 ) -> bool {
@@ -2109,5 +2187,61 @@ mod tests {
         .unwrap();
         let result = validate_mcp_post(&HeaderMap::new(), &body, LegacySessionEvidence::Absent, LEGACY_ONLY_POLICY);
         assert_eq!(result, Ok(McpRequestClassification::Legacy(LegacyRequestKind::Compatibility)));
+    }
+
+    #[test]
+    fn a_request_id_is_read_from_a_json_rpc_object_only() {
+        let id = |body: &[u8]| request_id_from_bytes(body);
+        assert_eq!(id(br#"{"jsonrpc":"2.0","id":"abc","method":"tools/list"}"#), Some(json!("abc")));
+        assert_eq!(id(br#"{"jsonrpc":"2.0","id":7,"method":"tools/list"}"#), Some(json!(7)));
+        assert_eq!(id(br#"{"jsonrpc":"2.0","id":null,"method":"tools/list"}"#), None);
+        assert_eq!(id(br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#), None);
+        assert_eq!(id(br#"[{"jsonrpc":"2.0","id":1,"method":"tools/list"}]"#), None);
+        assert_eq!(id(b"not json"), None);
+    }
+
+    #[tokio::test]
+    async fn a_refused_requests_id_is_read_within_sixteen_kib_and_any_smaller_endpoint_limit() {
+        let body = |bytes: usize| {
+            let mut envelope = json!({"jsonrpc": "2.0", "id": "variant", "method": "tools/list", "params": {}});
+            let padding = bytes - envelope.to_string().len() - r#""padding":"""#.len();
+            envelope["params"]["padding"] = json!("x".repeat(padding));
+            let body = envelope.to_string();
+            assert_eq!(body.len(), bytes);
+            axum::body::Body::from(body)
+        };
+        let one_mib = 1024 * 1024;
+
+        assert_eq!(read_request_id(body(20 * 1024), one_mib).await, None, "over the cap");
+        assert_eq!(read_request_id(body(16 * 1024), one_mib).await, Some(json!("variant")), "at the cap");
+        assert_eq!(read_request_id(body(1024), 64).await, None, "a smaller endpoint limit wins");
+    }
+
+    #[test]
+    fn a_routing_refusal_answers_internal_error_with_its_status_and_the_request_id() {
+        use crate::config::agent_surface_variants::VariantResolveError;
+        let facts = crate::audit::request_events::RequestFacts {
+            surface_id: "tools",
+            channel_name: "Tools",
+            trace_id: None,
+            via_fabric: false,
+        };
+        let cases = [
+            (VariantResolveError::UnknownAlias("missing".into()), StatusCode::NOT_FOUND),
+            (VariantResolveError::DisabledVariant("off".into()), StatusCode::NOT_FOUND),
+            (VariantResolveError::MisconfiguredDefault("removed".into()), StatusCode::INTERNAL_SERVER_ERROR),
+        ];
+        for (error, status) in cases {
+            let refusal = crate::audit::request_events::refuse_routing(&facts, &error, Some(-32603));
+            for id in [Some(json!("variant")), None] {
+                let answer = McpRequestValidationError::for_routing_refusal(&refusal, id.clone());
+
+                assert_eq!(answer.status, status, "{error}");
+                assert_eq!(answer.code, error_codes::INTERNAL_ERROR, "{error}");
+                assert_eq!(answer.message, refusal.message(), "{error}");
+                assert_eq!(answer.id, id, "{error}");
+                assert_eq!(answer.data, None, "{error}");
+            }
+        }
     }
 }

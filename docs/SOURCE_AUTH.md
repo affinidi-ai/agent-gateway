@@ -136,6 +136,10 @@ sequenceDiagram
 when its `iat` is more than 120 seconds in the future. The backdating allowance is
 wider, at 30 times that value.
 
+Sessions are kept in the `didauth` subdirectory of `[storage_paths] sessions`, apart
+from dashboard sessions. At startup the gateway moves any DID Auth session files it
+finds in `sessions` itself into that subdirectory.
+
 Workload Binding supports `caller_source: did`, which tags the Workload Binding
 presentation with the caller's identity hash as `user_hash` (see
 [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-callers-identity-hash)).

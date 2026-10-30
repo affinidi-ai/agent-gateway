@@ -3,6 +3,7 @@
 //! Types for the Machine Payments Protocol (MPP), following the IETF
 //! draft-httpauth-payment-00 specification.
 
+use crate::observability::loggable;
 use serde::{Deserialize, Serialize};
 
 /// Verification mode for crypto payment proofs.
@@ -48,7 +49,7 @@ pub struct MppPaymentMethod {
 }
 
 /// MPP channel configuration (stored in `mpp_policy` on a channel)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct MppConfig {
     /// Whether MPP payments are required for this channel
     #[serde(default = "default_true")]
@@ -131,6 +132,39 @@ impl Default for MppConfig {
             rpc_endpoints: std::collections::HashMap::new(),
             min_confirmations: 0,
         }
+    }
+}
+
+impl std::fmt::Debug for MppConfig {
+    fn fmt(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        let rpc_endpoint_origins: std::collections::BTreeMap<&str, String> = self
+            .rpc_endpoints
+            .iter()
+            .map(|(network, url)| (network.as_str(), loggable::origin(url)))
+            .collect();
+        f.debug_struct("MppConfig")
+            .field("enabled", &self.enabled)
+            .field("realm", &self.realm)
+            .field("secret_key", &loggable::REDACTED)
+            .field(
+                "stripe_secret_key",
+                &self
+                    .stripe_secret_key
+                    .as_ref()
+                    .map(|_| loggable::REDACTED),
+            )
+            .field("payment_methods", &self.payment_methods)
+            .field("challenge_ttl_seconds", &self.challenge_ttl_seconds)
+            .field("mcp_payment_triggers", &self.mcp_payment_triggers)
+            .field("a2a_method_filters", &self.a2a_method_filters)
+            .field("verification_timeout_ms", &self.verification_timeout_ms)
+            .field("crypto_verification_mode", &self.crypto_verification_mode)
+            .field("rpc_endpoints", &rpc_endpoint_origins)
+            .field("min_confirmations", &self.min_confirmations)
+            .finish()
     }
 }
 
@@ -571,6 +605,37 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("realm is empty"))
         );
+    }
+
+    #[test]
+    fn test_mpp_config_debug_redacts_secret_keys_and_rpc_paths() {
+        let config = MppConfig {
+            realm: "api.example.com".to_string(),
+            secret_key: "bXBwLWhtYWMtc2VjcmV0LWtleQ==".to_string(),
+            stripe_secret_key: Some("stripe-secret-marker".to_string()),
+            rpc_endpoints: std::collections::HashMap::from([(
+                "eip155:8453".to_string(),
+                "https://base-mainnet.example.com/v2/rpc-provider-key".to_string(),
+            )]),
+            ..Default::default()
+        };
+
+        let rendered = format!("{config:?}");
+
+        assert!(!rendered.contains("bXBwLWhtYWMtc2VjcmV0LWtleQ=="), "{rendered}");
+        assert!(!rendered.contains("stripe-secret-marker"), "{rendered}");
+        assert!(!rendered.contains("rpc-provider-key"), "{rendered}");
+        assert!(rendered.contains("secret_key: \"<redacted>\""), "{rendered}");
+        assert!(rendered.contains("stripe_secret_key: Some(\"<redacted>\")"), "{rendered}");
+        assert!(rendered.contains("\"eip155:8453\": \"https://base-mainnet.example.com\""), "{rendered}");
+        assert!(rendered.contains("realm: \"api.example.com\""), "{rendered}");
+    }
+
+    #[test]
+    fn test_mpp_config_debug_shows_absent_stripe_key_as_none() {
+        let rendered = format!("{:?}", MppConfig::default());
+
+        assert!(rendered.contains("stripe_secret_key: None"), "{rendered}");
     }
 
     #[test]

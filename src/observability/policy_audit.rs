@@ -98,17 +98,40 @@ tokio::task_local! {
     /// when no OTEL exporter is configured. Absent elsewhere (`try_with` errs).
     pub static REQUEST_TRACE_ID: String;
 
-    /// Id of the gateway request being served, installed at each entry point
+    /// The gateway request being served, installed at each entry point
     /// (Access Point, Transit Point, fabric receive, authenticated management
-    /// API request) and stamped on every audit
-    /// record the request produces. Always minted here, never read from a
-    /// header or token.
-    pub static REQUEST_ID: String;
+    /// API request). Its id and variant are stamped on every audit record the
+    /// request produces.
+    static REQUEST: Arc<RequestScope>;
+}
+
+/// One gateway request: its id, minted here and never read from a header or
+/// token, and the surface variant routing resolved it to, set once routing
+/// knows it.
+#[derive(Debug)]
+pub struct RequestScope {
+    id: String,
+    variant: std::sync::OnceLock<String>,
+}
+
+impl RequestScope {
+    /// A request with id `id` and no variant yet.
+    pub fn new(id: String) -> Arc<Self> {
+        Arc::new(Self {
+            id,
+            variant: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// A request with a fresh id.
+    pub fn fresh() -> Arc<Self> {
+        Self::new(new_request_id())
+    }
 }
 
 /// A fresh request id: a W3C span id (16 lowercase hex characters, never all
 /// zero).
-pub fn new_request_id() -> String {
+fn new_request_id() -> String {
     loop {
         let bytes = rand::random::<[u8; 8]>();
         if bytes != [0u8; 8] {
@@ -119,29 +142,70 @@ pub fn new_request_id() -> String {
 
 /// The id of the request being served, when an entry point scoped one.
 pub fn current_request_id() -> Option<String> {
-    REQUEST_ID
-        .try_with(String::clone)
+    REQUEST
+        .try_with(|scope| scope.id.clone())
         .ok()
 }
 
-/// Runs `future` as request `id`: every audit record it writes carries the id.
-/// An entry point serves its request through this and passes the response to
-/// [`response_in_request`].
+/// Records the surface variant the request being served resolved to, and
+/// stamps it on the current span as `surface.variant`. Only surface routing
+/// calls this, while the request span is current; the first value set is
+/// kept. Does nothing outside a request.
+pub fn set_request_variant(variant: &str) {
+    let first = REQUEST
+        .try_with(|scope| {
+            scope
+                .variant
+                .set(variant.to_string())
+                .is_ok()
+        })
+        .unwrap_or(false);
+    if first {
+        tracing::Span::current().record("surface.variant", variant);
+    }
+}
+
+/// The surface variant the request being served resolved to, when routing
+/// set one.
+pub fn current_request_variant() -> Option<String> {
+    REQUEST
+        .try_with(|scope| scope.variant.get().cloned())
+        .ok()
+        .flatten()
+}
+
+/// Runs `f` as a request that resolved to surface variant `variant`.
+#[cfg(test)]
+pub fn with_request_variant<R>(
+    variant: &str,
+    f: impl FnOnce() -> R,
+) -> R {
+    let scope = RequestScope::fresh();
+    let _ = scope
+        .variant
+        .set(variant.to_string());
+    REQUEST.sync_scope(scope, f)
+}
+
+/// Runs `future` as request `scope`: every audit record it writes carries
+/// the request's id and variant. An entry point serves its request through
+/// this and passes the response to [`response_in_request`].
 pub async fn in_request<F: std::future::Future>(
-    id: String,
+    scope: Arc<RequestScope>,
     future: F,
 ) -> F::Output {
-    REQUEST_ID
-        .scope(id, future)
+    REQUEST
+        .scope(scope, future)
         .await
 }
 
-/// `response` with a streamed body read as request `id`. A streamed body (an
-/// SSE stream) is read after its handler returned, outside the handler's
-/// scope, so the records written per event would otherwise lose the id. A
-/// body of known length is left as it is.
+/// `response` with a streamed body read and dropped as request `scope`. A
+/// streamed body (an SSE stream) is read after its handler returned, outside
+/// the handler's scope, so the records written per event, and those its
+/// observers write when a client disconnects and the body is dropped, would
+/// otherwise lose the request. A body of known length is left as it is.
 pub fn response_in_request(
-    id: String,
+    scope: Arc<RequestScope>,
     response: axum::response::Response,
 ) -> axum::response::Response {
     use axum::body::HttpBody;
@@ -156,23 +220,49 @@ pub fn response_in_request(
         return response;
     }
     response.map(|body| {
-        let mut data = body.into_data_stream();
+        let mut guard = DroppedInRequest {
+            data: Some(body.into_data_stream()),
+            scope,
+        };
         axum::body::Body::from_stream(futures::stream::poll_fn(move |cx| {
-            REQUEST_ID.sync_scope(id.clone(), || data.poll_next_unpin(cx))
+            let DroppedInRequest { data, scope } = &mut guard;
+            REQUEST.sync_scope(Arc::clone(scope), || match data.as_mut() {
+                Some(data) => data.poll_next_unpin(cx),
+                None => std::task::Poll::Ready(None),
+            })
         }))
     })
 }
 
+/// A streamed body that is dropped inside its request's scope, wherever the
+/// drop happens.
+struct DroppedInRequest<S> {
+    data: Option<S>,
+    scope: Arc<RequestScope>,
+}
+
+impl<S> Drop for DroppedInRequest<S> {
+    fn drop(&mut self) {
+        // Entering the scope can panic, and a panic while unwinding aborts.
+        if std::thread::panicking() {
+            return;
+        }
+        let data = self.data.take();
+        REQUEST.sync_scope(Arc::clone(&self.scope), move || drop(data));
+    }
+}
+
 /// Spawns `future` as the request being served, so the audit records it
-/// writes carry the request's id, as the task-local does not cross a spawn.
+/// writes carry the request's id and variant, as the task-local does not
+/// cross a spawn.
 pub fn spawn_in_request<F>(future: F) -> tokio::task::JoinHandle<F::Output>
 where
     F: std::future::Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    match current_request_id() {
-        Some(id) => tokio::spawn(REQUEST_ID.scope(id, future)),
-        None => tokio::spawn(future),
+    match REQUEST.try_with(Arc::clone) {
+        Ok(scope) => tokio::spawn(REQUEST.scope(scope, future)),
+        Err(_) => tokio::spawn(future),
     }
 }
 
@@ -486,6 +576,7 @@ pub fn record_policy_decision(event: PolicyDecisionEvent<'_>) {
         .policy_content_hash
         .unwrap_or_default();
     let policy_name = decision_policy_name(&event);
+    let surface_variant = current_request_variant();
 
     if allowed {
         tracing::debug!(
@@ -497,6 +588,7 @@ pub fn record_policy_decision(event: PolicyDecisionEvent<'_>) {
             policy_definition_id = policy_definition_id,
             deny_reason = reason,
             surface_id = surface_id,
+            surface_variant = surface_variant.as_deref(),
             gateway_did = gateway_did,
             actor_did = caller_did.as_str(),
             caller_auth_method = auth_method,
@@ -519,6 +611,7 @@ pub fn record_policy_decision(event: PolicyDecisionEvent<'_>) {
             policy_definition_id = policy_definition_id,
             deny_reason = reason,
             surface_id = surface_id,
+            surface_variant = surface_variant.as_deref(),
             gateway_did = gateway_did,
             actor_did = caller_did.as_str(),
             caller_auth_method = auth_method,
@@ -661,14 +754,47 @@ mod tests {
         assert!(thirteenth.len() > 1, "every character is random, none fixed by a UUID version");
     }
 
+    fn request(id: &str) -> Arc<RequestScope> {
+        RequestScope::new(id.to_string())
+    }
+
     #[tokio::test]
     async fn the_current_request_id_is_the_scoped_one_and_none_outside() {
         assert_eq!(current_request_id(), None);
-        REQUEST_ID
-            .scope("0123456789abcdef".to_string(), async {
-                assert_eq!(current_request_id().as_deref(), Some("0123456789abcdef"));
-            })
-            .await;
+        in_request(request("0123456789abcdef"), async {
+            assert_eq!(current_request_id().as_deref(), Some("0123456789abcdef"));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_variant_set_in_a_request_is_read_back() {
+        let variant = in_request(request("0123456789abcdef"), async {
+            assert_eq!(current_request_variant(), None, "routing has not set it yet");
+            set_request_variant("beta");
+            current_request_variant()
+        })
+        .await;
+
+        assert_eq!(variant.as_deref(), Some("beta"));
+    }
+
+    #[tokio::test]
+    async fn a_second_variant_set_in_a_request_is_ignored() {
+        let variant = in_request(request("0123456789abcdef"), async {
+            set_request_variant("beta");
+            set_request_variant("_base_");
+            current_request_variant()
+        })
+        .await;
+
+        assert_eq!(variant.as_deref(), Some("beta"));
+    }
+
+    #[test]
+    fn outside_a_request_there_is_no_variant() {
+        set_request_variant("beta");
+        assert_eq!(current_request_variant(), None);
     }
 
     #[tokio::test]
@@ -676,17 +802,102 @@ mod tests {
         use futures::StreamExt;
 
         let chunks = futures::stream::repeat_with(|| {
-            Ok::<_, std::convert::Infallible>(bytes::Bytes::from(current_request_id().unwrap_or_default()))
+            Ok::<_, std::convert::Infallible>(bytes::Bytes::from(format!(
+                "{}:{};",
+                current_request_id().unwrap_or_default(),
+                current_request_variant().unwrap_or_default()
+            )))
         })
         .take(2);
         let response = axum::response::Response::new(axum::body::Body::from_stream(chunks));
+        let scope = request("0123456789abcdef");
+        in_request(scope.clone(), async { set_request_variant("beta") }).await;
 
-        let response = response_in_request("0123456789abcdef".to_string(), response);
+        let response = response_in_request(scope, response);
         let body = axum::body::to_bytes(response.into_body(), 64)
             .await
             .unwrap();
 
-        assert_eq!(body, "0123456789abcdef0123456789abcdef");
+        assert_eq!(body, "0123456789abcdef:beta;0123456789abcdef:beta;");
+    }
+
+    #[tokio::test]
+    async fn a_streamed_body_dropped_before_its_end_is_dropped_as_its_request() {
+        use futures::StreamExt;
+        use http_body_util::BodyExt;
+
+        type Seen = Arc<Mutex<Option<(Option<String>, Option<String>)>>>;
+        struct RecordOnDrop(Seen);
+        impl Drop for RecordOnDrop {
+            fn drop(&mut self) {
+                *self.0.lock().unwrap() = Some((current_request_id(), current_request_variant()));
+            }
+        }
+        let seen = Seen::default();
+        let observer = RecordOnDrop(Arc::clone(&seen));
+        let chunks = futures::stream::once(async { Ok::<_, std::convert::Infallible>(bytes::Bytes::from("event")) })
+            .chain(futures::stream::pending())
+            .map(move |chunk| {
+                let _ = &observer;
+                chunk
+            });
+        let response = axum::response::Response::new(axum::body::Body::from_stream(chunks));
+        let scope = request("0123456789abcdef");
+        in_request(scope.clone(), async { set_request_variant("beta") }).await;
+        let mut body = response_in_request(scope, response).into_body();
+        let first = body
+            .frame()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.into_data().unwrap(), "event");
+
+        drop(body);
+
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            Some((Some("0123456789abcdef".to_string()), Some("beta".to_string())))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_streamed_body_dropped_while_panicking_is_dropped_outside_its_request() {
+        use futures::StreamExt;
+
+        type Seen = Arc<Mutex<Option<Option<String>>>>;
+        struct RecordOnDrop(Seen);
+        impl Drop for RecordOnDrop {
+            fn drop(&mut self) {
+                *self
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(current_request_variant());
+            }
+        }
+        let seen = Seen::default();
+        let observer = RecordOnDrop(Arc::clone(&seen));
+        let chunks = futures::stream::pending::<Result<bytes::Bytes, std::convert::Infallible>>().map(move |chunk| {
+            let _ = &observer;
+            chunk
+        });
+        let response = axum::response::Response::new(axum::body::Body::from_stream(chunks));
+        let scope = request("0123456789abcdef");
+        in_request(scope.clone(), async { set_request_variant("beta") }).await;
+        let body = response_in_request(scope, response).into_body();
+
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _body = body;
+            panic!("the request handler panics while holding its body");
+        }));
+
+        assert!(unwound.is_err(), "the panic is caught, not turned into an abort");
+        assert_eq!(
+            seen.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            Some(None),
+            "a body dropped during unwinding never enters the request scope"
+        );
     }
 
     #[test]
@@ -694,7 +905,7 @@ mod tests {
         use axum::body::HttpBody;
 
         let response = axum::response::Response::new(axum::body::Body::from("{}"));
-        let response = response_in_request("0123456789abcdef".to_string(), response);
+        let response = response_in_request(request("0123456789abcdef"), response);
 
         assert_eq!(
             response
@@ -706,19 +917,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_task_spawned_in_a_request_keeps_its_id() {
-        let spawned = in_request("0123456789abcdef".to_string(), async {
-            spawn_in_request(async { current_request_id() })
+    async fn a_task_spawned_in_a_request_keeps_its_id_and_variant() {
+        let spawned = in_request(request("0123456789abcdef"), async {
+            set_request_variant("beta");
+            spawn_in_request(async { (current_request_id(), current_request_variant()) })
                 .await
                 .unwrap()
         })
         .await;
-        let outside = spawn_in_request(async { current_request_id() })
+        let outside = spawn_in_request(async { (current_request_id(), current_request_variant()) })
             .await
             .unwrap();
 
-        assert_eq!(spawned.as_deref(), Some("0123456789abcdef"));
-        assert_eq!(outside, None);
+        assert_eq!(spawned, (Some("0123456789abcdef".to_string()), Some("beta".to_string())));
+        assert_eq!(outside, (None, None));
     }
 
     #[test]
@@ -952,27 +1164,29 @@ mod tests {
                 key_name: "alpha-key".to_string(),
                 provider_agent_id: None,
             };
-            record_policy_decision(PolicyDecisionEvent {
-                scope: PolicyScope::Surface,
-                allow: false,
-                reason: Some("trust check failed"),
-                policy_id: Some("pol-7"),
-                policy_definition_id: Some("def-uuid-7"),
-                policy_name: None,
-                surface_id: Some("surface-a"),
-                surface_name: Some("Surface A"),
-                trace_id: Some("trace-xyz"),
-                http_method: Some("POST"),
-                path: Some("/v1/agent"),
-                identity: Some(&identity),
-                actor_did: Some("did:example:agent"),
-                gateway_did: Some("did:web:gw1"),
-                flow: PolicyFlow::TransitPoint,
-                policy_version: Some(3),
-                policy_content_hash: Some("sha256:abc123"),
-                caller: None,
-                error: None,
-                removed_tools: None,
+            with_request_variant("beta", || {
+                record_policy_decision(PolicyDecisionEvent {
+                    scope: PolicyScope::Surface,
+                    allow: false,
+                    reason: Some("trust check failed"),
+                    policy_id: Some("pol-7"),
+                    policy_definition_id: Some("def-uuid-7"),
+                    policy_name: None,
+                    surface_id: Some("surface-a"),
+                    surface_name: Some("Surface A"),
+                    trace_id: Some("trace-xyz"),
+                    http_method: Some("POST"),
+                    path: Some("/v1/agent"),
+                    identity: Some(&identity),
+                    actor_did: Some("did:example:agent"),
+                    gateway_did: Some("did:web:gw1"),
+                    flow: PolicyFlow::TransitPoint,
+                    policy_version: Some(3),
+                    policy_content_hash: Some("sha256:abc123"),
+                    caller: None,
+                    error: None,
+                    removed_tools: None,
+                })
             });
         });
 
@@ -983,6 +1197,7 @@ mod tests {
             .expect("policy decision event not captured");
 
         assert_eq!(ev.level, "WARN");
+        assert_eq!(field(ev, "surface_variant"), Some("beta"));
         assert_eq!(field(ev, "policy_decision"), Some("deny"));
         assert_eq!(field(ev, "policy_flow"), Some("transit_point"));
         assert_eq!(field(ev, "deny_reason"), Some("trust check failed"));
@@ -1252,6 +1467,31 @@ mod tests {
 
         assert_eq!(ev.level, "DEBUG");
         assert_eq!(field(ev, "policy_decision"), Some("allow"));
+        assert_eq!(field(ev, "surface_variant"), None, "outside a request there is no variant");
+    }
+
+    #[test]
+    fn an_allow_line_names_the_request_variant() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(CapturingLayer { events: events.clone() });
+
+        tracing::subscriber::with_default(subscriber, || {
+            with_request_variant("_base_", || {
+                record_policy_decision(PolicyDecisionEvent {
+                    scope: PolicyScope::Gateway,
+                    allow: true,
+                    surface_id: Some("surface-b"),
+                    ..Default::default()
+                })
+            });
+        });
+
+        let captured = events.lock().unwrap();
+        let ev = captured
+            .iter()
+            .find(|e| field(e, "policy_scope") == Some("gateway"))
+            .expect("allow decision event not captured");
+        assert_eq!(field(ev, "surface_variant"), Some("_base_"));
     }
 
     #[test]

@@ -215,18 +215,6 @@ pub async fn prepare_transit(
         .ok_or(ContinuationError::BindingMismatch)?;
     let agent_did =
         crate::proxy::outbound_handler::delegation_agent_did(context).ok_or(ContinuationError::BindingMismatch)?;
-    if context
-        .variant_resolution_error
-        .is_some()
-        || (context
-            .active_variant_alias
-            .is_some()
-            && context
-                .active_variant_id
-                .is_none())
-    {
-        return Err(ContinuationError::BindingMismatch.into());
-    }
     let variant_id = context
         .active_variant_id
         .clone();

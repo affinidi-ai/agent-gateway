@@ -45,7 +45,13 @@ pub(crate) enum UpstreamBodyError {
     #[error("upstream response body stalled or exceeded its read deadline")]
     TimedOut,
     #[error("failed to read upstream response: {0}")]
-    Read(#[from] reqwest::Error),
+    Read(reqwest::Error),
+}
+
+impl From<reqwest::Error> for UpstreamBodyError {
+    fn from(error: reqwest::Error) -> Self {
+        Self::Read(error.without_url())
+    }
 }
 
 impl UpstreamBodyError {
@@ -126,7 +132,7 @@ impl BoundedChunks {
             if error.is_timeout() {
                 UpstreamBodyError::TimedOut
             } else {
-                UpstreamBodyError::Read(error)
+                UpstreamBodyError::from(error)
             }
         })?;
         let Some(chunk) = chunk else {

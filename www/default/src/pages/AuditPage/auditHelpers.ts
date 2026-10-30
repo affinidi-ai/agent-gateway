@@ -6,6 +6,7 @@ import {
   type PolicyChangeData,
   type PolicyChangeEvent,
   type PolicyDecisionData,
+  type RequestRejectedData,
   type TraceTerminatedData,
   type TrustCheckData,
   type WorkloadIntent,
@@ -224,6 +225,18 @@ export function traceTerminated(entry: AuditEntry): TraceTerminatedData | null {
   return null;
 }
 
+/** Extracts the RequestRejected payload if present, else null */
+export function requestRejected(entry: AuditEntry): RequestRejectedData | null {
+  if (
+    typeof entry.event === 'object' &&
+    entry.event !== null &&
+    'request_rejected' in entry.event
+  ) {
+    return (entry.event as { request_rejected: RequestRejectedData }).request_rejected;
+  }
+  return null;
+}
+
 /** Extracts a policy change event's name and body if present, else null */
 export function policyChange(
   entry: AuditEntry
@@ -232,7 +245,12 @@ export function policyChange(
   const event = entry.event as Partial<Record<PolicyChangeEvent, PolicyChangeData>>;
   for (const name of POLICY_CHANGE_EVENTS) {
     const change = event[name];
-    if (change) return { name, change };
+    if (change) {
+      return {
+        name,
+        change: { ...change, surface_variant: change.surface_variant ?? change.variant },
+      };
+    }
   }
   return null;
 }

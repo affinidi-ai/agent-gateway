@@ -65,7 +65,7 @@ pub struct X402WalletConfig {
 }
 
 /// Wallet binding for a specific network
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct WalletBinding {
     /// Network identifier (must match a NetworkDefinition.id)
     pub network: String,
@@ -78,6 +78,20 @@ pub struct WalletBinding {
 
     /// Supported token symbols with priority
     pub symbols: Vec<SymbolConfig>,
+}
+
+impl std::fmt::Debug for WalletBinding {
+    fn fmt(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        f.debug_struct("WalletBinding")
+            .field("network", &self.network)
+            .field("address", &self.address)
+            .field("private_key", &crate::observability::loggable::REDACTED)
+            .field("symbols", &self.symbols)
+            .finish()
+    }
 }
 
 impl WalletBinding {
@@ -182,4 +196,33 @@ pub fn load_x402_proxy_config(bootstrap_config: &crate::config::BootstrapConfig)
         .config_files
         .x402_proxy;
     X402ProxyConfig::from_file(config_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SymbolConfig, WalletBinding};
+
+    #[test]
+    fn wallet_binding_debug_redacts_private_key() {
+        let binding = WalletBinding {
+            network: "eip155:8453".to_string(),
+            address: "0x2c7536E3605D9C16a7a3D7b1898e529396a65c23".to_string(),
+            private_key: "test-private-key-marker".to_string(),
+            symbols: vec![SymbolConfig {
+                symbol: "USDC".to_string(),
+                priority: 1,
+                token_address: None,
+                decimals: Some(6),
+                usd_price: None,
+            }],
+        };
+
+        let rendered = format!("{binding:?}");
+
+        assert!(!rendered.contains("test-private-key-marker"), "{rendered}");
+        assert!(rendered.contains("private_key: \"<redacted>\""), "{rendered}");
+        assert!(rendered.contains("0x2c7536E3605D9C16a7a3D7b1898e529396a65c23"), "{rendered}");
+        assert!(rendered.contains("eip155:8453"), "{rendered}");
+        assert!(rendered.contains("USDC"), "{rendered}");
+    }
 }

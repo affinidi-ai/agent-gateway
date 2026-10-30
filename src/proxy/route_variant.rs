@@ -66,9 +66,8 @@ pub fn parse_route_with_variant<'a>(
 /// Returns `None` when `path` does not match `route` at all, otherwise
 /// `Some(alias_or_none)` where `None` means "default variant".
 ///
-/// This is the single helper the inbound handler, the outbound handler,
-/// and the cross-hop ForwardRequest builder all share so the alias-extraction
-/// rules stay consistent (plan §2.3 + §4.4).
+/// The alias names a variant of this gateway's surface only: a request over
+/// Fabric carries the alias its `fabric://` Target pins, never this one.
 pub fn extract_variant_alias_for_route(
     path: &str,
     route: &str,
@@ -179,11 +178,9 @@ mod tests {
 
     // ── extract_variant_alias_for_route ─────────────────────────────────────
     //
-    // These tests pin down the cross-hop carrier (plan §4.4): the value GW1
-    // places into `ForwardRequest.body.active_variant_alias` MUST be the
-    // alias parsed from the request URL — and `None` for the default
-    // variant — regardless of how the channel author wrote the route in
-    // config (with/without leading slash, special `/` catch-all).
+    // The alias parsed from the request URL, and `None` for the default
+    // variant, however the route is written in config (with or without a
+    // leading slash, the `/` catch-all).
 
     #[test]
     fn carrier_default_variant_emits_none() {
@@ -219,41 +216,7 @@ mod tests {
     #[test]
     fn carrier_path_does_not_match_route_returns_none() {
         // Distinguishes "default variant" (Some(None)) from "route mismatch"
-        // (None). The cross-hop builder uses `.and_then(|a| a)` to flatten
-        // both into "no alias to forward", which is the correct behaviour
-        // when the request didn't actually hit the channel.
+        // (None).
         assert_eq!(extract_variant_alias_for_route("/other/path", "/api/sales"), None);
-    }
-
-    #[test]
-    fn carrier_round_trips_through_forward_request_json() {
-        // This is the cross-hop wire-shape contract enforced by plan §4.4:
-        // both the legacy `virtual_channel_alias` and the spec-aligned
-        // `active_variant_alias` MUST be present and carry the same value.
-        // GW2 prefers the new field but falls back to the legacy one.
-        let alias = extract_variant_alias_for_route("/api/sales$dev/v1", "/api/sales").and_then(|a| a);
-        assert_eq!(alias.as_deref(), Some("dev"));
-
-        let body = serde_json::json!({
-            "virtual_channel_alias": alias,
-            "active_variant_alias": alias,
-        });
-        assert_eq!(body["virtual_channel_alias"], "dev");
-        assert_eq!(body["active_variant_alias"], "dev");
-    }
-
-    #[test]
-    fn carrier_default_variant_round_trips_as_null() {
-        // The default-variant case MUST produce `null` (not omitted, not
-        // empty string) so GW2 can distinguish "default" from "missing".
-        let alias = extract_variant_alias_for_route("/api/sales/v1", "/api/sales").and_then(|a| a);
-        assert_eq!(alias, None);
-
-        let body = serde_json::json!({
-            "virtual_channel_alias": alias,
-            "active_variant_alias": alias,
-        });
-        assert_eq!(body["virtual_channel_alias"], serde_json::Value::Null);
-        assert_eq!(body["active_variant_alias"], serde_json::Value::Null);
     }
 }
