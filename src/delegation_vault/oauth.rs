@@ -1300,6 +1300,31 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_client_assertion_without_a_certificate_names_its_key_by_kid_only() {
+            let fixture = fixture().await;
+            let mut endpoint = token_endpoint(200, issued()).await;
+            let provider = provider(json!({
+                "provider_type": "oauth2_client_credentials_jwt_auth",
+                "client_id_secret_ref": "CLIENT_ID",
+                "jwt_signing_algorithm": "RS256",
+                "jwt_key_id": "key1"
+            }));
+            fetch_client_credentials_jwt_auth_token(&provider, &[], &fixture.secrets, &endpoint.client)
+                .await
+                .unwrap();
+            let form = endpoint
+                .requests
+                .recv()
+                .await
+                .unwrap();
+            let header = decode_header(&form["client_assertion"]).unwrap();
+            assert_eq!(header.alg, Algorithm::RS256);
+            assert_eq!(header.kid.as_deref(), Some("key1"));
+            assert_eq!(header.x5t_s256, None);
+            assert_eq!(claims(&form["client_assertion"], &fixture.key.public_pem, Algorithm::RS256)["iss"], "client-123");
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_refused_or_incomplete_token_response_is_an_error_without_key_material() {
             let fixture = fixture().await;
             let provider = provider(json!({"provider_type": "oauth2_jwt_bearer", "jwt_issuer": "sa@example"}));

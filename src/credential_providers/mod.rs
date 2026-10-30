@@ -92,7 +92,8 @@ pub struct JwtAssertionSettings {
     /// Secret holding the PEM private key (PKCS#1 or PKCS#8 for RSA, PKCS#8 for EC)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jwt_signing_key_secret_ref: Option<String>,
-    /// Secret holding the PEM certificate whose SHA-256 thumbprint goes in `x5t#S256`
+    /// Secret holding the PEM certificate whose SHA-256 thumbprint goes in `x5t#S256`;
+    /// optional, for issuers such as Entra that identify the key by certificate
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jwt_certificate_secret_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

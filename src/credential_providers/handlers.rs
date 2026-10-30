@@ -215,13 +215,6 @@ fn validate_jwt_provider(provider: &CredentialProvider) -> Result<(), ProviderVa
                     .jwt_signing_key_secret_ref
                     .as_deref(),
             ),
-            (
-                "jwt_certificate_secret_ref",
-                provider
-                    .jwt
-                    .jwt_certificate_secret_ref
-                    .as_deref(),
-            ),
         ],
         CredentialProviderType::OAuth2AuthorizationCode
         | CredentialProviderType::OAuth2ClientCredentials
@@ -1110,6 +1103,25 @@ mod jwt_provider_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_client_credentials_jwt_provider_needs_no_certificate() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let mut body = jwt_auth("ory");
+        body.as_object_mut()
+            .unwrap()
+            .remove("jwt_certificate_secret_ref");
+        body["jwt_key_id"] = json!("key1");
+        let (status, response) = create(&state, body).await;
+        assert_eq!(status, StatusCode::CREATED, "{response}");
+        assert!(
+            response
+                .get("jwt_certificate_secret_ref")
+                .is_none(),
+            "{response}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_client_credentials_jwt_provider_is_created_with_a_certificate() {
         let directory = tempfile::tempdir().unwrap();
         let state = with_key_material(&directory).await;
@@ -1128,7 +1140,6 @@ mod jwt_provider_tests {
             (jwt_bearer("b"), "jwt_signing_key_secret_ref"),
             (jwt_bearer("c"), "token_endpoint"),
             (jwt_auth("d"), "client_id_secret_ref"),
-            (jwt_auth("e"), "jwt_certificate_secret_ref"),
             (jwt_auth("f"), "jwt_signing_key_secret_ref"),
         ] {
             body.as_object_mut()
@@ -1277,12 +1288,20 @@ mod jwt_provider_tests {
             response["error"],
             "jwt_signing_key_secret_ref must reference a PEM private key matching jwt_signing_algorithm"
         );
-        let (status, response) = update(&state, id, json!({"jwt_certificate_secret_ref": " "})).await;
+        let (status, response) = update(&state, id, json!({"jwt_signing_key_secret_ref": " "})).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(response["error"], "jwt_certificate_secret_ref is required for this provider type");
+        assert_eq!(response["error"], "jwt_signing_key_secret_ref is required for this provider type");
         let (status, response) = update(&state, id, json!({"name": "Renamed"})).await;
         assert_eq!(status, StatusCode::OK, "{response}");
         assert_eq!(response["jwt_certificate_secret_ref"], "CERT");
+        let (status, response) = update(&state, id, json!({"jwt_certificate_secret_ref": " "})).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert!(
+            response
+                .get("jwt_certificate_secret_ref")
+                .is_none(),
+            "a blank certificate reference clears it: {response}"
+        );
     }
 
     /// A client whose every request reaches a local server that answers GET with 405, as a
