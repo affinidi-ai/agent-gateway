@@ -11,8 +11,11 @@
 
 ## Status
 
-Proposed. Decisions D1 to D5 are aligned with the owner's recommendation,
-pending recorded agreement.
+Accepted on 2026-10-30. Decisions D1 to D5 follow the recommendations of Anton Iskryzhytskyi
+and were agreed by Kajal Sinha. Two defaults inside D2, that an AP2 Access Point declares and that
+`scopes_supported` is the union of `required_scopes` and the extra stored scopes, are built but
+not agreed: Anton recommended A2A and MCP only, and both stay under
+[Open questions](#open-questions).
 
 Extends [1. Adopt OpenID Connect and OAuth 2.0 as a provider-neutral trust plane in Agent Gateway](0001-openid-oauth-agent-gateway.md).
 
@@ -25,7 +28,8 @@ ADR leaves it unchanged.
 Anton Iskryzhytskyi, who owns the MCP protected resource module
 (`src/protocols/protected_resource.rs`), recommended an outcome for each of D1 to D5: agree with
 D4 and D5, change D1 and D2, adjust D3, and have the sending gateway of a Fabric route answer a
-peer's authorization refusal itself. The gateway is built to those recommendations. The defaults
+peer's authorization refusal itself. Kajal Sinha agreed all five on 2026-10-30, and the gateway
+follows them. The defaults
 recorded earlier are kept under [Alternatives](#alternatives) as rejected options, with his
 reasons, and the code keeps each choice in the functions named under
 [Isolation points](#11-isolation-points), so a different outcome changes only those.
@@ -33,7 +37,7 @@ reasons, and the code keeps each choice in the functions named under
 | Decision | Decision taken | Section |
 | --- | --- | --- |
 | D1. When a failed caller of a declaring Access Point is refused | At source authentication on every protocol, in the order MCP already used: token check and `401`, scope check and `403`, before rate limiting, before the request body is read and before every policy plane, the AP2 gate and payment. Public paths are exempt. | [Decision 2](#2-failure-kind-and-the-source-auth-refusal) |
-| D2. How an Access Point declares | One explicit opt-in, `caller_authentication.protected_resource`, on MCP, A2A and AP2 Access Points. `resource` is explicit. The advertised authorization server is the strategy's `expected_issuer` and the advertised scopes start with `required_scopes`; the stored `authorization_servers` and `scopes` are optional. | [Decision 3](#3-the-declaration-and-its-outcomes) |
+| D2. How an Access Point declares | One explicit opt-in, `caller_authentication.protected_resource`, on MCP, A2A and AP2 Access Points (AP2 is a built default pending open question 2). `resource` is explicit. The advertised authorization server is the strategy's `expected_issuer` and the advertised scopes start with `required_scopes`, then each extra stored scope (a built default pending open question 3); the stored `authorization_servers` and `scopes` are optional. | [Decision 3](#3-the-declaration-and-its-outcomes) |
 | D3. Resource and audience | The stored, declared resource, validated at save against the listener's external URLs and the route; `<resource>$<alias>` per variant; a token is accepted when the resource is one of its `aud` values; one resolver for direct and Fabric requests | [Decision 4](#4-declared-resource-and-audience) |
 | D4. Fabric | Only the sending gateway declares and challenges. The receiving gateway refuses without a metadata URL. The sending gateway answers a peer `401`, and a peer `403` with `error="insufficient_scope"`, with `502` and a fixed detail, relays no `WWW-Authenticate` and audits the refusal, on MCP and A2A alike. | [Decision 9](#9-fabric-only-the-sending-gateway-challenges) |
 | D5. Surfaces saved through the API | Protected by the D1 refusal exactly as dashboard saves; no generated deny rule | [Decision 2](#2-failure-kind-and-the-source-auth-refusal) |
@@ -64,8 +68,8 @@ rule beside the MCP ones, and the card, the metadata and the validator could dri
 ADR 0001 exists to prevent.
 
 The owner of the MCP protected resource module then reviewed the defaults first built for D1 to
-D5. His recommendation is recorded as the decision; the earlier defaults are recorded as rejected
-alternatives.
+D5. His recommendation, agreed by Kajal Sinha, is the decision; the earlier defaults are recorded
+as rejected alternatives.
 
 ### Glossary
 
@@ -149,7 +153,7 @@ Each needs its own ADR if it is taken up.
 - **A policy override of the source-auth refusal** (alternative D1-D). A policy cannot admit a
   failed caller on a declaring Access Point.
 - **A network rule (IP allow or deny) that answers before source authentication.** Gateway
-  policy runs after it ([open question 7](#open-questions)).
+  policy runs after it ([open question 6](#open-questions)).
 - **Challenges on refusals that are not caller refusals:** 402, 413, 429, 501 (AP2 gate), 500,
   and MCP tool-policy denials returned as JSON-RPC errors keep their responses.
 - **A receiving gateway accepting the sending gateway's caller authentication** in place of its
@@ -208,7 +212,7 @@ least effort. Effort is in engineer-days. For D1 to D4 the option first built is
 | D2-A (earlier default, rejected) | A declaration derived from one pinned `jwt_bearer` method with `required_scopes` whose `audiences` contain the Access Point URL; an MCP `protected_resource` takes precedence as an explicit source | No setting beyond the method. Older releases load every surface. | Removing `required_scopes` silently turns the refusal and the `aud` binding off, and an API-saved surface without a deny rule then forwards failed tokens. A second trigger needs every save-time check of the explicit setting again. A `required_scopes` trigger cannot express discovery without scopes. | 5 |
 | D2-B | Explicit only, every field typed: `protected_resource` allowed on A2A with the `authorization_servers` the operator types | One mechanism | Typed issuers drift from the strategy: a strategy edit re-checks no surface, so the metadata can name an issuer the validator no longer trusts | 4 |
 | D2-C | An on/off field inside `protected_resource` that defaults to the derived value | An explicit switch | `ProtectedResourceConfig` and `CallerAuthentication` refuse unknown fields, so an older release skips the whole surface after a downgrade | 4 |
-| **D2-D (Chosen)** | One explicit opt-in, `protected_resource`, on MCP, A2A and AP2. `resource` is explicit. `authorization_servers` is optional and, when sent, must equal the strategy's `expected_issuer`; the gateway always advertises that issuer. `scopes` is optional; the advertised scopes are `required_scopes`, then each extra stored scope. | Removing scopes cannot switch discovery off. One set of save-time checks. The advertised issuer and scopes cannot drift from what is enforced. Discovery works without required scopes. Existing MCP records load. | A `protected_resource` stored without `authorization_servers`, or on an A2A or AP2 Access Point, cannot be served by an older release | 4 |
+| **D2-D (Chosen)** | One explicit opt-in, `protected_resource`, on MCP and A2A, and on AP2 as a built default pending open question 2. `resource` is explicit. `authorization_servers` is optional and, when sent, must equal the strategy's `expected_issuer`; the gateway always advertises that issuer. `scopes` is optional; the advertised scopes are `required_scopes`, then each extra stored scope (a built default pending open question 3). | Removing scopes cannot switch discovery off. One set of save-time checks. The advertised issuer and scopes cannot drift from what is enforced. Discovery works without required scopes. Existing MCP records load. | A `protected_resource` stored without `authorization_servers`, or on an A2A or AP2 Access Point, cannot be served by an older release | 4 |
 
 | Aspect | Weight | D2-A | D2-B | D2-C | D2-D | Info |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -644,15 +648,15 @@ this filter runs.
 | Consequence | Mitigation |
 | --- | --- |
 | No policy can admit a failed caller on a declaring Access Point | Only Access Points the operator made declare; removing `protected_resource` (PATCH it to `null`) returns to "OPA decides". D1-D is the isolated follow-up if an admit rule is needed. |
-| Gateway policy and its audit no longer see failed callers on a declaring A2A or AP2 Access Point, and a gateway rule used as an IP deny list answers such a caller 401 with `resource_metadata` instead of 403 | The blocking `auth_failed` record names every refused caller; the caller is still refused and nothing is forwarded or paid. A pre-sign-in network rule is [open question 7](#open-questions). |
-| A failed caller of a declaring Access Point does not count against the surface rate limit | Each refusal costs a JWT parse and a signature check against cached keys, with no network call; the same holds for MCP before this decision. A per-address throttle is [open question 8](#open-questions). |
+| Gateway policy and its audit no longer see failed callers on a declaring A2A or AP2 Access Point, and a gateway rule used as an IP deny list answers such a caller 401 with `resource_metadata` instead of 403 | The blocking `auth_failed` record names every refused caller; the caller is still refused and nothing is forwarded or paid. A pre-sign-in network rule is [open question 6](#open-questions). |
+| A failed caller of a declaring Access Point does not count against the surface rate limit | Each refusal costs a JWT parse and a signature check against cached keys, with no network call; the same holds for MCP before this decision. A per-address throttle is [open question 7](#open-questions). |
 | MCP responses that differ from the previous release: `InsufficientScope` is 403 instead of 503; the challenge's `scope` names `required_scopes` only; a metadata-path prefix stops startup instead of disabling the listener's metadata; relayed challenges are dropped on a declaring MCP Access Point; the advertised `authorization_servers` is the strategy's `expected_issuer`, not the stored list; a declaring MCP Access Point whose strategy is missing or names an issuer metadata cannot name answers 503 | Each is a changelog entry and is documented in [`MCP_METADATA.md`](../MCP_METADATA.md); the save report warns `authorization_servers_stale`; `make mcp-conformance` differs only in these |
 | Every `fabric://` surface's relayed Target 401 becomes 502 | Changelog breaking entry; the 502 detail names the gateway's credential, which the operator fixes |
 | A receiving gateway's 403 `insufficient_scope` reaches the sending gateway's caller as 502 | The `request_rejected` record (`peer_scope_refused`) on the sending gateway says which; the caller cannot fix it in either case |
 | A sending gateway older than this release still relays the receiving gateway's 401 and its challenge | Upgrade sending gateways before receiving ones ([`FABRIC.md`](../FABRIC.md)) |
 | A declaring GW2 surface admits only a credential GW1 injects for GW2's resource | Documented in [`FABRIC.md`](../FABRIC.md); the save report warns `fabric_only_declaration` for a declaration on a surface reached only over Fabric |
 | A `protected_resource` without `authorization_servers`, or on an A2A or AP2 Access Point, cannot be served by an older release | Rollback steps under [Migration](#migration-and-change-management) |
-| A strategy edit to an issuer metadata cannot name turns its declaring Access Points 503 (`issuer_not_advertisable`), and the strategy save does not warn | The save report and the card metric name the reason; a strategy-save check is [open question 9](#open-questions) |
+| A strategy edit to an issuer metadata cannot name turns its declaring Access Points 503 (`issuer_not_advertisable`), and the strategy save does not warn | The save report and the card metric name the reason; a strategy-save check is [open question 8](#open-questions) |
 | A policy keyed on `variant_alias` may now match direct requests | Changelog `changed` entry |
 | A surface whose route holds `$` or `%24` can no longer be saved | Such a route was unreachable as written; changelog `fixed` entry |
 
@@ -678,7 +682,7 @@ this filter runs.
 | Elevation of privilege: a GW2 Target reached with a caller GW2 never authenticated | GW2's declaring surface refuses before policy; ADR 0002's caller requirement for `credential_provider` |
 | Denial of service: a colliding route takes a listener down on reload | Collisions are refused before the listener is swapped |
 | Denial of service: anonymous bodies read and parsed | Refused before the body is read on a declaring Access Point |
-| Denial of service: unauthenticated metadata or refusal traffic | No network call on the card, metadata or refusal path; the refusal is not rate limited ([open question 8](#open-questions)) |
+| Denial of service: unauthenticated metadata or refusal traffic | No network call on the card, metadata or refusal path; the refusal is not rate limited ([open question 7](#open-questions)) |
 | Repudiation | `auth_failed` audit events with the failure kind and whether the gateway refused; `request_rejected` with `peer_token_refused` or `peer_scope_refused` on the sending gateway; the card outcome and reason in logs and metrics |
 
 - **Least privilege and tenancy:** a surface declares only from a strategy its tenant may
@@ -849,24 +853,27 @@ flowchart LR
 
 ## Open questions
 
+The five recommendations behind D1 to D5 were agreed on 2026-10-30 (see [Status](#status)), except
+that the AP2 and scopes union defaults of D2 are open (questions 2 and 3). Each
+question below is still open, and the current behaviour it names stays until it is answered.
+
 | # | Question | Owner | Resolves by |
 | --- | --- | --- | --- |
-| 1 | Which team owns this ADR (the Team field)? Same question as ADR 0001 open question 1. | Kajal Sinha | Before the ADR is accepted |
-| 2 | Is the alignment of D1 to D5 with the owner's recommendation recorded as agreed? Each alternative is isolated as listed under [Isolation points](#11-isolation-points). | Anton Iskryzhytskyi | Before the ADR is accepted |
-| 3 | Does an AP2 Access Point declare with `protected_resource`? Built: yes, as an A2A Access Point. | Anton Iskryzhytskyi | Before the ADR is accepted |
-| 4 | Is `scopes_supported` the union of `required_scopes` and the extra stored `scopes`, or `required_scopes` only? Built: the union, required first. | Anton Iskryzhytskyi | Before the ADR is accepted |
-| 5 | Does a declaring A2A Access Point whose strategy has no matching pin declare without a card scheme, or is the save refused? Built: it declares and the save report warns `card_scheme_unavailable`. | Anton Iskryzhytskyi | Before the ADR is accepted |
-| 6 | Should a stored surface at the metadata path stop startup rather than be logged and skipped? Default: logged and skipped. | Kajal Sinha | Before the ADR is accepted |
-| 7 | Should a network rule (IP allow or deny) run before source authentication, so an anonymous caller a gateway rule denies gets 403 rather than the challenge? Default: no; gateway policy runs after the refusal. | Kajal Sinha, Anton Iskryzhytskyi | Follow-up ADR if needed |
-| 8 | Should anonymous refusals on a declaring Access Point be throttled per address? Default: not throttled, as for MCP before this decision. | Kajal Sinha | Follow-up |
-| 9 | Should a strategy save refuse or warn when its new issuer would leave declaring Access Points unservable? Default: no check; the save report names `issuer_not_advertisable`. | Kajal Sinha | Follow-up |
-| 10 | Should a Transit Point's Fabric forward, and the gateway STS as a receiving resource server, take part in the peer refusal and the declaration? Default: out of scope. | Anton Iskryzhytskyi | Follow-up ADR if needed |
-| 11 | Should a deleted strategy (`ConfigNotFound`) on an Access Point that does not declare answer 403 rather than the existing 500? Default: 500, as before this decision. A declaring one answers 503 (`strategy_unavailable`). | Kajal Sinha | Before the ADR is accepted |
+| 1 | Which team owns this ADR (the Team field)? Same question as ADR 0001 open question 1. | Kajal Sinha | Before the release that ships this change |
+| 2 | Does an AP2 Access Point declare with `protected_resource`? Current behaviour: yes, as an A2A Access Point. | Anton Iskryzhytskyi | Before the release that ships this change |
+| 3 | Is `scopes_supported` the union of `required_scopes` and the extra stored `scopes`, or `required_scopes` only? Current behaviour: the union, required first. | Anton Iskryzhytskyi | Before the release that ships this change |
+| 4 | Does a declaring A2A Access Point whose strategy has no matching pin declare without a card scheme, or is the save refused? Current behaviour: it declares and the save report warns `card_scheme_unavailable`. | Anton Iskryzhytskyi | Before the release that ships this change |
+| 5 | Should a stored surface at the metadata path stop startup rather than be logged and skipped? Current behaviour: logged and skipped. | Kajal Sinha | Before the release that ships this change |
+| 6 | Should a network rule (IP allow or deny) run before source authentication, so an anonymous caller a gateway rule denies gets 403 rather than the challenge? Current behaviour: no; gateway policy runs after the refusal. | Kajal Sinha, Anton Iskryzhytskyi | Follow-up ADR if needed |
+| 7 | Should anonymous refusals on a declaring Access Point be throttled per address? Current behaviour: not throttled, as for MCP before this decision. | Kajal Sinha | After this release |
+| 8 | Should a strategy save refuse or warn when its new issuer would leave declaring Access Points unservable? Current behaviour: no check; the save report names `issuer_not_advertisable`. | Kajal Sinha | After this release |
+| 9 | Should a Transit Point's Fabric forward, and the gateway STS as a receiving resource server, take part in the peer refusal and the declaration? Current behaviour: out of scope. | Anton Iskryzhytskyi | Follow-up ADR if needed |
+| 10 | Should a deleted strategy (`ConfigNotFound`) on an Access Point that does not declare answer 403 rather than the existing 500? Current behaviour: 500, as before this decision. A declaring one answers 503 (`strategy_unavailable`). | Kajal Sinha | Before the release that ships this change |
 
 ## Future work
 
 - A sign-in-required switch for JWT Bearer Access Points that do not publish discovery.
-- A pre-sign-in network rule stage (IP allow or deny), if [open question 7](#open-questions)
+- A pre-sign-in network rule stage (IP allow or deny), if [open question 6](#open-questions)
   needs it.
 - A policy rule that admits failed callers on a declaring Access Point (D1-D), if one is needed.
 - Gateway-signed cards, and `apiKey`, `mutualTLS` and `http` declarations (ADR 0001 future work).

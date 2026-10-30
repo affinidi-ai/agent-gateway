@@ -11,7 +11,7 @@
 
 ## Status
 
-Proposed. This is the first ADR in this repository. It amends, extends and supersedes nothing.
+Accepted on 2026-10-30. This is the first ADR in this repository. It amends, extends and supersedes nothing.
 
 - Extended by [2. Resolve hop 2 Target Authentication through one gateway-scoped credential resolver](0002-hop-two-target-authentication.md)
 - Extended by [3. Specify the hop 1 resource server contract for scopes, challenges, metadata and card declarations](0003-hop-one-resource-server-contract.md)
@@ -510,8 +510,8 @@ flowchart LR
 
 | # | Question | Owner | Resolves by |
 | --- | --- | --- | --- |
-| 1 | Which team owns this ADR (the Team field)? Who are the contacts for the backend, dashboard and hosted documentation teams? | Kajal Sinha | Before the ADR is accepted |
-| 2 | Should the cards of Access Points that do not declare also lose the upstream security and signatures (alternative C2), or keep only upstream `apiKey` schemes sent in a forwarded header? Default: they keep the upstream card, as before this decision. The choice lives in `secures_cards` (`src/a2a/card_security.rs`) and the Transit Point check in `src/proxy/outbound_handler.rs`. | Kajal Sinha | Before the ADR is accepted |
+| 1 | Which team owns this ADR (the Team field)? Who are the contacts for the backend, dashboard and hosted documentation teams? | Kajal Sinha | Before the release that ships this change |
+| 2 | Should the cards of Access Points that do not declare also lose the upstream security and signatures (alternative C2), or keep only upstream `apiKey` schemes sent in a forwarded header? Default: they keep the upstream card, as before this decision. The choice lives in `secures_cards` (`src/a2a/card_security.rs`) and the Transit Point check in `src/proxy/outbound_handler.rs`. | Kajal Sinha | Before the release that ships this change |
 | 3 | Interop bar: are a2a-python and a2a-js enough, or must a2a-java and a2a-go pass too? | Cosmin Mogos | Before card declaration merges |
 | 4 | Should the Auth0 leg run on a schedule, or only on demand? | Kajal Sinha | Before the Auth0 demo leg |
 | 5 | Should a Transit Point card declare its outbound listener authentication? Should a DID Auth Access Point declare anything? | Cosmin Mogos | A follow-up ADR |
