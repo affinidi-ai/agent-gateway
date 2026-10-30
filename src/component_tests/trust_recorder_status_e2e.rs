@@ -72,6 +72,7 @@ async fn surface_trust_recorder_status_is_null_until_attempted_and_follows_the_s
                 "listen_address": harness.gateway_base,
                 "route": "/recorder-status",
                 "protocol": "mcp",
+                "public": true,
                 "trust_recorder": {"entries": [{
                     "trust_registry_id": registry_id,
                     "issuer_did": "did:web:example.com:issuer",

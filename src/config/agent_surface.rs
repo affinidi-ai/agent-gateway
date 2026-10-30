@@ -3454,7 +3454,8 @@ mod tests {
             assert_eq!(surface.access_point.public, unchanged["public"].as_bool());
             assert!(!surface.rejects_failed_caller_authentication());
         }
-        let mut resource_authorized = surface_with_access_point(serde_json::json!({"public": false, "protocol": "mcp"}));
+        let mut resource_authorized =
+            surface_with_access_point(serde_json::json!({"public": false, "protocol": "mcp"}));
         resource_authorized["mcp_http"] =
             serde_json::json!({"authorization": {"resource": "https://gateway.example/agent", "scopes": []}});
         assert!(close(resource_authorized).is_ok(), "MCP resource authorization authenticates callers");
