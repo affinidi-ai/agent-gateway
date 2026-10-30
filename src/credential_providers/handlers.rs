@@ -316,6 +316,11 @@ async fn validate_jwt_key_material(
     Ok(())
 }
 
+/// A blank secret reference is no reference: the dashboard sends unused fields empty.
+fn blank_to_none(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.trim().is_empty())
+}
+
 /// Validate a set of named URL fields against the SSRF blocklist.
 /// Returns an error response on the first invalid URL, or `None` if all pass.
 fn validate_url_fields(fields: &[(&str, Option<&str>)]) -> Option<Response> {
@@ -405,6 +410,10 @@ pub async fn create_provider(
         }
         CredentialProviderType::OAuth2JwtBearer | CredentialProviderType::OAuth2ClientCredentialsJwtAuth => {}
     }
+    req.client_secret_secret_ref = blank_to_none(
+        req.client_secret_secret_ref
+            .take(),
+    );
     req.jwt = req.jwt.normalized();
 
     if let Some(resource) = &req.resource
@@ -693,10 +702,11 @@ pub async fn update_provider(
         client_id_secret_ref: req
             .client_id_secret_ref
             .or(existing.client_id_secret_ref),
-        client_secret_secret_ref: req
-            .client_secret_secret_ref
-            .or(existing.client_secret_secret_ref)
-            .filter(|secret_ref| !secret_ref.trim().is_empty()),
+        // A blank reference in the request clears the stored one.
+        client_secret_secret_ref: blank_to_none(
+            req.client_secret_secret_ref
+                .or(existing.client_secret_secret_ref),
+        ),
         default_scopes: req
             .default_scopes
             .unwrap_or(existing.default_scopes),
@@ -1048,6 +1058,37 @@ mod jwt_provider_tests {
         assert_eq!(stored.jwt_signing_algorithm(), Some(crate::credential_providers::JwtSigningAlgorithm::RS256));
         assert_eq!(stored.client_id_secret_ref, None);
         assert_eq!(stored.client_secret_secret_ref, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_with_a_blank_client_secret_reference_stores_none() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        // The body the dashboard sends: unused references blank, not absent.
+        let blanks = json!({
+            "client_secret_secret_ref": "", "jwt_certificate_secret_ref": "", "jwt_audience": "",
+            "jwt_key_id": "", "jwt_issuer": "", "jwt_subject": ""
+        });
+        for (mut body, provider_id) in [(jwt_bearer("vertex"), "vertex"), (jwt_auth("foundry"), "foundry")] {
+            for (field, value) in blanks
+                .as_object()
+                .unwrap()
+            {
+                body.as_object_mut()
+                    .unwrap()
+                    .entry(field.as_str())
+                    .or_insert(value.clone());
+            }
+            let (status, response) = create(&state, body).await;
+            assert_eq!(status, StatusCode::CREATED, "{provider_id}: {response}");
+            let stored = state
+                .store
+                .find_by_provider_id(provider_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.client_secret_secret_ref, None, "{provider_id}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
