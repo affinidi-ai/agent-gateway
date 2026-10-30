@@ -4614,9 +4614,10 @@ async fn process_forward_request_in_request_scope(
 
     // ── Unified source authentication ──────────────────────────────────────────
     // Public paths (e.g. agent-card) bypass all authentication gates.
-    // Caller-attributable failures are non-blocking: the outcome is handed to the
-    // policy layer via `source_auth_context` below. Only server-side failures
-    // (setup/config resolution, internal errors) still block here (now 500).
+    // Caller-attributable failures are refused with 401 on an Access Point that
+    // publishes protected resource metadata or rejects failed callers; otherwise
+    // the outcome is handed to the policy layer via `source_auth_context` below.
+    // Server-side failures (setup/config resolution, internal errors) block with 500.
     // The caller connected to the sending gateway, so its address is not known here.
     let audit_facts = crate::audit::request_events::RequestFacts {
         surface_id: config_id,
@@ -4784,9 +4785,10 @@ async fn process_forward_request_in_request_scope(
                 {
                     Ok(identity) => Some(identity),
                     // Caller-attributable failure. An Access Point that
-                    // publishes protected resource metadata answers it with
-                    // its challenge; otherwise record the outcome for the
-                    // policy layer and continue with no asserted caller identity.
+                    // publishes protected resource metadata, or whose caller
+                    // authentication rejects failures, refuses it; otherwise
+                    // record the outcome for the policy layer and continue with
+                    // no asserted caller identity.
                     Err(e) if e.is_caller_attributable() => {
                         let refused = protected_resource.is_some() || surface.rejects_failed_caller_authentication();
                         channel_warn!(

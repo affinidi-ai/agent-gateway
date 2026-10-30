@@ -45,13 +45,15 @@ export const ACCESS_POINT_NO_CALLER_CONTEXT_MESSAGE =
 
 /**
  * Caller access rules. A new surface, or one stored with `public: false`,
- * needs a caller authentication method unless it is public. A surface stored
- * without `public` keeps admitting anonymous callers, so it only warns.
+ * needs a caller authentication method, or an MCP resource token
+ * (`mcp_http.authorization`), unless it is public. A surface stored without
+ * `public` keeps admitting anonymous callers, so it only warns.
  */
 function accessPointAccessIssues(payload: any, isNew: boolean): ValidationIssue[] {
   const ap = payload?.access_point;
   const methods = ap?.caller_authentication?.methods;
-  const hasCallerAuth = Array.isArray(methods) && methods.length > 0;
+  const hasCallerAuth =
+    (Array.isArray(methods) && methods.length > 0) || payload?.mcp_http?.authorization != null;
   const isPublic = ap?.public === true;
   if (isPublic) {
     return [
