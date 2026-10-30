@@ -4023,7 +4023,9 @@ async fn target_credential_provider_received_token_requests(
     );
 }
 
-#[then(expr = "the target's credential provider received a client credentials grant from client {string} for scope {string}")]
+#[then(
+    expr = "the target's credential provider received a client credentials grant from client {string} for scope {string}"
+)]
 async fn target_credential_provider_received_client_credentials_grant(
     world: &mut SurfaceWorld,
     client_id: String,
@@ -4033,7 +4035,11 @@ async fn target_credential_provider_received_client_credentials_grant(
     let grant = requests
         .first()
         .expect("the token endpoint received a grant");
-    let field = |name: &str| grant.get(name).map(String::as_str);
+    let field = |name: &str| {
+        grant
+            .get(name)
+            .map(String::as_str)
+    };
     assert_eq!(
         field("grant_type"),
         Some("client_credentials"),
