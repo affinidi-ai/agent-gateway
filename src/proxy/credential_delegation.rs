@@ -368,6 +368,7 @@ pub async fn resolve_delegation_credentials(
         if provider.is_external_consent() {
             warn!(
                 target: "credential_delegation",
+                surface_variant,
                 provider_id = %binding.credential_provider_id,
                 "A provider with an issuer serves only consent_mode external bindings - refusing the request"
             );
