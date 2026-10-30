@@ -11,7 +11,7 @@ use crate::audit::journal::Pending;
 use crate::audit::registry::{Sinks, sinks};
 use crate::delegation_vault::audit::{DelegationAuditEvent, action_category, new_event_id};
 use crate::metrics::backends::prometheus::{track_audit_record_produced, track_audit_records_lost};
-use crate::observability::policy_audit::current_request_id;
+use crate::observability::policy_audit::{current_request_id, current_request_variant};
 
 pub struct Producer {
     sinks: &'static Sinks,
@@ -80,7 +80,8 @@ impl Producer {
         }
     }
 
-    /// Finalises a built record: held while a [`DeferredAudit`] scope is
+    /// Finalises a built record: stamped with the request's id and surface
+    /// variant when it has none, held while a [`DeferredAudit`] scope is
     /// active, otherwise given an event id, addressed to the sinks that
     /// select it now, and handed to the journal without waiting.
     pub fn submit(
@@ -89,6 +90,12 @@ impl Producer {
     ) {
         if event.request_id.is_none() {
             event.request_id = current_request_id();
+        }
+        if event
+            .surface_variant
+            .is_none()
+        {
+            event.surface_variant = current_request_variant();
         }
         match DEFERRED.try_with(Arc::clone) {
             Ok(held) => held.lock().push(event),
@@ -257,6 +264,14 @@ mod tests {
 
     fn received(rx: &Receiver<Pending>) -> Vec<Pending> {
         rx.try_iter().collect()
+    }
+
+    async fn in_request<F: std::future::Future>(
+        id: &str,
+        future: F,
+    ) -> F::Output {
+        use crate::observability::policy_audit::{RequestScope, in_request};
+        in_request(RequestScope::new(id.to_string()), future).await
     }
 
     #[test]
@@ -431,11 +446,10 @@ mod tests {
     async fn a_record_submitted_in_a_request_scope_carries_its_request_id() {
         let (producer, rx) = producer(&[(SinkId::AuditLog, &["consent_granted"])]);
 
-        crate::observability::policy_audit::REQUEST_ID
-            .scope("0123456789abcdef".to_string(), async {
-                producer.submit(consent());
-            })
-            .await;
+        in_request("0123456789abcdef", async {
+            producer.submit(consent());
+        })
+        .await;
 
         assert_eq!(
             received(&rx)[0]
@@ -452,11 +466,10 @@ mod tests {
         let mut record = consent();
         record.request_id = Some("fedcba9876543210".to_string());
 
-        crate::observability::policy_audit::REQUEST_ID
-            .scope("0123456789abcdef".to_string(), async {
-                producer.submit(record);
-            })
-            .await;
+        in_request("0123456789abcdef", async {
+            producer.submit(record);
+        })
+        .await;
 
         assert_eq!(
             received(&rx)[0]
@@ -486,15 +499,14 @@ mod tests {
         let (producer, rx) = producer(&[(SinkId::AuditLog, &["consent_granted"])]);
         let deferred = DeferredAudit::new(producer);
 
-        crate::observability::policy_audit::REQUEST_ID
-            .scope("0123456789abcdef".to_string(), async {
-                deferred
-                    .scope(async {
-                        producer.submit(consent());
-                    })
-                    .await;
-            })
-            .await;
+        in_request("0123456789abcdef", async {
+            deferred
+                .scope(async {
+                    producer.submit(consent());
+                })
+                .await;
+        })
+        .await;
         deferred.flush_with_vp("vp");
 
         assert_eq!(
@@ -504,6 +516,111 @@ mod tests {
                 .as_deref(),
             Some("0123456789abcdef")
         );
+    }
+
+    async fn in_request_with_variant<F: std::future::Future>(
+        variant: &str,
+        future: F,
+    ) -> F::Output {
+        use crate::observability::policy_audit::set_request_variant;
+        in_request("0123456789abcdef", async {
+            set_request_variant(variant);
+            future.await
+        })
+        .await
+    }
+
+    fn surface_variants(rx: &Receiver<Pending>) -> Vec<Option<String>> {
+        received(rx)
+            .into_iter()
+            .map(|pending| pending.record.surface_variant)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_record_in_a_request_with_a_variant_carries_it() {
+        let (producer, rx) = producer(&[(SinkId::AuditLog, &["consent_granted"])]);
+
+        in_request_with_variant("beta", async {
+            producer.submit(consent());
+        })
+        .await;
+
+        assert_eq!(surface_variants(&rx), vec![Some("beta".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn a_variant_already_on_the_record_is_kept() {
+        let (producer, rx) = producer(&[(SinkId::AuditLog, &["consent_granted"])]);
+        let mut record = consent();
+        record.surface_variant = Some("_unknown_".to_string());
+
+        in_request_with_variant("beta", async {
+            producer.submit(record);
+        })
+        .await;
+
+        assert_eq!(surface_variants(&rx), vec![Some("_unknown_".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn a_deferred_record_keeps_the_variant_of_the_request_that_produced_it() {
+        let (producer, rx) = producer(&[(SinkId::AuditLog, &["consent_granted"])]);
+        let deferred = DeferredAudit::new(producer);
+
+        in_request_with_variant("_base_", async {
+            deferred
+                .scope(async {
+                    producer.submit(consent());
+                })
+                .await;
+        })
+        .await;
+        deferred.flush_with_vp("vp");
+
+        assert_eq!(surface_variants(&rx), vec![Some("_base_".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn a_management_request_record_has_no_variant() {
+        let (producer, rx) = producer(&[(SinkId::AuditLog, &["consent_granted"])]);
+
+        crate::audit::context::in_management_request(crate::audit::events::Actor::user("u-1"), async {
+            producer.submit(consent());
+        })
+        .await;
+
+        let pending = received(&rx);
+        assert!(
+            pending[0]
+                .record
+                .request_id
+                .is_some()
+        );
+        assert_eq!(
+            pending[0]
+                .record
+                .surface_variant,
+            None
+        );
+    }
+
+    #[test]
+    fn a_record_without_a_variant_leaves_the_field_out_and_an_old_row_still_reads() {
+        let stored = serde_json::to_value(consent()).unwrap();
+        assert!(
+            stored
+                .get("surface_variant")
+                .is_none(),
+            "{stored}"
+        );
+
+        let read: DelegationAuditEvent = serde_json::from_value(stored).unwrap();
+        assert_eq!(read.surface_variant, None);
+
+        let mut with_variant = consent();
+        with_variant.surface_variant = Some("beta".to_string());
+        assert_eq!(serde_json::to_value(with_variant).unwrap()["surface_variant"], "beta");
     }
 
     #[tokio::test]

@@ -11,6 +11,7 @@ use super::filesystem::ConnectionPointStore;
 use super::messages::ReceivedMessage;
 use crate::gateways::filesystem::GatewayStore;
 use crate::messages::MessageType;
+use crate::observability::loggable;
 use crate::proxy::backend_identity::ProtectedAgentIdentity;
 use crate::proxy::protocol_router::join_endpoint_path;
 use crate::surfaces::AgentSurfaceStore;
@@ -681,7 +682,12 @@ async fn process_forward(message: &ReceivedMessage) -> ProcessingResult {
         .message_body
         .get("next")
     {
-        debug!("Extracted forwarded message: {:?}", forwarded_msg);
+        debug!(
+            "Extracted forwarded message ({} bytes)",
+            forwarded_msg
+                .to_string()
+                .len()
+        );
         // In a real implementation, you would decrypt and process the forwarded message
         ProcessingResult::ProcessedNoResponse
     } else {
@@ -693,7 +699,7 @@ async fn process_forward(message: &ReceivedMessage) -> ProcessingResult {
 
 // Problem Report
 async fn process_problem_report(message: &ReceivedMessage) -> ProcessingResult {
-    warn!("Received problem report from {:?}: {:?}", message.from_did, message.message_body);
+    warn!("Received problem report {} from {:?}", message.didcomm_message_id, message.from_did);
 
     // Extract problem code and description
     let code = message
@@ -708,22 +714,22 @@ async fn process_problem_report(message: &ReceivedMessage) -> ProcessingResult {
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    info!("Problem code: {}, comment: {}", code, comment);
+    info!("Problem code: {}, comment: {} bytes", code, comment.len());
 
     ProcessingResult::ProcessedNoResponse
 }
 
 // Basic Message
 async fn process_basic_message(message: &ReceivedMessage) -> ProcessingResult {
-    info!("Processing basic message from {:?}", message.from_did);
-
-    if let Some(content) = message
+    let content_length = message
         .message_body
         .get("content")
         .and_then(|v| v.as_str())
-    {
-        info!("Basic message content: {}", content);
-    }
+        .map_or(0, str::len);
+    info!(
+        "Processing basic message {} ({}) from {:?}: {} content bytes",
+        message.didcomm_message_id, message.message_type, message.from_did, content_length
+    );
 
     ProcessingResult::ProcessedNoResponse
 }
@@ -2145,8 +2151,8 @@ async fn extract_caller_identity_inbound(
                         if let Some(identity_ext) = metadata.get(crate::config::AFFINIDI_AGENT_IDENTITY_EXTENSION) {
                             channel_info!(
                                 config_id,
-                                "GW2: Found identity extension in metadata: {}",
-                                serde_json::to_string_pretty(identity_ext).unwrap_or_default()
+                                "GW2: Found identity extension in metadata ({} bytes)",
+                                identity_ext.to_string().len()
                             );
 
                             if let Some(did) = identity_ext
@@ -2943,7 +2949,7 @@ async fn enrich_and_evaluate_surface_policies(
                         .trim_end_matches('/')
                 )
             };
-            channel_info!(config_id, "GW2: Fetching agent card from: {}", card_url);
+            channel_info!(config_id, "GW2: Fetching agent card from: {}", loggable::url(&card_url));
             let timeout = GLOBAL_FORWARD_TIMEOUT
                 .get()
                 .copied()
@@ -3096,13 +3102,12 @@ async fn enrich_and_evaluate_surface_policies(
         }
         policy_input.normalize_caller_did();
         let input_value = serde_json::to_value(&policy_input).unwrap_or_default();
-        channel_info!(
+        channel_debug!(
             config_id,
-            "GW2: surface OPA input (identity_binding present={}): {}",
+            "GW2: surface OPA input built (identity_binding present={})",
             input_value
                 .get("identity_binding")
-                .is_some(),
-            serde_json::to_string(&input_value).unwrap_or_default()
+                .is_some()
         );
 
         // Appliance-wide (global) surface policy — enforced deny-overrides ahead
@@ -3685,7 +3690,12 @@ async fn fetch_agent_card(
     let client = match forward_client_for(card_url, timeout).await {
         Ok(client) => client,
         Err(error) => {
-            channel_warn!(config_id, "GW2: Agent card target {} blocked by egress policy: {}", card_url, error);
+            channel_warn!(
+                config_id,
+                "GW2: Agent card target {} blocked by egress policy: {}",
+                loggable::url(card_url),
+                error
+            );
             return None;
         }
     };
@@ -3696,7 +3706,12 @@ async fn fetch_agent_card(
     {
         Ok(response) => response,
         Err(e) => {
-            channel_warn!(config_id, "GW2: Agent card fetch request failed (url={}): {}", card_url, e);
+            channel_warn!(
+                config_id,
+                "GW2: Agent card fetch request failed (url={}): {}",
+                loggable::url(card_url),
+                e.without_url()
+            );
             return None;
         }
     };
@@ -3925,47 +3940,56 @@ pub(crate) struct FabricStreamRequest {
     pub headers: axum::http::HeaderMap,
     pub body: bytes::Bytes,
     pub surface: crate::config::agent_surface::AgentSurface,
-    pub variant_id: Option<String>,
+    pub variant: crate::config::agent_surface_variants::ForwardedVariant,
     pub capabilities: crate::proxy::fabric_stream::peer::StreamCapabilities,
+    /// The request the stream's Open was admitted as.
+    pub scope: Arc<crate::observability::policy_audit::RequestScope>,
 }
 
+/// Resolves the surface a Fabric stream Open names, served by the variant its
+/// target pins. The sending gateway's variant is not consulted: with no
+/// alias, this surface's default variant, else its base, serves the stream.
+/// A peer that may not reach the surface is refused before the alias is
+/// resolved, so its Open records nothing on the surface's tenant.
 pub(crate) async fn resolve_stream_surface(
     message: &ReceivedMessage,
     request: &crate::proxy::fabric_stream::wire::OpenRequest,
-) -> Result<(crate::config::agent_surface::AgentSurface, Option<String>), String> {
+    peer_tenant_id: Option<&str>,
+) -> Result<(crate::config::agent_surface::AgentSurface, crate::config::agent_surface_variants::ForwardedVariant), String>
+{
     let surface = lookup_channel(message, &request.channel_id)
         .await?
         .ok_or("Fabric stream surface is unavailable")?;
-    let variant_id = match request
-        .variant_alias
-        .as_deref()
-    {
-        Some(alias) => Some(
-            surface
-                .variants
-                .iter()
-                .find(|variant| variant.alias == alias)
-                .ok_or("Fabric stream variant is unavailable")?
-                .id
-                .clone(),
-        ),
-        None => surface
-            .default_variant_id
-            .clone(),
+    if !fabric_peer_may_reach_surface(peer_tenant_id, surface.tenant_id.as_deref()) {
+        return Err("Fabric stream peer or route is unavailable".to_string());
+    }
+    let (variant, surface) = match surface.serve_variant(
+        request
+            .variant_alias
+            .as_deref(),
+    ) {
+        Ok(served) => served.into_parts(),
+        Err(error) => {
+            crate::audit::request_events::refuse_routing(
+                &crate::audit::request_events::RequestFacts {
+                    surface_id: &surface.surface_id,
+                    channel_name: &surface.name,
+                    trace_id: Some(&request.trace_id.to_string()),
+                    via_fabric: true,
+                },
+                &error,
+                None,
+            )
+            .warn(&surface);
+            return Err("Fabric stream variant is unavailable".to_string());
+        }
     };
-    let surface = surface
-        .resolve_variant(
-            request
-                .variant_alias
-                .as_deref(),
-        )
-        .map_err(|error| error.to_string())?;
     if surface.status != crate::config::agent_surface::SurfaceStatus::Active
         || surface.channel_protocol() != crate::config::ChannelProtocol::Mcp
     {
         return Err("Fabric stream requires an active MCP surface".to_string());
     }
-    Ok((surface, variant_id))
+    Ok((surface, variant))
 }
 
 pub(crate) async fn process_stream_forward_request(
@@ -3998,17 +4022,19 @@ async fn process_forward_request_with_mcp_runtime(
     mcp_versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
     mcp_continuations: Option<Arc<crate::mcp::continuations::config::ContinuationRuntime>>,
 ) -> ProcessingResult {
-    use crate::observability::policy_audit::{in_request, new_request_id, response_in_request};
+    use crate::observability::policy_audit::{RequestScope, in_request, response_in_request};
 
-    let id = new_request_id();
+    let scope = stream_request
+        .as_ref()
+        .map_or_else(RequestScope::fresh, |request| Arc::clone(&request.scope));
     let result = in_request(
-        id.clone(),
+        scope.clone(),
         Box::pin(process_forward_request_in_request_scope(message, stream_request, mcp_versions, mcp_continuations)),
     )
     .await;
     match result {
         ProcessingResult::StreamingResponse { response } => ProcessingResult::StreamingResponse {
-            response: response_in_request(id, response),
+            response: response_in_request(scope, response),
         },
         other => other,
     }
@@ -4102,7 +4128,8 @@ async fn process_forward_request_in_request_scope(
             otel.kind = "server",
             caller.auth_method = tracing::field::Empty,
             caller.principal = tracing::field::Empty,
-            caller.did = tracing::field::Empty
+            caller.did = tracing::field::Empty,
+            surface.variant = tracing::field::Empty
         );
         let _ = span.set_parent(parent_cx.clone());
 
@@ -4129,7 +4156,8 @@ async fn process_forward_request_in_request_scope(
             otel.kind = "server",
             caller.auth_method = tracing::field::Empty,
             caller.principal = tracing::field::Empty,
-            caller.did = tracing::field::Empty
+            caller.did = tracing::field::Empty,
+            surface.variant = tracing::field::Empty
         )
     };
 
@@ -4212,22 +4240,23 @@ async fn process_forward_request_in_request_scope(
         },
     };
 
+    let logged_path = path
+        .parse()
+        .map_or_else(|_| loggable::REDACTED.to_string(), |uri| loggable::uri(&uri));
     info!(
         "📤 Forwarding {} {} to channel {} (headers: {}, body: {} bytes)",
         method,
-        path,
+        logged_path,
         channel_id,
         headers.as_ref().map(|h| h.len()).unwrap_or(0),
         body_bytes.len()
     );
 
-    debug!("  ↳ Received path from gateway 1: '{}'", path);
-
     // Debug: Log all received headers to diagnose payment propagation
     if let Some(ref h) = headers {
         info!("  ↳ Received headers: {:?}", h.keys().collect::<Vec<_>>());
-        if let Some(payment_sig) = h.get("PAYMENT-SIGNATURE") {
-            info!("  ↳ PAYMENT-SIGNATURE present: {:?}", payment_sig);
+        if h.contains_key("PAYMENT-SIGNATURE") {
+            info!("  ↳ PAYMENT-SIGNATURE present");
         } else {
             info!("  ↳ No PAYMENT-SIGNATURE header found");
         }
@@ -4291,44 +4320,58 @@ async fn process_forward_request_in_request_scope(
     // Extract config_id for channel-specific logging
     let config_id = surface.config_id().unwrap_or("unknown");
 
-    // Apply virtual channel variant override if specified by GW1
+    // The alias the sender's `fabric://` Target pins, if any.
     let variant_alias = message
         .message_body
         .get("virtual_channel_alias")
         .or_else(|| message.message_body.get("active_variant_alias"))
         .and_then(|v| v.as_str());
 
-    let active_variant_id = match stream_request.as_ref() {
-        Some(request) => request.variant_id.clone(),
-        None => match variant_alias {
-            Some(alias) => surface.variants.iter().find(|variant| variant.enabled && variant.alias == alias)
-                .map(|variant| variant.id.clone()),
-            None => surface.default_variant_id.clone(),
-        },
+    // This gateway's own variant serves the request: the alias the sender's
+    // Target pins, else this surface's default variant, else its base. A
+    // variant that can't be resolved is refused, never served by another.
+    let selected = match stream_request.as_ref() {
+        Some(request) => Ok((request.variant.clone(), surface.clone())),
+        None => surface
+            .serve_variant(variant_alias)
+            .map(crate::config::agent_surface_variants::ServedVariant::into_parts),
     };
-
-    // The alias the surface was resolved for: `None` once a named alias did
-    // not resolve and the default stands in, whose resource is then the one
-    // a caller's token must name.
-    let mut resolved_alias = variant_alias;
-    let surface = if stream_request.is_some() { surface.clone() } else { match surface.resolve_variant(variant_alias) {
-        Ok(s) => {
-            if let Some(alias) = variant_alias {
-                channel_info!(config_id, "GW2: Applied variant '{}'", alias);
-            }
-            s
+    let (active_variant_id, surface) = match selected {
+        Ok((variant, resolved)) => {
+            crate::observability::policy_audit::set_request_variant(&variant.recorded);
+            (variant.id, resolved)
         }
-        Err(e) => {
-            channel_warn!(
-                config_id,
-                "GW2: Variant '{}' not found ({}), using default",
-                variant_alias.unwrap_or(""),
-                e
+        Err(error) => {
+            let refusal = crate::audit::request_events::refuse_routing(
+                &crate::audit::request_events::RequestFacts {
+                    surface_id: &surface.surface_id,
+                    channel_name: &surface.name,
+                    trace_id: (!trace_id_field.is_empty()).then_some(trace_id_field),
+                    via_fabric: true,
+                },
+                &error,
+                None,
             );
-            resolved_alias = None;
-            surface.resolve_variant(None).unwrap_or_else(|_| surface.clone())
+            refusal.warn(&surface);
+            return ProcessingResult::RequiresResponse {
+                response_type: MessageType::ForwardResponse.to_string(),
+                response_body: refused_forward_response(
+                    refusal
+                        .status()
+                        .as_u16(),
+                    refusal
+                        .status()
+                        .canonical_reason()
+                        .unwrap_or("Error"),
+                    refusal.message(),
+                ),
+            };
         }
-    }};
+    };
+    // The alias the surface is served for, whose resource a caller's token
+    // must name. A named alias that can't be served was refused above, so it
+    // is the one the sender named.
+    let resolved_alias = variant_alias;
 
     // Check if channel is active
     if surface.status != crate::config::agent_surface::SurfaceStatus::Active {
@@ -5206,7 +5249,7 @@ async fn process_forward_request_in_request_scope(
     channel_info!(
         config_id,
         "🎯 Forwarding to channel target: {}",
-        surface.target_endpoint()
+        loggable::url(surface.target_endpoint())
     );
 
     // Check if this channel uses a2a-proxy:// backend (A2A Proxy)
@@ -5347,7 +5390,9 @@ async fn process_forward_request_in_request_scope(
         channel_info!(
             config_id,
             "Agent card location override applied: {} (origin={}, custom_path={})",
-            url, origin, custom_path
+            loggable::url(&url),
+            loggable::origin(origin),
+            custom_path
         );
         url
     } else {
@@ -5358,7 +5403,7 @@ async fn process_forward_request_in_request_scope(
         config_id,
         "🌐 Making HTTP request: {} {}",
         method.to_uppercase(),
-        target_url
+        loggable::url(&target_url)
     );
 
     // Start timer for latency measurement
@@ -5371,7 +5416,12 @@ async fn process_forward_request_in_request_scope(
     let client = match forward_client_for(&target_url, timeout).await {
         Ok(client) => client,
         Err(error) => {
-            channel_warn!(config_id, "GW2: target {} blocked by egress policy: {}", target_url, error);
+            channel_warn!(
+                config_id,
+                "GW2: target {} blocked by egress policy: {}",
+                loggable::url(&target_url),
+                error
+            );
             if let ForwardClientError::Blocked(_) = error {
                 crate::audit::request_events::request_rejected(
                     &audit_facts,
@@ -5824,7 +5874,7 @@ async fn process_forward_request_in_request_scope(
     }
 
     // Send the request
-    channel_debug!(config_id, "Sending request to {}", target_url);
+    channel_debug!(config_id, "Sending request to {}", loggable::url(&target_url));
 
     let mut header_timeout = std::time::Duration::from_secs(surface.timeout().map(|timeout| timeout.request_secs).unwrap_or(30));
     if modern_request.is_some() {
@@ -5870,7 +5920,7 @@ async fn process_forward_request_in_request_scope(
         };
 
         if has_session {
-            channel_info!(config_id, "GW2: Reusing persistent SSE session for {}", target_url);
+            channel_info!(config_id, "GW2: Reusing persistent SSE session for {}", loggable::url(&target_url));
             let response_start = std::time::Instant::now();
 
             match crate::mcp::sse_transport::send_via_persistent_sse(
@@ -6141,10 +6191,9 @@ async fn process_forward_request_in_request_scope(
                 let metric_target = target_url.clone();
                 let metric_identity = caller_identity.clone();
                 let metric_trace = audit_trace_id.map(str::to_string).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                let metric_variant = active_variant_alias.clone();
                 Some(move |outcome: crate::mcp::modern_sse::ResponseOutcome| {
                     let latency = start_time.elapsed().as_millis() as u64;
-                    tokio::spawn(async move {
+                    crate::observability::policy_audit::spawn_in_request(async move {
                         guard.decrement().await;
                         if let (Some(monitor), Some(task_id)) = (monitor, tracked_task_id) {
                             monitor.record_bytes(&task_id, request_bytes, outcome.bytes).await;
@@ -6157,12 +6206,12 @@ async fn process_forward_request_in_request_scope(
                             metrics.record_connection_with_bytes_and_ucp(
                                 metric_surface.clone(), metric_source.clone(), metric_target.clone(), result,
                                 Some(latency), metric_identity.clone(), crate::metrics::ConnectionDirection::Request,
-                                metric_trace.clone(), request_bytes, 0, None, None, None, latency, metric_variant.clone(),
+                                metric_trace.clone(), request_bytes, 0, None, None, None, latency,
                             ).await;
                             metrics.record_connection_with_bytes(
                                 metric_surface, metric_target, metric_source, result, Some(latency), metric_identity,
                                 crate::metrics::ConnectionDirection::Response, metric_trace, 0, outcome.bytes, None, None,
-                                latency, metric_variant,
+                                latency,
                             ).await;
                         }
                     });
@@ -6546,7 +6595,6 @@ async fn process_forward_request_in_request_scope(
                     validation_status,
                     None,                    // validation_error
                     caller_identity.clone(), // identity_hash
-                    active_variant_alias.as_deref(),
                 )
                 .await;
 
@@ -6631,12 +6679,8 @@ async fn process_forward_request_in_request_scope(
                             let identity_ext = &identity_ext;
                             channel_info!(
                                 config_id,
-                                "GW2: Found identity extension in response metadata: {}",
-                                serde_json::to_string_pretty(identity_ext)
-                                    .unwrap_or_default()
-                                    .chars()
-                                    .take(500)
-                                    .collect::<String>()
+                                "GW2: Found identity extension in response metadata ({} bytes)",
+                                identity_ext.to_string().len()
                             );
 
                             // Check if agent already sent a DID
@@ -6820,7 +6864,6 @@ async fn process_forward_request_in_request_scope(
                         None,
                         None,
                         request_latency_ms,
-                        None,
                     )
                     .await;
 
@@ -6854,7 +6897,6 @@ async fn process_forward_request_in_request_scope(
                         None,
                         None,
                         response_latency_ms,
-                        None,
                     )
                     .await;
 
@@ -7166,11 +7208,12 @@ async fn process_forward_request_in_request_scope(
             Box::pin(process_response(response_body, response_headers)).await
         }
         Err(e) => {
+            let e = e.without_url();
             channel_error!(
                 config_id,
                 "❌ Forward failed: {} {} - {}",
                 http_method,
-                target_url,
+                loggable::url(&target_url),
                 e
             );
 
@@ -7214,31 +7257,17 @@ async fn process_forward_request_in_request_scope(
 
             // Provide more specific error messages based on error type
             let (error_msg, status_code) = if e.is_timeout() {
-                ("Request timed out after 30 seconds".to_string(), 504)
+                ("Request timed out after 30 seconds", 504)
             } else if e.is_connect() {
-                (
-                    format!(
-                        "Failed to connect to target endpoint: {}. Service may not be running on port {}",
-                        surface.target_endpoint(),
-                        surface
-                            .target_endpoint()
-                            .split(':')
-                            .next_back()
-                            .unwrap_or("unknown")
-                    ),
-                    502,
-                )
+                ("Failed to connect to the target endpoint", 502)
             } else {
-                (format!("Failed to forward request: {}", e), 502)
+                ("Failed to forward the request to the target endpoint", 502)
             };
 
             let error_body = serde_json::json!({
                 "error": error_msg,
                 "status": status_code,
-                "target": surface.target_endpoint(),
                 "method": http_method.as_str(),
-                "url": target_url,
-                "error_details": error_details,
             });
             ProcessingResult::RequiresResponse {
                 response_type: MessageType::ForwardResponse.to_string(),
@@ -7893,17 +7922,6 @@ async fn handle_a2a_proxy_forward(
             .config_id()
             .map(str::to_string)
             .unwrap_or_else(|| channel_id.to_string());
-        let active_variant_alias = message
-            .message_body
-            .get("active_variant_alias")
-            .and_then(|v| v.as_str())
-            .or_else(|| {
-                message
-                    .message_body
-                    .get("virtual_channel_alias")
-                    .and_then(|v| v.as_str())
-            })
-            .map(str::to_string);
 
         metrics_store
             .record_connection_with_bytes(
@@ -7920,7 +7938,6 @@ async fn handle_a2a_proxy_forward(
                 None,
                 None,
                 latency_ms,
-                active_variant_alias.clone(),
             )
             .await;
         metrics_store
@@ -7938,7 +7955,6 @@ async fn handle_a2a_proxy_forward(
                 None,
                 None,
                 latency_ms,
-                active_variant_alias,
             )
             .await;
     }
@@ -7967,7 +7983,6 @@ async fn handle_a2a_proxy_forward(
             validation_status,
             None,
             caller_identity,
-            None,
         )
         .await;
     }
@@ -8303,16 +8318,6 @@ async fn handle_mcp_proxy_forward(
                 let config_id = surface
                     .config_id()
                     .unwrap_or("unknown");
-                let active_variant_alias = message
-                    .message_body
-                    .get("active_variant_alias")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| {
-                        message
-                            .message_body
-                            .get("virtual_channel_alias")
-                            .and_then(|v| v.as_str())
-                    });
                 crate::observability::payload_capture::broadcast_payload_capture_async(
                     &Some(ws_state.clone()),
                     &Some(metrics_store.clone()),
@@ -8323,7 +8328,6 @@ async fn handle_mcp_proxy_forward(
                     "success", // MCP protocol doesn't have A2A extension validation
                     None,
                     None, // identity_hash
-                    active_variant_alias,
                 )
                 .await;
             }
@@ -8381,7 +8385,6 @@ async fn handle_mcp_proxy_forward(
                         None,
                         None,
                         latency_ms,
-                        None,
                     )
                     .await;
 
@@ -8404,7 +8407,6 @@ async fn handle_mcp_proxy_forward(
                         None,
                         None,
                         latency_ms,
-                        None,
                     )
                     .await;
 
@@ -8449,16 +8451,6 @@ async fn handle_mcp_proxy_forward(
 
             // Broadcast payload capture for failed MCP proxy request
             if let (Some(ws_state), Some(metrics_store)) = (GLOBAL_WS_STATE.get(), GLOBAL_METRICS_STORE.get()) {
-                let active_variant_alias = message
-                    .message_body
-                    .get("active_variant_alias")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| {
-                        message
-                            .message_body
-                            .get("virtual_channel_alias")
-                            .and_then(|v| v.as_str())
-                    });
                 crate::observability::payload_capture::broadcast_payload_capture_async(
                     &Some(ws_state.clone()),
                     &Some(metrics_store.clone()),
@@ -8469,7 +8461,6 @@ async fn handle_mcp_proxy_forward(
                     "mcp_error", // Custom status for MCP errors
                     Some(format!("MCP Proxy Error: {}", error_msg)),
                     None,
-                    active_variant_alias,
                 )
                 .await;
             }
@@ -8508,7 +8499,6 @@ async fn handle_mcp_proxy_forward(
                         None,
                         None,
                         latency_ms,
-                        None,
                     )
                     .await;
 
@@ -8531,7 +8521,6 @@ async fn handle_mcp_proxy_forward(
                         None,
                         None,
                         latency_ms,
-                        None,
                     )
                     .await;
 
@@ -8743,13 +8732,7 @@ async fn verify_x402_request(
     if let Some(ref vid) = verification_id {
         info!("   Verification ID: {}", vid);
     }
-    info!(
-        "   Payment signature: {}...",
-        &payment_signature
-            .chars()
-            .take(20)
-            .collect::<String>()
-    );
+    info!("   Payment signature: {} bytes", payment_signature.len());
     info!("   Network: {}", network);
     info!("   Channel: {}", channel_id);
     info!("   Resource: {}", resource);
@@ -8909,8 +8892,6 @@ async fn process_x402_verify_response(message: &ReceivedMessage) -> ProcessingRe
         info!("   Correlation ID (thid): {}", correlation_id);
 
         if let Some(payment) = body.get("payment") {
-            info!("   Payment details: {}", payment);
-
             // CRITICAL: GW2 must record the verification to its TransactionStore
             // This ensures both GW1 and GW2 have transaction records for traceability
             if let Some(txn_store) = transaction_store
@@ -9574,6 +9555,9 @@ mod mcp_receive_tests;
 
 #[cfg(test)]
 mod fabric_transit_tests;
+
+#[cfg(test)]
+mod variant_routing_tests;
 
 #[cfg(test)]
 mod tests {
@@ -11755,6 +11739,59 @@ mod tests {
         // process-global surface-store state this test does not own, so assert only that the
         // sender was not refused.
         assert_ne!(response["status"], 403, "an Active registered peer must pass the sender check");
+    }
+
+    #[tokio::test]
+    async fn forward_request_logs_payment_signature_presence_without_its_value() {
+        const PAYMENT_SIGNATURE_MARKER: &str = "payment-signature-marker-9b2d";
+        const QUERY_MARKER: &str = "query-marker-4e7a";
+        let temp = tempfile::tempdir().unwrap();
+        register_gateway(
+            temp.path(),
+            "did:web:peer.example",
+            crate::gateways::types::GatewayStatus::Active,
+            crate::gateways::types::ExposureMode::All,
+            vec![],
+        )
+        .await;
+        let mut msg = make_forward_request_msg(temp.path(), Some("did:web:peer.example"), "surface-1");
+        msg.message_body["path"] = serde_json::json!(format!("/pay?token={QUERY_MARKER}"));
+        msg.message_body["headers"] = serde_json::json!({ "PAYMENT-SIGNATURE": PAYMENT_SIGNATURE_MARKER });
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        let response = forward_response(&msg).await;
+
+        let text = logs.text();
+        assert_ne!(response["status"], 403);
+        assert!(text.contains("PAYMENT-SIGNATURE present"), "{text}");
+        assert!(text.contains("Forwarding GET /pay?token=<redacted> to channel surface-1"), "{text}");
+        assert!(!text.contains(PAYMENT_SIGNATURE_MARKER), "{text}");
+        assert!(!text.contains(QUERY_MARKER), "{text}");
+    }
+
+    #[tokio::test]
+    async fn basic_message_logs_type_id_and_length_without_content() {
+        const CONTENT_MARKER: &str = "basic-message-content-marker-3f8c";
+        let msg = make_handshake_msg(
+            "https://didcomm.org/basicmessage/2.0/message",
+            None,
+            serde_json::json!({ "content": CONTENT_MARKER }),
+        );
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        let result = process_basic_message(&msg).await;
+
+        let text = logs.text();
+        assert!(matches!(result, ProcessingResult::ProcessedNoResponse));
+        assert!(
+            text.contains(&format!(
+                "Processing basic message {} (https://didcomm.org/basicmessage/2.0/message) from Some(\"did:web:peer.example:tmp\"): {} content bytes",
+                msg.didcomm_message_id,
+                CONTENT_MARKER.len()
+            )),
+            "{text}"
+        );
+        assert!(!text.contains(CONTENT_MARKER), "{text}");
     }
 
     const INVITATION_MESSAGE_ID: &str = "invitation-msg-1";

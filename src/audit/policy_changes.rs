@@ -83,7 +83,7 @@ pub async fn surface_written(
         });
         change.scope = Some(key.scope.to_string());
         change.slot = Some(key.slot);
-        change.variant = slot.variant_alias;
+        change.surface_variant = Some(slot.surface_variant);
         change.transit_point = key.point;
         match key.slot {
             PolicySlot::McpTool => change.mcp_tool_name = slot.place_label,
@@ -682,9 +682,34 @@ mod tests {
                 "target": { "kind": "surface", "id": "s-1", "name": "Orders" },
                 "scope": "surface",
                 "slot": "target",
+                "surface_variant": "_base_",
                 "actor": { "kind": "user", "id": "u-1" },
                 "source": "api",
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_write_to_a_variant_slot_records_the_variant() {
+        let mut after = surface(serde_json::json!({}));
+        after.variants.push(
+            serde_json::from_value(serde_json::json!({
+                "id": "v-1", "alias": "beta", "name": "Beta",
+                "overrides": { "target": { "policy": policy("a") } }
+            }))
+            .unwrap(),
+        );
+
+        let ((), records) =
+            capture(in_management_request(Actor::user("u-1"), surface_written(None, Some(&after)))).await;
+
+        assert_eq!(records.len(), 1);
+        let json = serde_json::to_value(&records[0]).unwrap();
+        assert_eq!(json["event"]["policy_attached"]["surface_variant"], "beta");
+        assert!(
+            json.get("surface_variant")
+                .is_none(),
+            "a management record has no top-level variant: {json}"
         );
     }
 
@@ -786,6 +811,7 @@ mod tests {
         assert_eq!(attached.scope.as_deref(), Some("gateway"));
         assert_eq!(attached.slot, Some(PolicySlot::Target));
         assert_eq!(attached.enabled, Some(true));
+        assert_eq!(attached.surface_variant, None, "a gateway has no variants");
     }
 
     #[test]

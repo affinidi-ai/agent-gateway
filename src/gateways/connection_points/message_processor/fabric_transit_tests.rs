@@ -389,7 +389,7 @@ async fn a_fabric_request_past_the_hop_limit_or_with_a_malformed_count_is_refuse
                 _ => None,
             })
             .collect();
-        assert_eq!(rejected, [(RejectionStage::Routing, reason, status)], "{hops}");
+        assert_eq!(rejected, [(RejectionStage::Routing, reason, None)], "{hops}: no HTTP status on Fabric");
         assert!(
             events
                 .iter()
@@ -506,8 +506,12 @@ async fn a_framed_stream_past_the_hop_limit_or_with_a_malformed_count_is_refused
                             .unwrap()
                             .into(),
                         surface: surface.clone(),
-                        variant_id: None,
+                        variant: crate::config::agent_surface_variants::ForwardedVariant {
+                            id: None,
+                            recorded: "_base_".into(),
+                        },
                         capabilities: crate::proxy::fabric_stream::peer::StreamCapabilities::local(true, true),
+                        scope: crate::observability::policy_audit::RequestScope::fresh(),
                     }),
                     crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
                     None,
@@ -538,8 +542,8 @@ async fn a_framed_stream_past_the_hop_limit_or_with_a_malformed_count_is_refused
             .collect();
         assert_eq!(
             rejected,
-            [(RejectionStage::Routing, reason, status, Some("trace-from-the-peer".to_string()))],
-            "{hops}"
+            [(RejectionStage::Routing, reason, None, Some("trace-from-the-peer".to_string()))],
+            "{hops}: no HTTP status on Fabric"
         );
     }
     assert!(target.received().is_empty(), "a refused stream never reaches the agent");
@@ -578,8 +582,12 @@ async fn a_modern_mcp_stream_reaches_the_agent_with_one_transit_token() {
                     .unwrap()
                     .into(),
                 surface,
-                variant_id: None,
+                variant: crate::config::agent_surface_variants::ForwardedVariant {
+                    id: None,
+                    recorded: "_base_".into(),
+                },
                 capabilities: crate::proxy::fabric_stream::peer::StreamCapabilities::local(true, true),
+                scope: crate::observability::policy_audit::RequestScope::fresh(),
             }),
             crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
             None,

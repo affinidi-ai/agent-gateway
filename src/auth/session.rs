@@ -6,7 +6,10 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use crate::storage::filesystem::{StorableEntity, StorageBackend, in_memory_storage_with_timeout, rwlock_storage};
+use crate::observability::loggable;
+use crate::storage::filesystem::{
+    StorableEntity, StorageBackend, in_memory_storage_with_timeout, loggable_id, rwlock_storage,
+};
 
 /// Manager for authenticated sessions with filesystem persistence
 pub struct SessionManager {
@@ -25,7 +28,7 @@ pub enum TermsSessionGate {
 }
 
 /// Session data
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Session {
     /// Session token (used as storage key)
     #[serde(default)]
@@ -38,7 +41,26 @@ pub struct Session {
     pub terms_gate: TermsSessionGate,
 }
 
+impl std::fmt::Debug for Session {
+    fn fmt(
+        &self,
+        formatter: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        formatter
+            .debug_struct("Session")
+            .field("token", &loggable::secret(&self.token))
+            .field("username", &self.username)
+            .field("user_id", &self.user_id)
+            .field("created_at", &self.created_at)
+            .field("expires_at", &self.expires_at)
+            .field("terms_gate", &self.terms_gate)
+            .finish()
+    }
+}
+
 impl StorableEntity for Session {
+    const ID_IS_SECRET: bool = true;
+
     fn id(&self) -> &str {
         &self.token
     }
@@ -96,7 +118,7 @@ impl SessionManager {
         // Delete expired session files from disk
         for token in &expired_tokens {
             if let Err(e) = storage.delete(token).await {
-                tracing::warn!("Failed to delete expired session file {}: {}", token, e);
+                tracing::warn!("Failed to delete expired session file {}: {}", loggable_id::<Session>(token), e);
             }
         }
 
@@ -159,7 +181,7 @@ impl SessionManager {
 
         let session = Session {
             token: session_token.clone(),
-            username: username.clone(),
+            username,
             user_id: user_id.clone(),
             created_at: now,
             expires_at: now + chrono::Duration::minutes(self.timeout_minutes as i64),
@@ -174,7 +196,7 @@ impl SessionManager {
             tracing::error!("Failed to persist session: {}", e);
         }
 
-        tracing::info!("Session created for username: {}, user_id: {}", username, user_id);
+        tracing::info!("Session created for user_id: {}", user_id);
 
         session_token
     }
@@ -225,15 +247,15 @@ impl SessionManager {
         &self,
         token: &str,
     ) -> Option<Session> {
+        if token.starts_with(crate::access_tokens::TOKEN_PREFIX) {
+            return None;
+        }
         let _guard = self
             .terms_gate_update_lock
             .read()
             .await;
-        let token_prefix: String = token
-            .chars()
-            .take(8)
-            .collect();
-        tracing::debug!("Validating session token: {}...", token_prefix);
+        let token_prefix = loggable_id::<Session>(token);
+        tracing::debug!("Validating session token: {}", token_prefix);
 
         let mut session = match self
             .storage
@@ -243,7 +265,7 @@ impl SessionManager {
         {
             Some(s) => s,
             None => {
-                tracing::warn!("Session token {}... not found", token_prefix);
+                tracing::warn!("Session token {} not found", token_prefix);
                 return None;
             }
         };
@@ -251,18 +273,18 @@ impl SessionManager {
         let now = chrono::Utc::now();
         if now >= session.expires_at {
             tracing::debug!(
-                "Session {} found for user {} - expired (expired: {})",
+                "Session {} found for user_id {} - expired (expired: {})",
                 token_prefix,
-                session.username,
+                session.user_id,
                 session.expires_at,
             );
             return None;
         }
 
         tracing::debug!(
-            "Session {} found for user {} - valid (expires: {}, {} seconds remaining)",
+            "Session {} found for user_id {} - valid (expires: {}, {} seconds remaining)",
             token_prefix,
-            session.username,
+            session.user_id,
             session.expires_at,
             (session.expires_at - now).num_seconds()
         );
@@ -272,9 +294,9 @@ impl SessionManager {
         let result = session.clone();
 
         tracing::debug!(
-            "Session {} refreshed for user {} - new expiration: {}",
+            "Session {} refreshed for user_id {} - new expiration: {}",
             token_prefix,
-            session.username,
+            session.user_id,
             session.expires_at
         );
 
@@ -334,7 +356,12 @@ impl SessionManager {
                 .delete(token)
                 .await
             {
-                tracing::warn!("Failed to delete session {} for user {}: {}", token, user_id, e);
+                tracing::warn!(
+                    "Failed to delete session {} for user {}: {}",
+                    loggable_id::<Session>(token),
+                    user_id,
+                    e
+                );
             }
         }
 
@@ -366,7 +393,7 @@ impl SessionManager {
                 .delete(token)
                 .await
             {
-                tracing::warn!("Failed to delete expired session {}: {}", token, e);
+                tracing::warn!("Failed to delete expired session {}: {}", loggable_id::<Session>(token), e);
             }
         }
 
@@ -383,6 +410,128 @@ impl Default for SessionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::component_tests::helpers::formatted_logs::FormattedLogs;
+
+    const TOKEN: &str = "0f2c9d7e-1b3a-4c5d-8e9f-a0b1c2d3e4f5";
+
+    fn session_with_token(
+        token: &str,
+        user_id: &str,
+        expires_in_minutes: i64,
+    ) -> Session {
+        let now = chrono::Utc::now();
+        Session {
+            token: token.to_string(),
+            username: "alice@example.com".to_string(),
+            user_id: user_id.to_string(),
+            created_at: now,
+            expires_at: now + chrono::Duration::minutes(expires_in_minutes),
+            terms_gate: TermsSessionGate::AllowedAtLogin,
+        }
+    }
+
+    #[test]
+    fn session_debug_shows_only_a_token_prefix() {
+        let rendered = format!("{:?}", session_with_token(TOKEN, "user-a", 20));
+
+        assert!(rendered.contains(r#"token: "0f2c9d7e...""#), "{rendered}");
+        assert!(rendered.contains(r#"user_id: "user-a""#), "{rendered}");
+        assert!(!rendered.contains(TOKEN), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn session_save_startup_scan_and_delete_log_only_a_token_prefix() {
+        let directory = tempfile::tempdir().unwrap();
+        let logs = FormattedLogs::capture();
+
+        let manager = SessionManager::with_storage(20, directory.path().to_path_buf())
+            .await
+            .unwrap();
+        let token = manager
+            .create_session("alice@example.com".into(), "user-a".into())
+            .await;
+        let reloaded = SessionManager::with_storage(20, directory.path().to_path_buf())
+            .await
+            .unwrap();
+        assert!(
+            reloaded
+                .validate_session(&token)
+                .await
+                .is_some()
+        );
+        reloaded
+            .remove_session(&token)
+            .await;
+
+        let text = logs.text();
+        let prefix = loggable::secret(&token);
+        assert!(text.contains("Session created for user_id: user-a"), "{text}");
+        assert!(text.contains(&format!("Saved session {prefix} to")), "{text}");
+        assert!(text.contains("Loaded session from"), "{text}");
+        assert!(text.contains(&format!("Deleted session {prefix}")), "{text}");
+        assert!(!text.contains(&token), "{text}");
+        assert!(!text.contains("alice@example.com"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn failed_session_deletes_log_only_a_token_prefix() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = SessionManager::with_storage(20, directory.path().to_path_buf())
+            .await
+            .unwrap();
+        let revoked = "revoked/0123456789-session-token";
+        let expired = "expired/0123456789-session-token";
+        {
+            let mut sessions = manager
+                .sessions()
+                .write()
+                .await;
+            sessions.insert(revoked.to_string(), session_with_token(revoked, "user-a", 20));
+            sessions.insert(expired.to_string(), session_with_token(expired, "user-b", -1));
+        }
+        let logs = FormattedLogs::capture();
+
+        assert_eq!(
+            manager
+                .remove_sessions_for_user("user-a")
+                .await,
+            1
+        );
+        manager
+            .cleanup_expired()
+            .await;
+
+        let text = logs.text();
+        assert!(text.contains("Failed to delete session revoked/... for user user-a"), "{text}");
+        assert!(text.contains("Failed to delete expired session expired/..."), "{text}");
+        assert!(!text.contains(revoked), "{text}");
+        assert!(!text.contains(expired), "{text}");
+    }
+
+    #[tokio::test]
+    async fn an_access_token_is_never_validated_as_a_session() {
+        let manager = SessionManager::new();
+        let access_token = "agpat_K7xQ2mZp9vR4tY8wB3nL6cF1hJ5dS0gA2eU7iO4kM9q";
+        let unknown_session = "1d2e3f4a-5b6c-4d7e-8f90-a1b2c3d4e5f6";
+        let logs = FormattedLogs::capture();
+
+        assert!(
+            manager
+                .validate_session(access_token)
+                .await
+                .is_none()
+        );
+        assert!(
+            manager
+                .validate_session(unknown_session)
+                .await
+                .is_none()
+        );
+
+        let text = logs.text();
+        assert!(text.contains("Session token 1d2e3f4a... not found"), "{text}");
+        assert!(!text.contains("agpat_"), "{text}");
+    }
 
     #[tokio::test]
     async fn remove_sessions_for_user_removes_all_matching() {

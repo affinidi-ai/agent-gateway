@@ -21,6 +21,7 @@ use crate::a2a::{
     validate_jsonrpc_envelope,
 };
 use crate::observability::broadcast_payload_capture_async;
+use crate::observability::loggable;
 use crate::proxy::backend_identity::ProtectedAgentIdentity;
 use crate::server::ConnectionGuard;
 use crate::state::{MultiSurfaceProxyState, ProxyState};
@@ -1129,10 +1130,7 @@ pub async fn handle_agent_card(
         } else {
             None
         };
-        let variant_alias = state
-            .active_variant_alias
-            .clone();
-        tokio::spawn(async move {
+        crate::observability::policy_audit::spawn_in_request(async move {
             metrics
                 .record_connection_with_ucp(
                     channel_config_id,
@@ -1147,7 +1145,6 @@ pub async fn handle_agent_card(
                     None,
                     None,
                     0,
-                    variant_alias,
                 )
                 .await;
         });
@@ -1473,14 +1470,11 @@ fn streamed_response_completion(
         .target
         .endpoint
         .clone();
-    let variant = state
-        .active_variant_alias
-        .clone();
     move |outcome: crate::mcp::modern_sse::ResponseOutcome| {
         let latency = start_time
             .elapsed()
             .as_millis() as u64;
-        tokio::spawn(async move {
+        crate::observability::policy_audit::spawn_in_request(async move {
             guard.decrement().await;
             if let (Some(monitor), Some(task_id)) = (monitor, task_id) {
                 monitor
@@ -1512,7 +1506,6 @@ fn streamed_response_completion(
                         None,
                         None,
                         latency,
-                        variant,
                     )
                     .await;
             }
@@ -2418,37 +2411,6 @@ async fn proxy_handler_with_mcp_runtime(
         Some(crate::mcp::request_validation::McpRequestClassification::Modern(request)) => Some((**request).clone()),
         _ => None,
     };
-    if let Some(request) = modern_request.as_ref()
-        && let Some(error) = state
-            .variant_resolution_error
-            .as_ref()
-    {
-        connection_guard
-            .decrement()
-            .await;
-        let status = match error {
-            crate::config::agent_surface_variants::VariantResolveError::UnknownAlias(_) => {
-                crate::audit::request_events::request_rejected(
-                    &audit_facts,
-                    crate::audit::request_events::RejectionStage::Routing,
-                    crate::audit::request_events::RejectionReason::UnknownVariant,
-                    404,
-                    Some(i64::from(crate::mcp::error_codes::INTERNAL_ERROR)),
-                );
-                StatusCode::NOT_FOUND
-            }
-            // A misconfigured default variant is a gateway fault, not a refusal.
-            _ => StatusCode::SERVICE_UNAVAILABLE,
-        };
-        return Ok(crate::mcp::request_validation::McpRequestValidationError {
-            status,
-            id: request.id.clone(),
-            code: crate::mcp::error_codes::INTERNAL_ERROR,
-            message: "MCP surface variant is unavailable".into(),
-            data: None,
-        }
-        .into_response());
-    }
     let subscription_lifetime = if let Some(request) = modern_request
         .as_ref()
         .filter(|request| request.method == "subscriptions/listen")
@@ -2686,7 +2648,7 @@ async fn proxy_handler_with_mcp_runtime(
             channel_info!(
                 config_id,
                 "📩 MCP elicitation response routed session={} elicit_id={} resolved={}",
-                session_id,
+                loggable::secret(session_id),
                 elicit_id,
                 resolved
             );
@@ -2891,18 +2853,11 @@ async fn proxy_handler_with_mcp_runtime(
             &state.surface.name,
         );
         gw_input.source_auth = source_auth_context.clone();
-        // [OPA-INPUT] Gateway policy input BEFORE agent/TR data
-        info!(
-            channel = state.surface.name,
-            "[OPA-INPUT] Gateway policy input before TR: {}",
-            serde_json::to_string(&gw_input).unwrap_or_default()
-        );
         gw_input.agent = agent_context.clone();
         gw_input.mcp = mcp_context.clone();
         gw_input.a2a = a2a_context.clone();
         gw_input.trust_check_results = trust_check_results.clone();
         let gw_input_value = serde_json::to_value(&gw_input).unwrap_or_default();
-        info!(channel = state.surface.name, "[OPA-INPUT] Gateway policy input before eval: {}", gw_input_value);
         let (gw_policy_def_id, gw_policy_version, gw_policy_hash) =
             match gw_policy_manager.policy_evidence(&self_gateway_id) {
                 Some((id, v, h)) => (id, v, Some(h)),
@@ -3407,7 +3362,7 @@ async fn proxy_handler_with_mcp_runtime(
                                 .clone();
                             let metrics_clone = Arc::clone(metrics);
                             let trace_id_clone = trace_id.clone();
-                            tokio::spawn(async move {
+                            crate::observability::policy_audit::spawn_in_request(async move {
                                 metrics_clone
                                     .record_connection(
                                         channel_config_id,
@@ -3421,7 +3376,6 @@ async fn proxy_handler_with_mcp_runtime(
                                         None,
                                         None,
                                         latency_ms,
-                                        None,
                                     )
                                     .await;
                             });
@@ -3498,7 +3452,7 @@ async fn proxy_handler_with_mcp_runtime(
                         .clone();
                     let metrics_clone = Arc::clone(metrics);
                     let trace_id_clone = trace_id.clone();
-                    tokio::spawn(async move {
+                    crate::observability::policy_audit::spawn_in_request(async move {
                         metrics_clone
                             .record_connection(
                                 channel_config_id,
@@ -3512,7 +3466,6 @@ async fn proxy_handler_with_mcp_runtime(
                                 None,
                                 None,
                                 latency_ms,
-                                None,
                             )
                             .await;
                     });
@@ -3584,7 +3537,11 @@ async fn proxy_handler_with_mcp_runtime(
                 return Err(create_error_response(StatusCode::NOT_FOUND, "SSE session not found or expired"));
             }
 
-            channel_info!(config_id, "📨 SSE session POST for fabric:// MCP channel session={}", session_id);
+            channel_info!(
+                config_id,
+                "📨 SSE session POST for fabric:// MCP channel session={}",
+                loggable::secret(&session_id)
+            );
 
             // Parse the JSON-RPC request
             let json_request: serde_json::Value = serde_json::from_slice(&body_bytes).map_err(|e| {
@@ -3606,7 +3563,7 @@ async fn proxy_handler_with_mcp_runtime(
                 "📨 Fabric SSE: forwarding through Fabric — rewritten_uri={}, body_len={}, method=POST, target={}",
                 rewritten_uri,
                 body_bytes.len(),
-                state.surface.target.endpoint
+                loggable::url(&state.surface.target.endpoint)
             );
 
             // Forward through Fabric
@@ -3661,10 +3618,9 @@ async fn proxy_handler_with_mcp_runtime(
 
                     channel_info!(
                         config_id,
-                        "📨 Fabric SSE: response status={}, body_len={}, body_preview={}",
+                        "📨 Fabric SSE: response status={}, body_len={}",
                         parts.status,
-                        json_str.len(),
-                        &json_str[..json_str.len().min(500)]
+                        json_str.len()
                     );
 
                     if parts.status.is_success() && !json_str.is_empty() {
@@ -3688,7 +3644,6 @@ async fn proxy_handler_with_mcp_runtime(
                     }
                 }
                 Err(err_resp) => {
-                    // Extract error details for debugging
                     let err_status = err_resp.status();
                     let (err_parts, err_body) = err_resp.into_parts();
                     let err_body_bytes = axum::body::to_bytes(err_body, 1024 * 1024)
@@ -3697,10 +3652,12 @@ async fn proxy_handler_with_mcp_runtime(
                     let err_body_str = String::from_utf8_lossy(&err_body_bytes);
                     channel_error!(
                         config_id,
-                        "📨 Fabric SSE: forwarding FAILED — status={}, headers={:?}, body={}",
+                        "📨 Fabric SSE: forwarding FAILED — status={}, content_type={:?}, body_len={}",
                         err_status,
-                        err_parts.headers,
-                        &err_body_str[..err_body_str.len().min(1000)]
+                        err_parts
+                            .headers
+                            .get(axum::http::header::CONTENT_TYPE),
+                        err_body_bytes.len()
                     );
 
                     let error_json = serde_json::json!({
@@ -3938,7 +3895,7 @@ async fn proxy_handler_with_mcp_runtime(
                         .endpoint
                         .clone();
                     let trace_id = uuid::Uuid::new_v4().to_string();
-                    tokio::spawn(async move {
+                    crate::observability::policy_audit::spawn_in_request(async move {
                         metrics
                             .record_connection(
                                 channel_config_id,
@@ -3952,7 +3909,6 @@ async fn proxy_handler_with_mcp_runtime(
                                 None,
                                 None,
                                 latency_ms,
-                                None,
                             )
                             .await;
                     });
@@ -3998,7 +3954,7 @@ async fn proxy_handler_with_mcp_runtime(
     }
 
     if !is_a2a_proxy_target {
-        debug!(channel = channel_name, target = %target_url, "Forwarding to upstream");
+        debug!(channel = channel_name, target = %loggable::url(&target_url), "Forwarding to upstream");
     }
 
     let _prep_span = tracing::info_span!(
@@ -4072,7 +4028,7 @@ async fn proxy_handler_with_mcp_runtime(
                         .clone();
                     let metrics = Arc::clone(metrics);
                     let trace = trace_id.clone();
-                    tokio::spawn(async move {
+                    crate::observability::policy_audit::spawn_in_request(async move {
                         metrics
                             .record_connection(
                                 channel_config_id,
@@ -4086,7 +4042,6 @@ async fn proxy_handler_with_mcp_runtime(
                                 None,
                                 None,
                                 latency_ms,
-                                None,
                             )
                             .await;
                     });
@@ -4130,6 +4085,8 @@ async fn proxy_handler_with_mcp_runtime(
                 config_id,
                 "🔌 MCP Streamable HTTP GET: opening notification stream session_id={:?}",
                 session_id_opt
+                    .as_deref()
+                    .map(loggable::secret)
             );
 
             let stream: std::pin::Pin<
@@ -4163,6 +4120,8 @@ async fn proxy_handler_with_mcp_runtime(
                 config_id,
                 "🔌 MCP Streamable HTTP DELETE: terminating session session_id={:?}",
                 session_id_opt
+                    .as_deref()
+                    .map(loggable::secret)
             );
             if let Some(sid) = session_id_opt {
                 crate::mcp::streamable_sse::global_streamable_session_registry()
@@ -4288,7 +4247,7 @@ async fn proxy_handler_with_mcp_runtime(
                 config_id,
                 "📨 SSE session POST for proxy:// channel proxy_id={} session={}",
                 proxy_id,
-                session_id
+                loggable::secret(&session_id)
             );
 
             // Parse JSON-RPC request
@@ -4623,7 +4582,7 @@ async fn proxy_handler_with_mcp_runtime(
                             .target
                             .endpoint
                             .clone();
-                        tokio::spawn(async move {
+                        crate::observability::policy_audit::spawn_in_request(async move {
                             metrics
                                 .record_connection(
                                     channel_config_id,
@@ -4637,7 +4596,6 @@ async fn proxy_handler_with_mcp_runtime(
                                     None,
                                     None,
                                     latency_ms,
-                                    None,
                                 )
                                 .await;
                         });
@@ -4715,7 +4673,7 @@ async fn proxy_handler_with_mcp_runtime(
                             .target
                             .endpoint
                             .clone();
-                        tokio::spawn(async move {
+                        crate::observability::policy_audit::spawn_in_request(async move {
                             metrics
                                 .record_connection(
                                     channel_config_id,
@@ -4729,7 +4687,6 @@ async fn proxy_handler_with_mcp_runtime(
                                     None,
                                     None,
                                     latency_ms,
-                                    None,
                                 )
                                 .await;
                         });
@@ -4805,9 +4762,6 @@ async fn proxy_handler_with_mcp_runtime(
             source_authenticated: authenticated_identity.is_some(),
             metrics_store: &state.metrics_store,
             ws_state: &state.ws_state,
-            variant_alias: state
-                .active_variant_alias
-                .as_deref(),
         };
 
         let identity_result = match async { inspect_message_extensions(&body_bytes, &inspection_ctx).await }
@@ -4834,7 +4788,7 @@ async fn proxy_handler_with_mcp_runtime(
                         .endpoint
                         .clone();
                     let trace_id = uuid::Uuid::new_v4().to_string();
-                    tokio::spawn(async move {
+                    crate::observability::policy_audit::spawn_in_request(async move {
                         metrics
                             .record_connection(
                                 channel_config_id,
@@ -4848,7 +4802,6 @@ async fn proxy_handler_with_mcp_runtime(
                                 None,
                                 None,
                                 latency_ms,
-                                None,
                             )
                             .await;
                     });
@@ -5734,12 +5687,6 @@ async fn proxy_handler_with_mcp_runtime(
             &state.surface.name,
         );
         policy_input.source_auth = source_auth_context.clone();
-        // [OPA-INPUT] Surface policy input BEFORE agent/TR data
-        info!(
-            channel = config_id_str,
-            "[OPA-INPUT] Surface policy input before TR: {}",
-            serde_json::to_string(&policy_input).unwrap_or_default()
-        );
         policy_input.agent = agent_context.clone();
         policy_input.mcp = mcp_context.clone();
         policy_input.a2a = a2a_context.clone();
@@ -5749,8 +5696,6 @@ async fn proxy_handler_with_mcp_runtime(
         policy_input.trust_check_results = trust_check_results.clone();
         policy_input.normalize_caller_did();
         let input_value = serde_json::to_value(&policy_input).unwrap_or_default();
-        // [OPA-INPUT] Surface policy input fully populated
-        info!(channel = config_id_str, "[OPA-INPUT] Surface policy input before eval: {}", input_value);
 
         let Some(policy_manager) = state
             .policy_manager
@@ -6536,6 +6481,7 @@ async fn proxy_handler_with_mcp_runtime(
         });
     }
     if !outbound_credentials.is_empty() {
+        let surface_variant = crate::observability::policy_audit::current_request_variant();
         // Credential delegation requires a verified identity — both source_auth
         // (to know *who* the caller is) and managed_identity / extension inspection
         // (to know *which agent* is acting). Anonymous callers must be rejected.
@@ -6552,6 +6498,7 @@ async fn proxy_handler_with_mcp_runtime(
             warn!(
                 target: "credential_delegation",
                 surface = %channel_name,
+                surface_variant = surface_variant.as_deref(),
                 "Credential delegation requires source authentication — rejecting anonymous request"
             );
             crate::audit::request_events::request_rejected(
@@ -6699,6 +6646,7 @@ async fn proxy_handler_with_mcp_runtime(
                 info!(
                     target: "credential_delegation",
                     surface = %channel_name,
+                    surface_variant = surface_variant.as_deref(),
                     providers = %consent_entries.len(),
                     user_hash = %user_hash,
                     agent_did = %agent_did_for_vault,
@@ -6791,6 +6739,7 @@ async fn proxy_handler_with_mcp_runtime(
                             warn!(
                                 target: "credential_delegation",
                                 surface = %channel_name,
+                                surface_variant = surface_variant.as_deref(),
                                 error = %e,
                                 "Failed to mint consent_required identity VP for audit log"
                             );
@@ -6800,6 +6749,7 @@ async fn proxy_handler_with_mcp_runtime(
                     debug!(
                         target: "credential_delegation",
                         surface = %channel_name,
+                        surface_variant = surface_variant.as_deref(),
                         has_identity_selector = %state.identity_selector.is_some(),
                         has_identity_result = %identity_result.is_some(),
                         "Skipping consent_required VP audit — missing identity selector or resolved agent identity"
@@ -6846,6 +6796,7 @@ async fn proxy_handler_with_mcp_runtime(
                                         debug!(
                                             target: "credential_delegation",
                                             surface = %channel_name,
+                                            surface_variant = surface_variant.as_deref(),
                                             meta_field = %field,
                                             "Injected delegated credential into MCP metadata"
                                         );
@@ -6854,6 +6805,7 @@ async fn proxy_handler_with_mcp_runtime(
                                         warn!(
                                             target: "credential_delegation",
                                             surface = %channel_name,
+                                            surface_variant = surface_variant.as_deref(),
                                             meta_field = %field,
                                             error = %error,
                                             "Failed to inject delegated credential into MCP metadata"
@@ -6873,6 +6825,7 @@ async fn proxy_handler_with_mcp_runtime(
                                 debug!(
                                     target: "credential_delegation",
                                     surface = %channel_name,
+                                    surface_variant = surface_variant.as_deref(),
                                     header = %name,
                                     "Injected delegated credential header"
                                 );
@@ -6885,6 +6838,7 @@ async fn proxy_handler_with_mcp_runtime(
             warn!(
                 target: "credential_delegation",
                 surface = %channel_name,
+                surface_variant = surface_variant.as_deref(),
                 has_user_hash = %delegation_user_hash.is_some(),
                 "Credential delegation configured but stores not available — skipping"
             );
@@ -7089,7 +7043,7 @@ async fn proxy_handler_with_mcp_runtime(
         deferred_audit.flush();
     }
 
-    debug!("🟢 OUTBOUND REQUEST: trace_id={} target={}", trace_id, target_url);
+    debug!("🟢 OUTBOUND REQUEST: trace_id={} target={}", trace_id, loggable::url(&target_url));
 
     // Traffic mirroring - send duplicate request to mirror endpoint (if configured)
     if let Some(mirror_config) = state.surface.mirror() {
@@ -7106,7 +7060,7 @@ async fn proxy_handler_with_mcp_runtime(
 
         if should_mirror {
             let mirror_endpoint = mirror_config.endpoint.clone();
-            let mirror_endpoint_for_log = mirror_endpoint.clone(); // Clone for later use
+            let mirror_endpoint_for_log = loggable::url(&mirror_endpoint);
             let mirror_timeout = std::time::Duration::from_secs(mirror_config.timeout_secs);
             let wait_for_response = mirror_config.wait_for_response;
             let channel_name_clone = channel_name.to_string();
@@ -7147,7 +7101,7 @@ async fn proxy_handler_with_mcp_runtime(
                         Ok(resp) => {
                             info!(
                                 channel = channel_name_clone,
-                                mirror_endpoint = mirror_endpoint,
+                                mirror_endpoint = mirror_endpoint_for_log,
                                 status = resp.status().as_u16(),
                                 trace_id = trace_id_clone,
                                 "Mirror request completed"
@@ -7156,8 +7110,8 @@ async fn proxy_handler_with_mcp_runtime(
                         Err(e) => {
                             warn!(
                                 channel = channel_name_clone,
-                                mirror_endpoint = mirror_endpoint,
-                                error = %e,
+                                mirror_endpoint = mirror_endpoint_for_log,
+                                error = %e.without_url(),
                                 trace_id = trace_id_clone,
                                 "Mirror request failed"
                             );
@@ -7166,6 +7120,7 @@ async fn proxy_handler_with_mcp_runtime(
                 } else {
                     // Fire-and-forget mirror request
                     let config_id_clone = config_id.to_string();
+                    let mirror_endpoint_for_task = mirror_endpoint_for_log.clone();
                     tokio::spawn(async move {
                         match mirror_req_with_headers
                             .send()
@@ -7175,7 +7130,7 @@ async fn proxy_handler_with_mcp_runtime(
                                 channel_info!(
                                     config_id_clone,
                                     "Mirror request completed (async): endpoint={}, status={}",
-                                    mirror_endpoint,
+                                    mirror_endpoint_for_task,
                                     resp.status().as_u16()
                                 );
                             }
@@ -7183,8 +7138,8 @@ async fn proxy_handler_with_mcp_runtime(
                                 channel_warn!(
                                     config_id_clone,
                                     "Mirror request failed (async): endpoint={}, error={}",
-                                    mirror_endpoint,
-                                    e
+                                    mirror_endpoint_for_task,
+                                    e.without_url()
                                 );
                             }
                         }
@@ -7296,7 +7251,7 @@ async fn proxy_handler_with_mcp_runtime(
         "http.client.send",
         otel.name = "Send Request & Await Response",
         http.method = %method,
-        http.url = %target_url,
+        http.url = %loggable::url(&target_url),
         surface = %channel_name
     );
 
@@ -7434,6 +7389,7 @@ async fn proxy_handler_with_mcp_runtime(
                     }
                     Err(e) => {
                         if attempt <= retry_config.max_attempts {
+                            let e = e.without_url();
                             warn!(channel = channel_name, attempt = attempt, error = %e, "Request failed, will retry");
 
                             // Calculate backoff delay
@@ -7576,7 +7532,7 @@ async fn proxy_handler_with_mcp_runtime(
         info!(
             surface = %channel_name,
             status = %sse_status,
-            body = %String::from_utf8_lossy(&body_bytes),
+            body_bytes = body_bytes.len(),
             "Upstream rejected direct POST ({}), falling back to Legacy SSE transport",
             sse_status
         );
@@ -7591,7 +7547,11 @@ async fn proxy_handler_with_mcp_runtime(
         .await
         {
             Ok(json_response) => {
-                info!(channel = %channel_name, response = %json_response, "SSE fallback succeeded, returning JSON response");
+                info!(
+                    channel = %channel_name,
+                    response_bytes = json_response.len(),
+                    "SSE fallback succeeded, returning JSON response"
+                );
                 connection_guard
                     .decrement()
                     .await;
@@ -7720,7 +7680,7 @@ async fn proxy_handler_with_mcp_runtime(
                             .endpoint
                             .clone();
                         let trace = trace_id.clone();
-                        tokio::spawn(async move {
+                        crate::observability::policy_audit::spawn_in_request(async move {
                             metrics
                                 .record_connection(
                                     channel_config_id,
@@ -7734,7 +7694,6 @@ async fn proxy_handler_with_mcp_runtime(
                                     None,
                                     None,
                                     latency_ms,
-                                    None,
                                 )
                                 .await;
                         });
@@ -8642,7 +8601,7 @@ async fn proxy_handler_with_mcp_runtime(
                             .endpoint
                             .clone();
                         let trace_id = uuid::Uuid::new_v4().to_string();
-                        tokio::spawn(async move {
+                        crate::observability::policy_audit::spawn_in_request(async move {
                             metrics
                                 .record_connection(
                                     channel_config_id,
@@ -8656,7 +8615,6 @@ async fn proxy_handler_with_mcp_runtime(
                                     None,
                                     None,
                                     latency_ms,
-                                    None,
                                 )
                                 .await;
                         });
@@ -8914,9 +8872,6 @@ async fn proxy_handler_with_mcp_runtime(
                 "success",
                 None,
                 identity_hash.clone(),
-                state
-                    .active_variant_alias
-                    .as_deref(),
             )
             .await;
         }
@@ -9031,10 +8986,7 @@ async fn proxy_handler_with_mcp_runtime(
             }
 
             // Record single metric with all latency breakdowns
-            let variant_alias = state
-                .active_variant_alias
-                .clone();
-            tokio::spawn(async move {
+            crate::observability::policy_audit::spawn_in_request(async move {
                 metrics
                     .record_connection_with_ucp(
                         channel_config_id,
@@ -9049,7 +9001,6 @@ async fn proxy_handler_with_mcp_runtime(
                         Some(request_latency_ms),
                         Some(channel_response_latency_ms),
                         total_latency_ms,
-                        variant_alias,
                     )
                     .await;
             });
@@ -9375,6 +9326,39 @@ async fn proxy_handler_with_mcp_runtime(
     process_response(status, response_headers, response_body).await
 }
 
+/// Refuses an Access Point request whose surface variant can't be resolved,
+/// recording the refusal once. A modern MCP request, told by its headers, is
+/// answered with a JSON-RPC error whatever its method: its body is read,
+/// within the surface's MCP body limit, only to echo its `id`. Every other
+/// request gets a plain error.
+async fn refuse_access_point_variant(
+    surface: &crate::config::agent_surface::AgentSurface,
+    network_config: &crate::config::NetworkConfig,
+    versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
+    req: Request,
+    error: &crate::config::agent_surface_variants::VariantResolveError,
+) -> Response {
+    let modern_mcp = surface.access_point.protocol == crate::config::agent_surface::SurfaceProtocol::Mcp
+        && crate::mcp::request_validation::has_modern_header(req.headers(), versions);
+    let refusal = crate::audit::request_events::refuse_routing(
+        &routing_facts(surface),
+        error,
+        modern_mcp.then_some(i64::from(crate::mcp::error_codes::INTERNAL_ERROR)),
+    );
+    refusal.warn(surface);
+    if !modern_mcp {
+        return create_error_response(refusal.status(), refusal.message());
+    }
+    crate::mcp::request_validation::answer_routing_refusal(
+        &refusal,
+        surface.mcp_http.as_ref(),
+        &network_config.get_inbound_external_urls(),
+        versions,
+        Some(req.into_body()),
+    )
+    .await
+}
+
 fn normalize_route_for_match(route: &str) -> String {
     let with_leading_slash = if route.starts_with('/') {
         route.to_string()
@@ -9423,15 +9407,28 @@ async fn multi_channel_proxy_handler_with_mcp_runtime(
     mcp_versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
     mcp_continuations: Option<Arc<crate::mcp::continuations::config::ContinuationRuntime>>,
 ) -> Response {
-    use crate::observability::policy_audit::{in_request, new_request_id, response_in_request};
+    use crate::observability::policy_audit::{RequestScope, in_request, response_in_request};
 
-    let id = new_request_id();
+    let scope = RequestScope::fresh();
     let response = in_request(
-        id.clone(),
+        scope.clone(),
         Box::pin(multi_channel_proxy_handler_in_request_scope(addr, state, req, mcp_versions, mcp_continuations)),
     )
     .await;
-    response_in_request(id, response)
+    response_in_request(scope, response)
+}
+
+/// The single-channel request future, moved to the heap where it is built.
+/// It is large, so building it in the router would hold a copy in the
+/// router's own frame and in the task-local future that wraps it.
+fn boxed_proxy_handler(
+    addr: SocketAddr,
+    state: ProxyState,
+    req: Request,
+    mcp_versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
+    mcp_continuations: Option<Arc<crate::mcp::continuations::config::ContinuationRuntime>>,
+) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<Response, Response>>>> {
+    Box::pin(proxy_handler_with_mcp_runtime(addr, state, req, mcp_versions, mcp_continuations))
 }
 
 async fn multi_channel_proxy_handler_in_request_scope(
@@ -9512,180 +9509,51 @@ async fn multi_channel_proxy_handler_in_request_scope(
         Some(ch) => {
             info!("Matched channel '{}' with route '{}' for path '{}'", ch.surface.name, ch.surface.route(), path);
 
-            // Base-mode (no variants): resolve to base surface, use channel-level
-            // engines, and forward through the normal pipeline below.
-            // Variant-mode (one or more variants): pick by alias or
-            // default_variant_id, use per-variant engines.
-            // `variant_id` is None in base-mode.
-            let mut variant_resolution_error = None;
-            let variant_id: Option<String> = if ch.surface.variants.is_empty() {
-                if let Some(alias) = virtual_channel_alias.as_deref() {
-                    warn!(
-                        surface = %ch.surface.name,
-                        requested_alias = %alias,
-                        "Channel has no variants — alias in path is ignored, routing to base surface"
-                    );
-                    variant_resolution_error = Some(
-                        crate::config::agent_surface_variants::VariantResolveError::UnknownAlias(alias.to_string()),
-                    );
-                } else if let Some(id) = ch
-                    .surface
-                    .default_variant_id
-                    .as_deref()
-                {
-                    variant_resolution_error =
-                        Some(crate::config::agent_surface_variants::VariantResolveError::MisconfiguredDefault(
-                            id.to_string(),
-                        ));
-                }
-                None
-            } else {
-                let candidate = if let Some(alias) = virtual_channel_alias.as_deref() {
-                    ch.surface
-                        .variants
-                        .iter()
-                        .find(|v| v.alias == alias)
-                        .map(|v| v.id.clone())
-                } else {
-                    ch.surface
-                        .default_variant_id
-                        .clone()
-                };
-
-                match candidate {
-                    Some(id) => Some(id),
-                    None => {
-                        if let Some(alias) = virtual_channel_alias.as_deref() {
-                            error!(
-                                surface = %ch.surface.name,
-                                config_id = ?ch.surface.config_id(),
-                                requested_alias = %alias,
-                                available_variants = ?ch.surface.variants.iter().map(|v| &v.alias).collect::<Vec<_>>(),
-                                "❌ ROUTING FAILED: Virtual channel alias not found"
-                            );
-                            crate::audit::request_events::request_rejected(
-                                &routing_facts(&ch.surface),
-                                crate::audit::request_events::RejectionStage::Routing,
-                                crate::audit::request_events::RejectionReason::UnknownVariant,
-                                400,
-                                None,
-                            );
-                            return create_error_response(
-                                StatusCode::BAD_REQUEST,
-                                &format!("Virtual channel alias '{}' not found for this channel", alias),
-                            );
-                        } else {
-                            // No alias in path and no default_variant_id
-                            // configured → route to the bare base surface
-                            // (base is the implicit default). variant_id =
-                            // None drops into channel-level engine handling
-                            // below.
-                            debug!(
-                                surface = %ch.surface.name,
-                                "Alias-less request, no default_variant_id — routing to base surface"
-                            );
-                            None
-                        }
-                    }
+            // The URL's alias, else the default variant, else the base surface
+            // (`variant_id` None) serves the request. A variant that can't be
+            // resolved is refused, never served by the base or another variant.
+            let selected = match ch
+                .surface
+                .select_variant(virtual_channel_alias.as_deref())
+            {
+                Ok(variant) => variant,
+                Err(error) => {
+                    // The refusal may wait on the caller's body, so it must not
+                    // hold the surface list a surface update writes to.
+                    let surface = Arc::clone(&ch.surface);
+                    drop(sorted_channels);
+                    drop(channels);
+                    return refuse_access_point_variant(&surface, &state.network_config, mcp_versions, req, &error)
+                        .await;
                 }
             };
+            let variant_id = selected.map(|variant| variant.id.clone());
 
-            // Check if variant exists and is enabled (only in variant-mode)
-            if let Some(ref vid) = variant_id {
-                let variant = match ch
-                    .surface
-                    .variants
-                    .iter()
-                    .find(|v| &v.id == vid)
-                {
-                    Some(v) => v,
-                    None => {
-                        error!(
-                            surface = %ch.surface.name,
-                            config_id = ?ch.surface.config_id(),
-                            variant_id = %vid,
-                            "❌ ROUTING FAILED: Variant ID not found in channel's variants list"
-                        );
-                        return create_error_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "Selected variant not found in channel configuration",
-                        );
-                    }
-                };
-
-                if !variant.enabled {
-                    warn!(
-                        surface = %ch.surface.name,
-                        variant_id = %vid,
-                        variant_alias = %variant.alias,
-                        "❌ Virtual channel variant is DISABLED"
-                    );
-                    crate::audit::request_events::request_rejected(
-                        &routing_facts(&ch.surface),
-                        crate::audit::request_events::RejectionStage::Routing,
-                        crate::audit::request_events::RejectionReason::VariantDisabled,
-                        503,
-                        None,
-                    );
-                    return create_error_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        &format!("Virtual channel variant '{}' is disabled", variant.alias),
-                    );
-                }
-
-                info!(
-                    "✓ Using virtual channel variant '{}' (alias: '{}') for channel '{}'",
-                    vid, variant.alias, ch.surface.name
-                );
-            }
-
-            // Phase D — prefer the pre-resolved snapshot from
+            // Prefer the pre-resolved snapshot from
             // `MultiSurfaceProxyState.resolved_surface_cache`, which is
             // populated by `apply_surface_change` whenever a surface is
-            // saved. Falls back to resolving the variant from the
-            // channel's mirror surface when the cache has no entry
-            // (e.g. a legacy JSON-config channel that never came from a
-            // surface, or a startup race before seeding). The mirror
-            // surface is built by `AgentSurface::from_channel_mapping`,
-            // whose `variants[]` projection (see
-            // `virtual_channel_to_surface_variant`) carries every
-            // per-variant field that `apply_variant_overrides` would
-            // write, so `resolve_variant` returns an equivalent
-            // surface.
-            let resolved_surface = {
-                let cache_lookup = ch
-                    .surface
-                    .config_id()
-                    .and_then(|sid| {
-                        state
-                            .resolved_surface_cache
-                            .resolve(sid, virtual_channel_alias.as_deref())
-                            .ok()
-                    });
-                if let Some(snap) = cache_lookup {
-                    snap
-                } else {
-                    match ch
+            // saved and keeps its last good entry when that fails. Falls back
+            // to serving the selected variant from the channel's surface when
+            // the cache has no entry for it. The variant recorded comes from
+            // the same place as the surface served.
+            let (resolved_surface, recorded_variant) = match ch
+                .surface
+                .config_id()
+                .and_then(|sid| {
+                    state
+                        .resolved_surface_cache
+                        .resolve(sid, virtual_channel_alias.as_deref())
+                        .ok()
+                }) {
+                Some(cached) => (cached.surface, cached.surface_variant),
+                None => {
+                    let served = ch
                         .surface
-                        .resolve_variant(virtual_channel_alias.as_deref())
-                    {
-                        Ok(s) => Arc::new(s),
-                        Err(e) => {
-                            error!(
-                                surface = %ch.surface.name,
-                                config_id = ?ch.surface.config_id(),
-                                requested_alias = ?virtual_channel_alias,
-                                error = %e,
-                                "❌ VARIANT RESOLVE FAILED on surface mirror"
-                            );
-                            return create_error_response(
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                "Failed to resolve virtual channel variant",
-                            );
-                        }
-                    }
+                        .serve_selected(selected);
+                    (Arc::new(served.surface), served.recorded)
                 }
             };
+            crate::observability::policy_audit::set_request_variant(&recorded_variant);
 
             // Select the correct engines. In base-mode (variant_id == None) we
             // use channel-level engines and resolve to the base surface.
@@ -9813,7 +9681,6 @@ async fn multi_channel_proxy_handler_in_request_scope(
                 vc_issuer: state.vc_issuer.clone(),
                 active_variant_alias: virtual_channel_alias.clone(),
                 active_variant_id: variant_id,
-                variant_resolution_error,
                 surface: resolved_surface,
             };
 
@@ -9831,14 +9698,6 @@ async fn multi_channel_proxy_handler_in_request_scope(
                 stripped_path.clone()
             };
 
-            debug!(
-                "Rewriting URI: original='{}' new='{}' (stripped route '{}' alias={:?})",
-                path,
-                new_uri,
-                ch.surface.route(),
-                virtual_channel_alias
-            );
-
             let parsed_uri = match new_uri.parse() {
                 Ok(uri) => uri,
                 Err(e) => {
@@ -9846,6 +9705,13 @@ async fn multi_channel_proxy_handler_in_request_scope(
                     return create_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Failed to process request path");
                 }
             };
+            debug!(
+                "Rewriting URI: original='{}' new='{}' (stripped route '{}' alias={:?})",
+                path,
+                loggable::uri(&parsed_uri),
+                ch.surface.route(),
+                virtual_channel_alias
+            );
             parts.uri = parsed_uri;
 
             let new_req = Request::from_parts(parts, body);
@@ -9861,11 +9727,12 @@ async fn multi_channel_proxy_handler_in_request_scope(
             let policy_collector = std::sync::Arc::new(std::sync::Mutex::new(Vec::<
                 crate::observability::policy_audit::PolicyDecisionSummary,
             >::new()));
-            let result = Box::pin(crate::observability::policy_audit::POLICY_DECISION_COLLECTOR.scope(
-                policy_collector,
-                proxy_handler_with_mcp_runtime(addr, proxy_state, new_req, mcp_versions, mcp_continuations),
-            ))
-            .await;
+            let result = crate::observability::policy_audit::POLICY_DECISION_COLLECTOR
+                .scope(
+                    policy_collector,
+                    boxed_proxy_handler(addr, proxy_state, new_req, mcp_versions, mcp_continuations),
+                )
+                .await;
             match result {
                 Ok(response) => {
                     channel_info!(
@@ -10034,44 +9901,14 @@ fn handle_upstream_error(
             .endpoint
             .contains("your-domain.com");
 
-    // Provide more specific error messages based on the error type
-    let error_message = if e.is_connect() {
-        if e.to_string().contains("dns")
-            || e.to_string()
-                .contains("resolve")
-        {
-            if is_example_domain {
-                format!(
-                    "Target endpoint '{}' uses a placeholder domain that doesn't resolve. Please configure a valid endpoint in your channel settings.",
-                    state.surface.target.endpoint
-                )
-            } else {
-                format!(
-                    "DNS resolution failed for target endpoint '{}'. Please check that the hostname is valid and resolvable.",
-                    state.surface.target.endpoint
-                )
-            }
-        } else if e
-            .to_string()
-            .contains("timeout")
-        {
-            format!(
-                "Connection timeout to target endpoint '{}'. The server may be unavailable or slow to respond.",
-                state.surface.target.endpoint
-            )
-        } else {
-            format!("Connection failed to target endpoint '{}': {}", state.surface.target.endpoint, e)
-        }
-    } else if e.is_timeout() {
-        format!(
-            "Request timeout to target endpoint '{}'. The server did not respond within the configured timeout period.",
-            state.surface.target.endpoint
-        )
-    } else {
-        format!("Failed to forward request to target endpoint '{}': {}", state.surface.target.endpoint, e)
-    };
-
-    error!(channel = channel_name, error = %e, target = %state.surface.target.endpoint, "Failed to forward request to upstream - bad gateway");
+    let error_message = upstream_error_message(&e, is_example_domain);
+    let e = e.without_url();
+    error!(
+        channel = channel_name,
+        error = %e,
+        target = %loggable::url(&state.surface.target.endpoint),
+        "Failed to forward request to upstream - bad gateway"
+    );
 
     // Record gateway fault in metrics
     if let Some(ref metrics) = state.metrics_store {
@@ -10088,10 +9925,7 @@ fn handle_upstream_error(
             .clone();
         let hash = identity_hash.clone();
         let ucp_op = ucp_operation.clone();
-        let variant_alias = state
-            .active_variant_alias
-            .clone();
-        tokio::spawn(async move {
+        crate::observability::policy_audit::spawn_in_request(async move {
             metrics
                 .record_connection_with_ucp(
                     channel_config_id,
@@ -10106,7 +9940,6 @@ fn handle_upstream_error(
                     None,
                     None,
                     0,
-                    variant_alias,
                 )
                 .await;
         });
@@ -10138,7 +9971,36 @@ fn handle_upstream_error(
     } else {
         StatusCode::BAD_GATEWAY
     };
-    create_error_response(status_code, &error_message)
+    create_error_response(status_code, error_message)
+}
+
+/// Message returned to the caller when forwarding to the target fails. It names the
+/// kind of failure only: the target URL and the transport error stay in the server log.
+fn upstream_error_message(
+    error: &reqwest::Error,
+    is_example_domain: bool,
+) -> &'static str {
+    let causes = std::iter::successors(std::error::Error::source(error), |cause| cause.source())
+        .map(|cause| cause.to_string())
+        .collect::<Vec<_>>()
+        .join(": ");
+    if error.is_connect() {
+        if causes.contains("dns") || causes.contains("resolve") {
+            if is_example_domain {
+                "Target endpoint uses a placeholder domain that doesn't resolve. Please configure a valid endpoint in your channel settings."
+            } else {
+                "DNS resolution failed for target endpoint. Please check that the hostname is valid and resolvable."
+            }
+        } else if causes.contains("timeout") {
+            "Connection timeout to target endpoint. The server may be unavailable or slow to respond."
+        } else {
+            "Connection failed to target endpoint"
+        }
+    } else if error.is_timeout() {
+        "Request timeout to target endpoint. The server did not respond within the configured timeout period."
+    } else {
+        "Failed to forward request to target endpoint"
+    }
 }
 
 async fn handle_onboarding_request(
@@ -10188,7 +10050,8 @@ async fn fetch_agent_card(
     let urls = [format!("{}/.well-known/agent-card.json", base), format!("{}/.well-known/agent.json", base)];
 
     for url in &urls {
-        info!(channel = channel_id, "GW1 fabric: [Target mode] Fetching agent card from: {}", url);
+        let logged_url = loggable::url(url);
+        info!(channel = channel_id, "GW1 fabric: [Target mode] Fetching agent card from: {}", logged_url);
         match client.get(url).send().await {
             Ok(resp) => {
                 info!(channel = channel_id, "GW1 fabric: Agent card fetch HTTP status: {}", resp.status());
@@ -10198,7 +10061,7 @@ async fn fetch_agent_card(
                         Err(e) => {
                             warn!(
                                 channel = channel_id,
-                                "GW1 fabric: Agent card exceeded its bounds (url={}): {}", url, e
+                                "GW1 fabric: Agent card exceeded its bounds (url={}): {}", logged_url, e
                             );
                             return None;
                         }
@@ -10208,7 +10071,7 @@ async fn fetch_agent_card(
                             info!(
                                 channel = channel_id,
                                 "GW1 fabric: Agent card fetched successfully (url={}): name={:?} endpoint={:?}",
-                                url,
+                                logged_url,
                                 card.get("name"),
                                 // Reads either era: a pure-1.0 card has no top-level
                                 // `url`, only `supportedInterfaces[]`.
@@ -10220,7 +10083,7 @@ async fn fetch_agent_card(
                             // JSON parse failure — no value in retrying with http
                             warn!(
                                 channel = channel_id,
-                                "GW1 fabric: Failed to parse agent card JSON (url={}): {}", url, e
+                                "GW1 fabric: Failed to parse agent card JSON (url={}): {}", logged_url, e
                             );
                             return None;
                         }
@@ -10230,14 +10093,19 @@ async fn fetch_agent_card(
                     warn!(
                         channel = channel_id,
                         "GW1 fabric: Agent card fetch non-success status (url={}): {}",
-                        url,
+                        logged_url,
                         resp.status()
                     );
                     return None;
                 }
             }
             Err(e) => {
-                warn!(channel = channel_id, "GW1 fabric: Agent card fetch request failed (url={}): {}", url, e);
+                warn!(
+                    channel = channel_id,
+                    "GW1 fabric: Agent card fetch request failed (url={}): {}",
+                    logged_url,
+                    e.without_url()
+                );
                 // Transport-level failure — try the next well-known path
             }
         }
@@ -10455,6 +10323,63 @@ fn fabric_mcp_gate_input(
     serde_json::to_value(&policy_input).unwrap_or_default()
 }
 
+/// Where a request to a `fabric://{gateway_id}/{channel_id}[$alias]` Target
+/// goes: the peer gateway and surface, the variant alias sent with a
+/// `ForwardRequest`, and the target a framed stream opens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FabricSendRoute {
+    gateway_id: String,
+    channel_id: String,
+    /// The alias the Target pins, never the caller's own `$alias`, which names
+    /// a variant of this surface. With none, the peer serves its own default
+    /// variant or base surface.
+    variant_alias: Option<String>,
+    stream_target: String,
+}
+
+/// The [`FabricSendRoute`] of the served `surface`, whose Target is the
+/// variant's own when the variant overrides it, or `None` when the Target is
+/// not a valid `fabric://` URL.
+fn fabric_send_route(surface: &crate::config::agent_surface::AgentSurface) -> Option<FabricSendRoute> {
+    let endpoint = &surface.target.endpoint;
+    let mut parts = endpoint
+        .strip_prefix("fabric://")?
+        .split('/');
+    let gateway_id = parts.next()?;
+    let (channel_id, variant_alias) = crate::proxy::fabric_forward::pinned_alias(parts.next()?);
+    Some(FabricSendRoute {
+        gateway_id: gateway_id.to_string(),
+        channel_id: channel_id.to_string(),
+        variant_alias: variant_alias.map(str::to_string),
+        stream_target: endpoint.clone(),
+    })
+}
+
+/// The body of the `ForwardRequest` that retries a request along `route` once
+/// MPP auto-pay has paid for it, with `headers` carrying the payment.
+fn mpp_retry_forward_request_body(
+    route: &FabricSendRoute,
+    method: &Method,
+    path: &str,
+    headers: &std::collections::HashMap<String, String>,
+    body: &serde_json::Value,
+    trace_id: &str,
+    deadline_ms: u64,
+) -> serde_json::Value {
+    crate::proxy::fabric_forward::with_pinned_alias(
+        serde_json::json!({
+            "channel_id": route.channel_id,
+            "method": method.as_str(),
+            "path": path,
+            "headers": headers,
+            "body": body,
+            "trace_id": trace_id,
+            "deadline_ms": deadline_ms,
+        }),
+        route.variant_alias.as_deref(),
+    )
+}
+
 /// Handle requests through the fabric:// protocol by forwarding via gateway
 async fn handle_fabric_request(
     state: ProxyState,
@@ -10526,20 +10451,8 @@ async fn handle_fabric_request(
         );
     }
 
-    // Log the incoming URI details
-    channel_debug!(config_id, "📍 Incoming URI: {}", uri);
-    channel_debug!(config_id, "  ↳ Path: {:?}", uri.path());
-    channel_debug!(config_id, "  ↳ Query: {:?}", uri.query());
-    channel_debug!(config_id, "  ↳ Path and Query: {:?}", uri.path_and_query());
-
-    // Parse fabric://{gateway_id}/{channel_id}
-    let fabric_path = &state.surface.target.endpoint[9..]; // Remove "fabric://"
-    let parts: Vec<&str> = fabric_path
-        .split('/')
-        .collect();
-
-    if parts.len() < 2 {
-        channel_error!(config_id, "Invalid fabric URL format: {}", state.surface.target.endpoint);
+    let Some(fabric_route) = fabric_send_route(&state.surface) else {
+        channel_error!(config_id, "Invalid fabric URL format: {}", loggable::url(&state.surface.target.endpoint));
         connection_guard
             .decrement()
             .await;
@@ -10547,10 +10460,13 @@ async fn handle_fabric_request(
             StatusCode::BAD_REQUEST,
             "Invalid fabric URL format. Expected: fabric://{gateway_id}/{channel_id}",
         ));
-    }
-
-    let gateway_id = parts[0];
-    let channel_id = parts[1];
+    };
+    let gateway_id = fabric_route
+        .gateway_id
+        .as_str();
+    let channel_id = fabric_route
+        .channel_id
+        .as_str();
 
     channel_info!(config_id, "Fabric - forwarding to gateway {} channel {}", gateway_id, channel_id);
 
@@ -10676,9 +10592,6 @@ async fn handle_fabric_request(
             source_authenticated: authenticated_identity.is_some(),
             metrics_store: &state.metrics_store,
             ws_state: &state.ws_state,
-            variant_alias: state
-                .active_variant_alias
-                .as_deref(),
         };
         match async { inspect_message_extensions(&body_bytes, &inspection_ctx).await }
             .instrument(inspection_span)
@@ -11168,8 +11081,8 @@ async fn handle_fabric_request(
             );
             info!(
                 channel = config_id_str,
-                fabric_target = %state.surface.target.endpoint,
-                resolved_url = %card_url,
+                fabric_target = %loggable::url(&state.surface.target.endpoint),
+                resolved_url = %loggable::url(&card_url),
                 "GW1 fabric: resolving agent card via access point listen address"
             );
             fetch_agent_card(
@@ -11218,12 +11131,6 @@ async fn handle_fabric_request(
         );
         policy_input.source_auth = source_auth_context.clone();
         policy_input.mcp = modern_mcp_context.clone();
-        // [OPA-INPUT] Fabric surface policy input BEFORE agent/TR data
-        info!(
-            channel = config_id_str,
-            "[OPA-INPUT] Fabric surface policy input before TR: {}",
-            serde_json::to_string(&policy_input).unwrap_or_default()
-        );
         policy_input.agent = agent_ctx;
         if matches!(
             state
@@ -11275,8 +11182,6 @@ async fn handle_fabric_request(
             }
         }
         let input_value = serde_json::to_value(&policy_input).unwrap_or_default();
-        // [OPA-INPUT] Fabric surface policy input fully populated
-        info!(channel = config_id_str, "[OPA-INPUT] Fabric surface policy input before eval: {}", input_value);
 
         if let Some(ref policy_manager) = state.policy_manager {
             let channel_opa_def_id = state
@@ -11513,7 +11418,8 @@ async fn handle_fabric_request(
             debug!(
                 target: "credential_delegation",
                 surface_id = %state.surface.surface_id,
-                route = %state.surface.target.endpoint,
+                surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
+                route = %loggable::url(&state.surface.target.endpoint),
                 reason = "fabric_delegated_credentials=false",
                 "Delegated credentials withheld from Fabric peer"
             );
@@ -11710,6 +11616,7 @@ async fn handle_fabric_request(
 
         if should_mirror {
             let mirror_endpoint = mirror_config.endpoint.clone();
+            let mirror_endpoint_for_log = loggable::url(&mirror_endpoint);
             let mirror_timeout = std::time::Duration::from_secs(mirror_config.timeout_secs);
             let wait_for_response = mirror_config.wait_for_response;
             let client = crate::http_client::with_timeout(mirror_timeout).unwrap_or_else(|_| reqwest::Client::new());
@@ -11757,7 +11664,7 @@ async fn handle_fabric_request(
                         channel_info!(
                             config_id,
                             "Fabric mirror request completed: endpoint={}, status={}",
-                            mirror_endpoint,
+                            mirror_endpoint_for_log,
                             resp.status().as_u16()
                         );
                     }
@@ -11776,8 +11683,8 @@ async fn handle_fabric_request(
                             config_id,
                             "Fabric mirror request failed ({}): endpoint={}, error={}",
                             error_type,
-                            mirror_endpoint,
-                            e
+                            mirror_endpoint_for_log,
+                            e.without_url()
                         );
 
                         // For synchronous mirroring, return error if mirror fails
@@ -11786,16 +11693,13 @@ async fn handle_fabric_request(
                             .await;
                         return Err(create_error_response(
                             StatusCode::SERVICE_UNAVAILABLE,
-                            &format!(
-                                "Traffic mirroring failed ({}): Mirror endpoint '{}' is unreachable. Error: {}",
-                                error_type, mirror_endpoint, e
-                            ),
+                            &format!("Traffic mirroring failed ({error_type}): the mirror endpoint is unreachable"),
                         ));
                     }
                 }
             } else {
                 // Fire-and-forget mirror request
-                let mirror_endpoint_clone = mirror_endpoint.clone();
+                let mirror_endpoint_clone = mirror_endpoint_for_log.clone();
                 let config_id_clone = config_id.to_string();
                 tokio::spawn(async move {
                     match mirror_req_with_headers
@@ -11815,7 +11719,7 @@ async fn handle_fabric_request(
                                 config_id_clone,
                                 "Fabric mirror request failed (async): endpoint={}, error={}",
                                 mirror_endpoint_clone,
-                                e
+                                e.without_url()
                             );
                         }
                     }
@@ -12288,17 +12192,8 @@ async fn handle_fabric_request(
         }
     }
 
-    // Debug: Log payment-related headers to diagnose propagation
     if let Some(payment_sig) = headers_map.get("PAYMENT-SIGNATURE") {
-        channel_info!(
-            config_id,
-            "Forwarding PAYMENT-SIGNATURE header (first 50 chars): {}",
-            if payment_sig.len() > 50 {
-                &payment_sig[..50]
-            } else {
-                payment_sig
-            }
-        );
+        channel_info!(config_id, "Forwarding PAYMENT-SIGNATURE header ({} bytes)", payment_sig.len());
     } else {
         channel_info!(config_id, "No PAYMENT-SIGNATURE header to forward");
     }
@@ -12333,15 +12228,16 @@ async fn handle_fabric_request(
         serde_json::Value::Null
     };
 
+    let logged_path = loggable::uri(&uri);
     info!(
         "📦 Building ForwardRequest: {} {} ({} headers, {} bytes body)",
         method.as_str(),
-        path_and_query,
+        logged_path,
         headers_map.len(),
         body_bytes.len()
     );
 
-    debug!("  ↳ Full path being sent: '{}'", path_and_query);
+    debug!("  ↳ Full path being sent: '{}'", logged_path);
     debug!("  ↳ Body bytes length: {}", body_bytes.len());
 
     // Calculate message expiration time (use channel timeout if configured, otherwise global)
@@ -12396,37 +12292,9 @@ async fn handle_fabric_request(
         }
     };
 
-    // Extract variant alias from the request path (for fabric routing).
-    // This allows GW2 to resolve the same surface variant on its side.
-    // URL grammar: `/route$alias/...` (suffix on the route, see plan §2.3).
-    let virtual_channel_alias = crate::proxy::route_variant::extract_variant_alias_for_route(
-        uri.path(),
-        state
-            .surface
-            .access_point
-            .route
-            .as_str(),
-    )
-    .and_then(|a| a);
-
     let (modern_upstream, forward_result) = if modern_request.is_some() {
         crate::mcp::modern_http::strip_protocol_session_headers(&mut stream_headers);
-        let stream_target = match virtual_channel_alias.as_deref() {
-            Some(alias)
-                if !state
-                    .surface
-                    .target
-                    .endpoint
-                    .contains('$') =>
-            {
-                format!("{}${alias}", state.surface.target.endpoint)
-            }
-            _ => state
-                .surface
-                .target
-                .endpoint
-                .clone(),
-        };
+        let stream_target = &fabric_route.stream_target;
         let header_timeout = state
             .surface
             .timeout()
@@ -12442,7 +12310,7 @@ async fn handle_fabric_request(
         let response = crate::proxy::fabric_forward::forward_stream_via_fabric(
             &state.listener_manager,
             crate::proxy::fabric_forward::FabricStreamForwardRequest {
-                fabric_target: &stream_target,
+                fabric_target: stream_target,
                 path: path_and_query,
                 headers: stream_headers,
                 body: body_bytes.clone(),
@@ -12492,21 +12360,21 @@ async fn handle_fabric_request(
             MessageType::ForwardRequest
                 .as_str()
                 .to_string(),
-            serde_json::json!({
-                "channel_id": channel_id,
-                "method": method.as_str(),
-                "path": path_and_query,
-                "headers": headers_map,
-                "body": body_value,
-                "trace_id": egress_trace_id.clone(),
-                "otel_context": otel_context,
-                "deadline_ms": deadline_ms,
-                // `virtual_channel_alias` retained for backward compatibility with
-                // older GW2s. `active_variant_alias` is the spec-aligned name
-                // (plan §4.4); GW2 prefers it when present.
-                "virtual_channel_alias": virtual_channel_alias,
-                "active_variant_alias": virtual_channel_alias,
-            }),
+            crate::proxy::fabric_forward::with_pinned_alias(
+                serde_json::json!({
+                    "channel_id": channel_id,
+                    "method": method.as_str(),
+                    "path": path_and_query,
+                    "headers": headers_map,
+                    "body": body_value,
+                    "trace_id": egress_trace_id.clone(),
+                    "otel_context": otel_context,
+                    "deadline_ms": deadline_ms,
+                }),
+                fabric_route
+                    .variant_alias
+                    .as_deref(),
+            ),
         )
         .from(
             gateway_listener
@@ -12736,15 +12604,15 @@ async fn handle_fabric_request(
                                 MessageType::ForwardRequest
                                     .as_str()
                                     .to_string(),
-                                serde_json::json!({
-                                    "channel_id": channel_id,
-                                    "method": method.as_str(),
-                                    "path": path_and_query,
-                                    "headers": retry_headers,
-                                    "body": saved_body,
-                                    "trace_id": egress_trace_id.clone(),
-                                    "deadline_ms": retry_deadline_ms,
-                                }),
+                                mpp_retry_forward_request_body(
+                                    &fabric_route,
+                                    &method,
+                                    path_and_query,
+                                    &retry_headers,
+                                    &saved_body,
+                                    &egress_trace_id,
+                                    retry_deadline_ms,
+                                ),
                             )
                             .from(
                                 gateway_listener
@@ -12883,15 +12751,12 @@ async fn handle_fabric_request(
             let source = source_addr.clone();
             let identity = identity_hash.clone();
             let trace = trace_id.clone();
-            let variant = state
-                .active_variant_alias
-                .clone();
             let request_bytes = body_bytes.len() as u64;
             move |outcome: crate::mcp::modern_sse::ResponseOutcome| {
                 let latency = start_time
                     .elapsed()
                     .as_millis() as u64;
-                tokio::spawn(async move {
+                crate::observability::policy_audit::spawn_in_request(async move {
                     guard.decrement().await;
                     if let (Some(monitor), Some(task_id)) = (monitor, task_id) {
                         monitor
@@ -12923,7 +12788,6 @@ async fn handle_fabric_request(
                                 None,
                                 None,
                                 latency,
-                                variant,
                             )
                             .await;
                     }
@@ -13605,7 +13469,7 @@ async fn handle_fabric_request(
                                                                 if let Some(extension_obj) = extension_data.as_object_mut() {
                                                                     if let Some(payload_obj) = payload.as_object() {
                                                                         for (key, value) in payload_obj {
-                                                                            channel_info!(config_id, "Injecting A2A response metadata key '{}' = {:?} under {}", key, value, extension_uri);
+                                                                            channel_info!(config_id, "Injecting A2A response metadata key '{}' under {}", key, extension_uri);
                                                                             extension_obj.insert(key.clone(), value.clone());
                                                                         }
                                                                         modified = true;
@@ -13869,9 +13733,6 @@ async fn handle_fabric_request(
                         validation_status,
                         None, // validation_error
                         identity_hash.clone(),
-                        state
-                            .active_variant_alias
-                            .as_deref(),
                     )
                     .await;
 
@@ -14122,12 +13983,9 @@ async fn handle_fabric_request(
                     let identity = identity_hash.clone();
                     let trace = trace_id.clone();
                     let ucp_op = ucp_operation.clone();
-                    let variant_alias = state
-                        .active_variant_alias
-                        .clone();
 
                     // Record single metric with total latency
-                    tokio::spawn(async move {
+                    crate::observability::policy_audit::spawn_in_request(async move {
                         metrics
                             .record_connection_with_ucp(
                                 channel_config_id,
@@ -14142,7 +14000,6 @@ async fn handle_fabric_request(
                                 None,
                                 None,
                                 latency_ms,
-                                variant_alias,
                             )
                             .await;
                     });
@@ -14197,10 +14054,7 @@ async fn handle_fabric_request(
                     let identity = identity_hash.clone();
                     let trace = trace_id.clone();
                     let ucp_op = ucp_operation.clone();
-                    let variant_alias = state
-                        .active_variant_alias
-                        .clone();
-                    tokio::spawn(async move {
+                    crate::observability::policy_audit::spawn_in_request(async move {
                         metrics
                             .record_connection_with_ucp(
                                 channel_config_id,
@@ -14215,7 +14069,6 @@ async fn handle_fabric_request(
                                 None,
                                 None,
                                 latency_ms,
-                                variant_alias,
                             )
                             .await;
                     });
@@ -14261,10 +14114,7 @@ async fn handle_fabric_request(
                     let identity = identity_hash.clone();
                     let trace = trace_id.clone();
                     let ucp_op = ucp_operation.clone();
-                    let variant_alias = state
-                        .active_variant_alias
-                        .clone();
-                    tokio::spawn(async move {
+                    crate::observability::policy_audit::spawn_in_request(async move {
                         metrics
                             .record_connection_with_ucp(
                                 channel_config_id,
@@ -14279,7 +14129,6 @@ async fn handle_fabric_request(
                                 None,
                                 None,
                                 latency_ms,
-                                variant_alias,
                             )
                             .await;
                     });
@@ -14653,7 +14502,7 @@ fn record_agent_card_gateway_fault(
             .endpoint
             .clone();
         let trace_id = uuid::Uuid::new_v4().to_string();
-        tokio::spawn(async move {
+        crate::observability::policy_audit::spawn_in_request(async move {
             metrics
                 .record_connection(
                     channel_config_id,
@@ -14667,7 +14516,6 @@ fn record_agent_card_gateway_fault(
                     None,
                     None,
                     0,
-                    None,
                 )
                 .await;
         });
@@ -14710,7 +14558,7 @@ async fn fetch_agent_card_from_surface_target(
     channel_name: &str,
     target_url: &str,
 ) -> Result<JsonValue, Response> {
-    debug!(channel = channel_name, target = %target_url, "Fetching agent card from upstream");
+    debug!(channel = channel_name, target = %loggable::url(target_url), "Fetching agent card from upstream");
 
     let source_cred_header = state
         .surface
@@ -14805,9 +14653,13 @@ async fn fetch_agent_card_from_surface_target(
             .send()
             .await
             .map_err(|e| {
-                error!(channel = channel_name, error = %e, "Failed to fetch agent card from upstream - bad gateway");
+                error!(
+                    channel = channel_name,
+                    error = %e.without_url(),
+                    "Failed to fetch agent card from upstream - bad gateway"
+                );
                 record_agent_card_gateway_fault(state, source_addr);
-                create_error_response(StatusCode::BAD_GATEWAY, &format!("Failed to fetch from upstream: {}", e))
+                create_error_response(StatusCode::BAD_GATEWAY, "Failed to fetch from upstream")
             })?;
 
         if response
@@ -14903,7 +14755,7 @@ async fn pinned_target_client(
     match tokio::task::spawn_blocking(move || crate::egress::pinned_forward_client(&candidate, timeout)).await {
         Ok(Ok((client, _target))) => Ok(client),
         Ok(Err(e)) => {
-            warn!(channel = channel_name, target = %target_url, "SSRF blocked by egress policy: {}", e);
+            warn!(channel = channel_name, target = %loggable::url(target_url), "SSRF blocked by egress policy: {}", e);
             crate::audit::request_events::request_rejected(
                 facts,
                 crate::audit::request_events::RejectionStage::Forward,
@@ -14914,7 +14766,12 @@ async fn pinned_target_client(
             Err(create_error_response(StatusCode::FORBIDDEN, "Request blocked by egress policy"))
         }
         Err(e) => {
-            warn!(channel = channel_name, target = %target_url, "SSRF egress validation task failed: {}", e);
+            warn!(
+                channel = channel_name,
+                target = %loggable::url(target_url),
+                "SSRF egress validation task failed: {}",
+                e
+            );
             Err(create_error_response(StatusCode::FORBIDDEN, "Request blocked by egress policy"))
         }
     }
@@ -15035,9 +14892,6 @@ async fn record_a2a_proxy_connection_metric(
             None,
             None,
             latency_ms,
-            state
-                .active_variant_alias
-                .clone(),
         )
         .await;
 
@@ -15866,9 +15720,6 @@ async fn handle_mcp_proxy_request(
                 "success", // MCP protocol doesn't have A2A extension validation
                 None,
                 None, // identity_hash - MCP channels might not have identity tracking
-                state
-                    .active_variant_alias
-                    .as_deref(),
             )
             .await;
 
@@ -15887,7 +15738,7 @@ async fn handle_mcp_proxy_request(
                 let trace = trace_id.clone();
 
                 // Record single metric with total latency
-                tokio::spawn(async move {
+                crate::observability::policy_audit::spawn_in_request(async move {
                     metrics
                         .record_connection(
                             channel_config_id,
@@ -15901,7 +15752,6 @@ async fn handle_mcp_proxy_request(
                             None,
                             None,
                             latency_ms,
-                            None,
                         )
                         .await;
                 });
@@ -15947,9 +15797,6 @@ async fn handle_mcp_proxy_request(
                 "mcp_error", // Custom status to differentiate MCP errors from A2A validation failures
                 Some(format!("MCP Proxy Error: {}", e)),
                 None,
-                state
-                    .active_variant_alias
-                    .as_deref(),
             )
             .await;
 
@@ -15968,7 +15815,7 @@ async fn handle_mcp_proxy_request(
                 let trace = trace_id.clone();
 
                 // Record single metric with total latency
-                tokio::spawn(async move {
+                crate::observability::policy_audit::spawn_in_request(async move {
                     metrics
                         .record_connection(
                             channel_config_id,
@@ -15982,7 +15829,6 @@ async fn handle_mcp_proxy_request(
                             None,
                             None,
                             latency_ms,
-                            None,
                         )
                         .await;
                 });
@@ -16523,6 +16369,9 @@ fn compute_transit_token_caller_context(
 }
 
 #[cfg(test)]
+mod variant_routing_tests;
+
+#[cfg(test)]
 mod forward_response_log_tests {
     #[test]
     fn forward_response_log_summary_keeps_header_values_and_body_out() {
@@ -17015,7 +16864,7 @@ allow if {
         }
     }
 
-    async fn modern_access_point_router_keeps_legacy_variant_fallback(state: &crate::state::ProxyState) {
+    async fn access_point_router_refuses_a_variant_it_cannot_resolve(state: &crate::state::ProxyState) {
         use serde_json::json;
         use std::sync::atomic::Ordering;
 
@@ -17048,10 +16897,10 @@ allow if {
         let versions = crate::mcp::request_validation::MODERN_CAPABLE_POLICY;
         for (router, path, modern, expected) in [
             (&router, "/mcp", true, axum::http::StatusCode::OK),
-            (&router, "/mcp$missing", false, axum::http::StatusCode::OK),
+            (&router, "/mcp$missing", false, axum::http::StatusCode::NOT_FOUND),
             (&router, "/mcp$missing", true, axum::http::StatusCode::NOT_FOUND),
-            (&broken, "/broken", false, axum::http::StatusCode::OK),
-            (&broken, "/broken", true, axum::http::StatusCode::SERVICE_UNAVAILABLE),
+            (&broken, "/broken", false, axum::http::StatusCode::INTERNAL_SERVER_ERROR),
+            (&broken, "/broken", true, axum::http::StatusCode::INTERNAL_SERVER_ERROR),
         ] {
             let before = target
                 .request_count
@@ -17101,7 +16950,9 @@ allow if {
             let response: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|error| {
                 panic!("{path} modern={modern} body {text:?}: {error}");
             });
-            assert_eq!(response["id"], "router-request");
+            if expected.is_success() {
+                assert_eq!(response["id"], "router-request");
+            }
             assert_eq!(
                 target
                     .request_count
@@ -17575,7 +17426,13 @@ allow if {
                     reason,
                     http_status,
                     rpc_error_code,
-                } => Some((stage, reason, http_status, rpc_error_code)),
+                    ..
+                } => Some((
+                    stage,
+                    reason,
+                    http_status.expect("an Access Point refusal records its HTTP status"),
+                    rpc_error_code,
+                )),
                 _ => None,
             })
             .collect();
@@ -17829,8 +17686,8 @@ allow if {
                 direct_router_state(state, a2a_surface(variants)),
                 "/a2a$missing/rpc",
                 message.clone(),
-                400,
-                (RejectionStage::Routing, RejectionReason::UnknownVariant, 400, None),
+                404,
+                (RejectionStage::Routing, RejectionReason::UnknownVariant, 404, None),
             ),
             (
                 "MCP body on an A2A Access Point",
@@ -19329,10 +19186,9 @@ allow if {
             a2a_proxy_store: None,
             active_variant_alias: None,
             active_variant_id: None,
-            variant_resolution_error: None,
             surface: Arc::new(surface),
         };
-        modern_access_point_router_keeps_legacy_variant_fallback(&state).await;
+        access_point_router_refuses_a_variant_it_cannot_resolve(&state).await;
         mounted_access_point_uses_the_direct_access_point_policy(&state).await;
         direct_access_point_caps_legacy_initialize(&state).await;
         initialize_wrapped_as_sse_returns_one_session_id(&state).await;
@@ -21035,6 +20891,296 @@ allow if {
             );
         }
     }
+
+    // ── Log and span redaction ─────────────────────────────────────────────────
+
+    /// A `ProxyState` for `surface` with no stores and no source authentication.
+    fn bare_proxy_state(
+        surface: crate::config::agent_surface::AgentSurface,
+        policy_manager: Option<std::sync::Arc<crate::policies::SurfacePolicyManager>>,
+    ) -> crate::state::ProxyState {
+        let network = serde_json::from_value(serde_json::json!({
+            "did": {"domain": "gateway.example"},
+            "webauthn": {"rp_id": "gateway.example", "external_origin": "https://gateway.example"},
+            "integration": {"types": [], "categories": []},
+            "listeners": [], "routes": {}
+        }))
+        .unwrap();
+        let config = serde_json::from_value(serde_json::json!({
+            "tls": {"cert_path": "unused.pem", "key_path": "unused-key.pem"},
+            "integration": {"variable_pattern": "\\$\\{([^}]+)\\}", "custom_variable_prefix": "_", "types": [], "categories": []},
+            "extension_inspection": {"enabled": false}
+        }))
+        .unwrap();
+        crate::state::ProxyState {
+            config: std::sync::Arc::new(config),
+            network_config: std::sync::Arc::new(network),
+            client: reqwest::Client::new(),
+            metrics_store: None,
+            identity_rules_engine: None,
+            identity_selector: None,
+            protected_rules_engine: None,
+            protected_selector: None,
+            external_rules_engine: None,
+            external_selector: None,
+            task_monitor: None,
+            task_id: None,
+            ws_state: None,
+            listener_manager: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
+            secrets_store: None,
+            certificates_store: None,
+            vc_issuer: None,
+            policy_manager,
+            gateway_policy_manager: None,
+            didauth_session_store: std::sync::Arc::new(crate::didauth::DidAuthSessionStore::new()),
+            transaction_store: None,
+            mpp_transaction_store: None,
+            trust_registry_listener_manager: None,
+            source_auth_middleware: None,
+            #[cfg(feature = "didwebvh")]
+            didwebvh_identity_store: None,
+            #[cfg(feature = "didwebvh")]
+            didwebvh_log_manager: None,
+            credential_provider_store: None,
+            delegation_vault_store: None,
+            gateway_base_url: None,
+            transit_token_issuer: None,
+            mcp_proxy_store: None,
+            a2a_proxy_store: None,
+            active_variant_alias: None,
+            active_variant_id: None,
+            surface: std::sync::Arc::new(surface),
+        }
+    }
+
+    fn mcp_surface(
+        surface_id: &str,
+        endpoint: &str,
+        policy_definition_id: Option<&str>,
+    ) -> crate::config::agent_surface::AgentSurface {
+        let mut target = serde_json::json!({"endpoint": endpoint});
+        if let Some(policy_definition_id) = policy_definition_id {
+            target["policy"] = serde_json::json!({"policy_definition_id": policy_definition_id});
+        }
+        serde_json::from_value(serde_json::json!({
+            "surface_id": surface_id, "name": surface_id,
+            "access_point": {"listen_address": "https://gateway.example", "route": format!("/{surface_id}"), "protocol": "mcp"},
+            "target": target
+        }))
+        .unwrap()
+    }
+
+    fn legacy_mcp_request(
+        uri: &str,
+        body: &serde_json::Value,
+    ) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-protocol-version", crate::mcp::MCP_LEGACY_VERSION)
+            .body(axum::body::Body::from(serde_json::to_vec(body).unwrap()))
+            .unwrap()
+    }
+
+    async fn send_to_surface(
+        state: &crate::state::ProxyState,
+        surface: crate::config::agent_surface::AgentSurface,
+        request: axum::http::Request<axum::body::Body>,
+    ) -> axum::response::Response {
+        super::multi_channel_proxy_handler(
+            axum::extract::ConnectInfo(
+                "127.0.0.1:12345"
+                    .parse()
+                    .unwrap(),
+            ),
+            axum::extract::State(direct_router_state(state, surface)),
+            request,
+        )
+        .await
+    }
+
+    fn tool_call_with_argument(argument: &str) -> serde_json::Value {
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+            "name": "send", "arguments": {"text": argument}
+        }})
+    }
+
+    /// Fields of every `http.client.send` span opened on the current thread.
+    #[derive(Clone, Default)]
+    struct ClientSendSpans(std::sync::Arc<std::sync::Mutex<Vec<HashMap<String, String>>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ClientSendSpans {
+        fn on_new_span(
+            &self,
+            attributes: &tracing::span::Attributes<'_>,
+            _id: &tracing::span::Id,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if attributes.metadata().name() != "http.client.send" {
+                return;
+            }
+            let mut fields = SpanFields::default();
+            attributes.record(&mut fields);
+            self.0
+                .lock()
+                .unwrap()
+                .push(fields.0);
+        }
+    }
+
+    #[derive(Default)]
+    struct SpanFields(HashMap<String, String>);
+
+    impl tracing::field::Visit for SpanFields {
+        fn record_debug(
+            &mut self,
+            field: &tracing::field::Field,
+            value: &dyn std::fmt::Debug,
+        ) {
+            self.0
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn the_client_send_span_records_the_target_url_without_query_values() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let target = crate::component_tests::helpers::MockServer::start_with_response(
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"tools": []}}).to_string(),
+        )
+        .await;
+        let surface = mcp_surface("client-span-url", &target.url(), None);
+        let state = bare_proxy_state(surface.clone(), None);
+        let spans = ClientSendSpans::default();
+        let _guard = crate::component_tests::helpers::thread_subscriber::set_thread_default(
+            tracing_subscriber::registry().with(spans.clone()),
+        );
+
+        let response = send_to_surface(
+            &state,
+            surface,
+            legacy_mcp_request(
+                "/client-span-url?code=oauth-code-value&bare-token-value",
+                &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+            ),
+        )
+        .await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let spans = spans.0.lock().unwrap();
+        let url = spans
+            .iter()
+            .find_map(|fields| fields.get("http.url"))
+            .expect("the request opened an http.client.send span");
+        assert!(url.starts_with(&target.url()), "{url}");
+        assert!(url.ends_with("?code=<redacted>&<redacted>"), "{url}");
+        assert!(!url.contains("oauth-code-value"), "{url}");
+        assert!(!url.contains("bare-token-value"), "{url}");
+    }
+
+    #[tokio::test]
+    async fn an_opa_enforced_request_logs_neither_tool_arguments_nor_header_values() {
+        use std::sync::atomic::Ordering;
+
+        let target = crate::component_tests::helpers::MockServer::start().await;
+        let surface = mcp_surface("opa-input-logs", &target.url(), Some("deny-all"));
+        let policies = crate::policies::SurfacePolicyManager::new();
+        policies
+            .load_policy_text("opa-input-logs", "package surface.policy\n\ndefault allow := false\n")
+            .unwrap();
+        let state = bare_proxy_state(surface.clone(), Some(std::sync::Arc::new(policies)));
+        let mut request = legacy_mcp_request("/opa-input-logs", &tool_call_with_argument("tool-argument-marker"));
+        request
+            .headers_mut()
+            .insert("x-request-note", HeaderValue::from_static("header-value-marker"));
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        send_to_surface(&state, surface, request).await;
+
+        let text = logs.text();
+        assert!(text.contains("policy decision: deny"), "{text}");
+        assert_eq!(
+            target
+                .request_count
+                .load(Ordering::SeqCst),
+            0
+        );
+        assert!(!text.contains("tool-argument-marker"), "a log holds a tool argument: {text}");
+        assert!(!text.contains("header-value-marker"), "a log holds a header value: {text}");
+    }
+
+    /// An upstream that answers every request with `404`, as a Legacy SSE server
+    /// does for a direct POST to its root.
+    async fn upstream_answering_not_found() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().fallback(|| async { axum::http::StatusCode::NOT_FOUND });
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        url
+    }
+
+    #[tokio::test]
+    async fn the_legacy_sse_fallback_logs_the_status_and_size_but_not_the_body() {
+        let target = upstream_answering_not_found().await;
+        let surface = mcp_surface("sse-fallback-logs", &target, None);
+        let state = bare_proxy_state(surface.clone(), None);
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        send_to_surface(
+            &state,
+            surface,
+            legacy_mcp_request("/sse-fallback-logs", &tool_call_with_argument("tool-argument-marker")),
+        )
+        .await;
+
+        let text = logs.text();
+        let fallback = text
+            .lines()
+            .find(|line| line.contains("falling back to Legacy SSE transport"))
+            .unwrap_or_else(|| panic!("no fallback log line: {text}"));
+        assert!(fallback.contains("status=404 Not Found"), "{fallback}");
+        assert!(fallback.contains("body_bytes="), "{fallback}");
+        assert!(text.contains("SSE fallback also failed"), "{text}");
+        assert!(!text.contains("tool-argument-marker"), "a log holds the request body: {text}");
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_target_answers_a_generic_error_and_logs_no_target_url() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let endpoint = format!("http://127.0.0.1:{port}/agent?api_key=endpoint-key-value");
+        let state = bare_proxy_state(mcp_surface("unreachable-target", &endpoint, None), None);
+        let error = reqwest::Client::new()
+            .get(&endpoint)
+            .send()
+            .await
+            .expect_err("nothing listens on the port");
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        let response =
+            super::handle_upstream_error(error, &state, "127.0.0.1:12345", &None, "unreachable-target", &None);
+
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_GATEWAY);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(problem["detail"], "Connection failed to target endpoint");
+        let text = logs.text();
+        assert!(text.contains("Failed to forward request to upstream - bad gateway"), "{text}");
+        assert!(text.contains(&format!("target=http://127.0.0.1:{port}/agent?api_key=<redacted>")), "{text}");
+        assert!(text.contains("error=error sending request "), "{text}");
+        assert!(!text.contains("endpoint-key-value"), "a log holds the target's query value: {text}");
+        assert!(!text.contains("for url"), "a log holds the reqwest error URL: {text}");
+    }
 }
 
 #[cfg(test)]
@@ -21193,7 +21339,6 @@ mod fabric_extended_card_tests {
             a2a_proxy_store: None,
             active_variant_alias: None,
             active_variant_id: None,
-            variant_resolution_error: None,
             surface: Arc::new(surface),
         };
         FabricPeer {
