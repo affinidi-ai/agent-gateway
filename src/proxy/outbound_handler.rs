@@ -14380,9 +14380,10 @@ mod tests {
 
     /// The `credential_delegation` lines that refuse a Transit Point call for
     /// want of a caller or an agent to key its delegated credentials by, or
-    /// because it arrived over Fabric, name the surface variant that served
-    /// it; a `source_auth` caller with no managed agent identity takes the
-    /// agent line.
+    /// because it arrived over Fabric (with the Transit Point opted out, or
+    /// opted in with no caller the receiving surface verified), name the
+    /// surface variant that served it; a `source_auth` caller with no managed
+    /// agent identity takes the agent line.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_delegation_refusal_line_names_the_request_variant() {
         use crate::observability::policy_audit::{RequestScope, in_request, set_request_variant};
@@ -14407,17 +14408,29 @@ mod tests {
         });
         no_agent.authenticated_by = Some(SourceAuth);
         no_agent.resolved_identity = ProtectedAgentIdentity::Anonymous;
-        let mut over_fabric = no_caller();
-        over_fabric.transit_token_claims =
-            Some(fabric_claims(Some("did:web:agent.example"), "fabric-asserted", Some("sha256:user"), 2));
+        let over_fabric = || {
+            let mut ctx = no_caller();
+            ctx.transit_token_claims =
+                Some(fabric_claims(Some("did:web:agent.example"), "fabric-asserted", Some("sha256:user"), 2));
+            ctx
+        };
+        let mut over_fabric_opted_in = over_fabric();
+        over_fabric_opted_in
+            .virtual_channel
+            .delegated_credentials_for_fabric_callers = true;
 
         for (mut ctx, expected, line) in [
             (no_caller(), DelegationRefusal::CallerIdentityMissing, "identifies the caller - refusing the request"),
             (no_agent, DelegationRefusal::AgentIdentityMissing, "No managed agent identity for delegated credentials"),
             (
-                over_fabric,
+                over_fabric(),
                 DelegationRefusal::CallerIdentityMissing,
                 "not released for requests that arrived over Fabric",
+            ),
+            (
+                over_fabric_opted_in,
+                DelegationRefusal::CallerIdentityMissing,
+                "verified no caller of the request that arrived over Fabric",
             ),
         ] {
             let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
