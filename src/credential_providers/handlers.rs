@@ -48,11 +48,13 @@ pub struct CredentialProviderState {
 }
 
 /// Whether a surface's Target Authentication uses a provider, whether a surface binds it
-/// where a JWT bearer binding is refused, and the tenants of the surfaces that reference it.
+/// where a JWT bearer or Client Credentials binding is refused, and the tenants of the
+/// surfaces that reference it.
 #[derive(Default)]
 struct ProviderUsage {
     target_authentication: bool,
     jwt_bearer_refused: bool,
+    client_credentials_refused: bool,
     surface_tenants: Vec<Option<String>>,
 }
 
@@ -94,6 +96,9 @@ async fn provider_usage(
                 crate::identity::handlers::surface_tenancy::resolved_views(&surface).map_err(|_| ProviderUsageError)?;
             usage.jwt_bearer_refused |=
                 crate::identity::handlers::surfaces::check_jwt_bearer_bindings(&views, |id| id == provider_id).is_err();
+            usage.client_credentials_refused |=
+                crate::identity::handlers::surfaces::check_client_credentials_bindings(&views, |id| id == provider_id)
+                    .is_err();
         }
         if crate::identity::handlers::surface_tenancy::target_auth_provider_ids(&surface)
             .map_err(|_| ProviderUsageError)?
@@ -747,7 +752,9 @@ pub async fn update_provider(
                         .provider_type
                         .serves_target_authentication())
                     || (usage.jwt_bearer_refused
-                        && matches!(updated.provider_type, CredentialProviderType::OAuth2JwtBearer)) =>
+                        && matches!(updated.provider_type, CredentialProviderType::OAuth2JwtBearer))
+                    || (usage.client_credentials_refused
+                        && matches!(updated.provider_type, CredentialProviderType::OAuth2ClientCredentials)) =>
             {
                 return provider_in_use("A surface uses this credential provider in a way the new type cannot serve");
             }
@@ -1127,6 +1134,7 @@ mod consent_strategy_tests {
             .expect("readable surfaces give a usage");
         assert!(!usage.target_authentication);
         assert!(!usage.jwt_bearer_refused);
+        assert!(!usage.client_credentials_refused);
         assert!(
             usage
                 .surface_tenants
@@ -1195,6 +1203,81 @@ mod consent_strategy_tests {
                 .expect("no surface store gives an empty usage")
                 .jwt_bearer_refused
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provider_usage_finds_bindings_that_refuse_a_client_credentials_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = state_with_provider(&directory, None).await;
+        let bound = |endpoint: &str| {
+            serde_json::from_value::<crate::config::agent_surface::AgentSurface>(json!({
+                "name": "s",
+                "access_point": {"listen_address": "127.0.0.1:0", "route": "/s", "protocol": "a2a"},
+                "target": {"endpoint": endpoint},
+                "outbound_credentials": [{"credential_provider_id": "provider"}]
+            }))
+            .unwrap()
+        };
+        let usage_of = |surfaces: Vec<crate::config::agent_surface::AgentSurface>| {
+            let mut state = state.clone();
+            state.surfaces = Some(Arc::new(Surfaces { readable: true, surfaces }));
+            async move {
+                provider_usage(&state, "provider")
+                    .await
+                    .expect("readable surfaces give a usage")
+            }
+        };
+
+        let safe = usage_of(vec![bound("https://agent.example")]).await;
+        assert!(!safe.client_credentials_refused);
+        assert_eq!(safe.surface_tenants, vec![None]);
+        assert!(
+            usage_of(vec![bound("https://agent.example"), bound("http://agent.example")])
+                .await
+                .client_credentials_refused
+        );
+        state.surfaces = None;
+        assert!(
+            !provider_usage(&state, "provider")
+                .await
+                .expect("no surface store gives an empty usage")
+                .client_credentials_refused
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_retype_to_client_credentials_is_refused_when_a_surface_binds_it_over_plain_http() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = api_key_provider_bound_by_a_tenant(&directory).await;
+        let plain_http_surface = serde_json::from_value::<crate::config::agent_surface::AgentSurface>(json!({
+            "name": "s",
+            "access_point": {"listen_address": "127.0.0.1:0", "route": "/s", "protocol": "a2a"},
+            "target": {"endpoint": "http://agent.example/api"},
+            "outbound_credentials": [{"credential_provider_id": "provider"}]
+        }))
+        .unwrap();
+        state.surfaces = Some(Arc::new(Surfaces {
+            readable: true,
+            surfaces: vec![plain_http_surface],
+        }));
+        let retype = json!({
+            "provider_type": "oauth2_client_credentials", "name": "Retyped provider",
+            "token_endpoint": "https://192.0.2.10/token",
+            "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET"
+        });
+
+        let (status, body) = update_as_operator(&state, retype).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"], "A surface uses this credential provider in a way the new type cannot serve");
+
+        let stored = state
+            .store
+            .get("provider")
+            .await
+            .unwrap()
+            .expect("provider is stored");
+        assert_eq!(stored.name, "Operator provider");
+        assert_eq!(stored.provider_type, CredentialProviderType::ApiKey);
     }
 
     async fn state_with_provider(

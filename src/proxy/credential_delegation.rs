@@ -153,9 +153,9 @@ pub enum DelegationActionOutcome {
     NotApplicable,
     /// The binding's credential provider cannot be used: it was deleted, its
     /// record cannot be read, it is outside the surface's tenant, it would send an
-    /// `oauth2_jwt_bearer` token on a leg that may not carry it, or no authorization
-    /// URL can be built from it. The request is refused rather than forwarded
-    /// without the credential.
+    /// `oauth2_jwt_bearer` or `oauth2_client_credentials` token on a leg that may not
+    /// carry it, or no authorization URL can be built from it. The request is refused
+    /// rather than forwarded without the credential.
     ProviderUnavailable,
     /// The stored credential was consented by a different principal than the
     /// one making this request, so it was not released.

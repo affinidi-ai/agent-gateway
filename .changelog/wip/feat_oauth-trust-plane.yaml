@@ -860,8 +860,9 @@ changes:
         400, and a request on such a leg is refused with 503 and detail
         client_credentials_leg_forbidden, or 403 on modern MCP delegation. https, fabric:// and
         proxy routes are unaffected, and the caller-authentication and Target-base rules still
-        apply only to JWT bearer bindings. Before upgrading, move the Target or Transit Point to
-        https.
+        apply only to JWT bearer bindings. Changing a bound provider to Client Credentials is
+        refused with 409 when it would break such a leg. Before upgrading, move the Target or
+        Transit Point to https.
     - timestamp: '2026-10-21T15:10:00Z'
       title: Refuse appliance-wide secrets in tenant credential providers
       description: >-
@@ -947,7 +948,8 @@ changes:
         a reference or sends jwt_bearer, which every dashboard save does, so a stored authorization
         code provider with an http token endpoint is refused on any dashboard save until its
         endpoint is https. A stored authorization code provider with an http token endpoint now
-        fails each exchange and refresh, so move such endpoints to https before upgrading.
+        fails each authorization code exchange, legacy and modern refresh, and modern consent
+        exchange before any secret is read, so move such endpoints to https before upgrading.
     - timestamp: '2026-10-30T09:00:00Z'
       title: Refuse required_scopes on a later caller authentication method
       description: >-

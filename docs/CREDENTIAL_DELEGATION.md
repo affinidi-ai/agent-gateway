@@ -112,8 +112,9 @@ The `token_endpoint` of every OAuth provider (authorization code, Client Credent
 bearer) must be an `https` URL. The check runs when a provider is created and on any update that sends `token_endpoint`,
 changes the type, clears a reference or sends `jwt_bearer` (every dashboard save does), so a
 stored authorization code provider with an http token endpoint is refused on any dashboard
-save until its endpoint is https. It also runs before every gateway grant, before any secret
-is read, and before every authorization code exchange, refresh and modern consent exchange. Under `AG_TEST_MODE=true` an
+save until its endpoint is https. It also runs before every gateway grant, and before the authorization
+code exchange, the legacy and modern refresh, and the modern consent exchange, each before any secret
+is read. Under `AG_TEST_MODE=true` an
 `http` endpoint listed exactly in `AG_BDD_OAUTH_ENDPOINT_ALLOWLIST` is also accepted, for
 a local authorization server.
 
@@ -443,8 +444,8 @@ http is refused: https, `fabric://` (encrypted by DIDComm) and proxy routes whos
 configured elsewhere are unaffected. Under `AG_TEST_MODE` an http origin named in the test
 egress allowlist counts as https. Legacy resolution refuses the request with 503, outcome
 `provider_unavailable` and detail `client_credentials_leg_forbidden`; modern MCP delegation
-refuses it with 403. The caller-authentication and Target-base conditions apply to
-`oauth2_jwt_bearer` bindings only.
+refuses it with 403. Retyping a bound provider to Client Credentials is refused with 409 when it would
+break a leg. The caller-authentication and Target-base conditions apply to `oauth2_jwt_bearer` bindings only.
 
 ### Credential headers on a Transit Point
 

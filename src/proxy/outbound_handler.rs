@@ -14038,6 +14038,45 @@ mod tests {
         assert_eq!(header_values(&received[0], "authorization"), ["Bearer vendor-access"]);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_client_credentials_binding_is_refused_on_a_plain_http_transit_leg() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = crate::component_tests::helpers::RecordingTarget::start(StatusCode::OK, &[]).await;
+        let (state, issuer) = delegation_pipeline(
+            directory.path(),
+            &target.url,
+            &[("granted", "mcp", binding("provider", json!({"type": "bearer_header"})))],
+        )
+        .await;
+        let token = issuer
+            .issue("transit-fabric", Some("did:web:agent.example"), None, None, Some("sha256:user"), None, vec![])
+            .unwrap();
+
+        let (status, body) = through_the_pipeline(&state, "granted", &token).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(target.received().len(), 1);
+
+        let providers = state
+            .credential_provider_store
+            .clone()
+            .unwrap();
+        let mut provider = providers
+            .get("provider")
+            .await
+            .unwrap()
+            .expect("provider is stored");
+        provider.provider_type = crate::credential_providers::CredentialProviderType::OAuth2ClientCredentials;
+        providers
+            .update(provider)
+            .await
+            .unwrap();
+
+        let (status, body) = through_the_pipeline(&state, "granted", &token).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["error"]["message"], "Delegated credentials unavailable", "{body}");
+        assert_eq!(target.received().len(), 1, "the plain http leg must not carry the client credentials token");
+    }
+
     /// A public discovery read needs no transit token and names no caller, so
     /// it reaches the target without a delegated credential, as it does without
     /// a target authentication one, rather than being refused.

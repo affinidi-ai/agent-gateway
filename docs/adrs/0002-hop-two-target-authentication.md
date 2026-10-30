@@ -284,7 +284,7 @@ described in [`CREDENTIAL_DELEGATION.md`](../CREDENTIAL_DELEGATION.md).
 | Topic | Decision |
 | --- | --- |
 | Target Authentication method | `TargetAuthMethod` gains `CredentialProvider { credential_provider_id, scopes, inject_as }`. The field name matches `OutboundCredentialBinding` and `TransitCredentials`, and avoids confusion with the provider's slug `provider_id`. |
-| JWT bearer provider type | `CredentialProviderType` gains `oauth2_jwt_bearer`, with `jwt_bearer` settings `assertion_issuer`, optional `assertion_subject` (the issuer when absent), `signing_key_secret_ref` (a PKCS#8 PEM private key or a Google service account JSON key), `signing_algorithm` (`RS256`, the default, or `ES256`) and optional `key_id`. There is no `audience` field: the assertion `aud` is always the provider's `token_endpoint`, which must be https, as must the `token_endpoint` of Client Credentials and authorization code providers. The authorization code exchange, refresh and modern consent exchange enforce it too, before any secret is read. |
+| JWT bearer provider type | `CredentialProviderType` gains `oauth2_jwt_bearer`, with `jwt_bearer` settings `assertion_issuer`, optional `assertion_subject` (the issuer when absent), `signing_key_secret_ref` (a PKCS#8 PEM private key or a Google service account JSON key), `signing_algorithm` (`RS256`, the default, or `ES256`) and optional `key_id`. There is no `audience` field: the assertion `aud` is always the provider's `token_endpoint`, which must be https, as must the `token_endpoint` of Client Credentials and authorization code providers. The authorization code exchange, legacy and modern refresh, and modern consent exchange enforce it too, each before any secret is read. |
 | Token storage | Target Authentication tokens live in a per-replica in-memory cache (D1) and are never persisted. Delegation bindings keep using the vault. |
 | Fabric | Only the receiving gateway resolves `credential_provider` (E1); the sending gateway rejects it on a `fabric://` Target. |
 | Latency | The first use of a key and each refresh block the request that triggers them, bounded by the grant client's 10 s timeout. Other requests use the still-valid token or wait on the single in-flight grant. |
@@ -1063,7 +1063,8 @@ sequenceDiagram
   share a token. Records under the old bare key are no longer read and stay listed until they
   expire or are revoked.
 - A stored authorization code provider with an http token endpoint fails each authorization code
-  exchange, refresh and modern consent exchange, before the request is sent.
+  exchange, legacy and modern refresh, and modern consent exchange, before any secret is read and
+  before the request is sent.
 - `credential_provider` Target Authentication is not available on Transit Points or MCP proxy
   targets, and path confinement does not apply on those legs, for `static_secret` either.
 - A paired, exposed Fabric peer is never accepted as the authenticated caller for
