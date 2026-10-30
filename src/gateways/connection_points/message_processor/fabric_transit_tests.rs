@@ -111,6 +111,21 @@ async fn receiver(
     root: &std::path::Path,
     surface: &AgentSurface,
 ) -> (Gateway, tempfile::TempDir) {
+    let strategies = Arc::new(
+        crate::jwt_bearer::storage::FileSystemJwtVerificationStrategyStore::new(root.join("strategies"))
+            .await
+            .unwrap(),
+    );
+    receiver_with_strategies(root, surface, strategies).await
+}
+
+/// [`receiver`], whose source authentication reads JWT verification
+/// strategies from `strategies`.
+async fn receiver_with_strategies(
+    root: &std::path::Path,
+    surface: &AgentSurface,
+    strategies: Arc<crate::jwt_bearer::storage::FileSystemJwtVerificationStrategyStore>,
+) -> (Gateway, tempfile::TempDir) {
     use crate::secrets::SecretsStore;
     let secrets = crate::secrets::FilesystemSecretsStore::new_async(
         root.join("secrets")
@@ -133,11 +148,7 @@ async fn receiver(
         .unwrap();
     super::init_source_auth_middleware(Arc::new(crate::source_auth::SourceAuthMiddleware::new(
         Arc::new(crate::didauth::DidAuthSessionStore::new()),
-        Arc::new(
-            crate::jwt_bearer::storage::FileSystemJwtVerificationStrategyStore::new(root.join("strategies"))
-                .await
-                .unwrap(),
-        ),
+        strategies,
         Arc::new(crate::jwt_bearer::JwksClient::new()),
         Some(Arc::new(secrets)),
         Arc::new(dashmap::DashMap::new()),
@@ -234,8 +245,9 @@ fn a2a_body() -> Value {
 /// request a peer sends, whatever tokens the peer sent: valid for each of the
 /// surface's Transit Points and no other, naming the peer's record and issuer
 /// DID and the Fabric crossings the request made, continuing the request's
-/// trace, and carrying no principal even though the surface's `source_auth`
-/// verified one. The hop count header never reaches the agent.
+/// trace, and carrying the principal the surface's `source_auth` verified only
+/// as `fabric.principal_hash`, never as the top-level `user_identity_hash`. The
+/// hop count header never reaches the agent.
 #[tokio::test]
 async fn a_fabric_request_reaches_the_agent_with_one_transit_token_issued_for_it() {
     if ran_in_child("ATG_FABRIC_TRANSIT_TOKEN_CHILD").await {
@@ -251,13 +263,34 @@ async fn a_fabric_request_reaches_the_agent_with_one_transit_token_issued_for_it
             .filter(|event| matches!(event.event, DelegationAuditAction::AuthFailed { .. }))
             .count()
     };
-    let (_, events) = crate::audit::producer::capture(forward_response(&forward_request(
+    let (response, events) = crate::audit::producer::capture(forward_response(&forward_request(
         root.path(),
         json!({ "content-type": "application/json", "x-api-key": "a-key-the-surface-refuses" }),
         a2a_body(),
     )))
     .await;
     assert_eq!(auth_failures(&events), 1, "the surface checks the peer's key");
+    assert_eq!(response["status"], 200, "no policy refuses the unverified request: {response}");
+    let refused = target
+        .received()
+        .pop()
+        .unwrap();
+    let refused_claims = issuer
+        .validate(header_values(&refused, "x-transit-token")[0], 300)
+        .unwrap();
+    assert_eq!(
+        refused_claims
+            .fabric
+            .and_then(|fabric| fabric.principal_hash),
+        None,
+        "a key the surface refused verifies no caller"
+    );
+    let verified_caller = crate::source_auth::AuthenticatedIdentity::ApiKey {
+        key_name: "peer-callers".to_string(),
+        provider_agent_id: None,
+    }
+    .principal_hash(None);
+    assert!(verified_caller.is_some());
 
     for (case, hops_header, expected_hops) in [("an older peer", None, 1), ("three crossings", Some("3"), 3)] {
         let mut headers = json!({ "content-type": "application/json", "x-api-key": CALLER_KEY,
@@ -301,10 +334,11 @@ async fn a_fabric_request_reaches_the_agent_with_one_transit_token_issued_for_it
                 peer_gateway_id: peer.id.clone(),
                 peer_issuer_did: Some(PEER_ISSUER_DID.to_string()),
                 hops: expected_hops,
+                principal_hash: verified_caller.clone(),
             }),
             "{case}"
         );
-        assert_eq!(claims.user_identity_hash, None, "{case}: the peer's principal is never the caller's");
+        assert_eq!(claims.user_identity_hash, None, "{case}: never the principal an Access Point verified");
         assert_eq!(claims.sub, None, "{case}");
         assert_eq!(
             claims
@@ -345,6 +379,13 @@ async fn a_fabric_request_reaches_the_agent_with_one_transit_token_issued_for_it
         Some("fabric-asserted")
     );
     assert_eq!(claims.user_identity_hash, None);
+    assert_eq!(
+        claims
+            .fabric
+            .and_then(|fabric| fabric.principal_hash),
+        verified_caller,
+        "the principal is the key the surface verified, never the identity the payload names"
+    );
 }
 
 /// A request past the hop limit is refused with `508`, and one whose hop
@@ -633,7 +674,219 @@ fn caller(
         hops: 1,
         caller_identity,
         verification,
+        verified_identity: None,
     }
+}
+
+/// The token's principal and caller context fields come only from the caller
+/// the receiving surface verified, namespaced by the surface's tenant: a DID a
+/// connection issuer's presentation carried is never one.
+#[test]
+fn a_fabric_tokens_principal_is_only_the_caller_the_receiving_surface_verified() {
+    let issuer = test_issuer();
+    let mut surface = surface("a2a", "https://agent.example", &["crm", "billing"]);
+    surface.tenant_id = Some("tenant-a".to_string());
+    let transit = surface
+        .transit
+        .as_mut()
+        .unwrap();
+    for (point, fields) in transit
+        .points
+        .iter_mut()
+        .zip([json!(["email"]), json!(["name"])])
+    {
+        point.workload_binding = Some(
+            serde_json::from_value(
+                json!({ "enabled": true, "caller_source": "transit_token", "caller_context_fields": fields }),
+            )
+            .unwrap(),
+        );
+    }
+    let claims = |caller: &FabricReceiveCaller<'_>| {
+        let (token, _) = fabric_receive_transit_token(
+            Some(&issuer),
+            Some(30),
+            &surface,
+            "https://agent.example/rpc",
+            false,
+            caller,
+            Some("trace"),
+        )
+        .unwrap();
+        issuer
+            .validate(&token, 300)
+            .unwrap()
+    };
+
+    let presented = claims(&caller(Some("did:web:agent.example"), IdentityVerification::Vp));
+    assert_eq!(presented.sub.as_deref(), Some("did:web:agent.example"));
+    assert_eq!(
+        presented
+            .fabric
+            .and_then(|fabric| fabric.principal_hash),
+        None,
+        "a presentation names the caller, it does not verify it"
+    );
+    assert!(
+        presented
+            .caller_context_fields
+            .is_empty()
+    );
+
+    let alice = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+        subject: "alice".to_string(),
+        claims: json!({ "iss": "https://idp.example", "sub": "alice", "email": "alice@example.com",
+            "name": "Alice", "phone": "+15550100" }),
+    };
+    let mut verified = caller(Some("did:web:agent.example"), IdentityVerification::Vp);
+    verified.verified_identity = Some(&alice);
+    let verified = claims(&verified);
+    assert_eq!(verified.user_identity_hash, None);
+    assert_eq!(
+        verified
+            .fabric
+            .and_then(|fabric| fabric.principal_hash),
+        alice.principal_hash(Some("tenant-a"))
+    );
+    assert_ne!(alice.principal_hash(Some("tenant-a")), alice.principal_hash(None));
+    assert_eq!(
+        Value::Object(verified.caller_context_fields),
+        json!({ "email": "alice@example.com", "name": "Alice" }),
+        "the claims some Transit Point of the surface allowlists"
+    );
+}
+
+/// A surface that verifies no caller of its own gives its agent a token with
+/// no principal, whatever identity the peer's request names.
+#[tokio::test]
+async fn a_surface_that_verifies_no_caller_issues_a_fabric_token_without_a_principal() {
+    if ran_in_child("ATG_FABRIC_UNVERIFIED_CALLER_CHILD").await {
+        return;
+    }
+    let target = RecordingTarget::start(axum::http::StatusCode::OK, &[]).await;
+    let root = tempfile::tempdir().unwrap();
+    let mut open = surface("a2a", &target.url, &["crm"]);
+    open.access_point
+        .caller_authentication = None;
+    let _receiver = receiver(root.path(), &open).await;
+
+    let mut body = a2a_body();
+    body["params"]["message"]["extensions"] = json!([crate::config::AFFINIDI_AGENT_IDENTITY_EXTENSION]);
+    body["params"]["message"]["metadata"] = json!({ crate::config::AFFINIDI_AGENT_IDENTITY_EXTENSION: {
+        "agentId": "agent-7", "did": "did:web:asserted.example" } });
+    let response = forward_response(&forward_request(
+        root.path(),
+        json!({ "content-type": "application/json", "x-api-key": CALLER_KEY }),
+        body,
+    ))
+    .await;
+    assert_eq!(response["status"], 200, "{response}");
+    let received = target
+        .received()
+        .pop()
+        .unwrap();
+    let claims = test_issuer()
+        .validate(header_values(&received, "x-transit-token")[0], 300)
+        .unwrap();
+    assert_eq!(claims.user_identity_hash, None);
+    assert_eq!(
+        claims
+            .fabric
+            .and_then(|fabric| fabric.principal_hash),
+        None
+    );
+    assert!(
+        claims
+            .caller_context_fields
+            .is_empty()
+    );
+}
+
+/// A JWT the receiving surface verified on a Fabric request is the token's
+/// principal, and the claims the surface's Transit Points allowlist ride with
+/// it; claims no Transit Point allowlists stay behind.
+#[tokio::test]
+async fn a_jwt_the_receiving_surface_verified_is_the_fabric_tokens_principal_with_its_allowlisted_claims() {
+    if ran_in_child("ATG_FABRIC_JWT_CALLER_CHILD").await {
+        return;
+    }
+    use crate::component_tests::helpers::jwt::{JwksFixture, now_secs, sign_jwt};
+    use crate::jwt_bearer::storage::JwtVerificationStrategyStorage;
+
+    let fixture = JwksFixture::start().await;
+    let target = RecordingTarget::start(axum::http::StatusCode::OK, &[]).await;
+    let root = tempfile::tempdir().unwrap();
+    let strategies = Arc::new(
+        crate::jwt_bearer::storage::FileSystemJwtVerificationStrategyStore::new(root.path().join("strategies"))
+            .await
+            .unwrap(),
+    );
+    let strategy = strategies
+        .create(
+            serde_json::from_value(json!({
+                "id": "partner-idp", "name": "Partner IdP", "expected_issuer": fixture.issuer,
+                "jwks_source": {"type": "remote", "jwks_uri": format!("{}/.well-known/jwks.json", fixture.issuer)},
+                "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut surface = surface("a2a", &target.url, &["crm"]);
+    surface
+        .access_point
+        .caller_authentication = Some(
+        serde_json::from_value(json!({ "methods": [{ "type": "jwt_bearer",
+            "jwt_verification_strategy_id": strategy.id, "audiences": ["https://receiver.example/agent"] }] }))
+        .unwrap(),
+    );
+    surface
+        .transit
+        .as_mut()
+        .unwrap()
+        .points[0]
+        .workload_binding = Some(
+        serde_json::from_value(
+            json!({ "enabled": true, "caller_source": "transit_token", "caller_context_fields": ["email"] }),
+        )
+        .unwrap(),
+    );
+    let _receiver = receiver_with_strategies(root.path(), &surface, strategies).await;
+    let claims = json!({ "iss": fixture.issuer, "sub": "user-123", "aud": "https://receiver.example/agent",
+        "exp": now_secs() + 300, "email": "user-123@partner.example", "phone": "+15550100" });
+    let jwt = sign_jwt(claims.clone(), &fixture.kid);
+
+    let response = forward_response(&forward_request(
+        root.path(),
+        json!({ "content-type": "application/json", "authorization": format!("Bearer {jwt}") }),
+        a2a_body(),
+    ))
+    .await;
+    assert_eq!(response["status"], 200, "{response}");
+    let received = target
+        .received()
+        .pop()
+        .unwrap();
+    let token = test_issuer()
+        .validate(header_values(&received, "x-transit-token")[0], 300)
+        .unwrap();
+    let verified = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+        subject: "user-123".to_string(),
+        claims,
+    };
+    assert_eq!(token.user_identity_hash, None);
+    assert_eq!(
+        token
+            .fabric
+            .and_then(|fabric| fabric.principal_hash),
+        verified.principal_hash(None)
+    );
+    assert!(
+        verified
+            .principal_hash(None)
+            .is_some()
+    );
+    assert_eq!(Value::Object(token.caller_context_fields), json!({ "email": "user-123@partner.example" }));
 }
 
 /// The token's `sub` is the caller only when it is a DID; it is

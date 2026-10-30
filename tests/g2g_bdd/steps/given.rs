@@ -20,7 +20,7 @@ use crate::bdd_support::mediator::Mediator as _;
 use crate::bdd_support::oidc::{OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_ISSUER, OidcProvider};
 use crate::bdd_support::policies::{
     build_gateway_deny_all_policy, build_gateway_deny_unverified_source_auth_policy, build_mcp_tool_allow_policy,
-    build_surface_identity_binding_issuer_policy,
+    build_surface_identity_binding_issuer_policy, build_transit_point_partner_policy,
 };
 use crate::world::{FabricLink, G2gWorld, McpCaller, TransitPointFabricLink};
 
@@ -438,6 +438,45 @@ pub async fn transit_point_requires_a_transit_token(
     transit_point: String,
 ) {
     transit_point_spec_mut(world, &transit_point).require_transit_token = true;
+}
+
+/// How long a fresh pairing may take to record the peer's issuer DID.
+const PAIRING_ISSUER_DID_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Starts the fabric, since the policy names the sending gateway's issuer DID
+/// as the Transit Point's gateway recorded it at pairing.
+#[given(expr = "Transit Point {string} admits only requests that gateway {int} sent")]
+pub async fn transit_point_admits_only_requests_that_a_gateway_sent(
+    world: &mut G2gWorld,
+    transit_point: String,
+    sender_gw: usize,
+) {
+    world.start().await;
+    let link = world
+        .transit_point_link(&transit_point)
+        .clone();
+    let issuer_did = world
+        .wait_for_recorded_issuer_did(link.from_gw, sender_gw, PAIRING_ISSUER_DID_TIMEOUT)
+        .await
+        .issuer_did
+        .unwrap_or_else(|| panic!("gateway {} recorded no issuer DID for gateway {sender_gw}", link.from_gw));
+    let policy_definition_id = format!("{}-{transit_point}-partner-policy", link.from_surface);
+    world
+        .harness()
+        .gw(link.from_gw)
+        .admin
+        .create_surface_policy_definition(
+            &policy_definition_id,
+            &format!("g2g BDD partner policy for Transit Point {transit_point}"),
+            &build_transit_point_partner_policy(&issuer_did),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{error:#}"));
+    world
+        .harness()
+        .set_transit_point_policy(link.from_gw, &link.from_surface, &transit_point, &policy_definition_id)
+        .await
+        .unwrap_or_else(|error| panic!("{error:#}"));
 }
 
 /// Boots the topology and sends the caller's A2A request, which must be

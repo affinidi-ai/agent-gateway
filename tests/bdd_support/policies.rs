@@ -149,6 +149,24 @@ deny_reason := sprintf("caller identity was not issued by gateway %v", [{did_lit
     )
 }
 
+/// Transit Point policy that admits only a call whose transit token was issued
+/// for a request the paired gateway with issuer DID `issuer_did` sent over
+/// Fabric, the recipe `docs/POLICY.md` gives.
+pub fn build_transit_point_partner_policy(issuer_did: &str) -> String {
+    let did_literal = serde_json::to_string(issuer_did).expect("DID should serialize");
+    format!(
+        r#"package surface.policy
+
+default allow := false
+
+allow if {{
+    input.transit.caller.verification == "fabric_peer"
+    input.transit.caller.fabric.peer_issuer_did == {did_literal}
+}}
+"#
+    )
+}
+
 pub fn build_transit_point_request_path_policy(allowed_path: &str) -> String {
     let allowed_path_literal = serde_json::to_string(allowed_path).expect("allowed path should serialize");
 

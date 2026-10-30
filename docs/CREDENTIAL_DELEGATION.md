@@ -101,12 +101,44 @@ carries, so a `source_auth` caller without a transit token needs a managed ident
 Transit Point.
 
 A transit token the gateway issued for a request that arrived over Fabric (see
-[`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)) keys no grant: it carries no principal, and
-the caller DID in it is the peer gateway's word, so it is never the agent half of a key either.
-A binding that applies to such a call refuses it with `403` and the target is not called; the
-log says delegated credentials are not released for requests that arrived over Fabric. A caller
-the Transit Point's own `source_auth` verified on the same call still keys its own grant, and
-static `target_auth` credentials are added as for any caller.
+[`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)) keys a grant only on a Transit Point that
+sets `delegated_credentials_for_fabric_callers: true` (off by default), and then only by its
+`fabric.principal_hash`: the caller the receiving surface's own `source_auth` or resource token
+verified on that request, the same identity hash its Access Point computes for the same
+credential. The caller DID or pseudonym the peer gateway sent, and a top-level
+`user_identity_hash`, never key a grant, and the caller DID is never the agent half of a key
+either, so such a call needs the Transit Point's managed identity: its own `managed_identity`,
+or the surface's when the Transit Point injects a VP, in any mode but `from_jwt_claim`. Without
+one, a binding that applies refuses every Fabric caller with `403`, and a save of a Transit
+Point that sets the switch, on the surface or in an enabled variant, answers with a `Warning`
+header saying so.
+
+Set the switch only when the receiving surface verifies a per-user credential on each Fabric
+request: a JWT whose `sub` is the end user, with an audience naming this gateway. The receiving
+surface normally verifies the credential the peer's `target_auth` presents, and when that is the
+partner's own key, every request the partner sends has the same identity hash. One partner
+credential is then one grant: the first of the partner's users to complete consent binds their
+account, and every later request from that partner, for any of its users, is sent with it.
+
+Without the switch, or when the receiving surface verified no caller, a binding that applies
+refuses the call with `403` and the target is not called. The log says delegated credentials
+are not released for requests that arrived over Fabric
+(`reason=delegated_credentials_for_fabric_callers=false`), or that the receiving surface
+verified no caller of the request (`reason=no_fabric_caller_verified`). The grant follows the
+caller the Transit Point's policy input ranks first: a caller the Transit Point's own
+`source_auth` verified on the same call keys its own grant only when the token names no caller
+the receiving surface verified. When the token names one, that caller outranks it, so without
+the switch the call is refused, never served with the grant of the Transit Point's caller.
+Static `target_auth` credentials are added as for any caller. A release that predates the
+switch, or `fabric.principal_hash`, keys no grant by a Fabric-issued token; a caller its own
+`source_auth` verified still keys its own grant there, and its policy input and audit records
+name that caller first. During a rolling upgrade, a `PUT` of the surface through a node that
+predates the switch saves it without the switch, which turns it off.
+
+On a `fabric://` Transit Point the two switches are independent:
+`delegated_credentials_for_fabric_callers` decides whether a Fabric caller's grant is looked up
+at all, and `fabric_delegated_credentials` whether a resolved credential crosses to the next
+peer (see [Across Fabric](#across-fabric)).
 
 ## When a token is missing
 

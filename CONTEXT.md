@@ -64,7 +64,7 @@ Use **Target** only for the managed-agent component of a surface. A Transit Poin
 | **Fabric route**                        | A `fabric://{gateway_id}/{surface_id}` Target endpoint. The DIDComm request field `channel_id` is the legacy wire name for the destination surface identifier.                                                                                        |
 | **Envelope replay protection**          | The receiving gateway's rule that a fabric envelope carries a bounded expiry and is processed at most once per sender and message id. See [`docs/FABRIC.md`](docs/FABRIC.md#fabric-receive-pipeline). _Avoid: nonce check, dedup._ |
 | **Fabric hops**                         | How many Fabric crossings a request has made, its own included: sent between gateways as `X-Gateway-Fabric-Hops` and carried inside a gateway by the transit token it issues for a Fabric request. A request past 8 crossings is refused with `508`. See [`docs/FABRIC.md`](docs/FABRIC.md#chains-across-gateways). _Avoid: TTL, depth._ |
-| **Fabric caller**                       | The verified caller of a request that arrived over Fabric: the peer gateway the handshake authenticated, never the user or agent the peer says it acts for. A Transit Point's policy sees it as `fabric_peer`. _Avoid: partner user, remote principal._ |
+| **Fabric caller**                       | The verified caller of a request that arrived over Fabric: the peer gateway the handshake authenticated and, when the receiving surface's own source authentication checked a credential on the request, that principal; never the user or agent the peer says it acts for. A Transit Point's policy sees it as `fabric_peer`. _Avoid: partner user, remote principal._ |
 
 ## Identity
 

@@ -265,22 +265,27 @@ that:
 - sets both `source_auth` and `mcp_http.authorization`;
 - sets a `source_auth` a Transit Point does not support, such as a `jwt_bearer` that names no
   audience, or one the Access Point's rules refuse, such as mTLS trust that names no
-  certificate.
+  certificate;
+- sets `delegated_credentials_for_fabric_callers` but does not require a transit token, the
+  only way a Fabric caller reaches it (see [Transit token](#transit-token)).
 
 A surface stored with such a Transit Point still loads, with a warning in the log naming the
 Transit Point and, for one a variant defines, the variant, but the Transit Point refuses every
-request with `503`, discovery reads included; a Transit Point that sets
-`allow_unauthenticated_callers` but authenticates its callers keeps authenticating them. The
-caller is told only that the Transit Point is unavailable, as a JSON-RPC error on an MCP
-Transit Point and a problem JSON otherwise; the reason is logged.
+request with `503`, discovery reads included. Two kinds serve their callers instead: a Transit
+Point that sets `allow_unauthenticated_callers` but authenticates its callers keeps
+authenticating them, and one that sets `delegated_credentials_for_fabric_callers` without
+requiring a transit token serves its callers as before and releases nothing to Fabric callers,
+since it never reads the token that names them. The caller of a refused request is told only
+that the Transit Point is unavailable, as a JSON-RPC error on an MCP Transit Point and a problem
+JSON otherwise; the reason is logged.
 
 `transit.source_auth`, on the surface's `transit` block rather than a Transit Point, is not
 enforced. The admin API refuses a surface that sets it, on the surface or in a variant's
 overrides, with `400`. A surface stored with it still loads, with a warning in the log, but
 its Transit Points refuse every request with `503` in the same way.
 
-The Surface Builder shows neither a Transit Point's `source_auth` nor its
-`allow_unauthenticated_callers`. These rules hold for a `PUT` of the surface and for a `PUT`
+The Surface Builder shows none of a Transit Point's `source_auth`,
+`allow_unauthenticated_callers` and `delegated_credentials_for_fabric_callers`. These rules hold for a `PUT` of the surface and for a `PUT`
 of one variant (`PUT /v1/surfaces/{id}/variants/{variant_id}`), for the Transit Points its
 overrides list. An omitted `source_auth` in a `PUT`, as in a dashboard save, keeps the stored
 one; `"source_auth": null` removes it, and so does a merge `PATCH` of the surface or the
@@ -289,7 +294,9 @@ save rules above then apply, so a Transit Point left with no caller authenticati
 with `400` unless it requires a transit token or is marked `allow_unauthenticated_callers`. A
 `PUT` that omits `allow_unauthenticated_callers` keeps it while the Transit Point still
 authenticates no caller, and drops it once the Transit Point authenticates its callers. A
-`PUT` matches each Transit Point to the stored one by `id`, and a Transit Point sent without
+`PUT` that omits `delegated_credentials_for_fabric_callers` keeps it while the Transit Point
+still requires a transit token, and drops it once it does not; a value the `PUT` sends is
+saved. A `PUT` matches each Transit Point to the stored one by `id`, and a Transit Point sent without
 an `id` gets a new one, so a `PUT` that omits both the `id` and `source_auth` drops the stored
 `source_auth`: a Transit Point that still requires a transit token is saved, authenticated by
 the token alone, and one that does not is refused with `400`. Send each Transit Point's `id`
@@ -458,28 +465,46 @@ so its agent gets exactly one. It differs from an Access Point token:
 | --- | --- |
 | `sub` | The caller DID the peer's request names, only when it is a DID; a payload pseudonym (`sha256:...`) is left out |
 | `identity_source` | `fabric-presentation` when a presentation signed by one of the connection's issuers carried the DID, `fabric-asserted` otherwise |
-| `user_identity_hash`, `caller_context_fields`, `caller_dna_uai` | Never present: the peer gateway is verified, its caller is not. Even when the receiving surface's `source_auth` verified a credential the peer sent, the token carries no principal |
+| `user_identity_hash`, `caller_dna_uai` | Never present. `user_identity_hash` names a caller an Access Point verified; a Fabric token's principal is `fabric.principal_hash` |
+| `caller_context_fields` | The claims the surface's Transit Points allowlist (their enabled `workload_binding.caller_context_fields` with `caller_source: transit_token`), taken from the JWT the receiving surface's own `source_auth` or resource token verified on the request. Never anything the peer's presentation or payload says |
 | `trace_id` | The trace this gateway sends on to its agent, so the agent's Transit Point calls continue it |
-| `fabric` | `peer_gateway_id` (the sender's Remote gateway record), `peer_issuer_did` (its issuer DID, once pairing established it) and `hops`, the Fabric crossings the request made (see [`FABRIC.md`](FABRIC.md#chains-across-gateways)) |
+| `fabric` | `peer_gateway_id` (the sender's Remote gateway record), `peer_issuer_did` (its issuer DID, once pairing established it), `hops`, the Fabric crossings the request made (see [`FABRIC.md`](FABRIC.md#chains-across-gateways)), and `principal_hash` (below) |
+| `fabric.principal_hash` | The [identity hash](CREDENTIAL_DELEGATION.md#the-callers-identity-hash) of the caller the receiving surface's own `source_auth` or resource token verified on this request, the value an Access Point would put in `user_identity_hash` for the same credential. Absent when the surface verified no caller: it has no caller authentication, or a caller-attributable failure was left to policy. Never derived from the caller DID, presentation or payload the peer sent |
+
+The peer gateway is always verified, by the Fabric handshake. Its caller is verified only when
+the receiving surface checked a credential itself on the request, normally the one the peer's
+`target_auth` presents, since the sending gateway never forwards its own caller's credential.
 
 A Transit Point accepts such a token as it accepts an Access Point's, and its policy sees the
-peer as the caller (`verification: fabric_peer`, see
-[`POLICY.md`](POLICY.md#caller-in-transit-point-policy-input)), with the DID unverified
+caller as `verification: fabric_peer`, verified only with a `fabric.principal_hash` (see
+[`POLICY.md`](POLICY.md#caller-in-transit-point-policy-input)), and with the DID unverified
 (`did_verified: false`) even when a presentation carried it. Static `target_auth`
-credentials are added as for any caller; delegated per-user credentials are never released for
-it (see [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-a-transit-point)).
-A Transit Point's audit records name its caller with `auth_method: fabric_asserted`, the peer
-(its issuer DID, else its Remote gateway record id) as `iss` and the DID as `sub`, below a caller
-the Transit Point verified itself. The identity presentation a Transit Point with a
-`workload_binding` signs for its agent never names that DID as the user it acts for
-(`userIdentity`), as it does the DID of an Access Point token.
+credentials are added as for any caller. Delegated per-user credentials are released for it
+only on a Transit Point that sets `delegated_credentials_for_fabric_callers: true`, and only
+for the caller in `fabric.principal_hash` (see
+[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-a-transit-point)).
+A Transit Point's audit records name a caller in `fabric.principal_hash` with
+`auth_method: fabric_verified`, that hash as `user_identity_hash`, which is all that names a
+caller verified by an API key, and the allowlisted `sub`, `email` and `name` the receiving
+surface verified, with no `iss`: the peer issued none of them. They rank it ahead of a caller
+the Transit Point verified itself, as a verified Access Point token is. Without one they name
+the DID with `auth_method: fabric_asserted` and the peer as `iss`, below a caller the Transit
+Point verified itself. Both name the peer (its issuer DID, else its Remote gateway record id) as
+`peer_gateway`. Policy sees both as `verification: fabric_peer`; in audit records,
+`fabric_verified` is a Fabric caller the receiving surface verified and `fabric_asserted` one it
+did not, so a search for every request from paired gateways matches both labels, or
+`peer_gateway`. The identity presentation a Transit Point with a `workload_binding` signs for
+its agent never names that DID as the user it acts for (`userIdentity`), as it does the DID of
+an Access Point token.
 A release that predates the `fabric` claim reads such a token as one naming an unverified DID,
-with no principal. So during a rolling upgrade, a Transit Point served by such a node still
-names that DID as the user its agent acts for (`userIdentity`) in the identity presentation it
-signs, and audits it with `auth_method: transit_token`, until every node is upgraded. A release
-that predates the hop count neither reads nor sends
-`X-Gateway-Fabric-Hops`, so a chain through such a gateway starts counting again at 1 after it
-(see [`FABRIC.md`](FABRIC.md#chains-across-gateways)).
+with no principal, and one that predates `fabric.principal_hash` reads it as a `fabric_peer`
+caller with no principal, so neither releases a delegated credential for it. During a rolling
+upgrade, a Transit Point served by a node that predates the `fabric` claim still names that DID
+as the user its agent acts for (`userIdentity`) in the identity presentation it signs, and
+audits it with `auth_method: transit_token`, until every node is upgraded. A release that
+predates the hop count neither reads nor sends `X-Gateway-Fabric-Hops`, so a chain through such
+a gateway starts counting again at 1 after it (see
+[`FABRIC.md`](FABRIC.md#chains-across-gateways)).
 
 A Transit Point refuses the call with `401` unless the token:
 

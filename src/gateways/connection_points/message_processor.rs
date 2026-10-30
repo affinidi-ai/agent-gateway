@@ -3840,13 +3840,16 @@ fn fabric_hops_refusal(
 }
 
 /// Who sent a request over Fabric, for the transit token issued with it: the
-/// peer the handshake verified, and the caller the peer's request names.
+/// peer the handshake verified, the caller the peer's request names, and the
+/// caller the receiving surface's own `source_auth` or resource token verified
+/// on the request.
 pub(super) struct FabricReceiveCaller<'caller> {
     pub peer_gateway_id: &'caller str,
     pub peer_issuer_did: Option<&'caller str>,
     pub hops: u8,
     pub caller_identity: Option<&'caller str>,
     pub verification: crate::surface_context::IdentityVerification,
+    pub verified_identity: Option<&'caller crate::source_auth::AuthenticatedIdentity>,
 }
 
 /// The `sub` and `identity_source` of a transit token issued on Fabric
@@ -3873,6 +3876,10 @@ pub(super) fn fabric_caller_did_and_source(
 /// itself, by HTTP or HTTPS. A Target the gateway runs has no agent to hold
 /// one, and an agent card fetch is no request of the agent's own.
 /// `min_lifetime_secs` is the appliance's `transit_token_min_lifetime_secs`.
+/// Its only principal, `fabric.principal_hash`, and its caller context fields
+/// come from the caller the surface verified itself (`verified_identity`),
+/// exactly as the Access Point fills `user_identity_hash` and the fields; the
+/// caller the peer names never contributes either.
 /// Returns the token and its `jti`; one that cannot be issued is logged and
 /// the request goes on without it.
 pub(super) fn fabric_receive_transit_token(
@@ -3909,6 +3916,10 @@ pub(super) fn fabric_receive_transit_token(
             .iter()
             .map(|point| point.alias.clone())
             .collect(),
+        caller_context_fields: crate::proxy::handler::compute_transit_token_caller_context(
+            surface,
+            caller.verified_identity,
+        ),
         fabric: crate::proxy::transit_token::FabricTransitClaims {
             peer_gateway_id: caller
                 .peer_gateway_id
@@ -3917,6 +3928,7 @@ pub(super) fn fabric_receive_transit_token(
                 .peer_issuer_did
                 .map(str::to_string),
             hops: caller.hops,
+            principal_hash: crate::proxy::handler::source_auth_user_hash(caller.verified_identity, surface),
         },
     };
     match issuer.issue_for_fabric_request(
@@ -5866,6 +5878,7 @@ async fn process_forward_request_in_request_scope(
             hops: fabric_hops,
             caller_identity: caller_identity.as_deref(),
             verification: caller_identity_verification,
+            verified_identity: authenticated_identity.as_ref(),
         },
         onward_trace_id.as_deref(),
     ) {
