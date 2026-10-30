@@ -1105,7 +1105,10 @@ pub struct TransitConfig {
 /// Shared transit configuration applied to all transit points.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SharedTransitConfig {
-    /// Transit token mode (how caller context is carried).
+    /// Transit token mode (how caller context is carried). Only `embedded` is
+    /// supported, and it is what every surface gets: the admin API refuses
+    /// `reference` ([`TRANSIT_TOKEN_REFERENCE_REFUSED`]), and a stored `reference`
+    /// is served as `embedded` with a warning when the surface loads.
     #[serde(default)]
     pub transit_token_mode: TransitTokenMode,
 
@@ -1124,7 +1127,10 @@ pub struct SharedTransitConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<RateLimitConfig>,
 
-    /// Inject signed VP into every outbound request.
+    /// Has no effect, whatever its value, and is deprecated. Whether a Transit
+    /// Point sends a signed VP follows its `managed_identity` and
+    /// `identity_injection.inject_vp`. A stored `false` gets a warning when the
+    /// surface loads, since the operator may expect requests without a VP.
     #[serde(default = "default_true")]
     pub sign_requests: bool,
 
@@ -1198,6 +1204,13 @@ impl SharedTransitConfig {
         }
     }
 }
+
+/// Why the admin API refuses `transit.transit_token_mode: reference`: the gateway
+/// has no such mode, and a surface that chose it would expose the caller context
+/// in the token to its agent while expecting it kept server-side.
+pub const TRANSIT_TOKEN_REFERENCE_REFUSED: &str = "transit.transit_token_mode 'reference' is not supported: the \
+     transit token always carries the caller context itself, readable by the managed agent; set it to 'embedded' \
+     or remove it";
 
 /// Why a surface that sets [`SharedTransitConfig::source_auth`] is refused by the
 /// admin API, and has every Transit Point request refused when it is loaded.
@@ -1809,8 +1822,63 @@ impl StorableEntity for AgentSurface {
         let stripped = strip_legacy_trust_registry_fields(value);
         let split = split_target_trust_checks_per_transit_point(value);
         warn_target_lists_that_cannot_run(value);
+        warn_inert_transit_settings(value);
         let marked = mark_transit_point_source_auth(value);
         Ok(stripped || split || marked)
+    }
+}
+
+/// Warn about a stored surface that sets a transit setting the gateway does not
+/// act on, on the base surface or in a variant's overrides: `transit_token_mode:
+/// reference` (the tokens are embedded all the same) and `sign_requests: false`
+/// (it changes nothing; a VP follows each Transit Point's `managed_identity` and
+/// `identity_injection.inject_vp`). Nothing is changed and nothing is refused.
+fn warn_inert_transit_settings(value: &serde_json::Value) {
+    let surface_id = value
+        .get("surface_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("?");
+    let warn = |variant: &str, shared: Option<&serde_json::Value>| {
+        let Some(shared) = shared else {
+            return;
+        };
+        if shared
+            .get("transit_token_mode")
+            .and_then(serde_json::Value::as_str)
+            == Some("reference")
+        {
+            tracing::warn!(
+                surface_id = %surface_id,
+                variant = %variant,
+                setting = "transit_token_mode",
+                "transit_token_mode 'reference' is not supported; the transit tokens are embedded, so the caller \
+                 context is readable by the managed agent; set it to 'embedded'"
+            );
+        }
+        if shared.get("sign_requests") == Some(&serde_json::Value::Bool(false)) {
+            tracing::warn!(
+                surface_id = %surface_id,
+                variant = %variant,
+                setting = "sign_requests",
+                "sign_requests has no effect: a Transit Point still sends a signed VP when its managed_identity and \
+                 identity_injection.inject_vp call for one; remove it"
+            );
+        }
+    };
+    warn("", value.get("transit"));
+    for variant in value
+        .get("variants")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        warn(
+            variant
+                .get("alias")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+            variant.pointer("/overrides/transit/shared"),
+        );
     }
 }
 
@@ -4053,6 +4121,85 @@ mod tests {
 
         assert!(!migrate(&mut json), "nothing to migrate");
         assert_eq!(json, before);
+    }
+
+    fn inert_transit_warnings(json: &mut serde_json::Value) -> Vec<(String, String, String)> {
+        use crate::observability::trust_check_audit::test_support::{capture, field};
+        capture(|| {
+            migrate(json);
+        })
+        .iter()
+        .filter(|event| event.level == "WARN" && field(event, "setting").is_some())
+        .map(|event| {
+            (
+                field(event, "surface_id")
+                    .unwrap_or_default()
+                    .to_string(),
+                field(event, "variant")
+                    .unwrap_or_default()
+                    .to_string(),
+                field(event, "setting")
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+        })
+        .collect()
+    }
+
+    /// A stored surface that asks for reference transit tokens, or for unsigned
+    /// transit requests, loads and gets a warning naming it, on the base surface
+    /// and in each variant; the stored JSON is left as it is.
+    #[test]
+    fn load_warns_of_reference_transit_tokens_and_unsigned_transit_requests() {
+        let mut json = serde_json::json!({
+            "surface_id": "legacy-reference",
+            "transit": { "transit_token_mode": "reference", "sign_requests": false, "points": [] },
+            "variants": [
+                { "alias": "dev", "overrides": { "transit": { "shared": {
+                    "transit_token_mode": "reference", "sign_requests": false } } } },
+                { "alias": "quiet", "overrides": { "transit": { "shared": {
+                    "transit_token_mode": "embedded", "sign_requests": true } } } }
+            ]
+        });
+        let before = json.clone();
+        let mut warnings = inert_transit_warnings(&mut json);
+        warnings.sort();
+        let expected = [
+            ("legacy-reference", "", "sign_requests"),
+            ("legacy-reference", "", "transit_token_mode"),
+            ("legacy-reference", "dev", "sign_requests"),
+            ("legacy-reference", "dev", "transit_token_mode"),
+        ]
+        .map(|(a, b, c)| (a.to_string(), b.to_string(), c.to_string()));
+        assert_eq!(warnings, expected);
+        assert_eq!(json, before, "a warning changes nothing");
+    }
+
+    /// Nothing to warn of for the supported values, for no setting at all, or for
+    /// a surface with no transit.
+    #[test]
+    fn load_does_not_warn_of_embedded_transit_tokens_or_signed_transit_requests() {
+        for transit in [
+            serde_json::json!({ "transit_token_mode": "embedded", "sign_requests": true, "points": [] }),
+            serde_json::json!({ "points": [] }),
+        ] {
+            let mut json = serde_json::json!({ "surface_id": "fine", "transit": transit });
+            assert_eq!(inert_transit_warnings(&mut json), vec![]);
+        }
+        let mut json = serde_json::json!({ "surface_id": "no-transit" });
+        assert_eq!(inert_transit_warnings(&mut json), vec![]);
+    }
+
+    /// A surface stored with `reference` still deserializes and serves embedded
+    /// tokens: the gateway never stops for it.
+    #[test]
+    fn a_stored_reference_mode_still_loads() {
+        let transit: SharedTransitConfig = serde_json::from_value(serde_json::json!({
+            "transit_token_mode": "reference", "sign_requests": false
+        }))
+        .unwrap();
+        assert_eq!(transit.transit_token_mode, TransitTokenMode::Reference);
+        assert!(!transit.sign_requests);
     }
 
     fn migration_warnings(json: &mut serde_json::Value) -> Vec<(String, String, String)> {

@@ -99,7 +99,6 @@ fn transit_surface(point_networking: Option<NetworkingConfig>) -> AgentSurface {
         },
         "transit": {
             "outbound_listen_address": "outbound_port_placeholder",
-            "sign_requests": false,
             "points": [{
                 "alias": "target",
                 "target_endpoint": "outbound_target_placeholder",

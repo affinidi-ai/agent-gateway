@@ -442,6 +442,11 @@ it is issued, 300 seconds unless the surface sets another. The agent may send th
 token on any number of calls to that surface's Transit Points until then. The header is
 never forwarded to a Transit Point's target.
 
+Every token is embedded: `transit.transit_token_mode` has one working value, `embedded`, and the
+admin API refuses `reference` (see
+[`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md#surface-transit-settings-that-do-nothing)).
+Do not put in the caller context claims you would not show the agent.
+
 Which requests carry one:
 
 | Pipeline | Issues a transit token |

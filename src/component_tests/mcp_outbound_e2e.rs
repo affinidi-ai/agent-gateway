@@ -45,7 +45,6 @@ fn build_mcp_outbound_surface(custom_metadata: serde_json::Value) -> AgentSurfac
         },
         "transit": {
             "outbound_listen_address": "outbound_port_placeholder",
-            "sign_requests": false,
             "custom_metadata": custom_metadata,
             "points": [{
                 "alias": "target",

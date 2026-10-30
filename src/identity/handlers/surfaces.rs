@@ -757,6 +757,7 @@ fn validate_transit_points(
     if surface_sets_source_auth || variant_sets_source_auth {
         return Err(SurfaceApiError::BadRequest(crate::config::agent_surface::TRANSIT_SOURCE_AUTH_REFUSED.to_string()));
     }
+    refuse_reference_transit_tokens(surface)?;
     validate_transit_point_caller_authentication(surface)?;
     let Some(transit) = surface.transit.as_mut() else {
         return Ok(());
@@ -787,6 +788,39 @@ fn validate_transit_points(
             return Err(SurfaceApiError::BadRequest(format!(
                 "transit.points[{}]: duplicate alias '{}'. Each transit point alias must be unique within the surface.",
                 idx, tp.alias
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse `transit_token_mode: reference`, set on the surface or in a variant's
+/// overrides: the gateway only issues embedded tokens.
+fn refuse_reference_transit_tokens(surface: &AgentSurface) -> Result<(), SurfaceApiError> {
+    use crate::config::agent_surface::{TRANSIT_TOKEN_REFERENCE_REFUSED, TransitTokenMode};
+    if surface
+        .transit
+        .as_ref()
+        .is_some_and(|transit| {
+            transit
+                .shared
+                .transit_token_mode
+                == TransitTokenMode::Reference
+        })
+    {
+        return Err(SurfaceApiError::BadRequest(TRANSIT_TOKEN_REFERENCE_REFUSED.to_string()));
+    }
+    for variant in &surface.variants {
+        let asks = variant
+            .overrides
+            .transit
+            .as_ref()
+            .and_then(|transit| transit.shared.as_ref())
+            .is_some_and(|shared| shared.transit_token_mode == Some(TransitTokenMode::Reference));
+        if asks {
+            return Err(SurfaceApiError::BadRequest(format!(
+                "variant '{}' {}",
+                variant.alias, TRANSIT_TOKEN_REFERENCE_REFUSED
             )));
         }
     }
@@ -4390,6 +4424,57 @@ mod validation_tests {
                 "require_transit_token": false, "source_auth": caller_key() }]),
         );
         assert!(validate_transit_points(&mut open, 30, None).is_ok());
+    }
+
+    /// A save refuses `transit_token_mode: reference`, on the surface or in a
+    /// variant's overrides, naming the setting and saying plainly it is not
+    /// supported; `embedded` and an absent mode are accepted.
+    #[test]
+    fn a_save_refuses_reference_transit_tokens_on_the_surface_and_in_a_variant() {
+        let surface_with = |base: serde_json::Value, variant: serde_json::Value| {
+            let mut surface = surface_with_transit_points(serde_json::json!([]), serde_json::json!([]));
+            let transit = surface
+                .transit
+                .as_mut()
+                .unwrap();
+            transit
+                .shared
+                .transit_token_mode = serde_json::from_value(base).unwrap();
+            surface.variants[0]
+                .overrides
+                .transit
+                .as_mut()
+                .unwrap()
+                .shared = Some(serde_json::from_value(serde_json::json!({ "transit_token_mode": variant })).unwrap());
+            surface
+        };
+        for (case, base, variant, expected) in [
+            (
+                "on the surface",
+                serde_json::json!("reference"),
+                serde_json::json!("embedded"),
+                "transit.transit_token_mode 'reference' is not supported",
+            ),
+            (
+                "in a variant",
+                serde_json::json!("embedded"),
+                serde_json::json!("reference"),
+                "variant 'candidate' transit.transit_token_mode 'reference' is not supported",
+            ),
+        ] {
+            let mut surface = surface_with(base, variant);
+            match validate_transit_points(&mut surface, 30, None) {
+                Err(SurfaceApiError::BadRequest(message)) => {
+                    assert!(message.starts_with(expected), "{case}: {message}");
+                    assert!(message.contains("set it to 'embedded'"), "{case}: {message}");
+                }
+                other => panic!("{case}: expected a 400, got {other:?}"),
+            }
+        }
+        let mut embedded = surface_with(serde_json::json!("embedded"), serde_json::json!("embedded"));
+        assert!(validate_transit_points(&mut embedded, 30, None).is_ok());
+        let mut absent = surface_with_transit_points(serde_json::json!([]), serde_json::json!([]));
+        assert!(validate_transit_points(&mut absent, 30, None).is_ok());
     }
 
     fn a2a_block(
