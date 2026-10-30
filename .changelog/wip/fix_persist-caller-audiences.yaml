@@ -1,0 +1,19 @@
+branch: fix/persist-caller-audiences
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-10-29T15:00:00Z'
+      title: Persist audiences entered in Caller Context
+      description: >-
+        Save an audience typed into the Caller Context editor even when the operator does not
+        press Add, Enter, or comma first. The audience now appears in the list and clears the
+        warning that audience claim validation is disabled.
+    - timestamp: '2026-10-29T16:00:00Z'
+      title: Save pending Caller Context audiences with keyboard shortcuts
+      description: >-
+        Commit an audience that is still focused in the Caller Context editor before a keyboard
+        save builds the surface payload, and cover empty, duplicate, and discovery-locked values.
+  removed: []
+  security: []
+  breaking: []
