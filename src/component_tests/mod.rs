@@ -4,6 +4,7 @@ mod a2a_proxy_e2e;
 mod a2a_streaming_e2e;
 mod access_tokens_pat;
 mod channel_e2e;
+mod connection_point_integration_events_e2e;
 #[cfg(feature = "didwebvh")]
 mod didwebvh_e2e;
 mod event_hook_e2e;

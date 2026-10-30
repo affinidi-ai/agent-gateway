@@ -221,7 +221,7 @@ async fn verify_sd_jwt_vc(
 
     // 5. Optionally validate transaction_data hashes
     if let Some(transaction_data) = kb_claims.get("transaction_data") {
-        info!("Found transaction_data in key-binding JWT: {:?}", transaction_data);
+        info!("Found transaction_data in key-binding JWT");
         // Lenient validation: just check that it exists and is an array
         if !transaction_data.is_array() {
             warn!("transaction_data is not an array");

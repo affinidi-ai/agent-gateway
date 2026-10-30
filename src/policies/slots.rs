@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::audit::events::PolicySlot;
 use crate::config::agent_surface::{AgentSurface, McpToolGatingConfig, McpToolPolicyEntry, PolicyRef, TransitPoint};
+use crate::config::agent_surface_variants::SurfaceVariant;
 use crate::observability::PolicyScope;
 
 /// Where on a surface a policy is named. Variants and gates are keyed by id, so
@@ -31,7 +32,9 @@ pub struct SlotKey {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlotPolicy {
     pub policy_definition_id: String,
-    pub variant_alias: Option<String>,
+    /// The alias of the variant whose override names the policy, or `_base_`
+    /// for a base slot.
+    pub surface_variant: String,
     /// The tool's name or the gate's name.
     pub place_label: Option<String>,
 }
@@ -175,10 +178,11 @@ impl Slots {
         };
         let policy = SlotPolicy {
             policy_definition_id: policy_definition_id.to_string(),
-            variant_alias: self
+            surface_variant: self
                 .variant
                 .as_ref()
-                .map(|(_, alias)| alias.clone()),
+                .map_or(SurfaceVariant::BASE, |(_, alias)| alias.as_str())
+                .to_string(),
             place_label: place.map(|(_, label)| label.to_string()),
         };
         self.found.insert(key, policy);
@@ -421,11 +425,11 @@ mod tests {
             assert_eq!(named(&slots, &key).as_deref(), Some(policy), "{key:?}");
         }
         let inbound = &slots[&key(v, PolicySlot::Inbound, PolicyScope::Surface, None)];
+        assert_eq!(inbound.surface_variant, "beta");
         assert_eq!(
-            inbound
-                .variant_alias
-                .as_deref(),
-            Some("beta")
+            slots[&key(None, PolicySlot::Target, PolicyScope::Surface, None)].surface_variant,
+            "_base_",
+            "a base slot is the base surface's"
         );
     }
 

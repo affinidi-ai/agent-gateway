@@ -17,9 +17,9 @@ pub async fn in_management_request<F: Future>(
     actor: Actor,
     future: F,
 ) -> F::Output {
-    use crate::observability::policy_audit::{REQUEST_ID, new_request_id};
+    use crate::observability::policy_audit::{RequestScope, in_request};
     ACTOR
-        .scope(Some(actor), REQUEST_ID.scope(new_request_id(), future))
+        .scope(Some(actor), in_request(RequestScope::fresh(), future))
         .await
 }
 

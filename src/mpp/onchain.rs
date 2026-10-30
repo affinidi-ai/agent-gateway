@@ -9,6 +9,7 @@
 use tracing::info;
 
 use super::types::{MppConfig, MppCredential, MppVerificationMode};
+use crate::observability::loggable;
 
 /// Verify a crypto payment proof according to the configured verification mode.
 ///
@@ -94,7 +95,7 @@ async fn verify_evm_transaction(
 
     let url: reqwest::Url = rpc_url
         .parse()
-        .map_err(|e| format!("Invalid RPC URL '{}': {}", rpc_url, e))?;
+        .map_err(|e| format!("Invalid RPC URL: {}", e))?;
 
     let provider = ProviderBuilder::new().connect_http(url);
 
@@ -115,7 +116,7 @@ async fn verify_evm_transaction(
     let receipt = tokio::time::timeout(rpc_timeout, provider.get_transaction_receipt(tx_b256))
         .await
         .map_err(|_| format!("RPC timeout fetching receipt for {}", tx_hash))?
-        .map_err(|e| format!("RPC error fetching receipt: {}", e))?
+        .map_err(|e| format!("RPC error fetching receipt: {}", loggable::error_without_url(&e, rpc_url)))?
         .ok_or_else(|| format!("Transaction {} not found on chain", tx_hash))?;
 
     // Must be successful
@@ -128,7 +129,7 @@ async fn verify_evm_transaction(
         let latest_block = tokio::time::timeout(rpc_timeout, provider.get_block_number())
             .await
             .map_err(|_| "RPC timeout fetching block number".to_string())?
-            .map_err(|e| format!("RPC error: {}", e))?;
+            .map_err(|e| format!("RPC error: {}", loggable::error_without_url(&e, rpc_url)))?;
 
         let tx_block = receipt
             .block_number
@@ -146,7 +147,7 @@ async fn verify_evm_transaction(
     let tx = tokio::time::timeout(rpc_timeout, provider.get_transaction_by_hash(tx_b256))
         .await
         .map_err(|_| "RPC timeout fetching transaction".to_string())?
-        .map_err(|e| format!("RPC error: {}", e))?
+        .map_err(|e| format!("RPC error: {}", loggable::error_without_url(&e, rpc_url)))?
         .ok_or("Transaction not found")?;
 
     // Expected values from the challenge request

@@ -461,10 +461,7 @@ async fn inbound_with_percent_encoded_alias_routes() {
     assert_eq!(received.path, "/rpc", "percent-encoded alias suffix should be stripped");
 }
 
-/// Plan §4: an unknown variant alias is rejected before any forwarding occurs.
-/// Today the inbound handler returns 400; the spec calls for 404 once
-/// surface-side variants land. Either is acceptable here — what matters is
-/// that the mock target never receives the request.
+/// An unknown variant alias is refused with 404 before any forwarding occurs.
 #[tokio::test(flavor = "multi_thread")]
 async fn inbound_with_unknown_alias_is_rejected() {
     let h = GatewayHarness::start(|_, gw_config, _| {
@@ -483,8 +480,7 @@ async fn inbound_with_unknown_alias_is_rejected() {
         .await
         .expect("request failed");
 
-    let status = resp.status().as_u16();
-    assert!(matches!(status, 400 | 404), "expected 400 or 404 for unknown alias, got {status}");
+    assert_eq!(resp.status(), 404, "unknown alias is refused with 404");
 
     // Mock must NOT have seen the request.
     assert!(
@@ -496,12 +492,10 @@ async fn inbound_with_unknown_alias_is_rejected() {
     );
 }
 
-/// Plan §4.5: a disabled variant returns 503 ("listener temporarily
-/// unavailable") and is never forwarded. The route exists and is
-/// recognised — an operator has intentionally switched it off — so 404
-/// (which means "no such variant") would be misleading.
+/// A disabled variant is refused with 404, the same answer as an unknown
+/// alias: nothing is served at that URL. It is never forwarded.
 #[tokio::test(flavor = "multi_thread")]
-async fn inbound_with_disabled_variant_returns_503() {
+async fn inbound_with_disabled_variant_returns_404() {
     let h = GatewayHarness::start(|_, gw_config, _| {
         gw_config.surfaces = vec![helpers::build_channel_with_disabled_variant()];
     })
@@ -518,7 +512,7 @@ async fn inbound_with_disabled_variant_returns_503() {
         .await
         .expect("request failed");
 
-    assert_eq!(resp.status(), 503, "disabled variant should return 503");
+    assert_eq!(resp.status(), 404, "disabled variant is refused with 404");
 
     assert!(
         h.mock
