@@ -145,7 +145,9 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   forwards the token); an empty token scheme is allowed, as the gateway reads the raw header
   value then. Each shows as `transit-point-caller-auth-problem`. Choosing the API Key Provider
   shows `transit-point-caller-auth-provider-scope`: its keys are the surface's own, the same an
-  Access Point using the provider accepts. The strategy and API key secret lists load through
+  Access Point using the provider accepts. Its `agent_id` is written from the surface being
+  saved (`callerAuthToWire(config, surfaceId)`), as the Access Point's is, so a Transit Point
+  copied from a template or another surface does not keep that surface's. The strategy and API key secret lists load through
   `useJwtStrategies` and `useApiKeySecrets` (`elements/caller-auth/useCallerAuthOptions.ts`),
   shared with the Access Point's caller authentication editor.
 - The exposure warning: when a save answers with `Warning: 299` headers, `apiClient.createSurface`

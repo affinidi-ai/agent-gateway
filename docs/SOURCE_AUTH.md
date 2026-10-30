@@ -288,7 +288,9 @@ while it is already marked open; choosing the token or a method turns the markin
 empty token scheme is allowed: the gateway then reads the token as the raw header value. The
 API key provider validates the surface's own keys, the same keys an Access Point using the
 provider accepts, so the panel warns that the Access Point's callers can call the Transit Point
-too; an API key from the secret store keeps a separate set of callers. A `source_auth` set through the API with
+too; an API key from the secret store keeps a separate set of callers. A dashboard save writes
+the provider's `agent_id` from the surface being saved, so a Transit Point copied from a
+template accepts the new surface's keys, not the original's. A `source_auth` set through the API with
 mTLS shows as such and is kept; the panel does not edit it, nor DID Auth, which a Transit
 Point does not support. The panel applies the rules above before the save: a Transit Point that
 authenticates no caller and is not open, one that is open beside the token or a method, and a

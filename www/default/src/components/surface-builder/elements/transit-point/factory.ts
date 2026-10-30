@@ -407,7 +407,7 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
                     ? { header_metadata_mapping: headerMetadataMapping }
                     : {}),
                   require_transit_token: c.require_transit_token !== false,
-                  ...callerAuthToWire(c),
+                  ...callerAuthToWire(c, ctx.surfaceMeta.surface_id),
                   ...(typeof c.target_endpoint === 'string' &&
                   c.target_endpoint.startsWith('fabric://') &&
                   c.fabric_delegated_credentials === true

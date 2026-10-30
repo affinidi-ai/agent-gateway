@@ -14,7 +14,8 @@ changes:
         panel says why; an empty token scheme is allowed, as the gateway accepts it. A refusal
         from the gateway shows in plain words in the same section, of the base or the variant it
         names. Choosing the API key provider warns that it accepts the same keys as an Access
-        Point using the provider. A `source_auth` set through the API with mTLS is shown and kept.
+        Point using the provider, and a save points it at the surface being saved, so one
+        copied from a template accepts that surface's keys. A `source_auth` set through the API with mTLS is shown and kept.
     - timestamp: '2026-10-30T09:00:00.000Z'
       title: Show the gateway's save warnings on the Transit Point they name
       description: >-

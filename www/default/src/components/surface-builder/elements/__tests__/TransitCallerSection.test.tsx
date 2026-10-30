@@ -105,6 +105,25 @@ describe('Who can call this Transit Point', () => {
     );
   });
 
+  it("names the surface being edited, not a copied Transit Point's stored agent", () => {
+    render(
+      <Harness
+        initial={{
+          id: 'tp',
+          require_transit_token: false,
+          source_auth: {
+            type: 'api_key_provider',
+            extraction: { source: 'http_header', field: 'X-API-Key' },
+            agent_id: 'original-surface',
+          },
+        }}
+      />
+    );
+    const scope = screen.getByTestId('transit-point-caller-auth-provider-scope');
+    expect(scope).toHaveTextContent('surface-1');
+    expect(scope).not.toHaveTextContent('original-surface');
+  });
+
   it('configures a JWT: strategy, audiences, and no forwarding', async () => {
     render(<Harness initial={{ id: 'tp', require_transit_token: false }} />);
     fireEvent.change(screen.getByTestId('transit-point-caller-auth-method'), {

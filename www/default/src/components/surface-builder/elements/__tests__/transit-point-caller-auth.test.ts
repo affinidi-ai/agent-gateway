@@ -13,10 +13,10 @@ import {
 } from '../transit-point/callerAuth';
 import { joinWarnings, parseWarningHeader } from '../../../../utils/warningHeader';
 
-function makeCtx(nodes: any[]): SurfaceContext {
+function makeCtx(nodes: any[], surfaceId?: string): SurfaceContext {
   return {
     protocol: 'a2a',
-    surfaceMeta: { name: 'tp-caller-auth', tags: [], status: 'active' },
+    surfaceMeta: { name: 'tp-caller-auth', tags: [], status: 'active', surface_id: surfaceId },
     allNodes: nodes,
     nodesOfType: type => nodes.filter(n => n.type === type),
     firstNodeOfType: type => nodes.find(n => n.type === type),
@@ -231,6 +231,34 @@ describe('the dashboard save round-trip', () => {
   it('writes the fields only through callerAuthToWire', () => {
     expect(callerAuthToWire({})).toEqual({});
     expect(callerAuthToWire({ source_auth: apiKey })).toEqual({ source_auth: apiKey });
+    expect(callerAuthToWire({ source_auth: apiKey }, 'surface-1')).toEqual({ source_auth: apiKey });
+  });
+
+  it('validates API Key Provider keys against the surface being saved, not the one it was copied from', () => {
+    const provider = {
+      type: 'api_key_provider',
+      extraction: { source: 'http_header', field: 'X-API-Key' },
+      agent_id: 'original-surface',
+    };
+    const copied = {
+      access_point: { route: '/api' },
+      target: { endpoint: 'https://upstream.example.com' },
+      transit: {
+        points: [
+          {
+            alias: 'partner',
+            target_endpoint: 'https://partner.example.com',
+            protocol: 'a2a',
+            require_transit_token: false,
+            source_auth: provider,
+          },
+        ],
+      },
+    };
+    const tps = registry.nodesFromPayload(copied).filter(n => n.type === 'transit-point-a2a');
+    const written = (registry.buildPayload(makeCtx([...baseNodes, ...tps], 'new-surface')) as any)
+      .transit.points[0];
+    expect(written.source_auth).toEqual({ ...provider, agent_id: 'new-surface' });
   });
 });
 

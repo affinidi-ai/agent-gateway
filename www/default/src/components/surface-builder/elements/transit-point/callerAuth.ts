@@ -328,12 +328,16 @@ export function callerAuthSignature(config: Config): string {
  * PUT that left it out would keep it). `allow_unauthenticated_callers` is sent
  * only while the Transit Point authenticates no caller, since the gateway
  * refuses it beside one; an explicit `false` is sent when the operator turned
- * it off, so the stored marking does not return.
+ * it off, so the stored marking does not return. An `api_key_provider` validates
+ * the keys of the surface being saved, `surfaceId`, as the Access Point's does,
+ * so a Transit Point copied from another surface does not keep that one's.
  */
-export function callerAuthToWire(config: Config): Record<string, unknown> {
+export function callerAuthToWire(config: Config, surfaceId?: string): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   const sourceAuth = readSourceAuth(config);
-  if (sourceAuth) out.source_auth = sourceAuth;
+  if (sourceAuth?.type === 'api_key_provider' && surfaceId) {
+    out.source_auth = { ...sourceAuth, agent_id: surfaceId };
+  } else if (sourceAuth) out.source_auth = sourceAuth;
   else if (config && 'source_auth' in config && config.source_auth === null) out.source_auth = null;
   if (isOpenToAnyCaller(config) && !authenticatesCallers(config)) {
     out.allow_unauthenticated_callers = true;

@@ -291,10 +291,10 @@ const TransitCallerSection: React.FC<Props> = ({ config, alias, updateField, upd
                 data-testid="transit-point-caller-auth-provider-scope"
               >
                 Keys are validated against the API Key Provider for agent{' '}
-                <code>{String(sourceAuth.agent_id || 'this surface')}</code>; each issued key is one
-                caller. These are the same keys an Access Point using the API Key Provider accepts,
-                so its callers can call this Transit Point too. To accept a separate set of callers,
-                use an API key from the secret store.
+                <code>{meta?.surfaceId || 'this surface'}</code>; each issued key is one caller.
+                These are the same keys an Access Point using the API Key Provider accepts, so its
+                callers can call this Transit Point too. To accept a separate set of callers, use an
+                API key from the secret store.
               </Alert>
             )}
           </>
