@@ -74,7 +74,7 @@ async fn transit_source_auth_is_refused_by_the_api_and_closes_a_loaded_surfaces_
     let collection = format!("{}/api/v1/surfaces", h.gateway_base);
     let payload = json!({
         "name": "without-transit-source-auth",
-        "access_point": { "listen_address": h.gateway_base, "route": "/smoke", "protocol": "a2a" },
+        "access_point": { "listen_address": h.gateway_base, "route": "/smoke", "protocol": "a2a", "public": true },
         "target": { "endpoint": h.mock.url() },
         "transit": { "points": [{ "alias": "partner", "target_endpoint": h.mock.url() }] }
     });
