@@ -310,7 +310,10 @@ saved. A `PUT` matches each Transit Point to the stored one by `id`, and a Trans
 an `id` gets a new one, so a `PUT` that omits both the `id` and `source_auth` drops the stored
 `source_auth`: a Transit Point that still requires a transit token is saved, authenticated by
 the token alone, and one that does not is refused with `400`. Send each Transit Point's `id`
-back.
+back. A Transit Point with a `consent_mode: external` binding is the exception: sent without
+its `id`, it keeps the stored id of the Transit Point with its alias in the same list, so it
+keeps these stored settings too
+([`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#when-a-binding-is-removed)).
 
 ### Upgrading and rolling back
 

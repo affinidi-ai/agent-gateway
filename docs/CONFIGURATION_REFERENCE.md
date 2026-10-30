@@ -202,7 +202,7 @@ Network topology and the surfaces served. The largest configuration file; the ex
 | `terms`, `affinidi_terms_url` | Whether Terms acceptance is enforced, and where metadata is fetched |
 | `logging` | Log redaction rules. Only `redaction` is read here; level, JSON output, and directory come from `config.toml`. |
 | `oauth_callback_route` | Where OAuth redirects land |
-| `external_consent_resource_origins` | Resource origins permitted for the credential providers of external consent of each issuer, beyond the issuer's own host and its subdomains: an issuer origin maps to a list of resource origins, all `https`, for example `{"https://accounts.google.com": ["https://www.googleapis.com"]}`. Read at startup; no API changes it. See [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#external-consent-providers). |
+| `external_consent_resource_origins` | Resource origins permitted for the credential providers of external consent of each issuer, beyond the issuer's own host and its subdomains: an issuer origin maps to a list of resource origins, all `https`, for example `{"https://accounts.google.com": ["https://www.googleapis.com"]}`. Entries are exact origins, with no wildcard (`https://*.googleapis.com` is not one), path or userinfo; an entry that is not one permits nothing and is named in an `ERROR` at startup. Read at startup; no API changes it. See [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#external-consent-providers). |
 
 The example file also carries `oob_connection` and `secrets` blocks, which `NetworkConfig`
 does not read. Out-of-band invitation expiry is set by `[oob_connection]` in `config.toml`.

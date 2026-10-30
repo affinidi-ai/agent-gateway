@@ -21,7 +21,9 @@ changes:
         grants are stored at an endpoint of its choosing. A provider's resource must be
         permitted for its issuer: its host must be the issuer's host or one of its subdomains,
         or its origin listed for the issuer in the new `external_consent_resource_origins` of
-        gateway.json, which only the operator sets; otherwise the provider is refused with
+        gateway.json, which only the operator sets, as exact `https` origins: an entry that is
+        not one, such as a wildcard-looking `https://*.googleapis.com`, permits nothing and is
+        named at startup; otherwise the provider is refused with
         `provider_resource_not_permitted`, a surface cannot bind it, and a grant is not
         released once its entry is removed. Responses name the provider's `resource_origin`.
         It takes no `additional_params`, `client_id_secret_ref`, consent identity strategy or
@@ -44,8 +46,9 @@ changes:
         missing. A fingerprint of the pepper, which reveals nothing of it, is kept beside the
         grants; a gateway whose pepper does not match it while grants are stored says so at
         startup and neither stores nor releases a grant until the pepper is restored or the
-        grants are purged. Grants and tokens restored in plaintext are encrypted when the vault
-        starts.
+        grants are purged. A fingerprint that cannot be read at startup is named in an error
+        and disables only grants by binding, never the agent-keyed tokens. Grants and tokens
+        restored in plaintext are encrypted when the vault starts.
         Storage exports leave these grants out. Nothing is migrated: existing agent-keyed tokens
         stay where they are and are never moved into grants by binding, so people connect their
         accounts again through external consent.
@@ -63,7 +66,10 @@ changes:
         Transit Point must target it over public `https`, never over Fabric, its id must appear
         in one place only, the surface's Transit Points or one variant's, so the grant is used
         under one Transit Point's settings, and the request is
-        forwarded through Strict pinned egress after the destination is checked again. Saves,
+        forwarded through Strict pinned egress after the destination is checked again. A save
+        warns when an enabled variant keeps such a Transit Point from the surface while it
+        overrides its transit settings or Access Point, since calls through the variant then
+        use the surface's grants under the variant's own settings. Saves,
         including a surface's creation and tenant reassignment, are refused when such a binding
         has no subject, names another tenant's or an agent-keyed provider, sends the grant
         elsewhere, sits on a surface with `outbound_credentials`, or the vault cannot keep
@@ -75,9 +81,12 @@ changes:
         Deleting a surface, removing a Transit Point or its binding, changing the binding's
         subject or provider, moving the surface to another tenant, or disabling the only
         variant that holds the binding, or its transit, deletes the grants of each external
-        consent binding the change removes before the change is saved, then revokes them at the
-        vendor in the background, at most eight at a time, auditing each outcome, so the change
-        never waits on a vendor. A change that adds a binding deletes any grant left under it,
+        consent binding the change removes before the change is saved, then revokes at the
+        vendor what it deleted, at most eight at a time, auditing each outcome. Both run on a
+        task of their own, so the change never waits on a vendor, and a change dropped part
+        way, as when its client disconnects, still revokes and audits every grant it deleted;
+        a grant whose tokens were rotated meanwhile has its current tokens revoked. A change
+        that adds a binding deletes any grant left under it,
         so re-adding the same surface, Transit Point id and provider, or enabling the variant
         again, needs a new consent. Only the grants of the bindings a change touches are read: a
         grant that cannot be read refuses only the changes that remove its own binding, with 503
@@ -98,7 +107,10 @@ changes:
         without decrypting them, so a grant that cannot be read no longer blocks the removal of
         its binding or provider. They need `delegation_vault.delete` and refuse a tenant's
         token. A purged grant is not revoked at the vendor; each is audited as `token_revoked`
-        with `vendor_revocation:skipped,reason:purged` and the operator who purged it.
+        with `vendor_revocation:skipped,reason:purged` and the operator who purged it, and a
+        purge by binding records the binding too. While the grants stored were written under
+        another identity hash pepper, a purge by binding answers 409 and purges nothing, since
+        their ids are then the file names in the vault's `delegated_grants` directory.
   changed:
     - timestamp: '2026-10-30T20:00:00Z'
       title: Make credential provider slugs unique per tenant

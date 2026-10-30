@@ -78,8 +78,11 @@ in `external_consent_resource_origins` in `gateway.json`, which only the operato
 }
 ```
 
-Each key and value is an `https` origin, with no path; an entry that is not one permits nothing
-and is named in an `ERROR` at startup. The file is read at startup, so a change takes a restart.
+Each key and value is an exact `https` origin: no wildcard, path, userinfo, query or fragment,
+and a host that is an IP address or a plain DNS name (letters, digits and `-` in each label).
+List each host on its own: `https://*.googleapis.com` is not a wildcard. An entry that is not
+such an origin permits nothing, not even the literal origin it spells, and is named in an `ERROR`
+at startup. The file is read at startup, so a change takes a restart.
 The rule is checked when the provider is created (`400`, `provider_resource_not_permitted`),
 when a surface binds the provider (`400`), and again whenever a grant is released: a provider
 whose resource is no longer permitted, because its entry was removed, releases nothing, and the
@@ -248,6 +251,16 @@ The Transit Point itself must send the grant only where it belongs:
 | --- | --- |
 | `target_endpoint` | A public `https` URL with the origin (scheme, host and port) of the provider's `resource`. A `fabric://` route is refused: a grant never crosses Fabric |
 | `id` | Names one Transit Point in one place. It appears once, in the surface's points or in one variant's `overrides.transit.points`, and in no other list, whatever the target or binding there. A grant is kept under the Transit Point's id and used under that one Transit Point's settings, so no copy in another variant, with weaker gating or policy, may use it. To offer the binding in two variants, give each its own Transit Point id: each then has its own grants. A variant created from another gets new ids for these Transit Points |
+
+A variant that does not list its own Transit Points (`overrides.transit.points`) keeps the
+surface's, and so uses their grants under its own shared transit settings (`transit_policy`,
+`rate_limit`, `opa_policy_definition_id`, `source_auth` and the extension rules in
+`overrides.transit.shared`) and its own Access Point. Only a surface editor can set this up, and
+they could weaken the surface's own settings just as well, so it is not refused. A save adds a
+`Warning` header (`299`) for each Transit Point with `consent_mode: external` that an enabled
+variant keeps while it overrides `transit.shared` or its Access Point, unless the variant turns
+transit off. To keep a variant's callers apart, give the variant its own Transit Points, with
+new ids and so their own grants.
 
 A save of the surface, its base or a variant, is refused with `400` when the binding or its
 Transit Point breaks a rule above, when the surface also has `outbound_credentials` (which apply
@@ -523,6 +536,12 @@ with `503`: it cannot find their grants under its own ids. Restore the pepper th
 written under, or [purge them](#purging-grants-that-cannot-be-read). A fingerprint with no grant
 beside it is replaced by the next gateway that stores one.
 
+A fingerprint, or a `delegated_grants` directory, that cannot be read at startup is named in an
+`ERROR`, and the vault starts all the same: agent-keyed tokens are unaffected. Each grant
+operation that needs the fingerprint reads it again, so while it cannot be read no grant is
+stored, and a release, a removal or a provider delete that finds no grant fails rather than
+answering none. A grant found under the current pepper's id is released and removed as usual.
+
 Grants and agent-keyed tokens restored in plaintext, from a portable backup, are encrypted when
 the vault starts. Storage exports leave the `delegated_grants` directory out. Grants stored
 before this release do not exist: they are made only through external consent.
@@ -546,10 +565,15 @@ with a 10-second timeout, and its response body is never read or logged. When ma
 removed at once, at most eight are revoked at a time.
 
 A surface change deletes the grants it removes from the vault before it is saved, which ends
-their release at once, and revokes them at the vendor on a task of its own: the request never
-waits on a vendor, however slow or unreachable. A provider delete revokes its grants within the
-request, since a provider cannot be deleted while bound and so has, at most, grants a binding
-left behind outside the admin API.
+their release at once, then revokes at the vendor what the vault deleted. The deletions and the
+revocations run on one task of their own. The request waits only for the deletions, never on a
+vendor, however slow or unreachable. A request dropped part way, as when its client disconnects
+or a proxy times it out, stops neither: every grant deleted is still revoked and audited, and
+the surface's lock is held until the deletions end. Each grant is read and deleted in one step,
+under the vault's lock, and the copy deleted is the one revoked, so a grant whose tokens a
+refresh rotated after the change read it has its current tokens revoked. A provider delete
+revokes its grants within the request, since a provider cannot be deleted while bound and so
+has, at most, grants a binding left behind outside the admin API.
 
 Revocation is best effort: whatever its outcome the grant is deleted. A `token_revoked`
 delegation audit event records the grant's id, the caller that made the change (`caller`: the
@@ -561,7 +585,11 @@ it was skipped. An outcome is one of `revoked`, `refused` (the server answered a
 provider names no revocation endpoint), `client_unavailable` (the client's secret could not be
 resolved) or `skipped`, with the reason `no_secrets_store` (no secrets store is configured, so a
 client that authenticates with a secret cannot), `provider_missing` (the grant's provider no
-longer exists) or `purged` (an operator purged the grant without reading it). A public client
+longer exists) or `purged` (an operator purged the grant without reading it). A grant purged
+with its binding also has the binding: `surface_id` and `provider_id` in their own fields, and
+`,tenant:<tenant>` (for a tenanted surface) and `,transit_point:<id>` after the reason, each
+value a JSON string, for example
+`vendor_revocation:skipped,reason:purged,tenant:"tenant-a",transit_point:"crm"`. A public client
 is still revoked without a secrets store. The log says the outcome: `INFO` for `revoked` and
 `not_supported`, `WARN` otherwise. A vendor that does not revoke keeps the token alive until it
 expires or the person removes the app at the vendor.
@@ -585,7 +613,12 @@ surface or a variant, that leaves out the `id` of a Transit Point with `consent_
 external`, or sends it empty, keeps the id stored for the Transit Point with the same alias in
 the same place (the surface's points, or the same variant's), so a client that does not send
 ids back never revokes a person's grants by saving. A Transit Point whose id is sent keeps that
-id, and any other Transit Point sent without its id is a new one, as before.
+id, and any other Transit Point sent without its id is a new one, as before. Since it keeps its
+id, such a Transit Point also keeps the stored settings a `PUT` keeps for a Transit Point sent
+with its id when it leaves them out: `source_auth`, `allow_unauthenticated_callers` and
+`delegated_credentials_for_fabric_callers`, each under its usual rule ([Transit Point
+callers](SOURCE_AUTH.md#transit-point-callers)). Send them to change them, or
+`"source_auth": null` to remove it.
 
 A change that adds a binding deletes any grant already stored under it, left by an earlier
 binding of the same surface, Transit Point id and provider, so re-adding a binding, or creating
@@ -639,12 +672,19 @@ An operator can delete grants by binding without reading them, so a grant that c
 decrypted or parsed no longer blocks the removal of its binding or provider. A purged grant is
 not revoked at the vendor, so the token stays valid there until it expires or the person removes
 the app at the vendor. Each is audited as `token_revoked` with `detail`
-`vendor_revocation:skipped,reason:purged` and the operator as `caller`.
+`vendor_revocation:skipped,reason:purged` and the operator as `caller`; a purge by binding also
+records the binding ([Revoking grants at the vendor](#revoking-grants-at-the-vendor)).
 
 | Route | Purges |
 | --- | --- |
 | `DELETE /api/v1/delegation-vault/grants/{grant_id}` | One grant, by the id a refusal names: `204`, or `404` when there is none, `400` for an id that is not a grant's |
-| `DELETE /api/v1/delegation-vault/grants?surface_id=&transit_point_id=&credential_provider_id=&tenant_id=` | Every grant of one binding, the owner's and each caller's, under the current pepper. Leave `tenant_id` out for an untenanted surface. Answers `{"purged": n, "grant_ids": [...]}` |
+| `DELETE /api/v1/delegation-vault/grants?surface_id=&transit_point_id=&credential_provider_id=&tenant_id=` | Every grant of one binding, the owner's and each caller's, under the current pepper. Leave `tenant_id` out for an untenanted surface. Answers `{"purged": n, "grant_ids": [...]}`, or `409` with `code` `identity_hash_pepper_mismatch` and nothing purged while the grants stored were written under another pepper |
+
+A grant's id is its file name in the vault's `delegated_grants` directory, without `.json.enc`
+(`grant-` and three hex values; `pepper-fingerprint` is not a grant). After the identity hash
+pepper changed, the purge by binding cannot derive the binding's ids, so it answers `409`
+rather than purging nothing: restore the pepper, or purge each grant by its id, read from the
+file names. No route lists grants.
 
 Both need `delegation_vault.delete`, which only administrators hold by default, and refuse a
 tenant's token with `403`: a purge reads no grant, so it cannot tell whose it is. When the key
