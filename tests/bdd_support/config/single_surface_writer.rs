@@ -231,7 +231,11 @@ fn write_single_surface_config_inner(
     if let Some(path) = &surface_config.agent_card_path {
         surface_fixture = surface_fixture.with_agent_card_path(path);
     }
-    if let Some(auth) = &surface_config.source_auth {
+    for auth in surface_config
+        .source_auth
+        .iter()
+        .chain(&surface_config.additional_source_auth)
+    {
         let method = crate::bdd_support::config::source_auth::caller_authentication_method_json(auth);
         surface_fixture = surface_fixture.with_caller_auth_method(method);
     }
@@ -577,8 +581,14 @@ fn write_didwebvh_identity_file(
 
 fn secret_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<SecretFixture> {
     let mut secrets = Vec::new();
-    if let Some(SurfaceSourceAuthConfig::ApiKey(config)) = &surface_config.source_auth {
-        secrets.push(SecretFixture::new(&config.secret_id, &config.valid_key));
+    for auth in surface_config
+        .source_auth
+        .iter()
+        .chain(&surface_config.additional_source_auth)
+    {
+        if let SurfaceSourceAuthConfig::ApiKey(config) = auth {
+            secrets.push(SecretFixture::new(&config.secret_id, &config.valid_key));
+        }
     }
     if let Some(SurfaceSourceAuthConfig::ApiKey(config)) = &surface_config.alternate_variant_source_auth {
         secrets.push(SecretFixture::new(&config.secret_id, &config.valid_key));
@@ -612,14 +622,20 @@ fn secret_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<SecretFixture> 
 
 fn api_key_provider_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<ApiKeyProviderFixture> {
     let mut api_key_providers = Vec::new();
-    if let Some(SurfaceSourceAuthConfig::ApiKeyProvider(config)) = &surface_config.source_auth {
-        api_key_providers.push(ApiKeyProviderFixture::new(
-            format!("key-provider-{}-{}", config.agent_id, config.key_id),
-            &config.agent_id,
-            &config.key_id,
-            &config.client_id,
-            &config.valid_key,
-        ));
+    for auth in surface_config
+        .source_auth
+        .iter()
+        .chain(&surface_config.additional_source_auth)
+    {
+        if let SurfaceSourceAuthConfig::ApiKeyProvider(config) = auth {
+            api_key_providers.push(ApiKeyProviderFixture::new(
+                format!("key-provider-{}-{}", config.agent_id, config.key_id),
+                &config.agent_id,
+                &config.key_id,
+                &config.client_id,
+                &config.valid_key,
+            ));
+        }
     }
     api_key_providers
 }

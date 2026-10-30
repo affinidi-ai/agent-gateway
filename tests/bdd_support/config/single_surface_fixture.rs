@@ -20,6 +20,8 @@ pub struct SurfaceConfigBuilder {
     pub registered_routes: Vec<String>,
     pub seed_surface: bool,
     pub source_auth: Option<SurfaceSourceAuthConfig>,
+    /// Source authentication methods after `source_auth`, in order.
+    pub additional_source_auth: Vec<SurfaceSourceAuthConfig>,
     pub alternate_variant_source_auth: Option<SurfaceSourceAuthConfig>,
     pub alternate_variant_target_timeout_secs: Option<u64>,
     pub alternate_variant_complete_mode: bool,
@@ -77,6 +79,7 @@ impl Default for SurfaceConfigBuilder {
             registered_routes: vec!["/smoke".to_string()],
             seed_surface: true,
             source_auth: None,
+            additional_source_auth: Vec::new(),
             alternate_variant_source_auth: None,
             alternate_variant_target_timeout_secs: None,
             alternate_variant_complete_mode: false,

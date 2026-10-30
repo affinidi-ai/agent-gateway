@@ -243,21 +243,82 @@ impl SourceAuthConfig {
     /// from, if any. Used to strip the header before forwarding upstream — the
     /// source credential is consumed by the gateway and must not leak.
     pub fn credential_header_name(&self) -> Option<&str> {
+        match self.credential_source() {
+            CredentialSource::Header(name) => Some(name),
+            CredentialSource::McpMeta | CredentialSource::A2aExtension | CredentialSource::ClientCertificate => None,
+        }
+    }
+
+    /// Where this method reads the caller's credential.
+    pub fn credential_source(&self) -> CredentialSource<'_> {
         match self {
-            SourceAuthConfig::JwtBearer(c) => Some(c.token_header.as_str()),
-            SourceAuthConfig::ApiKey(c) => extraction_header(&c.extraction),
-            SourceAuthConfig::ApiKeyProvider(c) => extraction_header(&c.extraction),
-            SourceAuthConfig::DidAuth(c) => extraction_header(&c.extraction),
-            SourceAuthConfig::Mtls(_) => None,
+            SourceAuthConfig::JwtBearer(c) => CredentialSource::Header(c.token_header.as_str()),
+            SourceAuthConfig::ApiKey(c) => CredentialSource::from_extraction(&c.extraction),
+            SourceAuthConfig::ApiKeyProvider(c) => CredentialSource::from_extraction(&c.extraction),
+            SourceAuthConfig::DidAuth(c) => CredentialSource::from_extraction(&c.extraction),
+            SourceAuthConfig::Mtls(_) => CredentialSource::ClientCertificate,
+        }
+    }
+
+    fn is_presented(
+        &self,
+        headers: &axum::http::HeaderMap,
+        has_client_certificate: bool,
+    ) -> bool {
+        match self.credential_source() {
+            CredentialSource::Header(name) => headers.contains_key(name),
+            CredentialSource::ClientCertificate => has_client_certificate,
+            CredentialSource::McpMeta | CredentialSource::A2aExtension => false,
         }
     }
 }
 
-fn extraction_header(extraction: &CredentialExtraction) -> Option<&str> {
-    match extraction {
-        CredentialExtraction::HttpHeader { field } => Some(field.as_str()),
-        CredentialExtraction::McpMeta | CredentialExtraction::A2aExtension => None,
+/// Where a caller authentication method reads the caller's credential.
+#[derive(Debug, Clone, Copy)]
+pub enum CredentialSource<'a> {
+    Header(&'a str),
+    McpMeta,
+    A2aExtension,
+    ClientCertificate,
+}
+
+impl CredentialSource<'_> {
+    fn from_extraction(extraction: &CredentialExtraction) -> CredentialSource<'_> {
+        match extraction {
+            CredentialExtraction::HttpHeader { field } => CredentialSource::Header(field.as_str()),
+            CredentialExtraction::McpMeta => CredentialSource::McpMeta,
+            CredentialExtraction::A2aExtension => CredentialSource::A2aExtension,
+        }
     }
+
+    /// Header names compare case-insensitively, as HTTP does.
+    pub fn same_as(
+        &self,
+        other: &CredentialSource<'_>,
+    ) -> bool {
+        match (self, other) {
+            (CredentialSource::Header(a), CredentialSource::Header(b)) => a.eq_ignore_ascii_case(b),
+            (CredentialSource::McpMeta, CredentialSource::McpMeta)
+            | (CredentialSource::A2aExtension, CredentialSource::A2aExtension)
+            | (CredentialSource::ClientCertificate, CredentialSource::ClientCertificate) => true,
+            _ => false,
+        }
+    }
+}
+
+/// The caller authentication method that verifies a request: the first
+/// configured method whose credential the request carries, or the first
+/// method when it carries none. Only that method is verified; a failure never
+/// falls through to the next one.
+pub fn select_source_auth_method<'a>(
+    methods: &'a [SourceAuthConfig],
+    headers: &axum::http::HeaderMap,
+    has_client_certificate: bool,
+) -> Option<&'a SourceAuthConfig> {
+    methods
+        .iter()
+        .find(|method| method.is_presented(headers, has_client_certificate))
+        .or_else(|| methods.first())
 }
 
 // ── Credential extraction ────────────────────────────────────────────────────
@@ -1148,5 +1209,111 @@ mod tests {
         assert!(!json.contains("\"json_schema\""));
         let back: PayloadExtractionConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back, cfg);
+    }
+
+    fn method(value: serde_json::Value) -> SourceAuthConfig {
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn jwt_and_api_key() -> Vec<SourceAuthConfig> {
+        vec![
+            method(
+                serde_json::json!({"type": "jwt_bearer", "jwt_verification_strategy_id": "strat-1", "audiences": []}),
+            ),
+            method(serde_json::json!({
+                "type": "api_key",
+                "extraction": {"source": "http_header", "field": "X-API-Key"},
+                "secret_id": "keys"
+            })),
+        ]
+    }
+
+    fn headers(pairs: &[(&'static str, &'static str)]) -> axum::http::HeaderMap {
+        pairs
+            .iter()
+            .map(|(name, value)| {
+                (axum::http::HeaderName::from_static(name), axum::http::HeaderValue::from_static(value))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn selection_picks_the_method_whose_credential_the_request_carries() {
+        let methods = jwt_and_api_key();
+
+        let selected = select_source_auth_method(&methods, &headers(&[("x-api-key", "k")]), false).unwrap();
+        assert_eq!(selected.method_tag(), "api_key");
+
+        let selected = select_source_auth_method(&methods, &headers(&[("authorization", "Bearer t")]), false).unwrap();
+        assert_eq!(selected.method_tag(), "jwt_bearer");
+    }
+
+    #[test]
+    fn selection_prefers_configured_order_when_several_credentials_are_present() {
+        let methods = jwt_and_api_key();
+        let both = headers(&[("x-api-key", "k"), ("authorization", "Bearer t")]);
+
+        assert_eq!(
+            select_source_auth_method(&methods, &both, false)
+                .unwrap()
+                .method_tag(),
+            "jwt_bearer"
+        );
+
+        let reversed: Vec<_> = methods
+            .into_iter()
+            .rev()
+            .collect();
+        assert_eq!(
+            select_source_auth_method(&reversed, &both, false)
+                .unwrap()
+                .method_tag(),
+            "api_key"
+        );
+    }
+
+    #[test]
+    fn selection_falls_back_to_the_first_method_when_no_credential_is_present() {
+        let methods = jwt_and_api_key();
+        let selected = select_source_auth_method(&methods, &headers(&[("x-other", "v")]), false).unwrap();
+        assert_eq!(selected.method_tag(), "jwt_bearer");
+    }
+
+    #[test]
+    fn selection_counts_a_client_certificate_as_the_mtls_credential() {
+        let methods = vec![
+            jwt_and_api_key().remove(1),
+            method(serde_json::json!({
+                "type": "mtls",
+                "trust": {"type": "pinned", "certificate_ids": ["c1"]},
+                "identity_binding": {"type": "fingerprint"}
+            })),
+        ];
+        assert_eq!(
+            select_source_auth_method(&methods, &headers(&[]), true)
+                .unwrap()
+                .method_tag(),
+            "mtls"
+        );
+        assert_eq!(
+            select_source_auth_method(&methods, &headers(&[]), false)
+                .unwrap()
+                .method_tag(),
+            "api_key"
+        );
+    }
+
+    #[test]
+    fn selection_is_none_without_methods() {
+        assert!(select_source_auth_method(&[], &headers(&[("authorization", "Bearer t")]), true).is_none());
+    }
+
+    #[test]
+    fn credential_sources_compare_header_names_case_insensitively() {
+        assert!(CredentialSource::Header("X-API-Key").same_as(&CredentialSource::Header("x-api-key")));
+        assert!(!CredentialSource::Header("X-API-Key").same_as(&CredentialSource::Header("Authorization")));
+        assert!(CredentialSource::McpMeta.same_as(&CredentialSource::McpMeta));
+        assert!(!CredentialSource::McpMeta.same_as(&CredentialSource::A2aExtension));
+        assert!(!CredentialSource::ClientCertificate.same_as(&CredentialSource::Header("Authorization")));
     }
 }

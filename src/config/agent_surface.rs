@@ -2802,7 +2802,20 @@ impl AgentSurface {
             return Err("requires an MCP Access Point".into());
         }
         protected.validate()?;
-        match self.source_auth() {
+        if self
+            .source_auth_methods()
+            .iter()
+            .skip(1)
+            .any(|method| matches!(method, SourceAuthConfig::JwtBearer(_)))
+        {
+            return Err("allows JWT Bearer only as the first caller authentication method: the discovery audience \
+                        and challenge belong to that method"
+                .into());
+        }
+        match self
+            .source_auth_methods()
+            .first()
+        {
             Some(SourceAuthConfig::JwtBearer(jwt))
                 if jwt
                     .token_header
@@ -2863,7 +2876,7 @@ impl AgentSurface {
                 return Err("mcp_http requires an MCP Access Point".to_string());
             }
             config.validate()?;
-            if config.authorization.is_some() && self.source_auth().is_some() {
+            if config.authorization.is_some() && self.has_source_auth() {
                 return Err("MCP resource authorization cannot be combined with legacy source_auth".into());
             }
         }

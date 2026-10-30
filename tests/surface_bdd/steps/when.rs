@@ -1779,6 +1779,14 @@ async fn request_with_expired_token(world: &mut SurfaceWorld) {
     send_request_with_bearer_token(world, token).await;
 }
 
+#[when("the caller sends a request to the surface with an expired token and a valid API key")]
+async fn request_with_expired_token_and_valid_api_key(world: &mut SurfaceWorld) {
+    ensure_gateway_running(world).await;
+    let token = create_expired_jwt_for_issuer(get_jwt_source_auth_issuer(world), caller_token_audience(world));
+    let api_key = build_valid_api_key_source_auth_header(world);
+    send_request_and_record(world, vec![("authorization".to_string(), format!("Bearer {token}")), api_key]).await;
+}
+
 #[when("the caller sends a request to the surface with a malformed token")]
 async fn request_with_malformed_token(world: &mut SurfaceWorld) {
     send_request_with_bearer_token(world, "not-a-jwt".to_string()).await;
@@ -1806,37 +1814,37 @@ async fn request_without_api_key(world: &mut SurfaceWorld) {
     send_request_and_record(world, vec![]).await;
 }
 
+/// The API key method among the surface's source authentication methods:
+/// its header and the key the fixture stores as valid.
+fn api_key_source_auth(world: &SurfaceWorld) -> (String, String) {
+    world
+        .surface_config
+        .source_auth
+        .iter()
+        .chain(
+            &world
+                .surface_config
+                .additional_source_auth,
+        )
+        .find_map(|auth| match auth {
+            SurfaceSourceAuthConfig::ApiKey(config) => Some((config.header_name.clone(), config.valid_key.clone())),
+            SurfaceSourceAuthConfig::ApiKeyProvider(config) => {
+                Some((config.header_name.clone(), config.valid_key.clone()))
+            }
+            SurfaceSourceAuthConfig::JwtBearer(_) => None,
+        })
+        .expect("api key source_auth must be configured")
+}
+
 fn build_api_key_source_auth_header(
     world: &SurfaceWorld,
     key_value: String,
 ) -> (String, String) {
-    let header_name = world
-        .surface_config
-        .source_auth
-        .as_ref()
-        .map(|auth| match auth {
-            SurfaceSourceAuthConfig::ApiKey(config) => config.header_name.clone(),
-            SurfaceSourceAuthConfig::ApiKeyProvider(config) => config.header_name.clone(),
-            SurfaceSourceAuthConfig::JwtBearer(_) => panic!("api key source_auth must be configured"),
-        })
-        .expect("api key source_auth must be configured");
-
-    (header_name, key_value)
+    (api_key_source_auth(world).0, key_value)
 }
 
 fn build_valid_api_key_source_auth_header(world: &SurfaceWorld) -> (String, String) {
-    let (header_name, valid_key) = world
-        .surface_config
-        .source_auth
-        .as_ref()
-        .map(|auth| match auth {
-            SurfaceSourceAuthConfig::ApiKey(config) => (config.header_name.clone(), config.valid_key.clone()),
-            SurfaceSourceAuthConfig::ApiKeyProvider(config) => (config.header_name.clone(), config.valid_key.clone()),
-            SurfaceSourceAuthConfig::JwtBearer(_) => panic!("api key source_auth must be configured"),
-        })
-        .expect("api key source_auth must be configured");
-
-    (header_name, valid_key)
+    api_key_source_auth(world)
 }
 
 #[when("the caller sends a request to the surface with an invalid API key")]

@@ -689,6 +689,16 @@ async fn load_configuration(bootstrap: &BootstrapConfig) -> Result<GatewayConfig
             match dynamodb_result {
                 Ok(mut config) => {
                     info!("Successfully loaded configuration from DynamoDB");
+                    for surface in &mut config.surfaces {
+                        if let Some(reason) = config::fall_back_to_first_source_auth_method(surface) {
+                            error!(
+                                surface = %surface.name,
+                                surface_id = %surface.surface_id,
+                                "source authentication methods the gateway refuses ({reason}) — serving only the first \
+                                 method; resolve via the UI or API"
+                            );
+                        }
+                    }
 
                     // Load x402 headers from x402.json
                     config.x402_headers = match bootstrap.load_x402_headers() {
@@ -959,6 +969,7 @@ async fn load_surfaces(bootstrap: &BootstrapConfig) -> Result<Vec<crate::config:
         .context("Failed to load network config for duplicate-route detection")?;
     disable_duplicate_route_surfaces(&store, &mut channels, &network_config).await?;
     surfaces::strip_unsupported_header_metadata_mappings(&store, &mut channels).await?;
+    surfaces::fall_back_to_first_source_auth_methods(&store, &mut channels).await?;
     surfaces::clear_dangling_default_variants(&store, &mut channels).await?;
     surfaces::carry_over_a2a_settings(&store, &mut channels, !crate::server::mode::is_standby(), || {
         surfaces::RetiredA2aSwitches::read(bootstrap)

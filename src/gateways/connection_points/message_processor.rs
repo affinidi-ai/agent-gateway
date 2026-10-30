@@ -4271,7 +4271,7 @@ async fn process_forward_request_in_request_scope(
                 None => surface.access_point.route.clone(),
             };
             if surface.access_point.protocol != crate::config::agent_surface::SurfaceProtocol::Mcp
-                || surface.source_auth().is_some()
+                || surface.has_source_auth()
                 || authorization.validate_endpoint(&origins, &expected_path).is_err()
                 || profile.validate_network(network).is_err()
             {
@@ -4323,7 +4323,7 @@ async fn process_forward_request_in_request_scope(
                 .map(to_header_iter)
                 .map(axum::http::HeaderMap::from_iter).unwrap_or_else(axum::http::HeaderMap::new));
 
-            if let Some(auth_config) = surface.source_auth() {
+            if let Some(auth_config) = surface.source_auth_for_request(&axum_headers, None) {
                 let sa_middleware = match crate::source_auth::middleware::require_installed(get_source_auth_middleware()) {
                     Ok(middleware) => middleware,
                     Err(e) => {
@@ -4370,7 +4370,8 @@ async fn process_forward_request_in_request_scope(
                     // its challenge; otherwise record the outcome for the
                     // policy layer and continue with no asserted caller identity.
                     Err(e) if e.is_caller_attributable() => {
-                        let challenged = protected_resource.is_some();
+                        let challenged = protected_resource.is_some()
+                            && matches!(auth_config, crate::source_auth::SourceAuthConfig::JwtBearer(_));
                         channel_warn!(
                             config_id,
                             "GW2: Source authentication failed (reason={}) — {}",
@@ -4384,7 +4385,7 @@ async fn process_forward_request_in_request_scope(
                             challenged,
                             None,
                         );
-                        if let Some(protected_resource) = &protected_resource {
+                        if challenged && let Some(protected_resource) = &protected_resource {
                             return axum_response_to_forward_result(protected_resource.fabric_refusal(&e)).await;
                         }
                         source_auth_failure = Some(crate::surface_context::SourceAuthContext::Failed {
@@ -5255,8 +5256,6 @@ async fn process_forward_request_in_request_scope(
     // Track if content-type was set
     let mut has_content_type = false;
 
-    // Determine the source-auth credential header to strip (must not leak upstream).
-    let source_cred_header = surface.source_auth().and_then(|sa| sa.credential_header_name());
     let header_metadata_mapping = surface.access_point.header_metadata_mapping.as_ref();
 
     // Add headers if provided
@@ -5285,10 +5284,9 @@ async fn process_forward_request_in_request_scope(
                 );
                 continue;
             }
-            // Skip the source-auth credential header — it was consumed by the
-            // gateway for authentication and must not be forwarded upstream.
-            if let Some(cred) = source_cred_header
-                && key.eq_ignore_ascii_case(cred) {
+            // Skip the source-auth credential headers — the gateway consumed
+            // them for authentication and they must not be forwarded upstream.
+            if surface.is_source_credential_header(key) {
                     channel_info!(
                         config_id,
                         "    Skipping source auth credential header: {}",

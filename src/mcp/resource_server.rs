@@ -291,9 +291,7 @@ pub async fn surface_metadata(
             || authorization
                 .validate_endpoint(&origins, &expected_path)
                 .is_err()
-            || resolved
-                .source_auth()
-                .is_some()
+            || resolved.has_source_auth()
             || profile
                 .validate_network(&state.network_config)
                 .is_err()

@@ -708,8 +708,19 @@ fn validate_workload_binding_config(surface: &AgentSurface) -> Result<(), Surfac
 /// Without this hook a dashboard save could persist values that would then
 /// be rejected on the next process restart (`challenge_ttl_seconds: 0`,
 /// unsupported `allowed_algorithms`, etc.).
+///
+/// Each enabled variant is validated as resolved, since it can override the
+/// caller authentication methods and the identity slots.
 fn validate_source_auth(surface: &AgentSurface) -> Result<(), SurfaceApiError> {
-    crate::config::validate_source_auth_config(surface).map_err(|e| SurfaceApiError::BadRequest(e.to_string()))
+    crate::config::validate_source_auth_config(surface).map_err(|e| SurfaceApiError::BadRequest(e.to_string()))?;
+    for variant in &surface.variants {
+        let Ok(resolved) = surface.resolve_variant(Some(&variant.alias)) else {
+            continue;
+        };
+        crate::config::validate_source_auth_config(&resolved)
+            .map_err(|e| SurfaceApiError::BadRequest(format!("variant '{}': {e}", variant.alias)))?;
+    }
+    Ok(())
 }
 
 /// Validate every transit point: alias must match the URL-safe pattern,
@@ -1293,11 +1304,13 @@ fn validate_delegation_source_auth(surface: &AgentSurface) -> Result<(), Surface
     if !is_delegated_mpp {
         return Ok(());
     }
-    if let Some(crate::source_auth::SourceAuthConfig::JwtBearer(_)) = surface.source_auth()
-        && surface
-            .source_auth()
-            .and_then(|sa| sa.credential_header_name())
-            .is_some_and(|h| h.eq_ignore_ascii_case("authorization"))
+    if surface
+        .source_auth_methods()
+        .iter()
+        .any(|method| {
+            matches!(method, crate::source_auth::SourceAuthConfig::JwtBearer(jwt)
+                if jwt.token_header.eq_ignore_ascii_case("authorization"))
+        })
     {
         return Err(SurfaceApiError::BadRequest(format!(
             "Surface '{}': an A2A surface delegating payment to a remote MPP rail cannot use jwt_bearer source \
@@ -2052,9 +2065,12 @@ async fn validate_protected_resource_issuers(
                 .map(|resolved| (format!("variant '{}': ", variant.alias), resolved))
         });
     for (label, resolved) in std::iter::once((String::new(), surface.clone())).chain(variants) {
-        let (Some(protected), Some(crate::source_auth::SourceAuthConfig::JwtBearer(jwt))) =
-            (resolved.protected_resource(), resolved.source_auth())
-        else {
+        let (Some(protected), Some(crate::source_auth::SourceAuthConfig::JwtBearer(jwt))) = (
+            resolved.protected_resource(),
+            resolved
+                .source_auth_methods()
+                .first(),
+        ) else {
             continue;
         };
         let strategy = state
@@ -4948,6 +4964,54 @@ mod validation_tests {
             }
             other => panic!("expected BadRequest, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn delegation_source_auth_rejects_a_later_jwt_bearer_method_on_the_authorization_header() {
+        use crate::source_auth::models::{ApiKeyAuthConfig, CredentialExtraction, SourceAuthConfig};
+        let mut s = delegated_mpp_surface();
+        let mut caller = jwt_bearer_auth("Authorization");
+        caller.methods.insert(
+            0,
+            SourceAuthConfig::ApiKey(ApiKeyAuthConfig {
+                extraction: CredentialExtraction::HttpHeader { field: "X-API-Key".into() },
+                secret_id: "keys".into(),
+            }),
+        );
+        s.access_point
+            .caller_authentication = Some(caller);
+        assert!(matches!(validate_delegation_source_auth(&s), Err(SurfaceApiError::BadRequest(_))));
+    }
+
+    #[test]
+    fn source_auth_validation_checks_each_enabled_variant() {
+        let mut s = didauth_surface(valid_didauth_config());
+        s.variants = vec![serde_json::from_value(serde_json::json!({
+            "id": "partner",
+            "alias": "partner",
+            "name": "Partner",
+            "enabled": true,
+            "overrides": {
+                "access_point": {
+                    "caller_authentication": {
+                        "methods": [
+                            {"type": "api_key", "extraction": {"source": "http_header", "field": "X-Key"}, "secret_id": "a"},
+                            {"type": "api_key", "extraction": {"source": "http_header", "field": "x-key"}, "secret_id": "b"}
+                        ]
+                    }
+                }
+            }
+        }))
+        .unwrap()];
+        match validate_source_auth(&s) {
+            Err(SurfaceApiError::BadRequest(msg)) => {
+                assert!(msg.starts_with("variant 'partner': ") && msg.contains("both read the 'x-key' header"), "{msg}")
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+
+        s.variants[0].enabled = false;
+        validate_source_auth(&s).expect("a disabled variant is not validated on save");
     }
 
     #[test]

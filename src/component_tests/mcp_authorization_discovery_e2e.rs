@@ -6,12 +6,15 @@ use std::sync::atomic::Ordering;
 use serde_json::json;
 
 use super::helpers::jwt::{JwksFixture, now_secs, setup_jwt_bearer_auth_rejects_missing_then_accepts_valid, sign_jwt};
-use super::helpers::{GatewayHarness, MockServer, configure_admin_api};
+use super::helpers::{GatewayHarness, MockServer, configure_admin_api, write_api_key_secret};
 
 const PUBLIC_ORIGIN: &str = "https://gateway.example";
 const AUTHORIZATION_SERVER: &str = "https://idp.example/realms/agents";
 /// A strategy trusting `AUTHORIZATION_SERVER`, for surfaces saved through the API.
 const IDP_STRATEGY: &str = "discovery-idp-strategy";
+/// An API key secret a surface can add as a further caller authentication method.
+const PARTNER_KEY_SECRET: &str = "discovery-partner-keys";
+const PARTNER_KEY: &str = "partner-key";
 
 fn protected_resource(route: &str) -> serde_json::Value {
     json!({
@@ -49,6 +52,13 @@ async fn start_discovery_gateway_with(
             .extend(listeners);
         std::fs::write(&bootstrap.config_files.gateway, serde_json::to_vec(&network).unwrap()).unwrap();
         setup_jwt_bearer_auth_rejects_missing_then_accepts_valid(fixture, directory, config);
+        write_api_key_secret(
+            &bootstrap
+                .storage_paths
+                .secrets,
+            PARTNER_KEY_SECRET,
+            PARTNER_KEY,
+        );
         let strategy = json!({
             "id": IDP_STRATEGY,
             "name": "Discovery IdP",
@@ -646,6 +656,79 @@ async fn a_caller_without_a_valid_token_is_challenged_to_fetch_one() {
         .await
         .unwrap();
     assert_eq!(variant.status(), 200, "{}", variant.text().await.unwrap());
+    assert_eq!(
+        harness
+            .mock
+            .request_count
+            .load(Ordering::SeqCst),
+        2
+    );
+}
+
+/// Only the JWT Bearer method answers with the discovery challenge: a caller
+/// presenting a further method's credential is checked by that method, and a
+/// failure reaches policy, which here forwards it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_further_methods_failure_reaches_policy_without_the_challenge() {
+    let fixture = JwksFixture::start().await;
+    let (harness, _admin) = start_discovery_gateway_with(
+        &fixture,
+        |surface| {
+            surface
+                .access_point
+                .caller_authentication
+                .as_mut()
+                .unwrap()
+                .methods
+                .push(
+                    serde_json::from_value(json!({
+                        "type": "api_key",
+                        "extraction": {"source": "http_header", "field": "x-api-key"},
+                        "secret_id": PARTNER_KEY_SECRET
+                    }))
+                    .unwrap(),
+                );
+        },
+        Vec::new(),
+    )
+    .await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap();
+    let tools_list = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}});
+    let call = |api_key: Option<&str>| {
+        let mut request = client
+            .post(format!("{}/smoke/rpc", harness.gateway_base))
+            .json(&tools_list);
+        if let Some(api_key) = api_key {
+            request = request.header("x-api-key", api_key);
+        }
+        request.send()
+    };
+
+    let missing = call(None).await.unwrap();
+    assert_eq!(missing.status(), 401, "a caller with no credential is challenged");
+    assert!(
+        missing
+            .headers()
+            .contains_key("www-authenticate")
+    );
+
+    let wrong = call(Some("wrong"))
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), 200, "a failed API key reaches policy");
+    assert!(
+        !wrong
+            .headers()
+            .contains_key("www-authenticate")
+    );
+
+    let valid = call(Some(PARTNER_KEY))
+        .await
+        .unwrap();
+    assert_eq!(valid.status(), 200, "{}", valid.text().await.unwrap());
     assert_eq!(
         harness
             .mock

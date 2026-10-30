@@ -74,6 +74,40 @@ pub async fn strip_unsupported_header_metadata_mappings<S: AgentSurfaceStore + ?
     Ok(())
 }
 
+/// Keep only the first source authentication method of a stored surface whose
+/// methods break the rules for several methods, persisting the correction.
+///
+/// Before those rules the gateway enforced only the first method and ignored
+/// the rest, so a surface stored then can hold methods that now refuse it.
+/// Refusing to boot over them would take every surface down; keeping the
+/// first method serves the surface as it was served before.
+///
+/// Called from gateway startup (`main.rs::load_surfaces`), before the
+/// resolved-surface cache is seeded and the listeners are built.
+pub async fn fall_back_to_first_source_auth_methods<S: AgentSurfaceStore + ?Sized>(
+    store: &S,
+    channels: &mut [AgentSurface],
+) -> anyhow::Result<()> {
+    for surface in channels.iter_mut() {
+        let Some(reason) = crate::config::fall_back_to_first_source_auth_method(surface) else {
+            continue;
+        };
+        error!(
+            surface = %surface.name,
+            surface_id = %surface.surface_id,
+            "source authentication methods found in storage that the gateway refuses ({reason}) — keeping only the \
+             first method so the gateway can boot; resolve via the UI or API"
+        );
+        store
+            .save(surface)
+            .await
+            .with_context(|| {
+                format!("Failed to persist the source authentication fallback for surface '{}'", surface.surface_id)
+            })?;
+    }
+    Ok(())
+}
+
 /// Drop the `default_variant_id` of a surface with no variants, persisting the
 /// correction to storage.
 ///
@@ -746,6 +780,97 @@ mod tests {
             "default_variant_id": default_variant_id
         }))
         .expect("test surface should deserialize")
+    }
+
+    fn surface_with_methods(
+        id: &str,
+        methods: serde_json::Value,
+    ) -> AgentSurface {
+        serde_json::from_value(serde_json::json!({
+            "surface_id": id,
+            "name": format!("{id}-name"),
+            "access_point": {
+                "listen_address": "0.0.0.0:8443",
+                "route": format!("/agents/{id}"),
+                "protocol": "a2a",
+                "caller_authentication": { "methods": methods }
+            },
+            "target": { "endpoint": "https://a2a.internal/a2a" }
+        }))
+        .expect("test surface should deserialize")
+    }
+
+    #[tokio::test]
+    async fn a_stored_surface_breaking_the_method_rules_keeps_its_first_method() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = test_store(dir.path()).await;
+        let jwt = serde_json::json!({"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": []});
+        let shared_header = serde_json::json!({
+            "type": "api_key", "extraction": {"source": "http_header", "field": "authorization"}, "secret_id": "keys"
+        });
+        let partner_key = serde_json::json!({
+            "type": "api_key", "extraction": {"source": "http_header", "field": "x-api-key"}, "secret_id": "keys"
+        });
+        let mut channels = vec![
+            surface_with_methods("s-legacy", serde_json::json!([jwt.clone(), shared_header])),
+            surface_with_methods("s-valid", serde_json::json!([jwt.clone(), partner_key])),
+        ];
+
+        fall_back_to_first_source_auth_methods(&store, &mut channels)
+            .await
+            .expect("fallback should succeed");
+
+        assert_eq!(
+            channels[0]
+                .source_auth_methods()
+                .len(),
+            1
+        );
+        assert_eq!(channels[0].source_auth_methods()[0].method_tag(), "jwt_bearer");
+        let reloaded = store
+            .get("s-legacy")
+            .await
+            .expect("get should succeed")
+            .expect("surface should exist");
+        assert_eq!(
+            reloaded
+                .source_auth_methods()
+                .len(),
+            1
+        );
+
+        assert_eq!(
+            channels[1]
+                .source_auth_methods()
+                .len(),
+            2
+        );
+        assert!(
+            store
+                .get("s-valid")
+                .await
+                .expect("get should succeed")
+                .is_none(),
+            "a valid surface is not rewritten"
+        );
+    }
+
+    #[test]
+    fn a_surface_whose_first_method_is_invalid_does_not_fall_back() {
+        let mut surface = surface_with_methods(
+            "s-bad-first",
+            serde_json::json!([
+                {"type": "did_auth", "extraction": {"source": "http_header", "field": "X-Session"}, "challenge_ttl_seconds": 0},
+                {"type": "did_auth", "extraction": {"source": "http_header", "field": "X-Other"}}
+            ]),
+        );
+        assert!(crate::config::fall_back_to_first_source_auth_method(&mut surface).is_none());
+        assert_eq!(
+            surface
+                .source_auth_methods()
+                .len(),
+            2
+        );
     }
 
     #[tokio::test]

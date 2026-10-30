@@ -136,11 +136,23 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   that isn't a comma-separated list of HTTP status codes (100 to 599) blocks Save. Test
   ids: `networking-retry-status-codes-input` and
   `networking-retry-connection-errors-only-switch`.
+- **Caller Context methods**: the caller-auth element's own config is the first method, and
+  `additional_methods` (`caller-auth/CallerAuthAdditionalMethods.tsx`) holds methods 2..n in
+  order; together they save as `caller_authentication.methods`. Each method's fields render
+  through `CallerAuthMethodFields.tsx` with an id prefix: `caller-auth` for the first method (its
+  ids are unchanged) and `caller-auth-extra-<index>` for additional ones, whose radio groups are
+  named from the same prefix. Method 2 moves up into the first place by swapping with the
+  element's own method, except while authorization server discovery is on. `methods.ts` mirrors
+  the gateway's save rules (each method reads its own credential location, only a sole method
+  reads the request body, at most one DID Auth), shown in the editor and on the canvas. An
+  incomplete additional method marks the element unconfigured as `Method <n>: <reason>`. The
+  sidebar lists the additional methods. Loading a surface always replaces `additional_methods`,
+  so a stale canvas copy never brings back a removed method.
 - **Authorization server discovery** (`caller-auth/CallerAuthDiscoverySection.tsx`) edits
   `caller_authentication.protected_resource` in the Caller Context editor of an MCP surface whose
-  method is JWT Bearer. Turning it on prefills the resource with the Access Point's https listener
-  URL plus its route (left empty otherwise), empties Accepted Audiences, turns token forwarding
-  off and sets the `Authorization` header with the `Bearer` scheme; each of those controls stays
+  first method is JWT Bearer; additional methods never show it. Turning it on prefills the
+  resource with the Access Point's https listener URL plus its route (left empty otherwise),
+  empties Accepted Audiences, turns token forwarding off and sets the `Authorization` header with the `Bearer` scheme; each of those controls stays
   locked while discovery is on, once it holds that value. Authorization servers (1 to 8) and
   scopes are lists checked as each value is added, and `protectedResource.ts` mirrors the
   gateway's save rules, which block Save. Leaving JWT Bearer drops the setting. A variant shows
@@ -160,6 +172,13 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
 | Variant resource, default variant note, rules explainer toggle | `caller-auth-discovery-variant-resource`, `caller-auth-discovery-default-variant-note`, `caller-auth-discovery-context-toggle`                                                                     |
 | Errors                                                         | `caller-auth-discovery-save-error`, `caller-auth-discovery-rules-error`, `caller-auth-discovery-resource-error`, `caller-auth-discovery-<list>s-error`, `caller-auth-discovery-<list>-input-error` |
 | Sidebar status and error                                       | `caller-auth-panel-discovery-status`, `caller-auth-panel-discovery-save-error`                                                                                                                     |
+
+| Caller Context methods element                   | Test id                                                                                                                        |
+| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------ |
+| Additional methods section, add, selection error | `caller-auth-additional-methods`, `caller-auth-add-method-button`, `caller-auth-method-selection-error`                        |
+| One additional method and its method select      | `caller-auth-extra-<index>`, `caller-auth-extra-<index>-mode-select`                                                           |
+| Its move and remove buttons                      | `caller-auth-extra-<index>-move-up-button`, `caller-auth-extra-<index>-move-down-button`, `caller-auth-extra-<index>-remove-button` |
+| Sidebar list of additional methods               | `caller-auth-panel-additional-methods`                                                                                         |
 
 ## Trust Check
 

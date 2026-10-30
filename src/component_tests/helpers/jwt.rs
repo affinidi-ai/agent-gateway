@@ -65,16 +65,12 @@ impl JwksFixture {
 
 const JWK_STRATEGY_ID: &str = "e2e-jwt-strategy";
 
-/// Setup function for `jwt_bearer_auth_rejects_missing_then_accepts_valid`.
-///
-/// Writes a JWT verification strategy fixture to disk and configures the gateway
-/// with a channel that requires JWT Bearer authentication.
-pub fn setup_jwt_bearer_auth_rejects_missing_then_accepts_valid(
+/// Writes the JWT verification strategy that trusts `fixture`'s keys and
+/// returns its id.
+pub fn write_jwt_strategy(
     fixture: &JwksFixture,
     temp_dir: &Path,
-    gw_config: &mut GatewayConfig,
-) {
-    // Build and write the JWT verification strategy fixture to disk.
+) -> &'static str {
     let strategy_json = serde_json::json!({
         "id": JWK_STRATEGY_ID,
         "name": "E2E EdDSA Test",
@@ -93,6 +89,19 @@ pub fn setup_jwt_bearer_auth_rejects_missing_then_accepts_valid(
         serde_json::to_string_pretty(&strategy_json).expect("serialize strategy"),
     )
     .expect("write strategy fixture");
+    JWK_STRATEGY_ID
+}
+
+/// Setup function for `jwt_bearer_auth_rejects_missing_then_accepts_valid`.
+///
+/// Writes a JWT verification strategy fixture to disk and configures the gateway
+/// with a channel that requires JWT Bearer authentication.
+pub fn setup_jwt_bearer_auth_rejects_missing_then_accepts_valid(
+    fixture: &JwksFixture,
+    temp_dir: &Path,
+    gw_config: &mut GatewayConfig,
+) {
+    write_jwt_strategy(fixture, temp_dir);
 
     // Build a surface with JWT Bearer authentication on the access point.
     let json = serde_json::json!({
@@ -129,24 +138,7 @@ pub fn setup_jwt_claim_managed_identity(
     temp_dir: &Path,
     gw_config: &mut GatewayConfig,
 ) {
-    let strategy_json = serde_json::json!({
-        "id": JWK_STRATEGY_ID,
-        "name": "E2E EdDSA Test",
-        "expected_issuer": fixture.issuer,
-        "jwks_source": {
-            "type": "remote",
-            "jwks_uri": format!("{}/.well-known/jwks.json", fixture.issuer),
-        },
-        "created_at": "2026-01-01T00:00:00Z",
-        "updated_at": "2026-01-01T00:00:00Z"
-    });
-    let strat_dir = temp_dir.join("jwt_verification_strategies");
-    std::fs::create_dir_all(&strat_dir).expect("create strategy dir");
-    std::fs::write(
-        strat_dir.join(format!("{}.json", JWK_STRATEGY_ID)),
-        serde_json::to_string_pretty(&strategy_json).expect("serialize strategy"),
-    )
-    .expect("write strategy fixture");
+    write_jwt_strategy(fixture, temp_dir);
 
     let json = serde_json::json!({
         "name": "jwt-claim-identity",
@@ -197,24 +189,7 @@ pub fn setup_jwt_claim_inbound_identity(
     temp_dir: &Path,
     gw_config: &mut GatewayConfig,
 ) {
-    let strategy_json = serde_json::json!({
-        "id": JWK_STRATEGY_ID,
-        "name": "E2E EdDSA Test",
-        "expected_issuer": fixture.issuer,
-        "jwks_source": {
-            "type": "remote",
-            "jwks_uri": format!("{}/.well-known/jwks.json", fixture.issuer),
-        },
-        "created_at": "2026-01-01T00:00:00Z",
-        "updated_at": "2026-01-01T00:00:00Z"
-    });
-    let strat_dir = temp_dir.join("jwt_verification_strategies");
-    std::fs::create_dir_all(&strat_dir).expect("create strategy dir");
-    std::fs::write(
-        strat_dir.join(format!("{}.json", JWK_STRATEGY_ID)),
-        serde_json::to_string_pretty(&strategy_json).expect("serialize strategy"),
-    )
-    .expect("write strategy fixture");
+    write_jwt_strategy(fixture, temp_dir);
 
     let json = serde_json::json!({
         "name": "jwt-claim-inbound-identity",

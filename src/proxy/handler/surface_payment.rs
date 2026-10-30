@@ -64,9 +64,6 @@ fn delegation_headers(
     surface: &crate::config::agent_surface::AgentSurface,
     headers: &HeaderMap,
 ) -> std::collections::HashMap<String, String> {
-    let source_credential = surface
-        .source_auth()
-        .and_then(|auth| auth.credential_header_name());
     let resource_authorization = surface
         .mcp_http
         .as_ref()
@@ -74,10 +71,8 @@ fn delegation_headers(
     headers
         .iter()
         .filter_map(|(name, value)| {
-            if source_credential.is_some_and(|credential| {
-                name.as_str()
-                    .eq_ignore_ascii_case(credential)
-            }) || resource_authorization && name == axum::http::header::AUTHORIZATION
+            if surface.is_source_credential_header(name.as_str())
+                || resource_authorization && name == axum::http::header::AUTHORIZATION
             {
                 return None;
             }
@@ -781,6 +776,39 @@ mod tests {
                 .get("AUTHORIZATION")
                 .map(String::as_str),
             Some("Payment legacy-credential")
+        );
+    }
+
+    #[test]
+    fn delegated_payment_strips_every_source_credential_header() {
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+            "surface_id": "paid", "name": "Paid", "access_point": {
+                "listen_address": "https://gateway.example", "route": "/a2a", "protocol": "a2a",
+                "caller_authentication": {"methods": [
+                    {"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": [], "token_header": "X-User-Token"},
+                    {"type": "api_key", "extraction": {"source": "http_header", "field": "X-API-Key"}, "secret_id": "keys"}
+                ]}
+            }, "target": {"endpoint": "https://target.example/a2a"}
+        }))
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-user-token", "Bearer user".parse().unwrap());
+        headers.insert("x-api-key", "partner".parse().unwrap());
+        headers.insert(
+            "payment-signature",
+            "payment-proof"
+                .parse()
+                .unwrap(),
+        );
+
+        let delegated = delegation_headers(&surface, &headers);
+        assert!(!delegated.contains_key("X-USER-TOKEN"));
+        assert!(!delegated.contains_key("X-API-KEY"));
+        assert_eq!(
+            delegated
+                .get("PAYMENT-SIGNATURE")
+                .map(String::as_str),
+            Some("payment-proof")
         );
     }
 

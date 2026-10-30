@@ -358,8 +358,9 @@ request received by the destination gateway:
 4. Run the destination surface's configured source authentication and MCP request-boundary
    validation. DIDComm authentication proves the sending Gateway; source authentication separately
    evaluates caller evidence presented to the destination surface. On an MCP surface that
-   publishes protected resource metadata, a missing or refused token is answered here with a
-   `401` before policy, without `resource_metadata`: the sending Gateway strips the caller's
+   publishes protected resource metadata, a missing or refused token for its JWT Bearer method
+   is answered here with a `401` before policy, without `resource_metadata` (a failed credential
+   of a further method reaches policy): the sending Gateway strips the caller's
    own `Authorization` header, so only a credential it injects, issued for this surface's
    resource, can pass. There is no A2A counterpart:
    `A2A-Version` is negotiated and A2A requests are validated on the sending gateway, not here

@@ -116,9 +116,13 @@ The Identities page shows a Trust Recorder status chip and a Recorder filter, an
 Recorder panel shows a Last outcome row; see _Identities page_ and _Trust Recorder panel_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#trust-recorder-panel).
 
-The Caller Context editor of an MCP surface with JWT Bearer edits authorization server
-discovery (`caller_authentication.protected_resource`), and Save removes a setting the
-operator switched off in the same PUT; see _Authorization server discovery_ in
+The Caller Context editor edits an ordered list of caller authentication methods, the first
+on the element's own config and the rest under `additional_methods`; see _Caller Context
+methods_ in [`www/default/AGENTS.md`](www/default/AGENTS.md).
+
+The Caller Context editor of an MCP surface whose first method is JWT Bearer edits
+authorization server discovery (`caller_authentication.protected_resource`), and Save removes
+a setting the operator switched off in the same PUT; see _Authorization server discovery_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md).
 
 Keep `AGENTS.md` and any local `AGENTS.md` in sync in the same change when UI patterns evolve. Instruction drift is a blocker.
@@ -154,8 +158,9 @@ are `data.gateway.policy.deny_reason` and `data.surface.policy.deny_reason`.
 let OPA decide instead: Trust Check, and caller source authentication. A surface that must
 reject unauthenticated callers needs a policy denying `input.source_auth.method == "failed"`.
 An MCP Access Point that publishes protected resource metadata is the exception: a request to
-it, direct or over Fabric, is refused before policy with a `401` (direct requests get the
-discovery challenge).
+it whose JWT Bearer credential is missing or refused, direct or over Fabric, is refused before
+policy with a `401` (direct requests get the discovery challenge); a failed credential of a
+further method still reaches policy.
 See [`docs/POLICY.md`](docs/POLICY.md#failed-caller-authentication).
 
 **MCP revisions are admitted per transport path.** Every MCP endpoint admits `2026-07-28`

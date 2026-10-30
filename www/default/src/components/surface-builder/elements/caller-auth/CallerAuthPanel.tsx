@@ -5,6 +5,7 @@ import type { ConfigPanelProps } from '../types';
 import { useOptionalSurfaceMeta } from '../../SurfaceMetaContext';
 import { CALLER_AUTH_METHOD_OPTIONS, isSelectableCallerAuthMethod } from './methodOptions';
 import { discoverySaveError, readProtectedResource } from './protectedResource';
+import { readAdditionalMethods } from './methods';
 
 /**
  * Compact sidebar panel for the Caller Auth element. Picks the method
@@ -22,6 +23,7 @@ const CallerAuthPanel: React.FC<ConfigPanelProps> = ({
   const method = config.method_type || 'jwt_bearer';
   const meta = useOptionalSurfaceMeta();
   const discovery = readProtectedResource(config.protected_resource);
+  const additionalMethods = readAdditionalMethods(config);
   const showsDiscovery = protocol === 'mcp' && method === 'jwt_bearer';
   const discoveryError = showsDiscovery
     ? discoverySaveError(meta?.saveError, discovery?.resource)
@@ -79,9 +81,29 @@ const CallerAuthPanel: React.FC<ConfigPanelProps> = ({
         </Form.Select>
         <Form.Text className="text-muted d-block mt-1" style={{ fontSize: '10px' }}>
           Choose how the gateway checks the identity of whoever calls this agent. Click
-          &quot;Configure…&quot; below for details on each option. Default: JWT Bearer, the standard
-          choice unless you specifically need an API key or client certificate.
+          &quot;Configure…&quot; below for details on each option, or to accept more than one
+          method. Default: JWT Bearer, the standard choice unless you specifically need an API key
+          or client certificate.
         </Form.Text>
+        {additionalMethods.length > 0 && (
+          <Form.Text
+            className="text-muted d-block mt-2"
+            style={{ fontSize: '10px' }}
+            data-testid="caller-auth-panel-additional-methods"
+          >
+            Also accepts:{' '}
+            <strong>
+              {additionalMethods
+                .map(
+                  m =>
+                    CALLER_AUTH_METHOD_OPTIONS.find(option => option.value === m.method_type)
+                      ?.label ?? m.method_type
+                )
+                .join(', ')}
+            </strong>
+            . Each request is verified by the method its credential belongs to.
+          </Form.Text>
+        )}
         {showsDiscovery && (
           <Form.Text
             className="text-muted d-block mt-2"

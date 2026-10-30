@@ -94,6 +94,31 @@ Feature: HTTP surface source authentication
       | API Key          |
       | API Key Provider |
 
+  # A2A / several source authentication methods
+
+  Scenario Outline: A surface accepting JWT Bearer and API Key authenticates each caller by the credential it presents
+    Given an A2A surface targeting managed agent "bravo"
+    And the surface accepts "JWT Bearer" and "API Key" source authentication
+    And the surface has a policy denying callers whose source authentication failed
+    When the caller sends a request to the surface <credential condition>
+    Then the response status is 200
+    And managed agent "bravo" received the forwarded request
+    And managed agent "bravo" did not receive header "authorization"
+    And managed agent "bravo" did not receive header "x-api-key"
+
+    Examples:
+      | credential condition |
+      | with a valid token   |
+      | with a valid API key |
+
+  Scenario: A rejected credential is not retried with another source authentication method
+    Given an A2A surface targeting managed agent "bravo"
+    And the surface accepts "JWT Bearer" and "API Key" source authentication
+    And the surface has a policy denying callers whose source authentication failed
+    When the caller sends a request to the surface with an expired token and a valid API key
+    Then the response status is 403
+    And managed agent "bravo" was not called
+
   # MCP / JWT Bearer
 
   Scenario Outline: JWT Bearer MCP failures are forwarded when no blocking policy is configured

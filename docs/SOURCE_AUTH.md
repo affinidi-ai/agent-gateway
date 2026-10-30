@@ -27,9 +27,67 @@ Configured on the Access Point as `caller_authentication.methods`. Each method i
 | DID Auth | `did_auth` | A DID Auth session token |
 | mTLS | `mtls` | A TLS client certificate |
 
-`methods` is a list, but the inbound pipeline enforces only its first entry
-([`AgentSurface::source_auth`](../src/config/agent_surface_accessors.rs)); later entries
-are accepted and ignored.
+### Several methods on one Access Point
+
+`methods` is an ordered list, so one surface can accept callers with different
+credentials, for example a JWT for internal users and an API key for partner agents, and
+the managed agent keeps one identity. The gateway selects one method per request
+([`select_source_auth_method`](../src/source_auth/models.rs)) and verifies only that
+method:
+
+1. The method is the first, in configured order, whose credential the request carries: its
+   header is present (for JWT bearer, `token_header`; otherwise `extraction.field`), or, for
+   mTLS, a client certificate reached the gateway. No credential is read from the body, so a
+   method that extracts from `mcp_meta` or `a2a_extension` is allowed only as the sole method.
+2. A request that carries no method's credential is checked against the first method, so it
+   fails as a missing credential of that method.
+3. A rejected credential is never retried with another method. A request with an expired JWT
+   and a valid API key, on a surface listing JWT bearer first, fails.
+
+Policy sees the method that verified the caller as `input.source_auth.method`, so a rule can
+treat callers differently by method:
+
+```rego
+package surface.policy
+
+default allow := false
+
+allow if input.source_auth.method == "jwt_bearer"
+
+allow if {
+    input.source_auth.method == "api_key"
+    input.source_auth.key_name == "partner-keys"
+}
+```
+
+For `api_key`, `key_name` is the method's `secret_id`. An `api_key_provider` caller also
+reports `method: "api_key"`, with the provider's key id as `key_name`, so a policy tells the
+two API key methods apart by `key_name`.
+
+Saving a surface, and each of its enabled variants as resolved, refuses (and so does loading
+gateway configuration):
+
+- two methods that read the same credential location: the same header, compared without
+  regard to case, both `mcp_meta`, both `a2a_extension`, or two mTLS methods;
+- a method that reads `mcp_meta` or `a2a_extension` when there is more than one method, since
+  it could never be selected;
+- more than one `did_auth` method, because the `/authenticate` endpoints serve one;
+- a `from_jwt_claim` identity, in any identity slot or Transit Point override, unless every
+  method is `jwt_bearer`;
+- on an Access Point that publishes protected resource metadata, a JWT bearer method other
+  than the first: the discovery audience and challenge belong to the first method.
+
+Surfaces stored before these rules may break them, because the gateway then enforced only
+the first method and ignored the rest. At startup, a stored surface whose methods break them
+keeps only its first method, when that method is valid alone, the gateway logs an error naming
+the surface and the rule, and the local store persists the correction
+([`fall_back_to_first_source_auth_methods`](../src/surfaces/store.rs)); a DynamoDB-sourced
+surface is corrected in memory only. A stored `from_jwt_claim` identity beside a method other
+than `jwt_bearer` is logged as a warning at startup and refused on the next save.
+
+The credential headers of every method are stripped before a request is forwarded, on each
+inbound, mirror, Fabric and agent-card path. A JWT bearer method with `forward_header`
+forwards its header only when it was the method selected for that request.
 
 A JWT bearer token is accepted only when it is signed with an RS256, RS384, RS512, ES256,
 ES384 or EdDSA key from the strategy's key set, its `iss` equals the strategy's expected

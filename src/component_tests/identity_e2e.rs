@@ -1,5 +1,5 @@
 use super::helpers;
-use helpers::{GatewayHarness, MockServer};
+use helpers::{GatewayHarness, MockServer, write_api_key_secret};
 use serde_json::json;
 
 const AGENT_IDENTITY_URI: &str = "https://fabric.affinidi.io/extensions/agent-identity/v1";
@@ -9,35 +9,6 @@ const IDENTITY_BINDING_URI: &str = "https://fabric.affinidi.io/extensions/agent-
 const A2A_PROXY_PARITY_ID: &str = "entra-parity-proxy";
 const PARITY_ENTRA_AGENT_ID: &str = "agent-123";
 const PARITY_CLIENT_TENANT_ID: &str = "tenant-456";
-
-/// Returns true if `v` is a valid Verifiable Presentation — either a compact
-/// JWT string (three base64url segments), a JSON string containing a VP object,
-/// or a direct JSON-LD VP object with a `proof`.
-fn write_api_key_secret(
-    storage_path: &str,
-    secret_id: &str,
-    value: &str,
-) {
-    use crate::secrets::SecretsStore;
-
-    let store = crate::secrets::FilesystemSecretsStore::new(storage_path).expect("create secrets store");
-    tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(async {
-            store
-                .create(crate::secrets::CreateSecretRequest {
-                    tenant_id: None,
-                    name: "Slice 10 source API key".to_string(),
-                    secret_id: secret_id.to_string(),
-                    description: Some("component-test source auth secret".to_string()),
-                    value: value.to_string(),
-                    secret_type: "ApiKey".to_string(),
-                    tags: vec!["component-test".to_string()],
-                })
-                .await
-                .expect("create source auth secret");
-        })
-    });
-}
 
 fn write_entra_a2a_proxy_fixture(temp_dir: &std::path::Path) {
     let proxy_dir = temp_dir.join("a2a_proxies");
@@ -249,6 +220,9 @@ fn forwarded_binding_did(h: &GatewayHarness) -> String {
     panic!("forwarded binding VP should expose a DID, got {credential:?}")
 }
 
+/// Returns true if `v` is a valid Verifiable Presentation — either a compact
+/// JWT string (three base64url segments), a JSON string containing a VP object,
+/// or a direct JSON-LD VP object with a `proof`.
 fn is_valid_vp(v: &serde_json::Value) -> bool {
     match v {
         serde_json::Value::String(s) => {

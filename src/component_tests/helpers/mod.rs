@@ -585,6 +585,33 @@ impl RecordingTarget {
     }
 }
 
+/// Stores `value` as the API key secret `secret_id` for source auth.
+pub fn write_api_key_secret(
+    storage_path: &str,
+    secret_id: &str,
+    value: &str,
+) {
+    use crate::secrets::SecretsStore;
+
+    let store = crate::secrets::FilesystemSecretsStore::new(storage_path).expect("create secrets store");
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            store
+                .create(crate::secrets::CreateSecretRequest {
+                    tenant_id: None,
+                    name: "Component test source API key".to_string(),
+                    secret_id: secret_id.to_string(),
+                    description: Some("component-test source auth secret".to_string()),
+                    value: value.to_string(),
+                    secret_type: "ApiKey".to_string(),
+                    tags: vec!["component-test".to_string()],
+                })
+                .await
+                .expect("create source auth secret");
+        })
+    });
+}
+
 // ── gateway config builders ──────────────────────────────────────────────────
 
 /// Directory holding the TLS pair component tests boot the gateway with.

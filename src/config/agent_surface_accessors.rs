@@ -74,15 +74,60 @@ impl AgentSurface {
 
     // ── Target shorthands ───────────────────────────────────────────────────
 
-    /// First caller-authentication method on the access point. Mirrors the
-    /// legacy `ChannelMapping::source_auth` field, which carried only the
-    /// first configured method.
+    /// Caller-authentication methods on the access point, in configured order.
     #[inline]
-    pub fn source_auth(&self) -> Option<&crate::source_auth::SourceAuthConfig> {
+    pub fn source_auth_methods(&self) -> &[crate::source_auth::SourceAuthConfig] {
         self.access_point
             .caller_authentication
             .as_ref()
-            .and_then(|ca| ca.methods.first())
+            .map_or(&[], |ca| ca.methods.as_slice())
+    }
+
+    #[inline]
+    pub fn has_source_auth(&self) -> bool {
+        !self
+            .source_auth_methods()
+            .is_empty()
+    }
+
+    /// The caller-authentication method that verifies this request; see
+    /// [`crate::source_auth::models::select_source_auth_method`].
+    pub fn source_auth_for_request(
+        &self,
+        headers: &axum::http::HeaderMap,
+        peer_cert: Option<&crate::source_auth::models::PeerCertInfo>,
+    ) -> Option<&crate::source_auth::SourceAuthConfig> {
+        crate::source_auth::models::select_source_auth_method(self.source_auth_methods(), headers, peer_cert.is_some())
+    }
+
+    /// The DID Auth method, which serves the `/authenticate` endpoints.
+    pub fn did_auth_config(&self) -> Option<&crate::source_auth::models::DidAuthAuthConfig> {
+        self.source_auth_methods()
+            .iter()
+            .find_map(|method| match method {
+                crate::source_auth::SourceAuthConfig::DidAuth(config) => Some(config),
+                _ => None,
+            })
+    }
+
+    /// Every header a caller-authentication method reads. The gateway consumes
+    /// these credentials, so none of them is forwarded.
+    pub fn source_credential_headers(&self) -> Vec<&str> {
+        self.source_auth_methods()
+            .iter()
+            .filter_map(|method| method.credential_header_name())
+            .collect()
+    }
+
+    /// Whether `name` is a header a caller-authentication method reads.
+    pub fn is_source_credential_header(
+        &self,
+        name: &str,
+    ) -> bool {
+        self.source_auth_methods()
+            .iter()
+            .filter_map(|method| method.credential_header_name())
+            .any(|header| name.eq_ignore_ascii_case(header))
     }
 
     /// RFC 9728 settings of the Access Point's caller authentication.
@@ -688,6 +733,48 @@ fn transit_credential_binding(
 mod tests {
     use super::*;
     use crate::config::agent_surface::{AccessPoint, IdentityInjectionConfig, SurfaceStatus};
+
+    fn surface_with_methods(methods: serde_json::Value) -> AgentSurface {
+        let mut surface = surface(SurfaceProtocol::A2a);
+        surface
+            .access_point
+            .caller_authentication =
+            Some(serde_json::from_value(serde_json::json!({ "methods": methods })).expect("caller authentication"));
+        surface
+    }
+
+    #[test]
+    fn did_auth_config_is_found_at_any_position() {
+        let surface = surface_with_methods(serde_json::json!([
+            {"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": []},
+            {"type": "did_auth", "extraction": {"source": "http_header", "field": "X-Session-Token"}}
+        ]));
+        assert!(
+            surface
+                .did_auth_config()
+                .is_some()
+        );
+        assert!(
+            surface_with_methods(serde_json::json!([]))
+                .did_auth_config()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn every_method_header_is_a_source_credential_header() {
+        let surface = surface_with_methods(serde_json::json!([
+            {"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": []},
+            {"type": "api_key", "extraction": {"source": "http_header", "field": "X-API-Key"}, "secret_id": "keys"},
+            {"type": "mtls", "trust": {"type": "pinned", "certificate_ids": ["c1"]}, "identity_binding": {"type": "fingerprint"}}
+        ]));
+        assert_eq!(surface.source_credential_headers(), ["Authorization", "X-API-Key"]);
+        assert!(surface.is_source_credential_header("authorization"));
+        assert!(surface.is_source_credential_header("x-api-key"));
+        assert!(!surface.is_source_credential_header("x-trace"));
+        assert!(!surface_with_methods(serde_json::json!([])).has_source_auth());
+        assert!(surface.has_source_auth());
+    }
 
     fn surface(protocol: SurfaceProtocol) -> AgentSurface {
         AgentSurface {

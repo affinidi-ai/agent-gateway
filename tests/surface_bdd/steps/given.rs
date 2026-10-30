@@ -2042,43 +2042,51 @@ fn managed_agent_is_unreachable(
         .override_target_url = Some("http://127.0.0.1:1".to_string());
 }
 
+fn source_auth_fixture(auth_type: &str) -> SurfaceSourceAuthConfig {
+    match auth_type {
+        "JWT Bearer" => SurfaceSourceAuthConfig::JwtBearer(JwtSourceAuthConfig {
+            jwks_url: String::new(),
+            issuer: String::new(),
+            audiences: Vec::new(),
+        }),
+        "API Key" => SurfaceSourceAuthConfig::ApiKey(ApiKeySourceAuthConfig {
+            header_name: "X-API-Key".to_string(),
+            secret_id: "bdd-source-api-key".to_string(),
+            valid_key: "bdd-valid-api-key".to_string(),
+        }),
+        "API Key Provider" => SurfaceSourceAuthConfig::ApiKeyProvider(ApiKeyProviderSourceAuthConfig {
+            header_name: "X-API-Key".to_string(),
+            agent_id: "bdd-agent".to_string(),
+            key_id: "bdd-provider-key".to_string(),
+            client_id: "bdd-client".to_string(),
+            valid_key: "bdd-valid-api-key".to_string(),
+        }),
+        other => panic!("unsupported auth type: {}", other),
+    }
+}
+
 #[given(expr = "the surface requires {string} source authentication")]
 fn surface_requires_source_auth(
     world: &mut SurfaceWorld,
     auth_type: String,
 ) {
-    match auth_type.as_str() {
-        "JWT Bearer" => {
-            world
-                .surface_config
-                .source_auth = Some(SurfaceSourceAuthConfig::JwtBearer(JwtSourceAuthConfig {
-                jwks_url: String::new(),
-                issuer: String::new(),
-                audiences: Vec::new(),
-            }));
-        }
-        "API Key" => {
-            world
-                .surface_config
-                .source_auth = Some(SurfaceSourceAuthConfig::ApiKey(ApiKeySourceAuthConfig {
-                header_name: "X-API-Key".to_string(),
-                secret_id: "bdd-source-api-key".to_string(),
-                valid_key: "bdd-valid-api-key".to_string(),
-            }));
-        }
-        "API Key Provider" => {
-            world
-                .surface_config
-                .source_auth = Some(SurfaceSourceAuthConfig::ApiKeyProvider(ApiKeyProviderSourceAuthConfig {
-                header_name: "X-API-Key".to_string(),
-                agent_id: "bdd-agent".to_string(),
-                key_id: "bdd-provider-key".to_string(),
-                client_id: "bdd-client".to_string(),
-                valid_key: "bdd-valid-api-key".to_string(),
-            }));
-        }
-        other => panic!("unsupported auth type: {}", other),
-    }
+    world
+        .surface_config
+        .source_auth = Some(source_auth_fixture(&auth_type));
+}
+
+#[given(expr = "the surface accepts {string} and {string} source authentication")]
+fn surface_accepts_two_source_auth_methods(
+    world: &mut SurfaceWorld,
+    first: String,
+    second: String,
+) {
+    world
+        .surface_config
+        .source_auth = Some(source_auth_fixture(&first));
+    world
+        .surface_config
+        .additional_source_auth = vec![source_auth_fixture(&second)];
 }
 
 #[given(expr = "the alternate variant requires {string} source authentication")]
