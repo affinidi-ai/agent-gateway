@@ -94,6 +94,35 @@ describe('authorization server discovery round-trip', () => {
     expect(payload.access_point.caller_authentication.protected_resource).toEqual(setting);
   });
 
+  it('saves a setting that holds only a resource without inventing authorization servers or scopes', () => {
+    const setting = { resource: SETTING.resource };
+    const { nodes, payload } = rebuild(stored({ methods: [METHOD], protected_resource: setting }));
+
+    expect(callerAuthNode(nodes)?.config.protected_resource).toStrictEqual(setting);
+    expect(payload.access_point.caller_authentication.protected_resource).toStrictEqual(setting);
+    expect(
+      rebuild(payload).payload.access_point.caller_authentication.protected_resource
+    ).toStrictEqual(setting);
+  });
+
+  it('keeps a stored authorization server list through a save that does not touch it', () => {
+    const setting = {
+      resource: SETTING.resource,
+      authorization_servers: SETTING.authorization_servers,
+    };
+    const method = { ...METHOD, required_scopes: ['tools.call'] };
+    const { nodes, payload } = rebuild(stored({ methods: [method], protected_resource: setting }));
+    const edited = { ...callerAuthNode(nodes)!.config, required_scopes: ['tools.call', 'read'] };
+    const editedNodes = nodes.map(n => (n.type === 'caller-auth' ? { ...n, config: edited } : n));
+    const saved = registry.buildPayload(context(editedNodes));
+
+    expect(payload.access_point.caller_authentication.protected_resource).toStrictEqual(setting);
+    expect(saved.access_point.caller_authentication).toEqual({
+      methods: [{ ...METHOD, required_scopes: ['tools.call', 'read'] }],
+      protected_resource: setting,
+    });
+  });
+
   it('does not bring back a setting from a stale canvas copy once the surface has none', () => {
     const canvas = {
       version: 1,

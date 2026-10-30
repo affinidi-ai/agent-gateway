@@ -9,15 +9,13 @@ use serde::Serialize;
 use tracing::warn;
 
 use crate::config::NetworkConfig;
-use crate::config::agent_surface::AgentSurface;
+use crate::config::agent_surface::{AgentSurface, SurfaceProtocol};
 use crate::jwt_bearer::JwtVerificationStrategyStorage;
-use crate::jwt_bearer::models::JwtBearerAuthConfig;
 use crate::policies::failed_caller_dry_run::{
     CaseOutcome, FailedCallerCase, MAX_DRY_RUN_VIEWS, PolicyPlanes, ResolvedView, dry_run_failed_callers,
 };
-use crate::source_auth::SourceAuthConfig;
 use crate::source_auth::declaration::{
-    DeclarationOutcome, UnservableDeclaration, UnservableReason, access_point_resource_url,
+    Declaration, DeclarationOutcome, UnservableDeclaration, UnservableReason, access_point_resource_url,
     refuses_failed_callers_by_default, resolve_surface_declaration,
 };
 use crate::source_auth::errors::SourceAuthFailureKind;
@@ -37,8 +35,18 @@ pub struct DeclarationEntry {
     pub outcome: &'static str,
     /// The reason code when the outcome is `strip` or `unservable`.
     pub reason: Option<&'static str>,
-    /// The Access Point URL, when the Access Point has one.
+    /// The declared resource; for any other outcome, the resource the route's
+    /// `protected_resource` names if it names one, else the suggested Access
+    /// Point URL, else `null`.
     pub resource: Option<String>,
+    /// The issuer the metadata, challenge and card advertise. Empty unless declaring.
+    pub authorization_servers: Vec<String>,
+    /// The scopes a token must grant, which the challenge names. Empty unless declaring.
+    pub required_scopes: Vec<String>,
+    /// The `scopes_supported` of the metadata. Empty unless declaring.
+    pub scopes_supported: Vec<String>,
+    /// The protected resource metadata URL. `null` unless declaring.
+    pub metadata_url: Option<String>,
 }
 
 #[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,11 +55,11 @@ pub enum WarningCode {
     FailOpenPolicy,
     FailOpenUndetermined,
     PaymentBeforePolicy,
-    DeclarationStripped,
-    AdditionalAudiences,
     DryRunSkipped,
     FabricOnlyDeclaration,
     ProtectedResourceDropped,
+    AuthorizationServersStale,
+    CardSchemeUnavailable,
 }
 
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
@@ -105,8 +113,9 @@ const POLICY_PATH: &str = "access_point.inbound_policy";
 const TARGET_POLICY_PATH: &str = "target.policy";
 const FABRIC_SAFE_DENY: &str = "Deny input.source_auth.method == \"failed\" in target.policy, or in a gateway policy that \
                                 does not depend on input.a2a, so that callers arriving over Fabric are denied too.";
-const CALLER_AUTHENTICATION_PATH: &str = "access_point.caller_authentication";
 const PROTECTED_RESOURCE_PATH: &str = "access_point.caller_authentication.protected_resource";
+const AUTHORIZATION_SERVERS_PATH: &str = "access_point.caller_authentication.protected_resource.authorization_servers";
+const STRATEGY_PATH: &str = "access_point.caller_authentication.methods[0].jwt_verification_strategy_id";
 
 /// Compute the report for a surface record.
 pub async fn surface_report(
@@ -152,13 +161,53 @@ impl DeclarationEntry {
         outcome: &DeclarationOutcome,
         network: &NetworkConfig,
     ) -> Self {
+        let declared = match outcome {
+            DeclarationOutcome::Declare(declaration) => Some(declaration),
+            _ => None,
+        };
         Self {
-            resource: match outcome {
-                DeclarationOutcome::Declare(declaration) => Some(declaration.resource.clone()),
-                _ => access_point_resource_url(view, alias.as_deref(), network),
+            resource: match declared {
+                Some(declaration) => Some(declaration.resource.clone()),
+                None => view
+                    .protected_resource()
+                    .and_then(|configured| {
+                        configured
+                            .for_variant(alias.as_deref())
+                            .ok()
+                    })
+                    .map(|served| served.resource)
+                    .or_else(|| access_point_resource_url(view, alias.as_deref(), network)),
             },
             outcome: outcome.label(),
             reason: outcome.reason_code(),
+            authorization_servers: declared
+                .map(|declaration| {
+                    declaration
+                        .authorization_servers
+                        .clone()
+                })
+                .unwrap_or_default(),
+            required_scopes: declared
+                .map(|declaration| {
+                    declaration
+                        .required_scopes
+                        .clone()
+                })
+                .unwrap_or_default(),
+            scopes_supported: declared
+                .map(|declaration| {
+                    declaration
+                        .advertised_scopes
+                        .clone()
+                })
+                .unwrap_or_default(),
+            metadata_url: declared
+                .and_then(|declaration| {
+                    declaration
+                        .metadata_url()
+                        .ok()
+                })
+                .map(|url| url.to_string()),
             variant: alias,
         }
     }
@@ -204,17 +253,6 @@ async fn declaration_outcome(
         })
 }
 
-fn jwt_bearer_methods(view: &AgentSurface) -> impl Iterator<Item = &JwtBearerAuthConfig> {
-    view.access_point
-        .caller_authentication
-        .iter()
-        .flat_map(|authentication| authentication.methods.iter())
-        .filter_map(|method| match method {
-            SourceAuthConfig::JwtBearer(config) => Some(config),
-            _ => None,
-        })
-}
-
 /// Whether HTTP callers cannot reach the Access Point: its listen address names
 /// no listener of this gateway, so the gateway mounts no route for it and only
 /// Fabric reaches it.
@@ -234,42 +272,20 @@ fn declaration_warnings(
     network: &NetworkConfig,
 ) -> Vec<SurfaceWarning> {
     let mut warnings = Vec::new();
-    match outcome {
-        DeclarationOutcome::Strip(reason)
-            if jwt_bearer_methods(view)
-                .next()
-                .is_some() =>
+    if let DeclarationOutcome::Declare(declaration) = outcome {
+        warnings.extend(stale_authorization_servers(view, declaration, alias));
+        if matches!(view.access_point.protocol, SurfaceProtocol::A2a | SurfaceProtocol::Ap2)
+            && declaration.pin.is_none()
         {
             warnings.push(SurfaceWarning::new(
-                WarningCode::DeclarationStripped,
-                format!(
-                    "The Access Point does not declare its OAuth protection on the agent card or in protected \
-                     resource metadata: {}",
-                    reason.code()
-                ),
-                CALLER_AUTHENTICATION_PATH,
+                WarningCode::CardSchemeUnavailable,
+                "The agent card names no security scheme: the JWT verification strategy has no pinned authorization \
+                 server matching its expected_issuer and key set. Run Discover on the strategy."
+                    .to_string(),
+                STRATEGY_PATH,
                 alias,
             ));
         }
-        DeclarationOutcome::Declare(declaration) => {
-            let extra = jwt_bearer_methods(view)
-                .flat_map(|config| config.audiences.iter())
-                .filter(|audience| **audience != declaration.resource)
-                .count();
-            if extra > 0 {
-                warnings.push(SurfaceWarning::new(
-                    WarningCode::AdditionalAudiences,
-                    format!(
-                        "audiences lists {extra} value(s) besides the Access Point URL. This route declares, so a \
-                         caller's token must name the Access Point URL as its audience and the other values are \
-                         ignored here"
-                    ),
-                    "access_point.caller_authentication.methods[0].audiences",
-                    alias,
-                ));
-            }
-        }
-        DeclarationOutcome::Strip(_) | DeclarationOutcome::PassThrough | DeclarationOutcome::Unservable(_) => {}
     }
     if matches!(outcome, DeclarationOutcome::Declare(_) | DeclarationOutcome::Unservable(_))
         && reached_only_over_fabric(view, network)
@@ -286,6 +302,34 @@ fn declaration_warnings(
         ));
     }
     warnings
+}
+
+/// A stored `authorization_servers` that no longer names the issuer the
+/// strategy trusts, which the gateway advertises instead and the next save of
+/// the stored list refuses.
+fn stale_authorization_servers(
+    view: &AgentSurface,
+    declaration: &Declaration,
+    alias: Option<&str>,
+) -> Option<SurfaceWarning> {
+    let stored = view
+        .protected_resource()?
+        .authorization_servers
+        .as_ref()
+        .filter(|stored| **stored != declaration.authorization_servers)?;
+    let issuer = declaration
+        .authorization_servers
+        .first()
+        .map_or("", String::as_str);
+    Some(SurfaceWarning::new(
+        WarningCode::AuthorizationServersStale,
+        format!(
+            "authorization_servers lists {stored:?} but the JWT verification strategy now trusts {issuer}; the \
+             gateway advertises {issuer}. Send authorization_servers as [\"{issuer}\"] or omit it."
+        ),
+        AUTHORIZATION_SERVERS_PATH,
+        alias,
+    ))
 }
 
 fn takes_payment(view: &AgentSurface) -> bool {
@@ -399,7 +443,7 @@ fn dry_run_warnings(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use async_trait::async_trait;
     use serde_json::{Value, json};
 
@@ -414,7 +458,8 @@ mod tests {
     const DENY_FAILED: &str =
         "package surface.policy\ndefault allow := true\nallow := false if input.source_auth.method == \"failed\"\n";
 
-    struct OneStrategy(JwtVerificationStrategy);
+    /// A read-only strategy store holding one strategy.
+    pub(crate) struct OneStrategy(pub(crate) JwtVerificationStrategy);
 
     #[async_trait]
     impl JwtVerificationStrategyStorage for OneStrategy {
@@ -519,8 +564,8 @@ mod tests {
         })
     }
 
-    /// A surface whose `target.policy`, which both the direct path and Fabric receive
-    /// run, is `policy`.
+    /// An A2A surface whose `target.policy`, which both the direct path and Fabric
+    /// receive run, is `policy`.
     fn surface(
         methods: Vec<Value>,
         policy: Option<&str>,
@@ -543,8 +588,24 @@ mod tests {
         .expect("surface")
     }
 
+    /// `view` with a `protected_resource` naming its Access Point URL.
+    fn declares(mut view: AgentSurface) -> AgentSurface {
+        view.access_point
+            .caller_authentication
+            .as_mut()
+            .expect("caller authentication")
+            .protected_resource =
+            Some(serde_json::from_value(json!({"resource": format!("{ORIGIN}/agent")})).expect("protected resource"));
+        view
+    }
+
+    /// A JWT Bearer Access Point with `required_scopes` and no `protected_resource`.
+    fn undeclared(policy: Option<&str>) -> AgentSurface {
+        surface(vec![jwt_method(&[])], policy, json!([]))
+    }
+
     fn declaring(policy: Option<&str>) -> AgentSurface {
-        surface(vec![jwt_method(&[&format!("{ORIGIN}/agent")])], policy, json!([]))
+        declares(undeclared(policy))
     }
 
     fn variant(
@@ -590,73 +651,72 @@ mod tests {
             .collect()
     }
 
+    /// The entry of an outcome other than `declare`, which carries no advertised values.
+    fn entry(
+        variant: Option<&str>,
+        outcome: &'static str,
+        reason: Option<&'static str>,
+        resource: Option<String>,
+    ) -> DeclarationEntry {
+        DeclarationEntry {
+            variant: variant.map(str::to_string),
+            outcome,
+            reason,
+            resource,
+            authorization_servers: Vec::new(),
+            required_scopes: Vec::new(),
+            scopes_supported: Vec::new(),
+            metadata_url: None,
+        }
+    }
+
+    fn declared_entry(
+        variant: Option<&str>,
+        route: &str,
+    ) -> DeclarationEntry {
+        DeclarationEntry {
+            variant: variant.map(str::to_string),
+            outcome: "declare",
+            reason: None,
+            resource: Some(format!("{ORIGIN}{route}")),
+            authorization_servers: vec![ISSUER.to_string()],
+            required_scopes: vec!["agent.invoke".to_string()],
+            scopes_supported: vec!["agent.invoke".to_string()],
+            metadata_url: Some(format!("{ORIGIN}/.well-known/oauth-protected-resource{route}")),
+        }
+    }
+
     #[tokio::test]
     async fn test_report_declares_per_variant_and_reports_no_fail_open_on_declaring_views() {
-        let surface = surface(
-            vec![jwt_method(&[&format!("{ORIGIN}/agent"), &format!("{ORIGIN}/agent$beta")])],
+        let surface = declares(surface(
+            vec![jwt_method(&[])],
             None,
             json!([
                 variant("beta", true, json!({"access_point": {"inbound_policy": {"policy_definition_id": "deny"}}})),
                 variant("off", false, json!({})),
             ]),
-        );
+        ));
         let saved = report(&surface, &strategy(true)).await;
 
         assert_eq!(
             saved.declarations,
-            vec![
-                DeclarationEntry {
-                    variant: None,
-                    outcome: "declare",
-                    reason: None,
-                    resource: Some(format!("{ORIGIN}/agent")),
-                },
-                DeclarationEntry {
-                    variant: Some("beta".into()),
-                    outcome: "declare",
-                    reason: None,
-                    resource: Some(format!("{ORIGIN}/agent$beta")),
-                },
-            ]
-        );
-        assert_eq!(
-            codes(&saved),
-            vec![(WarningCode::AdditionalAudiences, None), (WarningCode::AdditionalAudiences, Some("beta"))],
-            "a declaring view refuses failed callers before policy, so no policy can let one through"
-        );
-        let audiences = &saved.warnings[0];
-        assert_eq!(audiences.path, "access_point.caller_authentication.methods[0].audiences");
-        assert!(
-            audiences
-                .message
-                .starts_with("audiences lists 1 value(s)"),
-            "{}",
-            audiences.message
+            vec![declared_entry(None, "/agent"), declared_entry(Some("beta"), "/agent$beta")]
         );
         assert!(
-            audiences
-                .message
-                .contains("ignored"),
-            "{}",
-            audiences.message
-        );
-        assert!(
-            !audiences
-                .message
-                .contains("also accepted"),
-            "{}",
-            audiences.message
+            saved.warnings.is_empty(),
+            "a declaring view refuses failed callers before policy, so no policy can let one through: {:?}",
+            saved.warnings
         );
     }
 
     #[tokio::test]
     async fn test_report_warns_where_failed_callers_get_through_a_view_that_does_not_declare() {
-        let open = declaring(None);
-        let saved = report(&open, &strategy(false)).await;
+        let saved = report(&undeclared(None), &strategy(true)).await;
 
         assert_eq!(saved.declarations[0].outcome, "strip");
-        assert_eq!(codes(&saved), vec![(WarningCode::DeclarationStripped, None), (WarningCode::FailOpenPolicy, None)]);
-        let fail_open = &saved.warnings[1];
+        assert_eq!(saved.declarations[0].reason, Some("not_declared"));
+        assert_eq!(codes(&saved), vec![(WarningCode::FailOpenPolicy, None)]);
+        let fail_open = &saved.warnings[0];
         assert_eq!(fail_open.path, "access_point.inbound_policy");
         assert!(
             fail_open
@@ -683,14 +743,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_report_warns_when_only_the_inbound_policy_denies_failed_callers() {
-        let mut inbound_only = declaring(None);
+        let mut inbound_only = undeclared(None);
         inbound_only
             .access_point
             .inbound_policy = Some(serde_json::from_value(json!({"policy_definition_id": "deny"})).expect("policy"));
-        let saved = report(&inbound_only, &strategy(false)).await;
+        let saved = report(&inbound_only, &strategy(true)).await;
 
-        assert_eq!(codes(&saved), vec![(WarningCode::DeclarationStripped, None), (WarningCode::FailOpenPolicy, None)]);
-        let fabric = &saved.warnings[1];
+        assert_eq!(codes(&saved), vec![(WarningCode::FailOpenPolicy, None)]);
+        let fabric = &saved.warnings[0];
         assert_eq!(fabric.path, "target.policy");
         assert!(
             fabric
@@ -707,62 +767,71 @@ mod tests {
             fabric.message
         );
 
-        let declared = report(&inbound_only, &strategy(true)).await;
+        let declared = report(&declares(inbound_only), &strategy(true)).await;
+        assert_eq!(declared.declarations[0].outcome, "declare");
         assert!(
-            declared
-                .warnings
-                .iter()
-                .all(|warning| warning.code != WarningCode::FailOpenPolicy),
+            declared.warnings.is_empty(),
             "a declaring view refuses failed callers before policy on both paths: {:?}",
             declared.warnings
         );
 
-        let covered = report(&declaring(Some("deny")), &strategy(false)).await;
-        assert_eq!(
-            codes(&covered),
-            vec![(WarningCode::DeclarationStripped, None)],
-            "target.policy denies failed callers on the direct path and over Fabric"
+        let covered = report(&undeclared(Some("deny")), &strategy(true)).await;
+        assert!(
+            covered.warnings.is_empty(),
+            "target.policy denies failed callers on the direct path and over Fabric: {:?}",
+            covered.warnings
         );
     }
 
     #[tokio::test]
     async fn test_report_names_the_strip_reason_for_a_jwt_bearer_access_point() {
-        let stripped = report(&declaring(Some("deny")), &strategy(false)).await;
+        let not_declared = report(&undeclared(Some("deny")), &strategy(true)).await;
         assert_eq!(
-            stripped.declarations,
-            vec![DeclarationEntry {
-                variant: None,
-                outcome: "strip",
-                reason: Some("not_pinned"),
-                resource: Some(format!("{ORIGIN}/agent")),
-            }]
+            not_declared.declarations,
+            vec![entry(None, "strip", Some("not_declared"), Some(format!("{ORIGIN}/agent")))],
+            "the resource is the suggested Access Point URL"
         );
-        assert_eq!(codes(&stripped), vec![(WarningCode::DeclarationStripped, None)]);
-        assert_eq!(stripped.warnings[0].path, "access_point.caller_authentication");
         assert!(
-            stripped.warnings[0]
-                .message
-                .ends_with("not_pinned"),
-            "{}",
-            stripped.warnings[0].message
+            not_declared
+                .warnings
+                .is_empty(),
+            "{:?}",
+            not_declared.warnings
         );
+
+        let unread = report_with(&undeclared(Some("deny")), &BrokenStore).await;
+        assert_eq!(
+            unread.declarations, not_declared.declarations,
+            "an Access Point without protected_resource never reads the strategy store"
+        );
+
+        let open = report(&undeclared(None), &strategy(true)).await;
+        assert_eq!(codes(&open), vec![(WarningCode::FailOpenPolicy, None)], "nothing beyond fail_open_policy");
     }
 
     #[tokio::test]
-    async fn test_report_names_forwards_caller_token_when_the_method_forwards_the_token() {
-        let mut method = jwt_method(&[&format!("{ORIGIN}/agent")]);
+    async fn test_report_names_a_forwarding_method_unservable_with_protected_resource_and_not_declared_without() {
+        let mut method = jwt_method(&[]);
         method["forward_header"] = json!(true);
-        let forwarding = report(&surface(vec![method], Some("deny"), json!([])), &strategy(true)).await;
+        let forwarding = surface(vec![method], Some("deny"), json!([]));
 
-        assert_eq!(forwarding.declarations[0].outcome, "strip");
-        assert_eq!(forwarding.declarations[0].reason, Some("forwards_caller_token"));
-        assert_eq!(codes(&forwarding), vec![(WarningCode::DeclarationStripped, None)]);
-        assert!(
-            forwarding.warnings[0]
-                .message
-                .ends_with("forwards_caller_token"),
-            "{}",
-            forwarding.warnings[0].message
+        let without = report(&forwarding, &strategy(true)).await;
+        assert_eq!(
+            without.declarations,
+            vec![entry(None, "strip", Some("not_declared"), Some(format!("{ORIGIN}/agent")))]
+        );
+        assert!(without.warnings.is_empty(), "{:?}", without.warnings);
+
+        let with = report(&declares(forwarding), &strategy(true)).await;
+        assert_eq!(
+            with.declarations,
+            vec![entry(
+                None,
+                "unservable",
+                Some("incompatible_caller_authentication"),
+                Some(format!("{ORIGIN}/agent"))
+            )],
+            "the resource is the one protected_resource names"
         );
     }
 
@@ -771,7 +840,8 @@ mod tests {
         let api_key = json!({"type": "api_key", "extraction": {"source": "http_header", "field": "X-Key"},
             "secret_id": "KEYS"});
         let other = report(&surface(vec![api_key], Some("deny"), json!([])), &strategy(true)).await;
-        assert_eq!(other.declarations[0].reason, Some("method_not_declarable"));
+        assert_eq!(other.declarations[0].outcome, "strip");
+        assert_eq!(other.declarations[0].reason, Some("not_declared"));
         assert!(other.warnings.is_empty(), "{:?}", other.warnings);
 
         let open = report(&surface(vec![], None, json!([])), &strategy(true)).await;
@@ -785,34 +855,28 @@ mod tests {
         let enabled = |on: bool| -> Option<crate::config::agent_surface::PaymentPolicy> {
             Some(serde_json::from_value(json!({"type": "x402", "enabled": on})).expect("payment policy"))
         };
-        let mut paid = declaring(Some("deny"));
+        let mut paid = undeclared(Some("deny"));
         paid.target.payment_policy = enabled(true);
 
-        let taken = report(&paid, &strategy(false)).await;
-        assert_eq!(
-            codes(&taken),
-            vec![(WarningCode::DeclarationStripped, None), (WarningCode::PaymentBeforePolicy, None)]
-        );
-        assert_eq!(taken.warnings[1].path, "target.payment_policy");
+        let taken = report(&paid, &strategy(true)).await;
+        assert_eq!(codes(&taken), vec![(WarningCode::PaymentBeforePolicy, None)]);
+        assert_eq!(taken.warnings[0].path, "target.payment_policy");
 
-        let declared = report(&paid, &strategy(true)).await;
+        let declared = report(&declares(paid.clone()), &strategy(true)).await;
         assert!(declared.warnings.is_empty(), "a declaring view refuses before payment: {:?}", declared.warnings);
 
         paid.target.payment_policy = enabled(false);
-        let disabled = report(&paid, &strategy(false)).await;
-        assert_eq!(codes(&disabled), vec![(WarningCode::DeclarationStripped, None)]);
+        let disabled = report(&paid, &strategy(true)).await;
+        assert!(disabled.warnings.is_empty(), "{:?}", disabled.warnings);
     }
 
     #[tokio::test]
     async fn test_report_warns_when_the_policy_cannot_be_evaluated() {
-        let missing_policy = declaring(Some("missing"));
-        let undetermined = report(&missing_policy, &strategy(false)).await;
-        assert_eq!(
-            codes(&undetermined),
-            vec![(WarningCode::DeclarationStripped, None), (WarningCode::FailOpenUndetermined, None)]
-        );
+        let missing_policy = undeclared(Some("missing"));
+        let undetermined = report(&missing_policy, &strategy(true)).await;
+        assert_eq!(codes(&undetermined), vec![(WarningCode::FailOpenUndetermined, None)]);
 
-        let declared = report(&missing_policy, &strategy(true)).await;
+        let declared = report(&declares(missing_policy), &strategy(true)).await;
         assert!(declared.warnings.is_empty(), "{:?}", declared.warnings);
     }
 
@@ -825,7 +889,7 @@ mod tests {
 
         let saved = report(&surface, &strategy(true)).await;
 
-        assert_eq!(saved.declarations.len(), MAX_DRY_RUN_VIEWS + 1, "every variant is still declared");
+        assert_eq!(saved.declarations.len(), MAX_DRY_RUN_VIEWS + 1, "every variant is still reported");
         let skipped: Vec<&SurfaceWarning> = saved
             .warnings
             .iter()
@@ -860,19 +924,30 @@ mod tests {
             .listen_address = "0.0.0.0:8443".into();
         let fabric_only = report(&unmounted, &strategy(true)).await;
 
-        assert_eq!(fabric_only.declarations[0].outcome, "declare");
+        assert_eq!(
+            fabric_only.declarations,
+            vec![declared_entry(None, "/agent")],
+            "the bind address names the listener"
+        );
         assert_eq!(codes(&fabric_only), vec![(WarningCode::FabricOnlyDeclaration, None)]);
         assert_eq!(fabric_only.warnings[0].path, "access_point.listen_address");
 
         let mounted = report(&declaring(Some("deny")), &strategy(true)).await;
         assert!(mounted.warnings.is_empty(), "{:?}", mounted.warnings);
 
-        let mut stripped = declaring(Some("deny"));
-        stripped
+        let mut not_declaring = undeclared(Some("deny"));
+        not_declaring
             .access_point
             .listen_address = "0.0.0.0:8443".into();
-        let not_declaring = report(&stripped, &strategy(false)).await;
-        assert_eq!(codes(&not_declaring), vec![(WarningCode::DeclarationStripped, None)]);
+        let not_declaring = report(&not_declaring, &strategy(true)).await;
+        assert_eq!(not_declaring.declarations[0].reason, Some("not_declared"));
+        assert!(
+            not_declaring
+                .warnings
+                .is_empty(),
+            "{:?}",
+            not_declaring.warnings
+        );
     }
 
     #[tokio::test]
@@ -880,16 +955,11 @@ mod tests {
         let unreadable = report_with(&declaring(Some("deny")), &BrokenStore).await;
         assert_eq!(
             unreadable.declarations,
-            vec![DeclarationEntry {
-                variant: None,
-                outcome: "unservable",
-                reason: Some("strategy_store_unavailable"),
-                resource: Some(format!("{ORIGIN}/agent")),
-            }]
+            vec![entry(None, "unservable", Some("strategy_store_unavailable"), Some(format!("{ORIGIN}/agent")))]
         );
     }
 
-    /// An MCP Access Point at `route` whose one method is `method` and whose
+    /// An Access Point at `route` whose one method is `method` and whose
     /// `protected_resource` is `protected`.
     fn explicit(
         protocol: &str,
@@ -910,14 +980,28 @@ mod tests {
 
     #[tokio::test]
     async fn test_report_names_why_an_explicit_protected_resource_is_unservable() {
-        let resource = json!({"resource": format!("{ORIGIN}/agent"), "authorization_servers": [ISSUER]});
-        for (case, surface, expected) in [
-            ("declares", explicit("mcp", "/agent", jwt_method(&[]), resource.clone(), json!([])), ("declare", None)),
+        let resource = json!({"resource": format!("{ORIGIN}/agent")});
+        let on = |protocol: &str| explicit(protocol, "/agent", jwt_method(&[]), resource.clone(), json!([]));
+        let mut elsewhere = strategy(true);
+        elsewhere.0.id = "strategy-2".into();
+        let mut did_issuer = strategy(false);
+        did_issuer.0.expected_issuer = "did:web:as.example".into();
+        for (case, view, store, expected) in [
+            ("mcp declares", on("mcp"), strategy(true), ("declare", None)),
+            ("a2a declares", on("a2a"), strategy(true), ("declare", None)),
             (
-                "not MCP",
-                explicit("a2a", "/agent", jwt_method(&[]), resource.clone(), json!([])),
-                ("unservable", Some("not_mcp")),
+                "the strategy's issuer is listed",
+                explicit(
+                    "mcp",
+                    "/agent",
+                    jwt_method(&[]),
+                    json!({"resource": format!("{ORIGIN}/agent"), "authorization_servers": [ISSUER]}),
+                    json!([]),
+                ),
+                strategy(true),
+                ("declare", None),
             ),
+            ("didcomm", on("didcomm"), strategy(true), ("unservable", Some("unsupported_protocol"))),
             (
                 "no authorization server",
                 explicit(
@@ -927,11 +1011,13 @@ mod tests {
                     json!({"resource": format!("{ORIGIN}/agent"), "authorization_servers": []}),
                     json!([]),
                 ),
+                strategy(true),
                 ("unservable", Some("invalid_protected_resource")),
             ),
             (
                 "audiences listed",
                 explicit("mcp", "/agent", jwt_method(&[&format!("{ORIGIN}/agent")]), resource.clone(), json!([])),
+                strategy(true),
                 ("unservable", Some("incompatible_caller_authentication")),
             ),
             (
@@ -940,13 +1026,16 @@ mod tests {
                     "mcp",
                     "/agent",
                     jwt_method(&[]),
-                    json!({"resource": "https://other.example/agent", "authorization_servers": [ISSUER]}),
+                    json!({"resource": "https://other.example/agent"}),
                     json!([]),
                 ),
+                strategy(true),
                 ("unservable", Some("resource_mismatch")),
             ),
+            ("strategy missing", on("a2a"), elsewhere, ("unservable", Some("strategy_unavailable"))),
+            ("did issuer", on("mcp"), did_issuer, ("unservable", Some("issuer_not_advertisable"))),
         ] {
-            let reported = report(&surface, &strategy(true)).await;
+            let reported = report(&view, &store).await;
             assert_eq!((reported.declarations[0].outcome, reported.declarations[0].reason), expected, "{case}");
         }
 
@@ -954,7 +1043,7 @@ mod tests {
             "mcp",
             "/",
             jwt_method(&[]),
-            json!({"resource": format!("{ORIGIN}/"), "authorization_servers": [ISSUER]}),
+            json!({"resource": format!("{ORIGIN}/")}),
             json!([variant("beta", true, json!({}))]),
         );
         let reported = report(&root, &strategy(true)).await;
@@ -969,6 +1058,88 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_report_warns_when_a_declaring_a2a_card_has_no_pinned_server() {
+        for protocol in ["a2a", "ap2"] {
+            let card = explicit(
+                protocol,
+                "/agent",
+                jwt_method(&[]),
+                json!({"resource": format!("{ORIGIN}/agent")}),
+                json!([]),
+            );
+
+            let unpinned = report(&card, &strategy(false)).await;
+            assert_eq!(unpinned.declarations, vec![declared_entry(None, "/agent")], "{protocol}");
+            assert_eq!(codes(&unpinned), vec![(WarningCode::CardSchemeUnavailable, None)], "{protocol}");
+            assert_eq!(
+                unpinned.warnings[0].path,
+                "access_point.caller_authentication.methods[0].jwt_verification_strategy_id"
+            );
+            assert_eq!(
+                unpinned.warnings[0].message,
+                "The agent card names no security scheme: the JWT verification strategy has no pinned authorization \
+                 server matching its expected_issuer and key set. Run Discover on the strategy."
+            );
+
+            let mut mismatched = strategy(true);
+            if let Some(pin) = mismatched
+                .0
+                .authorization_server
+                .as_mut()
+            {
+                pin.issuer = "https://other-as.example/".into();
+            }
+            let mismatched = report(&card, &mismatched).await;
+            assert_eq!(
+                codes(&mismatched),
+                vec![(WarningCode::CardSchemeUnavailable, None)],
+                "{protocol}: a pin for another issuer is no pin"
+            );
+
+            let pinned = report(&card, &strategy(true)).await;
+            assert!(pinned.warnings.is_empty(), "{protocol}: {:?}", pinned.warnings);
+        }
+
+        let mcp = explicit("mcp", "/agent", jwt_method(&[]), json!({"resource": format!("{ORIGIN}/agent")}), json!([]));
+        let unpinned = report(&mcp, &strategy(false)).await;
+        assert_eq!(unpinned.declarations[0].outcome, "declare");
+        assert!(unpinned.warnings.is_empty(), "an MCP Access Point has no agent card: {:?}", unpinned.warnings);
+    }
+
+    #[tokio::test]
+    async fn test_report_warns_when_stored_authorization_servers_differ_from_the_strategy_issuer() {
+        let listing = |servers: Value| {
+            explicit(
+                "mcp",
+                "/agent",
+                jwt_method(&[]),
+                json!({"resource": format!("{ORIGIN}/agent"), "authorization_servers": servers}),
+                json!([]),
+            )
+        };
+
+        let stale = report(&listing(json!(["https://old.example/"])), &strategy(true)).await;
+        assert_eq!(stale.declarations, vec![declared_entry(None, "/agent")], "the stored list is never advertised");
+        assert_eq!(codes(&stale), vec![(WarningCode::AuthorizationServersStale, None)]);
+        assert_eq!(
+            stale.warnings[0].path,
+            "access_point.caller_authentication.protected_resource.authorization_servers"
+        );
+        assert_eq!(
+            stale.warnings[0].message,
+            "authorization_servers lists [\"https://old.example/\"] but the JWT verification strategy now trusts \
+             https://as.example/; the gateway advertises https://as.example/. Send authorization_servers as \
+             [\"https://as.example/\"] or omit it."
+        );
+
+        let current = report(&listing(json!([ISSUER])), &strategy(true)).await;
+        assert!(current.warnings.is_empty(), "{:?}", current.warnings);
+
+        let omitted = report(&declaring(Some("deny")), &strategy(true)).await;
+        assert!(omitted.warnings.is_empty(), "{:?}", omitted.warnings);
+    }
+
     #[test]
     fn test_dropped_protected_resource_warning_names_the_setting_and_variant() {
         let dropped = SurfaceWarning::protected_resource_dropped(Some("beta"));
@@ -981,12 +1152,10 @@ mod tests {
     #[test]
     fn test_report_serializes_with_the_documented_field_names() {
         let report = SurfaceReport {
-            declarations: vec![DeclarationEntry {
-                variant: None,
-                outcome: "strip",
-                reason: Some("not_pinned"),
-                resource: None,
-            }],
+            declarations: vec![
+                declared_entry(None, "/agent"),
+                entry(Some("beta"), "strip", Some("not_declared"), None),
+            ],
             warnings: vec![SurfaceWarning {
                 code: WarningCode::FailOpenUndetermined,
                 message: "m".into(),
@@ -997,14 +1166,55 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&report).expect("json"),
             json!({
-                "declarations": [{"variant": null, "outcome": "strip", "reason": "not_pinned", "resource": null}],
+                "declarations": [
+                    {"variant": null, "outcome": "declare", "reason": null, "resource": format!("{ORIGIN}/agent"),
+                     "authorization_servers": [ISSUER], "required_scopes": ["agent.invoke"],
+                     "scopes_supported": ["agent.invoke"],
+                     "metadata_url": format!("{ORIGIN}/.well-known/oauth-protected-resource/agent")},
+                    {"variant": "beta", "outcome": "strip", "reason": "not_declared", "resource": null,
+                     "authorization_servers": [], "required_scopes": [], "scopes_supported": [], "metadata_url": null},
+                ],
                 "warnings": [{"code": "fail_open_undetermined", "message": "m", "path": "p", "variant": "beta"}],
             })
         );
+
+        let every = [
+            WarningCode::FailOpenPolicy,
+            WarningCode::FailOpenUndetermined,
+            WarningCode::PaymentBeforePolicy,
+            WarningCode::DryRunSkipped,
+            WarningCode::FabricOnlyDeclaration,
+            WarningCode::ProtectedResourceDropped,
+            WarningCode::AuthorizationServersStale,
+            WarningCode::CardSchemeUnavailable,
+        ];
+        for code in every {
+            match code {
+                WarningCode::FailOpenPolicy
+                | WarningCode::FailOpenUndetermined
+                | WarningCode::PaymentBeforePolicy
+                | WarningCode::DryRunSkipped
+                | WarningCode::FabricOnlyDeclaration
+                | WarningCode::ProtectedResourceDropped
+                | WarningCode::AuthorizationServersStale
+                | WarningCode::CardSchemeUnavailable => {}
+            }
+        }
+        let names = serde_json::to_value(every).expect("json");
         assert_eq!(
-            serde_json::to_value([WarningCode::FabricOnlyDeclaration, WarningCode::ProtectedResourceDropped])
-                .expect("json"),
-            json!(["fabric_only_declaration", "protected_resource_dropped"])
+            names,
+            json!([
+                "fail_open_policy",
+                "fail_open_undetermined",
+                "payment_before_policy",
+                "dry_run_skipped",
+                "fabric_only_declaration",
+                "protected_resource_dropped",
+                "authorization_servers_stale",
+                "card_scheme_unavailable",
+            ]),
+            "the match above lists every code, so a removed code such as declaration_stripped or \
+             additional_audiences cannot be serialized"
         );
     }
 }

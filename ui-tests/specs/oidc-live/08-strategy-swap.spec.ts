@@ -61,7 +61,8 @@ test.describe('Strategy swap', () => {
         const target = Object.values(names.strategies).find(strategy => strategy.name === strategyName);
         const [method] = saved.access_point.caller_authentication?.methods ?? [];
         expect(method.jwt_verification_strategy_id).toBe(target?.id);
-        expect(method.audiences).toEqual([env.entryPointUrl]);
+        expect(method.audiences ?? []).toEqual([]);
+        expect(saved.access_point.caller_authentication?.protected_resource).toEqual({resource: env.entryPointUrl, scopes: []});
         expect(method.required_scopes).toEqual([names.scopes.caller]);
         expect(saved.warnings ?? []).toEqual([]);
     }
@@ -121,8 +122,11 @@ test.describe('Strategy swap', () => {
         await expect(page.getByTestId('caller-auth-jwt-strategy')).toHaveValue(names.strategies.hydraB.id);
         await expect(page.getByTestId('caller-auth-outcome-chip').first()).toContainText('Declares OAuth');
         await expect(page.getByTestId('caller-auth-discovery-derived-authorization-server')).toHaveText(env.hydraB.issuer);
-        await expect(page.getByTestId('caller-auth-discovery-audience-listed')).toBeVisible();
-        await expect(page.getByTestId('caller-auth-discovery-derived-notes')).toHaveCount(0);
+        await expect(page.getByTestId('caller-auth-discovery-switch')).toBeChecked();
+        await expect(page.getByTestId('caller-auth-discovery-derived-authorization-server-source')).toContainText(
+            names.strategies.hydraB.name
+        );
+        await expect(page.getByTestId('caller-auth-discovery-authorization-servers-error')).toHaveCount(0);
     });
 
     test('swapping back restores hydra-a, still without a restart', async ({page}) => {

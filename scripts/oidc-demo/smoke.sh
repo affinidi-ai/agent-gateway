@@ -138,6 +138,8 @@ for name in hydra-a.system b-demo-caller.secret "b-${HOP2_CLIENT}.secret" test-t
         fail "the seed dry run printed the value of ${name}"
     fi
 done
+grep -qF "\"resource\": \"${AP_URL}\"" "${TMP_DIR}/seed-dry-run.txt" || fail "the seed dry run surface does not publish authorization server discovery for ${AP_URL}"
+if grep -qE '"audiences": \[ *("|$)' "${TMP_DIR}/seed-dry-run.txt"; then fail "the seed dry run surface still lists audiences"; fi
 if grep -q 'BEGIN' "${TMP_DIR}/seed-dry-run.txt"; then fail "the seed dry run printed key material"; fi
 pass "dry run printed no secret values or key material"
 

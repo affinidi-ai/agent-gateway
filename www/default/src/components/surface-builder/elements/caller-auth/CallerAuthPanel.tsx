@@ -26,17 +26,14 @@ const CallerAuthPanel: React.FC<ConfigPanelProps> = ({
   const surfaceId = useParams<{ surfaceId: string }>().surfaceId ?? meta?.surfaceId;
   const declares = method === 'jwt_bearer' && declaresOn(protocol);
   const discovery = readProtectedResource(config.protected_resource);
-  const showsDiscovery = protocol === 'mcp' && method === 'jwt_bearer';
-  const discoveryError = showsDiscovery
-    ? discoverySaveError(meta?.saveError, discovery?.resource)
-    : null;
+  const discoveryError = declares ? discoverySaveError(meta?.saveError, discovery?.resource) : null;
 
   return (
     <>
       <Form.Text className="text-muted d-block mb-1" style={{ fontSize: '10px' }}>
-        Extracts and verifies the caller&apos;s identity before any policy or payment gate runs. An
-        Access Point that declares its authorization server refuses a missing or invalid token
-        itself, with a challenge. Otherwise a failed credential reaches policy as{' '}
+        Extracts and verifies the caller&apos;s identity before any policy or payment gate runs.
+        With <strong>Authorization server discovery</strong> on, the gateway refuses a missing or
+        invalid token itself, with a challenge. Otherwise a failed credential reaches policy as{' '}
         <code>source_auth.method == &quot;failed&quot;</code>: add a policy that denies unverified
         callers, or the request is forwarded with no asserted identity.
       </Form.Text>
@@ -93,21 +90,13 @@ const CallerAuthPanel: React.FC<ConfigPanelProps> = ({
           &quot;Configure…&quot; below for details on each option. Default: JWT Bearer, the standard
           choice unless you specifically need an API key or client certificate.
         </Form.Text>
-        {showsDiscovery && (
+        {declares && (
           <Form.Text
             className="text-muted d-block mt-2"
             style={{ fontSize: '10px' }}
             data-testid="caller-auth-panel-discovery-status"
           >
-            Authorization server discovery:{' '}
-            {discovery ? (
-              <strong>
-                on, {discovery.authorization_servers.length} authorization server
-                {discovery.authorization_servers.length === 1 ? '' : 's'}
-              </strong>
-            ) : (
-              <strong>off</strong>
-            )}
+            Authorization server discovery: <strong>{discovery ? 'on' : 'off'}</strong>
           </Form.Text>
         )}
         {discoveryError && (

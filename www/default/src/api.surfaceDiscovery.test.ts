@@ -2,11 +2,7 @@ import { apiClient, type AgentSurface } from './api';
 
 const fetchMock = jest.fn();
 
-const SETTING = {
-  resource: 'https://gateway.example/mcp/alpha',
-  authorization_servers: ['https://idp.example/realms/agents'],
-  scopes: ['tools'],
-};
+const SETTING = { resource: 'https://gateway.example/mcp/alpha' };
 
 const SURFACE: AgentSurface = {
   surface_id: 's-1',
@@ -69,6 +65,29 @@ describe('surface API and authorization server discovery', () => {
     expect(saved.target.agent_identity).toEqual(agent_identity);
   });
 
+  it('sends a stored authorization server list back unchanged', async () => {
+    const stored = {
+      ...SETTING,
+      authorization_servers: ['https://idp.example/realms/agents'],
+      scopes: ['tools'],
+    };
+    const callerAuthentication = {
+      methods: SURFACE.access_point.caller_authentication!.methods,
+      protected_resource: stored,
+    };
+    const surface = {
+      ...SURFACE,
+      access_point: { ...SURFACE.access_point, caller_authentication: callerAuthentication },
+    };
+    fetchMock.mockResolvedValue(ok(surface));
+
+    const saved = await apiClient.updateSurface('s-1', surface);
+
+    const { body } = sent();
+    expect((body.access_point as any).caller_authentication.protected_resource).toEqual(stored);
+    expect(saved.access_point.caller_authentication?.protected_resource).toEqual(stored);
+  });
+
   it('sends a null that removes the setting on the same PUT', async () => {
     fetchMock.mockResolvedValue(ok(SURFACE));
 
@@ -104,9 +123,9 @@ describe('surface API and authorization server discovery', () => {
     ];
     const warnings = [
       {
-        code: 'declaration_stripped',
-        message: 'Declaration stripped.',
-        path: 'access_point',
+        code: 'fail_open_policy',
+        message: 'A caller whose token fails reaches policy, and no policy denies it.',
+        path: 'access_point.caller_authentication',
         variant: 'beta',
       },
     ];

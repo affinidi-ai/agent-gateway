@@ -38,8 +38,8 @@ _gateway_offset() {
 }
 GATEWAY_HTTP_PORT="${OIDC_DEMO_GATEWAY_PORT:-$((8080 + $(_gateway_offset)))}"
 GATEWAY_URL="http://localhost:${GATEWAY_HTTP_PORT}"
-# The Access Point lives on the gateway's HTTPS listener: an Access Point declares its
-# authorization server only at a canonical https URL. Clients trust the listener's development
+# The Access Point lives on the gateway's HTTPS listener: it publishes authorization server
+# discovery only at a canonical https URL. Clients trust the listener's development
 # certificate through --cacert.
 GATEWAY_HTTPS_PORT="${OIDC_DEMO_GATEWAY_HTTPS_PORT:-$((8443 + $(_gateway_offset)))}"
 ACCESS_POINT_ORIGIN="https://localhost:${GATEWAY_HTTPS_PORT}"
@@ -215,9 +215,13 @@ jwt_claims() { printf '%s' "$1" | python3 -I "${OIDC_DEMO_DIR}/jwt_tools.py" dec
 
 # caller_auth_method_json STRATEGY_ID: the Access Point's jwt_bearer method for this demo.
 caller_auth_method_json() {
-    jq -n --arg sid "$1" --arg aud "${AP_URL}" --arg scope "${REQUIRED_SCOPE}" \
-        '{type: "jwt_bearer", jwt_verification_strategy_id: $sid, audiences: [$aud], required_scopes: [$scope]}'
+    jq -n --arg sid "$1" --arg scope "${REQUIRED_SCOPE}" \
+        '{type: "jwt_bearer", jwt_verification_strategy_id: $sid, audiences: [], required_scopes: [$scope]}'
 }
+
+# caller_protected_resource_json: the Access Point's authorization server discovery for this demo: its resource
+# is the Access Point URL; the authorization server and scopes come from the strategy and required_scopes.
+caller_protected_resource_json() { jq -n --arg ap "${AP_URL}" '{resource: $ap}'; }
 
 # gateway_session: logs in through the test-mode endpoint and sets SESSION_TOKEN and SESSION_HEADER_FILE (a
 # mode 600 file under TMP_DIR holding the Authorization header, for curl -H @file). Needs make_tmp first.
@@ -303,9 +307,9 @@ auth0_token() {
     jq -er '.access_token' "${out}"
 }
 
-# auth0_auth_method_json STRATEGY_ID: the Access Point's jwt_bearer method for Auth0. Its one audience is the
-# Access Point URL, which auth0_load checked is the API identifier Auth0 puts in aud.
+# auth0_auth_method_json STRATEGY_ID: the Access Point's jwt_bearer method for Auth0. The Access Point URL, which
+# auth0_load checked is the API identifier Auth0 puts in aud, is the discovery resource.
 auth0_auth_method_json() {
-    jq -n --arg sid "$1" --arg ap "${AP_URL}" --arg scope "${AUTH0_REQUIRED_SCOPE}" \
-        '{type: "jwt_bearer", jwt_verification_strategy_id: $sid, audiences: [$ap], required_scopes: [$scope]}'
+    jq -n --arg sid "$1" --arg scope "${AUTH0_REQUIRED_SCOPE}" \
+        '{type: "jwt_bearer", jwt_verification_strategy_id: $sid, audiences: [], required_scopes: [$scope]}'
 }

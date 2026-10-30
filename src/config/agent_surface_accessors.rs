@@ -85,7 +85,8 @@ impl AgentSurface {
             .and_then(|ca| ca.methods.first())
     }
 
-    /// RFC 9728 settings of the Access Point's caller authentication.
+    /// RFC 9728 settings of the Access Point's caller authentication: set, the
+    /// Access Point declares (MCP, A2A or AP2).
     #[inline]
     pub fn protected_resource(&self) -> Option<&crate::protocols::protected_resource::ProtectedResourceConfig> {
         self.access_point

@@ -3,22 +3,20 @@ import type { Protocol } from '../types';
 
 /**
  * Authorization server discovery (`caller_authentication.protected_resource`):
- * the RFC 9728 metadata an MCP Access Point publishes so a client finds where
- * to get a token. These helpers mirror the gateway's save-time rules in
- * `src/protocols/protected_resource.rs` and `validate_protected_resource` in
- * `src/config/agent_surface.rs`, so the editor flags a setting the gateway
- * refuses before the save is sent.
- *
- * Without that setting, an Access Point whose only method is JWT Bearer with
- * required scopes derives its declaration from the strategy's pinned
- * authorization server (`src/source_auth/declaration.rs`). The derived helpers
- * below mirror its strip reasons as advice; the gateway saves such a surface
- * either way and reports the outcome.
+ * the one opt-in by which an A2A, AP2 or MCP Access Point declares how a caller
+ * gets a token. The gateway advertises the JWT verification strategy's expected
+ * issuer and the required scopes, publishes RFC 9728 metadata for the resource
+ * and challenges a failed caller itself. These helpers mirror the gateway's
+ * save-time rules in `src/protocols/protected_resource.rs` and
+ * `validate_protected_resource` in `src/config/agent_surface.rs`, so the editor
+ * flags a setting the gateway refuses before the save is sent.
  */
 export interface ProtectedResourceSetting {
   resource: string;
-  authorization_servers: string[];
-  scopes: string[];
+  /** Present only when stored; it must then be exactly the strategy's expected issuer. */
+  authorization_servers?: string[];
+  /** Extra advertised scopes, present only when stored. */
+  scopes?: string[];
 }
 
 export const MAX_AUTHORIZATION_SERVERS = 8;
@@ -36,6 +34,8 @@ export const DISCOVERY_FIELDS = {
   scopes: 'protected_resource.scopes',
 } as const;
 
+export type DiscoveryField = keyof typeof DISCOVERY_FIELDS;
+
 export interface DiscoveryProblem {
   field: string;
   message: string;
@@ -51,28 +51,84 @@ function asRecord(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
-/** The setting held in a caller-auth config or a stored `caller_authentication`, or null. */
+/**
+ * The setting held in a caller-auth config or a stored `caller_authentication`,
+ * or null. A list is kept only when stored, so an absent list stays absent.
+ */
 export function readProtectedResource(value: unknown): ProtectedResourceSetting | null {
   const record = asRecord(value);
   if (!record) return null;
   return {
     resource: typeof record.resource === 'string' ? record.resource : '',
-    authorization_servers: stringList(record.authorization_servers),
-    scopes: stringList(record.scopes),
+    ...(Array.isArray(record.authorization_servers)
+      ? { authorization_servers: stringList(record.authorization_servers) }
+      : {}),
+    ...(Array.isArray(record.scopes) ? { scopes: stringList(record.scopes) } : {}),
   };
 }
 
-/** The wire shape the gateway stores; `scopes` is left out when empty. */
+/**
+ * The wire shape the gateway stores: a stored authorization server list is sent
+ * back as it is, and empty scopes are left out.
+ */
 export function protectedResourcePayload(setting: ProtectedResourceSetting): {
   resource: string;
-  authorization_servers: string[];
+  authorization_servers?: string[];
   scopes?: string[];
 } {
   return {
     resource: setting.resource,
-    authorization_servers: [...setting.authorization_servers],
-    ...(setting.scopes.length > 0 ? { scopes: [...setting.scopes] } : {}),
+    ...(setting.authorization_servers
+      ? { authorization_servers: [...setting.authorization_servers] }
+      : {}),
+    ...(setting.scopes && setting.scopes.length > 0 ? { scopes: [...setting.scopes] } : {}),
   };
+}
+
+/** The setting without its stored authorization server list: the strategy issuer is advertised. */
+export function withoutStoredAuthorizationServers(
+  setting: ProtectedResourceSetting
+): ProtectedResourceSetting {
+  const { authorization_servers: _dropped, ...rest } = setting;
+  return rest;
+}
+
+/** The setting without its stored extra scopes, so only the required scopes are advertised. */
+export function withoutStoredScopes(setting: ProtectedResourceSetting): ProtectedResourceSetting {
+  const { scopes: _dropped, ...rest } = setting;
+  return rest;
+}
+
+/** The scopes the gateway advertises: the required scopes, then each stored extra scope once. */
+export function advertisedScopes(
+  required: readonly string[],
+  stored?: readonly string[]
+): string[] {
+  const scopes = [...required];
+  for (const scope of stored ?? []) {
+    if (!scopes.includes(scope)) scopes.push(scope);
+  }
+  return scopes;
+}
+
+/** The authorization server the gateway advertises: the selected strategy's expected issuer. */
+export function derivedAuthorizationServer(strategy?: DeclarationStrategy): {
+  value: string | null;
+  source: 'strategy' | 'none';
+} {
+  const issuer = strategy?.expected_issuer;
+  return issuer ? { value: issuer, source: 'strategy' } : { value: null, source: 'none' };
+}
+
+/** The audience a caller's token must name: the resource, or `<resource>$<alias>` on a variant. */
+export function declaredAudience(resource: string, alias?: string): string {
+  return alias ? variantResource(resource, alias) : resource;
+}
+
+/** Why a variant cannot publish discovery because its Access Point is at `/`, or null. */
+export function rootVariantProblem(route: unknown, alias: string | undefined): string | null {
+  if (!alias || (route !== '/' && route !== '')) return null;
+  return 'A variant of an Access Point at / has no resource of its own. Move the Access Point off /, or turn authorization server discovery off for this variant.';
 }
 
 function parseUrl(value: string): URL | null {
@@ -142,12 +198,29 @@ export function usesBearerScheme(config: Record<string, unknown>): boolean {
   return scheme === 'Bearer';
 }
 
+function storedAuthorizationServersProblem(
+  servers: string[],
+  strategyIssuer: string | undefined
+): string | null {
+  if (servers.length === 0 || servers.length > MAX_AUTHORIZATION_SERVERS) {
+    return `List 1 to ${MAX_AUTHORIZATION_SERVERS} authorization servers`;
+  }
+  const invalid = servers.map(authorizationServerProblem).find(Boolean);
+  if (invalid) return invalid;
+  if (new Set(servers).size !== servers.length) return 'List each authorization server once';
+  if (strategyIssuer && (servers.length !== 1 || servers[0] !== strategyIssuer)) {
+    return `The stored authorization server ${servers.join(', ')} is not the issuer the JWT verification strategy trusts (${strategyIssuer}), so the save is refused. Use the strategy's issuer.`;
+  }
+  return null;
+}
+
 /**
  * Every problem the gateway would refuse the discovery setting of a
  * caller-auth config for, in field order. Empty when discovery is off or the
- * method is not JWT Bearer, whose payload carries no setting. `strategyIssuer`
- * is the expected issuer of the selected JWT verification strategy, when known:
- * the authorization servers must be exactly that issuer.
+ * method is not JWT Bearer, whose payload carries no setting. A stored list is
+ * checked only when present; `strategyIssuer` is the expected issuer of the
+ * selected JWT verification strategy, when known, and a stored authorization
+ * server list must be exactly that issuer.
  */
 export function discoveryProblems(
   config: Record<string, unknown>,
@@ -180,31 +253,17 @@ export function discoveryProblems(
   const resourceError = resourceProblem(setting.resource);
   if (resourceError) problems.push({ field: DISCOVERY_FIELDS.resource, message: resourceError });
   const servers = setting.authorization_servers;
-  if (servers.length === 0 || servers.length > MAX_AUTHORIZATION_SERVERS) {
-    problems.push({
-      field: DISCOVERY_FIELDS.authorizationServers,
-      message: `List 1 to ${MAX_AUTHORIZATION_SERVERS} authorization servers`,
-    });
-  } else {
-    const invalid = servers.map(authorizationServerProblem).find(Boolean);
-    if (invalid) {
-      problems.push({ field: DISCOVERY_FIELDS.authorizationServers, message: invalid });
-    } else if (new Set(servers).size !== servers.length) {
-      problems.push({
-        field: DISCOVERY_FIELDS.authorizationServers,
-        message: 'List each authorization server once',
-      });
-    } else if (strategyIssuer && (servers.length !== 1 || servers[0] !== strategyIssuer)) {
-      problems.push({
-        field: DISCOVERY_FIELDS.authorizationServers,
-        message: `List only ${strategyIssuer}, the issuer the JWT verification strategy trusts: tokens from any other server are refused`,
-      });
+  if (servers) {
+    const serverError = storedAuthorizationServersProblem(servers, strategyIssuer);
+    if (serverError) {
+      problems.push({ field: DISCOVERY_FIELDS.authorizationServers, message: serverError });
     }
   }
+  const scopes = setting.scopes ?? [];
   const scopeError =
-    setting.scopes.length > MAX_SCOPES
+    scopes.length > MAX_SCOPES
       ? `List at most ${MAX_SCOPES} scopes`
-      : setting.scopes.map(scopeProblem).find(Boolean);
+      : scopes.map(scopeProblem).find(Boolean);
   if (scopeError) problems.push({ field: DISCOVERY_FIELDS.scopes, message: scopeError });
   return problems;
 }
@@ -247,19 +306,35 @@ export function discoverySaveError(
 ): string | null {
   if (!error) return null;
   if (error.includes('caller_authentication.protected_resource')) return error;
-  const named = /^MCP resource '([^']*)'/.exec(error)?.[1];
+  const named = /^(?:MCP )?resource '([^']*)'/i.exec(error)?.[1];
   if (named && resource && (named === resource || named.startsWith(`${resource}$`))) return error;
   return null;
 }
 
-/** The protocols whose Access Point can declare its authorization server. */
+/**
+ * The discovery field a refused save names, so the editor shows it there; null
+ * for a message that belongs in the section alert, such as a strategy whose
+ * expected issuer metadata cannot name.
+ */
+export function discoverySaveErrorField(message: string): DiscoveryField | null {
+  if (/expected_issuer/.test(message)) return null;
+  if (/authorization_servers/.test(message)) return 'authorizationServers';
+  if (/protected_resource: scopes|scopes_supported|\bscope token/.test(message)) return 'scopes';
+  if (/(^|: )(MCP )?resource '|resource must|canonical/i.test(message)) return 'resource';
+  if (/public origin|endpoint path|Access Point at \//.test(message)) return 'resource';
+  if (/forward_header|audiences|Authorization header|Bearer scheme/.test(message)) return 'rules';
+  if (/first caller authentication method/.test(message)) return 'rules';
+  return null;
+}
+
+/** The protocols whose Access Point can publish authorization server discovery. */
 export const DECLARING_PROTOCOLS: readonly Protocol[] = ['a2a', 'ap2', 'mcp'];
 
 export function declaresOn(protocol: Protocol | undefined): boolean {
   return !!protocol && DECLARING_PROTOCOLS.includes(protocol);
 }
 
-/** The fields of a JWT verification strategy a derived declaration reads. */
+/** The fields of a JWT verification strategy a declaration reads. */
 export interface DeclarationStrategy {
   id: string;
   expected_issuer?: string;
@@ -274,8 +349,9 @@ export type StrategyPin =
   | { state: 'mismatch'; issuer: string };
 
 /**
- * The authorization server a derived declaration names: the strategy's pinned
- * issuer, while the pin still matches its expected issuer and JWKS URI.
+ * The pinned authorization server the agent card's security scheme names: the
+ * strategy's pinned issuer, while the pin still matches its expected issuer and
+ * JWKS URI.
  */
 export function strategyPin(strategy: DeclarationStrategy): StrategyPin {
   const source = asRecord(strategy.jwks_source);
@@ -288,52 +364,6 @@ export function strategyPin(strategy: DeclarationStrategy): StrategyPin {
     typeof strategy.expected_issuer === 'string' && issuer !== strategy.expected_issuer;
   const jwksMoved = jwksUri !== undefined && pin?.jwks_uri !== jwksUri;
   return issuerMoved || jwksMoved ? { state: 'mismatch', issuer } : { state: 'pinned', issuer };
-}
-
-export type DerivedNoteCode = 'custom_token_header' | 'forwards_caller_token' | 'audience_missing';
-
-export interface DerivedNote {
-  code: DerivedNoteCode;
-  message: string;
-}
-
-/**
- * Why the JWT Bearer settings keep a derived declaration from being made, in
- * the gateway's order. `accessPointUrl` is the resource the gateway reported
- * for the route edited; the audience is checked only when it is known.
- */
-export function derivedDeclarationNotes(
-  config: Record<string, unknown>,
-  accessPointUrl?: string | null
-): DerivedNote[] {
-  const notes: DerivedNote[] = [];
-  const header = typeof config.jwt_token_header === 'string' ? config.jwt_token_header : '';
-  const scheme = typeof config.jwt_token_scheme === 'string' ? config.jwt_token_scheme : 'Bearer';
-  if (
-    (header.trim() || 'Authorization').toLowerCase() !== 'authorization' ||
-    scheme.trim().toLowerCase() !== 'bearer'
-  ) {
-    notes.push({
-      code: 'custom_token_header',
-      message:
-        'The token must arrive in the Authorization header with the Bearer scheme for this Access Point to declare its authorization server.',
-    });
-  }
-  if (config.jwt_forward_header === true) {
-    notes.push({
-      code: 'forwards_caller_token',
-      message:
-        "Forwarding the caller's token to the managed agent keeps this Access Point from declaring its authorization server.",
-    });
-  }
-  if (accessPointUrl && !stringList(config.audiences).includes(accessPointUrl)) {
-    notes.push({
-      code: 'audience_missing',
-      message:
-        'Add the Access Point URL to Accepted Audiences so this Access Point declares its authorization server.',
-    });
-  }
-  return notes;
 }
 
 /** The entry of the route edited: the base for no alias, otherwise that variant. */

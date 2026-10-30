@@ -55,7 +55,18 @@ export async function chooseStrategy(page: Page, strategyName: string): Promise<
     await page.getByTestId('caller-auth-close-button').click();
 }
 
-export async function configureCallerAuth(page: Page, options: {strategyName: string; scopes: string[]}): Promise<void> {
+export async function turnOnAuthorizationServerDiscovery(page: Page): Promise<void> {
+    const toggle = page.getByTestId('caller-auth-discovery-switch');
+    if (!(await toggle.isChecked())) await toggle.click();
+    const resource = page.getByTestId('caller-auth-discovery-resource-input');
+    await expect(resource).toHaveValue(env.entryPointUrl);
+    await expect(resource).toBeFocused();
+}
+
+export async function configureCallerAuth(
+    page: Page,
+    options: {strategyName: string; scopes: string[]; discovery?: boolean}
+): Promise<void> {
     await openCallerAuth(page);
     await page.getByTestId('caller-auth-jwt-strategy').selectOption({label: options.strategyName});
     for (const scope of options.scopes) {
@@ -63,6 +74,7 @@ export async function configureCallerAuth(page: Page, options: {strategyName: st
         await page.getByTestId('caller-auth-scope-add').click();
         await expect(page.getByTestId('caller-auth-scopes')).toContainText(scope);
     }
+    if (options.discovery) await turnOnAuthorizationServerDiscovery(page);
     await page.getByTestId('caller-auth-close-button').click();
 }
 
@@ -126,9 +138,10 @@ export interface SavedSurface {
             methods: Array<{
                 type: string;
                 jwt_verification_strategy_id: string;
-                audiences: string[];
+                audiences?: string[];
                 required_scopes?: string[];
             }>;
+            protected_resource?: {resource: string; authorization_servers?: string[]; scopes?: string[]} | null;
         };
         inbound_policy?: {policy_definition_id: string};
     };

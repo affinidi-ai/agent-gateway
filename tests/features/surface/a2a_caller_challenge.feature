@@ -2,15 +2,14 @@ Feature: Caller challenge and required scopes on an A2A Access Point
   An Access Point that authenticates callers with JWT Bearer, publishes the
   authorization server of its source authentication and requires scopes
   declares that authorization server. It refuses a caller whose source
-  authentication failed itself, whatever policy allows and before payment or
-  the managed agent sees the request, with a challenge that names its protected
-  resource metadata: 401 for a missing or invalid token and 403 for a token that
-  lacks a required scope. The challenge is a problem report that is not cached,
-  and a token is accepted only for the Access Point URL, whatever other
-  audiences the surface accepts. A surface needs no policy for this refusal,
-  and the VP Audit Log records it as a blocking source authentication failure.
-  A caller whose token grants every required scope is forwarded without its
-  token.
+  authentication failed itself, before reading the request and before rate
+  limiting, any policy, payment or the managed agent, with a challenge that
+  names its protected resource metadata: 401 for a missing or invalid token and
+  403 for a token that lacks a required scope. The challenge is a problem report
+  that is not cached, and a token is accepted when the Access Point URL is one
+  of its audiences. A surface needs no policy for this refusal, and the VP
+  Audit Log records it as a blocking source authentication failure. A caller
+  whose token grants every required scope is forwarded without its token.
 
   Background:
     Given an A2A surface targeting managed agent "bravo"
@@ -77,12 +76,44 @@ Feature: Caller challenge and required scopes on an A2A Access Point
     And the response challenges the caller to authorize for scopes "agent.invoke agent.read"
     And managed agent "bravo" was not called
 
-  Scenario: A token issued for another audience the surface accepts is challenged with invalid_token
-    Given the surface accepts JWT audience "https://other.example/agent"
-    When the caller sends a request to the surface with a token issued for another resource
+  Scenario: A token that names the surface resource among other audiences is accepted
+    When the caller sends a request to the surface with a token whose audiences are the surface resource and "https://as.example/userinfo" granting scopes "agent.invoke agent.read"
+    Then the response status is 200
+    And managed agent "bravo" received the forwarded request
+
+  Scenario: A caller without a token is challenged before a gateway policy that denies every request
+    Given the gateway has a gateway-level policy that denies every request
+    When the caller sends a request to the surface without a token
     Then the response status is 401
-    And the response challenges the caller with error "invalid_token" for scopes "agent.invoke agent.read"
+    And the response challenges the caller to authorize for scopes "agent.invoke agent.read"
     And managed agent "bravo" was not called
+
+  Scenario: A caller with a valid token is then refused by that gateway policy
+    Given the gateway has a gateway-level policy that denies every request
+    When the caller sends a request to the surface with a token issued for the surface granting scopes "agent.invoke agent.read" in its "scope" claim
+    Then the response status is 403
+    And the response does not include header "www-authenticate"
+    And managed agent "bravo" was not called
+
+  Scenario: A caller without a token is challenged before its request body is read
+    When the caller sends a request to the surface without a token and with a body that is not JSON
+    Then the response status is 401
+    And the response challenges the caller to authorize for scopes "agent.invoke agent.read"
+    And managed agent "bravo" was not called
+
+  Scenario: Callers without a token are challenged rather than rate limited
+    Given the surface admits 1 request per minute
+    When 2 callers send requests to the surface sequentially
+    Then the response status is 401
+    And the response challenges the caller to authorize for scopes "agent.invoke agent.read"
+    And managed agent "bravo" was not called
+
+  Scenario: No policy sees a caller whose source authentication failed
+    Given the surface has a policy admitting every caller
+    And the VP Audit Log keeps every audit event
+    When the caller sends a request to the surface without a token
+    Then the response status is 401
+    And the VP Audit Log records no policy decision
 
   Scenario: A challenged caller receives a problem report that is not cached
     When the caller sends a request to the surface without a token

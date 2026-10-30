@@ -168,7 +168,16 @@ test.describe('Agent Cards tab', () => {
         expect(body.served_url).toBe(CARD_URL);
         expect(body.source_url).toBe(SOURCE_CARD_URL);
         expect(body.source_url_query_hidden).toBe(false);
-        expect(body.outcome).toEqual({variant: null, outcome: 'declare', reason: null, resource: env.entryPointUrl});
+        expect(body.outcome).toEqual({
+            variant: null,
+            outcome: 'declare',
+            reason: null,
+            resource: env.entryPointUrl,
+            authorization_servers: [env.hydraA.issuer],
+            required_scopes: [names.scopes.caller],
+            scopes_supported: [names.scopes.caller],
+            metadata_url: `${env.accessPointOrigin}/.well-known/oauth-protected-resource${env.route}`,
+        });
         expect(body.before_bytes).toBeGreaterThan(0);
         expect(body.after_bytes).toBeGreaterThan(0);
         expect(body.display_limit_bytes).toBe(262144);
@@ -298,7 +307,7 @@ test.describe('Agent Cards tab', () => {
         await expect(entryPoint).toContainText(env.entryPointUrl);
     });
 
-    test('the authorization server, required scope and audience set in the Caller Context editor are what the served card declares', async ({
+    test('the authorization server, required scope and resource set in the Caller Context editor are what the served card declares', async ({
         page,
     }) => {
         ticket(TICKET, 'FTL-30894');
@@ -309,8 +318,15 @@ test.describe('Agent Cards tab', () => {
         await expect(page.getByTestId('caller-auth-discovery-derived-authorization-server')).toHaveText(env.hydraA.issuer);
         await expect(page.getByTestId('caller-auth-discovery-derived-scopes')).toHaveText(names.scopes.caller);
         await expect(page.getByTestId('caller-auth-discovery-derived-audience')).toContainText(env.entryPointUrl);
-        await expect(page.getByTestId('caller-auth-discovery-audience-listed')).toBeVisible();
+        await expect(page.getByTestId('caller-auth-discovery-switch')).toBeChecked();
+        await expect(page.getByTestId('caller-auth-discovery-resource-input')).toHaveValue(env.entryPointUrl);
         await expect(page.getByTestId('caller-auth-outcome-chip').first()).toContainText('Declares OAuth');
+        await attachCriterion(
+            TICKET,
+            5,
+            'Authorization server discovery, scopes and resource in the Caller Context editor',
+            page.getByTestId('caller-auth-discovery')
+        );
         await page.getByTestId('caller-auth-close-button').click();
 
         const panelOutcome = page.getByTestId('caller-auth-panel-outcome');

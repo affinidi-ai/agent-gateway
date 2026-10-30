@@ -605,21 +605,19 @@ describe('AgentCardTab, caller authentication in the served card', () => {
     expect(within(rowCells('scope').served).getByText('gw.invoke')).toBeInTheDocument();
     expect(screen.getByTestId('agent-card-outcome')).toHaveTextContent('Declares OAuth');
     expect(screen.getByTestId('agent-card-outcome-reason')).toHaveTextContent(
-      'The agent card advertises this gateway’s authorization server and scopes.'
+      'The agent card and the protected resource metadata name the authorization server of the selected strategy and the required scopes, and callers without a valid token are challenged.'
     );
   });
 
-  it('gives the reason a stripped card lost its security', async () => {
+  it('gives the reason a card is not declared and says it keeps the agent’s security', async () => {
     await showBody(
       previewBody({
-        outcome: { variant: null, outcome: 'strip', reason: 'not_pinned', resource: null },
+        outcome: { variant: null, outcome: 'strip', reason: 'not_declared', resource: null },
       })
     );
-    expect(screen.getByTestId('agent-card-outcome')).toHaveTextContent(
-      'Security removed from card'
-    );
+    expect(screen.getByTestId('agent-card-outcome')).toHaveTextContent('Not declared');
     expect(screen.getByTestId('agent-card-outcome-reason')).toHaveTextContent(
-      'The strategy has no pinned authorization server. Run Discover on the strategy.'
+      'Authorization server discovery is off for this route. The agent card keeps the managed agent’s own security.'
     );
   });
 

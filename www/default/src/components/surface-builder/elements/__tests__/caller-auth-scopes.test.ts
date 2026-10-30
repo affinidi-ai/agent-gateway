@@ -1,5 +1,5 @@
 import { registry } from '../index';
-import type { CanvasNode, PayloadContext } from '../types';
+import type { CanvasNode, PayloadContext, Protocol, SurfaceContext } from '../types';
 
 const def = registry.get('caller-auth')!;
 
@@ -26,11 +26,7 @@ const BASE = {
   audiences: ['https://gw.example.com/a'],
 };
 
-const SETTING = {
-  resource: 'https://gw.example.com/mcp',
-  authorization_servers: ['https://idp.example.com'],
-  scopes: ['tools'],
-};
+const SETTING = { resource: 'https://gw.example.com/mcp' };
 
 describe('caller-auth required_scopes round trip', () => {
   it('writes required_scopes on the jwt_bearer method', () => {
@@ -86,8 +82,8 @@ describe('caller-auth required_scopes round trip', () => {
     };
     const config = def.configFromPayload!(wire, {}) as Record<string, unknown>;
     expect(config.required_scopes).toEqual(['tools.call']);
-    expect(config.protected_resource).toEqual(SETTING);
-    expect(sliceFor(config)).toEqual(wire);
+    expect(config.protected_resource).toStrictEqual(SETTING);
+    expect(sliceFor(config)).toStrictEqual(wire);
   });
 });
 
@@ -107,5 +103,47 @@ describe('caller-auth required_scopes checks', () => {
         message: 'A scope cannot contain spaces, double quotes or backslashes.',
       },
     ]);
+  });
+});
+
+describe('caller-auth authorization server discovery dependencies', () => {
+  const DISCOVERY = {
+    method_type: 'jwt_bearer',
+    jwt_strategy_id: 's1',
+    audiences: [],
+    protected_resource: SETTING,
+  };
+  const warningsOn = (config: Record<string, unknown>, protocol: Protocol, route = '/mcp') => {
+    const context: SurfaceContext = {
+      protocol,
+      accessPoint: { route },
+      target: {},
+      transitPoints: [],
+      allNodes: [],
+    };
+    return registry.getDependencyWarnings('caller-auth', config, context);
+  };
+
+  it.each<Protocol>(['a2a', 'ap2', 'mcp'])('lets a %s Access Point publish it', protocol => {
+    expect(warningsOn(DISCOVERY, protocol)).toEqual([]);
+  });
+
+  it('refuses it on a DIDComm Access Point and off the Access Point route', () => {
+    expect(warningsOn(DISCOVERY, 'didcomm')).toEqual([
+      {
+        severity: 'error',
+        message: 'Authorization server discovery requires an A2A, AP2 or MCP Access Point',
+      },
+    ]);
+    expect(warningsOn(DISCOVERY, 'a2a', '/agents')).toEqual([
+      {
+        severity: 'error',
+        message: "The resource URL's path must be the Access Point route exactly",
+      },
+    ]);
+  });
+
+  it('has nothing to check while it is off', () => {
+    expect(warningsOn({ ...DISCOVERY, protected_resource: null }, 'didcomm')).toEqual([]);
   });
 });

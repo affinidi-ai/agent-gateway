@@ -14,8 +14,9 @@
 #   6. no token: 401 with a resource_metadata challenge
 #   7. a token for another audience: 401
 #   8. a token without the required scope: 403 insufficient_scope
-#   9. swapping the surface to hydra-b changes the card and the validation, without a restart
-#  10. swapping it back to hydra-a restores both
+#   9. removing the required scope keeps the gateway refusing a caller without a token
+#  10. swapping the surface to hydra-b changes the card and the validation, without a restart
+#  11. swapping it back to hydra-a restores both
 
 set -euo pipefail
 unset CDPATH
@@ -132,8 +133,23 @@ assert_eq "status" 403 "${RESP_CODE}"
 [[ "$(header_value www-authenticate)" == Bearer*insufficient_scope* ]] || fail "the 403 does not carry an insufficient_scope challenge"
 pass "the 403 names insufficient_scope"
 
-step "Swapping the surface to hydra-b changes the card and the validation, without a restart"
+step "Removing the required scope keeps the gateway refusing a caller without a token"
 gateway_session
+req PATCH "${GATEWAY_URL}/api/v1/surfaces/${SURFACE_ID}" -H 'Content-Type: application/merge-patch+json' -H "@${SESSION_HEADER_FILE}" \
+    -d "$(jq -n --arg sid "${STRATEGY_A_ID}" '{access_point: {caller_authentication: {methods: [{type: "jwt_bearer", jwt_verification_strategy_id: $sid, audiences: []}]}}}')"
+[[ "${RESP_CODE}" == "200" ]] || { show_body; fail "surface patch returned ${RESP_CODE}"; }
+call_agent
+assert_eq "status" 401 "${RESP_CODE}"
+CHALLENGE="$(header_value www-authenticate)"
+[[ "${CHALLENGE}" == *"resource_metadata=\"${PRM_URL}\""* ]] || fail "the challenge does not point at the protected resource metadata"
+[[ "${CHALLENGE}" != *"scope="* ]] || fail "the challenge still names a scope"
+pass "the challenge points at ${PRM_URL} and names no scope"
+req GET "${PRM_URL}"
+assert_eq "metadata status" 200 "${RESP_CODE}"
+assert_json "the protected resource metadata lists no scopes" '(.scopes_supported // []) == []' "${RESP_BODY}"
+use_strategy "${STRATEGY_A_ID}"
+
+step "Swapping the surface to hydra-b changes the card and the validation, without a restart"
 use_strategy "${STRATEGY_B_ID}"
 req GET "${CARD_URL}"
 assert_eq "card status" 200 "${RESP_CODE}"

@@ -3724,8 +3724,7 @@ async fn fabric_access_point_declaration(
     network: Option<&crate::config::NetworkConfig>,
 ) -> crate::source_auth::declaration::DeclarationOutcome {
     use crate::source_auth::declaration::{
-        DeclarationOutcome, DeclarationSource, UnservableDeclaration, UnservableReason, declaration_source,
-        resolve_surface_declaration,
+        DeclarationOutcome, UnservableDeclaration, UnservableReason, requests_declaration, resolve_surface_declaration,
     };
     match network {
         Some(network) => resolve_surface_declaration(surface, alias, strategies, network)
@@ -3736,12 +3735,10 @@ async fn fabric_access_point_declaration(
                     format!("the verification strategy store failed: {error}"),
                 ))
             }),
-        None if !matches!(declaration_source(surface, alias), DeclarationSource::None) => {
-            DeclarationOutcome::Unservable(UnservableDeclaration::new(
-                UnservableReason::NetworkUnavailable,
-                "network configuration unavailable",
-            ))
-        }
+        None if requests_declaration(surface) => DeclarationOutcome::Unservable(UnservableDeclaration::new(
+            UnservableReason::NetworkUnavailable,
+            "network configuration unavailable",
+        )),
         None => DeclarationOutcome::PassThrough,
     }
 }
@@ -4353,10 +4350,10 @@ async fn process_forward_request_in_request_scope(
                     .await
                 {
                     Ok(identity) => Some(identity),
-                    // Caller-attributable failure. A declaring Access Point,
-                    // explicit or derived, refuses it before policy with a
-                    // challenge that names no metadata, since only the sending
-                    // gateway challenges a Fabric caller; otherwise record the
+                    // Caller-attributable failure. A declaring Access Point
+                    // refuses it before policy with a challenge that names no
+                    // metadata, since only the sending gateway challenges a
+                    // Fabric caller; otherwise record the
                     // outcome for the policy layer and continue with no
                     // asserted caller identity.
                     Err(e) if e.is_caller_attributable() => {
@@ -10996,109 +10993,75 @@ mod tests {
         );
     }
 
-    enum Strategies {
-        Pinned,
-        Failing,
-    }
-
-    #[async_trait::async_trait]
-    impl crate::jwt_bearer::JwtVerificationStrategyStorage for Strategies {
-        async fn create(
-            &self,
-            _strategy: crate::jwt_bearer::models::JwtVerificationStrategy,
-        ) -> anyhow::Result<crate::jwt_bearer::models::JwtVerificationStrategy> {
-            anyhow::bail!("read-only")
-        }
-        async fn get(
-            &self,
-            id: &str,
-        ) -> anyhow::Result<Option<crate::jwt_bearer::models::JwtVerificationStrategy>> {
-            use crate::protocols::protected_resource::fixtures::ISSUER;
-            match self {
-                Self::Failing => anyhow::bail!("storage unavailable"),
-                Self::Pinned => Ok((id == "idp").then(|| {
-                    serde_json::from_value(serde_json::json!({
-                        "id": "idp",
-                        "name": "idp",
-                        "expected_issuer": ISSUER,
-                        "jwks_source": {"type": "remote", "jwks_uri": format!("{ISSUER}/certs")},
-                        "authorization_server": {
-                            "issuer": ISSUER,
-                            "metadata_url": format!("{ISSUER}/.well-known/openid-configuration"),
-                            "token_endpoint": format!("{ISSUER}/token"),
-                            "jwks_uri": format!("{ISSUER}/certs")
-                        },
-                        "created_at": "2026-01-01T00:00:00Z",
-                        "updated_at": "2026-01-01T00:00:00Z"
-                    }))
-                    .unwrap()
-                })),
-            }
-        }
-        async fn list(&self) -> anyhow::Result<Vec<crate::jwt_bearer::models::JwtVerificationStrategy>> {
-            Ok(Vec::new())
-        }
-        async fn update(
-            &self,
-            _strategy: crate::jwt_bearer::models::JwtVerificationStrategy,
-        ) -> anyhow::Result<crate::jwt_bearer::models::JwtVerificationStrategy> {
-            anyhow::bail!("read-only")
-        }
-        async fn delete(
-            &self,
-            _id: &str,
-        ) -> anyhow::Result<()> {
-            anyhow::bail!("read-only")
-        }
-    }
-
     /// An A2A Access Point at `/card` whose one JWT Bearer method, verified by the `idp`
-    /// strategy, accepts tokens for the route and requires `required_scopes`.
-    fn a2a_jwt_surface(required_scopes: serde_json::Value) -> crate::config::agent_surface::AgentSurface {
+    /// strategy, requires `required_scopes`. With `declares` its `protected_resource` names
+    /// the route.
+    fn scoped_a2a_surface(
+        required_scopes: serde_json::Value,
+        declares: bool,
+    ) -> crate::config::agent_surface::AgentSurface {
+        let mut caller_authentication = serde_json::json!({"methods": [{"type": "jwt_bearer",
+            "jwt_verification_strategy_id": "idp", "audiences": [], "required_scopes": required_scopes}]});
+        if declares {
+            caller_authentication["protected_resource"] =
+                serde_json::json!({"resource": "https://gateway.example/card"});
+        }
         serde_json::from_value(serde_json::json!({
             "surface_id": "card", "name": "card",
             "access_point": {"listen_address": "https://gateway.example", "route": "/card", "protocol": "a2a",
-                "caller_authentication": {"methods": [{"type": "jwt_bearer", "jwt_verification_strategy_id": "idp",
-                    "audiences": ["https://gateway.example/card"], "required_scopes": required_scopes}]}},
+                "caller_authentication": caller_authentication},
             "target": {"endpoint": "https://agent.example"}
         }))
         .unwrap()
     }
 
-    /// Whether the Access Point declares or fails closed, as opposed to passing through
-    /// or stripping a declaration it does not qualify for.
+    fn a2a_jwt_surface(required_scopes: serde_json::Value) -> crate::config::agent_surface::AgentSurface {
+        scoped_a2a_surface(required_scopes, true)
+    }
+
+    /// An A2A Access Point with a scoped JWT Bearer method and no `protected_resource`.
+    fn a2a_jwt_surface_without_protected_resource() -> crate::config::agent_surface::AgentSurface {
+        scoped_a2a_surface(serde_json::json!(["agent.call"]), false)
+    }
+
     fn declares_or_fails(outcome: &crate::source_auth::declaration::DeclarationOutcome) -> bool {
         use crate::source_auth::declaration::DeclarationOutcome;
         matches!(outcome, DeclarationOutcome::Declare(_) | DeclarationOutcome::Unservable(_))
     }
 
     fn explicit_mcp_surface() -> crate::config::agent_surface::AgentSurface {
-        use crate::protocols::protected_resource::fixtures::{ISSUER, discovery_surface, jwt_bearer_method};
+        use crate::protocols::protected_resource::fixtures::{discovery_surface, jwt_bearer_method};
         discovery_surface(
             jwt_bearer_method(),
-            Some(
-                serde_json::json!({"resource": "https://gateway.example/mcp/alpha", "authorization_servers": [ISSUER]}),
-            ),
+            Some(serde_json::json!({"resource": "https://gateway.example/mcp/alpha"})),
         )
     }
 
-    /// Without the network configuration an Access Point that would declare, explicitly or
-    /// by its required scopes, fails closed; any other Access Point passes through.
+    /// Without the network configuration an Access Point that sets `protected_resource`
+    /// fails closed; any other Access Point passes through.
     #[tokio::test]
     async fn without_the_network_only_a_declaring_access_point_fails_closed() {
+        use crate::protocols::protected_resource::fixtures::FixtureStrategies;
         use crate::source_auth::declaration::{DeclarationOutcome, UnservableDeclaration, UnservableReason};
 
         let unservable = DeclarationOutcome::Unservable(UnservableDeclaration::new(
             UnservableReason::NetworkUnavailable,
             "network configuration unavailable",
         ));
-        let derived = a2a_jwt_surface(serde_json::json!(["agent.call"]));
-        assert_eq!(fabric_access_point_declaration(&derived, None, Some(&Strategies::Pinned), None).await, unservable);
+        let declaring = a2a_jwt_surface(serde_json::json!(["agent.call"]));
+        assert_eq!(
+            fabric_access_point_declaration(&declaring, None, Some(&FixtureStrategies::Pinned), None).await,
+            unservable
+        );
         assert_eq!(fabric_access_point_declaration(&explicit_mcp_surface(), None, None, None).await, unservable);
 
-        let unscoped = a2a_jwt_surface(serde_json::json!([]));
-        let outcome = fabric_access_point_declaration(&unscoped, None, Some(&Strategies::Pinned), None).await;
-        assert!(!declares_or_fails(&outcome), "{outcome:?}");
+        let scoped = a2a_jwt_surface_without_protected_resource();
+        let outcome = fabric_access_point_declaration(&scoped, None, Some(&FixtureStrategies::Failing), None).await;
+        assert_eq!(outcome, DeclarationOutcome::PassThrough);
+        let network = crate::protocols::protected_resource::fixtures::discovery_network();
+        let outcome =
+            fabric_access_point_declaration(&scoped, None, Some(&FixtureStrategies::Failing), Some(&network)).await;
+        assert_eq!(outcome, DeclarationOutcome::Strip(crate::source_auth::declaration::StripReason::NotDeclared));
         let undeclared = surface_with_variants(serde_json::json!([]));
         assert_eq!(
             fabric_access_point_declaration(&undeclared, None, None, None).await,
@@ -11106,47 +11069,72 @@ mod tests {
         );
     }
 
-    /// The receiving gateway resolves an explicit setting from its configuration alone,
-    /// and declares a derived Access Point from its pinned strategy.
+    /// The receiving gateway declares an MCP and an A2A Access Point from the
+    /// `protected_resource` setting and the issuer of its JWT verification strategy.
     #[tokio::test]
-    async fn the_receiving_gateway_resolves_explicit_and_derived_declarations() {
-        use crate::protocols::protected_resource::fixtures::{ISSUER, discovery_network};
+    async fn the_receiving_gateway_resolves_mcp_and_a2a_declarations_from_the_strategy() {
+        use crate::protocols::protected_resource::fixtures::{FixtureStrategies, ISSUER, discovery_network};
         use crate::source_auth::declaration::DeclarationOutcome;
 
         let network = discovery_network();
-        match fabric_access_point_declaration(&explicit_mcp_surface(), None, None, Some(&network)).await {
+        match fabric_access_point_declaration(
+            &explicit_mcp_surface(),
+            None,
+            Some(&FixtureStrategies::Pinned),
+            Some(&network),
+        )
+        .await
+        {
             DeclarationOutcome::Declare(declaration) => {
                 assert_eq!(declaration.resource, "https://gateway.example/mcp/alpha");
                 assert_eq!(declaration.authorization_servers, vec![ISSUER.to_string()]);
             }
-            other => panic!("expected an explicit declaration, got {other:?}"),
+            other => panic!("expected an MCP declaration, got {other:?}"),
         }
 
-        let derived = a2a_jwt_surface(serde_json::json!(["agent.call"]));
-        match fabric_access_point_declaration(&derived, None, Some(&Strategies::Pinned), Some(&network)).await {
+        let a2a = a2a_jwt_surface(serde_json::json!(["agent.call"]));
+        match fabric_access_point_declaration(&a2a, None, Some(&FixtureStrategies::Pinned), Some(&network)).await {
             DeclarationOutcome::Declare(declaration) => {
                 assert_eq!(declaration.resource, "https://gateway.example/card");
                 assert_eq!(declaration.authorization_servers, vec![ISSUER.to_string()]);
                 assert_eq!(declaration.required_scopes, vec!["agent.call".to_string()]);
             }
-            other => panic!("expected a derived declaration, got {other:?}"),
+            other => panic!("expected an A2A declaration, got {other:?}"),
         }
     }
 
-    /// A derived declaration on the receiving gateway refuses a failed caller with the
-    /// Fabric refusal, which names no metadata: only the sending gateway challenges.
+    /// A required scope alone declares nothing on the receiving gateway: the failed
+    /// caller is handed to policy as it is on any Access Point that does not declare.
     #[tokio::test]
-    async fn a_derived_declaration_refuses_a_fabric_caller_without_naming_metadata() {
-        use crate::protocols::protected_resource::fixtures::discovery_network;
+    async fn a2a_jwt_surface_without_protected_resource_hands_failed_callers_to_policy() {
+        use crate::protocols::protected_resource::fixtures::{FixtureStrategies, discovery_network};
+        use crate::source_auth::declaration::{DeclarationOutcome, StripReason, requests_declaration};
+
+        let surface = a2a_jwt_surface_without_protected_resource();
+        assert!(!requests_declaration(&surface));
+        let network = discovery_network();
+        for strategies in [&FixtureStrategies::Pinned, &FixtureStrategies::Failing] {
+            assert_eq!(
+                fabric_access_point_declaration(&surface, None, Some(strategies), Some(&network)).await,
+                DeclarationOutcome::Strip(StripReason::NotDeclared)
+            );
+        }
+    }
+
+    /// A declaring A2A Access Point on the receiving gateway refuses a failed caller with
+    /// the Fabric refusal, which names no metadata: only the sending gateway challenges.
+    #[tokio::test]
+    async fn a_declaring_a2a_access_point_refuses_a_fabric_caller_without_naming_metadata() {
+        use crate::protocols::protected_resource::fixtures::{FixtureStrategies, discovery_network};
         use crate::source_auth::declaration::DeclarationOutcome;
         use crate::source_auth::errors::SourceAuthError;
 
-        let derived = a2a_jwt_surface(serde_json::json!(["agent.call"]));
+        let declaring = a2a_jwt_surface(serde_json::json!(["agent.call"]));
         let network = discovery_network();
         let DeclarationOutcome::Declare(declaration) =
-            fabric_access_point_declaration(&derived, None, Some(&Strategies::Pinned), Some(&network)).await
+            fabric_access_point_declaration(&declaring, None, Some(&FixtureStrategies::Pinned), Some(&network)).await
         else {
-            panic!("expected a derived declaration");
+            panic!("expected a declaration");
         };
         for (error, status, challenge) in [
             (
@@ -11177,16 +11165,17 @@ mod tests {
         }
     }
 
-    /// A strategy store failure on an Access Point that would declare fails closed, and an
-    /// Access Point without required scopes never reads the store.
+    /// A strategy store failure on an Access Point that declares fails closed, and an
+    /// Access Point without `protected_resource` never reads the store.
     #[tokio::test]
     async fn a_strategy_store_failure_leaves_a_declaring_fabric_access_point_unservable() {
-        use crate::protocols::protected_resource::fixtures::discovery_network;
-        use crate::source_auth::declaration::{DeclarationOutcome, UnservableReason};
+        use crate::protocols::protected_resource::fixtures::{FixtureStrategies, discovery_network};
+        use crate::source_auth::declaration::{DeclarationOutcome, StripReason, UnservableReason};
 
         let network = discovery_network();
-        let derived = a2a_jwt_surface(serde_json::json!(["agent.call"]));
-        match fabric_access_point_declaration(&derived, None, Some(&Strategies::Failing), Some(&network)).await {
+        let declaring = a2a_jwt_surface(serde_json::json!(["agent.call"]));
+        match fabric_access_point_declaration(&declaring, None, Some(&FixtureStrategies::Failing), Some(&network)).await
+        {
             DeclarationOutcome::Unservable(unservable) => {
                 assert_eq!(unservable.reason, UnservableReason::StrategyStoreUnavailable);
                 assert!(
@@ -11199,9 +11188,10 @@ mod tests {
             other => panic!("expected the Access Point to fail closed, got {other:?}"),
         }
 
-        let unscoped = a2a_jwt_surface(serde_json::json!([]));
+        let scoped = a2a_jwt_surface_without_protected_resource();
         let outcome =
-            fabric_access_point_declaration(&unscoped, None, Some(&Strategies::Failing), Some(&network)).await;
+            fabric_access_point_declaration(&scoped, None, Some(&FixtureStrategies::Failing), Some(&network)).await;
+        assert_eq!(outcome, DeclarationOutcome::Strip(StripReason::NotDeclared));
         assert!(!declares_or_fails(&outcome), "{outcome:?}");
     }
 

@@ -3,7 +3,7 @@
  *
  * An operator turns the audit log on in Settings, callers use the surface, and the dashboard shows
  * which call was allowed and who the caller was, which callers failed authentication, and the
- * gateway log lines for the same requests. The Access Point declares hydra-a, so the gateway
+ * gateway log lines for the same requests. The Access Point publishes authorization server discovery for hydra-a, so the gateway
  * refuses a caller that failed authentication itself, after gateway policy and before the
  * surface's policy: such a caller leaves an authentication failure and no surface policy decision.
  */

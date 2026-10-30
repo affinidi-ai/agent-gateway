@@ -229,7 +229,7 @@ async fn start_declaring_a2a_proxy_harness(
         surface_json["target"]["endpoint"] = json!(format!("a2a-proxy://{PROXY_ID}"));
         surface_json["target"]["a2a_proxy_id"] = json!(PROXY_ID);
         surface_json["access_point"]["a2a"] = a2a;
-        surface_json["access_point"]["caller_authentication"] = jwt_bearer_caller_authentication(&[SMOKE_RESOURCE]);
+        surface_json["access_point"]["caller_authentication"] = jwt_bearer_caller_authentication(Some(SMOKE_RESOURCE));
         gw_config.surfaces = vec![serde_json::from_value(surface_json).expect("A2A proxy surface")];
         write_a2a_proxy_fixtures(temp_dir, &direct_line_base_url, "active", true, 5, 100, 3);
     })

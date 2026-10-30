@@ -59,6 +59,12 @@ pub enum RejectionReason {
     SsrfBlocked,
     ConsentIdentityRequired,
     TargetAuthUnavailable,
+    /// The receiving gateway of a Fabric route answered `401`: it refused the
+    /// credential the sending gateway forwarded, or got none it accepts.
+    PeerTokenRefused,
+    /// The receiving gateway of a Fabric route answered `403` with a Bearer
+    /// `insufficient_scope` challenge.
+    PeerScopeRefused,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -262,7 +268,7 @@ pub enum TargetAuthKind {
 
 #[cfg(test)]
 mod tests {
-    use super::AuthScheme;
+    use super::{AuthScheme, RejectionReason};
 
     const SCHEMES: [AuthScheme; 5] =
         [AuthScheme::Jwt, AuthScheme::ApiKey, AuthScheme::DidAuth, AuthScheme::Mtls, AuthScheme::McpResourceToken];
@@ -282,5 +288,17 @@ mod tests {
             assert_eq!(serde_json::to_value(scheme).unwrap(), serde_json::json!(scheme.as_str()));
         }
         assert_ne!(AuthScheme::Jwt.as_str(), AuthScheme::McpResourceToken.as_str());
+    }
+
+    #[test]
+    fn peer_refusal_reasons_serialize_as_snake_case() {
+        for (reason, label) in [
+            (RejectionReason::PeerTokenRefused, "peer_token_refused"),
+            (RejectionReason::PeerScopeRefused, "peer_scope_refused"),
+        ] {
+            let value = serde_json::to_value(reason).unwrap();
+            assert_eq!(value, serde_json::json!(label));
+            assert_eq!(serde_json::from_value::<RejectionReason>(value).unwrap(), reason);
+        }
     }
 }

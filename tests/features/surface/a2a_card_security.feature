@@ -39,15 +39,15 @@ Feature: A2A agent card security
     Then the response status is 200
     And the agent card declares the surface authorization server for scopes "agent.invoke" in both shapes
 
-  Scenario: A JWT Bearer Access Point that requires no scope keeps the security of the managed agent
+  Scenario: A JWT Bearer Access Point that publishes its authorization server without required scopes declares it without scopes
     Given managed agent "bravo" publishes a v1.0 agent card with its own security
     And the surface requires "JWT Bearer" source authentication
     And the surface publishes the authorization server of its source authentication
     When the caller fetches the agent card
     Then the response status is 200
-    And the agent card keeps the security of the managed agent
+    And the agent card declares the surface authorization server without scopes in the 1.0 shape
 
-  Scenario: A JWT Bearer Access Point that publishes no authorization server keeps the security of the managed agent
+  Scenario: A JWT Bearer Access Point that requires scopes without publishing its authorization server keeps the security of the managed agent
     Given managed agent "bravo" publishes a v0.3 agent card with its own security
     And the surface requires "JWT Bearer" source authentication
     And the surface requires scopes "agent.invoke"

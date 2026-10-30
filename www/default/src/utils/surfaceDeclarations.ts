@@ -56,40 +56,36 @@ export const FAIL_OPEN_WARNING_CODES = ['fail_open_policy', 'fail_open_undetermi
 export const GATEWAY_DENY_WARNING_CODES = ['payment_before_policy'];
 
 export const STRIP_REASON_TEXT: Record<string, string> = {
-  transit_point: 'Transit Point cards never declare authentication.',
+  not_declared: 'Authorization server discovery is off for this route.',
   fabric_target: 'The Target is a Fabric peer and this surface has no caller authentication.',
-  multiple_methods: 'More than one caller authentication method is configured.',
-  method_not_declarable: 'Only JWT bearer caller authentication can be declared.',
-  strategy_unavailable: 'The JWT verification strategy is missing or not available to this tenant.',
-  static_jwks: 'The strategy uses static keys, so it has no authorization server to declare.',
-  not_pinned: 'The strategy has no pinned authorization server. Run Discover on the strategy.',
-  pin_mismatch: 'The pinned authorization server no longer matches the strategy. Discover again.',
-  custom_token_header: 'The token header is not Authorization with the Bearer scheme.',
-  forwards_caller_token:
-    'Forward token header to managed agent is on, so the caller’s token would reach the managed agent. No authorization server is declared.',
-  no_access_point_url: 'The gateway reports no https URL for this Access Point.',
-  audience_missing: 'The Access Point URL is not in Accepted Audiences.',
-  no_required_scopes: 'No required scopes are set.',
-  root_variant:
-    'A variant of an Access Point on the root route has no resource of its own to declare.',
+  transit_point: 'Transit Point cards never declare authentication.',
 };
 
 export const UNSERVABLE_REASON_TEXT: Record<string, string> = {
-  not_mcp:
-    'Protected resource metadata is set but this is not an MCP Access Point. Remove protected_resource.',
+  unsupported_protocol:
+    'Authorization server discovery is set but this Access Point’s protocol cannot publish it. Remove protected_resource.',
   root_variant_resource:
     'A variant of an Access Point on the root route has no resource of its own. Give the surface a route.',
-  resource_mismatch: 'The resource must be this Access Point URL. Set it to the URL shown.',
+  resource_mismatch:
+    'This Access Point’s listener no longer serves the resource URL, so callers are refused. Set the resource to a URL the listener serves.',
   invalid_protected_resource:
-    'The protected resource metadata settings are not valid. Check the authorization servers, scopes and resource.',
+    'The authorization server discovery settings are not valid. Check the resource URL and any stored authorization server or scopes.',
   incompatible_caller_authentication:
-    'Protected resource metadata needs the first caller authentication method to be JWT Bearer reading the Authorization header with the Bearer scheme, with no audiences and forward_header off. Fix the method or remove protected_resource.',
+    'Authorization server discovery needs JWT Bearer reading the Authorization header with the Bearer scheme, no Accepted Audiences and token forwarding off. Fix the method or turn authorization server discovery off.',
+  strategy_unavailable:
+    'The JWT verification strategy is missing or not available to this tenant, so no authorization server can be published. Callers are refused until it is fixed.',
+  issuer_not_advertisable:
+    'The JWT verification strategy’s issuer is not a URL protected resource metadata can name, so no authorization server can be published. Callers are refused until it is fixed.',
   strategy_store_unavailable:
     'The gateway could not read the JWT verification strategy. Callers get 503 until it can; check the gateway log.',
+  network_unavailable:
+    'The gateway could not read its listener settings. Callers are refused until it can; check the gateway log.',
 };
 
 const UNSERVABLE_FALLBACK =
   'The discovery setting cannot be served on this route, so callers are refused until it is fixed.';
+
+const CARD_KEEPS_SECURITY = 'The agent card keeps the managed agent’s own security.';
 
 export function describeDeclaration(
   d: SurfaceDeclaration,
@@ -100,8 +96,8 @@ export function describeDeclaration(
     return {
       label: 'Declares OAuth',
       detail: mcp
-        ? 'The protected resource metadata names this gateway’s authorization server and scopes.'
-        : 'The agent card advertises this gateway’s authorization server and scopes.',
+        ? 'The protected resource metadata names the authorization server of the selected strategy and the required scopes, and callers without a valid token are challenged.'
+        : 'The agent card and the protected resource metadata name the authorization server of the selected strategy and the required scopes, and callers without a valid token are challenged.',
     };
   }
   if (d.outcome === 'unservable') {
@@ -123,13 +119,14 @@ export function describeDeclaration(
             'No caller authentication is configured, so the upstream card’s security is kept.',
         };
   }
-  const fallback = mcp
-    ? 'No protected resource metadata is published.'
-    : 'The card declares no security scheme.';
-  return {
-    label: mcp ? 'Not declared' : 'Security removed from card',
-    detail: (d.reason && STRIP_REASON_TEXT[d.reason]) || fallback,
-  };
+  const reasonText = d.reason ? STRIP_REASON_TEXT[d.reason] : undefined;
+  let detail: string;
+  if (mcp) {
+    detail = reasonText ?? 'No protected resource metadata is published.';
+  } else {
+    detail = reasonText ? `${reasonText} ${CARD_KEEPS_SECURITY}` : CARD_KEEPS_SECURITY;
+  }
+  return { label: 'Not declared', detail };
 }
 
 export function surfacePathAfterCreate(created: {

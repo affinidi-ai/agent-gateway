@@ -6,6 +6,10 @@ use crate::bdd_support::config::target_auth::TargetTokenProviderFixture;
 /// The public https origin a surface's protected resource is published under.
 pub const PROTECTED_RESOURCE_PUBLIC_ORIGIN: &str = "https://gateway.bdd.example";
 
+/// The https issuer the JWT verification strategy of a declaring surface trusts, as a
+/// public authorization server's would be. Its keys still come from the local key set.
+pub const DECLARING_STRATEGY_ISSUER: &str = "https://idp.bdd.example";
+
 /// RFC 9728 discovery settings of the surface's caller authentication.
 #[derive(Debug, Clone)]
 pub struct ProtectedResourceFixture {
@@ -67,20 +71,40 @@ pub struct SurfaceConfigBuilder {
     /// Authorization server metadata the surface's JWT verification strategy is stored
     /// pinned to; its issuer becomes the strategy's and the caller tokens' issuer.
     pub jwt_strategy_authorization_server: Option<serde_json::Value>,
+    /// Gateway-level policy Rego source written to the gateway policy entry.
+    pub gateway_policy_rego: Option<String>,
+    /// An external URL the gateway lists before the surface's own, so the declared origin is not first.
+    pub external_url_listed_first: Option<String>,
 }
 
 impl SurfaceConfigBuilder {
     /// The issuer the surface's JWT verification strategy expects: the pinned authorization
-    /// server's when the strategy is pinned, otherwise `key_set_issuer`.
+    /// server's when the strategy is pinned, else the authorization server the surface's
+    /// protected resource metadata names, else [`DECLARING_STRATEGY_ISSUER`] when the
+    /// surface declares the authorization server of its source authentication, otherwise
+    /// `key_set_issuer`.
     pub fn jwt_strategy_issuer(
         &self,
         key_set_issuer: &str,
     ) -> String {
-        self.jwt_strategy_authorization_server
+        if let Some(issuer) = self
+            .jwt_strategy_authorization_server
             .as_ref()
             .and_then(|server| server["issuer"].as_str())
-            .unwrap_or(key_set_issuer)
-            .to_string()
+        {
+            return issuer.to_string();
+        }
+        if let Some(protected) = &self.protected_resource {
+            return protected
+                .authorization_server
+                .clone();
+        }
+        match &self.source_auth {
+            Some(SurfaceSourceAuthConfig::JwtBearer(jwt)) if jwt.declares_authorization_server => {
+                DECLARING_STRATEGY_ISSUER.to_string()
+            }
+            _ => key_set_issuer.to_string(),
+        }
     }
 }
 
@@ -133,6 +157,8 @@ impl Default for SurfaceConfigBuilder {
             rate_limit_per_minute: None,
             audit_log_keeps_every_event: false,
             jwt_strategy_authorization_server: None,
+            gateway_policy_rego: None,
+            external_url_listed_first: None,
         }
     }
 }
@@ -310,8 +336,8 @@ pub struct JwtSourceAuthConfig {
     pub issuer: String,
     pub audiences: Vec<String>,
     pub required_scopes: Vec<String>,
+    /// Writes `protected_resource: {resource: <declared Access Point URL>}` on the surface.
     pub declares_authorization_server: bool,
-    pub forwards_caller_token: bool,
 }
 
 #[derive(Debug, Clone)]

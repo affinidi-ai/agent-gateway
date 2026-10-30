@@ -27,9 +27,6 @@ pub fn caller_authentication_method_json(config: &SurfaceSourceAuthConfig) -> Va
             if !cfg.required_scopes.is_empty() {
                 method["required_scopes"] = json!(&cfg.required_scopes);
             }
-            if cfg.forwards_caller_token {
-                method["forward_header"] = json!(true);
-            }
             method
         }
         SurfaceSourceAuthConfig::ApiKey(cfg) => api_key_source_auth_method_json(&cfg.header_name, &cfg.secret_id),
@@ -74,18 +71,6 @@ mod tests {
                 .get("forward_header")
                 .is_none()
         );
-    }
-
-    #[test]
-    fn jwt_method_forwards_the_caller_token_only_when_asked() {
-        use crate::bdd_support::config::single_surface_fixture::{JwtSourceAuthConfig, SurfaceSourceAuthConfig};
-
-        let jwt = SurfaceSourceAuthConfig::JwtBearer(JwtSourceAuthConfig {
-            forwards_caller_token: true,
-            ..JwtSourceAuthConfig::default()
-        });
-
-        assert_eq!(super::caller_authentication_method_json(&jwt)["forward_header"], serde_json::json!(true));
     }
 
     #[test]

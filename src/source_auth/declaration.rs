@@ -8,10 +8,10 @@
 //! [`resolve_surface_declaration`]. The RFC 6750 and RFC 9728 strings come from
 //! [`crate::protocols::protected_resource`].
 //!
-//! An Access Point declares from one of two sources, chosen by
-//! [`declaration_source`]: the explicit `protected_resource` setting of an MCP
-//! Access Point, or a declaration derived from its one pinned `jwt_bearer`
-//! method with `required_scopes`.
+//! An Access Point declares from one source, its
+//! `caller_authentication.protected_resource` setting, whose authorization
+//! server and scopes come from the method's JWT verification strategy and
+//! `required_scopes`.
 
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -21,7 +21,7 @@ use crate::config::NetworkConfig;
 use crate::config::agent_surface::AgentSurface;
 use crate::jwt_bearer::JwtVerificationStrategyStorage;
 use crate::jwt_bearer::models::{AuthorizationServerMetadata, JwtBearerAuthConfig, JwtVerificationStrategy};
-use crate::protocols::protected_resource::{self, ProtectedResourceConfig, ResourceTokenError};
+use crate::protocols::protected_resource::{self, ResourceTokenError};
 use crate::source_auth::SourceAuthConfig;
 use crate::source_auth::errors::SourceAuthError;
 
@@ -31,23 +31,16 @@ const SCOPE_REQUIRED: &str = "A bearer token granting the scopes in the challeng
 const FABRIC_TOKEN_REQUIRED: &str = "A bearer token issued for this resource is required";
 const FABRIC_SCOPE_REQUIRED: &str = "A bearer token granting the scopes this resource requires is required";
 
-/// Why an Access Point without an explicit `protected_resource` declares
-/// nothing.
+/// Why nothing is declared: the Access Point sets no `protected_resource`, or
+/// the card is an outbound Transit Point's. Only reporting and metrics read
+/// it; the card is kept as the Target served it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StripReason {
+    /// No caller authentication and a `fabric://` Target.
     FabricTarget,
-    MultipleMethods,
-    MethodNotDeclarable,
-    StrategyUnavailable,
-    StaticJwks,
-    NotPinned,
-    PinMismatch,
-    CustomTokenHeader,
-    ForwardsCallerToken,
-    NoAccessPointUrl,
-    AudienceMissing,
-    NoRequiredScopes,
-    RootVariant,
+    /// Caller authentication without `protected_resource`.
+    NotDeclared,
+    /// An outbound Transit Point card.
     TransitPoint,
 }
 
@@ -55,18 +48,7 @@ impl StripReason {
     pub fn code(self) -> &'static str {
         match self {
             Self::FabricTarget => "fabric_target",
-            Self::MultipleMethods => "multiple_methods",
-            Self::MethodNotDeclarable => "method_not_declarable",
-            Self::StrategyUnavailable => "strategy_unavailable",
-            Self::StaticJwks => "static_jwks",
-            Self::NotPinned => "not_pinned",
-            Self::PinMismatch => "pin_mismatch",
-            Self::CustomTokenHeader => "custom_token_header",
-            Self::ForwardsCallerToken => "forwards_caller_token",
-            Self::NoAccessPointUrl => "no_access_point_url",
-            Self::AudienceMissing => "audience_missing",
-            Self::NoRequiredScopes => "no_required_scopes",
-            Self::RootVariant => "root_variant",
+            Self::NotDeclared => "not_declared",
             Self::TransitPoint => "transit_point",
         }
     }
@@ -75,11 +57,13 @@ impl StripReason {
 /// Why an Access Point cannot serve the declaration its settings ask for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnservableReason {
-    NotMcp,
+    UnsupportedProtocol,
     InvalidProtectedResource,
     IncompatibleCallerAuthentication,
     RootVariantResource,
     ResourceMismatch,
+    StrategyUnavailable,
+    IssuerNotAdvertisable,
     StrategyStoreUnavailable,
     NetworkUnavailable,
 }
@@ -87,11 +71,13 @@ pub enum UnservableReason {
 impl UnservableReason {
     pub fn code(self) -> &'static str {
         match self {
-            Self::NotMcp => "not_mcp",
+            Self::UnsupportedProtocol => "unsupported_protocol",
             Self::InvalidProtectedResource => "invalid_protected_resource",
             Self::IncompatibleCallerAuthentication => "incompatible_caller_authentication",
             Self::RootVariantResource => "root_variant_resource",
             Self::ResourceMismatch => "resource_mismatch",
+            Self::StrategyUnavailable => "strategy_unavailable",
+            Self::IssuerNotAdvertisable => "issuer_not_advertisable",
             Self::StrategyStoreUnavailable => "strategy_store_unavailable",
             Self::NetworkUnavailable => "network_unavailable",
         }
@@ -130,8 +116,12 @@ impl std::fmt::Display for UnservableDeclaration {
 pub struct Declaration {
     /// The resource of the route called, base or `$alias` variant.
     pub resource: String,
+    /// The strategy's `expected_issuer`, the one authorization server advertised.
     pub authorization_servers: Vec<String>,
-    /// The authorization server metadata a derived declaration was pinned to.
+    /// The strategy's pinned authorization server metadata when its issuer
+    /// equals the strategy's `expected_issuer` and, for a remote key set, its
+    /// `jwks_uri` equals the strategy's; the A2A card's `agent_gateway` scheme
+    /// needs it.
     pub pin: Option<AuthorizationServerMetadata>,
     /// The scopes a caller's token must grant, which the challenge names.
     pub required_scopes: Vec<String>,
@@ -284,233 +274,123 @@ impl DeclarationOutcome {
 }
 
 /// Whether the Access Point refuses a caller that failed source
-/// authentication with the declaration's challenge whatever policy allows,
-/// before AP2 and payment: it declares, so the gateway is the resource server.
+/// authentication itself, at the source authentication step and before rate
+/// limit, every policy plane, AP2 and payment: it declares, so the gateway is
+/// the resource server. The request path, the dry run and the save report
+/// agree through this predicate.
 pub fn refuses_failed_callers_by_default(outcome: &DeclarationOutcome) -> bool {
     matches!(outcome, DeclarationOutcome::Declare(_))
 }
 
-/// Where the declaration of an Access Point comes from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeclarationSource<'a> {
-    /// The `protected_resource` setting of its caller authentication.
-    Explicit(&'a ProtectedResourceConfig),
-    /// Its one `jwt_bearer` method with `required_scopes`, which declares once
-    /// its strategy is pinned.
-    Derived,
-    /// Nothing: it never declares, and resolving reads no strategy.
-    None,
-}
-
-/// The source of the declaration for the route called, `alias` naming its
-/// variant. An explicit `protected_resource` takes precedence; without one, a
-/// single `jwt_bearer` method with `required_scopes` derives the declaration,
-/// except on a variant of an Access Point at `/`, which has no resource of its
-/// own.
-pub fn declaration_source<'a>(
-    surface: &'a AgentSurface,
-    alias: Option<&str>,
-) -> DeclarationSource<'a> {
-    match surface.protected_resource() {
-        Some(configured) => DeclarationSource::Explicit(configured),
-        None if derived_method(surface, alias).is_ok() => DeclarationSource::Derived,
-        None => DeclarationSource::None,
-    }
+/// Whether the Access Point asks to declare on the route it resolves to: its
+/// caller authentication sets `protected_resource`. Such an Access Point fails
+/// closed when it cannot serve the declaration.
+pub fn requests_declaration(surface: &AgentSurface) -> bool {
+    surface
+        .protected_resource()
+        .is_some()
 }
 
 /// The declaration of a resolved Access Point for the route called, `alias`
 /// naming its variant. The direct path, Fabric receive and the metadata route
-/// all resolve it here. Only a derived declaration reads its strategy from
-/// `strategies`, and only a store failure is an error; a missing store or
-/// strategy strips.
+/// all resolve it here. An Access Point without `protected_resource` never
+/// declares and never reads `strategies`. One that sets it reads the strategy
+/// its JWT Bearer method names: the strategy's `expected_issuer` is the one
+/// authorization server advertised, so the stored `authorization_servers` is
+/// never read. Only a store failure is an error; a missing store, a missing or
+/// foreign strategy and an issuer metadata cannot name leave the declaration
+/// unservable.
 pub async fn resolve_surface_declaration(
     surface: &AgentSurface,
     alias: Option<&str>,
     strategies: Option<&dyn JwtVerificationStrategyStorage>,
     network: &NetworkConfig,
 ) -> anyhow::Result<DeclarationOutcome> {
-    let strategy = match declaration_source(surface, alias) {
-        DeclarationSource::Explicit(configured) => {
-            return Ok(explicit_declaration(surface, configured, alias, network));
-        }
-        DeclarationSource::Derived => match (declaration_strategy_id(surface), strategies) {
-            (Some(id), Some(store)) => store.get(id).await?,
-            _ => None,
-        },
-        DeclarationSource::None => None,
+    let Some(configured) = surface.protected_resource() else {
+        return Ok(undeclared(surface));
     };
-    Ok(derived_declaration(surface, alias, strategy.as_ref(), network))
-}
-
-fn explicit_declaration(
-    surface: &AgentSurface,
-    configured: &ProtectedResourceConfig,
-    alias: Option<&str>,
-    network: &NetworkConfig,
-) -> DeclarationOutcome {
-    match protected_resource::access_point_protected_resource(surface, alias, network) {
-        Some(Ok(served)) => {
-            let required_scopes = match surface.source_auth() {
-                Some(SourceAuthConfig::JwtBearer(config)) => config.required_scopes.clone(),
-                _ => Vec::new(),
-            };
-            DeclarationOutcome::Declare(Declaration {
-                resource: served.resource,
-                authorization_servers: configured
-                    .authorization_servers
-                    .clone(),
-                pin: None,
-                advertised_scopes: scopes_supported(&required_scopes, &configured.scopes),
-                required_scopes,
-            })
-        }
-        Some(Err(reason)) => DeclarationOutcome::Unservable(reason),
-        None => DeclarationOutcome::PassThrough,
+    let served = match protected_resource::access_point_protected_resource(surface, alias, network) {
+        Some(Ok(served)) => served,
+        Some(Err(unservable)) => return Ok(DeclarationOutcome::Unservable(unservable)),
+        None => return Ok(DeclarationOutcome::PassThrough),
+    };
+    let Some(SourceAuthConfig::JwtBearer(jwt)) = surface.source_auth() else {
+        return Ok(DeclarationOutcome::Unservable(UnservableDeclaration::new(
+            UnservableReason::IncompatibleCallerAuthentication,
+            "requires a first caller authentication method of JWT Bearer reading the Authorization header with \
+             the Bearer scheme",
+        )));
+    };
+    let Some(store) = strategies else {
+        return Ok(DeclarationOutcome::Unservable(UnservableDeclaration::new(
+            UnservableReason::StrategyStoreUnavailable,
+            "the JWT verification strategy store is unavailable",
+        )));
+    };
+    let Some(strategy) = store
+        .get(&jwt.jwt_verification_strategy_id)
+        .await?
+        .filter(|strategy| crate::tenancy::can_reference(surface.tenant_id.as_deref(), strategy.tenant_id.as_deref()))
+    else {
+        return Ok(DeclarationOutcome::Unservable(UnservableDeclaration::new(
+            UnservableReason::StrategyUnavailable,
+            "the JWT verification strategy is missing or not available to this surface's tenant",
+        )));
+    };
+    if !protected_resource::advertisable_strategy_issuer(&strategy) {
+        return Ok(DeclarationOutcome::Unservable(UnservableDeclaration::new(
+            UnservableReason::IssuerNotAdvertisable,
+            "the JWT verification strategy's expected_issuer is not an issuer URL protected resource metadata \
+             can name",
+        )));
     }
+    Ok(DeclarationOutcome::Declare(Declaration {
+        resource: served.resource,
+        pin: matching_pin(&strategy),
+        authorization_servers: vec![strategy.expected_issuer],
+        advertised_scopes: scopes_supported(&jwt.required_scopes, &configured.scopes),
+        required_scopes: jwt.required_scopes.clone(),
+    }))
 }
 
-/// The Access Point's `jwt_bearer` method when it is its only caller
-/// authentication method.
-fn single_jwt_bearer(surface: &AgentSurface) -> Result<Option<&JwtBearerAuthConfig>, StripReason> {
-    let methods = surface
+/// The outcome of an Access Point that sets no `protected_resource`.
+fn undeclared(surface: &AgentSurface) -> DeclarationOutcome {
+    let has_methods = surface
         .access_point
         .caller_authentication
         .as_ref()
-        .map(|auth| auth.methods.as_slice())
-        .unwrap_or_default();
-    match methods {
-        [] => Ok(None),
-        [SourceAuthConfig::JwtBearer(config)] => Ok(Some(config)),
-        [_] => Err(StripReason::MethodNotDeclarable),
-        _ => Err(StripReason::MultipleMethods),
-    }
-}
-
-/// The method a derived declaration is built from, or, for an Access Point
-/// that cannot derive one without reading its strategy, why it strips (`None`
-/// when it passes through).
-fn derived_method<'a>(
-    surface: &'a AgentSurface,
-    alias: Option<&str>,
-) -> Result<&'a JwtBearerAuthConfig, Option<StripReason>> {
-    let config = match single_jwt_bearer(surface) {
-        Ok(Some(config)) => config,
-        Ok(None)
-            if surface
-                .target
-                .endpoint
-                .starts_with("fabric://") =>
-        {
-            return Err(Some(StripReason::FabricTarget));
-        }
-        Ok(None) => return Err(None),
-        Err(reason) => return Err(Some(reason)),
-    };
-    if config
-        .required_scopes
-        .is_empty()
+        .is_some_and(|auth| !auth.methods.is_empty());
+    if has_methods {
+        DeclarationOutcome::Strip(StripReason::NotDeclared)
+    } else if surface
+        .target
+        .endpoint
+        .starts_with("fabric://")
     {
-        return Err(Some(StripReason::NoRequiredScopes));
-    }
-    if alias.is_some()
-        && matches!(
-            surface
-                .access_point
-                .route
-                .as_str(),
-            "" | "/"
-        )
-    {
-        return Err(Some(StripReason::RootVariant));
-    }
-    Ok(config)
-}
-
-/// The strategy a derived declaration reads.
-fn declaration_strategy_id(surface: &AgentSurface) -> Option<&str> {
-    single_jwt_bearer(surface)
-        .ok()
-        .flatten()
-        .map(|config| {
-            config
-                .jwt_verification_strategy_id
-                .as_str()
-        })
-}
-
-/// The derived outcome of a resolved Access Point. `strategy` is the stored
-/// strategy its method names, if it exists.
-fn derived_declaration(
-    surface: &AgentSurface,
-    alias: Option<&str>,
-    strategy: Option<&JwtVerificationStrategy>,
-    network: &NetworkConfig,
-) -> DeclarationOutcome {
-    let config = match derived_method(surface, alias) {
-        Ok(config) => config,
-        Err(Some(reason)) => return DeclarationOutcome::Strip(reason),
-        Err(None) => return DeclarationOutcome::PassThrough,
-    };
-    match declare(surface, alias, config, strategy, network) {
-        Ok(declaration) => DeclarationOutcome::Declare(declaration),
-        Err(reason) => DeclarationOutcome::Strip(reason),
+        DeclarationOutcome::Strip(StripReason::FabricTarget)
+    } else {
+        DeclarationOutcome::PassThrough
     }
 }
 
-fn declare(
-    surface: &AgentSurface,
-    alias: Option<&str>,
-    config: &JwtBearerAuthConfig,
-    strategy: Option<&JwtVerificationStrategy>,
-    network: &NetworkConfig,
-) -> Result<Declaration, StripReason> {
-    let strategy = strategy
-        .filter(|strategy| {
-            strategy.id == config.jwt_verification_strategy_id
-                && crate::tenancy::can_reference(surface.tenant_id.as_deref(), strategy.tenant_id.as_deref())
-        })
-        .ok_or(StripReason::StrategyUnavailable)?;
-    let jwks_uri = strategy
-        .remote_jwks_uri()
-        .ok_or(StripReason::StaticJwks)?;
-    let pin = strategy
+/// The strategy's pin when it names the strategy's own issuer and, for a
+/// remote key set, its own `jwks_uri`.
+fn matching_pin(strategy: &JwtVerificationStrategy) -> Option<AuthorizationServerMetadata> {
+    strategy
         .authorization_server
         .as_ref()
-        .ok_or(StripReason::NotPinned)?;
-    if pin.issuer != strategy.expected_issuer || pin.jwks_uri != jwks_uri {
-        return Err(StripReason::PinMismatch);
-    }
-    if !config
-        .token_header
-        .eq_ignore_ascii_case("authorization")
-        || !config
-            .token_scheme
-            .eq_ignore_ascii_case("bearer")
-    {
-        return Err(StripReason::CustomTokenHeader);
-    }
-    if config.forward_header {
-        return Err(StripReason::ForwardsCallerToken);
-    }
-    let resource = access_point_resource_url(surface, alias, network).ok_or(StripReason::NoAccessPointUrl)?;
-    if !config
-        .audiences
-        .contains(&resource)
-    {
-        return Err(StripReason::AudienceMissing);
-    }
-    Ok(Declaration {
-        resource,
-        authorization_servers: vec![pin.issuer.clone()],
-        pin: Some(pin.clone()),
-        required_scopes: config.required_scopes.clone(),
-        advertised_scopes: config.required_scopes.clone(),
-    })
+        .filter(|pin| {
+            pin.issuer == strategy.expected_issuer
+                && strategy
+                    .remote_jwks_uri()
+                    .is_none_or(|uri| pin.jwks_uri == uri)
+        })
+        .cloned()
 }
 
-/// The resource a derived declaration names: the public origin of the Access
-/// Point's listener and its route, as a canonical HTTPS URL, with `$alias` for
-/// a variant.
+/// The URL the save report suggests as the resource of an Access Point that
+/// does not declare: the first external URL of its listener and its route,
+/// `$alias` for a variant. It is never an audience.
 pub fn access_point_resource_url(
     surface: &AgentSurface,
     alias: Option<&str>,
@@ -533,7 +413,7 @@ mod tests {
     use super::*;
     use crate::jwt_bearer::models::JwksSource;
     use crate::protocols::protected_resource::fixtures::{
-        ISSUER, discovery_network, discovery_surface, jwt_bearer_method,
+        FixtureStrategies, ISSUER, discovery_network, discovery_surface, fixture_strategy, jwt_bearer_method,
     };
     use crate::protocols::protected_resource::is_gateway_challenge;
 
@@ -541,7 +421,7 @@ mod tests {
     const METADATA: &str = "https://gateway.example/.well-known/oauth-protected-resource/mcp/alpha";
 
     fn explicit(resource: &str) -> Value {
-        json!({"resource": resource, "authorization_servers": [ISSUER], "scopes": ["tools"]})
+        json!({"resource": resource, "scopes": ["tools"]})
     }
 
     fn declaring_surface() -> AgentSurface {
@@ -553,10 +433,7 @@ mod tests {
     fn scoped_surface() -> AgentSurface {
         let mut method = jwt_bearer_method();
         method["required_scopes"] = json!(["tools.call", "tools"]);
-        discovery_surface(
-            method,
-            Some(json!({"resource": RESOURCE, "authorization_servers": [ISSUER], "scopes": ["tools", "resources"]})),
-        )
+        discovery_surface(method, Some(json!({"resource": RESOURCE, "scopes": ["tools", "resources"]})))
     }
 
     fn short_of_scope() -> SourceAuthError {
@@ -580,16 +457,24 @@ mod tests {
         root
     }
 
-    async fn resolve(
+    async fn resolve_with(
         surface: &AgentSurface,
         alias: Option<&str>,
+        strategies: &FixtureStrategies,
     ) -> DeclarationOutcome {
         let view = surface
             .resolve_variant(alias)
             .expect("variant");
-        resolve_surface_declaration(&view, alias, None, &discovery_network())
+        resolve_surface_declaration(&view, alias, Some(strategies), &discovery_network())
             .await
-            .expect("an explicit declaration reads no strategy")
+            .expect("the fixture store answers")
+    }
+
+    async fn resolve(
+        surface: &AgentSurface,
+        alias: Option<&str>,
+    ) -> DeclarationOutcome {
+        resolve_with(surface, alias, &FixtureStrategies::Pinned).await
     }
 
     async fn declaration(
@@ -614,6 +499,13 @@ mod tests {
         }
     }
 
+    fn unservable_reason(outcome: &DeclarationOutcome) -> Option<UnservableReason> {
+        match outcome {
+            DeclarationOutcome::Unservable(unservable) => Some(unservable.reason),
+            _ => None,
+        }
+    }
+
     #[tokio::test]
     async fn an_explicit_protected_resource_declares_the_resource_of_the_route_called() {
         let surface = declaring_surface();
@@ -622,7 +514,7 @@ mod tests {
             DeclarationOutcome::Declare(Declaration {
                 resource: RESOURCE.into(),
                 authorization_servers: vec![ISSUER.into()],
-                pin: None,
+                pin: fixture_strategy(true).authorization_server,
                 required_scopes: Vec::new(),
                 advertised_scopes: vec!["tools".into()],
             })
@@ -642,23 +534,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_access_point_without_a_protected_resource_declares_only_from_a_pinned_strategy() {
-        let surface = discovery_surface(jwt_bearer_method(), None);
-        assert_eq!(resolve(&surface, None).await, DeclarationOutcome::Strip(StripReason::NoRequiredScopes));
-        assert_eq!(resolve(&surface, Some("beta")).await, DeclarationOutcome::Strip(StripReason::NoRequiredScopes));
-        assert!(!refuses_failed_callers_by_default(&resolve(&surface, None).await));
-
+    async fn an_access_point_without_protected_resource_never_declares() {
         let mut scoped = jwt_bearer_method();
         scoped["required_scopes"] = json!(["tools"]);
-        let scoped = discovery_surface(scoped, None);
-        assert_eq!(resolve(&scoped, None).await, DeclarationOutcome::Strip(StripReason::StrategyUnavailable));
-        assert!(!refuses_failed_callers_by_default(&resolve(&scoped, None).await));
-    }
-
-    fn unservable_reason(outcome: &DeclarationOutcome) -> Option<UnservableReason> {
-        match outcome {
-            DeclarationOutcome::Unservable(unservable) => Some(unservable.reason),
-            _ => None,
+        for method in [jwt_bearer_method(), scoped] {
+            let surface = discovery_surface(method.clone(), None);
+            for alias in [None, Some("beta")] {
+                let outcome = resolve(&surface, alias).await;
+                assert_eq!(outcome, DeclarationOutcome::Strip(StripReason::NotDeclared), "{method} {alias:?}");
+                assert!(!refuses_failed_callers_by_default(&outcome), "{method} {alias:?}");
+                assert_eq!(
+                    resolve_with(&surface, alias, &FixtureStrategies::Failing).await,
+                    DeclarationOutcome::Strip(StripReason::NotDeclared),
+                    "{method} {alias:?}"
+                );
+            }
         }
     }
 
@@ -669,14 +559,22 @@ mod tests {
             Some(UnservableReason::RootVariantResource)
         );
 
+        let mut didcomm = declaring_surface();
+        didcomm.access_point.protocol = crate::config::agent_surface::SurfaceProtocol::DIDComm;
+        assert_eq!(
+            resolve(&didcomm, None).await,
+            DeclarationOutcome::Unservable(UnservableDeclaration::new(
+                UnservableReason::UnsupportedProtocol,
+                "requires an MCP, A2A or AP2 Access Point"
+            ))
+        );
         let mut a2a = declaring_surface();
         a2a.access_point.protocol = crate::config::agent_surface::SurfaceProtocol::A2a;
         assert_eq!(
-            resolve(&a2a, None).await,
-            DeclarationOutcome::Unservable(UnservableDeclaration::new(
-                UnservableReason::NotMcp,
-                "requires an MCP Access Point"
-            ))
+            resolve(&a2a, None)
+                .await
+                .label(),
+            "declare"
         );
 
         let no_servers = json!({"resource": RESOURCE, "authorization_servers": []});
@@ -707,6 +605,88 @@ mod tests {
             assert!(!refuses_failed_callers_by_default(&outcome), "{method}");
         }
         assert_eq!(unservable_reason(&resolve(&declaring_surface(), None).await), None);
+    }
+
+    #[tokio::test]
+    async fn a_protected_resource_without_required_scopes_still_declares_and_refuses() {
+        let surface =
+            discovery_surface(jwt_bearer_method(), Some(json!({"resource": RESOURCE, "scopes": ["agent.read"]})));
+        let outcome = resolve(&surface, None).await;
+        assert!(refuses_failed_callers_by_default(&outcome));
+        let DeclarationOutcome::Declare(declaration) = outcome else {
+            panic!("expected a declaration");
+        };
+        assert_eq!(declaration.required_scopes, Vec::<String>::new());
+        assert_eq!(declaration.advertised_scopes, ["agent.read"]);
+        let challenge = declaration.caller_challenge(&missing());
+        assert_eq!(challenge.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            challenge.headers()[header::WWW_AUTHENTICATE],
+            format!("Bearer resource_metadata=\"{METADATA}\"").as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_stored_authorization_servers_are_never_advertised() {
+        let surface = discovery_surface(
+            jwt_bearer_method(),
+            Some(json!({"resource": RESOURCE, "authorization_servers": ["https://old.example/"]})),
+        );
+        let declaration = declaration(&surface, None).await;
+        assert_eq!(declaration.authorization_servers, [ISSUER]);
+        assert_eq!(declaration.metadata()["authorization_servers"], json!([ISSUER]));
+        assert_ne!(declaration.authorization_servers, ["https://old.example/"]);
+    }
+
+    #[tokio::test]
+    async fn the_audience_does_not_depend_on_the_order_of_external_urls() {
+        let method = JwtBearerAuthConfig {
+            jwt_verification_strategy_id: "idp".into(),
+            ..Default::default()
+        };
+        let mut bound = Vec::new();
+        for external_urls in [
+            ["https://internal.example", "https://gateway.example"],
+            ["https://gateway.example", "https://internal.example"],
+        ] {
+            let mut network = discovery_network();
+            network.listeners[0].external_urls = external_urls
+                .iter()
+                .map(|url| url.to_string())
+                .collect();
+            let outcome =
+                resolve_surface_declaration(&declaring_surface(), None, Some(&FixtureStrategies::Pinned), &network)
+                    .await
+                    .expect("resolve");
+            let DeclarationOutcome::Declare(declaration) = outcome else {
+                panic!("expected a declaration for {external_urls:?}");
+            };
+            assert_eq!(declaration.resource, RESOURCE, "{external_urls:?}");
+            bound.push(
+                declaration
+                    .bind_audience(&method)
+                    .audiences,
+            );
+        }
+        assert_eq!(bound, [vec![RESOURCE.to_string()], vec![RESOURCE.to_string()]]);
+    }
+
+    #[test]
+    fn requests_declaration_follows_protected_resource_only() {
+        assert!(requests_declaration(&declaring_surface()));
+        for protocol in [
+            crate::config::agent_surface::SurfaceProtocol::A2a,
+            crate::config::agent_surface::SurfaceProtocol::Ap2,
+            crate::config::agent_surface::SurfaceProtocol::DIDComm,
+        ] {
+            let mut surface = declaring_surface();
+            surface.access_point.protocol = protocol.clone();
+            assert!(requests_declaration(&surface), "{protocol:?}");
+        }
+        let mut scoped = jwt_bearer_method();
+        scoped["required_scopes"] = json!(["tools"]);
+        assert!(!requests_declaration(&discovery_surface(scoped, None)));
+        assert!(!requests_declaration(&discovery_surface(jwt_bearer_method(), None)));
     }
 
     #[tokio::test]
@@ -982,7 +962,7 @@ mod tests {
         let mut method = json!({
             "type": "jwt_bearer",
             "jwt_verification_strategy_id": "strategy-1",
-            "audiences": [A2A_RESOURCE],
+            "audiences": [],
             "required_scopes": ["agent.invoke"],
         });
         if let (Some(method), Some(overrides)) = (method.as_object_mut(), overrides.as_object()) {
@@ -1011,16 +991,22 @@ mod tests {
         .expect("surface")
     }
 
-    fn api_key_method() -> Value {
-        json!({
-            "type": "api_key",
-            "secret_id": "keys",
-            "extraction": { "source": "http_header", "field": "X-API-Key" },
-        })
-    }
-
-    fn derived_surface() -> AgentSurface {
-        a2a_surface(Some(vec![jwt_method(json!({}))]), "https://agent.internal")
+    /// An A2A Access Point whose one JWT Bearer method, changed by
+    /// `overrides`, declares `resource`.
+    fn declaring_a2a(
+        overrides: Value,
+        resource: &str,
+    ) -> AgentSurface {
+        let mut surface = a2a_surface(Some(vec![jwt_method(overrides)]), "https://agent.internal");
+        if let Some(caller_authentication) = surface
+            .access_point
+            .caller_authentication
+            .as_mut()
+        {
+            caller_authentication.protected_resource =
+                Some(serde_json::from_value(json!({ "resource": resource })).expect("protected resource"));
+        }
+        surface
     }
 
     fn pin() -> AuthorizationServerMetadata {
@@ -1043,20 +1029,63 @@ mod tests {
         }
     }
 
-    fn derived(
+    /// A read-only store holding one strategy under its id.
+    struct Holding(JwtVerificationStrategy);
+
+    #[async_trait::async_trait]
+    impl JwtVerificationStrategyStorage for Holding {
+        async fn create(
+            &self,
+            _strategy: JwtVerificationStrategy,
+        ) -> anyhow::Result<JwtVerificationStrategy> {
+            anyhow::bail!("read-only")
+        }
+
+        async fn get(
+            &self,
+            id: &str,
+        ) -> anyhow::Result<Option<JwtVerificationStrategy>> {
+            Ok((self.0.id == id).then(|| self.0.clone()))
+        }
+
+        async fn list(&self) -> anyhow::Result<Vec<JwtVerificationStrategy>> {
+            Ok(vec![self.0.clone()])
+        }
+
+        async fn update(
+            &self,
+            _strategy: JwtVerificationStrategy,
+        ) -> anyhow::Result<JwtVerificationStrategy> {
+            anyhow::bail!("read-only")
+        }
+
+        async fn delete(
+            &self,
+            _id: &str,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("read-only")
+        }
+    }
+
+    async fn resolve_a2a(
         surface: &AgentSurface,
-        strategy: Option<&JwtVerificationStrategy>,
+        alias: Option<&str>,
+        strategy: JwtVerificationStrategy,
+        network: &NetworkConfig,
     ) -> DeclarationOutcome {
-        derived_declaration(surface, None, strategy, &a2a_network())
+        resolve_surface_declaration(surface, alias, Some(&Holding(strategy)), network)
+            .await
+            .expect("the store answers")
     }
 
     fn stripped(reason: StripReason) -> DeclarationOutcome {
         DeclarationOutcome::Strip(reason)
     }
 
-    #[test]
-    fn a_single_pinned_jwt_bearer_method_with_required_scopes_declares_the_pinned_server() {
-        let outcome = derived(&derived_surface(), Some(&pinned_strategy()));
+    #[tokio::test]
+    async fn an_a2a_protected_resource_declares_the_strategy_issuer_and_its_pin() {
+        let outcome =
+            resolve_a2a(&declaring_a2a(json!({}), A2A_RESOURCE), None, pinned_strategy(), &a2a_network()).await;
         assert_eq!(
             outcome,
             DeclarationOutcome::Declare(Declaration {
@@ -1087,168 +1116,181 @@ mod tests {
         );
     }
 
-    #[test]
-    fn no_caller_authentication_passes_through_unless_the_target_is_fabric() {
-        assert_eq!(derived(&a2a_surface(None, "https://agent.internal"), None), DeclarationOutcome::PassThrough);
-        assert_eq!(
-            derived(&a2a_surface(Some(vec![]), "https://agent.internal"), None),
-            DeclarationOutcome::PassThrough
-        );
-        assert_eq!(derived(&a2a_surface(None, "fabric://peer/surface"), None), stripped(StripReason::FabricTarget));
-        assert!(!refuses_failed_callers_by_default(&DeclarationOutcome::PassThrough));
-        assert!(!refuses_failed_callers_by_default(&stripped(StripReason::FabricTarget)));
+    #[tokio::test]
+    async fn no_caller_authentication_passes_through_unless_the_target_is_fabric() {
+        let network = a2a_network();
+        for (surface, expected) in [
+            (a2a_surface(None, "https://agent.internal"), DeclarationOutcome::PassThrough),
+            (a2a_surface(Some(vec![]), "https://agent.internal"), DeclarationOutcome::PassThrough),
+            (a2a_surface(None, "fabric://peer/surface"), stripped(StripReason::FabricTarget)),
+            (a2a_surface(Some(vec![]), "fabric://peer/surface"), stripped(StripReason::FabricTarget)),
+            (
+                a2a_surface(Some(vec![jwt_method(json!({}))]), "fabric://peer/surface"),
+                stripped(StripReason::NotDeclared),
+            ),
+        ] {
+            let outcome = resolve_surface_declaration(&surface, None, Some(&FixtureStrategies::Failing), &network)
+                .await
+                .expect("an Access Point without protected_resource reads no strategy");
+            assert_eq!(outcome, expected, "{}", surface.target.endpoint);
+            assert!(!refuses_failed_callers_by_default(&outcome));
+        }
     }
 
-    #[test]
-    fn more_than_one_method_or_another_method_strips() {
-        let strategy = pinned_strategy();
-        let api_key = api_key_method();
-        let two = a2a_surface(Some(vec![jwt_method(json!({})), api_key.clone()]), "https://agent.internal");
-        assert_eq!(derived(&two, Some(&strategy)), stripped(StripReason::MultipleMethods));
-        let other = a2a_surface(Some(vec![api_key]), "https://agent.internal");
-        assert_eq!(derived(&other, Some(&strategy)), stripped(StripReason::MethodNotDeclarable));
-        assert_eq!(declaration_strategy_id(&two), None);
-        assert_eq!(declaration_strategy_id(&derived_surface()), Some("strategy-1"));
-    }
-
-    #[test]
-    fn a_missing_foreign_or_mismatched_strategy_strips() {
-        let surface = derived_surface();
-        assert_eq!(derived(&surface, None), stripped(StripReason::StrategyUnavailable));
-
-        let mut foreign = pinned_strategy();
-        foreign.tenant_id = Some("tenant-b".into());
-        assert_eq!(derived(&surface, Some(&foreign)), stripped(StripReason::StrategyUnavailable));
+    #[tokio::test]
+    async fn a_missing_or_foreign_strategy_leaves_a_declaration_unservable() {
+        let network = a2a_network();
+        let surface = declaring_a2a(json!({}), A2A_RESOURCE);
 
         let mut other_id = pinned_strategy();
         other_id.id = "strategy-2".into();
-        assert_eq!(derived(&surface, Some(&other_id)), stripped(StripReason::StrategyUnavailable));
+        let outcome = resolve_a2a(&surface, None, other_id, &network).await;
+        assert_eq!(
+            outcome,
+            DeclarationOutcome::Unservable(UnservableDeclaration::new(
+                UnservableReason::StrategyUnavailable,
+                "the JWT verification strategy is missing or not available to this surface's tenant"
+            ))
+        );
+        assert!(!refuses_failed_callers_by_default(&outcome));
 
-        let mut owned = derived_surface();
+        let mut foreign = pinned_strategy();
+        foreign.tenant_id = Some("tenant-b".into());
+        assert_eq!(
+            unservable_reason(&resolve_a2a(&surface, None, foreign.clone(), &network).await),
+            Some(UnservableReason::StrategyUnavailable)
+        );
+
+        let mut owned = declaring_a2a(json!({}), A2A_RESOURCE);
         owned.tenant_id = Some("tenant-a".into());
+        assert_eq!(
+            unservable_reason(&resolve_a2a(&owned, None, foreign, &network).await),
+            Some(UnservableReason::StrategyUnavailable)
+        );
         let mut own = pinned_strategy();
         own.tenant_id = Some("tenant-a".into());
-        assert_eq!(derived(&owned, Some(&own)).label(), "declare");
-        assert_eq!(derived(&owned, Some(&pinned_strategy())).label(), "declare");
+        assert_eq!(
+            resolve_a2a(&owned, None, own, &network)
+                .await
+                .label(),
+            "declare"
+        );
+        assert_eq!(
+            resolve_a2a(&owned, None, pinned_strategy(), &network)
+                .await
+                .label(),
+            "declare"
+        );
     }
 
-    #[test]
-    fn a_static_unpinned_or_mismatched_pin_strips() {
-        let surface = derived_surface();
+    #[tokio::test]
+    async fn a_static_unpinned_or_mismatched_strategy_still_declares() {
+        let surface = declaring_a2a(json!({}), A2A_RESOURCE);
 
         let mut static_keys = pinned_strategy();
         static_keys.jwks_source = JwksSource::Static { jwks: Vec::new() };
-        assert_eq!(derived(&surface, Some(&static_keys)), stripped(StripReason::StaticJwks));
+        let outcome = resolve_a2a(&surface, None, static_keys.clone(), &a2a_network()).await;
+        assert!(refuses_failed_callers_by_default(&outcome));
+        let DeclarationOutcome::Declare(declaration) = outcome else {
+            panic!("a static key set declares");
+        };
+        assert_eq!(declaration.authorization_servers, [AS_ISSUER]);
+        assert_eq!(declaration.pin, Some(pin()));
+        static_keys.authorization_server = None;
 
         let mut unpinned = pinned_strategy();
         unpinned.authorization_server = None;
-        assert_eq!(derived(&surface, Some(&unpinned)), stripped(StripReason::NotPinned));
-
         let mut other_issuer = pinned_strategy();
-        other_issuer.expected_issuer = "https://as.example".into();
-        assert_eq!(derived(&surface, Some(&other_issuer)), stripped(StripReason::PinMismatch));
-
+        other_issuer.authorization_server = Some(AuthorizationServerMetadata {
+            issuer: "https://other.example/".into(),
+            ..pin()
+        });
         let mut other_keys = pinned_strategy();
         other_keys.jwks_source = JwksSource::Remote {
             jwks_uri: "https://as.example/other.json".into(),
         };
-        assert_eq!(derived(&surface, Some(&other_keys)), stripped(StripReason::PinMismatch));
-    }
 
-    #[test]
-    fn a_custom_header_or_scheme_strips_and_case_does_not_matter() {
-        let strategy = pinned_strategy();
-        for overrides in
-            [json!({ "token_header": "X-Token" }), json!({ "token_scheme": "" }), json!({ "token_scheme": "DPoP" })]
-        {
-            let surface = a2a_surface(Some(vec![jwt_method(overrides)]), "https://agent.internal");
-            assert_eq!(derived(&surface, Some(&strategy)), stripped(StripReason::CustomTokenHeader));
+        for (case, strategy) in [
+            ("static unpinned", static_keys),
+            ("unpinned", unpinned),
+            ("other issuer", other_issuer),
+            ("other keys", other_keys),
+        ] {
+            let outcome = resolve_a2a(&surface, None, strategy, &a2a_network()).await;
+            assert!(refuses_failed_callers_by_default(&outcome), "{case}");
+            let DeclarationOutcome::Declare(declaration) = outcome else {
+                panic!("{case}: expected a declaration");
+            };
+            assert_eq!(declaration.authorization_servers, [AS_ISSUER], "{case}");
+            assert_eq!(declaration.pin, None, "{case}");
         }
-        let lower = a2a_surface(
-            Some(vec![jwt_method(json!({ "token_header": "authorization", "token_scheme": "bearer" }))]),
-            "https://agent.internal",
-        );
-        assert_eq!(derived(&lower, Some(&strategy)).label(), "declare");
     }
 
-    #[test]
-    fn forwarding_the_callers_token_strips_without_an_error() {
-        let forwarding =
-            a2a_surface(Some(vec![jwt_method(json!({ "forward_header": true }))]), "https://agent.internal");
-        let outcome = derived(&forwarding, Some(&pinned_strategy()));
-        assert_eq!(outcome, stripped(StripReason::ForwardsCallerToken));
-        assert_eq!(outcome.reason_code(), Some("forwards_caller_token"));
-        assert!(!refuses_failed_callers_by_default(&outcome));
-
-        let custom_and_forwarding = a2a_surface(
-            Some(vec![jwt_method(json!({ "forward_header": true, "token_header": "X-Token" }))]),
-            "https://agent.internal",
-        );
-        assert_eq!(derived(&custom_and_forwarding, Some(&pinned_strategy())), stripped(StripReason::CustomTokenHeader));
+    #[tokio::test]
+    async fn an_issuer_metadata_cannot_name_leaves_the_declaration_unservable() {
+        let unservable = DeclarationOutcome::Unservable(UnservableDeclaration::new(
+            UnservableReason::IssuerNotAdvertisable,
+            "the JWT verification strategy's expected_issuer is not an issuer URL protected resource metadata can \
+             name",
+        ));
+        let operators = declaring_a2a(json!({}), A2A_RESOURCE);
+        let mut tenants = declaring_a2a(json!({}), A2A_RESOURCE);
+        tenants.tenant_id = Some("tenant-a".into());
+        let cases = [
+            (&operators, None, "did:web:as.example"),
+            (&operators, None, "https://as.example/?tenant=a"),
+            (&operators, None, "http://user:pw@as.example/"),
+            (&tenants, Some("tenant-a"), "http://as.example/"),
+            (&tenants, Some("tenant-a"), "did:web:as.example"),
+        ];
+        for (surface, tenant, issuer) in cases {
+            let mut strategy = pinned_strategy();
+            strategy.expected_issuer = issuer.into();
+            strategy.tenant_id = tenant.map(Into::into);
+            let outcome = resolve_a2a(surface, None, strategy, &a2a_network()).await;
+            assert_eq!(outcome, unservable, "{issuer} for {tenant:?}");
+            assert!(!refuses_failed_callers_by_default(&outcome), "{issuer}");
+        }
     }
 
-    #[test]
-    fn no_listener_or_a_non_canonical_url_strips() {
-        let strategy = pinned_strategy();
-        let mut unmatched = derived_surface();
+    #[tokio::test]
+    async fn an_operator_strategy_with_an_http_issuer_declares_it() {
+        let mut strategy = pinned_strategy();
+        strategy.expected_issuer = "http://127.0.0.1:4444/".into();
+        let outcome = resolve_a2a(&declaring_a2a(json!({}), A2A_RESOURCE), None, strategy, &a2a_network()).await;
+        assert!(refuses_failed_callers_by_default(&outcome));
+        let DeclarationOutcome::Declare(declaration) = outcome else {
+            panic!("an operator's http issuer declares");
+        };
+        assert_eq!(declaration.authorization_servers, ["http://127.0.0.1:4444/"]);
+    }
+
+    #[tokio::test]
+    async fn a_resource_no_listener_serves_is_unservable() {
+        let mut unmatched = declaring_a2a(json!({}), A2A_RESOURCE);
         unmatched
             .access_point
             .listen_address = "0.0.0.0:9999".into();
-        assert_eq!(derived(&unmatched, Some(&strategy)), stripped(StripReason::NoAccessPointUrl));
-
-        let mut spaced = derived_surface();
-        spaced.access_point.route = "/a2a/bu yer".into();
-        assert_eq!(derived(&spaced, Some(&strategy)), stripped(StripReason::NoAccessPointUrl));
-
-        let mut relative = derived_surface();
-        relative.access_point.route = "a2a/buyer".into();
-        assert_eq!(derived(&relative, Some(&strategy)), stripped(StripReason::NoAccessPointUrl));
+        assert_eq!(
+            unservable_reason(&resolve_a2a(&unmatched, None, pinned_strategy(), &a2a_network()).await),
+            Some(UnservableReason::ResourceMismatch)
+        );
 
         let mut plain_http = a2a_network();
         plain_http.listeners[0].external_urls = vec!["http://gw.example".into()];
         assert_eq!(
-            derived_declaration(&derived_surface(), None, Some(&strategy), &plain_http),
-            stripped(StripReason::NoAccessPointUrl)
+            unservable_reason(
+                &resolve_a2a(&declaring_a2a(json!({}), A2A_RESOURCE), None, pinned_strategy(), &plain_http).await
+            ),
+            Some(UnservableReason::ResourceMismatch)
         );
     }
 
-    #[test]
-    fn the_access_point_url_must_be_an_exact_audience() {
-        let strategy = pinned_strategy();
-        for audiences in [
-            json!([]),
-            json!(["https://gw.example/a2a/buyer/"]),
-            json!(["https://GW.example/a2a/buyer"]),
-            json!([crate::source_auth::middleware::SURFACE_AGENT_DID_AUDIENCE]),
-        ] {
-            let surface =
-                a2a_surface(Some(vec![jwt_method(json!({ "audiences": audiences }))]), "https://agent.internal");
-            assert_eq!(derived(&surface, Some(&strategy)), stripped(StripReason::AudienceMissing));
-        }
-        let extra = a2a_surface(
-            Some(vec![jwt_method(json!({ "audiences": ["api://agent", A2A_RESOURCE] }))]),
-            "https://agent.internal",
-        );
-        assert_eq!(derived(&extra, Some(&strategy)).label(), "declare");
-    }
-
-    #[test]
-    fn empty_required_scopes_strip_before_the_strategy_is_needed() {
-        let surface = a2a_surface(Some(vec![jwt_method(json!({ "required_scopes": [] }))]), "https://agent.internal");
-        assert_eq!(derived(&surface, Some(&pinned_strategy())), stripped(StripReason::NoRequiredScopes));
-        assert_eq!(derived(&surface, None), stripped(StripReason::NoRequiredScopes));
-        assert_eq!(declaration_source(&surface, None), DeclarationSource::None);
-    }
-
-    #[test]
-    fn a_named_variant_declares_its_aliased_url() {
-        let surface = a2a_surface(
-            Some(vec![jwt_method(json!({ "audiences": ["https://gw.example/a2a/buyer$dev"] }))]),
-            "https://agent.internal",
-        );
-        let strategy = pinned_strategy();
+    #[tokio::test]
+    async fn a_named_variant_declares_its_aliased_url() {
+        let surface = declaring_a2a(json!({}), A2A_RESOURCE);
         let DeclarationOutcome::Declare(declaration) =
-            derived_declaration(&surface, Some("dev"), Some(&strategy), &a2a_network())
+            resolve_a2a(&surface, Some("dev"), pinned_strategy(), &a2a_network()).await
         else {
             panic!("expected declare");
         };
@@ -1260,119 +1302,28 @@ mod tests {
                 .as_str(),
             "https://gw.example/.well-known/oauth-protected-resource/a2a/buyer$dev"
         );
-        assert_eq!(derived(&surface, Some(&strategy)), stripped(StripReason::AudienceMissing));
     }
 
-    #[test]
-    fn a_variant_of_an_access_point_at_the_root_does_not_declare() {
-        let strategy = pinned_strategy();
+    #[tokio::test]
+    async fn a_variant_of_an_access_point_at_the_root_is_unservable() {
         for route in ["/", ""] {
-            let mut root = a2a_surface(
-                Some(vec![jwt_method(json!({ "audiences": ["https://gw.example/", "https://gw.example/$dev"] }))]),
-                "https://agent.internal",
-            );
+            let mut root = declaring_a2a(json!({}), "https://gw.example/");
             root.access_point.route = route.into();
-            let DeclarationOutcome::Declare(base) = derived_declaration(&root, None, Some(&strategy), &a2a_network())
+            let DeclarationOutcome::Declare(base) = resolve_a2a(&root, None, pinned_strategy(), &a2a_network()).await
             else {
                 panic!("expected the root Access Point to declare");
             };
             assert_eq!(base.resource, "https://gw.example/", "{route:?}");
             assert_eq!(
-                derived_declaration(&root, Some("dev"), Some(&strategy), &a2a_network()),
-                stripped(StripReason::RootVariant),
+                unservable_reason(&resolve_a2a(&root, Some("dev"), pinned_strategy(), &a2a_network()).await),
+                Some(UnservableReason::RootVariantResource),
                 "{route:?}"
             );
-            assert_eq!(declaration_source(&root, Some("dev")), DeclarationSource::None, "{route:?}");
-            assert_eq!(declaration_source(&root, None), DeclarationSource::Derived, "{route:?}");
-        }
-    }
-
-    #[test]
-    fn the_source_is_explicit_with_a_protected_resource_and_derived_only_with_required_scopes() {
-        let explicit = declaring_surface();
-        let DeclarationSource::Explicit(configured) = declaration_source(&explicit, None) else {
-            panic!("expected an explicit source");
-        };
-        assert_eq!(configured.resource, RESOURCE);
-        assert!(matches!(declaration_source(&explicit, Some("beta")), DeclarationSource::Explicit(_)));
-        assert!(matches!(declaration_source(&scoped_surface(), None), DeclarationSource::Explicit(_)));
-
-        assert_eq!(declaration_source(&derived_surface(), None), DeclarationSource::Derived);
-        assert_eq!(declaration_source(&derived_surface(), Some("dev")), DeclarationSource::Derived);
-        for undeclared in [
-            discovery_surface(jwt_bearer_method(), None),
-            a2a_surface(None, "https://agent.internal"),
-            a2a_surface(None, "fabric://peer/surface"),
-            a2a_surface(Some(vec![jwt_method(json!({})), api_key_method()]), "https://agent.internal"),
-        ] {
-            assert_eq!(declaration_source(&undeclared, None), DeclarationSource::None, "{}", undeclared.name);
-        }
-    }
-
-    #[test]
-    fn outcomes_report_their_label_and_reason() {
-        assert_eq!(stripped(StripReason::NotPinned).label(), "strip");
-        assert_eq!(stripped(StripReason::NotPinned).reason_code(), Some("not_pinned"));
-        assert_eq!(stripped(StripReason::RootVariant).reason_code(), Some("root_variant"));
-        assert_eq!(stripped(StripReason::TransitPoint).reason_code(), Some("transit_point"));
-        assert_eq!(DeclarationOutcome::PassThrough.label(), "pass_through");
-        assert_eq!(DeclarationOutcome::PassThrough.reason_code(), None);
-        for (reason, code) in [
-            (UnservableReason::NotMcp, "not_mcp"),
-            (UnservableReason::InvalidProtectedResource, "invalid_protected_resource"),
-            (UnservableReason::IncompatibleCallerAuthentication, "incompatible_caller_authentication"),
-            (UnservableReason::RootVariantResource, "root_variant_resource"),
-            (UnservableReason::ResourceMismatch, "resource_mismatch"),
-            (UnservableReason::StrategyStoreUnavailable, "strategy_store_unavailable"),
-            (UnservableReason::NetworkUnavailable, "network_unavailable"),
-        ] {
-            let unservable = DeclarationOutcome::Unservable(UnservableDeclaration::new(reason, "detail"));
-            assert_eq!(unservable.label(), "unservable");
-            assert_eq!(unservable.reason_code(), Some(code));
-        }
-        assert_eq!(UnservableDeclaration::new(UnservableReason::NotMcp, "the detail").to_string(), "the detail");
-    }
-
-    /// A strategy store whose every read fails.
-    struct FailingStore;
-
-    #[async_trait::async_trait]
-    impl JwtVerificationStrategyStorage for FailingStore {
-        async fn create(
-            &self,
-            _strategy: JwtVerificationStrategy,
-        ) -> anyhow::Result<JwtVerificationStrategy> {
-            anyhow::bail!("store unavailable")
-        }
-
-        async fn get(
-            &self,
-            _id: &str,
-        ) -> anyhow::Result<Option<JwtVerificationStrategy>> {
-            anyhow::bail!("store unavailable")
-        }
-
-        async fn list(&self) -> anyhow::Result<Vec<JwtVerificationStrategy>> {
-            anyhow::bail!("store unavailable")
-        }
-
-        async fn update(
-            &self,
-            _strategy: JwtVerificationStrategy,
-        ) -> anyhow::Result<JwtVerificationStrategy> {
-            anyhow::bail!("store unavailable")
-        }
-
-        async fn delete(
-            &self,
-            _id: &str,
-        ) -> anyhow::Result<()> {
-            anyhow::bail!("store unavailable")
         }
     }
 
     #[tokio::test]
-    async fn the_surface_resolver_reads_the_named_strategy_only_for_a_derived_declaration() {
+    async fn the_surface_resolver_reads_the_strategy_only_when_protected_resource_is_set() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = crate::jwt_bearer::FileSystemJwtVerificationStrategyStore::new(dir.path().to_path_buf())
             .await
@@ -1381,10 +1332,7 @@ mod tests {
             .create(pinned_strategy())
             .await
             .expect("create");
-        let surface = a2a_surface(
-            Some(vec![jwt_method(json!({ "jwt_verification_strategy_id": stored.id }))]),
-            "https://agent.internal",
-        );
+        let surface = declaring_a2a(json!({ "jwt_verification_strategy_id": stored.id }), A2A_RESOURCE);
         let network = a2a_network();
         assert_eq!(
             resolve_surface_declaration(&surface, None, Some(&store), &network)
@@ -1397,33 +1345,82 @@ mod tests {
             resolve_surface_declaration(&surface, None, None, &network)
                 .await
                 .expect("resolve"),
-            stripped(StripReason::StrategyUnavailable)
+            DeclarationOutcome::Unservable(UnservableDeclaration::new(
+                UnservableReason::StrategyStoreUnavailable,
+                "the JWT verification strategy store is unavailable"
+            ))
         );
-        assert_eq!(
-            resolve_surface_declaration(&derived_surface(), None, Some(&store), &network)
-                .await
-                .expect("resolve"),
-            stripped(StripReason::StrategyUnavailable)
-        );
-
         assert!(
-            resolve_surface_declaration(&surface, None, Some(&FailingStore), &network)
+            resolve_surface_declaration(&surface, None, Some(&FixtureStrategies::Failing), &network)
                 .await
                 .is_err()
         );
-        let unscoped = a2a_surface(Some(vec![jwt_method(json!({ "required_scopes": [] }))]), "https://agent.internal");
+        let undeclared = a2a_surface(Some(vec![jwt_method(json!({}))]), "https://agent.internal");
         assert_eq!(
-            resolve_surface_declaration(&unscoped, None, Some(&FailingStore), &network)
+            resolve_surface_declaration(&undeclared, None, Some(&FixtureStrategies::Failing), &network)
                 .await
-                .expect("an Access Point without required scopes reads no strategy"),
-            stripped(StripReason::NoRequiredScopes)
+                .expect("an Access Point without protected_resource reads no strategy"),
+            stripped(StripReason::NotDeclared)
         );
         assert_eq!(
-            resolve_surface_declaration(&declaring_surface(), None, Some(&FailingStore), &discovery_network())
+            resolve_surface_declaration(&undeclared, None, None, &network)
                 .await
-                .expect("an explicit declaration reads no strategy")
-                .label(),
-            "declare"
+                .expect("resolve"),
+            stripped(StripReason::NotDeclared)
+        );
+    }
+
+    #[test]
+    fn the_suggested_resource_is_the_first_external_url_and_the_route() {
+        let mut network = a2a_network();
+        network.listeners[0].external_urls = vec!["https://gw.example/".into(), "https://other.example".into()];
+        let mut surface = a2a_surface(Some(vec![jwt_method(json!({}))]), "https://agent.internal");
+        assert_eq!(
+            access_point_resource_url(&surface, None, &network).as_deref(),
+            Some("https://gw.example/a2a/buyer")
+        );
+        assert_eq!(
+            access_point_resource_url(&surface, Some("dev"), &network).as_deref(),
+            Some("https://gw.example/a2a/buyer$dev")
+        );
+        network.listeners[0].external_urls = vec!["http://gw.example".into()];
+        assert_eq!(access_point_resource_url(&surface, None, &network), None);
+        surface
+            .access_point
+            .listen_address = "0.0.0.0:9999".into();
+        assert_eq!(access_point_resource_url(&surface, None, &a2a_network()), None);
+    }
+
+    #[test]
+    fn outcomes_report_their_label_and_reason() {
+        for (reason, code) in [
+            (StripReason::NotDeclared, "not_declared"),
+            (StripReason::FabricTarget, "fabric_target"),
+            (StripReason::TransitPoint, "transit_point"),
+        ] {
+            assert_eq!(stripped(reason).label(), "strip");
+            assert_eq!(stripped(reason).reason_code(), Some(code));
+        }
+        assert_eq!(DeclarationOutcome::PassThrough.label(), "pass_through");
+        assert_eq!(DeclarationOutcome::PassThrough.reason_code(), None);
+        for (reason, code) in [
+            (UnservableReason::UnsupportedProtocol, "unsupported_protocol"),
+            (UnservableReason::InvalidProtectedResource, "invalid_protected_resource"),
+            (UnservableReason::IncompatibleCallerAuthentication, "incompatible_caller_authentication"),
+            (UnservableReason::RootVariantResource, "root_variant_resource"),
+            (UnservableReason::ResourceMismatch, "resource_mismatch"),
+            (UnservableReason::StrategyUnavailable, "strategy_unavailable"),
+            (UnservableReason::IssuerNotAdvertisable, "issuer_not_advertisable"),
+            (UnservableReason::StrategyStoreUnavailable, "strategy_store_unavailable"),
+            (UnservableReason::NetworkUnavailable, "network_unavailable"),
+        ] {
+            let unservable = DeclarationOutcome::Unservable(UnservableDeclaration::new(reason, "detail"));
+            assert_eq!(unservable.label(), "unservable");
+            assert_eq!(unservable.reason_code(), Some(code));
+        }
+        assert_eq!(
+            UnservableDeclaration::new(UnservableReason::UnsupportedProtocol, "the detail").to_string(),
+            "the detail"
         );
     }
 }

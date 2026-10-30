@@ -1349,20 +1349,34 @@ mod tests {
         }
     }
 
-    fn jwt_bearer_surface(route: &str) -> crate::config::agent_surface::AgentSurface {
+    fn scoped_surface(route: &str) -> crate::config::agent_surface::AgentSurface {
         let mut surface = make_surface("0.0.0.0:8080", route);
-        let resource = format!("https://gw.example.com{route}");
         surface
             .access_point
             .caller_authentication = Some(
             serde_json::from_value(json!({ "methods": [{
                 "type": "jwt_bearer",
                 "jwt_verification_strategy_id": "strategy",
-                "audiences": [resource, format!("{resource}$dev")],
+                "audiences": [],
                 "required_scopes": ["agent.invoke"]
             }] }))
             .unwrap(),
         );
+        surface
+    }
+
+    fn jwt_bearer_surface(route: &str) -> crate::config::agent_surface::AgentSurface {
+        let mut surface = scoped_surface(route);
+        surface
+            .access_point
+            .caller_authentication
+            .as_mut()
+            .unwrap()
+            .protected_resource = Some(crate::protocols::protected_resource::ProtectedResourceConfig {
+            resource: format!("https://gw.example.com{route}"),
+            authorization_servers: None,
+            scopes: Vec::new(),
+        });
         surface
     }
 
@@ -1431,21 +1445,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_access_point_that_cannot_declare_serves_the_card_as_the_target_secured_it() {
+    async fn an_access_point_that_does_not_declare_serves_the_card_as_the_target_secured_it() {
         let strategies = Strategies::Pinned;
         let variant_of_root = CardSecurityContext {
             variant_alias: Some("dev"),
             strategies: Some(&strategies),
         };
-        assert_eq!(
-            served_card(&jwt_bearer_surface("/"), variant_of_root).await,
-            upstream_card("https://gw.example.com")
-        );
+        assert_eq!(served_card(&scoped_surface("/"), variant_of_root).await, upstream_card("https://gw.example.com"));
         let missing_strategy = CardSecurityContext {
             variant_alias: Some("dev"),
             strategies: None,
         };
-        assert_eq!(served_card(&jwt_bearer_surface("/agents/buyer"), missing_strategy).await, upstream_card(RESOURCE));
+        assert_eq!(served_card(&scoped_surface("/agents/buyer"), missing_strategy).await, upstream_card(RESOURCE));
     }
 
     #[tokio::test]
@@ -1534,18 +1545,18 @@ mod tests {
             required_scopes: vec!["agent.invoke".into()],
             advertised_scopes: vec!["agent.invoke".into()],
         };
-        let strip_before = card_security_count("strip", "root_variant");
+        let strip_before = card_security_count("strip", "not_declared");
         let declare_before = card_security_count("declare", "none");
         let pass_before = card_security_count("pass_through", "none");
         let transit_before = card_security_count("strip", "transit_point");
 
-        record_served_card("surface", &DeclarationOutcome::Strip(StripReason::RootVariant), b"{}");
+        record_served_card("surface", &DeclarationOutcome::Strip(StripReason::NotDeclared), b"{}");
         record_served_card("surface", &DeclarationOutcome::Declare(declaration), b"{}");
         record_served_card("surface", &DeclarationOutcome::PassThrough, b"{}");
         process_outbound_agent_card(br#"{"name":"agent"}"#, PROXY_URL, "test", AgentCardKind::Public, true)
             .expect("outbound card");
 
-        assert!(card_security_count("strip", "root_variant") > strip_before);
+        assert!(card_security_count("strip", "not_declared") > strip_before);
         assert!(card_security_count("declare", "none") > declare_before);
         assert!(card_security_count("pass_through", "none") > pass_before);
         assert!(card_security_count("strip", "transit_point") > transit_before);

@@ -4,7 +4,8 @@ Feature: Target challenges relayed to the caller
   to the gateway, so a Target challenge is addressed to the gateway rather than
   the caller: only the Target's Payment challenges reach the caller, and a
   Target 401 left with no challenge becomes a 502. A surface that does not
-  publish the metadata relays every Target challenge unchanged.
+  publish the metadata relays every Target challenge unchanged. A Fabric
+  route's peer refusals are covered by the gateway's unit tests.
 
   Background:
     Given MCP surface "alpha" targets MCP server "bravo"

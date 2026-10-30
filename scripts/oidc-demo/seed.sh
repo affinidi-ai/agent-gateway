@@ -14,7 +14,8 @@
 #
 # With OIDC_DEMO_IDP=auth0 (see auth0.sh) the caller's authorization server is the Auth0 tenant: the
 # strategy is created through the API with discovery, as the dashboard's Discover from issuer does, and
-# the surface requires the Access Point URL (the tenant's API identifier) as audience and the scope agent:invoke.
+# the surface publishes authorization server discovery with the Access Point URL (the tenant's API identifier)
+# as its resource and requires the scope agent:invoke.
 #
 # Usage: scripts/oidc-demo/seed.sh [--dry-run]
 #   --dry-run   print the payloads with secret values redacted; no network and no gateway needed
@@ -80,10 +81,10 @@ surface_payload() {
     local method="${2:-}"
     [[ -n "${method}" ]] || method="$(caller_auth_method_json "${strategy_id}")"
     jq -n --arg id "${SURFACE_ID}" --arg listen "${ACCESS_POINT_ORIGIN}" --arg route "${SURFACE_ROUTE}" --arg agent "${AGENT_URL}" \
-        --arg policy "${POLICY_ID}" --argjson method "${method}" --argjson auth "${target_auth}" '{
+        --arg policy "${POLICY_ID}" --argjson method "${method}" --argjson protected "$(caller_protected_resource_json)" --argjson auth "${target_auth}" '{
         surface_id: $id, name: "oidc-demo", description: "OIDC demo surface in front of the mock agent", status: "active",
         access_point: {listen_address: $listen, route: $route, protocol: "a2a", publish_to_did_document: false,
-                       caller_authentication: {methods: [$method]},
+                       caller_authentication: {methods: [$method], protected_resource: $protected},
                        inbound_policy: {policy_definition_id: $policy}},
         target: ({endpoint: $agent, policy: null, response_policy: null, mcp_tool_policies_enabled: false,
                   identity_injection: {inject_vp: false}, mpp_auto_pay: false}

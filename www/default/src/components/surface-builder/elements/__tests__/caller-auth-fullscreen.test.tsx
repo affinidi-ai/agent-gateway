@@ -67,7 +67,7 @@ function declarationsOf(entries: Array<Record<string, unknown>>) {
 beforeEach(() => {
   jest.clearAllMocks();
   declarations = declarationsOf([
-    { variant: null, outcome: 'strip', reason: 'audience_missing', resource: ENTRY_URL },
+    { variant: null, outcome: 'strip', reason: 'not_declared', resource: ENTRY_URL },
   ]);
   mockFetch.mockImplementation(async (url: string) => {
     if (url === '/api/v1/jwt-verification-strategies') return json(strategies);
@@ -114,7 +114,10 @@ function renderPanel(
   return { updateField, updateFields, view };
 }
 
-function renderStatefulPanel(initial: Record<string, unknown>) {
+function renderStatefulPanel(
+  initial: Record<string, unknown>,
+  protocol: ConfigPanelProps['protocol'] = 'a2a'
+) {
   const Stateful: React.FC = () => {
     const [config, setConfig] = React.useState<Record<string, unknown>>(initial);
     const node: CanvasNode = {
@@ -129,7 +132,7 @@ function renderStatefulPanel(initial: Record<string, unknown>) {
       config,
       updateField: (key: string, value: unknown) => setConfig(c => ({ ...c, [key]: value })),
       updateFields: (fields: Record<string, unknown>) => setConfig(c => ({ ...c, ...fields })),
-      protocol: 'a2a',
+      protocol,
       allNodes: [AP, node],
     };
     return <CallerAuthFullscreen {...props} />;
@@ -144,6 +147,8 @@ function renderStatefulPanel(initial: Record<string, unknown>) {
     </MemoryRouter>
   );
 }
+
+const SETTING = { resource: ENTRY_URL };
 
 const JWT = {
   method_type: 'jwt_bearer',
@@ -186,8 +191,11 @@ describe('Caller Context labels and failed callers', () => {
     renderPanel(JWT);
     await strategiesLoaded();
     const intro = screen.getByTestId('caller-auth-jwt-intro');
+    expect(intro).toHaveTextContent('While Authorization server discovery is on');
     expect(intro).toHaveTextContent('a missing or invalid token gets 401 with a challenge');
-    expect(intro).toHaveTextContent('403 with insufficient_scope, before policy and payment run');
+    expect(intro).toHaveTextContent(
+      '403 with insufficient_scope, before rate limiting, any policy, the AP2 gate and payment'
+    );
     expect(intro).toHaveTextContent('Otherwise a failed caller reaches policy');
     expect(screen.queryByText(/403 Forbidden/)).not.toBeInTheDocument();
   });
@@ -263,155 +271,117 @@ describe('Required scopes', () => {
   });
 });
 
-describe('What the agent card declares', () => {
-  it('asks for a required scope before it declares anything', async () => {
-    renderPanel(JWT);
+describe('Authorization server discovery in the editor', () => {
+  it('shows the derived authorization server, scopes and audience once authorization server discovery is on', async () => {
+    renderStatefulPanel({ ...JWT, required_scopes: ['agent:invoke'] });
     await strategiesLoaded();
-    expect(screen.getByTestId('caller-auth-discovery-derived-off')).toHaveTextContent(
-      'Add a required scope'
-    );
-    expect(
-      screen.queryByTestId('caller-auth-discovery-derived-authorization-server')
-    ).not.toBeInTheDocument();
-  });
+    expect(screen.queryByTestId('caller-auth-discovery-derived')).not.toBeInTheDocument();
 
-  it('shows the pinned authorization server, the scopes and the Access Point URL', async () => {
-    renderPanel({ ...JWT, required_scopes: ['agent:invoke'], audiences: [ENTRY_URL] });
-    await strategiesLoaded();
+    fireEvent.click(screen.getByTestId('caller-auth-discovery-switch'));
+
     expect(
-      await screen.findByTestId('caller-auth-discovery-derived-authorization-server')
+      screen.getByTestId('caller-auth-discovery-derived-authorization-server')
     ).toHaveTextContent(ISSUER);
+    expect(
+      screen.getByTestId('caller-auth-discovery-derived-authorization-server-source')
+    ).toHaveTextContent('From the JWT verification strategy Pinned');
     expect(screen.getByTestId('caller-auth-discovery-derived-scopes')).toHaveTextContent(
       'agent:invoke'
     );
-    await waitFor(() =>
-      expect(screen.getByTestId('caller-auth-discovery-derived-audience')).toHaveTextContent(
-        `${ENTRY_URL}Listed in Accepted Audiences.`
-      )
+    expect(screen.getByTestId('caller-auth-discovery-derived-audience')).toHaveTextContent(
+      ENTRY_URL
     );
+    expect(screen.getByTestId('caller-auth-discovery-card-pin')).toHaveTextContent(ISSUER);
     expect(screen.queryByTestId('caller-auth-discovery-add-audience-button')).toBeNull();
-    expect(screen.getByText('What the agent card declares')).toBeInTheDocument();
   });
 
-  it('adds the Access Point URL the gateway reported to the audiences in one click', async () => {
-    const { updateFields } = renderPanel({
-      ...JWT,
-      required_scopes: ['agent:invoke'],
-      audiences: ['other'],
-    });
-    fireEvent.click(await screen.findByTestId('caller-auth-discovery-add-audience-button'));
-    expect(updateFields).toHaveBeenCalledWith({ audiences: ['other', ENTRY_URL] });
-    expect(screen.getByTestId('caller-auth-discovery-derived-note-audience_missing')).toBeVisible();
-  });
-
-  it('announces the added audience and moves focus to the confirmation', async () => {
-    renderStatefulPanel({ ...JWT, required_scopes: ['agent:invoke'], audiences: ['other'] });
-    const add = await screen.findByTestId('caller-auth-discovery-add-audience-button');
-    const status = screen.getByTestId('caller-auth-discovery-audience-status');
-    expect(status).toHaveAttribute('role', 'status');
-    expect(status).toBeEmptyDOMElement();
-    add.focus();
-    fireEvent.click(add);
-    await waitFor(() =>
-      expect(screen.getByTestId('caller-auth-discovery-audience-status')).toHaveTextContent(
-        'Listed in Accepted Audiences.'
-      )
-    );
-    expect(screen.getByTestId('caller-auth-discovery-audience-status')).toBe(status);
-    expect(screen.queryByTestId('caller-auth-discovery-add-audience-button')).toBeNull();
-    expect(screen.getByTestId('caller-auth-discovery-audience-listed')).toHaveFocus();
-  });
-
-  it('does not take focus when the audience was already listed', async () => {
-    renderStatefulPanel({ ...JWT, required_scopes: ['agent:invoke'], audiences: [ENTRY_URL] });
-    await screen.findByTestId('caller-auth-discovery-audience-listed');
-    expect(document.body).toHaveFocus();
-  });
-
-  it('uses the Access Point URL of the variant being edited', async () => {
-    declarations = declarationsOf([
-      { variant: null, outcome: 'declare', reason: null, resource: ENTRY_URL },
-      {
-        variant: 'beta',
-        outcome: 'strip',
-        reason: 'audience_missing',
-        resource: `${ENTRY_URL}$beta`,
-      },
-    ]);
-    const { updateFields } = renderPanel(
-      { ...JWT, required_scopes: ['agent:invoke'], audiences: [ENTRY_URL] },
+  it('names the resource of the variant being edited as its audience', async () => {
+    renderPanel(
+      { ...JWT, required_scopes: ['agent:invoke'], protected_resource: SETTING },
       { meta: { activeVariantAlias: 'beta' } }
     );
-    fireEvent.click(await screen.findByTestId('caller-auth-discovery-add-audience-button'));
-    expect(updateFields).toHaveBeenCalledWith({ audiences: [ENTRY_URL, `${ENTRY_URL}$beta`] });
+    await strategiesLoaded();
+    expect(screen.getByTestId('caller-auth-discovery-derived-audience')).toHaveTextContent(
+      `${ENTRY_URL}$beta`
+    );
   });
 
   it('links to the strategy page when the strategy is not pinned or its pin moved', async () => {
-    const { view } = renderPanel({ ...JWT, jwt_strategy_id: 'plain', required_scopes: ['a'] });
+    const { view } = renderPanel({
+      ...JWT,
+      jwt_strategy_id: 'plain',
+      protected_resource: SETTING,
+    });
     await strategiesLoaded();
-    expect(
-      await screen.findByTestId('caller-auth-discovery-derived-authorization-server')
-    ).toHaveTextContent('The strategy has no pinned authorization server.');
+    expect(await screen.findByTestId('caller-auth-discovery-card-pin')).toHaveTextContent(
+      'The strategy has no pinned authorization server'
+    );
     expect(screen.getByTestId('caller-auth-discovery-strategy-link')).toHaveAttribute(
       'href',
       '/jwt-verification-strategies/plain'
     );
     view.unmount();
 
-    renderPanel({ ...JWT, jwt_strategy_id: 'moved', required_scopes: ['a'] });
+    renderPanel({ ...JWT, jwt_strategy_id: 'moved', protected_resource: SETTING });
     await strategiesLoaded();
+    expect(await screen.findByTestId('caller-auth-discovery-card-pin')).toHaveTextContent(
+      'no longer matches the strategy'
+    );
     expect(
-      await screen.findByTestId('caller-auth-discovery-derived-authorization-server')
-    ).toHaveTextContent('no longer matches the strategy');
+      screen.getByTestId('caller-auth-discovery-derived-authorization-server')
+    ).toHaveTextContent('https://new-idp.example.com');
     expect(screen.getByTestId('caller-auth-discovery-strategy-link')).toHaveAttribute(
       'href',
       '/jwt-verification-strategies/moved'
     );
   });
 
-  it('keeps token forwarding editable and explains that it stops the declaration', async () => {
-    const { updateField } = renderPanel({
-      ...JWT,
-      required_scopes: ['agent:invoke'],
-      audiences: [ENTRY_URL],
-      jwt_forward_header: true,
-    });
+  it('keeps token forwarding editable while off and locks it off while on', async () => {
+    renderStatefulPanel({ ...JWT, jwt_forward_header: true });
     await strategiesLoaded();
-    expect(
-      await screen.findByTestId('caller-auth-discovery-derived-note-forwards_caller_token')
-    ).toHaveTextContent("Forwarding the caller's token");
     const forward = screen.getByTestId('caller-auth-jwt-forward-header-checkbox');
     expect(forward).toBeEnabled();
-    fireEvent.click(forward);
-    expect(updateField).toHaveBeenCalledWith('jwt_forward_header', false);
+    expect(forward).toBeChecked();
     expect(screen.getByLabelText(/Token Header/)).toBeEnabled();
-    expect(screen.queryByTestId('caller-auth-discovery-switch')).not.toBeInTheDocument();
+    expect(
+      screen.queryByTestId('caller-auth-jwt-forward-header-discovery-note')
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId('caller-auth-discovery-switch'));
+
+    expect(forward).not.toBeChecked();
+    expect(forward).toBeDisabled();
+    expect(screen.getByLabelText(/Token Header/)).toBeDisabled();
+    expect(screen.getByTestId('caller-auth-jwt-forward-header-discovery-note')).toHaveTextContent(
+      "the caller's token never reaches the managed agent"
+    );
+    expect(screen.getByTestId('caller-auth-jwt-token-discovery-note')).toHaveTextContent(
+      'Fixed to the Authorization header with the Bearer scheme'
+    );
   });
 
-  it('notes the audience rule only while the route declares', async () => {
-    declarations = declarationsOf([
-      { variant: null, outcome: 'declare', reason: null, resource: ENTRY_URL },
-    ]);
-    const { view } = renderPanel({
-      ...JWT,
-      required_scopes: ['agent:invoke'],
-      audiences: [ENTRY_URL],
-    });
-    expect(await screen.findByTestId('caller-auth-audiences-declared-note')).toHaveTextContent(
-      'only tokens whose audience is the Access Point URL'
+  it('locks Accepted Audiences and notes the audience rule only while authorization server discovery is on', async () => {
+    const { view } = renderPanel({ ...JWT, protected_resource: SETTING });
+    await strategiesLoaded();
+    expect(screen.getByLabelText('Accepted Audiences')).toBeDisabled();
+    expect(screen.getByTestId('caller-auth-audiences-discovery-note')).toHaveTextContent(
+      'a token is accepted when the resource URL is one of its audiences'
     );
     view.unmount();
 
     declarations = declarationsOf([
-      { variant: null, outcome: 'pass_through', reason: null, resource: ENTRY_URL },
+      { variant: null, outcome: 'declare', reason: null, resource: ENTRY_URL },
     ]);
-    renderPanel(JWT);
-    await screen.findByText('Upstream card unchanged');
+    renderPanel({ ...JWT, required_scopes: ['agent:invoke'] });
+    await screen.findByText('Declares OAuth');
+    expect(screen.getByLabelText('Accepted Audiences')).toBeEnabled();
+    expect(screen.queryByTestId('caller-auth-audiences-discovery-note')).not.toBeInTheDocument();
     expect(screen.queryByTestId('caller-auth-audiences-declared-note')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('caller-auth-discovery-derived')).not.toBeInTheDocument();
   });
 
   it('never shows a secret or token held by the strategy', async () => {
-    renderPanel({ ...JWT, required_scopes: ['agent:invoke'], audiences: [ENTRY_URL] });
+    renderPanel({ ...JWT, required_scopes: ['agent:invoke'], protected_resource: SETTING });
     await screen.findByTestId('caller-auth-discovery-derived-authorization-server');
     await waitFor(() =>
       expect(mockFetch.mock.calls.some(([u]) => String(u).endsWith('/declarations'))).toBe(true)
@@ -425,9 +395,9 @@ describe('What the agent card declares', () => {
 describe('Agent card outcome chip in the editor', () => {
   it('shows the saved surface outcome with the reason', async () => {
     renderPanel(JWT);
-    expect(await screen.findByText('Security removed from card')).toBeInTheDocument();
+    expect(await screen.findByText('Not declared')).toBeInTheDocument();
     expect(screen.getByTestId('caller-auth-outcome-detail')).toHaveTextContent(
-      'The Access Point URL is not in Accepted Audiences.'
+      'Authorization server discovery is off for this route.'
     );
     expect(mockFetch.mock.calls.some(([u]) => u === '/api/v1/surfaces/s1/declarations')).toBe(true);
   });
@@ -447,14 +417,14 @@ describe('Agent card outcome chip in the editor', () => {
     );
     renderPanel({ ...JWT, required_scopes: ['agent:invoke'] });
     expect(await screen.findByText('Agent card outcome unavailable')).toBeInTheDocument();
-    expect(screen.getByTestId('caller-auth-discovery-derived-audience')).toHaveTextContent(
-      'The Access Point URL is not available from the gateway yet.'
+    expect(screen.getByTestId('caller-auth-discovery-off-summary')).toHaveTextContent(
+      'Off. The agent card keeps the managed agent'
     );
   });
 
   it('reads the declarations again when the saved surface changes', async () => {
     const { view } = renderPanel(JWT, { meta: { agentCardRevision: 1 } });
-    await screen.findByText('Security removed from card');
+    await screen.findByText('Not declared');
     const reads = () =>
       mockFetch.mock.calls.filter(([u]) => String(u).endsWith('/declarations')).length;
     const before = reads();

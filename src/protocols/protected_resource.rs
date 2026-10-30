@@ -78,9 +78,9 @@ pub fn is_gateway_challenge(response: &Response) -> bool {
 }
 
 /// Access Point protocols whose caller authentication can publish protected
-/// resource metadata. Another protocol opts in here.
+/// resource metadata: MCP, and A2A with its AP2 extension.
 pub fn supports_protected_resource(protocol: &SurfaceProtocol) -> bool {
-    *protocol == SurfaceProtocol::Mcp
+    matches!(protocol, SurfaceProtocol::Mcp | SurfaceProtocol::A2a | SurfaceProtocol::Ap2)
 }
 
 /// A resource identifier and the scopes advertised for it: a canonical HTTPS
@@ -228,13 +228,22 @@ pub fn realm_challenge_header(error: ResourceTokenError) -> HeaderValue {
 const MAX_AUTHORIZATION_SERVERS: usize = 8;
 const MAX_AUTHORIZATION_SERVER_BYTES: usize = 2048;
 
-/// RFC 9728 discovery for an MCP Access Point whose JWT Bearer caller
-/// authentication accepts tokens from external authorization servers.
+/// RFC 9728 discovery for an MCP, A2A or AP2 Access Point whose JWT Bearer
+/// caller authentication accepts tokens from an external authorization server.
+/// The authorization server it advertises is always the `expected_issuer` of
+/// the method's JWT verification strategy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProtectedResourceConfig {
+    /// The resource the Access Point's base route serves (RFC 8707), on an
+    /// external URL of its listener with the route as path. A named variant
+    /// serves `<resource>$<alias>`.
     pub resource: String,
-    pub authorization_servers: Vec<String>,
+    /// Optional. When present it must equal `[expected_issuer]` of the method's
+    /// strategy at save. It is never advertised.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_servers: Option<Vec<String>>,
+    /// Optional extra scopes the metadata advertises after `required_scopes`.
     #[serde(default)]
     pub scopes: Vec<String>,
 }
@@ -242,18 +251,17 @@ pub struct ProtectedResourceConfig {
 impl ProtectedResourceConfig {
     pub fn validate(&self) -> Result<(), String> {
         validate_resource(&self.resource, &self.scopes)?;
-        if self
-            .authorization_servers
-            .is_empty()
-            || self
-                .authorization_servers
-                .len()
-                > MAX_AUTHORIZATION_SERVERS
-        {
-            return Err(format!("authorization_servers must list 1 to {MAX_AUTHORIZATION_SERVERS} issuers"));
+        let Some(authorization_servers) = &self.authorization_servers else {
+            return Ok(());
+        };
+        if authorization_servers.is_empty() || authorization_servers.len() > MAX_AUTHORIZATION_SERVERS {
+            return Err(format!(
+                "authorization_servers must list 1 to {MAX_AUTHORIZATION_SERVERS} issuers, or be omitted to \
+                 advertise the JWT verification strategy's issuer"
+            ));
         }
         let mut seen = std::collections::HashSet::new();
-        for issuer in &self.authorization_servers {
+        for issuer in authorization_servers {
             validate_authorization_server(issuer)?;
             if !seen.insert(issuer.as_str()) {
                 return Err("authorization_servers must not repeat an issuer".into());
@@ -316,13 +324,8 @@ pub(crate) fn refusal(
 /// query or fragment), and at most 2048 printable ASCII bytes. It is advertised
 /// exactly as configured, since clients compare it byte for byte with the
 /// issuer in the server's metadata.
-fn validate_authorization_server(issuer: &str) -> Result<(), String> {
-    if issuer.len() > MAX_AUTHORIZATION_SERVER_BYTES
-        || !issuer
-            .bytes()
-            .all(|byte| byte.is_ascii_graphic())
-        || crate::authz_metadata::validate_issuer(issuer, crate::authz_metadata::EgressPosture::Strict).is_err()
-    {
+pub(crate) fn validate_authorization_server(issuer: &str) -> Result<(), String> {
+    if !names_issuer(issuer, crate::authz_metadata::EgressPosture::Strict) {
         return Err(
             "authorization_servers entries must be https issuer URLs without credentials, query or fragment".into()
         );
@@ -330,30 +333,36 @@ fn validate_authorization_server(issuer: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The public origins of the listener an Access Point is served on.
-fn access_point_origins(
-    surface: &crate::config::agent_surface::AgentSurface,
-    network: &crate::config::NetworkConfig,
-) -> Vec<String> {
-    network
-        .map_url_to_port(
-            &surface
-                .access_point
-                .listen_address,
-        )
-        .and_then(|port| network.get_listener_by_port(port))
-        .map(|listener| listener.external_urls.clone())
-        .unwrap_or_default()
+/// Whether protected resource metadata can name a JWT verification strategy's
+/// issuer: an issuer [`validate_authorization_server`] accepts, or, for a
+/// strategy no tenant owns, also an `http` one, under the same egress posture
+/// as the operator's own discovery.
+pub(crate) fn advertisable_strategy_issuer(strategy: &crate::jwt_bearer::models::JwtVerificationStrategy) -> bool {
+    let posture = match strategy.tenant_id {
+        Some(_) => crate::authz_metadata::EgressPosture::Strict,
+        None => crate::authz_metadata::EgressPosture::CloudMetadataOnly,
+    };
+    names_issuer(&strategy.expected_issuer, posture)
 }
 
-/// The public origin a derived declaration names for an Access Point: the
-/// first public origin of its listener, without a trailing slash. The listener
-/// is the one its `listen_address` names, or for a bind address such as
-/// `0.0.0.0:8443`, the one on that port.
-pub fn access_point_origin(
+fn names_issuer(
+    issuer: &str,
+    posture: crate::authz_metadata::EgressPosture,
+) -> bool {
+    issuer.len() <= MAX_AUTHORIZATION_SERVER_BYTES
+        && issuer
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic())
+        && crate::authz_metadata::validate_issuer(issuer, posture).is_ok()
+}
+
+/// The listener an Access Point is served on: the one whose external URL its
+/// `listen_address` names, or, for a bind address such as `0.0.0.0:8443`, the
+/// one on that port.
+fn access_point_listener<'a>(
     surface: &crate::config::agent_surface::AgentSurface,
-    network: &crate::config::NetworkConfig,
-) -> Option<String> {
+    network: &'a crate::config::NetworkConfig,
+) -> Option<&'a crate::config::network::Listener> {
     let listen_address = &surface
         .access_point
         .listen_address;
@@ -365,9 +374,27 @@ pub fn access_point_origin(
                 .next()
                 .and_then(|port| port.parse().ok())
         })?;
-    network
-        .get_listener_by_port(port)?
-        .external_urls
+    network.get_listener_by_port(port)
+}
+
+/// The public origins of the listener an Access Point is served on.
+fn access_point_origins(
+    surface: &crate::config::agent_surface::AgentSurface,
+    network: &crate::config::NetworkConfig,
+) -> Vec<String> {
+    access_point_listener(surface, network)
+        .map(|listener| listener.external_urls.clone())
+        .unwrap_or_default()
+}
+
+/// The first public origin of an Access Point's listener, without a trailing
+/// slash: the card URL of an Access Point that does not declare and the
+/// resource the save report suggests. It is never an audience.
+pub fn access_point_origin(
+    surface: &crate::config::agent_surface::AgentSurface,
+    network: &crate::config::NetworkConfig,
+) -> Option<String> {
+    access_point_origins(surface, network)
         .first()
         .map(|origin| {
             origin
@@ -399,9 +426,10 @@ pub fn access_point_path(
     }
 }
 
-/// The protected resource a resolved MCP Access Point publishes for `alias`:
+/// The protected resource a resolved Access Point publishes for `alias`:
 /// `None` when it has none, and an error when its settings are not ones the
-/// Access Point serves, so callers fail closed.
+/// Access Point serves, so callers fail closed. The resource must be on one of
+/// its listener's external URLs, whatever their order, with the route as path.
 pub fn access_point_protected_resource(
     surface: &crate::config::agent_surface::AgentSurface,
     alias: Option<&str>,
@@ -422,10 +450,10 @@ pub fn access_point_protected_resource(
                     .for_variant(alias)
                     .map_err(|detail| UnservableDeclaration::new(UnservableReason::InvalidProtectedResource, detail))
             })
-            .and_then(|derived| {
-                derived
+            .and_then(|served| {
+                served
                     .validate_endpoint(&access_point_origins(surface, network), &path)
-                    .map(|()| derived)
+                    .map(|()| served)
                     .map_err(|detail| UnservableDeclaration::new(UnservableReason::ResourceMismatch, detail))
             }),
     )
@@ -505,14 +533,90 @@ pub(crate) mod fixtures {
     use serde_json::{Value, json};
 
     use super::ProtectedResourceConfig;
+    use crate::jwt_bearer::models::{AuthorizationServerMetadata, JwksSource, JwtVerificationStrategy};
 
     pub(crate) const ISSUER: &str = "https://idp.example/realms/agents";
+    pub(crate) const STRATEGY_ID: &str = "idp";
 
     pub(crate) fn protected_resource(resource: &str) -> ProtectedResourceConfig {
         ProtectedResourceConfig {
             resource: resource.into(),
-            authorization_servers: vec![ISSUER.into()],
+            authorization_servers: None,
             scopes: vec!["tools".into()],
+        }
+    }
+
+    /// The strategy [`STRATEGY_ID`] trusting [`ISSUER`] with a remote key set,
+    /// pinned to matching authorization server metadata when `pinned`.
+    pub(crate) fn fixture_strategy(pinned: bool) -> JwtVerificationStrategy {
+        JwtVerificationStrategy {
+            id: STRATEGY_ID.into(),
+            name: STRATEGY_ID.into(),
+            expected_issuer: ISSUER.into(),
+            jwks_source: JwksSource::Remote {
+                jwks_uri: format!("{ISSUER}/certs"),
+            },
+            authorization_server: pinned.then(|| AuthorizationServerMetadata {
+                issuer: ISSUER.into(),
+                metadata_url: format!("{ISSUER}/.well-known/openid-configuration"),
+                token_endpoint: format!("{ISSUER}/token"),
+                jwks_uri: format!("{ISSUER}/certs"),
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// A read-only strategy store holding [`fixture_strategy`] under
+    /// [`STRATEGY_ID`], pinned or not; `Failing` errors on every call.
+    pub(crate) enum FixtureStrategies {
+        Pinned,
+        Unpinned,
+        Failing,
+    }
+
+    impl FixtureStrategies {
+        fn stored(&self) -> anyhow::Result<JwtVerificationStrategy> {
+            match self {
+                Self::Pinned => Ok(fixture_strategy(true)),
+                Self::Unpinned => Ok(fixture_strategy(false)),
+                Self::Failing => anyhow::bail!("strategy store unavailable"),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::jwt_bearer::JwtVerificationStrategyStorage for FixtureStrategies {
+        async fn create(
+            &self,
+            _strategy: JwtVerificationStrategy,
+        ) -> anyhow::Result<JwtVerificationStrategy> {
+            anyhow::bail!("read-only")
+        }
+
+        async fn get(
+            &self,
+            id: &str,
+        ) -> anyhow::Result<Option<JwtVerificationStrategy>> {
+            let stored = self.stored()?;
+            Ok((id == STRATEGY_ID).then_some(stored))
+        }
+
+        async fn list(&self) -> anyhow::Result<Vec<JwtVerificationStrategy>> {
+            Ok(vec![self.stored()?])
+        }
+
+        async fn update(
+            &self,
+            _strategy: JwtVerificationStrategy,
+        ) -> anyhow::Result<JwtVerificationStrategy> {
+            anyhow::bail!("read-only")
+        }
+
+        async fn delete(
+            &self,
+            _id: &str,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("read-only")
         }
     }
 
@@ -531,7 +635,7 @@ pub(crate) mod fixtures {
     }
 
     pub(crate) fn jwt_bearer_method() -> Value {
-        json!({"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": []})
+        json!({"type": "jwt_bearer", "jwt_verification_strategy_id": STRATEGY_ID, "audiences": []})
     }
 
     pub(crate) fn discovery_surface(
@@ -565,12 +669,24 @@ mod tests {
     fn protected_resource_settings_take_only_https_issuers_and_bounded_scopes() {
         assert_eq!(protected_resource("https://gateway.example/mcp/alpha").validate(), Ok(()));
         let trailing_slash = ProtectedResourceConfig {
-            authorization_servers: vec!["https://tenant.auth0.example/".into(), "https://accounts.example".into()],
+            authorization_servers: Some(vec![
+                "https://tenant.auth0.example/".into(),
+                "https://accounts.example".into(),
+            ]),
             ..protected_resource("https://gateway.example/mcp/alpha")
         };
         assert_eq!(trailing_slash.validate(), Ok(()));
+        let empty = ProtectedResourceConfig {
+            authorization_servers: Some(Vec::new()),
+            ..protected_resource("https://gateway.example/mcp/alpha")
+        };
+        assert_eq!(
+            empty.validate(),
+            Err("authorization_servers must list 1 to 8 issuers, or be omitted to advertise the JWT verification \
+                 strategy's issuer"
+                .to_string())
+        );
         for servers in [
-            vec![],
             vec!["http://idp.example".to_string()],
             vec!["https://idp.example?tenant=a".to_string()],
             vec!["https://idp.example#issuer".to_string()],
@@ -584,11 +700,36 @@ mod tests {
             vec![format!("https://idp.example/{}", "a".repeat(2048))],
         ] {
             let config = ProtectedResourceConfig {
-                authorization_servers: servers.clone(),
+                authorization_servers: Some(servers.clone()),
                 ..protected_resource("https://gateway.example/mcp/alpha")
             };
             assert!(config.validate().is_err(), "{servers:?}");
         }
+        for (stored, expected) in [
+            (json!({"resource": "https://gateway.example/mcp/alpha"}), None),
+            (json!({"resource": "https://gateway.example/mcp/alpha", "authorization_servers": null}), None),
+            (
+                json!({"resource": "https://gateway.example/mcp/alpha", "authorization_servers": [ISSUER]}),
+                Some(vec![ISSUER.to_string()]),
+            ),
+        ] {
+            let config: ProtectedResourceConfig = serde_json::from_value(stored.clone()).unwrap();
+            assert_eq!(config.authorization_servers, expected, "{stored}");
+            assert_eq!(config.validate(), Ok(()), "{stored}");
+            assert_eq!(
+                serde_json::to_value(&config)
+                    .unwrap()
+                    .get("authorization_servers")
+                    .is_some(),
+                expected.is_some()
+            );
+        }
+        assert!(
+            serde_json::from_value::<ProtectedResourceConfig>(
+                json!({"resource": "https://gateway.example/mcp/alpha", "issuer": ISSUER})
+            )
+            .is_err()
+        );
         assert!(
             protected_resource("http://gateway.example/mcp/alpha")
                 .validate()
@@ -914,7 +1055,9 @@ mod tests {
         let Some(requested) = requested_resource_path(path) else {
             return Ok(None);
         };
-        match listener_metadata(surfaces, &[], &requested, None, None, &discovery_network()).await {
+        match listener_metadata(surfaces, &[], &requested, None, Some(&FixtureStrategies::Pinned), &discovery_network())
+            .await
+        {
             MetadataMatch::None => Ok(None),
             MetadataMatch::Metadata(metadata) => Ok(Some(metadata)),
             MetadataMatch::Unavailable => Err(()),
@@ -1053,9 +1196,101 @@ mod tests {
         let misconfigured = [std::sync::Arc::new(discovery_surface(api_key, Some(explicit.clone())))];
         assert_eq!(served(&misconfigured, path).await, Err(()));
 
-        let mut a2a = discovery_surface(jwt_bearer_method(), Some(explicit.clone()));
-        a2a.access_point.protocol = crate::config::agent_surface::SurfaceProtocol::A2a;
-        assert_eq!(served(&[std::sync::Arc::new(a2a)], path).await, Err(()));
+        let mut didcomm = discovery_surface(jwt_bearer_method(), Some(explicit.clone()));
+        didcomm.access_point.protocol = crate::config::agent_surface::SurfaceProtocol::DIDComm;
+        assert_eq!(served(&[std::sync::Arc::new(didcomm)], path).await, Err(()));
+    }
+
+    #[tokio::test]
+    async fn an_a2a_access_point_publishes_its_protected_resource() {
+        for protocol in
+            [crate::config::agent_surface::SurfaceProtocol::A2a, crate::config::agent_surface::SurfaceProtocol::Ap2]
+        {
+            let mut surface =
+                discovery_surface(jwt_bearer_method(), Some(json!({"resource": "https://gateway.example/mcp/alpha"})));
+            surface.access_point.protocol = protocol.clone();
+            assert_eq!(
+                served(&[std::sync::Arc::new(surface)], "/.well-known/oauth-protected-resource/mcp/alpha").await,
+                Ok(Some(json!({
+                    "resource": "https://gateway.example/mcp/alpha",
+                    "authorization_servers": [ISSUER],
+                    "bearer_methods_supported": ["header"]
+                }))),
+                "{protocol:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bind_address_names_the_listener_on_its_port() {
+        let mut network = discovery_network();
+        network.listeners[0].external_urls = vec!["https://internal.example".into(), "https://gateway.example".into()];
+        let mut surface = discovery_surface(jwt_bearer_method(), None);
+        surface
+            .access_point
+            .listen_address = "0.0.0.0:8443".into();
+        assert_eq!(
+            access_point_origins(&surface, &network),
+            vec!["https://internal.example".to_string(), "https://gateway.example".to_string()]
+        );
+        surface
+            .access_point
+            .listen_address = "0.0.0.0:9999".into();
+        assert_eq!(access_point_origins(&surface, &network), Vec::<String>::new());
+    }
+
+    #[test]
+    fn supports_protected_resource_admits_mcp_a2a_and_ap2_only() {
+        use crate::config::agent_surface::SurfaceProtocol;
+        for (protocol, supported) in [
+            (SurfaceProtocol::Mcp, true),
+            (SurfaceProtocol::A2a, true),
+            (SurfaceProtocol::Ap2, true),
+            (SurfaceProtocol::DIDComm, false),
+        ] {
+            assert_eq!(supports_protected_resource(&protocol), supported, "{protocol:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_fixture_store_holds_one_strategy_pinned_or_not() {
+        use crate::jwt_bearer::JwtVerificationStrategyStorage;
+        let pinned = FixtureStrategies::Pinned
+            .get(STRATEGY_ID)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pinned.expected_issuer, ISSUER);
+        assert_eq!(pinned.remote_jwks_uri(), Some(format!("{ISSUER}/certs").as_str()));
+        assert_eq!(pinned.authorization_server, fixture_strategy(true).authorization_server);
+        assert_eq!(
+            pinned
+                .authorization_server
+                .map(|pin| pin.issuer),
+            Some(ISSUER.to_string())
+        );
+        assert_eq!(
+            FixtureStrategies::Unpinned
+                .get(STRATEGY_ID)
+                .await
+                .unwrap()
+                .unwrap()
+                .authorization_server,
+            None
+        );
+        assert!(
+            FixtureStrategies::Pinned
+                .get("other")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            FixtureStrategies::Failing
+                .get(STRATEGY_ID)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

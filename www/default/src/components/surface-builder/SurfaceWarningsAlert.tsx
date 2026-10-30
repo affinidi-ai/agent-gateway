@@ -13,9 +13,13 @@ import {
 
 interface SurfaceWarningsAlertProps {
   warnings: SurfaceWarning[];
+  offersDiscovery?: boolean;
 }
 
-const SurfaceWarningsAlert: React.FC<SurfaceWarningsAlertProps> = ({ warnings }) => {
+const SurfaceWarningsAlert: React.FC<SurfaceWarningsAlertProps> = ({
+  warnings,
+  offersDiscovery = false,
+}) => {
   const failsOpen = warnings.some(w => FAIL_OPEN_WARNING_CODES.includes(w.code));
   const needsGatewayDeny = warnings.some(w => GATEWAY_DENY_WARNING_CODES.includes(w.code));
 
@@ -57,6 +61,13 @@ const SurfaceWarningsAlert: React.FC<SurfaceWarningsAlertProps> = ({ warnings })
                 too. If it already has a policy, do not paste this whole policy: add{' '}
                 <code>{DENY_FAILED_CALLERS_CONDITION}</code> to each of its allow rules.
               </small>
+              {offersDiscovery && (
+                <p className="mt-2 mb-0 small" data-testid="surface-warnings-discovery-hint">
+                  Or turn on <strong>Authorization server discovery</strong> in the Caller Context
+                  editor: the gateway then refuses a caller without a valid token itself, before any
+                  policy runs, for direct and Fabric callers alike.
+                </p>
+              )}
             </div>
           )}
           {needsGatewayDeny && (

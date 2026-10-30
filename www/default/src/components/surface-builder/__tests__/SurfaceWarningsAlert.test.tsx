@@ -36,20 +36,19 @@ describe('SurfaceWarningsAlert', () => {
   it('lists each warning in a labelled live region with its variant', () => {
     render(
       <SurfaceWarningsAlert
-        warnings={[warning('declaration_stripped'), warning('additional_audiences', 'beta')]}
+        warnings={[warning('fail_open_policy'), warning('protected_resource_dropped', 'beta')]}
       />
     );
     const region = screen.getByRole('region', { name: 'Surface warnings' });
     expect(region).not.toHaveAttribute('aria-live');
     expect(screen.getByTestId('surface-warnings-live')).toContainElement(region);
     expect(region).toHaveTextContent('2 warnings');
-    expect(screen.getByTestId('surface-warning-declaration_stripped')).toHaveTextContent(
-      'message for declaration_stripped'
+    expect(screen.getByTestId('surface-warning-fail_open_policy')).toHaveTextContent(
+      'message for fail_open_policy'
     );
-    expect(screen.getByTestId('surface-warning-additional_audiences')).toHaveTextContent(
-      'message for additional_audiences (variant beta)'
+    expect(screen.getByTestId('surface-warning-protected_resource_dropped')).toHaveTextContent(
+      'message for protected_resource_dropped (variant beta)'
     );
-    expect(screen.queryByTestId('surface-warnings-copy-rule')).not.toBeInTheDocument();
   });
 
   it('offers the deny rule to copy when a warning says a failed caller gets through', async () => {
@@ -70,6 +69,32 @@ describe('SurfaceWarningsAlert', () => {
     );
     expect(hint).not.toHaveTextContent("this surface's policy");
     expect(screen.queryByTestId('surface-warnings-copy-gateway-rule')).not.toBeInTheDocument();
+  });
+
+  it('points at Authorization server discovery beside a fail-open warning when the surface can publish it', () => {
+    render(<SurfaceWarningsAlert warnings={[warning('fail_open_policy')]} offersDiscovery />);
+    const hint = screen.getByTestId('surface-warnings-discovery-hint');
+    expect(hint).toHaveTextContent(
+      'Or turn on Authorization server discovery in the Caller Context editor: the gateway then refuses a caller without a valid token itself, before any policy runs, for direct and Fabric callers alike.'
+    );
+    expect(screen.getByTestId('surface-warnings-copy-rule')).toBeInTheDocument();
+  });
+
+  it('does not point at discovery without a fail-open warning or when the surface cannot publish it', () => {
+    const view = render(
+      <SurfaceWarningsAlert warnings={[warning('payment_before_policy')]} offersDiscovery />
+    );
+    expect(screen.queryByTestId('surface-warnings-discovery-hint')).not.toBeInTheDocument();
+    view.unmount();
+    render(<SurfaceWarningsAlert warnings={[warning('fail_open_policy')]} />);
+    expect(screen.queryByTestId('surface-warnings-discovery-hint')).not.toBeInTheDocument();
+    render(
+      <SurfaceWarningsAlert
+        warnings={[warning('fail_open_undetermined')]}
+        offersDiscovery={false}
+      />
+    );
+    expect(screen.queryByTestId('surface-warnings-discovery-hint')).not.toBeInTheDocument();
   });
 
   it('offers the surface deny rule for fail_open_undetermined', () => {

@@ -2078,9 +2078,10 @@ fn retain_protected_resource(
 
 /// A restored `protected_resource` the Access Point would no longer serve.
 /// When the setting itself no longer fits, after the dashboard switched the
-/// method, set `forward_header` or audiences, or moved the protocol off MCP, it
-/// is dropped and the save report warns of it: the client did not send it, and
-/// refusing the save over it would leave the client no way out. When it no
+/// method, set `forward_header` or audiences, or moved the protocol to one that
+/// cannot declare, it is dropped and the save report warns of it: the client
+/// did not send it, and refusing the save over it would leave the client no
+/// way out. When it no
 /// longer fits the Access Point, for example after a route or listen address
 /// change, the save is refused instead: dropping it would leave the JWT Bearer
 /// method checking no audience, so the client must send a new resource or
@@ -2156,14 +2157,17 @@ fn settle_retained_protected_resources(
     Ok(dropped)
 }
 
-/// The authorization servers an Access Point advertises (base and each enabled
-/// variant) must be exactly the issuer its JWT verification strategy trusts.
-/// Only that issuer's tokens are accepted, so a client following metadata that
-/// names another server, even listed beside it, gets tokens that are always
-/// refused and loops on the 401 challenge. `validate_surface_references` has already checked that the
-/// strategy exists and that the caller may use it.
-async fn validate_protected_resource_issuers(
-    state: &IdentityApiState,
+/// The JWT verification strategy of a declaring Access Point (base and each
+/// enabled variant) must trust an issuer protected resource metadata can name
+/// (see `advertisable_strategy_issuer`), the one authorization server its
+/// protected resource metadata, challenge and agent card name. A stored
+/// `authorization_servers`, which is never advertised, must be exactly that
+/// issuer or be omitted: only that issuer's tokens are accepted, so a list naming
+/// another server would mislead whoever reads the record.
+/// `validate_surface_references` has already checked that the strategy exists
+/// and that the caller may use it.
+async fn validate_protected_resource_strategy(
+    strategies: Option<&dyn crate::jwt_bearer::JwtVerificationStrategyStorage>,
     surface: &AgentSurface,
 ) -> Result<(), SurfaceApiError> {
     let variants = surface
@@ -2181,24 +2185,29 @@ async fn validate_protected_resource_issuers(
         else {
             continue;
         };
-        let strategy = state
-            .jwt_verification_strategy_store
-            .as_ref()
+        let strategy = strategies
             .ok_or_else(|| SurfaceApiError::InternalError("JWT verification strategy store not initialized".into()))?
             .get(&jwt.jwt_verification_strategy_id)
             .await
             .map_err(|e| SurfaceApiError::InternalError(format!("Failed to load the JWT verification strategy: {e}")))?
             .ok_or_else(|| SurfaceApiError::BadRequest(format!("{label}JWT verification strategy not found")))?;
-        if protected.authorization_servers
-            != [strategy
-                .expected_issuer
-                .as_str()]
+        let issuer = &strategy.expected_issuer;
+        if !crate::protocols::protected_resource::advertisable_strategy_issuer(&strategy) {
+            return Err(SurfaceApiError::BadRequest(format!(
+                "{label}access_point.caller_authentication.protected_resource: the JWT verification strategy's \
+                 expected_issuer \"{issuer}\" is not an issuer URL protected resource metadata can name: an https \
+                 URL, or an http one for a strategy no tenant owns"
+            )));
+        }
+        if protected
+            .authorization_servers
+            .as_ref()
+            .is_some_and(|listed| *listed != [issuer.as_str()])
         {
             return Err(SurfaceApiError::BadRequest(format!(
                 "{label}access_point.caller_authentication.protected_resource: authorization_servers must be \
-                 exactly [\"{}\"], the issuer the JWT verification strategy trusts: tokens from any other server \
-                 are refused",
-                strategy.expected_issuer
+                 exactly [\"{issuer}\"], the issuer the JWT verification strategy trusts, or be omitted: the gateway \
+                 advertises that issuer"
             )));
         }
     }
@@ -2315,7 +2324,13 @@ async fn validate_surface_for_save(
             .as_ref()
     });
     refuse_validation_off_by_scoped_caller(surface, stored_a2a, context, scope, resource_scoped)?;
-    validate_protected_resource_issuers(state, surface).await?;
+    validate_protected_resource_strategy(
+        state
+            .jwt_verification_strategy_store
+            .as_deref(),
+        surface,
+    )
+    .await?;
     validate_mcp_resource_declarations(state, surface).await
 }
 
@@ -3874,13 +3889,44 @@ mod validation_tests {
                 "{change}: {refused}"
             );
         }
-        let mut a2a = mcp_surface();
-        a2a.access_point.protocol = SurfaceProtocol::A2a;
-        a2a.access_point
+        // A2A and AP2 Access Points declare too, so the setting is kept; a
+        // protocol that cannot declare drops it.
+        for protocol in [SurfaceProtocol::A2a, SurfaceProtocol::Ap2] {
+            let mut declaring = mcp_surface();
+            declaring
+                .access_point
+                .protocol = protocol.clone();
+            declaring
+                .access_point
+                .caller_authentication = Some(caller_authentication(false));
+            declaring.variants = vec![variant(false)];
+            let kept = retain_mcp_settings(
+                &mut declaring,
+                &existing,
+                &discovery_network(),
+                &ProtectedResourceRemovals::default(),
+            )
+            .unwrap();
+            assert_eq!(stored_resource(&declaring), (expected.clone(), expected.clone()), "{protocol:?}");
+            assert!(kept.is_empty(), "{protocol:?}: {kept:?}");
+        }
+        let mut didcomm = mcp_surface();
+        didcomm.access_point.protocol = SurfaceProtocol::DIDComm;
+        didcomm
+            .access_point
             .caller_authentication = Some(caller_authentication(false));
-        a2a.variants = vec![variant(false)];
-        retain_mcp_settings(&mut a2a, &existing, &discovery_network(), &ProtectedResourceRemovals::default()).unwrap();
-        assert_eq!(stored_resource(&a2a), (None, None));
+        didcomm.variants = vec![variant(false)];
+        let dropped =
+            retain_mcp_settings(&mut didcomm, &existing, &discovery_network(), &ProtectedResourceRemovals::default())
+                .unwrap();
+        assert_eq!(stored_resource(&didcomm), (None, None));
+        assert_eq!(
+            dropped,
+            vec![
+                SurfaceWarning::protected_resource_dropped(None),
+                SurfaceWarning::protected_resource_dropped(Some("beta")),
+            ]
+        );
 
         // A setting the request itself sends is kept, for validation to refuse.
         let mut sent = mcp_surface();
@@ -3898,6 +3944,144 @@ mod validation_tests {
                 .cloned(),
             expected
         );
+    }
+
+    /// An MCP Access Point whose JWT Bearer method uses the fixture strategy, with
+    /// `protected_resource` when given, and a `beta` variant whose caller
+    /// authentication sets `variant_protected` when given.
+    fn declaring_surface(
+        protected: Option<serde_json::Value>,
+        variant_protected: Option<serde_json::Value>,
+    ) -> AgentSurface {
+        use crate::protocols::protected_resource::fixtures::STRATEGY_ID;
+        let caller = |protected: Option<serde_json::Value>| {
+            let mut caller = serde_json::json!({"methods": [
+                {"type": "jwt_bearer", "jwt_verification_strategy_id": STRATEGY_ID, "audiences": []}
+            ]});
+            if let Some(protected) = protected {
+                caller["protected_resource"] = protected;
+            }
+            caller
+        };
+        let mut surface = serde_json::json!({
+            "surface_id": "s-1", "name": "s-1",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp",
+                "caller_authentication": caller(protected)},
+            "target": {"endpoint": "https://agent.example"}
+        });
+        if let Some(variant_protected) = variant_protected {
+            surface["variants"] = serde_json::json!([{
+                "id": "v-beta", "alias": "beta", "name": "beta", "enabled": true,
+                "overrides": {"access_point": {"caller_authentication": caller(Some(variant_protected))}}
+            }]);
+        }
+        serde_json::from_value(surface).unwrap()
+    }
+
+    async fn strategy_check(
+        strategies: Option<&dyn crate::jwt_bearer::JwtVerificationStrategyStorage>,
+        surface: &AgentSurface,
+    ) -> Result<(), String> {
+        validate_protected_resource_strategy(strategies, surface)
+            .await
+            .map_err(|error| match error {
+                SurfaceApiError::BadRequest(message) => message,
+                other => panic!("expected a bad request, got {other:?}"),
+            })
+    }
+
+    #[tokio::test]
+    async fn a_save_refuses_authorization_servers_other_than_the_strategy_issuer_and_accepts_none() {
+        use crate::protocols::protected_resource::fixtures::{FixtureStrategies, ISSUER};
+        let resource = "https://gateway.example/mcp";
+        let listing = |servers: serde_json::Value| {
+            Some(serde_json::json!({"resource": resource, "authorization_servers": servers}))
+        };
+        let store = FixtureStrategies::Pinned;
+
+        for (case, protected) in [
+            ("omitted", Some(serde_json::json!({"resource": resource}))),
+            ("null", listing(serde_json::Value::Null)),
+            ("the strategy's issuer", listing(serde_json::json!([ISSUER]))),
+        ] {
+            assert_eq!(strategy_check(Some(&store), &declaring_surface(protected, None)).await, Ok(()), "{case}");
+        }
+
+        let refusal = format!(
+            "access_point.caller_authentication.protected_resource: authorization_servers must be exactly \
+             [\"{ISSUER}\"], the issuer the JWT verification strategy trusts, or be omitted: the gateway advertises \
+             that issuer"
+        );
+        for (case, servers) in [
+            ("another server", serde_json::json!(["https://other.example"])),
+            ("the issuer beside another", serde_json::json!([ISSUER, "https://other.example"])),
+        ] {
+            assert_eq!(
+                strategy_check(Some(&store), &declaring_surface(listing(servers), None)).await,
+                Err(refusal.clone()),
+                "{case}"
+            );
+        }
+        assert_eq!(
+            strategy_check(
+                Some(&store),
+                &declaring_surface(None, listing(serde_json::json!(["https://other.example"])))
+            )
+            .await,
+            Err(format!("variant 'beta': {refusal}")),
+            "an enabled variant is checked with its own setting"
+        );
+
+        assert_eq!(
+            strategy_check(Some(&FixtureStrategies::Failing), &declaring_surface(None, None)).await,
+            Ok(()),
+            "an Access Point without protected_resource never reads the strategy store"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_save_refuses_protected_resource_whose_strategy_issuer_metadata_cannot_name() {
+        use crate::protocols::protected_resource::fixtures::fixture_strategy;
+        use crate::surfaces::save_report::tests::OneStrategy;
+        let protected = Some(serde_json::json!({"resource": "https://gateway.example/mcp"}));
+        let strategy = |issuer: &str, tenant: Option<&str>| {
+            let mut strategy = fixture_strategy(false);
+            strategy.expected_issuer = issuer.to_string();
+            strategy.tenant_id = tenant.map(Into::into);
+            OneStrategy(strategy)
+        };
+
+        for (issuer, tenant) in [
+            ("did:web:idp.example", None),
+            ("http://user:pw@idp.example", None),
+            ("http://idp.example", Some("tenant-a")),
+        ] {
+            let store = strategy(issuer, tenant);
+            assert_eq!(
+                strategy_check(Some(&store), &declaring_surface(protected.clone(), None)).await,
+                Err(format!(
+                    "access_point.caller_authentication.protected_resource: the JWT verification strategy's \
+                     expected_issuer \"{issuer}\" is not an issuer URL protected resource metadata can name: an \
+                     https URL, or an http one for a strategy no tenant owns"
+                )),
+                "{issuer} for {tenant:?}"
+            );
+            assert_eq!(
+                strategy_check(Some(&store), &declaring_surface(None, None)).await,
+                Ok(()),
+                "{issuer}: a strategy any JWT Bearer method may use is refused only for a declaring Access Point"
+            );
+        }
+
+        for (issuer, tenant) in
+            [("https://idp.example", None), ("https://idp.example", Some("tenant-a")), ("http://127.0.0.1:4444/", None)]
+        {
+            assert_eq!(
+                strategy_check(Some(&strategy(issuer, tenant)), &declaring_surface(protected.clone(), None)).await,
+                Ok(()),
+                "{issuer} for {tenant:?} is accepted without a pinned authorization server"
+            );
+        }
     }
 
     #[test]
@@ -6750,6 +6934,10 @@ mod tests {
                 outcome: "pass_through",
                 reason: None,
                 resource: Some("https://gateway.example/agent".into()),
+                authorization_servers: Vec::new(),
+                required_scopes: Vec::new(),
+                scopes_supported: Vec::new(),
+                metadata_url: None,
             }],
             warnings: vec![SurfaceWarning::protected_resource_dropped(None)],
         }
@@ -6784,7 +6972,8 @@ mod tests {
                 "success": true,
                 "message": "deleted",
                 "declarations": [{"variant": null, "outcome": "pass_through", "reason": null,
-                    "resource": "https://gateway.example/agent"}],
+                    "resource": "https://gateway.example/agent", "authorization_servers": [],
+                    "required_scopes": [], "scopes_supported": [], "metadata_url": null}],
                 "warnings": [{"code": "protected_resource_dropped",
                     "message": SurfaceWarning::protected_resource_dropped(None).message,
                     "path": "access_point.caller_authentication.protected_resource", "variant": null}],

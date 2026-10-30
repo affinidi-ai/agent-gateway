@@ -243,11 +243,20 @@ impl GatewayBootstrapFixture {
     }
 
     pub fn write_self_record(&self) {
-        let base_dir = self
-            .root_dir
-            .as_ref()
-            .expect("root dir must be set")
-            .as_path();
+        self.write_self_record_in(
+            self.root_dir
+                .as_ref()
+                .expect("root dir must be set")
+                .as_path(),
+        );
+    }
+
+    /// Writes this gateway's own record, with its gateway-level policy when one is set,
+    /// under `base_dir`.
+    fn write_self_record_in(
+        &self,
+        base_dir: &Path,
+    ) {
         let gateway_record_dir = base_dir.join("_storage/gateways");
         let record_path = gateway_record_dir.join(format!("{}.json", self.key));
         let now = Utc::now().to_rfc3339();
@@ -323,6 +332,13 @@ pub fn write_gateway_config_tree(
         );
     } else {
         write_gateway_bootstrap_json(base_dir, fixture.gateway_port, &bootstrap_surfaces, &fixture.identity_route_key);
+    }
+
+    if fixture
+        .policy_opa_entry
+        .is_some()
+    {
+        fixture.write_self_record_in(base_dir);
     }
 
     let surfaces_dir = storage_dir.join("agent_surfaces");

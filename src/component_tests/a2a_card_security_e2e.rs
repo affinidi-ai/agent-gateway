@@ -6,16 +6,16 @@
 //! received. A Transit Point of a declaring Access Point serves its partner's card with
 //! no security at all. An Access Point that does not declare serves the upstream security
 //! and signatures unchanged. A declaring Access Point also publishes RFC 9728 protected
-//! resource metadata at its own URL, for its base route and for each Surface Variant
-//! whose URL its audiences name.
+//! resource metadata at its own URL, for its base route and for each enabled Surface
+//! Variant. An Access Point declares only when it sets `protected_resource`.
 
 use serde_json::{Value, json};
 
 use super::helpers;
 use helpers::card_security::{
     ISSUER, REQUIRED_SCOPE, SMOKE_RESOURCE, STRATEGY_ID, UPSTREAM_MARKER, add_upstream_security,
-    advertise_public_origin, assert_declares, assert_keeps_upstream_security, assert_strips,
-    jwt_bearer_caller_authentication, write_strategy,
+    advertise_public_origin, assert_declares, assert_keeps_upstream_security, assert_no_upstream_security,
+    assert_strips, jwt_bearer_caller_authentication, write_strategy, write_strategy_with_keys,
 };
 use helpers::jwt::{JwksFixture, now_secs, sign_jwt};
 use helpers::{GatewayHarness, MockServer};
@@ -64,32 +64,36 @@ fn extended_card_envelope(era: Era) -> String {
 
 enum CallerAuth {
     None,
-    Jwt { issuer: String, pinned: bool, audiences: Vec<&'static str> },
+    Jwt { jwks_uri: Option<String>, pinned: bool, declares: bool },
 }
 
 fn jwt(
     pinned: bool,
-    audiences: &[&'static str],
+    declares: bool,
 ) -> CallerAuth {
     CallerAuth::Jwt {
-        issuer: ISSUER.to_string(),
+        jwks_uri: None,
         pinned,
-        audiences: audiences.to_vec(),
+        declares,
     }
 }
 
-/// One pinned `jwt_bearer` method whose audiences name the base route's Access Point
-/// URL, so the base route declares and its `dev` variant does not.
+/// One pinned `jwt_bearer` method and a `protected_resource` setting, so the base route
+/// and its `dev` variant both declare.
 fn declaring() -> CallerAuth {
-    jwt(true, &[SMOKE_RESOURCE])
+    jwt(true, true)
 }
 
-/// The same method trusting the keys of `fixture`, so a caller can present a token.
-fn declaring_with_keys(fixture: &JwksFixture) -> CallerAuth {
+/// A pinned method trusting [`ISSUER`] with the keys of `fixture`, so a caller can
+/// present a token.
+fn with_keys(
+    fixture: &JwksFixture,
+    declares: bool,
+) -> CallerAuth {
     CallerAuth::Jwt {
-        issuer: fixture.issuer.clone(),
+        jwks_uri: Some(format!("{}/.well-known/jwks.json", fixture.issuer)),
         pinned: true,
-        audiences: vec![SMOKE_RESOURCE],
+        declares,
     }
 }
 
@@ -107,12 +111,18 @@ async fn start_gateway(
             }))
             .expect("variant"),
         ];
-        if let CallerAuth::Jwt { issuer, pinned, audiences } = caller_auth {
-            write_strategy(temp_dir, &issuer, pinned);
+        if let CallerAuth::Jwt { jwks_uri, pinned, declares } = caller_auth {
+            match jwks_uri {
+                Some(jwks_uri) => write_strategy_with_keys(temp_dir, ISSUER, &jwks_uri, pinned),
+                None => write_strategy(temp_dir, ISSUER, pinned),
+            }
+            let mut config = jwt_bearer_caller_authentication(declares.then_some(SMOKE_RESOURCE));
+            if !declares {
+                config["methods"][0]["audiences"] = json!([OTHER_AUDIENCE]);
+            }
             surface
                 .access_point
-                .caller_authentication =
-                Some(serde_json::from_value(jwt_bearer_caller_authentication(&audiences)).expect("caller auth"));
+                .caller_authentication = Some(serde_json::from_value(config).expect("caller auth"));
         }
         gw_config.surfaces = vec![surface];
     })
@@ -179,7 +189,7 @@ fn token(
 ) -> String {
     sign_jwt(
         json!({
-            "iss": fixture.issuer, "sub": "client", "aud": audience, "scope": REQUIRED_SCOPE,
+            "iss": ISSUER, "sub": "client", "aud": audience, "scope": REQUIRED_SCOPE,
             "exp": now_secs() + 300, "iat": now_secs(),
         }),
         &fixture.kid,
@@ -236,18 +246,18 @@ async fn a_declaring_access_point_replaces_upstream_security_on_its_public_card_
 async fn a_declaring_access_point_declares_on_its_extended_card_in_both_eras() {
     let fixture = JwksFixture::start().await;
     for (era, method) in [(Era::V1, "GetExtendedAgentCard"), (Era::V0_3, "agent/getAuthenticatedExtendedCard")] {
-        let h = start_gateway(extended_card_envelope(era), declaring_with_keys(&fixture)).await;
+        let h = start_gateway(extended_card_envelope(era), with_keys(&fixture, true)).await;
         let unauthenticated = request_extended_card(&h, method, None).await;
         assert_eq!(unauthenticated.status(), 401, "{era:?}: a caller without a token is challenged");
 
         let card = extended_card(&h, method, &token(&fixture, SMOKE_RESOURCE)).await;
-        assert_declares(&card, &fixture.issuer, era.has_v1(), era.has_v0_3());
+        assert_declares(&card, ISSUER, era.has_v1(), era.has_v0_3());
     }
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_access_point_that_does_not_declare_serves_upstream_security_unchanged() {
-    for caller_auth in [CallerAuth::None, jwt(false, &[SMOKE_RESOURCE]), jwt(true, &[OTHER_AUDIENCE])] {
+    for caller_auth in [CallerAuth::None, jwt(true, false), jwt(false, false)] {
         let h = start_gateway(upstream_card(Era::Dual).to_string(), caller_auth).await;
         let card = public_card(&h, "/smoke").await;
         assert_keeps_upstream_security(&card);
@@ -260,29 +270,33 @@ async fn an_access_point_that_does_not_declare_serves_upstream_security_unchange
     }
 
     let fixture = JwksFixture::start().await;
-    let other_audience = CallerAuth::Jwt {
-        issuer: fixture.issuer.clone(),
-        pinned: true,
-        audiences: vec![OTHER_AUDIENCE],
-    };
-    let h = start_gateway(extended_card_envelope(Era::V1), other_audience).await;
+    let h = start_gateway(extended_card_envelope(Era::V1), with_keys(&fixture, false)).await;
     let card = extended_card(&h, "GetExtendedAgentCard", &token(&fixture, OTHER_AUDIENCE)).await;
     assert_keeps_upstream_security(&card);
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_surface_variant_declares_only_when_the_audiences_name_its_url() {
+async fn every_enabled_variant_of_a_declaring_access_point_declares_its_own_resource() {
     let h = start_gateway(upstream_card(Era::V1).to_string(), declaring()).await;
-    assert_keeps_upstream_security(&public_card(&h, "/smoke$dev").await);
-    assert_declares(&public_card(&h, "/smoke").await, ISSUER, true, false);
-
-    let h = start_gateway(upstream_card(Era::V1).to_string(), jwt(true, &[SMOKE_RESOURCE, DEV_RESOURCE])).await;
     let variant = public_card(&h, "/smoke$dev").await;
     assert_declares(&variant, ISSUER, true, false);
     assert_eq!(endpoint(&variant), Some(DEV_RESOURCE), "the variant's card names the variant URL it declares");
     let base = public_card(&h, "/smoke").await;
     assert_declares(&base, ISSUER, true, false);
     assert_eq!(endpoint(&base), Some(SMOKE_RESOURCE));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unpinned_declaring_access_point_publishes_no_scheme_and_drops_upstream_security() {
+    let h = start_gateway(upstream_card(Era::V1).to_string(), jwt(false, true)).await;
+    let card = public_card(&h, "/smoke").await;
+    assert_no_upstream_security(&card);
+    assert!(
+        card["securitySchemes"]
+            .get("agent_gateway")
+            .is_none(),
+        "{card}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -347,10 +361,10 @@ async fn a_card_the_gateway_cannot_process_is_refused_without_its_body() {
 }
 
 /// A public card served through the card route is counted once with its outcome and
-/// reason. No other test serves a card whose strategy pin mismatches, so the count
-/// rises by exactly one.
+/// reason. No other test serves a card of a declaring surface whose pin issuer differs,
+/// so the count rises by exactly one.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_served_public_card_is_counted_once_with_its_strip_reason() {
+async fn a_served_public_card_is_counted_once_with_its_outcome() {
     let mock = MockServer::start_with_response(upstream_card(Era::V1).to_string()).await;
     let h = GatewayHarness::start_with_outbound_mock(mock, |temp_dir, gw_config, bootstrap| {
         advertise_public_origin(bootstrap);
@@ -366,18 +380,25 @@ async fn a_served_public_card_is_counted_once_with_its_strip_reason() {
         surface
             .access_point
             .caller_authentication =
-            Some(serde_json::from_value(jwt_bearer_caller_authentication(&[SMOKE_RESOURCE])).expect("caller auth"));
+            Some(serde_json::from_value(jwt_bearer_caller_authentication(Some(SMOKE_RESOURCE))).expect("caller auth"));
         gw_config.surfaces = vec![surface];
     })
     .await;
     let count = || {
         crate::metrics::backends::prometheus::CARD_SECURITY
-            .with_label_values(&["strip", "pin_mismatch"])
+            .with_label_values(&["declare", "none"])
             .get()
     };
 
     let before = count();
-    assert_keeps_upstream_security(&public_card(&h, "/smoke").await);
+    let card = public_card(&h, "/smoke").await;
+    assert_no_upstream_security(&card);
+    assert!(
+        card["securitySchemes"]
+            .get("agent_gateway")
+            .is_none(),
+        "{card}"
+    );
     assert_eq!(count() - before, 1, "one served card is counted once");
 }
 
@@ -398,7 +419,7 @@ fn expected_metadata(resource: &str) -> Value {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_declaring_access_point_publishes_protected_resource_metadata_at_its_own_url_only() {
+async fn a_declaring_access_point_publishes_protected_resource_metadata_for_its_routes_only() {
     let h = start_gateway(upstream_card(Era::V1).to_string(), declaring()).await;
     let (status, headers, body) = get(&protected_resource_url(&h, "/smoke")).await;
     assert_eq!(status, 200, "{body}");
@@ -409,15 +430,15 @@ async fn a_declaring_access_point_publishes_protected_resource_metadata_at_its_o
         Some("no-store")
     );
     assert_eq!(serde_json::from_str::<Value>(&body).expect("metadata JSON"), expected_metadata(SMOKE_RESOURCE));
-    for path in ["", "/unknown", "/smoke$dev", "/smoke%24dev", "/smoke/rpc"] {
+    for path in ["", "/unknown", "/smoke/rpc"] {
         let (status, _, body) = get(&protected_resource_url(&h, path)).await;
         assert_eq!(status, 404, "{path}: {body}");
     }
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_variant_whose_url_the_audiences_name_publishes_metadata_at_both_spellings() {
-    let h = start_gateway(upstream_card(Era::V1).to_string(), jwt(true, &[SMOKE_RESOURCE, DEV_RESOURCE])).await;
+async fn a_variant_publishes_metadata_at_both_spellings() {
+    let h = start_gateway(upstream_card(Era::V1).to_string(), declaring()).await;
     for path in ["/smoke$dev", "/smoke%24dev"] {
         let (status, _, body) = get(&protected_resource_url(&h, path)).await;
         assert_eq!(status, 200, "{path}: {body}");
@@ -473,7 +494,7 @@ async fn a_browser_reads_a_declaring_access_points_metadata_from_any_origin() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_access_point_that_does_not_declare_publishes_no_protected_resource_metadata() {
-    for caller_auth in [jwt(false, &[SMOKE_RESOURCE]), jwt(true, &[OTHER_AUDIENCE]), CallerAuth::None] {
+    for caller_auth in [jwt(true, false), CallerAuth::None] {
         let h = start_gateway(upstream_card(Era::V1).to_string(), caller_auth).await;
         let (status, _, body) = get(&protected_resource_url(&h, "/smoke")).await;
         assert_eq!(status, 404, "{body}");

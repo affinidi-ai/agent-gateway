@@ -9,6 +9,7 @@ pub mod channel_logging;
 pub mod credential_delegation;
 pub mod fabric_forward;
 pub mod fabric_identity;
+pub(crate) mod fabric_peer_refusal;
 pub(crate) mod fabric_response_waiter;
 pub(crate) mod fabric_stream;
 pub mod handler;

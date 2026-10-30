@@ -4,19 +4,21 @@
  * Covers creating a surface from the A2A starter through the builder against
  * the real gateway:
  * - The saved surface carries the Managed Agent target
- * - Caller authentication with a JWT strategy, required scopes and the Access
- *   Point URL as an accepted audience is saved and read back by the gateway
+ * - Caller authentication with a JWT strategy and required scopes is saved and
+ *   read back by the gateway, with authorization server discovery off
  * - A surface that lets failed callers through lands on its detail page with
  *   the save warnings and a deny rule to copy, and no policy is attached
- * - Add to Accepted Audiences moves focus to the status that replaces it
+ * - Turning on authorization server discovery from the keyboard moves focus to
+ *   the Resource URL field, and the gateway's refusal of a resource its listener
+ *   does not serve is shown at that field
  * - The selected node keeps its highlight when the canvas is redrawn
  * - A credential provider chosen as the Target Authentication is saved and
  *   read back by the gateway
  * - Saving is refused, with the reason next to the field, until a provider is
  *   chosen and the custom header is not a reserved name such as Host
  *
- * The test gateway's listeners are plain http, so it reports no Access Point
- * URL; the declarations response is given one so the audience control shows.
+ * The test gateway's listeners are plain http, so authorization server discovery
+ * cannot be saved here; the gateway's refusal is checked instead.
  */
 
 import type {Page} from '@playwright/test';
@@ -31,7 +33,6 @@ const STRATEGY_NAME = `e2e-builder-strategy-${RUN_ID}`;
 const TARGET_URL = 'https://agent.example.org/a2a';
 const A2A_STARTER_ID = '75c89fd7-d83f-4213-be48-a3777dacf2dc';
 const REQUIRED_SCOPE = 'agent:invoke';
-const ACCESS_POINT_URL = `https://gateway.example.org/e2e-builder-${RUN_ID}`;
 
 interface StoredSurface {
     surface_id: string;
@@ -47,12 +48,9 @@ interface StoredSurface {
                 audiences?: string[];
                 required_scopes?: string[];
             }>;
+            protected_resource?: {resource: string};
         };
     };
-}
-
-interface DeclarationsBody {
-    declarations?: Array<{resource: string | null}>;
 }
 
 async function startFromA2aStarter(page: Page): Promise<void> {
@@ -86,7 +84,12 @@ async function dropOnPipelineEdge(page: Page, nodeType: string): Promise<void> {
     throw new Error(`${nodeType} did not snap to any pipeline edge`);
 }
 
-async function addJwtCallerAuth(page: Page, strategyName: string, scope?: string): Promise<void> {
+async function addJwtCallerAuth(
+    page: Page,
+    strategyName: string,
+    scope?: string,
+    options?: {keepOpen?: boolean}
+): Promise<void> {
     await page.getByTestId('palette-section-policy').click();
     await dropOnPipelineEdge(page, 'caller-auth');
     await selectNode(page, 'caller-auth');
@@ -97,26 +100,7 @@ async function addJwtCallerAuth(page: Page, strategyName: string, scope?: string
         await page.getByTestId('caller-auth-scope-add').click();
         await expect(page.getByTestId('caller-auth-scopes')).toContainText(scope);
     }
-    await page.getByTestId('caller-auth-close-button').click();
-}
-
-async function reportAccessPointUrl(page: Page): Promise<void> {
-    await page.route('**/api/v1/surfaces/*/declarations', async route => {
-        const response = await route.fetch();
-        const body = (await response.json()) as DeclarationsBody;
-        const declarations = (body.declarations ?? []).map(declaration => ({
-            ...declaration,
-            resource: declaration.resource ?? ACCESS_POINT_URL,
-        }));
-        await route.fulfill({response, json: {...body, declarations}});
-    });
-}
-
-async function openSavedCallerAuth(page: Page, surfaceId: string): Promise<void> {
-    await expect(page).toHaveURL(new RegExp(`/surfaces/${surfaceId}$`));
-    await selectNode(page, 'caller-auth');
-    await page.getByTestId('caller-auth-configure').click();
-    await expect(page.getByTestId('caller-auth-discovery-derived-audience')).toContainText(ACCESS_POINT_URL);
+    if (!options?.keepOpen) await page.getByTestId('caller-auth-close-button').click();
 }
 
 async function createSurface(page: Page): Promise<StoredSurface> {
@@ -179,56 +163,78 @@ test.describe('Surface builder save', () => {
         expect(stored.body.access_point.caller_authentication).toBeUndefined();
     });
 
-    test('saves JWT caller authentication with scopes and the entry point audience', async ({page}) => {
+    test('saves JWT caller authentication with required scopes and authorization server discovery off', async ({page}) => {
         ticket('FTL-30892', 'FTL-30895');
-        await reportAccessPointUrl(page);
         await startFromA2aStarter(page);
         await addJwtCallerAuth(page, STRATEGY_NAME, REQUIRED_SCOPE);
         await fillTargetUrl(page, TARGET_URL);
 
         const created = await createSurface(page);
         createdSurfaceIds.push(created.surface_id);
-        await openSavedCallerAuth(page, created.surface_id);
-        await expect(page.getByTestId('caller-auth-discovery-derived-scopes')).toHaveText(REQUIRED_SCOPE);
-        await page.getByTestId('caller-auth-discovery-add-audience-button').click();
-        await page.getByTestId('caller-auth-close-button').click();
-
-        const updated = page.waitForResponse(
-            response =>
-                response.url().endsWith(`/api/v1/surfaces/${created.surface_id}`) && response.request().method() === 'PUT'
-        );
-        await page.getByTestId('surface-save-button').click();
-        expect((await updated).status()).toBe(200);
 
         const stored = await api.get<StoredSurface>(`/api/v1/surfaces/${created.surface_id}`);
-        const [method] = stored.body.access_point.caller_authentication?.methods ?? [];
+        const caller = stored.body.access_point.caller_authentication;
+        const [method] = caller?.methods ?? [];
         expect(method).toMatchObject({
             type: 'jwt_bearer',
             jwt_verification_strategy_id: strategyId,
             required_scopes: [REQUIRED_SCOPE],
-            audiences: [ACCESS_POINT_URL],
         });
+        expect(method.audiences ?? []).toEqual([]);
+        expect(caller?.protected_resource).toBeUndefined();
+
+        await expect(page).toHaveURL(new RegExp(`/surfaces/${created.surface_id}$`));
+        await selectNode(page, 'caller-auth');
+        await page.getByTestId('caller-auth-configure').click();
+        await expect(page.getByTestId('caller-auth-discovery-switch')).not.toBeChecked();
+        await expect(page.getByTestId('caller-auth-discovery-off-summary')).toBeVisible();
     });
 
-    test('moves focus to the Listed status after Add to Accepted Audiences', async ({page}) => {
+    test('turning on authorization server discovery from the keyboard moves focus to the Resource URL field', async ({page}) => {
         ticket('FTL-30895');
-        await reportAccessPointUrl(page);
         await startFromA2aStarter(page);
-        await addJwtCallerAuth(page, STRATEGY_NAME, REQUIRED_SCOPE);
+        await addJwtCallerAuth(page, STRATEGY_NAME, REQUIRED_SCOPE, {keepOpen: true});
+
+        await page.getByTestId('caller-auth-discovery-switch').focus();
+        await page.keyboard.press('Space');
+
+        const resource = page.getByTestId('caller-auth-discovery-resource-input');
+        await expect(resource).toBeFocused();
+        await expect(resource).toHaveValue('');
+        await expect(page.getByTestId('caller-auth-discovery-resource-hint')).toContainText('has no https URL');
+    });
+
+    test('refuses to save authorization server discovery whose resource the listener does not serve, with the reason at the Resource URL field', async ({
+        page,
+    }) => {
+        ticket('FTL-30893', 'FTL-30895');
+        const existing = await api.get<Array<{surface_id: string}>>('/api/v1/surfaces');
+        const before = new Set(existing.body.map(surface => surface.surface_id));
+        await startFromA2aStarter(page);
+        await addJwtCallerAuth(page, STRATEGY_NAME, REQUIRED_SCOPE, {keepOpen: true});
+        await page.getByTestId('caller-auth-discovery-switch').click();
+
+        const entryPoint = (await page.getByTestId('surface-entry-point-url').textContent()) ?? '';
+        const route = new URL(entryPoint.match(/https?:\/\/\S+/)![0]).pathname;
+        await page.getByTestId('caller-auth-discovery-resource-input').fill(`https://gateway.example.org${route}`);
+        await page.getByTestId('caller-auth-close-button').click();
         await fillTargetUrl(page, TARGET_URL);
 
-        const created = await createSurface(page);
-        createdSurfaceIds.push(created.surface_id);
-        await openSavedCallerAuth(page, created.surface_id);
-        const add = page.getByTestId('caller-auth-discovery-add-audience-button');
-        await add.focus();
-        await page.keyboard.press('Enter');
+        const posted = page.waitForResponse(
+            response => response.url().endsWith('/api/v1/surfaces') && response.request().method() === 'POST'
+        );
+        await page.getByTestId('surface-create-button').click();
+        expect((await posted).status()).toBe(400);
 
-        const listed = page.getByTestId('caller-auth-discovery-audience-listed');
-        await expect(listed).toHaveText('Listed in Accepted Audiences.');
-        await expect(listed).toBeFocused();
-        await expect(add).toHaveCount(0);
-        await expect(page.getByTestId('caller-auth-discovery-audience-status')).toHaveAttribute('role', 'status');
+        await selectNode(page, 'caller-auth');
+        await page.getByTestId('caller-auth-configure').click();
+        const error = page.getByTestId('caller-auth-discovery-resource-error');
+        await expect(error).toBeVisible();
+        await expect(error).toContainText(`https://gateway.example.org${route}' must be this endpoint's own public URL`);
+        await expect(page.getByTestId('caller-auth-discovery-resource-input')).toHaveAttribute('aria-invalid', 'true');
+
+        const after = await api.get<Array<{surface_id: string}>>('/api/v1/surfaces');
+        expect(after.body.map(surface => surface.surface_id).filter(id => !before.has(id))).toEqual([]);
     });
 
     test('opens the new surface with its save warnings when failed callers are not denied', async ({page}) => {
@@ -247,6 +253,7 @@ test.describe('Surface builder save', () => {
         await expect(alert).toBeVisible();
         await expect(alert).toHaveAttribute('aria-label', 'Surface warnings');
         await expect(page.getByTestId('surface-warning-fail_open_policy')).toBeVisible();
+        await expect(page.getByTestId('surface-warnings-discovery-hint')).toBeVisible();
 
         const copyRule = page.getByTestId('surface-warnings-copy-rule');
         await copyRule.click();

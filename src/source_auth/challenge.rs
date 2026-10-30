@@ -1,104 +1,16 @@
-//! What a refused caller receives at an Access Point, and which Target
-//! challenges reach it.
-//!
-//! A caller whose source authentication failed, refused on a declaring Access
-//! Point, receives the declaration's RFC 6750 challenge naming its protected
-//! resource metadata: `401` for a missing or invalid token, `403` for a scope
-//! shortfall. Every other refusal keeps the 403 of the stage that refused it.
-//! On an Access Point where the gateway is the resource server, Target
-//! challenges other than `Payment` are addressed to the gateway, so they never
-//! reach the caller, and a Target `401` left with no challenge becomes a `502`.
+//! Which Target challenges reach a caller. On an Access Point where the gateway
+//! is the resource server, Target challenges other than `Payment` are addressed
+//! to the gateway, so they never reach the caller, and a Target `401` left with
+//! no challenge becomes a `502`. The gateway's own caller challenge is built by
+//! `crate::proxy::caller_denial::challenge_failed_caller`. Over Fabric, a peer's
+//! `401` and its `403` `insufficient_scope` are answered by
+//! `crate::proxy::fabric_peer_refusal` before this filter runs.
 
-use axum::body::Body;
-use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, WWW_AUTHENTICATE};
+use axum::http::header::WWW_AUTHENTICATE;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 
-use crate::config::agent_surface::SurfaceProtocol;
-use crate::protocols::protected_resource::{ResourceTokenError, is_gateway_challenge, mark_gateway_challenge};
-use crate::source_auth::declaration::Declaration;
-use crate::surface_context::SourceAuthContext;
-
-/// The stage that refused a caller. It names the body of the refusal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CallerDenial {
-    AppliancePolicy,
-    GatewayPolicy,
-    SurfacePolicy,
-    SurfacePolicyUnloaded,
-    IdentityRequired,
-    CallerAuthentication,
-}
-
-impl CallerDenial {
-    /// The stage's refusal body with `status`.
-    fn response(
-        self,
-        status: StatusCode,
-    ) -> Response {
-        let title = status
-            .canonical_reason()
-            .unwrap_or("Error");
-        let proxy_error = |detail: &str| crate::a2a::errors::proxy_error_body(status, detail);
-        let surface_error = |message: &str| serde_json::json!({ "error": title, "message": message });
-        let (content_type, body) = match self {
-            Self::AppliancePolicy => {
-                ("application/problem+json", proxy_error("Request blocked by appliance-wide policy"))
-            }
-            Self::GatewayPolicy => ("application/problem+json", proxy_error("Request blocked by gateway policy")),
-            Self::CallerAuthentication => ("application/problem+json", proxy_error("Caller authentication failed")),
-            Self::SurfacePolicy => ("application/json", surface_error("Agent trust policy denied the request")),
-            Self::SurfacePolicyUnloaded => (
-                "application/json",
-                surface_error("OPA policy enforcement is enabled but no policy is loaded for this channel"),
-            ),
-            Self::IdentityRequired => (
-                "application/problem+json",
-                serde_json::json!({
-                    "type": "https://affinidi.com/atg/errors/identity-required",
-                    "title": "Identity Required for Credential Delegation",
-                    "status": status.as_u16(),
-                    "detail": "This channel requires credential delegation which needs authenticated source identity. \
-                               Configure source authentication and agent identity management on this channel.",
-                }),
-            ),
-        };
-        let mut response = Response::new(Body::from(body.to_string()));
-        *response.status_mut() = status;
-        response
-            .headers_mut()
-            .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
-        response
-    }
-}
-
-/// The response for a refused caller. A caller that failed source
-/// authentication on a declaring Access Point gets the declaration's challenge
-/// and its status: on an MCP Access Point as at the source-auth stage, on any
-/// other the refusing stage's body. Every other caller gets the stage's 403.
-pub fn caller_deny_response(
-    denial: CallerDenial,
-    protocol: &SurfaceProtocol,
-    declaration: Option<&Declaration>,
-    source_auth: Option<&SourceAuthContext>,
-) -> Response {
-    let (Some(declaration), Some(SourceAuthContext::Failed { kind, .. })) = (declaration, source_auth) else {
-        return denial.response(StatusCode::FORBIDDEN);
-    };
-    let error = ResourceTokenError::from(*kind);
-    if *protocol == SurfaceProtocol::Mcp {
-        return declaration.challenge(error);
-    }
-    let Some(challenge) = declaration.challenge_header(error) else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    let mut response = denial.response(error.status_code());
-    response
-        .headers_mut()
-        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    mark_gateway_challenge(&mut response, challenge);
-    response
-}
+use crate::protocols::protected_resource::is_gateway_challenge;
 
 /// What [`strip_relayed_challenges`] removed from a Target response: the
 /// scheme of each dropped challenge, in order, and whether the response
@@ -171,6 +83,86 @@ fn retain_payment_challenges(headers: &mut HeaderMap) -> Vec<String> {
     dropped
 }
 
+/// How a receiving gateway refused a request a sending gateway forwarded over
+/// Fabric.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerRefusal {
+    /// A `401` that carries no `Payment` challenge, with or without other
+    /// challenges.
+    Token,
+    /// A `403` carrying a `Bearer` challenge with `error="insufficient_scope"`.
+    Scope,
+}
+
+/// Whether a Fabric peer's answer refused the sending gateway's authorization.
+/// `None` for every other answer, a policy `403` and a `401` or `402` that asks
+/// for payment included. Schemes and parameter names compare case-insensitively,
+/// the `error` value exactly (RFC 6750 section 3.1).
+pub fn peer_refusal(
+    status: StatusCode,
+    headers: &HeaderMap,
+) -> Option<PeerRefusal> {
+    let challenges: Vec<String> = headers
+        .get_all(WWW_AUTHENTICATE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(challenges)
+        .collect();
+    if status == StatusCode::UNAUTHORIZED {
+        let asks_for_payment = challenges
+            .iter()
+            .any(|challenge| scheme(challenge).eq_ignore_ascii_case("payment"));
+        return (!asks_for_payment).then_some(PeerRefusal::Token);
+    }
+    if status == StatusCode::FORBIDDEN {
+        let short_of_scope = challenges
+            .iter()
+            .any(|challenge| {
+                scheme(challenge).eq_ignore_ascii_case("bearer")
+                    && challenge_param(challenge, "error").as_deref() == Some("insufficient_scope")
+            });
+        return short_of_scope.then_some(PeerRefusal::Scope);
+    }
+    None
+}
+
+/// The value of auth-param `name` in one challenge (RFC 9110 section 11.2),
+/// unquoted. A parameter inside another parameter's quoted value never matches.
+fn challenge_param(
+    challenge: &str,
+    name: &str,
+) -> Option<String> {
+    let params = &challenge[scheme(challenge).len()..];
+    list_elements(params)
+        .into_iter()
+        .find_map(|element| {
+            let (key, value) = element.split_once('=')?;
+            key.trim()
+                .eq_ignore_ascii_case(name)
+                .then(|| unquote(value.trim()))
+        })
+}
+
+fn unquote(value: &str) -> String {
+    let Some(inner) = value
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    else {
+        return value.to_string();
+    };
+    let mut unquoted = String::with_capacity(inner.len());
+    let mut escaped = false;
+    for c in inner.chars() {
+        if c == '\\' && !escaped {
+            escaped = true;
+            continue;
+        }
+        escaped = false;
+        unquoted.push(c);
+    }
+    unquoted
+}
+
 fn scheme(challenge: &str) -> &str {
     challenge
         .split(' ')
@@ -239,15 +231,13 @@ fn list_elements(value: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use axum::body::Body;
     use serde_json::{Value, json};
 
     use super::*;
+    use crate::protocols::protected_resource::ResourceTokenError;
     use crate::protocols::protected_resource::fixtures::ISSUER;
-    use crate::source_auth::errors::SourceAuthFailureKind;
-
-    const RESOURCE: &str = "https://gateway.example/mcp/alpha";
-    const METADATA: &str = "https://gateway.example/.well-known/oauth-protected-resource/mcp/alpha";
-    const A2A_METADATA: &str = "https://gw.example/.well-known/oauth-protected-resource/a2a/buyer";
+    use crate::source_auth::declaration::Declaration;
 
     fn declaration_for(
         resource: &str,
@@ -266,22 +256,6 @@ mod tests {
         }
     }
 
-    fn declaration() -> Declaration {
-        declaration_for(RESOURCE, &["tools"])
-    }
-
-    fn a2a_declaration() -> Declaration {
-        declaration_for("https://gw.example/a2a/buyer", &["agent.invoke", "agent.read"])
-    }
-
-    fn failed(kind: SourceAuthFailureKind) -> SourceAuthContext {
-        SourceAuthContext::Failed {
-            attempted_method: "jwt_bearer".into(),
-            kind,
-            reason: "x".into(),
-        }
-    }
-
     async fn body_json(response: Response) -> Value {
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -289,209 +263,11 @@ mod tests {
         serde_json::from_slice(&bytes).expect("json body")
     }
 
-    fn header(
-        response: &Response,
-        name: axum::http::HeaderName,
-    ) -> Option<&str> {
+    fn challenge_of(response: &Response) -> Option<&str> {
         response
             .headers()
-            .get(name)
+            .get(WWW_AUTHENTICATE)
             .and_then(|value| value.to_str().ok())
-    }
-
-    fn challenge_of(response: &Response) -> Option<&str> {
-        header(response, WWW_AUTHENTICATE)
-    }
-
-    #[tokio::test]
-    async fn test_a_failed_caller_on_a_declaring_mcp_access_point_gets_its_challenge_at_every_stage() {
-        let declaration = declaration();
-        for (denial, kind, challenge) in [
-            (
-                CallerDenial::SurfacePolicy,
-                SourceAuthFailureKind::Missing,
-                format!("Bearer resource_metadata=\"{METADATA}\", scope=\"tools\""),
-            ),
-            (
-                CallerDenial::GatewayPolicy,
-                SourceAuthFailureKind::Invalid,
-                format!("Bearer resource_metadata=\"{METADATA}\", error=\"invalid_token\", scope=\"tools\""),
-            ),
-        ] {
-            let response = caller_deny_response(denial, &SurfaceProtocol::Mcp, Some(&declaration), Some(&failed(kind)));
-            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{denial:?}");
-            assert_eq!(challenge_of(&response), Some(challenge.as_str()));
-            assert!(is_gateway_challenge(&response));
-            assert_eq!(header(&response, CONTENT_TYPE), Some("application/problem+json"));
-            assert_eq!(header(&response, CACHE_CONTROL), Some("no-store"));
-            assert_eq!(
-                body_json(response).await,
-                json!({
-                    "type": "about:blank",
-                    "title": "Unauthorized",
-                    "status": 401,
-                    "detail": "A bearer token from an authorization server in the protected resource metadata is required",
-                })
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn test_a_failed_caller_on_a_declaring_a2a_access_point_gets_the_challenge_with_the_stage_body() {
-        let declaration = a2a_declaration();
-        let scope = "scope=\"agent.invoke agent.read\"";
-        for (kind, status, title, challenge) in [
-            (
-                SourceAuthFailureKind::Missing,
-                StatusCode::UNAUTHORIZED,
-                "Unauthorized",
-                format!("Bearer resource_metadata=\"{A2A_METADATA}\", {scope}"),
-            ),
-            (
-                SourceAuthFailureKind::Invalid,
-                StatusCode::UNAUTHORIZED,
-                "Unauthorized",
-                format!("Bearer resource_metadata=\"{A2A_METADATA}\", error=\"invalid_token\", {scope}"),
-            ),
-            (
-                SourceAuthFailureKind::InsufficientScope,
-                StatusCode::FORBIDDEN,
-                "Forbidden",
-                format!("Bearer resource_metadata=\"{A2A_METADATA}\", error=\"insufficient_scope\", {scope}"),
-            ),
-        ] {
-            let response = caller_deny_response(
-                CallerDenial::CallerAuthentication,
-                &SurfaceProtocol::A2a,
-                Some(&declaration),
-                Some(&failed(kind)),
-            );
-            assert_eq!(response.status(), status, "{kind:?}");
-            assert_eq!(challenge_of(&response), Some(challenge.as_str()), "{kind:?}");
-            assert!(is_gateway_challenge(&response), "{kind:?}");
-            assert_eq!(header(&response, CONTENT_TYPE), Some("application/problem+json"), "{kind:?}");
-            assert_eq!(header(&response, CACHE_CONTROL), Some("no-store"), "{kind:?}");
-            assert_eq!(
-                body_json(response).await,
-                json!({
-                    "type": "https://a2a-protocol.org/errors/proxy-error",
-                    "title": title,
-                    "status": status.as_u16(),
-                    "detail": "Caller authentication failed",
-                })
-            );
-        }
-
-        let surface = caller_deny_response(
-            CallerDenial::SurfacePolicy,
-            &SurfaceProtocol::A2a,
-            Some(&declaration),
-            Some(&failed(SourceAuthFailureKind::Missing)),
-        );
-        assert_eq!(surface.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(header(&surface, CONTENT_TYPE), Some("application/json"));
-        assert!(is_gateway_challenge(&surface));
-        assert_eq!(
-            body_json(surface).await,
-            json!({"error": "Unauthorized", "message": "Agent trust policy denied the request"})
-        );
-    }
-
-    #[test]
-    fn test_a_declaration_that_cannot_name_its_metadata_fails_closed_without_a_challenge() {
-        let unnamed = declaration_for("http://gateway.example/mcp/alpha", &[]);
-        for protocol in [SurfaceProtocol::Mcp, SurfaceProtocol::A2a] {
-            let response = caller_deny_response(
-                CallerDenial::GatewayPolicy,
-                &protocol,
-                Some(&unnamed),
-                Some(&failed(SourceAuthFailureKind::Missing)),
-            );
-            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{protocol:?}");
-            assert_eq!(challenge_of(&response), None, "{protocol:?}");
-            assert!(!is_gateway_challenge(&response), "{protocol:?}");
-        }
-    }
-
-    #[tokio::test]
-    async fn test_a_failed_caller_without_a_declaration_keeps_the_stage_403() {
-        for protocol in [SurfaceProtocol::Mcp, SurfaceProtocol::A2a] {
-            for kind in [SourceAuthFailureKind::Missing, SourceAuthFailureKind::Invalid] {
-                let response = caller_deny_response(CallerDenial::SurfacePolicy, &protocol, None, Some(&failed(kind)));
-                assert_eq!(response.status(), StatusCode::FORBIDDEN, "{kind:?}");
-                assert_eq!(challenge_of(&response), None, "{kind:?}");
-                assert_eq!(header(&response, CACHE_CONTROL), None, "{kind:?}");
-                assert!(!is_gateway_challenge(&response), "{kind:?}");
-                assert_eq!(
-                    body_json(response).await,
-                    json!({"error": "Forbidden", "message": "Agent trust policy denied the request"})
-                );
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn test_an_authenticated_or_anonymous_caller_keeps_the_stage_403() {
-        let authenticated = SourceAuthContext::ApiKey { key_name: "k".into() };
-        let declarations = [(SurfaceProtocol::Mcp, declaration()), (SurfaceProtocol::A2a, a2a_declaration())];
-        for (protocol, declaration) in declarations {
-            for source_auth in [None, Some(&authenticated)] {
-                let response =
-                    caller_deny_response(CallerDenial::GatewayPolicy, &protocol, Some(&declaration), source_auth);
-                assert_eq!(response.status(), StatusCode::FORBIDDEN);
-                assert_eq!(challenge_of(&response), None);
-                assert_eq!(header(&response, CACHE_CONTROL), None);
-                assert_eq!(
-                    body_json(response).await,
-                    json!({
-                        "type": "https://a2a-protocol.org/errors/proxy-error",
-                        "title": "Forbidden",
-                        "status": 403,
-                        "detail": "Request blocked by gateway policy",
-                    })
-                );
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn test_each_stage_keeps_its_403_body() {
-        let cases = [
-            (CallerDenial::AppliancePolicy, "detail", "Request blocked by appliance-wide policy"),
-            (CallerDenial::CallerAuthentication, "detail", "Caller authentication failed"),
-            (
-                CallerDenial::SurfacePolicyUnloaded,
-                "message",
-                "OPA policy enforcement is enabled but no policy is loaded for this channel",
-            ),
-        ];
-        for (denial, field, text) in cases {
-            let response = caller_deny_response(denial, &SurfaceProtocol::A2a, None, None);
-            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{denial:?}");
-            assert_eq!(body_json(response).await[field], text, "{denial:?}");
-        }
-        let body =
-            body_json(caller_deny_response(CallerDenial::IdentityRequired, &SurfaceProtocol::A2a, None, None)).await;
-        assert_eq!(body["type"], "https://affinidi.com/atg/errors/identity-required");
-        assert_eq!(body["status"], 403);
-    }
-
-    #[test]
-    fn test_a_root_route_resource_names_the_bare_metadata_path() {
-        let root = declaration_for("https://gateway.example/", &[]);
-        for protocol in [SurfaceProtocol::Mcp, SurfaceProtocol::A2a] {
-            let response = caller_deny_response(
-                CallerDenial::SurfacePolicy,
-                &protocol,
-                Some(&root),
-                Some(&failed(SourceAuthFailureKind::Missing)),
-            );
-            assert_eq!(
-                challenge_of(&response),
-                Some("Bearer resource_metadata=\"https://gateway.example/.well-known/oauth-protected-resource\""),
-                "{protocol:?}"
-            );
-        }
     }
 
     fn header_values(headers: &HeaderMap) -> Vec<&str> {
@@ -538,14 +314,12 @@ mod tests {
 
     #[test]
     fn test_the_gateways_own_challenge_survives_the_filter() {
-        let declarations = [(SurfaceProtocol::Mcp, declaration()), (SurfaceProtocol::A2a, a2a_declaration())];
-        for (protocol, declaration) in declarations {
-            let mut own = caller_deny_response(
-                CallerDenial::GatewayPolicy,
-                &protocol,
-                Some(&declaration),
-                Some(&failed(SourceAuthFailureKind::Missing)),
-            );
+        let declarations = [
+            declaration_for("https://gateway.example/mcp/alpha", &["tools"]),
+            declaration_for("https://gw.example/a2a/buyer", &["agent.invoke", "agent.read"]),
+        ];
+        for declaration in declarations {
+            let mut own = declaration.challenge(ResourceTokenError::Missing);
             assert_eq!(strip_relayed_challenges(&mut own), StrippedChallenges::default());
             assert_eq!(own.status(), StatusCode::UNAUTHORIZED);
             assert!(
@@ -633,5 +407,94 @@ mod tests {
         assert_eq!(strip_relayed_challenges(&mut unchallenged), StrippedChallenges::default());
         assert_eq!(unchallenged.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(body_json(unchallenged).await["upstream"], "https://idp.internal");
+    }
+
+    fn peer_headers(values: &[&'static str]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for value in values {
+            headers.append(WWW_AUTHENTICATE, HeaderValue::from_static(value));
+        }
+        headers
+    }
+
+    const BEARER_INSUFFICIENT_SCOPE: &str = "Bearer realm=\"agent-gateway\", error=\"insufficient_scope\"";
+    const PAYMENT: &str = "Payment id=\"p1\", realm=\"tg\", method=\"tempo\"";
+
+    #[test]
+    fn test_a_peer_401_without_a_payment_challenge_is_a_token_refusal() {
+        let cases: [&[&'static str]; 6] = [
+            &[],
+            &["Bearer realm=\"agent-gateway\""],
+            &["Bearer realm=\"agent-gateway\", error=\"invalid_token\""],
+            &["Bearer resource_metadata=\"https://gw2.example/.well-known/oauth-protected-resource/a2a\""],
+            &["DPoP algs=\"ES256\""],
+            &["Basic realm=\"x\""],
+        ];
+        for values in cases {
+            assert_eq!(
+                peer_refusal(StatusCode::UNAUTHORIZED, &peer_headers(values)),
+                Some(PeerRefusal::Token),
+                "{values:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_peer_401_with_a_payment_challenge_is_not_a_peer_refusal() {
+        let cases: [&[&'static str]; 3] = [
+            &[PAYMENT],
+            &["Bearer realm=\"agent-gateway\", Payment id=\"p1\", request=\"e30=\""],
+            &["Bearer realm=\"agent-gateway\"", PAYMENT],
+        ];
+        for values in cases {
+            assert_eq!(peer_refusal(StatusCode::UNAUTHORIZED, &peer_headers(values)), None, "{values:?}");
+        }
+    }
+
+    #[test]
+    fn test_a_peer_403_with_a_bearer_insufficient_scope_challenge_is_a_scope_refusal() {
+        let cases: [&[&'static str]; 4] = [
+            &[BEARER_INSUFFICIENT_SCOPE],
+            &["bearer error=insufficient_scope"],
+            &["Bearer scope=\"a b\", error=\"insufficient_scope\""],
+            &[PAYMENT, BEARER_INSUFFICIENT_SCOPE],
+        ];
+        for values in cases {
+            assert_eq!(
+                peer_refusal(StatusCode::FORBIDDEN, &peer_headers(values)),
+                Some(PeerRefusal::Scope),
+                "{values:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_peer_403_without_a_bearer_insufficient_scope_challenge_is_not_a_peer_refusal() {
+        let cases: [&[&'static str]; 6] = [
+            &[],
+            &["Bearer error=\"invalid_token\""],
+            &["DPoP error=\"insufficient_scope\""],
+            &["Bearer error_description=\"insufficient_scope\""],
+            &["Bearer realm=\"error=\\\"insufficient_scope\\\"\""],
+            &["Bearer error=\"INSUFFICIENT_SCOPE\""],
+        ];
+        for values in cases {
+            assert_eq!(peer_refusal(StatusCode::FORBIDDEN, &peer_headers(values)), None, "{values:?}");
+        }
+    }
+
+    #[test]
+    fn test_other_peer_statuses_are_not_peer_refusals() {
+        let cases: [(StatusCode, &[&'static str]); 6] = [
+            (StatusCode::OK, &[]),
+            (StatusCode::PAYMENT_REQUIRED, &[BEARER_INSUFFICIENT_SCOPE]),
+            (StatusCode::NOT_FOUND, &[]),
+            (StatusCode::INTERNAL_SERVER_ERROR, &[]),
+            (StatusCode::BAD_GATEWAY, &[]),
+            (StatusCode::SERVICE_UNAVAILABLE, &["Bearer realm=\"agent-gateway\""]),
+        ];
+        for (status, values) in cases {
+            assert_eq!(peer_refusal(status, &peer_headers(values)), None, "{status}");
+        }
     }
 }

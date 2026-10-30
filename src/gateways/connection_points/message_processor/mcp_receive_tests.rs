@@ -2510,6 +2510,39 @@ fn fabric_receive_binds_tokens_to_the_routes_protected_resource() {
         .block_on(Box::pin(fabric_discovery_flow()));
 }
 
+/// A receive fixture that sets only `protected_resource.resource` declares the
+/// issuer its JWT verification strategy trusts.
+#[tokio::test]
+async fn a_receive_fixture_without_authorization_servers_declares_the_strategy_issuer() {
+    use crate::protocols::protected_resource::fixtures::{FixtureStrategies, ISSUER, discovery_network};
+    use crate::source_auth::declaration::DeclarationOutcome;
+
+    let surface: AgentSurface = serde_json::from_value(json!({
+        "surface_id": "fabric-discovery", "name": "Fabric discovery",
+        "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp",
+            "caller_authentication": {
+                "methods": [{"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": [],
+                    "required_scopes": ["mcp:tools"]}],
+                "protected_resource": {"resource": "https://gateway.example/mcp"}
+            }},
+        "target": {"endpoint": "https://tools.example/mcp"}
+    }))
+    .unwrap();
+    let outcome = super::fabric_access_point_declaration(
+        &surface,
+        None,
+        Some(&FixtureStrategies::Pinned),
+        Some(&discovery_network()),
+    )
+    .await;
+    let DeclarationOutcome::Declare(declaration) = outcome else {
+        panic!("expected a declaration, got {outcome:?}");
+    };
+    assert_eq!(declaration.resource, "https://gateway.example/mcp");
+    assert_eq!(declaration.authorization_servers, vec![ISSUER.to_string()]);
+    assert_eq!(declaration.required_scopes, vec!["mcp:tools".to_string()]);
+}
+
 /// An MCP Access Point that publishes protected resource metadata binds a
 /// Fabric request's token to the resource of the route called, as on the
 /// direct path. The sending gateway strips the caller's own token, so the
@@ -2546,7 +2579,8 @@ async fn fabric_discovery_flow() {
     let strategy = strategies
         .create(
             serde_json::from_value(json!({
-                "id": "idp", "name": "IdP", "expected_issuer": fixture.issuer,
+                "id": "idp", "name": "IdP",
+                "expected_issuer": crate::protocols::protected_resource::fixtures::ISSUER,
                 "jwks_source": {"type": "remote", "jwks_uri": format!("{}/.well-known/jwks.json", fixture.issuer)},
                 "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"
             }))
@@ -2560,8 +2594,7 @@ async fn fabric_discovery_flow() {
             "caller_authentication": {
                 "methods": [{"type": "jwt_bearer", "jwt_verification_strategy_id": strategy.id, "audiences": [],
                     "required_scopes": ["mcp:tools"]}],
-                "protected_resource": {"resource": "https://gateway.example/mcp",
-                    "authorization_servers": [crate::protocols::protected_resource::fixtures::ISSUER]}
+                "protected_resource": {"resource": "https://gateway.example/mcp"}
             }},
         "target": {"endpoint": format!("http://{}", target.addr)},
         "variants": [{"id": "beta", "alias": "beta", "name": "Beta", "enabled": true, "overrides": {}}]
@@ -2586,7 +2619,8 @@ async fn fabric_discovery_flow() {
     .await;
 
     let token_with = |audience: &str, scope: Option<&str>| {
-        let mut claims = json!({"iss": fixture.issuer, "sub": "user-123", "aud": audience, "exp": now_secs() + 300});
+        let mut claims = json!({"iss": crate::protocols::protected_resource::fixtures::ISSUER, "sub": "user-123", "aud": audience,
+            "exp": now_secs() + 300});
         if let Some(scope) = scope {
             claims["scope"] = json!(scope);
         }
@@ -2971,44 +3005,11 @@ async fn fabric_tool_call_batch_flow() {
     }
 }
 
-/// A strategy store whose every operation fails.
-struct FailingStrategies;
-
-#[async_trait::async_trait]
-impl crate::jwt_bearer::JwtVerificationStrategyStorage for FailingStrategies {
-    async fn create(
-        &self,
-        _strategy: crate::jwt_bearer::models::JwtVerificationStrategy,
-    ) -> anyhow::Result<crate::jwt_bearer::models::JwtVerificationStrategy> {
-        anyhow::bail!("storage unavailable")
-    }
-    async fn get(
-        &self,
-        _id: &str,
-    ) -> anyhow::Result<Option<crate::jwt_bearer::models::JwtVerificationStrategy>> {
-        anyhow::bail!("storage unavailable")
-    }
-    async fn list(&self) -> anyhow::Result<Vec<crate::jwt_bearer::models::JwtVerificationStrategy>> {
-        anyhow::bail!("storage unavailable")
-    }
-    async fn update(
-        &self,
-        _strategy: crate::jwt_bearer::models::JwtVerificationStrategy,
-    ) -> anyhow::Result<crate::jwt_bearer::models::JwtVerificationStrategy> {
-        anyhow::bail!("storage unavailable")
-    }
-    async fn delete(
-        &self,
-        _id: &str,
-    ) -> anyhow::Result<()> {
-        anyhow::bail!("storage unavailable")
-    }
-}
-
 /// Sends a Fabric `ForwardRequest` naming `alias` to an A2A Access Point without
-/// variants whose derived declaration cannot be resolved because the strategy
-/// store fails, and returns the `ForwardResponse` body, the audit records the
-/// request wrote and how many requests reached the Target.
+/// variants that sets `protected_resource` and whose declaration cannot be
+/// resolved because the strategy store fails, and returns the `ForwardResponse`
+/// body, the audit records the request wrote and how many requests reached the
+/// Target.
 async fn receive_on_an_unservable_a2a_access_point(
     alias: Option<&str>
 ) -> (Value, Vec<crate::delegation_vault::audit::DelegationAuditEvent>, usize) {
@@ -3024,7 +3025,8 @@ async fn receive_on_an_unservable_a2a_access_point(
         "surface_id": "fabric-a2a-unservable", "name": "Fabric A2A unservable",
         "access_point": {"listen_address": "https://gateway.example", "route": "/agent", "protocol": "a2a",
             "caller_authentication": {"methods": [{"type": "jwt_bearer", "jwt_verification_strategy_id": "idp",
-                "audiences": ["https://gateway.example/agent"], "required_scopes": ["agent.call"]}]}},
+                "audiences": [], "required_scopes": ["agent.call"]}],
+                "protected_resource": {"resource": "https://gateway.example/agent"}}},
         "target": {"endpoint": format!("http://{}", target.addr)}
     }))
     .unwrap();
@@ -3037,7 +3039,7 @@ async fn receive_on_an_unservable_a2a_access_point(
     super::init_mcp_auth_network(Arc::new(crate::protocols::protected_resource::fixtures::discovery_network()));
     super::init_source_auth_middleware(Arc::new(crate::source_auth::SourceAuthMiddleware::new(
         Arc::new(crate::didauth::DidAuthSessionStore::new()),
-        Arc::new(FailingStrategies),
+        Arc::new(crate::protocols::protected_resource::fixtures::FixtureStrategies::Failing),
         Arc::new(crate::jwt_bearer::JwksClient::new()),
         None,
         Arc::new(dashmap::DashMap::new()),
@@ -3091,7 +3093,7 @@ async fn receive_on_an_unservable_a2a_access_point(
     )
 }
 
-/// An A2A Access Point whose derived declaration cannot be resolved because the
+/// An A2A Access Point whose declaration cannot be resolved because the
 /// strategy store fails refuses a Fabric request with `503` and the A2A detail,
 /// not the MCP one, records the refusal on its base surface, and never reaches
 /// the Target.

@@ -7692,11 +7692,16 @@ mod tests {
                 "store"
             )
         ))));
+        assert!(secures_transit_cards(&Ok(DeclarationOutcome::Unservable(
+            crate::source_auth::declaration::UnservableDeclaration::new(
+                crate::source_auth::declaration::UnservableReason::StrategyUnavailable,
+                "strategy"
+            )
+        ))));
         assert!(secures_transit_cards(&Err(anyhow::anyhow!("strategy store down"))));
 
         assert!(!secures_transit_cards(&Ok(DeclarationOutcome::PassThrough)));
-        assert!(!secures_transit_cards(&Ok(DeclarationOutcome::Strip(StripReason::NoRequiredScopes))));
-        assert!(!secures_transit_cards(&Ok(DeclarationOutcome::Strip(StripReason::StrategyUnavailable))));
+        assert!(!secures_transit_cards(&Ok(DeclarationOutcome::Strip(StripReason::NotDeclared))));
     }
 
     #[tokio::test]
@@ -7720,7 +7725,7 @@ mod tests {
         scoped.surface = Arc::new(surface);
         assert!(
             !secures_transit_card(&state, &scoped, StatusCode::OK).await,
-            "a declaration without its strategy strips, so the card is kept as it is"
+            "without protected_resource nothing is declared, so the card is kept as it is"
         );
 
         let message = test_pipeline_context();

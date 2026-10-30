@@ -187,11 +187,14 @@ fn write_single_surface_config_inner(
             GatewayBootstrapSurface::new(id.clone(), id, route.clone())
         })
         .collect::<Vec<_>>();
-    let mut config_tree = GatewayBootstrapFixture::new(gateway_port, "api", bootstrap_surfaces, "");
+    let mut config_tree = GatewayBootstrapFixture::new(gateway_port, "api", bootstrap_surfaces, "bdd-gateway");
     config_tree.outbound_listener_port = outbound_port;
     if surface_config.audit_log_keeps_every_event {
         config_tree.settings = Some(crate::bdd_support::admin_client::audit_log_keeping_every_event());
     }
+    config_tree.policy_opa_entry = surface_config
+        .gateway_policy_rego
+        .clone();
     config_tree.terms_enabled = options
         .affinidi_terms_url
         .is_some();
@@ -237,15 +240,19 @@ fn write_single_surface_config_inner(
         surface_fixture = surface_fixture.with_agent_card_path(path);
     }
     if let Some(auth) = &surface_config.source_auth {
-        let mut auth = auth.clone();
-        if let SurfaceSourceAuthConfig::JwtBearer(jwt) = &mut auth
-            && jwt.declares_authorization_server
-        {
-            jwt.audiences
-                .push(declared_access_point_url(gateway_port, &surface_config.route));
-        }
-        let method = crate::bdd_support::config::source_auth::caller_authentication_method_json(&auth);
+        let method = crate::bdd_support::config::source_auth::caller_authentication_method_json(auth);
         surface_fixture = surface_fixture.with_caller_auth_method(method);
+    }
+    if declares_authorization_server(surface_config) {
+        assert!(
+            surface_config
+                .protected_resource
+                .is_none(),
+            "declare through one setting"
+        );
+        surface_fixture = surface_fixture.with_caller_protected_resource(serde_json::json!({
+            "resource": declared_access_point_url(gateway_port, &surface_config.route),
+        }));
     }
     if let Some(protected) = &surface_config.protected_resource {
         surface_fixture = surface_fixture.with_caller_protected_resource(serde_json::json!({
@@ -449,10 +456,11 @@ fn write_single_surface_config_inner(
     }
 
     if let Some(jwks) = jwks_fixture {
+        let strategy_issuer = surface_config.jwt_strategy_issuer(&jwks.issuer);
         let mut strategy = JwtVerificationStrategyFixture::new(
             SURFACE_JWT_STRATEGY_ID,
             "BDD EdDSA Test",
-            surface_config.jwt_strategy_issuer(&jwks.issuer),
+            strategy_issuer.clone(),
             format!("{}/.well-known/jwks.json", jwks.issuer),
         )
         .with_authorization_server(
@@ -466,8 +474,8 @@ fn write_single_surface_config_inner(
                 .is_none()
         {
             strategy = strategy.pinned_to_authorization_server(
-                format!("{}/.well-known/oauth-authorization-server", jwks.issuer),
-                format!("{}/token", jwks.issuer),
+                format!("{strategy_issuer}/.well-known/oauth-authorization-server"),
+                format!("{strategy_issuer}/token"),
             );
         }
         config_tree
@@ -542,6 +550,9 @@ fn write_single_surface_config_inner(
     }
     if declares_authorization_server(surface_config) {
         insert_https_origin_first(base_dir, &format!("https://localhost:{gateway_port}"));
+    }
+    if let Some(url) = &surface_config.external_url_listed_first {
+        insert_https_origin_first(base_dir, url);
     }
 }
 
@@ -755,6 +766,39 @@ mod tests {
             })),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn declaring_writes_protected_resource_and_no_audience() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut surface = jwt_surface(true);
+        surface.route = "/a2a/buyer".to_string();
+        super::write_single_surface_config(
+            dir.path(),
+            4321,
+            "http://127.0.0.1:1",
+            &surface,
+            Some(&super::JwksFiles {
+                issuer: "https://idp.example".to_string(),
+            }),
+        );
+        let surfaces = std::fs::read_dir(
+            dir.path()
+                .join("_storage")
+                .join("agent_surfaces"),
+        )
+        .expect("surface dir")
+        .map(|entry| std::fs::read_to_string(entry.expect("entry").path()).expect("surface file"))
+        .map(|text| serde_json::from_str::<serde_json::Value>(&text).expect("surface json"))
+        .collect::<Vec<_>>();
+        let auth = &surfaces[0]["access_point"]["caller_authentication"];
+        assert_eq!(auth["protected_resource"]["resource"], super::declared_access_point_url(4321, "/a2a/buyer"));
+        assert!(auth["protected_resource"]["authorization_servers"].is_null());
+        assert!(
+            auth["methods"][0]["audiences"]
+                .as_array()
+                .is_none_or(Vec::is_empty)
+        );
     }
 
     #[test]

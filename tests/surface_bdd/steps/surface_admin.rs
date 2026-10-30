@@ -118,6 +118,112 @@ async fn operator_has_saved_loaded_surface(world: &mut SurfaceWorld) {
     assert_status_with_body(response.status, 200, &response.body, "surface save");
 }
 
+fn caller_authentication(surface: &mut Value) -> &mut Value {
+    &mut surface["access_point"]["caller_authentication"]
+}
+
+fn declared_resource(surface: &mut Value) -> String {
+    caller_authentication(surface)["protected_resource"]["resource"]
+        .as_str()
+        .expect("the loaded surface must declare a protected resource")
+        .to_string()
+}
+
+#[when(
+    expr = "the operator saves the loaded surface through the admin API with its protected resource on origin {string}"
+)]
+async fn operator_saves_surface_with_resource_on_origin(
+    world: &mut SurfaceWorld,
+    origin: String,
+) {
+    let mut body = loaded_surface(world);
+    let path = url::Url::parse(&declared_resource(&mut body))
+        .expect("the declared resource must be a URL")
+        .path()
+        .to_string();
+    caller_authentication(&mut body)["protected_resource"]["resource"] = json!(format!("{origin}{path}"));
+    save_surface(world, body).await;
+}
+
+#[when(
+    expr = "the operator saves the loaded surface through the admin API with its protected resource at path {string}"
+)]
+async fn operator_saves_surface_with_resource_at_path(
+    world: &mut SurfaceWorld,
+    path: String,
+) {
+    let mut body = loaded_surface(world);
+    let resource = url::Url::parse(&declared_resource(&mut body)).expect("the declared resource must be a URL");
+    let origin = resource
+        .origin()
+        .ascii_serialization();
+    caller_authentication(&mut body)["protected_resource"]["resource"] = json!(format!("{origin}{path}"));
+    save_surface(world, body).await;
+}
+
+#[when(expr = "the operator saves the loaded surface through the admin API with authorization server {string}")]
+async fn operator_saves_surface_with_authorization_server(
+    world: &mut SurfaceWorld,
+    server: String,
+) {
+    let mut body = loaded_surface(world);
+    caller_authentication(&mut body)["protected_resource"]["authorization_servers"] = json!([server]);
+    save_surface(world, body).await;
+}
+
+#[when(expr = "the operator saves the loaded surface through the admin API with JWT audience {string}")]
+async fn operator_saves_surface_with_audience(
+    world: &mut SurfaceWorld,
+    audience: String,
+) {
+    let mut body = loaded_surface(world);
+    caller_authentication(&mut body)["methods"][0]["audiences"] = json!([audience]);
+    save_surface(world, body).await;
+}
+
+#[when("the operator saves the loaded surface through the admin API forwarding the caller's token")]
+async fn operator_saves_surface_forwarding_caller_token(world: &mut SurfaceWorld) {
+    let mut body = loaded_surface(world);
+    caller_authentication(&mut body)["methods"][0]["forward_header"] = json!(true);
+    save_surface(world, body).await;
+}
+
+fn without_required_scopes(mut surface: Value) -> Value {
+    caller_authentication(&mut surface)["methods"][0]
+        .as_object_mut()
+        .expect("the first caller authentication method must be an object")
+        .remove("required_scopes");
+    surface
+}
+
+async fn operator_saves_surface_without_required_scopes(world: &mut SurfaceWorld) {
+    let body = without_required_scopes(loaded_surface(world));
+    save_surface(world, body).await;
+}
+
+#[given("the operator has saved the loaded surface through the admin API without its required scopes")]
+async fn operator_has_saved_surface_without_required_scopes(world: &mut SurfaceWorld) {
+    operator_saves_surface_without_required_scopes(world).await;
+    let response = admin_response(world);
+    assert_status_with_body(response.status, 200, &response.body, "surface save");
+}
+
+#[when(
+    expr = "the operator saves the loaded surface through the admin API with its route changed to {string} and its protected resource left out"
+)]
+async fn operator_saves_surface_with_route_changed(
+    world: &mut SurfaceWorld,
+    route: String,
+) {
+    let mut body = loaded_surface(world);
+    body["access_point"]["route"] = json!(route);
+    caller_authentication(&mut body)
+        .as_object_mut()
+        .expect("the loaded surface must have caller authentication")
+        .remove("protected_resource");
+    save_surface(world, body).await;
+}
+
 #[when(expr = "the operator saves the loaded surface through the admin API with unknown field {string}")]
 async fn operator_saves_loaded_surface_with_unknown_field(
     world: &mut SurfaceWorld,

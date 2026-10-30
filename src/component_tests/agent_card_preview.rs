@@ -502,7 +502,8 @@ fn a_protected_card_is_previewed_through_the_provider_and_after_is_what_callers_
         assert_eq!(
             preview["outcome"],
             json!({"variant": null, "outcome": "pass_through", "reason": null,
-                "resource": format!("https://gateway.example{ROUTE}")})
+                "resource": format!("https://gateway.example{ROUTE}"), "authorization_servers": [],
+                "required_scopes": [], "scopes_supported": [], "metadata_url": null})
         );
         assert_eq!(preview["before"], agent_card(), "before is the agent's own card, security and signatures kept");
         assert_eq!(preview["after"]["securitySchemes"], agent_card()["securitySchemes"]);
@@ -851,7 +852,7 @@ fn a_preview_leaves_the_card_security_counter_alone_and_a_served_card_counts_onc
         .await;
         let served_cards = || {
             crate::metrics::backends::prometheus::CARD_SECURITY
-                .with_label_values(&["strip", "multiple_methods"])
+                .with_label_values(&["strip", "not_declared"])
                 .get()
         };
         let before = served_cards();
@@ -859,7 +860,7 @@ fn a_preview_leaves_the_card_security_counter_alone_and_a_served_card_counts_onc
         let preview = gateway.preview().await;
         assert_eq!(fetch_of(&preview).0, "ok", "{preview}");
         assert_eq!(preview["outcome"]["outcome"], "strip");
-        assert_eq!(preview["outcome"]["reason"], "multiple_methods");
+        assert_eq!(preview["outcome"]["reason"], "not_declared");
         assert_eq!(served_cards(), before, "a preview is not a served card");
 
         let (status, _) = gateway.live().await;
@@ -868,8 +869,8 @@ fn a_preview_leaves_the_card_security_counter_alone_and_a_served_card_counts_onc
     });
 }
 
-/// A strategy store that holds no strategy, and fails every read while `unreadable`
-/// is set.
+/// A strategy store that holds the pinned fixture strategy, and fails every read while
+/// `unreadable` is set.
 struct Strategies {
     unreadable: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -885,7 +886,7 @@ impl crate::jwt_bearer::JwtVerificationStrategyStorage for Strategies {
 
     async fn get(
         &self,
-        _id: &str,
+        id: &str,
     ) -> anyhow::Result<Option<crate::jwt_bearer::models::JwtVerificationStrategy>> {
         if self
             .unreadable
@@ -893,7 +894,8 @@ impl crate::jwt_bearer::JwtVerificationStrategyStorage for Strategies {
         {
             anyhow::bail!("strategy store unavailable");
         }
-        Ok(None)
+        use crate::protocols::protected_resource::fixtures::{STRATEGY_ID, fixture_strategy};
+        Ok((id == STRATEGY_ID).then(|| fixture_strategy(true)))
     }
 
     async fn list(&self) -> anyhow::Result<Vec<crate::jwt_bearer::models::JwtVerificationStrategy>> {
@@ -919,10 +921,14 @@ impl crate::jwt_bearer::JwtVerificationStrategyStorage for Strategies {
 fn a_card_the_gateway_refuses_to_serve_is_previewed_as_not_served() {
     run(|auth_server, agent| async move {
         let unreadable = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let declaring = json!({"caller_authentication": {"methods": [{
-            "type": "jwt_bearer", "jwt_verification_strategy_id": "card-strategy",
-            "audiences": [format!("https://gateway.example{ROUTE}")], "required_scopes": ["agent.invoke"]
-        }]}});
+        let declaring = json!({"caller_authentication": {
+            "methods": [{
+                "type": "jwt_bearer",
+                "jwt_verification_strategy_id": crate::protocols::protected_resource::fixtures::STRATEGY_ID,
+                "audiences": [], "required_scopes": ["agent.invoke"]
+            }],
+            "protected_resource": {"resource": format!("https://gateway.example{ROUTE}")}
+        }});
         let gateway = CardGateway::start_with(
             &auth_server,
             target(format!("{}/open", agent.url), None),

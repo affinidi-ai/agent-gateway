@@ -1,9 +1,10 @@
 //! Dry run of the policy planes against a caller whose source authentication failed.
 //!
-//! An Access Point that declares refuses a failed caller with its challenge whatever
-//! policy allows, as [`refuses_failed_callers_by_default`] decides. Any other Access
-//! Point publishes the failure to policy instead of refusing the request, so it admits
-//! failed callers unless some plane denies them. The dry run evaluates the effective
+//! An Access Point that declares refuses a failed caller at source authentication,
+//! before rate limit, every policy plane, AP2 and payment, as
+//! [`refuses_failed_callers_by_default`] decides, so no plane ever sees such a caller.
+//! Any other Access Point publishes the failure to policy instead of refusing the
+//! request, so it admits failed callers unless some plane denies them. The dry run evaluates the effective
 //! stack of one resolved Surface Variant with synthetic `Failed` inputs, one per failure
 //! kind and protocol method, and reports which plane, if any, denies each one. A case
 //! denied on the direct path is also run through the planes Fabric receive evaluates,
@@ -47,8 +48,8 @@ pub struct PolicyPlanes {
 /// How the effective stack treats one synthetic failed caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaseOutcome {
-    /// The Access Point declares, so it answers with its challenge before surface
-    /// policy, AP2 and payment, whatever any plane allows.
+    /// The Access Point declares, so it answers with its challenge at source
+    /// authentication, before every policy plane, AP2 and payment.
     RefusedBeforePolicy,
     /// The appliance-wide or this gateway's gateway policy denies it, before payment.
     DeniedByGatewayPolicy,
@@ -437,7 +438,7 @@ mod tests {
         json!({
             "type": "jwt_bearer",
             "jwt_verification_strategy_id": "strategy-1",
-            "audiences": ["https://gw.example/agent"],
+            "audiences": [],
             "required_scopes": required_scopes,
         })
     }
@@ -467,6 +468,17 @@ mod tests {
 
     fn a2a(policy: Option<&str>) -> AgentSurface {
         surface("a2a", vec![jwt_method(&["agent.invoke"])], policy)
+    }
+
+    /// `view` with `protected_resource` naming its Access Point URL, so it declares.
+    fn declaring(mut view: AgentSurface) -> AgentSurface {
+        view.access_point
+            .caller_authentication
+            .as_mut()
+            .expect("caller authentication")
+            .protected_resource =
+            Some(serde_json::from_value(json!({"resource": "https://gw.example/agent"})).expect("protected resource"));
+        view
     }
 
     fn with_inbound_policy(
@@ -746,11 +758,11 @@ mod tests {
     #[tokio::test]
     async fn test_dry_run_a_declaring_access_point_refuses_every_case_before_policy() {
         let planes = definitions(&[("allow", ALLOW_ALL)]).await;
-        let cases = cases_of(&a2a(Some("allow")), declares(), &planes).await;
+        let cases = cases_of(&declaring(a2a(Some("allow"))), declares(), &planes).await;
         assert_eq!(cases.len(), 3 * 12, "every kind and method is still reported");
         assert_eq!(outcomes(&cases), vec![CaseOutcome::RefusedBeforePolicy]);
 
-        let mcp = surface("mcp", vec![jwt_method(&["tools.call"])], None);
+        let mcp = declaring(surface("mcp", vec![jwt_method(&["tools.call"])], None));
         let cases = cases_of(&mcp, declares(), &planes).await;
         assert_eq!(cases.len(), 3 * 5);
         assert_eq!(outcomes(&cases), vec![CaseOutcome::RefusedBeforePolicy]);
@@ -762,7 +774,7 @@ mod tests {
             gateway: Some(Arc::new(gateway_denying_failed_callers().await)),
             ..Default::default()
         };
-        let cases = cases_of(&a2a(None), declares(), &planes).await;
+        let cases = cases_of(&declaring(a2a(None)), declares(), &planes).await;
         assert_eq!(outcomes(&cases), vec![CaseOutcome::RefusedBeforePolicy]);
     }
 
@@ -771,7 +783,7 @@ mod tests {
         let planes = definitions(&[]).await;
         for declaration in [
             DeclarationOutcome::PassThrough,
-            DeclarationOutcome::Strip(StripReason::ForwardsCallerToken),
+            DeclarationOutcome::Strip(StripReason::NotDeclared),
             DeclarationOutcome::Unservable(crate::source_auth::declaration::UnservableDeclaration::new(
                 crate::source_auth::declaration::UnservableReason::ResourceMismatch,
                 "no external URL",
@@ -791,7 +803,7 @@ mod tests {
             (Some("open".to_string()), surface("a2a", vec![], Some("deny"))),
             (Some("again".to_string()), a2a(Some("deny"))),
             (Some("loose".to_string()), a2a(None)),
-            (Some("declared".to_string()), a2a(None)),
+            (Some("declared".to_string()), declaring(a2a(None))),
             (Some("unlisted".to_string()), a2a(None)),
         ];
         let declarations = [

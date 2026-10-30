@@ -182,7 +182,13 @@ export async function findSurface(api: GatewayApi): Promise<Entity | undefined> 
 
 export async function ensureSurface(api: GatewayApi, world: World): Promise<Entity> {
     const existing = await findSurface(api);
-    if (existing) return existing;
+    if (existing) {
+        const declared = (existing.access_point as {caller_authentication?: {protected_resource?: {resource?: string} | null}})
+            ?.caller_authentication?.protected_resource?.resource;
+        if (declared === env.entryPointUrl) return existing;
+        const status = await api.delete(`/api/v1/surfaces/${existing.surface_id ?? existing.id}`);
+        expect(status, 'deleting the surface from an earlier run').toBeLessThan(300);
+    }
     await ensureSecrets(api, world);
     await ensureStrategy(api, 'a');
     const {jwtBearer} = await ensureProviders(api);
@@ -199,10 +205,11 @@ export async function ensureSurface(api: GatewayApi, world: World): Promise<Enti
                     {
                         type: 'jwt_bearer',
                         jwt_verification_strategy_id: names.strategies.hydraA.id,
-                        audiences: [env.entryPointUrl],
+                        audiences: [],
                         required_scopes: [names.scopes.caller],
                     },
                 ],
+                protected_resource: {resource: env.entryPointUrl},
             },
             inbound_policy: {policy_definition_id: policyId, require_agent_context: false},
         },

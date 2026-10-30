@@ -21,17 +21,29 @@ Feature: Protected resource metadata of an A2A Access Point
     And the protected resource metadata accepts bearer tokens in the Authorization header
     And managed agent "bravo" was not called
 
-  Scenario: An Access Point whose authorization server is not published has no metadata
+  Scenario: An Access Point that requires scopes without publishing its authorization server has no metadata
     Given the surface requires "JWT Bearer" source authentication
     And the surface requires scopes "agent.invoke"
     When the caller fetches the protected resource metadata of the surface
     Then the response status is 404
 
-  Scenario: An Access Point that requires no scope has no metadata
+  Scenario: An Access Point that publishes its authorization server without required scopes publishes metadata without scopes
     Given the surface requires "JWT Bearer" source authentication
     And the surface publishes the authorization server of its source authentication
     When the caller fetches the protected resource metadata of the surface
-    Then the response status is 404
+    Then the response status is 200
+    And the protected resource metadata names the surface Access Point URL as its resource
+    And the protected resource metadata lists the authorization server of the surface
+    And the protected resource metadata lists no scopes
+
+  Scenario: The metadata names the stored resource when another external URL is listed first
+    Given the gateway lists external URL "https://internal.bdd.example" before the surface's
+    And the surface requires "JWT Bearer" source authentication
+    And the surface publishes the authorization server of its source authentication
+    And the surface requires scopes "agent.invoke"
+    When the caller fetches the protected resource metadata of the surface
+    Then the response status is 200
+    And the protected resource metadata names the surface Access Point URL as its resource
 
   Scenario: An Access Point without caller authentication has no metadata
     When the caller fetches the protected resource metadata of the surface

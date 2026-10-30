@@ -1720,6 +1720,25 @@ async fn request_with_token_granting_scopes(
 }
 
 #[when(
+    expr = "the caller sends a request to the surface with a token whose audiences are the surface resource and {string} granting scopes {string}"
+)]
+async fn request_with_token_naming_resource_among_audiences(
+    world: &mut SurfaceWorld,
+    extra_audience: String,
+    scopes: String,
+) {
+    ensure_gateway_running(world).await;
+    let resource = caller_token_audience(world);
+    let claims = serde_json::json!({ "aud": [resource, extra_audience], "scope": scopes });
+    send_request_with_token_claims(world, claims).await;
+}
+
+#[when("the caller sends a request to the surface without a token and with a body that is not JSON")]
+async fn request_without_token_with_body_that_is_not_json(world: &mut SurfaceWorld) {
+    send_raw_string_request_and_record(world, "{not json", "application/json").await;
+}
+
+#[when(
     expr = "the caller sends a request to the surface with an identity token issued for the surface granting scopes {string}"
 )]
 async fn request_with_identity_token_granting_scopes(

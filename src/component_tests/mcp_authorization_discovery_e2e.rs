@@ -10,13 +10,13 @@ use super::helpers::{GatewayHarness, MockServer, configure_admin_api};
 
 const PUBLIC_ORIGIN: &str = "https://gateway.example";
 const AUTHORIZATION_SERVER: &str = "https://idp.example/realms/agents";
-/// A strategy trusting `AUTHORIZATION_SERVER`, for surfaces saved through the API.
+/// A strategy trusting `AUTHORIZATION_SERVER`, whose keys the fixture serves, for the
+/// harness surface and for surfaces saved through the API.
 const IDP_STRATEGY: &str = "discovery-idp-strategy";
 
 fn protected_resource(route: &str) -> serde_json::Value {
     json!({
         "resource": format!("{PUBLIC_ORIGIN}{route}"),
-        "authorization_servers": [AUTHORIZATION_SERVER],
         "scopes": ["tools"]
     })
 }
@@ -53,7 +53,7 @@ async fn start_discovery_gateway_with(
             "id": IDP_STRATEGY,
             "name": "Discovery IdP",
             "expected_issuer": AUTHORIZATION_SERVER,
-            "jwks_source": {"type": "remote", "jwks_uri": format!("{AUTHORIZATION_SERVER}/jwks")},
+            "jwks_source": {"type": "remote", "jwks_uri": format!("{}/.well-known/jwks.json", fixture.issuer)},
             "created_at": "2026-01-01T00:00:00Z",
             "updated_at": "2026-01-01T00:00:00Z"
         });
@@ -68,10 +68,13 @@ async fn start_discovery_gateway_with(
         surface.access_point.protocol = crate::config::agent_surface::SurfaceProtocol::Mcp;
         surface
             .access_point
-            .caller_authentication
-            .as_mut()
-            .unwrap()
-            .protected_resource = Some(serde_json::from_value(protected_resource("/smoke")).unwrap());
+            .caller_authentication = Some(
+            serde_json::from_value(json!({
+                "methods": [{"type": "jwt_bearer", "jwt_verification_strategy_id": IDP_STRATEGY, "audiences": []}],
+                "protected_resource": protected_resource("/smoke")
+            }))
+            .unwrap(),
+        );
         surface.variants = vec![
             serde_json::from_value(
                 json!({"id": "beta", "alias": "beta", "name": "Beta", "enabled": true, "overrides": {}}),
@@ -89,7 +92,10 @@ fn token_for(
     fixture: &JwksFixture,
     audience: serde_json::Value,
 ) -> String {
-    sign_jwt(json!({"iss": fixture.issuer, "sub": "user-123", "aud": audience, "exp": now_secs() + 300}), &fixture.kid)
+    sign_jwt(
+        json!({"iss": AUTHORIZATION_SERVER, "sub": "user-123", "aud": audience, "exp": now_secs() + 300}),
+        &fixture.kid,
+    )
 }
 
 fn metadata_url(
@@ -186,9 +192,11 @@ async fn an_mcp_access_point_publishes_the_protected_resource_its_caller_authent
             "target": {"endpoint": harness.mock.url()}
         })
     };
+    let mut with_server = protected_resource("/added");
+    with_server["authorization_servers"] = json!([AUTHORIZATION_SERVER]);
     let added = admin
         .post(&surfaces)
-        .json(&surface("/added", protected_resource("/added")))
+        .json(&surface("/added", with_server))
         .send()
         .await
         .unwrap();
@@ -199,12 +207,32 @@ async fn an_mcp_access_point_publishes_the_protected_resource_its_caller_authent
         .await
         .unwrap();
     assert_eq!(published.status(), 200);
+    let published: serde_json::Value = published
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(published["resource"], "https://gateway.example/added");
+    assert_eq!(published["authorization_servers"], json!([AUTHORIZATION_SERVER]));
+
+    let omitted = admin
+        .post(&surfaces)
+        .json(&surface("/omitted", protected_resource("/omitted")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(omitted.status(), 201, "{}", omitted.text().await.unwrap());
+    let published: serde_json::Value = client
+        .get(metadata_url(&harness, "/omitted"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(
-        published
-            .json::<serde_json::Value>()
-            .await
-            .unwrap()["resource"],
-        "https://gateway.example/added"
+        published["authorization_servers"],
+        json!([AUTHORIZATION_SERVER]),
+        "an omitted list advertises the issuer the strategy trusts"
     );
 
     let mut elsewhere = protected_resource("/other");
@@ -240,25 +268,27 @@ async fn an_mcp_access_point_publishes_the_protected_resource_its_caller_authent
             .unwrap()
             .contains("requires empty JWT Bearer audiences")
     );
-    // The strategy the harness surface uses trusts the local fixture issuer, not
-    // the advertised server, so every token a client got would be refused.
-    let mut untrusted = surface("/other", protected_resource("/other"));
-    untrusted["access_point"]["caller_authentication"]["methods"][0]["jwt_verification_strategy_id"] =
+    // The operator's strategy the fixture trusts names an http issuer, which
+    // its protected resource metadata advertises as configured.
+    let mut operator_http = surface("/operator", protected_resource("/operator"));
+    operator_http["access_point"]["caller_authentication"]["methods"][0]["jwt_verification_strategy_id"] =
         json!("e2e-jwt-strategy");
-    let refused = admin
+    let accepted = admin
         .post(&surfaces)
-        .json(&untrusted)
+        .json(&operator_http)
         .send()
         .await
         .unwrap();
-    assert_eq!(refused.status(), 400);
-    assert!(
-        refused
-            .text()
-            .await
-            .unwrap()
-            .contains("authorization_servers must be exactly")
-    );
+    assert_eq!(accepted.status(), 201, "{}", accepted.text().await.unwrap());
+    let published: serde_json::Value = client
+        .get(metadata_url(&harness, "/operator"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(published["authorization_servers"], json!([fixture.issuer.as_str()]));
     // Another server listed beside the trusted one, first or last, would be
     // refused too: its tokens never pass the strategy.
     for servers in [
@@ -673,10 +703,11 @@ async fn a_caller_without_a_valid_token_is_challenged_to_fetch_one() {
     assert_eq!(variant.headers()["www-authenticate"], challenge("/smoke$beta", "").as_str());
 
     let expired = sign_jwt(
-        json!({"iss": fixture.issuer, "sub": "user-123", "aud": "https://gateway.example/smoke", "exp": now_secs() - 600}),
+        json!({"iss": AUTHORIZATION_SERVER, "sub": "user-123", "aud": "https://gateway.example/smoke", "exp": now_secs() - 600}),
         &fixture.kid,
     );
-    let unbound = sign_jwt(json!({"iss": fixture.issuer, "sub": "user-123", "exp": now_secs() + 300}), &fixture.kid);
+    let unbound =
+        sign_jwt(json!({"iss": AUTHORIZATION_SERVER, "sub": "user-123", "exp": now_secs() + 300}), &fixture.kid);
     // Tokens the same authorization server issued for another resource,
     // including the variant's and the base's, are not accepted.
     for (path, route, invalid) in [
@@ -720,6 +751,63 @@ async fn a_caller_without_a_valid_token_is_challenged_to_fetch_one() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_token_whose_aud_array_names_the_resource_among_others_is_accepted() {
+    let fixture = JwksFixture::start().await;
+    let (harness, _admin) = start_discovery_gateway(&fixture).await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap();
+    let token = token_for(&fixture, json!(["https://gateway.example/smoke", "https://idp.example/userinfo"]));
+    let accepted = client
+        .post(format!("{}/smoke/rpc", harness.gateway_base))
+        .bearer_auth(token)
+        .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), 200, "{}", accepted.text().await.unwrap());
+    assert_eq!(
+        harness
+            .mock
+            .request_count
+            .load(Ordering::SeqCst),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_token_for_another_variants_resource_is_refused_even_in_an_aud_array() {
+    let fixture = JwksFixture::start().await;
+    let (harness, _admin) = start_discovery_gateway(&fixture).await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap();
+    let token = token_for(&fixture, json!(["https://gateway.example/smoke$beta", "x"]));
+    let refused = client
+        .post(format!("{}/smoke/rpc", harness.gateway_base))
+        .bearer_auth(token)
+        .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 401);
+    assert_eq!(
+        refused.headers()["www-authenticate"],
+        "Bearer resource_metadata=\"https://gateway.example/.well-known/oauth-protected-resource/smoke\", \
+         error=\"invalid_token\""
+    );
+    assert_eq!(
+        harness
+            .mock
+            .request_count
+            .load(Ordering::SeqCst),
+        0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_token_short_of_a_required_scope_is_refused_with_insufficient_scope_before_policy() {
     let fixture = JwksFixture::start().await;
     let (harness, _admin) = start_discovery_gateway_with(
@@ -753,7 +841,7 @@ async fn a_token_short_of_a_required_scope_is_refused_with_insufficient_scope_be
     };
     let scoped = |audience: &str, scope: &str| {
         sign_jwt(
-            json!({"iss": fixture.issuer, "sub": "user-123", "aud": audience, "scope": scope, "exp": now_secs() + 300}),
+            json!({"iss": AUTHORIZATION_SERVER, "sub": "user-123", "aud": audience, "scope": scope, "exp": now_secs() + 300}),
             &fixture.kid,
         )
     };
@@ -832,7 +920,7 @@ async fn a_token_short_of_a_required_scope_is_refused_with_insufficient_scope_be
          error=\"invalid_token\", scope=\"tools.call\""
     );
     let id_token = sign_jwt(
-        json!({"iss": fixture.issuer, "sub": "user-123", "aud": "https://gateway.example/smoke",
+        json!({"iss": AUTHORIZATION_SERVER, "sub": "user-123", "aud": "https://gateway.example/smoke",
             "scope": "tools.call", "nonce": "n-1", "exp": now_secs() + 300}),
         &fixture.kid,
     );
@@ -1052,7 +1140,7 @@ async fn the_same_route_on_two_listeners_publishes_each_listeners_own_resource()
             "access_point": {"listen_address": second_address, "route": "/smoke", "protocol": "mcp",
                 "caller_authentication": {
                     "methods": [{"type": "jwt_bearer", "jwt_verification_strategy_id": IDP_STRATEGY, "audiences": []}],
-                    "protected_resource": {"resource": "https://other.example/smoke", "authorization_servers": [AUTHORIZATION_SERVER]}
+                    "protected_resource": {"resource": "https://other.example/smoke"}
                 }},
             "target": {"endpoint": harness.mock.url()}
         }))

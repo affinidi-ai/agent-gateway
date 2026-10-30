@@ -23,7 +23,7 @@ describe('useSurfaceDeclarations', () => {
         declarations: [
           { variant: null, outcome: 'declare', reason: null, resource: 'https://gw/a' },
         ],
-        warnings: [{ code: 'additional_audiences', message: 'm', path: null, variant: null }],
+        warnings: [{ code: 'fail_open_policy', message: 'm', path: null, variant: null }],
       })
     );
     const { result } = renderHook(() => useSurfaceDeclarations('s1'));
@@ -31,7 +31,7 @@ describe('useSurfaceDeclarations', () => {
     await waitFor(() => expect(result.current.status).toBe('ready'));
     if (result.current.status !== 'ready') throw new Error('not ready');
     expect(result.current.declarations[0].outcome).toBe('declare');
-    expect(result.current.warnings[0].code).toBe('additional_audiences');
+    expect(result.current.warnings[0].code).toBe('fail_open_policy');
   });
 
   it('reads again when the refresh key changes', async () => {

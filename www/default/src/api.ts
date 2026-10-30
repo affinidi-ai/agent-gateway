@@ -1237,12 +1237,15 @@ export interface McpHttpConfig {
 }
 
 /**
- * RFC 9728 discovery an MCP Access Point publishes for its JWT Bearer caller
- * authentication (`ProtectedResourceConfig` in `src/protocols/protected_resource.rs`).
+ * Authorization server discovery an A2A, AP2 or MCP Access Point publishes for
+ * its JWT Bearer caller authentication (`ProtectedResourceConfig` in
+ * `src/protocols/protected_resource.rs`). The gateway always advertises the
+ * JWT verification strategy's expected issuer; a stored `authorization_servers`
+ * must equal it. Without `scopes` the required scopes are advertised.
  */
 export interface ProtectedResourceConfig {
   resource: string;
-  authorization_servers: string[];
+  authorization_servers?: string[];
   scopes?: string[];
 }
 

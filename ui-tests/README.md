@@ -83,7 +83,10 @@ because its pages can show secret material.
 
 `make oidc-ui-e2e` runs `playwright.oidc-live.config.ts` and the specs under `specs/oidc-live/`
 against two live Ory Hydra instances and the mock A2A agent, with a gateway of its own. It is a
-separate Playwright config, so `make ui-test` neither runs nor waits for it. See
+separate Playwright config, so `make ui-test` neither runs nor waits for it. Its surface-builder
+spec turns on **Authorization server discovery** in the Caller Context editor, which is the only way a
+surface declares, and proves that removing the required scope keeps the gateway refusing a caller
+without a token. See
 [`docs/development/TESTING.md`](../docs/development/TESTING.md#live-oidc-dashboard-tests).
 
 ### Run in Headed Mode (Visible Browser)
@@ -158,7 +161,7 @@ ui-tests/
 │   ├── credentials.spec.ts   # Outbound Credentials tests
 │   ├── strategy-discovery.spec.ts   # JWT strategy discovery, scope claims, list and delete
 │   ├── credential-providers.spec.ts # JWT bearer credential provider form, create and reopen
-│   ├── surface-builder-save.spec.ts # Surface Builder save path: target, caller auth, warnings
+│   ├── surface-builder-save.spec.ts # Surface Builder save path: target, caller auth, authorization server discovery, warnings
 │   ├── agent-card-layout.spec.ts    # Agent Cards tab: placement, compare, URLs, failed fetch, layout
 │   ├── accessibility.spec.ts # WCAG accessibility tests
 │   └── oidc-live/            # Live Ory Hydra suite, run by make oidc-ui-e2e

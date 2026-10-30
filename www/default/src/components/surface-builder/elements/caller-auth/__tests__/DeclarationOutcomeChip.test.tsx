@@ -71,11 +71,13 @@ describe('DeclarationOutcomeChip outcome', () => {
   it('shows the outcome of the variant being edited, not the base', async () => {
     answer([
       { variant: null, outcome: 'declare', reason: null, resource: 'https://gw/a' },
-      { variant: 'beta', outcome: 'strip', reason: 'not_pinned', resource: 'https://gw/a$beta' },
+      { variant: 'beta', outcome: 'strip', reason: 'not_declared', resource: 'https://gw/a$beta' },
     ]);
     render(inEditor({ activeVariantAlias: 'beta' }, 's-1', 'a2a'));
-    await waitFor(() => expect(chip()).toHaveTextContent('Security removed from card'));
-    expect(screen.getByTestId('caller-auth-outcome-detail')).toHaveTextContent(/Discover/);
+    await waitFor(() => expect(chip()).toHaveTextContent('Not declared'));
+    expect(screen.getByTestId('caller-auth-outcome-detail')).toHaveTextContent(
+      'Authorization server discovery is off for this route.'
+    );
   });
 
   it('says unavailable when the variant edited has no entry', async () => {
@@ -84,7 +86,7 @@ describe('DeclarationOutcomeChip outcome', () => {
   });
 
   it('labels an MCP outcome as metadata and offers no card link', async () => {
-    answer([{ variant: null, outcome: 'strip', reason: 'not_pinned', resource: null }]);
+    answer([{ variant: null, outcome: 'strip', reason: 'not_declared', resource: null }]);
     render(inEditor({ onOpenAgentCard: jest.fn() }, 's-1', 'mcp'));
     await waitFor(() => expect(chip()).toHaveTextContent('Not declared'));
     expect(screen.getByText('Protected resource metadata:')).toBeInTheDocument();
@@ -92,13 +94,12 @@ describe('DeclarationOutcomeChip outcome', () => {
     expect(screen.queryByTestId('caller-auth-outcome-card-link')).not.toBeInTheDocument();
   });
 
-  it('explains a declaration stripped because the caller token is forwarded', async () => {
-    answer([{ variant: null, outcome: 'strip', reason: 'forwards_caller_token', resource: null }]);
+  it('explains a route that does not publish authorization server discovery, and that the card keeps the agent’s security', async () => {
+    answer([{ variant: null, outcome: 'strip', reason: 'not_declared', resource: null }]);
     render(inEditor({}, 's-1', 'a2a'));
-    await waitFor(() => expect(chip()).toHaveTextContent('Security removed from card'));
-    expect(screen.getByTestId('caller-auth-outcome-detail')).toHaveTextContent(/forward/i);
-    expect(screen.getByTestId('caller-auth-outcome-detail')).not.toHaveTextContent(
-      'The card declares no security scheme.'
+    await waitFor(() => expect(chip()).toHaveTextContent('Not declared'));
+    expect(screen.getByTestId('caller-auth-outcome-detail')).toHaveTextContent(
+      'Authorization server discovery is off for this route. The agent card keeps the managed agent’s own security. This reflects the saved surface.'
     );
   });
 
@@ -113,8 +114,8 @@ describe('DeclarationOutcomeChip outcome', () => {
 
   it.each([
     ['declare', null, 'text-bg-success', 'fa-shield-halved'],
-    ['strip', 'not_pinned', 'text-bg-warning', 'fa-triangle-exclamation'],
-    ['unservable', 'transit_point', 'text-bg-danger', 'fa-circle-xmark'],
+    ['strip', 'not_declared', 'text-bg-warning', 'fa-triangle-exclamation'],
+    ['unservable', 'strategy_unavailable', 'text-bg-danger', 'fa-circle-xmark'],
   ])(
     'renders the %s outcome as a tinted app badge with readable text',
     async (outcome, reason, toneClass, iconClass) => {

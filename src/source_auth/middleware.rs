@@ -827,6 +827,50 @@ mod tests {
         assert_eq!(resolved, config);
     }
 
+    #[tokio::test]
+    async fn the_declared_resource_is_the_one_audience_for_direct_and_fabric_callers() {
+        use crate::protocols::protected_resource::fixtures::{
+            FixtureStrategies, discovery_network, discovery_surface, jwt_bearer_method,
+        };
+        use crate::source_auth::declaration::{DeclarationOutcome, resolve_surface_declaration};
+
+        let mut method = jwt_bearer_method();
+        method["required_scopes"] = json!(["tools.call"]);
+        let surface = discovery_surface(method, Some(json!({"resource": "https://gateway.example/mcp/alpha"})));
+        let beta = surface
+            .resolve_variant(Some("beta"))
+            .expect("variant");
+        let outcome =
+            resolve_surface_declaration(&beta, Some("beta"), Some(&FixtureStrategies::Pinned), &discovery_network())
+                .await
+                .expect("resolve");
+        let DeclarationOutcome::Declare(declaration) = outcome else {
+            panic!("the beta variant declares");
+        };
+        let config = beta
+            .source_auth()
+            .cloned()
+            .expect("caller authentication");
+
+        let bound = resolve_surface_audience(&config, Some(&declaration), None, "alpha")
+            .await
+            .expect("bind the declared resource");
+        let SourceAuthConfig::JwtBearer(bound) = bound else {
+            panic!("expected JWT bearer config");
+        };
+        assert_eq!(bound.audiences, vec!["https://gateway.example/mcp/alpha$beta"]);
+        assert_eq!(bound.required_scopes, vec!["tools.call"]);
+        assert_eq!(bound.jwt_verification_strategy_id, "idp");
+
+        let undeclared = resolve_surface_audience(&config, None, None, "alpha")
+            .await
+            .expect("keep the configured audiences");
+        let SourceAuthConfig::JwtBearer(undeclared) = undeclared else {
+            panic!("expected JWT bearer config");
+        };
+        assert_eq!(undeclared.audiences, Vec::<String>::new());
+    }
+
     // ── In-memory Secrets Store ─────────────────────────────────────────────
 
     struct InMemorySecretsStore {

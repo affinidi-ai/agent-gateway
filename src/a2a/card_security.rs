@@ -242,8 +242,7 @@ mod tests {
         )));
         for outcome in [
             DeclarationOutcome::PassThrough,
-            DeclarationOutcome::Strip(StripReason::ForwardsCallerToken),
-            DeclarationOutcome::Strip(StripReason::NoRequiredScopes),
+            DeclarationOutcome::Strip(StripReason::NotDeclared),
             DeclarationOutcome::Strip(StripReason::FabricTarget),
         ] {
             assert!(!secures_cards(&outcome), "{outcome:?} secured its cards");
@@ -262,8 +261,8 @@ mod tests {
     #[test]
     fn strip_removes_every_security_key_in_both_spellings_and_signatures_and_declares_nothing() {
         for outcome in [
-            DeclarationOutcome::Strip(StripReason::ForwardsCallerToken),
-            DeclarationOutcome::Strip(StripReason::NotPinned),
+            DeclarationOutcome::Strip(StripReason::NotDeclared),
+            DeclarationOutcome::Strip(StripReason::TransitPoint),
             DeclarationOutcome::Unservable(crate::source_auth::declaration::UnservableDeclaration::new(
                 crate::source_auth::declaration::UnservableReason::StrategyStoreUnavailable,
                 "unservable",

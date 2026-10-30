@@ -643,7 +643,7 @@ async fn a_modern_mcp_body_over_sixteen_kib_is_refused_for_its_variant_without_a
 
 /// A body that sends the start of an envelope with an id, then nothing more.
 /// `stalled` is told once the reader waits for the rest.
-fn stalled_body(stalled: tokio::sync::oneshot::Sender<()>) -> axum::body::Body {
+pub(super) fn stalled_body(stalled: tokio::sync::oneshot::Sender<()>) -> axum::body::Body {
     let mut stalled = Some(stalled);
     let prefix = futures::stream::iter([Ok::<_, std::io::Error>(bytes::Bytes::from_static(
         br#"{"jsonrpc":"2.0","id":"variant","#,
@@ -830,11 +830,14 @@ async fn a_surface_with_variants_but_no_default_serves_an_alias_less_request_fro
     );
 }
 
-/// JWT Bearer caller authentication declaring the protected resource at `/mcp`.
-fn declaring_caller_authentication() -> Value {
+/// The issuer the strategy `idp` trusts.
+const IDP_ISSUER: &str = "https://idp.example";
+
+/// JWT Bearer caller authentication declaring the protected resource at `route`.
+pub(super) fn declaring_caller_authentication(route: &str) -> Value {
     json!({
         "methods": [{"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": []}],
-        "protected_resource": {"resource": "https://gateway.example/mcp", "authorization_servers": ["https://idp.example"]}
+        "protected_resource": {"resource": format!("https://gateway.example{route}")}
     })
 }
 
@@ -848,7 +851,7 @@ fn surface_declaring_through_variants(default_variant_id: Option<&str>) -> Agent
         .filter(|variant| variant.alias != "off")
     {
         variant.overrides = serde_json::from_value(
-            json!({"access_point": {"caller_authentication": declaring_caller_authentication()}}),
+            json!({"access_point": {"caller_authentication": declaring_caller_authentication("/mcp")}}),
         )
         .unwrap();
     }
@@ -856,63 +859,69 @@ fn surface_declaring_through_variants(default_variant_id: Option<&str>) -> Agent
 }
 
 /// [`mcp_surface`] whose base declares.
-fn surface_declaring_on_its_base(default_variant_id: Option<&str>) -> AgentSurface {
+pub(super) fn surface_declaring_on_its_base(default_variant_id: Option<&str>) -> AgentSurface {
     let mut surface = mcp_surface(default_variant_id);
     surface
         .access_point
-        .caller_authentication = Some(serde_json::from_value(declaring_caller_authentication()).unwrap());
+        .caller_authentication = Some(serde_json::from_value(declaring_caller_authentication("/mcp")).unwrap());
     surface
 }
 
 /// [`router`] with source authentication, and the directory its strategies are
 /// stored in, which the caller keeps alive.
-async fn authenticating_router(surface: AgentSurface) -> (crate::state::MultiSurfaceProxyState, tempfile::TempDir) {
+pub(super) async fn authenticating_router(
+    surface: AgentSurface
+) -> (crate::state::MultiSurfaceProxyState, tempfile::TempDir) {
     authenticating_router_trusting(surface, None).await
 }
 
-/// [`authenticating_router`] whose strategy `idp` trusts the tokens `fixture`
-/// signs, when one is given.
-async fn authenticating_router_trusting(
+/// [`authenticating_router`] whose strategy `idp` reads the keys `fixture`
+/// serves, when one is given.
+pub(super) async fn authenticating_router_trusting(
     surface: AgentSurface,
     fixture: Option<&JwksFixture>,
 ) -> (crate::state::MultiSurfaceProxyState, tempfile::TempDir) {
     let directory = tempfile::tempdir().unwrap();
-    if let Some(fixture) = fixture {
-        let strategies = directory
-            .path()
-            .join("strategies");
-        std::fs::create_dir_all(&strategies).unwrap();
-        std::fs::write(
-            strategies.join("idp.json"),
-            json!({
-                "id": "idp", "name": "IdP", "expected_issuer": fixture.issuer,
-                "jwks_source": {"type": "remote", "jwks_uri": format!("{}/.well-known/jwks.json", fixture.issuer)},
-                "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"
-            })
-            .to_string(),
-        )
-        .unwrap();
-    }
-    let strategies = Arc::new(
-        crate::jwt_bearer::storage::FileSystemJwtVerificationStrategyStore::new(
-            directory
-                .path()
-                .join("strategies"),
-        )
-        .await
-        .unwrap(),
-    );
     let mut router = router(surface);
-    router.source_auth_middleware = Some(Arc::new(crate::source_auth::SourceAuthMiddleware::new(
-        Arc::clone(&router.didauth_session_store),
+    router.source_auth_middleware =
+        Some(idp_middleware(directory.path(), fixture, Arc::clone(&router.didauth_session_store)).await);
+    (router, directory)
+}
+
+/// Source authentication whose strategy `idp`, stored under `directory`, trusts
+/// [`IDP_ISSUER`] and reads its keys from `fixture`, when one is given.
+pub(super) async fn idp_middleware(
+    directory: &std::path::Path,
+    fixture: Option<&JwksFixture>,
+    didauth_sessions: Arc<crate::didauth::DidAuthSessionStore>,
+) -> Arc<crate::source_auth::SourceAuthMiddleware> {
+    let strategies = directory.join("strategies");
+    std::fs::create_dir_all(&strategies).unwrap();
+    let jwks_uri = format!("{}/.well-known/jwks.json", fixture.map_or(IDP_ISSUER, |fixture| fixture.issuer.as_str()));
+    std::fs::write(
+        strategies.join("idp.json"),
+        json!({
+            "id": "idp", "name": "IdP", "expected_issuer": IDP_ISSUER,
+            "jwks_source": {"type": "remote", "jwks_uri": jwks_uri},
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let strategies = Arc::new(
+        crate::jwt_bearer::storage::FileSystemJwtVerificationStrategyStore::new(strategies)
+            .await
+            .unwrap(),
+    );
+    Arc::new(crate::source_auth::SourceAuthMiddleware::new(
+        didauth_sessions,
         strategies,
         Arc::new(crate::jwt_bearer::JwksClient::new()),
         None,
         Arc::new(dashmap::DashMap::new()),
         None,
         None,
-    )));
-    (router, directory)
+    ))
 }
 
 /// Sends a legacy MCP `tools/list` without credentials and returns the status,
@@ -1040,7 +1049,7 @@ async fn without_a_declaring_bare_route_an_unresolved_variant_is_refused_and_a_k
 }
 
 /// The surface variant, scheme, reason and blocking flag of each `auth_failed` record.
-fn auth_failure_records(events: &[DelegationAuditEvent]) -> Vec<(Option<String>, AuthScheme, String, bool)> {
+pub(super) fn auth_failure_records(events: &[DelegationAuditEvent]) -> Vec<(Option<String>, AuthScheme, String, bool)> {
     events
         .iter()
         .filter_map(|event| match &event.event {
@@ -1061,15 +1070,23 @@ fn refusal_variants(events: &[DelegationAuditEvent]) -> Vec<Option<String>> {
         .collect()
 }
 
-/// A token the trusted IdP signs for the declared resource.
-fn resource_token(fixture: &JwksFixture) -> String {
+/// A token [`IDP_ISSUER`] signs, with the keys `fixture` serves, for `audience`.
+pub(super) fn idp_token(
+    fixture: &JwksFixture,
+    audience: &str,
+) -> String {
     sign_jwt(
         json!({
-            "iss": fixture.issuer, "sub": "client", "aud": "https://gateway.example/mcp",
+            "iss": IDP_ISSUER, "sub": "client", "aud": audience,
             "exp": now_secs() + 300, "iat": now_secs(),
         }),
         &fixture.kid,
     )
+}
+
+/// A token the trusted IdP signs for the declared resource.
+fn resource_token(fixture: &JwksFixture) -> String {
+    idp_token(fixture, "https://gateway.example/mcp")
 }
 
 /// A caller that fails authentication on a declaring Access Point and names a

@@ -179,7 +179,7 @@ fn surface_on(
 }
 
 fn forwarding_caller_authentication(route: &str) -> Value {
-    let mut authentication = jwt_bearer_caller_authentication(&[&format!("{PUBLIC_ORIGIN}{route}")]);
+    let mut authentication = jwt_bearer_caller_authentication(Some(&format!("{PUBLIC_ORIGIN}{route}")));
     authentication["methods"][0]["forward_header"] = json!(true);
     authentication
 }
@@ -251,7 +251,7 @@ async fn surface_saves_report_fail_open_policies_per_variant_and_recompute_on_re
         .collect();
     assert_eq!(variants, vec![&Value::Null, &json!("strict")]);
     assert_eq!(created["declarations"][0]["outcome"], "strip");
-    assert_eq!(created["declarations"][0]["reason"], "method_not_declarable");
+    assert_eq!(created["declarations"][0]["reason"], "not_declared");
 
     let (status, updated) = admin
         .put(&format!("surfaces/{surface_id}"), &created)
@@ -386,26 +386,31 @@ async fn a_declaring_access_point_reports_its_declaration_and_no_fail_open_polic
     let resource = format!("{PUBLIC_ORIGIN}{route}");
 
     let (status, created) = admin
-        .post("surfaces", &surface_on(&h, route, "a2a", jwt_bearer_caller_authentication(&[&resource])))
+        .post("surfaces", &surface_on(&h, route, "a2a", jwt_bearer_caller_authentication(Some(&resource))))
         .await;
     assert_eq!(status, 201, "{created}");
     assert_eq!(
         created["declarations"],
-        json!([{"variant": null, "outcome": "declare", "reason": null, "resource": resource}])
+        json!([{"variant": null, "outcome": "declare", "reason": null, "resource": resource,
+            "authorization_servers": [ISSUER], "required_scopes": [REQUIRED_SCOPE],
+            "scopes_supported": [REQUIRED_SCOPE],
+            "metadata_url": format!("{PUBLIC_ORIGIN}/.well-known/oauth-protected-resource{route}")}])
     );
     assert!(
         warning_codes(&created).is_empty(),
-        "the built-in refusal protects a declaring Access Point without a policy: {created}"
+        "the source-auth refusal protects a declaring Access Point without a policy: {created}"
     );
 
     let route = "/smoke/forwarding";
+    let mut forwarding_authentication = jwt_bearer_caller_authentication(None);
+    forwarding_authentication["methods"][0]["forward_header"] = json!(true);
     let (status, forwarding) = admin
-        .post("surfaces", &surface_on(&h, route, "a2a", forwarding_caller_authentication(route)))
+        .post("surfaces", &surface_on(&h, route, "a2a", forwarding_authentication))
         .await;
     assert_eq!(status, 201, "{forwarding}");
     assert_eq!(
         warning_codes(&forwarding),
-        vec![("declaration_stripped".to_string(), Value::Null), ("fail_open_policy".to_string(), Value::Null)],
+        vec![("fail_open_policy".to_string(), Value::Null)],
         "an Access Point that does not declare is still checked for failed callers"
     );
     let fail_open = warning(&forwarding, "fail_open_policy")["message"]
@@ -418,25 +423,26 @@ async fn a_declaring_access_point_reports_its_declaration_and_no_fail_open_polic
 async fn a_scoped_access_point_that_forwards_the_callers_token_is_saved_without_declaring() {
     let (h, admin) = declaring_admin().await;
     for (protocol, route) in [("a2a", "/smoke/forward-a2a"), ("mcp", "/smoke/forward-mcp")] {
+        let mut without_setting = jwt_bearer_caller_authentication(None);
+        without_setting["methods"][0]["forward_header"] = json!(true);
         let (status, created) = admin
-            .post("surfaces", &surface_on(&h, route, protocol, forwarding_caller_authentication(route)))
+            .post("surfaces", &surface_on(&h, route, protocol, without_setting))
             .await;
         assert_eq!(status, 201, "{protocol}: {created}");
         assert_eq!(
             created["declarations"],
-            json!([{"variant": null, "outcome": "strip", "reason": "forwards_caller_token",
-                "resource": format!("{PUBLIC_ORIGIN}{route}")}]),
+            json!([{"variant": null, "outcome": "strip", "reason": "not_declared",
+                "resource": format!("{PUBLIC_ORIGIN}{route}"), "authorization_servers": [],
+                "required_scopes": [], "scopes_supported": [], "metadata_url": null}]),
             "{protocol}"
         );
-        let stripped = warning(&created, "declaration_stripped");
-        assert_eq!(stripped["path"], "access_point.caller_authentication", "{protocol}");
-        assert_eq!(stripped["variant"], Value::Null, "{protocol}");
         assert!(
-            stripped["message"]
-                .as_str()
-                .expect("message")
-                .contains("forwards_caller_token"),
-            "{protocol}: {stripped}"
+            created["warnings"]
+                .as_array()
+                .expect("warnings")
+                .iter()
+                .all(|warning| warning["code"] == "fail_open_policy"),
+            "{protocol}: {created}"
         );
 
         let surface_id = created["surface_id"]
@@ -447,6 +453,21 @@ async fn a_scoped_access_point_that_forwards_the_callers_token_is_saved_without_
             .await;
         assert_eq!(status, 200, "{protocol}: {read}");
         assert_eq!(read["declarations"], created["declarations"], "{protocol}");
+
+        let forwarding_route = format!("{route}-declaring");
+        let (status, refused) = admin
+            .post(
+                "surfaces",
+                &surface_on(&h, &forwarding_route, protocol, forwarding_caller_authentication(&forwarding_route)),
+            )
+            .await;
+        assert_eq!(status, 400, "{protocol}: {refused}");
+        assert!(
+            refused
+                .to_string()
+                .contains("cannot be combined with forward_header"),
+            "{protocol}: {refused}"
+        );
     }
 }
 
@@ -480,7 +501,73 @@ async fn an_explicit_mcp_protected_resource_is_refused_with_forward_header_and_d
     assert_eq!(status, 201, "{created}");
     assert_eq!(
         created["declarations"],
-        json!([{"variant": null, "outcome": "declare", "reason": null, "resource": format!("{PUBLIC_ORIGIN}{route}")}])
+        json!([{"variant": null, "outcome": "declare", "reason": null, "resource": format!("{PUBLIC_ORIGIN}{route}"),
+            "authorization_servers": [ISSUER], "required_scopes": [], "scopes_supported": [REQUIRED_SCOPE],
+            "metadata_url": format!("{PUBLIC_ORIGIN}/.well-known/oauth-protected-resource{route}")}])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_strategy_issuer_change_is_advertised_without_a_surface_save() {
+    let (h, admin) = declaring_admin().await;
+    let route = "/smoke/issuer-change";
+    let resource = format!("{PUBLIC_ORIGIN}{route}");
+    let metadata_url = format!("{}/.well-known/oauth-protected-resource{route}", h.gateway_base);
+    let read_metadata = || async {
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("client")
+            .get(&metadata_url)
+            .send()
+            .await
+            .expect("metadata request");
+        assert_eq!(response.status().as_u16(), 200);
+        response
+            .json::<Value>()
+            .await
+            .expect("metadata JSON")
+    };
+
+    let (status, created) = admin
+        .post("surfaces", &surface_on(&h, route, "a2a", jwt_bearer_caller_authentication(Some(&resource))))
+        .await;
+    assert_eq!(status, 201, "{created}");
+    let surface_id = created["surface_id"]
+        .as_str()
+        .expect("surface id")
+        .to_string();
+    assert_eq!(read_metadata().await["authorization_servers"], json!([ISSUER]));
+
+    let new_issuer = "https://as2.example";
+    let (status, updated) = admin
+        .put(
+            &format!("jwt-verification-strategies/{STRATEGY_ID}"),
+            &json!({
+                "name": "Card security", "expected_issuer": new_issuer, "discover_metadata": false,
+                "jwks_source": {"type": "remote", "jwks_uri": format!("{new_issuer}/.well-known/jwks.json")}
+            }),
+        )
+        .await;
+    assert_eq!(status, 200, "{updated}");
+
+    assert_eq!(
+        read_metadata().await["authorization_servers"],
+        json!([new_issuer]),
+        "the advertised authorization server follows the strategy with no surface save"
+    );
+    let (status, read) = admin
+        .get(&format!("surfaces/{surface_id}/declarations"))
+        .await;
+    assert_eq!(status, 200, "{read}");
+    assert_eq!(read["declarations"][0]["authorization_servers"], json!([new_issuer]), "{read}");
+    assert!(
+        read["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .all(|warning| warning["code"] != "authorization_servers_stale"),
+        "a surface that stored no list is never stale: {read}"
     );
 }
 
@@ -563,16 +650,25 @@ async fn the_declarations_read_hides_another_tenants_or_an_out_of_scope_surface(
     }
 }
 
+/// An A2A surface on `route` whose JWT Bearer method uses `strategy_id`. With
+/// `declares` it sets `protected_resource` for the route.
 fn configured_surface(
     surface_id: &str,
     route: &str,
     strategy_id: &str,
+    declares: bool,
 ) -> crate::config::agent_surface::AgentSurface {
+    let resource = format!("{PUBLIC_ORIGIN}{route}");
+    let mut caller_authentication = json!({"methods": [{"type": "jwt_bearer",
+        "jwt_verification_strategy_id": strategy_id, "audiences": [&resource], "required_scopes": [REQUIRED_SCOPE]}]});
+    if declares {
+        caller_authentication["methods"][0]["audiences"] = json!([]);
+        caller_authentication["protected_resource"] = json!({"resource": resource});
+    }
     serde_json::from_value(json!({
         "surface_id": surface_id, "name": surface_id, "status": "active",
         "access_point": {"listen_address": "inbound_port_placeholder", "route": route, "protocol": "a2a",
-            "caller_authentication": {"methods": [{"type": "jwt_bearer", "jwt_verification_strategy_id": strategy_id,
-                "audiences": [format!("{PUBLIC_ORIGIN}{route}")], "required_scopes": [REQUIRED_SCOPE]}]}},
+            "caller_authentication": caller_authentication},
         "target": {"endpoint": "inbound_target_placeholder"}
     }))
     .expect("surface JSON")
@@ -586,8 +682,8 @@ async fn a_caller_of_a_surface_whose_strategy_was_deleted_gets_a_500_that_names_
         write_strategy(temp_dir, ISSUER, true);
         admin_client = Some(configure_admin_api(bootstrap));
         config.surfaces = vec![
-            configured_surface("deleted-strategy-surface", "/smoke/deleted", DELETED_STRATEGY),
-            configured_surface("present-strategy-surface", "/smoke/present", STRATEGY_ID),
+            configured_surface("deleted-strategy-surface", "/smoke/deleted", DELETED_STRATEGY, false),
+            configured_surface("present-strategy-surface", "/smoke/present", STRATEGY_ID, true),
         ];
     })
     .await;
@@ -639,7 +735,7 @@ async fn a_caller_of_a_surface_whose_strategy_was_deleted_gets_a_500_that_names_
     let route = "/smoke/strategy-gone";
     let resource = format!("{PUBLIC_ORIGIN}{route}");
     let (status, created) = admin
-        .post("surfaces", &surface_on(&h, route, "a2a", jwt_bearer_caller_authentication(&[&resource])))
+        .post("surfaces", &surface_on(&h, route, "a2a", jwt_bearer_caller_authentication(Some(&resource))))
         .await;
     assert_eq!(status, 201, "{created}");
     assert_eq!(created["declarations"][0]["outcome"], "declare", "{created}");
@@ -661,18 +757,25 @@ async fn a_caller_of_a_surface_whose_strategy_was_deleted_gets_a_500_that_names_
     assert_eq!(status, 200, "{read}");
     assert_eq!(
         read["declarations"],
-        json!([{"variant": null, "outcome": "strip", "reason": "strategy_unavailable", "resource": resource}])
+        json!([{"variant": null, "outcome": "unservable", "reason": "strategy_unavailable", "resource": resource,
+            "authorization_servers": [], "required_scopes": [], "scopes_supported": [], "metadata_url": null}])
     );
 
     let gone = call(route)
         .await
         .expect("caller request");
-    assert_eq!(gone.status().as_u16(), 500);
+    assert_eq!(gone.status().as_u16(), 503, "a declaring Access Point whose strategy is gone fails closed");
+    assert!(
+        gone.headers()
+            .get("www-authenticate")
+            .is_none(),
+        "an unservable declaration challenges no caller"
+    );
     let text = gone
         .text()
         .await
         .expect("body");
     assert!(!text.contains(STRATEGY_ID), "the body names the strategy: {text}");
     let body: Value = serde_json::from_str(&text).expect("problem JSON");
-    assert_eq!(body["detail"], crate::source_auth::errors::CONFIG_NOT_FOUND_DETAIL);
+    assert_eq!(body["detail"], "Caller authentication unavailable");
 }

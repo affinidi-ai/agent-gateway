@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 
 use crate::bdd_support::actors::{PRIMARY_COLLABORATOR_KEY, SECONDARY_COLLABORATOR_KEY, TargetActorKind};
 use crate::bdd_support::config::gateway_bootstrap::declared_access_point_url;
+use crate::steps::when::ensure_admin_session;
 use crate::world::{
     JwtSourceAuthConfig, RecordedResponse, RequestPolicyFixture, SurfaceSourceAuthConfig, SurfaceWorld,
 };
@@ -81,9 +82,21 @@ fn surface_publishes_authorization_server(world: &mut SurfaceWorld) {
     jwt_config(world).declares_authorization_server = true;
 }
 
-#[given("the surface forwards the caller's token to its Target")]
-fn surface_forwards_caller_token(world: &mut SurfaceWorld) {
-    jwt_config(world).forwards_caller_token = true;
+#[given("the gateway has a gateway-level policy that denies every request")]
+fn gateway_policy_denies_every_request(world: &mut SurfaceWorld) {
+    world
+        .surface_config
+        .gateway_policy_rego = Some("package gateway.policy\n\ndefault allow := false\n".to_string());
+}
+
+#[given(expr = "the gateway lists external URL {string} before the surface's")]
+fn gateway_lists_external_url_first(
+    world: &mut SurfaceWorld,
+    url: String,
+) {
+    world
+        .surface_config
+        .external_url_listed_first = Some(url);
 }
 
 #[given("the surface has a policy admitting every caller")]
@@ -295,6 +308,17 @@ fn card_declares_in_1_0_shape(
     assert!(card.get("security").is_none(), "a 1.0 card carries no flat security: {card}");
 }
 
+#[then(regex = r"^the agent card declares the surface authorization server without scopes in the (1\.0|0\.3) shape$")]
+fn card_declares_without_scopes(
+    world: &mut SurfaceWorld,
+    shape: String,
+) {
+    match shape.as_str() {
+        "1.0" => card_declares_in_1_0_shape(world, String::new()),
+        _ => card_declares_in_0_3_shape(world, String::new()),
+    }
+}
+
 #[then(expr = "the agent card declares the surface authorization server for scopes {string} in the 0.3 shape")]
 fn card_declares_in_0_3_shape(
     world: &mut SurfaceWorld,
@@ -452,6 +476,34 @@ fn response_challenges_caller(
     scopes: String,
 ) {
     assert_challenge(world, &expected_challenge(world, None, &scopes));
+}
+
+#[then("the response challenges the caller to authorize without naming a scope")]
+fn response_challenges_caller_without_scope(world: &mut SurfaceWorld) {
+    assert_challenge(world, &expected_challenge(world, None, ""));
+}
+
+#[then("the protected resource metadata lists no scopes")]
+fn metadata_lists_no_scopes(world: &mut SurfaceWorld) {
+    let scopes = &response(world).body["scopes_supported"];
+    assert!(scopes.is_null() || scopes == &json!([]), "metadata must list no scopes, was {}", response(world).body);
+}
+
+#[then("the VP Audit Log records no policy decision")]
+async fn vp_audit_log_records_no_policy_decision(world: &mut SurfaceWorld) {
+    ensure_admin_session(world).await;
+    let (found, events) = world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist")
+        .wait_for_audit_event(|event| {
+            event["event"]
+                .get("policy_decision")
+                .is_some()
+        })
+        .await
+        .unwrap_or_else(|error| panic!("the VP Audit Log must be readable: {error:#}"));
+    assert!(!found, "expected no policy decision, got {events:?}");
 }
 
 #[then(expr = "the response challenges the caller with error {string} for scopes {string}")]

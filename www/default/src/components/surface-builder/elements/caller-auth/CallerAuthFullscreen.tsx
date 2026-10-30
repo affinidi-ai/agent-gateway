@@ -14,7 +14,6 @@ import {
 } from './methodOptions';
 import CallerAuthDiscoverySection from './CallerAuthDiscoverySection';
 import {
-  declarationForVariant,
   declaresOn,
   readProtectedResource,
   readsAuthorizationHeader,
@@ -115,13 +114,7 @@ const CallerAuthFullscreen: React.FC<ConfigPanelProps> = ({
   const hasDiscovery = readProtectedResource(config.protected_resource) !== null;
   const discoveryOn = method === 'jwt_bearer' && hasDiscovery;
   const showsDiscovery = method === 'jwt_bearer' && (declares || hasDiscovery);
-  const routeDeclaration =
-    declarations.status === 'ready'
-      ? declarationForVariant(declarations.declarations, meta?.activeVariantAlias)
-      : undefined;
-  const accessPointUrl =
-    declarations.status === 'ready' ? (routeDeclaration?.resource ?? null) : undefined;
-  const derivedDeclares = !discoveryOn && routeDeclaration?.outcome === 'declare';
+  const selectedStrategy = jwtStrategies.find(s => s.id === config.jwt_strategy_id);
   // While discovery is on, each control the gateway constrains is locked once
   // it holds the required value, and stays editable until then.
   const tokenHeaderLocked = discoveryOn && readsAuthorizationHeader(config);
@@ -222,11 +215,12 @@ const CallerAuthFullscreen: React.FC<ConfigPanelProps> = ({
           <>
             <p className="text-muted mb-3" data-testid="caller-auth-jwt-intro">
               Validate incoming requests using a bearer token verified against a configured JWT
-              verification strategy. When this Access Point declares its authorization server, a
-              missing or invalid token gets <code>401</code> with a challenge, and a token short of
-              a required scope gets <code>403</code> with <code>insufficient_scope</code>, before
-              policy and payment run. Otherwise a failed caller reaches policy as{' '}
-              <code>source_auth.method == &quot;failed&quot;</code>, so add a policy that denies it.
+              verification strategy. While <strong>Authorization server discovery</strong> is on, a
+              missing or invalid token gets <code>401</code> with a challenge and a token short of a
+              required scope gets <code>403</code> with <code>insufficient_scope</code>, before rate
+              limiting, any policy, the AP2 gate and payment. Otherwise a failed caller reaches
+              policy as <code>source_auth.method == &quot;failed&quot;</code>, so add a policy that
+              denies it.
             </p>
 
             {declares && (
@@ -346,8 +340,8 @@ const CallerAuthFullscreen: React.FC<ConfigPanelProps> = ({
               </div>
               {discoveryOn ? (
                 <div className="form-text" data-testid="caller-auth-audiences-discovery-note">
-                  Stays empty while authorization server discovery is on: the gateway accepts only
-                  tokens whose audience is the resource URL.
+                  Stays empty while authorization server discovery is on: a token is accepted when
+                  the resource URL is one of its audiences.
                 </div>
               ) : (
                 audiences.length === 0 && (
@@ -360,12 +354,6 @@ const CallerAuthFullscreen: React.FC<ConfigPanelProps> = ({
                     </span>
                   </div>
                 )
-              )}
-              {derivedDeclares && (
-                <div className="form-text" data-testid="caller-auth-audiences-declared-note">
-                  While this Access Point declares its authorization server, the gateway accepts
-                  only tokens whose audience is the Access Point URL.
-                </div>
               )}
               <small className="form-text text-muted">
                 Optional. When set, the token's <code>aud</code> claim must match at least one of
@@ -441,8 +429,8 @@ const CallerAuthFullscreen: React.FC<ConfigPanelProps> = ({
                   className="form-text d-block"
                   data-testid="caller-auth-jwt-forward-header-discovery-note"
                 >
-                  Off while authorization server discovery is on: MCP forbids passing the
-                  caller&apos;s token to the managed agent.
+                  Off while authorization server discovery is on: the caller&apos;s token never
+                  reaches the managed agent.
                 </small>
               )}
             </div>
@@ -454,8 +442,8 @@ const CallerAuthFullscreen: React.FC<ConfigPanelProps> = ({
                 protocol={protocol}
                 allNodes={allNodes}
                 hasAttemptedSave={hasAttemptedSave}
-                strategy={jwtStrategies.find(s => s.id === config.jwt_strategy_id)}
-                accessPointUrl={accessPointUrl}
+                strategy={selectedStrategy}
+                strategyName={selectedStrategy?.name}
                 saved={!!surfaceId}
               />
             )}

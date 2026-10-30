@@ -38,6 +38,7 @@ import {
   nodesFromSurface,
 } from '../components/surface-builder/nodesFromSurface';
 import { findDuplicateListenerRoutes } from '../components/surface-builder/templates/scrubVolatile';
+import { declaresOn } from '../components/surface-builder/elements/caller-auth/protectedResource';
 import SurfaceWarningsAlert from '../components/surface-builder/SurfaceWarningsAlert';
 import { useSurfaceDeclarations } from '../hooks/useSurfaceDeclarations';
 import type { SurfaceWarning } from '../utils/surfaceDeclarations';
@@ -115,6 +116,11 @@ const SurfaceDetailPage: React.FC = () => {
   const declarationsState = useSurfaceDeclarations(surface?.surface_id, declarationsRevision);
   const shownWarnings =
     declarationsState.status === 'ready' ? declarationsState.warnings : saveWarnings;
+  const callerAuthentication = surface?.access_point.caller_authentication;
+  const offersDiscovery =
+    declaresOn(surface?.access_point.protocol) &&
+    (callerAuthentication?.methods?.[0] as { type?: string } | undefined)?.type === 'jwt_bearer' &&
+    !callerAuthentication?.protected_resource;
   const savedHasVariants = (surface?.variants ?? []).some(v => v.enabled !== false);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -1633,7 +1639,7 @@ const SurfaceDetailPage: React.FC = () => {
                 {error}
               </div>
             )}
-            <SurfaceWarningsAlert warnings={shownWarnings} />
+            <SurfaceWarningsAlert warnings={shownWarnings} offersDiscovery={offersDiscovery} />
           </>
         }
         meta={{

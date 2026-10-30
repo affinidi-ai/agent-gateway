@@ -1,7 +1,7 @@
 Feature: MCP authorization server discovery
   An MCP surface whose source authentication takes JWT Bearer tokens can publish
   protected resource metadata (RFC 9728) that names the authorization server
-  issuing them, so an MCP client finds where to get a token without manual
+  of its JWT verification strategy, or the one it lists, so an MCP client finds where to get a token without manual
   configuration. The metadata lists the scopes the surface requires and then
   the scopes it advertises. A caller without a valid token is answered with a
   challenge that points at that metadata, and names the scopes the surface
@@ -22,6 +22,24 @@ Feature: MCP authorization server discovery
     And the protected resource metadata names the surface as the resource
     And the protected resource metadata names authorization server "https://idp.example/realms/agents"
     And the protected resource metadata lists scope "tools"
+
+  Scenario: An MCP surface that publishes the authorization server of its source authentication names its strategy's issuer and its required scopes
+    Given the surface publishes the authorization server of its source authentication
+    And the surface requires scopes "tools.call"
+    When the caller fetches the protected resource metadata of the surface
+    Then the response status is 200
+    And the protected resource metadata names the surface Access Point URL as its resource
+    And the protected resource metadata lists the authorization server of the surface
+    And the protected resource metadata lists scopes "tools.call"
+
+  Scenario: A caller without a token is challenged before a gateway policy that denies every request
+    Given the surface publishes the authorization server of its source authentication
+    And the surface requires scopes "tools.call"
+    And the gateway has a gateway-level policy that denies every request
+    When the caller asks the MCP surface for available tools without a token
+    Then the response status is 401
+    And the response challenges the caller to authorize for scopes "tools.call"
+    And MCP server "bravo" was not called
 
   Scenario: The protected resource metadata lists the required scopes before the advertised ones
     Given the surface publishes protected resource metadata naming authorization server "https://idp.example/realms/agents" and scope "tools"

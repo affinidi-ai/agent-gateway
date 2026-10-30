@@ -16,7 +16,7 @@ describe('parseSurfaceDeclarations', () => {
         null,
       ],
       declarations: [
-        { variant: null, outcome: 'strip', reason: 'not_pinned', resource: null },
+        { variant: null, outcome: 'strip', reason: 'not_declared', resource: null },
         { variant: 'v2', outcome: 'declare', resource: 'https://gw.example/a$v2' },
         { variant: null, outcome: 'maybe' },
       ],
@@ -25,7 +25,7 @@ describe('parseSurfaceDeclarations', () => {
       { code: 'fail_open_policy', message: 'admits', path: 'access_point', variant: null },
     ]);
     expect(parsed.declarations).toEqual([
-      { variant: null, outcome: 'strip', reason: 'not_pinned', resource: null },
+      { variant: null, outcome: 'strip', reason: 'not_declared', resource: null },
       { variant: 'v2', outcome: 'declare', reason: null, resource: 'https://gw.example/a$v2' },
     ]);
   });
@@ -45,6 +45,7 @@ describe('parseSurfaceDeclarations', () => {
 
 describe('describeDeclaration', () => {
   const base = { variant: null, resource: null };
+  const CARD_KEEPS = 'The agent card keeps the managed agent’s own security.';
 
   it('labels each outcome and explains a strip reason', () => {
     expect(describeDeclaration({ ...base, outcome: 'declare', reason: null }).label).toBe(
@@ -53,51 +54,85 @@ describe('describeDeclaration', () => {
     expect(describeDeclaration({ ...base, outcome: 'pass_through', reason: null }).label).toBe(
       'Upstream card unchanged'
     );
-    const strip = describeDeclaration({ ...base, outcome: 'strip', reason: 'audience_missing' });
-    expect(strip.label).toBe('Security removed from card');
-    expect(strip.detail).toBe('The Access Point URL is not in Accepted Audiences.');
+    const strip = describeDeclaration({ ...base, outcome: 'strip', reason: 'not_declared' });
+    expect(strip.label).toBe('Not declared');
+    expect(strip.detail).toBe(
+      `Authorization server discovery is off for this route. ${CARD_KEEPS}`
+    );
   });
 
-  it('uses the Access Point URL and Accepted Audiences terms of the Caller Context editor', () => {
-    expect(STRIP_REASON_TEXT.no_access_point_url).toBe(
-      'The gateway reports no https URL for this Access Point.'
-    );
-    expect(STRIP_REASON_TEXT.static_jwks).toMatch(/no authorization server to declare/);
-    for (const text of Object.values(STRIP_REASON_TEXT)) {
-      expect(text).not.toMatch(/entry point URL/i);
-      expect(text).not.toMatch(/accepted audiences/);
+  it('labels a strip Not declared on every protocol', () => {
+    for (const protocol of ['mcp', 'a2a', 'ap2', undefined] as const) {
+      expect(
+        describeDeclaration({ ...base, outcome: 'strip', reason: 'not_declared' }, protocol).label
+      ).toBe('Not declared');
     }
   });
 
-  it('explains a caller token that would be forwarded to the managed agent', () => {
-    const strip = describeDeclaration({
-      ...base,
-      outcome: 'strip',
-      reason: 'forwards_caller_token',
-    });
-    expect(strip.detail).toBe(STRIP_REASON_TEXT.forwards_caller_token);
-    expect(strip.detail).toMatch(/Forward token header to managed agent is on/);
-    expect(strip.detail).toMatch(/No authorization server is declared/);
+  it('keeps only the strip reasons the gateway still produces', () => {
+    expect(Object.keys(STRIP_REASON_TEXT).sort()).toEqual([
+      'fabric_target',
+      'not_declared',
+      'transit_point',
+    ]);
+    expect(STRIP_REASON_TEXT.not_declared).toBe(
+      'Authorization server discovery is off for this route.'
+    );
   });
 
-  it('explains a variant of an Access Point on the root route', () => {
+  it('explains a Fabric Target and a Transit Point', () => {
     expect(
-      describeDeclaration({ ...base, outcome: 'strip', reason: 'root_variant' }).detail
-    ).toMatch(/root route/);
+      describeDeclaration({ ...base, outcome: 'strip', reason: 'fabric_target' }, 'mcp').detail
+    ).toBe('The Target is a Fabric peer and this surface has no caller authentication.');
+    expect(
+      describeDeclaration({ ...base, outcome: 'strip', reason: 'transit_point' }, 'a2a').detail
+    ).toBe(`Transit Point cards never declare authentication. ${CARD_KEEPS}`);
+  });
+
+  it('has a text for each of the nine unservable reasons and no other', () => {
+    expect(Object.keys(UNSERVABLE_REASON_TEXT).sort()).toEqual([
+      'incompatible_caller_authentication',
+      'invalid_protected_resource',
+      'issuer_not_advertisable',
+      'network_unavailable',
+      'resource_mismatch',
+      'root_variant_resource',
+      'strategy_store_unavailable',
+      'strategy_unavailable',
+      'unsupported_protocol',
+    ]);
   });
 
   it.each([
-    ['not_mcp', 'Remove protected_resource.'],
+    ['unsupported_protocol', 'Remove protected_resource.'],
     ['root_variant_resource', 'Give the surface a route.'],
-    ['resource_mismatch', 'Set it to the URL shown.'],
-    ['invalid_protected_resource', 'Check the authorization servers, scopes and resource.'],
-    ['incompatible_caller_authentication', 'Fix the method or remove protected_resource.'],
+    ['resource_mismatch', 'Set the resource to a URL the listener serves.'],
+    [
+      'invalid_protected_resource',
+      'Check the resource URL and any stored authorization server or scopes.',
+    ],
+    [
+      'incompatible_caller_authentication',
+      'Fix the method or turn authorization server discovery off.',
+    ],
+    ['strategy_unavailable', 'Callers are refused until it is fixed.'],
+    ['issuer_not_advertisable', 'Callers are refused until it is fixed.'],
     ['strategy_store_unavailable', 'Callers get 503 until it can; check the gateway log.'],
+    ['network_unavailable', 'Callers are refused until it can; check the gateway log.'],
   ])('says what to do when the declaration cannot be served because of %s', (reason, action) => {
     const d = describeDeclaration({ ...base, outcome: 'unservable', reason }, 'mcp');
     expect(d.label).toBe('Cannot be served');
     expect(d.detail).toBe(UNSERVABLE_REASON_TEXT[reason]);
     expect(d.detail.endsWith(action)).toBe(true);
+  });
+
+  it('names the unsupported protocol and the non-https issuer in their own words', () => {
+    expect(UNSERVABLE_REASON_TEXT.unsupported_protocol).toBe(
+      'Authorization server discovery is set but this Access Point’s protocol cannot publish it. Remove protected_resource.'
+    );
+    expect(UNSERVABLE_REASON_TEXT.issuer_not_advertisable).toBe(
+      'The JWT verification strategy’s issuer is not a URL protected resource metadata can name, so no authorization server can be published. Callers are refused until it is fixed.'
+    );
   });
 
   it('keeps the general unservable text for an unknown or missing reason', () => {
@@ -109,17 +144,20 @@ describe('describeDeclaration', () => {
     expect(describeDeclaration({ ...base, outcome: 'unservable', reason: 'new_code' }).detail).toBe(
       general
     );
-    expect(
-      describeDeclaration({ ...base, outcome: 'unservable', reason: 'audience_missing' }).detail
-    ).toBe(general);
+    expect(describeDeclaration({ ...base, outcome: 'unservable', reason: 'not_mcp' }).detail).toBe(
+      general
+    );
   });
 
   it('falls back for a reason it does not know or a missing reason', () => {
     expect(describeDeclaration({ ...base, outcome: 'strip', reason: 'new_code' }).detail).toBe(
-      'The card declares no security scheme.'
+      CARD_KEEPS
     );
     expect(describeDeclaration({ ...base, outcome: 'strip', reason: null }).detail).toBe(
-      'The card declares no security scheme.'
+      CARD_KEEPS
+    );
+    expect(describeDeclaration({ ...base, outcome: 'strip', reason: 'not_pinned' }).detail).toBe(
+      CARD_KEEPS
     );
   });
 
@@ -127,14 +165,20 @@ describe('describeDeclaration', () => {
     for (const protocol of ['a2a', 'ap2'] as const) {
       expect(describeDeclaration({ ...base, outcome: 'declare', reason: null }, protocol)).toEqual({
         label: 'Declares OAuth',
-        detail: 'The agent card advertises this gateway’s authorization server and scopes.',
+        detail:
+          'The agent card and the protected resource metadata name the authorization server of the selected strategy and the required scopes, and callers without a valid token are challenged.',
       });
+      expect(
+        describeDeclaration({ ...base, outcome: 'strip', reason: 'fabric_target' }, protocol).detail
+      ).toMatch(/The agent card keeps the managed agent’s own security\.$/);
     }
   });
 
   it('speaks of protected resource metadata for MCP', () => {
     const declare = describeDeclaration({ ...base, outcome: 'declare', reason: null }, 'mcp');
-    expect(declare.detail).toMatch(/protected resource metadata/);
+    expect(declare.detail).toBe(
+      'The protected resource metadata names the authorization server of the selected strategy and the required scopes, and callers without a valid token are challenged.'
+    );
     expect(declare.detail).not.toMatch(/agent card/);
     expect(
       describeDeclaration({ ...base, outcome: 'pass_through', reason: null }, 'mcp').label
@@ -143,8 +187,8 @@ describe('describeDeclaration', () => {
     expect(strip.label).toBe('Not declared');
     expect(strip.detail).toBe('No protected resource metadata is published.');
     expect(
-      describeDeclaration({ ...base, outcome: 'strip', reason: 'not_pinned' }, 'mcp').detail
-    ).toBe(STRIP_REASON_TEXT.not_pinned);
+      describeDeclaration({ ...base, outcome: 'strip', reason: 'not_declared' }, 'mcp').detail
+    ).toBe(STRIP_REASON_TEXT.not_declared);
   });
 });
 

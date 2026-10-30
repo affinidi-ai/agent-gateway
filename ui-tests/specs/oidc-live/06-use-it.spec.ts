@@ -112,6 +112,7 @@ test.describe('Use the surface', () => {
         await openSurface(page, surfaceId);
         await openCallerAuth(page);
         await expect(page.getByTestId('caller-auth-outcome-chip').first()).toContainText('Declares OAuth');
+        await expect(page.getByTestId('caller-auth-discovery-switch')).toBeChecked();
         await expect(page.getByTestId('caller-auth-discovery-derived-authorization-server')).toHaveText(env.hydraA.issuer);
         await expect(page.getByTestId('surface-warnings-alert')).toHaveCount(0);
     });

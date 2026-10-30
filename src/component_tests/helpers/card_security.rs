@@ -53,7 +53,16 @@ pub fn write_strategy(
     issuer: &str,
     pinned: bool,
 ) {
-    let jwks_uri = format!("{issuer}/.well-known/jwks.json");
+    write_strategy_with_keys(temp_dir, issuer, &format!("{issuer}/.well-known/jwks.json"), pinned);
+}
+
+/// [`write_strategy`] with the keys served at `jwks_uri`.
+pub fn write_strategy_with_keys(
+    temp_dir: &Path,
+    issuer: &str,
+    jwks_uri: &str,
+    pinned: bool,
+) {
     let mut strategy = json!({
         "id": STRATEGY_ID,
         "name": "Card security",
@@ -76,17 +85,20 @@ pub fn write_strategy(
 }
 
 /// Caller authentication with one `jwt_bearer` method requiring [`REQUIRED_SCOPE`]. It
-/// declares for a route when its strategy is pinned and `audiences` lists the route's
-/// Access Point URL.
-pub fn jwt_bearer_caller_authentication(audiences: &[&str]) -> Value {
-    json!({
+/// declares for a route when `resource` is `Some`: that is the route's Access Point URL.
+pub fn jwt_bearer_caller_authentication(resource: Option<&str>) -> Value {
+    let mut config = json!({
         "methods": [{
             "type": "jwt_bearer",
             "jwt_verification_strategy_id": STRATEGY_ID,
-            "audiences": audiences,
+            "audiences": [],
             "required_scopes": [REQUIRED_SCOPE],
         }]
-    })
+    });
+    if let Some(resource) = resource {
+        config["protected_resource"] = json!({ "resource": resource });
+    }
+    config
 }
 
 fn upstream_security() -> Value {
