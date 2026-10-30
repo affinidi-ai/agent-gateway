@@ -2205,6 +2205,21 @@ mod tests {
             assert_eq!(results.len(), 1);
             assert_eq!(result_tag(&results[0].result), "Unavailable", "{provider_type:?}");
             assert_eq!(results[0].action.outcome, outcome, "{provider_type:?}");
+            // The audit detail is the typed service-token error, never the issuer's response.
+            if provider_type != CredentialProviderType::ApiKey {
+                assert_eq!(
+                    results[0]
+                        .action
+                        .detail
+                        .as_deref(),
+                    Some(
+                        ServiceTokenError::TokenRequestFailed
+                            .to_string()
+                            .as_str()
+                    ),
+                    "{provider_type:?}"
+                );
+            }
         }
     }
 

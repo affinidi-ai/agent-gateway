@@ -1130,6 +1130,7 @@ mod tests {
                 ("SIGNING_KEY", key.private_pem.as_str()),
                 ("CERTIFICATE", certificate.as_str()),
                 ("CLIENT_ID", "client-123"),
+                ("CLIENT_SECRET", "client-secret"),
             ] {
                 secrets
                     .create(crate::secrets::CreateSecretRequest {
@@ -1251,6 +1252,48 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(form["resource"], "https://api.example/");
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_client_credentials_grant_posts_the_resource_only_when_the_provider_sets_one() {
+            let fixture = fixture().await;
+            let scopes = vec!["read".to_string()];
+            for (resource, expected_keys) in [
+                (Some("https://api.example/"), vec!["client_id", "client_secret", "grant_type", "resource", "scope"]),
+                (None, vec!["client_id", "client_secret", "grant_type", "scope"]),
+            ] {
+                let mut endpoint = token_endpoint(200, issued()).await;
+                let mut settings = json!({
+                    "provider_type": "oauth2_client_credentials",
+                    "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET"
+                });
+                if let Some(resource) = resource {
+                    settings["resource"] = json!(resource);
+                }
+                fetch_scoped_client_credentials_token(&provider(settings), &scopes, &fixture.secrets, &endpoint.client)
+                    .await
+                    .unwrap();
+                let form = endpoint
+                    .requests
+                    .recv()
+                    .await
+                    .unwrap();
+                let mut keys: Vec<_> = form
+                    .keys()
+                    .map(String::as_str)
+                    .collect();
+                keys.sort_unstable();
+                assert_eq!(keys, expected_keys, "resource {resource:?}");
+                assert_eq!(form["grant_type"], "client_credentials");
+                assert_eq!(form["client_id"], "client-123");
+                assert_eq!(form["client_secret"], "client-secret");
+                assert_eq!(form["scope"], "read");
+                assert_eq!(
+                    form.get("resource")
+                        .map(String::as_str),
+                    resource
+                );
+            }
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
