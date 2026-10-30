@@ -466,6 +466,7 @@ pub async fn resolve_delegation_credentials(
                     .await
                     .and_then(|mut token| match token.issued.take() {
                         Some(IssuedToken { id, cached }) => Ok((id, cached, token)),
+                        // Unreachable: acquire issues a vault token for each of these OAuth types.
                         None => Err(ServiceTokenError::Unsupported),
                     });
                 match acquired {

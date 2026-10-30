@@ -66,8 +66,6 @@ pub enum ServiceTokenError {
     SecretUnavailable,
     #[error("credential provider token request failed")]
     TokenRequestFailed,
-    #[error("credential provider token response has no expiry")]
-    MissingExpiry,
     #[error("credential provider issued other scopes than requested")]
     ScopeMismatch,
     #[error("credential provider changed during the token request")]
@@ -165,7 +163,11 @@ pub async fn acquire(
     let expires_at = response
         .expires_in
         .and_then(|seconds| created.checked_add_signed(chrono::Duration::seconds(seconds)))
-        .ok_or(ServiceTokenError::MissingExpiry)?;
+        .ok_or_else(|| {
+            // The token request already refuses a response without a bounded expires_in.
+            warn!(target: "credential_delegation", provider_id = %provider.provider_id, "Service token expiry out of range");
+            ServiceTokenError::TokenRequestFailed
+        })?;
     let token = context
         .vault
         .store(DelegationToken {

@@ -688,7 +688,6 @@ impl ModernDelegationContext<'_> {
             .map_err(|error| match error {
                 ServiceTokenError::ScopeMismatch => ContinuationError::Denied,
                 ServiceTokenError::ProviderChanged => ContinuationError::BindingMismatch,
-                ServiceTokenError::MissingExpiry => ContinuationError::InvalidRecord,
                 ServiceTokenError::Unsupported
                 | ServiceTokenError::SecretUnavailable
                 | ServiceTokenError::TokenRequestFailed
