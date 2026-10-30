@@ -1117,10 +1117,17 @@ async fn validate_transit_token(
         return Err(OutboundPipelineError::TransitTokenInvalid("missing X-Transit-Token header".to_string()));
     };
 
-    // Validate the token and check it was issued for this surface and opens this transit point.
+    // Validate the token and check it was issued for this surface, lives no longer than the
+    // surface now allows, and opens this transit point.
     let transit_point_name = &ctx.virtual_channel.alias;
     let claims = issuer
-        .validate_for_transit_point(token, &ctx.surface.surface_id, transit_point_name)
+        .validate_for_transit_point(
+            token,
+            &ctx.surface.surface_id,
+            transit_point_name,
+            ctx.surface
+                .transit_token_lifetime_secs(),
+        )
         .map_err(|e| OutboundPipelineError::TransitTokenInvalid(e.to_string()))?;
 
     if modern {
@@ -6649,13 +6656,7 @@ mod tests {
         for invalid in ["missing", "surface", "point", "expired", "duplicate", "missing-issuer"] {
             let mut request = subscription_request();
             let token = transit_issuer
-                .clone()
-                .with_ttl(if invalid == "expired" {
-                    0
-                } else {
-                    300
-                })
-                .issue(
+                .issue_with_caller_context(
                     if invalid == "surface" {
                         "different-surface"
                     } else {
@@ -6671,8 +6672,22 @@ mod tests {
                     } else {
                         "partner-a".into()
                     }],
+                    serde_json::Map::new(),
+                    300,
                 )
                 .unwrap();
+            let token = if invalid == "expired" {
+                let mut claims = transit_issuer
+                    .validate(&token, 300)
+                    .unwrap();
+                claims.iat -= 600;
+                claims.exp -= 600;
+                transit_issuer
+                    .sign(&claims)
+                    .unwrap()
+            } else {
+                token
+            };
             if invalid != "missing" {
                 request
                     .headers_mut()
@@ -6789,14 +6804,32 @@ mod tests {
                 assert_eq!(metadata["scopes_supported"], json!(["read"]));
             }
             let token = transit_issuer
-                .clone()
-                .with_ttl(if termination == "transit-expiry" {
-                    3
-                } else {
-                    300
-                })
-                .issue(&surface.surface_id, None, None, None, None, None, vec!["partner-a".into()])
+                .issue_with_caller_context(
+                    &surface.surface_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    vec!["partner-a".into()],
+                    serde_json::Map::new(),
+                    300,
+                )
                 .unwrap();
+            // The shortest lifetime the issuer allows is 30 seconds, so back-date a
+            // token to leave it three seconds.
+            let token = if termination == "transit-expiry" {
+                let mut claims = transit_issuer
+                    .validate(&token, 300)
+                    .unwrap();
+                claims.iat -= 297;
+                claims.exp -= 297;
+                transit_issuer
+                    .sign(&claims)
+                    .unwrap()
+            } else {
+                token
+            };
             let mut authenticated_request = subscription_request();
             authenticated_request
                 .headers_mut()
@@ -11073,6 +11106,66 @@ mod tests {
                 );
             } else {
                 assert!(matches!(result, Err(OutboundPipelineError::TransitTokenInvalid(_))), "{case}: {result:?}");
+            }
+        }
+    }
+
+    /// A Transit Point checks a transit token against the lifetime its surface
+    /// sets when the token is presented.
+    #[tokio::test]
+    async fn the_transit_token_step_checks_the_lifetime_the_surface_sets() {
+        use crate::proxy::transit_token::{TransitTokenClaims, TransitTokenIssuer, TransitTokenKey};
+
+        let issuer = TransitTokenIssuer::new(TransitTokenKey::generate().unwrap(), "gateway".into());
+        let mut state = test_outbound_state();
+        state.transit_token_issuer = Some(Arc::new(issuer.clone()));
+        let now = crate::proxy::credential_delegation::modern::now_secs().unwrap();
+        for (case, lifetime, iat, exp, accepted) in [
+            ("issued 400 s ago to live 600 s", Some(600), now - 400, now + 200, true),
+            ("the same token once the surface allows 300 s", Some(300), now - 400, now + 200, false),
+            ("the same token on a surface that sets no lifetime", None, now - 400, now + 200, false),
+            ("living 1 s longer than the surface allows", Some(600), now, now + 601, false),
+        ] {
+            let mut ctx = test_pipeline_context();
+            let surface = Arc::make_mut(&mut ctx.surface);
+            surface.surface_id = "surf-001".into();
+            surface
+                .transit
+                .as_mut()
+                .unwrap()
+                .shared
+                .transit_token_lifetime_secs = lifetime;
+            let claims: TransitTokenClaims = serde_json::from_value(json!({
+                "iss": "gateway", "surface_id": "surf-001", "iat": iat, "exp": exp,
+                "jti": uuid::Uuid::new_v4().to_string(), "allowed_transit_points": ["partner-a"]
+            }))
+            .unwrap();
+            ctx.original_headers.insert(
+                "x-transit-token",
+                issuer
+                    .sign(&claims)
+                    .unwrap()
+                    .parse()
+                    .unwrap(),
+            );
+
+            let result = step_validate_transit_token(&state, &mut ctx).await;
+
+            if accepted {
+                result.unwrap();
+                assert_eq!(
+                    ctx.transit_token_claims
+                        .as_ref()
+                        .map(|claims| (claims.iat, claims.exp)),
+                    Some((iat, exp)),
+                    "{case}"
+                );
+            } else {
+                assert!(
+                    matches!(&result, Err(OutboundPipelineError::TransitTokenInvalid(reason))
+                        if reason == "transit token lives longer than its surface allows"),
+                    "{case}: {result:?}"
+                );
             }
         }
     }

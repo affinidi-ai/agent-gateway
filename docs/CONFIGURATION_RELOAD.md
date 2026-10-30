@@ -166,6 +166,22 @@ A request admitted before the delete has already read the surface, so it can sti
 Transit Point's target, with its credentials, until it completes or times out. A `tools/call` to
 a Transit Point configured with MCP tool gating whose gating was evicted meanwhile is refused.
 
+## Transit token lifetime on reload
+
+A reload keeps the `transit_token_max_lifetime_secs` the gateway started with. A change to it
+in `gateway.json` takes a restart, and a reload never fails on it, even when the file holds a
+value startup would refuse by then, such as `0`, `901` or `"600"`. While the file holds a value
+other than the one in force, every load of `gateway.json`, a reload's included, logs a `WARN`
+naming both values, saying a restart is needed, and, for a value startup would refuse, saying
+so.
+
+On every full or single-surface reload, a stored `transit.transit_token_lifetime_secs` below 30
+seconds gets tokens living 30 seconds, and one above that longest lifetime gets tokens living
+the longest, with one `WARN` per surface naming the surface and both values, so the surface
+keeps serving. At
+startup the same `WARN` is logged for every stored surface, disabled ones included, and the
+gateway starts. See [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token-lifetime).
+
 ## Dashboard events
 
 Neither full nor single-surface reload broadcasts `WsUpdate::RefreshDashboard`. Dashboard state

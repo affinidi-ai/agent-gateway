@@ -435,6 +435,13 @@ impl SurfaceTaskManager {
             .bootstrap_config
             .load_network_config()
             .map_err(|e| anyhow::anyhow!("Failed to load network configuration: {}", e))?;
+        for surface in &new_config.surfaces {
+            if let Some(adjustment) =
+                surface.transit_token_lifetime_adjustment(network_config.transit_token_max_lifetime_secs)
+            {
+                warn!("{adjustment}");
+            }
+        }
 
         let configured_ports = network_config.get_ports();
         info!("Using ports from network config: {:?}", configured_ports);
@@ -1026,6 +1033,11 @@ impl SurfaceTaskManager {
                 .bootstrap_config
                 .load_network_config()
                 .map_err(|e| anyhow::anyhow!("Failed to load network configuration: {}", e))?;
+            if let Some(adjustment) =
+                new_surface.transit_token_lifetime_adjustment(network_config.transit_token_max_lifetime_secs)
+            {
+                warn!("{adjustment}");
+            }
 
             // Get the port for this channel
             port = network_config

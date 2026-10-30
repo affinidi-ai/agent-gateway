@@ -259,18 +259,19 @@ request it forwards to the managed agent, and the agent sends it back on its Tra
 calls ([`transit_token.rs`](../src/proxy/transit_token.rs)). The token is an HS256 JWT:
 signed, not encrypted, so the agent can read every claim. It names the surface, the
 caller, a hash of the caller's authenticated identity, the Transit Points it opens and the
-trace, and expires 300 seconds after it is issued. The agent may send the same token on
-any number of calls to that surface's Transit Points until then. The header is never
-forwarded to a Transit Point's target.
+trace, and expires its surface's [transit token lifetime](#transit-token-lifetime) after
+it is issued, 300 seconds unless the surface sets another. The agent may send the same
+token on any number of calls to that surface's Transit Points until then. The header is
+never forwarded to a Transit Point's target.
 
 A Transit Point refuses the call with `401` unless the token:
 
 - is signed with this gateway's key and names it in `kid`, with the gateway's domain as
   `iss`;
 - was issued for this Transit Point's surface, and lists this Transit Point or lists none;
-- has not expired, is not issued in the future, lives no longer than the 300 seconds the
-  gateway issues, and has a token ID. Expiry and issue time allow 5 seconds of clock
-  difference.
+- has not expired, is not issued in the future, lives no longer than its surface's transit
+  token lifetime when it is presented, and has a token ID. Expiry and issue time allow 5
+  seconds of clock difference.
 
 A `2026-07-28` MCP request must also carry exactly one token, and allows no clock difference.
 The refusal says only that the transit token is missing or invalid; which check it failed is
@@ -291,6 +292,77 @@ Instances that share the storage directory share the key, so a Standby that take
 accepts the tokens the Active instance issued. A portable backup carries the key, so a
 gateway restored from it accepts the tokens the original issued. To replace the key, stop
 every instance, delete the file, and start them again; every token issued before is refused.
+
+#### Transit token lifetime
+
+A surface sets how long its transit tokens live in `transit.transit_token_lifetime_secs`,
+from 30 seconds to the appliance's longest lifetime (300 seconds unless `gateway.json` sets
+`transit_token_max_lifetime_secs`, up to 900). Unset means 300 seconds, or the longest
+lifetime when that is below 300. Set a longer one when a managed agent's turn, such as a long
+tool call, needs its Transit Points for longer than 300 seconds. For that whole time the
+managed agent, or anyone who obtains the token, can call the surface's Transit Points as that
+caller, with the credentials they inject, so keep it no longer than a turn needs.
+
+```json
+{ "transit": { "transit_token_lifetime_secs": 600, "points": [ … ] } }
+```
+
+The lifetime belongs to the surface: a variant takes its surface's, and cannot set its own.
+A surface whose Transit Points exist only in a variant needs a base `transit` block, with
+empty `points`, to carry the lifetime; without one its tokens live as an unset lifetime does.
+The admin API refuses a new lifetime below 30 seconds or above the longest lifetime with
+`400`, naming `transit_token_max_lifetime_secs`, and one in a variant's overrides with `422`.
+A save that keeps the value already stored is accepted even when that value is outside the
+bounds, so a dashboard save, or a `GET` followed by a `PUT`, of such a surface still works.
+
+A stored lifetime outside the bounds never stops the gateway. At startup, for every stored
+surface, disabled ones included, and on every reload, the Access Point issues tokens living 30
+seconds for one below 30, and tokens living the longest lifetime for one above it, with one
+`WARN` per surface naming the surface, the stored value and the lifetime its tokens get; the
+surface keeps its stored value. A value above the longest arrives when the longest is
+lowered, when surfaces are restored from a backup taken on an appliance with a higher one, or
+when they are saved through another instance with a higher one. A value below 30 arrives from
+a hand edit. The token issuer itself also refuses a lifetime outside 30 to 900 seconds.
+
+The longest lifetime is a setting of the appliance, `transit_token_max_lifetime_secs` in
+`gateway.json` (see [`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md)): 300 seconds
+unless set, from 30 to 900. It caps how long the tokens this gateway issues live, whatever a
+surface stores, so it is how an operator bounds the window in which a leaked token can be
+used; surface writers cannot exceed it. The gateway reads it once, when it starts: anything
+but a whole number from 30 to 900 stops it from starting, and a change takes a restart. A
+reload, including the one a surface save triggers, keeps the value the gateway started with,
+whatever `gateway.json` says by then, and logs a `WARN` while the file says otherwise. The
+shortest, 30 seconds, and the highest the setting may take, 900 seconds, are fixed.
+
+A Transit Point never reads the longest lifetime: it checks a token against its surface's
+own lifetime, held to 30 to 900 seconds. Instances that share surfaces therefore accept each
+other's tokens even when their longest lifetimes differ, and lowering the longest lifetime
+does not refuse the longer tokens already issued; they stay valid until their own expiry.
+Upgrade every instance that shares surface storage, a Standby included, to this release or
+later before setting any surface's lifetime or raising the longest lifetime above 300. An
+earlier release refuses any token living longer than 300 seconds, so a request it serves
+gets an intermittent `401`, and it does not know the lifetime, so the next time it saves the
+surface it drops the stored value, which sets the lifetime back to 300 seconds.
+
+A Transit Point checks a token against the lifetime its surface sets when the token is
+presented, so a change applies to tokens already issued:
+
+- shortening the lifetime refuses every token issued to live longer, only while the shorter
+  lifetime is in force, until the caller's next request through the Access Point brings the
+  managed agent a new one;
+- lengthening it keeps the tokens already issued, each until its own expiry, and accepts
+  again a longer token a shorter lifetime refused if it has not expired; only tokens issued
+  after the change live longer.
+
+Shortening the lifetime is therefore not revocation. To revoke the tokens already issued,
+rotate the transit token key as described above.
+
+The Surface Builder does not show the lifetime. A `PUT` that omits
+`transit.transit_token_lifetime_secs`, as a dashboard save does, keeps the stored value. A
+`PUT` with no `transit` at all, as a dashboard save of a surface whose base has no Transit
+Points sends, keeps a stored base block with empty `points` holding only its lifetime;
+a merge `PATCH` with `"transit_token_lifetime_secs": null` removes it, which sets it back
+to 300 seconds.
 
 ### Headers through a Transit Point
 

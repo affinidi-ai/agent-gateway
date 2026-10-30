@@ -10,7 +10,7 @@ use serde::Serialize;
 use tracing::{debug, error, info, warn};
 
 use crate::auth_manager::pat::{PatContext, PatDelegationContext, PatResourceScope};
-use crate::config::agent_surface::AgentSurface;
+use crate::config::agent_surface::{AgentSurface, SharedTransitConfig, TransitConfig};
 use crate::identity::state::IdentityApiState;
 use crate::surfaces::AgentSurfaceStore;
 use crate::tenancy::{
@@ -716,8 +716,22 @@ fn validate_source_auth(surface: &AgentSurface) -> Result<(), SurfaceApiError> {
 /// be non-empty, and be unique within the surface. Also assigns a fresh
 /// UUID `id` to any TP that was sent without one so older payloads keep
 /// working without forcing the dashboard to mint IDs client-side. A
-/// `transit.source_auth`, which the gateway does not enforce, is refused.
-fn validate_transit_points(surface: &mut AgentSurface) -> Result<(), SurfaceApiError> {
+/// `transit.source_auth`, which the gateway does not enforce, is refused, and
+/// so is a transit token lifetime outside its bounds, unless it is the stored
+/// one (`stored`): a save that keeps it, such as a dashboard round trip, is
+/// accepted, and the gateway holds it to the nearer bound.
+fn validate_transit_points(
+    surface: &mut AgentSurface,
+    max_lifetime_secs: u64,
+    stored: Option<&AgentSurface>,
+) -> Result<(), SurfaceApiError> {
+    let stored_lifetime_secs = stored
+        .and_then(|stored| stored.transit.as_ref())
+        .and_then(|transit| {
+            transit
+                .shared
+                .transit_token_lifetime_secs
+        });
     let surface_sets_source_auth = surface
         .transit
         .as_ref()
@@ -744,6 +758,16 @@ fn validate_transit_points(surface: &mut AgentSurface) -> Result<(), SurfaceApiE
     let Some(transit) = surface.transit.as_mut() else {
         return Ok(());
     };
+    let kept = transit
+        .shared
+        .transit_token_lifetime_secs
+        .is_some_and(|secs| Some(secs) == stored_lifetime_secs);
+    if !kept {
+        transit
+            .shared
+            .validate_transit_token_lifetime(max_lifetime_secs)
+            .map_err(SurfaceApiError::BadRequest)?;
+    }
     let mut seen = std::collections::HashSet::with_capacity(transit.points.len());
     for (idx, tp) in transit
         .points
@@ -1396,7 +1420,13 @@ pub async fn create_surface(
 
     // Validate transit point aliases (URL-safe, non-empty, unique) and
     // backfill missing UUIDs.
-    validate_transit_points(&mut surface)?;
+    validate_transit_points(
+        &mut surface,
+        state
+            .network_config
+            .transit_token_max_lifetime_secs,
+        None,
+    )?;
 
     super::surface_tenancy::validate_surface_references(
         &state,
@@ -1556,6 +1586,7 @@ pub async fn update_surface(
     }
     retain_mcp_settings(&mut surface, &existing, &state.network_config, &ProtectedResourceRemovals::of(&sent))?;
     retain_a2a_settings(&mut surface, &existing);
+    retain_transit_token_lifetime(&mut surface, &existing);
 
     let saved = validate_and_save_surface(
         &state,
@@ -1568,6 +1599,48 @@ pub async fn update_surface(
     )
     .await?;
     Ok(Json(saved))
+}
+
+/// PUT carries the whole record, so an omitted
+/// `transit.transit_token_lifetime_secs` means "unchanged", never "back to
+/// 300". The Surface Builder does not show the field, so a save from it omits
+/// it, and resetting it would silently widen a tightened lifetime or cut short
+/// a lengthened one. Removal is explicit, via PATCH with a `null`. A stored
+/// base `transit` block with no Transit Points, which carries the lifetime of
+/// a surface whose Transit Points exist only in a variant, is kept with only
+/// its lifetime when the PUT has no `transit`, as a dashboard save sends.
+fn retain_transit_token_lifetime(
+    surface: &mut AgentSurface,
+    existing: &AgentSurface,
+) {
+    let Some(stored) = &existing.transit else {
+        return;
+    };
+    let Some(stored_secs) = stored
+        .shared
+        .transit_token_lifetime_secs
+    else {
+        return;
+    };
+    match &mut surface.transit {
+        Some(incoming) => {
+            incoming
+                .shared
+                .transit_token_lifetime_secs
+                .get_or_insert(stored_secs);
+        }
+        None if stored.points.is_empty() => {
+            surface.transit = Some(TransitConfig {
+                points: Vec::new(),
+                outbound_listen_address: None,
+                shared: SharedTransitConfig {
+                    transit_token_lifetime_secs: Some(stored_secs),
+                    ..Default::default()
+                },
+            });
+        }
+        None => {}
+    }
 }
 
 /// PUT carries the whole record, so an omitted `access_point.a2a` on an A2A or
@@ -2084,7 +2157,13 @@ async fn validate_and_save_surface(
     }
 
     validate_variant_aliases(&surface)?;
-    validate_transit_points(&mut surface)?;
+    validate_transit_points(
+        &mut surface,
+        state
+            .network_config
+            .transit_token_max_lifetime_secs,
+        existing,
+    )?;
     super::surface_tenancy::validate_surface_references(state, &surface, context, scope).await?;
     validate_listen_path_collisions(&surface, store, &state.network_config).await?;
     validate_access_point_route_collisions(&surface, store, &state.network_config).await?;
@@ -3670,6 +3749,105 @@ mod validation_tests {
                 "{versions:?}"
             );
         }
+    }
+
+    fn surface_with_transit_lifetime(lifetime: Option<u64>) -> AgentSurface {
+        let mut s = base_surface();
+        s.transit = Some(crate::config::agent_surface::TransitConfig {
+            points: Vec::new(),
+            outbound_listen_address: None,
+            shared: Default::default(),
+        });
+        s.transit
+            .as_mut()
+            .expect("transit")
+            .shared
+            .transit_token_lifetime_secs = lifetime;
+        s
+    }
+
+    fn stored_lifetime(surface: &AgentSurface) -> Option<u64> {
+        surface
+            .transit
+            .as_ref()
+            .and_then(|transit| {
+                transit
+                    .shared
+                    .transit_token_lifetime_secs
+            })
+    }
+
+    /// A PUT that omits the lifetime keeps the stored one, tightened or
+    /// lengthened, and one that sets it wins.
+    #[test]
+    fn a_put_that_omits_the_transit_token_lifetime_keeps_the_stored_one() {
+        for stored in [30, 900] {
+            let existing = surface_with_transit_lifetime(Some(stored));
+            let mut omitted = surface_with_transit_lifetime(None);
+            retain_transit_token_lifetime(&mut omitted, &existing);
+            assert_eq!(stored_lifetime(&omitted), Some(stored));
+        }
+        let existing = surface_with_transit_lifetime(Some(900));
+        let mut changed = surface_with_transit_lifetime(Some(60));
+        retain_transit_token_lifetime(&mut changed, &existing);
+        assert_eq!(stored_lifetime(&changed), Some(60));
+        let mut fresh = surface_with_transit_lifetime(None);
+        retain_transit_token_lifetime(&mut fresh, &surface_with_transit_lifetime(None));
+        assert_eq!(stored_lifetime(&fresh), None);
+    }
+
+    /// A PUT without `transit` keeps the lifetime a stored base block with no
+    /// Transit Points carries, and removes a block that has Transit Points.
+    #[test]
+    fn a_put_without_transit_keeps_the_lifetime_of_a_base_block_with_no_transit_points() {
+        let existing = surface_with_transit_lifetime(Some(600));
+        let mut omitted = base_surface();
+        retain_transit_token_lifetime(&mut omitted, &existing);
+        assert_eq!(stored_lifetime(&omitted), Some(600));
+        assert!(
+            omitted
+                .transit
+                .as_ref()
+                .is_some_and(|transit| transit.points.is_empty())
+        );
+
+        let mut without_lifetime = base_surface();
+        retain_transit_token_lifetime(&mut without_lifetime, &surface_with_transit_lifetime(None));
+        assert!(
+            without_lifetime
+                .transit
+                .is_none()
+        );
+
+        let mut with_points = surface_with_transit_lifetime(Some(600));
+        with_points
+            .transit
+            .as_mut()
+            .expect("transit")
+            .points
+            .push(
+                serde_json::from_value(serde_json::json!({
+                    "name": "partner",
+                    "target_endpoint": "https://partner.example/a2a",
+                    "protocol": "a2a"
+                }))
+                .expect("transit point"),
+            );
+        let mut removed = base_surface();
+        retain_transit_token_lifetime(&mut removed, &with_points);
+        assert!(removed.transit.is_none());
+    }
+
+    /// A merge PATCH with a `null` is the way to reset the lifetime to its
+    /// default.
+    #[test]
+    fn a_merge_patch_that_nulls_the_transit_token_lifetime_resets_it() {
+        let existing = surface_with_transit_lifetime(Some(900));
+        let mut merged = serde_json::to_value(&existing).unwrap();
+        json_patch::merge(&mut merged, &serde_json::json!({ "transit": { "transit_token_lifetime_secs": null } }));
+        let surface: AgentSurface = serde_json::from_value(merged).unwrap();
+        assert_eq!(stored_lifetime(&surface), None);
+        assert_eq!(surface.transit_token_lifetime_secs(), 300);
     }
 
     fn with_url_variant(surface: AgentSurface) -> AgentSurface {
