@@ -722,7 +722,7 @@ fn validate_source_auth(surface: &AgentSurface) -> Result<(), SurfaceApiError> {
 /// accepted, and the gateway holds it to the nearer bound.
 fn validate_transit_points(
     surface: &mut AgentSurface,
-    min_lifetime_secs: u64,
+    max_lifetime_secs: u64,
     stored: Option<&AgentSurface>,
 ) -> Result<(), SurfaceApiError> {
     let stored_lifetime_secs = stored
@@ -765,7 +765,7 @@ fn validate_transit_points(
     if !kept {
         transit
             .shared
-            .validate_transit_token_lifetime(min_lifetime_secs)
+            .validate_transit_token_lifetime(max_lifetime_secs)
             .map_err(SurfaceApiError::BadRequest)?;
     }
     let mut seen = std::collections::HashSet::with_capacity(transit.points.len());
@@ -1424,7 +1424,7 @@ pub async fn create_surface(
         &mut surface,
         state
             .network_config
-            .transit_token_min_lifetime_secs,
+            .transit_token_max_lifetime_secs,
         None,
     )?;
 
@@ -2161,7 +2161,7 @@ async fn validate_and_save_surface(
         &mut surface,
         state
             .network_config
-            .transit_token_min_lifetime_secs,
+            .transit_token_max_lifetime_secs,
         existing,
     )?;
     super::surface_tenancy::validate_surface_references(state, &surface, context, scope).await?;
@@ -3847,7 +3847,7 @@ mod validation_tests {
         json_patch::merge(&mut merged, &serde_json::json!({ "transit": { "transit_token_lifetime_secs": null } }));
         let surface: AgentSurface = serde_json::from_value(merged).unwrap();
         assert_eq!(stored_lifetime(&surface), None);
-        assert_eq!(surface.transit_token_lifetime_secs(30), 300);
+        assert_eq!(surface.transit_token_lifetime_secs(), 300);
     }
 
     fn with_url_variant(surface: AgentSurface) -> AgentSurface {

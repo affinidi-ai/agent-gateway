@@ -968,7 +968,7 @@ fn build_bootstrap_config(
         config_dir: None,
         server_mode: crate::server::mode::ServerMode::default(),
         cache_refresh_interval_secs: 0,
-        pinned_transit_token_min_lifetime_secs: None,
+        pinned_transit_token_max_lifetime_secs: None,
     }
 }
 
@@ -1753,7 +1753,7 @@ impl Drop for GatewayHarness {
     }
 }
 
-/// Sets a top-level `gateway.json` key, such as `transit_token_min_lifetime_secs`.
+/// Sets a top-level `gateway.json` key, such as `transit_token_max_lifetime_secs`.
 pub fn configure_gateway_setting(
     bootstrap: &crate::config::BootstrapConfig,
     key: &str,

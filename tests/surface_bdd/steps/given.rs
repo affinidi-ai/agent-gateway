@@ -890,6 +890,16 @@ fn transit_point_requires_a_transit_token(
     transit_point_config_mut(world, &transit_point).require_transit_token = true;
 }
 
+#[given(expr = "the appliance lets transit tokens live up to {int} seconds")]
+fn appliance_lets_transit_tokens_live_up_to(
+    world: &mut SurfaceWorld,
+    max_secs: u64,
+) {
+    world
+        .surface_config
+        .transit_token_max_lifetime_secs = Some(max_secs);
+}
+
 #[given(expr = "the surface's transit tokens live {int} seconds")]
 fn surface_transit_tokens_live(
     world: &mut SurfaceWorld,

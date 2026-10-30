@@ -502,12 +502,12 @@ pub async fn run_axum_proxy(
     config: GatewayConfig,
     mut bootstrap_config: crate::config::BootstrapConfig,
 ) -> anyhow::Result<()> {
-    // The shortest transit token lifetime is read once, here: every later load
+    // The longest transit token lifetime is read once, here: every later load
     // of gateway.json, a reload's included, keeps this value.
-    let transit_token_min_lifetime_secs = bootstrap_config
-        .pin_transit_token_min_lifetime()
+    let transit_token_max_lifetime_secs = bootstrap_config
+        .pin_transit_token_max_lifetime()
         .context("Configuration validation failed")?;
-    for adjustment in config.transit_token_lifetime_adjustments(transit_token_min_lifetime_secs) {
+    for adjustment in config.transit_token_lifetime_adjustments(transit_token_max_lifetime_secs) {
         warn!("{adjustment}");
     }
     let config = Arc::new(config);

@@ -507,6 +507,19 @@ fn write_single_surface_config_inner(
     {
         add_inbound_public_origin(base_dir, PROTECTED_RESOURCE_PUBLIC_ORIGIN);
     }
+    if let Some(max_secs) = surface_config.transit_token_max_lifetime_secs {
+        set_transit_token_max_lifetime(base_dir, max_secs);
+    }
+}
+
+fn set_transit_token_max_lifetime(
+    base_dir: &Path,
+    max_secs: u64,
+) {
+    let path = base_dir.join("gateway.json");
+    let mut gateway: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    gateway["transit_token_max_lifetime_secs"] = serde_json::json!(max_secs);
+    std::fs::write(&path, serde_json::to_string_pretty(&gateway).unwrap()).unwrap();
 }
 
 /// Adds a public origin to the inbound listener, the origin a protected

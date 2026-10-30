@@ -74,14 +74,14 @@ async fn start_gateway_with_transit_token_lifetime(lifetime_secs: Option<u64>) -
 }
 
 /// Like [`start_gateway_with_transit_token_lifetime`], on an appliance whose
-/// `gateway.json` sets `transit_token_min_lifetime_secs` to `min_secs`.
+/// `gateway.json` sets `transit_token_max_lifetime_secs` to `max_secs`.
 async fn start_gateway_with_transit_token_limits(
     lifetime_secs: Option<u64>,
-    min_secs: Option<u64>,
+    max_secs: Option<u64>,
 ) -> GatewayHarness {
     GatewayHarness::start_with_outbound_mock(MockServer::start().await, |_, gw_config, bootstrap| {
-        if let Some(min_secs) = min_secs {
-            helpers::configure_gateway_setting(bootstrap, "transit_token_min_lifetime_secs", json!(min_secs));
+        if let Some(max_secs) = max_secs {
+            helpers::configure_gateway_setting(bootstrap, "transit_token_max_lifetime_secs", json!(max_secs));
         }
         write_target_secret(
             &bootstrap
@@ -439,7 +439,7 @@ fn reissued(
 /// allows, is refused before the target.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_transit_token_opens_its_transit_point_for_the_lifetime_its_surface_sets() {
-    let h = start_gateway_with_transit_token_lifetime(Some(600)).await;
+    let h = start_gateway_with_transit_token_limits(Some(600), Some(900)).await;
     let token = transit_token_from_access_point(&h, "/smoke").await;
     assert_eq!(lifetime_of(&token), 600);
     let now = unix_now();
@@ -476,25 +476,31 @@ async fn a_transit_token_opens_its_transit_point_for_the_lifetime_its_surface_se
     );
 }
 
-/// An appliance whose `gateway.json` lowers `transit_token_min_lifetime_secs` to
-/// 10 admits a surface lifetime of 10 seconds through the admin API and has its
-/// Access Point issue 10 second tokens that its Transit Point accepts, while 5 is
-/// refused naming the new minimum; one that sets nothing still refuses 10.
+/// The appliance's `transit_token_max_lifetime_secs` holds the tokens its
+/// Access Point issues: 300 seconds unless set, so a surface stored at 600
+/// gets 300 second tokens. The admin API refuses a new lifetime above it,
+/// naming it, and accepts one up to it.
 #[tokio::test(flavor = "multi_thread")]
-async fn the_appliance_sets_the_shortest_transit_token_lifetime_a_surface_may_have() {
-    let h = start_gateway_with_transit_token_limits(Some(10), Some(10)).await;
+async fn the_appliance_sets_the_longest_transit_token_lifetime_a_surface_may_have() {
+    let h = start_gateway_with_transit_token_limits(Some(600), None).await;
     let token = transit_token_from_access_point(&h, "/smoke").await;
-    assert_eq!(lifetime_of(&token), 10);
+    assert_eq!(lifetime_of(&token), 300);
     assert_eq!(call_transit_point(&h, "/smoke", &token).await, 200);
 
-    for (min_secs, secs, accepted) in [(Some(10), 10, true), (Some(10), 5, false), (None, 10, false), (None, 30, true)]
-    {
+    for (max_secs, secs, accepted) in [
+        (Some(900), 600, true),
+        (None, 600, false),
+        (None, 300, true),
+        (Some(120), 121, false),
+        (Some(120), 120, true),
+        (None, 29, false),
+    ] {
         let mut admin = None;
         let h = GatewayHarness::start_with_outbound(|_, _, bootstrap| {
             admin = Some(helpers::configure_admin_api(bootstrap));
             helpers::configure_gateway_route_prefixes(bootstrap, &[("lifetime", "lifetime", "/lifetime")]);
-            if let Some(min_secs) = min_secs {
-                helpers::configure_gateway_setting(bootstrap, "transit_token_min_lifetime_secs", json!(min_secs));
+            if let Some(max_secs) = max_secs {
+                helpers::configure_gateway_setting(bootstrap, "transit_token_max_lifetime_secs", json!(max_secs));
             }
         })
         .await;
@@ -523,33 +529,38 @@ async fn the_appliance_sets_the_shortest_transit_token_lifetime_a_surface_may_ha
             .await
             .unwrap();
         if accepted {
-            assert_eq!(response.status(), 201, "{min_secs:?} {secs}");
+            assert_eq!(response.status(), 201, "{max_secs:?} {secs}");
         } else {
-            assert_eq!(response.status(), 400, "{min_secs:?} {secs}");
+            assert_eq!(response.status(), 400, "{max_secs:?} {secs}");
+            let max_secs = max_secs.unwrap_or(300);
             assert!(
                 response
                     .text()
                     .await
                     .unwrap()
                     .contains(&format!(
-                        "transit.transit_token_lifetime_secs must be from {} to 900 seconds, not {secs}",
-                        min_secs.unwrap_or(30)
+                        "transit.transit_token_lifetime_secs must be from 30 to {max_secs} seconds, not {secs} \
+                         ({max_secs} is transit_token_max_lifetime_secs in gateway.json)"
                     )),
-                "{min_secs:?} {secs}"
+                "{max_secs} {secs}"
             );
         }
     }
 }
 
-/// A Transit Point holds a surface's tokens to the appliance's shortest
-/// lifetime as the Access Point does: with a shortest lifetime of 600, an unset
-/// surface's tokens live 600 seconds, and the Transit Point accepts them.
+/// A Transit Point checks a token against its surface's lifetime alone, never
+/// its own appliance's `transit_token_max_lifetime_secs`, so it accepts the
+/// tokens another instance with a higher one issued: with a ceiling of 120 and
+/// a surface at 600, its own tokens live 120 seconds, and a 600 second token
+/// passes while a 601 second one is refused.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_transit_point_accepts_tokens_held_to_a_raised_shortest_lifetime() {
-    let h = start_gateway_with_transit_token_limits(None, Some(600)).await;
+async fn a_transit_point_accepts_tokens_another_instance_issued_under_a_higher_ceiling() {
+    let h = start_gateway_with_transit_token_limits(Some(600), Some(120)).await;
     let token = transit_token_from_access_point(&h, "/smoke").await;
-    assert_eq!(lifetime_of(&token), 600);
-    assert_eq!(call_transit_point(&h, "/smoke", &token).await, 200);
+    assert_eq!(lifetime_of(&token), 120);
+    let now = unix_now();
+    assert_eq!(call_transit_point(&h, "/smoke", &reissued(&token, now, now + 600)).await, 200);
+    assert_eq!(call_transit_point(&h, "/smoke", &reissued(&token, now, now + 601)).await, 401);
 }
 
 /// The `/lifetime` surface, served on the harness's listeners, whose Transit
@@ -597,30 +608,31 @@ fn listener_urls(bootstrap: &crate::config::BootstrapConfig) -> (String, String)
     (port_of("inbound"), port_of("outbound"))
 }
 
-/// A surface stored with a lifetime below the appliance's shortest neither stops
-/// the gateway nor blocks its own saves: its tokens live the shortest lifetime,
-/// a save that keeps the stored value is accepted, and only a new value below
-/// the shortest is refused, with a message naming the setting.
+/// A surface stored with a lifetime below 30 seconds, from a hand edit,
+/// neither stops the gateway nor blocks its own saves: its tokens live 30
+/// seconds, a save that keeps the stored value is accepted, and only a new
+/// value below 30 is refused.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_surface_below_the_shortest_lifetime_is_held_to_it_and_still_saves() {
-    assert_a_stored_lifetime_is_held_and_still_saves(Some(120), 60, 120, 50).await;
+    assert_a_stored_lifetime_is_held_and_still_saves(None, 10, 30, 29).await;
 }
 
-/// A surface stored with a lifetime above 900 seconds, such as one a later
-/// release allowed, neither stops the gateway nor blocks its own saves: its
-/// tokens live 900 seconds, a save that keeps the stored value is accepted, and
-/// only a new value above 900 is refused.
+/// A surface stored with a lifetime above the appliance's
+/// `transit_token_max_lifetime_secs`, as after the ceiling is lowered, neither
+/// stops the gateway nor blocks its own saves: its tokens live the ceiling, a
+/// save that keeps the stored value is accepted, and only a new value above the
+/// ceiling is refused, with a message naming the setting.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_surface_above_the_longest_lifetime_is_held_to_it_and_still_saves() {
-    assert_a_stored_lifetime_is_held_and_still_saves(None, 1000, 900, 1200).await;
+    assert_a_stored_lifetime_is_held_and_still_saves(Some(120), 600, 120, 601).await;
 }
 
-/// Starts a gateway whose `transit_token_min_lifetime_secs` is `min_secs` with
+/// Starts a gateway whose `transit_token_max_lifetime_secs` is `max_secs` with
 /// the `/lifetime` surface stored at `stored_secs`, and checks the gateway
 /// starts, logs one `WARN` naming the surface, issues tokens living
 /// `issued_secs`, keeps the stored value on a save and refuses `refused_secs`.
 async fn assert_a_stored_lifetime_is_held_and_still_saves(
-    min_secs: Option<u64>,
+    max_secs: Option<u64>,
     stored_secs: u64,
     issued_secs: u64,
     refused_secs: u64,
@@ -631,8 +643,8 @@ async fn assert_a_stored_lifetime_is_held_and_still_saves(
     let h = GatewayHarness::start_with_outbound_mock(mock, |_, gw_config, bootstrap| {
         admin = Some(helpers::configure_admin_api(bootstrap));
         helpers::configure_gateway_route_prefixes(bootstrap, &[("lifetime", "lifetime", "/lifetime")]);
-        if let Some(min_secs) = min_secs {
-            helpers::configure_gateway_setting(bootstrap, "transit_token_min_lifetime_secs", json!(min_secs));
+        if let Some(max_secs) = max_secs {
+            helpers::configure_gateway_setting(bootstrap, "transit_token_max_lifetime_secs", json!(max_secs));
         }
         let (inbound, outbound) = listener_urls(bootstrap);
         let stored = lifetime_surface(&inbound, &outbound, &target, Some(stored_secs));
@@ -711,9 +723,9 @@ async fn assert_a_stored_lifetime_is_held_and_still_saves(
     let refusal = refused.text().await.unwrap();
     assert!(
         refusal.contains(&format!(
-            "transit.transit_token_lifetime_secs must be from {} to 900 seconds, not {refused_secs}",
-            min_secs.unwrap_or(30)
-        )) && refusal.contains("transit_token_min_lifetime_secs"),
+            "transit.transit_token_lifetime_secs must be from 30 to {} seconds, not {refused_secs}",
+            max_secs.unwrap_or(300)
+        )) && refusal.contains("transit_token_max_lifetime_secs"),
         "{refusal}"
     );
     assert_eq!(
@@ -745,7 +757,7 @@ async fn a_put_without_transit_keeps_the_lifetime_of_a_base_block_with_no_transi
             .as_deref()
             .unwrap(),
         &h.mock.url(),
-        Some(600),
+        Some(120),
     );
     let points = surface["transit"]["points"].take();
     surface["transit"]["points"] = json!([]);
@@ -790,15 +802,15 @@ async fn a_put_without_transit_keeps_the_lifetime_of_a_base_block_with_no_transi
         .json()
         .await
         .unwrap();
-    assert_eq!(kept["transit"]["transit_token_lifetime_secs"], 600, "{kept}");
+    assert_eq!(kept["transit"]["transit_token_lifetime_secs"], 120, "{kept}");
 }
 
-/// The shortest lifetime is the one the gateway started with: a save that
+/// The longest lifetime is the one the gateway started with: a save that
 /// reloads the surfaces after `gateway.json` changed, even to a value the
 /// gateway would refuse at startup, keeps it, so the admin API, the Access
 /// Point and the Transit Point agree, and nothing goes down.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_reload_keeps_the_shortest_transit_token_lifetime_the_gateway_started_with() {
+async fn a_reload_keeps_the_longest_transit_token_lifetime_the_gateway_started_with() {
     let mut admin = None;
     let mut gateway_json = None;
     let h = GatewayHarness::start_with_outbound(|_, _, bootstrap| {
@@ -810,7 +822,7 @@ async fn a_reload_keeps_the_shortest_transit_token_lifetime_the_gateway_started_
                 .clone(),
         );
         helpers::configure_gateway_route_prefixes(bootstrap, &[("lifetime", "lifetime", "/lifetime")]);
-        helpers::configure_gateway_setting(bootstrap, "transit_token_min_lifetime_secs", json!(10));
+        helpers::configure_gateway_setting(bootstrap, "transit_token_max_lifetime_secs", json!(900));
     })
     .await;
     let (admin, gateway_json) = (admin.unwrap(), gateway_json.unwrap());
@@ -832,31 +844,31 @@ async fn a_reload_keeps_the_shortest_transit_token_lifetime_the_gateway_started_
                     .unwrap(),
             ),
             &h.mock.url(),
-            Some(10),
+            Some(600),
         ))
         .send()
         .await
         .unwrap();
     assert_eq!(created.status(), 201);
 
-    for on_disk in [json!(30), json!(0)] {
-        helpers::set_gateway_json_setting(&gateway_json, "transit_token_min_lifetime_secs", on_disk.clone());
+    for on_disk in [json!(300), json!(0)] {
+        helpers::set_gateway_json_setting(&gateway_json, "transit_token_max_lifetime_secs", on_disk.clone());
         let saved = admin
             .patch(format!("{}/api/v1/surfaces/lifetime", h.gateway_base))
             .header("content-type", "application/merge-patch+json")
-            .body(json!({ "transit": { "transit_token_lifetime_secs": 10 } }).to_string())
+            .body(json!({ "transit": { "transit_token_lifetime_secs": 600 } }).to_string())
             .send()
             .await
             .unwrap();
-        assert_eq!(saved.status(), 200, "{on_disk}: the admin API keeps the shortest lifetime it started with");
+        assert_eq!(saved.status(), 200, "{on_disk}: the admin API keeps the longest lifetime it started with");
         let token = transit_token_from_access_point(&h, "/lifetime").await;
-        assert_eq!(lifetime_of(&token), 10, "{on_disk}: so does the Access Point");
+        assert_eq!(lifetime_of(&token), 600, "{on_disk}: so does the Access Point");
         assert_eq!(call_transit_point(&h, "/lifetime", &token).await, 200, "{on_disk}: and the Transit Point");
     }
 }
 
-/// The admin API refuses a transit token lifetime outside 30 to 900 seconds,
-/// and one set in a variant. Lengthening a surface's lifetime keeps the
+/// On an appliance whose ceiling is 900, the admin API refuses a transit token
+/// lifetime outside 30 to 900 seconds, and one set in a variant. Lengthening a surface's lifetime keeps the
 /// shorter tokens already issued; shortening it refuses the tokens issued for
 /// longer at once, while the Access Point issues tokens for the new lifetime.
 #[tokio::test(flavor = "multi_thread")]
@@ -865,6 +877,7 @@ async fn changing_a_surfaces_transit_token_lifetime_applies_to_the_tokens_alread
     let h = GatewayHarness::start_with_outbound(|_, _, bootstrap| {
         admin = Some(helpers::configure_admin_api(bootstrap));
         helpers::configure_gateway_route_prefixes(bootstrap, &[("lifetime", "lifetime", "/lifetime")]);
+        helpers::configure_gateway_setting(bootstrap, "transit_token_max_lifetime_secs", json!(900));
     })
     .await;
     let admin = admin.unwrap();

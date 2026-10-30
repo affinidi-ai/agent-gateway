@@ -437,7 +437,7 @@ impl SurfaceTaskManager {
             .map_err(|e| anyhow::anyhow!("Failed to load network configuration: {}", e))?;
         for surface in &new_config.surfaces {
             if let Some(adjustment) =
-                surface.transit_token_lifetime_adjustment(network_config.transit_token_min_lifetime_secs)
+                surface.transit_token_lifetime_adjustment(network_config.transit_token_max_lifetime_secs)
             {
                 warn!("{adjustment}");
             }
@@ -1034,7 +1034,7 @@ impl SurfaceTaskManager {
                 .load_network_config()
                 .map_err(|e| anyhow::anyhow!("Failed to load network configuration: {}", e))?;
             if let Some(adjustment) =
-                new_surface.transit_token_lifetime_adjustment(network_config.transit_token_min_lifetime_secs)
+                new_surface.transit_token_lifetime_adjustment(network_config.transit_token_max_lifetime_secs)
             {
                 warn!("{adjustment}");
             }
