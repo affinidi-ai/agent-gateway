@@ -8,6 +8,7 @@
 //! version is incompatible with the active backend.
 
 use crate::encryption::EncryptedData;
+use crate::observability::loggable;
 use anyhow::{Result, anyhow};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -26,8 +27,9 @@ pub fn active_envelope_version(key_source: crate::config::KeySourceConfig) -> u8
 }
 
 /// Scan `storage_root` for encrypted values whose envelope version is
-/// incompatible with `active_version`, and fail closed (with a clear, file-named
-/// error) if any are found.
+/// incompatible with `active_version`, and fail closed (with an error that names
+/// the directory of the first offending file) if any are found. The file name is
+/// left out because it can be a session token.
 ///
 /// Covers both field-level encryption (`ENC[...]` tokens inside readable JSON)
 /// and whole-file encryption (`.json.enc` files, which store an `ENC[...]` string
@@ -52,7 +54,7 @@ pub fn check_envelope_versions(
              key_source writes version-{} envelopes. The stored values were written under a \
              different key_source and cannot be decrypted now. Restore the original key_source \
              (or migrate the data) before starting. ({} file(s) affected.)",
-            path.display(),
+            loggable::record_path(path).display(),
             found_version,
             active_version,
             offenders.len()
@@ -184,7 +186,16 @@ mod tests {
         fs::write(root.join("legacy.json"), r#"{"secret":"ENC[1:YWJj:ZGVm]"}"#).unwrap();
         let err = check_envelope_versions(&root, 2).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("legacy.json"), "error must name the offending file: {msg}");
+        assert!(
+            msg.contains(
+                &root
+                    .join("<redacted>")
+                    .display()
+                    .to_string()
+            ),
+            "error must name the offending file's directory: {msg}"
+        );
+        assert!(!msg.contains("legacy.json"), "error must not name the offending file: {msg}");
         assert!(msg.contains("version-1"), "error must name the found version: {msg}");
         assert!(msg.contains("version-2"), "error must name the active version: {msg}");
         fs::remove_dir_all(&root).ok();
@@ -218,7 +229,7 @@ mod tests {
         let msg = check_envelope_versions(&root, 1)
             .unwrap_err()
             .to_string();
-        assert!(msg.contains("dev.json.enc"), "{msg}");
+        assert!(msg.contains(&root.display().to_string()), "{msg}");
         assert!(msg.contains("version-0"), "{msg}");
         assert!(check_envelope_versions(&root, 0).is_ok());
         fs::remove_dir_all(&root).ok();
@@ -232,7 +243,8 @@ mod tests {
         fs::write(root.join("record.json.enc"), "ENC[1:YWJj:ZGVm]").unwrap();
         let err = check_envelope_versions(&root, 2).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("record.json.enc"), "error must name the offending file: {msg}");
+        assert!(msg.contains(&root.display().to_string()), "error must name the offending file's directory: {msg}");
+        assert!(!msg.contains("record.json.enc"), "error must not name the offending file: {msg}");
         assert!(msg.contains("version-1"), "error must name the found version: {msg}");
         fs::remove_dir_all(&root).ok();
     }

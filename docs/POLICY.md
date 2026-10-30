@@ -612,7 +612,13 @@ stored. They do not record which policy a request ends up under:
 - A variant's transit overrides (shared or per transit point) are recorded as written, but the
   runtime compiles transit policies from the base surface only, so they are not enforced.
 
-What actually decided a request is in its `policy_decision` records.
+A surface change record names the slot it wrote in `surface_variant`: the variant's alias for a
+slot in a variant's overrides, or `_base_` for a slot on the base surface. A base change also
+applies to every variant that inherits that slot, so it can change what several variants enforce.
+Gateway and appliance targets have no variants and no `surface_variant`.
+
+What actually decided a request is in its `policy_decision` records, each naming the
+`surface_variant` that served the request.
 
 The policy write routes are listed once, in `PolicyWrite` (`src/audit/policy_refusals.rs`); the
 router registers each through it, so a route's own refusals and those made before it by

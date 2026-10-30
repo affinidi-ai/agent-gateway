@@ -706,7 +706,7 @@ mod tests {
             let (failures_left, syncs) = (failures_left.clone(), syncs.clone());
             Box::new(move |_| {
                 syncs.fetch_add(1, Ordering::SeqCst);
-                match failures_left.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1)) {
+                match failures_left.try_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1)) {
                     Ok(_) => Err(io::Error::other("EIO")),
                     Err(_) => Ok(()),
                 }

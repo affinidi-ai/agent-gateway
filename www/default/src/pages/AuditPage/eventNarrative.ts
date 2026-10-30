@@ -8,6 +8,7 @@ import {
   policyChange,
   policyChangeTitle,
   policyDecision,
+  requestRejected,
   scopeLabel,
   slotLabel,
   surfaceIdOf,
@@ -16,6 +17,7 @@ import {
   trustCheck,
 } from './auditHelpers';
 import type { AuditEntry, PolicyChangeActor, PolicyChangeData, PolicyChangeEvent } from './types';
+import { isBaseSurfaceVariant, surfaceVariantPhrase } from '../../utils/surfaceVariant';
 
 export type EventTone = 'allow' | 'deny' | 'warn' | 'neutral';
 
@@ -78,6 +80,7 @@ export function eventTone(entry: AuditEntry): EventTone {
   if (pd) return isAllowDecision(pd.decision) ? 'allow' : 'deny';
   const tc = trustCheck(entry);
   if (tc) return tc.ok ? 'allow' : 'deny';
+  if (requestRejected(entry)) return 'deny';
   const name = eventTypeName(entry);
   if (name === 'consent_required') return 'warn';
   if (DENY_EVENTS.has(name)) return 'deny';
@@ -129,7 +132,11 @@ function describePolicyChange(
     typeof change.policy_version === 'number' ? `${quoted} v${change.policy_version}` : quoted;
   const target = targetLabel(change);
   const slot = slotLabel(change);
-  const variant = change.variant ? ` (variant ${change.variant})` : '';
+  // A change to a base slot also applies to every variant that inherits the slot.
+  const variantPhrase = isBaseSurfaceVariant(change.surface_variant)
+    ? 'on the base surface and the variants that inherit it'
+    : surfaceVariantPhrase(change.surface_variant);
+  const variant = variantPhrase ? `, ${variantPhrase}` : '';
   const where =
     change.target?.kind === 'surface' && slot
       ? `${target} as ${surfaceSlotPhrase(change, slot)}${variant}`
@@ -240,6 +247,15 @@ export function describeEntry(entry: AuditEntry, userName?: UserNameResolver): E
           : 'request';
     const policyName = pd.policy_name || pd.policy_id || 'policy';
     const flow = pd.flow ? ` on the ${flowLabel(pd.flow)} leg` : '';
+    const variantPhrase = surfaceVariantPhrase(entry.surface_variant);
+    // A gateway policy is the same for every surface and variant: name where it applied, never
+    // as a policy of that variant.
+    const summary =
+      pd.scope === 'gateway'
+        ? `Gateway-wide policy “${policyName}”${flow}${surface ? `, applied to ${surface}` : ''}${
+            variantPhrase ? `, ${variantPhrase.replace(/^on variant /, 'variant ')}` : ''
+          }.`
+        : `${scopeLabel(pd.scope)} policy “${policyName}”${flow}${variantPhrase ? `, ${variantPhrase}` : ''}.`;
     const parts: string[] = [];
     if (caller) parts.push(`Caller ${caller}`);
     if (surface) parts.push(caller ? `→ ${surface}` : surface);
@@ -251,8 +267,31 @@ export function describeEntry(entry: AuditEntry, userName?: UserNameResolver): E
     return {
       title: `${allow ? 'Allowed' : 'Denied'} ${target}`,
       tone,
-      summary: `${scopeLabel(pd.scope)} policy “${policyName}”${flow}.`,
+      summary,
       detail: detail || undefined,
+    };
+  }
+
+  const rejected = requestRejected(entry);
+  if (rejected) {
+    const variantPhrase = surfaceVariantPhrase(entry.surface_variant, rejected.requested_variant);
+    const where = `${surface ?? 'an unmatched route'}${variantPhrase ? `, ${variantPhrase}` : ''}`;
+    // `http_status` is absent on Fabric, where no HTTP response is involved.
+    const answered =
+      typeof rejected.http_status === 'number'
+        ? `The caller got HTTP ${rejected.http_status}${
+            typeof rejected.rpc_error_code === 'number'
+              ? ` with JSON-RPC error ${rejected.rpc_error_code}`
+              : ''
+          }.`
+        : entry.via_fabric
+          ? 'Refused over Fabric, so no HTTP status was recorded.'
+          : undefined;
+    return {
+      title: 'Request refused',
+      tone,
+      summary: `Refused at ${rejected.stage} on ${where}: ${rejected.reason.replace(/_/g, ' ')}.`,
+      detail: answered,
     };
   }
 

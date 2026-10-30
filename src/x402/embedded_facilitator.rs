@@ -38,6 +38,7 @@ use x402_types::{
 };
 
 use crate::config::types::X402Config;
+use crate::observability::loggable;
 
 /// Errors that can occur when working with the embedded facilitator
 #[derive(Debug, thiserror::Error)]
@@ -56,8 +57,8 @@ pub enum EmbeddedFacilitatorError {
     #[error("Unknown network name: {0}")]
     UnknownNetwork(String),
 
-    #[error("Invalid RPC URL {url}: {error}")]
-    InvalidRpcUrl { url: String, error: String },
+    #[error("Invalid RPC URL: {error}")]
+    InvalidRpcUrl { error: String },
 
     #[error("Invalid private key for chain {chain}: {error}")]
     InvalidPrivateKey { chain: String, error: String },
@@ -336,7 +337,7 @@ impl EmbeddedFacilitator {
             // Handle different chain types based on namespace
             if let Some(eip155_id) = chain_id_str.strip_prefix("eip155:") {
                 // EVM chain handling
-                debug!(chain = %chain_id, rpc = %rpc_url, "Adding EVM chain");
+                debug!(chain = %chain_id, rpc = %loggable::origin(rpc_url), "Adding EVM chain");
 
                 let chain_id_num = eip155_id
                     .parse::<u64>()
@@ -371,10 +372,7 @@ impl EmbeddedFacilitator {
                         signers: vec![signer_config],
                         rpc: vec![RpcConfig {
                             http: x402_types::config::LiteralOrEnv::from_literal(rpc_url.parse().map_err(
-                                |e: url::ParseError| EmbeddedFacilitatorError::InvalidRpcUrl {
-                                    url: rpc_url.clone(),
-                                    error: e.to_string(),
-                                },
+                                |e: url::ParseError| EmbeddedFacilitatorError::InvalidRpcUrl { error: e.to_string() },
                             )?),
                             rate_limit: Some(rate_limit),
                         }],
@@ -406,7 +404,7 @@ impl EmbeddedFacilitator {
 
                 debug!(
                     chain = %chain_id,
-                    rpc = %rpc_url,
+                    rpc = %loggable::origin(rpc_url),
                     caip2_reference = %caip2_reference,
                     network_key = %network_key,
                     "Adding Solana chain - fetching full genesis hash from RPC"
@@ -485,10 +483,7 @@ impl EmbeddedFacilitator {
                     inner: SolanaChainConfigInner {
                         signer: signer_config,
                         rpc: x402_types::config::LiteralOrEnv::from_literal(rpc_url.parse().map_err(
-                            |e: url::ParseError| EmbeddedFacilitatorError::InvalidRpcUrl {
-                                url: rpc_url.clone(),
-                                error: e.to_string(),
-                            },
+                            |e: url::ParseError| EmbeddedFacilitatorError::InvalidRpcUrl { error: e.to_string() },
                         )?),
                         pubsub: None,                    // Optional WebSocket endpoint for real-time updates
                         max_compute_unit_limit: 400_000, // Default Solana compute limit
@@ -499,7 +494,7 @@ impl EmbeddedFacilitator {
                 // Use from_config to build the provider
                 debug!(
                     chain = %chain_id,
-                    rpc = %rpc_url,
+                    rpc = %loggable::origin(rpc_url),
                     genesis_ref = %caip2_reference,
                     "Creating Solana chain provider with config"
                 );
@@ -681,7 +676,7 @@ impl EmbeddedFacilitator {
     /// - On-chain nonce checking
     /// - Balance validation
     /// - Timestamp validation
-    #[instrument(skip(self, request), fields(scheme = ?request))]
+    #[instrument(skip(self, request), fields(scheme = %payment_scheme(&request)))]
     pub async fn verify(
         &self,
         request: proto::VerifyRequest,
@@ -712,7 +707,7 @@ impl EmbeddedFacilitator {
     ///
     /// This submits the signed authorization to the blockchain
     /// for execution (e.g., EIP-3009 receiveWithAuthorization)
-    #[instrument(skip(self, request), fields(scheme = ?request))]
+    #[instrument(skip(self, request), fields(scheme = %payment_scheme(&request)))]
     pub async fn settle(
         &self,
         request: proto::SettleRequest,
@@ -730,5 +725,140 @@ impl EmbeddedFacilitator {
         }
 
         result
+    }
+}
+
+/// The scheme handler `request` is for (network, protocol version and scheme), as recorded on
+/// facilitator spans in place of the request, which carries the signed payment authorization.
+fn payment_scheme(request: &proto::VerifyRequest) -> String {
+    request
+        .scheme_handler_slug()
+        .map_or_else(|| "unknown".to_string(), |slug| slug.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fmt::Debug;
+    use std::sync::Mutex;
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id};
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+    use crate::component_tests::helpers::thread_subscriber::set_thread_default;
+
+    const SIGNATURE_MARKER: &str = "0x5167a7e0000000000000000000000000000000000000000000000000000000000";
+    const NONCE_MARKER: &str = "0x6e0ce00000000000000000000000000000000000000000000000000000000077";
+
+    /// Records every span's name and fields, and every event's fields.
+    struct RecordedTelemetry(Arc<Mutex<Vec<String>>>);
+
+    struct FieldText(String);
+
+    impl Visit for FieldText {
+        fn record_debug(
+            &mut self,
+            field: &Field,
+            value: &dyn Debug,
+        ) {
+            self.0
+                .push_str(&format!("{}={:?} ", field.name(), value));
+        }
+    }
+
+    impl<S: tracing::Subscriber> Layer<S> for RecordedTelemetry {
+        fn on_new_span(
+            &self,
+            attributes: &Attributes<'_>,
+            _id: &Id,
+            _context: Context<'_, S>,
+        ) {
+            let mut fields = FieldText(String::new());
+            attributes.record(&mut fields);
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("{}{{{}}}", attributes.metadata().name(), fields.0));
+        }
+
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _context: Context<'_, S>,
+        ) {
+            let mut fields = FieldText(String::new());
+            event.record(&mut fields);
+            self.0
+                .lock()
+                .unwrap()
+                .push(fields.0);
+        }
+    }
+
+    fn signed_verify_request() -> proto::VerifyRequest {
+        let requirement = serde_json::json!({
+            "scheme": "exact",
+            "network": "eip155:8453",
+            "amount": "1000",
+            "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+            "payTo": "0x00000000000000000000000000000000000000AA",
+            "maxTimeoutSeconds": 300
+        });
+        let request = serde_json::json!({
+            "x402Version": 2,
+            "paymentPayload": {
+                "x402Version": 2,
+                "accepted": requirement,
+                "payload": {
+                    "signature": SIGNATURE_MARKER,
+                    "authorization": {
+                        "from": "0x00000000000000000000000000000000000000BB",
+                        "to": "0x00000000000000000000000000000000000000AA",
+                        "value": "1000",
+                        "validAfter": "0",
+                        "validBefore": "4000000000",
+                        "nonce": NONCE_MARKER
+                    }
+                }
+            },
+            "paymentRequirements": requirement
+        });
+        serde_json::from_str(&request.to_string()).unwrap()
+    }
+
+    fn facilitator_without_chains() -> EmbeddedFacilitator {
+        let registry = SchemeRegistry::build(
+            ChainRegistry::<ChainProvider>::new(HashMap::new()),
+            SchemeBlueprints::<ChainProvider>::new(),
+            &Vec::new(),
+        );
+        EmbeddedFacilitator {
+            facilitator: Arc::new(FacilitatorLocal::new(registry)),
+        }
+    }
+
+    #[test]
+    fn payment_scheme_names_network_version_and_scheme_only() {
+        assert_eq!(payment_scheme(&signed_verify_request()), "eip155:8453:v2:exact");
+        assert_eq!(payment_scheme(&serde_json::from_str("{}").unwrap()), "unknown");
+    }
+
+    #[tokio::test]
+    async fn verify_records_scheme_without_signature_or_authorization() {
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let _guard = set_thread_default(tracing_subscriber::registry().with(RecordedTelemetry(recorded.clone())));
+
+        let result = facilitator_without_chains()
+            .verify(signed_verify_request())
+            .await;
+
+        let telemetry = recorded
+            .lock()
+            .unwrap()
+            .join("\n");
+        assert!(result.is_err());
+        assert!(telemetry.contains("verify{scheme=eip155:8453:v2:exact }"), "{telemetry}");
+        assert!(!telemetry.contains(SIGNATURE_MARKER), "{telemetry}");
+        assert!(!telemetry.contains(NONCE_MARKER), "{telemetry}");
     }
 }

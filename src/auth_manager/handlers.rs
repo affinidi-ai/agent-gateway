@@ -398,28 +398,15 @@ pub async fn update_user(
         && user_data.status == crate::auth::UserStatus::Approved
         && user_data.role != crate::auth::UserRole::Administrator
     {
-        tracing::info!(
-            "User approval detected - will send welcome notification to {} (user_id: {})",
-            user_data.username,
-            user_id
-        );
+        tracing::info!("User approval detected - will send welcome notification to user_id: {}", user_id);
         if let Some(notif_store) = &notification_store {
             use crate::integrations::NotificationStore;
             match notif_store
                 .send_user_welcome_notification(&user_data.user_id)
                 .await
             {
-                Ok(_) => tracing::info!(
-                    "Sent welcome notification to newly approved user: {} (user_id: {})",
-                    user_data.username,
-                    user_id
-                ),
-                Err(e) => tracing::error!(
-                    "Failed to send welcome notification to {} (user_id: {}): {}",
-                    user_data.username,
-                    user_id,
-                    e
-                ),
+                Ok(_) => tracing::info!("Sent welcome notification to newly approved user_id: {}", user_id),
+                Err(e) => tracing::error!("Failed to send welcome notification to user_id {}: {}", user_id, e),
             }
             if let Some(metrics_store) = metrics_store.clone() {
                 spawn_record_user_event(metrics_store, "approved".to_string(), user_data.role.clone());

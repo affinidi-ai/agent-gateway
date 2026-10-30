@@ -158,7 +158,7 @@ impl GatewayFacilitatorService {
                 .to(facilitator_did.to_string())
                 .finalize();
 
-        debug!("Verify-request message created: {:?}", verify_request_msg);
+        debug!(message_id = %message_id, "Verify-request message created");
 
         // Pack message encrypted
         let packed_message = atm

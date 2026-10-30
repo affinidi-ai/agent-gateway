@@ -7,6 +7,7 @@ import { AppButton } from '../components/shared/AppButton';
 import FieldHelp from '../components/shared/FieldHelp';
 import MetricsFlowVisualization from '../components/MetricsFlowVisualization';
 import { formatDID } from '../utils/stringUtils';
+import { surfaceVariantAlias } from '../utils/surfaceVariant';
 import { FLOW_COLORS, UI_COLORS } from '../utils/uiPalette';
 
 interface ConnectionDataPoint {
@@ -15,7 +16,8 @@ interface ConnectionDataPoint {
   latency_ms?: number;
   identity_hash?: string;
   direction: 'request' | 'response';
-  variant_alias?: string;
+  /** The variant's alias, `_base_` for the base surface; absent outside surface requests. */
+  surface_variant?: string;
 }
 
 interface RuleValidationDataPoint {
@@ -755,10 +757,15 @@ const MetricsPage: React.FC = () => {
                                                                 <small className="text-muted">
                                                                   {formatTimestamp(point.timestamp)}
                                                                 </small>
-                                                                {point.variant_alias && (
+                                                                {surfaceVariantAlias(
+                                                                  point.surface_variant
+                                                                ) && (
                                                                   <span className="badge text-bg-secondary ms-2">
                                                                     <i className="fas fa-code-branch me-1"></i>
-                                                                    ${point.variant_alias}
+                                                                    $
+                                                                    {surfaceVariantAlias(
+                                                                      point.surface_variant
+                                                                    )}
                                                                   </span>
                                                                 )}
                                                               </div>

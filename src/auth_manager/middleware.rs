@@ -2,6 +2,7 @@ use crate::auth::session::{SessionManager, TermsSessionGate};
 use crate::auth::session_cookie;
 use crate::auth::storage::PasskeyStorage;
 use crate::auth::types::UserStatus;
+use crate::observability::loggable;
 use axum::{
     Extension, Json,
     extract::{Request, State},
@@ -499,7 +500,7 @@ pub async fn extract_user_id(
         // Extract session token using the shared helper (header > query param > cookie)
         let session_token = extract_session_token(&request).ok_or(StatusCode::UNAUTHORIZED)?;
 
-        debug!("extract_user_id Validating session token: {}...", &session_token[..session_token.len().min(8)]);
+        debug!("extract_user_id Validating session token: {}", loggable::secret(&session_token));
         let (_username, user_id) = session_manager
             .validate_session(&session_token)
             .await
@@ -1522,6 +1523,59 @@ mod tests {
                 AuthGuardState::new(sessions, None, manager).with_pat_authenticator(Some(Arc::new(TermsTestPat))),
                 require_session_auth,
             ))
+    }
+
+    const ACCESS_TOKEN: &str = "agpat_K7xQ2mZp9vR4tY8wB3nL6cF1hJ5dS0gA2eU7iO4kM9q";
+
+    struct AccessTokenTestPat;
+
+    #[async_trait::async_trait]
+    impl crate::auth_manager::pat::PatAuthenticator for AccessTokenTestPat {
+        async fn authenticate(
+            &self,
+            token: &str,
+        ) -> Option<crate::auth_manager::pat::PatPrincipal> {
+            (token == ACCESS_TOKEN).then(|| crate::auth_manager::pat::PatPrincipal {
+                user_id: "user-1".to_string(),
+                scopes: None,
+                token_id: "agat_test".to_string(),
+                delegation_depth: 0,
+                resource_scope: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn an_access_token_is_not_looked_up_as_a_session() {
+        let sessions = Arc::new(SessionManager::new());
+        let session_token = sessions
+            .create_session("alice".into(), "user-1".into())
+            .await;
+        let app = Router::new()
+            .route("/v1/settings", get(ok_handler))
+            .layer(axum::middleware::from_fn_with_state(
+                AuthGuardState::new(sessions, None, Arc::new(crate::terms::TermsManager::disabled()))
+                    .with_pat_authenticator(Some(Arc::new(AccessTokenTestPat))),
+                require_session_auth,
+            ));
+        let unknown_access_token = "agpat_Unknown9vR4tY8wB3nL6cF1hJ5dS0gA2eU7iO4kM9q";
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        assert_eq!(get_status_with_bearer(&app, "/v1/settings", ACCESS_TOKEN).await, 200);
+        assert_eq!(get_status_with_bearer(&app, "/v1/settings", unknown_access_token).await, 401);
+        assert_eq!(get_status_with_bearer(&app, "/v1/settings", &session_token).await, 200);
+        assert_eq!(get_status_with_bearer(&app, "/v1/settings", "0f2c9d7e-unknown-session-token").await, 401);
+
+        let text = logs.text();
+        assert!(text.contains("Session token 0f2c9d7e... not found"), "{text}");
+        assert_eq!(
+            text.matches("not found")
+                .count(),
+            1,
+            "{text}"
+        );
+        assert!(text.contains("require_session_auth: invalid/expired session for /v1/settings"), "{text}");
+        assert!(!text.contains("agpat_"), "{text}");
     }
 
     #[tokio::test]

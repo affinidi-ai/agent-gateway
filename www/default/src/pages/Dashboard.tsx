@@ -200,15 +200,6 @@ const Dashboard: React.FC = () => {
     }
   };
 
-  // Debug: Log when dashboard stats change
-  useEffect(() => {
-    // console.log('Dashboard stats updated:', {
-    //   totalConnections: stats?.metrics?.total_connections,
-    //   timeSeriesLength: stats?.metrics?.time_series?.length,
-    //   latestPoint: stats?.metrics?.time_series?.[stats.metrics.time_series.length - 1]
-    // });
-  }, [stats?.metrics]);
-
   // Prepare connections chart data - memoized to avoid recalculating on every render
   const connectionsChartData = useMemo(() => {
     if (!stats?.metrics?.time_series) {
@@ -285,7 +276,6 @@ const Dashboard: React.FC = () => {
   // Prepare channel distribution chart data
   const getChannelDistributionData = () => {
     if (!stats?.channels || stats.channels.length === 0) {
-      //console.log('Channel Distribution: No channels data', { hasStats: !!stats, channelsLength: stats?.channels?.length });
       return { labels: [], datasets: [] };
     }
 
@@ -311,14 +301,6 @@ const Dashboard: React.FC = () => {
       .filter(ch => ch.activityValue > 0) // Only show channels with data
       .sort((a, b) => b.activityValue - a.activityValue) // Most active first
       .slice(0, 10); // Maximum 10 channels
-
-    // console.log('Channel Distribution Data:', {
-    //   totalChannels: channelData.length,
-    //   displayedChannels: sortedChannels.length,
-    //   totalConnections,
-    //   hasTraffic,
-    //   channels: sortedChannels
-    // });
 
     const colors = CHART_PALETTE;
 

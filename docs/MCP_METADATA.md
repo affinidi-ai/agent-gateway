@@ -128,19 +128,24 @@ from a surface's Access Point and from each Transit Point, and a Transit Point
 or MCP Proxy that still carries it is served without it. Protect every endpoint
 that relies on it another way, or disable it, before downgrading.
 
-Admitted modern Transit requests do not use the legacy base-surface fallback
-when a requested variant is absent, disabled or has a broken default reference.
-Unknown aliases return a correlated `404`; disabled or misconfigured defaults
-return `503`, before Target work. Fabric Open likewise rejects a named alias
-that is absent even when the variant catalog is empty. Legacy resolution is
-unchanged.
-
-The Access Point router applies the same rule on an empty variant catalog,
-where generic resolution returns the base surface. Legacy requests keep that
-fallback; an admitted modern request carrying an unknown alias returns a
-correlated `404`, and a surface whose `default_variant_id` no longer matches a
-variant returns `503`, both before Target work. Non-empty catalogs keep their
-existing router-level alias and disabled-variant errors for both eras.
+No request, legacy or modern, falls back to the base surface or another variant
+when the variant it selects can't be resolved. The Access Point, the Transit
+Point and Fabric receive refuse it at routing, before MCP admission and before
+Target work, with one status per reason: `404` for an alias the surface doesn't
+have (including on an empty variant catalog) and for a disabled named or default
+variant, and `500` when `default_variant_id` names no variant. A modern MCP
+request (`MCP-Protocol-Version` other than `2024-11-05`, or `Mcp-Method`) to an
+MCP Access Point or an MCP Transit Point, whatever its method, is answered with
+a JSON-RPC error with code `-32603` carrying the request's `id`. Its body is read
+only to recover that `id`, within the smaller of the endpoint's
+`mcp_http.max_request_bytes` and 16 KiB, and within 2 seconds: the read runs
+before source authentication and rate limiting, so what an unauthenticated
+caller can make the gateway buffer for a refused request, and how long it can
+keep the refusal pending by trickling or stalling its body, are bounded. A body
+that can't be read (larger than that, not complete within 2 seconds, not JSON,
+or without an `id`, as a `GET` normally has none) gets the same error without
+one. Every other request gets a plain error response. Fabric Open refuses the
+same requests.
 
 Resolved Access Point, Transit Point and Fabric request snapshots retain the
 selected stable variant ID separately from the materialized surface, whose
@@ -1472,8 +1477,14 @@ The audit records the failure as blocking. A valid token issued for the
 resource is attributed as before, and its identity reaches policy. Over
 Fabric, the receiving gateway binds the token audience to the same resource,
 because both paths resolve the accepted audiences in
-`source_auth::middleware::resolve_surface_audience`; a named variant that does
-not resolve falls back to the default, whose resource then binds. The sending
+`source_auth::middleware::resolve_surface_audience`. The variant whose
+`<resource>$<alias>` it binds is the one the sending route's `fabric://` Target
+pins (`fabric://<gateway>/<surface>$<alias>`), else the receiving surface's
+default variant or base route; the caller's own URL alias on the sending gateway
+never selects it (see
+[Which variant serves a request over Fabric](FABRIC.md#which-variant-serves-a-request-over-fabric)).
+A pinned variant that does not resolve is refused with `404` (`unknown_variant`)
+before any token is read, never served by the default. The sending
 gateway strips the caller's own `Authorization` header, so only a credential
 it injects (target authentication or a delegated credential) issued for this
 resource can pass, and a missing or refused one gets a `401` before policy
@@ -2110,7 +2121,7 @@ JWT strategy mutations/reload, provider mutations and explicit vault revocation 
 
 When a Transit Point requires a Transit token, admitted modern requests revalidate it after MCP admission: one header, configured validator, the checks every Transit token passes (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)), and strict issue/expiry times with no clock leeway. Missing authority, duplicates, cross-surface tokens and expiry fail before identity or Target work. The subscription lifetime is capped to that token's expiry; reconnect must pass current checks.
 
-Resolved Access Point, Transit Point and Fabric requests retain their selected stable variant ID independently of the materialized surface's cleared catalog. Modern credential preparation and continuations use that retained ID, including defaults. Admitted modern Transit requests reject unknown, disabled and broken-default variants before Target work instead of using the legacy base fallback; Fabric Open also rejects absent named aliases in an empty catalog. The Access Point router carries an unresolved selection on an empty catalog and applies the same rule: legacy keeps the base fallback, while an admitted modern request returns `404` for an unknown alias or `503` for a broken `default_variant_id`. Named variant resource audiences remain distinct from base audiences. Outbound listeners retain the original catalog in shared state while compiling default identity engines, register named canonical and custom paths with `$alias` or `%24alias`, and strip variant routing syntax before forwarding. Custom Transit audiences append `$alias` to the configured resource path; authentication and metadata share the derivation. Real-listener and signed custom-path fixtures cover routing, metadata, audience rejection and quiet cancellation, but complete Access Point router and encrypted cross-gateway authorization still require conformance. Legacy resolution is unchanged.
+Resolved Access Point, Transit Point and Fabric requests retain their selected stable variant ID independently of the materialized surface's cleared catalog. Modern credential preparation and continuations use that retained ID, including defaults. Every path refuses unknown, disabled and broken-default variants at routing, before Target work, for legacy and modern requests alike: `404` for an unknown or disabled variant, `500` for a broken `default_variant_id`; Fabric Open refuses the same requests, including an alias on an empty catalog. Named variant resource audiences remain distinct from base audiences. Outbound listeners retain the original catalog in shared state while compiling default identity engines, register named canonical and custom paths with `$alias` or `%24alias`, and strip variant routing syntax before forwarding. Custom Transit audiences append `$alias` to the configured resource path; authentication and metadata share the derivation. Real-listener and signed custom-path fixtures cover routing, metadata, audience rejection and quiet cancellation, but complete Access Point router and encrypted cross-gateway authorization still require conformance.
 
 ### Resource Server, consent and credentials
 

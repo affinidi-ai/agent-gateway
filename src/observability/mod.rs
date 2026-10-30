@@ -7,7 +7,7 @@ pub mod http_trace;
 pub mod identity_binding_audit;
 pub mod identity_view;
 pub mod log_redact;
-pub mod log_watcher;
+pub mod loggable;
 pub mod metrics_updater;
 pub mod opentelemetry;
 pub mod otlp_health;
@@ -45,5 +45,5 @@ pub use system_metrics::{
 };
 pub use task_monitor::*;
 pub use tasks::{spawn_traced_task, spawn_traced_task_with_fields};
-pub use trace_registry::{get_trace_info, register_channel_prefix, register_mcp_prefix, should_trace_path};
+pub use trace_registry::{get_trace_info, register_channel_prefix, register_mcp_prefix};
 pub use websocket_log_layer::{WebSocketLogLayer, init_websocket_log_broadcast};
