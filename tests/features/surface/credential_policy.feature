@@ -74,3 +74,35 @@ Feature: Credential policy on the request path
   Scenario: The startup report stays silent when no stored rule is broken
     When the caller sends a request to the surface
     Then the gateway log has no warning containing "Stored configuration breaks a credential policy rule"
+
+  Scenario: The agent card is fetched with a provider that has an http token endpoint in warn mode
+    Given the target's credential provider has a plain http token endpoint
+    When the caller fetches the agent card
+    Then the response status is 200
+    And managed agent "bravo" received header "authorization" with value "Bearer bdd-target-provider-token"
+    And the target's credential provider received 1 token request
+
+  Scenario: The agent card fails when https token endpoints are enforced and the provider's is http
+    Given the target's credential provider has a plain http token endpoint
+    And the gateway enforces the credential rule "token_endpoint_https"
+    When the caller fetches the agent card
+    Then the response status is 502
+    And the response body is error "agent_card_target_auth_failed"
+    And the target's credential provider received 0 token requests
+    And managed agent "bravo" was not called
+
+  Scenario: A tenant surface's agent card is fetched with a global credential provider in warn mode
+    Given the surface belongs to tenant "tenant-a"
+    When the caller fetches the agent card
+    Then the response status is 200
+    And managed agent "bravo" received header "authorization" with value "Bearer bdd-target-provider-token"
+    And the target's credential provider received 1 token request
+
+  Scenario: A tenant surface's agent card fails when tenant isolation is enforced
+    Given the surface belongs to tenant "tenant-a"
+    And the gateway enforces the credential rule "tenant_credential_isolation"
+    When the caller fetches the agent card
+    Then the response status is 502
+    And the response body is error "agent_card_target_auth_failed"
+    And the target's credential provider received 0 token requests
+    And managed agent "bravo" was not called

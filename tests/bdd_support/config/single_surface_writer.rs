@@ -112,6 +112,9 @@ fn transit_point_json(
     {
         transit_point_json["transit_credentials"] = binding.clone();
     }
+    if transit_point.target_auth_provider {
+        transit_point_json["target_auth"] = credential_provider_target_auth_json(TARGET_AUTH_PROVIDER_ID, "reject");
+    }
     if !transit_point
         .header_metadata_mapping
         .headers
@@ -263,7 +266,9 @@ fn write_single_surface_config_inner(
             &target_auth.fallback,
         ));
     }
-    if let Some(provider) = &surface_config.target_auth_provider {
+    if let Some(provider) = &surface_config.target_auth_provider
+        && provider.authenticates_surface_target
+    {
         surface_fixture = surface_fixture
             .with_target_auth(credential_provider_target_auth_json(TARGET_AUTH_PROVIDER_ID, &provider.fallback));
     }
@@ -664,7 +669,7 @@ fn secret_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<SecretFixture> 
             CredentialProviderKind::ApiKey { secret_id, secret_value } => {
                 secrets.push(SecretFixture::new(secret_id, secret_value));
             }
-            CredentialProviderKind::Unknown => {}
+            CredentialProviderKind::Unknown | CredentialProviderKind::ClientCredentials => {}
         }
     }
     secrets
@@ -740,7 +745,7 @@ fn delegation_provider_fixture(surface_config: &SurfaceConfigBuilder) -> Vec<Cre
     let now = chrono::Utc::now();
     let provider_id = delegation.provider_id.clone();
     let provider = match &delegation.provider_kind {
-        CredentialProviderKind::Unknown => return Vec::new(),
+        CredentialProviderKind::Unknown | CredentialProviderKind::ClientCredentials => return Vec::new(),
         CredentialProviderKind::OAuth2AuthorizationCode => {
             let base_url = surface_config
                 .oauth_provider_base_url

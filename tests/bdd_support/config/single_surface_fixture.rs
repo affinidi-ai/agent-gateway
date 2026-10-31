@@ -244,6 +244,9 @@ pub struct SurfaceTransitPointConfig {
     /// The surface's delegated credential is this Transit Point's own
     /// `transit_credentials` rather than the surface's `outbound_credentials`.
     pub delegated_credentials: bool,
+    /// The Transit Point authenticates its target with the surface's
+    /// `target_auth_provider`.
+    pub target_auth_provider: bool,
 }
 
 impl SurfaceTransitPointConfig {
@@ -262,6 +265,7 @@ impl SurfaceTransitPointConfig {
             source_auth: None,
             allow_unauthenticated_callers: true,
             delegated_credentials: false,
+            target_auth_provider: false,
         }
     }
 }
@@ -343,6 +347,9 @@ pub struct SurfaceTargetAuthProviderConfig {
     /// The test allowlist admits the http token endpoint's origin for egress only, so the
     /// gateway holds it to the https rule as it would any http token endpoint.
     pub insecure_token_endpoint: bool,
+    /// The surface's own Target authenticates with this provider; `false` when only a
+    /// Transit Point or a delegated credential binding uses it.
+    pub authenticates_surface_target: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -360,6 +367,7 @@ impl SurfaceTargetAuthProviderConfig {
             expires_in: 3600,
             token_endpoint: None,
             insecure_token_endpoint: false,
+            authenticates_surface_target: true,
         }
     }
 }
@@ -464,6 +472,9 @@ pub enum CredentialProviderKind {
     },
     /// A provider the gateway has no record of, as after it was deleted.
     Unknown,
+    /// The client credentials provider the harness serves as the surface's
+    /// `target_auth_provider`, whose fixture and secrets that config writes.
+    ClientCredentials,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
