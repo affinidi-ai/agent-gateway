@@ -16,9 +16,9 @@ use crate::bdd_support::config::single_surface_fixture::{
     TargetAuthProviderGrant,
 };
 use crate::bdd_support::config::target_auth::{
-    TARGET_AUTH_CLIENT_ID_SECRET, TARGET_AUTH_CLIENT_SECRET_SECRET, TARGET_AUTH_JWT_ISSUER, TARGET_AUTH_PROVIDER_ID,
-    TARGET_AUTH_PROVIDER_SCOPE, TARGET_AUTH_SIGNING_KEY_SECRET, credential_provider_target_auth_json,
-    static_secret_target_auth_json, target_auth_signing_key,
+    TARGET_AUTH_CLIENT_ID_SECRET, TARGET_AUTH_CLIENT_SECRET_SECRET, TARGET_AUTH_CLIENT_SECRET_VALUE,
+    TARGET_AUTH_JWT_ISSUER, TARGET_AUTH_PROVIDER_ID, TARGET_AUTH_PROVIDER_SCOPE, TARGET_AUTH_SIGNING_KEY_SECRET,
+    credential_provider_target_auth_json, static_secret_target_auth_json, target_auth_signing_key,
 };
 
 struct SingleSurfaceOptions<'a> {
@@ -528,6 +528,17 @@ fn write_single_surface_config_inner(
         set_transit_token_max_lifetime(base_dir, max_secs);
     }
     enforce_credential_rules(base_dir, &surface_config.enforced_credential_rules);
+    if surface_config.keeps_gateway_log {
+        log_warnings(base_dir);
+    }
+}
+
+/// Lowers the gateway's log level from the harness default `error` to `warn`.
+fn log_warnings(base_dir: &Path) {
+    let path = base_dir.join("config.toml");
+    let config = std::fs::read_to_string(&path).unwrap();
+    assert!(config.contains("level = \"error\""), "the gateway config must set the log level");
+    std::fs::write(&path, config.replacen("level = \"error\"", "level = \"warn\"", 1)).unwrap();
 }
 
 /// Appends a `[credential_policy]` table setting each of `rules` to `enforce`.
@@ -634,7 +645,7 @@ fn secret_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<SecretFixture> 
     {
         Some(TargetAuthProviderGrant::ClientCredentials) => {
             secrets.push(SecretFixture::new(TARGET_AUTH_CLIENT_ID_SECRET, "bdd-target-client"));
-            secrets.push(SecretFixture::new(TARGET_AUTH_CLIENT_SECRET_SECRET, "bdd-target-client-secret"));
+            secrets.push(SecretFixture::new(TARGET_AUTH_CLIENT_SECRET_SECRET, TARGET_AUTH_CLIENT_SECRET_VALUE));
         }
         Some(TargetAuthProviderGrant::JwtBearer) => {
             secrets.push(SecretFixture::new(TARGET_AUTH_SIGNING_KEY_SECRET, &target_auth_signing_key().private_pem));

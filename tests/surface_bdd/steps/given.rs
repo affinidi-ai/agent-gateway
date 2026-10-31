@@ -2476,6 +2476,13 @@ fn target_credential_provider_has_http_token_endpoint(world: &mut SurfaceWorld) 
     target_auth_provider(world).insecure_token_endpoint = true;
 }
 
+#[given("the gateway keeps its log of warnings")]
+fn gateway_keeps_its_log_of_warnings(world: &mut SurfaceWorld) {
+    world
+        .surface_config
+        .keeps_gateway_log = true;
+}
+
 #[given(expr = "the surface belongs to tenant {string}")]
 fn surface_belongs_to_tenant(
     world: &mut SurfaceWorld,

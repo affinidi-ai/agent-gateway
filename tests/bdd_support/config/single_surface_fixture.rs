@@ -71,6 +71,8 @@ pub struct SurfaceConfigBuilder {
     pub tenant_id: Option<String>,
     /// The `[credential_policy]` rules the gateway starts with set to `enforce`.
     pub enforced_credential_rules: Vec<String>,
+    /// The gateway logs warnings and keeps its log for the scenario to read.
+    pub keeps_gateway_log: bool,
 }
 
 impl Default for SurfaceConfigBuilder {
@@ -125,6 +127,7 @@ impl Default for SurfaceConfigBuilder {
             audit_log_keeps_every_event: false,
             tenant_id: None,
             enforced_credential_rules: Vec::new(),
+            keeps_gateway_log: false,
         }
     }
 }

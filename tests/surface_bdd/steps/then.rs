@@ -4009,6 +4009,100 @@ async fn target_token_requests(world: &SurfaceWorld) -> Vec<HashMap<String, Stri
         .collect()
 }
 
+/// The gateway's log with terminal colour codes removed.
+fn gateway_log(world: &SurfaceWorld) -> String {
+    let path = world
+        .infra
+        .as_ref()
+        .expect("the gateway must be running")
+        ._temp_dir
+        .path()
+        .join("gateway.log");
+    let raw = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("the scenario must keep the gateway log first: {}: {error}", path.display()));
+    let mut plain = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for skipped in chars.by_ref() {
+                if skipped.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            plain.push(c);
+        }
+    }
+    plain
+}
+
+fn warning_lines_containing(
+    world: &SurfaceWorld,
+    text: &str,
+) -> Vec<String> {
+    gateway_log(world)
+        .lines()
+        .filter(|line| line.contains("WARN") && line.contains(text))
+        .map(str::to_string)
+        .collect()
+}
+
+#[then(expr = "the gateway log has a warning containing {string}")]
+fn gateway_log_has_warning(
+    world: &mut SurfaceWorld,
+    text: String,
+) {
+    assert!(
+        !warning_lines_containing(world, &text).is_empty(),
+        "the gateway log has no warning containing {text:?}:\n{}",
+        gateway_log(world)
+    );
+}
+
+#[then(expr = "the gateway log has no warning containing {string}")]
+fn gateway_log_has_no_warning(
+    world: &mut SurfaceWorld,
+    text: String,
+) {
+    let lines = warning_lines_containing(world, &text);
+    assert!(lines.is_empty(), "the gateway log has warnings containing {text:?}: {lines:?}");
+}
+
+#[then(expr = "the startup report names the {word} {string} as breaking the rule {string} in {word} mode")]
+fn startup_report_names_breach(
+    world: &mut SurfaceWorld,
+    subject: String,
+    id: String,
+    rule: String,
+    mode: String,
+) {
+    let enforced = match mode.as_str() {
+        "enforce" => true,
+        "warn" => false,
+        other => panic!("unknown credential rule mode {other:?}"),
+    };
+    let expected = format!("subject=\"{subject}\" id={id} ");
+    let rule_and_mode = format!("rule=\"{rule}\" enforced={enforced}");
+    let reports = warning_lines_containing(world, "Stored configuration breaks a credential policy rule");
+    assert!(
+        reports
+            .iter()
+            .any(|line| line.contains(&expected) && line.contains(&rule_and_mode)),
+        "the startup report does not name the {subject} {id} for rule {rule} in {mode} mode: {reports:?}"
+    );
+}
+
+#[then("the gateway log shows no credential provider secret or token")]
+fn gateway_log_shows_no_provider_secret(world: &mut SurfaceWorld) {
+    let log = gateway_log(world);
+    for secret in [
+        crate::bdd_support::config::target_auth::TARGET_AUTH_PROVIDER_TOKEN,
+        crate::bdd_support::config::target_auth::TARGET_AUTH_CLIENT_SECRET_VALUE,
+    ] {
+        assert!(!log.contains(secret), "the gateway log shows a credential provider secret or token");
+    }
+}
+
 #[then(expr = "the target's credential provider received {int} token request(s)")]
 async fn target_credential_provider_received_token_requests(
     world: &mut SurfaceWorld,

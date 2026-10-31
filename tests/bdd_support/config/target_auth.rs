@@ -6,6 +6,7 @@ pub const TARGET_AUTH_PROVIDER_SCOPE: &str = "https://www.googleapis.com/auth/cl
 pub const TARGET_AUTH_JWT_ISSUER: &str = "bdd-agent@bdd-project.iam.gserviceaccount.com";
 pub const TARGET_AUTH_CLIENT_ID_SECRET: &str = "bdd-target-client-id";
 pub const TARGET_AUTH_CLIENT_SECRET_SECRET: &str = "bdd-target-client-secret";
+pub const TARGET_AUTH_CLIENT_SECRET_VALUE: &str = "bdd-target-client-secret-value";
 pub const TARGET_AUTH_SIGNING_KEY_SECRET: &str = "bdd-target-signing-key";
 
 /// The RSA key a JWT Bearer provider signs its grant with: the private PEM goes into

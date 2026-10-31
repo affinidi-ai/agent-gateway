@@ -378,7 +378,14 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
     {
         gateway_env.insert("AG_ALLOW_LOCAL_A2A_PROXY".to_string(), "true".to_string());
     }
-    let mut gateway = GatewayProcess::start_surface_with_env(&config_path, temp_dir.path(), &gateway_env);
+    let mut gateway = if world
+        .surface_config
+        .keeps_gateway_log
+    {
+        GatewayProcess::start_surface_logged_with_env(&config_path, temp_dir.path(), &gateway_env)
+    } else {
+        GatewayProcess::start_surface_with_env(&config_path, temp_dir.path(), &gateway_env)
+    };
     gateway = gateway
         .with_port(gateway_port)
         .with_port_reservation(port_reservation);
