@@ -126,6 +126,34 @@ changes:
         changed provider, a missing secret, a secrets store error or a refused token
         endpoint never serves the stale token. Legacy delegation audit details gain the
         value <grant>_stale, for example client_credentials_stale.
+    - timestamp: '2026-11-02T13:10:00Z'
+      title: Keep local token grant failures out of the token backoff
+      description: >-
+        A malformed or missing signing key, a missing token endpoint or client, or another unusable provider setting no longer starts the token retry backoff or serves a cached token as stale; only failures caused by the token endpoint do. The API status and audit text are unchanged.
+    - timestamp: '2026-11-02T13:11:00Z'
+      title: Warn once per token grant about an out-of-tenant secret
+      description: >-
+        In warn mode the out-of-tenant secret warning is now logged once when a token is granted instead of on every cache hit and twice on a fresh grant; the tenant check is one shared predicate.
+    - timestamp: '2026-11-02T13:12:00Z'
+      title: Fail startup on a malformed insecure token endpoint entry
+      description: >-
+        credential_policy.insecure_token_endpoints entries that do not parse, are not http, or carry a user name or password now fail startup with the entry named, instead of being silently ignored.
+    - timestamp: '2026-11-02T13:13:00Z'
+      title: Report every provider secret that sits outside the provider tenant
+      description: >-
+        The credential policy report now flags a tenant provider holding another tenant's secret and an appliance-wide provider holding a tenant secret, matching what the runtime refuses, not only a tenant provider holding an appliance-wide secret.
+    - timestamp: '2026-11-02T13:14:00Z'
+      title: Report surfaces the credential policy check could not inspect
+      description: >-
+        A surface whose references cannot be collected now logs a warning naming its id, tenant and error, and the clean line says how many surfaces could not be inspected instead of claiming nothing breaks a rule.
+    - timestamp: '2026-11-02T13:15:00Z'
+      title: Tell a refused agent card fetch the real wait
+      description: >-
+        The agent card preview limit is a burst of 10 then one fetch every 6 seconds; a 429 now carries a Retry-After of 1 to 6 seconds instead of a fixed 60, and the docs and dashboard toast say so.
+    - timestamp: '2026-11-02T13:16:00Z'
+      title: Warn instead of erroring on an http token endpoint in the dashboard
+      description: >-
+        The credential provider editor now shows a warning, not an invalid-field error, for an http token endpoint, explaining that new or changed ones need an exact entry in credential_policy.insecure_token_endpoints and that an unchanged stored one is still accepted in warn mode.
   removed: []
   security:
     - timestamp: '2026-10-30T23:00:04Z'
