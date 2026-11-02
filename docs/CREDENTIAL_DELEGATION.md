@@ -665,7 +665,7 @@ Direct Line secret, which must belong to the proxy's own tenant. Saving a tenant
 another tenant's or a new appliance-wide secret answers `400` "A2A proxy secret is not
 accessible"; an update that keeps the stored appliance-wide secret and `base_url` is saved with
 a warning in `warn` mode and refused in `enforce` mode, where a request through the proxy also
-fails as target unavailable, as for a missing secret, before the secret is read. An
+fails as target unavailable, as for a missing secret, before its value is used. An
 appliance-wide A2A Proxy that an operator published stays usable by tenant surfaces in both
 modes, with its appliance-wide secret, as a shared bot: a tenant can neither change where it
 sends the secret nor read it. A tenant reassignment that would give a tenant proxy an
