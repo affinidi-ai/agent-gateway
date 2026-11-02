@@ -1683,11 +1683,7 @@ async fn step_resolve_agent_identity(
     // credential (mTLS cert, API key) or fixed. Resolve them here so the
     // pipeline does not insist on parsing a JSON body when none is expected.
     let cred_id_start = Instant::now();
-    let cred_id_channel = ctx
-        .surface
-        .config_id()
-        .unwrap_or("unknown")
-        .to_string();
+    let cred_id_channel = ctx.surface.name.clone();
     let mode_label = match managed_identity {
         crate::source_auth::ManagedIdentityConfig::PayloadExtraction(_) => "payload_extraction",
         crate::source_auth::ManagedIdentityConfig::FromMtls { .. } => "from_mtls",
@@ -11636,11 +11632,7 @@ mod tests {
             .managed_identity = Some(crate::source_auth::ManagedIdentityConfig::FromApiKey {
             api_key_id: Some("atgk_ob_caller".to_string()),
         });
-        let channel = ctx
-            .surface
-            .config_id()
-            .unwrap_or("unknown")
-            .to_string();
+        let channel = ctx.surface.name.clone();
         let role_clashes = || {
             crate::metrics::backends::prometheus::MANAGED_IDENTITY_RESOLVE
                 .with_label_values(&[channel.as_str(), "from_api_key", "role_clash"])
@@ -11687,11 +11679,7 @@ mod tests {
         let mut ctx = test_pipeline_context();
         ctx.virtual_channel
             .managed_identity = Some(config);
-        let channel = ctx
-            .surface
-            .config_id()
-            .unwrap_or("unknown")
-            .to_string();
+        let channel = ctx.surface.name.clone();
         let count = |result: &str| {
             crate::metrics::backends::prometheus::MANAGED_IDENTITY_RESOLVE
                 .with_label_values(&[channel.as_str(), "from_api_key", result])
@@ -11738,9 +11726,7 @@ mod tests {
         surface.identity_slots.inbound = Some(legacy_key);
         ctx.surface = Arc::new(surface);
         let restamped = crate::metrics::backends::prometheus::MANAGED_IDENTITY_RESOLVE.with_label_values(&[
-            ctx.surface
-                .config_id()
-                .unwrap_or("unknown"),
+            ctx.surface.name.as_str(),
             "from_api_key",
             "legacy_role_restamped",
         ]);
@@ -11783,13 +11769,15 @@ mod tests {
             .managed_identity = Some(legacy_key.clone());
         let mut surface = (*ctx.surface).clone();
         surface.surface_id = "ob-takeover-unavailable".to_string();
+        surface.name = "ob-takeover-unavailable-name".to_string();
         surface.identity_slots.inbound = Some(legacy_key);
         ctx.surface = Arc::new(surface);
-        let count = |result: &str| {
+        let count_under = |channel: &str, result: &str| {
             crate::metrics::backends::prometheus::MANAGED_IDENTITY_RESOLVE
-                .with_label_values(&["ob-takeover-unavailable", "from_api_key", result])
+                .with_label_values(&[channel, "from_api_key", result])
                 .get()
         };
+        let count = |result: &str| count_under("ob-takeover-unavailable-name", result);
 
         let err = step_resolve_agent_identity(&state, &mut ctx)
             .await
@@ -11805,6 +11793,7 @@ mod tests {
         assert_eq!(err.status_code(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(count("identity_origin_unavailable"), 1);
         assert_eq!(count("role_clash"), 0);
+        assert_eq!(count_under("ob-takeover-unavailable", "identity_origin_unavailable"), 0);
     }
 
     #[tokio::test]

@@ -1041,6 +1041,12 @@ async fn saving_a_legacy_dual_role_surface_takes_over_the_key_and_drops_the_id()
         .send()
         .await
         .unwrap();
+    assert!(
+        saved
+            .headers()
+            .get(reqwest::header::WARNING)
+            .is_none()
+    );
     assert_eq!(saved.status(), 200, "{}", saved.text().await.unwrap());
     let again = admin
         .put(&surface_url)
@@ -1049,6 +1055,12 @@ async fn saving_a_legacy_dual_role_surface_takes_over_the_key_and_drops_the_id()
         .await
         .unwrap();
     assert_eq!(again.status(), 200);
+    assert!(
+        again
+            .headers()
+            .get(reqwest::header::WARNING)
+            .is_none()
+    );
 
     assert_legacy_dual_role_taken_over(&h, &admin, &identities_dir, SURFACE).await;
     assert_eq!(resolve_count(&name, "legacy_role_restamped") - restamped_before, 1);
@@ -1070,6 +1082,7 @@ async fn reassigning_a_legacy_dual_role_surface_takes_over_the_key_and_drops_the
         .send()
         .await
         .unwrap();
+    assert!(warning_headers(&reassigned).is_empty());
     assert_eq!(
         reassigned.status(),
         200,
@@ -1082,6 +1095,37 @@ async fn reassigning_a_legacy_dual_role_surface_takes_over_the_key_and_drops_the
 
     assert_legacy_dual_role_taken_over(&h, &admin, &identities_dir, SURFACE).await;
     assert_eq!(resolve_count(&name, "legacy_role_restamped") - restamped_before, 1);
+}
+
+/// Reassigning the tenant of a stored legacy surface whose Managed Agent key
+/// record another surface's callers also used leaves the record a caller's and
+/// warns that the key stays refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn reassigning_a_legacy_surface_whose_key_record_is_shared_warns() {
+    const SURFACE: &str = "legacy-dual-role-reassign-shared";
+    let (h, admin, identities_dir) =
+        start_with_stored_legacy_dual_role_surface(SURFACE, true, Some("another-caller-surface")).await;
+
+    let reassigned = admin
+        .put(format!("{}/api/v1/tenant-ownership/surfaces/{SURFACE}", h.gateway_base))
+        .json(&json!({ "tenant_id": "tenant-a" }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(warning_headers(&reassigned), vec![shared_legacy_key_warning()]);
+    assert_eq!(
+        reassigned.status(),
+        200,
+        "{}",
+        reassigned
+            .text()
+            .await
+            .unwrap()
+    );
+    let records = identity_records(&identities_dir);
+    let record = record_for_hash(&records, &api_key_identity_hash(LEGACY_SAVED_KEY_ID)).expect("the caller record");
+    assert_eq!(record.origin, Some(IdentityOrigin::ExternalCaller));
 }
 
 /// Replace the record file of `key_id` with a directory of the same name, so the
@@ -1165,9 +1209,33 @@ async fn a_takeover_the_identity_store_cannot_write_refuses_the_save_and_keeps_t
     }
 }
 
+/// The `Warning` header a save or reassignment answers with when another
+/// surface's callers used the record of [`LEGACY_SAVED_KEY_ID`].
+fn shared_legacy_key_warning() -> String {
+    format!(
+        "299 - \"API key '{LEGACY_SAVED_KEY_ID}' identifies callers of another surface, so this surface's \
+         Managed Agent or Transit Point is refused with it; issue a new API key for the Managed Agent or \
+         Transit Point\""
+    )
+}
+
+fn warning_headers(response: &reqwest::Response) -> Vec<String> {
+    response
+        .headers()
+        .get_all(reqwest::header::WARNING)
+        .iter()
+        .map(|value| {
+            value
+                .to_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect()
+}
+
 /// A save leaves the Managed Agent key's caller record alone when the key is
 /// named only by the saved body's inbound slot, or when another surface's
-/// callers also use the record.
+/// callers also use the record, and then warns that the key stays refused.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_save_takes_over_only_a_record_the_stored_surface_alone_named() {
     let cases: [(&'static str, bool, Option<&'static str>, u64); 2] = [
@@ -1198,6 +1266,12 @@ async fn a_save_takes_over_only_a_record_the_stored_surface_alone_named() {
             .await
             .unwrap();
 
+        let expected_warnings = if clashes == 0 {
+            Vec::new()
+        } else {
+            vec![shared_legacy_key_warning()]
+        };
+        assert_eq!(warning_headers(&saved), expected_warnings, "{surface_id}");
         assert_eq!(saved.status(), 200, "{surface_id}: {}", saved.text().await.unwrap());
         let records = identity_records(&identities_dir);
         let record = record_for_hash(&records, &api_key_identity_hash(LEGACY_SAVED_KEY_ID)).expect("the caller record");

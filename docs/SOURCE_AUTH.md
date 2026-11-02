@@ -859,18 +859,25 @@ when the surface or a variant is saved or the surface is reassigned to another t
 applies only while no other surface has used the record; a record with no recorded surface
 counts as this surface's. Otherwise a caller record stays a caller's, the save still drops the
 stored id, and the Managed Agent is refused with `role_clash`; a record with no role is left
-as it is. Each takeover counts as `legacy_role_restamped`. When the identity store fails during
+as it is. The save or reassignment then answers `200` with a `Warning` header naming the key
+id and the recovery:
+
+```
+Warning: 299 - "API key 'atgk_...' identifies callers of another surface, so this surface's Managed Agent or Transit Point is refused with it; issue a new API key for the Managed Agent or Transit Point"
+```
+
+A variant create, update, promotion or deletion answers with the same header. The dashboard
+shows it after a Surface Builder save, in the save warnings banner and a toast; it does not
+reassign tenants. Each takeover counts as `legacy_role_restamped`. When the identity store fails during
 the takeover, the request answers `503` (`identity_origin_unavailable`). A save or reassignment
 answers `503`, and keeps the stored id so it can be retried, when the identity store or the
 secrets store fails during the takeover.
 
 After an upgrade, find the affected surfaces through
 `agent_gateway_managed_identity_resolve_total` with `mode="from_api_key"` and `result`
-`api_key_unavailable` or `role_clash`. Its `channel_id` label is the surface name on the caller
-path, the Managed Agent fallback, the Managed Agent's response, a save and a reassignment, and
-the surface ID on a Transit Point's outbound request. A save-time takeover of a Transit Point
-key therefore counts under the surface name, and that key's outbound requests under the
-surface ID.
+`api_key_unavailable` or `role_clash`. Its `channel_id` label is the surface name on every
+path: the caller path, the Managed Agent fallback, the Managed Agent's response, a Transit
+Point's outbound request, a save and a reassignment.
 
 Request-time refusals return a fixed body and log the cause server-side. Each counts in
 `agent_gateway_managed_identity_resolve_total` with `mode="from_api_key"`:

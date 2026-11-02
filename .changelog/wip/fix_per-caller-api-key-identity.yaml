@@ -1,7 +1,15 @@
 branch: fix/per-caller-api-key-identity
 changes:
   added: []
-  changed: []
+  changed:
+    - timestamp: '2026-11-02T00:00:00Z'
+      title: Label a Transit Point's managed identity resolve metrics with the surface name
+      description: >-
+        A Transit Point's outbound request labelled
+        `agent_gateway_managed_identity_resolve_total` and its duration histogram with the
+        surface ID, while every other path used the surface name. It now reports the surface
+        name, so one surface counts under one `channel_id`. Update alerts and dashboards that
+        filter these metrics by a Transit Point surface's ID.
   fixed:
     - timestamp: '2026-10-31T00:00:00Z'
       title: ⭐ Identify each caller by the API key it presents
@@ -25,8 +33,7 @@ changes:
       description: >-
         Concurrent first requests for an identity with no record could each mint a different
         DID. The identity record is now created only if none exists for its hash, under a lock
-        on that record, so every concurrent first request gets the one stored DID and an API
-        key's record keeps the role it was first used in.
+        on that record, so every concurrent first request gets the one stored DID.
   removed: []
   security:
     - timestamp: '2026-10-31T00:00:00Z'
@@ -35,6 +42,20 @@ changes:
         A plain API Key secret id starting `atgk_` would derive the same caller DID as the API
         Key Provider key with that id. Saving such a surface with an inbound From API Key
         Identity is refused with 400, and a stored one is refused at request time with 500.
+    - timestamp: '2026-11-02T00:00:00Z'
+      title: Make the presented API key's DID replace any body-asserted caller identity
+      description: >-
+        On a direct request to a surface whose inbound Identity is From API Key, the presented
+        key's DID replaces any identity the request body asserts, so a key holder cannot choose
+        another DID. `input.agent.did` and its verification are the key's DID, and a
+        presentation or credential extension in the body no longer sets the caller DID, so
+        policies naming the presentation's DID stop matching. When the body does not assert
+        the key's own DID, or no caller identity resolves, the trust-registry claims it made
+        (`provider_did`, `trust_registry_did`, `authority_did`, `identity_issuer_did`,
+        `agent_dna` and trust verifications) are dropped, so Trust Check presets that read
+        `input.agent.provider_did` deny. Gateway and global policy see no `input.agent.did`
+        and none of those claims on these surfaces. Fabric receive does not read this mode; the request body sets the
+        caller there.
   breaking:
     - timestamp: '2026-11-02T00:00:00Z'
       title: Fail closed when an inbound From API Key caller does not use an API key
@@ -71,26 +92,14 @@ changes:
         Agent or a Transit Point key, the Managed Agent takes over that key's caller record, or
         its record with no role, once, keeping its DID, at request time or when the surface is
         saved or reassigned, provided no other surface has used the record (metric
-        `legacy_role_restamped`). A request returns 503 (metric `identity_origin_unavailable`)
-        when the identity store fails during the takeover, and a save or reassignment returns
+        `legacy_role_restamped`). When another surface has used it, the save or reassignment
+        answers 200 with a `Warning` header naming the key id and telling the operator to
+        issue a new API key for the Managed Agent or Transit Point. A request returns 503
+        (metric `identity_origin_unavailable`) when the identity store fails during the takeover, and a save or reassignment returns
         503 and keeps the stored id when the identity or secrets store fails during it. Find
         affected surfaces through
         `agent_gateway_managed_identity_resolve_total` with `mode="from_api_key"` and `result`
         `role_clash`.
-    - timestamp: '2026-11-02T00:00:00Z'
-      title: Make the presented API key's DID replace any body-asserted caller identity
-      description: >-
-        On a direct request to a surface whose inbound Identity is From API Key, the presented
-        key's DID replaces any identity the request body asserts, so a key holder cannot choose
-        another DID. `input.agent.did` and its verification are the key's DID, and a
-        presentation or credential extension in the body no longer sets the caller DID, so
-        policies naming the presentation's DID stop matching. When the body does not assert
-        the key's own DID, or no caller identity resolves, the trust-registry claims it made
-        (`provider_did`, `trust_registry_did`, `authority_did`, `identity_issuer_did`,
-        `agent_dna` and trust verifications) are dropped, so Trust Check presets that read
-        `input.agent.provider_did` deny. Gateway and global policy see no `input.agent.did`
-        and none of those claims on these surfaces. Fabric receive does not read this mode; the request body sets the
-        caller there.
     - timestamp: '2026-10-31T00:00:00Z'
       title: Refuse From API Key on an MCP proxy:// surface when it is saved again
       description: >-

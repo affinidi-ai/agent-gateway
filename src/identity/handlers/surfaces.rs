@@ -247,14 +247,16 @@ fn legacy_takeover_unavailable(detail: String) -> SurfaceApiError {
 /// inbound slot of `surface` recorded as a caller. Errors when the identity
 /// store or a key's secret cannot be read, so the save keeps the stored id the
 /// runtime takeover reads. Outcomes are counted under the surface name, as the
-/// request path counts them.
+/// request path counts them. Returns a warning for each key left refused
+/// because another surface used its record.
 pub(crate) async fn take_over_legacy_inbound_api_keys(
     state: &IdentityApiState,
     surface: &AgentSurface,
     api_key_ids: &[String],
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     use crate::identity::LegacyCallerTakeover;
     let surface_id = surface.surface_id.as_str();
+    let mut warnings = Vec::new();
     for api_key_id in api_key_ids {
         let started = std::time::Instant::now();
         let config = crate::source_auth::ManagedIdentityConfig::FromApiKey {
@@ -291,7 +293,10 @@ pub(crate) async fn take_over_legacy_inbound_api_keys(
             .map_err(|e| format!("legacy inbound API key identity could not be taken over: {e}"))?;
         let result = match outcome {
             LegacyCallerTakeover::TakenOver => "legacy_role_restamped",
-            LegacyCallerTakeover::SharedWithAnotherSurface => "role_clash",
+            LegacyCallerTakeover::SharedWithAnotherSurface => {
+                warnings.push(shared_legacy_api_key_warning(api_key_id));
+                "role_clash"
+            }
             LegacyCallerTakeover::NotApplicable => continue,
         };
         crate::metrics::backends::prometheus::track_managed_identity_resolve(
@@ -303,7 +308,28 @@ pub(crate) async fn take_over_legacy_inbound_api_keys(
                 .as_secs_f64(),
         );
     }
-    Ok(())
+    Ok(warnings)
+}
+
+fn shared_legacy_api_key_warning(api_key_id: &str) -> String {
+    format!(
+        "API key '{api_key_id}' identifies callers of another surface, so this surface's Managed Agent or \
+         Transit Point is refused with it; issue a new API key for the Managed Agent or Transit Point"
+    )
+}
+
+/// `Warning` headers (code 299), one per message.
+pub(crate) fn warning_headers(warnings: impl IntoIterator<Item = String>) -> axum::http::HeaderMap {
+    let mut headers = axum::http::HeaderMap::new();
+    for warning in warnings {
+        let quoted = warning
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"");
+        if let Ok(value) = axum::http::HeaderValue::from_str(&format!("299 - \"{quoted}\"")) {
+            headers.append(axum::http::header::WARNING, value);
+        }
+    }
+    headers
 }
 
 fn configured_api_key_id<'a>(
@@ -1246,12 +1272,13 @@ type SavedSurface = (axum::http::HeaderMap, Json<SurfaceResponse<AgentSurface>>)
 async fn save_warnings(
     state: &IdentityApiState,
     surface: &AgentSurface,
+    takeover_warnings: Vec<String>,
 ) -> axum::http::HeaderMap {
     let issuers = jwt_strategy_issuers(state, surface).await;
     let mut headers = axum::http::HeaderMap::new();
-    for warning in surface
-        .access_point_warnings()
+    for warning in takeover_warnings
         .into_iter()
+        .chain(surface.access_point_warnings())
         .chain(
             crate::proxy::server::open_transit_points(&state.network_config, surface)
                 .iter()
@@ -2600,7 +2627,7 @@ pub async fn create_surface(
 
     apply_surface_change(&state, SurfaceChange::Upsert(&surface)).await;
 
-    Ok((StatusCode::CREATED, save_warnings(&state, &surface).await, Json(surface.into())))
+    Ok((StatusCode::CREATED, save_warnings(&state, &surface, Vec::new()).await, Json(surface.into())))
 }
 
 /// Whether `access_point` in a PUT body removes its discovery setting.
@@ -2688,7 +2715,7 @@ pub async fn update_surface(
     retain_transit_token_lifetime(&mut surface, &existing);
     retain_transit_caller_authentication(&mut surface, &existing, &sent);
 
-    let saved = validate_and_save_surface(
+    let (saved, takeover_warnings) = validate_and_save_surface(
         &state,
         store,
         surface,
@@ -2699,7 +2726,7 @@ pub async fn update_surface(
         management_actor(&caller, &delegation).as_ref(),
     )
     .await?;
-    Ok((save_warnings(&state, &saved).await, Json(saved.into())))
+    Ok((save_warnings(&state, &saved, takeover_warnings).await, Json(saved.into())))
 }
 
 /// PUT carries the whole record, so an omitted
@@ -3474,7 +3501,7 @@ async fn validate_and_save_surface(
     scope: Option<&PatResourceScope>,
     resource_scoped: bool,
     actor: Option<&crate::delegation_vault::audit::AuditCallerContext>,
-) -> Result<AgentSurface, SurfaceApiError> {
+) -> Result<(AgentSurface, Vec<String>), SurfaceApiError> {
     drop_inbound_api_key_ids(&mut surface);
     // Ensure route starts with / BEFORE the shape check so the
     // historical "missing slash is auto-fixed" behaviour is preserved.
@@ -3553,11 +3580,14 @@ async fn validate_and_save_surface(
     let allowlist = crate::egress::bdd_egress_allowlist();
     surface.trust_check_split = surface.has_trust_check_lists();
     surface.transit_point_source_auth = surface.has_transit_point_source_auth();
-    if let Some(stored) = existing {
-        take_over_legacy_inbound_api_keys(state, &surface, &legacy_inbound_api_key_ids(stored, &surface))
-            .await
-            .map_err(legacy_takeover_unavailable)?;
-    }
+    let takeover_warnings = match existing {
+        Some(stored) => {
+            take_over_legacy_inbound_api_keys(state, &surface, &legacy_inbound_api_key_ids(stored, &surface))
+                .await
+                .map_err(legacy_takeover_unavailable)?
+        }
+        None => Vec::new(),
+    };
     super::surface_grants::write_surface(
         &super::surface_grants::GrantRemoval::of(state, allowlist.as_deref(), actor),
         store.clone(),
@@ -3589,7 +3619,7 @@ async fn validate_and_save_surface(
 
     apply_surface_change(state, SurfaceChange::Upsert(&surface)).await;
 
-    Ok(surface)
+    Ok((surface, takeover_warnings))
 }
 
 /// Whether an edit added, removed or changed the entries of the surface's Trust Recorder.
@@ -3690,7 +3720,7 @@ pub async fn patch_surface(
         refuse_a2a_settings_sent_on_other_protocols(&surface)?;
     }
 
-    let saved = validate_and_save_surface(
+    let (saved, takeover_warnings) = validate_and_save_surface(
         &state,
         &store,
         surface,
@@ -3701,7 +3731,7 @@ pub async fn patch_surface(
         management_actor(&caller, &delegation).as_ref(),
     )
     .await?;
-    Ok((save_warnings(&state, &saved).await, Json(saved.into())))
+    Ok((save_warnings(&state, &saved, takeover_warnings).await, Json(saved.into())))
 }
 
 /// `PATCH /v1/surfaces/{id}/variants/{variant_id}`
@@ -3786,7 +3816,7 @@ pub async fn patch_variant(
     let mut surface = existing.clone();
     surface.variants[variant_index] = new_variant;
 
-    let saved = validate_and_save_surface(
+    let (saved, takeover_warnings) = validate_and_save_surface(
         &state,
         &store,
         surface,
@@ -3797,7 +3827,7 @@ pub async fn patch_variant(
         management_actor(&caller, &delegation).as_ref(),
     )
     .await?;
-    Ok((save_warnings(&state, &saved).await, Json(saved.into())))
+    Ok((save_warnings(&state, &saved, takeover_warnings).await, Json(saved.into())))
 }
 
 /// Delete an agent surface (hard delete: removes from cache + filesystem).
@@ -4443,7 +4473,7 @@ pub async fn create_variant(
         .variants
         .push(new_variant.clone());
 
-    let saved = validate_and_save_surface(
+    let (saved, takeover_warnings) = validate_and_save_surface(
         &state,
         &store,
         surface,
@@ -4463,7 +4493,7 @@ pub async fn create_variant(
 
     info!("Created variant '{}' (id={}) on surface '{}'", new_variant.alias, new_variant.id, surface_id);
 
-    let mut warnings = save_warnings(&state, &saved).await;
+    let mut warnings = save_warnings(&state, &saved, takeover_warnings).await;
     if left_out_target_binding && let Some(value) = warning_header(&copied_target_binding_warning(&new_variant.alias)) {
         warnings.append(axum::http::header::WARNING, value);
     }
@@ -4599,7 +4629,7 @@ pub async fn update_variant(
     }
     settle_retained_protected_resources(&mut surface, false, &retained, &state.network_config)?;
 
-    let saved = validate_and_save_surface(
+    let (saved, takeover_warnings) = validate_and_save_surface(
         &state,
         &store,
         surface,
@@ -4625,7 +4655,7 @@ pub async fn update_variant(
 
     info!("Updated variant '{}' (id={}) on surface '{}'", updated.alias, updated.id, surface_id);
 
-    Ok((save_warnings(&state, &saved).await, Json(SurfaceResponse::variant(updated, &saved))))
+    Ok((save_warnings(&state, &saved, takeover_warnings).await, Json(SurfaceResponse::variant(updated, &saved))))
 }
 
 /// `DELETE /v1/surfaces/{id}/variants/{variant_id}`
@@ -4640,7 +4670,7 @@ pub async fn delete_variant(
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
     caller: Option<Extension<AuthGuardOk>>,
-) -> Result<Json<DeleteSurfaceResponse>, SurfaceApiError> {
+) -> Result<(axum::http::HeaderMap, Json<DeleteSurfaceResponse>), SurfaceApiError> {
     let (store, mut surface) = load_surface_or_404(
         &state,
         &surface_id,
@@ -4677,7 +4707,7 @@ pub async fn delete_variant(
         .variants
         .remove(position);
 
-    validate_and_save_surface(
+    let (_, takeover_warnings) = validate_and_save_surface(
         &state,
         &store,
         surface,
@@ -4691,10 +4721,13 @@ pub async fn delete_variant(
 
     info!("Deleted variant '{}' (id={}) from surface '{}'", removed.alias, removed.id, surface_id);
 
-    Ok(Json(DeleteSurfaceResponse {
-        success: true,
-        message: format!("Variant '{}' deleted from surface '{}'", variant_id, surface_id),
-    }))
+    Ok((
+        warning_headers(takeover_warnings),
+        Json(DeleteSurfaceResponse {
+            success: true,
+            message: format!("Variant '{}' deleted from surface '{}'", variant_id, surface_id),
+        }),
+    ))
 }
 
 /// `POST /v1/surfaces/{id}/variants/{variant_id}/promote-to-default`
@@ -4741,7 +4774,7 @@ pub async fn promote_variant_to_default(
     let variant_alias = variant.alias.clone();
     surface.default_variant_id = Some(variant_id.clone());
 
-    let saved = validate_and_save_surface(
+    let (saved, takeover_warnings) = validate_and_save_surface(
         &state,
         &store,
         surface,
@@ -4755,7 +4788,7 @@ pub async fn promote_variant_to_default(
 
     info!("Promoted variant '{}' (id={}) to default on surface '{}'", variant_alias, variant_id, surface_id);
 
-    Ok((save_warnings(&state, &saved).await, Json(saved.into())))
+    Ok((save_warnings(&state, &saved, takeover_warnings).await, Json(saved.into())))
 }
 
 /// `GET /v1/surfaces/{id}/variants/{alias}/resolved`
