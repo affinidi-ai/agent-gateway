@@ -2108,17 +2108,24 @@ async fn managed_api_key_identity_reached_inbound_first_stays_managed() {
 /// external caller even though the same credential mode backs managed identities.
 #[tokio::test(flavor = "multi_thread")]
 async fn inbound_slot_api_key_identity_is_recorded_as_external_caller() {
-    let inbound = json!({ "type": "from_api_key", "api_key_id": "atgk_e2e0000000000000000000000000004" });
     let mut base_dir = std::path::PathBuf::new();
-    let h = GatewayHarness::start(|dir, gw_config, _| {
+    let h = GatewayHarness::start(|dir, gw_config, bootstrap| {
         base_dir = dir.to_path_buf();
         write_caller_verification_policies(dir);
-        gw_config.surfaces = vec![inbound_identity_surface(inbound, UNVERIFIED_CALLER_POLICY_ID)];
+        write_api_key_secret(
+            &bootstrap
+                .storage_paths
+                .secrets,
+            INBOUND_CALLER_KEY_SECRET,
+            INBOUND_CALLER_KEY,
+        );
+        gw_config.surfaces = vec![inbound_api_key_identity_surface(UNVERIFIED_CALLER_POLICY_ID)];
     })
     .await;
 
     let resp = reqwest::Client::new()
         .post(&h.gateway_url)
+        .header("x-api-key", INBOUND_CALLER_KEY)
         .json(&a2a_request())
         .send()
         .await
@@ -2135,6 +2142,7 @@ async fn inbound_slot_api_key_identity_is_recorded_as_external_caller() {
 const STATIC_CALLER_DID: &str = "did:web:static-caller.example";
 const UNVERIFIED_CALLER_POLICY_ID: &str = "unverified-caller-policy";
 const VERIFIED_CALLER_POLICY_ID: &str = "verified-caller-policy";
+const UNVERIFIED_EXTENSION_IDENTITY_POLICY_ID: &str = "unverified-extension-identity-policy";
 const SOURCE_AUTH_CALLER_POLICY_ID: &str = "source-auth-caller-policy";
 
 fn write_caller_verification_policies(temp_dir: &std::path::Path) {
@@ -2162,6 +2170,18 @@ allow if {
 default allow := false
 
 allow if input.agent.did_verified == true
+"#,
+        ),
+        (
+            UNVERIFIED_EXTENSION_IDENTITY_POLICY_ID,
+            r#"package surface.policy
+
+default allow := false
+
+allow if {
+    startswith(input.extension_identity.did, "did:webvh:")
+    input.extension_identity.verification == "unverified"
+}
 "#,
         ),
         (
@@ -2221,6 +2241,60 @@ fn inbound_identity_surface(
     surface
 }
 
+const INBOUND_CALLER_KEY_SECRET: &str = "inbound-caller-key";
+const INBOUND_CALLER_KEY: &str = "inbound-caller-key-value";
+
+/// An inbound `from_api_key` surface whose callers authenticate with the
+/// plain API Key in [`INBOUND_CALLER_KEY_SECRET`].
+fn inbound_api_key_identity_surface(policy_id: &str) -> crate::config::agent_surface::AgentSurface {
+    let mut surface = inbound_identity_surface(json!({ "type": "from_api_key" }), policy_id);
+    surface
+        .access_point
+        .caller_authentication = Some(crate::config::agent_surface::CallerAuthentication {
+        protected_resource: None,
+        methods: vec![crate::source_auth::SourceAuthConfig::ApiKey(crate::source_auth::models::ApiKeyAuthConfig {
+            extraction: crate::source_auth::models::CredentialExtraction::HttpHeader { field: "x-api-key".to_string() },
+            secret_id: INBOUND_CALLER_KEY_SECRET.to_string(),
+        })],
+    });
+    surface
+}
+
+async fn send_api_key_identity_request(policy_id: &'static str) -> (reqwest::StatusCode, usize) {
+    send_api_key_identity_body(policy_id, a2a_request()).await
+}
+
+async fn send_api_key_identity_body(
+    policy_id: &'static str,
+    body: serde_json::Value,
+) -> (reqwest::StatusCode, usize) {
+    let h = GatewayHarness::start(move |temp_dir, gw_config, bootstrap| {
+        write_caller_verification_policies(temp_dir);
+        write_api_key_secret(
+            &bootstrap
+                .storage_paths
+                .secrets,
+            INBOUND_CALLER_KEY_SECRET,
+            INBOUND_CALLER_KEY,
+        );
+        gw_config.surfaces = vec![inbound_api_key_identity_surface(policy_id)];
+    })
+    .await;
+    let status = reqwest::Client::new()
+        .post(&h.gateway_url)
+        .header("x-api-key", INBOUND_CALLER_KEY)
+        .json(&body)
+        .send()
+        .await
+        .expect("inbound request failed")
+        .status();
+    let forwarded = h
+        .mock
+        .request_count
+        .load(std::sync::atomic::Ordering::SeqCst);
+    (status, forwarded)
+}
+
 async fn send_configured_identity_request(
     inbound: serde_json::Value,
     policy_id: &'static str,
@@ -2269,13 +2343,34 @@ async fn inbound_static_identity_does_not_satisfy_a_verified_caller_policy() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn inbound_from_api_key_identity_reaches_policy_as_unverified() {
-    let inbound = json!({ "type": "from_api_key", "api_key_id": "atgk_e2e0000000000000000000000000002" });
-    let (status, forwarded) = send_configured_identity_request(inbound.clone(), UNVERIFIED_CALLER_POLICY_ID).await;
-    assert_eq!(status, 200, "policy must see the API-key-derived DID as unverified");
+    let (status, forwarded) = send_api_key_identity_request(UNVERIFIED_CALLER_POLICY_ID).await;
+    assert_eq!(status, 200, "policy must see the plain-API-key-derived DID as unverified");
     assert_eq!(forwarded, 1);
 
-    let (status, forwarded) = send_configured_identity_request(inbound, VERIFIED_CALLER_POLICY_ID).await;
-    assert_eq!(status, 403, "an API-key-derived DID must not count as verified");
+    let (status, forwarded) = send_api_key_identity_request(VERIFIED_CALLER_POLICY_ID).await;
+    assert_eq!(status, 403, "a plain-API-key-derived DID must not count as verified");
+    assert_eq!(forwarded, 0);
+}
+
+/// A caller that presents a valid API key and a verified identity VP is still
+/// identified by its key: `input.extension_identity` is the key's unverified
+/// DID, not the VP holder's `vp_unanchored` one.
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_from_api_key_identity_wins_over_a_body_presentation() {
+    let signed = crate::identity::test_helpers::signed_agent_presentation().await;
+    let credential_uri = crate::config::AFFINIDI_AGENT_IDENTITY_CREDENTIAL_EXTENSION;
+    let mut body = a2a_request();
+    body["params"]["message"]["extensions"] = json!([credential_uri]);
+    body["params"]["message"]["metadata"] = json!({
+        credential_uri: { "did": signed.holder_did, "verifiablePresentation": signed.presentation.to_string() }
+    });
+
+    let (status, forwarded) = send_api_key_identity_body(UNVERIFIED_EXTENSION_IDENTITY_POLICY_ID, body.clone()).await;
+    assert_eq!(status, 200, "policy must see the key's unverified DID, not the presentation's");
+    assert_eq!(forwarded, 1);
+
+    let (status, forwarded) = send_api_key_identity_body(VERIFIED_CALLER_POLICY_ID, body).await;
+    assert_eq!(status, 403, "the verified presentation must not supply the caller identity");
     assert_eq!(forwarded, 0);
 }
 
@@ -2328,7 +2423,7 @@ async fn inbound_from_jwt_claim_identity_reaches_policy_as_source_auth() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn inbound_credential_identity_is_not_resolved_on_discovery_paths() {
-    let inbound = json!({ "type": "from_api_key", "api_key_id": "missing-secret-id" });
+    let inbound = json!({ "type": "from_api_key" });
     let h = GatewayHarness::start(move |temp_dir, gw_config, _| {
         write_caller_verification_policies(temp_dir);
         gw_config.surfaces = vec![inbound_identity_surface(inbound, UNVERIFIED_CALLER_POLICY_ID)];
@@ -2344,7 +2439,7 @@ async fn inbound_credential_identity_is_not_resolved_on_discovery_paths() {
         .await
         .expect("inbound request failed")
         .status();
-    assert_eq!(rpc_status, 502, "an unresolvable credential identity must fail the request");
+    assert_eq!(rpc_status, 500, "an inbound from_api_key identity without API key auth must fail the request");
 
     let discovery_status = client
         .get(

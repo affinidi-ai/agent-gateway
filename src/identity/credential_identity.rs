@@ -169,6 +169,9 @@ pub enum CredentialIdentityError {
     #[error("from_api_key identity has no api_key_id")]
     ApiKeyIdMissing,
 
+    #[error("API key secret '{0}' uses the reserved API Key Provider id prefix")]
+    ApiKeySecretIdReserved(String),
+
     #[error("invalid static DID: {0}")]
     InvalidStaticDid(String),
 
@@ -209,6 +212,7 @@ impl CredentialIdentityError {
             Self::CertificateNotFound(_)
             | Self::SecretNotFound(_)
             | Self::ApiKeyIdMissing
+            | Self::ApiKeySecretIdReserved(_)
             | Self::CertificateDisabled(_)
             | Self::CertificateExpired { .. }
             | Self::CertificateWrongKind { .. }
@@ -231,6 +235,7 @@ impl CredentialIdentityError {
             Self::CertificateParse { .. } => "cert_parse_failed",
             Self::SecretNotFound(_) => "secret_not_found",
             Self::ApiKeyIdMissing => "api_key_id_missing",
+            Self::ApiKeySecretIdReserved(_) => "api_key_secret_id_reserved",
             Self::InvalidStaticDid(_) => "invalid_static_did",
             Self::StoreLookup(_) => "store_lookup_failed",
             Self::JwtClaimsUnavailable => "jwt_claims_unavailable",
@@ -416,10 +421,42 @@ impl CredentialIdentityResolver {
         // Those IDs live in a separate subsystem (ApiKeyStore), not in SecretsStore,
         // so a secrets-store lookup would always fail. The hash is keyed on
         // `api_key_id` alone, so we derive identity directly — no store lookup needed.
-        if api_key_id.starts_with(crate::api_keys::KEY_ID_PREFIX) {
-            return Ok(self.derive_api_key_id_direct(api_key_id));
-        }
+        let (identity_fields, identity_hash) = if api_key_id.starts_with(crate::api_keys::KEY_ID_PREFIX) {
+            self.derive_api_key_id_direct(api_key_id)
+        } else {
+            self.resolve_secret_api_key(api_key_id, store)
+                .await?
+        };
+        Ok(CredentialIdentity::Derived { identity_fields, identity_hash })
+    }
 
+    /// The caller identity of the API key a request presented: an API Key
+    /// Provider key by its key id, a plain API Key by its `secret_id` through
+    /// the secrets store. Both hash as `from_api_key` does, so a provider key's
+    /// DID matches the one `from_api_key` gives the same key id. A plain key
+    /// whose `secret_id` carries the provider id prefix is refused, since its
+    /// hash would equal that provider key's.
+    pub async fn resolve_presented_api_key(
+        &self,
+        key_name: &str,
+        from_provider: bool,
+        store: Option<&Arc<dyn SecretsStore>>,
+    ) -> Result<(HashMap<String, JsonValue>, String), CredentialIdentityError> {
+        if from_provider {
+            Ok(self.derive_api_key_id_direct(key_name))
+        } else if key_name.starts_with(crate::api_keys::KEY_ID_PREFIX) {
+            Err(CredentialIdentityError::ApiKeySecretIdReserved(key_name.to_string()))
+        } else {
+            self.resolve_secret_api_key(key_name, store)
+                .await
+        }
+    }
+
+    async fn resolve_secret_api_key(
+        &self,
+        api_key_id: &str,
+        store: Option<&Arc<dyn SecretsStore>>,
+    ) -> Result<(HashMap<String, JsonValue>, String), CredentialIdentityError> {
         let store = store.ok_or(CredentialIdentityError::SecretsStoreUnavailable)?;
         let secret = store
             .get_by_secret_id(api_key_id)
@@ -432,10 +469,7 @@ impl CredentialIdentityResolver {
             .get(api_key_id)
             && entry.updated_at == secret.updated_at
         {
-            return Ok(CredentialIdentity::Derived {
-                identity_fields: entry.fields.clone(),
-                identity_hash: entry.hash.clone(),
-            });
+            return Ok((entry.fields.clone(), entry.hash.clone()));
         }
 
         let fields = build_api_key_identity_fields(api_key_id, &secret);
@@ -450,20 +484,17 @@ impl CredentialIdentityResolver {
             },
         );
 
-        Ok(CredentialIdentity::Derived {
-            identity_fields: fields,
-            identity_hash: hash,
-        })
+        Ok((fields, hash))
     }
 
-    /// Derive `CredentialIdentity` from an `atgk_`-prefixed API key ID without
-    /// a secrets-store lookup. Used when the key lives in the API key store
-    /// (a separate subsystem). The hash is identical to the secrets-store path
-    /// because it is keyed on `api_key_id` only.
+    /// Derive the identity fields and hash of an `atgk_`-prefixed API key ID
+    /// without a secrets-store lookup. Used when the key lives in the API key
+    /// store (a separate subsystem). The hash is identical to the secrets-store
+    /// path because it is keyed on `api_key_id` only.
     fn derive_api_key_id_direct(
         &self,
         api_key_id: &str,
-    ) -> CredentialIdentity {
+    ) -> (HashMap<String, JsonValue>, String) {
         // Sentinel updated_at that never expires — entries are valid for the
         // lifetime of the process. The key_id is immutable so no invalidation
         // is needed beyond process restart.
@@ -473,10 +504,7 @@ impl CredentialIdentityResolver {
             .get(api_key_id)
             && entry.updated_at == sentinel
         {
-            return CredentialIdentity::Derived {
-                identity_fields: entry.fields.clone(),
-                identity_hash: entry.hash.clone(),
-            };
+            return (entry.fields.clone(), entry.hash.clone());
         }
         let mut fields = HashMap::new();
         fields.insert("credential_type".to_string(), json!("api_key"));
@@ -490,10 +518,7 @@ impl CredentialIdentityResolver {
                 hash: hash.clone(),
             },
         );
-        CredentialIdentity::Derived {
-            identity_fields: fields,
-            identity_hash: hash,
-        }
+        (fields, hash)
     }
 
     /// Forget any cached entry for `certificate_id`. Call after store mutations.
@@ -1468,5 +1493,73 @@ mod tests {
             matches!(err, CredentialIdentityError::SecretsStoreUnavailable),
             "non-atgk_ IDs must require a secrets store; got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn presented_provider_key_hashes_like_from_api_key_with_its_id() {
+        let resolver = CredentialIdentityResolver::new();
+        let (fields, hash) = resolver
+            .resolve_presented_api_key("atgk_client_1", true, None)
+            .await
+            .unwrap();
+        let configured = unwrap_derived(
+            &resolver
+                .resolve(
+                    &ManagedIdentityConfig::FromApiKey {
+                        api_key_id: Some("atgk_client_1".into()),
+                    },
+                    None,
+                    None,
+                )
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .0;
+        let (_, other) = resolver
+            .resolve_presented_api_key("atgk_client_2", true, None)
+            .await
+            .unwrap();
+
+        assert_eq!(hash, configured);
+        assert_ne!(hash, other);
+        assert_eq!(fields.get("api_key_id"), Some(&json!("atgk_client_1")));
+    }
+
+    #[tokio::test]
+    async fn presented_plain_key_resolves_its_secret_through_the_store() {
+        let store: Arc<dyn SecretsStore> = Arc::new(InMemorySecretsStore::new(make_secret("v")));
+        let (fields, hash) = CredentialIdentityResolver::new()
+            .resolve_presented_api_key("demo-key", false, Some(&store))
+            .await
+            .unwrap();
+
+        assert_eq!(hash, hash_credential(&[("credential_type", "api_key"), ("api_key_id", "demo-key")]));
+        assert_eq!(fields.get("api_key_id"), Some(&json!("demo-key")));
+    }
+
+    #[tokio::test]
+    async fn presented_plain_key_needs_the_secrets_store() {
+        let err = CredentialIdentityResolver::new()
+            .resolve_presented_api_key("demo-key", false, None)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, CredentialIdentityError::SecretsStoreUnavailable));
+    }
+
+    #[tokio::test]
+    async fn presented_plain_key_with_provider_id_prefix_is_refused() {
+        let mut secret = make_secret("v");
+        secret.secret_id = "atgk_client_1".into();
+        let store: Arc<dyn SecretsStore> = Arc::new(InMemorySecretsStore::new(secret));
+        let err = CredentialIdentityResolver::new()
+            .resolve_presented_api_key("atgk_client_1", false, Some(&store))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, CredentialIdentityError::ApiKeySecretIdReserved(_)));
+        assert_eq!(err.classify(), CredentialIdentityErrorClass::Misconfigured);
+        assert_eq!(err.reason_label(), "api_key_secret_id_reserved");
     }
 }

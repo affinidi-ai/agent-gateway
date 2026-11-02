@@ -555,15 +555,24 @@ pub async fn resolve_agent_identity_for_slot(
                         });
                     }
                     Err(e) => {
+                        let role_clash = e.is::<crate::identity::IdentityRoleClash>();
                         crate::metrics::backends::prometheus::track_managed_identity_resolve(
                             channel_name,
                             mode_label,
-                            "vc_issuer_error",
+                            if role_clash {
+                                "role_clash"
+                            } else {
+                                "vc_issuer_error"
+                            },
                             started
                                 .elapsed()
                                 .as_secs_f64(),
                         );
-                        return Err(IdentityResolutionError::IdentityBackendUnavailable(e.to_string()));
+                        return Err(if role_clash {
+                            IdentityResolutionError::DidCreationFailed(e.to_string())
+                        } else {
+                            IdentityResolutionError::IdentityBackendUnavailable(e.to_string())
+                        });
                     }
                 }
             }
@@ -1209,6 +1218,48 @@ mod tests {
                 "{kind:?}: {resolved:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn protected_api_key_of_a_caller_is_a_misconfiguration() {
+        let (issuer, _dir) = crate::identity::test_helpers::test_vc_issuer().await;
+        let (fields, hash) = crate::identity::credential_identity::global_resolver()
+            .resolve_presented_api_key("atgk_bi_caller", true, None)
+            .await
+            .unwrap();
+        issuer
+            .issue_or_get_caller_credential(fields, Some(hash), None, None)
+            .await
+            .unwrap();
+        let selector =
+            Arc::new(crate::identity::IdentitySelector::new(&json!({"type": "object"}), Arc::new(issuer)).unwrap());
+        let mut surface = crate::config::agent_surface::AgentSurface::default();
+        surface
+            .identity_slots
+            .protected = Some(crate::source_auth::ManagedIdentityConfig::FromApiKey {
+            api_key_id: Some("atgk_bi_caller".to_string()),
+        });
+
+        let resolved = resolve_protected_agent_identity(
+            br#"{"name":"agent"}"#,
+            &surface,
+            Some(&selector),
+            None,
+            "bi-role-clash",
+            IdentityResponseKind::Message,
+            None,
+        )
+        .await;
+
+        let err = resolved.unwrap_err();
+        assert!(matches!(err, IdentityResolutionError::DidCreationFailed(_)), "{err:?}");
+        assert_eq!(err.http_status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            crate::metrics::backends::prometheus::MANAGED_IDENTITY_RESOLVE
+                .with_label_values(&["bi-role-clash", "from_api_key", "role_clash"])
+                .get(),
+            1
+        );
     }
 
     #[test]

@@ -48,13 +48,15 @@ pub trait IdentityStore: Send + Sync {
         verified: bool,
     ) -> Result<()>;
 
-    /// Record how an identity entered the store. Stores without origin tracking ignore it.
+    /// Record how an identity entered the store, unless it already has an
+    /// origin: an origin, once set, never changes. Returns the record's origin
+    /// after the call; `None` from stores without origin tracking.
     async fn set_origin(
         &self,
         _identity_hash: &str,
         _origin: filesystem::IdentityOrigin,
-    ) -> Result<()> {
-        Ok(())
+    ) -> Result<Option<filesystem::IdentityOrigin>> {
+        Ok(None)
     }
 
     /// Returns the base filesystem storage path, if this is a filesystem-backed store.

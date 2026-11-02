@@ -158,6 +158,7 @@ pub struct FilesystemIdentityStore {
     storage: Box<dyn StorageBackend<AgentIdentityRecord>>,
     storage_path: PathBuf,
     ws_state: Option<Arc<crate::server::WsState>>,
+    origin_lock: tokio::sync::Mutex<()>,
 }
 
 impl FilesystemIdentityStore {
@@ -181,6 +182,7 @@ impl FilesystemIdentityStore {
             storage,
             storage_path,
             ws_state,
+            origin_lock: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -446,7 +448,8 @@ impl IdentityStore for FilesystemIdentityStore {
         &self,
         identity_hash: &str,
         origin: IdentityOrigin,
-    ) -> Result<()> {
+    ) -> Result<Option<IdentityOrigin>> {
+        let _guard = self.origin_lock.lock().await;
         let Some(mut record) = self
             .storage
             .get(identity_hash)
@@ -454,13 +457,14 @@ impl IdentityStore for FilesystemIdentityStore {
         else {
             anyhow::bail!("identity record not found: {}", identity_hash);
         };
-        if record.origin == Some(origin) {
-            return Ok(());
+        if let Some(existing) = record.origin {
+            return Ok(Some(existing));
         }
         record.origin = Some(origin);
         self.storage
             .save(&record)
-            .await
+            .await?;
+        Ok(Some(origin))
     }
 
     fn base_path(&self) -> Option<std::path::PathBuf> {
@@ -749,6 +753,36 @@ mod tests {
             .await
             .unwrap();
         let record = reopened
+            .find_by_hash("h1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.origin, Some(IdentityOrigin::Managed));
+    }
+
+    #[tokio::test]
+    async fn test_set_origin_keeps_the_first_origin() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = FilesystemIdentityStore::new(temp_dir.path())
+            .await
+            .unwrap();
+        store
+            .create(local_record("h1"))
+            .await
+            .unwrap();
+
+        let first = store
+            .set_origin("h1", IdentityOrigin::Managed)
+            .await
+            .unwrap();
+        let second = store
+            .set_origin("h1", IdentityOrigin::ExternalCaller)
+            .await
+            .unwrap();
+
+        assert_eq!(first, Some(IdentityOrigin::Managed));
+        assert_eq!(second, Some(IdentityOrigin::Managed));
+        let record = store
             .find_by_hash("h1")
             .await
             .unwrap()

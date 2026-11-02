@@ -95,6 +95,12 @@ struct SavedIssuerConfig {
     is_vp_challenge_required: bool,
 }
 
+/// An API key's identity record already belongs to the other role: one key is
+/// either a Managed Agent's or an External Caller's, never both.
+#[derive(Debug, thiserror::Error)]
+#[error("identity record belongs to another role")]
+pub struct IdentityRoleClash;
+
 /// Response containing agent DID and credential
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AgentIdentityResponse {
@@ -833,24 +839,35 @@ impl VCIssuer {
             .await?
         {
             info!("[TR-TRACE] Identity ALREADY EXISTS for hash={}, did={}", identity_hash, record.did);
+            let effective_origin = match (record.origin, origin) {
+                (None, Some(requested)) => match self
+                    .identity_store
+                    .set_origin(&identity_hash, requested)
+                    .await
+                {
+                    Ok(stored) => stored.or(Some(requested)),
+                    Err(e) => {
+                        warn!(identity_hash = %identity_hash, error = %e, "Failed to record identity origin (non-fatal)");
+                        Some(requested)
+                    }
+                },
+                (existing, _) => existing,
+            };
+            if let (Some(existing), Some(requested)) = (effective_origin, origin)
+                && existing != requested
+                && identity_fields
+                    .get("credential_type")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("api_key")
+            {
+                warn!(did = %record.did, ?existing, ?requested, "API key identity requested in another role — refused");
+                return Err(IdentityRoleClash.into());
+            }
             // Update usage tracking with the current channel
             self.identity_store
                 .update_usage(&identity_hash, channel_config_id.clone())
                 .await?;
 
-            let effective_origin = match (record.origin, origin) {
-                (None, Some(requested)) => {
-                    if let Err(e) = self
-                        .identity_store
-                        .set_origin(&identity_hash, requested)
-                        .await
-                    {
-                        warn!(identity_hash = %identity_hash, error = %e, "Failed to record identity origin (non-fatal)");
-                    }
-                    Some(requested)
-                }
-                (existing, _) => existing,
-            };
             let name = self
                 .managed_display_name(&record.did, effective_origin, channel_config_id.as_deref())
                 .await;
@@ -2764,6 +2781,196 @@ mod tests {
                     .get("name")
                     .is_none()
             );
+        }
+
+        fn api_key_fields(key_id: &str) -> HashMap<String, serde_json::Value> {
+            HashMap::from([
+                ("credential_type".to_string(), json!("api_key")),
+                ("api_key_id".to_string(), json!(key_id)),
+            ])
+        }
+
+        fn api_key_hash(key_id: &str) -> Option<String> {
+            Some(format!("hash-{key_id}"))
+        }
+
+        /// Reads every record without its origin, as a lookup that ran before
+        /// a concurrent request stamped it would.
+        struct StaleOriginStore(crate::identity::test_helpers::MockIdentityStore);
+
+        #[async_trait::async_trait]
+        impl IdentityStore for StaleOriginStore {
+            async fn create(
+                &self,
+                record: crate::identity::filesystem::AgentIdentityRecord,
+            ) -> Result<()> {
+                self.0.create(record).await
+            }
+            async fn find_by_hash(
+                &self,
+                identity_hash: &str,
+            ) -> Result<Option<crate::identity::filesystem::AgentIdentityRecord>> {
+                Ok(self
+                    .0
+                    .find_by_hash(identity_hash)
+                    .await?
+                    .map(|record| crate::identity::filesystem::AgentIdentityRecord { origin: None, ..record }))
+            }
+            async fn find_by_did(
+                &self,
+                did: &str,
+            ) -> Result<Option<crate::identity::filesystem::AgentIdentityRecord>> {
+                self.0.find_by_did(did).await
+            }
+            async fn list_all(&self) -> Result<Vec<crate::identity::filesystem::AgentIdentityRecord>> {
+                self.0.list_all().await
+            }
+            async fn update_usage(
+                &self,
+                identity_hash: &str,
+                channel_config_id: Option<String>,
+            ) -> Result<()> {
+                self.0
+                    .update_usage(identity_hash, channel_config_id)
+                    .await
+            }
+            async fn store_external_did(
+                &self,
+                did: &str,
+                identity_fields: HashMap<String, serde_json::Value>,
+                channel_config_id: Option<String>,
+                verified: bool,
+            ) -> Result<()> {
+                self.0
+                    .store_external_did(did, identity_fields, channel_config_id, verified)
+                    .await
+            }
+            async fn set_origin(
+                &self,
+                identity_hash: &str,
+                origin: IdentityOrigin,
+            ) -> Result<Option<IdentityOrigin>> {
+                self.0
+                    .set_origin(identity_hash, origin)
+                    .await
+            }
+        }
+
+        #[tokio::test]
+        async fn api_key_role_stamped_concurrently_is_refused_and_kept() {
+            let store = Arc::new(StaleOriginStore(crate::identity::test_helpers::MockIdentityStore::new()));
+            let (issuer, _dir) = crate::identity::test_helpers::test_vc_issuer_with(store.clone()).await;
+            let managed = issuer
+                .issue_or_get_managed_credential(
+                    api_key_fields("atgk_r"),
+                    api_key_hash("atgk_r"),
+                    Some("vc-clash-r".into()),
+                    None,
+                )
+                .await
+                .unwrap();
+
+            let err = issuer
+                .issue_or_get_caller_credential(
+                    api_key_fields("atgk_r"),
+                    api_key_hash("atgk_r"),
+                    Some("vc-clash-r".into()),
+                    None,
+                )
+                .await
+                .unwrap_err();
+
+            assert!(err.is::<IdentityRoleClash>());
+            let record = store
+                .0
+                .find_by_did(&managed.did)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(record.origin, Some(IdentityOrigin::Managed));
+        }
+
+        #[tokio::test]
+        async fn caller_api_key_on_a_managed_record_is_refused() {
+            let f = fixture().await;
+            let issuer = &f.issuer;
+            let managed = issuer
+                .issue_or_get_managed_credential(
+                    api_key_fields("atgk_m"),
+                    api_key_hash("atgk_m"),
+                    Some("vc-clash-m".into()),
+                    None,
+                )
+                .await
+                .unwrap();
+
+            let err = issuer
+                .issue_or_get_caller_credential(
+                    api_key_fields("atgk_m"),
+                    api_key_hash("atgk_m"),
+                    Some("vc-clash-m".into()),
+                    None,
+                )
+                .await
+                .unwrap_err();
+
+            assert!(err.is::<IdentityRoleClash>());
+            assert_eq!(origin_of(issuer, &managed.did).await, Some(IdentityOrigin::Managed));
+        }
+
+        #[tokio::test]
+        async fn managed_api_key_on_a_caller_record_is_refused() {
+            let f = fixture().await;
+            let issuer = &f.issuer;
+            let caller = issuer
+                .issue_or_get_caller_credential(
+                    api_key_fields("atgk_c"),
+                    api_key_hash("atgk_c"),
+                    Some("vc-clash-c".into()),
+                    None,
+                )
+                .await
+                .unwrap();
+
+            let err = issuer
+                .issue_or_get_managed_credential(
+                    api_key_fields("atgk_c"),
+                    api_key_hash("atgk_c"),
+                    Some("vc-clash-c".into()),
+                    None,
+                )
+                .await
+                .unwrap_err();
+
+            assert!(err.is::<IdentityRoleClash>());
+            assert_eq!(origin_of(issuer, &caller.did).await, Some(IdentityOrigin::ExternalCaller));
+        }
+
+        #[tokio::test]
+        async fn api_key_in_its_own_role_resolves_the_same_did() {
+            let f = fixture().await;
+            let issuer = &f.issuer;
+            let first = issuer
+                .issue_or_get_caller_credential(
+                    api_key_fields("atgk_s"),
+                    api_key_hash("atgk_s"),
+                    Some("vc-clash-s".into()),
+                    None,
+                )
+                .await
+                .unwrap();
+            let second = issuer
+                .issue_or_get_caller_credential(
+                    api_key_fields("atgk_s"),
+                    api_key_hash("atgk_s"),
+                    Some("vc-clash-s".into()),
+                    None,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(second.did, first.did);
+            assert!(!second.is_new);
         }
 
         #[tokio::test]

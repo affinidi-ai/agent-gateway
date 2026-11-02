@@ -1754,17 +1754,25 @@ async fn step_resolve_agent_identity(
                 )
                 .await
                 .map_err(|e| {
+                    let role_clash = e.is::<crate::identity::IdentityRoleClash>();
                     crate::metrics::backends::prometheus::track_managed_identity_resolve(
                         &cred_id_channel,
                         mode_label,
-                        "vc_issuer_error",
+                        if role_clash {
+                            "role_clash"
+                        } else {
+                            "vc_issuer_error"
+                        },
                         cred_id_start
                             .elapsed()
                             .as_secs_f64(),
                     );
-                    OutboundPipelineError::IdentityResolutionFailed(IdentityResolutionFailure::ServiceUnavailable(
-                        format!("DID creation/lookup failed for credential identity: {}", e),
-                    ))
+                    let msg = format!("DID creation/lookup failed for credential identity: {}", e);
+                    OutboundPipelineError::IdentityResolutionFailed(if role_clash {
+                        IdentityResolutionFailure::Misconfigured(msg)
+                    } else {
+                        IdentityResolutionFailure::ServiceUnavailable(msg)
+                    })
                 })?;
             if response.is_new {
                 info!(
@@ -11562,6 +11570,48 @@ mod tests {
             }
             ProtectedAgentIdentity::Anonymous => panic!("expected Managed identity, got Anonymous"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_step_resolve_agent_identity_refuses_an_api_key_that_identifies_a_caller() {
+        let (vc_issuer, _temp_dir) = crate::identity::test_helpers::test_vc_issuer().await;
+        let (fields, hash) = crate::identity::credential_identity::global_resolver()
+            .resolve_presented_api_key("atgk_ob_caller", true, None)
+            .await
+            .unwrap();
+        vc_issuer
+            .issue_or_get_caller_credential(fields, Some(hash), None, None)
+            .await
+            .unwrap();
+        let mut state = test_outbound_state();
+        state.vc_issuer = Some(Arc::new(vc_issuer));
+        let mut ctx = test_pipeline_context();
+        ctx.virtual_channel
+            .managed_identity = Some(crate::source_auth::ManagedIdentityConfig::FromApiKey {
+            api_key_id: Some("atgk_ob_caller".to_string()),
+        });
+        let channel = ctx
+            .surface
+            .config_id()
+            .unwrap_or("unknown")
+            .to_string();
+        let role_clashes = || {
+            crate::metrics::backends::prometheus::MANAGED_IDENTITY_RESOLVE
+                .with_label_values(&[channel.as_str(), "from_api_key", "role_clash"])
+                .get()
+        };
+        let before = role_clashes();
+
+        let err = step_resolve_agent_identity(&state, &mut ctx)
+            .await
+            .expect_err("an API key that identifies a caller cannot be a Managed Agent key");
+
+        assert!(
+            matches!(err, OutboundPipelineError::IdentityResolutionFailed(IdentityResolutionFailure::Misconfigured(_))),
+            "expected a misconfiguration, got {err:?}"
+        );
+        assert_eq!(err.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(role_clashes() - before, 1);
     }
 
     #[tokio::test]
