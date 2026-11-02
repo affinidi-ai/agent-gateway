@@ -3895,6 +3895,25 @@ pub(super) fn fabric_caller_did_and_source(
     }
 }
 
+/// Whether a delegated credential binding of the receiving surface's Target
+/// applies to a Fabric request calling `tool`, so the request needs a caller
+/// the surface verified to key it.
+fn fabric_delegation_applies(
+    bindings: &[crate::config::types::OutboundCredentialBinding],
+    tool: Option<&str>,
+) -> bool {
+    bindings
+        .iter()
+        .any(|binding| match &binding.required_for {
+            crate::config::types::CredentialRequirement::All => true,
+            crate::config::types::CredentialRequirement::Tools(tools) => tool.is_some_and(|tool| {
+                tools
+                    .iter()
+                    .any(|named| named == tool)
+            }),
+        })
+}
+
 /// The `workloadBinding` of the presentation this gateway signs for its
 /// agent's response to a Fabric request: the agent's identity fields, the
 /// trace that correlates it with the peer's request-leg presentation, and, as
@@ -5178,7 +5197,12 @@ async fn process_forward_request_in_request_scope(
                 route: ContinuationRoute::Fabric { peer_did: message.from_did.clone().ok_or(ContinuationError::BindingMismatch)? },
                 authorization: resource_authorization.as_ref().ok_or(ContinuationError::BindingMismatch)?,
                 identity: authenticated_identity.as_ref().ok_or(ContinuationError::BindingMismatch)?,
-                agent_did: caller_identity.as_deref().ok_or(ContinuationError::BindingMismatch)?,
+                // The agent half of the key is a caller DID only a connection
+                // issuer's presentation proved, as a transit token carries one;
+                // the user half is the resource-token caller this surface verified.
+                agent_did: fabric_caller_did_and_source(caller_identity.as_deref(), caller_identity_verification)
+                    .0
+                    .ok_or(ContinuationError::BindingMismatch)?,
                 profile: network.sts.mcp_issuer.as_ref().ok_or(ContinuationError::Unavailable)?,
                 vault: vault.as_ref(), providers: providers.as_ref(), strategies: strategies.as_ref(),
                 secrets: secrets.as_ref(), provider_http: None,
@@ -5679,13 +5703,28 @@ async fn process_forward_request_in_request_scope(
 
     // ── Credential delegation: inject delegated OAuth tokens or signal consent ──
     if !outbound_creds.is_empty() {
-        // Derive user identity hash from caller_identity (already a DID or identity hash from VP)
-        // or fall back to the identity hash of the receiving surface's own source_auth
-        let delegation_user_hash: Option<String> = caller_identity.clone().or_else(|| {
-            authenticated_identity
-                .as_ref()
-                .and_then(|id| id.principal_hash(surface.tenant_id.as_deref()))
-        });
+        let delegation_user_hash = authenticated_identity
+            .as_ref()
+            .and_then(|id| id.principal_hash(surface.tenant_id.as_deref()));
+        if delegation_user_hash.is_none()
+            && fabric_delegation_applies(
+                &outbound_creds,
+                crate::mcp::tool_analyzer::called_tool_name(&body_bytes).as_deref(),
+            )
+        {
+            channel_warn!(
+                config_id,
+                "GW2: Delegated credentials need a caller the receiving surface verified - refusing the request"
+            );
+            return ProcessingResult::RequiresResponse {
+                response_type: MessageType::ForwardResponse.to_string(),
+                response_body: refused_forward_response(
+                    403,
+                    "Forbidden",
+                    "Delegated credentials need a caller this surface verified",
+                ),
+            };
+        }
 
         if let (
             Some(user_hash),

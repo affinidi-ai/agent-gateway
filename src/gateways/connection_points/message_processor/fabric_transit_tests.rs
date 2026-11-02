@@ -766,6 +766,116 @@ fn a_fabric_tokens_principal_is_only_the_caller_the_receiving_surface_verified()
     );
 }
 
+/// The receiving surface keys its Target's delegated credentials only by the
+/// caller its own source authentication verified. A pseudonym or DID the
+/// peer's request names never selects a stored grant, even one stored under
+/// exactly that identity, and without a verified caller a binding that
+/// applies refuses the request before the Target is called.
+#[tokio::test]
+async fn a_caller_the_peer_names_never_selects_a_stored_grant_on_fabric_receive() {
+    if ran_in_child("ATG_FABRIC_RECEIVE_DELEGATION_CHILD").await {
+        return;
+    }
+    use crate::credential_providers::storage::{CredentialProviderStorage, FileSystemCredentialProviderStore};
+    use crate::delegation_vault::storage::{DelegationVaultStorage, FileSystemDelegationVaultStore};
+    use sha2::Digest;
+
+    let target = RecordingTarget::start(axum::http::StatusCode::OK, &[]).await;
+    let root = tempfile::tempdir().unwrap();
+    let mut delegating = surface("a2a", &target.url, &[]);
+    delegating.outbound_credentials =
+        vec![serde_json::from_value(json!({ "credential_provider_id": "provider", "scopes": ["read"] })).unwrap()];
+    let _receiver = receiver(root.path(), &delegating).await;
+    let providers = Arc::new(
+        FileSystemCredentialProviderStore::new(root.path().join("providers"))
+            .await
+            .unwrap(),
+    );
+    providers
+        .create(
+            serde_json::from_value(json!({ "id": "provider", "name": "Provider", "provider_id": "provider",
+                "resource": "https://provider.example/api",
+                "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z" }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let vault = Arc::new(
+        FileSystemDelegationVaultStore::new(root.path().join("vault"))
+            .await
+            .unwrap(),
+    );
+    let partner = crate::source_auth::AuthenticatedIdentity::ApiKey {
+        key_name: "peer-callers".to_string(),
+        provider_agent_id: None,
+    }
+    .principal_hash(None)
+    .unwrap();
+    let victim_pseudonym = format!("sha256:{:x}", sha2::Sha256::digest(b"\"victim\""));
+    for (id, user_identity_hash, access_token) in [
+        ("partner", partner.as_str(), "partner-access"),
+        ("victim-pseudonym", victim_pseudonym.as_str(), "victim-pseudonym-access"),
+        ("victim-did", "did:web:victim.example", "victim-did-access"),
+    ] {
+        vault
+            .store(
+                serde_json::from_value(json!({
+                    "id": id, "agent_did": target.url, "user_identity_hash": user_identity_hash,
+                    "credential_provider_id": "provider", "provider_id": "provider",
+                    "access_token": access_token, "refresh_token": format!("{id}-refresh"), "scopes": ["read"],
+                    "expires_at": chrono::Utc::now() + chrono::Duration::hours(1),
+                    "consent_granted_at": "2026-09-01T00:00:00Z",
+                    "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+    super::init_credential_provider_store(providers).await;
+    super::init_delegation_vault_store(vault).await;
+    super::init_secrets_store(Arc::new(
+        crate::secrets::FilesystemSecretsStore::new_async(
+            root.path()
+                .join("delegation-secrets")
+                .to_str()
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    ))
+    .await;
+    super::init_gateway_base_url("https://receiver.example".to_string()).await;
+    let naming = |metadata: Value| {
+        let mut body = a2a_body();
+        body["params"]["message"]["extensions"] = json!([crate::config::AFFINIDI_AGENT_IDENTITY_EXTENSION]);
+        body["params"]["message"]["metadata"] = json!({ crate::config::AFFINIDI_AGENT_IDENTITY_EXTENSION: metadata });
+        body
+    };
+    let send = |key: &str, metadata: Value| {
+        forward_request(root.path(), json!({ "content-type": "application/json", "x-api-key": key }), naming(metadata))
+    };
+
+    for metadata in [json!({ "agentId": "victim" }), json!({ "agentId": "victim", "did": "did:web:victim.example" })] {
+        let response = forward_response(&send(CALLER_KEY, metadata.clone())).await;
+        assert_eq!(response["status"], 200, "{metadata}: {response}");
+        let received = target
+            .received()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            header_values(&received, "authorization"),
+            ["Bearer partner-access"],
+            "{metadata}: the caller the surface verified, never the one the peer named"
+        );
+    }
+
+    let reached = target.received().len();
+    let response = forward_response(&send("not-the-key", json!({ "agentId": "victim" }))).await;
+    assert_eq!(response["status"], 403, "no caller the surface verified: {response}");
+    assert_eq!(target.received().len(), reached, "the Target is not called");
+}
+
 /// A surface that verifies no caller of its own gives its agent a token with
 /// no principal, whatever identity the peer's request names.
 #[tokio::test]
