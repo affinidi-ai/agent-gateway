@@ -213,6 +213,67 @@ pub trait DelegationVaultStorage: Send + Sync {
     }
 }
 
+/// The grants store, opened and its plaintext records encrypted. A store that
+/// cannot be opened, or migrated, never keeps the vault from starting, since
+/// agent-keyed tokens do not depend on it: it is logged, and every grant read
+/// and write then fails, so nothing is reported missing that may be stored.
+async fn open_grants(directory: &std::path::Path) -> std::sync::Arc<dyn StorageBackend<DelegatedGrant>> {
+    let opened = async {
+        let grants = uncached_storage(directory.to_path_buf(), "delegated_grant").await?;
+        grants
+            .migrate_plaintext_at_rest()
+            .await?;
+        anyhow::Ok(grants)
+    }
+    .await;
+    match opened {
+        Ok(grants) => grants.into(),
+        Err(error) => {
+            tracing::error!(
+                target: "credential_delegation",
+                path = %directory.display(),
+                error = ?format!("{error:#}"),
+                "The delegated grants store cannot be opened: no grant by binding is stored, released or removed, \
+                 and a change that would remove one is refused, until it can be; agent-keyed delegated tokens are \
+                 unaffected. Fix the directory's permissions or type and restart"
+            );
+            std::sync::Arc::new(UnopenedGrants)
+        }
+    }
+}
+
+/// The grants store of a vault whose grants directory could not be opened:
+/// every call fails.
+struct UnopenedGrants;
+
+#[async_trait]
+impl StorageBackend<DelegatedGrant> for UnopenedGrants {
+    async fn save(
+        &self,
+        _entity: &DelegatedGrant,
+    ) -> Result<()> {
+        anyhow::bail!("The delegated grants store could not be opened")
+    }
+
+    async fn get(
+        &self,
+        _id: &str,
+    ) -> Result<Option<DelegatedGrant>> {
+        anyhow::bail!("The delegated grants store could not be opened")
+    }
+
+    async fn list_all(&self) -> Result<Vec<DelegatedGrant>> {
+        anyhow::bail!("The delegated grants store could not be opened")
+    }
+
+    async fn delete(
+        &self,
+        _id: &str,
+    ) -> Result<()> {
+        anyhow::bail!("The delegated grants store could not be opened")
+    }
+}
+
 /// Filesystem-backed delegation vault using uncached storage (security-sensitive)
 #[derive(Clone)]
 pub struct FileSystemDelegationVaultStore {
@@ -250,15 +311,12 @@ impl FileSystemDelegationVaultStore {
         let stable_grant_ids = crate::identity::credential_identity::pepper_is_configured();
         // Use uncached storage for security — tokens should not linger in memory
         let storage = uncached_storage(path.clone(), "delegation_token").await?;
-        let grants = uncached_storage(path.join(GRANTS_DIRECTORY), "delegated_grant").await?;
         // Uncached stores load nothing at boot, so records restored in
         // plaintext would stay so until read: encrypt them now.
         storage
             .migrate_plaintext_at_rest()
             .await?;
-        grants
-            .migrate_plaintext_at_rest()
-            .await?;
+        let grants = open_grants(&path.join(GRANTS_DIRECTORY)).await;
         if encrypted {
             info!(
                 target: "credential_delegation",
@@ -288,7 +346,7 @@ impl FileSystemDelegationVaultStore {
             refreshes: uncached_storage(path.join("refresh_claims"), "delegation_refresh")
                 .await?
                 .into(),
-            grants: grants.into(),
+            grants,
             grants_directory: path.join(GRANTS_DIRECTORY),
             encrypted,
             stable_grant_ids,
@@ -298,7 +356,7 @@ impl FileSystemDelegationVaultStore {
         // it never keeps the vault, and its agent-keyed tokens, from starting.
         match store.pepper_mismatch().await {
             Ok(false) => {}
-            Ok(true) => tracing::error!(
+            Ok(true) if stable_grant_ids => tracing::error!(
                 target: "credential_delegation",
                 path = %store.grants_directory.display(),
                 "The delegated grants stored were written under another identity hash pepper than \
@@ -307,6 +365,16 @@ impl FileSystemDelegationVaultStore {
                  (DELETE /api/v1/delegation-vault/grants/{{id}}, the ids being the file names in the delegated_grants \
                  directory without .json.enc, or by deleting that directory, which leaves them unrevoked at the \
                  vendor)"
+            ),
+            Ok(true) => tracing::error!(
+                target: "credential_delegation",
+                path = %store.grants_directory.display(),
+                "The delegated grants stored were written under another identity hash pepper, and \
+                 AG_IDENTITY_HASH_PEPPER is not set, so this process generated its own: they cannot be found, and no \
+                 binding with consent_mode external can be removed, until AG_IDENTITY_HASH_PEPPER is set to the \
+                 pepper they were written under, or they are purged (DELETE /api/v1/delegation-vault/grants/{{id}}, \
+                 the ids being the file names in the delegated_grants directory without .json.enc, or by deleting \
+                 that directory, which leaves them unrevoked at the vendor)"
             ),
             Err(error) => tracing::error!(
                 target: "credential_delegation",
@@ -1753,19 +1821,98 @@ mod tests {
         );
     }
 
+    /// A grants directory the vault cannot open never keeps the vault, and its
+    /// agent-keyed tokens, from starting: the startup log names it, and every
+    /// grant read or write fails rather than answering none.
     #[tokio::test]
-    async fn while_the_pepper_is_ephemeral_grants_are_neither_stored_nor_released() {
+    async fn a_grants_directory_that_cannot_be_opened_fails_only_grant_reads() {
+        use crate::component_tests::helpers::formatted_logs::FormattedLogs;
         use crate::delegation_vault::grants::tests::{grant, key};
         let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory
+                .path()
+                .join(GRANTS_DIRECTORY),
+            b"not a directory",
+        )
+        .unwrap();
+        with_at_rest_encryption();
+        crate::identity::credential_identity::configure_pepper_for_tests(true);
+        let logs = FormattedLogs::capture();
+        let vault = FileSystemDelegationVaultStore::new(directory.path().into())
+            .await
+            .expect("the vault starts");
+        let startup = logs.text();
+        assert!(startup.contains("ERROR"), "{startup}");
+        assert!(startup.contains("delegated grants store cannot be opened"), "{startup}");
+
+        let token: DelegationToken = serde_json::from_value(serde_json::json!({
+            "id": "agent-keyed", "agent_did": "did:web:agent.example",
+            "user_identity_hash": "sha256:user", "credential_provider_id": "provider",
+            "provider_id": "provider", "access_token": "agent-keyed-access", "scopes": ["read"],
+            "consent_granted_at": "2026-09-01T00:00:00Z",
+            "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+        }))
+        .unwrap();
+        vault
+            .store(token)
+            .await
+            .expect("agent-keyed tokens are stored");
+        assert!(
+            vault
+                .get("agent-keyed")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            vault
+                .store_grant(grant(&key(), "access"))
+                .await
+                .is_err()
+        );
+        assert!(
+            vault
+                .grant(&key())
+                .await
+                .is_err(),
+            "a grant read fails rather than answering none"
+        );
+        assert!(
+            vault
+                .binding_grants(&key().binding(), Principals::All)
+                .await
+                .is_err(),
+            "a removal must not pass for having found nothing"
+        );
+    }
+
+    /// Without `AG_IDENTITY_HASH_PEPPER` each start generates a pepper, so a
+    /// restarted gateway finds the grants written under another one: they are
+    /// neither stored, released nor listed, and the startup log says the
+    /// pepper was generated rather than set.
+    #[tokio::test]
+    async fn while_the_pepper_is_ephemeral_grants_are_neither_stored_nor_released() {
+        use crate::component_tests::helpers::formatted_logs::FormattedLogs;
+        use crate::delegation_vault::grants::tests::{grant, key};
+        use crate::identity::credential_identity::configure_pepper_bytes_for_tests;
+        let directory = tempfile::tempdir().unwrap();
+        configure_pepper_bytes_for_tests(&[3; 32]);
         let vault = encrypted_vault(directory.path()).await;
         vault
             .store_grant(grant(&key(), "owner-access"))
             .await
             .unwrap();
         crate::identity::credential_identity::configure_pepper_for_tests(false);
+        configure_pepper_bytes_for_tests(&[4; 32]);
+        let logs = FormattedLogs::capture();
         let restarted = FileSystemDelegationVaultStore::new(directory.path().into())
             .await
             .unwrap();
+        let startup = logs.text();
+        assert!(startup.contains("ERROR"), "{startup}");
+        assert!(startup.contains("AG_IDENTITY_HASH_PEPPER is not set"), "{startup}");
+        assert!(!startup.contains("than AG_IDENTITY_HASH_PEPPER now sets"), "{startup}");
         let refused = restarted
             .store_grant(grant(&key(), "other-access"))
             .await
@@ -1778,14 +1925,13 @@ mod tests {
                 .unwrap_err()
                 .is::<EphemeralPepper>()
         );
-        assert_eq!(
+        assert!(
             restarted
                 .provider_grants("provider")
                 .await
-                .unwrap()
-                .len(),
-            1,
-            "grants can still be listed, so they can be revoked and removed"
+                .unwrap_err()
+                .is::<super::super::grants::PepperMismatch>(),
+            "the grants of another start's pepper cannot be found to be revoked; an operator purges them"
         );
     }
 
