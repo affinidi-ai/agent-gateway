@@ -587,10 +587,11 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
   working when enforced" or "another tenant, refused by the gateway". The gateway keeps such a
   secret on save only in the field that holds it and while the provider's type and destination
   are unchanged.
-- A Token Endpoint starting with `http://` shows an inline error
-  (`credential-provider-token-endpoint-https-error`, field marked invalid) that names the bootstrap
-  `credential_policy.insecure_token_endpoints` list for a deliberate http identity provider. It does
-  not block Save; the gateway refuses new or changed http endpoints on save.
+- A Token Endpoint starting with `http://` shows a warning
+  (`credential-provider-token-endpoint-https-warning`, warning styling, field not marked invalid)
+  saying new or changed http endpoints are refused unless listed by exact URL in the bootstrap
+  `credential_policy.insecure_token_endpoints`, and that an unchanged stored one is still accepted
+  while `token_endpoint_https` is `warn`. It does not block Save; the gateway decides on save.
 - The Credential Providers tab labels the types from `PROVIDER_TYPE_LABELS` in the same module.
 
 ## Secret editor

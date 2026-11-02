@@ -482,21 +482,23 @@ const EditCredentialProviderPage: React.FC = () => {
                     id="token_endpoint"
                     name="token_endpoint"
                     type="url"
-                    className={`form-control${tokenEndpointIsHttp ? ' is-invalid' : ''}`}
+                    className="form-control"
                     value={form.token_endpoint}
                     onChange={handleChange}
                     required
                   />
                   {tokenEndpointIsHttp && (
                     <div
-                      className="invalid-feedback d-block"
-                      role="alert"
-                      data-testid="credential-provider-token-endpoint-https-error"
+                      className="alert alert-warning py-2 mt-2"
+                      role="status"
+                      data-testid="credential-provider-token-endpoint-https-warning"
                     >
-                      The token endpoint must use https. An internal identity provider that
-                      deliberately uses http has to be listed, by its exact URL, in{' '}
+                      <i className="fas fa-exclamation-triangle me-2" aria-hidden="true" />
+                      This token endpoint uses http. New or changed http token endpoints are refused
+                      unless listed by exact URL in{' '}
                       <code>credential_policy.insecure_token_endpoints</code> in the gateway
-                      bootstrap config; the gateway refuses to save any other http endpoint.
+                      bootstrap config. A stored endpoint that is unchanged is still accepted while
+                      token_endpoint_https is warn.
                     </div>
                   )}
                   <small className="form-text text-muted">

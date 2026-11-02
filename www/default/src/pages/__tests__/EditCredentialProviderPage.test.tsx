@@ -140,15 +140,21 @@ describe('EditCredentialProviderPage tenant-aware secrets and https error', () =
     expect(optionTexts(clientId)).toEqual(['-- Select a secret --', 'Wide id (WIDE_ID)']);
   });
 
-  it('shows an https error for an http token endpoint and none for https', async () => {
+  it('warns about an http token endpoint without marking the field invalid, and not for https', async () => {
     renderWith({ ...provider(null), token_endpoint: 'http://idp.internal/token' });
-    const error = await screen.findByTestId('credential-provider-token-endpoint-https-error');
-    expect(error).toHaveTextContent('credential_policy.insecure_token_endpoints');
-    fireEvent.change(screen.getByDisplayValue('http://idp.internal/token'), {
-      target: { value: 'https://idp.internal/token' },
-    });
+    const warning = await screen.findByTestId('credential-provider-token-endpoint-https-warning');
+    expect(warning).toHaveClass('alert-warning');
+    expect(warning).toHaveTextContent('credential_policy.insecure_token_endpoints');
+    expect(warning).toHaveTextContent(
+      'New or changed http token endpoints are refused unless listed by exact URL'
+    );
+    expect(warning).toHaveTextContent('still accepted while token_endpoint_https is warn');
+    expect(warning).not.toHaveTextContent('refuses to save any other http endpoint');
+    const input = screen.getByDisplayValue('http://idp.internal/token');
+    expect(input).not.toHaveClass('is-invalid');
+    fireEvent.change(input, { target: { value: 'https://idp.internal/token' } });
     expect(
-      screen.queryByTestId('credential-provider-token-endpoint-https-error')
+      screen.queryByTestId('credential-provider-token-endpoint-https-warning')
     ).not.toBeInTheDocument();
   });
 });
