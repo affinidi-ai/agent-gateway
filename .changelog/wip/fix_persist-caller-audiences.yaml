@@ -14,6 +14,12 @@ changes:
       description: >-
         Commit an audience that is still focused in the Caller Context editor before a keyboard
         save builds the surface payload, and cover empty, duplicate, and discovery-locked values.
+    - timestamp: '2026-10-30T09:00:00Z'
+      title: Run the license check on pull requests from forks
+      description: >-
+        The license check checked out the pull request branch by name from the base repository,
+        so it failed for branches that live on a fork. It now uses the default pull request
+        checkout.
   removed: []
   security: []
   breaking: []
