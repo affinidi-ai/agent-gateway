@@ -14,6 +14,7 @@ use crate::config::credential_policy::{CredentialPolicyConfig, RuleMode};
 const STORED_SECRET_SURFACE: &str = "stored-secret-surface";
 const STORED_BINDING_SURFACE: &str = "stored-binding-surface";
 const STORED_METADATA_SURFACE: &str = "stored-metadata-surface";
+const STORED_DANGLING_METADATA_SURFACE: &str = "stored-dangling-metadata-surface";
 const STORED_PROVIDER: &str = "stored-appliance-provider";
 const STORED_TENANT_PROVIDER: &str = "stored-tenant-provider";
 const STORED_TENANT_JWT_PROVIDER: &str = "stored-tenant-jwt-provider";
@@ -336,6 +337,16 @@ fn seed_stored_credentials(bootstrap: &crate::config::BootstrapConfig) {
             surface(
                 STORED_METADATA_SURFACE,
                 json!({"target": {"endpoint": "http://127.0.0.1:9/", "custom_metadata": secret_metadata("appliance-key")}}),
+            ),
+        ),
+        (
+            &bootstrap
+                .storage_paths
+                .agent_surfaces,
+            STORED_DANGLING_METADATA_SURFACE,
+            surface(
+                STORED_DANGLING_METADATA_SURFACE,
+                json!({"target": {"endpoint": "http://127.0.0.1:9/", "custom_metadata": secret_metadata("no-such-secret")}}),
             ),
         ),
         (
@@ -924,7 +935,7 @@ async fn assert_new_metadata_secrets_follow_the_tenant(api: &Api) {
         .into_iter()
         .enumerate()
     {
-        for refused in ["other-tenant-key", "appliance-key"] {
+        for refused in ["other-tenant-key", "appliance-key", "no-such-secret"] {
             assert_refused(
                 api.create(&with_metadata(
                     api,
@@ -937,7 +948,7 @@ async fn assert_new_metadata_secrets_follow_the_tenant(api: &Api) {
                 NOT_ACCESSIBLE_SECRET,
             );
         }
-        for saved in ["tenant-key", "no-such-secret"] {
+        for saved in ["tenant-key"] {
             assert_saved(
                 api.create(&with_metadata(
                     api,
@@ -1047,8 +1058,8 @@ async fn a_reassignment_that_would_give_a_tenant_surface_an_appliance_wide_custo
     let (status, body) = api
         .reassign("surfaces", &missing_metadata_surface, Some("tenant-a"))
         .await;
-    assert_eq!(status, 200, "{body}");
-    assert_eq!(body["tenant_id"], "tenant-a", "{body}");
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["conflicts"][0]["reason"], "Referenced resource does not exist", "{body}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1076,4 +1087,68 @@ async fn a_surface_with_no_tenant_names_any_metadata_secret_until_it_is_given_a_
         .await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["tenant_id"], "tenant-b", "{body}");
+}
+
+async fn assert_a_stored_missing_metadata_secret_is_kept_only_on_its_leg(api: &Api) {
+    let unchanged = api
+        .stored(STORED_DANGLING_METADATA_SURFACE)
+        .await;
+    let mut described = unchanged.clone();
+    described["description"] = json!("an unrelated edit");
+    assert_saved(
+        api.put(STORED_DANGLING_METADATA_SURFACE, &described)
+            .await,
+    );
+    let mut redirected = unchanged;
+    redirected["target"]["endpoint"] = json!(api.target);
+    assert_refused(
+        api.put(STORED_DANGLING_METADATA_SURFACE, &redirected)
+            .await,
+        NOT_ACCESSIBLE_SECRET,
+    );
+
+    let (status, body) = api
+        .reassign("surfaces", STORED_DANGLING_METADATA_SURFACE, Some("tenant-b"))
+        .await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["conflicts"][0]["reason"], "Referenced resource does not exist", "{body}");
+    let (status, body) = api
+        .reassign("surfaces", STORED_DANGLING_METADATA_SURFACE, Some("tenant-a"))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = api
+        .reassign("surfaces", STORED_DANGLING_METADATA_SURFACE, None)
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["tenant_id"], Value::Null, "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stored_missing_metadata_secret_is_kept_only_on_its_leg_in_warn_mode() {
+    let (_harness, api) = harness(RuleMode::Warn).await;
+    assert_a_stored_missing_metadata_secret_is_kept_only_on_its_leg(&api).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stored_missing_metadata_secret_is_kept_only_on_its_leg_in_enforce_mode() {
+    let (_harness, api) = harness(RuleMode::Enforce).await;
+    assert_a_stored_missing_metadata_secret_is_kept_only_on_its_leg(&api).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tenant_surface_cannot_claim_a_metadata_secret_before_it_is_created_appliance_wide() {
+    let (_harness, api) = harness(RuleMode::Warn).await;
+    let squatter = with_metadata(&api, "/smoke/squatter", Some("tenant-a"), METADATA_PLACES[0], "stripe-live");
+    let refused_before = api.create(&squatter).await;
+    assert_refused(refused_before.clone(), NOT_ACCESSIBLE_SECRET);
+    assert_eq!(
+        refused_before,
+        api.create(&with_metadata(&api, "/smoke/squatter", Some("tenant-a"), METADATA_PLACES[0], "other-tenant-key"))
+            .await,
+        "a missing secret and another tenant's secret answer alike"
+    );
+
+    api.secret("stripe-live", None, "v")
+        .await;
+    assert_refused(api.create(&squatter).await, NOT_ACCESSIBLE_SECRET);
 }

@@ -113,8 +113,8 @@ pub(crate) struct SurfaceReferenceKey {
     /// A secret a tenant surface sends upstream, which must not be appliance-wide.
     pub same_tenant: bool,
     /// Named only by `$SECRET:` helpers in custom metadata. A surface with no tenant may name
-    /// any secret there, and the secret need not exist: one that does not resolve fails when
-    /// the metadata is injected, not when the surface is saved.
+    /// any secret there, even one that does not exist; on a tenant surface only a reference
+    /// the stored surface already sent on the same leg may name a missing secret.
     pub custom_metadata: bool,
 }
 
@@ -300,6 +300,14 @@ impl ReferenceAuthorizer<'_> {
         reference_rule(&self.grandfathered, self.isolation, kind, id)
     }
 
+    fn is_grandfathered(
+        &self,
+        kind: ResourceKind,
+        id: &str,
+    ) -> bool {
+        is_grandfathered(&self.grandfathered, kind, id)
+    }
+
     async fn validate_reference(
         &self,
         reference: &SurfaceReferenceKey,
@@ -413,7 +421,7 @@ impl ReferenceAuthorizer<'_> {
             .await
             .map_err(|error| internal("Secret", error))?
         else {
-            return if reference.custom_metadata {
+            return if reference.custom_metadata && self.is_grandfathered(ResourceKind::Secrets, id) {
                 Ok(())
             } else {
                 Err(inaccessible("Secret"))
@@ -602,14 +610,21 @@ fn reference_rule(
     kind: ResourceKind,
     id: &str,
 ) -> RuleMode {
-    if grandfathered
-        .iter()
-        .any(|(stored_kind, stored_id)| *stored_kind == kind && stored_id == id)
-    {
+    if is_grandfathered(grandfathered, kind, id) {
         isolation
     } else {
         RuleMode::Enforce
     }
+}
+
+fn is_grandfathered(
+    grandfathered: &[(ResourceKind, String)],
+    kind: ResourceKind,
+    id: &str,
+) -> bool {
+    grandfathered
+        .iter()
+        .any(|(stored_kind, stored_id)| *stored_kind == kind && stored_id == id)
 }
 
 fn collect_effective_surface_references(

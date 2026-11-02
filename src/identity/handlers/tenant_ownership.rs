@@ -453,9 +453,6 @@ async fn collect_references(state: &IdentityApiState) -> Result<Vec<OwnershipRef
             for reference in collect_surface_reference_keys(&surface).map_err(|error| {
                 OwnershipApiError::Internal(format!("Failed to inspect Surface references: {:?}", error))
             })? {
-                if reference.custom_metadata && !secret_exists(state, &reference.id).await? {
-                    continue;
-                }
                 let same_tenant = reference.same_tenant
                     || (reference.kind == ResourceKind::CredentialProviders
                         && provider_sends_gateway_credential(state, &reference.id).await?);
@@ -778,21 +775,6 @@ async fn ownership_reference(
     }))
 }
 
-async fn secret_exists(
-    state: &IdentityApiState,
-    secret_id: &str,
-) -> Result<bool, OwnershipApiError> {
-    let store = state
-        .secrets_store
-        .as_ref()
-        .ok_or_else(|| unavailable(ResourceKind::Secrets))?;
-    Ok(store
-        .get_by_secret_id(secret_id)
-        .await
-        .map_err(internal)?
-        .is_some())
-}
-
 async fn provider_sends_gateway_credential(
     state: &IdentityApiState,
     id: &str,
@@ -818,7 +800,7 @@ async fn provider_sends_gateway_credential(
 /// target's credential is a conflict when the reassignment creates that situation, or when
 /// `isolation` is enforced; one that already exists is left alone while it is only warned about.
 /// A secret a surface names only in custom metadata is held to a tenant only while the surface
-/// has one.
+/// has one, and may be missing while the surface keeps its tenant.
 fn reassignment_conflicts(
     references: &[OwnershipReference],
     kind: ResourceKind,
@@ -850,7 +832,12 @@ fn reassignment_conflicts(
                     .tenant_id
                     .as_deref()
             };
-            if reference.custom_metadata && source_tenant.is_none() {
+            let keeps_tenant = source_tenant
+                == reference
+                    .source
+                    .tenant_id
+                    .as_deref();
+            if reference.custom_metadata && (source_tenant.is_none() || (!reference.target.exists && keeps_tenant)) {
                 return None;
             }
             let reason = if !reference.target.exists {
@@ -1455,6 +1442,33 @@ mod tests {
                 )
                 .is_empty()
             );
+        }
+    }
+
+    #[test]
+    fn a_missing_metadata_secret_is_a_conflict_only_when_its_surface_changes_tenant() {
+        const MISSING: &str = "Referenced resource does not exist";
+        let missing = |source_tenant: Option<&str>, custom_metadata: bool| OwnershipReference {
+            target: endpoint(ResourceKind::Secrets, "secret-1", None, false),
+            custom_metadata,
+            ..credential_edge(source_tenant, None)
+        };
+        let reasons = |reference, requested, isolation| {
+            conflict_reasons(reference, ResourceKind::Surfaces, "surface-1", requested, isolation)
+        };
+        for isolation in [RuleMode::Warn, RuleMode::Enforce] {
+            assert_eq!(
+                reasons(missing(Some("tenant-a"), true), Some("tenant-b"), isolation),
+                vec![MISSING.to_string()]
+            );
+            assert_eq!(reasons(missing(None, true), Some("tenant-a"), isolation), vec![MISSING.to_string()]);
+            assert!(reasons(missing(Some("tenant-a"), true), Some("tenant-a"), isolation).is_empty());
+            assert!(reasons(missing(Some("tenant-a"), true), None, isolation).is_empty());
+            assert_eq!(
+                reasons(missing(Some("tenant-a"), false), Some("tenant-a"), isolation),
+                vec![MISSING.to_string()]
+            );
+            assert_eq!(reasons(missing(None, false), None, isolation), vec![MISSING.to_string()]);
         }
     }
 

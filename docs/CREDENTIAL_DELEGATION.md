@@ -467,10 +467,13 @@ surface or of a variant, or a Transit Point, identified by the variant's and the
 `id`, so renaming or reordering them keeps it. Surface `outbound_credentials` are sent on the
 Target and every Transit Point. A secret in the Target's custom metadata or in either response
 custom metadata belongs to the Target's leg, and one in the shared transit custom metadata to
-every Transit Point. A `$SECRET:` that names no existing secret is saved as before and fails when
-the metadata is injected. A save that changes such a leg's endpoint, moves the reference
-to another leg, or adds a leg that would send it is refused with `400` in `warn` mode too.
-A tenant reassignment that would create such a reference answers `409`. See [Access tokens](ACCESS_TOKENS.md#what-a-tenant-pat-may-do-with-global-records).
+every Transit Point. On a tenant surface a new `$SECRET:` that names no existing secret is
+refused like another tenant's secret; one the stored surface already sent is kept on its leg
+under the same rule and fails when the metadata is injected. A save that changes such a leg's
+endpoint, moves the reference to another leg, or adds a leg that would send it is refused with
+`400` in `warn` mode too. A tenant reassignment that would create such a reference answers
+`409`, and so does giving a surface whose custom metadata names a missing secret a different
+tenant. See [Access tokens](ACCESS_TOKENS.md#what-a-tenant-pat-may-do-with-global-records).
 
 A refused Target authentication follows the usual 502 "Target authentication failed" (or
 `fallback`), and the cause is logged only. A refused legacy binding records
