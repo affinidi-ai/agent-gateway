@@ -9,6 +9,8 @@ import {
   ENTRY_POINT_URL_LABEL,
   RouteListenerBanner,
 } from './elements/_shared/RouteListenerSection';
+import AccessPointReadinessNotice from './elements/access-point/AccessPointReadinessNotice';
+import { useOptionalSurfaceMeta } from './SurfaceMetaContext';
 import type { UseSurfaceBuilderReturn, SurfaceBuilderState } from './hooks/useSurfaceBuilder';
 import {
   synthesizeFabricCanvasNodes,
@@ -224,6 +226,8 @@ export function SurfaceBuilder<T extends SurfaceBuilderState>({
     return displayNodes.find(n => n.id === id) ?? null;
   }, [selectedNode, state.selectedNodeId, displayNodes]);
 
+  const accessPointNotice = useOptionalSurfaceMeta()?.accessPointNotice;
+
   const exportPngRef = useRef<(() => void) | null>(null);
   const resetViewRef = useRef<(() => void) | null>(null);
 
@@ -277,6 +281,11 @@ export function SurfaceBuilder<T extends SurfaceBuilderState>({
               help={ENTRY_POINT_URL_HELP}
               testId="surface-entry-point-url"
               url={accessPointUrl}
+              footer={
+                accessPointNotice ? (
+                  <AccessPointReadinessNotice testId="surface-access-point-readiness" />
+                ) : undefined
+              }
             />
           </div>
         )}

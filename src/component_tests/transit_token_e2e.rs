@@ -517,7 +517,7 @@ async fn the_appliance_sets_the_longest_transit_token_lifetime_a_surface_may_hav
             .post(format!("{}/api/v1/surfaces", h.gateway_base))
             .json(&json!({
                 "name": "lifetime",
-                "access_point": { "listen_address": local(&h.gateway_base), "route": "/lifetime", "protocol": "a2a" },
+                "access_point": { "listen_address": local(&h.gateway_base), "route": "/lifetime", "protocol": "a2a", "public": true },
                 "target": { "endpoint": h.mock.url() },
                 "transit": {
                     "transit_token_lifetime_secs": secs,
@@ -573,7 +573,7 @@ fn lifetime_surface(
 ) -> serde_json::Value {
     let mut surface = json!({
         "surface_id": "lifetime", "name": "lifetime",
-        "access_point": { "listen_address": inbound, "route": "/lifetime", "protocol": "a2a" },
+        "access_point": { "listen_address": inbound, "route": "/lifetime", "protocol": "a2a", "public": true },
         "target": { "endpoint": target },
         "transit": {
             "outbound_listen_address": outbound,
@@ -892,7 +892,7 @@ async fn changing_a_surfaces_transit_token_lifetime_applies_to_the_tokens_alread
     let collection = format!("{}/api/v1/surfaces", h.gateway_base);
     let payload = json!({
         "name": "lifetime",
-        "access_point": { "listen_address": listener(&h.gateway_base), "route": "/lifetime", "protocol": "a2a" },
+        "access_point": { "listen_address": listener(&h.gateway_base), "route": "/lifetime", "protocol": "a2a", "public": true },
         "target": { "endpoint": h.mock.url() },
         "transit": {
             "outbound_listen_address": listener(h.outbound_url.as_deref().unwrap()),

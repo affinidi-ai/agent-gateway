@@ -914,6 +914,28 @@ fn admin_api_error_response_mentions(
     assert_json_body_mentions(&get_admin_response(world).body, &expected, "admin API error response");
 }
 
+#[then("the response says only that the Access Point is not available")]
+fn response_says_only_access_point_not_available(world: &mut SurfaceWorld) {
+    let expected = serde_json::json!({
+        "type": "https://a2a-protocol.org/errors/proxy-error",
+        "title": "Service Unavailable",
+        "status": 503,
+        "detail": "This Access Point is not available."
+    });
+    assert_json_bodies_equal(get_response_body_value(world), &expected, "not-ready Access Point refusal");
+}
+
+#[then("the response says only that the caller credential is missing or invalid")]
+fn response_says_only_caller_credential_missing_or_invalid(world: &mut SurfaceWorld) {
+    let expected = serde_json::json!({
+        "type": "https://a2a-protocol.org/errors/proxy-error",
+        "title": "Unauthorized",
+        "status": 401,
+        "detail": "Caller credential missing or invalid"
+    });
+    assert_json_bodies_equal(get_response_body_value(world), &expected, "caller credential refusal");
+}
+
 #[then("the operator can still read the stored surface through the admin API")]
 fn fetching_surface_by_id_returns_stored_configuration(world: &mut SurfaceWorld) {
     let lookup = get_surface_lookup_response(world);

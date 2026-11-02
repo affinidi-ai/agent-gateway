@@ -30,10 +30,12 @@ const CallerAuthPanel: React.FC<ConfigPanelProps> = ({
   return (
     <>
       <Form.Text className="text-muted d-block mb-1" style={{ fontSize: '10px' }}>
-        Extracts and verifies the caller&apos;s identity before any policy or payment gate runs. It
-        does not refuse the request on its own: a missing or invalid credential is reported to the
-        policy layer as <code>source_auth.method == &quot;failed&quot;</code>. Add a policy that
-        denies unverified callers, otherwise the request is forwarded with no asserted identity.
+        Extracts and verifies the caller&apos;s identity before any policy or payment gate runs. A
+        closed Access Point (Public access off) is not ready for external access without it, and
+        answers every caller with <code>503</code>. Once it is ready, a missing or invalid
+        credential is refused with <code>401</code>. On a public Access Point, or one without the
+        Public access setting, the request continues to policy as{' '}
+        <code>source_auth.method == &quot;failed&quot;</code>.
       </Form.Text>
       <InfoBanner
         title="Why does this matter to the rest of the pipeline?"

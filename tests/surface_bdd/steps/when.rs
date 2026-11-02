@@ -500,11 +500,41 @@ pub(crate) fn build_surface_payload(
             "listen_address": format!("http://localhost:{}", infra.gateway_port),
             "route": route,
             "protocol": world.surface_config.protocol,
+            "public": true,
         },
         "target": {
             "endpoint": target_url,
         }
     })
+}
+
+/// The payload that creates a new surface for `route`, with the scenario's
+/// caller authentication. It sets `access_point.public` only when the operator
+/// marks the Access Point public, so the gateway closes it otherwise.
+pub(crate) async fn build_new_surface_payload(
+    world: &mut SurfaceWorld,
+    route: &str,
+    public: bool,
+) -> serde_json::Value {
+    configure_unseeded_route(world, route);
+    let mut payload = build_primary_target_surface_payload(world, route).await;
+    let access_point = payload["access_point"]
+        .as_object_mut()
+        .expect("surface payload must have an access_point object");
+    access_point.remove("public");
+    if public {
+        access_point.insert("public".to_string(), serde_json::json!(true));
+    }
+    if let Some(auth) = &world
+        .surface_config
+        .source_auth
+    {
+        access_point.insert(
+            "caller_authentication".to_string(),
+            serde_json::json!({ "methods": [config::source_auth::caller_authentication_method_json(auth)] }),
+        );
+    }
+    payload
 }
 
 fn record_caller_response(
@@ -1584,6 +1614,58 @@ async fn valid_surface_create_request_submitted(
     create_valid_surface_for_route(world, &route).await;
 }
 
+pub(crate) async fn mark_surface_public(world: &mut SurfaceWorld) {
+    let mut payload = get_current_admin_surface_body(world, "marking the surface public");
+    payload["access_point"]["public"] = serde_json::json!(true);
+
+    update_created_surface(world, payload, "marking the surface public").await;
+}
+
+/// Save the scenario's source authentication on the created surface.
+pub(crate) async fn add_source_authentication(world: &mut SurfaceWorld) {
+    let mut payload = get_current_admin_surface_body(world, "adding source authentication");
+    let auth = world
+        .surface_config
+        .source_auth
+        .as_ref()
+        .expect("the scenario's source authentication must be configured");
+    payload["access_point"]["caller_authentication"] =
+        serde_json::json!({ "methods": [config::source_auth::caller_authentication_method_json(auth)] });
+
+    update_created_surface(world, payload, "adding source authentication").await;
+}
+
+pub(crate) async fn remove_source_authentication(world: &mut SurfaceWorld) {
+    let mut payload = get_current_admin_surface_body(world, "removing source authentication");
+    payload["access_point"]
+        .as_object_mut()
+        .expect("surface body must have an access_point object")
+        .remove("caller_authentication");
+
+    update_created_surface(world, payload, "removing source authentication").await;
+}
+
+pub(crate) async fn add_complete_variant_without_source_authentication(
+    world: &mut SurfaceWorld,
+    alias: &str,
+) {
+    let mut payload = get_current_admin_surface_body(world, "adding a variant");
+    let target_endpoint = payload["target"]["endpoint"].clone();
+    payload["variants"] = serde_json::json!([{
+        "id": format!("variant-{alias}"),
+        "alias": alias,
+        "name": alias,
+        "enabled": true,
+        "overrides": {
+            "complete": true,
+            "access_point": {},
+            "target": { "endpoint": target_endpoint }
+        }
+    }]);
+
+    update_created_surface(world, payload, "adding a variant").await;
+}
+
 #[when(expr = "the operator attempts to create an A2A surface for route {string} that accepts no A2A versions")]
 async fn surface_without_a2a_versions_create_request_submitted(
     world: &mut SurfaceWorld,
@@ -2100,15 +2182,31 @@ async fn fetch_agent_card_with_extra_headers(
     fetch_agent_card_with_headers(world, headers).await;
 }
 
+#[when(expr = "the caller reads the surface path {string}")]
+async fn caller_reads_surface_path(
+    world: &mut SurfaceWorld,
+    path: String,
+) {
+    get_path_and_record(world, &path, vec![]).await;
+}
+
 pub(crate) async fn fetch_agent_card_with_headers(
     world: &mut SurfaceWorld,
+    headers: Vec<(String, String)>,
+) {
+    let path = format!("{}/.well-known/agent-card.json", world.surface_config.route);
+    get_path_and_record(world, &path, headers).await;
+}
+
+async fn get_path_and_record(
+    world: &mut SurfaceWorld,
+    path: &str,
     headers: Vec<(String, String)>,
 ) {
     ensure_gateway_running(world).await;
 
     let infra = world.infra.as_ref().unwrap();
-    let url =
-        format!("http://127.0.0.1:{}{}/.well-known/agent-card.json", infra.gateway_port, world.surface_config.route);
+    let url = format!("http://127.0.0.1:{}{}", infra.gateway_port, path);
 
     let mut req = reqwest::Client::new().get(&url);
     for (name, value) in &headers {

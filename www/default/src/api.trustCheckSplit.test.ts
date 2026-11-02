@@ -41,6 +41,23 @@ describe('trust_check_split on surface writes', () => {
   });
 });
 
+describe('access_point_status on surface writes', () => {
+  const read = { ...surface, access_point_status: 'not_ready' };
+
+  it('is left out when creating or updating a surface', async () => {
+    await apiClient.createSurface(read);
+    await apiClient.updateSurface('s-1', read);
+    for (const [, init] of fetchMock.mock.calls) {
+      expect(JSON.parse(init.body)).not.toHaveProperty('access_point_status');
+    }
+  });
+
+  it('is left out of a write without a target', async () => {
+    await apiClient.updateSurface('s-1', { name: 's', access_point_status: 'ready' } as any);
+    expect(sentBody()).toEqual({ name: 's', trust_check_split: true });
+  });
+});
+
 describe('trust_check_split on Surface Template writes', () => {
   const template = { id: 't-1', name: 't', kind: 'full' as const, surface };
 

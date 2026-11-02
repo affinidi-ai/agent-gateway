@@ -2256,7 +2256,7 @@ async fn a2a_settings_survive_adding_policy_and_identity_elements_through_the_ad
             .post(&collection)
             .json(&serde_json::json!({
                 "name": "elements", "status": "active",
-                "access_point": {"listen_address": listener, "route": "/smoke/elements", "protocol": "a2a"},
+                "access_point": {"listen_address": listener, "route": "/smoke/elements", "protocol": "a2a", "public": true},
                 "target": {"endpoint": h.mock.url()}
             })),
     )
@@ -2451,7 +2451,7 @@ async fn a_tenant_access_token_cannot_turn_a2a_validation_off_through_the_admin_
     let surface = |route: &str, validation: &str| {
         serde_json::json!({
             "name": route.trim_start_matches('/'), "status": "disabled",
-            "access_point": {"listen_address": h.gateway_base, "route": route, "protocol": "a2a",
+            "access_point": {"listen_address": h.gateway_base, "route": route, "protocol": "a2a", "public": true,
                              "a2a": {"validation": validation}},
             "target": {"endpoint": "https://agent.example"}
         })
@@ -2602,7 +2602,7 @@ async fn a2a_settings_carried_over_on_reload_are_served() {
         .post(format!("{}/api/v1/surfaces", h.gateway_base))
         .json(&serde_json::json!({
             "name": "reloaded", "status": "active",
-            "access_point": {"listen_address": listener.origin().ascii_serialization(), "route": "/smoke/reloaded",
+            "access_point": {"public": true, "listen_address": listener.origin().ascii_serialization(), "route": "/smoke/reloaded",
                              "protocol": "a2a"},
             "target": {"endpoint": h.mock.url()}
         }))
@@ -2739,7 +2739,7 @@ async fn a2a_settings_a_reload_could_not_store_are_kept_by_its_storage_event() {
         .post(format!("{}/api/v1/surfaces", h.gateway_base))
         .json(&serde_json::json!({
             "name": "unstored", "status": "active",
-            "access_point": {"listen_address": listener.origin().ascii_serialization(), "route": "/smoke/unstored",
+            "access_point": {"public": true, "listen_address": listener.origin().ascii_serialization(), "route": "/smoke/unstored",
                              "protocol": "a2a"},
             "target": {"endpoint": h.mock.url()}
         }))

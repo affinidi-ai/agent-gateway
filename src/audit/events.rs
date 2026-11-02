@@ -59,6 +59,9 @@ pub enum RejectionReason {
     /// A Fabric request whose per-user delegated credential needs consent,
     /// which is never started through a partner.
     ConsentNotAvailableForPartners,
+    /// A closed Access Point without source authentication refused the
+    /// request with `503`.
+    AccessPointNotReady,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

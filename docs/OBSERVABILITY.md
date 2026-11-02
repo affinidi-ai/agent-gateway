@@ -305,7 +305,9 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
     headers, HTTP method, per-request capabilities, `_meta`), `extension_rejected` (request
     extension rules, and an inbound identity that is missing or invalid),
     `consent_identity_required` (credential delegation for an anonymous caller, and on Fabric
-    receive for a request whose caller the receiving surface did not verify), and on Fabric
+    receive for a request whose caller the receiving surface did not verify),
+    `access_point_not_ready` (a closed Access Point without source authentication answers every
+    request with `503`, on the direct path and over Fabric), and on Fabric
     receive `delegation_not_enabled_for_partners` (a per-user delegated credential binding
     applies, which a partner's request never gets); the peer is answered `403` with that reason (see
     [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-fabric-receive)). A

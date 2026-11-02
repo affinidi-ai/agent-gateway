@@ -9,8 +9,9 @@ import { validateSurfacePayload, hasBlockingIssues } from '../validateSurface';
 import '../index';
 
 describe('validateSurfacePayload', () => {
-  const ok = () => ({
+  const ok = (): Record<string, any> => ({
     name: 'My Surface',
+    access_point: { caller_authentication: { methods: [{ type: 'did_auth' }] } },
     target: { endpoint: 'https://upstream/y' },
   });
 
@@ -18,6 +19,40 @@ describe('validateSurfacePayload', () => {
     const issues = validateSurfacePayload(ok());
     expect(issues).toEqual([]);
     expect(hasBlockingIssues(issues)).toBe(false);
+  });
+
+  describe('caller access', () => {
+    const open = (extra: Record<string, unknown> = {}) => ({
+      ...ok(),
+      access_point: { route: '/a', ...extra },
+    });
+
+    it('lets a surface with no Caller Context save, leaving its warning to the gateway', () => {
+      const issues = validateSurfacePayload(open());
+      expect(hasBlockingIssues(issues)).toBe(false);
+      expect(issues.find(i => i.path?.startsWith('access_point.'))).toBeUndefined();
+    });
+
+    it('lets a stored closed surface without caller authentication save', () => {
+      for (const extra of [{}, { caller_authentication: { methods: [] } }]) {
+        const issues = validateSurfacePayload(open({ public: false, ...extra }));
+        expect(hasBlockingIssues(issues)).toBe(false);
+        expect(issues.find(i => i.path?.startsWith('access_point.'))).toBeUndefined();
+      }
+    });
+
+    it('does not warn about a stored MCP surface protected by a resource token', () => {
+      const issues = validateSurfacePayload({
+        ...open(),
+        mcp_http: { authorization: { scopes: ['tools:call'] } },
+      });
+      expect(issues.find(i => i.path?.startsWith('access_point.'))).toBeUndefined();
+    });
+
+    it('raises no access issue when Public access is on, leaving its warning to the gateway', () => {
+      const issues = validateSurfacePayload(open({ public: true }));
+      expect(issues.find(i => i.path?.startsWith('access_point.'))).toBeUndefined();
+    });
   });
 
   it('flags missing surface name as an error', () => {

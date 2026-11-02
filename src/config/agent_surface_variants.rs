@@ -970,6 +970,7 @@ mod tests {
                 didwebvh_identity: None,
                 terminate_trace_id: false,
                 a2a: None,
+                public: None,
             },
             target: Target {
                 endpoint: "https://prod.example.com".to_string(),
@@ -1401,6 +1402,7 @@ mod tests {
             .caller_authentication = Some(CallerAuthentication {
             methods: Vec::new(),
             protected_resource: None,
+            on_failure: crate::config::agent_surface::OnFailure::Continue,
         });
         // Variant override carries no caller-auth but is marked complete.
         s.variants = vec![variant(
@@ -1441,6 +1443,7 @@ mod tests {
             .caller_authentication = Some(CallerAuthentication {
             methods: Vec::new(),
             protected_resource: None,
+            on_failure: crate::config::agent_surface::OnFailure::Continue,
         });
         s.variants = vec![variant(
             "id-legacy",

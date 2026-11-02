@@ -1772,6 +1772,25 @@ async fn proxy_handler_with_mcp_runtime(
     let uri = req.uri().clone();
     let headers = req.headers().clone();
 
+    // A closed Access Point without source authentication is not ready: it
+    // refuses every request, discovery reads included, before source
+    // authentication, policy and the Target.
+    if state
+        .surface
+        .refuses_every_request()
+    {
+        return Ok(refuse_not_ready_access_point(
+            &state.surface,
+            &state.network_config,
+            mcp_versions,
+            state
+                .active_variant_alias
+                .as_deref(),
+            req,
+        )
+        .await);
+    }
+
     // Start timing the request
     let start_time = std::time::Instant::now();
 
@@ -1968,10 +1987,11 @@ async fn proxy_handler_with_mcp_runtime(
     // Must run before rate limiting so unauthenticated requests are rejected
     // before consuming any rate-limit budget.
     // Public paths (e.g. agent-card) bypass all authentication gates.
-    // Caller-attributable source-auth failures are non-blocking: the outcome is
-    // handed to the policy layer via `source_auth_context` below, which decides
-    // whether to allow or deny. Only server-side failures (setup/config
-    // resolution, internal errors) still block here (now with a 500).
+    // Caller-attributable source-auth failures are refused with 401 on an Access
+    // Point that publishes protected resource metadata or rejects failed callers;
+    // otherwise the outcome is handed to the policy layer via `source_auth_context`
+    // below, which decides whether to allow or deny. Server-side failures
+    // (setup/config resolution, internal errors) block with a 500.
     let resource_authorization = state
         .surface
         .mcp_http
@@ -2170,16 +2190,23 @@ async fn proxy_handler_with_mcp_runtime(
             // Caller-attributable failure (missing/invalid credential). An
             // Access Point that publishes protected resource metadata answers
             // it with its challenge, so the caller can fetch a token and
-            // retry. Otherwise record the outcome for the policy layer and
+            // retry, and one whose caller authentication rejects failures
+            // refuses it. Otherwise record the outcome for the policy layer and
             // continue with no asserted caller identity — do not block here.
             Err(e) if e.is_caller_attributable() => {
                 let challenged = protected_resource.is_some();
+                let refused = !challenged
+                    && state
+                        .surface
+                        .rejects_failed_caller_authentication();
                 channel_warn!(
                     config_id,
                     "Source authentication failed (reason={}) — {}",
                     e,
                     if challenged {
                         "sending the discovery challenge"
+                    } else if refused {
+                        "refusing the caller"
                     } else {
                         "deferring to policy"
                     }
@@ -2188,7 +2215,7 @@ async fn proxy_handler_with_mcp_runtime(
                     &audit_facts,
                     crate::audit::request_events::source_auth_scheme(&resolved_auth_config),
                     crate::audit::request_events::source_auth_reason(&e),
-                    challenged,
+                    challenged || refused,
                     client_ip,
                 );
                 if let Some(protected_resource) = &protected_resource {
@@ -2196,6 +2223,19 @@ async fn proxy_handler_with_mcp_runtime(
                         .decrement()
                         .await;
                     return Ok(protected_resource.caller_challenge(&e));
+                }
+                if refused {
+                    connection_guard
+                        .decrement()
+                        .await;
+                    return Ok(refuse_failed_caller(
+                        &state.surface,
+                        &state.network_config,
+                        mcp_versions,
+                        &resolved_auth_config,
+                        req,
+                    )
+                    .await);
                 }
                 source_auth_failure = Some(crate::surface_context::SourceAuthContext::Failed {
                     attempted_method: resolved_auth_config
@@ -9479,6 +9519,56 @@ async fn refuse_access_point_variant(
     }
     crate::mcp::request_validation::answer_routing_refusal(
         &refusal,
+        surface.mcp_http.as_ref(),
+        &network_config.get_inbound_external_urls(),
+        versions,
+        Some(req.into_body()),
+    )
+    .await
+}
+
+/// Refuses an Access Point caller whose credential is missing or invalid.
+async fn refuse_failed_caller(
+    surface: &crate::config::agent_surface::AgentSurface,
+    network_config: &crate::config::NetworkConfig,
+    versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
+    auth_config: &crate::source_auth::SourceAuthConfig,
+    req: Request,
+) -> Response {
+    let mcp_request_id = refused_mcp_request_id(surface, network_config, versions, req).await;
+    crate::source_auth::errors::caller_refusal(&surface.access_point.protocol, auth_config, mcp_request_id)
+}
+
+/// Refuses a request to an Access Point that is not ready, recording the
+/// refusal once.
+async fn refuse_not_ready_access_point(
+    surface: &crate::config::agent_surface::AgentSurface,
+    network_config: &crate::config::NetworkConfig,
+    versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
+    variant_alias: Option<&str>,
+    req: Request,
+) -> Response {
+    let mcp_request_id = refused_mcp_request_id(surface, network_config, versions, req).await;
+    crate::source_auth::errors::refuse_unavailable_access_point(
+        surface,
+        &routing_facts(surface),
+        variant_alias,
+        mcp_request_id,
+    )
+}
+
+/// The `id` a refusal of an MCP request answers. The body is read, within the
+/// surface's MCP body limit, only to echo it.
+async fn refused_mcp_request_id(
+    surface: &crate::config::agent_surface::AgentSurface,
+    network_config: &crate::config::NetworkConfig,
+    versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
+    req: Request,
+) -> Option<serde_json::Value> {
+    if surface.access_point.protocol != crate::config::agent_surface::SurfaceProtocol::Mcp {
+        return None;
+    }
+    crate::mcp::request_validation::refused_request_id(
         surface.mcp_http.as_ref(),
         &network_config.get_inbound_external_urls(),
         versions,
@@ -18180,9 +18270,23 @@ allow if {
                 "credential delegation for an anonymous caller",
                 direct_router_state(state, a2a_surface(delegated)),
                 "/a2a/rpc",
-                message,
+                message.clone(),
                 403,
                 (RejectionStage::Admission, RejectionReason::ConsentIdentityRequired, 403, None),
+            ),
+            (
+                "closed Access Point without source authentication",
+                direct_router_state(
+                    state,
+                    a2a_surface(json!({"access_point": {
+                        "listen_address": "https://gateway.example", "route": "/a2a", "protocol": "a2a",
+                        "public": false
+                    }})),
+                ),
+                "/a2a/rpc",
+                message,
+                503,
+                (RejectionStage::Admission, RejectionReason::AccessPointNotReady, 503, None),
             ),
         ];
         for (case, router, path, body, status, expected) in cases {
