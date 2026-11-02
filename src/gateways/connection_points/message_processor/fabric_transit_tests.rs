@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use super::{
     FabricReceiveCaller, ProcessingResult, fabric_caller_did_and_source, fabric_receive_transit_token,
-    transit_token_unavailable_refusal,
+    fabric_response_workload_binding, transit_token_unavailable_refusal,
 };
 use crate::audit::request_events::{RejectionReason, RejectionStage};
 use crate::component_tests::helpers::RecordingTarget;
@@ -665,6 +665,41 @@ fn a_fabric_token_carries_only_a_did_the_peers_presentation_proved() {
         (None, IdentityVerification::Unverified, (None, IdentitySource::FabricAsserted)),
     ] {
         assert_eq!(fabric_caller_did_and_source(identity, verification), expected, "{identity:?} {verification:?}");
+    }
+}
+
+/// The presentation this gateway signs for its agent's response names the
+/// caller as the user the agent acted for only when a presentation from one of
+/// the connection's issuers proved the caller's DID, the same caller a transit
+/// token carries: never a pseudonym, a DID this gateway computed from fields
+/// the peer sent, or one the peer only named.
+#[test]
+fn a_fabric_response_presentation_names_only_a_caller_the_peers_presentation_proved() {
+    let identity_fields = std::collections::HashMap::from([("model".to_string(), json!("gpt-4"))]);
+    let proved = fabric_response_workload_binding(
+        &identity_fields,
+        Some("did:web:agent.example"),
+        IdentityVerification::Vp,
+        Some("trace-1".to_string()),
+    );
+    assert_eq!(
+        proved,
+        json!({
+            "agentIdentity": { "model": "gpt-4" },
+            "userIdentity": { "id": "did:web:agent.example" },
+            "delegated": true,
+            "traceId": "trace-1"
+        })
+    );
+    for (identity, verification) in [
+        ("did:web:victim.example", IdentityVerification::Unverified),
+        ("did:web:this-gateway.example:computed:0f3a", IdentityVerification::Unverified),
+        ("did:web:victim.example", IdentityVerification::VpUnanchored),
+        ("sha256:0f3a", IdentityVerification::Vp),
+        ("0f3a-victim-pseudonym", IdentityVerification::Unverified),
+    ] {
+        let binding = fabric_response_workload_binding(&identity_fields, Some(identity), verification, None);
+        assert_eq!(binding, json!({ "agentIdentity": { "model": "gpt-4" } }), "{identity} {verification:?}");
     }
 }
 

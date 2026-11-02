@@ -80,5 +80,15 @@ changes:
         token starts the Fabric hop count again.
   fixed: []
   removed: []
-  security: []
+  security:
+    - timestamp: '2026-11-02T02:00:00.000Z'
+      title: Name a partner's caller in a response presentation only when it was proved
+      description: >-
+        The presentation a receiving gateway signs for its agent's response to a Fabric request,
+        when the Target has a Workload Binding, named whatever identity the peer's request
+        carried as the user the agent acted for (`userIdentity`, `delegated: true`): a payload
+        pseudonym, a DID computed from fields the peer sent, or a DID the peer only named. It
+        now names the caller only when a presentation from one of the connection's issuers
+        proved its DID, the same caller a transit token issued for the request carries, so the
+        gateway never attests a delegation the peer only claimed.
   breaking: []

@@ -3892,6 +3892,29 @@ pub(super) fn fabric_caller_did_and_source(
     }
 }
 
+/// The `workloadBinding` of the presentation this gateway signs for its
+/// agent's response to a Fabric request: the agent's identity fields, the
+/// trace that correlates it with the peer's request-leg presentation, and, as
+/// `userIdentity` with `delegated`, the caller a transit token issued for the
+/// request would carry: a DID a presentation from one of the connection's
+/// issuers proved, never one the peer only named or this gateway computed.
+pub(super) fn fabric_response_workload_binding(
+    identity_fields: &std::collections::HashMap<String, serde_json::Value>,
+    caller_identity: Option<&str>,
+    verification: crate::surface_context::IdentityVerification,
+    trace_id: Option<String>,
+) -> serde_json::Value {
+    let mut binding = serde_json::Map::from_iter([("agentIdentity".to_string(), serde_json::json!(identity_fields))]);
+    if let (Some(caller), _) = fabric_caller_did_and_source(caller_identity, verification) {
+        binding.insert("userIdentity".to_string(), serde_json::json!({ "id": caller }));
+        binding.insert("delegated".to_string(), serde_json::Value::Bool(true));
+    }
+    if let Some(trace_id) = trace_id {
+        binding.insert("traceId".to_string(), serde_json::Value::String(trace_id));
+    }
+    serde_json::Value::Object(binding)
+}
+
 /// The transit token the managed agent behind `surface` gets with a request a
 /// Fabric peer sent: when `target_url`, the Target, is the agent itself, by
 /// HTTP or HTTPS, and a Transit Point of the surface sets
@@ -6993,14 +7016,6 @@ async fn process_forward_request_in_request_scope(
                                 // Convert response_body String to Bytes for injection
                                 let response_bytes = bytes::Bytes::from(response_body.clone());
 
-                                // Bind the backend agent identity and the resolved caller
-                                // (the CA→AP request-leg identity — e.g. the GW1-hosted
-                                // surface DID `did:webvh:gw-1…`) into the backend-agent VP as
-                                // `agentIdentity` + `userIdentity`/`delegated`, so the VP
-                                // records both the backend agent and the caller it acted for.
-                                // `traceId` (seeded from the inbound fabric message into
-                                // `REQUEST_TRACE_ID`) correlates this response-leg VP with the
-                                // request-leg VP GW1 injected.
                                 // Only produced when the primary target has an
                                 // enabled Workload Binding element; otherwise the
                                 // response VP keeps the flat `identityFields` shape.
@@ -7008,25 +7023,12 @@ async fn process_forward_request_in_request_scope(
                                     .target_workload_binding()
                                     .is_some()
                                 {
-                                    let mut binding = serde_json::json!({
-                                        "agentIdentity": identity_fields,
-                                    });
-                                    if let (Some(caller), Some(obj)) =
-                                        (caller_identity.as_ref(), binding.as_object_mut())
-                                    {
-                                        obj.insert(
-                                            "userIdentity".to_string(),
-                                            serde_json::json!({ "id": caller }),
-                                        );
-                                        obj.insert("delegated".to_string(), serde_json::Value::Bool(true));
-                                    }
-                                    if let (Some(tid), Some(obj)) = (
+                                    Some(fabric_response_workload_binding(
+                                        &identity_fields,
+                                        caller_identity.as_deref(),
+                                        caller_identity_verification,
                                         crate::observability::policy_audit::current_span_trace_id(),
-                                        binding.as_object_mut(),
-                                    ) {
-                                        obj.insert("traceId".to_string(), serde_json::Value::String(tid));
-                                    }
-                                    Some(binding)
+                                    ))
                                 } else {
                                     None
                                 };

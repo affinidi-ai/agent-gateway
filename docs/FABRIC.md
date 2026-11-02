@@ -190,6 +190,15 @@ continues with no caller identity, only the audit record for the unverified DID 
 written, and no weaker identity source is consulted for that request, neither the identity
 binding VP nor a raw identity extension.
 
+The presentation the receiving gateway signs for its agent's response, when the Target has a
+Workload Binding, names the caller as the user the agent acted for (`userIdentity`, with
+`delegated: true`) only when a presentation from one of the connection's issuers proved the
+caller's DID (`vp` below), the caller a transit token issued for the request carries (see
+[`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)). A payload pseudonym, a DID computed from the
+extension's fields, or any other identity the peer named is left out, so the presentation never
+attests a delegation the peer only claimed. A `vp` DID is still the peer's word: any paired
+gateway's issuer can sign a presentation for any DID.
+
 The `did` field is never a source of identity. A credential extension carrying only a
 `did` claim yields nothing, and a `did` field in the raw `agent-identity/v1` extension is
 ignored. The identity is instead computed from:
