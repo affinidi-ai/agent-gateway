@@ -492,10 +492,18 @@ fn validate_ttls(
             );
         }
     }
-    if let Some(ttl) = session_ttl_seconds
-        && ttl == 0
-    {
-        anyhow::bail!("Channel '{}': did_auth.session_ttl_seconds must be > 0", surface_name);
+    if let Some(ttl) = session_ttl_seconds {
+        if ttl == 0 {
+            anyhow::bail!("Channel '{}': did_auth.session_ttl_seconds must be > 0", surface_name);
+        }
+        if ttl > DidAuthAuthConfig::MAX_SESSION_TTL_SECONDS {
+            anyhow::bail!(
+                "Channel '{}': did_auth.session_ttl_seconds {} exceeds max {}",
+                surface_name,
+                ttl,
+                DidAuthAuthConfig::MAX_SESSION_TTL_SECONDS
+            );
+        }
     }
     Ok(())
 }

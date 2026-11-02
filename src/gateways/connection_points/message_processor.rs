@@ -4801,8 +4801,12 @@ async fn process_forward_request_in_request_scope(
                         return axum_response_to_forward_result(deny).await;
                     }
                 };
+                let view = crate::didauth::sessions::SessionView {
+                    surface_id: &surface.surface_id,
+                    variant_id: active_variant_id.as_deref(),
+                };
                 match sa_middleware
-                    .authenticate(&resolved_auth_config, &axum_headers, &surface.name, &surface.surface_id, None)
+                    .authenticate(&resolved_auth_config, &axum_headers, &surface.name, view, None)
                     .await
                 {
                     Ok(identity) => Some(identity),
@@ -5165,6 +5169,14 @@ async fn process_forward_request_in_request_scope(
             .await;
     }
 
+    // A Target bound by external consent is never sent its grant for a caller
+    // the peer gateway asserts, so such a request is refused before any
+    // payment is asked for or settled, and so is a discovery read, which
+    // would carry the peer's headers to the vendor.
+    if let Some(refused) = crate::proxy::target_grant::refuse_over_fabric(&surface, &body_bytes) {
+        return axum_response_to_forward_result(refused).await;
+    }
+
     let payment_context = if modern_request.is_some() { None } else {
         let x402_headers = fabric_x402_headers(&message.context);
         match Box::pin(verify_payment_fabric(
@@ -5352,7 +5364,7 @@ async fn process_forward_request_in_request_scope(
     } else { None };
     let mut modern_delegation = None;
     if let Some(request) = modern_request.as_ref()
-        && !surface.outbound_credentials.is_empty()
+        && surface.has_agent_keyed_outbound_credentials()
     {
         use crate::mcp::continuations::{ContinuationError, protected::ContinuationRoute};
         use crate::proxy::credential_delegation::modern::{ModernDelegationContext, ModernDelegationError, ModernDelegationResult};
@@ -9840,6 +9852,9 @@ mod fabric_transit_tests;
 
 #[cfg(test)]
 mod variant_routing_tests;
+
+#[cfg(test)]
+mod target_grant_tests;
 
 #[cfg(test)]
 mod tests {

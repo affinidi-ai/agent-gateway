@@ -706,12 +706,14 @@ allow := false if contains(input.response.body.result.text, "SECRET")
             didwebvh_log_manager: None,
             credential_provider_store: None,
             delegation_vault_store: None,
+            egress_allowlist: None,
             gateway_base_url: None,
             transit_token_issuer: None,
             mcp_proxy_store: None,
             a2a_proxy_store: None,
             active_variant_alias: None,
             active_variant_id: None,
+            served_surface: std::sync::Arc::new(surface.clone()),
             surface: std::sync::Arc::new(surface),
         };
         AccessPointEvents::new(

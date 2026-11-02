@@ -490,6 +490,11 @@ a `403` with a fixed reason (`delegation_not_enabled_for_partners` or
 `partner_caller_not_verified`), answered before the Target is called and recorded as a
 `request_rejected`; an agent card fetch is never refused for a binding
 (see [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-fabric-receive)).
+A receiving surface whose Target is bound by external consent (`consent_mode: external`) refuses
+every request with `403`, public discovery reads included, before any payment is asked for or
+verified: the caller the peer asserts never keys a grant by binding, and a discovery read would
+carry the peer's headers to the vendor
+([`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#external-consent-on-the-access-point-target)).
 
 The gateway that receives a request applies these rules; the sending gateway's release does not
 matter. In a mixed-version fleet, a receiving node that predates them still keys its Target's

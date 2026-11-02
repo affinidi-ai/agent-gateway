@@ -47,6 +47,11 @@ pub struct MultiSurfaceProxyState {
     /// Delegation vault store for cached OAuth tokens
     pub delegation_vault_store: Option<Arc<dyn crate::delegation_vault::storage::DelegationVaultStorage>>,
 
+    /// The test allow-list of fixtures Strict egress admits for a request
+    /// carrying the Access Point Target's grant by binding
+    /// ([`crate::egress::bdd_egress_allowlist`]); `None` in production.
+    pub egress_allowlist: Option<String>,
+
     /// Gateway base URL for building OAuth callback URLs
     pub gateway_base_url: Option<String>,
 
@@ -159,6 +164,7 @@ impl MultiSurfaceProxyState {
             delegation_vault_store: self
                 .delegation_vault_store
                 .clone(),
+            egress_allowlist: self.egress_allowlist.clone(),
             gateway_base_url: self.gateway_base_url.clone(),
             transit_token_issuer: self
                 .transit_token_issuer
@@ -169,6 +175,7 @@ impl MultiSurfaceProxyState {
             active_variant_alias,
             active_variant_id,
             surface,
+            served_surface: Arc::clone(&channel.surface),
         }
     }
 

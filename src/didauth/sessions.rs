@@ -42,6 +42,15 @@ pub struct DidAuthSession {
     #[serde(default)]
     pub surface_id: String,
 
+    /// The variant of the surface that served the request the session was
+    /// minted on, `None` for the base surface. Written from server-side
+    /// state at mint time, like `surface_id`: a session authenticates only at
+    /// the view it was minted on, so one minted on a variant whose
+    /// `allowed_dids` name its DID is never taken at a view whose list may
+    /// not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant_id: Option<String>,
+
     /// When the session was created
     pub created_at: chrono::DateTime<chrono::Utc>,
 
@@ -63,6 +72,7 @@ impl std::fmt::Debug for DidAuthSession {
             .field("did", &self.did)
             .field("channel_name", &self.channel_name)
             .field("surface_id", &self.surface_id)
+            .field("variant_id", &self.variant_id)
             .field("created_at", &self.created_at)
             .field("expires_at", &self.expires_at)
             .field("challenge", &self.challenge)
@@ -75,6 +85,34 @@ impl StorableEntity for DidAuthSession {
 
     fn id(&self) -> &str {
         &self.session_id
+    }
+}
+
+/// The view of a surface a DID Auth session is minted on, and the only one it
+/// authenticates at: the surface, and the variant serving the request, `None`
+/// for the base surface. Both come from server-side state, never from the
+/// request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionView<'a> {
+    pub surface_id: &'a str,
+    pub variant_id: Option<&'a str>,
+}
+
+impl<'a> SessionView<'a> {
+    /// The base view of the surface `surface_id`.
+    #[cfg(test)]
+    pub fn base(surface_id: &'a str) -> Self {
+        Self { surface_id, variant_id: None }
+    }
+
+    /// Whether `session` was minted on this view.
+    pub fn minted(
+        &self,
+        session: &DidAuthSession,
+    ) -> bool {
+        !session.surface_id.is_empty()
+            && session.surface_id == self.surface_id
+            && session.variant_id.as_deref() == self.variant_id
     }
 }
 
@@ -282,16 +320,16 @@ impl DidAuthSessionStore {
         pending.pop()
     }
 
-    /// Create a new session bound to the surface it was minted for.
+    /// Create a new session bound to the view it was minted on.
     ///
-    /// `surface_id` must come from server-side state (the authenticating
-    /// surface's own `surface_id`), never from a client-controlled request
-    /// field — see [`DidAuthSession::surface_id`].
+    /// `view` must come from server-side state (the authenticating surface's
+    /// own `surface_id` and the variant serving the request), never from a
+    /// client-controlled request field - see [`DidAuthSession::surface_id`].
     pub async fn create_session(
         &self,
         did: String,
         channel_name: String,
-        surface_id: String,
+        view: SessionView<'_>,
         ttl_seconds: u64,
     ) -> DidAuthSession {
         let session_id = uuid::Uuid::new_v4().to_string();
@@ -301,7 +339,10 @@ impl DidAuthSessionStore {
             session_id: session_id.clone(),
             did,
             channel_name,
-            surface_id,
+            surface_id: view.surface_id.to_string(),
+            variant_id: view
+                .variant_id
+                .map(str::to_string),
             created_at: now,
             expires_at: now + chrono::Duration::seconds(ttl_seconds as i64),
             challenge: None,
@@ -415,6 +456,7 @@ mod tests {
             did: "did:example:alice".to_string(),
             channel_name: "surface-1".to_string(),
             surface_id: "surface-1".to_string(),
+            variant_id: None,
             created_at: now,
             expires_at: now + chrono::Duration::seconds(expires_in_seconds),
             challenge: None,
@@ -443,7 +485,7 @@ mod tests {
         .await
         .unwrap();
         let session = store
-            .create_session("did:example:alice".into(), "surface-1".into(), "surface-1".into(), 0)
+            .create_session("did:example:alice".into(), "surface-1".into(), SessionView::base("surface-1"), 0)
             .await;
         let session_file = sessions_directory
             .path()

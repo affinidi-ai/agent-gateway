@@ -7,6 +7,25 @@ use bytes::{Bytes, BytesMut};
 
 use crate::config::TimeoutConfig;
 
+/// Whether an upstream answer is compressed: its `Content-Encoding` names a
+/// coding other than `identity`, or cannot be read. The gateway does not
+/// decompress, so the checks that read such a body would read none of it.
+pub(crate) fn is_compressed(headers: &reqwest::header::HeaderMap) -> bool {
+    headers
+        .get_all(reqwest::header::CONTENT_ENCODING)
+        .iter()
+        .any(|value| {
+            value
+                .to_str()
+                .map_or(true, |value| {
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .any(|coding| !coding.is_empty() && !coding.eq_ignore_ascii_case("identity"))
+                })
+        })
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct UpstreamBodyLimits {
     max_bytes: usize,

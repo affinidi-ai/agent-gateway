@@ -91,6 +91,12 @@ impl Drop for RefreshDone {
 /// The label hashed with a caller's principal into a connect hint.
 const CONNECT_HINT_LABEL: &[u8] = b"agent-gateway-connect-hint\n";
 
+/// The largest request body a call whose grant the vendor refused is sent
+/// again with. A larger one, such as an upload, is not sent twice: its grant
+/// is refreshed, and the call answered `connector_unavailable`, so the caller
+/// tries again with the fresh token.
+pub const RETRY_BODY_LIMIT: usize = 1024 * 1024;
+
 /// Why a grant by binding was not released, as the caller is told.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GrantRefusal {
@@ -182,6 +188,39 @@ impl GrantRefusal {
         problem["title"] = serde_json::json!(self.message());
         problem["status"] = serde_json::json!(self.status().as_u16());
         problem
+    }
+
+    /// The answer to the call: for an MCP call, a JSON-RPC error for
+    /// `mcp_request_id`, with the fixed reason in its `data`, as `-32001` when
+    /// someone must act and `-32603` otherwise; for any other, the
+    /// [`Self::problem`] JSON. `no-store` either way.
+    pub fn response(
+        &self,
+        mcp_request_id: Option<serde_json::Value>,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse as _;
+        let mut response = match mcp_request_id {
+            Some(id) => crate::mcp::request_validation::McpRequestValidationError {
+                status: self.status(),
+                id: Some(id),
+                code: match self {
+                    Self::ConnectorUnavailable => crate::mcp::errors::error_codes::INTERNAL_ERROR,
+                    _ => -32001,
+                },
+                message: self.message().to_string(),
+                data: Some(self.data()),
+            }
+            .into_response(),
+            None => axum::response::Response::builder()
+                .status(self.status())
+                .header(axum::http::header::CONTENT_TYPE, "application/problem+json")
+                .body(axum::body::Body::from(self.problem().to_string()))
+                .unwrap_or_else(|_| self.status().into_response()),
+        };
+        response
+            .headers_mut()
+            .insert(axum::http::header::CACHE_CONTROL, axum::http::HeaderValue::from_static("no-store"));
+        response
     }
 }
 
@@ -401,6 +440,29 @@ impl ReleaseContext<'_> {
                 false
             }
         }
+    }
+
+    /// The grant to send a call once more with, after the vendor rejected the
+    /// token of `rejected` ([`VendorAnswer::TokenRejected`]): refreshed,
+    /// single-flight, or the one another call or a reconnect stored since
+    /// ([`Self::refresh_rejected`]). A call whose body is too large to send
+    /// again (`may_resend` false) is refused `connector_unavailable` once the
+    /// grant is refreshed, so the next call uses the fresh token.
+    pub async fn retry_grant(
+        &self,
+        provider: &CredentialProvider,
+        key: &GrantKey,
+        subject: GrantSubject,
+        rejected: &DelegatedGrant,
+        may_resend: bool,
+    ) -> Result<DelegatedGrant, Refused> {
+        let fresh = self
+            .refresh_rejected(provider, key, subject, rejected)
+            .await?;
+        if !may_resend {
+            return Err(unavailable("vendor_refused_a_large_body_refreshed_for_the_next_call"));
+        }
+        Ok(fresh)
     }
 
     /// Refresh `grant`, single-flight. `forced` refreshes a token the vendor
@@ -886,6 +948,76 @@ impl BearerChallenge {
     pub fn rejects_the_token(&self) -> bool {
         self.error.as_deref() == Some("invalid_token")
     }
+}
+
+/// How the vendor answered a call that carried a grant by binding, on a
+/// Transit Point or the Access Point's Target alike.
+#[derive(Debug)]
+pub enum VendorAnswer {
+    /// Pass the answer on.
+    Pass,
+    /// Refuse the call: a `403` whose `Bearer` challenge says
+    /// `insufficient_scope` (`scope_insufficient`, naming the scope; a wider
+    /// scope is never asked for silently), or a `401` without a challenge
+    /// that rejects the token, as a front proxy or a firewall answers, which
+    /// keeps the grant (`connector_unavailable`).
+    Refuse(Refused),
+    /// A `401` whose `Bearer` challenge rejects the token (`invalid_token`):
+    /// the grant is refreshed, single-flight, and the call sent once more
+    /// ([`ReleaseContext::retry_grant`]). A target checks the token before it
+    /// acts, so a `401` means nothing ran.
+    TokenRejected,
+}
+
+fn scope_refusal(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+) -> Option<Refused> {
+    (status == reqwest::StatusCode::FORBIDDEN)
+        .then(|| bearer_challenge(headers))
+        .flatten()
+        .filter(BearerChallenge::insufficient_scope)
+        .map(|challenge| {
+            refused(GrantRefusal::ScopeInsufficient { scope: challenge.scope }, "vendor_insufficient_scope")
+        })
+}
+
+/// How the vendor answered a call that carried a grant by binding.
+pub fn vendor_answer(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+) -> VendorAnswer {
+    if let Some(refusal) = scope_refusal(status, headers) {
+        return VendorAnswer::Refuse(refusal);
+    }
+    if status != reqwest::StatusCode::UNAUTHORIZED {
+        return VendorAnswer::Pass;
+    }
+    if bearer_challenge(headers).is_some_and(|challenge| challenge.rejects_the_token()) {
+        VendorAnswer::TokenRejected
+    } else {
+        VendorAnswer::Refuse(unavailable("vendor_401_not_rejecting_the_token"))
+    }
+}
+
+/// The vendor's answer to a call sent once more with a refreshed grant: a
+/// `403` for a missing scope is refused as on the first answer, and a second
+/// `401` refuses this call, `connector_unavailable`, and keeps the grant: the
+/// authorization server has just issued, or another call or a reconnect has
+/// just stored, the token refused again, so the vendor refuses this request,
+/// not the connection, which a caller of an owner binding could otherwise end
+/// for every caller. A dead authorization shows at the next refresh.
+pub fn vendor_answer_to_a_retry(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+) -> Result<(), Refused> {
+    if let Some(refusal) = scope_refusal(status, headers) {
+        return Err(refusal);
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(unavailable("vendor_rejected_a_refreshed_grant"));
+    }
+    Ok(())
 }
 
 /// The first `Bearer` challenge of a vendor's `WWW-Authenticate` headers. A

@@ -762,6 +762,7 @@ pub async fn run_port_server(
 
         credential_provider_store: crate::proxy::server::get_credential_provider_store(),
         delegation_vault_store: crate::proxy::server::get_delegation_vault_store(),
+        egress_allowlist: crate::egress::bdd_egress_allowlist(),
         gateway_base_url: crate::proxy::server::get_gateway_base_url(),
         transit_token_issuer: crate::proxy::server::get_transit_token_issuer(),
         mcp_proxy_store: mcp_proxy_store.clone(),

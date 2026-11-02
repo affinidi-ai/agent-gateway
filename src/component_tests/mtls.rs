@@ -186,7 +186,13 @@ async fn auth_handler(
         .cloned();
     match state
         .middleware
-        .authenticate(&state.config, &headers, "test-channel", "test-surface-id", peer.as_ref())
+        .authenticate(
+            &state.config,
+            &headers,
+            "test-channel",
+            crate::didauth::sessions::SessionView::base("test-surface-id"),
+            peer.as_ref(),
+        )
         .await
     {
         Ok(identity) => {

@@ -358,7 +358,7 @@ impl IntoResponse for OutboundPipelineError {
             .into_response();
         }
         if let Self::GrantRefused { refusal, mcp_request_id } = self {
-            return grant_refusal_response(&refusal, mcp_request_id);
+            return refusal.response(mcp_request_id);
         }
         if let Self::DelegationRefused { refusal, mcp_request_id: None } = &self
             && let Some(reason) = refusal.reason()
@@ -401,41 +401,6 @@ impl IntoResponse for OutboundPipelineError {
         }
         create_error_response(self.status_code(), &self.to_string())
     }
-}
-
-/// The answer to a call whose grant by binding was refused: on an MCP Transit
-/// Point a JSON-RPC error for the request's id, with the fixed reason in its
-/// `data`, as `-32001` when someone must act and `-32603` otherwise; on any
-/// other a problem JSON (RFC 9457) carrying the same reason. `no-store` either
-/// way.
-fn grant_refusal_response(
-    refusal: &crate::delegation_vault::release::GrantRefusal,
-    mcp_request_id: Option<serde_json::Value>,
-) -> Response {
-    let mut response = match mcp_request_id {
-        Some(id) => crate::mcp::request_validation::McpRequestValidationError {
-            status: refusal.status(),
-            id: Some(id),
-            code: match refusal {
-                crate::delegation_vault::release::GrantRefusal::ConnectorUnavailable => {
-                    crate::mcp::errors::error_codes::INTERNAL_ERROR
-                }
-                _ => -32001,
-            },
-            message: refusal.message().to_string(),
-            data: Some(refusal.data()),
-        }
-        .into_response(),
-        None => Response::builder()
-            .status(refusal.status())
-            .header(axum::http::header::CONTENT_TYPE, "application/problem+json")
-            .body(axum::body::Body::from(refusal.problem().to_string()))
-            .unwrap_or_else(|_| create_error_response(refusal.status(), refusal.message())),
-    };
-    response
-        .headers_mut()
-        .insert(axum::http::header::CACHE_CONTROL, axum::http::HeaderValue::from_static("no-store"));
-    response
 }
 
 // Static assertion: OutboundProxyState must satisfy axum Handler bounds.
@@ -1550,8 +1515,14 @@ async fn authenticate_transit_caller(
                 .extensions()
                 .get::<crate::source_auth::models::PeerCertInfo>()
         });
+    let view = crate::didauth::sessions::SessionView {
+        surface_id: &ctx.surface.surface_id,
+        variant_id: ctx
+            .active_variant_id
+            .as_deref(),
+    };
     let authenticated = middleware
-        .authenticate(&config, &ctx.original_headers, &ctx.surface.name, &ctx.surface.surface_id, peer_cert)
+        .authenticate(&config, &ctx.original_headers, &ctx.surface.name, view, peer_cert)
         .await;
     match authenticated {
         Ok(identity) => {
@@ -2494,7 +2465,7 @@ async fn step_map_transit_point_header_metadata(
 /// HTTP or Fabric. The caller's `Authorization`, cookies, and caller-info and DID
 /// identity headers ([`crate::proxy::caller_identity::CallerHeaders::NAMES`])
 /// never do; its other headers, such as its own API key header for the target, do.
-fn should_forward_outbound_request_header(
+pub(crate) fn should_forward_outbound_request_header(
     name: &str,
     header_metadata_mapping: Option<&crate::config::header_metadata_mapping::HeaderMetadataMappingConfig>,
 ) -> bool {
@@ -5187,6 +5158,18 @@ async fn step_inject_external_grant(
     {
         return Err(refuse_external_grant(ctx, "surface_outbound_credentials"));
     }
+    if let Some(unchecked) = binding
+        .subject
+        .and_then(|subject| crate::proxy::target_grant::unchecked_callers(&ctx.surface, subject))
+    {
+        return Err(refuse_external_grant(ctx, unchecked.reason()));
+    }
+    if ctx
+        .virtual_channel
+        .presents_the_agent()
+    {
+        return Err(refuse_external_grant(ctx, "presentation_of_the_agent"));
+    }
     let Some(caller) = delegation_caller_hash(ctx) else {
         warn!(
             target: "credential_delegation",
@@ -5283,7 +5266,7 @@ async fn step_inject_external_grant(
     // surface serves this Transit Point, as storing a grant and the sweep
     // decide: a surface stored outside the API may serve one Transit Point id
     // with other scopes in its base and a variant.
-    if !crate::identity::handlers::surface_grants::binding_permits(binding, &provider.default_scopes, &grant)
+    if !crate::identity::handlers::surface_grants::binding_permits(&binding.scopes, &provider.default_scopes, &grant)
         || !crate::identity::handlers::surface_grants::serves_grant(
             &ctx.served_surface,
             &grant,
@@ -5961,21 +5944,7 @@ fn refuse_a_compressed_mcp_answer(
     if ctx.virtual_channel.protocol != crate::config::agent_surface::TransitProtocol::Mcp {
         return Ok(());
     }
-    let compressed = response
-        .headers()
-        .get_all(reqwest::header::CONTENT_ENCODING)
-        .iter()
-        .any(|value| {
-            value
-                .to_str()
-                .map_or(true, |value| {
-                    value
-                        .split(',')
-                        .map(str::trim)
-                        .any(|coding| !coding.is_empty() && !coding.eq_ignore_ascii_case("identity"))
-                })
-        });
-    if compressed {
+    if crate::proxy::upstream_body::is_compressed(response.headers()) {
         warn!(
             request_id = %ctx.request_id,
             alias = %ctx.virtual_channel.alias,
@@ -5987,12 +5956,6 @@ fn refuse_a_compressed_mcp_answer(
     }
     Ok(())
 }
-
-/// The largest request body a call whose grant the vendor refused is sent
-/// again with. A larger one, such as an upload, is not sent twice: its grant
-/// is refreshed, and the call answered `connector_unavailable`, so the agent
-/// tries again with the fresh token.
-const GRANT_RETRY_BODY_LIMIT: usize = 1024 * 1024;
 
 /// [12a] A vendor's refusal of a grant by binding. A `401` whose `Bearer`
 /// challenge rejects the token (`invalid_token`) gets one refresh,
@@ -6010,41 +5973,29 @@ const GRANT_RETRY_BODY_LIMIT: usize = 1024 * 1024;
 /// it acts, so a `401` means nothing ran. A `403` whose `Bearer`
 /// challenge says `insufficient_scope` answers `scope_insufficient`, naming
 /// the scope: a wider scope is never asked for silently. Any other answer, and
-/// any answer to a call that carries no such grant, passes through.
+/// any answer to a call that carries no such grant, passes through. The
+/// Access Point's Target decides alike
+/// ([`crate::delegation_vault::release::vendor_answer`]).
 async fn step_answer_a_refused_grant(
     state: &OutboundProxyState,
     ctx: &mut OutboundPipelineContext,
     upstream: UpstreamResponse,
 ) -> Result<UpstreamResponse, OutboundPipelineError> {
-    use crate::delegation_vault::release::{GrantRefusal, bearer_challenge};
+    use crate::delegation_vault::release::{VendorAnswer, vendor_answer, vendor_answer_to_a_retry};
     let UpstreamResponse::Http(response) = upstream else {
         return Ok(upstream);
     };
     let Some(released) = ctx.released_grant.take() else {
         return Ok(UpstreamResponse::Http(response));
     };
-    let scope_refusal = |response: &reqwest::Response| {
-        (response.status() == reqwest::StatusCode::FORBIDDEN)
-            .then(|| bearer_challenge(response.headers()))
-            .flatten()
-            .filter(crate::delegation_vault::release::BearerChallenge::insufficient_scope)
-            .map(|challenge| GrantRefusal::ScopeInsufficient { scope: challenge.scope })
-    };
-    let token_rejected = |response: &reqwest::Response| {
-        bearer_challenge(response.headers()).is_some_and(|challenge| challenge.rejects_the_token())
-    };
-    if let Some(refusal) = scope_refusal(&response) {
-        return Err(refuse_grant(ctx, refusal, "vendor_insufficient_scope"));
+    match vendor_answer(response.status(), response.headers()) {
+        VendorAnswer::Pass => {
+            ctx.released_grant = Some(released);
+            return Ok(UpstreamResponse::Http(response));
+        }
+        VendorAnswer::Refuse(refused) => return Err(refuse_grant(ctx, refused.refusal, refused.reason)),
+        VendorAnswer::TokenRejected => drop(response),
     }
-    if response.status() != reqwest::StatusCode::UNAUTHORIZED {
-        ctx.released_grant = Some(released);
-        return Ok(UpstreamResponse::Http(response));
-    }
-    if !token_rejected(&response) {
-        drop(response);
-        return Err(refuse_external_grant(ctx, "vendor_401_not_rejecting_the_token"));
-    }
-    drop(response);
     let ReleasedGrant {
         grant,
         provider,
@@ -6070,36 +6021,26 @@ async fn step_answer_a_refused_grant(
                 .external_consent_refresh_refusals,
         ),
     };
+    let may_resend = ctx
+        .body_bytes
+        .as_ref()
+        .map_or(0, Bytes::len)
+        <= crate::delegation_vault::release::RETRY_BODY_LIMIT;
     let fresh = match release
-        .refresh_rejected(&provider, &key, subject, &grant)
+        .retry_grant(&provider, &key, subject, &grant, may_resend)
         .await
     {
         Ok(fresh) => fresh,
         Err(refused) => return Err(refuse_grant(ctx, refused.refusal, refused.reason)),
     };
-    let body_len = ctx
-        .body_bytes
-        .as_ref()
-        .map_or(0, Bytes::len);
-    if body_len > GRANT_RETRY_BODY_LIMIT {
-        return Err(refuse_external_grant(ctx, "vendor_refused_a_large_body_refreshed_for_the_next_call"));
-    }
     let injections = crate::proxy::credential_delegation::build_injection_headers(&injection, &fresh.access_token);
     apply_credential_injections(ctx, &injections)?;
     let caller = delegation_caller_hash(ctx).unwrap_or_default();
     audit_grant_injected(ctx, &caller, &provider, &fresh, subject);
     let retried = step_forward_request_http(state, ctx).await?;
-    if let Some(refusal) = scope_refusal(&retried) {
-        return Err(refuse_grant(ctx, refusal, "vendor_insufficient_scope"));
-    }
-    if retried.status() == reqwest::StatusCode::UNAUTHORIZED {
-        // The authorization server has just issued, or another call or a
-        // reconnect has just stored, the token refused again: the vendor
-        // refuses this request, not the connection, which a caller of an
-        // owner binding could otherwise end for every caller. A dead
-        // authorization shows at the next refresh.
+    if let Err(refused) = vendor_answer_to_a_retry(retried.status(), retried.headers()) {
         drop(retried);
-        return Err(refuse_external_grant(ctx, "vendor_rejected_a_refreshed_grant"));
+        return Err(refuse_grant(ctx, refused.refusal, refused.reason));
     }
     ctx.released_grant = Some(Box::new(ReleasedGrant {
         grant: fresh,
@@ -17642,7 +17583,7 @@ mod tests {
         store_grant(&state, key.clone(), "first", 3600).await;
         let surface = fixture_surface(&vendor, "owner", "http");
         let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&"a".repeat(64)));
-        ctx.body_bytes = Some(Bytes::from(vec![b'x'; GRANT_RETRY_BODY_LIMIT + 1]));
+        ctx.body_bytes = Some(Bytes::from(vec![b'x'; crate::delegation_vault::release::RETRY_BODY_LIMIT + 1]));
         let refused = send_with_grant(&state, &mut ctx)
             .await
             .unwrap_err();
@@ -17974,6 +17915,142 @@ mod tests {
             );
             assert_eq!(bearer(&ctx), None, "{case}");
         }
+    }
+
+    /// A Transit Point's grant by binding is never released on a surface whose
+    /// Access Point accepts callers who name themselves, as DID Auth without
+    /// `allowed_dids` does: whoever mints a DID would get a transit token
+    /// naming it. With an allow-list it is released.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grant_by_binding_is_never_released_beside_callers_who_name_themselves() {
+        use crate::delegation_vault::grants::GrantKey;
+        let directory = tempfile::tempdir().unwrap();
+        let state = external_grant_state(directory.path(), true).await;
+        let caller = "a".repeat(64);
+        store_grant(&state, GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "vendor"), "owner-access", 3600).await;
+        let authenticating = |allowed_dids: serde_json::Value| {
+            let mut surface = transit_surface(json!([vendor_transit_point(VENDOR_HOP, "vendor", "owner")]), json!([]));
+            surface.access_point = serde_json::from_value(json!({"listen_address": "https://gateway.example",
+                "route": "/mcp", "protocol": "mcp", "caller_authentication": {"methods": [{"type": "did_auth",
+                "extraction": {"source": "http_header", "field": "X-DID-Auth-Session"},
+                "allowed_dids": allowed_dids}]}}))
+            .unwrap();
+            surface
+        };
+
+        let listed = authenticating(json!(["did:example:alice"]));
+        let mut ctx = external_grant_context(&listed, VENDOR_HOP, Some(&caller));
+        step_inject_credentials(&state, &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(bearer(&ctx).as_deref(), Some("Bearer owner-access"));
+
+        let open = authenticating(json!([]));
+        let mut ctx = external_grant_context(&open, VENDOR_HOP, Some(&caller));
+        let refused = step_inject_credentials(&state, &mut ctx)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            grant_refusal(&refused),
+            Some(&crate::delegation_vault::release::GrantRefusal::ConnectorUnavailable),
+            "{refused:?}"
+        );
+        assert_eq!(bearer(&ctx), None);
+    }
+
+    /// A Transit Point's grant by binding is never released beside a
+    /// presentation of the agent, an identity VP or a workload binding, which
+    /// the save refuses, as on one edited by hand: it answers
+    /// `connector_unavailable`. Without one it is released.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grant_by_binding_is_never_released_with_a_presentation_of_the_agent() {
+        use crate::delegation_vault::grants::GrantKey;
+        let directory = tempfile::tempdir().unwrap();
+        let state = external_grant_state(directory.path(), true).await;
+        let caller = "a".repeat(64);
+        store_grant(&state, GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "vendor"), "owner-access", 3600).await;
+        let presenting = |field: Option<(&str, serde_json::Value)>| {
+            let mut point = vendor_transit_point(VENDOR_HOP, "vendor", "owner");
+            if let Some((field, value)) = field {
+                point[field] = value;
+            }
+            transit_surface(json!([point]), json!([]))
+        };
+
+        let plain = presenting(Some(("workload_binding", json!({"enabled": false}))));
+        let mut ctx = external_grant_context(&plain, VENDOR_HOP, Some(&caller));
+        step_inject_credentials(&state, &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(bearer(&ctx).as_deref(), Some("Bearer owner-access"));
+
+        for (case, field, value) in [
+            ("an identity VP", "identity_injection", json!({"inject_vp": true})),
+            ("a managed identity of its own", "managed_identity", json!({"type": "static", "did": "did:example:a"})),
+            ("a workload binding", "workload_binding", json!({"enabled": true})),
+        ] {
+            let surface = presenting(Some((field, value)));
+            let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&caller));
+            let refused = step_inject_credentials(&state, &mut ctx)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                grant_refusal(&refused),
+                Some(&crate::delegation_vault::release::GrantRefusal::ConnectorUnavailable),
+                "{case}: {refused:?}"
+            );
+            assert_eq!(bearer(&ctx), None, "{case}");
+        }
+    }
+
+    /// A caller's own grant on a Transit Point is never released on a surface
+    /// whose Access Point takes the gateway's resource access tokens: its
+    /// transit token names the caller by a subject the gateway's issuer
+    /// stated, without the identity provider that named it. The owner's grant
+    /// is released.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_callers_grant_by_binding_is_never_released_beside_resource_tokens() {
+        use crate::delegation_vault::grants::GrantKey;
+        let directory = tempfile::tempdir().unwrap();
+        let state = external_grant_state(directory.path(), true).await;
+        let caller = "a".repeat(64);
+        store_grant(&state, GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "vendor"), "owner-access", 3600).await;
+        store_grant(
+            &state,
+            GrantKey::caller(None, "transit-fabric", VENDOR_HOP, "vendor", &caller).unwrap(),
+            "caller-access",
+            3600,
+        )
+        .await;
+        let with_resource_tokens = |subject: &str| {
+            let mut surface = transit_surface(json!([vendor_transit_point(VENDOR_HOP, "vendor", subject)]), json!([]));
+            surface.mcp_http = Some(
+                serde_json::from_value(
+                    json!({"authorization": {"resource": "https://gateway.example/mcp", "scopes": ["read"]}}),
+                )
+                .unwrap(),
+            );
+            surface
+        };
+
+        let owner = with_resource_tokens("owner");
+        let mut ctx = external_grant_context(&owner, VENDOR_HOP, Some(&caller));
+        step_inject_credentials(&state, &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(bearer(&ctx).as_deref(), Some("Bearer owner-access"));
+
+        let callers = with_resource_tokens("caller");
+        let mut ctx = external_grant_context(&callers, VENDOR_HOP, Some(&caller));
+        let refused = step_inject_credentials(&state, &mut ctx)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            grant_refusal(&refused),
+            Some(&crate::delegation_vault::release::GrantRefusal::ConnectorUnavailable),
+            "{refused:?}"
+        );
+        assert_eq!(bearer(&ctx), None);
     }
 
     /// The refusal of a grant by binding a pipeline error carries, if any.

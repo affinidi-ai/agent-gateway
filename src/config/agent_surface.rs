@@ -1547,6 +1547,22 @@ impl TransitPoint {
             && !self.fabric_delegated_credentials
     }
 
+    /// Whether a request through this Transit Point may carry a presentation
+    /// of the agent to its destination: an identity VP, which
+    /// `identity_injection.inject_vp` or a `managed_identity` of its own has
+    /// it inject, or an enabled workload binding.
+    pub fn presents_the_agent(&self) -> bool {
+        self.identity_injection
+            .inject_vp
+            || self
+                .managed_identity
+                .is_some()
+            || self
+                .workload_binding
+                .as_ref()
+                .is_some_and(|binding| binding.enabled)
+    }
+
     /// Whether this Transit Point authenticates its callers: with a transit
     /// token, `mcp_http.authorization` or `source_auth`.
     pub fn authenticates_callers(&self) -> bool {

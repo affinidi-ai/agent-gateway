@@ -1,0 +1,104 @@
+branch: feat/delegation-access-point-target
+changes:
+  added:
+    - timestamp: '2026-10-30T18:00:00Z'
+      title: Bind an Access Point's Target to a provider of external consent
+      description: >-
+        A surface's outbound_credentials take consent_mode external with a subject, owner or
+        caller, for its Access Point Target, whose grants the vault keeps by binding under the
+        hop target, as a Transit Point's are kept under its id. The binding must be the only one
+        in outbound_credentials, on a surface without Transit Points, and is held in one place,
+        the surface's or one variant's. Its provider has an issuer and the surface's own
+        tenant, its resource is permitted for its issuer, and the Target's endpoint is a public
+        https URL with that resource's origin, and on an A2A or AP2 Access Point not the root of
+        that origin, since the grant goes at or under the endpoint path there. The grant goes in a
+        header, so neither inject_as
+        meta, a target.auth credential of the Target's own, nor a forwarded caller JWT
+        (forward_header) is accepted with it, and at-rest encryption and the identity hash
+        pepper must be set. The surface sends the vendor no presentation of the agent, so an
+        identity VP (inject_vp or identity_slots.inbound), an enabled workload binding and the
+        surface's DID injected protocol_native are refused with it, and it charges callers
+        nothing, so an enabled x402 or MPP payment policy is refused too: a payment is settled
+        before the grant is released, which can still be refused. A variant that keeps an owner
+        binding keeps the surface's caller authentication, Access Point inbound_policy and
+        trust_check_list and Target policy, since every caller they let through acts as the
+        owner. The connect API, the grants report and removal take hop target; the Target's
+        grants are removed and revoked when its binding goes or narrows, as a Transit Point's
+        are, and the daily sweep keeps them only while it is served. A save warns of an enabled
+        variant that keeps the binding under its own Access Point or Target settings, and a
+        variant created from one that holds it does not copy it. No agent-keyed path, legacy or
+        2026-07-28, ever serves such a binding.
+    - timestamp: '2026-10-30T19:00:00Z'
+      title: Send the Access Point's Target its grant in place of the caller's credentials
+      description: >-
+        An Access Point whose Target is bound by external consent sends the Target the owner's
+        grant, or the identified caller's own, in a header that replaces any of the same name,
+        and never the caller's credential. The request goes only to the origin of the
+        provider's resource, through Strict egress pinned to the vetted addresses, with
+        redirects refused and the destination checked again on every request, and only to the
+        Target's endpoint path on MCP, or at or under it on A2A, without the caller's query
+        string: a path the vendor might read otherwise than the gateway, with a dot segment
+        plain or percent-encoded, a segment of dots and spaces alone, a byte that is not ASCII
+        once decoded, an encoded separator, an empty segment, a path parameter or a second
+        encoding, is refused 400, and a method the protocol does not send the grant
+        with is refused 405. Of the caller's headers the Target gets only the protocol headers
+        its requests need, Content-Type, Accept, MCP-Protocol-Version, Mcp-Session-Id,
+        A2A-Version and A2A-Extensions (also as X-A2A-Extensions), so no cookies, credentials,
+        x-caller-* or x-did-* header, method, path or host override, or trace id of the
+        caller's; the gateway adds no caller-info or DID header, asks for an
+        uncompressed answer and refuses a compressed one. A caller the Access Point did not
+        identify is refused 403, so it never acts as the owner or as another caller; a public
+        discovery read carries no grant. The grant is released, refreshed and answered by the
+        same code as a Transit Point's: a grant due a refresh is refreshed first,
+        single-flight; the Target's 401 whose challenge says invalid_token gets one refresh and
+        one retry for bodies within 1 MiB, audited under the same caller and marked used, and
+        a second 401 refuses that request and keeps the grant; a 403 for a missing scope
+        answers scope_insufficient. Refusals carry the fixed reasons of a Transit Point's,
+        connect_required with its hint, scope_insufficient and connector_unavailable, as a
+        JSON-RPC error on an MCP Access Point and a problem JSON otherwise, no-store, and a
+        refusal before anything is sent for the path, the method or a broken rule is audited
+        request_rejected as target_path_refused, target_method_refused or
+        connector_unavailable. A surface
+        whose binding breaks a save rule is refused before any payment. The Target's cookies
+        and authentication challenges never reach the caller, and the legacy SSE fallback is
+        not used. A 2026-07-28 MCP request is refused with -32022, and a request that arrived
+        over Fabric, a public discovery read included, is refused before any payment is asked
+        for, since the caller a peer gateway asserts never keys a grant and a discovery read
+        would carry the peer's headers to the vendor.
+  changed:
+    - timestamp: '2026-10-30T20:00:00Z'
+      title: Require checked callers for every binding with external consent
+      description: >-
+        An external-consent binding needs callers that are authenticated by something the
+        gateway can check. On a Transit Point as on the Access Point Target, a binding with
+        consent_mode external is refused at save on a surface whose Access Point, in its base
+        or any variant, has a did_auth method without allowed_dids, which accepts any DID that
+        signs its challenge, or a jwt_bearer method without audiences while it publishes no
+        protected_resource, which accepts a token its issuer minted for any other service; and
+        a binding with subject caller is refused on a surface whose Access Point takes the
+        gateway's resource access tokens (mcp_http.authorization), which name a caller by its
+        subject without the identity provider that named it. A surface stored outside the API
+        that breaks one of these rules answers connector_unavailable and reads no grant.
+    - timestamp: '2026-10-30T22:00:00Z'
+      title: Send no presentation of the agent through a Transit Point with external consent
+      description: >-
+        A Transit Point whose transit_credentials use consent_mode external is refused at save
+        when it would send its vendor a presentation of the agent: an identity VP, from
+        identity_injection.inject_vp or a managed_identity of its own, or an enabled
+        workload_binding, as the Access Point Target already is. A Transit Point stored outside
+        the API with one answers connector_unavailable and reads no grant.
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-10-30T21:00:00Z'
+      title: Check a DID Auth session against the allow-list on every request
+      description: >-
+        A DID Auth session authenticates only at the view it was minted on, the surface and
+        the variant whose /authenticate minted it or the base surface, and every request it
+        carries is checked again against that view's allowed_dids as they are then. A DID
+        removed from the list, or left out of a list added after its session was minted, is
+        refused at once rather than when the session expires, and a session minted on a variant
+        is not taken at the base surface or another variant. session_ttl_seconds is capped at
+        86400, the default, and no session authenticates more than 86400 seconds after it was
+        minted, whatever it was stored with.
+  breaking: []

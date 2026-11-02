@@ -418,7 +418,7 @@ Each entry in `AgentSurface.outbound_credentials`
 | Field | Options | Default |
 | --- | --- | --- |
 | `required_for` | `all` outbound requests, or `tools`: a list of MCP tool names, matched against `params.name` of a `tools/call` on Access Points and Fabric receive, never on Transit Points | `all` |
-| `consent_mode` | `on_demand`, `pre_authorize`, or `elicit`; `external` only on a Transit Point's `transit_credentials` ([external consent](#external-consent-on-a-transit-point)) | `on_demand` |
+| `consent_mode` | `on_demand`, `pre_authorize`, or `elicit`; `external` on a Transit Point's `transit_credentials` ([external consent on a Transit Point](#external-consent-on-a-transit-point)), or as the only binding of `outbound_credentials`, for the Access Point's Target ([external consent on the Access Point Target](#external-consent-on-the-access-point-target)) | `on_demand` |
 | `inject_as` | `bearer_header`, `custom_header { name, format }`, or `meta { field }` | `bearer_header` |
 | `scopes` | Scopes to request | The provider's defaults |
 
@@ -664,6 +664,7 @@ The Transit Point itself must send the grant only where it belongs:
 | Field | Rule |
 | --- | --- |
 | `target_endpoint` | A public `https` URL with the origin (scheme, host and port) of the provider's `resource`. A `fabric://` route is refused: a grant never crosses Fabric |
+| No presentation of the agent | No identity VP (`identity_injection.inject_vp`, or a `managed_identity` of the Transit Point's own) and no enabled `workload_binding`, as on the Access Point Target ([below](#external-consent-on-the-access-point-target)): a presentation of the managed agent would describe the agent to the vendor, which could present it elsewhere. A Transit Point injects no DID of the surface's, so there is no DID mode to refuse. One stored outside the API with a presentation answers `connector_unavailable` and reads no grant |
 | `id` | Names one Transit Point in one place. It appears once, in the surface's points or in one variant's `overrides.transit.points`, and in no other list, whatever the target or binding there. A grant is kept under the Transit Point's id and used under that one Transit Point's settings, so no copy in another variant, with weaker gating or policy, may use it. The exception is a variant that lists no Transit Points of its own: it serves the surface's under the same ids, and so releases the same grants, even when it overrides `transit.shared` (transit policy, rate limit, OPA policy, source auth) or the Access Point. Only a surface editor can set this up, and could weaken the surface itself just as well, so it is allowed: a save answers with a `Warning` header for each Transit Point with `consent_mode: external` that an enabled variant, with transit on, keeps this way. To offer the binding in two variants, give each its own Transit Point id: each then has its own grants. A variant created from another gets new ids for these Transit Points. The id `target` is reserved for the grants of the surface's Access Point Target, which share its key space |
 
 A variant that does not list its own Transit Points (`overrides.transit.points`) keeps the
@@ -681,9 +682,10 @@ Transit Point breaks a rule above, when the surface also has `outbound_credentia
 on every Transit Point), or while the vault cannot keep grants: [at-rest
 encryption](#grants-by-binding) is not active, or `AG_IDENTITY_HASH_PEPPER` is not set. The same
 checks run on every write: `POST /surfaces`, `PUT`, `PATCH`, the variant routes, and a surface's
-tenant reassignment (refused there with `409`). Surface-level `outbound_credentials` cannot ask
-for `external`, and a provider with an `issuer` is bound by no other consent mode, on a Transit
-Point or in `outbound_credentials`. A save gives a Transit Point sent without an `id` a new one,
+tenant reassignment (refused there with `409`). Surface-level `outbound_credentials` ask for
+`external` only for the Access Point's Target ([below](#external-consent-on-the-access-point-target)),
+and a provider with an `issuer` is bound by no other consent mode, on a Transit Point or in
+`outbound_credentials`. A save gives a Transit Point sent without an `id` a new one,
 in a variant's list as in the surface's, and refuses a Transit Point with `consent_mode:
 external` whose id is empty.
 
@@ -691,6 +693,18 @@ A surface with such a binding cannot move to another tenant: the binding's provi
 the surface's own tenant, and a bound provider cannot move ([Deleting a
 provider](#deleting-a-provider)), so the reassignment answers `409`. Remove the binding, which
 removes and revokes its grants, move the surface and the provider, then bind it again.
+
+A binding with external consent, on a Transit Point or the Access Point Target, needs callers
+authenticated by something the gateway can check. A surface whose Access Point, in its base or
+any variant, has a `did_auth` method without `allowed_dids`, which accepts any DID that signs
+its challenge, or a `jwt_bearer` method without `audiences` while it publishes no
+`protected_resource` (which binds the audience), so that a token its issuer minted for any
+other service is accepted, is refused such a binding, `owner` or `caller`. A `caller` binding is
+also refused on a surface whose Access Point takes the gateway's resource access tokens
+(`mcp_http.authorization`): they name a caller by the subject its sign-in stated, under the
+gateway's issuer, so callers of two identity providers with the same subject would share a
+grant. An `owner` binding may be used there. A surface stored outside the API that breaks one
+of these rules answers `connector_unavailable` and reads no grant.
 
 A request through such a Transit Point needs a caller it identifies, as every delegated
 credential does: a transit token naming one, or a caller its `source_auth` verified; without
@@ -709,7 +723,7 @@ the request's id, with the reason in its `data`; on any other (`http`, A2A) it i
 | --- | --- | --- | --- |
 | `connect_required` | `403`, `-32001` | No grant is stored for the binding and principal; it expired and cannot be refreshed; its refresh token was refused (`invalid_grant`, which deletes and revokes it); the authorization server refused its refresh otherwise as often as `external_consent_refresh_refusals` allows since it last succeeded, and the grant cannot be used (it is kept: [Refreshing a grant](#refreshing-a-grant)); a refresh died part way, which may have spent the refresh token; or it was asked for beyond the binding's scopes as saved now (a binding narrowed since: below) | `subject`: `owner` or `caller`. For `caller`, `hint`: 16 bytes, base64url, of the SHA-256 of `agent-gateway-connect-hint\n` and the caller's identity hash, so whoever runs the connect can check that the person who signs in is that caller |
 | `scope_insufficient` | `403`, `-32001` | The vendor answered `403` with a `Bearer` challenge whose `error` is `insufficient_scope` | `scope`, when the challenge names one made of scope names only (letters, digits and `._:/-+=@`, at most 512 characters); a wider scope is never asked for silently |
-| `connector_unavailable` | `503`, `-32603` | Anything a new connect would not fix: the token endpoint cannot be reached, failed or refused the client (`invalid_client`), the client's secret cannot be resolved, the grant is waiting out a refresh failure, the vendor answered `401` without a `Bearer` challenge that rejects the token (`invalid_token`), or again after the grant was refreshed, the grant was refreshed or connected again while the vendor refused an earlier token, the provider is gone, has no issuer, is of another tenant or is [no longer permitted](#permitted-issuers), the Transit Point's target is not a public `https` URL with the origin of the provider's `resource`, the binding names no subject, the surface also has `outbound_credentials`, at-rest encryption is not active, the identity hash pepper is not configured or the grants stored were written under another pepper ([Grants by binding](#grants-by-binding)), or the resource is no longer permitted for its issuer | |
+| `connector_unavailable` | `503`, `-32603` | Anything a new connect would not fix: the token endpoint cannot be reached, failed or refused the client (`invalid_client`), the client's secret cannot be resolved, the grant is waiting out a refresh failure, the vendor answered `401` without a `Bearer` challenge that rejects the token (`invalid_token`), or again after the grant was refreshed, the grant was refreshed or connected again while the vendor refused an earlier token, the provider is gone, has no issuer, is of another tenant or is [no longer permitted](#permitted-issuers), the Transit Point's target is not a public `https` URL with the origin of the provider's `resource`, the binding names no subject, the surface also has `outbound_credentials`, its Access Point's callers are not ones a grant may go to ([above](#external-consent-on-a-transit-point)), at-rest encryption is not active, the identity hash pepper is not configured or the grants stored were written under another pepper ([Grants by binding](#grants-by-binding)), or the resource is no longer permitted for its issuer | |
 
 A `caller` binding is refused, `connector_unavailable`, for a caller named by anything but an
 identity hash. A binding that some other path reached with a provider that has an `issuer`, the
@@ -764,6 +778,104 @@ addresses, redirects returned rather than followed, and no proxy. It is never fo
 Fabric. A `fabric://` Transit Point withholds delegated credentials unless
 `fabric_delegated_credentials` is set, and with it set the grant is refused, so a grant never
 reaches a stored surface that predates these rules.
+
+### External consent on the Access Point Target
+
+When the vendor's server is itself the surface's Target, the Access Point sends it a grant by
+binding for each caller request ([`src/proxy/target_grant.rs`](../src/proxy/target_grant.rs)).
+The binding is the surface's `outbound_credentials` with `consent_mode: external`, and its
+grants are kept under the hop `target`, as a Transit Point's are kept under its id: the connect
+API, the grants report and their removal take `"hop": "target"`.
+
+```json
+"target": {"endpoint": "https://mcp.vendor.example/mcp"},
+"outbound_credentials": [{"credential_provider_id": "<provider record id>", "consent_mode": "external",
+  "subject": "caller", "scopes": ["read"]}]
+```
+
+| Rule | |
+| --- | --- |
+| `subject`, `credential_provider_id`, `scopes` | As on a Transit Point ([above](#external-consent-on-a-transit-point)): `owner` or `caller`, a provider with an `issuer` of the surface's own tenant, scopes within which every grant is asked for |
+| `inject_as` | `bearer_header` or `custom_header`. The grant goes in a header, which replaces any of the same name; `meta`, which would put it in the body, is refused |
+| The only binding | `outbound_credentials` holds no other binding, and the surface has no Transit Points, its own or a variant's: `outbound_credentials` would apply on every Transit Point |
+| In place of every other credential | The Target has no `target.auth`, and the Access Point does not forward the caller's JWT (`forward_header`). The caller's own `Authorization`, and the header its credential came in, never reach the vendor |
+| Callers | Authenticated by something the gateway can check, as on a Transit Point ([above](#external-consent-on-a-transit-point)): no `did_auth` without `allowed_dids`, no `jwt_bearer` without `audiences` unless the Access Point publishes `protected_resource`, and for `subject: caller` no `mcp_http.authorization` |
+| No presentation of the agent | No identity VP (`target.identity_injection.inject_vp`, or `identity_slots.inbound`), no enabled `target.workload_binding`, and the surface's DID, if it has one, injected in a header rather than `protocol_native`. A presentation of the managed agent, minted without an audience or a nonce, would describe the agent to the vendor, which could present it elsewhere |
+| No payment | No enabled `target.payment_policy`, x402 or MPP, local or delegated. A payment is settled before the surface's policy and before the grant is released, and the release can still be refused (no grant, a refused refresh, a Fabric caller); settling it later would hide it from the policies that read it |
+| `target.endpoint` | A public `https` URL with the origin of the provider's `resource`, as a Transit Point's `target_endpoint`; never `fabric://`, `proxy://` or `a2a-proxy://`. On an A2A or AP2 Access Point, whose requests carry the grant at or under the endpoint path, not the root of its origin (`/` or no path), where that would be every path of the vendor's: the A2A operation paths (`/tasks`, `/v1/...`) are ones a vendor's other APIs use too |
+| One place | The binding is held in the surface's `outbound_credentials` or in one variant's `overrides.outbound_credentials`, never in two: its grants are kept under one hop and used under one place's settings. A variant created from one that holds it does not copy it. A variant that keeps the surface's `outbound_credentials` serves the surface's binding, and is checked with its own Target, Access Point and Transit Points. For an `owner` binding, whose every caller acts as the owner, such a variant keeps what of the surface's chooses those callers: its caller authentication, `access_point.inbound_policy`, `access_point.trust_check_list` and `target.policy`. One of its own, or one a `complete` override clears, is refused, enabled or not, since which is wider cannot be told. A save adds a `Warning` header (`299`) for an enabled variant that keeps the binding while it overrides its Access Point or Target otherwise, since its callers then use the Target's grants under the variant's own tool gating and response policy, and, for a `caller` binding, its own caller authentication and policies |
+
+A save that breaks a rule, or the rules every binding with external consent keeps (encryption
+at rest, the identity hash pepper, a permitted resource and issuer), is refused with `400` on
+every surface write, as for a Transit Point. The Target's grants are removed and revoked when
+its binding goes, changes subject or provider, narrows its scopes, or is held only by a disabled
+variant, as a Transit Point's are ([When a binding is removed](#when-a-binding-is-removed)), and
+the daily sweep keeps them only while the surface serves the binding.
+
+At run time a request to the Target:
+
+- is sent the owner's grant, for `subject: owner`, or the caller's own, keyed by its [identity
+  hash](#the-callers-identity-hash), for `subject: caller`, only when the Access Point identified
+  the caller with its caller authentication (or its resource access token). A caller it did not
+  identify, as when its caller authentication failed and policy let the request on, is refused
+  `403`, so it never acts as the owner or as another caller; a caller with no grant is answered
+  `connect_required` with the hint of itself, never given another caller's;
+- goes only to the origin of the provider's `resource`, checked again on every request, through
+  pinned Strict egress, as a Transit Point's request carrying a grant does; the legacy SSE
+  fallback, which would send the body by another client, is not used;
+- goes to the Target's endpoint path on MCP, and at or under it on A2A and AP2, never with the
+  caller's query string. The vendor must read every request's path after the route as the
+  gateway does, so a path with a dot segment, plain or percent-encoded (`..`, `%2e%2e`), a
+  segment made only of dots and spaces, which servers that trim them read as one (`...`,
+  `..%20`), anything not ASCII once decoded (an overlong `%c0%ae`, a fullwidth dot
+  `%ef%bc%8e`), an encoded separator (`%2f`, `%5c`), an empty segment (`//`, a trailing `/`), a
+  `;` parameter or a second encoding (`%25`) is refused `400`, discovery reads included. A
+  request carrying the
+  grant has a method its protocol sends it with, `POST` on MCP and `GET`, `POST` or `DELETE` on
+  A2A and AP2, else it is refused `405` with `Allow`. The gateway still answers an MCP
+  notification-stream `GET` and a session `DELETE` itself, and the vendor is sent no request
+  without the grant but a public discovery read;
+- carries, of the caller's headers, only the protocol headers its requests need:
+  `Content-Type`, `Accept`, `MCP-Protocol-Version`, `Mcp-Session-Id`, `A2A-Version`,
+  `A2A-Extensions` and `X-A2A-Extensions`, never the header the caller's credential came in.
+  Every other header the caller set stays behind: `Cookie`, `Authorization`,
+  `Proxy-Authorization`, `x-caller-*` and `x-did-*`, a method override, a header a vendor may
+  read as another path or host (`X-Original-URL`, `X-Rewrite-URL`, `X-Forwarded-*`,
+  `Forwarded`), `User-Agent`, `Last-Event-ID` and the caller's own `X-Gateway-Trace-Id`. The
+  gateway adds no caller-info or DID header of its own, and asks for an uncompressed answer
+  (`Accept-Encoding: identity`); one compressed all the same is refused `connector_unavailable`,
+  since tool gating and the response checks read the body as it is sent;
+- is refreshed, retried and refused by the same code as a Transit Point's: a grant due a refresh
+  is refreshed first, single-flight, on a task of its own, and a call that finds another call's
+  refresh running waits for it; the Target's `401` whose `Bearer` challenge says
+  `invalid_token` gets one refresh and one retry for a body within 1 MiB, and a second `401`
+  refuses that request, `connector_unavailable`, and keeps the grant; a refresh token the
+  authorization server refuses removes and revokes the grant, and refusals of its refresh are
+  counted against `external_consent_refresh_refusals`; a `403` whose challenge says
+  `insufficient_scope` answers `scope_insufficient`; anything a new connect would not fix
+  answers `connector_unavailable` and keeps the grant;
+- marks the grant used and audits it `token_injected`, with the binding's subject in the detail
+  (`grant_by_binding:owner:target` or `grant_by_binding:caller:target`), under the identity hash
+  of the caller it was released for, on the first send and on the one retry alike;
+- is answered, when refused, before anything is sent, with the fixed reasons of the table above:
+  on an MCP Access Point a JSON-RPC error for the request's id, otherwise (A2A, AP2) an
+  `application/problem+json` body, `no-store` either way. A refusal for its path (`400`), its
+  method (`405`) or a rule the surface breaks (`503`) is also audited `request_rejected` at
+  admission, as `target_path_refused`, `target_method_refused` or `connector_unavailable`
+  ([`OBSERVABILITY.md`](OBSERVABILITY.md));
+- never passes the Target's `Set-Cookie` or `WWW-Authenticate` to the caller.
+
+A public discovery read (an agent card, `/.well-known/ucp`, `/discovery`) carries no caller and
+no grant, and of the caller's headers only those a request carrying the grant would; an agent
+card is fetched from the Target's own card URL, whatever path the caller named. A `2026-07-28`
+MCP request is refused with `-32022`: the vendor is reached over a
+session revision. A request that arrived over Fabric is refused `403` as one whose caller the
+gateway did not identify, before any payment is asked for or verified: the caller a peer gateway
+asserts never keys a grant. A public discovery read over Fabric is refused the same way, since
+it would carry the peer's headers, its caller's cookies among them, to the vendor, and no request
+over Fabric can use the Target. A surface whose binding breaks a rule above, as one edited by hand
+might, answers `connector_unavailable` before any payment is asked for or settled, and reads no
+grant.
 
 ## Tenant isolation on a surface's upstream legs
 
@@ -916,6 +1028,9 @@ Outside these checks a request is still forwarded without the credential: on an 
 or Fabric receive whose delegation stores
 are not available, and on the `elicit` outcomes above. Fabric receive refuses a request whose
 caller its surface did not verify, any per-user binding, and consent (see [The caller on Fabric receive](#the-caller-on-fabric-receive)).
+A Target bound by external consent is the exception: what cannot be released is refused, never
+forwarded without the grant ([External consent on the Access Point
+Target](#external-consent-on-the-access-point-target)).
 
 A grant is looked up by the managed agent's DID, the caller's identity hash and the provider,
 not by surface or Transit Point. Surfaces that share an agent DID, such as surfaces whose
@@ -938,6 +1053,11 @@ it, including A2A through header injection. A Transit Point on a surface without
 Target uses only `outbound_credentials`, never a Transit Point's `transit_credentials`. Consent, refresh
 and revocation stay on the sending gateway. See
 [Delegated credentials over Fabric](FABRIC.md#delegated-credentials-over-fabric).
+
+A grant by binding never crosses Fabric: a Target or Transit Point bound by external consent must
+be a public `https` URL, and a surface whose Target is bound by external consent refuses every
+request that arrives over Fabric, other than a public discovery read, with `403`: its caller is
+the one the peer gateway asserts, which never keys a grant.
 
 ## Consent flow
 
@@ -1075,12 +1195,13 @@ it serves and whose account it is:
 | --- | --- |
 | `tenant_id` | The surface's tenant, `null` for an untenanted surface |
 | `surface_id` | The surface |
-| `hop` | The Transit Point's `id` |
+| `hop` | The Transit Point's `id`, or `target` for the surface's [Access Point Target](#external-consent-on-the-access-point-target), an id no Transit Point with external consent may take |
 | `credential_provider_id` | The provider's record id |
 | `principal` | `owner` for the one grant every caller of the binding uses, or a caller's [identity hash](#the-callers-identity-hash) |
 
 No agent DID is involved, so a grant is never released on another surface, another Transit
-Point or another tenant, even when two Transit Points share a managed identity. A record's id is
+Point, the Target instead of a Transit Point, or another tenant, even when two Transit Points
+share a managed identity. A record's id is
 `grant-<provider>-<binding>-<key>`, three lowercase hex values under keys derived from
 `AG_IDENTITY_HASH_PEPPER`:
 
@@ -1220,19 +1341,20 @@ server to server only, under a management session or access token, and never ret
 `POST /api/v1/delegation-vault/connects` starts a connect:
 
 ```json
-{"surface_id": "crm", "hop": "<Transit Point id>", "credential_provider_id": "<provider record id>",
+{"surface_id": "crm", "hop": "<Transit Point id, or target>", "credential_provider_id": "<provider record id>",
  "subject": "caller", "principal": "<caller identity hash>", "scopes": ["read"],
  "redirect_uri": "https://connect.example/api/v1/connect/callback/linear"}
 ```
 
 - The surface must serve, at `hop`, a `consent_mode: external` binding of that provider and
-  subject. `principal` is the caller's identity hash for `subject: caller`, and absent or
-  `owner` for `subject: owner`.
+  subject: a Transit Point's, at its id, or the Access Point Target's, at `target`.
+  `principal` is the caller's identity hash for `subject: caller`, and absent or `owner` for
+  `subject: owner`.
 - `scopes` must lie within the binding's `scopes`, or the provider's `default_scopes` when the
   binding names none; left out, they are those.
 - `redirect_uri` must be the provider's `callback_url`.
 - The provider must still be [permitted](#permitted-issuers), its resource permitted for its
-  issuer, and the Transit Point's target its resource's origin.
+  issuer, and the Transit Point's target, or the Target's endpoint, its resource's origin.
 - A binding may have at most 32 connects open, and each principal of it at most 4, so one caller
   who opens the connect link again and again never blocks the binding's other callers; claimed
   and expired ones do not count. They are counted from the connects' file names, which name
@@ -1387,8 +1509,8 @@ grant keeps are recorded under the id of the grant they were for, which may stil
 so their `detail` ends `,unkept_tokens`, for example
 `vendor_revocation:revoked,access_token:revoked,unkept_tokens`: such a record is no disconnect. A grant purged
 with its binding also has the binding: `surface_id` and `provider_id` in their own fields, and
-`,tenant:<tenant>` (for a tenanted surface) and `,transit_point:<id>` after the reason, each
-value a JSON string, for example
+`,tenant:<tenant>` (for a tenanted surface) and `,transit_point:<hop>` (`"target"` for the Access
+Point Target's) after the reason, each value a JSON string, for example
 `vendor_revocation:skipped,reason:purged,tenant:"tenant-a",transit_point:"crm"`. A public client
 is still revoked without a secrets store. The log says the outcome: `INFO` for `revoked`,
 `not_supported` and a `deferred` revocation, `WARN` otherwise. A token a vendor does not revoke
@@ -1437,7 +1559,10 @@ provider changed, or the variant that holds it disabled, or its transit turned o
 (`overrides.transit.disabled`). A binding is kept while the surface, or an enabled variant that
 serves transit, still has it, with the same Transit Point id, provider and subject: a disabled
 variant's Transit Points are not served, so they keep no grant, and enabling the variant again
-needs a new consent. Disabling stays quick and always allowed.
+needs a new consent. Disabling stays quick and always allowed. The Access Point Target's binding
+follows the same rules under the hop `target`: it is removed with its surface, when it leaves
+`outbound_credentials` or changes consent mode, subject or provider, when the surface moves to
+another tenant, and when the variant that holds it is disabled.
 
 A grant follows its Transit Point's `id`, not its alias. A `PUT` or merge `PATCH`, of the
 surface or a variant, that leaves out the `id` of a Transit Point with `consent_mode:

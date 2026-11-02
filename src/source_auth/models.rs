@@ -91,8 +91,9 @@ pub struct DidAuthAuthConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub challenge_ttl_seconds: Option<u64>,
 
-    /// Session lifetime in seconds. `None` (default) uses 86400s (24h).
-    /// Rejected at validation time when `Some(0)`.
+    /// Session lifetime in seconds. `None` (default) uses 86400s (24h), also
+    /// the longest. Rejected at validation time when `Some(0)` or greater
+    /// than 86400.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_ttl_seconds: Option<u64>,
 
@@ -123,6 +124,11 @@ impl DidAuthAuthConfig {
     /// replay window without a real use-case.
     pub const MAX_CHALLENGE_TTL_SECONDS: u64 = 3_600;
 
+    /// Upper bound for `session_ttl_seconds`, 24 hours, the default: a
+    /// session is a bearer token, and no session authenticates longer than
+    /// this after it was minted.
+    pub const MAX_SESSION_TTL_SECONDS: u64 = 86_400;
+
     /// Every `alg` value the JWS verifier recognises. Config values outside
     /// this set are rejected at validation time.
     pub const SUPPORTED_ALGORITHMS: &'static [&'static str] = &["EdDSA", "ES256"];
@@ -133,10 +139,12 @@ impl DidAuthAuthConfig {
             .unwrap_or(Self::DEFAULT_CHALLENGE_TTL_SECONDS)
     }
 
-    /// Effective session TTL, applying the default when unset.
+    /// Effective session TTL, applying the default when unset, and never
+    /// longer than [`Self::MAX_SESSION_TTL_SECONDS`].
     pub fn effective_session_ttl_seconds(&self) -> u64 {
         self.session_ttl_seconds
             .unwrap_or(Self::DEFAULT_SESSION_TTL_SECONDS)
+            .min(Self::MAX_SESSION_TTL_SECONDS)
     }
 
     /// Effective algorithm allow-list, applying the `["EdDSA"]` default when
@@ -935,6 +943,16 @@ mod tests {
         assert_eq!(custom.effective_challenge_ttl_seconds(), 60);
         assert_eq!(custom.effective_session_ttl_seconds(), 120);
         assert_eq!(custom.effective_allowed_algorithms(), vec!["ES256".to_string()]);
+
+        let unchecked = DidAuthAuthConfig {
+            session_ttl_seconds: Some(30 * 86_400),
+            ..custom
+        };
+        assert_eq!(
+            unchecked.effective_session_ttl_seconds(),
+            DidAuthAuthConfig::MAX_SESSION_TTL_SECONDS,
+            "a lifetime over the longest, from a configuration never validated, is cut to the longest"
+        );
     }
 
     #[test]

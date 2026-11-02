@@ -358,6 +358,22 @@ pub async fn resolve_delegation_credentials(
     let surface_variant = surface_variant.as_deref();
 
     for binding in bindings {
+        if binding.is_external() {
+            warn!(
+                target: "credential_delegation",
+                surface_variant,
+                provider_id = %binding.credential_provider_id,
+                "A consent_mode external binding is served only by its grant by binding - refusing the request"
+            );
+            results.push(DelegationResolution::new(
+                binding,
+                None,
+                DelegationActionOutcome::ProviderUnavailable,
+                Some("binding_needs_external_consent".to_string()),
+                DelegationLookupResult::Unavailable,
+            ));
+            continue;
+        }
         // Check if this binding applies to the current request
         match &binding.required_for {
             CredentialRequirement::All => {}
@@ -1973,6 +1989,7 @@ mod tests {
             inject_as: CredentialInjection::BearerHeader,
             elicit_timeout_secs: 300,
             elicit_fallback: crate::config::types::ElicitFallback::OnDemand,
+            subject: None,
         }
     }
 
@@ -1988,6 +2005,7 @@ mod tests {
             inject_as: CredentialInjection::BearerHeader,
             elicit_timeout_secs: 300,
             elicit_fallback: crate::config::types::ElicitFallback::OnDemand,
+            subject: None,
         }
     }
 
@@ -3055,6 +3073,7 @@ mod tests {
             },
             elicit_timeout_secs: 300,
             elicit_fallback: crate::config::types::ElicitFallback::OnDemand,
+            subject: None,
         }];
 
         let results = resolve_delegation_credentials(
@@ -3087,6 +3106,40 @@ mod tests {
             }
             _ => panic!("Expected Inject with custom header"),
         }
+    }
+
+    /// A `consent_mode: external` binding is served only by its grant by
+    /// binding: an agent-keyed path that reaches one, whatever its provider,
+    /// refuses the request and never builds an authorization URL or reads an
+    /// agent-keyed token.
+    #[tokio::test]
+    async fn an_external_consent_binding_is_never_resolved_by_agent() {
+        let vault = MockVaultStore::new(VaultLookupResult::Found(make_token(false, false)));
+        let providers = MockProviderStore::with_oauth_provider("cp-1");
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+        let mut binding = make_binding("cp-1");
+        binding.consent_mode = ConsentMode::External;
+        binding.subject = Some(crate::config::agent_surface::GrantSubject::Owner);
+
+        let results = resolve_delegation_credentials(
+            &[binding],
+            "sha256:user1",
+            "did:web:agent.example",
+            "ch-1",
+            None,
+            &(vault as Arc<dyn DelegationVaultStorage>),
+            &(providers as Arc<dyn CredentialProviderStorage>),
+            &secrets,
+            "https://gw.example.com",
+            false,
+            None,
+            None,
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0].result, DelegationLookupResult::Unavailable));
+        assert_eq!(results[0].action.outcome, DelegationActionOutcome::ProviderUnavailable);
     }
 
     #[tokio::test]
@@ -3260,6 +3313,7 @@ mod tests {
             inject_as: CredentialInjection::BearerHeader,
             elicit_timeout_secs: 1,
             elicit_fallback: fallback,
+            subject: None,
         }
     }
 

@@ -220,7 +220,8 @@ fn revoke_unkept(
 #[serde(deny_unknown_fields)]
 pub struct StartConnectRequest {
     pub surface_id: String,
-    /// The Transit Point id whose binding the grant serves.
+    /// The Transit Point id whose binding the grant serves, or `target` for
+    /// the Access Point Target's binding.
     pub hop: String,
     pub credential_provider_id: String,
     pub subject: GrantSubject,
@@ -258,9 +259,9 @@ pub async fn start_connect(
         Err(response) => return *response,
     };
     let served = crate::identity::handlers::surface_grants::served_external_bindings(&surface);
-    let Some((point, binding)) = served
+    let Some(binding) = served
         .into_iter()
-        .find(|(point, _)| point.id == request.hop)
+        .find(|binding| binding.hop == request.hop)
     else {
         return error(
             StatusCode::NOT_FOUND,
@@ -277,14 +278,14 @@ pub async fn start_connect(
     let tenant_id = surface.tenant_id.as_deref();
     let key = match (request.subject, request.principal.as_deref()) {
         (GrantSubject::Owner, None | Some(OWNER_PRINCIPAL)) => {
-            GrantKey::owner(tenant_id, &surface.surface_id, &point.id, &binding.credential_provider_id)
+            GrantKey::owner(tenant_id, &surface.surface_id, binding.hop, binding.credential_provider_id)
         }
         (GrantSubject::Caller, Some(principal)) => {
             match GrantKey::caller(
                 tenant_id,
                 &surface.surface_id,
-                &point.id,
-                &binding.credential_provider_id,
+                binding.hop,
+                binding.credential_provider_id,
                 principal,
             ) {
                 Some(key) => key,
@@ -305,13 +306,13 @@ pub async fn start_connect(
             );
         }
     };
-    let provider = match permitted_provider(&state, &binding.credential_provider_id, tenant_id).await {
+    let provider = match permitted_provider(&state, binding.credential_provider_id, tenant_id).await {
         Ok(provider) => provider,
         Err((status, code)) => return error(status, code, "The binding's provider cannot be connected"),
     };
     if crate::credential_providers::external::check_grant_destination(
         &provider,
-        &point.target_endpoint,
+        &binding.target_endpoint,
         state
             .egress_allowlist
             .as_deref(),
@@ -322,7 +323,7 @@ pub async fn start_connect(
         return error(
             StatusCode::CONFLICT,
             "binding_not_servable",
-            "The binding's Transit Point does not send grants to its provider's resource",
+            "The binding's Transit Point or Target does not send grants to its provider's resource",
         );
     }
     if provider
@@ -336,13 +337,13 @@ pub async fn start_connect(
             "redirect_uri is not the provider's callback_url",
         );
     }
-    let permitted_scopes = if binding.scopes.is_empty() {
+    let permitted_scopes: &[String] = if binding.scopes.is_empty() {
         &provider.default_scopes
     } else {
-        &binding.scopes
+        binding.scopes
     };
     let scopes = if request.scopes.is_empty() {
-        permitted_scopes.clone()
+        permitted_scopes.to_vec()
     } else {
         request.scopes
     };
@@ -681,11 +682,11 @@ pub async fn list_grants(
         Err(response) => return *response,
     };
     let mut bindings = Vec::new();
-    for (point, binding) in crate::identity::handlers::surface_grants::served_external_bindings(&surface) {
+    for binding in crate::identity::handlers::surface_grants::served_external_bindings(&surface) {
         if query
             .hop
             .as_deref()
-            .is_some_and(|hop| hop != point.id)
+            .is_some_and(|hop| hop != binding.hop)
         {
             continue;
         }
@@ -695,11 +696,11 @@ pub async fn list_grants(
         let grant_binding = GrantBinding::new(
             surface.tenant_id.as_deref(),
             &surface.surface_id,
-            &point.id,
-            &binding.credential_provider_id,
+            binding.hop,
+            binding.credential_provider_id,
         );
         let mut entry = serde_json::json!({
-            "hop": point.id,
+            "hop": binding.hop,
             "credential_provider_id": binding.credential_provider_id,
             "subject": match subject { GrantSubject::Owner => "owner", GrantSubject::Caller => "caller" },
         });
@@ -742,8 +743,8 @@ pub async fn list_grants(
                 ..GrantKey::owner(
                     surface.tenant_id.as_deref(),
                     &surface.surface_id,
-                    &point.id,
-                    &binding.credential_provider_id,
+                    binding.hop,
+                    binding.credential_provider_id,
                 )
             };
             match state
@@ -1033,11 +1034,11 @@ pub async fn delete_binding_grants(
                 .and_then(|surface| {
                     crate::identity::handlers::surface_grants::served_external_bindings(surface)
                         .into_iter()
-                        .find(|(point, _)| point.id == query.hop)
-                        .map(|(_, binding)| {
+                        .find(|binding| binding.hop == query.hop)
+                        .map(|binding| {
                             binding
                                 .credential_provider_id
-                                .clone()
+                                .to_string()
                         })
                 })
         }) {
@@ -1493,6 +1494,119 @@ mod tests {
                 .contains("access-1"),
             "no token is listed"
         );
+    }
+
+    /// The Access Point Target's binding is connected under the hop `target`:
+    /// its grant is kept, reported and removed as a Transit Point's is, and
+    /// the hop serves only a surface whose Target holds the binding.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_access_point_targets_binding_is_connected_under_the_hop_target() {
+        let fixture = Fixture::new(vec![token_answer("target-access"), Answer::status(200)]).await;
+        let surfaces = fixture
+            .state
+            .agent_surface_store
+            .clone()
+            .unwrap();
+        surfaces
+            .save(
+                &serde_json::from_value(json!({
+                    "surface_id": "vendor-agent", "name": "vendor-agent", "tenant_id": "tenant-a",
+                    "access_point": {"listen_address": "https://gateway.example", "route": "/vendor", "protocol": "mcp"},
+                    "target": {"endpoint": format!("{}/mcp", fixture.vendor_origin)},
+                    "outbound_credentials": [{"credential_provider_id": "vendor", "consent_mode": "external",
+                        "subject": "caller", "scopes": ["read"]}]
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let target_start = |surface: &str| {
+            json!({"surface_id": surface, "hop": "target", "credential_provider_id": "vendor", "subject": "caller",
+                "principal": CALLER, "redirect_uri": CALLBACK})
+        };
+        let (status, refused) = fixture
+            .start(Some("tenant-a"), target_start("surface"))
+            .await;
+        assert_eq!((status, refused["code"].clone()), (StatusCode::NOT_FOUND, json!("binding_not_found")));
+
+        let (status, started) = fixture
+            .start(Some("tenant-a"), target_start("vendor-agent"))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{started}");
+        let (status, completed) = fixture
+            .complete(
+                started["connect_id"]
+                    .as_str()
+                    .unwrap(),
+                json!({"code": "code", "iss": fixture.issuer()}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{completed}");
+        let key = GrantKey::caller(Some("tenant-a"), "vendor-agent", "target", "vendor", CALLER).unwrap();
+        let grant = fixture
+            .state
+            .vault_store
+            .grant(&key)
+            .await
+            .unwrap()
+            .expect("the Target's grant is kept under the hop target");
+        assert_eq!(grant.access_token, "target-access");
+        assert_eq!(completed["grant_id"], grant.id);
+
+        let (status, listed) = read(
+            list_grants(
+                State(fixture.state.clone()),
+                caller(),
+                None,
+                tenant_context(Some("tenant-a")),
+                None,
+                Query(GrantsQuery {
+                    surface_id: "vendor-agent".into(),
+                    hop: Some("target".into()),
+                    principal: Some(CALLER.into()),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{listed}");
+        assert_eq!(listed["bindings"][0]["hop"], "target");
+        assert_eq!(listed["bindings"][0]["subject"], "caller");
+        assert_eq!(listed["bindings"][0]["callers"], 1);
+        assert_eq!(listed["bindings"][0]["grant"]["grant_id"], grant.id);
+
+        let (status, removed) = read(
+            delete_binding_grants(
+                State(fixture.state.clone()),
+                caller(),
+                None,
+                tenant_context(Some("tenant-a")),
+                None,
+                Query(BindingGrantsQuery {
+                    surface_id: "vendor-agent".into(),
+                    hop: "target".into(),
+                    credential_provider_id: None,
+                    principal: None,
+                    tenant_id: None,
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{removed}");
+        assert_eq!(removed["grant_ids"], json!([grant.id]));
+        assert!(
+            fixture
+                .state
+                .vault_store
+                .grant(&key)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        fixture
+            .revoked_eventually("target-access-refresh")
+            .await;
     }
 
     /// A connect is refused for a binding the surface does not serve, another
